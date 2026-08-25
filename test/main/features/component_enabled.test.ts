@@ -38,6 +38,16 @@ afterEach(() => {
 });
 
 describe('component_enabled resolver', () => {
+  it('resolves multiple connectors from one caller-owned snapshot', async () => {
+    const ce = await import('../../../src/main/features/component_enabled');
+    const snapshot = {
+      connectors: { notion: false },
+    };
+
+    expect(ce.isConnectorEnabledFromSnapshot(snapshot, 'notion')).toBe(false);
+    expect(ce.isConnectorEnabledFromSnapshot(snapshot, 'github')).toBe(true);
+  });
+
   it('returns true when no override and no spec default', async () => {
     const ce = await import('../../../src/main/features/component_enabled');
     expect(ce.isAgentEnabled(TEST_UID, 'a1')).toBe(true);

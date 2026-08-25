@@ -65,9 +65,11 @@ export class SkillStore {
 
   /** Read a skill by its id (directory name). Returns null if not found. */
   async read(id: string): Promise<Skill | null> {
-    const skillPath = path.join(this.skillsDir, id, SKILL_FILENAME);
+    const { skillDir, skillPath } = this.resolveSkillPaths(id);
     let raw: string;
     try {
+      await this.rejectSymlink(skillDir, "skill directory");
+      await this.rejectSymlink(skillPath, SKILL_FILENAME);
       raw = await fs.readFile(skillPath, "utf-8");
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
@@ -127,8 +129,7 @@ export class SkillStore {
     };
 
     const content = serializeFrontmatter(frontmatter) + opts.body;
-    const skillDir = path.join(this.skillsDir, opts.id);
-    const skillPath = path.join(skillDir, SKILL_FILENAME);
+    const { skillDir, skillPath } = this.resolveSkillPaths(opts.id);
 
     await fs.mkdir(skillDir, { recursive: true });
     await fs.writeFile(skillPath, content, "utf-8");
@@ -193,8 +194,9 @@ export class SkillStore {
 
   /** Delete a skill by id. Returns true if deleted, false if not found. */
   async delete(id: string): Promise<boolean> {
-    const skillDir = path.join(this.skillsDir, id);
+    const { skillDir } = this.resolveSkillPaths(id);
     try {
+      await this.rejectSymlink(skillDir, "skill directory");
       await fs.rm(skillDir, { recursive: true });
       log.info(`Deleted skill: ${id}`);
       return true;
@@ -240,11 +242,11 @@ export class SkillStore {
       // Scope this instruction explicitly to the list above. Other skill
       // surfaces (e.g. the regular `## Available skills (skills)` block injected by
       // the host app) live in different stores and are loaded differently
-      // (read_file on the logical/path reference the host gives you) — picking the
+      // (read_files on the logical/path reference the host gives you) — picking the
       // wrong path here returns "Skill not found" and leads the model to
       // fabricate reasons (we've seen "skill is in a 'pending' state" on a
       // perfectly populated regular skill).
-      `Use skill_manage(action='read', id='<id>') ONLY for the Learned Skills listed in this section. Regular skills shown elsewhere (e.g. under "## Available skills (skills)") are NOT in this store — load them with read_file using the exact read ref or path in the host's prompt instead.`,
+      `Use skill_manage(action='read', id='<id>') ONLY for the Learned Skills listed in this section. Regular skills shown elsewhere (e.g. under "## Available skills (skills)") are NOT in this store — load them with read_files using the exact read ref or path in the host's prompt instead.`,
     ].join("\n");
   }
 
@@ -275,6 +277,27 @@ export class SkillStore {
     }
     if (id.length > NAME_MAX_LEN) {
       throw new Error(`Skill id too long: ${id.length} chars (max ${NAME_MAX_LEN})`);
+    }
+  }
+
+  /** Resolve only one validated child directory of this store. The lexical
+   * containment check is defense-in-depth beside the one-segment id grammar;
+   * rejecting symlinks in read/delete prevents an externally planted entry
+   * from redirecting patch/touch writes outside the learned-Skill store. */
+  private resolveSkillPaths(id: string): { skillDir: string; skillPath: string } {
+    this.validateId(id);
+    const skillDir = path.resolve(this.skillsDir, id);
+    const rel = path.relative(this.skillsDir, skillDir);
+    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+      throw new Error(`Invalid skill id: "${id}" resolves outside the skill store`);
+    }
+    return { skillDir, skillPath: path.join(skillDir, SKILL_FILENAME) };
+  }
+
+  private async rejectSymlink(target: string, label: string): Promise<void> {
+    const st = await fs.lstat(target);
+    if (st.isSymbolicLink()) {
+      throw new Error(`Unsafe ${label}: symbolic links are not allowed in learned skills`);
     }
   }
 

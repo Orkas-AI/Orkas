@@ -33,6 +33,7 @@ import {
 import { getActiveUserId } from '../features/users.js';
 import { userToolResultsDir } from '../paths.js';
 import { createLogger } from '../logger.js';
+import { logPathRef, maskId } from '../util/log-redact.js';
 
 const log = createLogger('ipc:local_agents');
 
@@ -41,6 +42,23 @@ const log = createLogger('ipc:local_agents');
  *  cap reads here AND tell the renderer via `truncated: true` so it
  *  can suggest opening the file directly. */
 const READ_TOOL_RESULT_MAX_BYTES = 256 * 1024;
+const TOOL_RESULT_REF_RE = /^[A-Za-z0-9_-]{1,48}\.[a-f0-9]{16,64}$/i;
+
+function resolveToolResultRef(rootDir: string, ref: string): string | null {
+  if (!TOOL_RESULT_REF_RE.test(ref)) return null;
+  const fileName = `${ref}.txt`;
+  const direct = path.join(rootDir, fileName);
+  if (fs.existsSync(direct)) return direct;
+  let entries: fs.Dirent[];
+  try { entries = fs.readdirSync(rootDir, { withFileTypes: true }); }
+  catch { return null; }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const candidate = path.join(rootDir, entry.name, fileName);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
 
 function isLocalCliType(v: unknown): v is LocalCliType {
   return typeof v === 'string' && (LOCAL_CLI_TYPES as readonly string[]).includes(v);
@@ -132,8 +150,9 @@ export const invokeHandlers = {
 
   /**
    * Read a spilled CLI tool_result file. The renderer's click-to-expand
-   * UI calls this with the `outputPath` it received on a `tool-event
-   * phase:'result'` event.
+   * UI calls this with the opaque `outputRef` it received on a `tool-event
+   * phase:'result'` event. A legacy absolute `path` remains accepted for old
+   * local transcripts, but new cloud-synced events never carry it.
    *
    * Hard constraints:
    *   - Path MUST resolve under the active uid's
@@ -212,16 +231,27 @@ export const invokeHandlers = {
     return { session: closeInteractiveCliSession(ctx.userId, payload.session_id) };
   },
 
-  'localAgents.readToolResult': async ({ path: filePath }: { path?: unknown }) => {
-    if (typeof filePath !== 'string' || !filePath) {
-      return { ok: false as const, error: 'invalid path' };
-    }
+  'localAgents.readToolResult': async (
+    { path: legacyPath, ref }: { path?: unknown; ref?: unknown },
+  ) => {
     const uid = (() => {
       try { return getActiveUserId(); }
       catch { return ''; }
     })();
     if (!uid) return { ok: false as const, error: 'no active user' };
     const rootDir = userToolResultsDir(uid);
+    let filePath = '';
+    if (typeof ref === 'string' && ref) {
+      if (!TOOL_RESULT_REF_RE.test(ref)) {
+        return { ok: false as const, error: 'invalid result ref' };
+      }
+      filePath = resolveToolResultRef(rootDir, ref) || '';
+      if (!filePath) return { ok: false as const, error: 'file no longer exists' };
+    } else if (typeof legacyPath === 'string' && legacyPath) {
+      filePath = legacyPath;
+    } else {
+      return { ok: false as const, error: 'invalid result ref' };
+    }
     // Resolve both sides via realpath when they exist, then compare.
     // The renderer-supplied path may legitimately not exist anymore
     // (sweep ran, tool-result evicted) — handle ENOENT cleanly.
@@ -238,7 +268,10 @@ export const invokeHandlers = {
     catch { return { ok: false as const, error: 'tool-results dir not found' }; }
     const rel = path.relative(rootResolved, resolved);
     if (rel.startsWith('..') || path.isAbsolute(rel)) {
-      log.warn('readToolResult rejected out-of-scope path', { filePath, uid });
+      log.warn('readToolResult rejected out-of-scope path', {
+        path: logPathRef(filePath),
+        user_id: maskId(uid),
+      });
       return { ok: false as const, error: 'path is outside tool-results scope' };
     }
     try {

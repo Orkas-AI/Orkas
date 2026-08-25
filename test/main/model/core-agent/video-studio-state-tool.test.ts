@@ -7,7 +7,12 @@ import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import sharp from 'sharp';
 
+import {
+  SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS,
+  TOOL_DESCRIPTION_SOFT_BUDGET_CHARS,
+} from '../../../../src/core-agent/src/tools';
 import { bundledFfmpegPaths } from '../../../../src/main/util/bundled-runtime';
+import { chatMediaLocalPathFromUrl } from '../../../../src/main/util/chat-media-url';
 
 const PNG_2X2 = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAEUlEQVQImWOQUEj4D8IMMAYAM2QGXeoNXYQAAAAASUVORK5CYII=',
@@ -112,20 +117,28 @@ vi.mock('../../../../src/main/features/tts_capabilities', async (importOriginal)
       if (input.voiceRef && input.voiceRef !== voice.voiceRef) {
         return { ok: false, errorCode: 'E_TTS_VOICE_UNRESOLVED', message: 'missing voice' };
       }
-      if (input.legacyVoice && input.legacyVoice !== voice.providerVoiceId) {
+      // Two resolvable legacy voices so a schema-1 voice CHANGE is expressible:
+      // the reuse-provenance case needs a second valid profile, not a typo.
+      if (input.legacyVoice && input.legacyVoice !== voice.providerVoiceId
+        && input.legacyVoice !== 'zh_male_finance_anchor_bigtts') {
         return { ok: false, errorCode: 'E_TTS_VOICE_UNRESOLVED', message: 'missing voice' };
       }
       const language = input.language || voice.nativeLocale;
       if (!voice.supportedLocales.some((item) => item.split('-')[0] === language.split('-')[0])) {
         return { ok: false, errorCode: 'E_TTS_LANGUAGE_UNSUPPORTED', message: 'unsupported language' };
       }
+      // Distinct legacy voices resolve to distinct catalog selections, as the
+      // real resolver does — collapsing them onto one voiceRef would make two
+      // different requests share a synthesis signature and quietly legalize
+      // stale-voice reuse in the very cases that guard against it.
+      const finance = input.legacyVoice === 'zh_male_finance_anchor_bigtts';
       return {
         ok: true,
         selection: {
           routeRef: route.routeRef,
-          voiceRef: voice.voiceRef,
-          providerVoiceId: voice.providerVoiceId,
-          displayName: voice.displayName,
+          voiceRef: finance ? 'managed:orkas-voice:voice:finance-anchor' : voice.voiceRef,
+          providerVoiceId: finance ? 'zh_male_finance_anchor_bigtts' : voice.providerVoiceId,
+          displayName: finance ? 'Finance Anchor' : voice.displayName,
           provider: route.provider,
           model: route.model,
           catalogStatus: route.catalogStatus,
@@ -336,7 +349,12 @@ function markNarrationMapAsRuntimeReceipt(): void {
   fs.writeFileSync(narrationMapPath, JSON.stringify(narrationMap, null, 2), 'utf8');
 }
 
-function writeAutoParentPlan(opts: { targetSec?: number; scenes?: number; narration?: boolean } = {}): string {
+function writeAutoParentPlan(opts: {
+  targetSec?: number;
+  scenes?: number;
+  narration?: boolean;
+  providedSegment?: { producedPath: string };
+} = {}): string {
   const targetSec = opts.targetSec ?? 5;
   const sceneCount = opts.scenes ?? 1;
   const planPath = path.join(workspace, 'project', 'plan.json');
@@ -345,7 +363,17 @@ function writeAutoParentPlan(opts: { targetSec?: number; scenes?: number; narrat
     total_target_sec: targetSec,
     language: 'en',
     delivery_promise: { type: 'compose_led', source_required: false, motion_min_ratio: 0 },
-    segments: [{
+    segments: [...(opts.providedSegment ? [{
+      id: 'opening',
+      order: 0,
+      role: 'hook',
+      layer: 'primary',
+      source: 'provided',
+      target_sec: 4,
+      spec: { kind: 'video', input_id: 'source_video' },
+      produced_path: opts.providedSegment.producedPath,
+      status: 'done',
+    }] : []), {
       id: 'intro',
       order: 1,
       role: 'hook',
@@ -509,6 +537,34 @@ afterEach(() => {
 });
 
 describe('VideoStudio production-state tool protocol', () => {
+  it('keeps provider-visible descriptions within the reviewed budgets', async () => {
+    const mod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const tool = mod.createVideoStudioTool({
+      userId: UID,
+      agentId: VIDEO_STUDIO_AGENT_ID,
+    });
+    const overBudget: string[] = [];
+    const walk = (value: unknown, pointer: string): void => {
+      if (!value || typeof value !== 'object') return;
+      if (Array.isArray(value)) {
+        value.forEach((item, index) => walk(item, `${pointer}/${index}`));
+        return;
+      }
+      const object = value as Record<string, unknown>;
+      if (typeof object.description === 'string'
+        && object.description.replace(/\s+/g, ' ').trim().length > SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS) {
+        overBudget.push(`${pointer}/description`);
+      }
+      for (const [key, child] of Object.entries(object)) {
+        if (key !== 'description') walk(child, `${pointer}/${key}`);
+      }
+    };
+    expect(tool.description.replace(/\s+/g, ' ').trim().length)
+      .toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_CHARS);
+    walk(tool.inputSchema, 'inputSchema');
+    expect(overBudget).toEqual([]);
+  });
+
   it('exposes an unambiguous legacy design-review findings contract', async () => {
     // Compatibility callers should complete a passing review in one call.
     // The production trace put positive observations in review_findings because
@@ -1474,6 +1530,29 @@ describe('VideoStudio production-state tool protocol', () => {
     expect(parseResult(transcribe.content).message).toContain('input_path');
   });
 
+  it('rejects a delivered video outside the conversation path sandbox before probing it', async () => {
+    writeAutoParentPlan();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-delivery-outside-'));
+    try {
+      const outsideVideo = path.join(outsideDir, 'final.mp4');
+      fs.writeFileSync(outsideVideo, 'existing but out of scope');
+      const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+      const tool = toolMod.createVideoStudioTool({ userId: UID, agentId: VIDEO_STUDIO_AGENT_ID });
+
+      const result = await tool.execute({
+        op: 'production.status',
+        plan_path: 'project/plan.json',
+        delivered_video_path: outsideVideo,
+      }, { workingDir: workspace, state: {} } as any);
+
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain('E_PATH_OUT_OF_SCOPE');
+      expect(result.content).toContain('delivered_video_path');
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
   // The zero-route diagnosis itself (signed out, Orkas Voice switched off, not
   // configured) belongs to video-studio-tts-availability.test.ts. What is
   // pinned here is the one way out that does NOT exist: 2026-08-09 the model
@@ -1540,6 +1619,158 @@ describe('VideoStudio production-state tool protocol', () => {
     expect(result.isError).toBe(true);
     expect(result.content).toContain('E_TTS_VOICE_UNRESOLVED');
     expect(ttsMock.generateSpeech).not.toHaveBeenCalled();
+  });
+
+  // 2026-08-23: a user asked for a deliberately silent video. gate-control has
+  // the model run the free fit check before every plan stop, and the empty-text
+  // branch answered only "add narration_text" — rewriting the user's
+  // no-narration intent and leaving no passing path to Gate B, which pushed a
+  // live production off the native pipeline entirely.
+  it('passes a deliberately silent plan through the fit check and readies Gate B', async () => {
+    const manifestPath = path.join(compositionDir, 'composition-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    manifest.schema_version = 2;
+    delete manifest.scenes[0].narration_text;
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+
+    const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const stateMod = await import('../../../../src/main/features/video_studio_state');
+    const opts = {
+      userId: UID,
+      turnId: 'turn-silent-fit',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+      agentName: 'VideoStudio',
+    };
+    const ctx = { workingDir: workspace, state: {} } as any;
+    const result = await toolMod.createVideoStudioTool(opts).execute({
+      op: 'composition.check_narration_fit',
+      composition_dir: 'project/composition',
+    }, ctx);
+    expect(result.isError, String(result.content)).toBe(false);
+    const payload = parseResult(result.content);
+    expect(payload).toMatchObject({
+      ok: true,
+      status: 'not_applicable',
+      gate_b_ready: true,
+      gate_b_required: true,
+      requires_user_decision: true,
+      billable_request_sent: false,
+      next_action: 'open_gate_b',
+    });
+    expect(payload.message).not.toContain('Add the complete candidate narration_text');
+    expect(ttsMock.generateSpeech).not.toHaveBeenCalled();
+
+    // The silent plan earns the same durable review candidate a narrated plan
+    // gets, so a later natural-language approval routes and drift restores.
+    const statePath = toolMod.videoStudioProductionStatePath(opts, compositionDir);
+    const state = await stateMod.readVideoProductionState(statePath, compositionDir);
+    expect(state.plan_review_candidate?.checked_turn_id).toBe('turn-silent-fit');
+    expect(state.narration_fit).toBeUndefined();
+
+    const approve = await toolMod.createVideoStudioTool({
+      ...opts,
+      turnId: 'turn-silent-approve',
+      userMessage: approvalSubmission('gate_b_decision', 'approve'),
+    }).execute({ op: 'composition.approve_plan', composition_dir: 'project/composition' }, ctx);
+    expect(approve.isError, String(approve.content)).toBe(false);
+
+    // Rechecking after approval must not reopen the confirmation.
+    const recheck = parseResult((await toolMod.createVideoStudioTool({
+      ...opts,
+      turnId: 'turn-silent-recheck',
+    }).execute({
+      op: 'composition.check_narration_fit',
+      composition_dir: 'project/composition',
+    }, ctx)).content);
+    expect(recheck).toMatchObject({
+      ok: true,
+      status: 'not_applicable',
+      gate_b_required: false,
+      requires_user_decision: false,
+      next_action: 'continue_confirmed_plan',
+    });
+  });
+
+  it('treats a music-only plan with no narration as fit not_applicable', async () => {
+    const manifestPath = path.join(compositionDir, 'composition-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    manifest.schema_version = 2;
+    delete manifest.scenes[0].narration_text;
+    manifest.audio = {
+      owner: 'composition',
+      tracks: [{ id: 'bgm', kind: 'music', src: 'assets/bgm.mp3', start: 0, duration: 5, volume: 0.4 }],
+    };
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+
+    const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const result = await toolMod.createVideoStudioTool({
+      userId: UID,
+      turnId: 'turn-music-only-fit',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+    }).execute({
+      op: 'composition.check_narration_fit',
+      composition_dir: 'project/composition',
+    }, { workingDir: workspace, state: {} } as any);
+    expect(result.isError, String(result.content)).toBe(false);
+    expect(parseResult(result.content)).toMatchObject({
+      ok: true,
+      status: 'not_applicable',
+      gate_b_ready: true,
+    });
+  });
+
+  it('still blocks the empty-text fit check when a legacy voice explicitly requests narration', async () => {
+    const manifestPath = path.join(compositionDir, 'composition-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    delete manifest.scenes[0].narration_text;
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+
+    const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const result = await toolMod.createVideoStudioTool({
+      userId: UID,
+      turnId: 'turn-voice-no-text',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+    }).execute({
+      op: 'composition.check_narration_fit',
+      composition_dir: 'project/composition',
+      voice: 'orkas-voice-anchor',
+    }, { workingDir: workspace, state: {} } as any);
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_NARRATION_TEXT_MISSING');
+    // Recovery is stated in both directions: add the script, or declare the
+    // plan silent instead of abandoning the pipeline.
+    expect(parseResult(result.content).message).toContain('audio.owner "none"');
+  });
+
+  it('still blocks the empty-text fit check when the manifest signs a narration intent on an audible owner', async () => {
+    const manifestPath = path.join(compositionDir, 'composition-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    manifest.schema_version = 2;
+    delete manifest.scenes[0].narration_text;
+    manifest.audio = {
+      owner: 'composition',
+      tracks: [{ id: 'bgm', kind: 'music', src: 'assets/bgm.mp3', start: 0, duration: 5, volume: 0.4 }],
+      narration_intent: {
+        route_ref: 'managed:orkas-voice',
+        voice_ref: 'managed:orkas-voice:voice:anchor',
+        display_name: 'Anchor',
+        language: 'zh-CN',
+        speed: 1,
+      },
+    };
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+
+    const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const result = await toolMod.createVideoStudioTool({
+      userId: UID,
+      turnId: 'turn-intent-no-text',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+    }).execute({
+      op: 'composition.check_narration_fit',
+      composition_dir: 'project/composition',
+    }, { workingDir: workspace, state: {} } as any);
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_NARRATION_TEXT_MISSING');
   });
 
   it('recovers a legacy conversation-scoped ledger from a different resumed conversation', async () => {
@@ -2768,6 +2999,9 @@ describe('VideoStudio production-state tool protocol', () => {
     });
     expect(result.review_package.conclusion.summary).toContain('title hierarchy');
     expect(published.flat()).toContain(result.review_package.primary_artifact.path);
+    // The flat path list exists to feed publishing (proven above) and every
+    // path is already on the artifact entries; the returned package drops it.
+    expect(result.review_package.visible_artifact_paths).toBeUndefined();
   });
 
   it('inherits a passed approved-preview review instead of repeating static design review after draft render', async () => {
@@ -4110,6 +4344,19 @@ describe('VideoStudio production-state tool protocol', () => {
     expect(checked.delivery_check.ok).toBe(false);
     expect(checked.delivery_check.video_path).toBe(finalPath);
     expect(checked.delivery_check.issues.length).toBeGreaterThan(0);
+
+    // The assembly skill writes this canonical workspace-relative shape. It
+    // must not be resolved as project/project/render/video.mp4 merely because
+    // the plan itself lives under project/.
+    const renderPath = path.join(workspace, 'project', 'render', 'video.mp4');
+    fs.mkdirSync(path.dirname(renderPath), { recursive: true });
+    fs.writeFileSync(renderPath, 'not really a video either');
+    const projectRelative = parseResult((await tool.execute({
+      op: 'production.status',
+      plan_path: 'project/plan.json',
+      delivered_video_path: 'project/render/video.mp4',
+    }, ctx)).content);
+    expect(projectRelative.delivery_check.video_path).toBe(renderPath);
   });
 
   it('publishes one contact sheet for the whole production when the last segment is captured', async () => {
@@ -4621,6 +4868,129 @@ describe('VideoStudio production-state tool protocol', () => {
       errorCode: 'E_PREVIEW_GO_AHEAD_REQUIRED',
     });
     expect(draftSpy).toHaveBeenCalledTimes(4);
+  });
+
+  it('refuses to sign a plan whose provided footage cannot be read, and signs once it can', async () => {
+    // Drive-7 on 2026-08-23: a provided-footage segment that could never be
+    // reviewed was approved at Gate B and only surfaced many turns later as an
+    // unbindable preview go-ahead. Satisfiability is checked before signing.
+    const mod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const ctx = { workingDir: workspace, state: {} } as any;
+    writeAutoParentPlan({ targetSec: 24, scenes: 3, providedSegment: { producedPath: 'project/raw/opening.mp4' } });
+    const approve = () => mod.createVideoStudioTool({
+      userId: UID, cid: 'cid-gateb-media', turnId: 'turn-gateb-media',
+      agentId: VIDEO_STUDIO_AGENT_ID, agentName: 'VideoStudio',
+      userMessage: approvalSubmission('gate_b_decision', 'approve'),
+    }).execute({ op: 'production.approve_plan', plan_path: 'project/plan.json' }, ctx);
+
+    const refused = parseResult(String((await approve()).content));
+    expect(refused.errorCode).toBe('E_VIDEO_PRODUCTION_MEDIA_SEGMENT_UNRESOLVED');
+    expect(refused.media_segment_issues).toEqual([
+      { segment_id: 'opening', produced_path: 'project/raw/opening.mp4', issue: 'file_missing' },
+    ]);
+
+    fs.mkdirSync(path.join(workspace, 'project', 'raw'), { recursive: true });
+    fs.writeFileSync(path.join(workspace, 'project', 'raw', 'opening.mp4'), 'real opening bytes');
+    expect((await approve()).isError).toBe(false);
+
+    // Negative control: an edit segment's file is legitimately produced after
+    // approval, so its absence must not block Gate B.
+    writeMixedSourcePlan({ cutProducedPath: 'project/cuts/produced-later.mp4', composeIds: ['body'] });
+    expect((await mod.createVideoStudioTool({
+      userId: UID, cid: 'cid-gateb-edit', turnId: 'turn-gateb-edit',
+      agentId: VIDEO_STUDIO_AGENT_ID, agentName: 'VideoStudio',
+      userMessage: approvalSubmission('gate_b_decision', 'approve'),
+    }).execute({ op: 'production.approve_plan', plan_path: 'project/plan.json' }, ctx)).isError).toBe(false);
+  });
+
+  it('diagnoses an unbindable preview go-ahead instead of re-asking the user', async () => {
+    // The 2026-08-23 deadlock: the user confirmed the same keyframe five
+    // times while the go-ahead recording silently bailed on an unreviewable
+    // segment. A reply that cannot bind now names the blocker for the model
+    // to repair, and the already-recorded reply grants it in the same turn.
+    const mod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const stateMod = await import('../../../../src/main/features/video_studio_state');
+    const controlMod = await import('../../../../src/main/features/video_production_control');
+    const videoStudio = await import('../../../../src/main/features/video_studio');
+    const ctx = { workingDir: workspace, state: {} } as any;
+    const openingAbs = path.join(workspace, 'project', 'raw', 'opening.mp4');
+    fs.mkdirSync(path.dirname(openingAbs), { recursive: true });
+    fs.writeFileSync(openingAbs, 'real opening bytes');
+    writeAutoParentPlan({ targetSec: 24, scenes: 3, providedSegment: { producedPath: 'project/raw/opening.mp4' } });
+    const child = writeAutoChildComposition({ targetSec: 24, scenes: 3 });
+
+    await mod.createVideoStudioTool({
+      userId: UID, cid: 'cid-deadlock-parent', turnId: 'turn-deadlock-gate-b',
+      agentId: VIDEO_STUDIO_AGENT_ID, agentName: 'VideoStudio',
+      userMessage: approvalSubmission('gate_b_decision', 'approve'),
+    }).execute({ op: 'production.approve_plan', plan_path: 'project/plan.json' }, ctx);
+    const opts = {
+      userId: UID, cid: 'cid-deadlock-child', turnId: 'turn-deadlock-inherit',
+      agentId: VIDEO_STUDIO_AGENT_ID, agentName: 'VideoStudio',
+      userMessage: '<msg from="user">later turn</msg>',
+    };
+    expect((await mod.createVideoStudioTool(opts).execute({
+      op: 'composition.approve_plan',
+      composition_dir: 'project/compositions/intro',
+      plan_path: 'project/plan.json',
+      segment_id: 'intro',
+    }, ctx)).isError).toBe(false);
+
+    const statePath = mod.videoStudioProductionStatePath(opts, child);
+    const frames = ['01-first-frame.png', '02-mid.png'].map((n) => path.join(child, 'preview', n));
+    fs.mkdirSync(path.join(child, 'preview'), { recursive: true });
+    for (const f of frames) fs.writeFileSync(f, 'png');
+    const sheet = path.join(child, 'preview', 'contact-sheet.png');
+    fs.writeFileSync(sheet, 'png');
+    await mod.recordVideoStudioGate(statePath, 'preview', child, 'turn-deadlock-capture', {
+      preview_ready: true,
+      preview_qa: { ok: true, error_count: 0 },
+      preflight: { status: 'passed', blocking_error_count: 0 },
+      contact_sheet: sheet,
+      frame_paths: frames,
+    });
+    await stateMod.updateVideoProductionState(statePath, child, (next) => {
+      if (next.preview) next.preview.created_at = new Date(Date.now() - 60_000).toISOString();
+    });
+    const draftSpy = vi.spyOn(videoStudio, 'draftComposition').mockResolvedValue({
+      ok: false, op: 'composition.draft', errorCode: 'E_TEST_RENDER_STUB', message: 'stub',
+    } as any);
+    const draftInput = {
+      op: 'composition.draft',
+      composition_dir: 'project/compositions/intro',
+      output_path: 'project/parts/intro.mp4',
+    };
+
+    // The footage disappears after approval — the exact drive-7 shape.
+    fs.rmSync(openingAbs);
+    const replyTool = mod.createVideoStudioTool({
+      ...opts, turnId: 'turn-deadlock-reply', userMessage: '<msg from="user">看过了，继续</msg>',
+    });
+    const diagnosed = parseResult(String((await replyTool.execute(draftInput, ctx)).content));
+    expect(diagnosed.errorCode).toBe('E_PRODUCTION_REVIEW_INCOMPLETE');
+    expect(diagnosed.uncaptured_segments).toEqual([
+      { segment_id: 'opening', reason: 'media_path_unresolved' },
+    ]);
+    expect(String(diagnosed.message)).toContain('Do not ask the user to confirm again');
+    expect(diagnosed.requires_user_decision).toBeUndefined();
+    expect(draftSpy).not.toHaveBeenCalled();
+    const controlPath = controlMod.videoProductionControlStatePath({
+      userId: UID, planPath: path.join(workspace, 'project', 'plan.json'),
+    });
+    expect((await controlMod.readVideoProductionControlState(
+      controlPath, path.join(workspace, 'project', 'plan.json'),
+    )).preview_go_ahead).toBeUndefined();
+
+    // Repair in the same turn: the recorded reply grants the go-ahead and the
+    // draft proceeds without another confirmation.
+    fs.writeFileSync(openingAbs, 'real opening bytes');
+    const retry = await replyTool.execute(draftInput, ctx);
+    expect(String(retry.content)).not.toContain('E_PRODUCTION_REVIEW_INCOMPLETE');
+    expect(String(retry.content)).not.toContain('E_PREVIEW_GO_AHEAD_REQUIRED');
+    expect(draftSpy).toHaveBeenCalledTimes(1);
+    expect((await controlMod.readVideoProductionControlState(
+      controlPath, path.join(workspace, 'project', 'plan.json'),
+    )).preview_go_ahead?.turn_id).toBe('turn-deadlock-reply');
   });
 
   it('keeps the rest of a production moving when one segment exhausts its repair budget', async () => {
@@ -5528,6 +5898,66 @@ describe('VideoStudio production-state tool protocol', () => {
       output_path: 'project/parts/intro.mp4',
     }, ctx);
     expect(String(rendered.content)).not.toContain('E_PREVIEW_GO_AHEAD_REQUIRED');
+  });
+
+  it('echoes verdicts, not ledgers: minimal journal entries, visual-QA counts, no duplicate candidate', async () => {
+    // Second-harvest cuts measured on the 2026-08-23 drives: journal entries
+    // still dragged absolute paths and double timestamps (37% of the echo),
+    // visual_qa shipped its full cycle history with signature arrays (28%),
+    // and passing results carried the candidate twice.
+    const stateMod = await import('../../../../src/main/features/video_studio_state');
+    const mod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const echo = stateMod.summarizeVideoProductionState({
+      schema_version: 2,
+      revision: 9,
+      stage: 'draft_blocked',
+      artifacts: { html_sha256: 'h' },
+      operation_journal: [
+        {
+          op: 'composition.snapshot', status: 'failed', error_code: 'E_X', turn_id: 't1',
+          findings_path: '/abs/findings.json', output_path: '/abs/out.png',
+          started_at: '2026-08-23T00:00:00Z', finished_at: '2026-08-23T00:00:09Z',
+        },
+        { op: 'composition.draft', status: 'interrupted', consumes_same_input_attempt: false },
+      ],
+      visual_qa: {
+        cycle: {
+          inspector_version: 3, cycle_id: 'c1', status: 'active', visual_revision: 3,
+          max_repair_passes: 2, failed_signatures: ['a'.repeat(64), 'b'.repeat(64)],
+          passed_signatures: {}, started_at: 's', updated_at: 'u', last_error_code: 'E_INSPECT_BLOCKED',
+        },
+        history: [{ cycle_id: 'old-1' }, { cycle_id: 'old-2' }],
+      },
+    } as any);
+    expect(echo.operation_journal).toEqual([
+      { op: 'composition.snapshot', status: 'failed', error_code: 'E_X' },
+      { op: 'composition.draft', status: 'interrupted', consumes_same_input_attempt: false },
+    ]);
+    expect(echo.visual_qa).toEqual({
+      cycle: {
+        status: 'active', visual_revision: 3, max_repair_passes: 2,
+        failed_signature_count: 2, last_error_code: 'E_INSPECT_BLOCKED',
+      },
+      history_count: 2,
+    });
+
+    // A passing result carrying the candidate at top level ships one copy.
+    const deduped = JSON.parse(mod._resultContentForTest({
+      ok: true,
+      op: 'composition.snapshot',
+      current_candidate: { revision_id: 'r1' },
+      production_state: { stage: 'preview_ready', revision: 3, current_candidate: { revision_id: 'r1' } },
+    } as any));
+    expect(deduped.current_candidate.revision_id).toBe('r1');
+    expect(deduped.production_state.current_candidate).toBeUndefined();
+    expect(deduped.production_state.stage).toBe('preview_ready');
+    // Status has no top-level copy, so the echo's candidate must survive.
+    const statusLike = JSON.parse(mod._resultContentForTest({
+      ok: true,
+      op: 'composition.status',
+      production_state: { stage: 'preview_ready', current_candidate: { revision_id: 'r1' } },
+    } as any));
+    expect(statusLike.production_state.current_candidate.revision_id).toBe('r1');
   });
 
   it('keeps a QA-blocked result inline-able by bounding its durable-state sections', async () => {
@@ -6898,15 +7328,41 @@ describe('VideoStudio production-state tool protocol', () => {
     // matters, and it is asserted against durable state.
     expect(thirdPayload.production_state.candidate_history_count).toBeGreaterThan(0);
     expect(thirdPayload.production_state).not.toHaveProperty('candidate_history');
+    // Negative control: a failure with budget remaining is agent-recoverable,
+    // never a user fork.
+    expect(thirdPayload.requires_user_decision).toBeUndefined();
     expect(fs.readFileSync(frozenHtmlPath, 'utf8')).toBe(frozenHtml);
     expect(fs.readFileSync(frozenHtmlPath, 'utf8')).not.toContain('<!-- repaired -->');
     const revisedState = await stateMod.readVideoProductionState(statePath, compositionDir);
     expect(revisedState.candidate_history?.[0]?.snapshot?.locators.html_path).toBe(frozenHtmlPath);
 
     fs.appendFileSync(path.join(compositionDir, 'index.html'), '\n<!-- repaired again -->\n');
+    // The failure that exhausts the budget carries the user fork itself. It
+    // used to come back as an ordinary continue-class failure: a model that
+    // (correctly) refused to burn another attempt stopped with no tool
+    // backing, and the runner's plan-completion guard suppressed its report
+    // as a premature completion (2026-08-22 live run).
     const fourth = await tool.execute(input, ctx);
     expect(fourth.isError).toBe(true);
     expect(snapshot).toHaveBeenCalledTimes(3);
+    const fourthPayload = parseResult(fourth.content);
+    expect(fourth.content).toContain('E_PREVIEW_QA_BLOCKED');
+    expect(fourthPayload).toMatchObject({
+      outcome: 'need_user',
+      requires_user_decision: true,
+      next_step_owner: 'user',
+      next_action: 'present_findings_and_ask_user_direction',
+      visual_repair_cycle: expect.objectContaining({
+        status: 'exhausted',
+        repair_passes_remaining: 0,
+      }),
+      user_options: [
+        expect.objectContaining({ id: 'guide_revision' }),
+        expect.objectContaining({ id: 'simplify_scene' }),
+        expect.objectContaining({ id: 'retry_internal' }),
+        expect.objectContaining({ id: 'waive_findings' }),
+      ],
+    });
 
     // The repair the model wrote while the budget was running out is measured
     // once. It had already written it: the check that would have told it to
@@ -7629,11 +8085,16 @@ describe('VideoStudio production-state tool protocol', () => {
     expect(frozenDraftPath).not.toBe(failedDraftPath);
     expect(fs.readFileSync(frozenDraftPath, 'utf8')).toBe('reviewable failed draft');
     expect(published).toContainEqual([frozenDraftPath]);
-    expect((await tool.execute(input, {
+    // A deterministic QA verdict blocks the SECOND identical attempt: on
+    // 2026-08-22 the old two-attempt allowance let a model burn a 37.9-minute
+    // re-render of unchanged input into the exact same verdict.
+    const secondUnchanged = await tool.execute(input, {
       workingDir: workspace,
       state: {},
       emitProgress: vi.fn(),
-    } as any)).isError).toBe(true);
+    } as any);
+    expect(secondUnchanged.isError).toBe(true);
+    expect(parseResult(secondUnchanged.content).errorCode).toBe('E_FULL_RENDER_RETRY_NO_CHANGE');
     const resumedTool = toolMod.createVideoStudioTool(opts);
     const unchanged = await resumedTool.execute(input, {
       workingDir: workspace,
@@ -7647,17 +8108,38 @@ describe('VideoStudio production-state tool protocol', () => {
       requires_user_decision: false,
       next_action: 'repair_inputs_then_retry_render',
       operation_journal_evidence: {
-        same_input_attempts: 2,
+        same_input_attempts: 1,
+        same_input_deterministic_qa_failures: 1,
         durable: true,
       },
     });
-    expect(draft).toHaveBeenCalledTimes(2);
+    expect(draft).toHaveBeenCalledTimes(1);
 
     fs.appendFileSync(path.join(compositionDir, 'index.html'), '\n<!-- materially different repair -->\n');
     const afterEdit = await tool.execute(input, ctx);
     expect(afterEdit.isError).toBe(true);
     expect(parseResult(afterEdit.content).errorCode).toBe('E_VIDEO_QA_BLOCKED');
-    expect(draft).toHaveBeenCalledTimes(3);
+    expect(draft).toHaveBeenCalledTimes(2);
+
+    // An ambiguous render/infrastructure failure is NOT deterministic — it
+    // keeps the second identical attempt (a retry can genuinely pass) and
+    // only the third is blocked.
+    draft.mockImplementation(async (options: any) => ({
+      ok: false,
+      op: 'composition.draft',
+      errorCode: 'E_RENDER_ENCODE_FAILED',
+      message: 'ffmpeg exited 1',
+      path: options.outputAbsPath,
+      report: { steps: { render: { status: 'failed' } } },
+    }) as any);
+    fs.appendFileSync(path.join(compositionDir, 'index.html'), '\n<!-- second materially different repair -->\n');
+    expect(parseResult((await tool.execute(input, ctx)).content).errorCode).toBe('E_RENDER_ENCODE_FAILED');
+    expect(parseResult((await tool.execute(input, ctx)).content).errorCode).toBe('E_RENDER_ENCODE_FAILED');
+    const transientBlocked = parseResult((await tool.execute(input, ctx)).content);
+    expect(transientBlocked.errorCode).toBe('E_FULL_RENDER_RETRY_NO_CHANGE');
+    expect(transientBlocked.operation_journal_evidence).toMatchObject({ same_input_attempts: 2 });
+    expect(transientBlocked.operation_journal_evidence.same_input_deterministic_qa_failures).toBeUndefined();
+    expect(draft).toHaveBeenCalledTimes(4);
   });
 
   it('finalizes an approved export before registering or publishing its path', async () => {
@@ -7670,10 +8152,10 @@ describe('VideoStudio production-state tool protocol', () => {
     fs.mkdirSync(path.dirname(finalPath), { recursive: true });
     fs.writeFileSync(draftPath, 'approved draft');
 
+    const renderCalls: Array<{ quality?: string; fps?: number; allowFpsFallback?: boolean }> = [];
     vi.spyOn(videoStudio, 'draftComposition').mockImplementation(async (options: any) => {
       events.push('render');
-      expect(options.fps).toBe(30);
-      expect(options.allowFpsFallback).toBe(true);
+      renderCalls.push({ quality: options.quality, fps: options.fps, allowFpsFallback: options.allowFpsFallback });
       fs.writeFileSync(options.outputAbsPath, 'clean final');
       return {
         ok: true,
@@ -8216,9 +8698,113 @@ describe('VideoStudio production-state tool protocol', () => {
     expect(mod.deriveVideoStudioErrorClass('E_SNAPSHOT_RETRY_NO_CHANGE')).toBe('budget');
     expect(mod.deriveVideoStudioErrorClass('E_TTS_TEXT_TOO_LONG')).toBe('input_error');
     expect(mod.deriveVideoStudioErrorClass('E_TTS_MEASURED_DURATION_MISMATCH')).toBe('narration_timing');
-    expect(mod.deriveVideoStudioErrorClass('E_VIDEO_QA_BLOCKED')).toBe('provider_error');
+    // A deterministic frame-QA verdict is NOT transient: same input, same
+    // verdict. `precondition` steers the model to repair before retrying
+    // instead of re-rendering the identical composition (2026-08-22).
+    expect(mod.deriveVideoStudioErrorClass('E_VIDEO_QA_BLOCKED')).toBe('precondition');
+    // Resumable assembly failure: retry-same-input is the correct recovery,
+    // so it carries the transient-failure class, not precondition.
+    expect(mod.deriveVideoStudioErrorClass('E_SEGMENT_ASSEMBLY_INCOMPLETE')).toBe('provider_error');
     expect(mod.deriveVideoStudioErrorClass('E_GATE_B_ARTIFACTS_INCOMPLETE')).toBe('precondition');
     expect(mod.deriveVideoStudioErrorClass(undefined)).toBeUndefined();
+  });
+
+  it('prices the Gate D delivery options from the draft render the user is reviewing', async () => {
+    // 2026-08-22: a 402s video's high export implied minutes-scale work the
+    // user never chose. The passing draft carries both delivery options with
+    // honest estimates from this machine's just-measured capture rate.
+    const mod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    // Shaped exactly like a real draft envelope (2026-08-23 live run's
+    // aurora9-draft-report): render_profile carries render_fps and
+    // total_render_seconds, the probe carries the measured duration. The
+    // first fixture invented `canvas`/`fps` fields the envelope never has,
+    // and the live run shipped no options because of it.
+    const draftResult = {
+      ok: true,
+      render_profile: { render_fps: 30, total_render_seconds: 95.28 },
+      probe: { duration_seconds: 30 },
+    };
+    const options = mod.draftDeliveryOptions(draftResult as never, undefined)!;
+    expect(options).toEqual([
+      expect.objectContaining({
+        id: 'final_high',
+        call: { op: 'composition.export', quality: 'high' },
+        estimated_minutes: 2,
+        default: true,
+      }),
+      expect.objectContaining({
+        id: 'final_fast_preview',
+        call: { op: 'composition.export', quality: 'draft' },
+        estimated_minutes: 1,
+        requires_explicit_user_choice: true,
+      }),
+    ]);
+    expect(options[1].reuses_this_draft_render).toBeUndefined();
+
+    // A draft rendered under quality:'draft' is reusable by the fast export:
+    // flat one-minute estimate and the reuse flag.
+    const reusable = mod.draftDeliveryOptions(draftResult as never, 'draft')!;
+    expect(reusable[1]).toMatchObject({ estimated_minutes: 1, reuses_this_draft_render: true });
+
+    // Long-video scaling: 402s at ~10 frames/s capture -> 21 vs 11 minutes.
+    const long = mod.draftDeliveryOptions({
+      ok: true,
+      render_profile: { render_fps: 30, total_render_seconds: 1206 },
+      probe: { duration_seconds: 402 },
+    } as never, undefined)!;
+    expect(long[0].estimated_minutes).toBe(21);
+    expect(long[1].estimated_minutes).toBe(11);
+
+    // No measurements, no invented numbers.
+    expect(mod.draftDeliveryOptions({ ok: true, probe: { duration_seconds: 30 } } as never, undefined))
+      .toBeUndefined();
+  });
+
+  it('couples the Gate D presentation instruction to the delivery options it explains', async () => {
+    // 2026-08-23 live runs: the options data reached the stop but the model
+    // presented one path — the "show both, plain confirmation = high default,
+    // faster = quality acceptance" rule lived only in a skill reference the
+    // archives show was never read. The instruction must ride the same
+    // envelope as the options.
+    const mod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const measured = {
+      ok: true,
+      message: 'Draft passed QA.',
+      render_profile: { render_fps: 30, total_render_seconds: 95.28 },
+      probe: { duration_seconds: 30 },
+    };
+    const envelope = mod.gateDReadyEnvelope(measured as never, undefined);
+    expect(envelope).toMatchObject({ gate_d_ready: true, next_action: 'open_gate_d' });
+    expect(envelope.delivery_options).toHaveLength(2);
+    expect(envelope.message).toMatch(/present both delivery_options .* estimated_minutes/i);
+    expect(envelope.message).toMatch(/plain confirmation .* high-quality/i);
+    expect(envelope.message).toMatch(/explicit choice/i);
+    // The instruction appends to the draft's own message, never replaces it.
+    expect(envelope.message).toMatch(/^Draft passed QA\. /);
+
+    // No options (draft carried no measurements) -> no orphan instruction
+    // telling the model to present options that are not there.
+    const bare = mod.gateDReadyEnvelope({ ok: true } as never, undefined);
+    expect(bare).toMatchObject({ gate_d_ready: true, next_action: 'open_gate_d' });
+    expect(bare.delivery_options).toBeUndefined();
+    expect(bare.message).toBeUndefined();
+  });
+
+  it('does not charge a resumable segment-assembly failure as a full render attempt', async () => {
+    // A resumable failure resumes from cached segments on an unchanged-input
+    // retry: counting it toward the two-identical-full-renders breaker would
+    // block the very retry that completes the video. A QA-blocked draft that
+    // really rendered end to end still consumes its attempt.
+    const mod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const report = { steps: { render: { ok: false } } };
+    expect(mod.resultConsumesFullRenderTurnBudget({
+      errorCode: 'E_SEGMENT_ASSEMBLY_INCOMPLETE',
+      report,
+    })).toBe(false);
+    expect(mod.resultConsumesFullRenderTurnBudget({
+      errorCode: 'E_VIDEO_QA_BLOCKED',
+      report,
+    })).toBe(true);
   });
 
   it('fails legacy preview entries closed when they cannot prove visual identity', async () => {
@@ -9313,7 +9899,7 @@ describe('VideoStudio production-state tool protocol', () => {
     expect(finalState.narration).toMatchObject({ status: 'materialized', backend: 'mock-previous' });
   });
 
-  it('keeps visual recovery available after an uncertain narration charge without resending speech', async () => {
+  it('keeps visual recovery available and only resends speech after a fresh explicit retry', async () => {
     useSchema2Narration('Vivi');
     const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
     const opts = {
@@ -9523,29 +10109,34 @@ describe('VideoStudio production-state tool protocol', () => {
       errorCode: 'E_TTS_RETRY_EPISODE_EXHAUSTED',
       provider_error_code: 'E_TTS_PROVIDER_TIMEOUT',
       charge_status: 'charged',
-      requires_user_decision: false,
-      user_reconfirmation_required: false,
+      retry_policy: 'requires_user_action',
+      requires_user_decision: true,
+      user_reconfirmation_required: true,
       automatic_recovery_expected: false,
-      next_step_owner: 'external',
+      next_step_owner: 'user',
       same_turn_continuation_required: false,
-      recovery_status: 'completed_with_preserved_visual_candidate',
+      interaction_required: true,
+      recovery_status: 'awaiting_user_retry_decision_with_preserved_visual_candidate',
+      narration_retry_offer: {
+        previous_request_outcome: 'unknown',
+        new_billable_request_count: 1,
+      },
       narration_retry_episode: {
         status: 'exhausted',
         failed_request_count: 2,
         max_failed_requests: 2,
-        reset_condition: 'provider_outcome_reconciled_or_stable_narration_intent_changed',
+        reset_condition: 'fresh_explicit_user_retry_or_provider_outcome_reconciled_or_stable_narration_intent_changed',
       },
-      next_action: 'show_current_visual_candidate_and_recovery_options',
+      next_action: 'show_current_visual_candidate_then_request_a_new_narration_retry_decision',
       review_package: {
         status: 'current_approved',
         conclusion: {
-          requires_user_decision: false,
+          requires_user_decision: true,
           automatic_recovery_expected: false,
-          next_step_owner: 'external',
+          next_step_owner: 'user',
         },
       },
     });
-    expect(parseResult(retried.content)).not.toHaveProperty('narration_retry_offer');
     expect(ttsMock.generateSpeech).toHaveBeenCalledTimes(2);
 
     const afterRetryFailure = await stateMod.readVideoProductionState(statePath, compositionDir);
@@ -9566,46 +10157,84 @@ describe('VideoStudio production-state tool protocol', () => {
     }, ctx);
     expect(duplicate.isError).toBe(true);
     expect(parseResult(duplicate.content)).toMatchObject({
-      errorCode: 'E_TTS_RETRY_EPISODE_EXHAUSTED',
-      billable_request_sent: false,
-      requires_user_decision: false,
-      decision_acknowledged: true,
-      decision_applied: false,
-      decision_reuse_allowed: false,
-      submitted_decision: 'approve',
-      submitted_decision_source: 'model_interpreted_user_message',
-      submitted_decision_protocol: 'model_interpreted_user_message',
-      submitted_decision_status: 'superseded_by_current_transaction_ledger',
-      retry_proposal_status: 'superseded',
-      compatibility_status: 'stale_retry_decision_resolved_safely',
-      narration_retry_episode: {
-        failed_request_count: 2,
+      errorCode: 'E_TTS_RETRY_DECISION_ALREADY_CONSUMED',
+      approval_consumed: true,
+      requires_user_decision: true,
+      narration_retry_offer: {
+        previous_request_outcome: 'unknown',
+        new_billable_request_count: 1,
       },
-      next_action: 'acknowledge_superseded_confirmation_show_current_visual_candidate_and_recovery_options',
+      next_action: 'show_current_visual_candidate_then_request_a_new_narration_retry_decision',
     });
     expect(ttsMock.generateSpeech).toHaveBeenCalledTimes(2);
+
+    const noApprovalTool = toolMod.createVideoStudioTool({
+      ...opts,
+      turnId: 'turn-narration-retry-no-approval',
+      userMessage: '<msg from="user">先看当前画面</msg>',
+    });
+    const noApproval = await noApprovalTool.execute({
+      op: 'composition.materialize_narration',
+      composition_dir: 'project/composition',
+    }, ctx);
+    expect(noApproval.isError).toBe(true);
+    expect(parseResult(noApproval.content)).toMatchObject({
+      errorCode: 'E_TTS_RETRY_REQUIRES_USER_ACTION',
+      requires_user_decision: true,
+      narration_retry_offer: {
+        previous_request_outcome: 'unknown',
+        new_billable_request_count: 1,
+      },
+    });
+    expect(ttsMock.generateSpeech).toHaveBeenCalledTimes(2);
+
+    ttsMock.generateSpeech.mockImplementationOnce(async (request: { outputAbsPath: string }) => {
+      fs.mkdirSync(path.dirname(request.outputAbsPath), { recursive: true });
+      fs.writeFileSync(request.outputAbsPath, Buffer.from('third explicitly authorized narration'));
+      return {
+        ok: true,
+        path: request.outputAbsPath,
+        bytes: fs.statSync(request.outputAbsPath).size,
+        backend: 'mock-voice',
+      };
+    });
+    const explicitRetryTool = toolMod.createVideoStudioTool({
+      ...opts,
+      turnId: 'turn-narration-retry-2',
+      userMessage: '<msg from="user">继续生成旁白</msg>',
+    });
+    const explicitRetry = await explicitRetryTool.execute({
+      op: 'composition.materialize_narration',
+      composition_dir: 'project/composition',
+      decision_evidence: decisionEvidence('narration_retry', 'approve', '继续生成旁白'),
+    }, ctx);
+    expect(explicitRetry.isError, String(explicitRetry.content)).toBe(false);
+    expect(parseResult(explicitRetry.content)).toMatchObject({
+      ok: true,
+      billable_request_sent: true,
+    });
+    expect(ttsMock.generateSpeech).toHaveBeenCalledTimes(3);
 
     const finalState = await (await import('../../../../src/main/features/video_studio_state'))
       .readVideoProductionState(
         toolMod.videoStudioProductionStatePath(opts, compositionDir),
         compositionDir,
       );
-    expect(finalState.narration_transaction).toMatchObject({
-      status: 'failed',
-      attempt_number: 2,
-      charge_status: 'charged',
-    });
-    expect(finalState.narration_transaction_history).toHaveLength(1);
-    expect(finalState.narration_transaction_history[0]).toMatchObject({ status: 'failed' });
-    expect(finalState.narration).toBeUndefined();
+    expect(finalState.narration_transaction).toBeUndefined();
+    expect(finalState.narration_transaction_history).toHaveLength(3);
+    expect(finalState.narration_transaction_history).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: 'failed', attempt_number: 1 }),
+      expect.objectContaining({ status: 'failed', attempt_number: 2 }),
+    ]));
+    expect(finalState.narration).toMatchObject({ status: 'materialized' });
   });
 
   it.each([
-    ['narration_retry_decision', 'narration_retry_form'],
-    ['gate_c_decision', 'legacy_gate_c_form'],
+    'narration_retry_decision',
+    'gate_c_decision',
   ])(
-    'consumes one still-valid %s approval, then safely closes the same stale old-session action',
-    async (fieldId, expectedProtocol) => {
+    'consumes one still-valid %s approval, then refuses a replay from the same user turn',
+    async (fieldId) => {
       useSchema2Narration('Vivi');
       const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
       const stateMod = await import('../../../../src/main/features/video_studio_state');
@@ -9666,13 +10295,17 @@ describe('VideoStudio production-state tool protocol', () => {
       expect(parseResult(validApproval.content)).toMatchObject({
         errorCode: 'E_TTS_RETRY_EPISODE_EXHAUSTED',
         billable_request_sent: true,
+        requires_user_decision: true,
+        narration_retry_offer: {
+          previous_request_outcome: 'unknown',
+          new_billable_request_count: 1,
+        },
         narration_retry_episode: {
           failed_request_count: 2,
           max_failed_requests: 2,
         },
-        next_action: 'show_current_visual_candidate_and_recovery_options',
+        next_action: 'show_current_visual_candidate_then_request_a_new_narration_retry_decision',
       });
-      expect(parseResult(validApproval.content)).not.toHaveProperty('submitted_decision_status');
       expect(ttsMock.generateSpeech).toHaveBeenCalledTimes(2);
 
       const statePath = toolMod.videoStudioProductionStatePath(opts, compositionDir);
@@ -9686,8 +10319,8 @@ describe('VideoStudio production-state tool protocol', () => {
       expect(afterValidApproval.narration_transaction_history).toHaveLength(1);
 
       // Display/catalog metadata may change while an old conversation remains
-      // open. It must not create a third request episode for the same stable
-      // text/route/voice/language/speed/format identity.
+      // open. Replaying the same user turn still cannot consume its one-request
+      // authorization twice.
       if (fieldId === 'narration_retry_decision') {
         const manifestPath = path.join(compositionDir, 'composition-manifest.json');
         const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
@@ -9697,7 +10330,7 @@ describe('VideoStudio production-state tool protocol', () => {
 
       const staleApprovalTool = toolMod.createVideoStudioTool({
         ...opts,
-        turnId: `turn-old-session-stale-${fieldId}`,
+        turnId: `turn-old-session-valid-${fieldId}`,
         userMessage: approvalSubmission(fieldId, 'approve'),
       });
       const staleApproval = await staleApprovalTool.execute({
@@ -9706,32 +10339,20 @@ describe('VideoStudio production-state tool protocol', () => {
       }, ctx);
       expect(staleApproval.isError).toBe(true);
       expect(parseResult(staleApproval.content)).toMatchObject({
-        errorCode: 'E_TTS_RETRY_EPISODE_EXHAUSTED',
-        billable_request_sent: false,
-        decision_acknowledged: true,
-        decision_applied: false,
-        decision_reuse_allowed: false,
-        submitted_decision: 'approve',
-        submitted_decision_source: 'form',
-        submitted_decision_protocol: expectedProtocol,
-        submitted_decision_status: 'superseded_by_current_transaction_ledger',
-        retry_proposal_status: 'superseded',
-        compatibility_status: 'stale_retry_decision_resolved_safely',
-        narration_retry_episode: {
-          failed_request_count: 2,
+        errorCode: 'E_TTS_RETRY_DECISION_ALREADY_CONSUMED',
+        approval_consumed: true,
+        requires_user_decision: true,
+        narration_retry_offer: {
+          previous_request_outcome: 'unknown',
+          new_billable_request_count: 1,
         },
-        next_action: 'acknowledge_superseded_confirmation_show_current_visual_candidate_and_recovery_options',
-        review_package: {
-          status: expect.stringMatching(/^current/),
-        },
+        next_action: 'show_current_visual_candidate_then_request_a_new_narration_retry_decision',
       });
-      expect(parseResult(staleApproval.content).message).toContain('Your reply was received');
-      expect(parseResult(staleApproval.content)).not.toHaveProperty('narration_retry_offer');
       expect(ttsMock.generateSpeech).toHaveBeenCalledTimes(2);
     },
   );
 
-  it('starts a fresh narration request episode only after a real approved narration-intent change', async () => {
+  it('starts a fresh narration request after a real approved narration-intent change', async () => {
     useSchema2Narration('Vivi');
     const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
     const stateMod = await import('../../../../src/main/features/video_studio_state');
@@ -10048,6 +10669,197 @@ describe('VideoStudio production-state tool protocol', () => {
       measured_duration_sec: 4.8,
     });
     expect(ttsMock.generateSpeech).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-synthesizes when the narration intent changes but the text does not', async () => {
+    // Workorder id=20 (conv b79d406): the user changed the voice parameters
+    // without touching the script three times, and every time the pipeline
+    // answered status:reused with the old take — the reuse identity only
+    // covered the narration text. The intent parameters (voice/speed) are
+    // part of the synthesis request and must invalidate reuse.
+    useSchema2Narration();
+    const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const stateMod = await import('../../../../src/main/features/video_studio_state');
+    const opts = {
+      userId: UID,
+      cid: 'cid-narration-intent-change',
+      turnId: 'turn-narration-intent-initial',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+      agentName: 'VideoStudio',
+      userMessage: '确认',
+    };
+    const tool = toolMod.createVideoStudioTool(opts);
+    const ctx = { workingDir: workspace, state: {} } as any;
+    for (const op of ['composition.approve_plan', 'composition.doctor', 'composition.prepare']) {
+      expect((await tool.execute(compositionInput(op), ctx)).isError).toBe(false);
+    }
+    mediaProbeMock.duration.mockResolvedValue(4.8);
+    ttsMock.generateSpeech.mockImplementationOnce(async (request: { outputAbsPath: string }) => {
+      fs.mkdirSync(path.dirname(request.outputAbsPath), { recursive: true });
+      fs.writeFileSync(request.outputAbsPath, Buffer.from('take one: original intent'));
+      return {
+        ok: true,
+        path: request.outputAbsPath,
+        bytes: fs.statSync(request.outputAbsPath).size,
+        backend: 'mock-voice',
+      };
+    });
+    const first = await tool.execute({
+      op: 'composition.materialize_narration',
+      composition_dir: 'project/composition',
+    }, ctx);
+    expect(first.isError, String(first.content)).toBe(false);
+    expect(parseResult(first.content)).toMatchObject({ status: 'passed', billable_request_sent: true });
+    expect(ttsMock.generateSpeech).toHaveBeenCalledTimes(1);
+
+    // The user changes only the speaking speed; the narration text is
+    // byte-identical, which is exactly the shape the old text-only cache key
+    // silently reused. The intent edit reopens plan confirmation, so the
+    // amended plan is re-approved the same way the real journey does.
+    const manifestPath = path.join(compositionDir, 'composition-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    manifest.audio.narration_intent.speed = 1.5;
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
+    const amendmentTool = toolMod.createVideoStudioTool({
+      ...opts,
+      turnId: 'turn-narration-intent-amended',
+      userMessage: approvalSubmission('gate_b_decision', 'approve'),
+    });
+    expect((await amendmentTool.execute({
+      op: 'composition.approve_plan',
+      composition_dir: 'project/composition',
+    }, ctx)).isError).toBe(false);
+    for (const op of ['composition.doctor', 'composition.prepare']) {
+      expect((await amendmentTool.execute({
+        op,
+        composition_dir: 'project/composition',
+      }, ctx)).isError).toBe(false);
+    }
+
+    // The delivery gate must also see the old take as not satisfying the new
+    // intent: a draft muxing it would ship the exact fake delivery from the
+    // workorder. Only re-materialization clears this.
+    const blockedDraft = await amendmentTool.execute({
+      op: 'composition.draft',
+      composition_dir: 'project/composition',
+      output_path: 'project/render/draft.mp4',
+    }, ctx);
+    expect(blockedDraft.isError).toBe(true);
+    expect(String(blockedDraft.content)).toContain('E_NARRATION_MATERIALIZATION_REQUIRED');
+
+    ttsMock.generateSpeech.mockImplementationOnce(async (request: { outputAbsPath: string }) => {
+      fs.writeFileSync(request.outputAbsPath, Buffer.from('take two: new intent'));
+      return {
+        ok: true,
+        path: request.outputAbsPath,
+        bytes: fs.statSync(request.outputAbsPath).size,
+        backend: 'mock-voice',
+      };
+    });
+    const second = await amendmentTool.execute({
+      op: 'composition.materialize_narration',
+      composition_dir: 'project/composition',
+    }, ctx);
+    expect(second.isError, String(second.content)).toBe(false);
+    expect(parseResult(second.content)).toMatchObject({ status: 'passed', billable_request_sent: true });
+    expect(ttsMock.generateSpeech).toHaveBeenCalledTimes(2);
+    expect(fs.readFileSync(path.join(compositionDir, 'assets', 'narration.mp3'), 'utf8'))
+      .toBe('take two: new intent');
+    const statePath = toolMod.videoStudioProductionStatePath(opts, compositionDir);
+    const finalState = await stateMod.readVideoProductionState(statePath, compositionDir);
+    expect(finalState.narration).toMatchObject({ status: 'materialized', speed: 1.5 });
+    // The durable receipt now records which request produced the audio, so a
+    // later state loss cannot resurrect the old take for a different intent.
+    const receipt = JSON.parse(fs.readFileSync(path.join(compositionDir, 'narration-map.json'), 'utf8'));
+    expect(receipt.request_signature).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('re-synthesizes a schema-1 composition when the explicitly requested voice differs', async () => {
+    // 2026-08-22 (长江电力 → finance-anchor voice): the legacy tracked
+    // identity skipped the requested profile entirely, so a same-text voice
+    // change reused the old audio and reported it materialized — the host
+    // re-bound the old narration to the new selection, and the model's only
+    // escape was abandoning the composition for a fresh candidate, restarting
+    // every confirmation gate for one voice swap.
+    const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const opts = {
+      userId: UID,
+      cid: 'cid-legacy-voice-change',
+      turnId: 'turn-legacy-voice-initial',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+      agentName: 'VideoStudio',
+      userMessage: '确认',
+    };
+    const tool = toolMod.createVideoStudioTool(opts);
+    const ctx = { workingDir: workspace, state: {} } as any;
+    for (const op of ['composition.approve_plan', 'composition.doctor', 'composition.prepare']) {
+      expect((await tool.execute(compositionInput(op), ctx)).isError).toBe(false);
+    }
+    mediaProbeMock.duration.mockResolvedValue(4.8);
+    ttsMock.generateSpeech.mockImplementationOnce(async (request: { outputAbsPath: string }) => {
+      fs.mkdirSync(path.dirname(request.outputAbsPath), { recursive: true });
+      fs.writeFileSync(request.outputAbsPath, Buffer.from('take one: original voice'));
+      return {
+        ok: true,
+        path: request.outputAbsPath,
+        bytes: fs.statSync(request.outputAbsPath).size,
+        backend: 'mock-voice',
+      };
+    });
+    const first = await tool.execute({
+      op: 'composition.materialize_narration',
+      composition_dir: 'project/composition',
+      voice: 'zh_female_vv_uranus_bigtts',
+    }, ctx);
+    expect(first.isError, String(first.content)).toBe(false);
+    expect(ttsMock.generateSpeech).toHaveBeenCalledTimes(1);
+    // First narration: the bare audio is the earliest audible checkpoint.
+    expect(parseResult(first.content).narration_audition).toMatchObject({
+      action: 'share_audio_with_user_for_audition_now',
+    });
+
+    // Negative control: the same explicit profile keeps the reuse path — a
+    // repeated materialize must not spend another synthesis.
+    const sameVoice = await tool.execute({
+      op: 'composition.materialize_narration',
+      composition_dir: 'project/composition',
+      voice: 'zh_female_vv_uranus_bigtts',
+    }, ctx);
+    expect(sameVoice.isError, String(sameVoice.content)).toBe(false);
+    expect(parseResult(sameVoice.content)).toMatchObject({ billable_request_sent: false });
+    expect(ttsMock.generateSpeech).toHaveBeenCalledTimes(1);
+
+    // A different explicit voice cannot be proven by text-only provenance:
+    // it must synthesize, and the delivered audio must actually change.
+    ttsMock.generateSpeech.mockImplementationOnce(async (request: { outputAbsPath: string }) => {
+      fs.writeFileSync(request.outputAbsPath, Buffer.from('take two: finance anchor'));
+      return {
+        ok: true,
+        path: request.outputAbsPath,
+        bytes: fs.statSync(request.outputAbsPath).size,
+        backend: 'mock-voice',
+      };
+    });
+    const changedVoice = await tool.execute({
+      op: 'composition.materialize_narration',
+      composition_dir: 'project/composition',
+      voice: 'zh_male_finance_anchor_bigtts',
+    }, ctx);
+    expect(changedVoice.isError, String(changedVoice.content)).toBe(false);
+    expect(parseResult(changedVoice.content)).toMatchObject({ billable_request_sent: true });
+    expect(ttsMock.generateSpeech).toHaveBeenCalledTimes(2);
+    expect(fs.readFileSync(path.join(compositionDir, 'assets', 'narration.mp3'), 'utf8'))
+      .toBe('take two: finance anchor');
+    // A voice change on a composition that already carried narration, with
+    // scene windows unmoved, merges the audition into the cheap re-draft:
+    // one listen at the final-video stop instead of mp3-then-draft twice.
+    expect(parseResult(changedVoice.content)).toMatchObject({
+      scaffold_retimed: false,
+      next_action: 'redraft_same_turn_then_final_video_stop',
+      narration_audition: expect.objectContaining({
+        action: 'attach_audio_with_the_redrafted_video_at_the_final_video_stop',
+      }),
+    });
   });
 
   it('consumes a direct narration-retry rejection without sending or asking again', async () => {
@@ -10464,6 +11276,14 @@ describe('VideoStudio production-state tool protocol', () => {
       requires_user_decision: true,
       automatic_retries_used: 1,
       automatic_retry_limit: 1,
+      // Keep-the-take is the host-recommended default (first, flagged): the
+      // complete audio exists and retiming is free, while every revision round
+      // costs the user a confirmation plus a paid synthesis (2026-08-22
+      // voice-change report).
+      user_options: [
+        expect.objectContaining({ id: 'proceed_with_current_narration', recommended: true }),
+        expect.objectContaining({ id: 'continue_narration_revision' }),
+      ],
     });
     const repeated = await tool.execute({
       op: 'composition.materialize_narration',

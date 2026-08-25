@@ -130,6 +130,14 @@ describe('builtin-resource-gate', () => {
     }
   });
 
+  it('keeps standalone greenfield UI work independent of a repository path', () => {
+    const productDeveloper = readBuiltinAgent('a316881746f9');
+    expect(productDeveloper.dispatch).toMatch(/no repository is required/i);
+    expect(productDeveloper.workflow).toMatch(/standalone greenfield UI uses `product-ui`/i);
+    expect(productDeveloper.workflow).toMatch(/Do not ask for a repository or project directory/i);
+    expect(productDeveloper.workflow).toMatch(/current writable workspace/i);
+  });
+
   it('rejects shipped input definitions that runtime normalization would drop or rewrite', () => {
     const valid = readBuiltinAgent('79df9cc89f5f');
     const cases: Array<[string, (agent: any) => void, RegExp]> = [

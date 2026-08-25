@@ -286,6 +286,16 @@ export function isEnvironmentalDraftFailure(code: string): boolean {
   return ENVIRONMENTAL_DRAFT_FAILURE_CODES.has(code);
 }
 
+// A resumable render failure preserved its completed work (cached scene
+// segments), so retrying the same call with unchanged inputs genuinely
+// advances — it renders only what is missing. It must therefore not count as
+// a wasted identical full-render attempt. It is NOT environmental: a
+// zero-progress repetition still spends the content-repair budget, which is
+// what keeps unchanged-input repetition bounded.
+export function isResumableRenderFailure(code: string): boolean {
+  return code === 'E_SEGMENT_ASSEMBLY_INCOMPLETE';
+}
+
 const DRAFT_VISUAL_ADVISORY_CODES = new Set([
   'FONT_TOO_SMALL',
   'PALETTE_LARGE',
@@ -1169,6 +1179,48 @@ function addDesignContractAdvisories(
  * itself, so appending it costs nothing and removes the guessing pass: a
  * finding that says which ancestor set `opacity: 0` is repaired in one edit,
  * where "scene x is not visible" took seven QA rounds on 2026-08-07. */
+/** The frame-0 cover-promise verdict, shared by rendered-frame QA and the
+ * pre-render inspect probe. The same DOM semantics are readable before any
+ * frame is captured, and on 2026-08-22 a cover that started invisible burned
+ * a whole snapshot repair budget before the render-side check said why —
+ * inspect now delivers the identical finding and prescription during
+ * authoring iteration instead.
+ *
+ * A middle segment opens inside the finished video, so a missing opening
+ * title there is advisory rather than a broken promise to the viewer; the
+ * blank-frame check stays independent — an empty frame at a cut is a visible
+ * gap at any position. */
+export function hookPromiseIssue(
+  sample: {
+    visible_roles?: string[];
+    visible_text?: string;
+    hidden_elements?: HiddenSemanticElementEvidence[];
+  },
+  deliveredOpening: boolean,
+): Issue | null {
+  const roles = sample.visible_roles || [];
+  const visibleText = String(sample.visible_text || '').trim();
+  if (roles.includes('title') && visibleText) return null;
+  return {
+    code: 'HOOK_PROMISE_NOT_VISIBLE',
+    severity: deliveredOpening ? 'error' : 'warning',
+    message: deliveredOpening
+      ? 'The first frame must expose a visible data-role="title" and readable promise text.'
+        + hiddenElementClause(
+          sample.hidden_elements,
+          (entry) => entry.role === 'title' || entry.cover_hero === true,
+        )
+      : 'This segment opens without a visible data-role="title". It plays inside the assembled video rather than at its start, so this is advisory — the delivered opening is checked on the segment that plays first.',
+    // The dominant real-world cause is an enter animation that zeroes the
+    // content at t=0 (a fade-from-black opening spent a whole repair budget
+    // on 2026-08-22 without finding this). The host knows the passing
+    // pattern, so it hands over the prescription instead of only the
+    // measurement.
+    fixHint: 'Frame 0 is the video cover and must start visible: build the opening scene\'s enter animations from an already-visible base state (e.g. gsap fromTo whose 0s state is visible, or apply the reveal at timeline position 0), and put any fade-in/dawn mood on a separate overlay or brightness layer — never animate the title or cover hero\'s own opacity/visibility from 0 at the start.',
+    source: 'orkas-native-video-qa',
+  };
+}
+
 function hiddenElementClause(
   hidden: HiddenSemanticElementEvidence[] | undefined,
   match: (entry: HiddenSemanticElementEvidence) => boolean,
@@ -3541,27 +3593,8 @@ export function summarizeVideoFrameQa(
       }
     }
     if (opts.requireSemanticCoverage && sample.label === 'first-frame') {
-      const roles = sample.visible_roles || [];
-      const visibleText = String(sample.visible_text || '').trim();
-      if (!roles.includes('title') || !visibleText) {
-        // A middle segment opens inside the finished video, so a missing
-        // opening title is a note about its own composition rather than a
-        // broken promise to the viewer. Its blank-frame check above is
-        // untouched: an empty frame at a cut is a visible gap at any position.
-        const deliveredOpening = opts.isDeliveredOpening !== false;
-        issues.push({
-          code: 'HOOK_PROMISE_NOT_VISIBLE',
-          severity: deliveredOpening ? 'error' : 'warning',
-          message: deliveredOpening
-            ? 'The first frame must expose a visible data-role="title" and readable promise text.'
-              + hiddenElementClause(
-                sample.hidden_elements,
-                (entry) => entry.role === 'title' || entry.cover_hero === true,
-              )
-            : 'This segment opens without a visible data-role="title". It plays inside the assembled video rather than at its start, so this is advisory — the delivered opening is checked on the segment that plays first.',
-          source: 'orkas-native-video-qa',
-        });
-      }
+      const coverIssue = hookPromiseIssue(sample, opts.isDeliveredOpening !== false);
+      if (coverIssue) issues.push(coverIssue);
     }
   }
   if (opts.requireSemanticCoverage && opts.sceneWindows?.length) {

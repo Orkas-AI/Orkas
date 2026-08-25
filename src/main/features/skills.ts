@@ -25,8 +25,8 @@ import AdmZip from 'adm-zip';
 
 import {
   userSkillsDir, userSkillChatDir, userSessionFile, WS_ROOT, SRC_ROOT,
-  userMarketplaceSkillsDir, userSystemSkillsDir, userSkillCatalogCacheFile,
-  userChatAttachmentsDir,
+  userMarketplaceSkillsDir, userSkillCatalogCacheFile,
+  userChatAttachmentsDir, userSystemSkillsDir,
 } from '../paths';
 import { chatAttachmentDirForConversation } from '../util/project-layout';
 import { evictSession } from '../model/core-agent/session-store';
@@ -213,12 +213,14 @@ function _sidecarBilingualDescriptions(sidecar: SkillOrkasMeta): { description_z
 function _resolveSkillDescriptions(meta: SkillFrontmatter, sidecar: SkillOrkasMeta): { description_zh: string; description_en: string } {
   const pair = migrateDescriptionPair(meta as any);
   const sidecarPair = _sidecarBilingualDescriptions(sidecar);
+  const explicitZh = _normalizeDisplayDescription(meta.description_zh || '');
+  const explicitEn = _normalizeDisplayDescription(meta.description_en || '');
   return {
     description_zh: _normalizeDisplayDescription(
-      sidecarPair.description_zh || pair.description_zh || '',
+      explicitZh || sidecarPair.description_zh || pair.description_zh || '',
     ),
     description_en: _normalizeDisplayDescription(
-      sidecarPair.description_en || pair.description_en || '',
+      explicitEn || sidecarPair.description_en || pair.description_en || '',
     ),
   };
 }
@@ -1005,6 +1007,35 @@ export function skillMdContent(
   return `---\nname: "${cleanName}"\ndescription: "${cleanDesc}"\n---\n\n${trimmedBody}`;
 }
 
+function platformSkillMdContent(
+  name: string,
+  descriptionZh: string,
+  descriptionEn: string,
+  body = '',
+  existingMeta: SkillFrontmatter = {},
+): string {
+  const cleanName = (name || '').replace(/\n/g, ' ').replace(/"/g, '\\"');
+  const sanitize = (value: string) => _normalizeDisplayDescription(value)
+    .replace(/\n/g, ' ')
+    .replace(/"/g, '\\"');
+  const trimmedBody = body.replace(/^\n+/, '');
+  const reserved = new Set(['name', 'description', 'description_zh', 'description_en']);
+  const preservedScalars = Object.entries(existingMeta)
+    .filter(([key, value]) => !reserved.has(key) && typeof value === 'string')
+    .map(([key, value]) => `${key}: "${sanitize(value as string)}"`);
+  const lines = [
+    '---',
+    `name: "${cleanName}"`,
+    `description_zh: "${sanitize(descriptionZh)}"`,
+    `description_en: "${sanitize(descriptionEn)}"`,
+    ...preservedScalars,
+    '---',
+    '',
+    trimmedBody,
+  ];
+  return lines.join('\n');
+}
+
 export function splitSkillMd(text: string): { meta: SkillFrontmatter; body: string } {
   if (!text.startsWith('---')) return { meta: {}, body: text };
   const end = text.indexOf('---', 3);
@@ -1043,6 +1074,22 @@ function normalizeSkillMdForWrite(content: string, fallbackName = ''): string {
   const name = String(meta.name || fallbackName || '').trim();
   const descPair = migrateDescriptionPair(meta as any);
   return skillMdContent(name, { zh: descPair.description_zh, en: descPair.description_en }, body);
+}
+
+function normalizePlatformSkillMdForWrite(content: string, fallbackName = ''): string {
+  if (!content.startsWith('---')) return content;
+  const { meta, body } = splitSkillMd(content);
+  const name = String(meta.name || fallbackName || '').trim();
+  const descriptionZh = _normalizeDisplayDescription(meta.description_zh || '');
+  const descriptionEn = _normalizeDisplayDescription(meta.description_en || '');
+  if (descriptionZh && descriptionEn) {
+    return platformSkillMdContent(name, descriptionZh, descriptionEn, body, meta);
+  }
+  // Historical installed packages may still carry only one portable
+  // description. Keep those readable instead of fabricating a translation;
+  // repository-managed and newly published platform resources are gated to
+  // the bilingual shape separately.
+  return normalizeSkillMdForWrite(content, fallbackName);
 }
 
 async function _getCustomSkillForUser(skillId: string, userId: string): Promise<CustomSkill | null> {
@@ -2283,7 +2330,7 @@ export async function applySkillMetadataForEdit(
   if (!skill) return { ok: false, skillId, written: false, reason: 'missing_dir' };
   const mdPath = path.join(skill.dir, 'SKILL.md');
   const current = fs.existsSync(mdPath) ? fs.readFileSync(mdPath, 'utf8') : '';
-  const next = _applyMetadataToSkillMdContent(current, updates, skill.id);
+  const next = _applyMetadataToSkillMdContent(current, updates, skill.id, skill.source);
   let report: QualityReport | undefined;
   let wrote = false;
 
@@ -2296,7 +2343,10 @@ export async function applySkillMetadataForEdit(
     wrote = true;
   }
 
-  const sidecarPatch = _skillSidecarPatchFromMetadataUpdate(updates);
+  const rawSidecarPatch = _skillSidecarPatchFromMetadataUpdate(updates);
+  const sidecarPatch = skill.source === 'marketplace'
+    ? _stripSkillSidecarDescriptions(rawSidecarPatch)
+    : rawSidecarPatch;
   if (_hasSkillSidecarPatch(sidecarPatch)) {
     if (opts.replaceSidecar) {
       writeSkillOrkasMetaFullSync(
@@ -2511,6 +2561,7 @@ function _applyMetadataToSkillMdContent(
   content: string,
   updates: SkillMetadataUpdate,
   fallbackName = '',
+  source: SkillSource = 'custom',
 ): string {
   if (!_hasSkillMetadataUpdate(updates)) return content;
   const touchesSkillMd = ['name', 'description', 'description_zh', 'description_en']
@@ -2530,6 +2581,17 @@ function _applyMetadataToSkillMdContent(
   const descriptionEn = Object.prototype.hasOwnProperty.call(updates, 'description_en')
     ? String(updates.description_en || '')
     : persisted.description_en;
+  if (source === 'marketplace') {
+    let platformZh = descriptionZh;
+    let platformEn = descriptionEn;
+    if (Object.prototype.hasOwnProperty.call(updates, 'description')) {
+      if (descriptionLang(getLanguage()) === 'zh') platformZh = legacyDescription;
+      else platformEn = legacyDescription;
+    }
+    if (platformZh && platformEn) {
+      return platformSkillMdContent(name, platformZh, platformEn, body, meta);
+    }
+  }
   return skillMdContent(name, legacyDescription || { zh: descriptionZh, en: descriptionEn }, body);
 }
 
@@ -3250,6 +3312,8 @@ export async function sendToSkillChat(
   const result = await chatWithModel({
     userId, message: attachmentCtx.message, sessionId, systemPrompt,
     agentName: 'orkas_chat', timeout: 300,
+    skillList: [],
+    systemSkillList: ['skill-creator', 'package-installer'],
     // Read-only: the LLM in per-skill edit chat sees the skill dir for
     // inspection (read_file / search_files / grep_files / stat_file), but
     // every mutation goes through `<<<skill-file>>>` blocks parsed
@@ -3259,12 +3323,6 @@ export async function sendToSkillChat(
     // that, so it's blocked at the sandbox level.
     readOnlyExtraRoots: [
       ...(skill.dir ? [skill.dir] : []),
-      userMarketplaceSkillsDir(getActiveUserId()),
-      userSkillsDir(userId),
-      // System skills root so a URL-import chat can read `package-installer`
-      // before driving `orkas-pkg`; ordinary SkillRegistry no longer loads
-      // repo-shipped builtin skills.
-      userSystemSkillsDir(userId),
       ...(attachmentCtx.attachmentNames.length ? [chatAttachmentDirForConversation(userId, attachmentCtx.attachmentCid)] : []),
     ],
     attachmentMetadata: attachmentCtx.attachmentMetadata,

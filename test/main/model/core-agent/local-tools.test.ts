@@ -29,19 +29,19 @@ describe('local-tools › Windows PowerShell compatibility preflight', () => {
   });
 
   it('blocks incompatible commands through bash and both persistent session starters before spawning them', async () => {
-    await grant();
+    await allFilesAuto();
     const localTools = await import('../../../../src/main/model/core-agent/local-tools');
     const tools = localTools.createLocalTools({ userId: UID, cid: CID, hostPlatform: 'win32' });
     const bash = tools.find((tool) => tool.name === 'bash')!;
-    const processStart = tools.find((tool) => tool.name === 'process_start')!;
-    const interactive = tools.find((tool) => tool.name === 'interactive_cli_start')!;
+    const processStart = tools.find((tool) => tool.name === 'process_session')!;
+    const interactive = tools.find((tool) => tool.name === 'interactive_cli')!;
     const marker = path.join(tmpDir, 'must-not-run.txt');
     const command = `node -e "require('fs').writeFileSync('${marker}', 'ran')" && echo done`;
     const ctx = { workingDir: tmpDir, signal: undefined, state: {} } as any;
 
     const bashResult = await bash.execute({ command }, ctx);
-    const processResult = await processStart.execute({ command }, ctx);
-    const interactiveResult = await interactive.execute({ command }, ctx);
+    const processResult = await processStart.execute({ action: 'start', command }, ctx);
+    const interactiveResult = await interactive.execute({ action: 'start', command }, ctx);
 
     expect(bashResult).toMatchObject({ isError: true });
     expect(processResult).toMatchObject({ isError: true });
@@ -53,7 +53,7 @@ describe('local-tools › Windows PowerShell compatibility preflight', () => {
   });
 
   it.runIf(process.platform === 'win32')('executes a real PowerShell command with inherited UTF-8 environment and a spaced cwd', async () => {
-    await grant();
+    await allFilesAuto();
     const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
     const bash = createLocalTools({ userId: UID }).find((tool) => tool.name === 'bash')!;
     const cwd = path.join(tmpDir, 'native cwd with spaces');
@@ -74,7 +74,7 @@ describe('local-tools › Windows PowerShell compatibility preflight', () => {
   });
 
   it.runIf(process.platform === 'win32')('executes an explicit cmd /c command without sending cmd syntax through PowerShell', async () => {
-    await grant();
+    await allFilesAuto();
     const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
     const bash = createLocalTools({ userId: UID }).find((tool) => tool.name === 'bash')!;
     const cwd = path.join(tmpDir, 'cmd cwd with spaces');
@@ -95,7 +95,7 @@ describe('local-tools › Windows PowerShell compatibility preflight', () => {
   });
 
   it.runIf(process.platform === 'darwin')('executes a real POSIX command with inherited UTF-8 environment and a spaced cwd', async () => {
-    await grant();
+    await allFilesAuto();
     const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
     const bash = createLocalTools({ userId: UID }).find((tool) => tool.name === 'bash')!;
     const cwd = path.join(tmpDir, 'native cwd with spaces');
@@ -116,7 +116,7 @@ describe('local-tools › Windows PowerShell compatibility preflight', () => {
   });
 
   it('records exact before/after snapshots for small shell-edited code files', async () => {
-    await grant();
+    await allFilesAuto();
     const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
     const bash = createLocalTools({ userId: UID }).find((tool) => tool.name === 'bash')!;
     const filePath = path.join(tmpDir, 'tracked.ts');
@@ -233,14 +233,9 @@ async function buildDeleteTool(opts: Record<string, any> = {}) {
   return { del, wsDir };
 }
 
-async function grant() {
+async function allFilesAuto() {
   const perm = await import('../../../../src/main/features/permissions');
-  perm.grantLocalExec();
-}
-
-async function revoke() {
-  const perm = await import('../../../../src/main/features/permissions');
-  perm.revokeLocalExec();
+  perm.setLocalExecMode('all_files_auto');
 }
 
 async function workspaceOnly() {
@@ -268,7 +263,7 @@ async function buildBashTool() {
 
 describe('local-tools › persistent process sessions', () => {
   it('applies the workspace write boundary before starting a process', async () => {
-    await grant();
+    await allFilesAuto();
     await workspaceOnly();
     const localTools = await import('../../../../src/main/model/core-agent/local-tools');
     const ws = await import('../../../../src/main/features/user_workspace');
@@ -280,12 +275,13 @@ describe('local-tools › persistent process sessions', () => {
     const processStart = localTools.createLocalTools({
       userId: UID,
       cid: CID,
-    }).find((tool) => tool.name === 'process_start')!;
+    }).find((tool) => tool.name === 'process_session')!;
 
     const command = process.platform === 'win32'
       ? `Set-Content -LiteralPath ${JSON.stringify(outside)} -Value blocked`
       : `printf blocked > ${JSON.stringify(outside)}`;
     const result = await processStart.execute({
+      action: 'start',
       command,
     }, {
       workingDir: workspace,
@@ -298,7 +294,7 @@ describe('local-tools › persistent process sessions', () => {
   });
 
   it('reports terminal execution and file changes produced by a long process', async () => {
-    await grant();
+    await allFilesAuto();
     await workspaceOnly();
     const localTools = await import('../../../../src/main/model/core-agent/local-tools');
     const ws = await import('../../../../src/main/features/user_workspace');
@@ -312,14 +308,13 @@ describe('local-tools › persistent process sessions', () => {
       cid: CID,
       onFileWritten,
     });
-    const processStart = tools.find((tool) => tool.name === 'process_start')!;
-    const processRead = tools.find((tool) => tool.name === 'process_read')!;
-    const processStop = tools.find((tool) => tool.name === 'process_stop')!;
+    const processSession = tools.find((tool) => tool.name === 'process_session')!;
     const ctx = { workingDir: workspace, state: {} } as any;
     const command = process.platform === 'win32'
       ? 'Start-Sleep -Milliseconds 700; Set-Content -NoNewline -Path generated.ts -Value "export const generated = true;`n"'
       : "sleep 0.7; printf 'export const generated = true;\\n' > generated.ts";
-    const started = await processStart.execute({
+    const started = await processSession.execute({
+      action: 'start',
       command,
     }, ctx);
     const initial = JSON.parse(started.content);
@@ -328,14 +323,15 @@ describe('local-tools › persistent process sessions', () => {
     const deadline = Date.now() + 5_000;
     while (payload.status === 'running' && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 60));
-      terminal = await processRead.execute({
+      terminal = await processSession.execute({
+        action: 'read',
         session_id: initial.session_id,
         cursor: payload.next_cursor,
       }, ctx);
       payload = JSON.parse(terminal.content);
     }
     if (payload.status === 'running') {
-      await processStop.execute({ session_id: initial.session_id }, ctx);
+      await processSession.execute({ action: 'stop', session_id: initial.session_id }, ctx);
     }
 
     const generated = path.join(workspace, 'generated.ts');
@@ -358,7 +354,7 @@ describe('local-tools › persistent process sessions', () => {
 
 describe('local-tools › bash › disabled skills', () => {
   it('rejects run-skill.cjs for a disabled skill id', async () => {
-    await grant();
+    await allFilesAuto();
     const enabled = await import('../../../../src/main/features/component_enabled');
     enabled.setSkillEnabled(UID, 'disabled-skill', false);
 
@@ -373,21 +369,21 @@ describe('local-tools › bash › disabled skills', () => {
   });
 
   it('rejects a unique display-name invocation when its canonical marketplace id is disabled', async () => {
-    await grant();
+    await allFilesAuto();
     const enabled = await import('../../../../src/main/features/component_enabled');
     const paths = await import('../../../../src/main/paths');
     const skillDir = paths.userMarketplaceSkillDir(UID, '74e05fe08cc5');
     fs.mkdirSync(skillDir, { recursive: true });
     fs.writeFileSync(
       path.join(skillDir, 'SKILL.md'),
-      '---\nname: "agent-browser"\ndescription: browser automation\n---\n',
+      '---\nname: "marketplace-browser-disabled-alias-test"\ndescription: browser automation\n---\n',
       'utf8',
     );
     enabled.setSkillEnabled(UID, '74e05fe08cc5', false);
 
     const bash = await buildBashTool();
     const r = await run(bash, {
-      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" agent-browser search -- query',
+      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" marketplace-browser-disabled-alias-test search -- query',
     });
 
     expect(r.isError).toBe(true);
@@ -395,8 +391,43 @@ describe('local-tools › bash › disabled skills', () => {
     expect(r.content).toContain('74e05fe08cc5');
   });
 
+  it('rejects a disabled external-package Skill invoked by its display-name alias', async () => {
+    await allFilesAuto();
+    const enabled = await import('../../../../src/main/features/component_enabled');
+    const paths = await import('../../../../src/main/paths');
+    const packagesRoot = paths.userPackagesDir(UID);
+    const skillDir = path.join(packagesRoot, 'pkg-tools', 'skills', 'pkg-helper-id');
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      '---\nname: package-helper\ndescription: external helper\n---\n',
+      'utf8',
+    );
+    fs.mkdirSync(packagesRoot, { recursive: true });
+    fs.writeFileSync(paths.userPackagesRegistryFile(UID), JSON.stringify({
+      version: 1,
+      packages: [{
+        name: 'pkg-tools',
+        kind: 'skill',
+        skill_roots: ['skills'],
+        bin_entries: [],
+        enabled: true,
+      }],
+    }));
+    enabled.setSkillEnabled(UID, 'pkg-helper-id', false);
+
+    const bash = await buildBashTool();
+    const r = await run(bash, {
+      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" package-helper run',
+    });
+
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_SKILL_DISABLED');
+    expect(r.content).toContain('pkg-helper-id');
+  });
+
   it('does not let a disabled marketplace alias shadow an enabled exact custom id', async () => {
-    await grant();
+    await allFilesAuto();
     const enabled = await import('../../../../src/main/features/component_enabled');
     const paths = await import('../../../../src/main/paths');
     for (const skillDir of [
@@ -421,7 +452,7 @@ describe('local-tools › bash › disabled skills', () => {
   });
 
   it('rejects commands that directly enter a disabled skill directory', async () => {
-    await grant();
+    await allFilesAuto();
     const enabled = await import('../../../../src/main/features/component_enabled');
     const paths = await import('../../../../src/main/paths');
     enabled.setSkillEnabled(UID, 'disabled-skill', false);
@@ -438,9 +469,149 @@ describe('local-tools › bash › disabled skills', () => {
   });
 });
 
+describe('local-tools › bash › run-scoped Skill binding', () => {
+  it('executes the exact @skill binding instead of rescanning a same-id installed directory', async () => {
+    await allFilesAuto();
+    const paths = await import('../../../../src/main/paths');
+    const installedRoot = paths.userMarketplaceSkillDir(UID, 'collision-skill');
+    const boundRoot = path.join(tmpDir, 'exact-bound-skill');
+    for (const [root, source] of [[installedRoot, 'rescanned'], [boundRoot, 'bound']] as const) {
+      fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'SKILL.md'), `---\nname: collision-skill\ndescription: ${source}\n---\n`);
+      fs.writeFileSync(
+        path.join(root, 'scripts', 'probe.js'),
+        `module.exports = async () => ({ ok: true, source: '${source}' });\n`,
+      );
+    }
+    const binding = {
+      id: 'collision-skill',
+      name: 'collision-skill',
+      root: boundRoot,
+      entry: path.join(boundRoot, 'SKILL.md'),
+      source: 'global',
+    };
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const bash = createLocalTools({
+      userId: UID,
+      skillRuntimeBindings: new Map([['collision-skill', binding]]),
+    }).find((tool) => tool.name === 'bash')!;
+    const ctx = {
+      workingDir: tmpDir,
+      state: {
+        sandboxEnv: {
+          ORKAS_NODE: process.execPath,
+          ORKAS_PC_DIR: process.cwd(),
+          ORKAS_UID: UID,
+          ORKAS_WORKSPACE_ROOT: tmpDir,
+        },
+      },
+    } as any;
+
+    const result = await bash.execute({
+      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" collision-skill probe',
+      timeoutMs: 10_000,
+    }, ctx);
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toContain('"source":"bound"');
+    expect(result.content).not.toContain('"source":"rescanned"');
+    expect(ctx.state.sandboxEnv).not.toHaveProperty('ORKAS_RUN_SKILL_DIR');
+  });
+
+  it('exposes host evidence only to the bound Deep Research Skill', async () => {
+    await allFilesAuto();
+    const deepRoot = path.join(tmpDir, 'deep-research-bound');
+    const otherRoot = path.join(tmpDir, 'other-skill-bound');
+    for (const root of [deepRoot, otherRoot]) {
+      fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'SKILL.md'), '---\nname: probe\ndescription: probe\n---\n');
+      fs.writeFileSync(
+        path.join(root, 'scripts', 'probe.js'),
+        `module.exports = async () => ({ evidenceFile: process.env.ORKAS_DEEP_RESEARCH_EVIDENCE_FILE || null });\n`,
+      );
+    }
+    const binding = (id: string, root: string) => ({
+      id,
+      name: id,
+      root,
+      entry: path.join(root, 'SKILL.md'),
+      source: 'global',
+    });
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const bash = createLocalTools({
+      userId: UID,
+      skillRuntimeBindings: new Map([
+        ['deep-research', binding('ee99fbb42964', deepRoot)],
+        ['other-skill', binding('other-skill', otherRoot)],
+      ]),
+    }).find((tool) => tool.name === 'bash')!;
+    const evidenceFile = path.join(tmpDir, 'host-only-evidence.jsonl');
+    const ctx = {
+      workingDir: tmpDir,
+      state: {
+        sandboxEnv: {
+          ORKAS_NODE: process.execPath,
+          ORKAS_PC_DIR: process.cwd(),
+          ORKAS_UID: UID,
+          ORKAS_WORKSPACE_ROOT: tmpDir,
+        },
+        deepResearchEvidenceFile: evidenceFile,
+      },
+    } as any;
+
+    const other = await bash.execute({
+      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" other-skill probe',
+      timeoutMs: 10_000,
+    }, ctx);
+    const deep = await bash.execute({
+      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" deep-research probe',
+      timeoutMs: 10_000,
+    }, ctx);
+    const reservedEnvOverride = process.platform === 'win32'
+      ? '$env:ORKAS_DEEP_RESEARCH_EVIDENCE_FILE = "C:\\forged";'
+      : 'ORKAS_DEEP_RESEARCH_EVIDENCE_FILE=/tmp/forged';
+    const override = await bash.execute({
+      command: `${reservedEnvOverride} "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" deep-research probe`,
+      timeoutMs: 10_000,
+    }, ctx);
+
+    expect(other.isError).toBeFalsy();
+    expect(other.content).toContain('"evidenceFile":null');
+    expect(deep.isError).toBeFalsy();
+    expect(deep.content).toContain(JSON.stringify(evidenceFile));
+    expect(override).toMatchObject({ isError: true });
+    expect(override.content).toContain('E_SKILL_RUNTIME_ENV_RESERVED');
+    expect(ctx.state.sandboxEnv).not.toHaveProperty('ORKAS_DEEP_RESEARCH_EVIDENCE_FILE');
+  });
+
+  it('rejects an installed Skill that was not advertised in the current run', async () => {
+    await allFilesAuto();
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const bash = createLocalTools({
+      userId: UID,
+      skillRuntimeBindings: new Map(),
+    }).find((tool) => tool.name === 'bash')!;
+    const result = await bash.execute({
+      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" hidden-skill probe',
+    }, {
+      workingDir: tmpDir,
+      state: {
+        sandboxEnv: {
+          ORKAS_NODE: process.execPath,
+          ORKAS_PC_DIR: process.cwd(),
+        },
+      },
+    } as any);
+
+    expect(result).toMatchObject({ isError: true });
+    expect(result.content).toContain('E_SKILL_NOT_AVAILABLE');
+    expect(result.content).toContain('@skill/hidden-skill');
+  });
+});
+
 describe('local-tools › edit_file › permission mode', () => {
-  it('allows workspace edits after legacy revoke maps to workspace_approval', async () => {
-    await revoke();
+  it('allows workspace edits in workspace_approval mode', async () => {
+    await workspaceOnly();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'a.txt');
     fs.writeFileSync(p, 'hello world');
@@ -464,7 +635,7 @@ describe('local-tools › edit_file › trailing-whitespace fallback', () => {
   ].join('\n');
 
   it('matches when the FILE carries line-end whitespace the old_string omits', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'index.html');
     fs.writeFileSync(p, `${block('   ')}\n`);
@@ -475,7 +646,7 @@ describe('local-tools › edit_file › trailing-whitespace fallback', () => {
   });
 
   it('matches when the OLD_STRING carries line-end whitespace the file omits', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'index.html');
     fs.writeFileSync(p, `${block('')}\n`);
@@ -486,7 +657,7 @@ describe('local-tools › edit_file › trailing-whitespace fallback', () => {
   });
 
   it('leaves an exact match exact and does not flag it as relaxed', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'index.html');
     fs.writeFileSync(p, `${block('')}\n`);
@@ -496,7 +667,7 @@ describe('local-tools › edit_file › trailing-whitespace fallback', () => {
   });
 
   it('refuses a relaxed match that is not unique', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'index.html');
     // Two blocks whose line ends BOTH differ from the old_string, so the exact
@@ -511,7 +682,7 @@ describe('local-tools › edit_file › trailing-whitespace fallback', () => {
   });
 
   it('names the first line of old_string that is not in the file', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'index.html');
     // 2026-08-08: after eight reads of one region the caller sent a block whose
@@ -542,7 +713,7 @@ describe('local-tools › edit_file › trailing-whitespace fallback', () => {
   });
 
   it('reports an indentation-only mismatch as such, and still refuses the edit', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'app.py');
     const before = 'def run():\n    if ready:\n        go()\n';
@@ -556,7 +727,7 @@ describe('local-tools › edit_file › trailing-whitespace fallback', () => {
   });
 
   it('says nothing extra when the lines are all present but not adjacent', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'a.txt');
     const before = 'alpha\nintruder\nbeta\n';
@@ -568,7 +739,7 @@ describe('local-tools › edit_file › trailing-whitespace fallback', () => {
   });
 
   it('never relaxes LEADING indentation', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'app.py');
     // Indentation is meaning in Python and YAML; relaxing it would let a
@@ -582,7 +753,7 @@ describe('local-tools › edit_file › trailing-whitespace fallback', () => {
   });
 
   it('never relaxes a single-line old_string', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'a.txt');
     // There is no internal line break to disagree about, and relaxing a bare
@@ -602,7 +773,7 @@ describe('local-tools › edit_file › trailing-whitespace fallback', () => {
   });
 
   it('does not relax a genuine content difference', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'index.html');
     const before = `${block('  ')}\n`;
@@ -618,7 +789,7 @@ describe('local-tools › edit_file › trailing-whitespace fallback', () => {
   });
 
   it('treats regex metacharacters in old_string as literal text', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'a.ts');
     const before = 'const re = /^a.+(b|c)$/;   \nconst next = 1;\n';
@@ -725,6 +896,97 @@ describe('local-tools › edit_file › sandbox', () => {
     expect(deleteResult.isError).toBe(true);
     expect(deleteResult.content).toContain('E_PROTECTED_PATH_READ_ONLY');
     expect(fs.readFileSync(existing, 'utf8')).toBe('preserve me');
+  });
+
+  // A read-only root exists to widen READ access outside the workspace. Group
+  // chat derives one from `path.dirname()` of every referenced/produced file, so
+  // referencing a file stored at the workspace root used to hand the same list
+  // to the write blocklist and lock the agent out of its own workspace for the
+  // rest of the run — every write tool plus any bash command naming that path.
+  // The user-visible failure was a stalled agent whose only feedback pointed at
+  // the unrelated agent/skill edit flow.
+  it('keeps the workspace writable when a referenced file makes its own directory a read-only root', async () => {
+    await allFilesApproval();
+    const localTools = await import('../../../../src/main/model/core-agent/local-tools');
+    const ws = await import('../../../../src/main/features/user_workspace');
+    const wsDir = path.join(tmpDir, 'ws');
+    const nested = path.join(wsDir, 'cards');
+    fs.mkdirSync(nested, { recursive: true });
+    const referenced = path.join(wsDir, 'report.md');
+    fs.writeFileSync(referenced, 'produced by an earlier conversation');
+    const r = ws.setWorkspacePath(UID, wsDir);
+    if (!r.ok) throw new Error(`setWorkspacePath failed: ${r.error}`);
+
+    const tools = localTools.createLocalTools({
+      userId: UID,
+      cid: CID,
+      // Exactly what group chat admits: the workspace root itself (dirname of a
+      // produced file stored there) plus a working subdirectory.
+      runtimeReadOnlyRoots: [wsDir, nested],
+    });
+    const write = tools.find((tool) => tool.name === 'write_file');
+    const bash = tools.find((tool) => tool.name === 'bash');
+    if (!write || !bash) throw new Error('expected local tools missing');
+
+    const atRoot = path.join(wsDir, 'draft.md');
+    const inNested = path.join(nested, 'card-1.html');
+    const rootResult = await run(write, { path: atRoot, content: 'new draft' });
+    const nestedResult = await run(write, { path: inNested, content: '<html></html>' });
+    const bashResult = await run(bash, {
+      command: process.platform === 'win32'
+        ? `Set-Content -LiteralPath "${path.join(nested, 'note.txt')}" -Value ok`
+        : `printf ok > "${path.join(nested, 'note.txt')}"`,
+    });
+
+    expect(rootResult.isError).toBeUndefined();
+    expect(nestedResult.isError).toBeUndefined();
+    expect(bashResult.isError).toBeUndefined();
+    expect(fs.readFileSync(atRoot, 'utf8')).toBe('new draft');
+    expect(fs.readFileSync(inNested, 'utf8')).toBe('<html></html>');
+    expect(fs.readFileSync(path.join(nested, 'note.txt'), 'utf8').trim()).toBe('ok');
+    // The referenced file itself is ordinary workspace content, not a locked resource.
+    expect(fs.readFileSync(referenced, 'utf8')).toBe('produced by an earlier conversation');
+  });
+
+  // Negative control for the guard above: dropping workspace-overlapping roots
+  // must not become a way to reach a package. A workspace selected above the
+  // data directory overlaps every installed skill, and the structured
+  // agent/skill edit flow must stay the only mutation channel.
+  it('keeps package roots read-only even when the selected workspace contains them', async () => {
+    await allFilesApproval();
+    const paths = await import('../../../../src/main/paths');
+    const localTools = await import('../../../../src/main/model/core-agent/local-tools');
+    const ws = await import('../../../../src/main/features/user_workspace');
+    const skillDir = path.join(paths.userSkillsDir(UID), 'cloud-skill');
+    fs.mkdirSync(skillDir, { recursive: true });
+    const skillFile = path.join(skillDir, 'SKILL.md');
+    fs.writeFileSync(skillFile, 'original skill');
+    // tmpDir is ORKAS_WORKSPACE_ROOT, so selecting it puts every package under
+    // the writable workspace.
+    const r = ws.setWorkspacePath(UID, tmpDir);
+    if (!r.ok) throw new Error(`setWorkspacePath failed: ${r.error}`);
+
+    const tools = localTools.createLocalTools({
+      userId: UID,
+      cid: CID,
+      // This broad reference root is discarded because it overlaps the
+      // writable workspace. Package protection must come from the invariant,
+      // not from retaining a narrower caller-supplied package root by accident.
+      runtimeReadOnlyRoots: [tmpDir],
+    });
+    const write = tools.find((tool) => tool.name === 'write_file');
+    const edit = tools.find((tool) => tool.name === 'edit_file');
+    if (!write || !edit) throw new Error('expected local tools missing');
+
+    const editResult = await run(edit, { path: skillFile, old_string: 'original', new_string: 'mutated' });
+    const writeResult = await run(write, { path: path.join(skillDir, 'extra.md'), content: 'smuggled' });
+
+    expect(editResult.isError).toBe(true);
+    expect(editResult.content).toContain('E_PROTECTED_PATH_READ_ONLY');
+    expect(writeResult.isError).toBe(true);
+    expect(writeResult.content).toContain('E_PROTECTED_PATH_READ_ONLY');
+    expect(fs.readFileSync(skillFile, 'utf8')).toBe('original skill');
+    expect(fs.existsSync(path.join(skillDir, 'extra.md'))).toBe(false);
   });
 
   it('blocks direct local-tool mutation of marketplace installs in all-files mode', async () => {
@@ -864,7 +1126,7 @@ describe('local-tools › apply_patch › transactional text changes', () => {
   const hash = (text: string) => `sha256:${createHash('sha256').update(text).digest('hex')}`;
 
   it('applies update, add, and delete operations without a task-domain declaration', async () => {
-    await grant();
+    await allFilesAuto();
     const written: string[] = [];
     const { applyPatch, wsDir } = await buildPatchTool({ onFileWritten: (p) => written.push(p) });
     const source = path.join(wsDir, 'src', 'value.ts');
@@ -904,7 +1166,7 @@ describe('local-tools › apply_patch › transactional text changes', () => {
   });
 
   it('names the character that is wrong in a near-miss file header', async () => {
-    await grant();
+    await allFilesAuto();
     const { applyPatch, wsDir } = await buildPatchTool();
     const source = path.join(wsDir, 'index.html');
     fs.writeFileSync(source, 'const a = 1;\n');
@@ -936,7 +1198,7 @@ describe('local-tools › apply_patch › transactional text changes', () => {
   });
 
   it('preflights the whole patch before creating or changing any target', async () => {
-    await grant();
+    await allFilesAuto();
     const { applyPatch, wsDir } = await buildPatchTool();
     const source = path.join(wsDir, 'source.ts');
     const created = path.join(wsDir, 'created.ts');
@@ -962,7 +1224,7 @@ describe('local-tools › apply_patch › transactional text changes', () => {
   });
 
   it('enforces the existing read-before-edit and OCC contract', async () => {
-    await grant();
+    await allFilesAuto();
     const { applyPatch, wsDir } = await buildPatchTool();
     const source = path.join(wsDir, 'source.ts');
     fs.writeFileSync(source, 'const value = 1;\n');
@@ -987,8 +1249,49 @@ describe('local-tools › apply_patch › transactional text changes', () => {
     expect(fs.readFileSync(source, 'utf8')).toBe('const value = 2;\n');
   });
 
+  it('returns apply_patch-compatible recovery after E_NOT_READ and accepts a rebuilt patch', async () => {
+    await allFilesAuto();
+    const { applyPatch, wsDir } = await buildPatchTool();
+    const source = path.join(wsDir, 'source.ts');
+    fs.writeFileSync(source, 'const value = 1;\nconst label = "before";\n');
+    const ctx = { workingDir: wsDir, state: { readFileState: new Map() } } as any;
+
+    const blocked = await applyPatch.execute({
+      patch: [
+        '*** Begin Patch',
+        `*** Update File: ${source}`,
+        '@@',
+        '-const label = "before";',
+        '+const label = "after";',
+        '*** End Patch',
+      ].join('\n'),
+    }, ctx);
+
+    expect(blocked.isError).toBe(true);
+    expect(blocked.content).toContain('E_NOT_READ');
+    expect(blocked.content).toContain('<patch-recovery file_hash=');
+    expect(blocked.content).toContain('rebuild the patch against these bytes');
+    expect(blocked.content).not.toContain('expected_hash');
+    expect(fs.readFileSync(source, 'utf8')).toBe('const value = 1;\nconst label = "before";\n');
+
+    const retried = await applyPatch.execute({
+      patch: [
+        '*** Begin Patch',
+        `*** Update File: ${source}`,
+        '@@',
+        ' const value = 1;',
+        '-const label = "before";',
+        '+const label = "after";',
+        '*** End Patch',
+      ].join('\n'),
+    }, ctx);
+
+    expect(retried.isError).toBeFalsy();
+    expect(fs.readFileSync(source, 'utf8')).toBe('const value = 1;\nconst label = "after";\n');
+  });
+
   it('moves an updated file while preserving its mode and reporting the destination', async () => {
-    await grant();
+    await allFilesAuto();
     const { applyPatch, wsDir } = await buildPatchTool();
     const source = path.join(wsDir, 'before.txt');
     const destination = path.join(wsDir, 'nested', 'after.txt');
@@ -1017,7 +1320,7 @@ describe('local-tools › apply_patch › transactional text changes', () => {
   });
 
   it('preserves CRLF and supports a context-free insertion only at End of File', async () => {
-    await grant();
+    await allFilesAuto();
     const { applyPatch, wsDir } = await buildPatchTool();
     const source = path.join(wsDir, 'windows.txt');
     fs.writeFileSync(source, 'one\r\ntwo\r\n');
@@ -1068,7 +1371,7 @@ describe('local-tools › apply_patch › transactional text changes', () => {
 
 describe('local-tools › edit_file › input validation', () => {
   it('rejects missing path / old / new', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit } = await buildEditTool();
     expect((await run(edit, { old_string: 'a', new_string: 'b' })).isError).toBe(true);
     expect((await run(edit, { path: 'x', new_string: 'b' })).isError).toBe(true);
@@ -1076,7 +1379,7 @@ describe('local-tools › edit_file › input validation', () => {
   });
 
   it('rejects empty old_string', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'a.txt');
     fs.writeFileSync(p, 'x');
@@ -1086,7 +1389,7 @@ describe('local-tools › edit_file › input validation', () => {
   });
 
   it('rejects no-op when old === new', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'a.txt');
     fs.writeFileSync(p, 'foo');
@@ -1098,7 +1401,7 @@ describe('local-tools › edit_file › input validation', () => {
 
 describe('local-tools › edit_file › file kind / existence', () => {
   it('rejects when file does not exist (no auto-create)', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'missing.txt');
     const r = await run(edit, { path: p, old_string: 'a', new_string: 'b' });
@@ -1108,7 +1411,7 @@ describe('local-tools › edit_file › file kind / existence', () => {
   });
 
   it('rejects PDF kind with E_NOT_EDITABLE', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'doc.pdf');
     fs.writeFileSync(p, makeMinimalPdf(['some pdf text']));
@@ -1120,7 +1423,7 @@ describe('local-tools › edit_file › file kind / existence', () => {
 
 describe('local-tools › edit_file › matching semantics', () => {
   it('replaces a unique occurrence and returns char-counted result tag', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'a.md');
     fs.writeFileSync(p, '# Title\n\nhello world\n');
@@ -1131,7 +1434,7 @@ describe('local-tools › edit_file › matching semantics', () => {
   });
 
   it('rejects when old_string not found', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'a.md');
     fs.writeFileSync(p, 'abc');
@@ -1141,7 +1444,7 @@ describe('local-tools › edit_file › matching semantics', () => {
   });
 
   it('rejects multiple matches when replace_all=false', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'a.md');
     fs.writeFileSync(p, 'foo bar foo');
@@ -1153,7 +1456,7 @@ describe('local-tools › edit_file › matching semantics', () => {
   });
 
   it('replaces all when replace_all=true', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'a.md');
     fs.writeFileSync(p, 'foo bar foo');
@@ -1164,7 +1467,7 @@ describe('local-tools › edit_file › matching semantics', () => {
   });
 
   it('preserves CRLF line endings (no normalization)', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'a.md');
     fs.writeFileSync(p, 'line1\r\nALPHA\r\nline3\r\n');
@@ -1176,7 +1479,7 @@ describe('local-tools › edit_file › matching semantics', () => {
 
 describe('local-tools › edit_file › onFileWritten', () => {
   it('fires onFileWritten with the absolute path on success', async () => {
-    await grant();
+    await allFilesAuto();
     const written: string[] = [];
     const { edit, wsDir } = await buildEditTool({ onFileWritten: (p) => written.push(p) });
     const p = path.join(wsDir, 'a.md');
@@ -1187,7 +1490,7 @@ describe('local-tools › edit_file › onFileWritten', () => {
   });
 
   it('does NOT fire onFileWritten on error', async () => {
-    await grant();
+    await allFilesAuto();
     const written: string[] = [];
     const { edit, wsDir } = await buildEditTool({ onFileWritten: (p) => written.push(p) });
     const p = path.join(wsDir, 'a.md');
@@ -1215,13 +1518,13 @@ describe('local-tools › edit_file › read-before-edit + OCC', () => {
   async function buildReadTool() {
     const fileTools = await import('../../../../src/main/model/core-agent/file-tools');
     const tools = fileTools.createFileTools({ userId: UID, cid: CID });
-    const read = tools.find((t) => t.name === 'read_file');
-    if (!read) throw new Error('read_file tool missing');
+    const read = tools.find((t) => t.name === 'read_files');
+    if (!read) throw new Error('read_files tool missing');
     return read;
   }
 
   it('rejects an edit when the file was never read this run (E_NOT_READ)', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'a.md');
     fs.writeFileSync(p, 'hello world');
@@ -1232,14 +1535,14 @@ describe('local-tools › edit_file › read-before-edit + OCC', () => {
     expect(fs.readFileSync(p, 'utf8')).toBe('hello world'); // untouched
   });
 
-  it('allows the edit after read_file stamps the baseline, end to end', async () => {
-    await grant();
+  it('allows the edit after read_files stamps the baseline, end to end', async () => {
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const read = await buildReadTool();
     const p = path.join(wsDir, 'a.md');
     fs.writeFileSync(p, '# T\n\nhello world\n');
     const ctx = runCtx();
-    const rr = await read.execute({ path: p }, ctx);
+    const rr = await read.execute({ paths: [{ path: p }] }, ctx);
     expect(rr.isError).toBeFalsy();
     const hash = /file_hash="([^"]+)"/.exec(rr.content)?.[1];
     expect(hash).toMatch(/^sha256:[a-f0-9]{64}$/);
@@ -1249,13 +1552,13 @@ describe('local-tools › edit_file › read-before-edit + OCC', () => {
   });
 
   it('rejects a stale edit when the file changed since the read (E_STALE)', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const read = await buildReadTool();
     const p = path.join(wsDir, 'a.md');
     fs.writeFileSync(p, 'hello world');
     const ctx = runCtx();
-    await read.execute({ path: p }, ctx); // stamps baseline
+    await read.execute({ paths: [{ path: p }] }, ctx); // stamps baseline
     fs.writeFileSync(p, 'hello brave new world'); // another writer changes it (size differs)
     const r = await edit.execute({ path: p, old_string: 'hello', new_string: 'hi' }, ctx);
     expect(r.isError).toBe(true);
@@ -1264,13 +1567,13 @@ describe('local-tools › edit_file › read-before-edit + OCC', () => {
   });
 
   it('returns a current hash/context after stale expected_hash and accepts the corrected retry', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const read = await buildReadTool();
     const p = path.join(wsDir, 'a.md');
     fs.writeFileSync(p, 'alpha beta gamma');
     const ctx = runCtx();
-    const rr = await read.execute({ path: p }, ctx);
+    const rr = await read.execute({ paths: [{ path: p }] }, ctx);
     const oldHash = /file_hash="([^"]+)"/.exec(rr.content)?.[1];
     fs.writeFileSync(p, 'alpha BETA gamma');
 
@@ -1296,13 +1599,13 @@ describe('local-tools › edit_file › read-before-edit + OCC', () => {
   });
 
   it('returns bounded current context and hash on E_NO_MATCH', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const read = await buildReadTool();
     const p = path.join(wsDir, 'a.md');
     fs.writeFileSync(p, 'current line\n' + 'x'.repeat(2_000));
     const ctx = runCtx();
-    await read.execute({ path: p }, ctx);
+    await read.execute({ paths: [{ path: p }] }, ctx);
     const result = await edit.execute({ path: p, old_string: 'missing line', new_string: 'new' }, ctx);
     expect(result.isError).toBe(true);
     expect(result.content).toContain('E_NO_MATCH');
@@ -1311,13 +1614,13 @@ describe('local-tools › edit_file › read-before-edit + OCC', () => {
   });
 
   it('allows a second consecutive edit without re-reading (post-edit stamp refresh)', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const read = await buildReadTool();
     const p = path.join(wsDir, 'a.md');
     fs.writeFileSync(p, 'one two three');
     const ctx = runCtx();
-    await read.execute({ path: p }, ctx);
+    await read.execute({ paths: [{ path: p }] }, ctx);
     const r1 = await edit.execute({ path: p, old_string: 'one', new_string: 'ONE' }, ctx);
     expect(r1.isError).toBeFalsy();
     const r2 = await edit.execute({ path: p, old_string: 'three', new_string: 'THREE' }, ctx);
@@ -1326,7 +1629,7 @@ describe('local-tools › edit_file › read-before-edit + OCC', () => {
   });
 
   it('write_file stamps, so a follow-up edit needs no intervening read', async () => {
-    await grant();
+    await allFilesAuto();
     const { write, wsDir } = await buildWriteTool();
     const localTools = await import('../../../../src/main/model/core-agent/local-tools');
     const tools = localTools.createLocalTools({ userId: UID, cid: CID });
@@ -1341,7 +1644,7 @@ describe('local-tools › edit_file › read-before-edit + OCC', () => {
   });
 
   it('serializes concurrent edits to the same file — the loser sees E_STALE, no lost update', async () => {
-    await grant();
+    await allFilesAuto();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'shared.md');
     const original = 'AAA and BBB';
@@ -1419,8 +1722,8 @@ describe('local-tools › create_artifact › availability', () => {
 });
 
 describe('local-tools › create_artifact › permission mode', () => {
-  it('allows artifacts after legacy revoke maps to workspace_approval', async () => {
-    await revoke();
+  it('allows artifacts in workspace_approval mode', async () => {
+    await workspaceOnly();
     const tool = await buildCreateArtifactTool({ onArtifactCreated: () => {} });
     expect(tool).toBeTruthy();
     const r = await run(tool, { title: 'X', files: MIN_FILES });
@@ -1430,7 +1733,7 @@ describe('local-tools › create_artifact › permission mode', () => {
   });
 
   it('rejects and discards a static candidate before firing onArtifactCreated', async () => {
-    await grant();
+    await allFilesAuto();
     const created: unknown[] = [];
     let candidateDir = '';
     const tool = await buildCreateArtifactTool({
@@ -1454,11 +1757,35 @@ describe('local-tools › create_artifact › permission mode', () => {
     expect(candidateDir).toBeTruthy();
     expect(fs.existsSync(candidateDir)).toBe(false);
   });
+
+  it('turns blocked remote images into a bounded self-contained recovery path', async () => {
+    await allFilesAuto();
+    const tool = await buildCreateArtifactTool({
+      onArtifactCreated: () => {},
+      artifactInteractionSmoke: async () => ({
+        ok: false,
+        blockers: [
+          '6 images failed to load',
+          '30 external or out-of-directory requests were blocked',
+        ],
+        controlsExercised: 1,
+        observableEffects: 0,
+      }),
+    });
+    const r = await run(tool, { title: 'Remote image app', files: MIN_FILES });
+
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_ARTIFACT_INTERACTION_INCOMPLETE');
+    expect(r.content).toMatch(/user explicitly supplied or required an asset/i);
+    expect(r.content).toMatch(/bundle it under files.*base64/i);
+    expect(r.content).toMatch(/model-chosen remote assets.*local CSS\/SVG or data\/blob/i);
+    expect(r.content).toMatch(/Do not retry the same remote URLs/i);
+  });
 });
 
 describe('local-tools › create_artifact › success + callback', () => {
   it('writes the bundle, fires onArtifactCreated, and tells the model not to paste HTML', async () => {
-    await grant();
+    await allFilesAuto();
     const created: Array<{ id: string; title: string }> = [];
     const tool = await buildCreateArtifactTool({ agentId: 'helper', onArtifactCreated: (a) => created.push(a) });
     const r = await run(tool, { title: 'Tip calc', files: MIN_FILES });
@@ -1475,7 +1802,7 @@ describe('local-tools › create_artifact › success + callback', () => {
 
 describe('local-tools › create_artifact › backend rejection surfaces as isError', () => {
   it('missing index.html → isError, no callback', async () => {
-    await grant();
+    await allFilesAuto();
     const created: unknown[] = [];
     const tool = await buildCreateArtifactTool({ onArtifactCreated: (a) => created.push(a) });
     const r = await run(tool, { files: [{ path: 'main.html', content: 'x' }] });

@@ -224,9 +224,9 @@ export function onAgentTurnEnd(args: {
  *   - run `detectUserCorrection` once and extract text-class signals against
  *     the cached last agent message
  *
- * Returns `correctionDetected` so the caller can wire it into the agent's
- * RunMetrics.userCorrections (see plan §6.1: same boolean, two consumers,
- * no double-judgment).
+ * Returns `correctionDetected` for callers that want the shared judgment;
+ * currently informational only — the second consumer plan §6.1 cited (the
+ * runner's RunMetrics scorer) was deleted 2026-08-16.
  */
 export async function onUserMessage(args: {
   uid: string;

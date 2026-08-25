@@ -56,6 +56,7 @@ function fakeRuntime(options: {
   stateTransitionsObserved?: number;
   formsFound?: number;
   formsSubmitted?: number;
+  interactionFailureCount?: number;
   interactionFailures?: string[];
   loadFailure?: boolean;
 } = {}): {
@@ -141,6 +142,9 @@ function fakeRuntime(options: {
               formsSubmitted: options.formsSubmitted ?? 0,
               hashLinksChecked: 0,
               mailtoLinksChecked: 0,
+              failureCount: options.interactionFailureCount
+                ?? options.interactionFailures?.length
+                ?? 0,
               failures: options.interactionFailures ?? [],
             };
           }
@@ -498,7 +502,36 @@ describe('responsive HTML preview renderer', () => {
       formsFound: 3,
       formsSubmitted: 3,
     });
-    expect(result.evidence.blockers).toContain('1 safe interaction check(s) failed');
+    expect(result.evidence.blockers).toContain(
+      '1 safe interaction check(s) failed: enabled control produced no observable outcome: Create account',
+    );
+  });
+
+  it('reports the true interaction failure count with at most ten bounded reasons', async () => {
+    const interactionFailures = Array.from(
+      { length: 12 },
+      (_, index) => `[case-${index + 1}] ${'x'.repeat(500)}`,
+    );
+    const runtime = fakeRuntime({
+      interactionFailureCount: 14,
+      interactionFailures,
+    });
+    const result = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'),
+      [{ name: 'desktop', width: 1440, height: 900 }],
+      runtime.deps,
+    );
+
+    expect(result.evidence.ok).toBe(false);
+    expect(result.evidence.interactions.failureCount).toBe(14);
+    expect(result.evidence.interactions.failures).toHaveLength(10);
+    expect(result.evidence.interactions.failures.every((failure) => failure.length <= 400)).toBe(true);
+    const blocker = result.evidence.blockers.find((item) => (
+      item.startsWith('14 safe interaction check(s) failed')
+    ));
+    expect(blocker).toContain('[case-10]');
+    expect(blocker).not.toContain('[case-11]');
+    expect(blocker).toContain('(4 more not shown)');
   });
 
   it('requires an observable behavior only for interactive artifact smoke', async () => {

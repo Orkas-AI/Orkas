@@ -14,6 +14,17 @@ test.describe('settings modules and model guard', () => {
     await expect(appPage.locator('#settings-data-root-btn')).toBeVisible();
     await expect(appPage.locator('#settings-recycle-group')).toBeVisible();
     await expect(appPage.locator('#settings-recycle-body')).toBeVisible();
+    const recycleViewport = appPage.locator('#settings-recycle-body .settings-recycle-scroll');
+    await expect(recycleViewport).toBeVisible();
+    await expect(recycleViewport).toHaveAttribute('data-recycle-source', 'local');
+    await expect(appPage.locator('#settings-recycle-body [data-recycle-tab]')).toHaveCount(0);
+    const recycleLayout = await recycleViewport.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return { overflowY: style.overflowY, maxHeight: Number.parseFloat(style.maxHeight) };
+    });
+    expect(recycleLayout.overflowY).toBe('auto');
+    expect(recycleLayout.maxHeight).toBeGreaterThan(0);
+    expect(recycleLayout.maxHeight).toBeLessThanOrEqual(320);
 
     await openSettingsTab(appPage, 'credentials');
     await expect(appPage.locator('#settings-add-entry-btn')).toBeVisible();
@@ -134,6 +145,34 @@ test.describe('settings modules and model guard', () => {
     await row.locator('.entry-actions .danger').click();
     await relaunchedPage.locator('.ui-dialog-overlay:visible [data-act="ok"]').click();
     await expect(row).toHaveCount(0);
+  });
+
+  test('keeps an empty model state quiet until an LLM action needs configuration', async ({ appPage, orkas }) => {
+    const listed = await orkas.invoke<{
+      entries: Array<{ entryId: string }>;
+    }>('auth.listEntries');
+    for (const entry of listed.entries) {
+      const removed = await orkas.invoke<{ ok: boolean; removed: boolean }>('auth.removeEntry', {
+        entryId: entry.entryId,
+      });
+      expect(removed).toMatchObject({ ok: true, removed: true });
+    }
+
+    const silentResult = await appPage.evaluate(async () => {
+      await (window as any).refreshModelGuard();
+      return (window as any).ensureModelConfigured({ silent: true });
+    });
+    expect(silentResult).toBe(false);
+    await expect(appPage.locator('#model-guard-banner')).toHaveCount(0);
+    await expect(appPage.locator('#panel-new-chat')).toHaveClass(/\bactive\b/);
+
+    await appPage.locator('#new-chat-input').fill('This request needs a configured model.');
+    await appPage.locator('#new-chat-send-btn').click();
+
+    await expect(appPage.locator('#panel-settings')).toHaveClass(/\bactive\b/);
+    await expect(appPage.locator('.settings-tab[data-settings-tab="credentials"]')).toHaveClass(/\bis-active\b/);
+    await expect(appPage.locator('.ui-dialog-overlay:visible .ui-dialog')).toBeVisible();
+    await expect(appPage.locator('#conversation-list .conv-item')).toHaveCount(0);
   });
 
 });

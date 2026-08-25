@@ -3,7 +3,6 @@ ownerAgent: 814b61b027f0
 name: image-compose
 description_zh: 路线锁定为 COMPOSE 后，或其他路线确实需要确定性排版、图表、覆盖层、裁切、遮罩与合成时，使用本地 HTML/CSS/SVG 和私有脚本制作图片。
 description_en: After route lock, produces COMPOSE work or deterministic layout, diagram, overlay, crop, mask, and composite phases with local HTML/CSS/SVG and private updateable scripts.
-category: creation
 ---
 
 # Image Compose
@@ -62,14 +61,16 @@ If the required authoring, snapshot, or export tools are unavailable, do not cla
 ## Native workflow
 
 1. Call `image_studio` with `project.inspect` after the manifest and entry exist. Repair all structural blockers before creating visual evidence. A failed structural inspection carries no model image. The native tool is a stable capture/evidence/export security kernel, not an authoring library registry.
-2. Only after inspection passes, call `image_studio` with `project.snapshot` and an output path. The passing snapshot attaches the exact full-color candidate as model-visible evidence. Inspect that attachment directly; do not reopen the same path through generic `read_file`, which is not the design-evidence transport.
+2. Only after inspection passes, call `image_studio` with `project.snapshot` and an output path. The passing snapshot attaches the exact full-color candidate as model-visible evidence. Inspect that attachment directly; do not reopen the same path through generic `read_files`, which is not the design-evidence transport.
 3. Apply one coherent repair batch if required, then repeat inspect and snapshot. Do not make serial cosmetic tweaks without new evidence.
 4. Inspect the current evidence and submit a structured verdict with `project.submit_design_review`.
 5. Call `project.export` only after a passing review of the exact current signature.
 
 `project.export` is the delivery gate. A changed manifest, HTML file, or local resource invalidates the prior review and requires a new snapshot.
 
-In the final delivery, briefly name the concrete checks that passed, not only the overall review score: exact copy/content, hierarchy or thumbnail legibility, contrast, safe margins and clipping/overflow, and export dimensions/format. Put those facts before the exported image and keep the image as the final authored line.
+The first `project.export` call must use an explicit workspace-relative `output_path` ending in `.png`. After success, answer with the image instead of handing a completed direct request back to Commander.
+
+In the final delivery, briefly name the concrete checks that passed, not only the overall review score: exact copy/content, hierarchy or thumbnail legibility, contrast, safe margins and clipping/overflow, and export dimensions/format. Put those facts before the first preview. Show only exported final deliverables unless the user asks for review evidence, and write nothing after the last preview; the host may add its own produced-file footer.
 
 On a recoverable inspection, snapshot, review, or export result, use
 `project.status.current_candidate` and `recovery_context` to resume from the

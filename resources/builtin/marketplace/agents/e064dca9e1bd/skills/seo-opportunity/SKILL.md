@@ -1,12 +1,16 @@
 ---
 ownerAgent: e064dca9e1bd
 name: seo-opportunity
-description_zh: "把 GSC/Bing 查询数据、页面抓取和 GEO 探针结果合成一次诊断内的关键词机会池（quick win、CTR gap、内容缺口、GEO gap、关键词蚕食），输出优先级、证据和下一步动作；适合\"找 SEO 增长机会\"\"给关键词机会排序\"；触发词：关键词机会、增长机会、quick win、CTR、机会池、优先级"
-description_en: "Turn GSC/Bing query data, crawl facts and GEO probe results into a one-shot keyword opportunity pool (quick wins, CTR gaps, content gaps, GEO gaps, cannibalization), with priority, evidence and next action; For: 'find SEO growth opportunities', 'rank keyword opportunities'; Triggers: keyword opportunities, growth opportunities, quick win, CTR, opportunity pool, priority"
-category: data
+description_zh: "把 GSC/Bing 查询、页面抓取和 GEO 探针结果合成带优先级、证据和下一步动作的关键词机会池，覆盖 quick win、CTR、内容、GEO 缺口和关键词蚕食；用于 SEO 增长机会发现与关键词排序。"
+description_en: "Combine GSC/Bing queries, crawl facts, and GEO probe results into prioritized keyword opportunities covering quick wins, CTR, content and GEO gaps, and cannibalization, with evidence and next actions. Use for SEO growth and keyword prioritization."
 ---
 
 # seo-opportunity
+
+For product-focused strategy, prefer observed use-case, pricing,
+comparison, and trust/docs pages. Name missing page types as coverage gaps and
+map recommendations to owned pages, first-party proof, answer blocks, and one
+cannibalization owner per overlapping query cluster.
 
 Build a one-diagnosis keyword/GEO opportunity pool. This skill is deterministic and stdlib-only: it does not fetch data, call models, or persist anything.
 
@@ -32,6 +36,11 @@ Ownership evidence invariant: a verified Search Console property is not evidence
 - At least one `seo-crawl` JSON. GSC/Bing/GEO inputs are optional.
 
 ## Connector evidence acquisition
+
+Connector availability is closed-world: consume, reconcile, and name every
+runtime-listed console, never omit a second console, and never probe one from
+memory. Without returned console evidence, rankings and traffic remain
+Estimated.
 
 When `## Connectors` lists a search console, first call `list_connector_tools` once for that connector, then invoke every selected connector operation through the core `call_connector_tool`. For Google Search Console, call `list_sites`, select the verified property that owns the target URL, then call `query_search_analytics` once for the relevant query/page dimensions. Reconcile any user-declared target queries with the actual returned query rows before recommending an opportunity. Store raw connector results with `write_file`; only returned fields become Measured.
 

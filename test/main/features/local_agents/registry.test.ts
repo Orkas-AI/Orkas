@@ -52,7 +52,7 @@ describe('local CLI context capabilities', () => {
         resume: 'native',
         instructionChannel: 'user-message',
         durableInstructionScope: 'session',
-        codingProjectDirectory: false,
+        codingProjectDirectory: true,
         orkasBridge: false,
         activeRunIngress: 'none',
       },

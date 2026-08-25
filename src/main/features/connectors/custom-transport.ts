@@ -1,10 +1,10 @@
 /**
  * Validation for user-supplied custom MCP server transports — the single
  * gate between raw renderer form input and a stored `ConnectorInstance`
- * (docs/plans/open-ecosystem-architecture.md §C2: every install entry point
- * funnels through ONE validated route).
+ * (`CLAUDE.md`, "Connectors And Knowledge Base": every install entry point
+ * funnels through one validated route).
  *
- * Security posture (§C3):
+ * Security posture:
  *   - streamable-http: https only, except plain-http to loopback hosts
  *     (local dev servers). Header names/values length-capped.
  *   - stdio: the user-typed command IS the consent artifact — the renderer

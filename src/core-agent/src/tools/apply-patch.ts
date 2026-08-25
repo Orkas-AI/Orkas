@@ -500,14 +500,14 @@ export function createApplyPatchTool(hooks: ApplyPatchToolHooks = {}): AgentTool
   return defineTool({
     name: "apply_patch",
     description:
-      "Apply one transactional patch to existing or new text files. Supports *** Add File, *** Update File with @@ hunks, optional *** Move to, and *** Delete File inside *** Begin Patch / *** End Patch. Read existing targets first. Every target is validated before any file changes; conflicts fail the whole patch. Prefer a targeted edit tool for one small replacement and apply_patch for multiple edits or files.",
+      "Apply one transactional patch across existing or new text files. Read existing targets first; validation or conflicts leave every target unchanged. Use a targeted edit tool for one small replacement.",
     inputSchema: {
       type: "object",
       properties: {
         patch: {
           type: "string",
           description:
-            "File-oriented patch text. Context lines start with space, removals with -, additions with +. Paths may be relative to the working directory or absolute.",
+            "Patch within *** Begin Patch / *** End Patch. Supports *** Add File, *** Update File with @@ hunks / *** Move to, and *** Delete File. Line prefixes: space context, - remove, + add. Paths: absolute or cwd-relative.",
         },
       },
       required: ["patch"],

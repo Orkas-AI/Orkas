@@ -1,9 +1,8 @@
 ---
 ownerAgent: e064dca9e1bd
 name: seo-tech-audit
-description_zh: "对 seo-crawl 抽取的页面数据做技术 SEO 诊断，输出分级 findings（可索引/canonical/标题描述/标题层级/结构化数据/图片 alt/移动端/HTTPS/robots 等）与健康分，每条带证据、领先指标、失败判据；适合\"诊断这个页面的技术 SEO\"\"给我技术问题清单和健康分\"；触发词：技术诊断、SEO 审计、健康分、技术问题、可索引性"
-description_en: "Diagnose technical SEO from seo-crawl page data, emitting bucketed findings (indexability/canonical/title+description/heading hierarchy/structured data/image alt/mobile/HTTPS/robots) and a health score, each with evidence, a leading indicator and a failure criterion; For: 'audit this page's technical SEO', 'give me the technical issue list and health score'; Triggers: technical audit, SEO audit, health score, indexability"
-category: data
+description_zh: "根据 seo-crawl 证据诊断技术 SEO，输出健康分以及可索引性、canonical、元数据、标题层级、结构化数据、图片 alt、移动端、HTTPS 和 robots 问题；用于技术 SEO 审计和问题清单，每项包含证据、领先指标和失败判据。"
+description_en: "Diagnose technical SEO from seo-crawl evidence and return a health score plus findings for indexability, canonicals, metadata, headings, schema, image alt, mobile, HTTPS, and robots. Use for technical SEO audits and issue lists; each finding includes evidence and success/failure criteria."
 ---
 
 # seo-tech-audit
@@ -42,7 +41,10 @@ JSON on stdout:
 ```json
 { "ok": true, "data": {
   "health_score": 0,
-  "dimension_scores": { "security": 100, "indexability": 100, "content_meta": 100,
+  "assessed_dimensions": [ "content_meta", "structure" ],
+  "not_assessed": [ { "dimension": "security", "check": "https",
+                      "reason": "no request was made (local file crawl)" } ],
+  "dimension_scores": { "security": null, "indexability": 100, "content_meta": 100,
                         "structure": 100, "schema": 100, "i18n": 100, "media": 100,
                         "mobile": 100, "crawlability": 100 },
   "summary": { "critical": 0, "high": 0, "medium": 0, "low": 0, "total": 0 },
@@ -60,3 +62,5 @@ Findings are sorted critical→low. Failure: `{"ok": false, "error": "..."}` (e.
 ## Scoring
 
 `health_score = clamp(100 − Σ severity weights, 0, 100)` with weights critical=25, high=12, medium=6, low=2; the same weights drive per-dimension subscores. Scoring is deterministic so two runs over the same crawl are identical (drift-comparable).
+
+A check whose input the crawl never measured does not run: its dimension scores `null` and is listed in `not_assessed`, and `health_score` covers only the checks that did run. This is why a local-file crawl cannot report a clean security or indexability result — scoring deducts for findings, so a check that silently does not fire would otherwise read as a pass.

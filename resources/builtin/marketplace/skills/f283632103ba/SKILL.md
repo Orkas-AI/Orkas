@@ -1,9 +1,7 @@
 ---
 name: office-ppt
-description_zh: 使用内置 Office 工具创建、读取、轻量编辑和检查 PowerPoint / PPTX 演示文稿，覆盖结构、文本、备注、模板残留、图片、表格和可见版式。适合“检查 PPT 模板残留”“替换公司名”“修改备注”“生成一份简单 PPTX”；触发词：PPT、PPTX、PowerPoint、幻灯片、占位符、模板、备注、deck、演示文稿
-description_en: Use the built-in Office tools to create, read, lightly edit, and check PowerPoint/PPTX presentations, including structure, text, notes, template residue, images, tables, and visible layout. Use for existing-deck QA, safe small edits, and straightforward PPTX creation.
-category: office
-min_app_version: 1.6.1
+description_zh: "创建、读取、轻量编辑和检查 PowerPoint/PPTX 演示文稿，覆盖结构、文本、备注、模板残留、图片、表格和可见版式；用于已有演示的质量检查、安全小改和简单 PPTX 创建。"
+description_en: "Create, read, lightly edit, and check PowerPoint/PPTX presentations, including structure, text, notes, template residue, images, tables, and visible layout. Use for existing-deck QA, safe small edits, and straightforward PPTX creation."
 ---
 
 # Office PowerPoint
@@ -12,13 +10,13 @@ min_app_version: 1.6.1
 
 Use the bundled Office tools as the default path. Do not install OfficeCLI or `python-pptx` when these tools are available.
 
-- Use `stat_file` before `read_file` for broad content inspection.
+- Use `read_files` with one `paths` item for broad content inspection; use `metadata_only:true` when only prepared metadata is needed.
 - Use `create_pptx` for a straightforward new deck. Route a high-design presentation or full narrative strategy to the presentation-making workflow.
 - Use `office_read` with `outline`, `get`, or `query` to identify slides and shapes before editing.
 - Pass the pre-existing source directly to `edit_office`; it creates the
   separate working copy. Use `output_path` in that one edit call when a
   human-facing final name is desired.
-- Run `office_check` after every create or edit, then use `office_render` on every changed slide and representative unchanged slides.
+- After every create or edit, use `office_review` with `action:"check_and_render"` on every changed slide and representative unchanged slides.
 
 The built-in engine supports `.pptx`, not legacy `.ppt`. Require conversion before editing a legacy file.
 

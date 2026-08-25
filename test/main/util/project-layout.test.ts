@@ -6,6 +6,7 @@ import * as paths from '../../../src/main/paths';
 import {
   conversationLayout,
   findProjectIdForConversation,
+  listCloudSessionToolResultsDirs,
   projectIdForConversationHint,
 } from '../../../src/main/util/project-layout';
 
@@ -76,5 +77,28 @@ describe('project layout conversation ownership', () => {
 
     vi.advanceTimersByTime(2_001);
     expect(findProjectIdForConversation(uid, cid)).toBe(pid);
+  });
+});
+
+describe('listCloudSessionToolResultsDirs', () => {
+  it('finds main and project session spill dirs and skips other entries', () => {
+    const uid = 'layout-tool-results';
+    const pid = '123456abcdef';
+    createdUsers.push(uid);
+    seedProject(uid, pid, []);
+    const main = paths.sessionCloudToolResultsDir(uid, 'gconv-abc123');
+    const proj = paths.projectSessionCloudToolResultsDir(uid, pid, 'gmember-def456');
+    fs.mkdirSync(main, { recursive: true });
+    fs.mkdirSync(proj, { recursive: true });
+    // Session jsonl files and unrelated dirs beside the spills are not
+    // retention-sweep targets.
+    fs.writeFileSync(path.join(paths.userSessionsDir(uid), 'gconv-abc123.jsonl'), '');
+    fs.mkdirSync(path.join(paths.userSessionsDir(uid), 'not-a-spill'), { recursive: true });
+
+    expect(listCloudSessionToolResultsDirs(uid).sort()).toEqual([main, proj].sort());
+  });
+
+  it('returns empty for a user with no cloud layout', () => {
+    expect(listCloudSessionToolResultsDirs('layout-tool-results-none')).toEqual([]);
   });
 });

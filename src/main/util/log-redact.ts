@@ -1,6 +1,8 @@
 import * as crypto from 'crypto';
 import * as path from 'path';
 
+import { sanitizeLogTextForUpload } from './log-sanitize';
+
 const MAX_LOG_MESSAGE_LEN = 240;
 
 export function maskId(value: unknown): string {
@@ -60,10 +62,16 @@ export function logRenameRef(from: unknown, to: unknown): Record<string, unknown
 
 export function sanitizeLogText(value: unknown): string {
   let text = String(value ?? '');
+  // Normalize sync-specific paths first. The central cloud-path matcher is
+  // intentionally sentence-aware and can otherwise absorb a following
+  // `via <url>` diagnostic into the path hash.
   text = text.replace(/cloud\/[^\s'",)]+/g, (m) => `<cloud-path:${hashForLog(m)}>`);
   text = text.replace(/\/sync\/[A-Za-z0-9_/-]+/g, (m) => m.split('?')[0]);
   text = text.replace(/https?:\/\/[^\s'",)]+/g, (m) => safeUrlAction(m));
   text = text.replace(/\b(ORKLSEC1|ghp|github_pat|sk|sk-proj|xox[baprs])[-_][-_A-Za-z0-9+/=:.]{12,}\b/g, '***REDACTED***');
+  // Keep this helper safe when it is used before the central logger hook is
+  // initialized (for example in focused tests and startup error paths).
+  text = sanitizeLogTextForUpload(text);
   if (text.length > MAX_LOG_MESSAGE_LEN) text = `${text.slice(0, MAX_LOG_MESSAGE_LEN)}...`;
   return text;
 }

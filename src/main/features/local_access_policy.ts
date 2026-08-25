@@ -3,7 +3,13 @@ import * as path from 'node:path';
 
 import { clientConfig } from './client_config';
 
-export type LocalAccessRiskCategory = 'network_egress' | 'destructive' | 'priv_esc' | 'sensitive_path';
+export type LocalAccessRiskCategory =
+  | 'network_egress'
+  | 'destructive'
+  | 'priv_esc'
+  | 'sensitive_path'
+  | 'system_package_change'
+  | 'external_mutation';
 
 export interface SensitiveCommandPattern {
   category: LocalAccessRiskCategory;
@@ -17,7 +23,32 @@ export interface LocalAccessSensitivePolicy {
   sensitive_command_patterns: SensitiveCommandPattern[];
 }
 
-const RISK_CATEGORIES: readonly LocalAccessRiskCategory[] = ['network_egress', 'destructive', 'priv_esc', 'sensitive_path'];
+const RISK_CATEGORIES: readonly LocalAccessRiskCategory[] = [
+  'network_egress',
+  'destructive',
+  'priv_esc',
+  'sensitive_path',
+  'system_package_change',
+  'external_mutation',
+];
+
+/** Broad personal-folder locations are useful defaults for paths outside the
+ * active task, but a workspace selected inside one of these folders is not
+ * sensitive merely because of its parent directory. Intrinsic secret patterns
+ * such as `.env`, private keys, and cloud credentials still apply there. */
+const WORKSPACE_LOCATION_PATH_PATTERNS = new Set([
+  '^~/(Documents|Desktop|Downloads)(/|$)',
+  '^~/Library/(Application Support|Containers|Group Containers)(/|$)',
+]);
+const LEGACY_LIBRARY_LOCATION_PATTERN = '^~/Library/(Application Support|Containers|Group Containers|Keychains)(/|$)';
+
+function isWorkspaceLocationPattern(pattern: string, haystack: string): boolean {
+  if (WORKSPACE_LOCATION_PATH_PATTERNS.has(pattern)) return true;
+  // Older server policy payloads combined broad Library application folders
+  // with Keychains. Preserve Keychains as intrinsically sensitive while
+  // exempting the broad locations for an active workspace.
+  return pattern === LEGACY_LIBRARY_LOCATION_PATTERN && !/(^|\/)Keychains(\/|$)/i.test(haystack);
+}
 
 const DEFAULT_LOCAL_ACCESS_SENSITIVE_POLICY: LocalAccessSensitivePolicy = {
   enabled_categories: [...RISK_CATEGORIES],
@@ -38,7 +69,8 @@ const DEFAULT_LOCAL_ACCESS_SENSITIVE_POLICY: LocalAccessSensitivePolicy = {
     '/Keychains(/|$)',
     'login\\.keychain',
     '^~/(Documents|Desktop|Downloads)(/|$)',
-    '^~/Library/(Application Support|Containers|Group Containers|Keychains)(/|$)',
+    '^~/Library/(Application Support|Containers|Group Containers)(/|$)',
+    '^~/Library/Keychains(/|$)',
   ],
   sensitive_write_path_patterns: [
     '^~/(\\.bashrc|\\.bash_profile|\\.zshrc|\\.zprofile|\\.profile)$',
@@ -133,16 +165,18 @@ function compile(pattern: string): RegExp | null {
   catch { return null; }
 }
 
-function pathHaystack(absPath: string): string {
+function pathHaystacks(absPath: string): string[] {
   const resolved = path.resolve(absPath).split(path.sep).join('/');
   const home = os.homedir() ? path.resolve(os.homedir()).split(path.sep).join('/') : '';
   const tilde = home && (resolved === home || resolved.startsWith(`${home}/`))
     ? `~${resolved.slice(home.length)}`
     : '';
-  return tilde ? `${resolved}\n${tilde}` : resolved;
+  // Test both forms independently so anchored absolute server patterns and
+  // anchored default `^~/...` patterns remain compatible.
+  return tilde ? [resolved, tilde] : [resolved];
 }
 
-function patternsMatch(patterns: string[], haystack: string): boolean {
+function patternsMatch(patterns: readonly string[], haystack: string): boolean {
   for (const pattern of patterns) {
     const re = compile(pattern);
     if (re?.test(haystack)) return true;
@@ -150,12 +184,33 @@ function patternsMatch(patterns: string[], haystack: string): boolean {
   return false;
 }
 
-export function sensitivePathReasons(absPath: string, access: 'read' | 'write' = 'read'): LocalAccessRiskCategory[] {
+function pathIsWithinRoots(absPath: string, roots: readonly string[]): boolean {
+  const abs = path.resolve(absPath);
+  return roots.some((root) => {
+    if (!root) return false;
+    const rel = path.relative(path.resolve(root), abs);
+    return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+  });
+}
+
+export function sensitivePathReasons(
+  absPath: string,
+  access: 'read' | 'write' = 'read',
+  options: { trustedRoots?: readonly string[] } = {},
+): LocalAccessRiskCategory[] {
   const policy = getLocalAccessSensitivePolicy();
   if (!policy.enabled_categories.includes('sensitive_path')) return [];
-  const haystack = pathHaystack(absPath);
-  if (patternsMatch(policy.sensitive_path_patterns, haystack)) return ['sensitive_path'];
-  if (access === 'write' && patternsMatch(policy.sensitive_write_path_patterns, haystack)) return ['sensitive_path'];
+  const haystacks = pathHaystacks(absPath);
+  const joinedHaystack = haystacks.join('\n');
+  const insideTrustedRoot = pathIsWithinRoots(absPath, options.trustedRoots ?? []);
+  const readPatterns = insideTrustedRoot
+    ? policy.sensitive_path_patterns.filter((pattern) => !isWorkspaceLocationPattern(pattern, joinedHaystack))
+    : policy.sensitive_path_patterns;
+  if (haystacks.some((haystack) => patternsMatch(readPatterns, haystack))) return ['sensitive_path'];
+  if (access === 'write'
+    && haystacks.some((haystack) => patternsMatch(policy.sensitive_write_path_patterns, haystack))) {
+    return ['sensitive_path'];
+  }
   return [];
 }
 
@@ -167,7 +222,12 @@ export function classifyConfiguredBashCommand(
   const policy = getLocalAccessSensitivePolicy();
   const enabled = new Set(policy.enabled_categories);
   const reasons = new Set<LocalAccessRiskCategory>();
-  for (const r of baseReasons) if (enabled.has(r)) reasons.add(r);
+  // Host dependency and external-system changes are product safety invariants
+  // rather than remotely tunable heuristics. Preserve those base classifier
+  // results even while an older server payload omits newly introduced categories.
+  for (const r of baseReasons) {
+    if (r === 'system_package_change' || r === 'external_mutation' || enabled.has(r)) reasons.add(r);
+  }
 
   const text = String(command || '');
   if (text.trim()) {

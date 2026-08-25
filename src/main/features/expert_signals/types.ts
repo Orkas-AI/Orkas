@@ -2,7 +2,7 @@
  * Expert signals — shared types.
  *
  * Signals are user-behavior records produced at known chokepoints (bus
- * turn-end / retry-skip IPC / form submit / silence timer). They feed
+ * turn-end / form submit / silence timer). They feed
  * downstream reflection / patch suggester / critic (phase 1+). Each signal
  * is a single jsonl line under `<uid>/local/signals/<yyyy-mm-dd>.jsonl`.
  *
@@ -14,8 +14,6 @@
  *  When adding a new T0/T1 kind: extend this union, add an extractor case,
  *  add a positive + negative fixture (CLAUDE.md §9). */
 export type SignalType =
-  | 'retry'              // T0: plan rail "Retry" clicked
-  | 'skip'               // T0: plan rail "Skip" clicked
   | 'form_left_blank'    // T0: required field unfilled / default unchanged on submit
   | 'silence'            // T0: agent message followed by ≥ N min of no user response
   | 'tool_failure'       // T0: session jsonl has tool_result.isError=true unrecovered
@@ -25,8 +23,7 @@ export type SignalType =
   | 'edit'               // T1: user message token-diffed significantly from agent's last text
   | 'skill_advertised'   // T0: skills entered system prompt index at turn start (per system)
   | 'skill_invoked'      // T0: agent read_file'd a SKILL.md body during the turn
-  | 'skill_ineffective'  // T0: skill_invoked in a turn that ended with a non-transient, non-aborted error
-  | 'agent_dispatched';  // T0: commander dispatched ready plan steps (candidates + dispatched)
+  | 'skill_ineffective'; // T0: skill_invoked in a turn that ended with a non-transient, non-aborted error
 
 /** Which skill catalog produced a `skill_advertised` / `skill_invoked` signal.
  *  Three values, not two — `A.custom` (cloud/skills/) and `A.platform`
@@ -51,7 +48,6 @@ export const EXTRACTOR_VERSION = {
   text:  'text@1.0',
   silence: 'silence@1.0',
   skill_attribution: 'skill_attribution@1.0',
-  agent_dispatch:    'agent_dispatch@1.0',
 } as const;
 
 export interface SignalDelta {
@@ -69,12 +65,6 @@ export interface SignalDelta {
   skill_id?: string;
   /** skill_invoked: how the body was reached. */
   trigger?: SkillInvokeTrigger;
-  /** agent_dispatched: ready steps the commander considered this dispatch round (aids). */
-  candidates?: string[];
-  /** agent_dispatched: subset actually woken in this dispatch round. */
-  dispatched?: string[];
-  /** agent_dispatched: the parallel_group key (null = solo step). */
-  parallel_group?: string | null;
 }
 
 export interface SignalContextRef {
@@ -107,15 +97,9 @@ export interface Signal {
    *    the agent's own final message id for that turn.
    *  - user-reaction (`correction / reject / accept / edit`):
    *    the previous agent message id being reacted to.
-   *  - dispatch (`agent_dispatched`): the commander msg id that produced the
-   *    plan_set decision.
    *  - `form_left_blank`: the agent msg id that posted the form.
-   *  - `retry / skip`: the source agent msg id of the output being retried
-   *    (since 2026-05-19; was synthetic `<cid>:plan:<step>` before — break
-   *    rebased; consumers count repeat retries via `metadata.step_index`).
    *  Direct JOIN on `turn_id` recovers cross-signal causality
-   *  (skill_invoked × correction, retry × tool_failure, …). See
-   *  `Common/docs/plans/expert-signals-skill-attribution.md` §3.4. */
+   *  (skill_invoked × correction, …). */
   turn_id: string;
   pre?: SignalTextSlice;
   post?: SignalTextSlice;

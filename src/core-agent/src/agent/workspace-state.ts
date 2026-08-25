@@ -67,6 +67,14 @@ export type WorkspaceDiffRequest = {
   max_chars?: number;
 };
 
+export type WorkspaceContextProjection = {
+  text: string;
+  /** Tool result after which the current net file state became true. Omitted
+   * for host reconciliation or compacted legacy state that has no causal raw
+   * result in the active turn. */
+  anchorToolCallId?: string;
+};
+
 type NetChange = {
   originalPath: string;
   currentPath: string;
@@ -317,14 +325,37 @@ export function renderWorkspaceContext(
   activeTurnId: number,
   workingDir?: string,
 ): string {
-  if (!hasWorkspaceState(state)) return "";
+  return projectWorkspaceContext(state, activeTurnId, { workingDir }).text;
+}
+
+export function projectWorkspaceContext(
+  state: WorkspaceObservationState | undefined,
+  activeTurnId: number,
+  opts: {
+    workingDir?: string;
+    visibleToolResultIds?: ReadonlySet<string>;
+  } = {},
+): WorkspaceContextProjection {
+  if (!hasWorkspaceState(state)) return { text: "" };
   const entries = workspaceEntriesForTurn(state!, activeTurnId);
   const changes = netChanges(entries);
   const changed = changes.filter(hasNetChange);
-  if (!changed.length) return "";
-  const lastChangeSequence = Math.max(...changed.map((change) => change.lastSequence));
+  if (!changed.length) return { text: "" };
+  // Even a later mutation that returns a file to its original state is the
+  // causal point after which the current net ledger became true. Anchoring to
+  // only the paths that remain changed would project the final state before
+  // the create/delete sequence that produced it.
+  const lastObservedChangeSequence = Math.max(...changes.map((change) => change.lastSequence));
+  const anchorToolCallId = entries
+    .find((entry) => entry.sequence === lastObservedChangeSequence)?.toolCallId;
   const commands = entries
-    .filter((entry) => entry.execution && entry.sequence > lastChangeSequence)
+    .filter((entry) => entry.execution && entry.sequence > lastObservedChangeSequence)
+    // The raw result is more detailed while visible. Restore this bounded
+    // command evidence only after checkpointing removes that raw result, or
+    // when legacy/unattributed state cannot be matched safely.
+    .filter((entry) => (
+      !entry.toolCallId || !opts.visibleToolResultIds?.has(entry.toolCallId)
+    ))
     .slice(-WORKSPACE_CONTEXT_MAX_COMMANDS);
   const lines = [
     "[Workspace changes — deterministic host state]",
@@ -332,9 +363,9 @@ export function renderWorkspaceContext(
     "Changed:",
   ];
   for (const change of changed.slice(0, WORKSPACE_CONTEXT_MAX_FILES)) {
-    lines.push(`- ${changeStatus(change)} ${displayPath(change.currentPath, workingDir)}`
+    lines.push(`- ${changeStatus(change)} ${displayPath(change.currentPath, opts.workingDir)}`
       + (change.originalPath !== change.currentPath
-        ? ` (from ${displayPath(change.originalPath, workingDir)})`
+        ? ` (from ${displayPath(change.originalPath, opts.workingDir)})`
         : "")
       + (change.afterHash ? ` ${change.afterHash}` : "")
       + (changeIsStale(change) ? " stale=true" : "")
@@ -351,7 +382,10 @@ export function renderWorkspaceContext(
     }
   }
   lines.push("Use workspace_diff for the bounded current diff; do not infer unrecorded shell changes as exact.");
-  return lines.join("\n");
+  return {
+    text: lines.join("\n"),
+    ...(anchorToolCallId ? { anchorToolCallId } : {}),
+  };
 }
 
 export function renderWorkspaceDiff(
@@ -948,6 +982,7 @@ function netChanges(entries: readonly WorkspaceObservationEntry[]): NetChange[] 
 }
 
 function hasNetChange(change: NetChange): boolean {
+  if (!change.beforeExists && !change.afterExists) return false;
   if (change.beforeExists !== change.afterExists) return true;
   if (change.originalPath !== change.currentPath) return true;
   if (change.beforeHash && change.afterHash) return change.beforeHash !== change.afterHash;

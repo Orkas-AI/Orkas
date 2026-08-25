@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
-from report import build_action_plan, build_dashboard, validate_dashboard  # noqa: E402
+from report import build_action_plan, build_dashboard, merge_audits, validate_dashboard  # noqa: E402
 from report import _tone_for_percent, _health_tone, _data_of_optional  # noqa: E402
 
 AUDIT = {"ok": True, "data": {
@@ -354,6 +354,107 @@ class NonNumericProbeTest(unittest.TestCase):
         md = build_action_plan(AUDIT, geo_probe_obj=probe)  # must not raise
         self.assertIn("Foo 0%", md)    # junk value coerced to 0%
         self.assertIn("Bar 30%", md)   # good value preserved
+
+
+class LocalFileDisclosureTest(unittest.TestCase):
+    """What the user reads must say the live page was not requested.
+
+    The 2026-08-09 plan opened with `URL: https://orkas.ai/` and `Fetched: <ts>`
+    over a run that had only parsed a local file, and the dimension chart showed
+    Security 100. Withholding the score upstream is worthless if this layer
+    renders the gap as absence.
+    """
+
+    AUDIT = {"ok": True, "data": {
+        "health_score": 100,
+        "assessed_dimensions": ["content_meta", "structure"],
+        "not_assessed": [
+            {"dimension": "security", "check": "https", "reason": "no request was made (local file crawl)"},
+            {"dimension": "indexability", "check": "response_status", "reason": "no request was made (local file crawl)"},
+        ],
+        "dimension_scores": {"security": None, "indexability": None,
+                             "content_meta": 100, "structure": 94},
+        "summary": {"critical": 0, "high": 0, "medium": 0, "low": 0, "total": 0},
+        "findings": [],
+        "meta": {"url": "https://orkas.ai/", "final_url": "https://orkas.ai/",
+                 "fetched_at": "2026-08-09T07:42:10Z", "origin": "https://orkas.ai",
+                 "source": "file"},
+    }}
+
+    def test_dashboard_names_the_gap_and_omits_the_unscored_bars(self):
+        spec = build_dashboard(self.AUDIT)
+        validate_dashboard(spec)
+        nodes = spec["root"]["children"]
+        alerts = [n for n in nodes if n["type"] == "Alert"]
+        self.assertTrue(alerts, "an unassessed dimension must be stated")
+        body = " ".join(a["props"]["title"] + " " + a["props"]["body"] for a in alerts)
+        self.assertIn("Not assessed", body)
+        self.assertIn("no response was observed", body)
+        charts = [n for n in nodes if n["type"] == "Chart"]
+        plotted = {p["x"] for c in charts for p in c["props"]["data"]}
+        # Neither 0 nor 100: an unscored dimension has no bar at all.
+        self.assertNotIn("Security", plotted)
+        self.assertNotIn("Index", plotted)
+        self.assertIn("Meta", plotted)
+
+    def test_action_plan_states_the_evidence_and_the_gap(self):
+        plan = build_action_plan(self.AUDIT)
+        self.assertIn("local file parsed under this URL; the live page was not requested", plan)
+        self.assertIn("covers assessed checks only", plan)
+        self.assertIn("Not assessed:", plan)
+        self.assertIn("https (security)", plan)
+
+    def test_merge_with_add_finding_sets_keeps_the_disclosure(self):
+        # The documented full-report path is `seo-report --audit tech.json
+        # --add content.json`. merge_audits used to rebuild the merged audit
+        # without not_assessed and rescore blind dimensions from an empty
+        # penalty — Security popped back to 100 and the Alert vanished, the
+        # exact lie the disclosure layer exists to prevent.
+        content_add = {"ok": True, "data": {"findings": [
+            {"severity": "medium", "dimension": "content",
+             "title": "Thin intro copy",
+             "evidence": "first section is 40 words",
+             "recommendation": "Expand the first section past 40 words",
+             "leading_indicator": "section word count",
+             "failure_criterion": "intro stays under 100 words"},
+        ]}}
+        merged = merge_audits(self.AUDIT, [content_add])
+        data = merged["data"]
+        self.assertEqual(data["not_assessed"], self.AUDIT["data"]["not_assessed"])
+        self.assertIsNone(data["dimension_scores"]["security"])
+        self.assertIsNone(data["dimension_scores"]["indexability"])
+        self.assertNotIn("security", data["assessed_dimensions"])
+        self.assertEqual(data["summary"]["total"], 1)
+
+        spec = build_dashboard(merged)
+        validate_dashboard(spec)
+        nodes = spec["root"]["children"]
+        alerts = [n for n in nodes if n["type"] == "Alert"]
+        self.assertTrue(alerts, "merge must not erase the unassessed disclosure")
+        plotted = {p["x"] for n in nodes if n["type"] == "Chart"
+                   for p in n["props"]["data"]}
+        self.assertNotIn("Security", plotted)
+
+        plan = build_action_plan(merged)
+        self.assertIn("covers assessed checks only", plan)
+        self.assertIn("Not assessed:", plan)
+
+    def test_a_real_fetch_reads_exactly_as_before(self):
+        live = {"ok": True, "data": {**self.AUDIT["data"],
+                "not_assessed": [],
+                "dimension_scores": {"security": 100, "indexability": 100,
+                                     "content_meta": 100, "structure": 94},
+                "meta": {**self.AUDIT["data"]["meta"], "source": "fetch"}}}
+        spec = build_dashboard(live)
+        validate_dashboard(spec)
+        self.assertEqual([n for n in spec["root"]["children"] if n["type"] == "Alert"], [])
+        plotted = {p["x"] for n in spec["root"]["children"] if n["type"] == "Chart"
+                   for p in n["props"]["data"]}
+        self.assertIn("Security", plotted)
+        plan = build_action_plan(live)
+        self.assertIn("- Evidence: live fetch", plan)
+        self.assertNotIn("Not assessed:", plan)
+        self.assertNotIn("covers assessed checks only", plan)
 
 
 if __name__ == "__main__":

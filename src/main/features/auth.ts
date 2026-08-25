@@ -63,6 +63,7 @@ import { shell } from 'electron';
 
 import { userAuthProfilesFile, userLocalConfigDir } from '../paths';
 import * as localSecrets from '../util/local-secret-store';
+import { isBearerTokenHeaderSafe } from '../util/http-authorization';
 import { safeExternalUserActionUrl } from '../util/window-security';
 import { getActiveUserId } from './users';
 import {
@@ -75,7 +76,6 @@ import {
   curatedModelsFor,
   isSelectableModel,
   resolveConfiguredPiModel,
-  pickLatestGenerations,
   providerLabel,
   providerLabelKey,
   providerDocsUrl,
@@ -181,6 +181,8 @@ interface ApiKeyProfile {
   baseUrl?: string;
   contextWindow?: number;
   maxTokens?: number;
+  supportsReasoning?: boolean;
+  supportsVision?: boolean;
   reasoningEffort?: 'low' | 'medium' | 'high';
   email?: string;
   createdAt: number;
@@ -557,7 +559,52 @@ function isEntryAllowed(store: ProfilesFile, entry: Entry): boolean {
   return !!prof
     && isModelProviderAllowed(entry.provider, entry.model)
     && !isStoredProfileBlocked(prof)
-    && (!providerUsesCustomOpenAIConfig(entry.provider) || !!customRuntimeConfigFromProfile(prof));
+    && (!providerUsesCustomOpenAIConfig(entry.provider) || !!customRuntimeConfigFromProfile(prof))
+    && isSelectableModel(entry.provider, entry.model);
+}
+
+function modelNotAvailableError(): Error & { code: string } {
+  return Object.assign(new Error(t('errors.model_not_available')), {
+    code: 'MODEL_NOT_AVAILABLE',
+  });
+}
+
+/** A configured SDK-backed model is usable only when pi-ai knows the exact id
+ * or the public/configured catalog names an explicit template to clone.
+ * Direct adapters build their own Model objects and remain independently
+ * resolvable. */
+function isRuntimeModelResolvable(
+  catalog: CoreAgentModule,
+  providerId: string,
+  modelId: string,
+): boolean {
+  if (!isSelectableModel(providerId, modelId)) return false;
+  if (EXTERNAL_API_PROVIDERS.includes(providerId)) return true;
+  return resolveConfiguredPiModel(catalog, providerId, modelId) !== null;
+}
+
+async function assertRuntimeSelectableModel(providerId: string, modelId: string): Promise<void> {
+  if (!isSelectableModel(providerId, modelId)) throw modelNotAvailableError();
+  if (EXTERNAL_API_PROVIDERS.includes(providerId)) return;
+  if (isRuntimeModelResolvable(await ca(), providerId, modelId)) return;
+  throw modelNotAvailableError();
+}
+
+type RuntimeModelResolver = (providerId: string, modelId: string) => boolean;
+
+async function buildRuntimeModelResolver(
+  entries: readonly Pick<Entry, 'provider' | 'model'>[],
+): Promise<RuntimeModelResolver> {
+  const needsPiCatalog = entries.some((entry) => (
+    isSelectableModel(entry.provider, entry.model)
+    && !EXTERNAL_API_PROVIDERS.includes(entry.provider)
+  ));
+  const catalog = needsPiCatalog ? await ca() : null;
+  return (providerId, modelId) => (
+    isSelectableModel(providerId, modelId)
+    && (EXTERNAL_API_PROVIDERS.includes(providerId)
+      || (!!catalog && isRuntimeModelResolvable(catalog, providerId, modelId)))
+  );
 }
 
 function makeProfileId(provider: string, label: string): string {
@@ -662,6 +709,10 @@ function customRuntimeConfigFromProfile(
       baseUrl,
       contextWindow,
       maxTokens,
+      ...(profile.supportsReasoning === true ? { supportsReasoning: true } : {}),
+      ...(typeof profile.supportsVision === 'boolean'
+        ? { supportsVision: profile.supportsVision }
+        : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
     };
   } catch {
@@ -720,7 +771,10 @@ export async function getConfig(): Promise<AuthConfig> {
   // list. Credentials + model selection share one source of truth
   // (auth-profiles.json); there's no longer a fallback config.json.
   const store = loadProfiles();
-  const first = store.entries.find((e) => isEntryAllowed(store, e));
+  const runtimeResolvable = await buildRuntimeModelResolver(store.entries);
+  const first = store.entries.find((entry) => (
+    isEntryAllowed(store, entry) && runtimeResolvable(entry.provider, entry.model)
+  ));
   if (first) return { provider: first.provider, model: first.model };
   return { provider: '', model: '' };
 }
@@ -893,28 +947,25 @@ export async function listProviders(): Promise<{ providers: ProviderEntry[] }> {
 /**
  * Model list for a provider.
  *
- * Source priority:
- *   1. Hand-curated list in `provider_catalog.ts::CURATED_MODELS`
- *      (the sole file to edit when adding/removing models).
- *   2. Fallback: `pickLatestGenerations()` derives the last 2 (major,
- *      minor) version bands from pi-ai's raw list. Only used for
- *      uncurated providers.
+ * The visible list is explicitly curated. SDK-backed rows are returned only
+ * when the bundled runtime knows the id or can clone an explicit template;
+ * direct adapters resolve their own model metadata.
  */
 export async function listModels(providerId: string): Promise<{ models: { id: string; name: string }[] }> {
   const id = String(providerId || '').trim();
   if (!id) return { models: [] };
-  if (!isModelProviderAllowed(id)) return { models: [] };
+  if (!isVisibleProvider(id) || !isModelProviderAllowed(id)) return { models: [] };
   const allowed = (models: { id: string; name: string }[]) =>
     models.filter((m) => isModelProviderAllowed(id, m.id));
   const curated = curatedModelsFor(id);
-  if (curated.length) return { models: allowed(curated) };
-  try {
-    const mod = await ca();
-    const raw = mod.listPiModels(id) || [];
-    return { models: allowed(pickLatestGenerations(raw as any[], 2)) };
-  } catch {
-    return { models: [] };
+  const policyAllowed = allowed(curated);
+  if (EXTERNAL_API_PROVIDERS.includes(id) || policyAllowed.length === 0) {
+    return { models: policyAllowed };
   }
+  const catalog = await ca();
+  return {
+    models: policyAllowed.filter((model) => isRuntimeModelResolvable(catalog, id, model.id)),
+  };
 }
 
 // ── Credential writes ────────────────────────────────────────────────────
@@ -932,7 +983,6 @@ export async function addApiKey(
   if (providerUsesCustomOpenAIConfig(id)) {
     throw customConfigError('CUSTOM_CONFIG_REQUIRED', 'Use the custom model configuration flow');
   }
-
   const store = loadProfiles();
   const chosenLabel = label ? sanitizeLabel(label) : autoLabel(store, id);
   const profileId = makeProfileId(id, chosenLabel);
@@ -972,6 +1022,7 @@ export async function addApiKeyEntry(
   if (providerUsesCustomOpenAIConfig(id)) {
     throw customConfigError('CUSTOM_CONFIG_REQUIRED', 'Use the custom model configuration flow');
   }
+  await assertRuntimeSelectableModel(id, model);
 
   const store = loadProfiles();
   const chosenLabel = label ? sanitizeLabel(label) : autoLabel(store, id);
@@ -1014,6 +1065,9 @@ export interface AddCustomModelEntryInput {
   apiKey: string;
   contextWindow?: number | string | null;
   maxTokens?: number | string | null;
+  /** Internal capability metadata for a curated relay profile. */
+  supportsReasoning?: boolean;
+  supportsVision?: boolean;
   reasoningEffort?: 'low' | 'medium' | 'high' | null;
 }
 
@@ -1025,6 +1079,12 @@ export async function addCustomModelEntry(
   const key = String(input?.apiKey || '').trim();
   if (!model) throw customConfigError('CUSTOM_MODEL_REQUIRED', 'Model ID required');
   if (!key) throw customConfigError('CUSTOM_API_KEY_REQUIRED', 'API key required');
+  if (!isBearerTokenHeaderSafe(key)) {
+    throw customConfigError(
+      'CUSTOM_API_KEY_INVALID',
+      'Invalid API key: it contains characters unsupported by HTTP Authorization headers',
+    );
+  }
   assertModelProviderAllowed(CUSTOM_MODEL_PROVIDER, model);
   if (!isSelectableModel(CUSTOM_MODEL_PROVIDER, model)) {
     throw customConfigError('CUSTOM_MODEL_INVALID', 'Model ID is invalid');
@@ -1078,6 +1138,10 @@ export async function addCustomModelEntry(
     baseUrl,
     contextWindow,
     ...(maxTokens !== undefined ? { maxTokens } : {}),
+    ...(input.supportsReasoning === true ? { supportsReasoning: true } : {}),
+    ...(typeof input.supportsVision === 'boolean'
+      ? { supportsVision: input.supportsVision }
+      : {}),
     ...(reasoningEffort
       ? { reasoningEffort: reasoningEffort as 'low' | 'medium' | 'high' }
       : {}),
@@ -1156,7 +1220,12 @@ export interface EntryView {
   lastUsed: number;
 }
 
-function entryToView(e: Entry, store: ProfilesFile, modelNameLookup: (p: string, m: string) => string): EntryView {
+function entryToView(
+  e: Entry,
+  store: ProfilesFile,
+  modelNameLookup: (p: string, m: string) => string,
+  runtimeResolvable = true,
+): EntryView {
   const prof = store.profiles[e.profileId];
   const base = {
     entryId: e.entryId,
@@ -1166,7 +1235,7 @@ function entryToView(e: Entry, store: ProfilesFile, modelNameLookup: (p: string,
     model: e.model,
     modelName: modelNameLookup(e.provider, e.model),
     modelEditable: !providerUsesCustomOpenAIConfig(e.provider),
-    modelAvailable: isSelectableModel(e.provider, e.model),
+    modelAvailable: isSelectableModel(e.provider, e.model) && runtimeResolvable,
     profileId: e.profileId,
     profileAvailable: !!prof,
     profileLabel: prof?.label || e.profileId.split(':').slice(1).join(':') || '(missing)',
@@ -1206,11 +1275,20 @@ export async function listEntries(
   opts: { includeUnavailable?: boolean } = {},
 ): Promise<{ entries: EntryView[] }> {
   const store = loadProfiles();
+  const runtimeResolvable = await buildRuntimeModelResolver(store.entries);
   const lookup = await buildModelNameLookup();
   return {
     entries: store.entries
-      .filter((e) => opts.includeUnavailable === true || isEntryAllowed(store, e))
-      .map((e) => entryToView(e, store, lookup)),
+      .filter((entry) => (
+        opts.includeUnavailable === true
+        || (isEntryAllowed(store, entry) && runtimeResolvable(entry.provider, entry.model))
+      ))
+      .map((entry) => entryToView(
+        entry,
+        store,
+        lookup,
+        runtimeResolvable(entry.provider, entry.model),
+      )),
   };
 }
 
@@ -1224,6 +1302,7 @@ export async function addEntry({
   const pid = String(profileId || '').trim();
   if (!p || !m || !pid) throw new Error('provider / model / profileId required');
   assertModelProviderAllowed(p, m);
+  await assertRuntimeSelectableModel(p, m);
   const store = loadProfiles();
   if (!store.profiles[pid]) throw new Error('profile not found');
   if (store.profiles[pid].provider !== p) throw new Error('profile does not belong to provider');
@@ -1257,6 +1336,7 @@ export async function updateEntryModel(entryId: string, model: string): Promise<
   const target = store.entries.find((e) => e.entryId === id);
   if (!target) throw new Error('entry not found');
   assertModelProviderAllowed(target.provider, m);
+  await assertRuntimeSelectableModel(target.provider, m);
   // Deduplicate: if another entry with the same (provider, model, profileId)
   // already exists, removing the target makes the priority list cleaner.
   const collision = store.entries.find(
@@ -1284,6 +1364,7 @@ export async function removeEntry(entryId: string): Promise<{ removed: boolean }
 export async function reorderEntries(orderedIds: string[]): Promise<{ entries: EntryView[] }> {
   if (!Array.isArray(orderedIds)) throw new Error('orderedIds must be an array');
   const store = loadProfiles();
+  const runtimeResolvable = await buildRuntimeModelResolver(store.entries);
   const byId = new Map(store.entries.map((e) => [e.entryId, e]));
   const reordered: Entry[] = [];
   for (const id of orderedIds) {
@@ -1300,8 +1381,10 @@ export async function reorderEntries(orderedIds: string[]): Promise<{ entries: E
   const lookup = await buildModelNameLookup();
   return {
     entries: store.entries
-      .filter((e) => isEntryAllowed(store, e))
-      .map((e) => entryToView(e, store, lookup)),
+      .filter((entry) => (
+        isEntryAllowed(store, entry) && runtimeResolvable(entry.provider, entry.model)
+      ))
+      .map((entry) => entryToView(entry, store, lookup, true)),
   };
 }
 
@@ -1316,7 +1399,10 @@ export async function selectEntry(
   const requestedModel = String(model || '').trim();
   if (requestedModel) await updateEntryModel(id, requestedModel);
   const store = loadProfiles();
-  if (!store.entries.some((entry) => entry.entryId === id)) throw new Error('entry not found');
+  const selected = store.entries.find((entry) => entry.entryId === id);
+  if (!selected) throw new Error('entry not found');
+  if (!isEntryAllowed(store, selected)) throw modelNotAvailableError();
+  await assertRuntimeSelectableModel(selected.provider, selected.model);
   return reorderEntries([id]);
 }
 
@@ -1725,6 +1811,7 @@ export function bumpEntryLastUsed(entryId: string): void {
 export async function pickChatEntryGroup(): Promise<ChatEntryChoice[]> {
   const store = loadProfiles();
   if (store.entries.length === 0) return [];
+  const runtimeResolvable = await buildRuntimeModelResolver(store.entries);
 
   // Flatten: preserve entries[] order across groups, but within a
   // consecutive same-(provider, model) run, sort oldest lastUsed first.
@@ -1739,6 +1826,10 @@ export async function pickChatEntryGroup(): Promise<ChatEntryChoice[]> {
   for (const entry of ordered) {
     if (!isEntryAllowed(store, entry)) {
       log.info(`skipping disabled provider/model ${entry.provider}/${entry.model}`);
+      continue;
+    }
+    if (!runtimeResolvable(entry.provider, entry.model)) {
+      log.info(`skipping unresolved provider/model ${entry.provider}/${entry.model}`);
       continue;
     }
     if (isCooledDown(entry.profileId)) {
@@ -1887,10 +1978,20 @@ export async function testConnection(
 ): Promise<TestConnectionResult> {
   const pid = String(providerId || '').trim();
   if (!pid) return { ok: false, error: 'provider required' };
-  if (!isModelProviderAllowed(pid, modelId)) {
+  const selectedModel = String(modelId || '').trim() || curatedModelsFor(pid)[0]?.id || '';
+  if (!isModelProviderAllowed(pid, selectedModel || undefined)) {
     return { ok: false, error: 'DeepSeek is disabled in this build' };
   }
+  if (!selectedModel || !isSelectableModel(pid, selectedModel)) {
+    return { ok: false, error: t('errors.model_not_available') };
+  }
   const mod = await ca();
+  const resolvedModel = EXTERNAL_API_PROVIDERS.includes(pid)
+    ? null
+    : resolveConfiguredPiModel(mod, pid, selectedModel);
+  if (!EXTERNAL_API_PROVIDERS.includes(pid) && !resolvedModel) {
+    return { ok: false, error: t('errors.model_not_available') };
+  }
 
   let chosenProfileId: string | undefined = profileId;
   let apiKey: string | undefined;
@@ -1922,22 +2023,17 @@ export async function testConnection(
   // to their factory so we don't hit the "provider has no models registered"
   // guard below (which relies on pi-ai's listPiModels).
   if (EXTERNAL_API_PROVIDERS.includes(pid)) {
-    const modelForTest = String(modelId || '').trim();
+    const modelForTest = selectedModel;
     const t0 = Date.now();
     try {
       const ext = await import('../model/core-agent/external-providers');
       let provider;
       let probeModel = modelForTest;
       if (pid === 'moonshot') {
-        probeModel = probeModel || 'kimi-k2.5';
         provider = await ext.createMoonshotProvider({ apiKey, modelId: probeModel });
       } else if (pid === 'deepseek') {
-        // Default probe = V4 Flash (cheaper than Pro; fine for a 1-token ping).
-        probeModel = probeModel || 'deepseek-v4-flash';
         provider = await ext.createDeepSeekProvider({ apiKey, modelId: probeModel });
       } else if (pid === 'doubao') {
-        // Default probe = Seed 2.0 Lite (cheaper than Pro).
-        probeModel = probeModel || 'doubao-seed-2-0-lite-260215';
         provider = await ext.createDoubaoProvider({ apiKey, modelId: probeModel });
       } else if (pid === CUSTOM_MODEL_PROVIDER && customConfig) {
         provider = await ext.createCustomOpenAICompatibleProvider({
@@ -1977,9 +2073,7 @@ export async function testConnection(
   // IDs, which trips an NPE inside core-agent's `resolveModel`. Guard here
   // so we surface a clean "model not found" instead of "Cannot read
   // properties of undefined".
-  const requestedModel = modelId ? String(modelId).trim() : '';
-  let effectiveModel = requestedModel;
-  const resolvedModel = requestedModel ? resolveConfiguredPiModel(mod, pid, requestedModel) : null;
+  const requestedModel = selectedModel;
   if (resolvedModel?.isConfiguredFallback) {
     log.info('using configured model fallback for connection test', {
       provider: pid,
@@ -1988,29 +2082,17 @@ export async function testConnection(
       templateModel: resolvedModel.templateModelId,
     });
   }
-  try {
-    const knownIds: string[] = ((mod as any).listPiModels(pid) || [])
-      .map((m: any) => m && m.id)
-      .filter((id: unknown): id is string => typeof id === 'string');
-    if (requestedModel && !resolvedModel && !knownIds.includes(requestedModel)) {
-      if (!knownIds.length) {
-        return { ok: false, error: `provider "${pid}" has no models registered`, profileId: chosenProfileId };
-      }
-      effectiveModel = knownIds[0];
-    }
-  } catch { /* fall through — let pi-ai surface whatever it wants */ }
-
   const t0 = Date.now();
   try {
     const provider = mod.createPiProvider({
       provider: pid,
       ...(resolvedModel?.needsCustomModel
         ? { customModel: resolvedModel.model }
-        : { model: effectiveModel || undefined }),
+        : { model: requestedModel }),
       apiKey,
     });
     const msg = await provider.complete({
-      model: resolvedModel?.needsCustomModel ? requestedModel : effectiveModel,
+      model: requestedModel,
       // ChatGPT Codex's `responses` API rejects requests without
       // `instructions` (= system prompt). Plain providers ignore it.
       systemPrompt: 'You are a connectivity probe; reply with a single word.',

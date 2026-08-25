@@ -5,18 +5,21 @@
  * `_text.ts` template was wrong — opencode doesn't take stdin and
  * `--print` isn't a flag):
  *
- *   opencode run --format json [--session <id>] <prompt>
+ *   opencode run --format json --dir <absolute-cwd> [--session <id>] <prompt>
  *
  * Notes:
  *   - Prompt is passed as the LAST positional argv (NOT stdin).
+ *   - The selected project directory is passed explicitly because OpenCode
+ *     otherwise prefers an inherited PWD over the process cwd.
  *   - Model selection is left to OpenCode's own configuration.
  *   - Resume: `--session <id>` (different flag name from claude).
  *   - Output: NDJSON events on stdout. We care about:
  *       step_start, text (part.text), tool_use (part.tool/callID/state),
- *       error (error.data.message), step_finish (token usage; ignored).
+ *       error (error.data.message), step_finish (token usage).
  *   - sessionID may appear at top-level event or under part.
  */
 
+import * as path from 'node:path';
 import { createLogger } from '../../../logger.js';
 import { logErrorSummary } from '../../../util/log-redact.js';
 import {
@@ -83,13 +86,14 @@ export const opencodeBackend: LocalBackend = {
         }
         const ev = mapOpencodeEvent(obj);
         if (ev?.captureSessionId) observedSessionId = ev.captureSessionId;
-        if (ev?.event) {
-          opts.onEvent(ev.event);
-          if (ev.event.type === 'text-delta' && typeof (ev.event as any).text === 'string') {
-            textOut += (ev.event as any).text as string;
+        const events = ev?.events || (ev?.event ? [ev.event] : []);
+        for (const event of events) {
+          opts.onEvent(event);
+          if (event.type === 'text-delta' && typeof (event as any).text === 'string') {
+            textOut += (event as any).text as string;
           }
-          if (ev.event.type === 'status' && (ev.event as any).status === 'usage') {
-            const u = (ev.event as any).usage;
+          if (event.type === 'status' && (event as any).status === 'usage') {
+            const u = (event as any).usage;
             if (u && typeof u === 'object') lastUsage = u;
           }
         }
@@ -142,15 +146,45 @@ export const opencodeBackend: LocalBackend = {
 };
 
 export function buildOpencodeArgs(opts: Pick<BackendRunOptions,
-  'resumeSessionId' | 'customArgs' | 'prompt' | 'modelOverride' | 'thinkingLevel'
+  'resumeSessionId' | 'customArgs' | 'prompt' | 'modelOverride' | 'thinkingLevel' | 'cwd'
 >): string[] {
-  const args = ['run', '--format', 'json', '--dangerously-skip-permissions'];
+  const args = [
+    'run',
+    '--format', 'json',
+    '--dangerously-skip-permissions',
+  ];
   if (opts.resumeSessionId) args.push('--session', opts.resumeSessionId);
   if (opts.modelOverride) args.push('--model', opts.modelOverride);
   if (opts.thinkingLevel) args.push('--variant', opts.thinkingLevel);
-  if (opts.customArgs && opts.customArgs.length) args.push(...opts.customArgs);
+  // Put the host-owned flag before custom arguments so a user-supplied `--`
+  // terminator cannot turn it into prompt text. Stale custom --dir variants
+  // are removed below, so there is still exactly one authoritative value.
+  args.push('--dir', path.resolve(opts.cwd));
+  if (opts.customArgs && opts.customArgs.length) {
+    args.push(...withoutCustomProjectDir(opts.customArgs));
+  }
   args.push(opts.prompt);
   return args;
+}
+
+/** Remove stale user-saved directory overrides before custom arguments are
+ * appended. Keeping both relies on OpenCode's duplicate
+ * flag precedence, which has changed between CLI parsers and can silently run
+ * a task in the wrong project. */
+function withoutCustomProjectDir(customArgs: readonly string[]): string[] {
+  const filtered: string[] = [];
+  for (let index = 0; index < customArgs.length; index += 1) {
+    const arg = customArgs[index];
+    if (arg === '--dir') {
+      // Drop the paired stale value, but preserve a following option when
+      // this custom flag was left dangling (`--dir --verbose`).
+      if (index + 1 < customArgs.length && !customArgs[index + 1].startsWith('-')) index += 1;
+      continue;
+    }
+    if (arg.startsWith('--dir=')) continue;
+    filtered.push(arg);
+  }
+  return filtered;
 }
 
 /** Pure mapper for opencode NDJSON events. Exposed for unit testing. */
@@ -158,6 +192,7 @@ export function mapOpencodeEvent(obj: any):
   | undefined
   | {
       event?: LocalEvent;
+      events?: LocalEvent[];
       captureSessionId?: string;
       terminal?: { status: 'completed' | 'failed'; error?: string };
     } {
@@ -179,27 +214,53 @@ export function mapOpencodeEvent(obj: any):
       const part = obj.part || {};
       const state = part.state || {};
       const status = String(state.status || '');
-      // Two visible phases: when the tool is just invoked vs when its
-      // output landed. Map to phase 'use' / 'result' so the renderer
-      // shows a use → result transition.
-      if (status === 'completed' || status === 'success' || status === 'done') {
+      const input = minimalOpencodeToolInput(state.input);
+      // Current OpenCode JSON output commonly emits only the terminal tool
+      // state. Keep non-terminal states compatible with older builds, while
+      // making every terminal record self-contained for replay/rendering.
+      if (
+        status === 'completed'
+        || status === 'success'
+        || status === 'done'
+        || status === 'error'
+        || status === 'failed'
+      ) {
         const output = typeof state.output === 'string'
           ? state.output
           : (state.output != null ? JSON.stringify(state.output) : '');
-        out!.event = {
+        const durationMs = opencodeToolDurationMs(state.time);
+        const error = opencodeToolError(state.error);
+        const isError = status === 'error' || status === 'failed' || !!error;
+        const toolEvent: LocalEvent = {
           type: 'tool-event',
           tool: String(part.tool || 'tool'),
           callId: String(part.callID || part.id || ''),
           phase: 'result',
+          ...(input ? { input } : {}),
           output,
+          ...(durationMs !== undefined ? { durationMs } : {}),
+          ...(error ? { error } : {}),
+          ...(isError ? { isError: true } : {}),
         };
+        const mediaItems = opencodeImageAttachments(state.attachments);
+        if (mediaItems.length) {
+          out!.event = toolEvent;
+          out!.events = [toolEvent, {
+            type: 'media-output',
+            source: 'opencode',
+            callId: String(part.callID || part.id || ''),
+            items: mediaItems,
+          }];
+        } else {
+          out!.event = toolEvent;
+        }
       } else {
         out!.event = {
           type: 'tool-event',
           tool: String(part.tool || 'tool'),
           callId: String(part.callID || part.id || ''),
           phase: 'use',
-          input: state.input ?? {},
+          input: input ?? {},
         };
       }
       return out;
@@ -246,6 +307,85 @@ export function mapOpencodeEvent(obj: any):
       }
       return out!.captureSessionId ? out : undefined;
   }
+}
+
+function opencodeImageAttachments(raw: unknown): Array<Record<string, string>> {
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((entry): Array<Record<string, string>> => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+    const attachment = entry as Record<string, unknown>;
+    const mediaType = typeof attachment.mime === 'string' ? attachment.mime.trim() : '';
+    const uri = typeof attachment.url === 'string' ? attachment.url.trim() : '';
+    if (!mediaType.toLowerCase().startsWith('image/') || !uri) return [];
+    const name = typeof attachment.filename === 'string' ? attachment.filename.trim() : '';
+    return [{ uri, mediaType, ...(name ? { name } : {}) }];
+  });
+}
+
+const OPENCODE_COMMAND_INPUT_KEYS = ['command', 'cmd', 'script'] as const;
+const OPENCODE_PATH_INPUT_KEYS = ['path', 'file', 'file_path', 'filePath', 'filename'] as const;
+const MAX_OPENCODE_TOOL_INPUT_CHARS = 4_096;
+const MAX_OPENCODE_TOOL_INPUT_FILES = 64;
+
+/** Preserve only the input facts needed for a concise command/file process row.
+ * OpenCode completed events can carry the full write body inside `state.input`;
+ * that body must not enter persisted process events. */
+function minimalOpencodeToolInput(raw: unknown): Record<string, unknown> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const source = raw as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+
+  for (const key of [...OPENCODE_COMMAND_INPUT_KEYS, ...OPENCODE_PATH_INPUT_KEYS]) {
+    const value = boundedOpencodeToolInputString(source[key]);
+    if (value) out[key] = value;
+  }
+
+  if (Array.isArray(source.files)) {
+    const files = source.files.slice(0, MAX_OPENCODE_TOOL_INPUT_FILES).flatMap((entry): unknown[] => {
+      const stringPath = boundedOpencodeToolInputString(entry);
+      if (stringPath) return [stringPath];
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+      const file = entry as Record<string, unknown>;
+      const pathOnly: Record<string, string> = {};
+      for (const key of OPENCODE_PATH_INPUT_KEYS) {
+        const value = boundedOpencodeToolInputString(file[key]);
+        if (value) pathOnly[key] = value;
+      }
+      return Object.keys(pathOnly).length ? [pathOnly] : [];
+    });
+    if (files.length) out.files = files;
+  }
+
+  return Object.keys(out).length ? out : undefined;
+}
+
+function boundedOpencodeToolInputString(raw: unknown): string | undefined {
+  return typeof raw === 'string' && raw
+    ? raw.slice(0, MAX_OPENCODE_TOOL_INPUT_CHARS)
+    : undefined;
+}
+
+function opencodeToolDurationMs(raw: unknown): number | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const time = raw as Record<string, unknown>;
+  const start = time.start;
+  const end = time.end;
+  if (
+    typeof start !== 'number'
+    || !Number.isFinite(start)
+    || typeof end !== 'number'
+    || !Number.isFinite(end)
+    || end < start
+  ) return undefined;
+  return end - start;
+}
+
+function opencodeToolError(raw: unknown): string | undefined {
+  if (typeof raw === 'string') return raw || undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const error = raw as Record<string, any>;
+  const message = error.data?.message ?? error.message ?? error.name;
+  return typeof message === 'string' && message ? message : undefined;
 }
 
 /** Extract token usage from an opencode `step_finish` event's `part`

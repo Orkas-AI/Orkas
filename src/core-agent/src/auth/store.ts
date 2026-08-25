@@ -11,6 +11,7 @@ import os from "node:os";
 import type { OAuthCredentials } from "@earendil-works/pi-ai";
 import { createLogger } from "../shared/logger.js";
 import type { AuthCredential, AuthStore, OAuthCredential } from "./types.js";
+import { errorCodeForLog } from "../shared/errors.js";
 
 const log = createLogger("auth-store");
 
@@ -81,7 +82,7 @@ export function loadAuthStore(): AuthStore {
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      log.warn("failed to load auth store", { error: (err as Error).message });
+      log.warn("failed to load auth store", { code: errorCodeForLog(err) });
     }
   }
 
@@ -101,7 +102,7 @@ export function saveAuthStore(store: AuthStore): void {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
   }
   fs.writeFileSync(storePath, JSON.stringify(store, null, 2), "utf-8");
-  log.debug("saved auth store", { path: storePath });
+  log.debug("saved auth store");
 }
 
 /** Write OAuth credentials for a provider, returning the profile ID. */

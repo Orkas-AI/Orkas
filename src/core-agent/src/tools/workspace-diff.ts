@@ -14,7 +14,7 @@ export type WorkspaceDiffProvider = (
 export const workspaceDiffTool: AgentTool = defineTool({
   name: "workspace_diff",
   description:
-    "Show the bounded net file changes observed from agent tools. Defaults to the current user turn and unified text diff; use summary or paths to narrow output. This is read-only and does not require Git.",
+    "Show bounded net file changes observed from agent tools. This is read-only and does not require Git.",
   inputSchema: {
     type: "object",
     properties: {

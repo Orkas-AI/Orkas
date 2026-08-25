@@ -66,6 +66,12 @@ export function readJsonSync<T = Record<string, any>>(filePath: string): T {
 
 const RENAME_RETRY_DELAYS_MS = [10, 25, 50, 100, 200, 400, 800];
 const RENAME_RETRY_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+const ATOMIC_TMP_PATH_RE = /\.[1-9]\d*\.\d{13}\.[0-9a-f]{8}\.tmp$/;
+
+/** Whether a path is an unpublished sibling created by this module's atomic writers. */
+export function isAtomicWriteTempPath(filePath: string): boolean {
+  return ATOMIC_TMP_PATH_RE.test(path.basename(filePath));
+}
 
 function atomicTmpPath(filePath: string): string {
   return `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;

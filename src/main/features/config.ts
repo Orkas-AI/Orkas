@@ -220,7 +220,13 @@ export function setMetacognitionEnabled(enabled: boolean): boolean {
 }
 
 export function getGlobalSkillRootsEnabled(): boolean {
-  return readPreferences().global_skill_roots_enabled !== false;
+  return getGlobalSkillRootsEnabledForUser(getActiveUserId());
+}
+
+/** User-scoped form for background/model turns that must not consult a
+ * process-global active-user singleton after an account context changes. */
+export function getGlobalSkillRootsEnabledForUser(userId: string): boolean {
+  return readPreferencesForUser(userId).global_skill_roots_enabled !== false;
 }
 
 export function setGlobalSkillRootsEnabled(enabled: boolean): boolean {

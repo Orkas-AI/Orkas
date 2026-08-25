@@ -1,9 +1,8 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: stage-consistency
-description_zh: 多镜头叙事/角色一致性方法——角色档案(锁定正面肖像锚点)、按机位选参考图、近邻帧 carry-forward、Cameo(上传照片当主角)、长剧本/小说全局规划；让同一角色跨镜头跨场景外观一致。
-description_en: Multi-shot narrative & character consistency — a character bible with a locked front-portrait anchor, view-matched reference selection, recent-frame carry-forward, Cameo (a user photo as the lead), and global planning for long scripts/novels; keeps a character looking the same across shots and scenes.
-category: creation
+description_zh: "通过角色档案、正面肖像锚点、机位匹配参考图、近邻帧延续、Cameo 主角和全局规划维持多镜头叙事与角色一致性；用于同一人物或故事关系必须跨镜头、跨场景稳定的生成任务。"
+description_en: "Maintain character and narrative consistency across shots with a character bible, portrait anchor, view-matched references, recent-frame carry-forward, Cameo leads, and global planning. Use when recurring people or story continuity must remain stable across scenes."
 ---
 
 # stage-consistency

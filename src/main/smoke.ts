@@ -86,7 +86,8 @@ async function section(name: string, fn: () => void | Promise<void>): Promise<vo
         builtin_agents_dir: '/b/a', custom_agents_dir: '/c/a',
         builtin_skills_dir: '/b/s', custom_skills_dir: '/c/s',
         agents_index: '- foo', plan_state: '',
-        os: 'macOS', working_dir: '/tmp', shell_hint: '', local_exec_state: 'x',
+        project_tasks_rules: '',
+        os: 'macOS', working_dir: '/tmp', shell_hint: '',
         output_format_hint: 'x',
         project_files_block: '',
       });

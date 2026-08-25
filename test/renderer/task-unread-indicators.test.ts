@@ -542,8 +542,9 @@ describe('unread task reply indicators', () => {
     expect(projects).toMatch(/project-name-unread-group[\s\S]*\$\{nameNode\}[\s\S]*\$\{unreadDot\}/);
     expect(css).toContain('.task-unread-dot');
     const dotBlock = css.match(/\.task-unread-dot\s*\{[\s\S]*?\}/)?.[0] || '';
-    expect(dotBlock).toContain('width: 4px');
-    expect(dotBlock).toContain('height: 4px');
+    expect(css).toContain('--attention-dot-size: 4px');
+    expect(dotBlock).toContain('width: var(--attention-dot-size)');
+    expect(dotBlock).toContain('height: var(--attention-dot-size)');
     expect(dotBlock).toContain('background: var(--danger)');
     expect(dotBlock).not.toContain('box-shadow');
     expect(unreadSource).toContain(".sidebar-conversation-nav .conv-item[data-cid]");

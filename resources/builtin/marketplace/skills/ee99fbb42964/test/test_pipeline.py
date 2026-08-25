@@ -108,7 +108,7 @@ class PipelineCompose(unittest.TestCase):
         # spending the whole fetch budget trips the hard ceiling -> stop
         acct = caps.account({"steps": [{"step": "gather", "fetches": pl["total_fetch_budget"]}]})
         self.assertTrue(acct["stop"])
-        self.assertIn("max_fetches", acct["exceeded"])
+        self.assertIn("max_fetches", acct["limits_reached"])
 
 
 if __name__ == "__main__":

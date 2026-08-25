@@ -460,7 +460,7 @@ test.describe('projects', () => {
     );
     await expect(
       page.locator('#chat-history .chat-message.assistant [data-role="final"]'),
-    ).not.toContainText(/chat_search|chat_read|<chat-history/i);
+    ).not.toContainText(/chat_history|<chat-history/i);
 
     const allConversations = await modelOrkas.invoke<{
       conversations: Array<{ conversation_id: string; project_id?: string }>;

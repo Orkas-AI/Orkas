@@ -199,13 +199,13 @@ describe('_processEventName (turn_silent handoff-only tagging)', () => {
 // The turn_silent handler drops a commander placeholder when its process trail
 // "only routed". `_isRoutingOnlyEventNames` is that classifier over the per-line
 // `dataset.eventName` tags. It must drop the real-world trigger (a prep
-// `read_file <agent>/agent.json` before `hand_off_to`) while still freezing any
+// `read_files <agent>/agent.json` before `hand_off_to`) while still freezing any
 // trail that did real work.
 describe('_isRoutingOnlyEventNames (turn_silent routing-only drop)', () => {
   it('drops a prep-read + hand_off_to trail (the DeepResearcher bug)', () => {
     const routingOnly = loadRoutingOnly();
     // read agent.json ×2, then hand_off_to — the screenshot's second bubble.
-    expect(routingOnly(['read_file', 'read_file', 'hand_off_to'])).toBe(true);
+    expect(routingOnly(['read_files', 'read_files', 'hand_off_to'])).toBe(true);
   });
 
   it('drops a pure hand_off_to / dispatch_to trail', () => {
@@ -224,13 +224,13 @@ describe('_isRoutingOnlyEventNames (turn_silent routing-only drop)', () => {
   it('keeps a trail with real work (plan_set / write_file / bash) alongside routing', () => {
     const routingOnly = loadRoutingOnly();
     expect(routingOnly(['plan_set', 'hand_off_to'])).toBe(false);
-    expect(routingOnly(['read_file', 'write_file', 'hand_off_to'])).toBe(false);
+    expect(routingOnly(['read_files', 'write_file', 'hand_off_to'])).toBe(false);
     expect(routingOnly(['bash', 'hand_off_to'])).toBe(false);
   });
 
   it('keeps a silent turn that read but never delegated (no routing tool → not routing-only)', () => {
     const routingOnly = loadRoutingOnly();
-    expect(routingOnly(['read_file', 'read_file'])).toBe(false);
+    expect(routingOnly(['read_files', 'read_files'])).toBe(false);
     expect(routingOnly(['', ''])).toBe(false);
   });
 
@@ -250,9 +250,9 @@ describe('_isRoutingOnlyProcessItems (history-reload commander record filter)', 
   const cliItem = (tool: string) => ({ type: 'event', event: { stream: 'cli', data: { type: 'tool-event', tool } } });
   const runtimeItem = { type: 'event', event: { stream: 'runtime', data: { phase: 'end', duration_ms: 205000 } } };
 
-  it('matches the real persisted d9cbec9e037b trail (read_file×2 + hand_off_to + runtime)', () => {
+  it('matches the consolidated read_files×2 + hand_off_to + runtime trail', () => {
     const isRoutingOnly = loadRoutingOnlyItems();
-    expect(isRoutingOnly([toolItem('read_file'), toolItem('read_file'), toolItem('hand_off_to'), runtimeItem]))
+    expect(isRoutingOnly([toolItem('read_files'), toolItem('read_files'), toolItem('hand_off_to'), runtimeItem]))
       .toBe(true);
   });
 
@@ -263,13 +263,13 @@ describe('_isRoutingOnlyProcessItems (history-reload commander record filter)', 
 
   it('keeps a trail with real work (write_file / bash)', () => {
     const isRoutingOnly = loadRoutingOnlyItems();
-    expect(isRoutingOnly([toolItem('read_file'), toolItem('write_file'), toolItem('hand_off_to')])).toBe(false);
+    expect(isRoutingOnly([toolItem('read_files'), toolItem('write_file'), toolItem('hand_off_to')])).toBe(false);
     expect(isRoutingOnly([toolItem('bash'), toolItem('hand_off_to')])).toBe(false);
   });
 
   it('is false without a delegation tool or when empty/invalid', () => {
     const isRoutingOnly = loadRoutingOnlyItems();
-    expect(isRoutingOnly([toolItem('read_file'), runtimeItem])).toBe(false);
+    expect(isRoutingOnly([toolItem('read_files'), runtimeItem])).toBe(false);
     expect(isRoutingOnly([])).toBe(false);
     expect(isRoutingOnly(undefined as unknown as unknown[])).toBe(false);
   });

@@ -14,6 +14,7 @@ const _CHAT_USE_TOKEN_END = '\u2064';
 const _CHAT_USE_TOKEN_ZERO = '\u200B';
 const _CHAT_USE_TOKEN_ONE = '\u200C';
 const _CHAT_USE_TOKEN_PAD = '  ';
+const _CHAT_SKILL_SOURCES = new Set(['marketplace', 'custom', 'external', 'global']);
 
 function bindSkillPicker() {
   // Chip remove (×)
@@ -44,7 +45,15 @@ function _normalizeChatUseSelection(value) {
   const name = String(value.name || value.id || '').trim();
   const id = String(value.id || name).trim();
   if (!name && !id) return null;
-  return { kind, id: id || name, name: name || id };
+  const source = kind === 'skill' && _CHAT_SKILL_SOURCES.has(value.source)
+    ? value.source
+    : '';
+  return {
+    kind,
+    id: id || name,
+    name: name || id,
+    ...(source ? { source } : {}),
+  };
 }
 
 function _normalizeChatUseSelections(value) {
@@ -55,7 +64,7 @@ function _normalizeChatUseSelections(value) {
   raw.forEach((item) => {
     const sel = _normalizeChatUseSelection(item);
     if (!sel) return;
-    const key = `${sel.kind}:${sel.id || sel.name}`;
+    const key = `${sel.kind}:${sel.kind === 'skill' ? (sel.source || '') : ''}:${sel.id || sel.name}`;
     if (seen.has(key)) return;
     seen.add(key);
     out.push(sel);
@@ -253,6 +262,7 @@ function chatUseMessagePartsFromText(text) {
         kind: selection.kind,
         id: selection.id,
         name: selection.name,
+        ...(selection.kind === 'skill' && selection.source ? { source: selection.source } : {}),
       });
     }
     last = token.end;
@@ -448,10 +458,15 @@ function setChatUseSelection(target, selection, opts = {}) {
   input?.focus();
 }
 
-function setChatSkill(target, idOrName, maybeName) {
+function setChatSkill(target, idOrName, maybeName, maybeSource) {
   const id = String(idOrName || maybeName || '').trim();
   const name = String(maybeName || idOrName || '').trim();
-  setChatUseSelection(target, id || name ? { kind: 'skill', id: id || name, name: name || id } : null);
+  setChatUseSelection(target, id || name ? {
+    kind: 'skill',
+    id: id || name,
+    name: name || id,
+    ...(_CHAT_SKILL_SOURCES.has(maybeSource) ? { source: maybeSource } : {}),
+  } : null);
 }
 
 function setChatConnector(target, connectorId, connectorName) {

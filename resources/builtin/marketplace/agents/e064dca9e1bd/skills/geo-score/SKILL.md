@@ -1,9 +1,8 @@
 ---
 ownerAgent: e064dca9e1bd
 name: geo-score
-description_zh: "从 seo-crawl 数据算 GEO（生成式引擎优化）得分：Citability/结构可读/多模态/权威&品牌/技术可达 5 维加权，给实体解析状态（recognized/partial/unrecognized）与分级建议；与 SEO 健康分分开呈现；适合\"算一下这页的 GEO 分\"\"AI 引擎能不能引用这页\"；触发词：GEO、AI 引用、可引用性、实体解析、生成式引擎、AI 可见性"
-description_en: "Compute a GEO (Generative Engine Optimization) score from seo-crawl data: a 5-dimension weighted score (Citability/Structure/Multimodal/Authority&Brand/Technical-access), an entity-resolution status (recognized/partial/unrecognized), and ranked recommendations; reported separately from SEO health; For: 'score this page's GEO', 'can AI engines cite this page'; Triggers: GEO, AI citation, citability, entity resolution, generative engine, AI visibility"
-category: data
+description_zh: "从 seo-crawl 数据计算 GEO 就绪度，覆盖可引用性、结构、多模态、权威与品牌、技术可达五个维度，并给出实体解析状态和分级建议；用于判断页面是否便于 AI 引用，结果与 SEO 健康分分开呈现。"
+description_en: "Compute a five-dimension GEO readiness score from seo-crawl data covering citability, structure, multimodal, authority and brand, technical access, entity resolution, and ranked recommendations. Use to assess whether a page is ready for AI citation; report separately from SEO health."
 ---
 
 # geo-score

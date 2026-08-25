@@ -1,9 +1,8 @@
 ---
 ownerAgent: e064dca9e1bd
 name: seo-cwv
-description_zh: "用 Google PageSpeed Insights 查核心网页指标(Core Web Vitals)：LCP/CLS/INP/FCP 与性能分，区分 CrUX 真实用户字段数据(Measured)与实验室数据(Estimated)，输出 performance 维度 findings；免费、无需 OAuth；适合\"测一下这页的加载性能\"\"看看 CWV/LCP 怎么样\"；触发词：CWV、核心网页指标、LCP、CLS、INP、PageSpeed、性能、加载速度"
-description_en: "Fetch Core Web Vitals via Google PageSpeed Insights: LCP/CLS/INP/FCP and the performance score, separating CrUX real-user field data (Measured) from lab data (Estimated); emits performance-dimension findings; free, no OAuth; For: 'check this page's load performance', 'how are the Core Web Vitals / LCP'; Triggers: CWV, Core Web Vitals, LCP, CLS, INP, PageSpeed, performance, load speed"
-category: data
+description_zh: "通过 Google PageSpeed Insights 获取 LCP、CLS、INP、FCP 和性能分，并区分 CrUX 真实用户字段数据与实验室估算；用于页面加载性能和核心网页指标诊断，免费且无需 OAuth。"
+description_en: "Fetch Core Web Vitals with Google PageSpeed Insights and separate CrUX field data from lab estimates for LCP, CLS, INP, FCP, and performance score. Use for page-speed, load-performance, or CWV diagnosis; requires no OAuth."
 ---
 
 # seo-cwv

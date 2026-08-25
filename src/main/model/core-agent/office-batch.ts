@@ -184,14 +184,45 @@ export function buildDocxBatch(
  *  `set` (`fill`, `font.color`, `font.size`, `italic`, `underline`, `halign`,
  *  `valign`, `wrap`, `border`, `merge`, …), so styled cells are expressible at
  *  create time. */
-export type XlsxCell =
-  | string
-  | number
-  | { value?: string | number; formula?: string; format?: string; bold?: boolean; [key: string]: unknown };
+export type XlsxCellProperties = {
+  value?: string | number | boolean;
+  formula?: string;
+  format?: string;
+  bold?: boolean;
+  [key: string]: unknown;
+};
+
+export type XlsxCell = string | number | boolean | XlsxCellProperties;
 
 /** Structural xlsx cell keys handled explicitly below — excluded from
  *  passthrough (`format` → `numberformat`). */
 const XLSX_STRUCTURAL = new Set(['value', 'formula', 'format', 'bold']);
+
+/** Normalize the shared XLSX cell property contract used by both
+ * `create_xlsx` rows and `edit_office` cell `set` operations. Formula wins
+ * over value, `format` is normalized to OfficeCLI's canonical
+ * `numberformat`, and the remaining scalar cell properties pass through.
+ * Editing may explicitly write an empty value to clear existing content;
+ * create-time sparse grids continue to skip empty cells. */
+export function buildXlsxCellProps(
+  cell: XlsxCellProperties,
+  options: { allowEmptyValue?: boolean } = {},
+): Record<string, string> {
+  const props: Record<string, string> = {};
+  if (typeof cell.formula === 'string' && cell.formula) {
+    props.formula = cell.formula.replace(/^=/, '');
+  } else if (
+    cell.value !== undefined
+    && cell.value !== null
+    && (options.allowEmptyValue || cell.value !== '')
+  ) {
+    props.value = String(cell.value);
+  }
+  if (typeof cell.format === 'string' && cell.format) props.numberformat = cell.format;
+  if (typeof cell.bold === 'boolean') props.bold = String(cell.bold);
+  addPassthrough(props, cell, XLSX_STRUCTURAL);
+  return props;
+}
 
 /** 0-based column index → Excel column letters (0→A, 25→Z, 26→AA). */
 export function columnLetter(index: number): string {
@@ -219,14 +250,7 @@ export function buildXlsxBatch(sheet: string, rows: readonly (readonly XlsxCell[
       if (cell === null || cell === undefined || cell === '') return;
       const props: Record<string, string> = {};
       if (typeof cell === 'object') {
-        if (typeof cell.formula === 'string' && cell.formula) {
-          props.formula = cell.formula.replace(/^=/, '');
-        } else if (cell.value !== undefined && cell.value !== null && cell.value !== '') {
-          props.value = String(cell.value);
-        }
-        if (typeof cell.format === 'string' && cell.format) props.numberformat = cell.format;
-        if (cell.bold) props.bold = 'true';
-        addPassthrough(props, cell, XLSX_STRUCTURAL);
+        Object.assign(props, buildXlsxCellProps(cell));
       } else {
         props.value = String(cell);
       }

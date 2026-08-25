@@ -124,9 +124,15 @@ describe('user_workspace › setWorkspacePath', () => {
     process.env.ORKAS_TCC_GUARD_FORCE = '1';
     const home = path.join(tmpDir, 'fake-home');
     const protectedRoots = [
+      home,
       path.join(home, 'Downloads'),
+      path.join(home, 'Downloads', 'project'),
+      path.join(home, 'Documents'),
       path.join(home, 'Pictures'),
       path.join(home, 'Desktop'),
+      path.join(home, 'Desktop', 'project'),
+      path.join(home, 'Movies'),
+      path.join(home, 'Music'),
       path.join(home, 'Library', 'Containers', 'com.apple.mail'),
     ];
     protectedRoots.forEach((dir) => fs.mkdirSync(dir, { recursive: true }));
@@ -145,6 +151,38 @@ describe('user_workspace › setWorkspacePath', () => {
       const info = ws.getWorkspaceInfo(userId);
       expect(info.currentPath).toBe(p.DEFAULT_USER_WORKSPACE);
     }
+  });
+
+  it.runIf(process.platform === 'darwin')('rejects a symlink alias that resolves into a protected macOS workspace root', async () => {
+    await _pinZh();
+    process.env.ORKAS_TCC_GUARD_FORCE = '1';
+    const home = path.join(tmpDir, 'fake-home');
+    const desktopProject = path.join(home, 'Desktop', 'project');
+    const alias = path.join(tmpDir, 'apparently-safe-workspace');
+    fs.mkdirSync(desktopProject, { recursive: true });
+    fs.symlinkSync(desktopProject, alias, 'dir');
+    process.env.HOME = home;
+    const ws = await import('../../../src/main/features/user_workspace');
+
+    const result = ws.setWorkspacePath('userSymlinkProtected', alias);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain('隐私保护');
+  });
+
+  it.runIf(process.platform !== 'win32')('accepts a symlink to an ordinary project without rewriting the selected path', async () => {
+    process.env.ORKAS_TCC_GUARD_FORCE = '1';
+    const target = path.join(tmpDir, 'projects', 'ordinary');
+    const alias = path.join(tmpDir, 'ordinary-workspace-alias');
+    fs.mkdirSync(target, { recursive: true });
+    fs.symlinkSync(target, alias, 'dir');
+    const ws = await import('../../../src/main/features/user_workspace');
+
+    const result = ws.setWorkspacePath('userSafeSymlink', alias);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.path).toBe(alias);
+    expect(ws.getWorkspacePath('userSafeSymlink')).toBe(alias);
   });
 
   it('allows ordinary project directories under the home folder', async () => {
@@ -229,6 +267,29 @@ describe('user_workspace › selectDirectory (mocked)', () => {
     const ws = await import('../../../src/main/features/user_workspace');
     const result = await ws.selectDirectory();
     expect(result).toBe(dir);
+  });
+
+  it.runIf(process.platform === 'darwin')('does not persist a protected directory returned by the native picker', async () => {
+    await _pinZh();
+    process.env.ORKAS_TCC_GUARD_FORCE = '1';
+    const home = path.join(tmpDir, 'fake-home');
+    const downloads = path.join(home, 'Downloads');
+    fs.mkdirSync(downloads, { recursive: true });
+    process.env.HOME = home;
+    const { dialog } = await import('electron');
+    (dialog.showOpenDialog as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      canceled: false,
+      filePaths: [downloads],
+    });
+    const ws = await import('../../../src/main/features/user_workspace');
+    const p = await import('../../../src/main/paths');
+
+    const selected = await ws.selectDirectory();
+    expect(selected).toBe(downloads);
+    const result = ws.setWorkspacePath('userPickerProtected', selected!);
+
+    expect(result.ok).toBe(false);
+    expect(ws.getWorkspacePath('userPickerProtected')).toBe(p.DEFAULT_USER_WORKSPACE);
   });
 });
 
@@ -351,6 +412,27 @@ describe('user_workspace › scoped (projects)', () => {
     expect(info.defaultPath).toBe(p.DEFAULT_USER_WORKSPACE);
     expect(info.isDefault).toBe(true);
     expect(info.recentPaths).toEqual([]);
+  });
+
+  it.runIf(process.platform === 'darwin')('falls back from a legacy symlink that resolves into a protected workspace root', async () => {
+    process.env.ORKAS_TCC_GUARD_FORCE = '1';
+    const home = path.join(tmpDir, 'fake-home');
+    const downloadsProject = path.join(home, 'Downloads', 'legacy-project');
+    const alias = path.join(tmpDir, 'legacy-protected-alias');
+    fs.mkdirSync(downloadsProject, { recursive: true });
+    fs.symlinkSync(downloadsProject, alias, 'dir');
+    process.env.HOME = home;
+    const ws = await import('../../../src/main/features/user_workspace');
+    const p = await import('../../../src/main/paths');
+    const cfgFile = path.join(tmpDir, 'userLegacySymlink', 'local', 'workspace.json');
+    fs.mkdirSync(path.dirname(cfgFile), { recursive: true });
+    fs.writeFileSync(cfgFile, JSON.stringify({
+      selectedPath: alias,
+      updatedAt: '2026-08-24T00:00:00.000Z',
+      recentPaths: [],
+    }));
+
+    expect(ws.getWorkspacePath('userLegacySymlink')).toBe(p.DEFAULT_USER_WORKSPACE);
   });
 
   it('reset on project scope falls through to default; default scope intact', async () => {

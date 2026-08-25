@@ -86,6 +86,7 @@ import {
 import { readState as readGroupChatState } from '../features/group_chat/state';
 import { logErrorRef, logPathRef } from '../util/log-redact';
 import { chatMediaLocalPathFromUrl } from '../util/chat-media-url';
+import { captureDeliveredTaskIntervention } from '../util/task-intervention-events';
 import { macosTccSensitivePath } from '../util/macos-tcc';
 import { normalizeAppError } from '../util/app-error';
 import {
@@ -594,24 +595,41 @@ function _validHtmlPreviewLayout(width: unknown, height: unknown): HtmlPreviewLa
 // responsive page breakpoints as a fixed canvas.
 function _inferHtmlPreviewLayoutFromCss(html: string): HtmlPreviewLayout | null {
   const source = String(html || '').replace(/\/\*[\s\S]*?\*\//g, '');
-  const blocks = source.matchAll(/([^{}]+)\{([^{}]*)\}/g);
-  for (const match of blocks) {
-    const declarations = String(match[2] || '');
-    const px = (property: string): number => {
-      const found = declarations.match(new RegExp(`(?:^|;)\\s*${property}\\s*:\\s*(\\d+(?:\\.\\d+)?)px\\b`, 'i'));
-      return found ? Number(found[1]) : 0;
-    };
-    const aspect = declarations.match(/(?:^|;)\s*aspect-ratio\s*:\s*(\d+(?:\.\d+)?)(?:\s*\/\s*(\d+(?:\.\d+)?))?\s*(?:;|$)/i);
-    if (!aspect) continue;
-    const width = px('max-width') || px('width');
-    const height = px('max-height') || px('height');
-    const layout = _validHtmlPreviewLayout(width, height);
-    if (!layout) continue;
-    const declaredRatio = Number(aspect[1]) / Number(aspect[2] || 1);
-    const canvasRatio = layout.width / layout.height;
-    if (!Number.isFinite(declaredRatio) || declaredRatio <= 0) continue;
-    if (Math.abs(declaredRatio - canvasRatio) > Math.max(0.01, canvasRatio * 0.02)) continue;
-    return layout;
+  // Inspect CSS only, then find leaf declaration blocks with a linear brace
+  // walk. The former `/([^{}]+)\{([^{}]*)\}/g` ran over the entire HTML;
+  // on a long brace-free body its failed match retried from every character,
+  // turning a ~120 KB page into 20+ seconds of main-process CPU time.
+  const styleTags = source.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style\s*>/gi);
+  for (const styleTag of styleTags) {
+    const css = String(styleTag[1] || '');
+    const stack: Array<{ start: number; nested: boolean }> = [];
+    const declarationBlocks: string[] = [];
+    for (let index = 0; index < css.length; index += 1) {
+      if (css[index] === '{') {
+        if (stack.length) stack[stack.length - 1].nested = true;
+        stack.push({ start: index + 1, nested: false });
+      } else if (css[index] === '}' && stack.length) {
+        const block = stack.pop()!;
+        if (!block.nested) declarationBlocks.push(css.slice(block.start, index));
+      }
+    }
+    for (const declarations of declarationBlocks) {
+      const px = (property: string): number => {
+        const found = declarations.match(new RegExp(`(?:^|;)\\s*${property}\\s*:\\s*(\\d+(?:\\.\\d+)?)px\\b`, 'i'));
+        return found ? Number(found[1]) : 0;
+      };
+      const aspect = declarations.match(/(?:^|;)\s*aspect-ratio\s*:\s*(\d+(?:\.\d+)?)(?:\s*\/\s*(\d+(?:\.\d+)?))?\s*(?:;|$)/i);
+      if (!aspect) continue;
+      const width = px('max-width') || px('width');
+      const height = px('max-height') || px('height');
+      const layout = _validHtmlPreviewLayout(width, height);
+      if (!layout) continue;
+      const declaredRatio = Number(aspect[1]) / Number(aspect[2] || 1);
+      const canvasRatio = layout.width / layout.height;
+      if (!Number.isFinite(declaredRatio) || declaredRatio <= 0) continue;
+      if (Math.abs(declaredRatio - canvasRatio) > Math.max(0.01, canvasRatio * 0.02)) continue;
+      return layout;
+    }
   }
   return null;
 }
@@ -835,6 +853,9 @@ function _codedError(code: string): Error & { code: string } {
 
 async function _afterRecycleRestore(ctx: IpcContext, paths: string[]): Promise<void> {
   const change = _recycleDataChangeForPaths(paths);
+  if (change.domains.includes('chats')) {
+    chats.invalidateConversationCaches(ctx.userId);
+  }
   for (const raw of paths || []) {
     const rel = String(raw || '').replace(/\\/g, '/');
     if (rel.startsWith('cloud/contexts/')) {
@@ -1694,7 +1715,15 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // ── Group chat (replaces legacy conversations.send / .stream / .markFormSubmitted) ──
-  'groupChat.send': async ({ cid, content, title_text, attachments, use_selections, references }, ctx) => {
+  'groupChat.send': async ({
+    cid,
+    content,
+    title_text,
+    attachments,
+    use_selections,
+    references,
+    steer_active_turn,
+  }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
     const text = (content || '').trim();
     if (!text) throw new Error('empty message');
@@ -1705,6 +1734,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const refs = Array.isArray(references) ? references : [];
     return groupChat.send({
       userId: ctx.userId, cid, text,
+      ...(steer_active_turn === true ? { steerActiveTurn: true } : {}),
       ...(hasTitleText ? { title_text: titleText } : {}),
       ...(atts.length ? { attachments: atts } : {}),
       ...(useSelections.length ? { use_selections: useSelections } : {}),
@@ -1771,7 +1801,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // Generic native directory picker. Used by the agent-input-form
-  // `directory` type so coding agents (claude / codex) collect their
+  // `directory` type so coding agents collect their
   // project directory through the standard input-form pipeline.
   'common.pickDirectory': async ({ title } = {}) => {
     const parent = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
@@ -2631,9 +2661,17 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'auth.addApiKeyEntry': async ({ provider, model, apiKey, label }) => (
     auth.addApiKeyEntry(provider, model, apiKey, label)
   ),
-  'auth.addCustomModelEntry': async ({ label, baseUrl, model, apiKey, contextWindow, maxTokens }) => (
-    auth.addCustomModelEntry({ label, baseUrl, model, apiKey, contextWindow, maxTokens })
-  ),
+  'auth.addCustomModelEntry': async (
+    { label, baseUrl, model, apiKey, contextWindow, maxTokens, supportsVision },
+  ) => auth.addCustomModelEntry({
+    label,
+    baseUrl,
+    model,
+    apiKey,
+    contextWindow,
+    maxTokens,
+    supportsVision,
+  }),
   // Legacy alias; renderer migrated to auth.addApiKey.
   'auth.saveApiKey': async ({ provider, apiKey, label }) => auth.saveApiKey(provider, apiKey, label),
   'auth.renameProfile': async ({ profileId, label }) => auth.renameProfile(profileId, label),
@@ -2732,8 +2770,6 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // `{ ok: true, granted, grantedAt?, revokedAt? }` — settings.js reads
   // those fields directly off the response.
   'permissions.getLocalExec':    async () => permissions.getLocalExecState(),
-  'permissions.grantLocalExec':  async () => permissions.grantLocalExec(),
-  'permissions.revokeLocalExec': async () => permissions.revokeLocalExec(),
   // Three-mode setter (off / risk_prompt / allow_all). Returns the new state
   // in the same shape as getLocalExec so settings.js can read it back.
   'permissions.setLocalExecMode': async ({ mode }: { mode?: unknown }) => {
@@ -3555,6 +3591,9 @@ export function broadcastToRenderer(channel: string, payload: unknown): boolean 
         error: logErrorRef(err),
       });
     }
+  }
+  if (delivered) {
+    captureDeliveredTaskIntervention(channel, payload, _activeUserIdForPicker());
   }
   return delivered;
 }

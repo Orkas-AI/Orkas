@@ -19,17 +19,39 @@ describe('main process child-process ownership', () => {
     );
   });
 
-  it('keeps the open-build relaunch command detached and hidden', () => {
+  it('passes the exact old-process owner before launching the replacement', () => {
     const source = fs.readFileSync(
       path.resolve(process.cwd(), 'src/main/index.ts'),
       'utf8',
     );
-    const relaunchStart = source.indexOf('const child = spawn');
+    const relaunchStart = source.indexOf("ipcMain.handle('orkas.relaunch'");
     expect(relaunchStart).toBeGreaterThan(-1);
-    const relaunchBlock = source.slice(relaunchStart, relaunchStart + 500);
+    const relaunchBlock = source.slice(relaunchStart, relaunchStart + 1_800);
+
+    expect(relaunchBlock).toContain('resolveCliCommand');
+    expect(relaunchBlock).toContain('delete childEnv.ORKAS_WORKSPACE_ROOT');
+    expect(relaunchBlock).toContain('delete childEnv.CORE_AGENT_AUTH_DIR');
+    expect(relaunchBlock).toContain(
+      'childEnv.ORKAS_RELAUNCH_OWNER_PID = String(process.pid)',
+    );
     expect(relaunchBlock).toContain('detached: true');
     expect(relaunchBlock).toContain("stdio: 'ignore'");
     expect(relaunchBlock).toContain('windowsHide: true');
+    expect(relaunchBlock).toContain('windowsVerbatimArguments: resolved.windowsVerbatimArguments');
+    expect(relaunchBlock).toContain('env: childEnv');
     expect(relaunchBlock).toContain('child.unref()');
+
+    const shellLauncher = fs.readFileSync(
+      path.resolve(process.cwd(), 'run.sh'),
+      'utf8',
+    );
+    const windowsLauncher = fs.readFileSync(
+      path.resolve(process.cwd(), 'run.cmd'),
+      'utf8',
+    );
+    expect(shellLauncher).toContain('ORKAS_RELAUNCH_OWNER_PID');
+    expect(shellLauncher).not.toMatch(/pkill[^\n]+electron\/dist/i);
+    expect(windowsLauncher).toContain('ORKAS_RELAUNCH_OWNER_PID');
+    expect(windowsLauncher).not.toMatch(/taskkill[^\n]+electron\.exe/i);
   });
 });

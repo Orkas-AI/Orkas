@@ -90,9 +90,11 @@ export const ALLOWED_EXTENSIONS: ReadonlySet<string> = new Set([
 const MAX_BYTES_TEXT  = 5   * 1024 * 1024;
 const MAX_BYTES_DOCX  = 20  * 1024 * 1024;
 const MAX_BYTES_OFFICE = 50 * 1024 * 1024;
-const MAX_BYTES_IMAGE = 20  * 1024 * 1024;
+export const MAX_IMAGE_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+const MAX_BYTES_IMAGE = MAX_IMAGE_ATTACHMENT_BYTES;
 const MAX_BYTES_PDF   = 100 * 1024 * 1024;
-const MAX_BYTES_VIDEO = 200 * 1024 * 1024;
+export const MAX_VIDEO_ATTACHMENT_BYTES = 200 * 1024 * 1024;
+const MAX_BYTES_VIDEO = MAX_VIDEO_ATTACHMENT_BYTES;
 const MAX_BYTES_AUDIO = 50  * 1024 * 1024;
 // Keep the composer boundary aligned with the authoritative native Skill ZIP
 // importer. The importer still re-checks compressed/uncompressed size, entry
@@ -321,6 +323,149 @@ function attachmentInfoForPath(absPath: string, name = path.basename(absPath)): 
     kind: kindOf(ext),
     mtime: Math.floor(st.mtimeMs / 1000),
   };
+}
+
+/** Shared synchronous storage boundary for validated generated media bytes. */
+function saveGeneratedMediaBytes(
+  userId: string,
+  cid: string,
+  buffer: Buffer,
+  preferredName: string,
+  kind: 'image' | 'video',
+): Result<{ absPath: string; info: AttachmentInfo }> {
+  let safeConvId: string;
+  let safeName: string;
+  try {
+    safeConvId = safeCid(cid);
+    safeName = safeAttachmentName(preferredName);
+  } catch (err) {
+    return { ok: false, error: (err as Error).message };
+  }
+  const ext = path.extname(safeName).toLowerCase();
+  const allowed = kind === 'image' ? IMAGE_EXTS : VIDEO_EXTS;
+  const cap = kind === 'image' ? MAX_BYTES_IMAGE : MAX_BYTES_VIDEO;
+  if (!allowed.has(ext)) return { ok: false, error: `generated output must use a supported ${kind} extension` };
+  if (!Buffer.isBuffer(buffer) || !buffer.length) return { ok: false, error: `generated ${kind} is empty` };
+  if (buffer.length > cap) return { ok: false, error: `generated ${kind} exceeds the attachment size limit` };
+
+  const dir = ensureDir(userId, safeConvId);
+  let target = '';
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    target = uniqueTarget(dir, safeName);
+    try {
+      fs.writeFileSync(target, buffer, { flag: 'wx' });
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+        target = '';
+        continue;
+      }
+      try {
+        if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
+      } catch { /* best-effort */ }
+      return { ok: false, error: (err as Error).message };
+    }
+  }
+  if (!target) return { ok: false, error: `could not allocate a unique generated ${kind} filename` };
+
+  const info = attachmentInfoForPath(target, path.basename(target));
+  if (!info) {
+    try { fs.unlinkSync(target); } catch { /* best-effort */ }
+    return { ok: false, error: `generated ${kind} could not be verified after writing` };
+  }
+  notifyAttachmentDirtyIfSyncable(userId, safeConvId, info.name);
+  log.info('generated media attachment stored', { bytes: info.bytes, kind: info.kind });
+  return { ok: true, absPath: target, info };
+}
+
+export function saveGeneratedImageAttachment(
+  userId: string,
+  cid: string,
+  buffer: Buffer,
+  preferredName = 'codex-generated-image.png',
+): Result<{ absPath: string; info: AttachmentInfo }> {
+  const result = saveGeneratedMediaBytes(userId, cid, buffer, preferredName, 'image');
+  if (!result.ok && 'error' in result && result.error === 'generated output must use a supported image extension') {
+    return { ok: false, error: 'generated output must use a raster image extension' };
+  }
+  return result;
+}
+
+/** Persist validated host-generated image or video bytes in the synced
+ * conversation media pool. Callers must inspect the actual container bytes
+ * before choosing the extension; this boundary owns filename, size, collision,
+ * and sync invariants. */
+export function saveGeneratedMediaAttachment(
+  userId: string,
+  cid: string,
+  buffer: Buffer,
+  preferredName: string,
+  kind: 'image' | 'video',
+): Result<{ absPath: string; info: AttachmentInfo }> {
+  return saveGeneratedMediaBytes(userId, cid, buffer, preferredName, kind);
+}
+
+/** Store a remotely materialized media object at a stable, content-route name.
+ * Unlike ordinary generated outputs this path never allocates a collision
+ * suffix: the assistant message already contains the matching cid URL before
+ * the background download finishes. Conversation deletion and this writer use
+ * the same lock so a late download cannot recreate a deleted attachment pool. */
+export async function saveGeneratedMediaCacheAttachment(
+  userId: string,
+  cid: string,
+  buffer: Buffer,
+  stableName: string,
+  kind: 'image' | 'video',
+): Promise<Result<{ absPath: string; info: AttachmentInfo; reused?: boolean }>> {
+  let safeConvId: string;
+  let safeName: string;
+  try {
+    safeConvId = safeCid(cid);
+    safeName = safeAttachmentName(stableName);
+  } catch (err) {
+    return { ok: false, error: (err as Error).message };
+  }
+  const ext = path.extname(safeName).toLowerCase();
+  const allowed = kind === 'image' ? IMAGE_EXTS : VIDEO_EXTS;
+  const cap = kind === 'image' ? MAX_BYTES_IMAGE : MAX_BYTES_VIDEO;
+  if (!allowed.has(ext)) return { ok: false, error: `generated output must use a supported ${kind} extension` };
+  if (!Buffer.isBuffer(buffer) || !buffer.length) return { ok: false, error: `generated ${kind} is empty` };
+  if (buffer.length > cap) return { ok: false, error: `generated ${kind} exceeds the attachment size limit` };
+
+  return withAttachmentWriteLock(userId, safeConvId, () => {
+    if (!fs.existsSync(conversationMessageReadFile(userId, safeConvId))) {
+      return { ok: false, error: 'conversation no longer exists' };
+    }
+    const dir = ensureDir(userId, safeConvId);
+    const target = path.join(dir, safeName);
+    const existing = attachmentInfoForPath(target, safeName);
+    if (existing) {
+      if (existing.kind !== kind || existing.bytes > cap) {
+        return { ok: false, error: 'stable generated media target is invalid' };
+      }
+      return { ok: true, absPath: target, info: existing, reused: true };
+    }
+
+    const temp = path.join(dir, `.${safeName}.${process.pid}-${crypto.randomUUID()}.tmp`);
+    try {
+      fs.writeFileSync(temp, buffer, { flag: 'wx' });
+      fs.renameSync(temp, target);
+    } catch (err) {
+      try { fs.unlinkSync(temp); } catch { /* best-effort */ }
+      try {
+        if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
+      } catch { /* best-effort */ }
+      return { ok: false, error: (err as Error).message };
+    }
+    const info = attachmentInfoForPath(target, safeName);
+    if (!info || info.kind !== kind) {
+      try { fs.unlinkSync(target); } catch { /* best-effort */ }
+      return { ok: false, error: `generated ${kind} could not be verified after writing` };
+    }
+    notifyAttachmentDirtyIfSyncable(userId, safeConvId, safeName);
+    log.info('generated media cache attachment stored', { bytes: info.bytes, kind: info.kind });
+    return { ok: true, absPath: target, info };
+  });
 }
 
 function hashBuffer(buf: Buffer): string {
@@ -583,10 +728,38 @@ export function listPendingAttachments(userId: string, cid: string): AttachmentI
     const s = line.trim();
     if (!s) continue;
     try {
-      const rec = JSON.parse(s) as { attachments?: unknown };
+      const rec = JSON.parse(s) as { attachments?: unknown; produced?: unknown; text?: unknown };
       if (Array.isArray(rec.attachments)) {
         for (const name of rec.attachments) {
           if (typeof name === 'string') committed.add(name);
+        }
+      }
+      // Native CLI image generation is materialized into this same synced
+      // pool, but belongs to the assistant's `produced` output rather than a
+      // future composer upload. Mark only exact files under this cid root as
+      // committed so a restart cannot resurrect them as unsent user chips.
+      if (Array.isArray(rec.produced)) {
+        const root = path.resolve(attachmentDirForCid(userId, safeConvId));
+        for (const raw of rec.produced) {
+          if (typeof raw !== 'string' || !path.isAbsolute(raw)) continue;
+          const abs = path.resolve(raw);
+          const rel = path.relative(root, abs);
+          if (rel && !rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel) && path.dirname(rel) === '.') {
+            committed.add(path.basename(abs));
+          }
+        }
+      }
+      // A synced assistant row retains the portable cid URL even when its
+      // absolute `produced` path belongs to another device. Recover the
+      // committed filename from that URL so restored generated media never
+      // reappears as a local composer draft.
+      if (typeof rec.text === 'string') {
+        for (const match of rec.text.matchAll(/chat-media:\/\/cid\/([^/\s)]+)\/([^\s)#?]+)/g)) {
+          try {
+            const referencedCid = decodeURIComponent(match[1]);
+            const referencedName = safeAttachmentName(decodeURIComponent(match[2]));
+            if (referencedCid === safeConvId) committed.add(referencedName);
+          } catch { /* ignore malformed/non-attachment media URLs */ }
         }
       }
     } catch { /* skip malformed line */ }
@@ -963,23 +1136,25 @@ export async function purgeByCid(userId: string, cid: string): Promise<number> {
   let safeConvId: string;
   try { safeConvId = safeCid(cid); }
   catch { return 0; }
-  const dir = attachmentDirForCid(userId, safeConvId);
-  let count = 0;
-  let names: string[] = [];
-  try {
-    if (fs.existsSync(dir)) {
-      const entries = fs.readdirSync(dir);
-      names = entries.filter((n) => !n.startsWith('.'));
-      for (const n of entries) {
-        try { fs.unlinkSync(path.join(dir, n)); count++; } catch { /* best-effort */ }
+  return withAttachmentWriteLock(userId, safeConvId, async () => {
+    const dir = attachmentDirForCid(userId, safeConvId);
+    let count = 0;
+    let names: string[] = [];
+    try {
+      if (fs.existsSync(dir)) {
+        const entries = fs.readdirSync(dir);
+        names = entries.filter((n) => !n.startsWith('.'));
+        for (const n of entries) {
+          try { fs.unlinkSync(path.join(dir, n)); count++; } catch { /* best-effort */ }
+        }
+        try { fs.rmdirSync(dir); } catch { /* best-effort */ }
       }
-      try { fs.rmdirSync(dir); } catch { /* best-effort */ }
-    }
-  } catch (err) { log.warn(`purgeByCid(${cid}): ${(err as Error).message}`); }
-  try { await purgeFileCacheByCid(userId, safeConvId); }
-  catch (err) { log.warn(`purge file_cache cid=${safeConvId}: ${(err as Error).message}`); }
-  for (const name of names) notifyAttachmentDeletedIfSyncable(userId, safeConvId, name);
-  return count;
+    } catch (err) { log.warn(`purgeByCid(${cid}): ${(err as Error).message}`); }
+    try { await purgeFileCacheByCid(userId, safeConvId); }
+    catch (err) { log.warn(`purge file_cache cid=${safeConvId}: ${(err as Error).message}`); }
+    for (const name of names) notifyAttachmentDeletedIfSyncable(userId, safeConvId, name);
+    return count;
+  });
 }
 
 // ── Prompt injection (manifest + images) ─────────────────────────────────
@@ -1022,13 +1197,13 @@ export interface BuildConversationAttachmentIndexOpts {
  * Produce the model-facing view of the attachments for one turn:
  *   - text            → listed with `total_chars` (cheap: one fs.readFileSync
  *                       + .length via file_indexer.statFile). Model can go
- *                       straight to read_file.
+ *                       straight to read_files.
  *   - pdf / docx /
  *     spreadsheet /
  *     presentation   → listed with `total_chars` ONLY if the cache already has
  *                       it (i.e. someone has read/stated this file before).
  *                       Otherwise `total_chars` is omitted and the model must
- *                       call stat_file before read_file. Never eagerly extract
+ *                       let read_files prepare extraction. Never eagerly extract
  *                       here — upload stays zero-cost.
  *   - image           → compressed grayscale JPEG via real-time
  *                       toCompressedGrayJpeg on the raw source → images[]
@@ -1119,7 +1294,7 @@ export async function buildAttachmentManifest(
     let totalChars: number | undefined;
     if (kind === 'text') {
       // Text is cheap to stat (one fs.readFileSync). Always include total_chars
-      // so the first read_file can land on the right range without a stat round-trip.
+      // so the first read_files call can land on the right range.
       try {
         const meta = await statFile(userId, abs);
         totalChars = meta.totalChars;
@@ -1150,11 +1325,11 @@ export async function buildAttachmentManifest(
     : '';
   const hasArchives = entries.some((e) => e.includes('kind="archive"'));
   const archiveNote = hasArchives
-    ? '\n<!-- ZIP archives are opaque inputs. Do not call read_file on them; use a task-specific host import tool with the exact path when the user requested that import. -->'
+    ? '\n<!-- ZIP archives are opaque inputs. Do not call read_files on them; use a task-specific host import tool with the exact path when the user requested that import. -->'
     : '';
   const hasImages = entries.some((e) => e.includes('kind="image"'));
   const imageNote = hasImages
-    ? '\n<!-- image delivery is bounded by the active model. image_order maps prepared vision blocks in source order. If an image is deferred or is not actually visible in this request, call read_file(path=...) for that image, one at a time; listing a path alone is not visual processing. -->'
+    ? '\n<!-- image delivery is bounded by the active model. image_order maps prepared vision blocks in source order. If an image is deferred or is not actually visible in this request, call read_files({"paths":[{"path":"<exact-path>"}]}) for that image, one at a time; listing a path alone is not visual processing. -->'
     : '';
   const manifest = entries.length
     ? `<attachments>${mediaNote}${archiveNote}${imageNote}\n${entries.join('\n')}\n</attachments>`
@@ -1236,7 +1411,7 @@ export async function buildConversationAttachmentIndex(
     : '';
   return (
     `<conversation-attachments cid="${escapeAttr(safeConvId)}">\n` +
-    '<!-- Files uploaded earlier in this conversation. Use read_file/stat_file for readable files and task-specific host tools for opaque archives; images/videos/archives are not inline. -->\n' +
+    '<!-- Files uploaded earlier in this conversation. Use read_files for readable files and task-specific host tools for opaque archives; images/videos/archives are not inline. -->\n' +
     entries.join('\n') +
     omitted +
     '\n</conversation-attachments>'

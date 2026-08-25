@@ -88,6 +88,14 @@ describe('quality › red-flags › no_eval_with_external_input', () => {
     expect(v.map((x) => x.rule)).not.toContain('no_eval_with_external_input');
   });
 
+  it('does NOT flag a regular expression method call', () => {
+    const v = scanRedFlags({
+      content: 'const match = tokenPattern.exec(input);',
+      kind: 'script', field: 'scripts/vendor.js',
+    });
+    expect(v.map((x) => x.rule)).not.toContain('no_eval_with_external_input');
+  });
+
   it('does NOT flag the word "evaluate" in prose comments', () => {
     const v = scanRedFlags({
       content: '# We evaluate the result later',

@@ -7,7 +7,7 @@
  * within the token budget pass through. Larger results are always persisted
  * losslessly and replaced with a bounded preview plus a stable result reference.
  * Retrieval goes through the dedicated
- * `tool_result_search` / `tool_result_read_chunk` tools so a persisted result
+ * `tool_result` tool so a persisted result
  * can never be pulled back into context as one unbounded read.
  *
  * Budgets are token-aware (including CJK) rather than fixed character counts.
@@ -21,7 +21,9 @@ import { createHash } from 'crypto';
 import { StringDecoder } from 'string_decoder';
 import type { AgentTool, ToolResult, ToolContext } from '#core-agent';
 import { createLogger } from '../logger';
+import { CONSERVATIVE_CJK_WEIGHT, countTokenCharacters, estimateTokensWithWeight } from './token-estimate';
 import { logErrorRef, logPathRef, maskId } from './log-redact';
+import { describeToolResultData, type ToolResultDataDescriptor } from './tool-result-data';
 
 const log = createLogger('util/tool-result-cap');
 
@@ -205,7 +207,7 @@ export function wrapToolWithCap(tool: AgentTool, opts: WrapOpts): AgentTool {
     // EVERY capped tool sequential (the runner's G4 partitioner keys on
     // `executionMode === 'parallel'`), defeating parallel reads/search AND
     // concurrent dispatch (run_worker / dispatch_to). This now also matters for
-    // read_file / kb_read: they used to be returned unwrapped (Infinity) and
+    // read_files / library: they used to be returned unwrapped (Infinity) and
     // kept their parallel mode natively, but now flow through this wrapper, so
     // their executionMode must be carried over here.
     ...(tool.executionMode ? { executionMode: tool.executionMode } : {}),
@@ -261,27 +263,20 @@ function claimRoundInlineBudget(ctx: ToolContext, estimatedTokens: number): bool
 
 // ── Core helpers ─────────────────────────────────────────────────────────
 
+/** Must stay byte-for-byte equivalent to core-agent's
+ * `session.ts::estimateTextTokens`: the same text is measured here at the
+ * inline-cap boundary and there for every context-budget decision, so a
+ * divergent count moves a result across the spill line on one side only.
+ * A separate implementation exists there because `#core-agent` is
+ * dynamic-import-only in main and this estimator is called synchronously;
+ * the parity test in `test/main/util/tool-result-cap.test.ts` pins the two
+ * together, non-BMP input included (both count UTF-16 units, not code
+ * points — a surrogate pair is two "other" units).
+ *
+ * Conservative on purpose: an under-estimate here overflows a model window
+ * and ends a run, while an over-estimate only spills a result sooner. */
 export function estimateToolResultTokens(text: string): number {
-  const { cjk, other } = countTokenCharacters(text);
-  return Math.ceil(cjk * 1.5 + other / 4);
-}
-
-function countTokenCharacters(text: string): { cjk: number; other: number } {
-  let cjk = 0;
-  let other = 0;
-  for (const ch of text) {
-    const code = ch.codePointAt(0) ?? 0;
-    if (
-      (code >= 0x4E00 && code <= 0x9FFF) ||
-      (code >= 0x3400 && code <= 0x4DBF) ||
-      (code >= 0x3000 && code <= 0x303F) ||
-      (code >= 0x3040 && code <= 0x30FF) ||
-      (code >= 0xFF00 && code <= 0xFFEF) ||
-      (code >= 0xAC00 && code <= 0xD7AF)
-    ) cjk++;
-    else other++;
-  }
-  return { cjk, other };
+  return estimateTokensWithWeight(text, CONSERVATIVE_CJK_WEIGHT);
 }
 
 export function persistToolResult(
@@ -477,28 +472,64 @@ export function buildPersistedOutputMarkerFromPreview(
   },
 ): string {
   const ref = toolResultRefForPath(absPath);
+  const completePreview = preview.length >= meta.sizeChars;
   // The outline needs the whole document to be honest about its offsets. The
   // streamed-adoption path passes a partial `preview` against the persisted
   // `sizeChars`, so only build one when we were handed the full text.
-  const outline = preview.length >= meta.sizeChars ? buildStructureOutline(preview) : null;
+  const outline = completePreview ? buildStructureOutline(preview) : null;
+  const dataDescriptor = completePreview ? describeToolResultData(preview) : null;
+  const actions = dataDescriptor && dataDescriptor.reason !== 'input_too_large'
+    ? 'query,search,read'
+    : 'search,read';
+  const dataSummary = dataDescriptor ? `${renderToolResultDataSummary(dataDescriptor)}\n` : '';
   const body = outline
     ? `${buildBoundedPreview(preview, OUTLINE_HEAD_PREVIEW_TOKENS)}\n\n`
-      + `[Section map — @N is the 0-based char cursor for tool_result_read_chunk(ref, N)]\n`
+      + `[Section map — @N is the 0-based char cursor for tool_result(action="read", requests=[{ref, cursor:N}])]\n`
       + outline
     : buildBoundedPreview(preview, PERSISTED_PREVIEW_TOKENS);
   const sourceWarning = meta.sourceTruncated
     ? '[WARNING: The producer exceeded its hard safety limit. The stored file is an incomplete prefix; do not treat it as a lossless full result.]\n'
     : '';
+  const queryHint = actions.startsWith('query')
+    ? ' Use tool_result action="query" for deterministic calculations supported by the Result data contract.'
+    : '';
   const retrievalHint = outline
-    ? `[Full content is stored under result ref ${ref}. Seek a section with tool_result_read_chunk(ref, cursor) using the @N offsets above; use tool_result_search(ref, query) when you do not know which section you need. Do not use read_file on the stored path.]`
-    : `[Full content is stored under result ref ${ref}. Use tool_result_search(ref, query) first, or tool_result_read_chunk(ref, cursor, maxTokens) for an exact bounded slice. Do not use read_file on the stored path.]`;
+    ? `[Full content is stored under result ref ${ref}.${queryHint} Seek a section with tool_result(action="read", requests=[{ref, cursor}]) using the @N offsets above; use action="search" with requests=[{ref, query}] when you do not know which section you need. Do not use read_files on the stored path.]`
+    : `[Full content is stored under result ref ${ref}.${queryHint} Use tool_result(action="search", requests=[{ref, query}]) to locate content, or tool_result(action="read", requests=[{ref, cursor, max_tokens}]) for an exact bounded slice. Do not use read_files on the stored path.]`;
   return (
-    `<persisted-output ref="${escapeAttr(ref)}" tool="${escapeAttr(toolName)}" size="${meta.sizeChars}" estimated_tokens="${meta.estimatedTokens}" status="${meta.isError ? 'error' : 'success'}" source_truncated="${meta.sourceTruncated ? 'true' : 'false'}">\n` +
+    `<persisted-output ref="${escapeAttr(ref)}" tool="${escapeAttr(toolName)}" size="${meta.sizeChars}" estimated_tokens="${meta.estimatedTokens}" status="${meta.isError ? 'error' : 'success'}" source_truncated="${meta.sourceTruncated ? 'true' : 'false'}" data_type="${dataDescriptor?.reason === 'input_too_large' ? 'unknown' : dataDescriptor?.kind || 'unknown'}" actions="${actions}">\n` +
     sourceWarning +
+    dataSummary +
     `${body}\n` +
     `${retrievalHint}\n` +
     `</persisted-output>`
   );
+}
+
+function renderToolResultDataSummary(descriptor: ToolResultDataDescriptor): string {
+  if (descriptor.reason === 'input_too_large') {
+    return `[Result data — input exceeds the deterministic query limit; use search to locate content or read with a cursor.]`;
+  }
+  if (!descriptor.queryable) {
+    return `[Result data — type=text; lines=${descriptor.textLines ?? 0}; query supports exact count only with match + count_unit; search locates excerpts; read uses a cursor.]`;
+  }
+  let remainingFieldSlots = 16;
+  const visibleDatasets = descriptor.datasets.slice(0, 8);
+  const datasets = visibleDatasets.map((dataset, index) => {
+    const remainingDatasets = visibleDatasets.length - index;
+    const fieldSlots = Math.min(8, Math.max(1, Math.floor(remainingFieldSlots / remainingDatasets)));
+    const fields = dataset.fields
+      .slice(0, fieldSlots)
+      .map((field) => `${field.name}:${field.type}`)
+      .join(',');
+    const shownFields = Math.min(dataset.fields.length, fieldSlots);
+    remainingFieldSlots = Math.max(0, remainingFieldSlots - shownFields);
+    const omitted = dataset.fields.length > shownFields
+      ? `${fields ? ',' : ''}+${dataset.fields.length - shownFields} more`
+      : '';
+    return `${dataset.name}{records=${dataset.records};fields=${fields || '(none)'}${omitted}}`;
+  }).join(' ');
+  return `[Result data — type=${descriptor.kind}; query operations=count,sum,average,minimum,maximum; datasets: ${datasets}]`;
 }
 
 /** Outline entries emitted at most; keeps the marker bounded on a document with
@@ -509,7 +540,7 @@ const OUTLINE_MAX_ENTRIES = 40;
 const OUTLINE_MIN_ENTRIES = 3;
 
 /** Build a heading outline with **character offsets**, so the model can feed an
- *  entry straight into `tool_result_read_chunk(ref, cursor)`.
+ *  entry straight into `tool_result(action="read", requests=[{ref, cursor}])`.
  *
  *  A head/tail preview is close to useless on a structured document: it shows
  *  the opening and the closing and hides everything in between, which is where
@@ -518,7 +549,7 @@ const OUTLINE_MIN_ENTRIES = 3;
  *  keyword-searches for something it cannot name, or guesses. An outline costs
  *  the same tokens and turns retrieval into one targeted seek.
  *
- *  Offsets, not line numbers: `tool_result_read_chunk` takes a 0-based char
+ *  Offsets, not line numbers: `tool_result` action `read` takes a 0-based char
  *  cursor, so anything else would need a conversion the model can't perform.
  *
  *  Returns null when the text has too little structure to be worth it. */
@@ -668,4 +699,82 @@ function toolResultEntryBytes(abs: string): number {
 function removeToolResultEntry(abs: string, isDirectory: boolean): void {
   if (isDirectory) fs.rmSync(abs, { recursive: true, force: true });
   else fs.unlinkSync(abs);
+}
+
+// ── Cloud-side retention ─────────────────────────────────────────────────
+
+/** Cloud-side persisted results expire per-file after this many days. Unlike
+ *  the machine-local store swept above, these files sit beside their cloud
+ *  session, sync to the server and every device, and were previously
+ *  reclaimed only by conversation deletion — a long-lived chat grew without
+ *  bound. Expiry is by file mtime (spill files are content-addressed and
+ *  write-once, so mtime is creation time). A ref past this window resolves to
+ *  E_RESULT_REF_MISSING, whose message carries this retention and the remedy
+ *  (re-run the original tool). */
+export const CLOUD_TOOL_RESULT_MAX_AGE_DAYS = 30;
+
+/** Per-sweep deletion cap. Cloud removals ride the normal sync reconcile as
+ *  ordinary delete ops (the same primitive conversation deletion uses); one
+ *  sync pass deleting 50+ files would trip the engine's mass-delete
+ *  confirmation prompt, so a backlogged account amortizes cleanup across
+ *  activations — oldest first, so the backlog converges. */
+export const CLOUD_TOOL_RESULT_SWEEP_MAX_DELETIONS = 40;
+
+export type CloudToolResultSweepStats = {
+  removedFiles: number;
+  removedDirs: number;
+  /** True when the deletion budget ran out with expired files remaining. */
+  truncated: boolean;
+};
+
+/** Expire individual persisted-result files under the given cloud session
+ *  tool-results dirs. Symlink-safe: only regular-file dirents are considered,
+ *  and a dir emptied by the sweep is removed. Missing dirs are tolerated. */
+export function sweepExpiredCloudToolResults(
+  sessionToolResultsDirs: readonly string[],
+  maxAgeDays = CLOUD_TOOL_RESULT_MAX_AGE_DAYS,
+  maxDeletions = CLOUD_TOOL_RESULT_SWEEP_MAX_DELETIONS,
+): CloudToolResultSweepStats {
+  const stats: CloudToolResultSweepStats = { removedFiles: 0, removedDirs: 0, truncated: false };
+  const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+  const expired: Array<{ abs: string; mtimeMs: number }> = [];
+  const scannedDirs: string[] = [];
+  for (const dir of sessionToolResultsDirs) {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch { continue; }
+    scannedDirs.push(dir);
+    for (const ent of entries) {
+      if (!ent.isFile()) continue;
+      const abs = path.join(dir, ent.name);
+      try {
+        const st = fs.lstatSync(abs);
+        if (st.isFile() && st.mtimeMs < cutoffMs) expired.push({ abs, mtimeMs: st.mtimeMs });
+      } catch { /* per-entry best-effort */ }
+    }
+  }
+  expired.sort((a, b) => a.mtimeMs - b.mtimeMs || a.abs.localeCompare(b.abs));
+  const budget = Math.max(0, Math.floor(maxDeletions));
+  for (const entry of expired) {
+    if (stats.removedFiles >= budget) { stats.truncated = true; break; }
+    try {
+      fs.unlinkSync(entry.abs);
+      stats.removedFiles++;
+    } catch { /* per-entry best-effort */ }
+  }
+  for (const dir of scannedDirs) {
+    try {
+      if (fs.readdirSync(dir).length === 0) {
+        fs.rmdirSync(dir);
+        stats.removedDirs++;
+      }
+    } catch { /* best-effort */ }
+  }
+  if (stats.removedFiles || stats.removedDirs) log.info('swept expired cloud tool-results', {
+    removed_files: stats.removedFiles,
+    removed_dirs: stats.removedDirs,
+    truncated: stats.truncated,
+    maxAgeDays,
+  });
+  return stats;
 }

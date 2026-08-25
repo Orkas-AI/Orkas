@@ -1,9 +1,8 @@
 ---
 ownerAgent: e064dca9e1bd
 name: seo-schema
-description_zh: "校验页面 JSON-LD 结构化数据并按页面角色推荐应补的类型，也能生成可粘贴的 JSON-LD 模板（Organization/WebSite/SoftwareApplication/FAQPage/BreadcrumbList/Article/Product）；校验项含缺 @type、缺必填字段、已废弃富结果类型（FAQPage/HowTo）；适合\"检查结构化数据\"\"给我一段 Organization 的 JSON-LD\"；触发词：结构化数据、JSON-LD、schema、富结果、FAQ schema"
-description_en: "Validate a page's JSON-LD structured data, recommend types to add by page role, and generate paste-ready JSON-LD templates (Organization/WebSite/SoftwareApplication/FAQPage/BreadcrumbList/Article/Product); lint covers missing @type, missing required fields, deprecated rich-result types (FAQPage/HowTo); For: 'check structured data', 'give me Organization JSON-LD'; Triggers: structured data, JSON-LD, schema, rich result, FAQ schema"
-category: data
+description_zh: "校验页面 JSON-LD、按页面角色推荐结构化数据类型，并生成可粘贴的 Organization、WebSite、SoftwareApplication、FAQPage、BreadcrumbList、Article 或 Product 模板；用于 schema 检查、富结果问题和 JSON-LD 生成。"
+description_en: "Validate page JSON-LD, recommend schema types by page role, and generate paste-ready Organization, WebSite, SoftwareApplication, FAQPage, BreadcrumbList, Article, or Product templates. Use for structured-data checks, rich-result issues, and JSON-LD generation."
 ---
 
 # seo-schema

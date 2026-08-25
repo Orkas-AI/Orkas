@@ -232,11 +232,13 @@ describe('html_preview tool', () => {
         },
       },
     });
-    expect(tool.description).toContain('target defaults to desktop');
-    expect(tool.description).toContain('responsive only on a user multi-device request');
-    expect(tool.description).toContain('screenshots defaults to false');
-    expect(tool.description).toContain('set it false for visual-only UI review');
-    expect(tool.description).toContain('never invokes a separate vision API');
+    const properties = tool.inputSchema.properties as any;
+    expect(tool.description).toContain('isolated, network-blocked browser');
+    expect(properties.target.description).toContain('Defaults to desktop');
+    expect(properties.target.description).toContain('responsive only when viewport-dependent reflow is explicitly requested');
+    expect(properties.screenshots.description).toContain('Defaults to false');
+    expect(properties.screenshots.description).toContain('never invokes a separate vision API');
+    expect(properties.interactions.description).toContain('Set false for visual-only UI review');
   });
 
   it('returns deterministic evidence without model images by default', async () => {
@@ -515,6 +517,19 @@ describe('html_preview tool', () => {
       { name: 'desktop', width: 1280, height: 720 },
       { name: 'mobile', width: 360, height: 780 },
     ]);
+  });
+
+  it('preserves browser-unavailable as an infrastructure-specific result code', async () => {
+    const { render, tool, workspace, context } = await buildTool();
+    fs.writeFileSync(path.join(workspace, 'index.html'), '<!doctype html><main>Preview</main>');
+    render.mockRejectedValueOnce(new Error(
+      'E_HTML_PREVIEW_BROWSER_UNAVAILABLE: Electron BrowserWindow is unavailable',
+    ));
+
+    const result = await tool.execute({ path: 'index.html' }, context);
+
+    expect(result).toMatchObject({ isError: true });
+    expect(result.content).toMatch(/^E_HTML_PREVIEW_BROWSER_UNAVAILABLE:/);
   });
 
   it('rejects invalid, missing, and out-of-workspace entries before starting the renderer', async () => {

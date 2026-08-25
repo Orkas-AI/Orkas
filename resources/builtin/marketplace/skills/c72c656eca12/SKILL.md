@@ -1,9 +1,7 @@
 ---
 name: office-word
-description_zh: 使用内置 Office 工具创建、读取、编辑和检查 Word / DOCX 文档，重点保护样式、编号、修订、批注、字段、表格、分节和页眉页脚。适合“做一份 Word 报告”“修改这份 DOCX 并保留格式”“检查长文档编号和版式”；触发词：Word、DOCX、文档、修订、批注、字段、模板、排版、编号、页眉页脚
-description_en: Use the built-in Office tools to create, read, edit, and check Word/DOCX documents while protecting styles, numbering, revisions, comments, fields, tables, sections, headers, and footers. Use for Word reports, DOCX edits, redlines, comments, templates, numbering cleanup, and layout-safe delivery.
-category: office
-min_app_version: 1.6.1
+description_zh: "创建、读取、编辑和检查 Word/DOCX 文档，并保护样式、编号、修订、批注、字段、表格、分节和页眉页脚；用于 Word 报告、保格式修改、红线批注、模板套用、编号清理和版式安全交付。"
+description_en: "Create, read, edit, and check Word/DOCX documents while protecting styles, numbering, revisions, comments, fields, tables, sections, headers, and footers. Use for Word reports, format-safe edits, redlines, comments, templates, numbering cleanup, and layout-safe delivery."
 ---
 
 # Office Word
@@ -12,13 +10,13 @@ min_app_version: 1.6.1
 
 Use the bundled Office tools as the default path. Do not install OfficeCLI or document libraries when these tools are available.
 
-- Use `stat_file` before `read_file` for broad text inspection.
+- Use `read_files` with one `paths` item for broad text inspection; use `metadata_only:true` when only prepared metadata is needed.
 - Use `create_docx` for a new `.docx`.
 - Use `office_read` to discover stable element paths before a precise edit.
 - Pass the pre-existing source to `edit_office`; it creates the separate
   `-edited` working copy automatically. Never copy or edit the user's only
   source yourself.
-- Run `office_check` after every create or edit, then use `office_render` on representative pages when layout matters.
+- After every create or edit, use `office_review` with `action:"check_and_render"` on representative pages when layout matters, or `action:"check"` for structural-only validation.
 
 The built-in engine supports `.docx`, not legacy `.doc`. Require conversion before editing a legacy file. Do not execute macros or embedded code.
 

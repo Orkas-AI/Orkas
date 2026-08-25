@@ -43,6 +43,20 @@ import {
 export type { Violation, ValidationReport, Level } from './types';
 export { VALIDATOR_VERSION } from './types';
 
+export type SkillValidationSource =
+  | 'custom'
+  | 'marketplace'
+  | 'system'
+  | 'agent-private';
+
+export interface SkillValidationOptions {
+  enforceSkillRunner?: boolean;
+  /** Source ownership decides whether standalone Marketplace metadata is
+   * required. System freshness belongs to its manifest; private-Skill
+   * freshness and category belong to the parent Agent. */
+  source?: SkillValidationSource;
+}
+
 // ── File-level skill validation ─────────────────────────────────────────
 
 /**
@@ -82,7 +96,7 @@ export function validateSkillFile(args: {
  */
 export function validateSkillDir(
   skillDir: string,
-  options: { enforceSkillRunner?: boolean } = {},
+  options: SkillValidationOptions = {},
 ): ValidationReport {
   const violations: Violation[] = [];
   const skillMdPath = path.join(skillDir, 'SKILL.md');
@@ -107,8 +121,11 @@ export function validateSkillDir(
       'SKILL.md',
       meta,
       options.enforceSkillRunner !== false,
+      options.source === 'system',
     ));
-    violations.push(...validateSkillMeta(meta));
+    if (options.source !== 'system' && options.source !== 'agent-private') {
+      violations.push(...validateSkillMeta(meta));
+    }
   } catch (err) {
     violations.push(parseFailureViolation({
       kind: 'frontmatter',
@@ -227,6 +244,7 @@ function _scanSkillMd(
   field: string,
   skillMeta: Record<string, unknown> = {},
   enforceSkillRunner = true,
+  allowFrontmatterExtensions = false,
 ): Violation[] {
   const violations: Violation[] = [];
 
@@ -241,7 +259,9 @@ function _scanSkillMd(
     }));
     return violations;
   }
-  violations.push(...validateSkillFrontmatter(meta, skillMeta));
+  violations.push(...validateSkillFrontmatter(meta, skillMeta, {
+    allowExtensionFields: allowFrontmatterExtensions,
+  }));
   if (enforceSkillRunner) {
     violations.push(...scanSkillRunnerContract({ content, field }));
   }

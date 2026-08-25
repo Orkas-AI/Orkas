@@ -32,7 +32,7 @@
  * If ANY dependency install throws, the whole agent install fails; the agent never gets recorded.
  * **Why:** prevents "agent installed but its skills are missing" inconsistency that would survive
  * across devices via the cloud manifest. Previously-installed skills from a partial retry are
- * no-ops (`_skillAlreadyOnDisk` check), so retry-on-failure is cheap. The user just re-clicks
+ * no-ops (`_marketplaceSkillDependencyInstalled` check), so retry-on-failure is cheap. The user just re-clicks
  * Install.
  *
  * Upload + delete (publishing custom items to the Server) are dev-only and live in
@@ -60,7 +60,6 @@ import {
 } from '../util/app-version-compat';
 
 import {
-  userSkillsDir,
   userMarketplaceAgentDir, userMarketplaceSkillDir,
   userMarketplaceAgentsDir, userMarketplaceSkillsDir,
   marketplaceCacheAgentDir, marketplaceCacheSkillDir,
@@ -641,8 +640,8 @@ function _agentJsonName(agentJson: Record<string, unknown>): string {
 
 const SKILL_DISPLAY_REF_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/;
 const BUILTIN_WORKFLOW_REFS = new Set([
-  'read_file', 'write_file', 'bash', 'kb_search', 'kb_read',
-  'markdown_to_pdf', 'html_to_pdf', 'generate_image', 'web_search', 'web_fetch',
+  'read_files', 'write_file', 'bash', 'library',
+  'create_pdf', 'generate_image', 'web_search', 'web_fetch',
 ]);
 
 function _agentSkillDependencyDisplayNames(
@@ -876,7 +875,7 @@ async function _installMarketplaceAgentLocked(
 
     // 2. Install dependent standalone skills FIRST, in parallel. Any failure throws — the agent body
     //    and manifest entry are never touched, so retry is a clean re-run (previously-installed
-    //    skills short-circuit via `_skillAlreadyOnDisk`). This is the atomicity guarantee called
+    //    skills short-circuit via `_marketplaceSkillDependencyInstalled`). This is the atomicity guarantee called
     //    out in the file header.
     const skillList = Array.isArray((detail.agent_json as Record<string, unknown>).skill_list)
       ? ((detail.agent_json as Record<string, unknown>).skill_list as unknown[])
@@ -885,7 +884,7 @@ async function _installMarketplaceAgentLocked(
       : [];
     const depSkillNames = _agentSkillDependencyDisplayNames(detail.agent_json, skillList);
     const missingSkillIds = skillList.filter(
-      (sid) => !privateSkillIds.has(sid) && !_skillAlreadyOnDisk(sid, uid),
+      (sid) => !privateSkillIds.has(sid) && !_marketplaceSkillDependencyInstalled(sid, uid),
     );
     if (missingSkillIds.length > 0) {
       await Promise.all(missingSkillIds.map(async (sid) => {
@@ -1073,6 +1072,7 @@ async function _installMarketplaceSkillLocked(
       // install. A rejected or malformed update must leave the old version
       // intact and retryable.
       const skillReport = validateSkillDir(staged, {
+        source: 'marketplace',
         // Installation restores published bytes verbatim. Runner compatibility
         // is enforced while authoring/publishing, not retroactively on install.
         enforceSkillRunner: false,
@@ -1128,13 +1128,12 @@ async function _installMarketplaceSkillLocked(
   }
 }
 
-/** Check if a skill is already present in any local source — either as a custom skill under
- *  `<uid>/cloud/skills/<id>/` OR a marketplace install under `<uid>/local/marketplace/skills/<id>/`.
- *  Both are valid; cascade install only triggers when missing. */
-function _skillAlreadyOnDisk(skillId: string, uid = getActiveUserId()): boolean {
+/** Agent dependency ids refer to marketplace resources. A custom Skill with
+ * the same id is a separate source and cannot satisfy that provenance: doing
+ * so would skip the official install and make the Agent resolve differently
+ * across machines. */
+function _marketplaceSkillDependencyInstalled(skillId: string, uid = getActiveUserId()): boolean {
   try {
-    const customRoot = userSkillsDir(uid);
-    if (fs.existsSync(path.join(customRoot, skillId, 'SKILL.md'))) return true;
     const installedDir = userMarketplaceSkillDir(uid, skillId);
     if (fs.existsSync(path.join(installedDir, 'SKILL.md'))) return true;
   } catch { /* getActiveUserId throws when no active uid */ }

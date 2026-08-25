@@ -1,8 +1,6 @@
 export { AgentRunner } from "./runner.js";
 export type {
   ReflectionModelCallEvent,
-  SharedHistorySummaryCache,
-  SharedHistorySummaryCheckpoint,
 } from "./runner.js";
 export { Session } from "./session.js";
 export { PersistentSession } from "./persistent-session.js";
@@ -19,6 +17,7 @@ export type {
   ExecutionPlanUpdate,
   HistoryResource,
   HistoryResourceKind,
+  ToolSurfaceState,
 } from "./session.js";
 export type { RepositoryInstructionFile, RepositoryInstructions } from "./repository-instructions.js";
 export {

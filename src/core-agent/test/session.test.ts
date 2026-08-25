@@ -12,8 +12,11 @@ import {
   COMPLETED_WORK_MODEL_MAX_ENTRIES,
   EXECUTION_PLAN_AUDIT_MAX_ENTRIES,
   HISTORY_EXACT_FACTS_HEADING,
-  HISTORY_EXACT_FACTS_MAX_ITEMS,
+  HISTORY_EXACT_FACTS_MAX_TOKENS,
+  estimateTextTokens,
   HISTORY_RAW_RETAIN_TOKEN_BUDGET,
+  HISTORY_SUMMARY_MAX_TOKENS,
+  IMAGE_BLOCK_ESTIMATE_TOKENS,
   DEFAULT_CONTEXT_BUDGET,
   contextBudget,
 } from "../src/agent/session.js";
@@ -177,7 +180,7 @@ describe("Session", () => {
     });
   });
 
-  it("keeps old large tool results verbatim in model and summary views", () => {
+  it("keeps old large tool results verbatim in the model view", () => {
     const session = new Session();
     const raw = "0123456789" + "x".repeat(2_000) + "TAIL!";
 
@@ -189,13 +192,9 @@ describe("Session", () => {
     expect(modelResult.type).toBe("tool_result");
     expect((modelResult as { content: string }).content).toBe(raw);
     expect((modelResult as { content: string }).content).not.toContain("<compacted-tool-result");
-
-    const summaryResult = session.getMessagesForSummary()[1].content[0];
-    expect(summaryResult.type).toBe("tool_result");
-    expect((summaryResult as { content: string }).content).toBe(raw);
   });
 
-  it("keeps old tool_use inputs verbatim in model and summary views", () => {
+  it("keeps old tool_use inputs verbatim in the model view", () => {
     const session = new Session();
     const fileContent = "START-" + "x".repeat(900) + "-END";
     const command = "printf " + "y".repeat(900);
@@ -214,13 +213,7 @@ describe("Session", () => {
     expect(toolUses[0].input).toEqual({ path: "/tmp/a.txt", content: fileContent });
     expect(toolUses[1].input).toEqual({ command });
 
-    const summaryToolUses = session.getMessagesForSummary()
-      .flatMap((m) => m.content)
-      .filter((c) => c.type === "tool_use") as Array<{ input: Record<string, unknown> }>;
-    expect(summaryToolUses[0].input).toEqual({ path: "/tmp/a.txt", content: fileContent });
-    expect(summaryToolUses[1].input).toEqual({ command });
-
-    const serialized = JSON.stringify(summaryToolUses.map((u) => u.input));
+    const serialized = JSON.stringify(toolUses.map((u) => u.input));
     expect(serialized).not.toContain("__orkas_compacted_tool_use");
     expect(serialized).not.toContain("old tool input string compacted");
   });
@@ -333,42 +326,6 @@ describe("Session", () => {
     expect(session.getPendingHistoryArchive()?.turnIds).toEqual(candidate.turnIds);
   });
 
-  it("builds shared history input from canonical turns without private session context", () => {
-    const session = new Session();
-    for (let i = 0; i < 3; i++) {
-      session.beginUserTurn([{ type: "text", text: `Canonical user ${i}` }]);
-      session.addAssistantMessage([{ type: "text", text: `Canonical answer ${i}` }]);
-      session.completeActiveTurn();
-    }
-    session.applyHistorySummary(
-      `PRIVATE_SESSION_SUMMARY\n\n${HISTORY_EXACT_FACTS_HEADING}\n- private_nonce=secret`,
-      [1],
-      "canonical-message-1",
-    );
-    session.addHistoryResource({
-      kind: "final_output",
-      path: "/private/agent/output.txt",
-      name: "PRIVATE_RESOURCE",
-    });
-
-    const input = JSON.stringify(session.buildSharedHistoryArchiveMessages(0, 2));
-    expect(input).toContain("Canonical user 0");
-    expect(input).toContain("Canonical answer 1");
-    expect(input).not.toContain("PRIVATE_SESSION_SUMMARY");
-    expect(input).not.toContain("private_nonce=secret");
-    expect(input).not.toContain("PRIVATE_RESOURCE");
-
-    session.applyHistorySummary("Shared canonical summary", [1, 2], "canonical-message-2");
-    const state = session.getSerializedContextState()!;
-    expect(state.summaryThroughTurnId).toBe(2);
-    expect(state.summaryThroughMessageId).toBe("canonical-message-2");
-
-    const restored = new Session();
-    restored.restoreContextState(state);
-    expect(restored.getSerializedContextState()?.summaryThroughMessageId)
-      .toBe("canonical-message-2");
-  });
-
   it("accumulates exact history facts outside probabilistic rolling summaries", () => {
     const session = new Session();
     session.beginUserTurn([{ type: "text", text: "Remember the deployment facts" }]);
@@ -437,16 +394,17 @@ describe("Session", () => {
     ]);
   });
 
-  it("retains the newest facts when the bounded history ledger is full", () => {
+  it("retains the newest facts when the token budget is full", () => {
     const session = new Session();
     session.beginUserTurn([{ type: "text", text: "Remember a bounded fact set" }]);
     session.addAssistantMessage([{ type: "text", text: "Recorded." }]);
     session.completeActiveTurn();
+    // ~10 estimated tokens per fact; 700 of them overshoot the 6,000-token
+    // budget by ~17%, so the oldest hundred-odd must go while everything
+    // newer survives — including far more than the old 128-item cap allowed.
+    const factOf = (index: number) => `fact-${String(index).padStart(4, "0")}-${"x".repeat(28)}`;
     const state = session.getSerializedContextState()!;
-    state.historyExactFacts = Array.from(
-      { length: HISTORY_EXACT_FACTS_MAX_ITEMS },
-      (_, index) => `fact-${index}`,
-    );
+    state.historyExactFacts = Array.from({ length: 700 }, (_, index) => factOf(index));
     session.restoreContextState(state);
 
     session.applyHistorySummary(
@@ -455,12 +413,49 @@ describe("Session", () => {
     );
 
     const facts = session.getSerializedContextState()!.historyExactFacts!;
-    expect(facts).toHaveLength(HISTORY_EXACT_FACTS_MAX_ITEMS);
-    expect(facts).not.toContain("fact-0");
+    const totalTokens = facts.reduce((sum, item) => sum + estimateTextTokens(item), 0);
+    expect(totalTokens).toBeLessThanOrEqual(HISTORY_EXACT_FACTS_MAX_TOKENS);
+    // The count cap is gone: short facts retain well past the old 128 line.
+    expect(facts.length).toBeGreaterThan(128);
+    expect(facts.length).toBeLessThan(700);
+    expect(facts).not.toContain(factOf(0));
     expect(facts.at(-1)).toBe("newest-fact");
     const view = JSON.stringify(session.getMessagesForModel());
     expect(view).toContain("host-persisted model extraction");
     expect(view).not.toContain("deterministic host state, not a summary");
+  });
+
+  // The budget is denominated in tokens, not characters, so languages pay the
+  // same price: a CJK pool retains fewer ITEMS than an ASCII pool of equal
+  // per-item character length, but both stop at the same token spend. Under
+  // the old char budget the same two pools were priced 2-4x apart.
+  it("prices the facts budget equally across languages", () => {
+    const fill = (item: (index: number) => string) => {
+      const session = new Session();
+      session.beginUserTurn([{ type: "text", text: "fairness" }]);
+      session.addAssistantMessage([{ type: "text", text: "ok" }]);
+      session.completeActiveTurn();
+      const state = session.getSerializedContextState()!;
+      state.historyExactFacts = Array.from({ length: 900 }, (_, index) => item(index));
+      session.restoreContextState(state);
+      session.applyHistorySummary(
+        `S\n\n${HISTORY_EXACT_FACTS_HEADING}\n- probe`,
+        [1],
+      );
+      const facts = session.getSerializedContextState()!.historyExactFacts!;
+      return {
+        count: facts.length,
+        tokens: facts.reduce((sum, f) => sum + estimateTextTokens(f), 0),
+      };
+    };
+    const ascii = fill((index) => `a${String(index).padStart(4, "0")}-${"x".repeat(25)}`);
+    const cjk = fill((index) => `汉${String(index).padStart(4, "0")}-${"字".repeat(25)}`);
+    expect(ascii.tokens).toBeLessThanOrEqual(HISTORY_EXACT_FACTS_MAX_TOKENS);
+    expect(cjk.tokens).toBeLessThanOrEqual(HISTORY_EXACT_FACTS_MAX_TOKENS);
+    // Equal token spend, different item counts — that asymmetry is the point.
+    expect(cjk.count).toBeLessThan(ascii.count);
+    expect(ascii.tokens).toBeGreaterThan(HISTORY_EXACT_FACTS_MAX_TOKENS * 0.8);
+    expect(cjk.tokens).toBeGreaterThan(HISTORY_EXACT_FACTS_MAX_TOKENS * 0.8);
   });
 
   it("migrates an older sidecar whose history exact facts were embedded in summary prose", () => {
@@ -729,6 +724,85 @@ describe("Session", () => {
     // inside the wide one's.
     expect(build().getPendingActiveCheckpoint(wide)).toBeNull();
     expect(build().getPendingActiveCheckpoint(narrow)).toBeTruthy();
+  });
+
+  // 2026-08-16 latency review P1-5: the estimator weighs CJK at 1.5 tok/char
+  // against real tokenizers' ~0.6-1.0, so Chinese-heavy sessions crossed the
+  // segment triggers 1.5-2.5x early — each early fire is one extra 29-105s
+  // summarization call. Anchored calls observe the real/estimated ratio of the
+  // previous request; the trigger comparisons scale by it.
+  it("anchored calibration defers the active-checkpoint trigger, and heavier traffic still fires it", () => {
+    const build = (steps: number) => {
+      const session = new Session();
+      session.beginUserTurn([{ type: "text", text: "Calibrated task" }]);
+      for (let i = 0; i < steps; i++) {
+        session.addAssistantMessage([{ type: "tool_use", id: `k-${i}`, name: "bash", input: { command: `c-${i}` } }]);
+        session.addToolResult(`k-${i}`, `out-${i}\n${"x".repeat(8_000)}`, undefined, false);
+      }
+      return session;
+    };
+
+    // Baseline: ~20K estimated tokens of live tool traffic crosses the 18K
+    // default trigger.
+    expect(build(10).getPendingActiveCheckpoint()).toBeTruthy();
+
+    // Provider truth says the estimate runs 2x hot: the same traffic defers...
+    const calibrated = build(10);
+    calibrated.setEstimatorCalibration(1_000, 2_000);
+    expect(calibrated.getEstimatorCalibration()).toBe(0.5);
+    expect(calibrated.getPendingActiveCheckpoint()).toBeNull();
+
+    // ...but calibration only defers — heavier traffic fires even at 0.5.
+    const heavier = build(22);
+    heavier.setEstimatorCalibration(1_000, 2_000);
+    expect(heavier.getPendingActiveCheckpoint()).toBeTruthy();
+  });
+
+  it("anchored calibration defers the history-archive trigger the same way", () => {
+    const build = (turns: number) => {
+      const session = new Session();
+      for (let t = 0; t < turns; t++) {
+        session.beginUserTurn([{ type: "text", text: `question ${t}` }]);
+        session.addAssistantMessage([{ type: "text", text: `answer ${t}\n${"y".repeat(2_000)}` }]);
+        session.completeActiveTurn();
+      }
+      return session;
+    };
+
+    expect(build(30).getPendingHistoryArchive()).toBeTruthy();
+
+    const calibrated = build(30);
+    calibrated.setEstimatorCalibration(1, 2);
+    expect(calibrated.getPendingHistoryArchive()).toBeNull();
+
+    const heavier = build(70);
+    heavier.setEstimatorCalibration(1, 2);
+    expect(heavier.getPendingHistoryArchive()).toBeTruthy();
+  });
+
+  it("clamps calibration to [0.5, 1], ignores unusable observations, and resets on clear", () => {
+    const session = new Session();
+    expect(session.getEstimatorCalibration()).toBe(1);
+
+    session.setEstimatorCalibration(7, 10);
+    expect(session.getEstimatorCalibration()).toBe(0.7);
+
+    // Unusable observations keep the last known ratio rather than resetting it.
+    session.setEstimatorCalibration(0, 10);
+    session.setEstimatorCalibration(10, 0);
+    session.setEstimatorCalibration(Number.NaN, 10);
+    expect(session.getEstimatorCalibration()).toBe(0.7);
+
+    // Correction is capped at 2x…
+    session.setEstimatorCalibration(1, 10);
+    expect(session.getEstimatorCalibration()).toBe(0.5);
+    // …and under-estimation is never "corrected" into earlier firing.
+    session.setEstimatorCalibration(30, 10);
+    expect(session.getEstimatorCalibration()).toBe(1);
+
+    session.setEstimatorCalibration(6, 10);
+    session.clear();
+    expect(session.getEstimatorCalibration()).toBe(1);
   });
 
   // Used by the emergency path, which runs when summarization is unavailable
@@ -1137,119 +1211,91 @@ describe("Session", () => {
     expect(view.some((m) => m.content.some((c) => (c as { text?: string }).text === "Q6"))).toBe(true);
   });
 
-  it("compacts session with summary", () => {
-    const session = new Session();
-
-    // Add several messages
-    for (let i = 0; i < 6; i++) {
-      session.addUserMessage(`Message ${i}`);
-      session.addAssistantMessage([{ type: "text", text: `Response ${i}` }]);
-    }
-
-    const beforeLength = session.length;
-    session.compact("This is a summary of the conversation.");
-
-    expect(session.length).toBeLessThan(beforeLength);
-    // First message should contain the summary
-    const msgs = session.getMessages();
-    const firstText = msgs[0].content[0];
-    expect(firstText.type).toBe("text");
-    expect((firstText as { text: string }).text).toContain("summary");
+  // Image blocks cost real tokens (provider caps sit around 1,600 per image)
+  // but the estimator priced them at zero, so image-heavy turns — frame
+  // screenshots from browser/video tools — were invisible to every derived
+  // trigger and budget until the provider refused the request.
+  it("prices image blocks instead of estimating them at zero", () => {
+    const textOnly = new Session();
+    textOnly.addUserMessage("inspect the frames");
+    const withImages = new Session();
+    withImages.addMessage("user", [
+      { type: "text", text: "inspect the frames" },
+      { type: "image", data: "aW1n", mediaType: "image/png" },
+      { type: "image", data: "aW1n", mediaType: "image/png" },
+    ]);
+    expect(withImages.estimateTokens() - textOnly.estimateTokens())
+      .toBe(2 * IMAGE_BLOCK_ESTIMATE_TOKENS);
   });
 
-  // Pairing invariant — compact's slice(-keepCount) can land its head on a
-  // tool_result-only user message whose tool_use is in the about-to-be-
-  // discarded older slice. Without the leading-orphan drop in compact(),
-  // the next provider call sends a function_call_output with no matching
-  // function_call and OpenAI / Anthropic reject with
-  // "No tool call found for function call output with call_id ...".
-  // Reproduced as the user-reported bug at runner.ts:374 (mid-turn
-  // compaction triggered by the 82% context guard) where post-compact
-  // heal hadn't run yet.
-  it("compact drops leading orphan tool_result whose tool_use was sliced off", () => {
+  it("image-heavy tool steps reach the active checkpoint trigger", () => {
     const session = new Session();
-    // Build a 6-message history: text round + 2 tool rounds + final text.
-    // Slice(-4) lands head on the tool_result for call-X whose tool_use is
-    // at position 1 (about to be dropped).
-    session.addUserMessage("kick off");                                          // 0
-    session.addAssistantMessage([{ type: "tool_use", id: "call-X", name: "a", input: {} }]); // 1
-    session.addToolResult("call-X", "ok-X", undefined, false);                   // 2
-    session.addAssistantMessage([{ type: "tool_use", id: "call-Y", name: "b", input: {} }]); // 3
-    session.addToolResult("call-Y", "ok-Y", undefined, false);                   // 4
-    session.addAssistantMessage([{ type: "text", text: "done" }]);               // 5
+    session.beginUserTurn([{ type: "text", text: "render the video frames" }]);
+    // 14 steps, each returning one screenshot: ~22K estimated tokens of
+    // images against the 18K default trigger. With images priced at zero
+    // this turn estimated as a few hundred tokens and never produced a
+    // checkpoint candidate while the real request kept growing.
+    for (let i = 0; i < 14; i++) {
+      session.addAssistantMessage([{ type: "tool_use", id: `frame-${i}`, name: "screenshot", input: { frame: i } }]);
+      session.addToolResult(`frame-${i}`, `frame ${i} captured`, [
+        { data: "aW1n", mediaType: "image/png" },
+      ]);
+    }
+    const candidate = session.getPendingActiveCheckpoint();
+    expect(candidate).not.toBeNull();
+    expect(candidate!.tokensBefore).toBeGreaterThan(ACTIVE_PROCESS_TRIGGER_TOKENS);
+  });
 
-    session.compact("summary");
-
-    const msgs = session.getMessages();
-    // Layout: [summary, understood, ...kept (orphan tool_result-X dropped)].
-    // Expected kept = [3, 4, 5] = [tool_use(Y), tool_result(Y), text].
-    expect(msgs).toHaveLength(5);
-    expect(msgs[0].role).toBe("user");
-    expect((msgs[0].content[0] as { text: string }).text).toContain("summary");
-    expect(msgs[1].role).toBe("assistant");
-    // The third message must NOT be the orphan tool_result for call-X.
-    expect(msgs[2].role).toBe("assistant");
-    expect((msgs[2].content[0] as { type: string }).type).toBe("tool_use");
-    expect((msgs[2].content[0] as { id: string }).id).toBe("call-Y");
-    // No tool_result for call-X anywhere — its tool_use was sliced away.
-    const allContent = msgs.flatMap((m) => m.content);
-    const orphanX = allContent.find(
-      (c) => (c as { type?: string }).type === "tool_result"
-        && (c as { toolUseId?: string }).toolUseId === "call-X",
+  // Persistent-block shrink: the overflow-recovery lever for the one part of
+  // the projection no compaction layer can reduce. REPLACE semantics are the
+  // point — a merge would keep every prior fact and re-grow what the shrink
+  // removed.
+  it("persistent-block shrink replaces the facts pool instead of merging into it", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "long project" }]);
+    session.addAssistantMessage([{ type: "text", text: "ack" }]);
+    session.completeActiveTurn();
+    const staleFacts = Array.from({ length: 40 }, (_, i) => `- stale_fact_${i}: value ${"v".repeat(200)}`);
+    session.applyHistorySummary(
+      `Long-running summary prose. ${"p".repeat(9_000)}\n${HISTORY_EXACT_FACTS_HEADING}\n${staleFacts.join("\n")}`,
+      [1],
     );
-    expect(orphanX).toBeUndefined();
+
+    const candidate = session.getPersistentBlockShrinkCandidate();
+    expect(candidate).not.toBeNull();
+    expect(candidate!.estimatedTokens).toBeGreaterThan(HISTORY_SUMMARY_MAX_TOKENS * 2);
+
+    const epochBefore = session.contentEpoch();
+    session.applyPersistentBlockShrink(
+      `Shrunk prose.\n${HISTORY_EXACT_FACTS_HEADING}\n- kept_fact_1: run id RX-7`,
+    );
+    // Rewrite is a content rewrite: the request-token anchor must fall back.
+    expect(session.contentEpoch()).toBeGreaterThan(epochBefore);
+
+    const state = session.getSerializedContextState();
+    expect(state?.historySummary).toContain("Shrunk prose");
+    expect(state?.historySummary).not.toContain("Long-running summary");
+    const facts = JSON.stringify(state?.historyExactFacts ?? []);
+    expect(facts).toContain("kept_fact_1");
+    // The stale facts must be GONE — merge semantics would have kept them.
+    expect(facts).not.toContain("stale_fact_0");
   });
 
-  it("compact preserves tool_result whose tool_use IS within kept window", () => {
+  it("persistent-block shrink declines small blocks and empty rewrites", () => {
     const session = new Session();
-    // Slice(-4) here lands on the tool_use itself, so the pair is intact.
-    session.addUserMessage("kick off");                                          // 0
-    session.addAssistantMessage([{ type: "text", text: "ack" }]);                // 1
-    session.addAssistantMessage([{ type: "tool_use", id: "call-Z", name: "a", input: {} }]); // 2
-    session.addToolResult("call-Z", "ok-Z", undefined, false);                   // 3
-    session.addAssistantMessage([{ type: "text", text: "done" }]);               // 4
+    session.beginUserTurn([{ type: "text", text: "short project" }]);
+    session.addAssistantMessage([{ type: "text", text: "ack" }]);
+    session.completeActiveTurn();
+    session.applyHistorySummary(`Small summary.\n${HISTORY_EXACT_FACTS_HEADING}\n- one_fact: ok`, [1]);
 
-    session.compact("summary");
+    // Well under the threshold: not worth a rewrite call.
+    expect(session.getPersistentBlockShrinkCandidate()).toBeNull();
 
-    const msgs = session.getMessages();
-    // kept = [1, 2, 3, 4] — all four tail messages survive because none
-    // of them is a tool_result-only user message at the head boundary.
-    expect(msgs.length).toBe(6);
-    // tool_use(Z) and its tool_result(Z) both present, in order.
-    const flat = msgs.flatMap((m) => m.content);
-    expect(flat.some((c) => (c as { type?: string }).type === "tool_use" && (c as { id?: string }).id === "call-Z")).toBe(true);
-    expect(flat.some((c) => (c as { type?: string }).type === "tool_result" && (c as { toolUseId?: string }).toolUseId === "call-Z")).toBe(true);
-  });
-
-  // estimateKeptTailTokens powers the runner's "skip a no-progress compaction"
-  // guard: it must report the tokens of exactly the tail compact() preserves.
-  it("estimateKeptTailTokens counts only the tail compact() would keep", () => {
-    const session = new Session();
-    for (let i = 0; i < 8; i++) {
-      session.addUserMessage(`older message number ${i} with several words`);
-      session.addAssistantMessage([{ type: "text", text: `older response ${i}` }]);
-    }
-    const tail = session.estimateKeptTailTokens();
-    const all = session.estimateTokens();
-    // The kept tail is at most the last 4 messages — a strict subset of 16.
-    expect(tail).toBeGreaterThan(0);
-    expect(tail).toBeLessThan(all);
-  });
-
-  it("estimateKeptTailTokens ~= total when a huge result dominates the kept tail", () => {
-    const session = new Session();
-    session.addUserMessage("kick off");                                              // 0 (older)
-    session.addAssistantMessage([{ type: "text", text: "starting" }]);               // 1
-    session.addAssistantMessage([{ type: "tool_use", id: "call-read", name: "read_file", input: { path: "big.txt" } }]); // 2
-    session.addToolResult("call-read", "x".repeat(400_000), undefined, false);       // 3 (huge, cap-exempt)
-    session.addAssistantMessage([{ type: "text", text: "read it" }]);                // 4
-
-    const tail = session.estimateKeptTailTokens();
-    const all = session.estimateTokens();
-    // The huge read_file result sits in the kept tail (last 4), so a compaction
-    // would free almost nothing (only message 0). The runner's guard reads this
-    // as "no progress" and skips the wasteful summary pass.
-    expect(all - tail).toBeLessThan(all * 0.05);
+    // An empty rewrite must not wipe the blocks.
+    const epochBefore = session.contentEpoch();
+    session.applyPersistentBlockShrink("   ");
+    expect(session.contentEpoch()).toBe(epochBefore);
+    expect(session.getSerializedContextState()?.historySummary).toContain("Small summary");
   });
 
   it("clear removes all messages", () => {
@@ -1350,10 +1396,23 @@ describe("Session execution plan anchor", () => {
     expect(tail).toContain("Implement the long-running import safely");
     expect(tail).toContain("Implement bounded streaming");
     expect(tail).toContain("in_progress");
+    expect(tail).toContain("step_2 [in_progress]");
+    expect(tail).not.toContain("For the same user instruction, preserve every existing milestone");
     expect(plan.objective).toBe("Implement the long-running import safely");
 
     expect(JSON.stringify(session.getMessages())).not.toContain("Execution plan anchor");
-    expect(JSON.stringify(session.getMessagesForSummary())).not.toContain("Execution plan anchor");
+    // The plan must not leak into the history summarizer's input either — the
+    // L1 archive candidate carries the real summarizer-facing messages (a
+    // floor-low trigger materializes the candidate for this small fixture).
+    session.completeActiveTurn();
+    const candidate = session.getPendingHistoryArchive({
+      ...DEFAULT_CONTEXT_BUDGET,
+      historyTrigger: 1,
+      historyRetainTokens: 0,
+      historySingleTurnMaxTokens: 0,
+    });
+    expect(candidate).not.toBeNull();
+    expect(JSON.stringify(candidate!.messages)).not.toContain("Execution plan anchor");
   });
 
   it("survives an active checkpoint even when the checkpoint omits the goal", () => {
@@ -1609,6 +1668,143 @@ describe("Session execution plan anchor", () => {
     expect(JSON.stringify(session.getMessages())).not.toContain("Completed work ledger");
   });
 
+  it("does not duplicate a completed-work entry while its raw tool result is model-visible", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Inspect the source and continue from the result" }]);
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "call-visible",
+      name: "read_file",
+      input: { path: "src/example.ts" },
+    }]);
+    session.addToolResult("call-visible", "VISIBLE_RESULT_SENTINEL", undefined, false);
+    const tokensWithRawResultOnly = session.estimateModelTokens();
+
+    session.recordCompletedWork({
+      toolCallId: "call-visible",
+      tool: "read_file",
+      inputDigest: "visible:1",
+      inputSummary: "read src/example.ts",
+      status: "succeeded",
+      resultSummary: "VISIBLE_RESULT_SENTINEL",
+    });
+
+    const modelView = JSON.stringify(session.getMessagesForModel());
+    expect(modelView.match(/VISIBLE_RESULT_SENTINEL/g)).toHaveLength(1);
+    expect(modelView).not.toContain("Completed work ledger");
+    expect(session.estimateModelTokens()).toBe(tokensWithRawResultOnly);
+    expect(session.getCompletedWorkLedger()).toHaveLength(1);
+  });
+
+  it("projects only completed work whose raw result is hidden by a partial checkpoint", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Process both sources without losing earlier outcomes" }]);
+
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "call-hidden",
+      name: "read_file",
+      input: { path: "src/old.ts" },
+    }]);
+    session.addToolResult("call-hidden", "HIDDEN_RAW_RESULT", undefined, false);
+    session.recordCompletedWork({
+      toolCallId: "call-hidden",
+      tool: "read_file",
+      inputDigest: "hidden:1",
+      inputSummary: "read src/old.ts",
+      status: "succeeded",
+      resultSummary: "HIDDEN_LEDGER_RESULT",
+    });
+
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "call-recent",
+      name: "read_file",
+      input: { path: "src/recent.ts" },
+    }]);
+    session.addToolResult("call-recent", "RECENT_RAW_RESULT", undefined, false);
+    session.recordCompletedWork({
+      toolCallId: "call-recent",
+      tool: "read_file",
+      inputDigest: "recent:1",
+      inputSummary: "read src/recent.ts",
+      status: "succeeded",
+      resultSummary: "RECENT_LEDGER_RESULT",
+    });
+
+    session.applyActiveCheckpointSummary("The first source was processed.", 2);
+
+    const modelView = JSON.stringify(session.getMessagesForModel());
+    expect(modelView).not.toContain("HIDDEN_RAW_RESULT");
+    expect(modelView).toContain("HIDDEN_LEDGER_RESULT");
+    expect(modelView).toContain("RECENT_RAW_RESULT");
+    expect(modelView).not.toContain("RECENT_LEDGER_RESULT");
+    expect(modelView).toContain("Completed work ledger");
+  });
+
+  it("restores a failed completed-work entry after its raw error is checkpointed", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Diagnose the failing command" }]);
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "call-failed",
+      name: "bash",
+      input: { command: "npm test" },
+    }]);
+    session.addToolResult("call-failed", "RAW_FAILURE_DETAIL", undefined, true);
+    session.recordCompletedWork({
+      toolCallId: "call-failed",
+      tool: "bash",
+      inputDigest: "failed:1",
+      inputSummary: "run npm test",
+      status: "failed",
+      resultSummary: "LEDGER_FAILURE_DETAIL",
+    });
+
+    const visibleView = JSON.stringify(session.getMessagesForModel());
+    expect(visibleView).toContain("RAW_FAILURE_DETAIL");
+    expect(visibleView).not.toContain("LEDGER_FAILURE_DETAIL");
+
+    session.applyActiveCheckpointSummary("The command failed and needs a focused repair.", 2);
+    const checkpointedView = JSON.stringify(session.getMessagesForModel());
+    expect(checkpointedView).not.toContain("RAW_FAILURE_DETAIL");
+    expect(checkpointedView).toContain("LEDGER_FAILURE_DETAIL");
+    expect(checkpointedView).toContain("[failed]");
+  });
+
+  it("keeps collapsed repeat evidence when only the latest raw result can be identified", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Retry the same operation and preserve the retry history" }]);
+    session.recordCompletedWork({
+      toolCallId: "call-earlier",
+      tool: "bash",
+      inputDigest: "repeat:1",
+      inputSummary: "run the focused test",
+      status: "succeeded",
+      resultSummary: "earlier pass",
+    });
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "call-latest",
+      name: "bash",
+      input: { command: "npm test -- focused" },
+    }]);
+    session.addToolResult("call-latest", "LATEST_RAW_RESULT", undefined, false);
+    session.recordCompletedWork({
+      toolCallId: "call-latest",
+      tool: "bash",
+      inputDigest: "repeat:1",
+      inputSummary: "run the focused test",
+      status: "succeeded",
+      resultSummary: "latest pass",
+    });
+
+    const modelView = JSON.stringify(session.getMessagesForModel());
+    expect(modelView).toContain("LATEST_RAW_RESULT");
+    expect(modelView).toContain("Completed work ledger");
+    expect(modelView).toContain("[succeeded x2]");
+  });
+
   it("marks workspace observations as private model-only runtime context", () => {
     const session = new Session();
     session.beginUserTurn([{ type: "text", text: "Update the workspace file" }]);
@@ -1634,6 +1830,452 @@ describe("Session execution plan anchor", () => {
     if (workspaceContext?.type !== "text") throw new Error("missing workspace projection");
     expect(workspaceContext.text).toContain("Private runtime context for task continuation only.");
     expect(JSON.stringify(session.getMessages())).not.toContain("[Workspace changes");
+  });
+
+  it("anchors workspace state after its visible file-change result and omits a visible command summary", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Update the file and verify it" }]);
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "change-visible",
+      name: "edit_file",
+      input: { path: "/workspace/example.ts" },
+    }]);
+    session.recordToolObservations({
+      toolCallId: "change-visible",
+      tool: "edit_file",
+      observations: {
+        fileChanges: [{
+          operation: "update",
+          sourcePath: "/workspace/example.ts",
+          beforeExists: true,
+          afterExists: true,
+          beforeHash: "sha256:before",
+          afterHash: "sha256:after",
+          coverage: "exact",
+        }],
+      },
+    });
+    session.addToolResult("change-visible", "VISIBLE_FILE_CHANGE_RESULT", undefined, false);
+    const modelViewAfterChange = session.getMessagesForModel();
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "command-visible",
+      name: "bash",
+      input: { command: "npm test" },
+    }]);
+    session.addToolResult("command-visible", "VISIBLE_COMMAND_RESULT", undefined, false);
+    const tokensBeforeCommandObservation = session.estimateModelTokens();
+    session.recordToolObservations({
+      toolCallId: "command-visible",
+      tool: "bash",
+      observations: {
+        execution: {
+          status: "succeeded",
+          exitCode: 0,
+          durationMs: 25,
+          timedOut: false,
+          outputLimitExceeded: false,
+          stdout: { bytes: 2, truncated: false },
+          stderr: { bytes: 0, truncated: false },
+        },
+      },
+    });
+
+    const modelView = session.getMessagesForModel();
+    const indexOfContent = (predicate: (content: typeof modelView[number]["content"][number]) => boolean) => (
+      modelView.findIndex((message) => message.content.some(predicate))
+    );
+    const changeResultIndex = indexOfContent((content) => (
+      content.type === "tool_result" && content.toolUseId === "change-visible"
+    ));
+    const workspaceIndex = indexOfContent((content) => (
+      content.type === "text" && content.text.startsWith("[Workspace changes")
+    ));
+    const commandUseIndex = indexOfContent((content) => (
+      content.type === "tool_use" && content.id === "command-visible"
+    ));
+    const workspaceText = modelView[workspaceIndex]?.content
+      .find((content) => content.type === "text")?.text ?? "";
+
+    expect(changeResultIndex).toBeGreaterThanOrEqual(0);
+    expect(workspaceIndex).toBe(changeResultIndex + 1);
+    expect(workspaceIndex).toBeLessThan(commandUseIndex);
+    expect(workspaceText).toContain("example.ts");
+    expect(workspaceText).not.toContain("Commands after latest observed change");
+    expect(JSON.stringify(modelView)).toContain("VISIBLE_COMMAND_RESULT");
+    expect(modelView.slice(0, modelViewAfterChange.length)).toEqual(modelViewAfterChange);
+    expect(session.estimateModelTokens()).toBe(tokensBeforeCommandObservation);
+  });
+
+  it("moves the workspace anchor only after the latest causal file change", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Update both files in order" }]);
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "change-first",
+      name: "edit_file",
+      input: { path: "/workspace/first.ts" },
+    }]);
+    session.recordToolObservations({
+      toolCallId: "change-first",
+      tool: "edit_file",
+      observations: {
+        fileChanges: [{
+          operation: "update",
+          sourcePath: "/workspace/first.ts",
+          beforeExists: true,
+          afterExists: true,
+          beforeHash: "sha256:first-before",
+          afterHash: "sha256:first-after",
+          coverage: "exact",
+        }],
+      },
+    });
+    session.addToolResult("change-first", "FIRST_CHANGE_RESULT", undefined, false);
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "change-second",
+      name: "edit_file",
+      input: { path: "/workspace/second.ts" },
+    }]);
+    session.recordToolObservations({
+      toolCallId: "change-second",
+      tool: "edit_file",
+      observations: {
+        fileChanges: [{
+          operation: "create",
+          sourcePath: "/workspace/second.ts",
+          beforeExists: false,
+          afterExists: true,
+          afterHash: "sha256:second-after",
+          coverage: "exact",
+        }],
+      },
+    });
+    session.addToolResult("change-second", "SECOND_CHANGE_RESULT", undefined, false);
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "revert-second",
+      name: "delete_file",
+      input: { path: "/workspace/second.ts" },
+    }]);
+    session.recordToolObservations({
+      toolCallId: "revert-second",
+      tool: "delete_file",
+      observations: {
+        fileChanges: [{
+          operation: "delete",
+          sourcePath: "/workspace/second.ts",
+          beforeExists: true,
+          afterExists: false,
+          beforeHash: "sha256:second-after",
+          coverage: "exact",
+        }],
+      },
+    });
+    session.addToolResult("revert-second", "SECOND_CHANGE_REVERTED", undefined, false);
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "read-after-second",
+      name: "read_file",
+      input: { path: "/workspace/first.ts" },
+    }]);
+    session.addToolResult("read-after-second", "READ_AFTER_SECOND_RESULT", undefined, false);
+
+    const modelView = session.getMessagesForModel();
+    const firstResultIndex = modelView.findIndex((message) => message.content.some((content) => (
+      content.type === "tool_result" && content.toolUseId === "change-first"
+    )));
+    const revertedResultIndex = modelView.findIndex((message) => message.content.some((content) => (
+      content.type === "tool_result" && content.toolUseId === "revert-second"
+    )));
+    const workspaceIndex = modelView.findIndex((message) => message.content.some((content) => (
+      content.type === "text" && content.text.startsWith("[Workspace changes")
+    )));
+    const workspaceText = modelView[workspaceIndex]?.content
+      .find((content) => content.type === "text")?.text ?? "";
+
+    expect(workspaceIndex).toBe(revertedResultIndex + 1);
+    expect(workspaceIndex).toBeGreaterThan(firstResultIndex);
+    expect(workspaceText).toContain("first.ts");
+    expect(workspaceText).not.toContain("second.ts");
+  });
+
+  it("restores hidden command evidence beside the checkpointed workspace state", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Update and verify the checkpointed file" }]);
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "change-hidden",
+      name: "edit_file",
+      input: { path: "/workspace/checkpointed.ts" },
+    }]);
+    session.recordToolObservations({
+      toolCallId: "change-hidden",
+      tool: "edit_file",
+      observations: {
+        fileChanges: [{
+          operation: "create",
+          sourcePath: "/workspace/checkpointed.ts",
+          beforeExists: false,
+          afterExists: true,
+          afterHash: "sha256:checkpointed",
+          coverage: "exact",
+        }],
+      },
+    });
+    session.addToolResult("change-hidden", "HIDDEN_FILE_CHANGE_RESULT", undefined, false);
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "command-hidden",
+      name: "bash",
+      input: { command: "npm test" },
+    }]);
+    session.recordToolObservations({
+      toolCallId: "command-hidden",
+      tool: "bash",
+      observations: {
+        execution: {
+          status: "succeeded",
+          exitCode: 0,
+          durationMs: 40,
+          timedOut: false,
+          outputLimitExceeded: false,
+          stdout: { bytes: 2, truncated: false },
+          stderr: { bytes: 0, truncated: false },
+        },
+      },
+    });
+    session.addToolResult("command-hidden", "HIDDEN_COMMAND_RESULT", undefined, false);
+    session.applyActiveCheckpointSummary("The file was updated and its tests passed.", 4);
+
+    const modelView = session.getMessagesForModel();
+    const checkpointIndex = modelView.findIndex((message) => message.content.some((content) => (
+      content.type === "text" && content.text.startsWith("[Current turn checkpoint]")
+    )));
+    const workspaceIndex = modelView.findIndex((message) => message.content.some((content) => (
+      content.type === "text" && content.text.startsWith("[Workspace changes")
+    )));
+    const workspaceText = modelView[workspaceIndex]?.content
+      .find((content) => content.type === "text")?.text ?? "";
+
+    expect(workspaceIndex).toBe(checkpointIndex + 1);
+    expect(workspaceText).toContain("checkpointed.ts");
+    expect(workspaceText).toContain("Commands after latest observed change");
+    expect(workspaceText).toContain("bash: status=succeeded exit_code=0");
+    expect(JSON.stringify(modelView)).not.toContain("HIDDEN_FILE_CHANGE_RESULT");
+    expect(JSON.stringify(modelView)).not.toContain("HIDDEN_COMMAND_RESULT");
+  });
+
+  it("anchors after a partial checkpoint without duplicating a still-visible command", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Continue after the earlier edit" }]);
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "change-checkpointed",
+      name: "edit_file",
+      input: { path: "/workspace/partial.ts" },
+    }]);
+    session.recordToolObservations({
+      toolCallId: "change-checkpointed",
+      tool: "edit_file",
+      observations: {
+        fileChanges: [{
+          operation: "update",
+          sourcePath: "/workspace/partial.ts",
+          beforeExists: true,
+          afterExists: true,
+          beforeHash: "sha256:old",
+          afterHash: "sha256:new",
+          coverage: "exact",
+        }],
+      },
+    });
+    session.addToolResult("change-checkpointed", "CHECKPOINTED_CHANGE_RESULT", undefined, false);
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "command-recent",
+      name: "bash",
+      input: { command: "npm test" },
+    }]);
+    session.recordToolObservations({
+      toolCallId: "command-recent",
+      tool: "bash",
+      observations: {
+        execution: {
+          status: "succeeded",
+          exitCode: 0,
+          durationMs: 15,
+          timedOut: false,
+          outputLimitExceeded: false,
+          stdout: { bytes: 2, truncated: false },
+          stderr: { bytes: 0, truncated: false },
+        },
+      },
+    });
+    session.addToolResult("command-recent", "RECENT_COMMAND_RESULT", undefined, false);
+    session.applyActiveCheckpointSummary("The file edit is complete.", 2);
+
+    const modelView = session.getMessagesForModel();
+    const checkpointIndex = modelView.findIndex((message) => message.content.some((content) => (
+      content.type === "text" && content.text.startsWith("[Current turn checkpoint]")
+    )));
+    const workspaceIndex = modelView.findIndex((message) => message.content.some((content) => (
+      content.type === "text" && content.text.startsWith("[Workspace changes")
+    )));
+    const commandUseIndex = modelView.findIndex((message) => message.content.some((content) => (
+      content.type === "tool_use" && content.id === "command-recent"
+    )));
+    const workspaceText = modelView[workspaceIndex]?.content
+      .find((content) => content.type === "text")?.text ?? "";
+
+    expect(workspaceIndex).toBe(checkpointIndex + 1);
+    expect(workspaceIndex).toBeLessThan(commandUseIndex);
+    expect(workspaceText).not.toContain("Commands after latest observed change");
+    expect(JSON.stringify(modelView)).toContain("RECENT_COMMAND_RESULT");
+  });
+
+  it("keeps an unanchored workspace reconciliation at the conservative tail", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Respect an externally changed file" }]);
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "read-before-reconcile",
+      name: "read_file",
+      input: { path: "/workspace/external.ts" },
+    }]);
+    session.addToolResult("read-before-reconcile", "VISIBLE_READ_RESULT", undefined, false);
+    session.recordToolObservations({
+      tool: "workspace_reconcile",
+      observations: {
+        fileChanges: [{
+          operation: "update",
+          sourcePath: "/workspace/external.ts",
+          beforeExists: true,
+          afterExists: true,
+          beforeHash: "sha256:observed",
+          afterHash: "sha256:external",
+          coverage: "exact",
+        }],
+      },
+    });
+
+    const modelView = session.getMessagesForModel();
+    const rawResultIndex = modelView.findIndex((message) => message.content.some((content) => (
+      content.type === "tool_result" && content.toolUseId === "read-before-reconcile"
+    )));
+    const workspaceIndex = modelView.findIndex((message) => message.content.some((content) => (
+      content.type === "text" && content.text.startsWith("[Workspace changes")
+    )));
+
+    expect(workspaceIndex).toBeGreaterThan(rawResultIndex);
+    expect(workspaceIndex).toBe(modelView.length - 1);
+  });
+
+  it("keeps tool-result image evidence attached before the workspace cache anchor", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Update the visual asset and inspect the result" }]);
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "visual-change",
+      name: "edit_file",
+      input: { path: "/workspace/preview.png" },
+    }]);
+    session.recordToolObservations({
+      toolCallId: "visual-change",
+      tool: "edit_file",
+      observations: {
+        fileChanges: [{
+          operation: "update",
+          sourcePath: "/workspace/preview.png",
+          beforeExists: true,
+          afterExists: true,
+          beforeHash: "sha256:visual-before",
+          afterHash: "sha256:visual-after",
+          binary: true,
+          coverage: "exact",
+        }],
+      },
+    });
+    session.addToolResult("visual-change", "VISUAL_CHANGE_RESULT", [{
+      data: "aGVsbG8=",
+      mediaType: "image/png",
+      analysisMode: "quality_review",
+    }], false);
+
+    const firstModelView = session.getMessagesForModel();
+    const firstChangeResultIndex = firstModelView.findIndex((message) => message.content.some((content) => (
+      content.type === "tool_result" && content.toolUseId === "visual-change"
+    )));
+    const firstImageIndex = firstModelView.findIndex((message) => message.content.some((content) => (
+      content.type === "image" && content.data === "aGVsbG8="
+    )));
+    const firstWorkspaceIndex = firstModelView.findIndex((message) => message.content.some((content) => (
+      content.type === "text" && content.text.startsWith("[Workspace changes")
+    )));
+    expect(firstImageIndex).toBe(firstChangeResultIndex + 1);
+    expect(firstWorkspaceIndex).toBe(firstImageIndex + 1);
+
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "inspect-after-visual",
+      name: "read_file",
+      input: { path: "/workspace/notes.txt" },
+    }]);
+    session.addToolResult("inspect-after-visual", "LATER_READ_RESULT", undefined, false);
+
+    const modelView = session.getMessagesForModel();
+    const changeResultIndex = modelView.findIndex((message) => message.content.some((content) => (
+      content.type === "tool_result" && content.toolUseId === "visual-change"
+    )));
+    const workspaceIndex = modelView.findIndex((message) => message.content.some((content) => (
+      content.type === "text" && content.text.startsWith("[Workspace changes")
+    )));
+    const laterUseIndex = modelView.findIndex((message) => message.content.some((content) => (
+      content.type === "tool_use" && content.id === "inspect-after-visual"
+    )));
+
+    expect(JSON.stringify(modelView)).not.toContain("aGVsbG8=");
+    expect(workspaceIndex).toBe(changeResultIndex + 1);
+    expect(workspaceIndex).toBeLessThan(laterUseIndex);
+  });
+
+  it("retains an unattributed command summary that cannot be safely matched to a raw result", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Preserve legacy command evidence" }]);
+    session.recordToolObservations({
+      toolCallId: "legacy-change",
+      tool: "edit_file",
+      observations: {
+        fileChanges: [{
+          operation: "create",
+          sourcePath: "/workspace/legacy.ts",
+          beforeExists: false,
+          afterExists: true,
+          afterHash: "sha256:legacy",
+          coverage: "exact",
+        }],
+      },
+    });
+    session.recordToolObservations({
+      tool: "legacy_bash",
+      observations: {
+        execution: {
+          status: "failed",
+          exitCode: 2,
+          durationMs: 12,
+          timedOut: false,
+          outputLimitExceeded: false,
+          stdout: { bytes: 0, truncated: false },
+          stderr: { bytes: 5, truncated: false },
+        },
+      },
+    });
+
+    const modelView = JSON.stringify(session.getMessagesForModel());
+    expect(modelView).toContain("Commands after latest observed change");
+    expect(modelView).toContain("legacy_bash: status=failed exit_code=2");
   });
 
   it("bounds the sidecar ledger and its model projection independently", () => {

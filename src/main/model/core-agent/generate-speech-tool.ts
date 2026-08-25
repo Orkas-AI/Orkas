@@ -10,7 +10,6 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
 import type { AgentTool, ToolContext, ToolResult } from '#core-agent';
-import { getLocalExecGranted } from '../../features/permissions';
 import {
   generateSpeech,
   hasConfiguredTtsProvider,
@@ -33,10 +32,6 @@ import {
 
 const log = createLogger('generate-speech-tool');
 const VIDEO_STUDIO_AGENT_ID = '79df9cc89f5f';
-
-const DENY_MESSAGE =
-  'E_TOOL_EXECUTION_ACCESS_DISABLED: Tool execution access is disabled, so command execution and file writes were not run. ' +
-  'Ask the user to open Settings > Tool Execution Access and enable "Enable Tool Execution Access", then retry.';
 
 export interface GenerateSpeechToolOpts {
   userId: string;
@@ -191,28 +186,25 @@ export function createGenerateSpeechTool(opts: GenerateSpeechToolOpts): AgentToo
   return {
     name: 'generate_speech',
     description:
-      'Synthesize narration/voiceover audio to a workspace or attachment file. Timed media MUST pass target_duration so overlong text is rejected before any paid request; shorten it and call once. VideoStudio COMPOSE narration is stage-owned and must use video_studio composition.materialize_narration instead. Do not regenerate the same output_path in one turn. Present the returned chat_media_url so the chat renders audio.',
+      'Synthesize narration audio to a local file. For VideoStudio COMPOSE narration, use video_studio composition.materialize_narration.',
     inputSchema: {
       type: 'object',
       properties: {
         text: { type: 'string', description: 'The text to speak.' },
-        output_path: { type: 'string', description: 'Where to write audio. `project/...` paths resolve under the current workspace; other relative paths prefer chat attachments. Extension optional.' },
+        output_path: { type: 'string', description: 'Where to write audio. `project/...` resolves under the workspace; other relative paths prefer chat attachments. Extension optional. Each requested path may be used once per turn.' },
         route_ref: { type: 'string', description: 'Configured TTS route returned by video_studio speech.capabilities.' },
         voice_ref: { type: 'string', description: 'Route-bound voice returned by video_studio speech.capabilities. VideoStudio plans must use this instead of inventing provider ids.' },
         language: { type: 'string', description: 'BCP-47 narration language supported by the selected voice and signed during production plan confirmation, such as zh-CN or en-US.' },
         voice: { type: 'string', description: 'Legacy provider voice id. New VideoStudio plans use route_ref + voice_ref.' },
         speed: { type: 'number', description: 'Speech speed multiplier (1.0 = normal). Optional.' },
         format: { type: 'string', description: 'Audio format: mp3 (default) / wav / opus. Optional.' },
-        target_duration: { type: 'number', description: 'Optional target clip length in seconds; result reports fit and suggested text/speed adjustment.' },
+        target_duration: { type: 'number', description: 'Target clip length in seconds. Required for timed media so overlong text is rejected before a paid request; result reports fit and suggested adjustment.' },
         production_plan_path: { type: 'string', description: 'For VideoStudio EDL narration, the confirmed project/plan.json that owns this synthesis selection and line.' },
         narration_segment_index: { type: 'number', description: 'Zero-based tracks.narration.segments index in production_plan_path. Required with route_ref/voice_ref for VideoStudio.' },
       },
       required: ['text', 'output_path'],
     },
     async execute(input, ctx) {
-      if (!getLocalExecGranted()) {
-        return { content: DENY_MESSAGE, isError: true } as ToolResult;
-      }
       const text = String(input.text ?? '').trim();
       const outputPathRaw = String(input.output_path ?? '').trim();
       if (!text) return { content: 'text is required', isError: true } as ToolResult;

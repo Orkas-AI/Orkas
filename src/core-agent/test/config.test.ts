@@ -10,7 +10,7 @@ describe("Config", () => {
       expect(config.agent.defaultProvider).toBe("anthropic");
       expect(config.agent.maxRetries).toBe(3);
       expect(config.agent.maxToolLoops).toBe(100);
-      expect(config.agent.thinkingLevel).toBe("off");
+      expect(config.agent.thinkingLevel).toBeUndefined();
     });
 
     it("allows overriding specific fields", () => {
@@ -24,15 +24,19 @@ describe("Config", () => {
       expect(config.agent.maxRetries).toBe(3);
     });
 
-    it("creates memory config with defaults", () => {
-      const config = createConfig();
+    it.each(["off", "low", "high"] as const)(
+      "preserves an explicit %s thinking override",
+      (thinkingLevel) => {
+        const config = createConfig({ agent: { thinkingLevel } });
+        expect(config.agent.thinkingLevel).toBe(thinkingLevel);
+      },
+    );
 
-      expect(config.memory.enabled).toBe(true);
-      expect(config.memory.provider).toBe("auto");
-      expect(config.memory.maxResults).toBe(10);
-      expect(config.memory.minScore).toBe(0.3);
-      expect(config.memory.fts.enabled).toBe(true);
-      expect(config.memory.vector.enabled).toBe(true);
+    it("strips a legacy memory-engine section from older config files", () => {
+      // The retrieval-engine config was removed with the unwired engine
+      // (2026-08-16); a config.json written by an older build must still load.
+      const config = createConfig({ memory: { enabled: true, provider: "auto" } } as never);
+      expect((config as Record<string, unknown>).memory).toBeUndefined();
     });
 
     it("accepts provider configurations", () => {

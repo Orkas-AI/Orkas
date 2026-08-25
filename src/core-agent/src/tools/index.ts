@@ -43,6 +43,7 @@ export type {
 export {
   _resetProcessSessionsForTest,
   getProcessSessionTools,
+  processSessionTool,
   processReadTool,
   processStartTool,
   processStopTool,

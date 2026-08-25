@@ -71,7 +71,7 @@ function _buildKbStatusMap(tree, statusRows) {
 }
 
 function _applyKbStatusResult(data) {
-  if (data && data.ok) {
+  if (data && data.ok !== false && Array.isArray(data.files)) {
     _kbUnavailableCode = '';
     _kbUnavailableReportedCode = '';
     return true;

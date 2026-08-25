@@ -15,6 +15,7 @@ import {
   estimateToolResultTokens,
   maybeSpillToolResult,
   persistToolResult,
+  sweepExpiredCloudToolResults,
   sweepToolResults,
   wrapToolWithCap,
 } from '../../../src/main/util/tool-result-cap';
@@ -51,6 +52,32 @@ describe('tool-result-cap configuration', () => {
     expect(estimateToolResultTokens('汉'.repeat(1_000))).toBe(1_500);
     expect(estimateToolResultTokens('a'.repeat(1_000))).toBe(250);
   });
+
+  // The same text is measured here at the inline-cap boundary and by
+  // core-agent's estimateTextTokens for every context-budget decision. The
+  // implementations are twins by necessity (#core-agent is dynamic-import-only
+  // in main, this path is synchronous); a divergence moves a result across the
+  // spill line on one side only. Non-BMP input is the case that split them
+  // before: a code-point iterator counts an astral char once, a UTF-16
+  // iterator counts its surrogate pair twice.
+  it('stays byte-for-byte equivalent to core-agent estimateTextTokens', async () => {
+    const { estimateTextTokens } = await import('../../../src/core-agent/src/agent/session');
+    const fixtures = [
+      '',
+      'plain ascii with spaces and 1234 !@#',
+      '这是一段中文说明文字，包含标点。',
+      'ひらがなとカタカナのテキスト',
+      '한글 음절 텍스트',
+      'ＦＵＬＬＷＩＤＴＨ　ｆｏｒｍｓ！',
+      'emoji 😀😀 and flags 🇨🇳',
+      'astral CJK 𠮷野家 mixed with 汉字',
+      'mixed 中英 mixed ascii 汉字 with everything かな 한글 😀 𠮷',
+      '汉'.repeat(1_000) + 'a'.repeat(1_000),
+    ];
+    for (const text of fixtures) {
+      expect(estimateToolResultTokens(text), JSON.stringify(text.slice(0, 24))).toBe(estimateTextTokens(text));
+    }
+  });
 });
 
 describe('wrapToolWithCap', () => {
@@ -75,8 +102,8 @@ describe('wrapToolWithCap', () => {
     });
     const result = await tool.execute({}, ctx);
     expect(result.content).toMatch(/^<persisted-output ref="web_fetch\.[0-9a-f]{64}"/);
-    expect(result.content).toContain('tool_result_search');
-    expect(result.content).toContain('tool_result_read_chunk');
+    expect(result.content).toContain('tool_result');
+    expect(result.content).toContain('action="read"');
     expect(result.content).not.toContain('Use read_file(path)');
     expect(result.content).not.toContain(' path="');
     expect(result.persistedOutput).toMatchObject({
@@ -386,9 +413,40 @@ describe('persisted result helpers', () => {
     expect(estimateToolResultTokens(marker)).toBeLessThan(1_000);
   });
 
+  it('advertises deterministic query capabilities and bounded schema for structured output', () => {
+    const marker = buildPersistedOutputMarker(
+      '/tmp/connector.0123456789abcdef.txt',
+      'connector',
+      JSON.stringify([
+        { status: 'active', amount: 3, nested: { region: 'PH' } },
+        { status: 'paused', amount: 7, nested: { region: 'SG' } },
+      ]),
+    );
+
+    expect(marker).toContain('data_type="json"');
+    expect(marker).toContain('actions="query,search,read"');
+    expect(marker).toContain('query operations=count,sum,average,minimum,maximum');
+    expect(marker).toContain('data{records=2;fields=');
+    expect(marker).toContain('amount:number');
+    expect(marker).toContain('nested.region:string');
+  });
+
+  it('labels the only safe query for unstructured text instead of inventing record semantics', () => {
+    const marker = buildPersistedOutputMarker(
+      '/tmp/bash.0123456789abcdef.txt',
+      'bash',
+      'first error\nsecond line\nthird error',
+    );
+
+    expect(marker).toContain('data_type="text"');
+    expect(marker).toContain('actions="query,search,read"');
+    expect(marker).toContain('query supports exact count only with match + count_unit');
+    expect(marker).toContain('lines=3');
+  });
+
   // A head/tail preview hides the middle of a structured document, which is
   // where reference material lives. The section map replaces guesswork with a
-  // seek: every offset is a `tool_result_read_chunk` cursor.
+  // seek: every offset is a `tool_result` read cursor.
   it('emits a section map with char cursors for structured documents', () => {
     const doc = [
       '# Title',
@@ -419,6 +477,9 @@ describe('persisted result helpers', () => {
       { sizeChars: full.length, estimatedTokens: 3_000, isError: false, sourceTruncated: false },
     );
     expect(marker).not.toContain('Section map');
+    expect(marker).toContain('data_type="unknown"');
+    expect(marker).toContain('actions="search,read"');
+    expect(marker).not.toContain('query operations=');
   });
 
   it('leaves unstructured output on the plain head/tail preview', () => {
@@ -508,5 +569,79 @@ describe('sweepToolResults', () => {
     expect(fs.existsSync(middle)).toBe(true);
     expect(fs.existsSync(newest)).toBe(true);
     expect(stats).toMatchObject({ removedStale: 0, removedForQuota: 1, retainedBytes: 24 });
+  });
+});
+
+describe('sweepExpiredCloudToolResults', () => {
+  let dir: string;
+  beforeEach(() => { dir = makeTmpDir(); });
+  afterEach(() => cleanup(dir));
+
+  const daysAgoSec = (days: number) => (Date.now() - days * 24 * 60 * 60 * 1_000) / 1_000;
+  const spillDir = (name: string) => {
+    const abs = path.join(dir, name);
+    fs.mkdirSync(abs, { recursive: true });
+    return abs;
+  };
+  const spillFile = (parent: string, name: string, ageDays: number) => {
+    const abs = path.join(parent, name);
+    fs.writeFileSync(abs, name);
+    const t = daysAgoSec(ageDays);
+    fs.utimesSync(abs, t, t);
+    return abs;
+  };
+
+  it('expires old files, keeps fresh ones, and removes only emptied dirs', () => {
+    const emptied = spillDir('gconv-a.tool-results');
+    const mixed = spillDir('gconv-b.tool-results');
+    const oldA = spillFile(emptied, 'bash.a1.txt', 40);
+    const oldB = spillFile(mixed, 'web_fetch.b1.txt', 31);
+    const fresh = spillFile(mixed, 'web_fetch.b2.txt', 1);
+
+    const stats = sweepExpiredCloudToolResults([emptied, mixed]);
+
+    expect(fs.existsSync(oldA)).toBe(false);
+    expect(fs.existsSync(oldB)).toBe(false);
+    expect(fs.existsSync(fresh)).toBe(true);
+    expect(fs.existsSync(emptied)).toBe(false);
+    expect(fs.existsSync(mixed)).toBe(true);
+    expect(stats).toEqual({ removedFiles: 2, removedDirs: 1, truncated: false });
+  });
+
+  it('spends the deletion budget oldest-first across dirs and reports truncation', () => {
+    const a = spillDir('gconv-a.tool-results');
+    const b = spillDir('gconv-b.tool-results');
+    const oldest = spillFile(b, 'bash.oldest.txt', 90);
+    const middle = spillFile(a, 'bash.middle.txt', 60);
+    const newerExpired = spillFile(a, 'bash.newer.txt', 35);
+
+    const stats = sweepExpiredCloudToolResults([a, b], 30, 2);
+
+    expect(fs.existsSync(oldest)).toBe(false);
+    expect(fs.existsSync(middle)).toBe(false);
+    expect(fs.existsSync(newerExpired)).toBe(true);
+    expect(stats).toEqual({ removedFiles: 2, removedDirs: 1, truncated: true });
+  });
+
+  it('tolerates missing dirs', () => {
+    expect(sweepExpiredCloudToolResults([path.join(dir, 'absent.tool-results')]))
+      .toEqual({ removedFiles: 0, removedDirs: 0, truncated: false });
+  });
+
+  it('never follows or deletes symlink entries', () => {
+    const spill = spillDir('gconv-a.tool-results');
+    const outside = path.join(dir, 'outside.txt');
+    fs.writeFileSync(outside, 'target');
+    const t = daysAgoSec(90);
+    fs.utimesSync(outside, t, t);
+    const link = path.join(spill, 'bash.link.txt');
+    fs.symlinkSync(outside, link);
+    // lutimes is not portable; the dirent type gate must skip the link even
+    // though its target is long expired.
+    const stats = sweepExpiredCloudToolResults([spill]);
+
+    expect(fs.existsSync(outside)).toBe(true);
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(stats).toEqual({ removedFiles: 0, removedDirs: 0, truncated: false });
   });
 });

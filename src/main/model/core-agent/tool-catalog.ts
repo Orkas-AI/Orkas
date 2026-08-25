@@ -1,253 +1,411 @@
 /**
- * ToolCatalog — registry of injected built-in tools.
+ * Canonical catalog for every in-process Orkas tool.
  *
- * Source of truth: a hand-written central constant table `TOOL_CATALOG`.
- * Historically it also rendered an "available tools" markdown block into the
- * setup-LLM prompts, but the runner no longer injects that block; the catalog
- * now backs the anti-drift test below (and any future tool-listing surface).
- * NOT derived from `AgentTool` instances — the runtime `description` on
- * each tool is a long English doc aimed at the runtime LLM, while the
- * catalog `summary` is a short blurb aimed at the setup LLM; the two
- * audiences are different. `group` / `permission` are human-judged
- * metadata and cannot be inferred from code.
- *
- * Anti-drift: `tool-catalog.test.ts` asserts that the set of tool names
- * runner.ts actually injects is a subset of `TOOL_CATALOG`. Forgetting
- * a catalog entry → test red.
- *
- * Connectors (Notion / Slack / GitHub / Gmail / …) are surfaced through two umbrella meta-
- * tools (`list_connector_tools` / `call_connector_tool`) PLUS a `## Connectors` system-prompt
- * block enumerating connector ids + descriptions. Both are injected only when ≥1 connector is
- * visible to the current actor; otherwise zero connector slots in `tools[]`. The two meta-
- * tools are static and ARE in this catalog; the per-connector MCP actions discovered at
- * runtime are NOT enumerated here (they vary per-user / per-install). See
- * `connector-meta-tools.ts` for the rationale (tool-selection accuracy cliff at 20–50 tools +
- * prompt-cache stability).
+ * Tool groups are a stable compatibility API used by agent.json.tool_list,
+ * runtime activation, and persisted session state. Runtime availability is
+ * still authoritative: catalog membership never grants a tool or permission.
  */
 
 import { createLogger } from '../../logger';
 
 const log = createLogger('tool-catalog');
 
-export type ToolGroup =
-  | 'fs'         // files / workspace
-  | 'shell'      // command line
-  | 'pdf'        // PDF rendering
-  | 'office'     // Word / Excel / PowerPoint documents
-  | 'kb'         // Library
-  | 'chat'       // conversation history
-  | 'image'      // image generation
-  | 'video'      // video generation
-  | 'web'        // web access
-  | 'connector'  // third-party services via MCP umbrella tools
-  | 'meta';      // cross-session state
+export type ToolGroupId =
+  | 'workspace'
+  | 'workspace.read'
+  | 'workspace.write'
+  | 'workspace.write.output'
+  | 'workspace.write.edit'
+  | 'workspace.execute'
+  | 'workspace.execute.command'
+  | 'workspace.execute.session'
+  | 'workspace.artifact'
+  | 'office'
+  | 'office.word'
+  | 'office.spreadsheet'
+  | 'office.presentation'
+  | 'office.pdf'
+  | 'library'
+  | 'web'
+  | 'media'
+  | 'media.image'
+  | 'media.video'
+  | 'media.speech'
+  | 'connectors'
+  | 'context'
+  | 'orchestration'
+  | 'management'
+  | 'runtime';
 
-export interface ToolCatalogEntry {
-  /** Tool name. Must match `AgentTool.name` exactly. */
-  name: string;
-  /** One-line English description aimed at the setup LLM. */
+export interface ToolGroupEntry {
+  id: ToolGroupId;
+  title: string;
   summary: string;
-  /** Render group; decides which section the entry lands in. */
-  group: ToolGroup;
-  /** Filled when the tool is gated by a runtime permission. Currently
-   *  the only value is `localExec`. */
-  permission?: 'localExec';
-  /** When set, the tool is OWNED by one agent (a single id) or a fixed set of
-   *  agents (a list of ids): it is injected only when the current actor's
-   *  agentId is the owner / among the owners, and is invisible to every other
-   *  actor (commander included). Default-deny — used for agent-specific tools
-   *  that would only clutter the commander's `tools[]`. Enforced in runner.ts
-   *  via `isToolVisibleToAgent`; the binding lives here so the catalog stays
-   *  the single source of truth. */
-  ownerAgent?: string | string[];
+  parent?: ToolGroupId;
+  /** Whether Commander may activate the group with tool_load. */
+  activation: 'loadable' | 'host-managed';
+  /** Whether Agent Creator may persist this group in agent.json.tool_list. */
+  agentDependency: boolean;
 }
 
-/**
- * The central constant table. **Always** append a row when adding a new
- * tool; the anti-drift test catches omissions.
- *
- * Within each group the order is "most frequently used first", kept stable
- * to keep the rendered KV-cache prefix stable.
- */
+export interface ToolCatalogEntry {
+  /** Exact AgentTool.name. */
+  name: string;
+  /** Compact discovery/diagnostic description. */
+  summary: string;
+  /** Groups that may activate this tool. */
+  loadGroups?: ToolGroupId[];
+  /** Existing default-deny owner isolation. */
+  ownerAgent?: string | string[];
+  /** False for Commander-only tools that share a loadable group with tools a
+   * named Agent may declare. Defaults to true when the group is eligible. */
+  agentAssignable?: boolean;
+  /** Execution permission; loading never grants it. */
+  permission?: 'localExec';
+}
+
 export const VIDEO_STUDIO_AGENT_ID = '79df9cc89f5f';
 export const IMAGE_STUDIO_AGENT_ID = '814b61b027f0';
 
-export const TOOL_CATALOG: ToolCatalogEntry[] = [
-  // Files / workspace
-  { name: 'read_file',     group: 'fs', summary: 'Read a slice of text from a workspace or attachment file (PDF/modern Office text or image as multimodal).' },
-  { name: 'read_files',    group: 'fs', summary: 'Read several related workspace/attachment file slices in one bounded parallel call.' },
-  { name: 'write_file',    group: 'fs', permission: 'localExec', summary: 'Write text/code/markdown into the workspace; resolves under $working_dir.' },
-  { name: 'append_file',   group: 'fs', permission: 'localExec', summary: 'Append one bounded, byte-offset-checked text chunk to an existing workspace file without duplicate replay writes.' },
-  { name: 'apply_patch',   group: 'fs', permission: 'localExec', summary: 'Apply one validated, transactional multi-file text patch using Add/Update/Move/Delete operations.' },
-  { name: 'edit_file',     group: 'fs', permission: 'localExec', summary: 'In-place `old_string → new_string` replacement on an existing text file (instead of rewriting the whole file).' },
-  { name: 'delete_file',   group: 'fs', permission: 'localExec', summary: 'Delete a single file. Files inside the current workspace/attachment/editor scope are deleted immediately; files outside that scope use an inline confirmation card with a token, and multiple out-of-scope deletes from the same turn are grouped when possible. Use instead of `bash rm` for removals.' },
-  { name: 'list_files',    group: 'fs', summary: 'List the workspace directory tree.' },
-  { name: 'stat_file',     group: 'fs', summary: 'Trigger PDF/modern Office extraction and return total_chars; call before read_file.' },
-  { name: 'ocr_file',      group: 'fs', summary: 'Run local OCR on PDF pages or image files when visual text is not available through read_file/stat_file.' },
-  { name: 'search_files',  group: 'fs', summary: 'Find files by name / glob across the workspace + attachment scope.' },
-  { name: 'grep_files',    group: 'fs', summary: 'Grep text across the workspace + attachment scope (PDF/modern Office auto-extracted, then searched); optional `glob` scope + `output_mode` files/count.' },
-  { name: 'workspace_diff', group: 'fs', summary: 'Read the bounded net file changes observed from agent tools for the current turn or session.' },
-  { name: 'tool_result_search', group: 'fs', summary: 'Search persisted oversized tool results by opaque ref; batch independent queries in one call and receive bounded matching excerpts.' },
-  { name: 'tool_result_read_chunk', group: 'fs', summary: 'Read bounded cursor chunks from persisted oversized tool results; batch independent chunks in one call.' },
-  { name: 'publish_outputs', group: 'fs', summary: 'Declare the complete set of current-turn files that should appear as final deliverables in the message footer.' },
-  { name: 'create_artifact', group: 'fs', permission: 'localExec', summary: 'Build an interactive multi-file app (HTML/CSS/JS) rendered live & clickable inside the chat bubble; for interactive dashboards / calculators / visualizations / mini-tools. Static/read-only dashboards should use :::dashboard; not documents (html_to_pdf) or images (generate_image).' },
-  { name: 'html_preview', group: 'fs', permission: 'localExec', summary: 'Audit local HTML at the default desktop target, an explicit mobile target, or responsive desktop/mobile when the user requests multi-device behavior. Screenshots are returned as model-visible images only when screenshots=true and checks pass; no separate vision API is invoked. Network and browser host permissions are blocked.' },
+export const TOOL_GROUPS: readonly ToolGroupEntry[] = [
+  { id: 'workspace', title: 'Workspace', summary: 'Read, modify, execute in, or build interactive artifacts in the workspace.', activation: 'loadable', agentDependency: true },
+  { id: 'workspace.read', title: 'Workspace read', summary: 'Read, inspect, find, OCR, and search workspace or attachment files.', parent: 'workspace', activation: 'loadable', agentDependency: true },
+  { id: 'workspace.write', title: 'Workspace write', summary: 'Create, edit, delete, diff, and publish workspace files.', parent: 'workspace', activation: 'loadable', agentDependency: true },
+  { id: 'workspace.write.output', title: 'Workspace output', summary: 'Create, append, and publish output files without editing or deleting existing files.', parent: 'workspace.write', activation: 'loadable', agentDependency: true },
+  { id: 'workspace.write.edit', title: 'Workspace edit', summary: 'Patch, edit, delete, and inspect changes to existing workspace files.', parent: 'workspace.write', activation: 'loadable', agentDependency: true },
+  { id: 'workspace.execute', title: 'Workspace execute', summary: 'Run shell commands and persistent or interactive local processes.', parent: 'workspace', activation: 'loadable', agentDependency: true },
+  { id: 'workspace.execute.command', title: 'Workspace command', summary: 'Run non-interactive shell commands.', parent: 'workspace.execute', activation: 'loadable', agentDependency: true },
+  { id: 'workspace.execute.session', title: 'Workspace process session', summary: 'Manage persistent processes and interactive command-line sessions.', parent: 'workspace.execute', activation: 'loadable', agentDependency: true },
+  { id: 'workspace.artifact', title: 'Workspace artifact', summary: 'Create and visually inspect interactive HTML artifacts.', parent: 'workspace', activation: 'loadable', agentDependency: true },
+  { id: 'office', title: 'Office', summary: 'Create, read, edit, render, and review PDF, Word, Excel, and PowerPoint files.', activation: 'loadable', agentDependency: true },
+  { id: 'office.word', title: 'Word', summary: 'Create, inspect, edit, and review DOCX files.', parent: 'office', activation: 'loadable', agentDependency: true },
+  { id: 'office.spreadsheet', title: 'Spreadsheet', summary: 'Create, inspect, edit, and review XLSX files.', parent: 'office', activation: 'loadable', agentDependency: true },
+  { id: 'office.presentation', title: 'Presentation', summary: 'Create, inspect, edit, and review PPTX files.', parent: 'office', activation: 'loadable', agentDependency: true },
+  { id: 'office.pdf', title: 'PDF', summary: 'Create, edit, and render PDF files.', parent: 'office', activation: 'loadable', agentDependency: true },
+  { id: 'library', title: 'Library', summary: 'List, search, and read the user Library.', activation: 'loadable', agentDependency: true },
+  { id: 'web', title: 'Web', summary: 'Search the web and fetch web pages.', activation: 'loadable', agentDependency: true },
+  { id: 'media', title: 'Media', summary: 'Generate images, video, and speech or use an owned Studio runtime.', activation: 'loadable', agentDependency: true },
+  { id: 'media.image', title: 'Image media', summary: 'Generate images or use the ImageStudio-owned runtime.', parent: 'media', activation: 'loadable', agentDependency: true },
+  { id: 'media.video', title: 'Video media', summary: 'Generate or edit video or use the VideoStudio-owned runtime.', parent: 'media', activation: 'loadable', agentDependency: true },
+  { id: 'media.speech', title: 'Speech media', summary: 'Generate speech audio.', parent: 'media', activation: 'loadable', agentDependency: true },
+  { id: 'connectors', title: 'Connectors', summary: 'Discover and call enabled third-party connector actions.', activation: 'loadable', agentDependency: true },
+  { id: 'context', title: 'Context', summary: 'Conversation, plan, memory, and project context managed by the host.', activation: 'host-managed', agentDependency: false },
+  { id: 'orchestration', title: 'Orchestration', summary: 'Commander delegation, handoff, and anonymous worker controls.', activation: 'host-managed', agentDependency: false },
+  { id: 'management', title: 'Management', summary: 'Skill, marketplace, and automation management controls.', activation: 'loadable', agentDependency: false },
+  { id: 'runtime', title: 'Runtime', summary: 'Tool-surface, learned-skill, and oversized-result runtime controls.', activation: 'host-managed', agentDependency: false },
+] as const;
 
-  // Shell
-  { name: 'bash',          group: 'shell', permission: 'localExec', summary: 'Execute a shell command on the user\'s machine (cwd = $working_dir).' },
-  { name: 'process_start', group: 'shell', permission: 'localExec', summary: 'Start a persistent long-running build, test, watcher, server, or stdin-driven process session.' },
-  { name: 'process_read',  group: 'shell', permission: 'localExec', summary: 'Read bounded incremental output and status from a persistent process session using a cursor.' },
-  { name: 'process_write', group: 'shell', permission: 'localExec', summary: 'Write known non-secret stdin characters to a running persistent process session.' },
-  { name: 'process_stop',  group: 'shell', permission: 'localExec', summary: 'Stop a persistent process session and its process tree.' },
-  { name: 'interactive_cli_start', group: 'shell', permission: 'localExec', summary: 'Start a live stdin/stdout session for any local CLI command expected to wait for user input.' },
-  { name: 'interactive_cli_read',  group: 'shell', permission: 'localExec', summary: 'Read status and recent output from an interactive CLI session.' },
-  { name: 'interactive_cli_send',  group: 'shell', permission: 'localExec', summary: 'Send non-secret stdin to an interactive CLI session; user secrets must go through the UI panel.' },
-  { name: 'interactive_cli_close', group: 'shell', permission: 'localExec', summary: 'Terminate an interactive CLI session and its process tree.' },
+export const LOADABLE_TOOL_GROUP_IDS: readonly ToolGroupId[] = TOOL_GROUPS
+  .filter((group) => group.activation === 'loadable')
+  .map((group) => group.id);
 
-  // PDF
-  { name: 'markdown_to_pdf', group: 'pdf', permission: 'localExec', summary: 'Markdown → PDF (CJK-friendly, zero external dependency).' },
-  { name: 'html_to_pdf',     group: 'pdf', permission: 'localExec', summary: 'HTML → PDF (same renderer).' },
-  { name: 'edit_pdf',        group: 'pdf', permission: 'localExec', summary: 'Edit PDF pages, order, rotation, overlays, watermarks, images, and form values with a bundled cross-platform engine.' },
-  { name: 'pdf_render',      group: 'pdf', permission: 'localExec', summary: 'Render a selected PDF page to an inline PNG for visual quality review.' },
+export const AGENT_DEPENDENCY_TOOL_GROUP_IDS: readonly ToolGroupId[] = TOOL_GROUPS
+  .filter((group) => group.agentDependency)
+  .map((group) => group.id);
 
-  // Office documents (bundled OfficeCLI engine — no MS Office needed)
-  { name: 'create_docx',   group: 'office', permission: 'localExec', summary: 'Create a Word (.docx) document from paragraphs (styles + inline bold/font/size/color), plus tables and images; CJK-ready, first-page PNG preview; built-in engine, no MS Office required.' },
-  { name: 'create_xlsx',   group: 'office', permission: 'localExec', summary: 'Create one Excel (.xlsx) workbook from rows (values + formulas + number formats + cell styling), multiple sheets, column widths, and native editable charts bound to cell ranges; CJK-ready, PNG preview.' },
-  { name: 'create_pptx',   group: 'office', permission: 'localExec', summary: 'Create an editable PowerPoint (.pptx) deck with free-positioned styled shapes, cropped images, native charts, styled tables, backgrounds, and transitions; CJK-ready, first-slide PNG preview.' },
-  { name: 'office_read',   group: 'office', permission: 'localExec', summary: 'Read an existing .docx/.xlsx/.pptx with element paths (text/outline/get/query) so edits can target them; pairs with edit_office.' },
-  { name: 'edit_office',   group: 'office', permission: 'localExec', summary: 'Safely edit an existing .docx/.xlsx/.pptx (set/add/remove on element paths): pre-existing sources become validated working copies, while conversation-produced outputs can be refined in place; optionally returns a first-page PNG with preview:true.' },
-  { name: 'office_check',  group: 'office', permission: 'localExec', summary: 'Validate an existing .docx/.xlsx/.pptx against OpenXML and scan for formatting/content/structure issues before delivery; invalid OpenXML is a fatal result.' },
-  { name: 'office_render', group: 'office', permission: 'localExec', summary: 'Render a page of an existing .docx/.xlsx/.pptx to a PNG image to inspect layout / fonts / CJK glyphs.' },
+/** Lowest-privilege groups a named Agent may activate as a turn-local
+ * fallback. Persisted Agent dependencies may still use parent groups; the
+ * fallback surface intentionally cannot turn one request into a broad parent
+ * expansion. */
+export const AGENT_FALLBACK_TOOL_GROUP_IDS: readonly ToolGroupId[] = TOOL_GROUPS
+  .filter((group) => (
+    group.agentDependency
+    && !TOOL_GROUPS.some((child) => child.parent === group.id && child.agentDependency)
+  ))
+  .map((group) => group.id);
 
-  // Library
-  { name: 'kb_list',       group: 'kb', summary: 'List Library files and indexing status before choosing what to search or read.' },
-  { name: 'kb_search',     group: 'kb', summary: 'Semantic search over the user\'s Library.' },
-  { name: 'kb_read',       group: 'kb', summary: 'Read source-text chunks from a Library file that kb_search has hit.' },
+export const TOOL_GROUP_ALIASES: Readonly<Record<string, ToolGroupId>> = Object.freeze({
+  fs: 'workspace',
+  shell: 'workspace.execute',
+  pdf: 'office.pdf',
+  kb: 'library',
+  image: 'media',
+  video: 'media',
+  connector: 'connectors',
+});
 
-  // Conversation history
-  { name: 'chat_search',   group: 'chat', summary: 'Search quoted prior messages for missing continuity context; current scope is bound to the active conversation.' },
-  { name: 'chat_read',     group: 'chat', summary: 'Read quoted nearby or latest messages; current scope stops before the triggering message.' },
+export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
+  { name: 'read_files', loadGroups: ['workspace.read'], summary: 'Read one or more files, ranges, images, or prepared document metadata.' },
+  { name: 'list_files', loadGroups: ['workspace.read'], summary: 'List the workspace directory tree.' },
+  { name: 'ocr_file', loadGroups: ['workspace.read'], summary: 'OCR PDF pages or image files.' },
+  { name: 'search_files', loadGroups: ['workspace.read'], summary: 'Find files by name or glob.' },
+  { name: 'grep_files', loadGroups: ['workspace.read'], summary: 'Search text across workspace and attachment files.' },
 
-  // Image
-  { name: 'generate_image', group: 'image', permission: 'localExec', summary: 'Call the configured image-generation API and save the result into the workspace.' },
-  { name: 'image_studio', group: 'image', permission: 'localExec', ownerAgent: IMAGE_STUDIO_AGENT_ID, summary: 'ImageStudio-owned security kernel for project inspection, local snapshot review, configured workflow dispatch, and approved image export.' },
-  { name: 'generate_speech', group: 'video', permission: 'localExec', summary: 'Text-to-speech audio via a configured BYO speech provider.' },
-  { name: 'video_studio', group: 'video', permission: 'localExec', ownerAgent: VIDEO_STUDIO_AGENT_ID, summary: 'VideoStudio-owned native runtime for HTML preview, QA-gated draft/export, and speech transcription fallback orchestration.' },
+  { name: 'write_file', loadGroups: ['workspace.write.output'], permission: 'localExec', summary: 'Write a text file.' },
+  { name: 'append_file', loadGroups: ['workspace.write.output'], permission: 'localExec', summary: 'Append a checked chunk to a text file.' },
+  { name: 'publish_outputs', loadGroups: ['workspace.write.output'], summary: 'Declare final file deliverables for the turn.' },
+  { name: 'apply_patch', loadGroups: ['workspace.write.edit'], permission: 'localExec', summary: 'Apply a transactional multi-file patch.' },
+  { name: 'edit_file', loadGroups: ['workspace.write.edit'], permission: 'localExec', summary: 'Replace exact text in an existing file.' },
+  { name: 'delete_file', loadGroups: ['workspace.write.edit'], permission: 'localExec', summary: 'Delete one file, requesting confirmation only outside the active workspace scope.' },
+  { name: 'workspace_diff', loadGroups: ['workspace.write.edit'], summary: 'Read observed workspace changes.' },
 
-  // Web (when a vendor-native search is available the framework picks it automatically; the two below are the fallback channel)
-  { name: 'web_search',    group: 'web', summary: 'Built-in fallback web search (vendor-native search is preferred automatically when available).' },
-  { name: 'web_fetch',     group: 'web', summary: 'Fetch the body of a URL; pairs with web_search.' },
+  { name: 'bash', loadGroups: ['workspace.execute.command'], permission: 'localExec', summary: 'Run a shell command.' },
+  { name: 'process_session', loadGroups: ['workspace.execute.session'], permission: 'localExec', summary: 'Manage a persistent process session.' },
+  { name: 'interactive_cli', loadGroups: ['workspace.execute.session'], permission: 'localExec', summary: 'Manage a live user-input CLI session.' },
+  { name: 'create_artifact', loadGroups: ['workspace.artifact'], permission: 'localExec', summary: 'Build an interactive HTML/CSS/JS artifact.' },
+  { name: 'html_preview', loadGroups: ['workspace.artifact'], permission: 'localExec', summary: 'Audit local HTML at desktop or mobile targets.' },
 
-  // Connectors (umbrella meta-tools — actual MCP actions are discovered + invoked via these;
-  // injected only when at least one connector is visible to the actor, alongside a
-  // `## Connectors` system-prompt block listing the connector ids + descriptions)
-  { name: 'list_connector_tools', group: 'connector', summary: 'Discover the actions a specific connector exposes (returns name + JSON input schema for each).' },
-  { name: 'call_connector_tool',  group: 'connector', summary: 'Invoke an action on a connector; call list_connector_tools first to learn the action name and schema.' },
-  { name: 'add_custom_connector', group: 'connector', summary: 'Commander-only: add a user-described custom MCP server (requires a user confirmation dialog before install).' },
+  { name: 'create_pdf', loadGroups: ['office.pdf'], permission: 'localExec', summary: 'Create a PDF from Markdown or HTML.' },
+  { name: 'edit_pdf', loadGroups: ['office.pdf'], permission: 'localExec', summary: 'Edit PDF pages, overlays, watermarks, and forms.' },
+  { name: 'pdf_render', loadGroups: ['office.pdf'], permission: 'localExec', summary: 'Render a PDF page for visual review.' },
+  { name: 'create_docx', loadGroups: ['office.word'], permission: 'localExec', summary: 'Create a Word document.' },
+  { name: 'create_xlsx', loadGroups: ['office.spreadsheet'], permission: 'localExec', summary: 'Create an Excel workbook.' },
+  { name: 'create_pptx', loadGroups: ['office.presentation'], permission: 'localExec', summary: 'Create a PowerPoint deck.' },
+  { name: 'office_read', loadGroups: ['office.word', 'office.spreadsheet', 'office.presentation'], permission: 'localExec', summary: 'Inspect an Office document with editable paths.' },
+  { name: 'edit_office', loadGroups: ['office.word', 'office.spreadsheet', 'office.presentation'], permission: 'localExec', summary: 'Edit an existing Word, Excel, or PowerPoint file; optionally returns a first-page PNG with preview:true.' },
+  { name: 'office_review', loadGroups: ['office.word', 'office.spreadsheet', 'office.presentation'], permission: 'localExec', summary: 'Validate and render an Office file for review.' },
 
-  // Task-local and cross-session state
-  { name: 'manage_execution_plan', group: 'meta', summary: 'Manage the durable current-task objective and milestone statuses for long/tool-heavy work; session-local and independent of context summaries.' },
-  { name: 'cross_session_memory', group: 'meta', summary: 'Read/write user profile, shared facts, and agent memory that persist across sessions.' },
-  { name: 'project_instructions', group: 'meta', summary: "Replace the project's standing goal + rules (ORKAS.md, the Project instructions block); commander-only, project sessions." },
-  { name: 'project_tasks',        group: 'meta', summary: "Read/update the project's shared structured task backlog; project sessions only." },
-  { name: 'metacognition',        group: 'meta', summary: 'Read/write metacognition (COMPETENCE / LEARNING_STRATEGIES); env-flag gated.' },
+  { name: 'library', loadGroups: ['library'], summary: 'List, search, or read the user Library.' },
+  { name: 'web_search', loadGroups: ['web'], summary: 'Search the web.' },
+  { name: 'web_fetch', loadGroups: ['web'], summary: 'Fetch the body of a URL.' },
 
-  // NB: the commander's group-dispatch tools (dispatch_to / run_worker) and other
-  // group_chat extras (auto_tasks_list / marketplace_* / skill_search) are
-  // caller-supplied `extraTools`, NOT runner-injected, so they are intentionally
-  // absent here — the anti-drift test only covers runner-injected builtins.
-];
+  { name: 'generate_image', loadGroups: ['media.image'], permission: 'localExec', summary: 'Generate an image into the workspace.' },
+  { name: 'image_studio', loadGroups: ['media.image'], permission: 'localExec', ownerAgent: IMAGE_STUDIO_AGENT_ID, summary: 'ImageStudio-owned QA and export runtime.' },
+  { name: 'video_studio', loadGroups: ['media.video'], permission: 'localExec', ownerAgent: VIDEO_STUDIO_AGENT_ID, summary: 'VideoStudio-owned production runtime.' },
+  { name: 'generate_speech', loadGroups: ['media.speech'], permission: 'localExec', summary: 'Generate speech audio.' },
 
-/** Fixed render order + section heading per group. */
-const GROUP_ORDER: ReadonlyArray<{ group: ToolGroup; title: string }> = [
-  { group: 'fs',    title: 'Files / workspace' },
-  { group: 'shell', title: 'Shell' },
-  { group: 'pdf',   title: 'PDF' },
-  { group: 'office', title: 'Office documents' },
-  { group: 'kb',    title: 'Library' },
-  { group: 'chat',  title: 'Conversation history' },
-  { group: 'image', title: 'Image' },
-  { group: 'video', title: 'Video' },
-  { group: 'web',       title: 'Web' },
-  { group: 'connector', title: 'Connectors (third-party services)' },
-  { group: 'meta',      title: 'Task / cross-session state' },
-];
+  { name: 'list_connector_tools', loadGroups: ['connectors'], summary: 'List actions exposed by one connector.' },
+  { name: 'call_connector_tool', loadGroups: ['connectors'], summary: 'Call an action on an enabled connector.' },
+  { name: 'add_custom_connector', loadGroups: ['connectors'], agentAssignable: false, summary: 'Commander-only custom MCP installation request.' },
 
-const CATALOG_BY_NAME: ReadonlyMap<string, ToolCatalogEntry> = new Map(
-  TOOL_CATALOG.map((e) => [e.name, e]),
-);
+  { name: 'chat_history', loadGroups: ['context'], summary: 'Search or read prior conversation messages.' },
+  { name: 'manage_execution_plan', loadGroups: ['context'], summary: 'Manage the durable current-task execution plan.' },
+  { name: 'cross_session_memory', loadGroups: ['context'], summary: 'Read or update cross-session memory.' },
+  { name: 'metacognition', loadGroups: ['context'], summary: 'Read or update agent competence and strategies.' },
+  { name: 'project_instructions', loadGroups: ['context'], summary: 'Update project standing instructions.' },
+  { name: 'project_tasks', loadGroups: ['context'], summary: 'Read or update the project task backlog.' },
 
-/**
- * Owner-scoped visibility gate. A tool is visible to an actor when its catalog
- * entry declares no `ownerAgent`, or lists `agentId` among its owner(s) (a
- * single id or an array of ids). Tools not in the catalog (caller-supplied
- * `extraTools` such as the commander's dispatch tools) are never owner-gated →
- * always visible. This is the authoritative check runner.ts applies before
- * handing `tools[]` to the model.
- */
+  { name: 'dispatch_to', loadGroups: ['orchestration'], summary: 'Delegate visible work and continue the commander turn.' },
+  { name: 'hand_off_to', loadGroups: ['orchestration'], summary: 'Transfer terminal ownership to another Agent.' },
+  { name: 'run_worker', loadGroups: ['orchestration'], summary: 'Run an anonymous private worker.' },
+
+  { name: 'skill_search', loadGroups: ['management'], summary: 'Search available open-tier skills.' },
+  { name: 'import_skill_package', loadGroups: ['management'], summary: 'Import a user-requested skill package.' },
+  { name: 'skill_manage', loadGroups: ['runtime'], summary: 'Manage an Agent-owned learned skill.' },
+  { name: 'marketplace_search', loadGroups: ['management'], summary: 'Search the marketplace.' },
+  { name: 'marketplace_request_install', loadGroups: ['management'], summary: 'Request a user-confirmed marketplace installation.' },
+  { name: 'auto_tasks_list', loadGroups: ['management'], summary: 'List automation tasks.' },
+
+  { name: 'tool_load', loadGroups: ['runtime'], summary: 'Activate one or more loadable tool groups.' },
+  { name: 'tool_result', loadGroups: ['runtime'], summary: 'Search, aggregate, or page a persisted oversized tool result.' },
+] as const;
+
+const GROUP_BY_ID = new Map(TOOL_GROUPS.map((group) => [group.id, group]));
+const CATALOG_BY_NAME = new Map(TOOL_CATALOG.map((entry) => [entry.name, entry]));
+const GROUP_ORDER = new Map(TOOL_GROUPS.map((group, index) => [group.id, index]));
+
+export function getToolCatalogEntry(name: string): ToolCatalogEntry | undefined {
+  return CATALOG_BY_NAME.get(name);
+}
+
 export function isToolVisibleToAgent(name: string, agentId: string): boolean {
-  const owner = CATALOG_BY_NAME.get(name)?.ownerAgent;
+  const entry = CATALOG_BY_NAME.get(name);
+  if (agentId && entry?.agentAssignable === false) return false;
+  const owner = entry?.ownerAgent;
   if (!owner) return true;
   return Array.isArray(owner) ? owner.includes(agentId) : owner === agentId;
 }
 
-const PREAMBLE =
-  'Built-in tools available in the current session, grouped by purpose. ' +
-  '**Calling a tool does NOT require a skill wrapper** — if a tool can do the job in one call, just call it; ' +
-  'do not design a skill for a single-step task. The real value of a skill is encapsulating multi-step logic, ' +
-  'managing third-party API credentials, or reusing a high-frequency composite flow.';
+export function canonicalToolGroupId(value: unknown): ToolGroupId | undefined {
+  if (typeof value !== 'string') return undefined;
+  const id = value.trim();
+  if (GROUP_BY_ID.has(id as ToolGroupId)) return id as ToolGroupId;
+  return TOOL_GROUP_ALIASES[id];
+}
 
-/**
- * Render the `## Available tools` block.
- *
- * `names` should be sourced from runner.ts's actual assembled
- * `allTools.map(t => t.name)` — that way runtime-conditional tools
- * (memory / metacognition / plan_* / uid-gated fileTools, ...) follow
- * the actual injection state automatically; no "listed but not
- * actually injected" drift.
- *
- * Behaviour:
- * - empty `names` → return `""` (core-agent treats empty string as "skip
- *   this section")
- * - a name in `names` that is missing from `TOOL_CATALOG` → warn log +
- *   skip that name; never throws
- * - output is assembled in fixed `GROUP_ORDER`; within each group the
- *   order matches the catalog array — same input → same output, KV
- *   cache friendly
- */
-export function getToolsSystemPromptBlock(names: string[]): string {
-  if (!names.length) return '';
+export function isLoadableToolGroup(id: ToolGroupId): boolean {
+  return GROUP_BY_ID.get(id)?.activation === 'loadable';
+}
 
-  const seen = new Set<string>();
-  const present: ToolCatalogEntry[] = [];
-  for (const name of names) {
-    if (typeof name !== 'string' || !name) continue;
-    if (seen.has(name)) continue;
-    seen.add(name);
-    const entry = CATALOG_BY_NAME.get(name);
-    if (!entry) {
-      log.warn('runtime tool missing from TOOL_CATALOG', { tool: name });
+export function isAgentDependencyToolGroup(id: ToolGroupId): boolean {
+  return GROUP_BY_ID.get(id)?.agentDependency === true;
+}
+
+export function isAgentFallbackToolGroup(id: ToolGroupId): boolean {
+  return AGENT_FALLBACK_TOOL_GROUP_IDS.includes(id);
+}
+
+export function expandToolGroups(values: readonly string[]): ToolGroupId[] {
+  const requested = new Set<ToolGroupId>();
+  for (const value of values) {
+    const id = canonicalToolGroupId(value);
+    if (id && isLoadableToolGroup(id)) requested.add(id);
+  }
+  const expanded = new Set<ToolGroupId>();
+  const pending = [...requested];
+  while (pending.length) {
+    const id = pending.shift()!;
+    if (expanded.has(id)) continue;
+    expanded.add(id);
+    for (const group of TOOL_GROUPS) {
+      if (group.parent === id && group.activation === 'loadable') pending.push(group.id);
+    }
+  }
+  return [...expanded].sort((a, b) => (GROUP_ORDER.get(a) ?? 999) - (GROUP_ORDER.get(b) ?? 999));
+}
+
+/** Stable minimal representation for runtime loading and persisted sidecars. */
+export function canonicalizeToolGroups(values: readonly string[]): ToolGroupId[] {
+  return canonicalizeGroups(values, isLoadableToolGroup);
+}
+
+/** Stable representation accepted by agent.json.tool_list and Agent Creator. */
+export function canonicalizeAgentToolGroups(values: readonly string[]): ToolGroupId[] {
+  return canonicalizeGroups(values, isAgentDependencyToolGroup);
+}
+
+function canonicalizeGroups(
+  values: readonly string[],
+  accepts: (id: ToolGroupId) => boolean,
+): ToolGroupId[] {
+  const ids = new Set<ToolGroupId>();
+  for (const value of values) {
+    const id = canonicalToolGroupId(value);
+    if (id && accepts(id)) ids.add(id);
+  }
+  for (const id of [...ids]) {
+    let parent = GROUP_BY_ID.get(id)?.parent;
+    while (parent) {
+      if (ids.has(parent)) {
+        ids.delete(id);
+        break;
+      }
+      parent = GROUP_BY_ID.get(parent)?.parent;
+    }
+  }
+  return [...ids].sort((a, b) => (GROUP_ORDER.get(a) ?? 999) - (GROUP_ORDER.get(b) ?? 999));
+}
+
+export function invalidToolGroupRefs(values: readonly unknown[]): string[] {
+  return invalidGroupRefs(values, isLoadableToolGroup);
+}
+
+export function invalidAgentToolGroupRefs(values: readonly unknown[]): string[] {
+  return invalidGroupRefs(values, isAgentDependencyToolGroup);
+}
+
+function invalidGroupRefs(
+  values: readonly unknown[],
+  accepts: (id: ToolGroupId) => boolean,
+): string[] {
+  return values
+    .filter((value): value is string => typeof value === 'string')
+    .map((value) => value.trim())
+    .filter((value) => !canonicalToolGroupId(value) || !accepts(canonicalToolGroupId(value)!));
+}
+
+export function toolNamesForGroups(groups: readonly string[]): string[] {
+  const expanded = new Set(expandToolGroups(groups));
+  return TOOL_CATALOG
+    .filter((entry) => entry.loadGroups?.some((group) => expanded.has(group)))
+    .map((entry) => entry.name);
+}
+
+export function toolNamesForAgentGroups(groups: readonly string[]): string[] {
+  return toolNamesForGroups(groups).filter((name) => CATALOG_BY_NAME.get(name)?.agentAssignable !== false);
+}
+
+export function hostManagedToolNames(): string[] {
+  return TOOL_CATALOG
+    .filter((entry) => entry.loadGroups?.some((group) => GROUP_BY_ID.get(group)?.activation === 'host-managed'))
+    .map((entry) => entry.name);
+}
+
+/** Compact deterministic category index; full tool schemas arrive only after activation. */
+export function getLoadableToolGroupsSystemPromptBlock(input: {
+  availableToolNames: readonly string[];
+  /** Optional runtime allow-list supplied by ToolSurfaceController. */
+  allowedGroupIds?: readonly ToolGroupId[];
+  /** Runtime mode advertises `tool_load`.
+   * Agent-runtime mode is the lower-privilege fallback directory for a named
+   * Agent and contains only Agent-declarable groups/tools.
+   * Agent-authoring mode is a schema directory only: it lets Agent Creator
+   * write exact dependency ids without changing the current legacy surface. */
+  purpose?: 'runtime' | 'agent-runtime' | 'agent-authoring';
+}): string {
+  const purpose = input.purpose ?? 'runtime';
+  const available = new Set(input.availableToolNames);
+  const allowedGroups = input.allowedGroupIds
+    ? new Set(input.allowedGroupIds)
+    : purpose === 'agent-runtime'
+      ? new Set(AGENT_FALLBACK_TOOL_GROUP_IDS)
+      : undefined;
+  const toolAllowedForPurpose = (entry: ToolCatalogEntry): boolean => purpose === 'runtime'
+    || entry.agentAssignable !== false;
+  const groupHasAvailableTool = (id: ToolGroupId): boolean => TOOL_CATALOG.some(
+    (entry) => toolAllowedForPurpose(entry) && available.has(entry.name) && entry.loadGroups?.includes(id),
+  );
+  const groupAllowedForPurpose = (group: ToolGroupEntry): boolean => (
+    purpose === 'runtime' ? group.activation === 'loadable' : group.agentDependency
+  );
+  const groupHasAvailableToolInSubtree = (id: ToolGroupId): boolean => {
+    if (groupHasAvailableTool(id)) return true;
+    return TOOL_GROUPS.some((child) => (
+      child.parent === id
+      && groupAllowedForPurpose(child)
+      && groupHasAvailableToolInSubtree(child.id)
+    ));
+  };
+  const visible = TOOL_GROUPS.filter((group) => {
+    if (!groupAllowedForPurpose(group)) return false;
+    if (allowedGroups && !allowedGroups.has(group.id)) return false;
+    return groupHasAvailableToolInSubtree(group.id);
+  });
+  if (!visible.length) return '';
+  const lines = [
+    purpose === 'agent-authoring' ? '## Agent tool dependencies' : '## Loadable tool groups',
+    '',
+    purpose !== 'agent-authoring'
+      ? (purpose === 'agent-runtime'
+        ? 'Fallback only: if the current tools cannot complete an in-domain request, load the smallest sufficient groups in one call. Loads last for this user turn only.'
+        : 'Fallback only: use `tool_load` when the tools already shown cannot complete the task. Load all clearly needed groups in one call; choose the smallest sufficient groups, and remember that a parent loads all children. Loads last for the current user turn only. Runtime-only groups must not be written into an Agent dependency list.')
+      : 'Use these exact group ids when authoring an Agent\'s built-in tool dependencies. This directory does not change the current session\'s tool surface.',
+    '',
+  ];
+  for (const group of visible) {
+    const directTools = purpose !== 'runtime'
+      ? TOOL_CATALOG
+        .filter((entry) => (
+          entry.agentAssignable !== false
+          && available.has(entry.name)
+          && entry.loadGroups?.includes(group.id)
+        ))
+        .map((entry) => `\`${entry.name}\``)
+      : [];
+    if (purpose === 'agent-runtime') {
+      lines.push(`- \`${group.id}\` — ${group.title}. Tools: ${directTools.join(', ')}.`);
       continue;
     }
-    present.push(entry);
-  }
-  if (!present.length) return '';
-
-  const presentSet = new Set(present.map((e) => e.name));
-  const lines: string[] = ['## Available tools', '', PREAMBLE, ''];
-
-  for (const { group, title } of GROUP_ORDER) {
-    const groupEntries = TOOL_CATALOG.filter(
-      (e) => e.group === group && presentSet.has(e.name),
-    );
-    if (!groupEntries.length) continue;
-    lines.push(`### ${title}`);
-    for (const e of groupEntries) {
-      const perm = e.permission === 'localExec' ? ' (gated by local-execution permission)' : '';
-      lines.push(`- **${e.name}** — ${e.summary}${perm}`);
+    let depth = 0;
+    let parent = group.parent;
+    while (parent) {
+      depth += 1;
+      parent = GROUP_BY_ID.get(parent)?.parent;
     }
-    lines.push('');
+    const indent = '  '.repeat(depth);
+    const markers = purpose === 'runtime' && !group.agentDependency
+      ? ['runtime only; not an Agent dependency']
+      : [];
+    const status = markers.length ? ` (${markers.join('; ')})` : '';
+    const members = directTools.length ? ` Tools: ${directTools.join(', ')}.` : '';
+    lines.push(`${indent}- \`${group.id}\`${status} — ${group.summary}${members}`);
   }
+  return lines.join('\n');
+}
 
-  return lines.join('\n').trimEnd();
+/** Per-turn activation state, kept out of the stable system prefix so the
+ * connector, Skill, Agent, and project instruction blocks stay byte-stable
+ * across ordinary rounds. Providers with native deferred-tool loading insert
+ * newly activated schemas after the corresponding tool result and preserve
+ * the earlier prefix. Other providers still receive the ordinary expanded
+ * `tools[]` snapshot; for those providers a group's first load can rewrite the
+ * provider-defined tool prefix. */
+export function getActiveToolGroupsTurnBlock(groups: readonly string[]): string {
+  const active = canonicalizeToolGroups(groups);
+  if (!active.length) return '';
+  return [
+    '## Active tool groups',
+    '',
+    `Already active; do not call \`tool_load\` for these groups: ${active.map((id) => `\`${id}\``).join(', ')}.`,
+  ].join('\n');
 }

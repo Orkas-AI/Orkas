@@ -10,7 +10,10 @@ import { describe, it, expect, beforeEach, afterAll } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { claudeBackend } from '../../../../src/main/features/local_agents/backends/claude';
+import {
+  CLAUDE_BACKGROUND_TIMEOUT_MS,
+  claudeBackend,
+} from '../../../../src/main/features/local_agents/backends/claude';
 
 const isWindows = process.platform === 'win32';
 const itPosix = isWindows ? it.skip : it;
@@ -57,6 +60,10 @@ describe('local_agents/backends/claude › end-to-end with fake CLI', () => {
     }
   });
 
+  it('uses an exact 24-hour production background cap', () => {
+    expect(CLAUDE_BACKGROUND_TIMEOUT_MS).toBe(24 * 60 * 60_000);
+  });
+
   it('parses a minimal completed conversation', async () => {
     // fake CLI reads one stdin line (the user message JSON) and then
     // emits its stream-json output. We can't EOF-wait the way a real
@@ -67,7 +74,7 @@ describe('local_agents/backends/claude › end-to-end with fake CLI', () => {
       '{"type":"system","subtype":"init","session_id":"sess-fake","cwd":"/x"}',
       '{"type":"assistant","message":{"content":[{"type":"text","text":"Hello "}]}}',
       '{"type":"assistant","message":{"content":[{"type":"text","text":"world."}]}}',
-      '{"type":"result","subtype":"success","result":"Hello world.","total_cost_usd":0,"duration_ms":1}',
+      '{"type":"result","subtype":"success","result":"  Hello world.  ","total_cost_usd":0,"duration_ms":1}',
     ]));
     const events: any[] = [];
     const ac = new AbortController();
@@ -85,7 +92,7 @@ describe('local_agents/backends/claude › end-to-end with fake CLI', () => {
     expect(types[types.length - 1]).toBe('done');
     const done = events[events.length - 1];
     expect(done.status).toBe('completed');
-    expect(done.output).toBe('Hello world.');
+    expect(done.output).toBe('  Hello world.  ');
     expect(done.sessionId).toBe('sess-fake');
   });
 
@@ -526,8 +533,445 @@ input.on('line', (line) => {
     expect(ingressStates[0]).toBeTruthy();
     expect(ingressStates.at(-1)).toBeNull();
   });
-});
 
+  /** The 2026-08-11 incident: closing the CLI at its first result destroyed
+   *  background work. A later partial fix kept the process but ended the Orkas
+   *  turn, which removed loading/Stop and split the final answer. This case
+   *  protects the user outcome with the background file as an independent
+   *  oracle and the absence of an early `done` as the turn-lifetime oracle. */
+  itPosix('keeps one pending turn through background work and its resumed answer', async () => {
+    // The oracle is the background task's side effect, not the event stream:
+    // that file is what the user loses when the host reaps too early. The fake
+    // exits the moment stdin closes, reproducing the measured CLI behaviour
+    // (exit 0 within 183–569ms of `stdin.end()`), so closing stdin destroys the
+    // pending work exactly as it did in production.
+    const workProof = path.join(tmpDir, 'background-work-completed.txt');
+    const fake = writeNodeExecutable(tmpDir, 'claude', `
+const fs = require('node:fs');
+let started = false;
+const w = (line) => process.stdout.write(line + '\\n');
+process.stdin.on('end', () => process.exit(0));
+process.stdin.on('data', (buf) => {
+  if (String(buf).includes('"interrupt"')) process.exit(0);
+  if (started) return;
+  started = true;
+  w('{"type":"system","subtype":"init","session_id":"sess-linger","cwd":"/x"}');
+  w('{"type":"system","subtype":"task_started","task_id":"bg-1","task_type":"local_bash","description":"long build"}');
+  w('{"type":"assistant","message":{"content":[{"type":"text","text":"main answer"}]}}');
+  w('{"type":"result","subtype":"success","result":"main answer","total_cost_usd":0,"duration_ms":1}');
+  setTimeout(() => {
+    fs.writeFileSync(${JSON.stringify(workProof)}, 'done');
+    w('{"type":"system","subtype":"task_updated","task_id":"bg-1","patch":{"status":"completed"}}');
+    w('{"type":"system","subtype":"task_notification","task_id":"bg-1","status":"completed","summary":"build finished"}');
+    w('{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"build/report.txt"}}]}}');
+    w('{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}');
+    w('{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"MultiEdit","input":{"files":["build/summary.md",{"filePath":"build/details.txt"}]}}]}}');
+    w('{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"ok"}]}}');
+    w('{"type":"assistant","message":{"content":[{"type":"text","text":"the build passed"}]}}');
+    w('{"type":"result","subtype":"success","result":"the build passed","usage":{"output_tokens":7},"total_cost_usd":0,"duration_ms":1}');
+  }, 250);
+});
+`);
+    const events: any[] = [];
+    const backgroundHandles: any[] = [];
+    let pid = 0;
+    let sawFirstResult = false;
+    let resolveBackground!: () => void;
+    const enteredBackground = new Promise<void>(resolve => { resolveBackground = resolve; });
+    let runSettled = false;
+
+    try {
+      const run = claudeBackend.run({
+        binPath: fake,
+        prompt: 'start the build in the background',
+        cwd: tmpDir,
+        signal: new AbortController().signal,
+        onEvent: event => {
+          events.push(event);
+          if (event.type === 'process-info') pid = Number(event.pid);
+          if (event.type === 'status' && event.status === 'result') sawFirstResult = true;
+          if (sawFirstResult && event.type === 'status' && event.status === 'background-running') {
+            resolveBackground();
+          }
+        },
+        onBackgroundRun: handle => backgroundHandles.push(handle),
+        timeoutMs: 10_000,
+      });
+      void run.then(() => { runSettled = true; });
+
+      await enteredBackground;
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(runSettled).toBe(false);
+      expect(events.filter(event => event.type === 'done')).toHaveLength(0);
+      expect(events).toContainEqual(expect.objectContaining({
+        type: 'status',
+        status: 'background-running',
+        taskId: 'bg-1',
+        taskType: 'local_bash',
+        message: 'long build',
+      }));
+      expect(() => process.kill(pid, 0)).not.toThrow();
+      expect(backgroundHandles).toHaveLength(1);
+
+      await run;
+      expect(fs.existsSync(workProof)).toBe(true);
+      expect(events.filter(event => event.type === 'done')).toHaveLength(1);
+      expect(events.at(-1)).toMatchObject({
+        type: 'done',
+        status: 'completed',
+        output: 'main answer\n\nthe build passed',
+        sessionId: 'sess-linger',
+      });
+      expect(events.some(event => (
+        event.type === 'tool-event' && event.tool === 'Write'
+      ))).toBe(true);
+      await expectProcessToExit(pid, 2_000);
+    } finally {
+      if (pid > 0) {
+        try { process.kill(-pid, 'SIGKILL'); } catch { /* already exited */ }
+      }
+    }
+  });
+
+  /** A resumed foreground turn that fails must terminate the still-pending
+   *  host turn with one honest failure, not append an out-of-band message. */
+  itPosix('keeps a resumed foreground failure on the original turn', async () => {
+    const fake = writeNodeExecutable(tmpDir, 'claude', `
+let started = false;
+const w = (line) => process.stdout.write(line + '\\n');
+process.stdin.on('end', () => process.exit(0));
+process.stdin.on('data', (buf) => {
+  if (String(buf).includes('"interrupt"')) process.exit(0);
+  if (started) return;
+  started = true;
+  w('{"type":"system","subtype":"init","session_id":"sess-fail","cwd":"/x"}');
+  w('{"type":"system","subtype":"task_started","task_id":"bg-1","task_type":"local_bash","description":"long job"}');
+  w('{"type":"result","subtype":"success","result":"kicked off","total_cost_usd":0,"duration_ms":1}');
+  setTimeout(() => {
+    w('{"type":"system","subtype":"task_notification","task_id":"bg-1","status":"completed","summary":"job finished"}');
+    w('{"type":"result","subtype":"error_during_execution","error":"boom","duration_ms":1}');
+  }, 250);
+});
+`);
+    const events: any[] = [];
+    let pid = 0;
+    try {
+      await claudeBackend.run({
+        binPath: fake,
+        prompt: 'start the long job',
+        cwd: tmpDir,
+        signal: new AbortController().signal,
+        onEvent: event => {
+          events.push(event);
+          if (event.type === 'process-info') pid = Number(event.pid);
+        },
+        onBackgroundRun: () => {},
+        timeoutMs: 10_000,
+      });
+      await expectProcessToExit(pid, 8_000);
+      expect(events.filter(event => event.type === 'done')).toHaveLength(1);
+      expect(events.at(-1)).toMatchObject({
+        type: 'done',
+        status: 'failed',
+        error: 'boom',
+        output: 'kicked off',
+      });
+    } finally {
+      if (pid > 0) {
+        try { process.kill(-pid, 'SIGKILL'); } catch { /* already exited */ }
+      }
+    }
+  });
+
+  /** Background progress must not slide the 24-hour hard cap. The small test
+   *  override proves a busy-but-never-finishing task still ends with a
+   *  structured background timeout for localized recovery copy. */
+  itPosix('enforces a non-sliding background hard cap', async () => {
+    const fake = writeNodeExecutable(tmpDir, 'claude', `
+let started = false;
+const w = (line) => process.stdout.write(line + '\\n');
+process.stdin.on('data', (buf) => {
+  if (String(buf).includes('"interrupt"')) process.exit(0);
+  if (started) return;
+  started = true;
+  w('{"type":"system","subtype":"init","session_id":"sess-cap","cwd":"/x"}');
+  w('{"type":"system","subtype":"task_started","task_id":"bg-1","task_type":"local_bash","description":"endless job"}');
+  w('{"type":"result","subtype":"success","result":"running it","total_cost_usd":0,"duration_ms":1}');
+  setInterval(() => w('{"type":"system","subtype":"task_progress","task_id":"bg-1","summary":"still running"}'), 40);
+});
+`);
+    const events: any[] = [];
+    let pid = 0;
+    process.env.ORKAS_LOCAL_AGENT_BACKGROUND_TIMEOUT_MS = '250';
+    try {
+      await claudeBackend.run({
+        binPath: fake,
+        prompt: 'start the endless job',
+        cwd: tmpDir,
+        signal: new AbortController().signal,
+        onEvent: event => {
+          events.push(event);
+          if (event.type === 'process-info') pid = Number(event.pid);
+        },
+        onBackgroundRun: () => {},
+        timeoutMs: 20_000,
+      });
+      await expectProcessToExit(pid, 8_000);
+      expect(events.filter(event => (
+        event.type === 'status' && event.status === 'background-running'
+      )).length).toBeGreaterThan(2);
+      expect(events.at(-1)).toMatchObject({
+        type: 'done',
+        status: 'timeout',
+        timeoutPhase: 'background',
+      });
+    } finally {
+      delete process.env.ORKAS_LOCAL_AGENT_BACKGROUND_TIMEOUT_MS;
+      if (pid > 0) {
+        try { process.kill(-pid, 'SIGKILL'); } catch { /* already exited */ }
+      }
+    }
+  });
+
+  /** A self-woken foreground turn may launch another background task. Each
+   *  transition must remain inside the same host turn and give the new
+   *  continuous background phase its own cap. */
+  itPosix('supports repeated foreground and background phases in one turn', async () => {
+    const workProof = path.join(tmpDir, 'second-generation-work.txt');
+    const fake = writeNodeExecutable(tmpDir, 'claude', `
+const fs = require('node:fs');
+let started = false;
+const w = (line) => process.stdout.write(line + '\\n');
+process.stdin.on('data', (buf) => {
+  if (String(buf).includes('"interrupt"')) process.exit(0);
+  if (started) return;
+  started = true;
+  w('{"type":"system","subtype":"init","session_id":"sess-drain","cwd":"/x"}');
+  w('{"type":"system","subtype":"task_started","task_id":"bg-1","task_type":"local_bash","description":"first job"}');
+  w('{"type":"result","subtype":"success","result":"kicked off","total_cost_usd":0,"duration_ms":1}');
+  setTimeout(() => {
+    // The first task retires, then real assistant activity resumes foreground.
+    w('{"type":"system","subtype":"task_notification","task_id":"bg-1","status":"completed","summary":"first done"}');
+    w('{"type":"assistant","message":{"content":[{"type":"text","text":"starting the next stage"}]}}');
+    // That resumed foreground turn starts a second background phase.
+    w('{"type":"system","subtype":"task_started","task_id":"bg-2","task_type":"local_bash","description":"second job"}');
+    w('{"type":"result","subtype":"success","result":"second stage running","duration_ms":1}');
+  }, 100);
+  setTimeout(() => {
+    // The second phase stays alive until its own task and resumed result finish.
+    fs.writeFileSync(${JSON.stringify(workProof)}, 'done');
+    w('{"type":"system","subtype":"task_notification","task_id":"bg-2","status":"completed","summary":"second done"}');
+    w('{"type":"result","subtype":"success","result":"second task done","duration_ms":1}');
+  }, 800);
+});
+`);
+    const events: any[] = [];
+    let pid = 0;
+    try {
+      await claudeBackend.run({
+        binPath: fake,
+        prompt: 'start the first job',
+        cwd: tmpDir,
+        signal: new AbortController().signal,
+        onEvent: event => {
+          events.push(event);
+          if (event.type === 'process-info') pid = Number(event.pid);
+        },
+        onBackgroundRun: () => {},
+        timeoutMs: 20_000,
+      });
+      await expectProcessToExit(pid, 8_000);
+      expect(fs.existsSync(workProof)).toBe(true);
+      expect(events.filter(event => (
+        event.type === 'status' && event.status === 'background-running'
+      )).length).toBeGreaterThanOrEqual(2);
+      expect(events.filter(event => event.type === 'done')).toHaveLength(1);
+      expect(events.at(-1)).toMatchObject({
+        type: 'done',
+        status: 'completed',
+        output: 'kicked off\n\nsecond stage running\n\nsecond task done',
+      });
+    } finally {
+      if (pid > 0) {
+        try { process.kill(-pid, 'SIGKILL'); } catch { /* already exited */ }
+      }
+    }
+  });
+
+  /** The initial foreground wall clock must be disabled while background work
+   *  waits, then restarted from zero when Claude resumes model output. */
+  itPosix('restores a fresh foreground watchdog after background work wakes Claude', async () => {
+    const fake = writeNodeExecutable(tmpDir, 'claude', `
+let started = false;
+const w = (line) => process.stdout.write(line + '\\n');
+process.stdin.on('data', (buf) => {
+  if (started) return;
+  started = true;
+  w('{"type":"system","subtype":"init","session_id":"sess-watchdog","cwd":"/x"}');
+  w('{"type":"system","subtype":"task_started","task_id":"bg-1","task_type":"local_bash","description":"slow job"}');
+  w('{"type":"result","subtype":"success","result":"kicked off","total_cost_usd":0,"duration_ms":1}');
+  setTimeout(() => {
+    w('{"type":"system","subtype":"task_notification","task_id":"bg-1","status":"completed","summary":"slow job done"}');
+    w('{"type":"assistant","message":{"content":[{"type":"text","text":"foreground resumed"}]}}');
+    // No result follows. The newly armed foreground wall cap must stop us.
+  }, 1_100);
+});
+`);
+    const events: any[] = [];
+    let pid = 0;
+    try {
+      await claudeBackend.run({
+        binPath: fake,
+        prompt: 'start the slow job',
+        cwd: tmpDir,
+        signal: new AbortController().signal,
+        onEvent: event => {
+          events.push(event);
+          if (event.type === 'process-info') pid = Number(event.pid);
+        },
+        onBackgroundRun: () => {},
+        timeoutMs: 800,
+      });
+      expect(events).toContainEqual(expect.objectContaining({
+        type: 'text-delta',
+        text: 'foreground resumed',
+      }));
+      expect(events.at(-1)).toMatchObject({
+        type: 'done',
+        status: 'timeout',
+        timeoutPhase: 'foreground',
+      });
+      await expectProcessToExit(pid, 2_000);
+    } finally {
+      if (pid > 0) {
+        try { process.kill(-pid, 'SIGKILL'); } catch { /* already exited */ }
+      }
+    }
+  });
+
+  /** Stop must cancel the live host turn and the CLI-owned background process
+   *  tree. A terminal `cancelled` event alone is not sufficient: the delayed
+   *  child side effect is the independent prohibited-effect oracle. */
+  itPosix('cancels the CLI and its background child process when the user stops', async () => {
+    const lateProof = path.join(tmpDir, 'must-not-exist.txt');
+    const fake = writeNodeExecutable(tmpDir, 'claude', `
+const { spawn } = require('node:child_process');
+let started = false;
+const w = (line) => process.stdout.write(line + '\\n');
+process.stdin.on('data', (buf) => {
+  if (String(buf).includes('"interrupt"')) return;
+  if (started) return;
+  started = true;
+  const childSource = "setTimeout(() => require('node:fs').writeFileSync("
+    + ${JSON.stringify(JSON.stringify(lateProof))}
+    + ", 'late'), 700)";
+  spawn(process.execPath, ['-e', childSource], { stdio: 'ignore' });
+  w('{"type":"system","subtype":"init","session_id":"sess-user-stop","cwd":"/x"}');
+  w('{"type":"system","subtype":"task_started","task_id":"bg-stop","task_type":"local_bash","description":"delayed write"}');
+  w('{"type":"result","subtype":"success","result":"running it","duration_ms":1}');
+});
+setInterval(() => {}, 1_000);
+`);
+    const events: any[] = [];
+    const controller = new AbortController();
+    let resolveBackground!: () => void;
+    const enteredBackground = new Promise<void>(resolve => { resolveBackground = resolve; });
+    let pid = 0;
+
+    try {
+      const run = claudeBackend.run({
+        binPath: fake,
+        prompt: 'start the delayed write',
+        cwd: tmpDir,
+        signal: controller.signal,
+        onEvent: event => {
+          events.push(event);
+          if (event.type === 'process-info') pid = Number(event.pid);
+          if (event.type === 'status' && event.status === 'background-running') {
+            resolveBackground();
+          }
+        },
+        onBackgroundRun: () => {},
+        timeoutMs: 10_000,
+      });
+
+      await enteredBackground;
+      controller.abort();
+      await run;
+      await new Promise(resolve => setTimeout(resolve, 900));
+
+      expect(events.at(-1)).toMatchObject({ type: 'done', status: 'cancelled' });
+      expect(fs.existsSync(lateProof)).toBe(false);
+      await expectProcessToExit(pid, 2_000);
+    } finally {
+      if (pid > 0) {
+        try { process.kill(-pid, 'SIGKILL'); } catch { /* already exited */ }
+      }
+    }
+  });
+
+  /** Quitting the app must not leave the CLI running. Its process is our child
+   *  but its own process-group leader, so nothing else would end it — it would
+   *  keep holding the workspace and spending the user's budget with nobody left
+   *  to report to. The fake exits only on the interrupt the stop path sends. */
+  itPosix('ends a background run on demand so quitting cannot orphan it', async () => {
+    const fake = writeNodeExecutable(tmpDir, 'claude', `
+let started = false;
+const w = (line) => process.stdout.write(line + '\\n');
+process.stdin.on('data', (buf) => {
+  if (String(buf).includes('"interrupt"')) process.exit(0);
+  if (started) return;
+  started = true;
+  w('{"type":"system","subtype":"init","session_id":"sess-quit","cwd":"/x"}');
+  w('{"type":"system","subtype":"task_started","task_id":"long","task_type":"local_bash","description":"long job"}');
+  w('{"type":"result","subtype":"success","result":"running it","total_cost_usd":0,"duration_ms":1}');
+  setInterval(() => {}, 1_000);
+});
+`);
+    let pid = 0;
+    let stop: ((reason: string) => void) | null = null;
+    let exited: Promise<void> | null = null;
+    let resolveRegistered!: () => void;
+    const registered = new Promise<void>(resolve => { resolveRegistered = resolve; });
+
+    try {
+      const run = claudeBackend.run({
+        binPath: fake,
+        prompt: 'start the long job',
+        cwd: tmpDir,
+        signal: new AbortController().signal,
+        onEvent: event => { if (event.type === 'process-info') pid = Number(event.pid); },
+        onBackgroundRun: handle => {
+          stop = handle.stop;
+          exited = handle.untilProcessExit;
+          resolveRegistered();
+        },
+        timeoutMs: 20_000,
+      });
+
+      await registered;
+      // The task never finishes, so nothing else will end this process.
+      expect(() => process.kill(pid, 0)).not.toThrow();
+      expect(typeof stop).toBe('function');
+
+      stop!('the app is quitting');
+      // Bounded: a stop that does nothing must fail here with a verdict, not
+      // hang the suite waiting for a process that will never go.
+      const settled = await Promise.race([
+        exited!.then(() => 'exited'),
+        new Promise(resolve => setTimeout(() => resolve('still running'), 8_000)),
+      ]);
+      expect(settled).toBe('exited');
+      await run;
+      await expectProcessToExit(pid, 2_000);
+    } finally {
+      if (pid > 0) {
+        try { process.kill(-pid, 'SIGKILL'); } catch { /* already exited */ }
+      }
+    }
+  });
+
+});
 async function expectProcessToExit(pid: number, timeoutMs: number): Promise<void> {
   expect(pid).toBeGreaterThan(0);
   const deadline = Date.now() + timeoutMs;

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const oauthProgress = vi.fn();
+const logInfo = vi.fn();
 
 function mockElectron() {
   vi.doMock('electron', () => ({
@@ -29,6 +30,14 @@ beforeEach(() => {
   }));
   vi.doMock('../../../../src/main/features/connectors/oauth-events', () => ({
     broadcastOAuthConnectProgress: oauthProgress,
+  }));
+  vi.doMock('../../../../src/main/logger', () => ({
+    createLogger: () => ({
+      error: vi.fn(),
+      warn: vi.fn(),
+      info: logInfo,
+      debug: vi.fn(),
+    }),
   }));
 });
 

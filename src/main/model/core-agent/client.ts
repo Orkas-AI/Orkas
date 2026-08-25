@@ -37,7 +37,12 @@ const log = createLogger('model');
 import { genConversationId } from '../../storage';
 import type { ChatOptions, ChatResult, StreamEvent } from '../client';
 
-import { buildRunner, type ToolDefSnapshot } from './runner';
+import {
+  buildRunner,
+  type ToolDefSnapshot,
+  type ToolSurfaceTelemetrySnapshot,
+} from './runner';
+import type { SkillSelectionInput } from './skill-registry';
 import { mapCoreAgentEvents } from './event-mapper';
 import {
   getSessionForUser as _getCachedSessionForUser,
@@ -48,7 +53,7 @@ import { app } from 'electron';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as paths from '../../paths';
-import { getCurrentLang } from '../../i18n';
+import { getCurrentLang, t } from '../../i18n';
 import { bundledRuntimeEnv, bundledRuntimePathEntries } from '../../util/bundled-runtime';
 import { resolveBackgroundNodeRuntime, withBackgroundNodeEnv } from '../../util/background-node';
 
@@ -70,6 +75,7 @@ export async function* stopStreamOnAbort<T>(
   events: AsyncIterable<T>,
   signal: AbortSignal,
   label = 'stream',
+  flushBeforeAbort?: () => T | null | undefined,
 ): AsyncGenerator<T, void, unknown> {
   const iterator = events[Symbol.asyncIterator]();
   const aborted = Symbol('aborted');
@@ -85,6 +91,12 @@ export async function* stopStreamOnAbort<T>(
       const next = iterator.next();
       const result = await Promise.race([next, abortPromise]);
       if (result === aborted) {
+        try {
+          const pending = flushBeforeAbort?.();
+          if (pending !== null && pending !== undefined) yield pending;
+        } catch (err) {
+          log.warn('abortable stream flush failed', { label, error: logErrorSummary(err) });
+        }
         const ret = iterator.return?.();
         if (ret) {
           void Promise.resolve(ret).catch((err) => {
@@ -98,6 +110,83 @@ export async function* stopStreamOnAbort<T>(
     }
   } finally {
     if (abortListener) signal.removeEventListener('abort', abortListener);
+  }
+}
+
+/** First user-visible stall notice while the model/provider is silent, and
+ * the repeat cadence afterwards. Deliberately far below the 180s/1800s idle
+ * watchdog tiers: sampled conversations showed users staring at a silent
+ * bubble for 18-42 minutes before the first failure surfaced, with nothing
+ * telling them the run was retrying or that Stop was available. */
+const STALL_NOTICE_MODEL_FIRST_SEC = 60;
+const STALL_NOTICE_MODEL_REPEAT_SEC = 120;
+/** Tool executions are legitimately long/silent (downloads, renders), so the
+ * first mid-tool notice waits longer and repeats slowly. */
+const STALL_NOTICE_TOOL_FIRST_SEC = 300;
+const STALL_NOTICE_TOOL_REPEAT_SEC = 300;
+
+function stallNoticeDurationLabel(seconds: number): string {
+  return seconds >= 120 ? `${Math.round(seconds / 60)}min` : `${Math.round(seconds)}s`;
+}
+
+/** Injects `{type:'progress'}` stall notices into a silent mapped-event
+ * stream so a hang becomes user-visible long before the idle watchdog or a
+ * provider error does. Synthetic events carry `event.stream='stall_notice'`
+ * so the pump loop does NOT reset the idle watchdog for them (they would
+ * otherwise keep a dead stream alive forever) and the task-turn sampler does
+ * not count them as model activity. The wrapper never swallows or reorders
+ * real events: a pending `next()` stays pending across notice emissions. */
+export async function* withStallNotices(
+  events: AsyncIterable<StreamEvent>,
+  opts: { inToolPhase: () => boolean },
+): AsyncGenerator<StreamEvent, void, unknown> {
+  const iterator = events[Symbol.asyncIterator]();
+  let pending: Promise<IteratorResult<StreamEvent, void>> | null = null;
+  let silentSinceMs = Date.now();
+  let noticesThisStretch = 0;
+  const timerToken = Symbol('stall');
+  try {
+    while (true) {
+      pending ||= iterator.next();
+      const inTool = opts.inToolPhase();
+      const firstSec = inTool ? STALL_NOTICE_TOOL_FIRST_SEC : STALL_NOTICE_MODEL_FIRST_SEC;
+      const repeatSec = inTool ? STALL_NOTICE_TOOL_REPEAT_SEC : STALL_NOTICE_MODEL_REPEAT_SEC;
+      const dueAtMs = silentSinceMs + (firstSec + noticesThisStretch * repeatSec) * 1000;
+      const waitMs = Math.max(250, dueAtMs - Date.now());
+      let timer: NodeJS.Timeout | null = null;
+      const timerPromise = new Promise<typeof timerToken>((resolve) => {
+        timer = setTimeout(() => resolve(timerToken), waitMs);
+      });
+      const winner = await Promise.race([pending, timerPromise])
+        .finally(() => { if (timer) clearTimeout(timer); });
+      if (winner === timerToken) {
+        noticesThisStretch += 1;
+        const elapsedSec = (Date.now() - silentSinceMs) / 1000;
+        yield {
+          type: 'progress',
+          text: inTool
+            ? t('model.stall_tool_running', { duration: stallNoticeDurationLabel(elapsedSec) })
+            : t('model.stall_waiting', { duration: stallNoticeDurationLabel(elapsedSec) }),
+          event: {
+            stream: 'stall_notice',
+            data: {
+              phase: inTool ? 'tool' : 'provider_wait',
+              elapsed_s: Math.round(elapsedSec),
+            },
+          },
+        };
+        continue;
+      }
+      pending = null;
+      silentSinceMs = Date.now();
+      noticesThisStretch = 0;
+      if (winner.done) return;
+      // `done` was checked above; TS cannot narrow IteratorResult<T, void>
+      // through the raced union here.
+      yield winner.value as StreamEvent;
+    }
+  } finally {
+    void iterator.return?.();
   }
 }
 
@@ -145,6 +234,9 @@ function buildSkillSandboxEnvStatic(): Record<string, string> {
  *     parsing users.json.
  *   - `ORKAS_AGENT_ID` = the current acting agent id, so `bin/run-skill.cjs`
  *     can resolve agent-private installed skills from the per-user data tree.
+ *   - `ORKAS_GLOBAL_SKILL_ROOTS_ENABLED` = current account preference, so the
+ *     standalone Skill runner enforces the same global-root boundary as the
+ *     registry instead of independently scanning hidden roots.
  *   - `ORKAS_PATH_PREPEND` = bundled runtime bins plus enabled external
  *     package CLI dirs (`.bin`, package-local bin fallbacks) when present.
  *     Composed into PATH by the sandbox executor (see core-agent
@@ -184,6 +276,18 @@ export function buildSkillSandboxEnv(userId?: string, agentId?: string): Record<
     env.ORKAS_UID = userId;
     const safeAgentId = safeAgentEnvId(agentId);
     if (safeAgentId) env.ORKAS_AGENT_ID = safeAgentId;
+    try {
+      const preferences = JSON.parse(
+        fs.readFileSync(paths.userPreferencesFile(userId), 'utf8'),
+      ) as { global_skill_roots_enabled?: unknown };
+      env.ORKAS_GLOBAL_SKILL_ROOTS_ENABLED = preferences.global_skill_roots_enabled === false
+        ? '0'
+        : '1';
+    } catch {
+      // Preserve the product default when preferences are not available during
+      // early boot or when the preference file is missing/malformed.
+      env.ORKAS_GLOBAL_SKILL_ROOTS_ENABLED = '1';
+    }
     try {
       // Lazy require keeps module-load order safe (client.ts loads before
       // some features in boot paths) and avoids a static feature import in
@@ -296,6 +400,19 @@ type SafeUsage = {
   totalTokens?: number;
 };
 
+/** Privacy-bounded request evidence retained only by local Model Eval runs.
+ * Prompt text, tool arguments, model output, paths, and provider identifiers
+ * are deliberately absent. */
+export interface ProviderRoundEvidence {
+  index: number;
+  durationMs: number;
+  outcome: 'completed' | 'failed';
+  stopReason?: string;
+  textChars?: number;
+  usage?: SafeUsage;
+  toolNames: string[];
+}
+
 export type LiveRunTimingPhase = 'provider' | 'tool' | 'compaction' | 'retry_wait' | 'other';
 
 export type LiveRunTimingState = {
@@ -402,9 +519,24 @@ export interface ModelRunLogDiagnostics {
   compactionCount: number;
   compactionAttemptCount: number;
   compactionFailureCount: number;
+  /** Context-gate interventions on this run's event stream: provider-overflow
+   * recoveries that retried, emergency folds applied pre-model, and emergency
+   * passes that found nothing left to drop (the known L3 blind spot). */
+  overflowRecoveryCount: number;
+  emergencyFoldCount: number;
+  emergencyNoDropCount: number;
+  /** Re-read accounting summed over measured compaction spans (the runner
+   * reports it from a run's second compaction on): reads seen, re-reads of an
+   * already-read path, and byte-identical re-reads. Fleet calibration input
+   * for the derived context-budget ceilings. */
+  rereadReads: number;
+  rereadPaths: number;
+  rereadIdentical: number;
   providerCallCount: number;
   providerCallMaxMs: number;
   providerSlowCallCount: number;
+  providerRounds: ProviderRoundEvidence[];
+  providerRoundsTruncated: number;
   toolDeltaCount: number;
   toolStarts: number;
   toolProgress: number;
@@ -533,9 +665,17 @@ export function createModelRunLogDiagnostics(nowMs = Date.now()): ModelRunLogDia
     compactionCount: 0,
     compactionAttemptCount: 0,
     compactionFailureCount: 0,
+    overflowRecoveryCount: 0,
+    emergencyFoldCount: 0,
+    emergencyNoDropCount: 0,
+    rereadReads: 0,
+    rereadPaths: 0,
+    rereadIdentical: 0,
     providerCallCount: 0,
     providerCallMaxMs: 0,
     providerSlowCallCount: 0,
+    providerRounds: [],
+    providerRoundsTruncated: 0,
     toolDeltaCount: 0,
     toolStarts: 0,
     toolProgress: 0,
@@ -589,6 +729,8 @@ function toolCounter(stats: ModelRunLogDiagnostics, rawName: unknown): ToolRunLo
 
 const MAX_TOOL_TIMELINE_LOG_ENTRIES = 80;
 const MAX_RUN_TIMELINE_LOG_ENTRIES = 120;
+const MAX_PROVIDER_ROUND_EVIDENCE = 64;
+const MAX_PROVIDER_ROUND_TOOL_NAMES = 16;
 
 function safeToolNameForLog(rawName: unknown): string {
   return String(rawName || 'unknown').slice(0, 80) || 'unknown';
@@ -753,6 +895,16 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
   noteElapsedOnce(stats, 'firstRawEventMs', nowMs);
   const e = ev as Record<string, unknown>;
   switch (e.type) {
+    case 'thinking': {
+      const phase = String(e.phase || 'progress').slice(0, 16);
+      const chars = Math.max(0, Math.round(finiteNumber(e.chars) || 0));
+      // Reasoning proves that the model is alive, but it is not answer/tool
+      // content and must not contaminate first-content latency. Log only size;
+      // the mapper owns the separately sanitized process-pane representation.
+      noteElapsedOnce(stats, 'firstModelEventMs', nowMs);
+      noteRunTimelineForLog(stats, `thinking_${phase}`, nowMs, `chars=${chars}`);
+      break;
+    }
     case 'text_delta': {
       stats.textDeltaEvents += 1;
       stats.textDeltaChars += typeof e.text === 'string' ? e.text.length : 0;
@@ -790,6 +942,13 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
     case 'tool_start': {
       stats.toolStarts += 1;
       stats.toolEventSequence += 1;
+      const providerRound = stats.providerRounds.at(-1);
+      const providerRoundTool = safeToolNameForLog(e.name);
+      if (providerRound
+          && providerRound.toolNames.length < MAX_PROVIDER_ROUND_TOOL_NAMES
+          && !providerRound.toolNames.includes(providerRoundTool)) {
+        providerRound.toolNames.push(providerRoundTool);
+      }
       const id = toolCallIdentity(e.id);
       if (id) {
         const recoveryIdentity = toolRecoveryIdentity(e.name, e.input);
@@ -868,6 +1027,24 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
       stats.providerCallCount += 1;
       stats.providerCallMaxMs = Math.max(stats.providerCallMaxMs, durationMs);
       if (durationMs >= 60_000) stats.providerSlowCallCount += 1;
+      if (stats.providerRounds.length < MAX_PROVIDER_ROUND_EVIDENCE) {
+        const usage = safeUsageForLog(e.usage);
+        stats.providerRounds.push({
+          index: stats.providerCallCount,
+          durationMs,
+          outcome: e.outcome === 'failed' ? 'failed' : 'completed',
+          ...(typeof e.stopReason === 'string' && e.stopReason
+            ? { stopReason: e.stopReason.slice(0, 64) }
+            : {}),
+          ...(Math.max(0, Math.round(finiteNumber(e.textChars) || 0)) > 0
+            ? { textChars: Math.max(0, Math.round(finiteNumber(e.textChars) || 0)) }
+            : {}),
+          ...(usage ? { usage } : {}),
+          toolNames: [],
+        });
+      } else {
+        stats.providerRoundsTruncated += 1;
+      }
       noteRunTimelineForLog(
         stats,
         'provider_call',
@@ -922,6 +1099,18 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
       const phase = typeof e.phase === 'string' ? e.phase : '';
       if (phase.endsWith('_start')) stats.compactionAttemptCount += 1;
       if (phase.endsWith('_failed')) stats.compactionFailureCount += 1;
+      const statusData = (e.data && typeof e.data === 'object' ? e.data : {}) as Record<string, unknown>;
+      // Context-gate hits, per phase. An overflow whose recovery found nothing
+      // is not counted here: that run terminates with error_code
+      // context_overflow, which already carries the signal.
+      if (phase === 'overflow_recovery' && statusData.result === 'retried') stats.overflowRecoveryCount += 1;
+      if (phase === 'emergency_reduction' && statusData.result === 'applied') stats.emergencyFoldCount += 1;
+      if (phase === 'emergency_reduction' && statusData.result === 'nothing_to_drop') stats.emergencyNoDropCount += 1;
+      if (phase === 'history_summary_start' || phase === 'active_process_compaction_start') {
+        stats.rereadReads += Math.max(0, Math.round(finiteNumber(statusData.readsSinceLastCompaction) ?? 0));
+        stats.rereadPaths += Math.max(0, Math.round(finiteNumber(statusData.rereadPaths) ?? 0));
+        stats.rereadIdentical += Math.max(0, Math.round(finiteNumber(statusData.rereadIdenticalContent) ?? 0));
+      }
       noteRunTimelineForLog(
         stats,
         'context_status',
@@ -1027,6 +1216,12 @@ export function summarizeModelRunForLog(stats: ModelRunLogDiagnostics, nowMs = D
     compactionCount: stats.compactionCount,
     compactionAttemptCount: stats.compactionAttemptCount,
     compactionFailureCount: stats.compactionFailureCount,
+    overflowRecoveryCount: stats.overflowRecoveryCount,
+    emergencyFoldCount: stats.emergencyFoldCount,
+    emergencyNoDropCount: stats.emergencyNoDropCount,
+    rereadReads: stats.rereadReads,
+    rereadPaths: stats.rereadPaths,
+    rereadIdentical: stats.rereadIdentical,
     providerCallCount: stats.providerCallCount,
     providerCallMaxMs: stats.providerCallMaxMs,
     providerSlowCallCount: stats.providerSlowCallCount,
@@ -1173,6 +1368,7 @@ function agentRunResultEventForTelemetry(input: {
   streamIdleTimeoutSec?: number;
   timings?: AgentRunTimings;
   failureCode?: string;
+  failureRawCode?: string;
   failurePhase?: StreamEvent['failurePhase'];
 }): StreamEvent {
   const result = input.status === 'completed'
@@ -1221,9 +1417,10 @@ export function modelTurnContextForLog(input: {
   idleTimeout?: number;
   streamIdleTimeout?: number;
   maxToolLoops?: number;
-  elapsedConvergenceMs?: number;
   skillList?: readonly string[];
-  forceOpenSkillRefs?: readonly string[];
+  toolList?: readonly string[];
+  toolSurfaceMode?: 'scoped' | 'legacy_all';
+  forceOpenSkillRefs?: readonly SkillSelectionInput[];
   projectAllowedSkillIds?: readonly string[];
   extraTools?: readonly AgentTool[];
   extraRoots?: readonly string[];
@@ -1272,9 +1469,11 @@ export function modelTurnContextForLog(input: {
     idle_timeout_sec: input.idleTimeout,
     stream_idle_timeout_sec: input.streamIdleTimeout,
     max_tool_loops: input.maxToolLoops,
-    elapsed_convergence_ms: input.elapsedConvergenceMs,
     skill_list_mode: input.skillList === undefined ? 'all' : 'allowlist',
     skill_list_count: input.skillList === undefined ? undefined : input.skillList.length,
+    tool_list_mode: input.toolList === undefined ? 'legacy' : 'scoped',
+    tool_list_count: input.toolList === undefined ? undefined : input.toolList.length,
+    tool_surface_mode: input.toolSurfaceMode,
     force_open_skill_count: input.forceOpenSkillRefs?.length,
     project_skill_allowlist_count: input.projectAllowedSkillIds?.length,
     extra_tool_count: input.extraTools?.length || 0,
@@ -1318,7 +1517,12 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     elapsedConvergenceMs,
     abortSignal = null,
     skillList,
+    systemSkillList,
+    toolList,
+    agentToolDependencyAuthoring = false,
     forceOpenSkillRefs,
+    runtimeSkillBindings,
+    runtimeGrantedToolGroups,
     projectAllowedSkillIds,
     extraTools,
     extraRoots,
@@ -1335,6 +1539,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     projectId,
     onFileWritten,
     onOutputsPublished,
+    getPublishableOutputPaths,
     hasProducedPath,
     onArtifactCreated,
     onSkillAdvertised,
@@ -1363,8 +1568,8 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     idleTimeout,
     streamIdleTimeout,
     maxToolLoops,
-    elapsedConvergenceMs,
     skillList,
+    toolList,
     forceOpenSkillRefs,
     projectAllowedSkillIds,
     extraTools,
@@ -1453,8 +1658,8 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   let externalAbort = false;
   let directSessionAbort = false;
   // Phase-aware idle watchdog. `toolDepth` > 0 means a tool is executing (a
-  // long/silent download is normal there — bash heartbeats + core-agent's
-  // per-tool watchdog handle that), so we use the long `idleTimeout`.
+  // long/silent download is normal there — core-agent's per-tool watchdog or
+  // a delegated child executor handles that), so we use the long `idleTimeout`.
   // `assemblingToolCallIds` covers the model-side gap after a streamed tool
   // call begins but before core-agent has the complete JSON needed to emit
   // `tool_start`; large `write_file` payloads can legitimately be silent there.
@@ -1465,6 +1670,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   // next text delta arrives. `idleHitWindow` records which window actually fired
   // for the surfaced error text.
   let toolDepth = 0;
+  const activeToolTimeoutOwners = new Map<string, "runner" | "executor">();
   const assemblingToolCallIds = new Set<string>();
   let modelTextStreamActive = false;
   let idleHitWindow = idleTimeout;
@@ -1480,12 +1686,35 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   };
   addActiveSessionAbort(userId, sessionId, activeAbortEntry);
 
+  // For runner-owned tools, keep the session-level tier strictly behind the
+  // per-tool watchdog; both derive from the same configured idleTimeout.
+  const TOOL_PHASE_BACKSTOP_RATIO = 1.15;
+  const toolIdleTimeoutMs = Math.max(1, Math.round(idleTimeout * 1000));
+  const toolPhaseBackstopMs = Math.max(
+    toolIdleTimeoutMs + 1,
+    Math.ceil(toolIdleTimeoutMs * TOOL_PHASE_BACKSTOP_RATIO),
+  );
   const resetIdle = () => {
     if (controller.signal.aborted) return;
     if (idleTimer) clearTimeout(idleTimer);
     const assemblingToolCall = assemblingToolCallIds.size > 0;
-    const inToolPhase = toolDepth > 0 || assemblingToolCall;
-    const window = !inToolPhase && modelTextStreamActive ? streamIdleTimeout : idleTimeout;
+    const toolExecuting = toolDepth > 0;
+    const executorOwnedToolsOnly = toolExecuting
+      && activeToolTimeoutOwners.size === toolDepth
+      && [...activeToolTimeoutOwners.values()].every((owner) => owner === "executor");
+    // A synchronous delegation tool is already bounded by its Agent/Worker/CLI
+    // executor. Do not stack a Commander session deadline on top of it. The
+    // external abort listener remains active and still cancels the child.
+    if (executorOwnedToolsOnly) {
+      idleTimer = null;
+      return;
+    }
+    // Only an executing tool has a core-agent watchdog to own the base window;
+    // the host may then wait longer as a session backstop. Argument assembly
+    // happens before tool_start, so the host keeps the base idle deadline there.
+    const window = toolExecuting
+      ? toolPhaseBackstopMs / 1000
+      : (!assemblingToolCall && modelTextStreamActive ? streamIdleTimeout : idleTimeout);
     const phase: NonNullable<StreamEvent['failurePhase']> = toolDepth > 0
       ? 'tool'
       : (assemblingToolCall ? 'tool_input' : (modelTextStreamActive ? 'model_text' : 'provider_wait'));
@@ -1523,6 +1752,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   let errText: string | null = null;
   let abortedFlag = false;
   let terminalFailureCode = '';
+  let terminalFailureRawCode = '';
   let terminalFailurePhase: StreamEvent['failurePhase'];
   // Set only after runner construction and all host-side preflight gates pass.
   // This is the taxonomy boundary between setup/config failures and failures
@@ -1551,6 +1781,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(resumeActiveTurn ? { resumeActiveTurn: true } : {}),
       ...(agentName ? { agentName } : {}),
       ...(maxToolLoops ? { maxToolLoops } : {}),
+      toolIdleTimeoutMs,
       ...(elapsedConvergenceMs != null ? { elapsedConvergenceMs } : {}),
       providerFirstEventTimeoutMs: Math.max(1, streamIdleTimeout * 1000),
       ...(cid ? { cid } : {}),
@@ -1562,7 +1793,12 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(attachmentMetadata ? { attachmentMetadata } : {}),
       ...(projectId ? { projectId } : {}),
       ...(skillList !== undefined ? { skillList } : {}),
+      ...(systemSkillList !== undefined ? { systemSkillList: [...systemSkillList] } : {}),
+      ...(toolList !== undefined ? { toolList } : {}),
+      ...(agentToolDependencyAuthoring ? { agentToolDependencyAuthoring: true } : {}),
       ...(forceOpenSkillRefs && forceOpenSkillRefs.length ? { forceOpenSkillRefs } : {}),
+      ...(runtimeSkillBindings ? { runtimeSkillBindings } : {}),
+      ...(runtimeGrantedToolGroups ? { runtimeGrantedToolGroups } : {}),
       ...(projectAllowedSkillIds !== undefined ? { projectAllowedSkillIds } : {}),
       ...(extraTools && extraTools.length ? { extraTools } : {}),
       ...(extraRoots && extraRoots.length ? { extraRoots } : {}),
@@ -1572,6 +1808,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(richSteerEnabled ? { richSteerEnabled: true } : {}),
       ...(onFileWritten ? { onFileWritten } : {}),
       ...(onOutputsPublished ? { onOutputsPublished } : {}),
+      ...(getPublishableOutputPaths ? { getPublishableOutputPaths } : {}),
       ...(hasProducedPath ? { hasProducedPath } : {}),
       ...(onArtifactCreated ? { onArtifactCreated } : {}),
       ...(onSkillAdvertised ? { onSkillAdvertised } : {}),
@@ -1605,7 +1842,23 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     }).finally(() => {
       runnerBuildMs = Math.max(0, Date.now() - buildStartedAt);
     });
-    const { runner, providerId, modelId, resolvedSystemPrompt, turnEphemeral, profileId, entryId, toolDefs, skillDisplayNameById, agentDisplayNameById } = built;
+    const {
+      runner,
+      failureTrackingScope,
+      providerId,
+      modelId,
+      toolSurfaceMode,
+      toolSurfaceTelemetry,
+      resolvedSystemPrompt,
+      turnEphemeral,
+      profileId,
+      entryId,
+      toolDefs,
+      skillDisplayNameById,
+      skillMetadataByReadRef,
+      agentDisplayNameById,
+      connectorDisplayNameById,
+    } = built;
     activeProviderId = providerId || '';
     activeModelId = modelId || '';
     activeToolCount = toolDefs.length;
@@ -1625,8 +1878,9 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       idleTimeout,
       streamIdleTimeout,
       maxToolLoops,
-      elapsedConvergenceMs,
       skillList,
+      toolList,
+      toolSurfaceMode,
       forceOpenSkillRefs,
       projectAllowedSkillIds,
       extraTools,
@@ -1733,6 +1987,10 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
         // toolDepth > 0 spans the whole (possibly silent) tool execution.
         else if (ev.type === 'text_delta') {
           modelTextStreamActive = true;
+        } else if (ev.type === 'thinking') {
+          // Reasoning deltas use the longer provider-wait idle window. The
+          // raw events still reset that watchdog on every chunk below.
+          modelTextStreamActive = false;
         } else if (ev.type === 'tool_delta') {
           modelTextStreamActive = false;
           assemblingToolCallIds.add(ev.id || 'stream_tool');
@@ -1740,9 +1998,14 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
           modelTextStreamActive = false;
           assemblingToolCallIds.clear();
           toolDepth += 1;
+          activeToolTimeoutOwners.set(
+            ev.id,
+            ev.executionTimeoutOwner === 'executor' ? 'executor' : 'runner',
+          );
         } else if (ev.type === 'tool_end') {
           modelTextStreamActive = false;
           assemblingToolCallIds.delete(ev.id || 'stream_tool');
+          activeToolTimeoutOwners.delete(ev.id);
           toolDepth = Math.max(0, toolDepth - 1);
           if (toolDepth === 0 && liveRunTimings.phase === 'tool') {
             transitionLiveRunTimings(liveRunTimings, 'provider', liveNow);
@@ -1760,21 +2023,38 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     // terminal final/error synthesis. We re-yield every event it produces,
     // resetting the idle timer on each one.
     let eventCount = 0;
+    let flushReasoningBeforeAbort: (() => StreamEvent | null) | null = null;
     const mappedEvents = mapCoreAgentEvents(captureResult(rawEvents), {
       userId,
+      failureTrackingScope,
       isDev: false,
       workingDir,
       skillDisplayNameById,
+      skillMetadataByReadRef,
       agentDisplayNameById,
+      connectorDisplayNameById,
+      registerReasoningAbortFlush: (flush) => { flushReasoningBeforeAbort = flush; },
     });
-    for await (const ev of stopStreamOnAbort(mappedEvents, controller.signal, turnTag)) {
+    const abortableEvents = stopStreamOnAbort(
+      mappedEvents,
+      controller.signal,
+      turnTag,
+      () => flushReasoningBeforeAbort?.() ?? null,
+    );
+    for await (const ev of withStallNotices(abortableEvents, {
+      inToolPhase: () => toolDepth > 0 || assemblingToolCallIds.size > 0,
+    })) {
+      const isStallNotice = (ev as StreamEvent).event?.stream === 'stall_notice';
       // The raw-event wrapper owns phase tracking. Reset here too because
       // mapped UI events can be synthesized from accumulated raw state.
-      resetIdle();
+      // Synthetic stall notices are host-generated and must NOT feed the
+      // watchdog — they would keep a dead stream alive past every idle tier.
+      if (!isStallNotice) resetIdle();
       eventCount += 1;
       let outgoing: StreamEvent = ev;
       if (ev.type === 'error' && !(ev as StreamEvent).aborted) {
         terminalFailureCode = (ev as StreamEvent).failureCode || 'model_stream_error';
+        terminalFailureRawCode = (ev as StreamEvent).failureRawCode || '';
         terminalFailurePhase = (ev as StreamEvent).failurePhase || (finalText ? 'model_text' : 'provider_wait');
         outgoing = {
           ...ev,
@@ -1930,6 +2210,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       streamIdleTimeoutSec: streamIdleTimeout,
       timings: agentRunResult?.meta.timings || snapshotLiveRunTimings(liveRunTimings),
       failureCode: terminalFailureCode || undefined,
+      failureRawCode: terminalFailureRawCode || undefined,
       failurePhase: terminalFailurePhase
         || (terminalStatus === 'aborted' ? liveRunFailurePhase(liveRunTimings.phase) : undefined),
     });

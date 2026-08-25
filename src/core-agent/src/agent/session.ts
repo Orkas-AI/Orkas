@@ -5,8 +5,8 @@ import {
   cloneWorkspaceObservationState,
   emptyWorkspaceObservationState,
   normalizeWorkspaceObservationState,
+  projectWorkspaceContext,
   reconcileWorkspaceObservations,
-  renderWorkspaceContext,
   renderWorkspaceDiff,
   workspaceReadRepetition,
   type WorkspaceDiffRequest,
@@ -37,15 +37,37 @@ export {
   type ContextBudget,
 } from "./context-budget.js";
 
+/** Flat per-image estimate. Real cost is dimension-dependent — Anthropic caps
+ *  around 1,600 tokens per image and OpenAI high-detail lands nearby — but the
+ *  estimator only needs to stop pricing a thousand-token block at zero: the
+ *  request-token anchor corrects to provider truth at the next completed call,
+ *  overestimating merely compacts a little early, and underestimating is an
+ *  overflow. Dimension-aware costing is deliberately not attempted. */
+export const IMAGE_BLOCK_ESTIMATE_TOKENS = 1_600;
+
 export const HISTORY_SUMMARY_MAX_TOKENS = 2_048;
 export const HISTORY_EXACT_FACTS_HEADING =
   "Exact facts and identifiers required across turns (cumulative):";
-export const HISTORY_EXACT_FACTS_MAX_ITEMS = 128;
+/** Total budget for the exact-facts pool, in ESTIMATED tokens — the resource
+ *  the pool actually spends on every request. Chars were the old denominator
+ *  and priced the same budget 2-4x apart across languages (24,000 chars is
+ *  ~6,000 real tokens of English but far more of Chinese), while the old
+ *  128-item count cap bound typical short facts at ~5.9K chars and the char
+ *  cap never engaged (live pools 2026-08-14: p50 1,399 / p90 2,516 / max
+ *  6,044 estimated tokens). 6,000 keeps the English equivalent of the old
+ *  budget, frees the count-capped pools, and trims no live pool. Eviction
+ *  stays newest-first; the per-item cap below remains the single-fact shape
+ *  guard, and no count cap exists — the token budget bounds cost, and the
+ *  list-noise dimension is token-proportional anyway. */
+export const HISTORY_EXACT_FACTS_MAX_TOKENS = 6_000;
 export const HISTORY_EXACT_FACT_MAX_CHARS = 1_000;
-export const HISTORY_EXACT_FACTS_MAX_CHARS = 24_000;
 
+/** Soft target for the checkpoint ESTIMATE and the provider maxTokens of the
+ *  summarizer call — the provider cap is the real output bound. The estimate
+ *  can still exceed this (CJK weighs 1.5 per char in the estimator); that
+ *  corridor only costs a slightly larger checkpoint and is warned, not
+ *  enforced. */
 export const ACTIVE_CHECKPOINT_SUMMARY_MAX_TOKENS = 1_200;
-export const ACTIVE_CHECKPOINT_SUMMARY_HARD_MAX_TOKENS = 2_048;
 /** Projection caps for the summarizer request: primary content (model text,
  *  successful tool output) versus dense metadata (tool input, error output)
  *  that survives a shorter cut with less loss. */
@@ -191,6 +213,22 @@ type ActiveTurnRecord = {
   checkpointThroughMessageIndex?: number;
 };
 
+export type ToolSurfaceState = {
+  /** v1 stored the union of configured, host-preloaded, and dynamically
+   * loaded groups. v2 stored groups explicitly activated by tool_load across
+   * turns. v3 is a durable scoped-mode/catalog marker only; dynamic groups
+   * are deliberately turn-local. */
+  version: 1 | 2 | 3;
+  mode: "scoped" | "legacy_all";
+  /** Legacy v1/v2 payload. Must be empty in v3. Configured dependencies and
+   * host preloads are recomputed for every runner build. */
+  loadedGroups: string[];
+  /** Catalog-drift pin consumed by eval production-regression evidence, not
+   * by runtime activation. See host
+   * tool-surface.ts::TOOL_CATALOG_REVISION. */
+  catalogRevision?: string;
+};
+
 export type SerializedSessionContextState = {
   version: 1;
   nextTurnId: number;
@@ -207,7 +245,6 @@ export type SerializedSessionContextState = {
   summaryThroughTurnId?: number;
   /** Stable host-owned canonical message boundary covered by historySummary.
    * Unlike turn ids, this can be compared across independent Agent sessions. */
-  summaryThroughMessageId?: string;
   completedTurns?: CompletedTurnRecord[];
   activeTurn?: ActiveTurnRecord;
   resources?: HistoryResource[];
@@ -216,6 +253,9 @@ export type SerializedSessionContextState = {
   nextWorkLedgerId?: number;
   executionPlanAudit?: ExecutionPlanAuditRecord[];
   workspaceObservations?: WorkspaceObservationState;
+  /** Host-owned dynamic tool activation state. Group ids are resolved
+   * against the current host catalog on every restore. */
+  toolSurface?: ToolSurfaceState;
 };
 
 export type HistoryArchiveCandidate = {
@@ -247,7 +287,6 @@ type TurnTrackingState = Required<
   historySummary: string;
   historyExactFacts: string[];
   summaryThroughTurnId?: number;
-  summaryThroughMessageId?: string;
   completedTurns: CompletedTurnRecord[];
   activeTurn?: ActiveTurnRecord;
   resources: HistoryResource[];
@@ -347,7 +386,7 @@ function mergeHistoryExactFacts(
   const newestFirst: string[] = [];
   const seen = new Set<string>();
   const seenAssignmentKeys = new Set<string>();
-  let chars = 0;
+  let tokens = 0;
   const combined = [...(previous ?? []), ...(next ?? [])];
   for (let index = combined.length - 1; index >= 0; index--) {
     const raw = combined[index];
@@ -358,17 +397,14 @@ function mergeHistoryExactFacts(
       || seen.has(item)
       || (assignmentKey && seenAssignmentKeys.has(assignmentKey))
     ) continue;
-    const addedChars = item.length + (newestFirst.length ? 1 : 0);
-    if (
-      newestFirst.length >= HISTORY_EXACT_FACTS_MAX_ITEMS
-      || chars + addedChars > HISTORY_EXACT_FACTS_MAX_CHARS
-    ) {
+    const addedTokens = estimateTextTokens(item);
+    if (tokens + addedTokens > HISTORY_EXACT_FACTS_MAX_TOKENS) {
       break;
     }
     seen.add(item);
     if (assignmentKey) seenAssignmentKeys.add(assignmentKey);
     newestFirst.push(item);
-    chars += addedChars;
+    tokens += addedTokens;
   }
   return newestFirst.reverse();
 }
@@ -443,9 +479,23 @@ export class Session {
   private messages: Message[] = [];
   private readonly maxHistoryTurns: number;
   private turnState: TurnTrackingState | null = null;
+  private toolSurfaceState: ToolSurfaceState | undefined;
+  /** Bumped by every rewrite of model-visible content (folds, archives,
+   *  legacy compaction, clear/replace). Append-only growth does not count:
+   *  the request-token anchor measures growth with an estimator differential,
+   *  but a rewrite changes content whose real cost the anchor already
+   *  measured, so anchor consumers must fall back to the estimator until the
+   *  next completed call re-anchors. A spurious bump only costs that fallback,
+   *  so ambiguous paths bump rather than risk a stale anchor. */
+  private contentRewriteEpoch = 0;
 
   constructor(opts?: { maxHistoryTurns?: number }) {
     this.maxHistoryTurns = opts?.maxHistoryTurns ?? 50;
+  }
+
+  /** Current content-rewrite epoch; see `contentRewriteEpoch`. */
+  contentEpoch(): number {
+    return this.contentRewriteEpoch;
   }
 
   /**
@@ -494,9 +544,39 @@ export class Session {
     return mutate();
   }
 
+  getToolSurfaceState(): ToolSurfaceState | undefined {
+    return this.toolSurfaceState
+      ? { ...this.toolSurfaceState, loadedGroups: [...this.toolSurfaceState.loadedGroups] }
+      : undefined;
+  }
+
+  setToolSurfaceState(state: ToolSurfaceState | undefined): void {
+    this.toolSurfaceState = state
+      ? { ...state, loadedGroups: [...state.loadedGroups] }
+      : undefined;
+    if (state) this.ensureTurnTracking();
+  }
+
   /** Add an assistant message from LLM response content. */
   addAssistantMessage(content: MessageContent[]): void {
     this.addMessage("assistant", content);
+  }
+
+  /** True when the active turn already contains this exact user message —
+   * e.g. a transparent in-turn retry resuming with the message the failed
+   * attempt committed via beginUserTurn. tool_result-bearing user rows are
+   * request plumbing and never compared. */
+  activeTurnHasUserMessage(content: MessageContent[]): boolean {
+    const active = this.turnState?.activeTurn;
+    if (!active) return false;
+    const wanted = JSON.stringify(content);
+    for (let i = active.startIndex; i < this.messages.length; i++) {
+      const m = this.messages[i];
+      if (m.turnId !== active.id || m.role !== "user") continue;
+      if (m.content.some((c) => c.type === "tool_result")) continue;
+      if (JSON.stringify(m.content) === wanted) return true;
+    }
+    return false;
   }
 
   /** Mark the current active turn as completed. */
@@ -504,6 +584,9 @@ export class Session {
     const state = this.turnState;
     const active = state?.activeTurn;
     if (!state || !active) return;
+    // Completion swaps the turn's raw tool process for the condensed pair in
+    // the model view — a rewrite, not growth.
+    this.contentRewriteEpoch++;
 
     const checkpointFacts = active.checkpointSummary
       ? checkpointExactFactSection(active.checkpointSummary)?.items
@@ -810,8 +893,18 @@ export class Session {
     result: string,
     images?: ToolResultImage[],
     isError?: boolean,
+    addedToolNames?: string[],
   ): void {
-    this.addMessage("user", [{ type: "tool_result", toolUseId, content: result, isError }]);
+    const uniqueAddedToolNames = [...new Set(
+      (addedToolNames ?? []).map((name) => String(name || "").trim()).filter(Boolean),
+    )];
+    this.addMessage("user", [{
+      type: "tool_result",
+      toolUseId,
+      content: result,
+      isError,
+      ...(uniqueAddedToolNames.length ? { addedToolNames: uniqueAddedToolNames } : {}),
+    }]);
     if (images && images.length) {
       const imageBlocks: ImageContent[] = images.map((img) => ({
         type: "image",
@@ -853,6 +946,7 @@ export class Session {
     if (!normalizedSource) {
       throw new Error("conversation history source is required");
     }
+    this.contentRewriteEpoch++;
 
     const previous = this.turnState;
     const sameSource = previous?.conversationHistorySource === normalizedSource;
@@ -946,7 +1040,6 @@ export class Session {
         historyExactFacts: previous.historyExactFacts,
         summaryVersion: previous.summaryVersion,
         summaryThroughTurnId: previous.summaryThroughTurnId,
-        summaryThroughMessageId: previous.summaryThroughMessageId,
         nextTurnId: previous.nextTurnId,
       } : {}),
       conversationHistorySource: normalizedSource,
@@ -1038,6 +1131,7 @@ export class Session {
 
     const active = state.activeTurn;
     if (active) {
+      let checkpointContextIndex: number | undefined;
       const user = this.messages[active.userMessageIndex];
       if (user) {
         const cloned = cloneMessage(user);
@@ -1069,6 +1163,7 @@ export class Session {
             ),
           }],
         });
+        checkpointContextIndex = result.length - 1;
       }
       const checkpointThrough = active.checkpointThroughMessageIndex ?? active.userMessageIndex;
       for (let i = active.userMessageIndex + 1; i < this.messages.length; i++) {
@@ -1079,19 +1174,46 @@ export class Session {
         result.push(cloneMessage(this.messages[i]));
       }
 
-      // The plan is persistent structured state, not checkpoint prose. Inject
-      // deterministic work evidence first, then the plan at the uncached tail
-      // on every model loop. Both live outside raw message history, so a
-      // probabilistic checkpoint cannot omit completed calls or the objective.
+      // Workspace state is persistent structured evidence. When its latest
+      // file change has a visible causal tool result, place the net state
+      // immediately after that result so later read/command rounds can reuse it
+      // as prefix. If checkpointing hides the result, place it after the
+      // checkpoint; unattributed reconciliation remains conservatively at the
+      // tail. Visible command results are not repeated in this projection.
+      //
+      // Completed work and the plan remain deterministic tail state.
+      // Completed-work entries whose exact raw tool_result is still present in
+      // `result` are omitted from the projection: the raw result is the more
+      // authoritative representation, and repeating its ledger summary here
+      // adds fresh suffix tokens without adding another source of truth.
+      // Once a checkpoint hides that raw result, the durable ledger entry is
+      // projected again automatically. The objective remains explicit because
+      // it is not otherwise guaranteed by tool protocol history.
       if (opts?.includeExecutionPlan !== false) {
-        const workspaceLedger = renderWorkspaceContext(state.workspaceObservations, active.id);
-        if (workspaceLedger) {
-          result.push({
+        const visibleResultIds = visibleToolResultIds(result);
+        const workspace = projectWorkspaceContext(
+          state.workspaceObservations,
+          active.id,
+          { visibleToolResultIds: visibleResultIds },
+        );
+        if (workspace.text) {
+          const workspaceMessage: Message = {
             role: "user",
-            content: [{ type: "text", text: markPrivateRuntimeContext(workspaceLedger) }],
-          });
+            content: [{ type: "text", text: markPrivateRuntimeContext(workspace.text) }],
+          };
+          const anchoredIndex = workspace.anchorToolCallId
+            ? insertionIndexAfterToolResult(result, workspace.anchorToolCallId)
+            : undefined;
+          const insertionIndex = anchoredIndex
+            ?? (workspace.anchorToolCallId && checkpointContextIndex !== undefined
+              ? checkpointContextIndex + 1
+              : result.length);
+          result.splice(insertionIndex, 0, workspaceMessage);
         }
-        const workLedger = this.completedWorkContextText(active.id);
+        const workLedger = this.completedWorkContextText(
+          active.id,
+          visibleResultIds,
+        );
         if (workLedger) {
           result.push({
             role: "user",
@@ -1109,17 +1231,6 @@ export class Session {
     }
 
     return stripOldImages(result);
-  }
-
-  /**
-   * Get the summarizer-facing view of the session.
-   *
-   * Tool input and result content stay verbatim for legacy whole-session
-   * compaction. The new history/active summarizers use dedicated candidate
-   * builders that already project only the intended slice.
-   */
-  getMessagesForSummary(): Message[] {
-    return this.getMessagesForModel({ includeExecutionPlan: false });
   }
 
   /** Estimate the token count for the same provider-facing view sent to providers. */
@@ -1152,26 +1263,9 @@ export class Session {
   clear(): void {
     this.messages = [];
     this.turnState = null;
-  }
-
-  /**
-   * Compact the session by summarizing older messages.
-   * Returns a summary of the compacted context.
-   *
-   * This legacy whole-session compaction remains as an overflow fallback. It
-   * rewrites raw session history and therefore disables turn-tracking metadata.
-   */
-  compact(summary: string): void {
-    if (this.messages.length <= 2) return;
-
-    const kept = this.computeKeptTail();
-
-    this.messages = [
-      { role: "user", content: [{ type: "text", text: `[Previous conversation summary]\n${summary}` }] },
-      { role: "assistant", content: [{ type: "text", text: "Understood. I have context from our previous conversation." }] },
-      ...kept,
-    ];
-    this.turnState = null;
+    this.toolSurfaceState = undefined;
+    this.estimatorCalibrationRatio = 1;
+    this.contentRewriteEpoch++;
   }
 
   /** Candidate for rolling history archival. The high-water mark measures the
@@ -1198,7 +1292,8 @@ export class Session {
       state.historySummary,
       this.historyExactFactsText(),
     ].filter(Boolean).join("\n\n"));
-    if (rawTokens + summaryTokens < limits.historyTrigger) {
+    // Calibrated like the active-process trigger; see estimatorCalibrationRatio.
+    if ((rawTokens + summaryTokens) * this.estimatorCalibrationRatio < limits.historyTrigger) {
       return null;
     }
 
@@ -1231,12 +1326,12 @@ export class Session {
   applyHistorySummary(
     summary: string,
     turnIds: readonly number[],
-    throughMessageId?: string,
   ): void {
     const state = this.turnState;
     if (!state) return;
     const archived = new Set(turnIds);
     if (!archived.size) return;
+    this.contentRewriteEpoch++;
     for (const turn of state.completedTurns) {
       if (archived.has(turn.id)) turn.archived = true;
     }
@@ -1247,54 +1342,49 @@ export class Session {
       split.exactFacts,
     );
     state.summaryVersion += 1;
-    const previousBoundary = state.summaryThroughTurnId ?? 0;
     state.summaryThroughTurnId = Math.max(
       state.summaryThroughTurnId ?? 0,
       ...turnIds,
     );
-    if (state.summaryThroughTurnId > previousBoundary) {
-      state.summaryThroughMessageId = throughMessageId?.trim() || undefined;
-    } else if (
-      state.summaryThroughTurnId === previousBoundary
-      && throughMessageId?.trim()
-    ) {
-      state.summaryThroughMessageId = throughMessageId.trim();
-    }
   }
 
-  /** Completed canonical turn ids represented at or before a shared summary
-   * boundary. Raw completed I/O remains in Session even after archival, so a
-   * different Agent can safely adopt a conversation-owned checkpoint later. */
-  getHistoryTurnIdsThrough(throughTurnId: number): number[] {
-    if (!this.turnState || !isPositiveInteger(throughTurnId)) return [];
-    return this.turnState.completedTurns
-      .filter((turn) => turn.id <= throughTurnId)
-      .map((turn) => turn.id);
-  }
-
-  /** Build summary input from canonical completed dialogue only. Private
-   * execution facts, tool resources, plans, and checkpoints intentionally stay
-   * in the owning Agent session and are composed separately for model calls. */
-  buildSharedHistoryArchiveMessages(
-    fromTurnIdExclusive: number,
-    throughTurnIdInclusive: number,
-    existingSharedSummary?: string,
-  ): Message[] {
+  /**
+   * Persistent-block shrink candidate for overflow recovery: the rolling
+   * history summary plus the exact-facts ledger, the one part of the
+   * projection no compaction layer can reduce — emergency reduction's
+   * `nothing_to_drop` category. Their caps are fixed rather than
+   * window-derived, so on a narrow window (or after rotating onto one) they
+   * alone can hold a request over the ceiling. Only worth a rewrite call when
+   * they are actually large; below the threshold returns null.
+   */
+  getPersistentBlockShrinkCandidate(): { text: string; estimatedTokens: number } | null {
     const state = this.turnState;
-    if (!state || !isPositiveInteger(throughTurnIdInclusive)) return [];
-    const turns = state.completedTurns
-      .filter((turn) => (
-        turn.id > Math.max(0, Math.floor(fromTurnIdExclusive))
-        && turn.id <= throughTurnIdInclusive
-      ))
-      .sort((left, right) => left.id - right.id);
-    if (!turns.length && !existingSharedSummary?.trim()) return [];
-    return this.buildHistoryArchiveMessages(turns, {
-      // Empty is intentional: never fall back to this Session's private
-      // rolling summary when a conversation-owned base does not exist yet.
-      existingSummary: existingSharedSummary ?? "",
-      includePrivateContext: false,
-    });
+    if (!state) return null;
+    const text = [state.historySummary, this.historyExactFactsText()]
+      .filter(Boolean)
+      .join("\n\n");
+    if (!text.trim()) return null;
+    const estimatedTokens = estimateTextTokens(text);
+    if (estimatedTokens <= HISTORY_SUMMARY_MAX_TOKENS * 2) return null;
+    return { text, estimatedTokens };
+  }
+
+  /**
+   * Apply a shrunk rewrite of the persistent blocks. REPLACE semantics on
+   * purpose: the normal merge keeps every prior fact (dedupe plus
+   * newest-first eviction), which would immediately re-grow what the shrink
+   * just removed — the rewrite prompt owns carrying still-valid facts
+   * forward. Bumps the content epoch like every other rewrite so the
+   * request-token anchor falls back to the estimator until the next call.
+   */
+  applyPersistentBlockShrink(newSummaryText: string): void {
+    const state = this.turnState;
+    if (!state || !newSummaryText.trim()) return;
+    this.contentRewriteEpoch++;
+    const split = splitHistorySummary(newSummaryText);
+    state.historySummary = split.summary;
+    state.historyExactFacts = mergeHistoryExactFacts(undefined, split.exactFacts);
+    state.summaryVersion += 1;
   }
 
   /** Estimate the model-facing size after a history summary without mutating
@@ -1330,6 +1420,35 @@ export class Session {
       state.summaryThroughTurnId = previous.summaryThroughTurnId;
       state.completedTurns.forEach((turn, index) => { turn.archived = previous.archived[index]; });
     }
+  }
+
+  /** Session-level estimator calibration observed from provider truth.
+   *
+   * The segment triggers stay estimator-based on purpose (a single real total
+   * cannot be attributed to a segment — see request-token-anchor.ts), but the
+   * estimator's systematic bias IS observable: every anchored call captures a
+   * real request+response footprint and a same-scope estimate of the same
+   * request. Their ratio is this session's content-mix bias — CJK is weighed
+   * at 1.5 tokens/char against real tokenizers' ~0.6-1.0, so Chinese-heavy
+   * sessions fired the 29-105s summarization calls 1.5-2.5x early. The ratio
+   * scales ONLY the two trigger comparisons; retention and min-savings math
+   * stay in estimator space, which is internally consistent. Clamped to
+   * [0.5, 1]: only the measured over-estimation direction is corrected (an
+   * under-estimating session keeps today's behavior — the request-level
+   * ceiling is already anchored to truth and G.9/L3 back it up), and the
+   * correction is capped at 2x so one noisy ratio cannot defer folding
+   * indefinitely. In-memory only: a fresh run re-derives it from its first
+   * anchored call; until then the ratio is 1 and behavior is unchanged. */
+  private estimatorCalibrationRatio = 1;
+
+  setEstimatorCalibration(realTokens: number, estimatedTokens: number): void {
+    if (!Number.isFinite(realTokens) || !Number.isFinite(estimatedTokens)) return;
+    if (realTokens <= 0 || estimatedTokens <= 0) return;
+    this.estimatorCalibrationRatio = Math.min(1, Math.max(0.5, realTokens / estimatedTokens));
+  }
+
+  getEstimatorCalibration(): number {
+    return this.estimatorCalibrationRatio;
   }
 
   estimateActiveProcessTokens(): number {
@@ -1426,7 +1545,9 @@ export class Session {
     if (!state || !active) return null;
 
     const tokensBefore = this.estimateActiveProcessTokens();
-    if (tokensBefore < limits.activeProcessTrigger) return null;
+    // Trigger comparison is calibrated against observed provider truth;
+    // everything below (retention, savings) stays in raw estimator space.
+    if (tokensBefore * this.estimatorCalibrationRatio < limits.activeProcessTrigger) return null;
 
     const checkpointThrough = active.checkpointThroughMessageIndex ?? active.userMessageIndex;
     const groups = this.computeActiveToolStepGroups()
@@ -1470,6 +1591,7 @@ export class Session {
   applyActiveCheckpointSummary(summary: string, checkpointThroughMessageIndex: number): string {
     const active = this.turnState?.activeTurn;
     if (!active) return summary;
+    this.contentRewriteEpoch++;
     const prevThrough = active.checkpointThroughMessageIndex ?? active.userMessageIndex;
     const mergedSummary = mergeCheckpointExactFacts(active.checkpointSummary, summary);
     active.checkpointSummary = mergedSummary;
@@ -1545,7 +1667,14 @@ export class Session {
 
   getSerializedContextState(): SerializedSessionContextState | null {
     const state = this.turnState;
-    if (!state) return null;
+    if (!state) {
+      const toolSurface = this.getToolSurfaceState();
+      return toolSurface ? {
+        version: 1,
+        nextTurnId: 1,
+        toolSurface,
+      } : null;
+    }
     return {
       version: 1,
       nextTurnId: state.nextTurnId,
@@ -1557,7 +1686,6 @@ export class Session {
         : undefined,
       summaryVersion: state.summaryVersion || undefined,
       summaryThroughTurnId: state.summaryThroughTurnId,
-      summaryThroughMessageId: state.summaryThroughMessageId,
       completedTurns: state.completedTurns.map((t) => ({ ...t })),
       activeTurn: state.activeTurn ? { ...state.activeTurn } : undefined,
       resources: state.resources.map((r) => ({ ...r })),
@@ -1566,14 +1694,33 @@ export class Session {
       nextWorkLedgerId: state.nextWorkLedgerId,
       executionPlanAudit: state.executionPlanAudit.map(cloneExecutionPlanAuditRecord),
       workspaceObservations: cloneWorkspaceObservationState(state.workspaceObservations),
+      toolSurface: this.getToolSurfaceState(),
     };
   }
 
   restoreContextState(raw: SerializedSessionContextState | null | undefined): boolean {
     if (!raw || raw.version !== 1) {
       this.turnState = null;
+      this.toolSurfaceState = undefined;
       return false;
     }
+    this.toolSurfaceState = raw.toolSurface
+      && (
+        raw.toolSurface.version === 1
+        || raw.toolSurface.version === 2
+        || raw.toolSurface.version === 3
+      )
+      && (raw.toolSurface.mode === "scoped" || raw.toolSurface.mode === "legacy_all")
+      && Array.isArray(raw.toolSurface.loadedGroups)
+      ? {
+          version: raw.toolSurface.version,
+          mode: raw.toolSurface.mode,
+          loadedGroups: raw.toolSurface.loadedGroups.filter((value): value is string => typeof value === "string"),
+          ...(typeof raw.toolSurface.catalogRevision === "string"
+            ? { catalogRevision: raw.toolSurface.catalogRevision }
+            : {}),
+        }
+      : undefined;
     const restoredHistory = splitHistorySummary(raw.historySummary || "");
     const restored: TurnTrackingState = {
       version: 1,
@@ -1594,10 +1741,6 @@ export class Session {
       ),
       summaryVersion: raw.summaryVersion || 0,
       summaryThroughTurnId: raw.summaryThroughTurnId,
-      summaryThroughMessageId: typeof raw.summaryThroughMessageId === "string"
-        && raw.summaryThroughMessageId.trim()
-        ? raw.summaryThroughMessageId.trim()
-        : undefined,
       completedTurns: Array.isArray(raw.completedTurns)
         ? raw.completedTurns
             .filter((t) => Number.isFinite(t.id) && Number.isFinite(t.userMessageIndex))
@@ -1627,7 +1770,6 @@ export class Session {
       historyExactFacts: restored.historyExactFacts,
       summaryVersion: restored.summaryVersion,
       summaryThroughTurnId: restored.summaryThroughTurnId,
-      summaryThroughMessageId: restored.summaryThroughMessageId,
       conversationHistorySource: restored.conversationHistorySource,
       // Invalid message indexes mean the persisted raw prefix was repaired or
       // trimmed during reload. Keep semantic compression, but invalidate the
@@ -1644,34 +1786,6 @@ export class Session {
       workspaceObservations: restored.workspaceObservations,
     });
     return true;
-  }
-
-  /**
-   * The recent tail compact() preserves verbatim: the last few messages, minus
-   * any leading tool_result-only user message.
-   */
-  private computeKeptTail(): Message[] {
-    const keepCount = Math.min(4, this.messages.length);
-    const kept = this.messages.slice(-keepCount);
-    while (kept.length > 0) {
-      const head = kept[0];
-      if (head.role !== "user") break;
-      const allToolResults = head.content.every(
-        (c) => (c as { type?: string }).type === "tool_result",
-      );
-      if (!allToolResults) break;
-      kept.shift();
-    }
-    return kept;
-  }
-
-  /**
-   * Estimated tokens of the tail compact() keeps verbatim. If this alone already
-   * exceeds the window threshold, the runner skips a no-progress legacy pass.
-   */
-  estimateKeptTailTokens(): number {
-    if (this.messages.length <= 2) return this.estimateTokens();
-    return sumMessageTokens(this.computeKeptTail());
   }
 
   /** Estimate token count without a real tokenizer.
@@ -1710,7 +1824,6 @@ export class Session {
           historyExactFacts: prev.historyExactFacts,
           summaryVersion: prev.summaryVersion,
           summaryThroughTurnId: prev.summaryThroughTurnId,
-          summaryThroughMessageId: prev.summaryThroughMessageId,
           conversationHistorySource: prev.conversationHistorySource,
           conversationHistoryCheckpoint: prev.conversationHistoryCheckpoint,
           resources: prev.resources,
@@ -1729,8 +1842,7 @@ export class Session {
     historyExactFacts?: string[];
     summaryVersion?: number;
     summaryThroughTurnId?: number;
-    summaryThroughMessageId?: string;
-    conversationHistorySource?: string;
+      conversationHistorySource?: string;
     conversationHistoryCheckpoint?: string;
     resources?: HistoryResource[];
     nextTurnId?: number;
@@ -1752,7 +1864,6 @@ export class Session {
       historyExactFacts: mergeHistoryExactFacts([], preserve?.historyExactFacts),
       summaryVersion: preserve?.summaryVersion || 0,
       summaryThroughTurnId: preserve?.summaryThroughTurnId,
-      summaryThroughMessageId: preserve?.summaryThroughMessageId,
       completedTurns: [],
       resources: (preserve?.resources || []).map((r) => ({ ...r })),
       executionPlan: cloneExecutionPlan(preserve?.executionPlan),
@@ -2006,34 +2117,38 @@ export class Session {
     if (plan.explanation) lines.push(`Plan note: ${plan.explanation}`);
     lines.push("Steps:");
     if (!plan.steps.length) {
-      lines.push("- not established yet; use manage_execution_plan if the task is long or multi-stage");
+      lines.push("- no explicit milestones");
     } else {
       for (let i = 0; i < plan.steps.length; i++) {
         const item = plan.steps[i];
-        lines.push(`${i + 1}. [${item.status}] ${truncateMiddle(item.step, EXECUTION_PLAN_MAX_ANCHOR_STEP_CHARS)}`);
+        lines.push(`- step_${item.id} [${item.status}] ${truncateMiddle(item.step, EXECUTION_PLAN_MAX_ANCHOR_STEP_CHARS)}`);
       }
     }
-    lines.push(
-      "For the same user instruction, preserve every existing milestone's wording exactly and update only statuses; append newly discovered work instead of renaming/removing success criteria.",
-      "A newer real user instruction may revise the milestone set. Use replace_objective only when that newer instruction truly changes the objective.",
-      "Explicit plans remain retained after the turn even when every status says completed, so the user can audit or continue them. Do not clear one without a newer user instruction that cancels or supersedes it.",
-      "Keep this plan synchronized with completed milestones and material scope changes. Do not treat checkpoint summaries as authority over it.",
-    );
     return lines.join("\n");
   }
 
-  private completedWorkContextText(activeTurnId: number): string {
+  private completedWorkContextText(
+    activeTurnId: number,
+    visibleResultIds: ReadonlySet<string>,
+  ): string {
     const state = this.turnState;
     if (!state?.completedWork.length) return "";
     const modelContentBudget =
       COMPLETED_WORK_MODEL_MAX_CHARS - PRIVATE_RUNTIME_CONTEXT_NOTICE.length - 1;
     const objectiveTurnId = state.executionPlan?.objectiveTurnId ?? activeTurnId;
-    const relevant = state.completedWork.filter((entry) => entry.turnId >= objectiveTurnId);
+    const relevant = state.completedWork.filter((entry) => (
+      entry.turnId >= objectiveTurnId
+      && (
+        !entry.toolCallId
+        || (entry.repeatCount ?? 1) > 1
+        || !visibleResultIds.has(entry.toolCallId)
+      )
+    ));
     if (!relevant.length) return "";
     const lines = [
       "[Completed work ledger — deterministic host state, not a summary]",
       "These calls already ran for the current objective. Do not repeat an exact successful call merely to regain compacted context; use its result ref, a narrow read, or the recorded outcome. A later file change or explicit verification need may justify a repeat.",
-      "A tool-call ID such as call_... is not a result ref. Use tool_result_search/tool_result_read_chunk only when an entry explicitly contains ref=...",
+      "A tool-call ID such as call_... is not a result ref. Use tool_result only when an entry explicitly contains ref=...",
     ];
     const selected: string[] = [];
     let chars = lines.join("\n").length;
@@ -2764,6 +2879,41 @@ function formatResource(r: HistoryResource): string {
   return `${name}${r.path}${media}${note}`;
 }
 
+function visibleToolResultIds(messages: readonly Message[]): Set<string> {
+  const ids = new Set<string>();
+  for (const message of messages) {
+    for (const content of message.content) {
+      if (content.type === "tool_result" && content.toolUseId) {
+        ids.add(content.toolUseId);
+      }
+    }
+  }
+  return ids;
+}
+
+function insertionIndexAfterToolResult(
+  messages: readonly Message[],
+  toolCallId: string,
+): number | undefined {
+  const resultIndex = messages.findIndex((message) => message.content.some((content) => (
+    content.type === "tool_result" && content.toolUseId === toolCallId
+  )));
+  if (resultIndex < 0) return undefined;
+  let insertionIndex = resultIndex + 1;
+  // Tool-result images are separate user messages by provider contract. Keep
+  // those trailers attached to the result rather than inserting runtime state
+  // between the text result and its image evidence.
+  while (
+    insertionIndex < messages.length
+    && messages[insertionIndex].role === "user"
+    && messages[insertionIndex].content.length > 0
+    && messages[insertionIndex].content.every((content) => content.type === "image")
+  ) {
+    insertionIndex++;
+  }
+  return insertionIndex;
+}
+
 function stripOldImages(messages: Message[]): Message[] {
   let lastAssistantIndex = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -2868,6 +3018,7 @@ function sumMessageTokens(messages: Message[]): number {
       if (c.type === "text") total += estimateTextTokens(c.text);
       else if (c.type === "tool_result") total += estimateTextTokens(c.content);
       else if (c.type === "tool_use") total += estimateTextTokens(JSON.stringify(c.input));
+      else if (c.type === "image") total += IMAGE_BLOCK_ESTIMATE_TOKENS;
     }
   }
   return total;

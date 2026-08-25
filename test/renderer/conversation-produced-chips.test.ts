@@ -101,18 +101,21 @@ describe('conversation produced chips', () => {
 });
 
 describe('chat video layout', () => {
-  it('reserves a stable 16:9 slot for inline chat videos', () => {
+  it('reserves a stable 16:9 slot for markdown videos', () => {
     expect(styleSource).toContain('.chat-md-video-shell');
     expect(styleSource).toContain('aspect-ratio: 16 / 9;');
     expect(styleSource).toContain('width: min(640px, 100%);');
-    expect(styleSource).toContain('.chat-msg-attach-video-shell');
+    expect(styleSource).not.toContain('.chat-msg-attach-video-shell');
   });
 
-  it('wires bubble and floating-player surfaces to the shared playback toggle', () => {
-    expect(source).toContain('data-chat-video-playback-surface="attachment_bubble"');
+  it('wires expanded markdown and floating-player surfaces to the shared playback toggle', () => {
+    expect(source).not.toContain('data-chat-video-playback-surface="attachment_bubble"');
     expect(utilsSource).toContain('data-chat-video-playback-surface="markdown_bubble"');
-    expect((viewerSource.match(/data-chat-video-playback-surface="floating_player"/g) || [])).toHaveLength(2);
+    expect((viewerSource.match(
+      /data-chat-video-playback-surface="floating_player"|chatVideoPlaybackSurface = 'floating_player'/g,
+    ) || [])).toHaveLength(2);
     expect(utilsSource).toContain("target.closest('[data-chat-video-playback-surface]')");
     expect(utilsSource).toContain('_toggleChatVideoFromSurface(e, surface)');
+    expect(utilsSource).not.toMatch(/Monitor\.click\(['"]chat_video_surface_toggle/);
   });
 });

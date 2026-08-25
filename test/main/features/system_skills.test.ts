@@ -3,6 +3,12 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+import {
+  SKILL_DESCRIPTION_AUTHORING_MAX_CHARS,
+  SKILL_DESCRIPTION_AUTHORING_MIN_CHARS,
+  SKILL_DESCRIPTION_ROSTER_MAX_CHARS,
+} from '../../../src/main/util/skill-description-policy';
+
 const UID = 'system-skills-user';
 
 let tmpDir: string;
@@ -10,6 +16,7 @@ let prevWs: string | undefined;
 
 beforeEach(() => {
   vi.doUnmock('node:fs');
+  vi.doUnmock('../../../src/main/paths');
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-system-skills-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
@@ -47,6 +54,16 @@ function packagedSystemSkillReference(id: string, reference: string): string {
   );
 }
 
+function packagedSystemSkillBundle(id: string): string {
+  const root = path.resolve(process.cwd(), 'resources', 'builtin', 'system', 'skills', id);
+  const refs = path.join(root, 'references');
+  const files = [path.join(root, 'SKILL.md')];
+  if (fs.existsSync(refs)) {
+    files.push(...fs.readdirSync(refs).sort().map((name) => path.join(refs, name)));
+  }
+  return files.map((file) => fs.readFileSync(file, 'utf8')).join('\n');
+}
+
 function frontmatterOf(md: string): string {
   expect(md.startsWith('---\n')).toBe(true);
   const end = md.indexOf('\n---', 4);
@@ -65,13 +82,27 @@ describe('system skills reconciliation', () => {
     expect(results.map((r) => [r.id, r.action]).sort()).toEqual([
       ['agent-creator', 'created'],
       ['autotask-creator', 'created'],
+      ['memory-manager', 'created'],
       ['package-installer', 'created'],
+      ['project-tasks', 'created'],
       ['skill-creator', 'created'],
     ]);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'agent-creator'), 'SKILL.md'))).toBe(true);
+    expect(fs.existsSync(path.join(
+      paths.userSystemSkillDir(UID, 'agent-creator'),
+      'references',
+      'llm-agent-fields.md',
+    ))).toBe(true);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'autotask-creator'), 'SKILL.md'))).toBe(true);
+    expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'memory-manager'), 'SKILL.md'))).toBe(true);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'package-installer'), 'SKILL.md'))).toBe(true);
+    expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'project-tasks'), 'SKILL.md'))).toBe(true);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'skill-creator'), 'SKILL.md'))).toBe(true);
+    expect(fs.existsSync(path.join(
+      paths.userSystemSkillDir(UID, 'skill-creator'),
+      'references',
+      'metadata.md',
+    ))).toBe(true);
     expect(fs.existsSync(paths.userSystemSkillsManifestFile(UID))).toBe(true);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'agent-creator'), '_system.json'))).toBe(false);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'skill-creator'), '_system.json'))).toBe(false);
@@ -91,12 +122,16 @@ describe('system skills reconciliation', () => {
     expect(results.map((r) => [r.id, r.action]).sort()).toEqual([
       ['agent-creator', 'created'],
       ['autotask-creator', 'created'],
+      ['memory-manager', 'created'],
       ['package-installer', 'created'],
+      ['project-tasks', 'created'],
       ['skill-creator', 'created'],
     ]);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(loginUid, 'agent-creator'), 'SKILL.md'))).toBe(true);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(loginUid, 'autotask-creator'), 'SKILL.md'))).toBe(true);
+    expect(fs.existsSync(path.join(paths.userSystemSkillDir(loginUid, 'memory-manager'), 'SKILL.md'))).toBe(true);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(loginUid, 'package-installer'), 'SKILL.md'))).toBe(true);
+    expect(fs.existsSync(path.join(paths.userSystemSkillDir(loginUid, 'project-tasks'), 'SKILL.md'))).toBe(true);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(loginUid, 'skill-creator'), 'SKILL.md'))).toBe(true);
     expect(fs.existsSync(paths.userSystemSkillDir(UID, 'agent-creator'))).toBe(false);
   });
@@ -115,8 +150,23 @@ describe('system skills reconciliation', () => {
       'skipped',
       'skipped',
       'skipped',
+      'skipped',
+      'skipped',
     ]);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'agent-creator'), '_system.json'))).toBe(false);
+
+    const packagedSkillCreator = packagedSystemSkill('skill-creator');
+    const installedSkillCreator = path.join(
+      paths.userSystemSkillDir(UID, 'skill-creator'),
+      'SKILL.md',
+    );
+    const installedMetadataReference = path.join(
+      paths.userSystemSkillDir(UID, 'skill-creator'),
+      'references',
+      'metadata.md',
+    );
+    fs.writeFileSync(installedSkillCreator, 'stale local skill-creator content', 'utf8');
+    fs.writeFileSync(installedMetadataReference, 'stale metadata reference', 'utf8');
 
     const skillManifest = paths.userSystemSkillsManifestFile(UID);
     const stale = JSON.parse(fs.readFileSync(skillManifest, 'utf8'));
@@ -127,6 +177,9 @@ describe('system skills reconciliation', () => {
     const updated = await systemSkills.reconcileAllForActiveUser();
     expect(updated.find((r) => r.id === 'agent-creator')?.action).toBe('skipped');
     expect(updated.find((r) => r.id === 'skill-creator')?.action).toBe('updated');
+    expect(fs.readFileSync(installedSkillCreator, 'utf8')).toBe(packagedSkillCreator);
+    expect(fs.readFileSync(installedMetadataReference, 'utf8'))
+      .toBe(packagedSystemSkillReference('skill-creator', 'metadata.md'));
   });
 
   it('restores a missing local skill even when the root manifest is current', async () => {
@@ -211,6 +264,80 @@ describe('system skills reconciliation', () => {
     expect(nextManifest.some((entry: any) => entry.id === retiredId)).toBe(false);
   });
 
+  it('deletes an untracked system Skill directory that is absent from the packaged manifest', async () => {
+    const users = await import('../../../src/main/features/users');
+    const systemSkills = await import('../../../src/main/features/system_skills');
+    const paths = await import('../../../src/main/paths');
+    users.activateUser(UID);
+
+    await systemSkills.reconcileAllForActiveUser();
+    const orphanId = 'untracked-system-skill';
+    const orphanDir = paths.userSystemSkillDir(UID, orphanId);
+    fs.mkdirSync(orphanDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(orphanDir, 'SKILL.md'),
+      '---\nname: untracked-system-skill\ndescription: must be removed\n---\n',
+    );
+    const manifestFile = paths.userSystemSkillsManifestFile(UID);
+    const beforeManifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+    expect(beforeManifest.some((entry: any) => entry.id === orphanId)).toBe(false);
+
+    const results = await systemSkills.reconcileAllForActiveUser();
+    expect(results.find((r) => r.id === orphanId)?.action).toBe('deleted');
+    expect(fs.existsSync(orphanDir)).toBe(false);
+
+    const registry = await import('../../../src/main/model/core-agent/skill-registry');
+    expect(await registry.getSystemSkillsPromptBlock()).not.toContain('untracked-system-skill');
+  });
+
+  it('preserves local mirrors when the packaged manifest is unreadable, partial, or empty', async () => {
+    const paths = await import('../../../src/main/paths');
+    const localRoot = paths.userSystemSkillsDir(UID);
+    const localId = 'kept-system-skill';
+    const localDir = paths.userSystemSkillDir(UID, localId);
+    const localManifestFile = paths.userSystemSkillsManifestFile(UID);
+    fs.mkdirSync(localDir, { recursive: true });
+    fs.writeFileSync(path.join(localDir, 'SKILL.md'), 'local mirror must survive');
+    fs.writeFileSync(localManifestFile, `${JSON.stringify([{ id: localId, update_at: 1 }], null, 2)}\n`);
+    const localManifestBefore = fs.readFileSync(localManifestFile, 'utf8');
+
+    const packagedRoot = path.join(tmpDir, 'broken-packaged-system-skills');
+    const packagedManifestFile = path.join(packagedRoot, '_system.json');
+    fs.mkdirSync(packagedRoot, { recursive: true });
+    vi.doMock('../../../src/main/paths', async () => {
+      const actual = await vi.importActual<typeof import('../../../src/main/paths')>(
+        '../../../src/main/paths',
+      );
+      return {
+        ...actual,
+        packagedSystemSkillsDir: () => packagedRoot,
+        packagedSystemSkillsManifestFile: () => packagedManifestFile,
+      };
+    });
+
+    const users = await import('../../../src/main/features/users');
+    const systemSkills = await import('../../../src/main/features/system_skills');
+    users.activateUser(UID);
+    const invalidSources = [
+      '{not-json',
+      JSON.stringify([
+        { id: 'agent-creator', update_at: 1 },
+        { id: '../invalid', update_at: 1 },
+      ]),
+      '[]',
+    ];
+    for (const source of invalidSources) {
+      fs.writeFileSync(packagedManifestFile, source);
+      const results = await systemSkills.reconcileAllForActiveUser();
+      expect(results).toEqual([
+        expect.objectContaining({ id: '*', action: 'invalid_manifest' }),
+      ]);
+      expect(fs.readFileSync(path.join(localDir, 'SKILL.md'), 'utf8')).toBe('local mirror must survive');
+      expect(fs.readFileSync(localManifestFile, 'utf8')).toBe(localManifestBefore);
+      expect(fs.existsSync(localRoot)).toBe(true);
+    }
+  });
+
   it('does not allow repo-shipped builtin skills to be added', async () => {
     const builtinSkillsDir = path.resolve(process.cwd(), 'src', 'builtin', 'skills');
     const offenders: string[] = [];
@@ -227,21 +354,68 @@ describe('system skills reconciliation', () => {
   });
 });
 
-describe('system creator skill contracts', () => {
-  it('keeps creator SKILL.md frontmatter portable', () => {
-    for (const id of ['agent-creator', 'skill-creator']) {
+describe('system skill contracts', () => {
+  it('keeps every platform-managed system Skill bilingual without a generic description', () => {
+    const ids = [
+      'agent-creator',
+      'autotask-creator',
+      'memory-manager',
+      'package-installer',
+      'project-tasks',
+      'skill-creator',
+    ];
+    for (const id of ids) {
       const fm = frontmatterOf(packagedSystemSkill(id));
       expect(fm).toMatch(/^name:\s*/m);
-      expect(fm).toMatch(/^description:\s*/m);
-      expect(fm).not.toMatch(/^description_zh:/m);
-      expect(fm).not.toMatch(/^description_en:/m);
-      expect(fm).not.toMatch(/^category:/m);
+      expect(fm).toMatch(/^description_zh:\s*\S/m);
+      expect(fm).toMatch(/^description_en:\s*\S/m);
+      expect(fm).not.toMatch(/^description:/m);
     }
   });
 
+  it('keeps the project backlog workflow in a triggerable system skill', () => {
+    const md = packagedSystemSkill('project-tasks');
+    const fm = frontmatterOf(md);
+
+    expect(fm).toMatch(/^name:\s*project-tasks$/m);
+    expect(fm).toMatch(/^description_zh:/m);
+    expect(fm).toMatch(/^description_en:/m);
+    expect(fm).toMatch(/^category:\s*"general"$/m);
+    expect(md).toContain('## Project status');
+    expect(md).toContain('project_tasks');
+    expect(md).toContain('depends_on');
+    expect(md).toContain('An `in_progress` task is already started');
+    expect(md).toContain('result_ref');
+    expect(md).toContain('evidence, not authority');
+    expect(md).toContain('never as a filesystem path');
+    expect(md).toContain('explicit complete or empty state is authoritative');
+  });
+
+  it('keeps durable-memory mutations in a triggerable system skill', () => {
+    const md = packagedSystemSkill('memory-manager');
+    const fm = frontmatterOf(md);
+
+    expect(fm).toMatch(/^name:\s*memory-manager$/m);
+    expect(fm).toMatch(/^description_zh:\s*/m);
+    expect(fm).toMatch(/^description_en:\s*/m);
+    expect(fm).toMatch(/remember this/i);
+    expect(fm).toMatch(/read-only questions/i);
+    expect(md).toContain('target: "agent"');
+    expect(md).toContain('target: "user"');
+    expect(md).toContain('target: "shared"');
+    expect(md).toContain('target: "project"');
+    expect(md).toContain('project_instructions');
+    expect(md).toMatch(/Choose exactly one destination/i);
+    expect(md).toMatch(/base future proposals on this fact[\s\S]{0,80}project memory/i);
+    expect(md).toMatch(/full replacement/i);
+    expect(md).toMatch(/several records match[\s\S]{0,160}without mutating/i);
+    expect(md).toMatch(/exact tool, operation, and target/i);
+    expect(md).toMatch(/only after its tool result confirms success/i);
+  });
+
   it('authors one shared action-authority boundary instead of blanket reconfirmation', () => {
-    const agentCreator = packagedSystemSkill('agent-creator');
-    const skillCreator = packagedSystemSkill('skill-creator');
+    const agentCreator = packagedSystemSkillBundle('agent-creator');
+    const skillCreator = packagedSystemSkillBundle('skill-creator');
 
     for (const body of [agentCreator, skillCreator]) {
       expect(body).toContain('current user request authorizes that exact action');
@@ -253,9 +427,11 @@ describe('system creator skill contracts', () => {
   });
 
   it('pins skill-creator import behavior to explicit intent and faithful restoration', () => {
-    const md = packagedSystemSkill('skill-creator');
+    const md = packagedSystemSkillBundle('skill-creator');
     expect(md).toContain('Explicit creation intent required');
     expect(md).toContain('Do **not** consult this skill for a plain "install this URL');
+    expect(md).toContain('read the relevant source contents before authoring');
+    expect(md).toContain('a filename plus a short request is not enough');
     expect(md).toContain('emit one `<skill>` container per source skill');
     expect(md).toContain('make the first source skill become the current import draft');
     expect(md).toContain('Do not merge multiple source skills into one Orkas skill');
@@ -267,15 +443,36 @@ describe('system creator skill contracts', () => {
     expect(md).toContain('Do not re-emit unchanged package files');
   });
 
+  it('pins skill-creator description guidance to the runtime roster boundary', () => {
+    const md = packagedSystemSkillBundle('skill-creator');
+    expect(md).toContain('normally one or two sentences containing');
+    expect(md).toContain('Core capability and delivery');
+    expect(md).toContain('Typical user intent');
+    expect(md).toContain('Necessary boundary');
+    expect(md).toContain('without quoting sample requests or adding a separate keyword list');
+    expect(md).toContain('When authoring or repairing a description, use the same compact routing index as SKILL.md frontmatter');
+    expect(md).toContain(
+      `aim for ${SKILL_DESCRIPTION_AUTHORING_MIN_CHARS}–${SKILL_DESCRIPTION_AUTHORING_MAX_CHARS} characters without padding`,
+    );
+    expect(md).toContain(`at or below ${SKILL_DESCRIPTION_ROSTER_MAX_CHARS} characters`);
+    expect(md).toContain('preserve the complete description up to that boundary');
+    expect(md).toContain('Preserve faithful imported descriptions unless the user asks for a rewrite');
+    expect(md).not.toMatch(/three-part dispatch format/i);
+    expect(md).not.toContain('one-line function; suitable user phrasings; trigger words');
+  });
+
   it('pins agent-creator descriptions to current-language defaults and hidden provenance', () => {
-    const md = packagedSystemSkill('agent-creator');
+    const md = packagedSystemSkillBundle('agent-creator');
     expect(md).toContain('Use `<description_zh>` / `<description_en>` only when the user explicitly asks for multilingual/bilingual descriptions');
     expect(md).toContain('Default: one current-language description only');
     expect(md).toContain('Do **not** show source provenance by default');
     expect(md).toContain('No container, no mutation, no success claim');
     expect(md).toContain('the number of valid containers must equal the number of Agents');
-    expect(md).toContain('An Agent role is not a model runtime');
-    expect(md).toContain('Do not name or describe role-based Agents as ChatGPT');
+    expect(md).toContain('Agent roles are not model runtimes');
+    expect(md).toContain('Do not imitate or claim an unavailable provider');
+    expect(md).toContain('current-turn attachments or referenced files');
+    expect(md).toContain('concrete target before the current request');
+    expect(md).toContain('not from the meta act of creating an Agent');
     expect(md).not.toContain('Both are required');
   });
 
@@ -291,8 +488,8 @@ describe('system creator skill contracts', () => {
   });
 
   it('keeps intentional creator-skill category and provenance rules in parity', () => {
-    const agentCreator = packagedSystemSkill('agent-creator');
-    const skillCreator = packagedSystemSkill('skill-creator');
+    const agentCreator = packagedSystemSkillBundle('agent-creator');
+    const skillCreator = packagedSystemSkillBundle('skill-creator');
     const categoryCodes = (md: string): string[] => {
       const section = md.match(/Pick one code from this fixed marketplace category list:[\s\S]*?\n\nMatch the primary domain/);
       expect(section).not.toBeNull();

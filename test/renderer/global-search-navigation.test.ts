@@ -215,7 +215,9 @@ describe('global search conversation navigation', () => {
   it('does not let a slow previous query replace the cleared empty state', async () => {
     let resolveFetch!: (value: unknown) => void;
     const rendered: string[] = [];
+    const trackResult = vi.fn();
     const context: any = {
+      Date,
       _SEARCH_FETCH_LIMIT: 200,
       _searchSeq: 0,
       _searchResults: [],
@@ -230,6 +232,7 @@ describe('global search conversation navigation', () => {
       _renderSearchEmptyState: () => { rendered.push('empty'); },
       _renderSearchResults: (query: string) => { rendered.push(`results:${query}`); },
       _renderSearchError: (message: string) => { rendered.push(`error:${message}`); },
+      _trackGlobalSearchResult: trackResult,
       apiFetch: () => new Promise((resolve) => { resolveFetch = resolve; }),
     };
     vm.createContext(context);
@@ -250,11 +253,15 @@ describe('global search conversation navigation', () => {
     expect(Array.from(context._searchResults)).toEqual([]);
     expect(Array.from(context._searchVisibleResults)).toEqual([]);
     expect(context._searchActiveIdx).toBe(-1);
+    expect(trackResult).toHaveBeenCalledWith('cancelled', 'superseded', expect.any(Number), {
+      has_project: false,
+    });
   });
 
   it('invalidates an in-flight query when the search overlay closes', async () => {
     let rejectFetch!: (reason: Error) => void;
     const reportFailure = vi.fn();
+    const trackResult = vi.fn();
     const renderError = vi.fn();
     const overlay: any = { style: { display: '' } };
     const input: any = { value: 'private query' };
@@ -272,6 +279,7 @@ describe('global search conversation navigation', () => {
       _renderSearchResults: vi.fn(),
       _renderSearchError: renderError,
       _reportGlobalSearchFailure: reportFailure,
+      _trackGlobalSearchResult: trackResult,
       apiFetch: () => new Promise((_resolve, reject) => { rejectFetch = reject; }),
       clearTimeout,
     };

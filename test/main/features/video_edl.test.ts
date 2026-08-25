@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { validateEdl, summarizeEdl, assessDelivery, type VideoEdl } from '../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edl';
+import {
+  validateEdl,
+  summarizeEdl,
+  assessDelivery,
+  type VideoEdl,
+} from '../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edl';
 
 /** A minimal but fully valid hybrid plan: one trimmed source clip on primary,
  *  a composed title card overlay, narration + ducked music. This is the M0
@@ -184,6 +189,82 @@ describe('validateEdl — per-source spec requirements', () => {
     expect(codes(p).errors).toContain('E_SPEC_GENERATE_SETTINGS_ALIAS');
   });
 
+  it('rejects every unknown generate field with its path and the allowed fields', () => {
+    const p = validPlan();
+    p.segments[1] = {
+      id: 'gen',
+      order: 2,
+      role: 'body',
+      layer: 'primary',
+      source: 'generate',
+      target_sec: 5,
+      spec: {
+        media_kind: 'video',
+        prompt: 'city establishing shot',
+        settings: { resolution: '1080p' },
+        provider_options: { audio: false },
+      },
+    } as never;
+    p.cost_estimate = { billable_generations: 1 };
+
+    const unknownFields = validateEdl(p).errors
+      .filter((issue) => issue.code === 'E_SPEC_GENERATE_UNKNOWN_FIELD');
+    expect(unknownFields.map((issue) => issue.path)).toEqual([
+      'segments[1].spec.settings',
+      'segments[1].spec.provider_options',
+    ]);
+    expect(unknownFields[0]?.message).toContain('write only video generation fields directly on spec');
+    expect(unknownFields[0]?.message).toContain('generation_duration_sec');
+    expect(unknownFields[0]?.message).toContain('generate_audio');
+  });
+
+  it('accepts the complete image field family and rejects cross-kind look-alikes', () => {
+    const imagePlan = validPlan();
+    imagePlan.segments[1] = {
+      id: 'still',
+      order: 2,
+      role: 'body',
+      layer: 'primary',
+      source: 'generate',
+      target_sec: 5,
+      spec: {
+        media_kind: 'image',
+        prompt: 'editorial product still',
+        aspect: '9:16',
+        size: '1024x1792',
+        variation_type: 'small',
+        characters: ['product'],
+        refs: ['references/look.png'],
+        reference_images: ['references/product.png'],
+        reference_image_urls: ['https://example.test/look.png'],
+      },
+    };
+    imagePlan.cost_estimate = { billable_generations: 1 };
+    expect(validateEdl(imagePlan).errors).toEqual([]);
+
+    (imagePlan.segments[1].spec as Record<string, unknown>).resolution = '1080p';
+    expect(validateEdl(imagePlan).errors).toContainEqual(expect.objectContaining({
+      path: 'segments[1].spec.resolution',
+      code: 'E_SPEC_GENERATE_UNKNOWN_FIELD',
+    }));
+
+    const videoPlan = validPlan();
+    videoPlan.segments[1] = {
+      id: 'video',
+      order: 2,
+      role: 'body',
+      layer: 'primary',
+      source: 'generate',
+      target_sec: 5,
+      spec: { media_kind: 'video', prompt: 'moving product', size: '1024x1792' },
+    } as never;
+    videoPlan.cost_estimate = { billable_generations: 1 };
+    expect(validateEdl(videoPlan).errors).toContainEqual(expect.objectContaining({
+      path: 'segments[1].spec.size',
+      code: 'E_SPEC_GENERATE_UNKNOWN_FIELD',
+    }));
+  });
+
   it('validates image and video references by intent instead of origin', () => {
     const p = validPlan();
     p.references = [
@@ -234,7 +315,9 @@ describe('validateEdl — per-source spec requirements', () => {
 
   it('treats semantic video editing as an EDIT workflow with a signed AI edit segment', () => {
     const p = validPlan();
-    p.segments[1] = {
+    p.total_target_sec = 12;
+    p.delivery_promise = { type: 'source_led', source_required: true, motion_min_ratio: 1 };
+    p.segments = [{
       id: 'semantic-fix',
       order: 2,
       role: 'body',
@@ -251,7 +334,7 @@ describe('validateEdl — per-source spec requirements', () => {
         quality: 'balanced',
         generate_audio: true,
       },
-    };
+    }];
     p.references = [{
       id: 'source-video',
       media_type: 'video',
@@ -274,6 +357,11 @@ describe('validateEdl — per-source spec requirements', () => {
     };
     p.cost_estimate = { billable_generations: 1 };
     expect(validateEdl(p).errors).toEqual([]);
+    expect(assessDelivery(p)).toEqual(expect.objectContaining({
+      source_present: true,
+      source_ok: true,
+      verdict: 'pass',
+    }));
 
     delete p.edit_strategy;
     expect(codes(p).errors).toContain('E_SEMANTIC_EDIT_STRATEGY_REQUIRED');
@@ -286,6 +374,50 @@ describe('validateEdl — per-source spec requirements', () => {
       may_change: ['unwanted sign'],
     };
     expect(codes(p).errors).toContain('E_SEMANTIC_EDIT_SIGNAL_REQUIRED');
+  });
+
+  it('does not let ordinary generated video satisfy a source-footage promise', () => {
+    const p = validPlan();
+    p.total_target_sec = 12;
+    p.delivery_promise = { type: 'source_led', source_required: true, motion_min_ratio: 1 };
+    p.segments = [{
+      id: 'generated-shot',
+      order: 1,
+      role: 'body',
+      layer: 'primary',
+      source: 'generate',
+      target_sec: 12,
+      spec: {
+        media_kind: 'video',
+        prompt: 'Generate a new city shot.',
+        operation: 'generate',
+        generation_duration_sec: 12,
+        resolution: '720p',
+        quality: 'balanced',
+        generate_audio: false,
+        reference_video_paths: ['references/style.mp4'],
+      },
+    }];
+    p.references = [{
+      id: 'style-video',
+      media_type: 'video',
+      source: 'references/style.mp4',
+      intent: 'guide',
+      intent_basis: 'user',
+      roles: ['style'],
+      required: true,
+      preserve: ['visual tone'],
+      may_change: [],
+      target_segment_ids: ['generated-shot'],
+    }];
+    p.cost_estimate = { billable_generations: 1 };
+
+    expect(codes(p).errors).toContain('E_PROMISE_NO_SOURCE');
+    expect(assessDelivery(p)).toEqual(expect.objectContaining({
+      source_present: false,
+      source_ok: false,
+      verdict: 'fail',
+    }));
   });
 
   it('accepts evidence-driven intelligent cutting without turning it into AI generation', () => {

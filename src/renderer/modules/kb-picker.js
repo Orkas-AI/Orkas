@@ -56,7 +56,7 @@ async function pickKbLocation(opts = {}) {
 
   const modal = document.getElementById('kb-picker-modal');
   document.getElementById('kb-picker-title').textContent =
-    opts.title || t('kb_picker.title');
+    opts.title || _kbPickerDefaultTitle(_kbPickerScope);
   document.getElementById('kb-picker-name').value = opts.defaultName || '';
   document.getElementById('kb-picker-msg').textContent = '';
   _kbPickerRenderTree();
@@ -73,6 +73,12 @@ function _kbPickerNormalizeScope(scope) {
     return { type: 'project', projectId: scope.projectId };
   }
   return { type: 'global' };
+}
+
+function _kbPickerDefaultTitle(scope) {
+  return scope && scope.type === 'project'
+    ? t('kb_picker.title_project')
+    : t('kb_picker.title_global');
 }
 
 function _kbPickerLastDirKey(scope) {
@@ -221,10 +227,13 @@ function _kbPickerBindTreeHandlers(container) {
 function _kbPickerRenderTarget() {
   const el = document.getElementById('kb-picker-target');
   if (!el) return;
+  const library = _kbPickerScope.type === 'project'
+    ? t('contexts.transfer.project_library')
+    : t('contexts.transfer.global_library');
   const label = _kbPickerCurrentDir
     ? `${_kbPickerCurrentDir}/`
     : t('contexts.root_label');
-  el.textContent = t('kb_picker.target', { rel: label });
+  el.textContent = t('kb_picker.target', { library, rel: label });
 }
 
 function closeKbPicker() {

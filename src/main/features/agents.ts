@@ -20,8 +20,6 @@ import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 
-import type { AgentTool } from '#core-agent';
-
 import {
   userAgentsDir, userSkillsDir, userAgentChatDir, userSessionFile,
   agentDir, agentDefinitionFile, agentRuntimeStatsFile,
@@ -62,9 +60,7 @@ import {
 import {
   listSkillSpecsForAgentMetadata,
   normalizeKnownSkillRefsForDisplay,
-  openSkillReadRoots,
   resolveSkillAllowlistRefs,
-  searchOpenTierSkills,
   type SkillAllowlistRef,
 } from '../model/core-agent/skill-registry';
 import { readDisabledSets, setAgentEnabled } from './component_enabled';
@@ -77,6 +73,15 @@ import {
 } from './marketplace_biz';
 import { normalizeInstallVersion } from './marketplace_installs';
 import { NAME_DISPLAY_MAX_UNITS, nameDisplayWidth } from '../util/name-limit';
+import {
+  canonicalizeAgentToolGroups,
+  getToolCatalogEntry,
+  invalidAgentToolGroupRefs,
+  isAgentDependencyToolGroup,
+  isLoadableToolGroup,
+  toolNamesForAgentGroups,
+  type ToolGroupId,
+} from '../model/core-agent/tool-catalog';
 
 export type AgentSource = 'marketplace' | 'custom';
 type AgentSourceInput = AgentSource | 'builtin';
@@ -154,14 +159,23 @@ export interface AgentProfileScope {
   rejects?: string[];
 }
 
-/** Structured, display-facing profile for richer agents. Old agents can omit
- *  it entirely and still render from description/workflow/skills. New specs
- *  persist knowhow / standards as top-level fields; `profile` is the
- *  normalized read shape consumed by UI/runtime. */
+/** Structured profile for richer agents. Old agents can omit it entirely and
+ *  still render from description/workflow/skills. New specs persist knowhow /
+ *  standards as top-level fields; `profile` is the normalized read shape.
+ *  `knowhow` is display-only, while `standards` is also runtime guidance. */
 export interface AgentProfile {
   role?: string;
   dispatch?: string;
+  /** Stable capabilities shown on the Agent detail surface. This field is not
+   *  injected into the worker prompt; execution behavior belongs in workflow
+   *  or a routed Skill. */
   knowhow?: string[];
+  /** Pre-handoff checklist, resident on every turn of this agent and read as
+   *  mandatory: the model checks its finished result against each entry and
+   *  reports a blocker for anything it cannot meet. Route- or phase-specific
+   *  rules, procedures, command syntax and soft preferences belong in the Skill
+   *  that reads them; anything needing the words "not a gate" is in the wrong
+   *  list. See the injection site in `group_chat/bus.ts` for the full contract. */
   standards?: string[];
   /** Legacy/read-only compatibility. New authoring must use top-level
    *  `workflow` markdown instead of profile.workflow. */
@@ -199,6 +213,17 @@ export interface Agent {
    * Maintained exclusively by the agent-edit LLM via the `<skills>` child of
    * the `<agent>` container. Not exposed in the UI. */
   skill_list?: string[];
+  /** Fixed runtime tool groups. The Agent cannot load groups beyond this list;
+   * [] is an explicit host-only surface. Missing is retained only for
+   * historical compatibility and resolves to a fixed legacy-capability set. */
+  tool_list?: ToolGroupId[];
+  /** Host-owned terminal delivery checks this agent's final replies must pass,
+   * by `terminal-checks.ts` registry name (e.g. 'content-delivery'). Each name
+   * enforces one of the agent's delivery standards in code: the host runs the
+   * named checks on terminal text and asks the runner for at most one repair.
+   * Undefined / [] → no checks. Runtime-recognized only for now — not part of
+   * the agent-creator authoring contract until a second consumer exists. */
+  delivery_checks?: string[];
   /** User-facing input schema. Three-state:
    *   - undefined / field missing → agent needs no up-front confirmation
    *   - []                        → explicit zero inputs
@@ -239,11 +264,6 @@ export interface Agent {
   /** Marketplace category code. Empty string only for legacy/manual specs.
    *  Maintained by hidden create defaults and by the agent-edit LLM's `<category>` sub-tag. */
   category: string;
-  /** Connector instance ids previously selected for this agent. Runtime
-   *  group-chat agents now share the commander's connector visibility; this is
-   *  retained as UI/compatibility metadata. Maintained by the agent edit UI,
-   *  NOT by the agent-edit LLM. */
-  enabled_connectors?: string[];
   /** Output rendering preference — agent-level hint injected into the worker
    *  system prompt at dispatch time. Four user-facing values, progressive
    *  capability disclosure:
@@ -300,6 +320,8 @@ export interface AgentRaw {
   created_at?: string;
   updated_at?: string;
   skill_list?: unknown;
+  tool_list?: unknown;
+  delivery_checks?: unknown;
   inputs?: unknown;
   icon?: unknown;
   color?: unknown;
@@ -309,7 +331,6 @@ export interface AgentRaw {
   category?: unknown;
   status?: unknown;
   state?: unknown;
-  enabled_connectors?: unknown;
   output_format?: unknown;
   profile?: unknown;
   role?: unknown;
@@ -742,7 +763,16 @@ function _profileEntries(raw: unknown, limit = 16): AgentProfileEntry[] | undefi
   return out.length ? out : undefined;
 }
 
-function _profileTextList(raw: unknown, limit = 16, max = 220): string[] | undefined {
+/** One warn per distinct (owner, field, damage) so a hot normalize path cannot
+ *  spam the log while a change in damage still gets reported. */
+const _profileOverflowWarned = new Set<string>();
+
+function _profileTextList(
+  raw: unknown,
+  limit = 16,
+  max = 220,
+  overflow?: { field: string; ownerId?: string },
+): string[] | undefined {
   const input = Array.isArray(raw)
     ? raw
     : (_plainObj(raw) ? Object.entries(raw as Record<string, unknown>).map(([key, value]) => {
@@ -752,19 +782,78 @@ function _profileTextList(raw: unknown, limit = 16, max = 220): string[] | undef
       }) : []);
   const out: string[] = [];
   const seen = new Set<string>();
+  let dropped = 0;
+  let truncated = 0;
+  const textFor = (item: unknown, boundedMax: number): string => {
+    const direct = _cleanProfileString(item, boundedMax);
+    if (direct) return direct;
+    const obj = _plainObj(item);
+    if (!obj || obj.kept === false || obj.enabled === false) return '';
+    return _firstProfileString(obj, ['title', 't', 'name', 'n', 'label', 'k', 'description', 'd', 'summary', 'detail', 'body'], boundedMax);
+  };
   for (const item of input) {
-    let text = _cleanProfileString(item, max);
-    if (!text) {
-      const obj = _plainObj(item);
-      if (!obj || obj.kept === false || obj.enabled === false) continue;
-      text = _firstProfileString(obj, ['title', 't', 'name', 'n', 'label', 'k', 'description', 'd', 'summary', 'detail', 'body'], max);
-    }
+    const text = textFor(item, max);
     if (!text || seen.has(text)) continue;
     seen.add(text);
+    if (out.length >= limit) {
+      // Same admission rules as a kept item; only the limit stops it. Counted
+      // instead of silently skipped so the loss is observable.
+      dropped++;
+      continue;
+    }
+    // The unbounded read picks the same source key (cleaning never empties a
+    // non-empty value), so a longer result means this exact line was cut.
+    if (textFor(item, Number.MAX_SAFE_INTEGER).length > text.length) truncated++;
     out.push(text);
-    if (out.length >= limit) break;
+  }
+  if (overflow && (dropped > 0 || truncated > 0)) {
+    const owner = String(overflow.ownerId || 'unknown').slice(0, 6);
+    const key = `${owner}|${overflow.field}|${dropped}|${truncated}`;
+    if (!_profileOverflowWarned.has(key)) {
+      _profileOverflowWarned.add(key);
+      // Counts only — the dropped lines are user-authored content.
+      log.warn('agent profile list over budget', {
+        agent: owner,
+        field: overflow.field,
+        kept: out.length,
+        dropped,
+        truncated,
+        limit,
+        max_chars: max,
+      });
+    }
   }
   return out.length ? out : undefined;
+}
+
+/** Resident runtime guidance is paid on every Agent turn. Keep new authored
+ * lists small; legacy specs remain readable through the separate 16-item
+ * normalization path above. */
+export const AGENT_GUIDANCE_ITEM_LIMIT = 5;
+
+function _guidanceListOverLimit(raw: unknown): boolean {
+  return (_profileTextList(raw, AGENT_GUIDANCE_ITEM_LIMIT + 1)?.length || 0)
+    > AGENT_GUIDANCE_ITEM_LIMIT;
+}
+
+function _assertAgentGuidanceMutationValid(
+  updates: Pick<UpdateAgentFields, 'profile' | 'knowhow' | 'standards'>,
+): void {
+  const over: Array<'knowhow' | 'standards'> = [];
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'knowhow')
+    && _guidanceListOverLimit(updates.knowhow)) over.push('knowhow');
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'standards')
+    && _guidanceListOverLimit(updates.standards)) over.push('standards');
+  if (updates?.profile && typeof updates.profile === 'object') {
+    if (_guidanceListOverLimit(updates.profile.knowhow)) over.push('knowhow');
+    if (_guidanceListOverLimit(updates.profile.standards)) over.push('standards');
+  }
+  if (!over.length) return;
+  const fields = [...new Set(over)].join(', ');
+  throw new Error(
+    `${fields} exceeds the maximum of ${AGENT_GUIDANCE_ITEM_LIMIT} items; `
+    + 'merge overlapping items or move route-specific rules into Skills',
+  );
 }
 
 function _profileStats(raw: unknown, limit = 8): AgentProfileStat[] | undefined {
@@ -819,7 +908,10 @@ function _profileValue(profile: Record<string, unknown>, raw: Record<string, unk
   return undefined;
 }
 
-function normalizeAgentProfile(raw: AgentRaw | null | undefined): AgentProfile | undefined {
+function normalizeAgentProfile(
+  raw: AgentRaw | null | undefined,
+  ownerId?: string,
+): AgentProfile | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const outer = raw as Record<string, unknown>;
   const embedded = _plainObj(raw.profile) || {};
@@ -833,10 +925,14 @@ function normalizeAgentProfile(raw: AgentRaw | null | undefined): AgentProfile |
   const knowhow = _profileTextList(
     Object.prototype.hasOwnProperty.call(outer, 'knowhow') ? outer.knowhow : embedded.knowhow,
     16,
+    220,
+    { field: 'knowhow', ownerId },
   );
   const standards = _profileTextList(
     Object.prototype.hasOwnProperty.call(outer, 'standards') ? outer.standards : embedded.standards,
     16,
+    220,
+    { field: 'standards', ownerId },
   );
   if (knowhow) profile.knowhow = knowhow;
   if (standards) profile.standards = standards;
@@ -874,6 +970,7 @@ function normalizeAgentRuntimeStats(raw: unknown): AgentRuntimeStats | undefined
     stats.attempts
     || stats.successes
     || stats.deliveries
+    || stats.execution_failures
     || stats.failures
     || stats.errors
     || stats.total_duration_ms
@@ -910,7 +1007,7 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
     // it is never persisted.
     enabled: true,
   };
-  const profile = normalizeAgentProfile(raw);
+  const profile = normalizeAgentProfile(raw, raw.agent_id);
   if (profile) agent.profile = profile;
   const runtimeStats = normalizeAgentRuntimeStats(raw.runtime_stats);
   if (runtimeStats) agent.runtime_stats = runtimeStats;
@@ -922,6 +1019,32 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
       (v): v is string => typeof v === 'string' && safeId(v),
     );
   }
+  const hasToolList = Object.prototype.hasOwnProperty.call(raw, 'tool_list');
+  if (Array.isArray(raw.tool_list)) {
+    const invalid = raw.tool_list.filter((value) => (
+      typeof value !== 'string' || invalidAgentToolGroupRefs([value]).length > 0
+    ));
+    if (!invalid.length) {
+      agent.tool_list = canonicalizeAgentToolGroups(raw.tool_list as string[]);
+    } else {
+      // An explicitly malformed dependency contract must never broaden into
+      // the historical missing-field compatibility surface.
+      agent.tool_list = [];
+      log.warn(`agent ${raw.agent_id}: invalid tool_list normalized to host-only`);
+    }
+  } else if (hasToolList) {
+    agent.tool_list = [];
+    log.warn(`agent ${raw.agent_id}: malformed tool_list normalized to host-only`);
+  }
+  // delivery_checks follows the same exact-array convention. Entries are
+  // registry names (kebab tokens), bounded at 8; name resolution happens at
+  // wiring time (`terminal-checks.ts`), where an unknown name warns loudly
+  // instead of vanishing.
+  if (Array.isArray(raw.delivery_checks)) {
+    agent.delivery_checks = raw.delivery_checks
+      .filter((v): v is string => typeof v === 'string' && /^[a-z][a-z0-9-]{0,47}$/.test(v))
+      .slice(0, 8);
+  }
   // inputs follows the same three-state convention as skill_list. Only the
   // exact-array branch makes it through; malformed JSON is treated as "unset"
   // rather than "zero", so a corrupted field never silently erases the real
@@ -931,16 +1054,6 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
   }
   if (avatars.isKnownIcon(raw.icon)) agent.icon = raw.icon;
   if (avatars.isKnownColor(raw.color)) agent.color = raw.color;
-  // enabled_connectors is UI/compatibility metadata. Runtime group-chat agents
-  // share the commander's connector visibility; filtering keeps malformed JSON
-  // from injecting weird ids into the detail UI.
-  if (Array.isArray(raw.enabled_connectors)) {
-    const filtered = raw.enabled_connectors
-      .filter((v): v is string => typeof v === 'string')
-      .map((v) => v.trim())
-      .filter((v) => v.length > 0 && safeId(v));
-    if (filtered.length) agent.enabled_connectors = filtered;
-  }
   // interactive — tolerant boolean coerce (LLMs sometimes emit "true"/"false"
   // strings). Missing/malformed → undefined; downstream readers treat
   // undefined the same as false.
@@ -955,7 +1068,16 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
   // collapses to "no field set" (downstream readers default to form).
   if (raw.input_channel === 'prose') agent.input_channel = 'prose';
   const rt = _normalizeRuntime(raw.runtime);
-  if (rt) agent.runtime = rt;
+  if (rt) {
+    agent.runtime = rt;
+    if (rt.kind === 'cli' && cliIsCodingAgent(rt.cli)) {
+      // Older coding-agent specs can predate the host-owned project_dir
+      // schema. Repair only the normalized read view: the empty default means
+      // "inherit workspace", and no machine-specific path is written back to
+      // the cloud-synced agent.json.
+      agent.inputs = _withCodingProjectDirInput(agent.inputs || []);
+    }
+  }
   // output_format: enum-coerce + legacy alias canonicalization. Missing /
   // unknown collapses to "no field set" (downstream reads default to 'auto').
   const outputFormat = _canonicalOutputFormat(raw.output_format);
@@ -996,7 +1118,7 @@ function _normalizeCliRuntimeOverride(value: unknown): string {
   return trimmed;
 }
 
-/** True when this CLI is a coding agent (Claude Code / Codex). Coding
+/** True when this CLI is a coding agent with project-directory support. Coding
  *  agents are dispatched with a per-conversation project directory as
  *  cwd instead of the user workspace; the chip in the conversation
  *  surface lets the user set it. Single source of truth for both UI
@@ -1217,7 +1339,9 @@ export async function setAgentCliProjectDir(
   return getCliProjectDirInfoForAgent(userId, agent);
 }
 
-const AGENT_CATALOG_CACHE_VERSION = 2;
+// Bump when normalizeAgent's materialized schema changes so persisted rows are
+// rebuilt instead of bypassing read-time compatibility reconciliation.
+const AGENT_CATALOG_CACHE_VERSION = 3;
 const AGENT_ENRICHED_CACHE_TTL_MS = 2_000;
 
 interface AgentListCache { stamp: string; data: Agent[] }
@@ -1513,6 +1637,10 @@ export interface CreateAgentOptions {
   profile?: AgentProfile;
   knowhow?: string[];
   standards?: string[];
+  /** Fixed built-in tool groups for an in-process Agent. Omitted keeps the
+   * manual-create staging default (`[]`); model-authored creation requires an
+   * explicit array so a missing dependency list cannot create a broken Agent. */
+  tool_list?: string[];
   /** Picked at create time from the modal's runtime selector. Stored as
    *  authored — `normalizeAgent` validates on read. */
   runtime?: AgentRuntime;
@@ -1640,11 +1768,20 @@ function bumpAgentSpecRevision(data: AgentRaw): void {
  * before the spec is written.
  */
 export async function createCustomAgent(
-  { name = '', description = '', description_zh, description_en, workflow = '', icon, color, interactive, profile, knowhow, standards, runtime, category, output_format }: CreateAgentOptions = {},
+  { name = '', description = '', description_zh, description_en, workflow = '', icon, color, interactive, profile, knowhow, standards, tool_list, runtime, category, output_format }: CreateAgentOptions = {},
 ): Promise<Agent | null> {
   const userId = getActiveUserId();
   assertAgentNameAllowed(name);
   await assertAgentNameUnique(String(name || '').trim(), undefined, userId);
+  _assertAgentGuidanceMutationValid({ profile, knowhow, standards });
+  if (tool_list !== undefined) _assertToolListMutationValid({ tool_list });
+  const requestedRuntime = _normalizeRuntime(runtime);
+  if (!requestedRuntime || requestedRuntime.kind !== 'cli') {
+    _assertWorkflowToolListCoverage(
+      workflow,
+      Array.isArray(tool_list) ? canonicalizeAgentToolGroups(tool_list) : [],
+    );
+  }
   fs.mkdirSync(userAgentsDir(userId), { recursive: true });
   let agentId: string;
   do { agentId = genAgentId(); }
@@ -1691,7 +1828,7 @@ export async function createCustomAgent(
   const rt = _normalizeRuntime(runtime);
   if (rt && rt.kind === 'cli') {
     data.runtime = rt;
-    // Coding CLIs (claude / codex) need a working directory. We inject
+    // Coding CLIs need a working directory. We inject
     // a `project_dir` input dependency so the standard agent-input-form
     // pipeline collects it before the first dispatch — same UX as any
     // other required input. The agent worker reads the submitted
@@ -1699,6 +1836,13 @@ export async function createCustomAgent(
     if (cliIsCodingAgent(rt.cli)) {
       data.inputs = [_buildProjectDirInput()];
     }
+  } else {
+    // New in-process Agents are fixed-surface from birth. Manual creation is a
+    // staging flow and starts host-only; model-authored creation passes its
+    // explicit dependencies here so the first persisted spec is executable.
+    data.tool_list = Array.isArray(tool_list)
+      ? canonicalizeAgentToolGroups(tool_list)
+      : [];
   }
   // Quality validation gate. EXTREME findings (missing required fields / red
   // flags in workflow text / etc.) block the write; MEDIUM warnings pass
@@ -1747,6 +1891,13 @@ function _buildProjectDirInput(): AgentInput {
   };
 }
 
+function _withCodingProjectDirInput(inputs: AgentInput[]): AgentInput[] {
+  return [
+    _buildProjectDirInput(),
+    ...inputs.filter((input) => input.id !== PROJECT_DIR_INPUT_ID),
+  ];
+}
+
 export interface UpdateAgentFields {
   name?: string;
   description?: string;
@@ -1761,6 +1912,13 @@ export interface UpdateAgentFields {
    *   null  → drop the dependency metadata
    *   omitted → untouched */
   skill_list?: string[] | null;
+  /** Three-way update for Agent-declarable tool groups; null drops the field,
+   * an empty array requests the host-only surface. */
+  tool_list?: string[] | null;
+  /** Parser-only rejection evidence. Never persisted: an explicit `<tools>`
+   * tag containing an unknown, host-managed, runtime-only, or malformed group must reject
+   * the whole mutation instead of becoming an omitted legacy-all field. */
+  tool_list_invalid_refs?: string[];
   /** Three-way update mirror of `skill_list`:
    *   array → replace (validated via `validateAgentInputs`)
    *   null  → drop the field
@@ -1791,18 +1949,153 @@ export interface UpdateAgentFields {
    *  Missing model output is repaired to the default category on create. */
   category?: string;
   /** Three-way update:
-   *   array (possibly empty) → replace (filtered to non-empty strings)
-   *   null  → drop the field
-   *   omitted → untouched
-   *  UI/compatibility metadata authored by the agent edit UI, NOT the
-   *  agent-edit LLM. */
-  enabled_connectors?: string[] | null;
-  /** Three-way update:
    *   OutputFormat string → set (one of the constrained enum values)
    *   null                 → drop (revert to default 'auto')
    *   omitted              → untouched
    *  Authored by the agent edit UI dropdown. */
   output_format?: OutputFormat | null;
+}
+
+function _assertToolListMutationValid(updates: UpdateAgentFields): void {
+  const invalid: unknown[] = [];
+  if (Array.isArray(updates?.tool_list_invalid_refs)) {
+    invalid.push(...updates.tool_list_invalid_refs);
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'tool_list')
+    && Array.isArray(updates.tool_list)) {
+    invalid.push(...updates.tool_list.filter((item) => (
+      typeof item !== 'string' || invalidAgentToolGroupRefs([item]).length > 0
+    )));
+  }
+  if (!invalid.length) return;
+  const refs = [...new Set(invalid
+    .slice(0, 8)
+    .map((value) => (typeof value === 'string' ? value.trim() : ''))
+    .map((value) => (/^[a-z][a-z0-9._-]{0,79}$/.test(value) ? value : '<invalid>')))];
+  throw new Error(`invalid, unknown, host-managed, or runtime-only tool groups: ${refs.join(', ')}`);
+}
+
+const WORKFLOW_TOOL_NEGATION_RE = /(?:\b(?:do not|don't|never|without|avoid|instead of|rather than|must not|should not|cannot|can't)\b|(?:不要|不得|禁止|避免|无需|不可|不能|不应))[^.!?。！？;；\n]{0,120}$/i;
+const WORKFLOW_TOOL_ACTION_RE = /(?:\b(?:call|use|run|invoke|execute)\s*|(?:调用|使用|运行|执行)\s*)$/i;
+const WORKFLOW_BULLET_PREFIX_RE = /^\s*(?:[-*•]|\d+[.)])\s*$/;
+
+/** Extract only explicit built-in calls from the authored workflow. Skill names
+ * and incidental prose are ignored; a negated example such as "do not use
+ * `bash`" must not create a capability dependency. */
+export function workflowBuiltinToolCalls(workflow: unknown): string[] {
+  if (typeof workflow !== 'string' || !workflow.trim()) return [];
+  const found = new Set<string>();
+  const codeSpanRe = /`([^`\r\n]+)`/g;
+  for (const match of workflow.matchAll(codeSpanRe)) {
+    const code = match[1].trim();
+    const call = code.match(/^([a-z][a-z0-9_]{0,63})(?:\s*\([^`]*\))?$/);
+    if (!call || !getToolCatalogEntry(call[1])) continue;
+    const offset = match.index ?? 0;
+    const lineStart = workflow.lastIndexOf('\n', Math.max(0, offset - 1)) + 1;
+    const prefix = workflow.slice(lineStart, offset);
+    if (WORKFLOW_TOOL_NEGATION_RE.test(prefix)) continue;
+    const explicitCallShape = code !== call[1];
+    if (explicitCallShape
+      || WORKFLOW_BULLET_PREFIX_RE.test(prefix)
+      || WORKFLOW_TOOL_ACTION_RE.test(prefix)) {
+      found.add(call[1]);
+    }
+  }
+  return [...found];
+}
+
+function _assertWorkflowToolListCoverage(
+  workflow: unknown,
+  toolList: unknown,
+  agentId?: string,
+): void {
+  // A missing field is the historical compatibility sentinel. New model-authored
+  // Agents cannot reach this path without an explicit list, but legacy specs may
+  // still receive unrelated edits without being forced through a migration.
+  if (!Array.isArray(toolList)) return;
+  const active = new Set(toolNamesForAgentGroups(toolList as string[]));
+  const missing = workflowBuiltinToolCalls(workflow)
+    .map((name) => {
+      const entry = getToolCatalogEntry(name);
+      if (entry?.agentAssignable === false) {
+        return `${name} (cannot be declared for a named Agent)`;
+      }
+      const owner = entry?.ownerAgent;
+      const ownedByActor = !owner || (Array.isArray(owner)
+        ? !!agentId && owner.includes(agentId)
+        : owner === agentId);
+      if (!ownedByActor) return `${name} (owned by another Agent)`;
+      if (active.has(name)) return '';
+      const loadGroups = entry?.loadGroups ?? [];
+      const groups = loadGroups
+        .filter(isAgentDependencyToolGroup);
+      if (groups.length) return `${name} (add ${groups.join(' or ')})`;
+      if (name === 'tool_load' || loadGroups.some(isLoadableToolGroup)) {
+        return `${name} (cannot be declared for a named Agent)`;
+      }
+      return '';
+    })
+    .filter(Boolean);
+  if (missing.length) {
+    throw new Error(`workflow invokes built-in tools outside declared Agent groups: ${missing.join(', ')}`);
+  }
+}
+
+/** Resolve the initial capability groups for a model-authored Agent create.
+ *
+ * The resolver is catalog-driven rather than capability-specific: it merges
+ * the authored groups with exact built-in calls found in the workflow and
+ * exact tool names supplied by trusted structured UI selections. A missing
+ * tool is inferred only when it maps to one unambiguous Agent-dependency
+ * group. Ambiguous Office-style tools still require the author to choose the
+ * relevant leaf, and host/runtime/owner-only tools never become dependencies.
+ */
+function _resolveAgentCreationToolList(input: {
+  authoredGroups: readonly string[];
+  workflow: unknown;
+  dependencyToolNames?: readonly string[];
+}): ToolGroupId[] {
+  let groups = canonicalizeAgentToolGroups(input.authoredGroups);
+  const toolNames = [...new Set([
+    ...workflowBuiltinToolCalls(input.workflow),
+    ...(input.dependencyToolNames || []),
+  ])];
+
+  for (const name of toolNames) {
+    const entry = getToolCatalogEntry(name);
+    if (!entry) throw new Error(`unknown Agent tool dependency: ${name}`);
+    if (entry.agentAssignable === false) {
+      throw new Error(
+        `workflow invokes built-in tools outside declared Agent groups: ${name} (cannot be declared for a named Agent)`,
+      );
+    }
+    if (entry.ownerAgent) {
+      throw new Error(
+        `workflow invokes built-in tools outside declared Agent groups: ${name} (owned by another Agent)`,
+      );
+    }
+    if (toolNamesForAgentGroups(groups).includes(name)) continue;
+
+    const candidates = [...new Set(
+      (entry.loadGroups || []).filter(isAgentDependencyToolGroup),
+    )];
+    if (candidates.length === 1) {
+      groups = canonicalizeAgentToolGroups([...groups, candidates[0]]);
+      continue;
+    }
+    if (candidates.length > 1) {
+      throw new Error(
+        `workflow invokes an ambiguous built-in tool: ${name} (choose ${candidates.join(' or ')})`,
+      );
+    }
+    if (name === 'tool_load' || (entry.loadGroups || []).some(isLoadableToolGroup)) {
+      throw new Error(
+        `workflow invokes built-in tools outside declared Agent groups: ${name} (cannot be declared for a named Agent)`,
+      );
+    }
+    // Host-managed tools need no persisted Agent dependency.
+  }
+  return groups;
 }
 
 /**
@@ -1876,7 +2169,7 @@ function _setAgentTextListField(
     return;
   }
   if (Array.isArray(value)) {
-    const clean = _profileTextList(value, 16);
+    const clean = _profileTextList(value, AGENT_GUIDANCE_ITEM_LIMIT);
     if (clean) (data as Record<string, unknown>)[key] = clean;
     else delete (data as Record<string, unknown>)[key];
   }
@@ -1900,6 +2193,7 @@ function _applyLegacyProfileUpdate(data: AgentRaw, value: AgentProfile | null | 
 async function _applyAgentUpdates(
   data: AgentRaw, agentId: string, updates: UpdateAgentFields, userId = getActiveUserId(),
 ): Promise<void> {
+  _assertToolListMutationValid(updates);
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'name')) {
     const incomingName = typeof updates.name === 'string' ? updates.name : '';
     assertAgentNameAllowed(incomingName);
@@ -1920,10 +2214,12 @@ async function _applyAgentUpdates(
   if (effectiveCli) {
     if ('workflow' in (updates || {})) delete (updates as any).workflow;
     if ('skill_list' in (updates || {})) delete (updates as any).skill_list;
+    if ('tool_list' in (updates || {})) delete (updates as any).tool_list;
     if ('profile' in (updates || {})) delete (updates as any).profile;
     if ('knowhow' in (updates || {})) delete (updates as any).knowhow;
     if ('standards' in (updates || {})) delete (updates as any).standards;
   }
+  _assertAgentGuidanceMutationValid(updates);
   for (const k of ['name', 'workflow'] as const) {
     if (Object.prototype.hasOwnProperty.call(updates || {}, k)) {
       const v = (updates as any)[k];
@@ -1990,6 +2286,14 @@ async function _applyAgentUpdates(
     }
     // any other value (undefined sneaking through) is a no-op
   }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'tool_list')) {
+    const value = updates.tool_list;
+    if (value === null) {
+      delete data.tool_list;
+    } else if (Array.isArray(value)) {
+      data.tool_list = canonicalizeAgentToolGroups(value);
+    }
+  }
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'inputs')) {
     const v = updates.inputs;
     if (v === null) {
@@ -1998,18 +2302,6 @@ async function _applyAgentUpdates(
       // Re-validate on every write so even a trusted caller can't slip a
       // half-formed schema past us.
       data.inputs = validateAgentInputs(v);
-    }
-  }
-  if (Object.prototype.hasOwnProperty.call(updates || {}, 'enabled_connectors')) {
-    const v = (updates as { enabled_connectors?: string[] | null }).enabled_connectors;
-    if (v === null) {
-      delete (data as { enabled_connectors?: unknown }).enabled_connectors;
-    } else if (Array.isArray(v)) {
-      const ids = v
-        .filter((s): s is string => typeof s === 'string')
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0 && safeId(s));
-      (data as { enabled_connectors?: string[] }).enabled_connectors = ids;
     }
   }
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'output_format')) {
@@ -2089,10 +2381,11 @@ async function _applyAgentUpdates(
     const wantsProjectDir = cliIsCodingAgent(finalCli);
     const inputs = Array.isArray(data.inputs) ? validateAgentInputs(data.inputs) : [];
     const without = inputs.filter((i) => i.id !== PROJECT_DIR_INPUT_ID);
-    if (wantsProjectDir) data.inputs = [_buildProjectDirInput(), ...without];
+    if (wantsProjectDir) data.inputs = _withCodingProjectDirInput(without);
     else if (without.length) data.inputs = without;
     else delete data.inputs;
   }
+  if (!effectiveCli) _assertWorkflowToolListCoverage(data.workflow, data.tool_list, agentId);
   if (!data.name) data.name = t('agent.default_name');
   bumpAgentSpecRevision(data);
   data.updated_at = nowIso();
@@ -2262,7 +2555,7 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
 // ─────────────────────────────────────────────────────────────────────────
 
 // Single outer container: `<agent>...</agent>`. Inside: child tags `<name>`,
-// `<description>`, `<icon>`, `<workflow>`, `<skills>`, `<inputs>`. One
+// `<description>`, `<icon>`, `<workflow>`, `<skills>`, `<tools>`, `<inputs>`. One
 // container per turn gives us atomic extraction (all fields in or none) and
 // a single placeholder to stream-hide. Shared between agent-edit chat and main-chat
 // quick-create; see the "Create agent" section of
@@ -2271,14 +2564,23 @@ const AGENT_CHILD_RE = (tag: string) => new RegExp(`<${tag}>([\\s\\S]*?)<\\/${ta
 
 const AGENT_CATEGORY_CODE_RE = /^[a-z][a-z0-9_-]{0,79}$/;
 
+export type AgentMutationOperation = 'create' | 'edit';
+
 export interface ExtractedFields {
-  /** Parsed from `<agent_id>` inside `<agent>`. Present → commander wants to
-   * patch this existing custom agent (main-chat edit flow); absent → create
-   * a brand-new agent. The agent-edit-chat surface ignores this field — the
-   * target id is supplied by URL context, the LLM never writes it. Body
-   * must pass `safeId`; otherwise the key is dropped (mis-spelled id should
-   * NOT silently fall through to the create branch). */
+  /** Explicit mutation intent for an unbound Commander session. Bound Agent
+   * editors omit it because the host already owns the edit target. Unknown
+   * values are dropped so the mutation boundary can fail closed. */
+  operation?: AgentMutationOperation;
+  /** Parsed from `<agent_id>` inside `<agent>`. Required for an unbound edit
+   * and forbidden for create. The Agent-edit-chat surface ignores this field
+   * because the target id is supplied by URL context. Body must pass `safeId`;
+   * otherwise the key is dropped. The mutation boundary validates it together
+   * with `operation`, so a malformed edit id can never fall through to create. */
   agent_id?: string;
+  /** Internal parse evidence that an `<agent_id>` tag was present but invalid.
+   * It lets the mutation boundary reject create+id instead of silently treating
+   * a malformed id tag as if it had never been emitted. */
+  agent_id_invalid?: boolean;
   name?: string;
   description?: string;
   description_zh?: string;
@@ -2293,6 +2595,11 @@ export interface ExtractedFields {
   /** Parsed from `<skills>` inside `<agent>`. Empty tag body → `[]` (explicit
    * zero). Absent tag → key omitted (leave `skill_list` untouched). */
   skill_list?: string[];
+  /** Parsed from `<tools>`; empty body means explicit host-only tools. */
+  tool_list?: ToolGroupId[];
+  /** Explicit invalid `<tools>` values retained until the mutation boundary
+   * can reject the complete create/edit atomically. */
+  tool_list_invalid_refs?: string[];
   /** Parsed from `<inputs>` inside `<agent>`. Empty body → `[]` (explicit
    * zero). Absent or malformed JSON → key omitted. */
   inputs?: AgentInput[];
@@ -2307,10 +2614,16 @@ export interface ExtractedFields {
 
 function _parseAgentBlock(inner: string): ExtractedFields {
   const fields: ExtractedFields = {};
+  const operationM = inner.match(AGENT_CHILD_RE('operation'));
+  if (operationM) {
+    const value = operationM[1].trim().toLowerCase();
+    if (value === 'create' || value === 'edit') fields.operation = value;
+  }
   const aidM = inner.match(AGENT_CHILD_RE('agent_id'));
   if (aidM) {
     const v = aidM[1].trim();
     if (safeId(v)) fields.agent_id = v;
+    else fields.agent_id_invalid = true;
   }
   const nameM = inner.match(AGENT_CHILD_RE('name'));
   if (nameM) {
@@ -2363,7 +2676,9 @@ function _parseAgentBlock(inner: string): ExtractedFields {
     if (trimmed === '' || trimmed === '[]') return [];
     if (/^[\[{]/.test(trimmed)) {
       try {
-        return _profileTextList(JSON.parse(trimmed), 16);
+        // Keep one item past the write limit so the mutation boundary can
+        // reject overflow instead of silently storing a truncated list.
+        return _profileTextList(JSON.parse(trimmed), AGENT_GUIDANCE_ITEM_LIMIT + 1);
       } catch (err) {
         log.warn(`<${tag}> JSON parse failed: ${(err as Error).message}`);
         return undefined;
@@ -2377,7 +2692,7 @@ function _parseAgentBlock(inner: string): ExtractedFields {
       if (!text || seen.has(text)) continue;
       seen.add(text);
       out.push(text);
-      if (out.length >= 16) break;
+      if (out.length > AGENT_GUIDANCE_ITEM_LIMIT) break;
     }
     return out.length ? out : undefined;
   };
@@ -2402,6 +2717,16 @@ function _parseAgentBlock(inner: string): ExtractedFields {
       .split(/\r?\n/)
       .map((s) => s.trim())
       .filter((s) => s.length > 0 && safeId(s));
+  }
+  const toolsM = inner.match(AGENT_CHILD_RE('tools'));
+  if (toolsM) {
+    const values = toolsM[1]
+      .split(/\r?\n/)
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const invalid = invalidAgentToolGroupRefs(values);
+    if (!invalid.length) fields.tool_list = canonicalizeAgentToolGroups(values);
+    else fields.tool_list_invalid_refs = invalid;
   }
   const inM = inner.match(AGENT_CHILD_RE('inputs'));
   if (inM) {
@@ -2549,6 +2874,7 @@ export function buildAgentEditSystemPrompt(agent: {
   icon?: string;
   workflow?: string;
   skill_list?: string[];
+  tool_list?: string[];
   inputs?: AgentInput[];
   profile?: AgentProfile;
   knowhow?: string[];
@@ -2581,6 +2907,7 @@ export function buildAgentEditSystemPrompt(agent: {
   const standardsText = profile?.standards?.length ? profile.standards.join('\n') : '(not provided)';
   const inputsJson = Array.isArray(agent.inputs) ? JSON.stringify(agent.inputs, null, 2) : '(not provided)';
   const skillsText = Array.isArray(agent.skill_list) ? agent.skill_list.join('\n') : '(not provided)';
+  const toolsText = Array.isArray(agent.tool_list) ? agent.tool_list.join('\n') : '(not provided)';
   const body = isCli
     ? prompts.load('chat_agent_setup_cli', {
         // Runtime cli + model are deliberately NOT passed: the LLM is
@@ -2602,6 +2929,7 @@ export function buildAgentEditSystemPrompt(agent: {
         icon: avatars.isKnownIcon(agent.icon) ? agent.icon : '(not provided)',
         workflow: (agent.workflow || '').trim() || '(not provided)',
         skills: skillsText || '(not provided)',
+        tools: toolsText || '(not provided)',
         inputs_json: inputsJson,
         knowhow_text: knowhowText,
         standards_text: standardsText,
@@ -2658,68 +2986,11 @@ async function buildAgentEditMessageWithAttachments(
   };
 }
 
-function _trimText(raw: unknown, max = 2000): string {
-  const s = typeof raw === 'string' ? raw.trim() : '';
-  return s.length > max ? s.slice(0, max) : s;
-}
-
-function _clampLimit(raw: unknown, fallback: number, min: number, max: number): number {
-  const n = Number(raw);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.max(min, Math.min(max, Math.floor(n)));
-}
-
-function buildAgentEditSkillSearchTool(uid: string): AgentTool {
-  return {
-    name: 'skill_search',
-    description: [
-      'Find skills contributed by the user\'s global skill folders when the listed skills do not cover the agent being authored.',
-      'Returns each match\'s name, source, and SKILL.md path; read_file that path before referencing the skill in an agent workflow.',
-      'Matching is keyword-based over names + descriptions, which may be English — if a user-language query returns nothing, retry once with English keywords before concluding none exist.',
-      'This does NOT search the marketplace catalog and installs nothing.',
-    ].join(' '),
-    inputSchema: {
-      type: 'object',
-      properties: {
-        query: {
-          type: 'string',
-          description: 'Capability text matched against skill names and descriptions. Leave empty to list available global skills. Use the user language when possible.',
-        },
-        limit: {
-          type: 'number',
-          description: 'Maximum results to return (1-20). Default: 8.',
-        },
-      },
-      additionalProperties: false,
-    },
-    async execute(input) {
-      const query = _trimText(input?.query, 300);
-      const limit = _clampLimit(input?.limit, 8, 1, 20);
-      try {
-        const { skills: disabledSkillIds } = readDisabledSets(uid);
-        const res = await searchOpenTierSkills(uid, query, limit, disabledSkillIds);
-        return { content: JSON.stringify({ ok: true, query, ...res }) };
-      } catch (err) {
-        return { content: JSON.stringify({ ok: false, error: (err as Error).message || 'skill search failed' }), isError: true };
-      }
-    },
-  };
-}
-
-function agentEditExtraTools(userId: string): AgentTool[] {
-  return [buildAgentEditSkillSearchTool(userId)];
-}
-
 function agentEditReadOnlyRoots(userId: string, attachmentCid?: string): string[] {
   const roots = [
     userMarketplaceSkillsDir(userId),
     userSkillsDir(userId),
   ];
-  try {
-    roots.push(...openSkillReadRoots(userId));
-  } catch (err) {
-    log.warn(`agent edit open skill read roots unavailable: ${(err as Error).message}`);
-  }
   if (attachmentCid) roots.push(chatAttachmentDirForConversation(userId, attachmentCid));
   return roots;
 }
@@ -2756,15 +3027,15 @@ export async function sendToAgentEditChat(
     });
 
   const { chatWithModel } = await import('../model/client');
-  // Read-only access to the builtin skills root so the LLM can `read_file`
-  // the `agent-creator` skill (the canonical authoring rules pointer in
-  // `chat_agent_setup.md`). No write side — every mutation goes through
-  // the `<agent>` container parser post-stream.
+  // The runner binds only `agent-creator` as a logical `@skill/...` read for
+  // this authoring session. No write side — every mutation goes through the
+  // `<agent>` container parser post-stream.
   const result = await chatWithModel({
     userId, message: attachmentCtx.message, sessionId, systemPrompt,
     agentName: 'orkas_chat', timeout: 300,
+    systemSkillList: ['agent-creator'],
+    ...(!isCliAgent(agent) ? { agentToolDependencyAuthoring: true } : {}),
     readOnlyExtraRoots: readOnlyRoots,
-    extraTools: agentEditExtraTools(userId),
     attachmentMetadata: attachmentCtx.attachmentMetadata,
     ...(attachmentCtx.attachmentNames.length ? { images: attachmentCtx.images } : {}),
   });
@@ -2846,9 +3117,10 @@ export async function* streamSendToAgentEditChat(
     for await (let event of streamChatWithModel({
       userId, message: attachmentCtx.message, sessionId, systemPrompt,
       agentName: 'orkas_chat',
+      systemSkillList: ['agent-creator'],
+      ...(!isCliAgent(agent) ? { agentToolDependencyAuthoring: true } : {}),
       cacheRetention: 'short',
       readOnlyExtraRoots: readOnlyRoots,
-      extraTools: agentEditExtraTools(userId),
       attachmentMetadata: attachmentCtx.attachmentMetadata,
       ...(attachmentCtx.images.length ? { images: attachmentCtx.images } : {}),
       ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
@@ -2899,6 +3171,9 @@ export async function* streamSendToAgentEditChat(
             synthesizedProgress.push(fields.skill_list.length
               ? t('process.agent.update_skills', { list: fields.skill_list.join(', ') })
               : t('process.agent.clear_skills'));
+          }
+          if (fields.tool_list !== undefined) {
+            synthesizedProgress.push(t('process.agent.update_field', { field: 'tools' }));
           }
           if (fields.inputs !== undefined) {
             synthesizedProgress.push(fields.inputs.length
@@ -2996,7 +3271,28 @@ export function isValidAgentId(id: unknown): boolean {
  * (`extractAgentFieldBlocks`), only the outcome differs: agent-edit
  * updates an existing agent, this one creates a fresh one.
  */
-export async function createAgentFromBlocks(fields: ExtractedFields): Promise<Agent | null> {
+export async function createAgentFromBlocks(
+  fields: ExtractedFields,
+  opts: { dependencyToolNames?: readonly string[] } = {},
+): Promise<Agent | null> {
+  // Validate before createCustomAgent allocates an id/directory. Otherwise an
+  // invalid explicit `<tools>` tag would be omitted by parsing and leave a
+  // successfully-created legacy-all Agent behind.
+  _assertToolListMutationValid(fields);
+  _assertAgentGuidanceMutationValid(fields);
+  if (!Array.isArray(fields.tool_list)) {
+    throw new Error('Agent creation requires an explicit <tools> list; use an empty tag only for an intentional host-only Agent');
+  }
+  // Dependency resolution is based only on exact workflow calls and trusted
+  // structured tool names. It never parses Skill prose or guesses from broad
+  // natural-language intent.
+  const toolList = _resolveAgentCreationToolList({
+    authoredGroups: fields.tool_list,
+    workflow: fields.workflow,
+    ...(opts.dependencyToolNames
+      ? { dependencyToolNames: opts.dependencyToolNames }
+      : {}),
+  });
   const name = (fields.name || '').trim();
   const workflow = (fields.workflow || '').trim();
   const category = fields.category
@@ -3009,14 +3305,16 @@ export async function createAgentFromBlocks(fields: ExtractedFields): Promise<Ag
 
   const created = await createCustomAgent({
     name, description, description_zh, description_en, workflow, category,
+    tool_list: toolList,
     ...(fields.icon ? { icon: fields.icon } : {}),
     ...(fields.knowhow ? { knowhow: fields.knowhow } : {}),
     ...(fields.standards ? { standards: fields.standards } : {}),
     ...(typeof fields.interactive === 'boolean' ? { interactive: fields.interactive } : {}),
   });
   if (!created) return null;
-  // Fold optional skill_list + inputs in via updateCustomAgent so the
-  // closure expansion / input validation happens in one place.
+  // Fold optional Skill metadata + inputs in via updateCustomAgent so Skill
+  // resolution and input validation happen in one place. Tool dependencies
+  // were written atomically by createCustomAgent above.
   const updates: UpdateAgentFields = {};
   if (Array.isArray(fields.skill_list)) updates.skill_list = fields.skill_list;
   if (Array.isArray(fields.inputs)) updates.inputs = fields.inputs;

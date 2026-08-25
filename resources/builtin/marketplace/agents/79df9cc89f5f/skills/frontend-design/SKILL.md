@@ -3,7 +3,6 @@ ownerAgent: 79df9cc89f5f
 name: frontend-design
 description_zh: VideoStudio 的 HTML/动态图形审美层——在 stage-compose 写 manifest.art_direction 与 index.html 前，用主题世界、字体、配色、布局签名、动效克制和反模板检查，把普通可渲染页面提升为有明确视觉观点的视频画面。
 description_en: Aesthetic direction for VideoStudio HTML and motion-graphics compositions. Use before stage-compose writes manifest.art_direction and index.html to choose a subject-specific visual point of view, type, palette, layout signature, restrained motion, and anti-template checks.
-category: creation
 ---
 
 # frontend-design
@@ -12,13 +11,13 @@ Use this as the design-lead layer for VideoStudio COMPOSE work. It shapes `proje
 
 This skill does not pick the video production line, replace `video-craft`, or relax Orkas renderer constraints. If there is a conflict, renderer determinism, safe zones, legibility, audio ownership, and user-approved creative direction win.
 
-## Required generation references
+## Generation references
 
-For every non-trivial COMPOSE deliverable, read these compact references before authoring HTML:
+Read only the references required by the current composition:
 
-- `references/html-generation-playbook.md` — the private pre-code art-direction pass, frame-composition rules, and opening/resolved-state authoring pattern.
-- `references/visual-primitives.md` — reusable CSS/SVG composition primitives and scene-grammar selection guidance.
-- `references/worked-compositions.md` — worked examples showing how subject matter becomes a cohesive visual system without copying a fixed template.
+- [HTML generation playbook](references/html-generation-playbook.md) — read before coding every non-trivial COMPOSE deliverable for the private art-direction pass, frame-composition rules, and opening/resolved-state authoring pattern.
+- [Visual primitives](references/visual-primitives.md) — read when selecting reusable CSS/SVG composition primitives and scene grammar.
+- [Worked compositions](references/worked-compositions.md) — read when examples are needed to turn subject matter into a cohesive visual system without copying a fixed template.
 
 These references improve the initial generation. They do not create a new artifact, user gate, or approval step. Keep the art-direction pass internal and record only the decisions needed to make the manifest art direction executable.
 
@@ -176,8 +175,8 @@ The rest of `manifest.art_direction` must make the thesis executable:
 
 When writing `index.html`:
 
-- Complete the private art-direction pass from `references/html-generation-playbook.md` immediately before coding. Decide the dominant visual, spatial tension, depth layers, opening/resolved states, and continuity behavior for every scene; do not output this as a new user gate.
-- Select and adapt primitives from `references/visual-primitives.md`. They are ingredients, not templates: change geometry, scale, rhythm, and content so the result belongs to the brief.
+- Complete the private art-direction pass from the [HTML generation playbook](references/html-generation-playbook.md) immediately before coding. Decide the dominant visual, spatial tension, depth layers, opening/resolved states, and continuity behavior for every scene; do not output this as a new user gate.
+- When a reusable CSS/SVG scene grammar improves the brief, select and adapt it from [Visual primitives](references/visual-primitives.md). These are ingredients, not templates: change geometry, scale, rhythm, and content so the result belongs to the brief.
 - Derive the main CSS variables from `manifest.art_direction`; keep extra chromatic colors intentional and named enough to audit. Do not flatten the design or recolor the whole video only to reduce a static palette count.
 - Let one element carry personality: a custom progress line, typographic reveal, diagram grammar, texture, data mark, or transition family. Keep surrounding elements quiet.
 - Use type as design material: contrast display/body roles, make title/body hierarchy unmistakable, and keep labels large enough for the video-craft floor.

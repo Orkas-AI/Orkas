@@ -320,20 +320,22 @@ function _writeSync(uid: string, data: ConnectorsFile): void {
       _deleted_at: data._deleted_at || {},
     }, null, 2);
     fs.writeFileSync(file, body, { mode: 0o600 });
-    // Diagnostic verify: read back size + the secrets_enc fingerprints we just wrote so a
+    // Diagnostic verify: read back size + a fingerprint of the secrets_enc we just wrote so a
     // future "the RT we sent doesn't match server" failure can be traced against actual
-    // bytes on disk at write time. `secrets_enc` is the AES-GCM blob; comparing its first
-    // 16 chars across log entries reveals whether a subsequent write clobbered this one.
+    // bytes on disk at write time. `secrets_enc` is the AES-GCM blob; a hash of it is a
+    // stable clobber-detection key without putting connector-grant bytes in the log.
     try {
       const st = fs.statSync(file);
       const fingerprints: Record<string, string> = {};
       for (const [id, disk] of Object.entries(onDisk)) {
-        if (disk.secrets_enc) fingerprints[id] = disk.secrets_enc.slice(0, 16);
+        if (disk.secrets_enc) {
+          fingerprints[id] = crypto.createHash('sha256').update(disk.secrets_enc).digest('hex').slice(0, 8);
+        }
       }
       log.info('connectors.json write ok', {
         bytes: st.size,
         mtime_ms: st.mtimeMs,
-        secrets_enc_prefix: fingerprints,
+        secrets_enc_hash: fingerprints,
       });
       _cacheWrite(uid, file, st, data);
     } catch (verifyErr) {

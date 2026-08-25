@@ -4,7 +4,7 @@ import path from 'node:path';
 import { expect, test } from './fixtures/orkas';
 
 test.describe('library and global search', () => {
-  test('indexes a Library file and closes the model kb_search to kb_read loop', async ({ modelOrkas }) => {
+  test('indexes a Library file and closes the model library search-to-read loop', async ({ modelOrkas }) => {
     test.setTimeout(90_000);
     if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
     const page = modelOrkas.page;

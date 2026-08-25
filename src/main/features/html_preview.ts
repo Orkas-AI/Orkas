@@ -12,6 +12,8 @@ import { hardenedWebPreferences } from '../util/window-security';
 const HTML_PREVIEW_TIMEOUT_MS = 20_000;
 const HTML_PREVIEW_MAX_BLOCKED_RESOURCE_SAMPLES = 8;
 const HTML_PREVIEW_MAX_DIAGNOSTICS = 12;
+const HTML_PREVIEW_MAX_INTERACTION_FAILURE_SAMPLES = 10;
+const HTML_PREVIEW_MAX_DIAGNOSTIC_CHARS = 400;
 
 export type HtmlPreviewViewportName = 'desktop' | 'mobile';
 
@@ -80,6 +82,7 @@ export interface HtmlPreviewInteractionEvidence {
   mailtoLinksChecked: number;
   downloads: HtmlPreviewDownloadEvidence[];
   keyboard: HtmlPreviewKeyboardEvidence;
+  failureCount: number;
   failures: string[];
 }
 
@@ -148,6 +151,7 @@ function emptyPageInteractionEvidence(): PageInteractionEvidence {
     formsSubmitted: 0,
     hashLinksChecked: 0,
     mailtoLinksChecked: 0,
+    failureCount: 0,
     failures: [],
   };
 }
@@ -511,7 +515,10 @@ const INTERACTION_SCRIPT = `(async () => {
     formsSubmitted,
     hashLinksChecked,
     mailtoLinksChecked,
-    failures: failures.slice(0, ${HTML_PREVIEW_MAX_DIAGNOSTICS})
+    failureCount: failures.length,
+    failures: failures
+      .slice(0, ${HTML_PREVIEW_MAX_INTERACTION_FAILURE_SAMPLES})
+      .map((failure) => String(failure || '').replace(/\\s+/g, ' ').trim().slice(0, ${HTML_PREVIEW_MAX_DIAGNOSTIC_CHARS}))
   };
 })()`;
 
@@ -640,7 +647,7 @@ function withTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
 }
 
 function boundedDiagnostic(value: unknown): string {
-  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, HTML_PREVIEW_MAX_DIAGNOSTIC_CHARS);
 }
 
 function blockedResourceLabel(raw: string): string {
@@ -924,8 +931,26 @@ export async function renderResponsiveHtmlPreview(
     if (pageInteractions.keyboard.failures.length) {
       blockers.push(`${pageInteractions.keyboard.failures.length} keyboard traversal check(s) failed`);
     }
-    if (pageInteractions.performed && pageInteractions.failures.length) {
-      blockers.push(`${pageInteractions.failures.length} safe interaction check(s) failed`);
+    const interactionFailureSamples = pageInteractions.failures
+      .slice(0, HTML_PREVIEW_MAX_INTERACTION_FAILURE_SAMPLES)
+      .map(boundedDiagnostic)
+      .filter(Boolean);
+    const interactionFailureCount = Math.max(
+      Number.isFinite(pageInteractions.failureCount)
+        ? Math.max(0, Math.floor(pageInteractions.failureCount))
+        : 0,
+      pageInteractions.failures.length,
+    );
+    if (pageInteractions.performed && interactionFailureCount) {
+      const omittedFailureCount = Math.max(
+        0,
+        interactionFailureCount - interactionFailureSamples.length,
+      );
+      blockers.push(
+        `${interactionFailureCount} safe interaction check(s) failed`
+        + (interactionFailureSamples.length ? `: ${interactionFailureSamples.join(' | ')}` : '')
+        + (omittedFailureCount ? ` (${omittedFailureCount} more not shown)` : ''),
+      );
     }
     if (
       pageInteractions.performed
@@ -968,6 +993,8 @@ export async function renderResponsiveHtmlPreview(
           performed: pageInteractions.performed,
           viewport: rendered[0]?.evidence.name ?? 'desktop',
           ...pageInteractions,
+          failureCount: interactionFailureCount,
+          failures: interactionFailureSamples,
           downloads,
         },
       },

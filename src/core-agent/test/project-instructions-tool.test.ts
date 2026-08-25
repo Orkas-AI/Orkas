@@ -20,14 +20,15 @@ describe('project_instructions tool', () => {
     expect((tool.inputSchema as any).required).toEqual(['instructions']);
   });
 
-  it('keeps the routing guidance (full replace + what belongs here) in the definition', () => {
+  it('keeps replacement and adjacent-state selection boundaries in the right contract layers', () => {
     const def = toToolDefinition(createProjectInstructionsTool(stubHandler().handler));
+    const instructions = (def.inputSchema.properties as any).instructions;
     expect(def.description.length).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_CHARS);
-    expect(def.description).toContain('FULL replace');
-    expect(def.description).toContain('cross_session_memory');
-    expect(def.description).toContain('target "user"');
-    expect(def.description).toContain('target "project"');
+    expect(def.description).toContain('standing goal and rules');
     expect(def.description).toContain('project_tasks');
+    expect(def.description).toContain('project memory');
+    expect(instructions.description).toContain('Complete replacement');
+    expect(instructions.description).toContain('existing content that still applies');
   });
 
   it('dispatches to handler.set with the full content', async () => {

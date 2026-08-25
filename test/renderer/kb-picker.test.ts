@@ -10,10 +10,20 @@ const source = readFileSync(
 
 function load(initialStorage: Record<string, string> = {}) {
   const values = new Map(Object.entries(initialStorage));
+  const translations: Record<string, string> = {
+    'contexts.root_label': 'Root',
+    'contexts.transfer.global_library': 'Global Library',
+    'contexts.transfer.project_library': 'Project Library',
+    'kb_picker.title_global': 'Save to Global Library',
+    'kb_picker.title_project': 'Save to Project Library',
+    'kb_picker.target': 'Saving to: {library} / {rel}',
+  };
   const sandbox: Record<string, any> = {
     currentUserId: 'account-a',
     createLogger: () => ({ warn: vi.fn() }),
-    t: (key: string) => key,
+    t: (key: string, params: Record<string, unknown> = {}) => (
+      (translations[key] || key).replace(/\{(\w+)\}/g, (_, name) => String(params[name] ?? `{${name}}`))
+    ),
     escapeHtml: (value: unknown) => String(value ?? ''),
     apiFetch: vi.fn(),
     localStorage: {
@@ -31,6 +41,30 @@ function load(initialStorage: Record<string, string> = {}) {
 }
 
 describe('Library location picker', () => {
+  it('identifies the Global or Project Library in both the title and destination', () => {
+    const { sandbox } = load();
+    const target = { textContent: '' };
+    sandbox.document = {
+      getElementById: (id: string) => (id === 'kb-picker-target' ? target : null),
+    };
+
+    expect(sandbox._kbPickerDefaultTitle({ type: 'global' }))
+      .toBe('Save to Global Library');
+    vm.runInContext(
+      "_kbPickerScope = { type: 'global' }; _kbPickerCurrentDir = ''; _kbPickerRenderTarget();",
+      sandbox,
+    );
+    expect(target.textContent).toBe('Saving to: Global Library / Root');
+
+    expect(sandbox._kbPickerDefaultTitle({ type: 'project', projectId: 'project-1' }))
+      .toBe('Save to Project Library');
+    vm.runInContext(
+      "_kbPickerScope = { type: 'project', projectId: 'project-1' }; _kbPickerCurrentDir = 'research'; _kbPickerRenderTarget();",
+      sandbox,
+    );
+    expect(target.textContent).toBe('Saving to: Project Library / research/');
+  });
+
   it('scopes remembered global and project folders to the active account', () => {
     const { sandbox } = load();
 

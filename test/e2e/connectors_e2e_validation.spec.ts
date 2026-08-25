@@ -132,11 +132,11 @@ rl.on('line', (line) => {
     const disabledToolNames = (disabledRequestPayload.tools || [])
       .map((tool) => tool.function?.name)
       .filter(Boolean);
-    // Rich-steer turns retain stable connector schemas so a connector can be
-    // enabled by a later active-turn message. Visibility is resolved live at
-    // execution time; the disabled instance must still stay out of the prompt.
-    expect(disabledToolNames).toContain('list_connector_tools');
-    expect(disabledToolNames).toContain('call_connector_tool');
+    // A disabled Connector is neither active nor advertised. Commander keeps
+    // only the separately reviewed installation surface when no Connector is
+    // visible; a later turn can discover list/call after visibility is restored.
+    expect(disabledToolNames).not.toContain('list_connector_tools');
+    expect(disabledToolNames).not.toContain('call_connector_tool');
     const disabledSystemPrompt = (disabledRequestPayload.messages || [])
       .filter((message) => message.role === 'system')
       .map((message) => String(message.content || ''))

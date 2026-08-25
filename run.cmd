@@ -1,6 +1,7 @@
 @echo off
-REM Windows counterpart of run.sh. Stop the old Electron process before
-REM starting a fresh development instance.
+REM Windows counterpart of run.sh. An in-app relaunch waits for its exact
+REM owner process; it never terminates every electron.exe process because
+REM other tasks can share the same bundled runtime.
 setlocal EnableExtensions EnableDelayedExpansion
 set "APP_DIR=%~dp0"
 if "%APP_DIR:~-1%"=="\" set "APP_DIR=%APP_DIR:~0,-1%"
@@ -28,13 +29,22 @@ if errorlevel 1 (
   exit /b 1
 )
 
+if defined ORKAS_RELAUNCH_OWNER_PID (
+  powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$owner = 0; if (-not [int]::TryParse($env:ORKAS_RELAUNCH_OWNER_PID, [ref]$owner) -or $owner -le 0) { exit 2 }; try { Wait-Process -Id $owner -Timeout 15 -ErrorAction Stop } catch { if (Get-Process -Id $owner -ErrorAction SilentlyContinue) { exit 3 } }"
+  if errorlevel 1 (
+    echo [Orkas] Relaunch owner did not exit within 15 seconds; refusing to terminate unrelated processes. 1>&2
+    exit /b 1
+  )
+  set "ORKAS_RELAUNCH_OWNER_PID="
+)
+
 call node "%APP_DIR%\scripts\ensure-deps.cjs"
 if errorlevel 1 exit /b 1
 call node "%APP_DIR%\scripts\ensure-dev-dependencies.cjs"
 if errorlevel 1 exit /b 1
 
 pushd "%APP_DIR%"
-taskkill /F /IM electron.exe >nul 2>nul
 call npm run start:electron
 set "RC=%ERRORLEVEL%"
 popd

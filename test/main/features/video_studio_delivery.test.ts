@@ -174,6 +174,7 @@ describe('verifyProductionDelivery unverifiable narration', () => {
         planAbsPath,
         plan: plan as unknown as Record<string, unknown>,
         videoAbsPath: video,
+        allowedRoots: [dir],
       });
 
       expect(verdict.ok).toBe(false);
@@ -194,7 +195,7 @@ describe('verifyProductionDelivery unverifiable narration', () => {
     }
   }, 60_000);
 
-  it('names start_sec when that is the field a line is missing', async () => {
+  it('names start_sec when JSON null or an empty string leaves the timeline position missing', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-no-start-'));
     try {
       // The plan lives at <video>/project/plan.json and produced_path reads
@@ -218,8 +219,12 @@ describe('verifyProductionDelivery unverifiable narration', () => {
         total_target_sec: 10,
         tracks: {
           narration: {
-            // produced_path is present and correct; start_sec is not.
-            segments: [{ text: 'a', target_sec: 5, produced_path: 'project/audio/line-0.mp3' }],
+            // produced_path is present and correct; neither JSON null nor an
+            // empty string is a real timeline position.
+            segments: [
+              { text: 'a', start_sec: null, target_sec: 5, produced_path: 'project/audio/line-0.mp3' },
+              { text: 'b', start_sec: '', target_sec: 5, produced_path: 'project/audio/line-0.mp3' },
+            ],
           },
         },
       };
@@ -231,9 +236,11 @@ describe('verifyProductionDelivery unverifiable narration', () => {
         planAbsPath,
         plan: plan as unknown as Record<string, unknown>,
         videoAbsPath: video,
+        allowedRoots: [dir],
       });
       const unverifiable = verdict.issues.find((i) => i.code === 'DELIVERY_NARRATION_UNVERIFIABLE');
       expect(unverifiable?.message).toContain('line 0 — no start_sec');
+      expect(unverifiable?.message).toContain('line 1 — no start_sec');
       expect(unverifiable?.message).not.toContain('no produced_path');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -252,12 +259,47 @@ describe('verifyProductionDelivery unverifiable narration', () => {
         planAbsPath,
         plan: plan as unknown as Record<string, unknown>,
         videoAbsPath: video,
+        allowedRoots: [dir],
       });
       expect(verdict.issues.some((i) => i.code === 'DELIVERY_NARRATION_UNVERIFIABLE')).toBe(false);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   }, 60_000);
+
+  it('does not probe narration audio outside the approved roots', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-delivery-scope-'));
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-delivery-outside-'));
+    try {
+      const outsideAudio = path.join(outsideDir, 'line-0.mp3');
+      fs.writeFileSync(outsideAudio, 'not audio, and must never be probed');
+      const planAbsPath = path.join(dir, 'project', 'plan.json');
+      fs.mkdirSync(path.dirname(planAbsPath), { recursive: true });
+      const plan = {
+        tracks: {
+          narration: {
+            segments: [{ text: 'a', start_sec: 0, target_sec: 5, produced_path: outsideAudio }],
+          },
+        },
+      };
+      const video = path.join(dir, 'project', 'final.mp4');
+      fs.writeFileSync(video, 'not a video');
+
+      const verdict = await verifyProductionDelivery({
+        planAbsPath,
+        plan: plan as unknown as Record<string, unknown>,
+        videoAbsPath: video,
+        allowedRoots: [dir],
+      });
+
+      expect(verdict.narration_lines_measured).toBe(0);
+      expect(verdict.issues.find((i) => i.code === 'DELIVERY_NARRATION_UNVERIFIABLE')?.message)
+        .toContain('outside allowed scope');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('parseVoicedSpan', () => {
@@ -385,6 +427,7 @@ describe('verifyProductionDelivery', () => {
         planAbsPath: planPath,
         plan: plan as unknown as Record<string, unknown>,
         videoAbsPath: video,
+        allowedRoots: [dir],
       });
 
       expect(verdict.ok).toBe(false);

@@ -199,11 +199,11 @@ describe('systemSkillsExposureFromSessionId', () => {
 });
 
 describe('openSkillSourcesExposureFromSessionId', () => {
-  it('exposes open-tier skills to group-chat task sessions and agent-edit only', async () => {
+  it('exposes open-tier skills to Commander only', async () => {
     const { openSkillSourcesExposureFromSessionId } = await import('../../../../src/main/model/core-agent/runner');
     expect(openSkillSourcesExposureFromSessionId('gconv-ac5559863d42')).toBe(true);
-    expect(openSkillSourcesExposureFromSessionId('gmember-cv1-agt-42')).toBe(true);
-    expect(openSkillSourcesExposureFromSessionId('agent-agt-7')).toBe(true);
+    expect(openSkillSourcesExposureFromSessionId('gmember-cv1-agt-42')).toBe(false);
+    expect(openSkillSourcesExposureFromSessionId('agent-agt-7')).toBe(false);
     expect(openSkillSourcesExposureFromSessionId('skill-sk1')).toBe(false);
     expect(openSkillSourcesExposureFromSessionId('extract-img-deadbeef')).toBe(false);
     expect(openSkillSourcesExposureFromSessionId('cli-claude-run-1')).toBe(false);
@@ -246,11 +246,12 @@ describe('createConnectorMetaTools', () => {
     expect(await createConnectorMetaTools({ userId: UID })).toEqual([]);
   });
 
-  it('returns [] when an explicit actor filter has empty enabled_connectors', async () => {
+  it('uses agentId only for diagnostics rather than connector visibility', async () => {
     fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
     fixtures.agents = { 'a1': { agent_id: 'a1', enabled_connectors: [] } };
     const { createConnectorMetaTools } = await loadModule();
-    expect(await createConnectorMetaTools({ userId: UID, agentId: 'a1' })).toEqual([]);
+    expect((await createConnectorMetaTools({ userId: UID, agentId: 'a1' })).map((tool) => tool.name))
+      .toEqual(['list_connector_tools', 'call_connector_tool']);
   });
 
   it('returns [] when uid empty (no scope)', async () => {
@@ -346,7 +347,7 @@ describe('getConnectorPromptBlock', () => {
     expect(block).not.toContain(': '); // no description colon when fallback
   });
 
-  it('respects the optional actor enabled_connectors filter (only allowed connectors appear)', async () => {
+  it('does not treat diagnostic agentId metadata as a visibility filter', async () => {
     fixtures.instances = [
       makeInstance({ id: 'notion', tools: NOTION_TOOLS }),
       makeInstance({ id: 'github', tools: GITHUB_TOOLS }),
@@ -355,7 +356,7 @@ describe('getConnectorPromptBlock', () => {
     const { getConnectorPromptBlock } = await loadModule();
     const block = await getConnectorPromptBlock(UID, 'a1');
     expect(block).toContain('**notion**');
-    expect(block).not.toContain('**github**');
+    expect(block).toContain('**github**');
   });
 
   it('returns "" when no connector is visible (commander, none installed)', async () => {
@@ -364,11 +365,11 @@ describe('getConnectorPromptBlock', () => {
     expect(await getConnectorPromptBlock(UID, undefined)).toBe('');
   });
 
-  it('returns "" when an explicit actor filter has undefined enabled_connectors', async () => {
+  it('keeps visible connectors when diagnostic actor metadata has no connector list', async () => {
     fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
     fixtures.agents = { 'a1': { agent_id: 'a1' } };
     const { getConnectorPromptBlock } = await loadModule();
-    expect(await getConnectorPromptBlock(UID, 'a1')).toBe('');
+    expect(await getConnectorPromptBlock(UID, 'a1')).toContain('**notion**');
   });
 
   it('returns "" when uid is empty', async () => {
@@ -436,7 +437,7 @@ describe('list_connector_tools', () => {
     expect(r.content).toContain('E_BAD_INPUT');
   });
 
-  it('respects the optional actor filter at execution time (not just at build time)', async () => {
+  it('does not apply diagnostic actor metadata as an execution-time filter', async () => {
     fixtures.instances = [
       makeInstance({ id: 'notion', tools: NOTION_TOOLS }),
       makeInstance({ id: 'github', tools: GITHUB_TOOLS }),
@@ -445,8 +446,8 @@ describe('list_connector_tools', () => {
     const { createConnectorMetaTools } = await loadModule();
     const [listTools] = await createConnectorMetaTools({ userId: UID, agentId: 'a1' });
     const r = await runTool(listTools, { connector_id: 'github' });
-    expect(r.isError).toBe(true);
-    expect(r.content).toContain('E_CONNECTOR_NOT_VISIBLE');
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('### list_repos');
   });
 
   it('dedupes Google Workspace tools when the matching single-service connector is also visible', async () => {

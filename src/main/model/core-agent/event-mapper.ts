@@ -6,6 +6,9 @@
  *
  * Mapping rules:
  *   text_delta → accumulated into `finalText`; surfaced as {type:'final'} at done
+ *   thinking   → structured reasoning lifecycle; this boundary sanitizes
+ *                provider reasoning before UI/persistence, coalesces live
+ *                updates, bounds their preview, and preserves full terminal text
  *   tool_delta → first named/id-bearing delta emits the visible
  *                {phase:'start'} milestone before argument assembly
  *   tool_start → emits {phase:'progress'} with complete input when an early
@@ -42,14 +45,45 @@ import {
   isStorageFullError,
 } from '../../../core-agent/src/shared/errors';
 import { classifyKeyFailure, type KeyFailureKind } from './auth-error';
+import { sanitizeLogTextForUpload } from '../../util/log-sanitize';
+import { redactPaths } from '../../util/redact';
 
 const log = createLogger('model');
 
 type CA = typeof import('#core-agent');
 type AgentRunEvent = CA extends { AgentRunner: infer _ } ? import('#core-agent').AgentRunEvent : never;
 
+/** Convert provider reasoning into a safe, complete single-line process-pane
+ * detail. Callers use patches for live transport so completeness does not
+ * multiply IPC volume as the reasoning grows. */
+export function sanitizePublicReasoningSummary(value: unknown): string {
+  return redactPaths(sanitizeLogTextForUpload(String(value ?? '')))
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+const REASONING_PROGRESS_INTERVAL_MS = 250;
+const MAX_LIVE_REASONING_SUMMARY_CHARS = 2_048;
+
+function boundedLiveReasoningSummary(value: unknown): string {
+  const sanitized = sanitizePublicReasoningSummary(value);
+  if (sanitized.length <= MAX_LIVE_REASONING_SUMMARY_CHARS) return sanitized;
+  return `…${sanitized.slice(-(MAX_LIVE_REASONING_SUMMARY_CHARS - 1))}`;
+}
+
+function commonPrefixLength(left: string, right: string): number {
+  const limit = Math.min(left.length, right.length);
+  let index = 0;
+  while (index < limit && left.charCodeAt(index) === right.charCodeAt(index)) index += 1;
+  return index;
+}
+
 export interface MapCoreAgentEventsOptions {
   userId?: string;
+  /** Opaque identity of the persisted model session that owns this run.
+   *  Repeated-failure guidance is isolated by object identity and is released
+   *  automatically when the session cache releases the underlying session. */
+  failureTrackingScope: object;
   /** Whether development-only process diagnostics may be rendered. Defaults
    *  to false so a missing caller option cannot expose internal routing. */
   isDev?: boolean;
@@ -59,18 +93,34 @@ export interface MapCoreAgentEventsOptions {
   /** UI-only metadata collected while rendering the skills prompt block.
    *  This avoids a second skill scan and does not change model-visible text. */
   skillDisplayNameById?: ReadonlyMap<string, string>;
+  /** UI-only Skill identity collected for each run-scoped `@skill/<read-ref>`.
+   *  Values deliberately omit physical roots so process events can label
+   *  virtual entry/reference reads without persisting host paths. */
+  skillMetadataByReadRef?: ReadonlyMap<string, {
+    id: string;
+    name: string;
+    source: string;
+  }>;
   /** UI-only metadata collected before the run starts. Used to label
    *  read_file(agent.json) process rows without scanning agents again. */
   agentDisplayNameById?: ReadonlyMap<string, string>;
+  /** UI-only metadata from the exact visible Connector snapshot used to
+   * construct the runner. Live list/call checks may refresh the same map. */
+  connectorDisplayNameById?: ReadonlyMap<string, string>;
   /** Monotonic lifecycle clock used for persisted per-tool end-to-end timing.
    *  Production uses performance.now(); tests may inject a deterministic clock. */
   nowMs?: () => number;
+  /** Registers a privacy-safe terminal reasoning flush for the outer abort
+   *  wrapper. The wrapper can stop a wedged provider before another raw event
+   *  reaches this mapper, so cancellation must close the live row explicitly. */
+  registerReasoningAbortFlush?: (flush: (() => StreamEvent | null) | null) => void;
 }
 
 export interface SkillReadEventMetadata {
   skill_id: string;
   skill_name: string;
   skill_system: 'A.custom' | 'A.platform' | 'B' | 'system';
+  skill_file: string;
 }
 
 export interface AgentReadEventMetadata {
@@ -79,23 +129,32 @@ export interface AgentReadEventMetadata {
   agent_system: 'custom' | 'marketplace';
 }
 
+interface ConnectorEventMetadata {
+  connector_id: string;
+}
+
 type AgentErrorMeta = {
   kind: 'auth' | 'rate_limit' | 'context_overflow' | 'timeout' | 'provider_error';
   message: string;
   code?: string;
+  statusCode?: number;
 };
 
 function modelFailureDetails(
   error: AgentErrorMeta,
   hasVisibleText: boolean,
-): Pick<StreamEvent, 'failureKind' | 'failureCode' | 'failurePhase'> {
+  providerId?: string,
+): Pick<StreamEvent, 'failureKind' | 'failureCode' | 'failurePhase' | 'failureRawCode'> {
   const rawCode = String(error.code || '').trim();
   const code = rawCode.toUpperCase();
+  const statusCode = typeof error.statusCode === 'number' ? error.statusCode : 0;
   const transientKind = classifyTransientNetworkError(error);
   let failureCode = 'provider_error';
   let failurePhase: NonNullable<StreamEvent['failurePhase']> = hasVisibleText ? 'model_text' : 'provider_wait';
 
   if (isStorageFullError(error)) failureCode = 'storage_full';
+  else if (code === 'OUTPUT_LIMIT') failureCode = 'provider_max_tokens';
+  else if (code === 'PROVIDER_RETRIES_EXHAUSTED') failureCode = 'provider_retries_exhausted';
   else if (code === 'PROVIDER_NO_FIRST_EVENT_TIMEOUT') failureCode = 'provider_no_first_event';
   else if (code === 'PROVIDER_EMPTY_NORMAL') failureCode = 'empty_response_normal';
   else if (code === 'PROVIDER_EMPTY_SAFETY') failureCode = 'empty_response_safety';
@@ -116,8 +175,23 @@ function modelFailureDetails(
   else if (/BALANCE|QUOTA|CREDIT|FUNDS|PAYMENT/.test(code)) failureCode = 'provider_balance';
   else if (/PERMISSION|FORBIDDEN|PLAN_REQUIRED|SUBSCRIPTION/.test(code)) failureCode = 'provider_permission';
   else if (/INVALID_REQUEST|INVALID_ARGUMENT|INVALID_SCHEMA|MODEL_NOT_FOUND|UNSUPPORTED_MODEL/.test(code)) failureCode = 'provider_request';
+  // An endpoint-level HTTP client rejection (custom/BYOK endpoint gone, bad
+  // request without a body, …). The status is syntax-bounded into the code so
+  // dashboards can separate "your endpoint is broken" from provider_error.
+  else if (statusCode >= 400 && statusCode < 500) failureCode = `provider_http_${statusCode}`;
 
-  return { failureKind: 'model', failureCode, failurePhase };
+  // Whatever still lands in the generic bucket keeps the original machine
+  // code as sample-only diagnostics so the next reclassification pass works
+  // from codes, not error prose.
+  const failureRawCode = failureCode === 'provider_error' && rawCode
+    ? rawCode.slice(0, 64)
+    : undefined;
+  return {
+    failureKind: 'model',
+    failureCode,
+    failurePhase,
+    ...(failureRawCode ? { failureRawCode } : {}),
+  };
 }
 
 /**
@@ -198,12 +272,96 @@ function localizeKnownRunnerText(text: string, code?: string): string {
   return text;
 }
 
-function localizeKnownRunnerError(error: AgentErrorMeta): string {
+type ModelFailureTrackingState = {
+  customEndpointConsecutiveFailures: number;
+  consecutiveMaxTokensFailures: number;
+};
+
+/** Session-local terminal-failure guidance. The cached PersistentSession
+ * instance is the opaque key in production, so separate accounts,
+ * conversations, and actors cannot influence one another. Weak ownership
+ * also keeps this diagnostic heuristic aligned with the existing session
+ * lifecycle without persisting ids or introducing a second cleanup path. */
+let modelFailureTrackingBySession = new WeakMap<object, ModelFailureTrackingState>();
+
+function modelFailureTrackingState(scope: object): ModelFailureTrackingState {
+  const existing = modelFailureTrackingBySession.get(scope);
+  if (existing) return existing;
+  const created = { customEndpointConsecutiveFailures: 0, consecutiveMaxTokensFailures: 0 };
+  modelFailureTrackingBySession.set(scope, created);
+  return created;
+}
+
+/** Consecutive endpoint-level terminal failures for the user-defined custom
+ * provider (W4-1). One 4xx can be a transient upstream hiccup; the sampled
+ * incident was three consecutive `410 (no body)` runs where the user only
+ * ever saw "模型调用失败：410" and left with zero output. From the second
+ * consecutive endpoint-level failure the visible error names the real
+ * problem — the configured endpoint/key — instead of the bare status. The
+ * counter is a session-local UX heuristic and resets on the next successful
+ * custom-provider run. */
+const CUSTOM_ENDPOINT_FAILURE_THRESHOLD = 2;
+
+const NO_BODY_HTTP_RE = /\b(4\d\d)\s+status code\s*\(\s*no body\s*\)/i;
+
+function isEndpointLevelFailure(error: AgentErrorMeta, failureCode: string): boolean {
+  return /^provider_http_4\d\d$/.test(failureCode)
+    || NO_BODY_HTTP_RE.test(String(error.message || ''));
+}
+
+/** Exposed for unit tests so cases cannot inherit another case's WeakMap. */
+export function resetCustomEndpointFailureTracking(): void {
+  modelFailureTrackingBySession = new WeakMap<object, ModelFailureTrackingState>();
+}
+
+/** Consecutive terminal provider_max_tokens failures (W4-2). One overrun is
+ * normal on a long answer; the sampled 8B-model case hit six error turns
+ * because a small output cap kept truncating every reply and nothing ever
+ * said the MODEL was the problem. From the second consecutive overrun the
+ * visible error adds "this model's output cap is small — switch models or
+ * split the task". Same session-local heuristic shape as the endpoint counter
+ * above. */
+
+function maxTokensAdvice(
+  tracking: ModelFailureTrackingState,
+  failureCode: string,
+): string | null {
+  if (failureCode !== 'provider_max_tokens') {
+    tracking.consecutiveMaxTokensFailures = 0;
+    return null;
+  }
+  tracking.consecutiveMaxTokensFailures += 1;
+  if (tracking.consecutiveMaxTokensFailures < 2) return null;
+  return t('errors.model_output_cap_repeated');
+}
+
+function customEndpointDiagnostic(
+  tracking: ModelFailureTrackingState,
+  providerId: string | undefined,
+  error: AgentErrorMeta,
+  failureCode: string,
+): string | null {
+  if (providerId !== 'custom') return null;
+  if (!isEndpointLevelFailure(error, failureCode)) {
+    tracking.customEndpointConsecutiveFailures = 0;
+    return null;
+  }
+  tracking.customEndpointConsecutiveFailures += 1;
+  if (tracking.customEndpointConsecutiveFailures < CUSTOM_ENDPOINT_FAILURE_THRESHOLD) return null;
+  const status = typeof error.statusCode === 'number'
+    ? String(error.statusCode)
+    : (NO_BODY_HTTP_RE.exec(String(error.message || ''))?.[1] || '4xx');
+  return t('errors.custom_endpoint_suspect', { status });
+}
+
+function localizeKnownRunnerError(error: AgentErrorMeta, providerId?: string): string {
   const raw = error.message || 'unknown error';
   const known = localizeKnownRunnerText(raw, error.code);
   if (known !== raw) return known;
   const code = String(error.code || '').trim().toUpperCase();
-  const explicitKind: KeyFailureKind | null = error.kind === 'auth' || code === 'PROVIDER_AUTH_EXHAUSTED'
+  const explicitKind: KeyFailureKind | null = /BALANCE|QUOTA|CREDIT|FUNDS|PAYMENT/.test(code)
+    ? 'balance'
+    : error.kind === 'auth' || code === 'PROVIDER_AUTH_EXHAUSTED'
     ? 'auth'
     : code === 'PROVIDER_PERMISSION_EXHAUSTED'
       ? 'permission'
@@ -217,7 +375,11 @@ function localizeKnownRunnerError(error: AgentErrorMeta): string {
   if (explicitKind === 'auth') return t('errors.model_auth_unavailable');
   if (explicitKind === 'permission') return t('errors.model_permission_unavailable');
   if (explicitKind === 'rate_limit') return t('errors.model_rate_limited');
-  if (explicitKind === 'balance') return t('errors.model_credits_insufficient');
+  if (explicitKind === 'balance') {
+    return providerId
+      ? t('errors.model_provider_balance_insufficient_named', { provider: providerLabel(providerId) })
+      : t('errors.model_provider_balance_insufficient');
+  }
   if (explicitKind === 'network') return t('errors.model_network_unavailable');
   const transientKind = classifyTransientNetworkError(error);
   if (transientKind === 'connection_dropped' || transientKind === 'timeout' || transientKind === 'network') {
@@ -231,7 +393,13 @@ function toolInputPath(input: unknown): string {
   if (typeof input === 'string') return input;
   if (typeof input !== 'object') return '';
   const p = (input as Record<string, unknown>).path;
-  return typeof p === 'string' ? p : '';
+  if (typeof p === 'string') return p;
+  const paths = (input as Record<string, unknown>).paths;
+  if (!Array.isArray(paths) || paths.length !== 1) return '';
+  const item = paths[0];
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return '';
+  const nested = (item as Record<string, unknown>).path;
+  return typeof nested === 'string' ? nested : '';
 }
 
 function toolResourceScopeForStart(
@@ -253,11 +421,15 @@ function toolResourceScopeForStart(
 export function skillReadMetadataForToolStart(
   toolName: string,
   input: unknown,
-  opts: MapCoreAgentEventsOptions = {},
+  opts: Partial<MapCoreAgentEventsOptions> = {},
 ): SkillReadEventMetadata | null {
-  if (toolName !== 'read_file' || !opts.userId) return null;
+  if (toolName !== 'read_files' && toolName !== 'read_file') return null;
   const p = toolInputPath(input);
   if (!p) return null;
+
+  const runtime = runtimeSkillReadMetadata(p, opts.skillMetadataByReadRef);
+  if (runtime) return runtime;
+  if (!opts.userId) return null;
 
   // Product-protocol and owner-private skills are intentionally absent from
   // the public skill registry, so parse their runtime roots before falling
@@ -270,6 +442,7 @@ export function skillReadMetadataForToolStart(
       skill_id: hidden.skill_id,
       skill_name: hidden.skill_id,
       skill_system: hidden.system,
+      skill_file: 'SKILL.md',
     };
   }
 
@@ -280,6 +453,38 @@ export function skillReadMetadataForToolStart(
     skill_id: parsed.skill_id,
     skill_name: display,
     skill_system: parsed.system,
+    skill_file: 'SKILL.md',
+  };
+}
+
+function runtimeSkillReadMetadata(
+  requestedPath: string,
+  metadataByReadRef: MapCoreAgentEventsOptions['skillMetadataByReadRef'],
+): SkillReadEventMetadata | null {
+  if (!metadataByReadRef || !requestedPath.startsWith('@skill/')) return null;
+  if (requestedPath.includes('\0') || requestedPath.includes('\\')) return null;
+  const tail = requestedPath.slice('@skill/'.length);
+  const slash = tail.indexOf('/');
+  const ref = slash >= 0 ? tail.slice(0, slash) : tail;
+  const relative = slash >= 0 ? tail.slice(slash + 1) : 'SKILL.md';
+  if (!ref || !relative) return null;
+  const segments = relative.split('/');
+  if (segments.some((segment) => !segment || segment === '.' || segment === '..')) return null;
+  const binding = metadataByReadRef.get(ref);
+  if (!binding) return null;
+  const source = String(binding.source || '');
+  const skillSystem: SkillReadEventMetadata['skill_system'] = source === 'system'
+    ? 'system'
+    : source === 'custom'
+      ? 'A.custom'
+      : source === 'platform' || source === 'builtin'
+        ? 'A.platform'
+        : 'B';
+  return {
+    skill_id: binding.id,
+    skill_name: binding.name || binding.id,
+    skill_system: skillSystem,
+    skill_file: relative,
   };
 }
 
@@ -323,9 +528,9 @@ function _skillSegmentsUnderRoot(abs: string, root: string, expectedDirSegments:
 export function agentReadMetadataForToolStart(
   toolName: string,
   input: unknown,
-  opts: MapCoreAgentEventsOptions = {},
+  opts: Partial<MapCoreAgentEventsOptions> = {},
 ): AgentReadEventMetadata | null {
-  if (toolName !== 'read_file' || !opts.userId) return null;
+  if ((toolName !== 'read_files' && toolName !== 'read_file') || !opts.userId) return null;
   const p = toolInputPath(input);
   if (!p) return null;
   const parsed = parseAgentJsonPath(p, opts.userId);
@@ -344,7 +549,7 @@ function skillReadEventFields(meta: SkillReadEventMetadata | null): Record<strin
     skill_id: meta.skill_id,
     skill_name: meta.skill_name,
     skill_system: meta.skill_system,
-    skill_file: 'SKILL.md',
+    skill_file: meta.skill_file,
   };
 }
 
@@ -355,6 +560,26 @@ function agentReadEventFields(meta: AgentReadEventMetadata | null): Record<strin
     agent_name: meta.agent_name,
     agent_system: meta.agent_system,
     agent_file: 'agent.json',
+  };
+}
+
+function connectorMetadataForToolStart(toolName: string, input: unknown): ConnectorEventMetadata | null {
+  if (toolName !== 'list_connector_tools' && toolName !== 'call_connector_tool') return null;
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  const connectorId = String((input as { connector_id?: unknown }).connector_id || '').trim();
+  return connectorId ? { connector_id: connectorId } : null;
+}
+
+function connectorEventFields(
+  meta: ConnectorEventMetadata | null,
+  displayNameById: ReadonlyMap<string, string> | undefined,
+): Record<string, unknown> {
+  if (!meta) return {};
+  const displayName = String(displayNameById?.get(meta.connector_id) || '').trim();
+  if (!displayName) return {};
+  return {
+    connector_id: meta.connector_id,
+    connector_name: displayName,
   };
 }
 
@@ -387,17 +612,118 @@ function _tryAgentUnderRoot(abs: string, root: string): string | null {
  */
 export async function* mapCoreAgentEvents(
   events: AsyncIterable<AgentRunEvent>,
-  opts: MapCoreAgentEventsOptions = {},
+  opts: MapCoreAgentEventsOptions,
 ): AsyncGenerator<StreamEvent, { finalText: string; error: string | null }, unknown> {
   let finalText = '';
   let error: string | null = null;
   let failureDetails: Pick<StreamEvent, 'failureKind' | 'failureCode' | 'failurePhase'> | null = null;
   const skillReadByToolId = new Map<string, SkillReadEventMetadata>();
   const agentReadByToolId = new Map<string, AgentReadEventMetadata>();
+  const connectorByToolId = new Map<string, ConnectorEventMetadata>();
   const earlyToolStarts = new Set<string>();
   const toolDeltaNames = new Map<string, string>();
   const toolLifecycleStartedAt = new Map<string, number>();
   const nowMs = opts.nowMs ?? (() => performance.now());
+  const failureTracking = modelFailureTrackingState(opts.failureTrackingScope);
+  let thinkingSequence = 0;
+  let activeThinkingId = '';
+  let activeThinkingChars = 0;
+  let activeThinkingText = '';
+  let pendingThinkingParts: string[] = [];
+  let activeThinkingSummary = '';
+  let activeThinkingDirty = false;
+  let thinkingProgressEmitted = false;
+  let lastThinkingProgressMs = 0;
+
+  const appendThinkingText = (value: string) => {
+    if (value) pendingThinkingParts.push(value);
+    activeThinkingDirty = true;
+  };
+
+  const flushPendingThinkingText = () => {
+    if (!pendingThinkingParts.length) return;
+    activeThinkingText += pendingThinkingParts.join('');
+    pendingThinkingParts = [];
+  };
+
+  const startThinking = () => {
+    thinkingSequence += 1;
+    activeThinkingId = `reasoning-${thinkingSequence}`;
+    activeThinkingChars = 0;
+    activeThinkingText = '';
+    pendingThinkingParts = [];
+    activeThinkingSummary = '';
+    activeThinkingDirty = false;
+    thinkingProgressEmitted = false;
+    lastThinkingProgressMs = 0;
+    return {
+      type: 'event' as const,
+      event: {
+        stream: 'reasoning',
+        data: { phase: 'start', id: activeThinkingId, chars: 0 },
+      },
+    };
+  };
+
+  const flushThinkingProgress = (): StreamEvent | null => {
+    if (!activeThinkingId || !activeThinkingDirty) return null;
+    flushPendingThinkingText();
+    const summary = boundedLiveReasoningSummary(activeThinkingText);
+    const summaryFrom = commonPrefixLength(activeThinkingSummary, summary);
+    const summaryDelta = summary.slice(summaryFrom);
+    activeThinkingSummary = summary;
+    activeThinkingDirty = false;
+    thinkingProgressEmitted = true;
+    lastThinkingProgressMs = nowMs();
+    return {
+      type: 'event',
+      event: {
+        stream: 'reasoning',
+        data: {
+          phase: 'progress',
+          id: activeThinkingId,
+          chars: activeThinkingChars,
+          heartbeat: true,
+          ...(summary || summaryFrom > 0
+            ? { summary_from: summaryFrom, summary_delta: summaryDelta }
+            : {}),
+        },
+      },
+    };
+  };
+
+  const endThinking = (reportedChars = 0): StreamEvent | null => {
+    if (!activeThinkingId) return null;
+    activeThinkingChars = Math.max(
+      activeThinkingChars,
+      Math.max(0, Math.round(Number(reportedChars) || 0)),
+    );
+    flushPendingThinkingText();
+    const summary = sanitizePublicReasoningSummary(activeThinkingText);
+    const event: StreamEvent = {
+      type: 'event',
+      event: {
+        stream: 'reasoning',
+        data: {
+          phase: 'end',
+          id: activeThinkingId,
+          chars: activeThinkingChars,
+          ...(summary ? { summary } : {}),
+        },
+      },
+    };
+    activeThinkingId = '';
+    activeThinkingChars = 0;
+    activeThinkingText = '';
+    pendingThinkingParts = [];
+    activeThinkingSummary = '';
+    activeThinkingDirty = false;
+    thinkingProgressEmitted = false;
+    lastThinkingProgressMs = 0;
+    return event;
+  };
+
+  opts.registerReasoningAbortFlush?.(() => endThinking());
 
   // Separator between turns (tool-loop interim commentary + final answer).
   // Inserted lazily on the first delta of a new turn so we don't append a
@@ -405,8 +731,58 @@ export async function* mapCoreAgentEvents(
   let turnStarted = finalText.length > 0;
   let pendingSeparator = false;
 
-  for await (const ev of events) {
-    switch (ev.type) {
+  const eventIterator = events[Symbol.asyncIterator]();
+  let nextEvent: Promise<IteratorResult<AgentRunEvent>> | null = null;
+  const progressDue = Symbol('reasoning-progress-due');
+
+  try {
+    while (true) {
+      if (!nextEvent) nextEvent = Promise.resolve(eventIterator.next());
+      let next: IteratorResult<AgentRunEvent> | typeof progressDue;
+      try {
+        if (activeThinkingDirty && thinkingProgressEmitted) {
+          const remainingMs = Math.max(
+            0,
+            REASONING_PROGRESS_INTERVAL_MS - (nowMs() - lastThinkingProgressMs),
+          );
+          if (remainingMs === 0) {
+            next = progressDue;
+          } else {
+            let timer: ReturnType<typeof setTimeout> | null = null;
+            try {
+              next = await Promise.race([
+                nextEvent,
+                new Promise<typeof progressDue>((resolve) => {
+                  timer = setTimeout(() => resolve(progressDue), remainingMs);
+                }),
+              ]);
+            } finally {
+              if (timer) clearTimeout(timer);
+            }
+          }
+        } else {
+          next = await nextEvent;
+        }
+      } catch (err) {
+        const terminalReasoning = endThinking();
+        if (terminalReasoning) yield terminalReasoning;
+        throw err;
+      }
+
+      if (next === progressDue) {
+        const progress = flushThinkingProgress();
+        if (progress) yield progress;
+        continue;
+      }
+      nextEvent = null;
+      if (next.done) break;
+      const ev = next.value;
+
+      if (ev.type !== 'thinking') {
+        const terminalReasoning = endThinking();
+        if (terminalReasoning) yield terminalReasoning;
+      }
+      switch (ev.type) {
       case 'text_delta': {
         const piece = ev.text || '';
         if (!piece) break;
@@ -419,6 +795,31 @@ export async function* mapCoreAgentEvents(
         turnStarted = true;
         // Surface each delta so the renderer can paint text as it arrives.
         yield { type: 'delta', text: piece };
+        break;
+      }
+
+      case 'thinking': {
+        if (ev.phase === 'start') {
+          const previousThinking = endThinking();
+          if (previousThinking) yield previousThinking;
+          yield startThinking();
+          break;
+        }
+
+        if (!activeThinkingId) yield startThinking();
+        if (ev.phase === 'progress') {
+          activeThinkingChars += Math.max(0, Math.round(Number(ev.chars) || 0));
+          appendThinkingText(ev.text || '');
+          if (!thinkingProgressEmitted
+              || nowMs() - lastThinkingProgressMs >= REASONING_PROGRESS_INTERVAL_MS) {
+            const progress = flushThinkingProgress();
+            if (progress) yield progress;
+          }
+          break;
+        }
+
+        const terminalReasoning = endThinking(ev.chars);
+        if (terminalReasoning) yield terminalReasoning;
         break;
       }
 
@@ -460,6 +861,8 @@ export async function* mapCoreAgentEvents(
         if (skillMeta) skillReadByToolId.set(ev.id, skillMeta);
         const agentMeta = agentReadMetadataForToolStart(ev.name, ev.input, opts);
         if (agentMeta) agentReadByToolId.set(ev.id, agentMeta);
+        const connectorMeta = connectorMetadataForToolStart(ev.name, ev.input);
+        if (connectorMeta) connectorByToolId.set(ev.id, connectorMeta);
         const resourceScope = toolResourceScopeForStart(ev.name, ev.input, opts.workingDir);
         const wasAnnounced = earlyToolStarts.has(ev.id);
         yield {
@@ -477,6 +880,7 @@ export async function* mapCoreAgentEvents(
               ...(resourceScope ? { resource_scope: resourceScope } : {}),
               ...skillReadEventFields(skillMeta),
               ...agentReadEventFields(agentMeta),
+              ...connectorEventFields(connectorMeta, opts.connectorDisplayNameById),
             },
           },
         };
@@ -530,6 +934,8 @@ export async function* mapCoreAgentEvents(
         skillReadByToolId.delete(ev.id);
         const agentMeta = agentReadByToolId.get(ev.id) || null;
         agentReadByToolId.delete(ev.id);
+        const connectorMeta = connectorByToolId.get(ev.id) || null;
+        connectorByToolId.delete(ev.id);
         // Two click-to-expand storage paths, decided here:
         //   - oversized → util/tool-result-cap.ts already spilled to disk and
         //     tool_end carries model-hidden persistedOutput metadata. Pass its
@@ -556,6 +962,7 @@ export async function* mapCoreAgentEvents(
           ...(ev.errorSeverity ? { errorSeverity: ev.errorSeverity } : {}),
           ...skillReadEventFields(skillMeta),
           ...agentReadEventFields(agentMeta),
+          ...connectorEventFields(connectorMeta, opts.connectorDisplayNameById),
         };
         if (spill) {
           data.result_path = spill.path;
@@ -594,6 +1001,20 @@ export async function* mapCoreAgentEvents(
               attempt: Math.max(1, Math.round(Number(ev.attempt) || 1)),
               ...(Number.isFinite(Number(ev.waitMs)) ? { wait_ms: Math.max(0, Math.round(Number(ev.waitMs))) } : {}),
             },
+          },
+        };
+        break;
+      }
+
+      case 'images_omitted': {
+        // W4-2: without this row the only symptom of a text-only model is
+        // the model itself claiming it cannot see the attachment.
+        yield {
+          type: 'progress',
+          text: t('model.images_omitted', { count: ev.count }),
+          event: {
+            stream: 'provider',
+            data: { phase: 'images_omitted', count: ev.count, provider_id: ev.providerId },
           },
         };
         break;
@@ -670,8 +1091,21 @@ export async function* mapCoreAgentEvents(
           };
         }
         if (result.meta.error) {
-          error = localizeKnownRunnerError(result.meta.error);
-          failureDetails = modelFailureDetails(result.meta.error, finalText.length > 0);
+          error = localizeKnownRunnerError(result.meta.error, result.meta.provider);
+          failureDetails = modelFailureDetails(
+            result.meta.error,
+            finalText.length > 0,
+            result.meta.provider,
+          );
+          const endpointDiagnostic = customEndpointDiagnostic(
+            failureTracking,
+            result.meta.provider,
+            result.meta.error,
+            failureDetails.failureCode || '',
+          );
+          if (endpointDiagnostic) error = endpointDiagnostic;
+          const capAdvice = maxTokensAdvice(failureTracking, failureDetails.failureCode || '');
+          if (capAdvice) error = `${error} ${capAdvice}`;
           // meta.error is `{kind, message}` — cause/stack live on the
           // ProviderError that runner.ts already logged via `log.warn(...)`
           // on the retry path. Keep this line focused on what survives.
@@ -685,6 +1119,11 @@ export async function* mapCoreAgentEvents(
             durationMs: result.meta.durationMs,
           });
         } else {
+          // A successful custom-provider run clears the endpoint suspicion.
+          if (result.meta.provider === 'custom') {
+            failureTracking.customEndpointConsecutiveFailures = 0;
+          }
+          failureTracking.consecutiveMaxTokensFailures = 0;
           // Prefer the explicit `result.text` over our accumulated delta —
           // the runner may have trimmed trailing whitespace etc.
           if (result.text) finalText = localizeKnownRunnerText(result.text);
@@ -702,7 +1141,10 @@ export async function* mapCoreAgentEvents(
         // Unknown event type — ignore rather than throw so a future
         // core-agent release can add events without breaking this client.
         break;
+      }
     }
+  } finally {
+    opts.registerReasoningAbortFlush?.(null);
   }
 
   if (error) {

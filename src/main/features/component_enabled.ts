@@ -178,8 +178,20 @@ export function isSkillEnabled(uid: string, skillId: string, specDefault?: boole
 
 export function isConnectorEnabled(uid: string, connectorId: string, specDefault?: boolean): boolean {
   if (!connectorId) return true;
-  const map = readEnabledMap(uid);
-  return resolve(map.connectors, connectorId, specDefault);
+  return isConnectorEnabledFromSnapshot(readEnabledMap(uid), connectorId, specDefault);
+}
+
+/** Resolve several Connector visibility checks from one caller-owned config
+ * snapshot. Runner construction enumerates all connected instances together;
+ * reading component-enabled.json once avoids one synchronous file read per
+ * Connector while preserving the same default-enabled semantics. */
+export function isConnectorEnabledFromSnapshot(
+  snapshot: Pick<ComponentEnabledFile, 'connectors'>,
+  connectorId: string,
+  specDefault?: boolean,
+): boolean {
+  if (!connectorId) return true;
+  return resolve(snapshot.connectors, connectorId, specDefault);
 }
 
 function resolve(overrides: Record<string, boolean>, id: string, specDefault?: boolean): boolean {

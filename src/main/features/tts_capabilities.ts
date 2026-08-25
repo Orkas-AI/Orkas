@@ -154,6 +154,14 @@ export function ttsVoiceCatalogDeclaresLanguage(
   return declared.length > 0;
 }
 
+function ttsVoiceIsEligibleForLanguage(
+  voice: Pick<TtsVoiceCapability, 'nativeLocale' | 'supportedLocales' | 'languageConfidence'>,
+  language: string,
+): boolean {
+  return !ttsVoiceCatalogDeclaresLanguage(voice)
+    || (ttsVoiceSupportsLanguage(voice, language) && ttsVoiceLanguageIsVerified(voice, language));
+}
+
 export function ttsVoiceLanguageIsVerified(
   voice: Pick<TtsVoiceCapability, 'nativeLocale' | 'languageConfidence'>,
   language: string,
@@ -278,10 +286,7 @@ export function listableTtsVoices(
   // language is named. Only a voice whose catalog names a different language is
   // withheld.
   const eligible = language
-    ? voices.filter((voice) => (
-      !ttsVoiceCatalogDeclaresLanguage(voice)
-      || (ttsVoiceSupportsLanguage(voice, language) && ttsVoiceLanguageIsVerified(voice, language))
-    ))
+    ? voices.filter((voice) => ttsVoiceIsEligibleForLanguage(voice, language))
     : voices;
   const limit = opts.limit ?? TTS_VOICE_LISTING_LIMIT;
   if (eligible.length <= limit) return { voices: eligible, eligible: eligible.length };
@@ -356,7 +361,11 @@ export async function resolveTtsSelection(input: {
     ? route.voices.find((candidate) => candidate.voiceRef === requestedVoiceRef)
     : legacyVoice
       ? route.voices.find((candidate) => candidate.providerVoiceId === legacyVoice)
-      : route.voices.find((candidate) => candidate.voiceRef === route.defaultVoiceRef) || route.voices[0];
+      : route.voices.find((candidate) => candidate.voiceRef === route.defaultVoiceRef
+        && (!requestedLanguage || ttsVoiceIsEligibleForLanguage(candidate, requestedLanguage)))
+        || route.voices.find((candidate) => (
+          !requestedLanguage || ttsVoiceIsEligibleForLanguage(candidate, requestedLanguage)
+        ));
   if (!voice) {
     return {
       ok: false,
@@ -366,14 +375,15 @@ export async function resolveTtsSelection(input: {
   }
 
   const language = requestedLanguage || voice.nativeLocale;
-  if (language !== 'und' && !ttsVoiceSupportsLanguage(voice, language)) {
+  const languageDeclared = ttsVoiceCatalogDeclaresLanguage(voice);
+  if (languageDeclared && !ttsVoiceSupportsLanguage(voice, language)) {
     return {
       ok: false,
       errorCode: 'E_TTS_LANGUAGE_UNSUPPORTED',
       message: `${voice.displayName} does not support ${language} as the narration language. Choose a compatible voice from speech.capabilities.`,
     };
   }
-  if (language !== 'und' && !ttsVoiceLanguageIsVerified(voice, language)) {
+  if (languageDeclared && !ttsVoiceLanguageIsVerified(voice, language)) {
     return {
       ok: false,
       errorCode: 'E_TTS_LANGUAGE_UNVERIFIED',

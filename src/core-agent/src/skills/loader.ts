@@ -4,6 +4,7 @@ import { createLogger } from "../shared/logger.js";
 import { parseFrontmatter } from "./frontmatter.js";
 import type { SkillLoaderOptions, SkillSpec } from "./types.js";
 import { pickDescription } from "./types.js";
+import { errorCodeForLog } from "../shared/errors.js";
 
 const log = createLogger("skill-loader");
 
@@ -26,10 +27,11 @@ function normalizeDescription(value: string | undefined): string {
  * SkillLoader scans one or more directories for `SKILL.md` files and
  * returns a de-duplicated `SkillSpec[]`.
  *
- * Caching: the list is cached per `(dir, mtimeMs)` tuple — as long as the
- * directory's mtime hasn't changed we reuse the previous scan. Callers that
- * add/remove skill directories out-of-band can call `invalidate()` to force
- * a fresh scan on the next `list()`.
+ * Caching: the list is cached by root inventory plus each immediate Skill's
+ * `SKILL.md` / `_meta.json` metadata stamp. This catches in-place edits made
+ * by external hosts without re-reading or reparsing every frontmatter block
+ * on an unchanged turn. Callers may still call `invalidate()` after known
+ * mutations to force a fresh scan.
  *
  * De-duplication: when the same skill id appears in multiple dirs, the
  * FIRST occurrence wins. Put higher-priority roots earlier — for example,
@@ -48,7 +50,7 @@ export class SkillLoader {
     this.dirs = [...opts.dirs];
   }
 
-  /** List all skills, de-duplicated. Cached by per-dir mtime. */
+  /** List all skills, de-duplicated. Cached by inventory/file metadata. */
   list(): SkillSpec[] {
     const stamp = this.dirStamp();
     if (this.cache && this.cache.stamp === stamp) return this.cache.skills;
@@ -60,7 +62,7 @@ export class SkillLoader {
       try {
         entries = fs.readdirSync(dir, { withFileTypes: true });
       } catch (err) {
-        log.warn(`failed to read ${dir}: ${(err as Error).message}`);
+        log.warn("skill root read failed", { code: errorCodeForLog(err) });
         continue;
       }
       for (const e of entries) {
@@ -128,7 +130,7 @@ export class SkillLoader {
     try {
       raw = fs.readFileSync(skillFile, "utf-8");
     } catch (err) {
-      log.warn(`failed to read ${skillFile}: ${(err as Error).message}`);
+      log.warn("skill file read failed", { code: errorCodeForLog(err) });
       return null;
     }
     const { data } = parseFrontmatter(raw);
@@ -137,7 +139,8 @@ export class SkillLoader {
     // path component). `name` = frontmatter human-readable display label; falls back to
     // the id when frontmatter is missing one. Decoupled because marketplace installs land
     // under `<server-id>/` (hex string) but should still surface their authored name to
-    // the LLM picker — see PC CLAUDE.md §6 and `skill-registry::renderSkillLines`.
+    // the LLM picker — see `docs/architecture/skill-engineering-contract.md`
+    // and `skill-registry::renderSkillLines`.
     const id = path.basename(dir);
     const declaredName = (data.name && data.name.trim()) || id;
     // Migrate legacy single-`description` into the matching language slot.
@@ -157,8 +160,12 @@ export class SkillLoader {
     return {
       id,
       name: declaredName,
-      description_zh: sidecarZh || explicitZh || (legacy && legacyHasChinese ? legacy : ""),
-      description_en: sidecarEn || explicitEn || (legacy && !legacyHasChinese ? legacy : ""),
+      // Platform-managed packages own their localized descriptions directly
+      // in SKILL.md. A sidecar pair remains a compatibility fallback for
+      // custom and older external packages, and a single portable
+      // `description` remains the last fallback.
+      description_zh: explicitZh || sidecarZh || (legacy && legacyHasChinese ? legacy : ""),
+      description_en: explicitEn || sidecarEn || (legacy && !legacyHasChinese ? legacy : ""),
       dir,
       skillFile,
       source,
@@ -180,13 +187,41 @@ export class SkillLoader {
     const parts: string[] = [];
     for (const d of this.dirs) {
       try {
-        const st = fs.statSync(d);
-        parts.push(`${d}:${st.mtimeMs}`);
+        const st = fs.statSync(d, { bigint: true });
+        parts.push(`${d}:root:${st.mtimeNs}:${st.ctimeNs}:${st.size}:${st.ino}`);
       } catch {
         parts.push(`${d}:missing`);
+        continue;
+      }
+
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(d, { withFileTypes: true })
+          .filter((entry) => !entry.name.startsWith("."))
+          .sort((a, b) => a.name.localeCompare(b.name));
+      } catch {
+        parts.push(`${d}:unreadable`);
+        continue;
+      }
+      for (const entry of entries) {
+        const skillDir = path.join(d, entry.name);
+        if (!entry.isDirectory() && !(entry.isSymbolicLink() && this.isDir(skillDir))) continue;
+        parts.push(this.fileStamp(path.join(skillDir, "SKILL.md")));
+        parts.push(this.fileStamp(path.join(skillDir, "_meta.json")));
       }
     }
     return parts.join("|");
+  }
+
+  private fileStamp(file: string): string {
+    try {
+      const st = fs.statSync(file, { bigint: true });
+      // ctime catches same-size rewrites even when an external host restores
+      // mtime; inode also catches atomic replacement with preserved metadata.
+      return `${file}:${st.mtimeNs}:${st.ctimeNs}:${st.size}:${st.ino}`;
+    } catch {
+      return `${file}:missing`;
+    }
   }
 
   private isDir(p: string): boolean {

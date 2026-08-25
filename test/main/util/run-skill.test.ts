@@ -38,6 +38,20 @@ function writeMarketplaceSkill(dirId: string, displayName: string, scriptBase: s
   );
 }
 
+function writeCustomSkill(dirId: string, displayName: string, scriptBase: string): void {
+  const skillDir = path.join(tmpDir, 'u1', 'cloud', 'skills', dirId);
+  const scriptsDir = path.join(skillDir, 'scripts');
+  fs.mkdirSync(scriptsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(skillDir, 'SKILL.md'),
+    `---\nname: ${displayName}\ndescription: custom test\n---\n\nbody\n`,
+  );
+  fs.writeFileSync(
+    path.join(scriptsDir, `${scriptBase}.js`),
+    'module.exports = async () => ({ ok: true, source: "custom" });\n',
+  );
+}
+
 function writeAgentMarketplaceSkill(agentId: string, dirId: string, displayName: string, scriptBase: string): void {
   const skillDir = path.join(tmpDir, 'u1', 'local', 'marketplace', 'agents', agentId, 'skills', dirId);
   const scriptsDir = path.join(skillDir, 'scripts');
@@ -49,6 +63,20 @@ function writeAgentMarketplaceSkill(agentId: string, dirId: string, displayName:
   fs.writeFileSync(
     path.join(scriptsDir, `${scriptBase}.js`),
     'module.exports = async ({ args }) => ({ ok: true, agent: process.env.ORKAS_AGENT_ID, argv: args.join(" ") });\n',
+  );
+}
+
+function writeGlobalSkill(home: string, dirId: string, displayName: string, scriptBase: string): void {
+  const skillDir = path.join(home, '.claude', 'skills', dirId);
+  const scriptsDir = path.join(skillDir, 'scripts');
+  fs.mkdirSync(scriptsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(skillDir, 'SKILL.md'),
+    `---\nname: ${displayName}\ndescription: global test\n---\n\nbody\n`,
+  );
+  fs.writeFileSync(
+    path.join(scriptsDir, `${scriptBase}.js`),
+    'module.exports = async () => ({ ok: true, source: "global" });\n',
   );
 }
 
@@ -145,6 +173,47 @@ describe('run-skill.cjs', () => {
     expect(JSON.parse(r.stdout.trim())).toEqual({ ok: true, argv: 'youtube' });
   });
 
+  it('executes the platform Skill when platform and custom roots share an id', () => {
+    writeMarketplaceSkill('shared-id', 'shared-display-name', 'run');
+    fs.writeFileSync(
+      path.join(tmpDir, 'u1', 'local', 'marketplace', 'skills', 'shared-id', 'scripts', 'run.js'),
+      'module.exports = async () => ({ ok: true, source: "platform" });\n',
+    );
+    writeCustomSkill('shared-id', 'shared-display-name', 'run');
+
+    for (const ref of ['shared-id', 'shared-display-name']) {
+      const r = runSkill(ref, 'run', [], { ORKAS_UID: 'u1' });
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stderr).toBe('');
+      expect(JSON.parse(r.stdout.trim())).toEqual({ ok: true, source: 'platform' });
+    }
+  });
+
+  it('does not resolve global Skill scripts when the account preference is off', () => {
+    const home = path.join(tmpDir, 'home');
+    writeGlobalSkill(home, 'global-helper', 'global-helper', 'run');
+    const homeEnv = process.platform === 'win32'
+      ? { USERPROFILE: home, HOME: home }
+      : { HOME: home };
+
+    const enabled = runSkill('global-helper', 'run', [], {
+      ...homeEnv,
+      ORKAS_GLOBAL_SKILL_ROOTS_ENABLED: '1',
+    });
+    expect(enabled.status).toBe(0);
+    expect(JSON.parse(enabled.stdout.trim())).toEqual({ ok: true, source: 'global' });
+
+    const disabled = runSkill('global-helper', 'run', [], {
+      ...homeEnv,
+      ORKAS_GLOBAL_SKILL_ROOTS_ENABLED: '0',
+    });
+    expect(disabled.status).toBe(66);
+    expect(JSON.parse(disabled.stderr.trim())).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('skill script not found'),
+    });
+  });
+
   it.each([
     [
       'js',
@@ -222,6 +291,26 @@ describe('run-skill.cjs', () => {
       valid: false,
       reason: 'informational result',
     });
+  });
+
+  it('flushes module stdout larger than the process pipe before exiting', () => {
+    const skillDir = path.join(tmpDir, 'u1', 'cloud', 'skills', 'large-module-output');
+    fs.mkdirSync(path.join(skillDir, 'scripts'), { recursive: true });
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      '---\nname: large-module-output\ndescription: large output fixture\n---\n\nbody\n',
+    );
+    fs.writeFileSync(
+      path.join(skillDir, 'scripts', 'run.js'),
+      "module.exports = async () => { process.stdout.write('x'.repeat(80000)); return { tail: 'done' }; };\n",
+    );
+
+    const r = runSkill('large-module-output', 'run');
+
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stderr).toBe('');
+    expect(Buffer.byteLength(r.stdout)).toBe(80016);
+    expect(r.stdout).toBe(`${'x'.repeat(80000)}{"tail":"done"}\n`);
   });
 
   it('uses an exact internal id to disambiguate same-name Skill scripts', () => {

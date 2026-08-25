@@ -58,9 +58,26 @@ export const VIDEO_EDIT_DECISION_SIGNALS: readonly VideoEditDecisionSignal[] = [
 export type VariationType = 'small' | 'medium' | 'large';
 export const VARIATION_TYPES: readonly VariationType[] = ['small', 'medium', 'large'];
 
+const COMMON_GENERATE_SPEC_FIELDS = [
+  'prompt', 'media_kind', 'aspect', 'variation_type', 'characters', 'refs',
+] as const;
+export const GENERATE_SPEC_ALLOWED_FIELDS = {
+  image: [
+    ...COMMON_GENERATE_SPEC_FIELDS,
+    'size', 'reference_images', 'reference_image_urls',
+  ],
+  video: [
+    ...COMMON_GENERATE_SPEC_FIELDS,
+    'operation', 'generation_duration_sec', 'resolution', 'quality', 'generate_audio',
+    'reference_image_urls', 'reference_image_paths', 'reference_video_urls', 'reference_video_paths',
+  ],
+} as const;
+const GENERATE_SPEC_REJECTED_ALIASES = new Set(['duration_sec', 'audio']);
+
 export interface DeliveryPromise {
   type: DeliveryPromiseType;
-  /** Hard requirement: the deliverable must contain real source footage. */
+  /** Hard requirement: the deliverable must contain real source footage,
+   *  including a reference-bound semantic edit of that footage. */
   source_required: boolean;
   /** Minimum share [0..1] of runtime that must be real motion (footage/generated
    *  video) rather than static composed cards. Guards against slideshow drift. */
@@ -114,9 +131,9 @@ export interface VideoEditStrategy {
   may_change: string[];
 }
 
-/** Per-source `spec` is intentionally open (`Record<string, unknown>`): the
- *  validator only enforces the identifying field each source needs to be
- *  executable, and leaves the rest to the stage skills. */
+/** Non-generate `spec` objects are intentionally open so stage-owned compose,
+ *  edit, and provided extensions remain possible. Generate specs are a closed
+ *  paid-request contract: every approved field must be understood by the host. */
 export interface EdlSegment {
   id: string;
   order: number;
@@ -223,6 +240,45 @@ const isObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
 const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 const isStr = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
+
+type SourceSegmentLike = { id?: unknown; source?: unknown; spec?: unknown };
+type SourceReferenceLike = {
+  source?: unknown;
+  media_type?: unknown;
+  intent?: unknown;
+  required?: unknown;
+  target_segment_ids?: unknown;
+};
+
+/** A semantic edit is billable and therefore uses `source: generate`, but it
+ * still preserves source footage when its input is bound by the EDL's signed
+ * top-level edit reference. Ordinary generation never satisfies this test. */
+function isSourceBackedPrimary(
+  segment: SourceSegmentLike,
+  references: SourceReferenceLike[],
+): boolean {
+  if (segment.source === 'edit') return true;
+  if (segment.source === 'provided' && isObject(segment.spec) && segment.spec.kind === 'video') return true;
+  if (segment.source !== 'generate'
+    || !isStr(segment.id)
+    || !isObject(segment.spec)
+    || segment.spec.media_kind !== 'video'
+    || segment.spec.operation !== 'edit') {
+    return false;
+  }
+
+  const sources = [
+    ...(Array.isArray(segment.spec.reference_video_paths) ? segment.spec.reference_video_paths : []),
+    ...(Array.isArray(segment.spec.reference_video_urls) ? segment.spec.reference_video_urls : []),
+  ].filter(isStr);
+  return sources.some((source) => references.some((reference) =>
+    reference.source === source
+    && reference.media_type === 'video'
+    && reference.intent === 'edit'
+    && reference.required === true
+    && Array.isArray(reference.target_segment_ids)
+    && reference.target_segment_ids.includes(segment.id)));
+}
 
 /**
  * Validate a parsed plan.json against the EDL contract. Returns every issue
@@ -504,13 +560,12 @@ export function validateEdl(obj: unknown): EdlValidation {
   // --- promise vs. segments consistency -----------------------------------
   if (isObject(promise) && segments.length > 0) {
     const primaries = segments.filter((s) => s.layer === 'primary');
-    const hasSource = primaries.some((s) => s.source === 'edit'
-      || (s.source === 'provided' && isObject(s.spec) && s.spec.kind === 'video'));
+    const hasSource = primaries.some((segment) => isSourceBackedPrimary(segment, references));
     if (promise.source_required === true && !hasSource) {
       err(
         'delivery_promise.source_required',
         'E_PROMISE_NO_SOURCE',
-        'source_required is true but no primary segment uses real footage (edit or provided kind=video)',
+        'source_required is true but no primary segment uses real footage (edit, provided video, or a reference-bound semantic edit)',
       );
     }
     if (promise.type === 'compose_led' && !segments.some((s) => s.source === 'compose')) {
@@ -727,6 +782,19 @@ function validateSpec(
       } else if (spec.media_kind === undefined) {
         warn(`${at}.spec.media_kind`, 'W_SPEC_GENERATE_KIND_DEFAULT', 'missing media_kind defaults to video; declare it explicitly for Gate C');
       }
+      const generateKind = spec.media_kind === 'image' ? 'image' : 'video';
+      const allowedFields: readonly string[] = GENERATE_SPEC_ALLOWED_FIELDS[generateKind];
+      const knownRejectedFields = generateKind === 'image' ? new Set(['operation']) : new Set<string>();
+      for (const field of Object.keys(spec)) {
+        if (allowedFields.includes(field)
+          || GENERATE_SPEC_REJECTED_ALIASES.has(field)
+          || knownRejectedFields.has(field)) continue;
+        err(
+          `${at}.spec.${field}`,
+          'E_SPEC_GENERATE_UNKNOWN_FIELD',
+          `unsupported generate spec field "${field}"; write only ${generateKind} generation fields directly on spec: ${allowedFields.join(', ')}`,
+        );
+      }
       const referenceFields = spec.media_kind === 'image'
         ? ['reference_images', 'reference_image_urls']
         : ['reference_image_urls', 'reference_image_paths', 'reference_video_urls', 'reference_video_paths'];
@@ -902,8 +970,8 @@ export function assessDelivery(edl: VideoEdl, opts: { producedSec?: Record<strin
 
   const promise = edl.delivery_promise || ({} as DeliveryPromise);
   const sourceRequired = promise.source_required === true;
-  const sourcePresent = primaries.some((s) => s.source === 'edit'
-    || (s.source === 'provided' && s.spec?.kind === 'video'));
+  const sourcePresent = primaries.some((segment) =>
+    isSourceBackedPrimary(segment, edl.references ?? []));
   // `motion_min_ratio` measures footage/generated motion, not animation inside
   // HTML compositions. Native composition inspect/snapshot/draft owns that
   // motion contract, so compose-led plans always use a zero real-motion floor.

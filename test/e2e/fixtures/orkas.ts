@@ -61,6 +61,8 @@ export type CliStubInvocation = {
   prompt: string;
   resumeSessionId: string | null;
   sessionId: string;
+  cwd?: string;
+  pwd?: string | null;
   model?: string;
   effort?: string;
   toolExecuted?: boolean;
@@ -87,7 +89,14 @@ type AgentFanoutTarget = {
 };
 type ModelToolScenario =
   | { kind: 'connector'; connectorId: string }
-  | { kind: 'bash-sequence'; commands: string[]; finalText: string }
+  | { kind: 'agent-authoring'; finalText: string }
+  | {
+    kind: 'bash-sequence';
+    commands: string[];
+    finalText: string;
+    nextCommandIndex: number;
+    toolLoadRequested: boolean;
+  }
   | {
     kind: 'produced-file-cleanup';
     filePath: string;
@@ -95,23 +104,51 @@ type ModelToolScenario =
     deleteCommand: string;
     finalText: string;
     bashArgumentDelayMs: number;
+    writeIssued: boolean;
+    bashIssued: boolean;
+    writeToolLoadRequested: boolean;
+    bashToolLoadRequested: boolean;
   }
-  | { kind: 'interactive-cli'; command: string; purpose: string }
+  | {
+    kind: 'interactive-cli';
+    command: string;
+    purpose: string;
+    issued: boolean;
+    toolLoadRequested: boolean;
+  }
   | {
     kind: 'write-file';
     filePath: string;
     content: string;
     finalText: string;
     toolArgumentDelayMs?: number;
+    writeIssued: boolean;
+    toolLoadRequested: boolean;
   }
-  | { kind: 'generate-speech'; text: string; outputPath: string; finalText: string }
-  | { kind: 'generate-image'; prompt: string; outputPath: string; finalText: string }
+  | {
+    kind: 'generate-speech';
+    text: string;
+    outputPath: string;
+    finalText: string;
+    issued: boolean;
+    toolLoadRequested: boolean;
+  }
+  | {
+    kind: 'generate-image';
+    prompt: string;
+    outputPath: string;
+    finalText: string;
+    issued: boolean;
+    toolLoadRequested: boolean;
+  }
   | {
     kind: 'generate-video';
     prompt: string;
     outputPath: string;
     finalText: string;
     referenceImagePath?: string;
+    issued: boolean;
+    toolLoadRequested: boolean;
   }
   | {
     kind: 'agent-handoff';
@@ -168,10 +205,12 @@ type ModelToolScenario =
     filePath: string;
     expectedFact: string;
     finalText: string;
+    nextAction: 'search' | 'read' | 'final';
+    toolLoadRequested: boolean;
   }
   | {
     kind: 'context-compaction';
-    sources: Array<{ path: string; fact: string }>;
+    sources: Array<{ path: string; fact: string; charEnd: number }>;
     nextSourceIndex: number;
     finalText: string;
     stallCompaction: boolean;
@@ -233,6 +272,11 @@ const readState = () => {
   try { return { ...blank(), ...JSON.parse(fs.readFileSync(statePath, 'utf8')) }; }
   catch { return blank(); }
 };
+const writeState = value => {
+  const tmp = statePath + '.' + String(process.pid) + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2));
+  fs.renameSync(tmp, statePath);
+};
 const state = readState();
 const sessionIndex = args.indexOf('--session');
 const resumeSessionId = sessionIndex >= 0 ? String(args[sessionIndex + 1] || '') : '';
@@ -244,6 +288,7 @@ for (const candidate of [
   'E2E_CLI_RESTART_STALE_BINDING',
   'E2E_CLI_SEND_NOW_ACTIVE',
   'E2E_CLI_SEND_NOW_FOLLOWUP',
+  'E2E_OPENCODE_CUSTOM_PROJECT_DIR',
 ]) {
   if (prompt.includes(candidate)) marker = candidate;
 }
@@ -255,12 +300,14 @@ const invocation = {
   cli: 'opencode', args, prompt,
   resumeSessionId: resumeSessionId || null,
   sessionId,
+  cwd: process.cwd(),
+  pwd: process.env.PWD || null,
 };
 const emit = value => process.stdout.write(JSON.stringify(value) + '\n');
 
 if (marker === 'E2E_CLI_SEND_NOW_ACTIVE') {
   state.invocations.push(invocation);
-  fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+  writeState(state);
   setTimeout(() => {
     emit({ type: 'text', sessionID: sessionId, part: { text: 'E2E_CLI_SEND_NOW_ACTIVE_OK' } });
   }, 4000);
@@ -268,19 +315,54 @@ if (marker === 'E2E_CLI_SEND_NOW_ACTIVE') {
   invocation.toolExecuted = true;
   state.toolExecutions += 1;
   state.invocations.push(invocation);
-  fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+  writeState(state);
   emit({ type: 'tool_use', sessionID: sessionId, part: { tool: 'exec_command', callID: 'e2e-tool-1', state: { status: 'running', input: { command: 'e2e-side-effect' } } } });
   emit({ type: 'tool_use', sessionID: sessionId, part: { tool: 'exec_command', callID: 'e2e-tool-1', state: { status: 'completed', output: 'side-effect-complete' } } });
   process.stderr.write('deterministic failure after tool execution\n');
   process.exitCode = 7;
 } else if (marker === 'E2E_CLI_RESTART_STALE_BINDING' && attempt === 1) {
   state.invocations.push(invocation);
-  fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+  writeState(state);
   process.stderr.write('deterministic failure before a new session is observed\n');
   process.exitCode = 7;
+} else if (marker === 'E2E_OPENCODE_CUSTOM_PROJECT_DIR') {
+  state.invocations.push(invocation);
+  writeState(state);
+  fs.writeFileSync('snake.html', '<main>deterministic snake</main>');
+  for (let index = 0; index < 4; index += 1) {
+    emit({ type: 'step_start', sessionID: sessionId, part: { id: 'step-' + index } });
+  }
+  emit({
+    type: 'tool_use', sessionID: sessionId,
+    part: {
+      tool: 'bash', callID: 'e2e-result-command',
+      state: {
+        status: 'completed',
+        input: { command: 'head -60 ' + process.cwd().replace(/ /g, '\\ ') + '/CLAUDE.md' },
+        output: 'deterministic command output',
+        time: { start: 100, end: 105 },
+      },
+    },
+  });
+  emit({
+    type: 'tool_use', sessionID: sessionId,
+    part: {
+      tool: 'write', callID: 'e2e-result-write',
+      state: {
+        status: 'completed',
+        input: {
+          filePath: process.cwd() + '/snake.html',
+          content: '<main>private event body</main>',
+        },
+        output: 'created snake.html',
+        time: { start: 200, end: 225 },
+      },
+    },
+  });
+  emit({ type: 'text', sessionID: sessionId, part: { text: 'E2E_CLI_DEFAULT_OK' } });
 } else {
   state.invocations.push(invocation);
-  fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+  writeState(state);
   let text = 'E2E_CLI_DEFAULT_OK';
   if (marker === 'E2E_CLI_RESUME_AFTER_RELAUNCH') text = 'E2E_CLI_RESUMED_WITHOUT_DUPLICATE_TOOL';
   if (marker === 'E2E_CLI_RESTART_STALE_BINDING') text = 'E2E_CLI_FRESH_RESTART_OK';
@@ -392,6 +474,25 @@ input.on('line', line => {
   if (handled) return;
   let message;
   try { message = JSON.parse(line); } catch { return; }
+  if (message.type === 'control_request' && message.request?.subtype === 'list_models') {
+    send({ type: 'control_response', response: {
+      subtype: 'success',
+      request_id: message.request_id,
+      response: { models: [
+        { value: 'default', resolvedModel: concreteModels.sonnet, displayName: 'Default (recommended)' },
+        {
+          value: 'sonnet', resolvedModel: concreteModels.sonnet, displayName: 'Sonnet',
+          supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+        },
+        {
+          value: 'opus', resolvedModel: concreteModels.opus, displayName: 'Opus',
+          supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+        },
+        { value: 'haiku', resolvedModel: concreteModels.haiku, displayName: 'Haiku' },
+      ] },
+    } });
+    return;
+  }
   if (message.type !== 'user') return;
   handled = true;
   const prompt = String(message.message?.content?.[0]?.text || '');
@@ -953,7 +1054,7 @@ export class OrkasTestApp {
             await (window as any).refreshModelGuard();
           }
         });
-        await expect(page.locator('#model-guard-banner')).toBeHidden();
+        await expect(page.locator('#model-guard-banner')).toHaveCount(0);
       }
       // Builtin Marketplace installation is intentionally deferred from the
       // renderer-ready signal. Open-build E2E cases exercise shipped agents
@@ -1180,6 +1281,13 @@ export class OrkasTestApp {
     this.modelToolScenario = { kind: 'connector', connectorId };
   }
 
+  setAgentAuthoringScenario(finalText: string): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (!finalText.trim()) throw new Error('The Agent authoring scenario requires a final reply');
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = { kind: 'agent-authoring', finalText };
+  }
+
   clearModelToolScenario(): void {
     if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
     this.modelToolScenarioRequestStart = this.modelRequests.length;
@@ -1193,6 +1301,8 @@ export class OrkasTestApp {
       kind: 'bash-sequence',
       commands: [command],
       finalText: 'E2E dangerous command remained denied.',
+      nextCommandIndex: 0,
+      toolLoadRequested: false,
     };
   }
 
@@ -1206,6 +1316,8 @@ export class OrkasTestApp {
       kind: 'bash-sequence',
       commands: commands.slice(),
       finalText,
+      nextCommandIndex: 0,
+      toolLoadRequested: false,
     };
   }
 
@@ -1235,6 +1347,10 @@ export class OrkasTestApp {
       deleteCommand,
       finalText,
       bashArgumentDelayMs: Math.round(bashArgumentDelayMs),
+      writeIssued: false,
+      bashIssued: false,
+      writeToolLoadRequested: false,
+      bashToolLoadRequested: false,
     };
   }
 
@@ -1248,6 +1364,8 @@ export class OrkasTestApp {
       kind: 'interactive-cli',
       command,
       purpose,
+      issued: false,
+      toolLoadRequested: false,
     };
   }
 
@@ -1262,6 +1380,8 @@ export class OrkasTestApp {
       filePath,
       content,
       finalText,
+      writeIssued: false,
+      toolLoadRequested: false,
     };
   }
 
@@ -1288,6 +1408,8 @@ export class OrkasTestApp {
       content,
       finalText,
       toolArgumentDelayMs: Math.round(toolArgumentDelayMs),
+      writeIssued: false,
+      toolLoadRequested: false,
     };
   }
 
@@ -1302,6 +1424,8 @@ export class OrkasTestApp {
       text,
       outputPath,
       finalText,
+      issued: false,
+      toolLoadRequested: false,
     };
   }
 
@@ -1316,6 +1440,8 @@ export class OrkasTestApp {
       prompt,
       outputPath,
       finalText,
+      issued: false,
+      toolLoadRequested: false,
     };
   }
 
@@ -1341,6 +1467,8 @@ export class OrkasTestApp {
       outputPath,
       finalText,
       ...(referenceImagePath ? { referenceImagePath } : {}),
+      issued: false,
+      toolLoadRequested: false,
     };
   }
 
@@ -1513,18 +1641,25 @@ export class OrkasTestApp {
       filePath,
       expectedFact,
       finalText,
+      nextAction: 'search',
+      toolLoadRequested: false,
     };
   }
 
   setContextCompactionScenario(
-    sources: Array<{ path: string; fact: string }>,
+    sources: Array<{ path: string; fact: string; charEnd: number }>,
     finalText: string,
     options: { stallCompaction?: boolean } = {},
   ): void {
     if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
     if (
       sources.length < 3
-      || sources.some((source) => !source.path.trim() || !source.fact.trim())
+      || sources.some((source) => (
+        !source.path.trim()
+        || !source.fact.trim()
+        || !Number.isInteger(source.charEnd)
+        || source.charEnd <= 0
+      ))
       || new Set(sources.map((source) => source.path)).size !== sources.length
       || !finalText.trim()
     ) {
@@ -2214,6 +2349,14 @@ export class OrkasTestApp {
             usage: { prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 },
           },
         ];
+        const advertisedToolNames = new Set(
+          (Array.isArray(requestBody.tools) ? requestBody.tools : [])
+            .map((tool) => String((tool as { function?: { name?: unknown } })?.function?.name || ''))
+            .filter(Boolean),
+        );
+        const requestToolGroup = (callId: string, group: string): void => {
+          finishImmediately(toolCallEvents(callId, 'tool_load', { groups: [group] }));
+        };
 
         const requestText = JSON.stringify(requestBody);
         if (requestText.includes('Library image-understanding assistant')) {
@@ -2246,12 +2389,35 @@ export class OrkasTestApp {
           }
           return;
         }
-        if (scenario?.kind === 'bash-sequence') {
-          if (requestNumber <= scenario.commands.length) {
+        if (scenario?.kind === 'agent-authoring') {
+          const readPaths = [
+            '@skill/agent-creator',
+            '@skill/agent-creator/references/llm-agent-fields.md',
+          ];
+          if (requestNumber <= readPaths.length) {
             finishImmediately(toolCallEvents(
-              `call-e2e-bash-${requestNumber}`,
+              `call-e2e-agent-authoring-read-${requestNumber}`,
+              'read_files',
+              { paths: [{ path: readPaths[requestNumber - 1] }] },
+            ));
+          } else {
+            finishImmediately(finalTextEvents(scenario.finalText));
+          }
+          return;
+        }
+        if (scenario?.kind === 'bash-sequence') {
+          if (!advertisedToolNames.has('bash')
+            && advertisedToolNames.has('tool_load')
+            && !scenario.toolLoadRequested) {
+            scenario.toolLoadRequested = true;
+            requestToolGroup('call-e2e-load-bash', 'workspace.execute.command');
+          } else if (scenario.nextCommandIndex < scenario.commands.length) {
+            const commandIndex = scenario.nextCommandIndex;
+            scenario.nextCommandIndex += 1;
+            finishImmediately(toolCallEvents(
+              `call-e2e-bash-${commandIndex + 1}`,
               'bash',
-              { command: scenario.commands[requestNumber - 1] },
+              { command: scenario.commands[commandIndex] },
             ));
           } else {
             finishImmediately(finalTextEvents(scenario.finalText));
@@ -2259,13 +2425,27 @@ export class OrkasTestApp {
           return;
         }
         if (scenario?.kind === 'produced-file-cleanup') {
-          if (requestNumber === 1) {
+          if (!scenario.writeIssued
+            && !advertisedToolNames.has('write_file')
+            && advertisedToolNames.has('tool_load')
+            && !scenario.writeToolLoadRequested) {
+            scenario.writeToolLoadRequested = true;
+            requestToolGroup('call-e2e-load-write-file', 'workspace.write.output');
+          } else if (!scenario.writeIssued) {
+            scenario.writeIssued = true;
             finishImmediately(toolCallEvents(
               'call-e2e-produce-cleanup-file',
               'write_file',
               { path: scenario.filePath, content: scenario.content },
             ));
-          } else if (requestNumber === 2) {
+          } else if (!scenario.bashIssued
+            && !advertisedToolNames.has('bash')
+            && advertisedToolNames.has('tool_load')
+            && !scenario.bashToolLoadRequested) {
+            scenario.bashToolLoadRequested = true;
+            requestToolGroup('call-e2e-load-cleanup-bash', 'workspace.execute.command');
+          } else if (!scenario.bashIssued) {
+            scenario.bashIssued = true;
             streamToolCallWithDelayedArguments(
               'call-e2e-cleanup-produced-file',
               'bash',
@@ -2278,11 +2458,19 @@ export class OrkasTestApp {
           return;
         }
         if (scenario?.kind === 'interactive-cli') {
-          if (requestNumber === 1) {
+          if (!scenario.issued
+            && !advertisedToolNames.has('interactive_cli')
+            && advertisedToolNames.has('tool_load')
+            && !scenario.toolLoadRequested) {
+            scenario.toolLoadRequested = true;
+            requestToolGroup('call-e2e-load-interactive-cli', 'workspace.execute.session');
+          } else if (!scenario.issued) {
+            scenario.issued = true;
             finishImmediately(toolCallEvents(
               'call-e2e-interactive-cli',
-              'interactive_cli_start',
+              'interactive_cli',
               {
+                action: 'start',
                 command: scenario.command,
                 purpose: scenario.purpose,
                 max_lifetime_ms: 600_000,
@@ -2294,7 +2482,14 @@ export class OrkasTestApp {
           return;
         }
         if (scenario?.kind === 'write-file') {
-          if (requestNumber === 1) {
+          if (!scenario.writeIssued
+            && !advertisedToolNames.has('write_file')
+            && advertisedToolNames.has('tool_load')
+            && !scenario.toolLoadRequested) {
+            scenario.toolLoadRequested = true;
+            requestToolGroup('call-e2e-load-write-file', 'workspace.write.output');
+          } else if (!scenario.writeIssued) {
+            scenario.writeIssued = true;
             if (scenario.toolArgumentDelayMs) {
               streamToolCallWithDelayedArguments(
                 'call-e2e-write-conflict-file',
@@ -2315,7 +2510,14 @@ export class OrkasTestApp {
           return;
         }
         if (scenario?.kind === 'generate-speech') {
-          if (requestNumber === 1) {
+          if (!scenario.issued
+            && !advertisedToolNames.has('generate_speech')
+            && advertisedToolNames.has('tool_load')
+            && !scenario.toolLoadRequested) {
+            scenario.toolLoadRequested = true;
+            requestToolGroup('call-e2e-load-generate-speech', 'media.speech');
+          } else if (!scenario.issued) {
+            scenario.issued = true;
             finishImmediately(toolCallEvents(
               'call-e2e-generate-speech',
               'generate_speech',
@@ -2327,7 +2529,14 @@ export class OrkasTestApp {
           return;
         }
         if (scenario?.kind === 'generate-image') {
-          if (requestNumber === 1) {
+          if (!scenario.issued
+            && !advertisedToolNames.has('generate_image')
+            && advertisedToolNames.has('tool_load')
+            && !scenario.toolLoadRequested) {
+            scenario.toolLoadRequested = true;
+            requestToolGroup('call-e2e-load-generate-image', 'media.image');
+          } else if (!scenario.issued) {
+            scenario.issued = true;
             finishImmediately(toolCallEvents(
               'call-e2e-generate-image',
               'generate_image',
@@ -2476,8 +2685,8 @@ export class OrkasTestApp {
           if (requestNumber === 1) {
             finishImmediately(toolCallEvents(
               'call-e2e-project-history-search',
-              'chat_search',
-              { query: scenario.query, k: 4 },
+              'chat_history',
+              { action: 'search', query: scenario.query, k: 4 },
             ));
           } else if (requestNumber === 2) {
             const searchResult = JSON.stringify(requestBody);
@@ -2486,10 +2695,13 @@ export class OrkasTestApp {
             );
             finishImmediately(toolCallEvents(
               'call-e2e-project-history-read',
-              'chat_read',
+              'chat_history',
               {
+                action: 'read',
                 cid: scenario.sourceCid,
-                ...(sourceHit ? { msg_index: Number(sourceHit[1]), window: 1 } : {}),
+                ...(sourceHit
+                  ? { page: { mode: 'around', index: Number(sourceHit[1]), count: 1 } }
+                  : {}),
               },
             ));
           } else {
@@ -2518,27 +2730,35 @@ export class OrkasTestApp {
         }
         if (scenario?.kind === 'knowledge-base') {
           const requestText = JSON.stringify(requestBody);
-          if (requestNumber === 1) {
+          if (scenario.nextAction === 'search'
+            && !advertisedToolNames.has('library')
+            && advertisedToolNames.has('tool_load')
+            && !scenario.toolLoadRequested) {
+            scenario.toolLoadRequested = true;
+            requestToolGroup('call-e2e-load-library', 'library');
+          } else if (scenario.nextAction === 'search') {
+            scenario.nextAction = 'read';
             finishImmediately(toolCallEvents(
               'call-e2e-kb-search',
-              'kb_search',
-              { query: scenario.query, k: 5, scope: 'global' },
+              'library',
+              { action: 'search', query: scenario.query, k: 5, scope: 'global' },
             ));
-          } else if (requestNumber === 2) {
+          } else if (scenario.nextAction === 'read') {
             if (!requestText.includes(scenario.filePath)) {
-              finishImmediately(finalTextEvents('E2E Library retrieval failed: kb_search did not return the indexed file.'));
+              finishImmediately(finalTextEvents('E2E Library retrieval failed: search did not return the indexed file.'));
               return;
             }
+            scenario.nextAction = 'final';
             finishImmediately(toolCallEvents(
               'call-e2e-kb-read',
-              'kb_read',
-              { path: scenario.filePath, scope: 'global' },
+              'library',
+              { action: 'read', path: scenario.filePath, scope: 'global' },
             ));
           } else {
             finishImmediately(finalTextEvents(
               requestText.includes(scenario.expectedFact)
                 ? scenario.finalText
-                : 'E2E Library retrieval failed: kb_read did not return the indexed fact.',
+                : 'E2E Library retrieval failed: read did not return the indexed fact.',
             ));
           }
           return;
@@ -2597,8 +2817,13 @@ export class OrkasTestApp {
             scenario.nextSourceIndex += batch.length;
             finishImmediately(toolCallsEvents(batch.map((source, offset) => ({
               callId: `call-e2e-context-source-${startIndex + offset + 1}`,
-              name: 'read_file',
-              args: { path: source.path },
+              name: 'read_files',
+              args: {
+                paths: [{
+                  path: source.path,
+                  range: { unit: 'char', start: 0, end: source.charEnd },
+                }],
+              },
             }))));
           } else {
             const missingFacts = scenario.sources

@@ -1,4 +1,11 @@
-import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import type { Page } from '@playwright/test';
 
@@ -67,6 +74,114 @@ function appendCanonicalMessages(
 
 test.describe('CLI Agent runtime settings', () => {
   test.describe.configure({ timeout: 120_000 });
+
+  test('runs a first OpenCode task in the custom directory shown on its Agent detail page', async ({ cliOrkas }) => {
+    const agentName = 'OpenCodeProjectDirE2E';
+    const { page, agentId } = await createCliAgent(cliOrkas, agentName, 'opencode');
+    const selectedProjectDirCandidate = path.join(
+      cliOrkas.workspaceRoot,
+      'selected OpenCode project',
+    );
+    mkdirSync(selectedProjectDirCandidate, { recursive: true });
+    // macOS exposes /var as a symlink to /private/var. Select the canonical
+    // directory so the user-visible setting, argv, process.cwd(), and PWD all
+    // share the same identity instead of comparing two aliases.
+    const selectedProjectDir = realpathSync(selectedProjectDirCandidate);
+    writeFileSync(path.join(selectedProjectDir, 'CLAUDE.md'), '# E2E project instructions\n');
+
+    const saved = await cliOrkas.invoke<{
+      ok: boolean;
+      info?: { mode?: string; path?: string; exists?: boolean };
+    }>('agents.cliProjectDir.set', {
+      agent_id: agentId,
+      path: selectedProjectDir,
+    });
+    expect(saved).toMatchObject({
+      ok: true,
+      info: { mode: 'custom', path: selectedProjectDir, exists: true },
+    });
+
+    await page.locator('#agents-btn').click();
+    const card = page.locator(`.agent-card[data-id="${agentId}"]`);
+    await expect(card).toBeVisible({ timeout: 30_000 });
+    await card.click();
+    await expect(page.locator('#agents-detail-project-dir-section')).toBeVisible();
+    await expect(page.locator('#agents-detail-project-dir .agent-project-dir-path'))
+      .toHaveText(selectedProjectDir);
+
+    await page.locator('#agent-use-btn').click();
+    await expect(page.locator('#panel-new-chat')).toHaveClass(/\bactive\b/);
+    await sendNewChat(page, 'E2E_OPENCODE_CUSTOM_PROJECT_DIR');
+    await expect.poll(() => cliOrkas.readCliState().invocations.filter(
+      (item) => item.prompt.includes('E2E_OPENCODE_CUSTOM_PROJECT_DIR'),
+    ).length).toBe(1);
+    await expect(page.locator('#chat-history .chat-input-form')).toHaveCount(0);
+    const reply = page.locator('#chat-history .chat-message.assistant', {
+      hasText: 'E2E_CLI_DEFAULT_OK',
+    });
+    await expect(reply.locator('[data-role="final"]')).toBeVisible({ timeout: 30_000 });
+
+    const processRail = reply.locator('.stream-process');
+    await expect(processRail).toBeVisible();
+    if (!await processRail.evaluate((element: HTMLDetailsElement) => element.open)) {
+      await processRail.locator('.stream-process-summary').click();
+    }
+    await expect(processRail.locator('.stream-process-line', { hasText: 'Handle task' }))
+      .toHaveCount(1);
+    const commandRow = processRail.locator(
+      '.stream-process-line[data-process-call-id="cli:e2e-result-command"]',
+    );
+    const writeRow = processRail.locator(
+      '.stream-process-line[data-process-call-id="cli:e2e-result-write"]',
+    );
+    await expect(commandRow).toContainText('Run command · head -60 CLAUDE.md · Done · 5ms');
+    await expect(writeRow).toContainText('Edit file · snake.html · Done · 25ms');
+    await expect(commandRow).not.toContainText(selectedProjectDir);
+    await expect(writeRow).not.toContainText('private event body');
+    await expect(reply.locator('.chat-msg-produced-item')).toContainText('snake.html');
+    await commandRow.click();
+    await expect(commandRow).toHaveAttribute('aria-expanded', 'true');
+    await expect(commandRow.locator('xpath=following-sibling::*[1]'))
+      .toContainText('deterministic command output');
+
+    const invocation = cliOrkas.readCliState().invocations.find(
+      (item) => item.prompt.includes('E2E_OPENCODE_CUSTOM_PROJECT_DIR'),
+    );
+    expect(invocation).toBeDefined();
+    if (!invocation) throw new Error('OpenCode task invocation was not recorded');
+    expect(invocation).toMatchObject({
+      cli: 'opencode',
+      cwd: selectedProjectDir,
+    });
+    if (process.platform !== 'win32') expect(invocation.pwd).toBe(selectedProjectDir);
+    const directoryFlags = invocation.args.filter(
+      (arg) => arg === '--dir' || arg.startsWith('--dir='),
+    );
+    expect(directoryFlags).toEqual(['--dir']);
+    const directoryIndex = invocation.args.indexOf('--dir');
+    expect(invocation.args[directoryIndex + 1]).toBe(selectedProjectDir);
+
+    const conversationId = await page.locator('#conversation-list .conv-item').first()
+      .getAttribute('data-cid');
+    expect(conversationId).toBeTruthy();
+    const relaunchedPage = await cliOrkas.relaunch();
+    await relaunchedPage.locator(`.conv-item[data-cid="${conversationId}"]`).click();
+    const restoredReply = relaunchedPage.locator('#chat-history .chat-message.assistant', {
+      hasText: 'E2E_CLI_DEFAULT_OK',
+    });
+    const restoredRail = restoredReply.locator('.stream-process');
+    await expect(restoredRail).toBeVisible();
+    await restoredRail.locator('.stream-process-summary').click();
+    const restoredCommand = restoredRail.locator(
+      '.stream-process-line[data-process-call-id="cli:e2e-result-command"]',
+    );
+    await expect(restoredCommand)
+      .toContainText('Run command · head -60 CLAUDE.md · Done · 5ms');
+    await restoredCommand.press('Enter');
+    await expect(restoredCommand).toHaveAttribute('aria-expanded', 'true');
+    await expect(restoredCommand.locator('xpath=following-sibling::*[1]'))
+      .toContainText('deterministic command output');
+  });
 
   test('persists overrides, resets model-specific thinking, and restores CLI defaults', async ({ cliOrkas }) => {
     const agentName = 'CodexRuntimeSettingsE2E';

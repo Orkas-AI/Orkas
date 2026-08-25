@@ -87,11 +87,12 @@ describe('PptMaker built-in agent evaluation', () => {
     const router = readSkill('ppt-router');
     const planner = readSkill('ppt-planner');
 
-    expect(agent.workflow).toContain('Read `ppt-router` first and alone');
-    expect(agent.workflow).toContain('`CREATE`, `EDIT`, `REVIEW`, or `OUTLINE`');
-    expect(agent.workflow).toContain('`QUICK` or `STANDARD`');
-    expect(agent.workflow).toContain('Honor an explicit user review gate; otherwise continue');
-    expect(agent.workflow).toContain('do not create a separate runtime execution plan');
+    expect(agent.workflow).toContain('Read `ppt-router` first');
+    expect(agent.workflow).toContain('CREATE, EDIT, REVIEW, or OUTLINE');
+    expect(agent.workflow).toContain('QUICK or STANDARD');
+    expect(router).toContain('An explicit review gate is part of the lock');
+    expect(router).toContain('do not stop merely to ask approval for an internal outline or visual direction');
+    expect(router).toContain('do not create a separate runtime execution plan');
     expect(router).toContain('next_skills');
     expect(router).toContain('execution order, not permission to preload');
     expect(planner).toContain('Presentation brief');
@@ -99,7 +100,20 @@ describe('PptMaker built-in agent evaluation', () => {
     expect(planner).toContain('Narrative outline');
     expect(planner).toContain('Slide storyboard');
     expect(planner).toContain('Adaptive design lock');
-    expect(agent.standards.join('\n')).toContain('QUICK may keep them compact but may not skip them');
+    // The contract is that QUICK compresses the planning artifacts and cannot
+    // drop them, so assert those two facts rather than the sentence carrying
+    // them: pinning the copy failed the suite on 2026-08-11 when the standard
+    // was reworded to say the same thing more briefly.
+    const standards = agent.standards.join('\n');
+    const planningContract = [standards, router, planner].join('\n');
+    for (const artifact of [
+      'brief', 'evidence boundary', 'narrative outline', 'storyboard',
+      'visual source', 'design lock',
+    ]) {
+      expect(planningContract.toLowerCase(), `planning artifact missing: ${artifact}`)
+        .toContain(artifact);
+    }
+    expect(planningContract).toMatch(/QUICK[^.]*?(?:never skip|not skip|cannot skip)/i);
   });
 
   it('keeps internal routing private and uses plain-language progress updates', () => {
@@ -110,7 +124,7 @@ describe('PptMaker built-in agent evaluation', () => {
     const review = readSkill('ppt-review');
     const combined = [agent.standards.join('\n'), router, review].join('\n');
 
-    expect(combined).toContain('Never expose route/depth codes');
+    expect(combined).toMatch(/route and depth are private execution metadata/i);
     expect(router).toContain('Keep them in working context only');
     expect(router).toContain('never print the route contract');
     expect(router).toContain('Never show raw codes such as `CREATE / STANDARD`');
@@ -133,30 +147,30 @@ describe('PptMaker built-in agent evaluation', () => {
       'create_pptx',
       'office_read',
       'edit_office',
-      'office_check',
-      'office_render',
+      'office_review',
       'publish_outputs',
     ]) {
       expect(combined).toContain(`\`${tool}\``);
     }
-    expect(combined).toContain('call `create_pptx` exactly once');
-    expect(combined).toContain('do not call `create_pptx` again');
+    expect(craft).toMatch(/Call it exactly once with the complete slide array/i);
+    expect(craft).toContain('issue a second create call for the same deck');
     expect(craft).toContain('complete slide array and `preview:false`');
-    expect(craft.indexOf('Run `office_check` on that exact path'))
-      .toBeLessThan(craft.indexOf('request every required initial `office_render` call'));
-    expect(craft).toContain('every required initial `office_render` call together in one assistant tool-call batch');
-    expect(craft).toContain('`analysis_mode:"quality_review"` on every output-deck render');
+    expect(craft).toContain('`office_review` once on that exact path');
+    expect(craft).toContain('`action:"check_and_render"`');
+    expect(craft).toContain('every required initial slide in `pages`');
+    expect(craft).toContain('`analysis_mode:"quality_review"`');
     expect(craft).toContain('default `analysis_mode:"understand"`');
-    expect(craft).toContain('no model round between pages');
     expect(craft).toContain('Do not infer a construction failure from equal strings alone');
     expect(craft).toContain('accidental overlap or redundant visual hierarchy');
     expect(craft).toContain('any numeral, percentage, duration, rank, benchmark');
     expect(craft).toContain('must map to supplied or explicitly approved evidence');
     expect(craft).not.toContain('complete slide array and `preview:true`');
     expect(combined).toContain('separate validated working copy');
-    expect(combined).toContain('Do not install Office libraries');
+    expect(combined).toMatch(/do not install Office libraries/i);
     expect(combined).toContain('patch OpenXML directly');
-    expect(combined).toContain('never substitute a full-slide screenshot');
+    expect(craft).toMatch(/reread the same returned object\s+path on the output/i);
+    expect(craft).toMatch(/requested properties do not match/i);
+    expect(craft).toMatch(/does not establish SmartArt, animation sequences, speaker notes, or master\/layout authoring/i);
     expect(craft).toContain('supports native text, shapes, pictures, charts, tables');
     expect(craft).toContain('speaker notes');
   });
@@ -249,14 +263,14 @@ describe('PptMaker built-in agent evaluation', () => {
     const review = readSkill('ppt-review');
     const combined = [agent.workflow, agent.standards.join('\n'), review].join('\n');
 
-    expect(review).toContain('only after current `office_check` output');
+    expect(review).toContain('only after current `office_review` structural output');
     expect(review).toContain('For a new deck, render every slide');
     expect(review).toContain('After a repair affects multiple pages');
-    expect(review).toContain('together in one assistant tool-call batch');
+    expect(review).toContain('together in one `office_review` call');
     expect(review).toContain('Every render intended as current visual-defect evidence');
-    expect(review).toContain('each with `analysis_mode:"quality_review"`');
+    expect(review).toContain('`analysis_mode:"quality_review"`');
     expect(review).toContain('default `understand` mode');
-    expect(review).toContain('Do not insert a model round between page renders');
+    expect(review).toContain('One collected image set');
     expect(review).toContain('retry only that page');
     expect(review).toContain('Rendered image blocks are transient after the next assistant response');
     expect(review).toContain('write one concise plain-language evidence sentence before any follow-up tool calls');
@@ -272,7 +286,7 @@ describe('PptMaker built-in agent evaluation', () => {
     expect(review).toContain('automatic first-page preview must not run ahead of structural validation');
     expect(review).toContain('`BLOCKER`');
     expect(review).toContain('Consolidate all known defects into one edit batch where possible');
-    expect(review).toContain('rerender only affected slides at a new `artifact_revision`');
+    expect(review).toContain('rerendering only affected slides at a new `artifact_revision`');
     expect(review).toContain('Stop when only non-blocking warnings remain');
     expect(review).not.toContain('at most two targeted `office_render` calls total');
     expect(review).not.toContain('hard render-call budget');
@@ -286,7 +300,8 @@ describe('PptMaker built-in agent evaluation', () => {
     expect(review).toContain('Do not include numeric aesthetic scores');
     expect(review).toContain('Design\nPASS/WARNING/BLOCKER');
     expect(combined).toContain('invalid OpenXML');
-    expect(combined).toContain('Do not publish an empty or invalid output set');
+    expect(review).toContain('Publish only when:');
+    expect(review).toContain('no blocker remains');
     expect(combined).toContain('target-viewer review');
   });
 });

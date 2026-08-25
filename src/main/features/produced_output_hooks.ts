@@ -36,6 +36,9 @@ export function registerProducedOutputHooks(next: ProducedOutputHooks): () => vo
   };
 }
 
+/** Prepare a previously produced file for reuse as a downstream input. Most
+ * formats are a no-op; registered output policies may reverse presentation-
+ * only finalization that must not be baked into a derived deliverable. */
 export async function prepareProducedFileForInput(
   absPath: string,
   context: ProducedOutputContext = {},

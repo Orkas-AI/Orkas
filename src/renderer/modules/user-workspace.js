@@ -28,6 +28,15 @@ const _wsInfoByTarget = {
   project: { currentPath: '', defaultPath: '', isDefault: true, recentPaths: [], scope: 'default' },
 };
 
+function _trackWorkspaceOpenFolderResult(target, result, startedAt, errorCode = '') {
+  if (result !== 'failure') return;
+  _wsLog.warn('workspace open folder failed', {
+    target,
+    error_code: errorCode || 'unknown',
+    duration_ms: Math.max(0, Date.now() - startedAt),
+  });
+}
+
 // ── Workspace display helpers ───────────────────────────────────────
 
 /** Extract just the folder name from an absolute path. */
@@ -190,6 +199,7 @@ async function _resetWorkspace(target) {
 
 async function _openWorkspaceFolder(target) {
   const hint = _wsScopeHintFor(target);
+  const startedAt = Date.now();
   try {
     const result = await window.orkas.invoke('workspace.openPath', hint);
     if (result && result.ok) {

@@ -205,4 +205,63 @@ describe('local_agents/backends/_acp process lifecycle', () => {
       output: 'silent setter recovered',
     });
   });
+
+  it('does not infer a transport failure from successful ACP response text', async () => {
+    const fakeAcpServer = String.raw`
+      let buffer = '';
+      const send = (message) => process.stdout.write(JSON.stringify(message) + '\n');
+      process.stdin.setEncoding('utf8');
+      process.stdin.on('data', (chunk) => {
+        buffer += chunk;
+        let newline;
+        while ((newline = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          if (!line.trim()) continue;
+          const message = JSON.parse(line);
+          if (message.method === 'initialize') {
+            send({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: 1 } });
+          } else if (message.method === 'session/new') {
+            send({ jsonrpc: '2.0', id: message.id, result: { sessionId: 'acp-api-retry-failure' } });
+          } else if (message.method === 'session/prompt') {
+            send({ jsonrpc: '2.0', method: 'session/update', params: {
+              sessionId: 'acp-api-retry-failure',
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: {
+                  text: 'API call failed after 3 retries: HTTP 404: 404 Not found. Check the docs for available routes.',
+                },
+              },
+            } });
+            send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } });
+          }
+        }
+      });
+    `;
+    const backend = makeAcpBackend({
+      logName: 'local-agents:test-acp',
+      argv: ['-e', fakeAcpServer],
+      clientName: 'orkas-test',
+    });
+    const events: any[] = [];
+
+    await backend.run({
+      binPath: TEST_NODE,
+      prompt: 'answer the user',
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+      timeoutMs: 2_000,
+      onEvent: event => events.push(event),
+    });
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'text-delta',
+      text: expect.stringContaining('API call failed after 3 retries'),
+    }));
+    expect(events.at(-1)).toMatchObject({
+      type: 'done',
+      status: 'completed',
+      output: 'API call failed after 3 retries: HTTP 404: 404 Not found. Check the docs for available routes.',
+    });
+  });
 });

@@ -16,6 +16,28 @@ vi.mock('../../../../src/main/features/local_agents/registry', async (importOrig
   };
 });
 
+const runnerConnectorMock = vi.hoisted(() => ({
+  resolveVisibleConnectors: vi.fn(async () => [] as any[]),
+}));
+vi.mock('../../../../src/main/features/connectors', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../../src/main/features/connectors')>();
+  return {
+    ...actual,
+    resolveVisibleConnectors: runnerConnectorMock.resolveVisibleConnectors,
+  };
+});
+
+const remoteMediaDownloadMock = vi.hoisted(() => ({
+  download: vi.fn(),
+}));
+vi.mock('../../../../src/main/util/proxy-dispatcher', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../../src/main/util/proxy-dispatcher')>();
+  return {
+    ...actual,
+    downloadBinaryWithProxyPolicy: (...args: any[]) => remoteMediaDownloadMock.download(...args),
+  };
+});
+
 let mockBackendImpl: ((opts: any) => Promise<void>) | null = null;
 vi.mock('../../../../src/main/features/local_agents/backends/claude', () => ({
   claudeBackend: {
@@ -30,9 +52,18 @@ vi.mock('../../../../src/main/features/local_agents/backends/openclaw', () => ({
   },
 }));
 
+let mockCodexBackendImpl: ((opts: any) => Promise<void>) | null = null;
+vi.mock('../../../../src/main/features/local_agents/backends/codex', () => ({
+  codexBackend: {
+    run: (opts: any) => (mockCodexBackendImpl ? mockCodexBackendImpl(opts) : Promise.resolve()),
+  },
+}));
+
 let tmpDir: string;
 let prevWs: string | undefined;
 const TEST_UID = 'u1';
+const PNG_1X1_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6nKsAAAAASUVORK5CYII=';
+const MP4_FTYP = Buffer.from('000000186674797069736f6d0000020069736f6d69736f32', 'hex');
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-runner-'));
@@ -42,8 +73,13 @@ beforeEach(async () => {
   const users = await import('../../../../src/main/features/users');
   users.activateUser(TEST_UID);
   mockDetect.mockReset();
+  runnerConnectorMock.resolveVisibleConnectors.mockReset();
+  runnerConnectorMock.resolveVisibleConnectors.mockResolvedValue([]);
+  remoteMediaDownloadMock.download.mockReset();
+  remoteMediaDownloadMock.download.mockRejectedValue(new Error('remote media unavailable in this test'));
   mockBackendImpl = null;
   mockOpenclawBackendImpl = null;
+  mockCodexBackendImpl = null;
 });
 
 afterEach(() => {
@@ -148,7 +184,7 @@ describe('local_agents/runner', () => {
     expect(serialized).not.toContain('private recovered transcript');
     expect(serialized).not.toContain('super-secret-token');
     expect(serialized).not.toContain('resume-private-session-id');
-    expect(serialized).not.toContain('/Users/alice');
+    expect(serialized).not.toContain('/Users/test');
     expect(serialized).not.toContain('Secret Workspace');
     expect(serialized).not.toContain('conversation-private');
     expect(serialized).not.toContain('agent-private');
@@ -255,7 +291,7 @@ describe('local_agents/runner', () => {
     expect(serialized).not.toContain('private tool output');
     expect(serialized).not.toContain('second private tool output');
     expect(serialized).not.toContain('private final');
-    expect(serialized).not.toContain('/Users/alice');
+    expect(serialized).not.toContain('/Users/test');
     expect(serialized).not.toContain('secretText');
     expect(serialized).not.toContain('local-secret-123456');
     expect(serialized).not.toContain('local-secret-abcdef');
@@ -403,6 +439,9 @@ describe('local_agents/runner', () => {
     const resultEvent = events.find((event) => event.type === 'tool-event' && event.phase === 'result');
     expect(resultEvent.durationMs).toBeGreaterThanOrEqual(0);
     expect(events.find((event) => event.type === 'tool-event'
+      && event.callId === 'web-1' && event.phase === 'use'))
+      .toMatchObject({ input: { url: 'https://example.com/docs' } });
+    expect(events.find((event) => event.type === 'tool-event'
       && event.callId === 'read-1' && event.phase === 'result'))
       .toMatchObject({ phase: 'result', durationMs: 41 });
 
@@ -415,6 +454,128 @@ describe('local_agents/runner', () => {
     expect(persisted.find((event) => event.type === 'tool-event'
       && event.callId === 'read-1' && event.phase === 'result'))
       .toMatchObject({ phase: 'result', durationMs: 41 });
+  });
+
+  it.each([
+    {
+      label: 'after a fresh-run Skill listing',
+      resumeSessionId: '',
+      listFirst: true,
+      tool: 'mcp__orkas__orkas_read_skill',
+      input: { id: 'efb0fe5d9664' },
+    },
+    {
+      label: 'on the first call of a resumed CLI session',
+      resumeSessionId: 'prior-cli-session',
+      listFirst: false,
+      tool: 'orkas.orkas_read_skill',
+      input: { id: 'efb0fe5d9664' },
+    },
+    {
+      label: 'while running one of its scripts',
+      resumeSessionId: '',
+      listFirst: true,
+      tool: 'mcp__orkas__orkas_run_skill',
+      input: { skill: 'efb0fe5d9664', script: 'scripts/check-release.js' },
+    },
+  ])('persists a Bridge Skill display name $label', async ({
+    resumeSessionId, listFirst, tool, input,
+  }) => {
+    const skillId = 'efb0fe5d9664';
+    const skillDir = path.join(tmpDir, TEST_UID, 'cloud', 'skills', skillId);
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(path.join(skillDir, 'SKILL.md'), [
+      '---',
+      'name: Release Decision',
+      'description: Decide whether a release is ready.',
+      '---',
+      'Review the release evidence.',
+    ].join('\n'));
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    mockBackendImpl = async ({ bridge, onEvent }) => {
+      if (listFirst) {
+        const listed = await callRunnerBridge(bridge, 'skills.list', {});
+        expect(listed).toMatchObject({ ok: true });
+      }
+      onEvent({
+        type: 'tool-event',
+        tool,
+        callId: 'read-skill-1',
+        phase: 'use',
+        input,
+      });
+      onEvent({
+        type: 'tool-event',
+        tool: 'tool_result',
+        callId: 'read-skill-1',
+        phase: 'result',
+        output: 'skill body',
+      });
+      onEvent({ type: 'done', status: 'completed', output: 'done' });
+    };
+
+    const runner = await loadRunner();
+    const events: any[] = [];
+    const result = await runner.run({
+      uid: TEST_UID,
+      cid: 'c-skill-display-name',
+      agentId: 'agent-x',
+      currentMessageId: 'message-x',
+      cli: 'claude',
+      ...(resumeSessionId ? { resumeSessionId } : {}),
+      prompt: 'review the release',
+      cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: event => events.push(event),
+    });
+
+    expect(events.find(event => event.type === 'tool-event' && event.phase === 'use'))
+      .toMatchObject({ skill_name: 'Release Decision', input });
+    const eventPath = path.join(
+      tmpDir, TEST_UID, 'local', 'file_cache', 'local-agent-runs', result.runId, 'events.jsonl',
+    );
+    const persisted = fs.readFileSync(eventPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(persisted.find(event => event.type === 'tool-event' && event.phase === 'use'))
+      .toMatchObject({ skill_name: 'Release Decision', input });
+  });
+
+  it('persists a Bridge Connector display name instead of its internal id', async () => {
+    runnerConnectorMock.resolveVisibleConnectors.mockResolvedValue([{
+      instance: { id: 'connector-instance-91f0', display_name: 'Notion Workspace' },
+      tools: [{ name: 'search', description: 'Search pages', input_schema: {} }],
+    }] as any);
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({
+        type: 'tool-event',
+        tool: 'mcp__orkas__orkas_call_connector_tool',
+        callId: 'connector-call-1',
+        phase: 'use',
+        input: {
+          connector_id: 'connector-instance-91f0',
+          tool_name: 'search',
+          args: { query: 'release plan' },
+        },
+      });
+      onEvent({ type: 'done', status: 'completed', output: 'done' });
+    };
+
+    const runner = await loadRunner();
+    const events: any[] = [];
+    await runner.run({
+      uid: TEST_UID,
+      cid: 'c-connector-display-name',
+      agentId: 'agent-x',
+      currentMessageId: 'message-x',
+      cli: 'claude',
+      prompt: 'search the release plan',
+      cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: event => events.push(event),
+    });
+
+    expect(events.find(event => event.type === 'tool-event'))
+      .toMatchObject({ connector_name: 'Notion Workspace' });
   });
 
   it('forwards the backend active-run ingress and always clears it after the attempt', async () => {
@@ -546,7 +707,7 @@ describe('local_agents/runner', () => {
     ].join(' ');
     const summary = runner.sanitizePublicThinkingSummary(raw);
 
-    expect(summary).not.toContain('/Users/alice');
+    expect(summary).not.toContain('/Users/test');
     expect(summary).not.toContain('sk-proj-local-agent-secret-123456789');
     expect(summary).toMatch(/^Reviewing <abs-path:[a-f0-9]{12}>; token=\*\*\*/);
     expect(summary.length).toBeLessThanOrEqual(2_049);
@@ -622,6 +783,143 @@ describe('local_agents/runner', () => {
     for (const privateValue of [privatePath, privateToken, 'alice@example.com']) {
       expect(publicDiagnostics).not.toContain(privateValue);
     }
+  });
+
+  it('keeps useful tool metadata while stripping private command, path, and body data before forwarding and persistence', async () => {
+    const privateToken = 'sk-proj-local-agent-secret-123456789';
+    const opaqueToken = 'opaque-secret-value';
+    const opaqueSession = 'opaque-session-value';
+    const opaqueShortPassword = 'opaque-short-password';
+    const opaqueHeader = 'opaque-header-value';
+    const opaqueAuth = 'opaque-auth-value';
+    const outsidePath = '/Users/test/private/customer-plan.md';
+    const ownedAbsolutePath = path.join(tmpDir, 'project', 'nested', 'result.ts');
+    const unchangedOutput = 'unchanged tool output\nsecond line';
+    mockDetect.mockResolvedValue({
+      type: 'claude',
+      available: true,
+      path: '/fake/claude',
+      version: '2.0.0',
+    });
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({
+        type: 'tool-event',
+        tool: 'write',
+        callId: 'private-tool-input',
+        phase: 'result',
+        input: {
+          command: `run ${outsidePath} --token=${privateToken} --token ${opaqueToken} --session-id ${opaqueSession} -ualice:${opaqueShortPassword} -H"X-Api-Key: ${opaqueHeader}" --auth ${opaqueAuth}\nPRIVATE_COMMAND_BODY`,
+          filePath: ownedAbsolutePath,
+          path: outsidePath,
+          content: 'PRIVATE_WRITE_BODY',
+          description: 'PRIVATE_DESCRIPTION',
+          token: privateToken,
+          files: [
+            { path: outsidePath, content: 'PRIVATE_NESTED_BODY' },
+            { path: 'nested/../../outside/traversal.ts' },
+            { file: ownedAbsolutePath, token: privateToken },
+            { file_path: 'relative/nested/file-path.ts' },
+            { filePath: 'relative/nested/filePath.ts' },
+            { filename: 'notes.txt' },
+          ],
+        },
+        error: `failed ${outsidePath} token=${privateToken}`,
+        isError: true,
+        output: unchangedOutput,
+      });
+      onEvent({ type: 'done', status: 'completed', output: 'done' });
+    };
+
+    const runner = await loadRunner();
+    const events: any[] = [];
+    const result = await runner.run({
+      uid: TEST_UID,
+      cid: 'c-private-tool-input',
+      agentId: 'agent-x',
+      cli: 'claude',
+      prompt: 'run',
+      cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: event => events.push(event),
+    });
+
+    const liveToolEvent = events.find(event => event.type === 'tool-event');
+    expect(liveToolEvent.input).toEqual({
+      command: expect.stringMatching(/^run\s+\S+/),
+      filePath: 'project/nested/result.ts',
+      displayPath: 'customer-plan.md',
+      files: [
+        { displayPath: 'customer-plan.md' },
+        { displayPath: 'traversal.ts' },
+        { file: 'project/nested/result.ts' },
+        { file_path: 'relative/nested/file-path.ts' },
+        { filePath: 'relative/nested/filePath.ts' },
+        { filename: 'notes.txt' },
+      ],
+    });
+    expect(liveToolEvent.input.command).not.toContain('\n');
+    expect(liveToolEvent.input.command).not.toContain(privateToken);
+    expect(liveToolEvent.input.command).not.toContain(opaqueToken);
+    expect(liveToolEvent.input.command).not.toContain(opaqueSession);
+    expect(liveToolEvent.input.command).not.toContain(opaqueShortPassword);
+    expect(liveToolEvent.input.command).not.toContain(opaqueHeader);
+    expect(liveToolEvent.input.command).not.toContain(opaqueAuth);
+    expect(liveToolEvent.input.command).toContain('customer-plan.md');
+    expect(liveToolEvent.input.command).not.toContain('<path>');
+    expect(liveToolEvent.error).toMatch(/^failed <(?:abs-)?path:/);
+    expect(liveToolEvent.output).toBe(unchangedOutput);
+
+    const eventsPath = path.join(
+      tmpDir,
+      TEST_UID,
+      'local',
+      'file_cache',
+      'local-agent-runs',
+      result.runId,
+      'events.jsonl',
+    );
+    const persistedEvents = fs.readFileSync(eventsPath, 'utf8').trim()
+      .split('\n').map(line => JSON.parse(line));
+    const persistedToolEvent = persistedEvents.find(event => event.type === 'tool-event');
+    expect(persistedToolEvent).toEqual(liveToolEvent);
+    expect(persistedToolEvent.output).toBe(unchangedOutput);
+
+    const publicMetadata = JSON.stringify({
+      input: liveToolEvent.input,
+      error: liveToolEvent.error,
+      persistedInput: persistedToolEvent.input,
+      persistedError: persistedToolEvent.error,
+    });
+    for (const privateValue of [
+      privateToken,
+      opaqueToken,
+      opaqueSession,
+      opaqueShortPassword,
+      opaqueHeader,
+      opaqueAuth,
+      outsidePath,
+      ownedAbsolutePath,
+      'PRIVATE_COMMAND_BODY',
+      'PRIVATE_WRITE_BODY',
+      'PRIVATE_DESCRIPTION',
+      'PRIVATE_NESTED_BODY',
+    ]) {
+      expect(publicMetadata).not.toContain(privateValue);
+    }
+  });
+
+  it('marks nested Windows traversal as display-only metadata', async () => {
+    const runner = await loadRunner();
+    const event = runner.redactPrivateLocalAgentEvent({
+      type: 'tool-event',
+      tool: 'write',
+      callId: 'windows-traversal',
+      phase: 'result',
+      input: { filePath: 'nested\\..\\..\\outside\\secret.ts' },
+      output: 'created',
+    }, 'C:\\project');
+
+    expect((event as any).input).toEqual({ displayPath: 'secret.ts' });
   });
 
   it('reports backend exception as a failed done event', async () => {
@@ -768,12 +1066,18 @@ describe('local_agents/runner', () => {
     expect(meta.status).toBe('cancelled');
   });
 
-  it('records timeout terminal status when backend reports it', async () => {
+  it('preserves the background timeout phase for localized caller recovery', async () => {
     mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
     mockBackendImpl = async ({ onEvent, timeoutMs }) => {
       // Backend honors timeoutMs internally; here we simulate it firing.
       expect(timeoutMs).toBeGreaterThan(0);
-      onEvent({ type: 'done', status: 'timeout', error: 'cli exceeded timeout', durationMs: timeoutMs });
+      onEvent({
+        type: 'done',
+        status: 'timeout',
+        timeoutPhase: 'background',
+        error: 'cli exceeded timeout',
+        durationMs: timeoutMs,
+      });
     };
     const events: any[] = [];
     const result = await (await import('../../../../src/main/features/local_agents/runner')).run({
@@ -783,7 +1087,36 @@ describe('local_agents/runner', () => {
       onEvent: e => events.push(e),
     });
     expect(result.status).toBe('timeout');
+    expect(result.timeoutPhase).toBe('background');
     expect(result.error).toMatch(/timeout/);
+  });
+
+  it('registers a background process for bounded app-shutdown cleanup', async () => {
+    mockDetect.mockResolvedValue({
+      type: 'claude', available: true, path: '/fake/claude', version: '2.0.0',
+    });
+    let resolveProcessExit!: () => void;
+    const untilProcessExit = new Promise<void>(resolve => { resolveProcessExit = resolve; });
+    const stop = vi.fn(() => resolveProcessExit());
+    mockBackendImpl = async ({ onBackgroundRun, onEvent }) => {
+      onBackgroundRun({ untilProcessExit, liveTasks: () => 1, stop });
+      onEvent({ type: 'done', status: 'completed', output: 'queued cleanup' });
+    };
+
+    const runner = await import('../../../../src/main/features/local_agents/runner');
+    const result = await runner.run({
+      uid: TEST_UID, cid: 'c', agentId: 'a',
+      cli: 'claude', prompt: 'p', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+    });
+    expect(result.status).toBe('completed');
+
+    await expect(runner.stopBackgroundRuns('the app is quitting', 1_000)).resolves.toBe(1);
+    expect(stop).toHaveBeenCalledOnce();
+    expect(stop).toHaveBeenCalledWith('the app is quitting');
+    await Promise.resolve();
+    await expect(runner.stopBackgroundRuns('already drained', 10)).resolves.toBe(0);
   });
 
   it('uses a long wall cap and no idle kill for OpenClaw no-stream runs', async () => {
@@ -821,11 +1154,13 @@ describe('local_agents/runner', () => {
     try {
       mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
       let onEventCb: ((e: any) => void) | null = null;
+      let backendLastEventAt: (() => number) | null = null;
       let resolveBackend!: () => void;
       let markBackendReady!: () => void;
       const backendReady = new Promise<void>((resolve) => { markBackendReady = resolve; });
-      mockBackendImpl = async ({ onEvent }) => {
+      mockBackendImpl = async ({ onEvent, lastEventAt }) => {
         onEventCb = onEvent;
+        backendLastEventAt = lastEventAt;
         onEvent({ type: 'process-info', pid: 42, cwd: '/x', cmd: 'claude', args: [] });
         markBackendReady();
         await new Promise<void>(resolve => { resolveBackend = resolve; });
@@ -843,6 +1178,7 @@ describe('local_agents/runner', () => {
 
       await backendReady;
       expect(onEventCb).not.toBeNull();
+      expect(backendLastEventAt).not.toBeNull();
 
       // Threshold=120ms, tick = max(50, 120/3=40) → 50ms. Wait ~250ms:
       // at least 2 idle pulses should fire after the 120ms quiet period.
@@ -855,13 +1191,17 @@ describe('local_agents/runner', () => {
       const idleCount2 = events.filter(e => e.type === 'idle').length;
       expect(idleCount2).toBeGreaterThan(idleCount1);
 
-      // A content-free Codex reasoning heartbeat is UI liveness only. It must
-      // remain visible without resetting the real backend-activity deadline.
+      // A content-free Codex reasoning heartbeat is UI liveness. While those
+      // pulses continue, the user must not be told that the active reasoning
+      // item is unresponsive.
+      const watchdogClock = backendLastEventAt!;
+      const realActivityBeforeHeartbeat = watchdogClock();
       onEventCb!({ type: 'thinking', chars: 0, itemId: 'reasoning-1', heartbeat: true, synthetic: true });
       const beforeHeartbeat = events.filter(e => e.type === 'idle').length;
       await vi.advanceTimersByTimeAsync(80);  // less than 120ms threshold
-      const afterHeartbeat = events.filter(e => e.type === 'idle').length;
-      expect(afterHeartbeat).toBeGreaterThan(beforeHeartbeat);
+      expect(events.filter(e => e.type === 'idle')).toHaveLength(beforeHeartbeat);
+      // UI liveness must remain separate from the backend kill watchdog.
+      expect(watchdogClock()).toBe(realActivityBeforeHeartbeat);
       expect(events).toContainEqual({
         type: 'thinking',
         chars: 0,
@@ -870,9 +1210,14 @@ describe('local_agents/runner', () => {
         synthetic: true,
       });
 
-      // A real protocol event still resets both idle reporting and the
+      // If heartbeats stop, the ordinary visible-idle state still recovers.
+      await vi.advanceTimersByTimeAsync(80);
+      expect(events.filter(e => e.type === 'idle').length).toBeGreaterThan(beforeHeartbeat);
+
+      // A real protocol event resets both visible-idle reporting and the
       // backend watchdog activity clock.
       onEventCb!({ type: 'status', status: 'running' });
+      expect(watchdogClock()).toBeGreaterThan(realActivityBeforeHeartbeat);
       const beforeRealReset = events.filter(e => e.type === 'idle').length;
       await vi.advanceTimersByTimeAsync(80);
       expect(events.filter(e => e.type === 'idle')).toHaveLength(beforeRealReset);
@@ -889,7 +1234,7 @@ describe('local_agents/runner', () => {
     }
   });
 
-  it('spills oversized tool-event results to disk and rewrites output + outputPath', async () => {
+  it('spills oversized tool-event results and exposes only an opaque output ref', async () => {
     const { DEFAULT_INLINE_RESULT_TOKENS } = await import('../../../../src/main/util/tool-result-cap');
     // ASCII length past the token-aware spill budget (~4 chars per token).
     const big = 'X'.repeat(DEFAULT_INLINE_RESULT_TOKENS * 4 + 200);
@@ -916,19 +1261,29 @@ describe('local_agents/runner', () => {
 
     const toolEvent = events.find(e => e.type === 'tool-event' && e.phase === 'result');
     expect(toolEvent).toBeDefined();
-    expect(toolEvent.outputPath).toBeTruthy();
+    expect(toolEvent.outputRef).toMatch(/^bash\.[0-9a-f]+$/);
+    expect(toolEvent.outputPath).toBeUndefined();
     expect(typeof toolEvent.output).toBe('string');
     // Output is now the preview marker, not the full payload.
     expect(toolEvent.output.length).toBeLessThan(big.length);
     expect(toolEvent.output).toMatch(/<persisted-output/);
-    // The full content is on disk at the reported path.
-    expect(fs.existsSync(toolEvent.outputPath)).toBe(true);
-    expect(fs.readFileSync(toolEvent.outputPath, 'utf8')).toBe(big);
+    // The full content remains machine-local; the cloud-safe event exposes no
+    // absolute path and resolves through the content-addressed ref.
+    const spillPath = path.join(
+      tmpDir,
+      TEST_UID,
+      'local',
+      'tool-results',
+      `cli-claude-${result.runId}`,
+      `${toolEvent.outputRef}.txt`,
+    );
+    expect(fs.existsSync(spillPath)).toBe(true);
+    expect(fs.readFileSync(spillPath, 'utf8')).toBe(big);
     // Spill landed under the expected per-session directory shape:
     // <uid>/local/tool-results/cli-claude-<runId>/bash.<id>.txt (CLAUDE.md §5 — session_id
     // dropped uid prefix; user scoping comes from path root, not the filename)
-    expect(toolEvent.outputPath).toContain(`cli-claude-${result.runId}`);
-    expect(toolEvent.outputPath).toMatch(/bash\.[0-9a-f]+\.txt$/);
+    expect(JSON.stringify(toolEvent)).not.toContain(`cli-claude-${result.runId}`);
+    expect(JSON.stringify(toolEvent)).not.toContain(tmpDir);
   });
 
   it('does not spill small tool-event outputs', async () => {
@@ -948,6 +1303,475 @@ describe('local_agents/runner', () => {
     const toolEvent = events.find(e => e.type === 'tool-event' && e.phase === 'result');
     expect(toolEvent.output).toBe('small output');
     expect(toolEvent.outputPath).toBeUndefined();
+    expect(toolEvent.outputRef).toBeUndefined();
+  });
+
+  it('materializes a real Codex Base64 image result before generic tool-result spill', async () => {
+    mockDetect.mockResolvedValue({ type: 'codex', available: true, path: '/fake/codex', version: '1.2.3' });
+    mockCodexBackendImpl = async ({ onEvent }) => {
+      onEvent({
+        type: 'tool-event', tool: 'image_generation', callId: 'image-1', phase: 'use', input: {},
+      });
+      onEvent({
+        type: 'tool-event', tool: 'image_generation', callId: 'image-1', phase: 'result', output: PNG_1X1_BASE64,
+      });
+      onEvent({ type: 'done', status: 'completed', output: 'Image generated.', durationMs: 1 });
+    };
+
+    const runner = await loadRunner();
+    const events: any[] = [];
+    const result = await runner.run({
+      uid: TEST_UID, cid: 'c-codex-image', agentId: 'a',
+      cli: 'codex', prompt: 'generate an image', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: e => events.push(e),
+    });
+
+    expect(result.status).toBe('completed');
+    const toolResultIndex = events.findIndex((event) => (
+      event.type === 'tool-event' && event.tool === 'image_generation' && event.phase === 'result'
+    ));
+    const fileEventIndex = events.findIndex((event) => event.type === 'file-change');
+    const doneIndex = events.findIndex((event) => event.type === 'done');
+    expect(toolResultIndex).toBeGreaterThanOrEqual(0);
+    expect(fileEventIndex).toBeGreaterThan(toolResultIndex);
+    expect(doneIndex).toBeGreaterThan(fileEventIndex);
+    expect(events[toolResultIndex]).toMatchObject({
+      output: 'Generated PNG image (1×1, 68 bytes).',
+    });
+    expect(events[toolResultIndex].outputRef).toBeUndefined();
+    expect(events[fileEventIndex]).toMatchObject({
+      scope: 'conversation-media',
+      source: 'image_generation',
+      synthetic: true,
+    });
+
+    const generatedPath = events[fileEventIndex].paths[0];
+    const layout = await import('../../../../src/main/util/project-layout');
+    expect(path.dirname(generatedPath)).toBe(layout.chatAttachmentDirForConversation(TEST_UID, 'c-codex-image'));
+    expect(path.basename(generatedPath)).toMatch(/^codex-generated-image(?:-.+)?\.png$/);
+    expect(fs.readFileSync(generatedPath)).toEqual(Buffer.from(PNG_1X1_BASE64, 'base64'));
+
+    const eventPath = path.join(
+      tmpDir, TEST_UID, 'local', 'file_cache', 'local-agent-runs', result.runId, 'events.jsonl',
+    );
+    const persistedText = fs.readFileSync(eventPath, 'utf8');
+    const persisted = persistedText.trim().split('\n').map(line => JSON.parse(line));
+    expect(persisted.find((event) => event.type === 'file-change')).toMatchObject({
+      paths: [generatedPath],
+      scope: 'conversation-media',
+      source: 'image_generation',
+    });
+    expect(persistedText).not.toContain(PNG_1X1_BASE64);
+    expect(fs.existsSync(path.join(
+      tmpDir, TEST_UID, 'local', 'tool-results', `cli-codex-${result.runId}`,
+    ))).toBe(false);
+  });
+
+  it('materializes CLI media privately, keeps safe remote images, and rejects paths outside cwd', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    const outsidePath = path.join(path.dirname(tmpDir), `orkas-outside-${path.basename(tmpDir)}.png`);
+    fs.writeFileSync(outsidePath, Buffer.from(PNG_1X1_BASE64, 'base64'));
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({
+        type: 'media-output',
+        source: 'claude',
+        callId: 'image-2',
+        items: [
+          { data: PNG_1X1_BASE64, mediaType: 'image/png', name: '../result.png' },
+          { uri: 'https://cdn.example/generated.webp?token=signed', mediaType: 'image/webp' },
+          { uri: outsidePath, mediaType: 'image/png' },
+          { uri: 'javascript:alert(1)' },
+        ],
+      });
+      onEvent({ type: 'done', status: 'completed', output: '', durationMs: 1 });
+    };
+
+    try {
+      const runner = await loadRunner();
+      const events: any[] = [];
+      const result = await runner.run({
+        uid: TEST_UID, cid: 'c-claude-image', agentId: 'a',
+        cli: 'claude', prompt: 'generate an image', cwd: tmpDir,
+        signal: new AbortController().signal,
+        onEvent: e => events.push(e),
+      });
+
+      expect(result.status).toBe('completed');
+      expect(events.find(event => event.type === 'media-output')).toEqual({
+        type: 'media-output',
+        source: 'claude',
+        callId: 'image-2',
+        items: [{
+          uri: 'https://cdn.example/generated.webp?token=signed',
+          mediaType: 'image/webp',
+          localName: 'cli-remote-06c6a1b1220c68fd1dc1c9a1.webp',
+        }],
+        materializedCount: 1,
+        scheduledCount: 1,
+        rejectedCount: 2,
+      });
+      const fileEvent = events.find(event => event.type === 'file-change');
+      expect(fileEvent).toMatchObject({
+        scope: 'conversation-media', source: 'cli_media_output', synthetic: true,
+      });
+      expect(path.basename(fileEvent.paths[0])).toMatch(/^result(?:-.+)?\.png$/);
+      expect(fs.readFileSync(fileEvent.paths[0])).toEqual(Buffer.from(PNG_1X1_BASE64, 'base64'));
+
+      const eventPath = path.join(
+        tmpDir, TEST_UID, 'local', 'file_cache', 'local-agent-runs', result.runId, 'events.jsonl',
+      );
+      const persistedText = fs.readFileSync(eventPath, 'utf8');
+      expect(persistedText).not.toContain(PNG_1X1_BASE64);
+      expect(persistedText).not.toContain(outsidePath);
+      expect(persistedText).not.toContain('javascript:');
+      expect(persistedText).toContain('https://cdn.example/generated.webp?token=signed');
+    } finally {
+      fs.rmSync(outsidePath, { force: true });
+    }
+  });
+
+  it('finishes the turn before serial background image/video downloads materialize stable conversation media', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    const imageBytes = Buffer.from(PNG_1X1_BASE64, 'base64');
+    const releases = new Map<string, () => void>();
+    remoteMediaDownloadMock.download.mockImplementation(async (url: string, options: any) => {
+      await new Promise<void>((resolve) => { releases.set(url, resolve); });
+      const body = url.includes('/clip.mp4') ? MP4_FTYP : imageBytes;
+      options.validate?.(body);
+      return { status: 200, body };
+    });
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({
+        type: 'media-output',
+        source: 'claude',
+        callId: 'media-remote',
+        items: [
+          { uri: 'https://8.8.8.8/generated.png?token=signed', mediaType: 'image/png' },
+          { uri: 'https://8.8.4.4/clip.mp4?token=signed', mediaType: 'video/mp4' },
+          { uri: 'http://127.0.0.1/private.png', mediaType: 'image/png' },
+        ],
+      });
+      onEvent({ type: 'done', status: 'completed', output: '', durationMs: 1 });
+    };
+
+    const runner = await loadRunner();
+    const layout = await import('../../../../src/main/util/project-layout');
+    const messageFile = layout.conversationMessageReadFile(TEST_UID, 'c-remote-media');
+    fs.mkdirSync(path.dirname(messageFile), { recursive: true });
+    fs.writeFileSync(messageFile, '{}\n');
+    const events: any[] = [];
+    const result = await runner.run({
+      uid: TEST_UID, cid: 'c-remote-media', agentId: 'a',
+      cli: 'claude', prompt: 'generate media', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: event => events.push(event),
+    });
+
+    expect(result.status).toBe('completed');
+    expect(events.at(-1)).toMatchObject({ type: 'done', status: 'completed' });
+    await vi.waitFor(() => expect(remoteMediaDownloadMock.download).toHaveBeenCalledTimes(1));
+    const mediaEvent = events.find(event => event.type === 'media-output');
+    expect(mediaEvent).toMatchObject({
+      source: 'claude',
+      callId: 'media-remote',
+      materializedCount: 0,
+      scheduledCount: 2,
+      rejectedCount: 0,
+      backgroundSkippedCount: 1,
+    });
+    expect(mediaEvent.items).toEqual([
+      expect.objectContaining({
+        uri: 'https://8.8.8.8/generated.png?token=signed',
+        mediaType: 'image/png',
+        localName: expect.stringMatching(/^cli-remote-[a-f0-9]{24}\.png$/),
+      }),
+      expect.objectContaining({
+        uri: 'https://8.8.4.4/clip.mp4?token=signed',
+        mediaType: 'video/mp4',
+        localName: expect.stringMatching(/^cli-remote-[a-f0-9]{24}\.mp4$/),
+      }),
+      { uri: 'http://127.0.0.1/private.png', mediaType: 'image/png' },
+    ]);
+    expect(events.filter(event => event.type === 'file-change')).toHaveLength(0);
+
+    releases.get('https://8.8.8.8/generated.png?token=signed')?.();
+    await vi.waitFor(() => expect(remoteMediaDownloadMock.download).toHaveBeenCalledTimes(2));
+    releases.get('https://8.8.4.4/clip.mp4?token=signed')?.();
+    const attachmentDir = layout.chatAttachmentDirForConversation(TEST_UID, 'c-remote-media');
+    await vi.waitFor(() => {
+      expect(fs.existsSync(path.join(attachmentDir, mediaEvent.items[0].localName))).toBe(true);
+      expect(fs.existsSync(path.join(attachmentDir, mediaEvent.items[1].localName))).toBe(true);
+    });
+    expect(fs.readFileSync(path.join(attachmentDir, mediaEvent.items[0].localName))).toEqual(imageBytes);
+    expect(fs.readFileSync(path.join(attachmentDir, mediaEvent.items[1].localName))).toEqual(MP4_FTYP);
+    await new Promise<void>(resolve => { setImmediate(resolve); });
+    await expect(runner.stopBackgroundRuns('already drained', 10)).resolves.toBe(0);
+  });
+
+  it('does not let a late background download recreate media after its conversation is deleted', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    const imageBytes = Buffer.from(PNG_1X1_BASE64, 'base64');
+    let release!: () => void;
+    remoteMediaDownloadMock.download.mockImplementation(async (_url: string, options: any) => {
+      await new Promise<void>((resolve) => { release = resolve; });
+      options.validate?.(imageBytes);
+      return { status: 200, body: imageBytes };
+    });
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({
+        type: 'media-output',
+        source: 'claude',
+        items: [{ uri: 'https://8.8.8.8/deleted.png', mediaType: 'image/png' }],
+      });
+      onEvent({ type: 'done', status: 'completed', output: '' });
+    };
+
+    const runner = await loadRunner();
+    const layout = await import('../../../../src/main/util/project-layout');
+    const attachments = await import('../../../../src/main/features/chat_attachments');
+    const cid = 'c-deleted-background-media';
+    const messageFile = layout.conversationMessageReadFile(TEST_UID, cid);
+    const attachmentDir = layout.chatAttachmentDirForConversation(TEST_UID, cid);
+    fs.mkdirSync(path.dirname(messageFile), { recursive: true });
+    fs.writeFileSync(messageFile, '{}\n');
+
+    const events: any[] = [];
+    await runner.run({
+      uid: TEST_UID, cid, agentId: 'a',
+      cli: 'claude', prompt: 'generate image', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: event => events.push(event),
+    });
+    await vi.waitFor(() => expect(remoteMediaDownloadMock.download).toHaveBeenCalledOnce());
+    expect(events.at(-1)).toMatchObject({ type: 'done', status: 'completed' });
+
+    fs.unlinkSync(messageFile);
+    await attachments.purgeByCid(TEST_UID, cid);
+    release();
+    await new Promise<void>(resolve => { setImmediate(resolve); });
+
+    expect(fs.existsSync(attachmentDir)).toBe(false);
+    await expect(runner.stopBackgroundRuns('already drained', 10)).resolves.toBe(0);
+  });
+
+  it('cancels background media for one deleted conversation without touching another', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    const signals = new Map<string, AbortSignal>();
+    remoteMediaDownloadMock.download.mockImplementation(async (url: string, options: any) => {
+      signals.set(url, options.signal);
+      await new Promise<never>((_resolve, reject) => {
+        if (options.signal.aborted) reject(new Error('aborted'));
+        else options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      });
+    });
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({
+        type: 'media-output',
+        source: 'claude',
+        items: [{ uri: `https://8.8.8.8/${currentCid}.png`, mediaType: 'image/png' }],
+      });
+      onEvent({ type: 'done', status: 'completed', output: '' });
+    };
+
+    const runner = await loadRunner();
+    const layout = await import('../../../../src/main/util/project-layout');
+    let currentCid = 'c-delete-cancel-one';
+    for (const cid of [currentCid, 'c-delete-cancel-two']) {
+      currentCid = cid;
+      const messageFile = layout.conversationMessageReadFile(TEST_UID, cid);
+      fs.mkdirSync(path.dirname(messageFile), { recursive: true });
+      fs.writeFileSync(messageFile, '{}\n');
+      await runner.run({
+        uid: TEST_UID, cid, agentId: 'a',
+        cli: 'claude', prompt: 'generate image', cwd: tmpDir,
+        signal: new AbortController().signal,
+        onEvent: () => {},
+      });
+    }
+    await vi.waitFor(() => expect(signals.size).toBe(2));
+
+    expect(runner.cancelBackgroundMediaForConversation(TEST_UID, 'c-delete-cancel-one')).toBe(1);
+    expect(signals.get('https://8.8.8.8/c-delete-cancel-one.png')?.aborted).toBe(true);
+    expect(signals.get('https://8.8.8.8/c-delete-cancel-two.png')?.aborted).toBe(false);
+
+    await runner.stopBackgroundRuns('test cleanup', 1_000);
+  });
+
+  it('aborts old-user media downloads synchronously when the active account changes', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    let downloadSignal: AbortSignal | undefined;
+    remoteMediaDownloadMock.download.mockImplementation(async (_url: string, options: any) => {
+      downloadSignal = options.signal;
+      await new Promise<never>((_resolve, reject) => {
+        if (options.signal.aborted) reject(new Error('aborted'));
+        else options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      });
+    });
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({
+        type: 'media-output',
+        source: 'claude',
+        items: [{ uri: 'https://8.8.8.8/account.png', mediaType: 'image/png' }],
+      });
+      onEvent({ type: 'done', status: 'completed', output: '' });
+    };
+
+    const runner = await loadRunner();
+    const layout = await import('../../../../src/main/util/project-layout');
+    const users = await import('../../../../src/main/features/users');
+    const cid = 'c-account-background-media';
+    const messageFile = layout.conversationMessageReadFile(TEST_UID, cid);
+    fs.mkdirSync(path.dirname(messageFile), { recursive: true });
+    fs.writeFileSync(messageFile, '{}\n');
+    await runner.run({
+      uid: TEST_UID, cid, agentId: 'a',
+      cli: 'claude', prompt: 'generate image', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+    });
+    await vi.waitFor(() => expect(downloadSignal).toBeDefined());
+
+    users.activateUser('u2');
+
+    expect(downloadSignal?.aborted).toBe(true);
+    await new Promise<void>(resolve => { setImmediate(resolve); });
+    await expect(runner.stopBackgroundRuns('already drained', 10)).resolves.toBe(0);
+    expect(fs.existsSync(layout.chatAttachmentDirForConversation(TEST_UID, cid))).toBe(false);
+    users.activateUser(TEST_UID);
+  });
+
+  it('cancels and drains background media work during bounded app shutdown cleanup', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    let downloadSignal: AbortSignal | undefined;
+    remoteMediaDownloadMock.download.mockImplementation(async (_url: string, options: any) => {
+      downloadSignal = options.signal;
+      await new Promise<never>((_resolve, reject) => {
+        if (options.signal.aborted) reject(new Error('aborted'));
+        else options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      });
+    });
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({
+        type: 'media-output',
+        source: 'claude',
+        items: [{ uri: 'https://8.8.8.8/shutdown.png', mediaType: 'image/png' }],
+      });
+      onEvent({ type: 'done', status: 'completed', output: '' });
+    };
+
+    const runner = await loadRunner();
+    const layout = await import('../../../../src/main/util/project-layout');
+    const cid = 'c-shutdown-background-media';
+    const messageFile = layout.conversationMessageReadFile(TEST_UID, cid);
+    fs.mkdirSync(path.dirname(messageFile), { recursive: true });
+    fs.writeFileSync(messageFile, '{}\n');
+    await runner.run({
+      uid: TEST_UID, cid, agentId: 'a',
+      cli: 'claude', prompt: 'generate image', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+    });
+    await vi.waitFor(() => expect(downloadSignal).toBeDefined());
+
+    await expect(runner.stopBackgroundRuns('the app is quitting', 1_000)).resolves.toBe(1);
+
+    expect(downloadSignal?.aborted).toBe(true);
+    expect(fs.existsSync(layout.chatAttachmentDirForConversation(TEST_UID, cid))).toBe(false);
+    await expect(runner.stopBackgroundRuns('already drained', 10)).resolves.toBe(0);
+  });
+
+  it('bounds one turn to four background media downloads', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({
+        type: 'media-output',
+        source: 'claude',
+        items: Array.from({ length: 5 }, (_, index) => ({
+          uri: `https://8.8.8.${index + 1}/generated-${index}.png`,
+          mediaType: 'image/png',
+        })),
+      });
+      onEvent({ type: 'done', status: 'completed', output: '' });
+    };
+
+    const runner = await loadRunner();
+    const events: any[] = [];
+    await runner.run({
+      uid: TEST_UID, cid: 'c-bounded-background-media', agentId: 'a',
+      cli: 'claude', prompt: 'generate images', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: event => events.push(event),
+    });
+
+    expect(events.find(event => event.type === 'media-output')).toMatchObject({
+      scheduledCount: 4,
+      backgroundSkippedCount: 1,
+    });
+    await new Promise<void>(resolve => { setImmediate(resolve); });
+    await runner.stopBackgroundRuns('test cleanup', 100);
+  });
+
+  it('shares one 128 MiB reservation budget across concurrent background media runs', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    remoteMediaDownloadMock.download.mockImplementation(async (_url: string, options: any) => {
+      await new Promise<never>((_resolve, reject) => {
+        if (options.signal.aborted) reject(new Error('aborted'));
+        else options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      });
+    });
+    let pendingItems: Array<{ uri: string; mediaType: string }> = [];
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({ type: 'media-output', source: 'claude', items: pendingItems });
+      onEvent({ type: 'done', status: 'completed', output: '' });
+    };
+
+    const runner = await loadRunner();
+    const layout = await import('../../../../src/main/util/project-layout');
+    const runWith = async (cid: string, items: typeof pendingItems) => {
+      pendingItems = items;
+      const messageFile = layout.conversationMessageReadFile(TEST_UID, cid);
+      fs.mkdirSync(path.dirname(messageFile), { recursive: true });
+      fs.writeFileSync(messageFile, '{}\n');
+      const events: any[] = [];
+      await runner.run({
+        uid: TEST_UID, cid, agentId: 'a',
+        cli: 'claude', prompt: 'generate media', cwd: tmpDir,
+        signal: new AbortController().signal,
+        onEvent: event => events.push(event),
+      });
+      return events.find(event => event.type === 'media-output');
+    };
+
+    const first = await runWith('c-global-budget-one', [
+      { uri: 'https://8.8.8.8/one.mp4', mediaType: 'video/mp4' },
+      { uri: 'https://8.8.4.4/two.mp4', mediaType: 'video/mp4' },
+    ]);
+    const second = await runWith('c-global-budget-two', [
+      { uri: 'https://1.1.1.1/three.png', mediaType: 'image/png' },
+    ]);
+
+    expect(first).toMatchObject({ scheduledCount: 2 });
+    expect(first).not.toHaveProperty('backgroundSkippedCount');
+    expect(second).toMatchObject({ scheduledCount: 0, backgroundSkippedCount: 1 });
+    await expect(runner.stopBackgroundRuns('test cleanup', 1_000)).resolves.toBe(2);
+  });
+
+  it('rejects malformed, unsupported, oversized, and unsafe-dimension Codex image payloads', async () => {
+    const runner = await loadRunner();
+    expect(runner.decodeCodexGeneratedImageResult('completed')).toEqual({ ok: false, reason: 'not_image' });
+    expect(runner.decodeCodexGeneratedImageResult('iVBORw0KGgo!!!')).toEqual({ ok: false, reason: 'malformed' });
+    expect(runner.decodeCodexGeneratedImageResult('data:image/jpeg;base64,/9j/2Q==')).toEqual({
+      ok: false, reason: 'unsupported_format',
+    });
+    expect(runner.decodeCodexGeneratedImageResult(PNG_1X1_BASE64, 16)).toEqual({
+      ok: false, reason: 'too_large',
+    });
+    const unsafeDimensions = Buffer.from(PNG_1X1_BASE64, 'base64');
+    unsafeDimensions.writeUInt32BE(20_000, 16);
+    expect(runner.decodeCodexGeneratedImageResult(unsafeDimensions.toString('base64'))).toEqual({
+      ok: false, reason: 'invalid_dimensions',
+    });
   });
 
   it('rejects unregistered CLI types cleanly', async () => {
