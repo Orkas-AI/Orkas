@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { redactPaths } from '../../../src/main/util/redact';
-import { logErrorRef, logErrorSummary, maskId, safeUrlAction } from '../../../src/main/util/log-redact';
+import {
+  logErrorRef,
+  logErrorSummary,
+  maskId,
+  safeUrlAction,
+  sanitizeLogText,
+} from '../../../src/main/util/log-redact';
 
 describe('log-redact', () => {
   it('masks opaque account and local ids while preserving anonymous', () => {
@@ -41,6 +47,19 @@ describe('log-redact', () => {
     expect(serialized).not.toContain('/Users/test');
     expect(serialized).not.toContain('Private Clips');
     expect(serialized).not.toContain('not-a-directory');
+  });
+
+  it('preserves safe URLs adjacent to cloud paths while redacting secrets', () => {
+    const text = sanitizeLogText(
+      'failed cloud/agents/abc123/skills/private/SKILL.md via https://example.com/sync/sts?token=secret ghp_abcdefghijklmnopqrstuvwxyz',
+    );
+
+    expect(text).toContain('<cloud-path:');
+    expect(text).toContain('https://example.com/sync/sts');
+    expect(text).toContain('***REDACTED***');
+    expect(text).not.toContain('private/SKILL.md');
+    expect(text).not.toContain('token=secret');
+    expect(text).not.toContain('ghp_abcdefghijklmnopqrstuvwxyz');
   });
 
   it('redacts local paths in subprocess stderr tails', () => {
