@@ -481,6 +481,77 @@ describe('persisted tool-result retrieval', () => {
     expect((ctx.state.toolResultReadLedger as { readKeys: Set<string> }).readKeys.size).toBe(0);
   });
 
+  it('keeps the main event loop responsive while querying the maximum record count', async () => {
+    const records = Array.from({ length: 250_000 }, () => ({ amount: 1 }));
+    const maximumRecordsRef = toolResultRefForPath(persistToolResult(
+      dir,
+      'connector',
+      JSON.stringify(records),
+    ));
+    const mainLoopHeartbeat = new Promise<void>((resolve) => setImmediate(resolve));
+    let settled = false;
+    const pending = getTool(tools, 'tool_result').execute({
+      action: 'query',
+      requests: [{ ref: maximumRecordsRef, operation: 'sum', field: 'amount' }],
+    }, ctx).finally(() => { settled = true; });
+
+    await mainLoopHeartbeat;
+    expect(settled).toBe(false);
+
+    const result = await pending;
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toContain('scanned="250000"');
+    expect(queryRows(result.content)).toEqual([{ value: 250_000 }]);
+  });
+
+  it('terminates an in-flight query worker when the tool context is aborted', async () => {
+    const records = Array.from({ length: 250_000 }, (_, index) => ({
+      amount: index % 17,
+      region: index % 2 ? 'PH' : 'SG',
+    }));
+    const cancellableRef = toolResultRefForPath(persistToolResult(
+      dir,
+      'connector',
+      JSON.stringify(records),
+    ));
+    const controller = new AbortController();
+    const cancellableCtx: ToolContext = { ...ctx, signal: controller.signal };
+    const pending = getTool(tools, 'tool_result').execute({
+      action: 'query',
+      requests: [{
+        ref: cancellableRef,
+        operation: 'sum',
+        field: 'amount',
+        group_by: ['region'],
+      }],
+    }, cancellableCtx);
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    expect((ctx.state.toolResultReadLedger as { readKeys: Set<string> }).readKeys.size).toBe(0);
+  });
+
+  it('returns a bounded recovery error when the off-thread query boundary fails', async () => {
+    const failedTools = createToolResultTools({
+      toolResultsDir: dir,
+      async queryExecutor() {
+        throw new Error('private worker detail');
+      },
+    });
+    const result = await getTool(failedTools, 'tool_result').execute({
+      action: 'query',
+      requests: [{ ref, operation: 'count', match: 'needle', count_unit: 'occurrences' }],
+    }, ctx);
+
+    expect(result).toMatchObject({ isError: true });
+    expect(result.content).toContain('E_RESULT_QUERY_READ');
+    expect(result.content).toMatch(/Re-run the original tool/);
+    expect(result.content).not.toContain('private worker detail');
+    expect((ctx.state.toolResultReadLedger as { readKeys: Set<string> }).readKeys.size).toBe(0);
+  });
+
   it('reads an exact bounded chunk and returns a continuation cursor', async () => {
     const result = await getTool(tools, 'tool_result').execute({
       action: 'read',

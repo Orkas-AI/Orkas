@@ -12,12 +12,15 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import { Worker } from 'node:worker_threads';
 import type { AgentTool, ToolContext } from '#core-agent';
+import { createLogger } from '../../logger';
 import { CLOUD_TOOL_RESULT_MAX_AGE_DAYS, estimateToolResultTokens } from '../../util/tool-result-cap';
 import {
   TOOL_RESULT_QUERY_MAX_INPUT_BYTES,
   aggregateToolResultData,
   type ToolResultAggregateRequest,
+  type ToolResultAggregateResult,
   type ToolResultQueryFilter,
 } from '../../util/tool-result-data';
 
@@ -31,6 +34,25 @@ const TOOL_RESULT_REF_RE = new RegExp(TOOL_RESULT_REF_SCHEMA_PATTERN);
 const TOOL_RESULT_FILE_SCAN_BYTES = 64 * 1024;
 const TOOL_RESULT_REF_DESCRIPTION =
   'Literal opaque ref from <persisted-output ref="...">. It has tool.hash form; never use a tool-call ID such as call_...';
+const TOOL_RESULT_QUERY_WORKER_SOURCE = String.raw`
+'use strict';
+const { parentPort, workerData } = require('node:worker_threads');
+require(workerData.tsxCjsPath);
+const { aggregateToolResultData } = require(workerData.dataModulePath);
+parentPort.on('message', (message) => {
+  try {
+    const bytes = message.bytes;
+    const content = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('utf8');
+    parentPort.postMessage({
+      id: message.id,
+      result: aggregateToolResultData(content, message.request),
+    });
+  } catch {
+    parentPort.postMessage({ id: message && message.id, failed: true });
+  }
+});
+`;
+const log = createLogger('tool-result-query');
 
 export type ToolResultReadLedger = {
   epoch: number;
@@ -40,7 +62,150 @@ export type ToolResultReadLedger = {
 
 type ToolResultToolsOpts = {
   toolResultsDir: string;
+  queryExecutor?: PersistedToolResultQueryExecutor;
 };
+
+type PersistedToolResultQueryExecutor = (
+  filePath: string,
+  request: ToolResultAggregateRequest,
+  signal?: AbortSignal,
+) => Promise<ToolResultAggregateResult>;
+
+type PendingWorkerQuery = {
+  worker: Worker;
+  resolve: (result: ToolResultAggregateResult) => void;
+  reject: (reason: Error) => void;
+  cleanup: () => void;
+};
+
+class PersistedToolResultQueryWorker {
+  private worker: Worker | null = null;
+  private nextId = 1;
+  private readonly pending = new Map<number, PendingWorkerQuery>();
+  private disposed = false;
+
+  async query(
+    filePath: string,
+    request: ToolResultAggregateRequest,
+    signal?: AbortSignal,
+  ): Promise<ToolResultAggregateResult> {
+    throwIfQueryAborted(signal);
+    const stat = await fs.promises.stat(filePath);
+    if (stat.size > TOOL_RESULT_QUERY_MAX_INPUT_BYTES) return queryTooLargeResult();
+    const bytes = await fs.promises.readFile(filePath, signal ? { signal } : undefined);
+    throwIfQueryAborted(signal);
+    if (bytes.byteLength > TOOL_RESULT_QUERY_MAX_INPUT_BYTES) return queryTooLargeResult();
+    return this.aggregate(bytes, request, signal);
+  }
+
+  async dispose(): Promise<void> {
+    this.disposed = true;
+    const worker = this.worker;
+    this.worker = null;
+    if (!worker) return;
+    const error = new Error('Persisted-result query worker disposed.');
+    for (const [id, pending] of this.pending) {
+      if (pending.worker !== worker) continue;
+      this.pending.delete(id);
+      pending.cleanup();
+      pending.reject(error);
+    }
+    await worker.terminate();
+  }
+
+  private aggregate(
+    bytes: Buffer,
+    request: ToolResultAggregateRequest,
+    signal?: AbortSignal,
+  ): Promise<ToolResultAggregateResult> {
+    throwIfQueryAborted(signal);
+    const worker = this.ensureWorker();
+    const id = this.nextId++;
+    return new Promise<ToolResultAggregateResult>((resolve, reject) => {
+      const onAbort = () => {
+        const reason = queryAbortError(signal);
+        this.failWorker(worker, reason);
+        void worker.terminate();
+      };
+      const cleanup = () => signal?.removeEventListener('abort', onAbort);
+      this.pending.set(id, { worker, resolve, reject, cleanup });
+      signal?.addEventListener('abort', onAbort, { once: true });
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      try {
+        const transfer = bytes.buffer instanceof ArrayBuffer ? [bytes.buffer] : [];
+        worker.postMessage({ id, bytes, request }, transfer);
+      } catch {
+        this.pending.delete(id);
+        cleanup();
+        reject(new Error('Persisted-result query worker could not accept input.'));
+      }
+    });
+  }
+
+  private ensureWorker(): Worker {
+    if (this.disposed) throw new Error('Persisted-result query worker is closed.');
+    if (this.worker) return this.worker;
+    const worker = new Worker(TOOL_RESULT_QUERY_WORKER_SOURCE, {
+      eval: true,
+      workerData: {
+        tsxCjsPath: require.resolve('tsx/cjs'),
+        dataModulePath: require.resolve('../../util/tool-result-data.ts'),
+      },
+    });
+    worker.on('message', (message: unknown) => this.onMessage(worker, message));
+    worker.once('error', () => {
+      this.failWorker(worker, new Error('Persisted-result query worker failed.'));
+    });
+    worker.once('exit', (code) => {
+      if (this.disposed || (this.worker !== worker && !this.hasPendingFor(worker))) return;
+      this.failWorker(worker, new Error(`Persisted-result query worker exited with code ${code}.`));
+    });
+    this.worker = worker;
+    return worker;
+  }
+
+  private onMessage(worker: Worker, raw: unknown): void {
+    if (!raw || typeof raw !== 'object') {
+      this.failWorker(worker, new Error('Persisted-result query worker returned an invalid response.'));
+      void worker.terminate();
+      return;
+    }
+    const message = raw as { id?: unknown; result?: unknown; failed?: unknown };
+    if (!Number.isInteger(message.id)) {
+      this.failWorker(worker, new Error('Persisted-result query worker omitted its request id.'));
+      void worker.terminate();
+      return;
+    }
+    const id = Number(message.id);
+    const pending = this.pending.get(id);
+    if (!pending || pending.worker !== worker) return;
+    this.pending.delete(id);
+    pending.cleanup();
+    const result = message.result as ToolResultAggregateResult | undefined;
+    if (message.failed === true || !result || typeof result.ok !== 'boolean') {
+      pending.reject(new Error('Persisted-result query worker could not process the input.'));
+      return;
+    }
+    pending.resolve(result);
+  }
+
+  private failWorker(worker: Worker, reason: Error): void {
+    if (this.worker === worker) this.worker = null;
+    for (const [id, pending] of this.pending) {
+      if (pending.worker !== worker) continue;
+      this.pending.delete(id);
+      pending.cleanup();
+      pending.reject(reason);
+    }
+  }
+
+  private hasPendingFor(worker: Worker): boolean {
+    return [...this.pending.values()].some((pending) => pending.worker === worker);
+  }
+}
 
 export function createToolResultTools(opts: ToolResultToolsOpts): AgentTool[] {
   return [createToolResultTool(opts)];
@@ -160,8 +325,18 @@ function createQueryTool(opts: ToolResultToolsOpts): AgentTool {
       const ledger = readLedger(ctx);
       const batch = batchItems(input, 'queries', ['ref', 'operation']);
       if (batch.error) return batch.error;
-      return executeBatch(batch.items, ledger, (item, maxOutputTokens) =>
-        executeQueryItem(opts, item, ledger, maxOutputTokens));
+      const worker = opts.queryExecutor ? null : new PersistedToolResultQueryWorker();
+      const queryExecutor = opts.queryExecutor ?? worker!.query.bind(worker);
+      try {
+        return await executeBatch(batch.items, ledger, (item, maxOutputTokens) =>
+          executeQueryItem(opts, item, ledger, maxOutputTokens, queryExecutor, ctx.signal));
+      } finally {
+        try {
+          await worker?.dispose();
+        } catch {
+          log.warn('persisted-result query worker cleanup failed', { phase: 'terminate' });
+        }
+      }
     },
   };
 }
@@ -282,11 +457,14 @@ function batchItems(
   return { items: [input] };
 }
 
-function executeBatch(
+async function executeBatch(
   items: Record<string, unknown>[],
   ledger: ToolResultReadLedger | null,
-  executeItem: (item: Record<string, unknown>, maxOutputTokens: number) => RetrievalItemResult,
-): RetrievalItemResult {
+  executeItem: (
+    item: Record<string, unknown>,
+    maxOutputTokens: number,
+  ) => RetrievalItemResult | Promise<RetrievalItemResult>,
+): Promise<RetrievalItemResult> {
   const outputs: string[] = [];
   let successes = 0;
   let remainingOutputTokens = Math.min(
@@ -305,7 +483,7 @@ function executeBatch(
       Math.floor((remainingOutputTokens - separatorTokens) / remainingItems),
     );
     if (itemBudget < 1) break;
-    const result = executeItem(item, itemBudget);
+    const result = await executeItem(item, itemBudget);
     const content = prefixWithinTokenBudget(result.content, itemBudget);
     outputs.push(content);
     remainingOutputTokens = Math.max(
@@ -321,12 +499,14 @@ function executeBatch(
   };
 }
 
-function executeQueryItem(
+async function executeQueryItem(
   opts: ToolResultToolsOpts,
   input: Record<string, unknown>,
   ledger: ToolResultReadLedger | null,
   maxOutputTokens: number,
-): RetrievalItemResult {
+  queryExecutor: PersistedToolResultQueryExecutor,
+  signal?: AbortSignal,
+): Promise<RetrievalItemResult> {
   const ref = String(input.ref || '').trim();
   const operation = String(input.operation || '').trim() as ToolResultAggregateRequest['operation'];
   if (!ref || !operation) return error('E_BAD_INPUT', '`ref` and `operation` are required.');
@@ -359,16 +539,12 @@ function executeQueryItem(
 
   let content: string;
   try {
-    if (fs.statSync(resolved.path).size > TOOL_RESULT_QUERY_MAX_INPUT_BYTES) {
-      return error(
-        'E_RESULT_QUERY_TOO_LARGE',
-        `This result exceeds the ${TOOL_RESULT_QUERY_MAX_INPUT_BYTES}-byte deterministic query limit. Use search or paged read instead.`,
-      );
-    }
-    const result = aggregateToolResultData(fs.readFileSync(resolved.path, 'utf8'), request);
+    const result = await queryExecutor(resolved.path, request, signal);
     if (result.ok === false) return error(result.code, result.message);
     content = renderAggregateResult(ref, request, result, budget);
-  } catch {
+  } catch (queryError) {
+    if (signal?.aborted || isQueryAbortError(queryError)) throw queryError;
+    log.warn('persisted-result query failed', { phase: 'read_or_worker' });
     return error(
       'E_RESULT_QUERY_READ',
       'The persisted result could not be read for querying. Re-run the original tool or use a different retained result ref.',
@@ -376,6 +552,34 @@ function executeQueryItem(
   }
   commitRead(ledger, key, estimateToolResultTokens(content));
   return { content };
+}
+
+function queryTooLargeResult(): Extract<ToolResultAggregateResult, { ok: false }> {
+  return {
+    ok: false,
+    code: 'E_RESULT_QUERY_TOO_LARGE',
+    message:
+      `This result exceeds the ${TOOL_RESULT_QUERY_MAX_INPUT_BYTES}-byte deterministic query limit. `
+      + 'Use search or paged read instead.',
+  };
+}
+
+function queryAbortError(signal?: AbortSignal): Error {
+  if (signal?.reason instanceof Error) return signal.reason;
+  return Object.assign(new Error('Persisted-result query aborted.'), {
+    name: 'AbortError',
+    code: 'ABORT_ERR',
+  });
+}
+
+function throwIfQueryAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw queryAbortError(signal);
+}
+
+function isQueryAbortError(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const errorValue = value as { name?: unknown; code?: unknown };
+  return errorValue.name === 'AbortError' || errorValue.code === 'ABORT_ERR';
 }
 
 function renderAggregateResult(
