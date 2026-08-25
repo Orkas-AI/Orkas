@@ -309,6 +309,34 @@ describe('group_chat failed-turn smart retry', () => {
     expect(resolved.value.enqueue.failedTurnRetryMode).toBe('resume');
   });
 
+  it('does not recover a missing roster entry for a disabled Agent', async () => {
+    const cid = 'disabled-agent-retry-cid';
+    const agentId = 'disabled-cli-agent';
+    const paths = await import('../../../../src/main/paths');
+    const dir = paths.agentDir(UID, agentId);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify({
+      agent_id: agentId,
+      name: 'Disabled CLI Agent',
+      runtime: { kind: 'cli', cli: 'codex' },
+      created_at: 't',
+      updated_at: 't',
+    }));
+    const enabled = await import('../../../../src/main/features/component_enabled');
+    enabled.setAgentEnabled(UID, agentId, false);
+    await writeAttempt(cid, { failure_kind: 'runtime', failure_code: 'cli_timeout' }, agentId);
+
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const resolved = await groupChat.resolveFailedTurnRetry({
+      userId: UID,
+      cid,
+      failedMessageId: `${cid}-failed`,
+      visibleText: 'Continue',
+    });
+
+    expect(resolved).toEqual({ ok: false, error: 'retry actor is unavailable' });
+  });
+
   it('replays the authoritative request and attachments when no recoverable state exists', async () => {
     const cid = 'restart-cid';
     await writeAttempt(cid, { failure_kind: 'config', failure_code: 'model_not_configured' });

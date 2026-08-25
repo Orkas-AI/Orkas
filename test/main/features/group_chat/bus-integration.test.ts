@@ -2213,6 +2213,76 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     expect(rows.some((row: any) => String(row.model_text || '').includes('<orchestration-resume>'))).toBe(false);
   }, 15_000);
 
+  it('restores a missing Agent roster entry before persisting and dispatching a failed-turn retry', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const paths = await import('../../../../src/main/paths');
+    const agentSid = state.buildGmemberSessionId(cid, AGENT_ID);
+    const sourceId = `${cid}-source`;
+    const failedId = `${cid}-failed`;
+    const retryClientId = `retry-missing-roster-${cid}`;
+
+    // A synced/legacy task can retain its authoritative message history while
+    // the derived members.json contains only the reserved actors.
+    await state.seedReservedActors(TEST_UID, cid);
+    const messageFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    fs.writeFileSync(messageFile, [
+      JSON.stringify({
+        id: sourceId,
+        ts: '2026-08-25T09:00:00.000Z',
+        from: 'user',
+        to: [AGENT_ID],
+        text: 'Run the original task.',
+        model_text: 'Run the authoritative original task.',
+      }),
+      JSON.stringify({
+        id: failedId,
+        ts: '2026-08-25T09:01:00.000Z',
+        from: AGENT_ID,
+        to: ['user'],
+        text: 'The Agent timed out.',
+        failure_kind: 'runtime',
+        failure_code: 'cli_timeout',
+        source_message_id: sourceId,
+        turn_id: `${cid}-turn`,
+      }),
+    ].join('\n') + '\n');
+    expect((await state.readMembers(TEST_UID, cid)).actors.some((actor) => actor.id === AGENT_ID))
+      .toBe(false);
+
+    _setScript(agentSid, [
+      { type: 'final', text: 'MISSING-ROSTER-RETRY-SUCCESS: original task resumed.' },
+    ]);
+
+    const retry = await groupChat.retryFailedTurn({
+      userId: TEST_UID,
+      cid,
+      failedMessageId: failedId,
+      visibleText: 'Continue',
+      client_msg_id: retryClientId,
+    });
+    expect(retry.ok).toBe(true);
+    await waitForQuiescent(TEST_UID, cid, 5000);
+
+    const members = await state.readMembers(TEST_UID, cid);
+    expect(members.actors).toContainEqual(expect.objectContaining({
+      id: AGENT_ID,
+      kind: 'agent',
+    }));
+    const rows = fs.readFileSync(messageFile, 'utf8')
+      .split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    expect(rows.find((row: any) => row.client_msg_id === retryClientId)).toMatchObject({
+      from: 'user',
+      text: 'Continue',
+      to: [AGENT_ID],
+    });
+    expect(rows.some((row: any) => (
+      row.from === AGENT_ID
+      && String(row.text || '').includes('MISSING-ROSTER-RETRY-SUCCESS')
+    ))).toBe(true);
+  }, 15_000);
+
   it.each(['dispatch_to', 'hand_off_to'] as const)(
     '%s relies on canonical history for an unresolved “above” reference without duplicating source snapshots',
     async (sourceTool) => {

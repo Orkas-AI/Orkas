@@ -26,7 +26,7 @@ import { fileEditLock } from '../../util/locks';
 
 import {
   COMMANDER_ID, USER_ID, readMembers, readState, seedReservedActors, purgeGroupDir,
-  setCodingProjectDir, setStatus, actorSessionId,
+  setCodingProjectDir, setStatus, actorSessionId, type Actor,
 } from './state';
 import { isPlaceholderTitle } from './conv_title';
 import {
@@ -438,7 +438,30 @@ export async function resolveFailedTurnRetry(
 
   await seedReservedActors(userId, cid);
   const members = await readMembers(userId, cid);
-  const actor = members.actors.find((item) => item.id === failed.from);
+  let actor: Actor | undefined = members.actors.find((item) => item.id === failed.from);
+  let recoveredAgent: Awaited<ReturnType<typeof import('../agents')['getAgent']>> | null = null;
+  // Conversation history is the durable proof of who produced the failed
+  // reply. Older/synced conversations can retain that canonical JSONL while
+  // their derived members.json roster is missing the Agent. If the same Agent
+  // is still installed and enabled, recover its identity from the registry;
+  // enqueue() will restore membership at its normal recipient boundary before
+  // dispatch. A deleted or disabled Agent remains unavailable.
+  if (!actor && safeId(failed.from)) {
+    try {
+      const agents = await import('../agents');
+      recoveredAgent = await agents.getAgent(failed.from);
+      if (recoveredAgent && recoveredAgent.enabled !== false) {
+        actor = {
+          kind: 'agent',
+          id: recoveredAgent.agent_id,
+          name: recoveredAgent.name,
+          joined_at: failed.ts || nowIso(),
+        };
+      }
+    } catch (err) {
+      log.warn('retry Agent identity recovery failed', { error: logErrorRef(err) });
+    }
+  }
   if (!actor || actor.kind === 'user' || actor.kind === 'worker') {
     return { ok: false, error: 'retry actor is unavailable' };
   }
@@ -446,8 +469,7 @@ export async function resolveFailedTurnRetry(
   let cliRuntime: string | null = null;
   if (actor.kind === 'agent') {
     try {
-      const agents = await import('../agents');
-      const agent = await agents.getAgent(actor.id);
+      const agent = recoveredAgent || await (await import('../agents')).getAgent(actor.id);
       cliRuntime = agent?.runtime?.kind === 'cli' ? agent.runtime.cli : null;
     } catch (err) {
       log.warn('retry CLI runtime inspection failed', { error: logErrorRef(err) });
