@@ -17,20 +17,36 @@ const enumOf = (tool: ReturnType<typeof createCrossSessionMemoryTool>): string[]
   ((tool.inputSchema as any).properties.target.enum as string[]);
 
 describe('cross_session_memory tool › project tier exposure', () => {
-  it('non-project sessions: legacy three-tier schema, no project mention in the description', () => {
+  it('non-project sessions expose three stores and keep routing in the target parameter', () => {
     const tool = createCrossSessionMemoryTool(stubHandler());
+    const target = (tool.inputSchema as any).properties.target;
+    const action = (tool.inputSchema as any).properties.action;
     expect(enumOf(tool)).toEqual(['agent', 'shared', 'user']);
-    expect(tool.description).not.toContain('project:');
-    expect(tool.description).toContain('repo/project conventions -> shared'); // legacy routing line intact
+    expect(tool.description).toContain('durable cross-session memory');
+    expect(action.description).toContain('entries are already injected');
+    expect(target.description).toContain('Defaults to agent');
+    expect(target.description).toContain('user-wide profile/preferences');
+    expect(target.description).toContain('rare cross-project facts');
   });
 
-  it('project sessions: four-tier schema and the belongs-where routing rule', () => {
+  it('project sessions expose four stores with project routing and exact mutation guidance', () => {
     const tool = createCrossSessionMemoryTool(stubHandler(), { includeProjectTier: true });
+    const target = (tool.inputSchema as any).properties.target;
     expect(enumOf(tool)).toEqual(['agent', 'project', 'shared', 'user']);
-    expect(tool.description).toContain('project: durable facts, decisions, outcomes, milestones, and conventions that belong to THIS project only');
-    expect(tool.description).toContain('would this still hold in another project?');
-    expect(tool.description).toContain('Ambiguous matches are');
+    expect(tool.description).toContain('use project_tasks for task progress');
+    expect(target.description).toContain('project-specific facts and decisions');
+    expect(target.description).toContain('this agent\'s reusable lessons');
     expect((tool.inputSchema as any).properties.old_text.description).toContain('must match exactly one entry');
+  });
+
+  it('marks project memory read-only in both selection and parameter guidance', () => {
+    const tool = createCrossSessionMemoryTool(stubHandler(), {
+      includeProjectTier: true,
+      projectTierReadOnly: true,
+    });
+    expect(tool.description).toContain('Project memory is read-only');
+    expect((tool.inputSchema as any).properties.target.description)
+      .toContain('Project is read-only');
   });
 
   it('project target executes against the handler only when the tier is offered', async () => {

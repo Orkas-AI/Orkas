@@ -1,6 +1,6 @@
 {
   "name": "orkas",
-  "version": "2026.8.11",
+  "version": "2026.8.25",
   "private": true,
   "description": "Orkas desktop — Electron + Node one-piece app",
   "main": "bootstrap.cjs",
@@ -14,7 +14,7 @@
     "start": "electron .",
     "prestart:electron": "node scripts/ensure-dev-dependencies.cjs",
     "start:electron": "electron .",
-    "stop": "pkill -9 -f \"$PWD/node_modules/electron/dist\" || true",
+    "stop": "pkill -TERM -f \"^$PWD/node_modules/electron/dist/Orkas\\.app/Contents/MacOS/Electron $PWD\" || true",
     "smoke": "tsx src/main/smoke.ts",
     "typecheck": "tsc --noEmit",
     "test": "npm run test:js && npm run test:resources",
@@ -63,7 +63,7 @@
     "vitest": "^4.1.5"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "^0.83.0",
+    "@earendil-works/pi-ai": "^0.84.2",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "adm-zip": "^0.6.0",
     "async-mutex": "^0.5.0",

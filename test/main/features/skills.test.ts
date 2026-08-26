@@ -885,6 +885,26 @@ describe('skills › listSkills', () => {
     expect(dup[0].description_en).toBe('bx');
   });
 
+  it('uses platform frontmatter descriptions instead of a duplicate legacy sidecar pair', async () => {
+    const dir = path.join(builtinSkillsDir(), 'platform-pair');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'SKILL.md'), [
+      '---',
+      'name: "Platform Pair"',
+      'description_zh: "平台中文"',
+      'description_en: "Platform English"',
+      '---',
+    ].join('\n'));
+    fs.writeFileSync(path.join(dir, '_meta.json'), JSON.stringify({
+      descriptions: { zh: '旧中文', en: 'Legacy English' },
+    }));
+
+    const s = await loadSkills();
+    const found = (await s.listSkills()).find((x) => x.id === 'platform-pair');
+    expect(found?.description_zh).toBe('平台中文');
+    expect(found?.description_en).toBe('Platform English');
+  });
+
   it('exposes marketplace install version and freshness metadata', async () => {
     const builtinDir = path.join(builtinSkillsDir(), 'platform-skill');
     fs.mkdirSync(builtinDir, { recursive: true });
@@ -2003,18 +2023,27 @@ describe('skills › blocking edit-chat failure recovery', () => {
     ['fetch failed', '已生成的导入预览。'],
   ])('persists partial model text before %s', async (error, partial) => {
     writeCustomSkill('alpha');
-    chatImpl.current = async () => ({
-      ok: false,
-      text: partial,
-      error,
-      aborted: false,
-    });
+    let seenOpts: any = null;
+    chatImpl.current = async (opts: any) => {
+      seenOpts = opts;
+      return {
+        ok: false,
+        text: partial,
+        error,
+        aborted: false,
+      };
+    };
     const s = await loadSkills();
 
     const result = await s.sendToSkillChat('u1', 'alpha', '更新 Skill');
     expect(result).toMatchObject({ ok: false, error });
     expect(result.message).toContain(partial);
     expect(result.message).toContain(error);
+    expect(seenOpts.skillList).toEqual([]);
+    expect(seenOpts.systemSkillList).toEqual(['skill-creator', 'package-installer']);
+    expect(seenOpts.readOnlyExtraRoots).toContain(path.join(customSkillsDir(), 'alpha'));
+    expect(seenOpts.readOnlyExtraRoots).not.toContain(customSkillsDir());
+    expect(seenOpts.readOnlyExtraRoots).not.toContain(builtinSkillsDir());
 
     const chatPath = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'skill', 'alpha', 'chat.jsonl');
     const rows = fs.readFileSync(chatPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));

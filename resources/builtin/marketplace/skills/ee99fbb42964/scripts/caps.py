@@ -9,13 +9,15 @@ does with `add_costs` keyed by `_current_step`:
              them to the cap, allocate a per-sub-question fetch budget, and refuse
              to recurse past max_depth. Nothing is dropped silently — trimmed and
              duplicate questions are reported back.
-  account  — given the running ledger of work done (fetches / model_calls / cost
-             per step), aggregate by step and by total, and say `stop: true` the
-             moment any hard ceiling is crossed.
+  account  — count actual attempts directly from caps_plan.json and
+             fetch_ledger.jsonl, or aggregate an explicit work ledger (fetches /
+             model_calls / cost per step), and say `stop: true` the moment any
+             hard ceiling is reached.
 
-The agent supplies the numbers (it owns the loop and the model); this skill does
-the deterministic arithmetic and enforcement. Overrides are clamped to absolute
-ceilings so a mis-configured agent still cannot blow the budget.
+File-backed fetch accounting owns the attempt count instead of trusting a model
+to reproduce it. Explicit accounting remains available for model-call and cost
+totals. Overrides are clamped to absolute ceilings so a mis-configured agent
+still cannot blow the budget.
 
 stdlib only.
 """
@@ -37,6 +39,7 @@ DEFAULT_CAPS = {
     "max_depth": 2,
     "max_cost_usd": None,   # opt-in; enforced only when the agent sets it
 }
+ALLOWED_CAP_FIELDS = frozenset(DEFAULT_CAPS)
 
 # Absolute ceilings — an override may lower a cap but never raise it past these,
 # so even a mis-configured agent cannot trigger the GPT-R exponential blowup.
@@ -79,6 +82,12 @@ def _num(v) -> float:
 def effective_caps(overrides) -> dict:
     caps = dict(DEFAULT_CAPS)
     if isinstance(overrides, dict):
+        unknown = sorted(set(overrides) - ALLOWED_CAP_FIELDS)
+        if unknown:
+            allowed = ", ".join(sorted(ALLOWED_CAP_FIELDS))
+            raise ValueError(
+                f"unknown caps field(s): {', '.join(unknown)}; allowed fields: {allowed}"
+            )
         caps.update({k: v for k, v in overrides.items() if v is not None})
     for k, absolute in ABSOLUTE_CAPS.items():
         val = caps.get(k)
@@ -158,13 +167,21 @@ def account(payload: dict) -> dict:
         agg["cost_usd"] = round(agg["cost_usd"] + c, 6)
         totals["cost_usd"] = round(totals["cost_usd"] + c, 6)
 
-    exceeded = []
+    # A budget that is fully spent must stop, so `>=` is the right test — the
+    # 40th fetch of a 40-fetch allowance is the last legal one, not a violation.
+    # The field used to be called `exceeded`, which reported a compliant 4/4 as
+    # an overrun; an independent judge flagged it and docked budget-continuity
+    # from ~95 to 82 (2026-08-09 E2E). Nothing about the behaviour was wrong,
+    # only the word. Spent-vs-overspent needs no extra field either: `totals`
+    # and `caps` both ride in the same result, so 40 vs 40 and 41 vs 40 are one
+    # comparison away for anyone who cares.
+    limits_reached = []
     if totals["fetches"] >= caps["max_fetches"]:
-        exceeded.append("max_fetches")
+        limits_reached.append("max_fetches")
     if totals["model_calls"] >= caps["max_model_calls"]:
-        exceeded.append("max_model_calls")
+        limits_reached.append("max_model_calls")
     if caps.get("max_cost_usd") is not None and totals["cost_usd"] >= caps["max_cost_usd"]:
-        exceeded.append("max_cost_usd")
+        limits_reached.append("max_cost_usd")
 
     remaining = {"fetches": max(0, caps["max_fetches"] - totals["fetches"]),
                  "model_calls": max(0, caps["max_model_calls"] - totals["model_calls"])}
@@ -172,25 +189,89 @@ def account(payload: dict) -> dict:
         remaining["cost_usd"] = round(max(0.0, caps["max_cost_usd"] - totals["cost_usd"]), 6)
 
     return {"totals": totals, "by_step": by_step, "remaining": remaining,
-            "exceeded": exceeded, "stop": bool(exceeded), "caps": caps}
+            "limits_reached": limits_reached, "stop": bool(limits_reached), "caps": caps}
 
 
 def _load(path):
-    raw = sys.stdin.read() if not path or path == "-" else open(path, encoding="utf-8").read()
+    if not path or path == "-":
+        raw = sys.stdin.read()
+    else:
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
     return json.loads(raw)
+
+
+def _fetch_attempt_count(path: str) -> int:
+    count = 0
+    with open(path, encoding="utf-8") as fh:
+        for line_number, raw in enumerate(fh, start=1):
+            if not raw.strip():
+                continue
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"fetch ledger line {line_number} is not valid JSON: {exc.msg}"
+                ) from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"fetch ledger line {line_number} must be a JSON object")
+            kind = str(row.get("kind") or "").strip().casefold()
+            if kind in {"search", "query", "web_search"}:
+                continue
+            if (not kind and row.get("query") is not None
+                    and row.get("url") is None and row.get("canonical_url") is None):
+                continue
+            count += 1
+    return count
+
+
+def account_from_files(plan_path: str, fetch_ledger_path: str) -> dict:
+    """Account persisted fetch attempts, not discovery searches, against caps."""
+    plan_document = _load(plan_path)
+    if not isinstance(plan_document, dict):
+        raise ValueError("caps plan must be a JSON object")
+    plan_data = plan_document.get("data")
+    if not isinstance(plan_data, dict):
+        raise ValueError("caps plan must contain a data object")
+    plan_caps = plan_data.get("caps")
+    if not isinstance(plan_caps, dict):
+        raise ValueError("caps plan data must contain a caps object")
+
+    return account({
+        "caps": plan_caps,
+        "steps": [{"step": "fetch_ledger", "fetches": _fetch_attempt_count(fetch_ledger_path)}],
+    })
 
 
 def main(argv):
     ap = argparse.ArgumentParser(prog="deep-research/caps")
     ap.add_argument("--op", choices=["plan", "account"], required=True)
     ap.add_argument("--input", default=None, help="payload JSON (default stdin)")
+    ap.add_argument("--plan", default=None, help="saved caps_plan.json for file-backed account")
+    ap.add_argument("--fetch-ledger", default=None,
+                    help="saved fetch_ledger.jsonl for file-backed account")
     ap.add_argument("--out", default=None)
     args = ap.parse_args(argv)
 
-    payload = _load(args.input)
-    if not isinstance(payload, dict):
-        raise ValueError("input must be a JSON object")
-    data = plan(payload) if args.op == "plan" else account(payload)
+    file_account = args.plan is not None or args.fetch_ledger is not None
+    if args.op == "plan":
+        if file_account:
+            raise ValueError("--plan and --fetch-ledger are valid only with --op account")
+        payload = _load(args.input)
+        if not isinstance(payload, dict):
+            raise ValueError("input must be a JSON object")
+        data = plan(payload)
+    elif file_account:
+        if args.input is not None:
+            raise ValueError("use either --input or --plan with --fetch-ledger, not both")
+        if args.plan is None or args.fetch_ledger is None:
+            raise ValueError("file-backed account requires both --plan and --fetch-ledger")
+        data = account_from_files(args.plan, args.fetch_ledger)
+    else:
+        payload = _load(args.input)
+        if not isinstance(payload, dict):
+            raise ValueError("input must be a JSON object")
+        data = account(payload)
 
     result = {"ok": True, "data": data}
     if args.out:

@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
+import * as path from 'node:path';
 
-import { sanitizeLocalAgentPublicOutput } from '../../../../src/main/features/local_agents/public-output';
+import {
+  CodexFileCitationStreamFilter,
+  normalizeLocalAgentPublicOutput,
+  persistedCodexOutputCitationPaths,
+  sanitizeLocalAgentPublicOutput,
+  sanitizePersistedCodexFileCitations,
+} from '../../../../src/main/features/local_agents/public-output';
 
 describe('local_agents/public-output', () => {
   it('publishes only the result from a real Hermes KSTAR scaffold', () => {
@@ -206,5 +213,164 @@ describe('local_agents/public-output', () => {
       text: raw,
       userTask: 'Summarize',
     })).toBe(raw);
+  });
+
+  it('does not infer a Hermes runtime failure from successful response text', () => {
+    const raw = 'API call failed after 3 retries: HTTP 404: 404 Not found. Check the docs for available routes.';
+
+    expect(sanitizeLocalAgentPublicOutput({
+      cli: 'hermes',
+      text: raw,
+      userTask: 'Reply with this diagnostic verbatim.',
+    })).toBe(raw);
+    expect(sanitizeLocalAgentPublicOutput({
+      cli: 'codex',
+      text: raw,
+      userTask: 'Repeat this diagnostic.',
+    })).toBe(raw);
+  });
+
+  describe('Codex file citations', () => {
+    const workingDir = path.resolve('tmp-public-output-workspace');
+    const deckPath = path.join(workingDir, 'assets', 'AI会议助手竞品分析.pptx');
+
+    it('turns the native output directive into an exact published-file selection', () => {
+      const raw = [
+        '演示文稿已经完成。',
+        '',
+        `:codex-file-citation{path="${deckPath}" purpose="output"}`,
+      ].join('\n');
+
+      expect(normalizeLocalAgentPublicOutput({
+        cli: 'codex',
+        text: raw,
+        workingDir,
+        producedPaths: [deckPath, path.join(workingDir, 'supporting-notes.md')],
+      })).toEqual({
+        text: '演示文稿已经完成。',
+        publishedPaths: [deckPath],
+      });
+    });
+
+    it('supports relative paths, attribute order, and multiple deduplicated outputs', () => {
+      const spreadsheetPath = path.join(workingDir, 'results', 'metrics.xlsx');
+      const raw = [
+        ':codex-file-citation{purpose="output" path="assets/AI会议助手竞品分析.pptx"}',
+        ':codex-file-citation{path="results/metrics.xlsx" purpose="output"}',
+        ':codex-file-citation{path="results/metrics.xlsx" purpose="output"}',
+      ].join('\n');
+
+      expect(normalizeLocalAgentPublicOutput({
+        cli: 'codex',
+        text: raw,
+        workingDir,
+        producedPaths: [deckPath, spreadsheetPath],
+      })).toEqual({
+        text: '',
+        publishedPaths: [deckPath, spreadsheetPath],
+      });
+    });
+
+    it('removes transport metadata but cannot publish a path not registered by the turn', () => {
+      const outsidePath = path.resolve('private', 'unregistered.pdf');
+      expect(normalizeLocalAgentPublicOutput({
+        cli: 'codex',
+        text: `Done.\n${`:codex-file-citation{path="${outsidePath}" purpose="output"}`}`,
+        workingDir,
+        producedPaths: [deckPath],
+      })).toEqual({
+        text: 'Done.',
+        publishedPaths: [],
+      });
+    });
+
+    it('preserves fenced, quoted, inline, and malformed examples', () => {
+      const raw = [
+        'Example:',
+        '```text',
+        `:codex-file-citation{path="${deckPath}" purpose="output"}`,
+        '```',
+        `> :codex-file-citation{path="${deckPath}" purpose="output"}`,
+        `Inline :codex-file-citation{path="${deckPath}" purpose="output"}`,
+        ':codex-file-citation{path="unterminated purpose="output"}',
+      ].join('\n');
+
+      expect(normalizeLocalAgentPublicOutput({
+        cli: 'codex',
+        text: raw,
+        workingDir,
+        producedPaths: [deckPath],
+      })).toEqual({ text: raw, publishedPaths: [] });
+    });
+
+    it('does not interpret a Codex directive emitted by another CLI adapter', () => {
+      const raw = `:codex-file-citation{path="${deckPath}" purpose="output"}`;
+      expect(normalizeLocalAgentPublicOutput({
+        cli: 'claude',
+        text: raw,
+        workingDir,
+        producedPaths: [deckPath],
+      })).toEqual({ text: raw, publishedPaths: [] });
+    });
+
+    it('projects legacy persisted output only when its structured file list backs the citation', () => {
+      const raw = `Ready.\n:codex-file-citation{path="${deckPath}" purpose="output"}`;
+      expect(sanitizePersistedCodexFileCitations(raw, [deckPath])).toBe('Ready.');
+      expect(sanitizePersistedCodexFileCitations(raw, [])).toBe(raw);
+    });
+
+    it('extracts legacy output candidates without consuming fenced examples', () => {
+      const raw = [
+        `:codex-file-citation{path="assets/AI会议助手竞品分析.pptx" purpose="output"}`,
+        '```text',
+        ':codex-file-citation{path="private/inside-example.pdf" purpose="output"}',
+        '```',
+        ':codex-file-citation{path="assets/notes.md" purpose="input"}',
+      ].join('\n');
+
+      expect(persistedCodexOutputCitationPaths(raw, workingDir)).toEqual([deckPath]);
+    });
+
+    it('consumes the legacy suffix adjacent to a Markdown link for the same file', () => {
+      const directive = `:codex-file-citation{path="${deckPath}" name="deck" purpose="output"}`;
+      const link = `新版文件：[AI会议助手竞品分析.pptx](${deckPath})`;
+      const raw = `${link}${directive}`;
+
+      expect(persistedCodexOutputCitationPaths(raw)).toEqual([deckPath]);
+      expect(sanitizePersistedCodexFileCitations(raw, [deckPath])).toBe(link);
+
+      const mismatched = `${link}:codex-file-citation{path="${path.join(workingDir, 'other.pptx')}" purpose="output"}`;
+      expect(persistedCodexOutputCitationPaths(mismatched)).toEqual([]);
+      expect(sanitizePersistedCodexFileCitations(mismatched, [deckPath])).toBe(mismatched);
+    });
+
+    it('never streams a split directive and keeps fenced examples visible', () => {
+      const filter = new CodexFileCitationStreamFilter();
+      const chunks = [
+        filter.push('完成。\n:codex-file-'),
+        filter.push(`citation{path="${deckPath}" purpose="out`),
+        filter.push('put"}\n下一行'),
+        filter.flush(),
+      ];
+      expect(chunks.join('')).toBe('完成。\n下一行');
+
+      const inline = new CodexFileCitationStreamFilter();
+      const link = `[deck](${deckPath})`;
+      expect([
+        inline.push(`${link}:codex-file-citation{path="${deckPath}" purpose="output"}\n`),
+        inline.flush(),
+      ].join('')).toBe(`${link}\n`);
+
+      const fenced = new CodexFileCitationStreamFilter();
+      expect([
+        fenced.push(`\`\`\`text\n:codex-file-citation{path="${deckPath}" purpose="output"}\n`),
+        fenced.push('\`\`\`'),
+        fenced.flush(),
+      ].join('')).toBe([
+        '```text',
+        `:codex-file-citation{path="${deckPath}" purpose="output"}`,
+        '```',
+      ].join('\n'));
+    });
   });
 });

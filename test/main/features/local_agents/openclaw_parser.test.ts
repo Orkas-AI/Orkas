@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { buildOpenclawArgs, parseOpenclawReply } from '../../../../src/main/features/local_agents/backends/openclaw';
 
 describe('local_agents/backends/openclaw › parseOpenclawReply', () => {
@@ -38,6 +40,50 @@ describe('local_agents/backends/openclaw › parseOpenclawReply', () => {
 }`;
     const r = parseOpenclawReply(stderr);
     expect(r?.text).toBe('first\nsecond');
+  });
+
+  it('extracts and deduplicates mediaUrl/mediaUrls, including a media-only reply', () => {
+    const stderr = JSON.stringify({
+      payloads: [
+        { text: '', mediaUrl: 'https://cdn.example/one.png' },
+        { mediaUrls: ['https://cdn.example/two.webp', 'https://cdn.example/one.png'] },
+      ],
+      meta: { agentMeta: { sessionId: 'media-session' } },
+    });
+    const r = parseOpenclawReply(stderr);
+    expect(r).toMatchObject({
+      text: '',
+      media: ['https://cdn.example/one.png', 'https://cdn.example/two.webp'],
+      sessionId: 'media-session',
+    });
+  });
+
+  it('separates structured local attachments from remote preview media', () => {
+    const reportPath = path.resolve('tmp-openclaw', 'report.pdf');
+    const sheetPath = path.resolve('tmp-openclaw', 'metrics.xlsx');
+    const notesPath = path.resolve('tmp-openclaw', 'notes.docx');
+    const stderr = JSON.stringify({
+      payloads: [
+        {
+          text: 'Artifacts ready.',
+          path: reportPath,
+          filePath: sheetPath,
+          media: [
+            'https://cdn.example/preview.png',
+            pathToFileURL(notesPath).toString(),
+          ],
+        },
+        { path: reportPath },
+      ],
+      meta: { agentMeta: { sessionId: 'attachment-session' } },
+    });
+
+    expect(parseOpenclawReply(stderr)).toMatchObject({
+      text: 'Artifacts ready.',
+      media: ['https://cdn.example/preview.png'],
+      files: [notesPath, reportPath, sheetPath],
+      sessionId: 'attachment-session',
+    });
   });
 
   it('strips ANSI color escapes before parsing', () => {

@@ -1,9 +1,8 @@
 ---
 ownerAgent: e064dca9e1bd
 name: seo-content
-description_zh: "对 seo-crawl 抽取的正文做启发式内容质量与 GEO 就绪度诊断：AI 腔/填充词、统计声明无引用、答案是否前置、句子过长、标题与正文不一致，输出 content 维度 findings；适合\"看看这页内容质量\"\"内容有没有 AI 味、答案前不前置\"；触发词：内容质量、E-E-A-T、AI 腔、引用缺口、答案前置、可读性"
-description_en: "Heuristic content-quality & GEO-readiness findings over seo-crawl text: AI/filler tone, uncited statistical claims, answer-first placement, over-long sentences, title↔body mismatch; emits content-dimension findings; For: 'check this page's content quality', 'is the content AI-sounding / answer front-loaded'; Triggers: content quality, E-E-A-T, AI tone, citation gap, answer-first, readability"
-category: data
+description_zh: "检查 seo-crawl 正文的内容质量与 GEO 就绪度，包括 AI 腔或填充词、统计声明缺少引用、答案前置、长句和标题正文不一致；用于内容质量、E-E-A-T、引用缺口和可读性诊断。"
+description_en: "Assess seo-crawl text for content quality and GEO readiness, including filler or AI tone, unsupported statistics, answer-first placement, sentence length, and title/body mismatch. Use for content-quality, E-E-A-T, citation-gap, and readability diagnosis."
 ---
 
 # seo-content

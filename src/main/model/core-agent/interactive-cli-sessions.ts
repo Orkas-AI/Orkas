@@ -195,7 +195,11 @@ function detectPrompt(text: string): { kind: InteractiveCliPromptKind; sensitive
 }
 
 function broadcast(s: Session, payload: Record<string, unknown>): void {
-  const scopedPayload = { ...payload, user_id: s.uid };
+  const scopedPayload = {
+    ...payload,
+    user_id: s.uid,
+    conversation_id: s.cid,
+  };
   if (_broadcastOverride) {
     _broadcastOverride('interactive-cli:event', scopedPayload);
     return;

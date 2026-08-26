@@ -4,6 +4,7 @@ import {
   nativeSearchToolForApi,
   nativeSearchToolForProvider,
   nativeSearchToolName,
+  routeSearchPayloadTools,
 } from '../../../src/main/model/core-agent/native-search-tools';
 
 describe('nativeSearchToolForApi', () => {
@@ -79,5 +80,129 @@ describe('nativeSearchToolName', () => {
 
   it('returns undefined for undefined input', () => {
     expect(nativeSearchToolName(undefined)).toBeUndefined();
+  });
+});
+
+describe('routeSearchPayloadTools', () => {
+  const localSearch = { type: 'function', name: 'web_search', parameters: {} };
+  const fetchTool = { type: 'function', name: 'web_fetch', parameters: {} };
+  const readTool = { type: 'function', name: 'read_file', parameters: {} };
+
+  it('replaces Orkas search with OpenAI native search instead of exposing both', () => {
+    const original = [readTool, localSearch, fetchTool];
+    const result = routeSearchPayloadTools({
+      tools: original,
+      nativeEnabled: true,
+      paidSearchConfigured: false,
+      nativeTool: { type: 'web_search' },
+    });
+
+    expect(result).toEqual({
+      tools: [readTool, fetchTool, { type: 'web_search' }],
+      route: 'native',
+      replacedOrkasSearch: true,
+    });
+    expect(result.tools).not.toBe(original);
+    expect(original).toEqual([readTool, localSearch, fetchTool]);
+  });
+
+  it('replaces the nested function schema with Gemini native search', () => {
+    const googleFunctions = {
+      functionDeclarations: [
+        { name: 'read_file', description: 'read' },
+        { name: 'web_search', description: 'search' },
+        { name: 'web_fetch', description: 'fetch' },
+      ],
+    };
+    const result = routeSearchPayloadTools({
+      tools: [googleFunctions],
+      nativeEnabled: true,
+      paidSearchConfigured: false,
+      nativeTool: { google_search: {} },
+    });
+
+    expect(result.tools).toEqual([
+      {
+        functionDeclarations: [
+          { name: 'read_file', description: 'read' },
+          { name: 'web_fetch', description: 'fetch' },
+        ],
+      },
+      { google_search: {} },
+    ]);
+    expect(result.route).toBe('native');
+  });
+
+  it('also supports providers that wrap one function per tool object', () => {
+    const nestedLocalSearch = { type: 'function', function: { name: 'web_search' } };
+    const result = routeSearchPayloadTools({
+      tools: [nestedLocalSearch, fetchTool],
+      nativeEnabled: true,
+      paidSearchConfigured: false,
+      nativeTool: { type: 'web_search' },
+    });
+
+    expect(result.tools).toEqual([fetchTool, { type: 'web_search' }]);
+  });
+
+  it('keeps only the paid Orkas search route when a paid profile exists', () => {
+    const original = [localSearch, fetchTool];
+    const result = routeSearchPayloadTools({
+      tools: original,
+      nativeEnabled: true,
+      paidSearchConfigured: true,
+      nativeTool: { type: 'web_search' },
+    });
+
+    expect(result).toEqual({
+      tools: original,
+      route: 'orkas',
+      replacedOrkasSearch: false,
+    });
+    expect(result.tools).toBe(original);
+  });
+
+  it.each([
+    { nativeEnabled: false, nativeTool: { type: 'web_search' } },
+    { nativeEnabled: true, nativeTool: undefined },
+  ])('keeps Orkas search when native search is disabled or unsupported: %o', ({ nativeEnabled, nativeTool }) => {
+    const original = [localSearch, fetchTool];
+    const result = routeSearchPayloadTools({
+      tools: original,
+      nativeEnabled,
+      paidSearchConfigured: false,
+      nativeTool,
+    });
+
+    expect(result.route).toBe('orkas');
+    expect(result.tools).toBe(original);
+  });
+
+  it('does not bypass the scoped tool surface when web_search is absent', () => {
+    const original = [readTool];
+    const result = routeSearchPayloadTools({
+      tools: original,
+      nativeEnabled: true,
+      paidSearchConfigured: false,
+      nativeTool: { type: 'web_search' },
+    });
+
+    expect(result).toEqual({
+      tools: original,
+      route: 'absent',
+      replacedOrkasSearch: false,
+    });
+    expect(result.tools).toBe(original);
+  });
+
+  it('deduplicates a pre-existing native search entry during payload repair', () => {
+    const result = routeSearchPayloadTools({
+      tools: [localSearch, { type: 'web_search' }, fetchTool],
+      nativeEnabled: true,
+      paidSearchConfigured: false,
+      nativeTool: { type: 'web_search' },
+    });
+
+    expect(result.tools).toEqual([fetchTool, { type: 'web_search' }]);
   });
 });

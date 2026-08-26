@@ -34,6 +34,7 @@ const streamProbe = vi.hoisted(() => ({
   historyResources: [] as any[][],
   dispatchResults: [] as string[],
   maxToolLoops: [] as Array<number | undefined>,
+  toolLists: [] as Array<string[] | undefined>,
 }));
 
 // Mock the model client so `runTurn` doesn't try to do a real LLM call.
@@ -51,7 +52,47 @@ vi.mock('../../../../src/main/model/client', () => ({
     streamProbe.readOnlyRoots.push(Array.isArray(_opts?.readOnlyExtraRoots) ? [..._opts.readOnlyExtraRoots] : []);
     streamProbe.historyResources.push(Array.isArray(_opts?.historyResources) ? [..._opts.historyResources] : []);
     streamProbe.maxToolLoops.push(typeof _opts?.maxToolLoops === 'number' ? _opts.maxToolLoops : undefined);
+    streamProbe.toolLists.push(Array.isArray(_opts?.toolList) ? [..._opts.toolList] : undefined);
     const message = rawMessage;
+    const reasoningMarker = 'REASONING_PROCESS_PERSISTENCE_TEST:';
+    const reasoningIdx = message.indexOf(reasoningMarker);
+    if (isCommanderTurn && reasoningIdx >= 0) {
+      const encoded = message.slice(reasoningIdx + reasoningMarker.length).split(/\s/, 1)[0];
+      const summary = Buffer.from(encoded, 'base64').toString('utf8');
+      const splitAt = Math.floor(summary.length / 2);
+      yield {
+        type: 'event',
+        event: {
+          stream: 'reasoning',
+          data: {
+            phase: 'progress', id: 'reasoning-complete', chars: splitAt,
+            summary_from: 0, summary_delta: summary.slice(0, splitAt), heartbeat: true,
+          },
+        },
+      };
+      yield {
+        type: 'event',
+        event: {
+          stream: 'reasoning',
+          data: {
+            phase: 'progress', id: 'reasoning-complete', chars: summary.length,
+            summary_from: splitAt, summary_delta: summary.slice(splitAt), heartbeat: true,
+          },
+        },
+      };
+      yield {
+        type: 'event',
+        event: {
+          stream: 'reasoning',
+          data: {
+            phase: 'end', id: 'reasoning-complete', chars: summary.length, summary,
+          },
+        },
+      };
+      yield { type: 'final', text: 'Reasoning complete.' };
+      yield { type: 'done' };
+      return;
+    }
     if (isCommanderTurn && message.includes('COMMANDER_BLOCKER_HANDOFF_TEST')) {
       const tool = (Array.isArray(_opts?.extraTools) ? _opts.extraTools : [])
         .find((candidate: any) => candidate?.name === 'hand_off_to');
@@ -140,12 +181,26 @@ vi.mock('../../../../src/main/model/client', () => ({
       return;
     }
     if (message.includes('AGENT_RESULT_FAILURE_TEST')) {
-      yield { type: 'final', text: '没有完成交付。\n<agent-result status="failure" />' };
+      yield { type: 'final', text: '没有完成交付。' };
+      yield { type: 'done' };
+      return;
+    }
+    const localMediaMarker = 'LOCAL_MEDIA_REPLY_TEST:';
+    const localMediaIdx = message.indexOf(localMediaMarker);
+    if (localMediaIdx >= 0) {
+      const encoded = message.slice(localMediaIdx + localMediaMarker.length).split(/\s/, 1)[0];
+      const data = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+      yield { type: 'final', text: data.text };
       yield { type: 'done' };
       return;
     }
     if (message.includes('COMMANDER_RESULT_FAILURE_TEST')) {
-      yield { type: 'final', text: '没有完成调度。\n<commander-result status="failure" />' };
+      yield { type: 'final', text: '没有完成调度。' };
+      yield { type: 'done' };
+      return;
+    }
+    if (message.includes('AGENT_MARKERLESS_SUCCESS_TEST')) {
+      yield { type: 'final', text: '已完成交付。' };
       yield { type: 'done' };
       return;
     }
@@ -192,13 +247,17 @@ vi.mock('../../../../src/main/model/client', () => ({
       const data = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
       for (const p of data.paths || []) await _opts?.onFileWritten?.(p);
       _opts?.onOutputsPublished?.(data.published || []);
+      const eligible = data.inspectEligible
+        ? _opts?.getPublishableOutputPaths?.() ?? []
+        : null;
       const interaction = data.planInteraction === 'open' || data.planInteraction === 'closed'
         ? `\n<plan-interaction status="${data.planInteraction}" />`
         : '';
       const form = data.withForm
         ? `\n<agent-input-form>\n${JSON.stringify({ fields: [{ id: 'decision', label: 'Decision', type: 'text' }] })}\n</agent-input-form>`
         : '';
-      yield { type: 'final', text: `published output ok${form}${interaction}` };
+      const eligibleText = eligible ? ` eligible=${JSON.stringify(eligible)}` : '';
+      yield { type: 'final', text: `published output ok${eligibleText}${form}${interaction}` };
       yield { type: 'done' };
       return;
     }
@@ -319,6 +378,7 @@ beforeEach(async () => {
   streamProbe.historyResources.length = 0;
   streamProbe.dispatchResults.length = 0;
   streamProbe.maxToolLoops.length = 0;
+  streamProbe.toolLists.length = 0;
   streamGate.releaseActiveTurn = null;
   cidsToDrop.clear();
   const users = await import('../../../../src/main/features/users');
@@ -376,6 +436,75 @@ async function waitForQuiescent(uid: string, cid: string, timeoutMs = 2000) {
 }
 
 describe('group_chat bus › enqueue routing + persistence', () => {
+  it('keeps CLI and model-reasoning heartbeats live-only', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+
+    expect(bus.isEphemeralProcessHeartbeat({
+      stream: 'cli',
+      data: { type: 'thinking', heartbeat: true },
+    })).toBe(true);
+    expect(bus.isEphemeralProcessHeartbeat({
+      stream: 'reasoning',
+      data: { phase: 'progress', heartbeat: true, summary: 'Reviewing constraints' },
+    })).toBe(true);
+    expect(bus.isEphemeralProcessHeartbeat({
+      stream: 'reasoning',
+      data: { phase: 'end', chars: 123, summary: 'Reviewing constraints' },
+    })).toBe(false);
+  });
+
+  it('streams complete reasoning live and persists only its complete terminal event', async () => {
+    const summary = `BEGIN_${'x'.repeat(10_000)}_END`;
+    const encoded = Buffer.from(summary, 'utf8').toString('base64');
+    const cid = 'cid-complete-reasoning-process';
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const events: any[] = [];
+    bus.subscribe(TEST_UID, cid, (event) => events.push(event));
+
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `REASONING_PROCESS_PERSISTENCE_TEST:${encoded}`,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const liveReasoning = events
+      .filter(event => event?.type === 'process')
+      .map(event => event?.data)
+      .filter(data => data?.type === 'event' && data?.event?.stream === 'reasoning')
+      .map(data => data.event.data);
+    expect(liveReasoning).toEqual([
+      {
+        phase: 'progress', id: 'reasoning-complete', chars: Math.floor(summary.length / 2),
+        summary_from: 0,
+        summary_delta: summary.slice(0, Math.floor(summary.length / 2)),
+        heartbeat: true,
+      },
+      {
+        phase: 'progress', id: 'reasoning-complete', chars: summary.length,
+        summary_from: Math.floor(summary.length / 2),
+        summary_delta: summary.slice(Math.floor(summary.length / 2)),
+        heartbeat: true,
+      },
+      {
+        phase: 'end', id: 'reasoning-complete', chars: summary.length, summary,
+      },
+    ]);
+
+    const paths = await import('../../../../src/main/paths');
+    const rows = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8')
+      .trim().split('\n').map(line => JSON.parse(line));
+    const reply = rows.find(row => row.from === 'commander');
+    const persistedReasoning = (reply?.process || [])
+      .filter((item: any) => item?.type === 'event'
+        && item?.event?.stream === 'reasoning')
+      .map((item: any) => item.event.data);
+    expect(persistedReasoning).toEqual([{
+      phase: 'end', id: 'reasoning-complete', chars: summary.length, summary,
+    }]);
+  });
+
   it('user → commander default route persists with to=["commander"]', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const events: any[] = [];
@@ -409,7 +538,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(streamProbe.messages.some((m) => m.includes('Please resolve the conflict using the hidden protocol.'))).toBe(true);
     expect(streamProbe.messages.some((m) => m.includes('请帮我处理冲突。'))).toBe(false);
     expect(streamProbe.conversationHistories[0]).toMatchObject({
-      source: `group-main-v1:${cid}`,
+      source: `group-main-v2:${cid}`,
       messages: [],
     });
   });
@@ -527,7 +656,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(call).toContain('total_chars=');
   });
 
-  it('strips commander result markers and records commander model failures', async () => {
+  it('does not treat commander failure prose as an execution failure', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const paths = await import('../../../../src/main/paths');
     await bus.enqueue({
@@ -540,13 +669,12 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     const lines = fs.readFileSync(mainFile, 'utf-8').trim().split('\n').map((line) => JSON.parse(line));
     const reply = lines.find((line) => line.from === 'commander');
     expect(reply?.text).toBe('没有完成调度。');
-    expect(reply?.text).not.toContain('commander-result');
 
     const stats = JSON.parse(fs.readFileSync(paths.commanderRuntimeStatsFile(TEST_UID), 'utf-8'));
     expect(stats.attempts).toBe(1);
-    expect(stats.successes).toBe(0);
-    expect(stats.deliveries).toBe(0);
-    expect(stats.failures).toBe(1);
+    expect(stats.successes).toBe(1);
+    expect(stats.deliveries).toBe(1);
+    expect(stats.failures).toBe(0);
     expect(stats.errors).toBe(0);
   });
 
@@ -654,6 +782,30 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     const m = await state.readMembers(TEST_UID, TEST_CID);
     expect(m.actors.find((a) => a.id === AGENT_ID)).toBeTruthy();
     expect(m.actors.find((a) => a.id === AGENT_ID)?.name).toBe(AGENT_NAME);
+  });
+
+  it('passes the named Agent tool_list to its in-process model turn', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+    const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+    spec.tool_list = ['workspace.read', 'web'];
+    fs.writeFileSync(agentFile, JSON.stringify(spec));
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const cid = 'cid-agent-tool-list';
+
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `@${AGENT_NAME} TOOL_LIST_PROPAGATION_TEST`,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const callIndex = streamProbe.messages.findIndex((message) => (
+      message.includes('TOOL_LIST_PROPAGATION_TEST')
+    ));
+    expect(callIndex).toBeGreaterThanOrEqual(0);
+    expect(streamProbe.toolLists[callIndex]).toEqual(['workspace.read', 'web']);
   });
 
   it('injects canonical group history, not compatibility-slice-only rows, into a fresh Agent session', async () => {
@@ -906,7 +1058,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(streamProbe.messages.some((message) => message.includes('BUILTIN_TURN_BARRIER_TEST'))).toBe(true);
   });
 
-  it('strips agent result markers and records model failures separately from errors', async () => {
+  it('does not treat agent failure prose as an execution failure', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const paths = await import('../../../../src/main/paths');
     await bus.enqueue({
@@ -919,14 +1071,65 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     const lines = fs.readFileSync(mainFile, 'utf-8').trim().split('\n').map((line) => JSON.parse(line));
     const reply = lines.find((line) => line.from === AGENT_ID);
     expect(reply?.text).toBe('没有完成交付。');
-    expect(reply?.text).not.toContain('agent-result');
 
     const stats = JSON.parse(fs.readFileSync(paths.agentRuntimeStatsFile(TEST_UID, AGENT_ID), 'utf-8'));
     expect(stats.attempts).toBe(1);
-    expect(stats.successes).toBe(0);
-    expect(stats.deliveries).toBe(0);
-    expect(stats.failures).toBe(1);
+    expect(stats.successes).toBe(1);
+    expect(stats.deliveries).toBe(1);
+    expect(stats.failures).toBe(0);
     expect(stats.errors).toBe(0);
+  });
+
+  it('persists assistant sandbox media as a versioned local URL without rewriting the user row', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const cid = 'cid-local-media-persistence';
+    const videoPath = path.join(tmpDir, 'workspace', 'final.mp4');
+    fs.writeFileSync(videoPath, 'final-video');
+    const mediaText = `[video](sandbox:${videoPath})`;
+    const encoded = Buffer.from(JSON.stringify({ text: mediaText }), 'utf8').toString('base64');
+
+    await bus.enqueue({
+      uid: TEST_UID, cid, fromActorId: 'user',
+      text: `@${AGENT_NAME} LOCAL_MEDIA_REPLY_TEST:${encoded} keep ${mediaText}`,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const rows = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8')
+      .trim().split('\n').map((line) => JSON.parse(line));
+    const user = rows.find((row: any) => row.from === 'user');
+    const reply = rows.find((row: any) => row.from === AGENT_ID);
+    expect(user?.text).toContain(mediaText);
+    expect(reply?.text).toMatch(/^\[video\]\(chat-media:\/\/local\/.+\?v=\d+-\d+-11\)$/);
+    expect(reply?.text).not.toContain('sandbox:');
+    expect(reply?.failure_kind).toBeUndefined();
+  });
+
+  it('keeps a missing sandbox media destination canonical without recording a failure', async () => {
+    // A missing deliverable is not an execution failure: the host observes
+    // execution outcomes and no longer synthesizes `claimed_media_missing`.
+    // The alias still normalizes to a stable canonical URL so the renderer's
+    // normal missing-media handling owns the user-visible outcome.
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const cid = 'cid-missing-sandbox-media';
+    const missingPath = path.join(tmpDir, 'workspace', 'never-rendered.mp4');
+    const mediaText = `[video](sandbox:${missingPath})`;
+    const encoded = Buffer.from(JSON.stringify({ text: mediaText }), 'utf8').toString('base64');
+
+    await bus.enqueue({
+      uid: TEST_UID, cid, fromActorId: 'user',
+      text: `@${AGENT_NAME} LOCAL_MEDIA_REPLY_TEST:${encoded}`,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const rows = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8')
+      .trim().split('\n').map((line) => JSON.parse(line));
+    const reply = rows.find((row: any) => row.from === AGENT_ID);
+    expect(reply?.text).toContain('chat-media://local/');
+    expect(reply?.text).not.toContain('sandbox:');
+    expect(reply?.failure_kind).toBeUndefined();
+    expect(reply?.failure_code).toBeUndefined();
   });
 
   it('records markerless agent completions as success when no runtime error occurs', async () => {
@@ -934,7 +1137,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     const paths = await import('../../../../src/main/paths');
     await bus.enqueue({
       uid: TEST_UID, cid: TEST_CID, fromActorId: 'user',
-      text: `@${AGENT_NAME} 普通任务`,
+      text: `@${AGENT_NAME} AGENT_MARKERLESS_SUCCESS_TEST`,
     });
     await waitForQuiescent(TEST_UID, TEST_CID);
 
@@ -1080,6 +1283,36 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(finalPath)).toBe(true);
   });
 
+  it('normalizes produced-file identity and exposes the canonical current-turn publication path', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const cid = 'cid-canonical-publication-path';
+    const finalPath = path.join(tmpDir, 'workspace', 'sales-report.xlsx');
+    const nonCanonicalPath = `${path.join(tmpDir, 'workspace')}${path.sep}drafts${path.sep}..${path.sep}sales-report.xlsx`;
+    fs.mkdirSync(path.dirname(finalPath), { recursive: true });
+    fs.writeFileSync(finalPath, 'xlsx');
+
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `PUBLISHED_OUTPUT_TEST:${Buffer.from(JSON.stringify({
+        paths: [nonCanonicalPath],
+        published: [finalPath],
+        inspectEligible: true,
+      })).toString('base64')}`,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const commanderMsg = rows.find((row: any) => row.from === 'commander');
+    expect(commanderMsg?.text).toContain(`eligible=${JSON.stringify([finalPath])}`);
+    expect(commanderMsg?.produced).toEqual([finalPath]);
+    expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(finalPath)).toBe(true);
+    expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(nonCanonicalPath)).toBe(false);
+  });
+
   it('persists only the terminal deliverable while retaining supporting-file ownership', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const paths = await import('../../../../src/main/paths');
@@ -1115,7 +1348,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(finalPath)).toBe(true);
   });
 
-  it('runs generic produced-file hooks for source-like files', async () => {
+  it('finalizes a source-like file only when it is explicitly published as a deliverable', async () => {
     const hooks = await import('../../../../src/main/features/produced_output_hooks');
     const finalized: string[] = [];
     const unregister = hooks.registerProducedOutputHooks({
@@ -1135,7 +1368,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
         text: `PRODUCED_FILTER_TEST:${Buffer.from(JSON.stringify({ paths: [sourcePath] })).toString('base64')}`,
       });
       await waitForQuiescent(TEST_UID, 'cid-source-provenance');
-      expect(finalized).toEqual([sourcePath]);
+      expect(finalized).toEqual([]);
 
       await bus.enqueue({
         uid: TEST_UID,
@@ -1147,13 +1380,13 @@ describe('group_chat bus › enqueue routing + persistence', () => {
         })).toString('base64')}`,
       });
       await waitForQuiescent(TEST_UID, 'cid-explicit-source-deliverable');
-      expect(finalized).toEqual([sourcePath, sourcePath]);
+      expect(finalized).toEqual([sourcePath]);
     } finally {
       unregister();
     }
   });
 
-  it('keeps generic produced-file hooks independent from review-gate visibility', async () => {
+  it('does not finalize files produced at an open review gate', async () => {
     const hooks = await import('../../../../src/main/features/produced_output_hooks');
     const finalized: string[] = [];
     const unregister = hooks.registerProducedOutputHooks({
@@ -1190,14 +1423,14 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       const agentMsg = rows.find((row: any) => row.from === AGENT_ID && row.text === 'produced filter ok');
       expect(agentMsg?.produced).toBeUndefined();
       expect(agentMsg?.form?.fields?.[0]?.id).toBe('decision');
-      expect(finalized).toEqual([htmlPath]);
+      expect(finalized).toEqual([]);
       expect(fs.readFileSync(htmlPath, 'utf8')).toContain('clean composition');
     } finally {
       unregister();
     }
   });
 
-  it('shows explicitly published review outputs while running generic produced-file hooks', async () => {
+  it('shows explicitly published review outputs at an open gate without finalizing them', async () => {
     const hooks = await import('../../../../src/main/features/produced_output_hooks');
     const finalized: string[] = [];
     const unregister = hooks.registerProducedOutputHooks({
@@ -1233,7 +1466,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       const agentMsg = rows.find((row: any) => row.from === AGENT_ID && row.text === 'published output ok');
       expect(agentMsg?.produced).toEqual([contactSheetPath]);
       expect(agentMsg?.form?.fields?.[0]?.id).toBe('decision');
-      expect(finalized).toEqual([contactSheetPath]);
+      expect(finalized).toEqual([]);
     } finally {
       unregister();
     }
@@ -1605,7 +1838,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     }
   });
 
-  it('publishes a capable CLI ingress, applies the queued update in the same native run, and avoids a second dispatch', async () => {
+  it('uses explicit control without analytics attribution to steer the same native CLI run', async () => {
     const paths = await import('../../../../src/main/paths');
     const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
     const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
@@ -1642,13 +1875,14 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       ]);
     });
 
-    await bus.enqueue({
-      uid: TEST_UID,
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const steerResult = await groupChat.send({
+      userId: TEST_UID,
       cid,
-      fromActorId: 'user',
-      text: 'CLI_NATIVE_STEER_UPDATE',
-      forceTo: [AGENT_ID],
+      text: `@${AGENT_NAME} CLI_NATIVE_STEER_UPDATE`,
+      steerActiveTurn: true,
     });
+    expect(steerResult.ok).toBe(true);
     await vi.waitFor(() => expect(cliRunMock.submittedSteers).toHaveLength(1));
     expect(cliRunMock.submittedSteers[0].text).toContain('CLI_NATIVE_STEER_UPDATE');
 
@@ -1658,6 +1892,60 @@ describe('group_chat bus › enqueue routing + persistence', () => {
 
     expect(cliRunMock.calls).toHaveLength(1);
     expect(bus.runtimeSnapshot(TEST_UID, cid).activeTurns).toEqual([]);
+  });
+
+  it('keeps an explicitly non-steering CLI message in FIFO despite Send now attribution', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+    const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+    spec.runtime = { kind: 'cli', cli: 'claude' };
+    spec.interactive = true;
+    fs.writeFileSync(agentFile, JSON.stringify(spec));
+
+    cliRunMock.nextResult = {
+      runId: 'continuous-background-turn',
+      status: 'completed',
+      output: 'Background work and its resumed answer finished.',
+    };
+    cliRunMock.activeIngress = {
+      submit: vi.fn(async (input: any) => {
+        cliRunMock.submittedSteers.push(input);
+        return { mode: 'steered', acceptedId: input.id };
+      }),
+    };
+
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const cid = 'cid-cli-background-default-fifo';
+    cidsToDrop.add(cid);
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: 'FIRST_LONG_BACKGROUND_TASK',
+      forceTo: [AGENT_ID],
+    });
+    await vi.waitFor(() => expect(cliRunMock.releaseActiveIngressRun).toBeTypeOf('function'));
+
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const queuedResult = await groupChat.send({
+      userId: TEST_UID,
+      cid,
+      text: `@${AGENT_NAME} SECOND_MESSAGE_MUST_WAIT`,
+      entry_point: 'queue_send_now',
+      steerActiveTurn: false,
+    });
+    expect(queuedResult.ok).toBe(true);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(cliRunMock.submittedSteers).toHaveLength(0);
+    expect(cliRunMock.calls).toHaveLength(1);
+
+    cliRunMock.activeIngress = null;
+    cliRunMock.releaseActiveIngressRun?.();
+    cliRunMock.releaseActiveIngressRun = null;
+    await waitForQuiescent(TEST_UID, cid);
+
+    expect(cliRunMock.calls).toHaveLength(2);
+    expect(cliRunMock.calls[1].prompt).toContain('SECOND_MESSAGE_MUST_WAIT');
   });
 
   it('dropConv terminates the worker so it doesn\'t leak after conv delete', async () => {
@@ -2168,38 +2456,677 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(streamProbe.messages.some((message) => message.includes('<agent-handback>'))).toBe(false);
   });
 
-  it('initialises a coding CLI conversation cwd from the agent project-dir setting without replaying on first dispatch', async () => {
+  it.each(['codex', 'opencode'] as const)(
+    'initialises a %s coding CLI conversation cwd from the agent project-dir setting without replaying or asking again',
+    async (cli) => {
+      const paths = await import('../../../../src/main/paths');
+      const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+      const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+      spec.runtime = { kind: 'cli', cli };
+      fs.writeFileSync(agentFile, JSON.stringify(spec));
+
+      const projectDir = path.join(tmpDir, 'repo');
+      fs.mkdirSync(projectDir);
+      const agents = await import('../../../../src/main/features/agents');
+      await agents.setAgentCliProjectDir(TEST_UID, AGENT_ID, projectDir);
+
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const state = await import('../../../../src/main/features/group_chat/state');
+      const cid = 'cid-coding-dir';
+      await bus.enqueue({
+        uid: TEST_UID, cid, fromActorId: 'user',
+        text: `@${AGENT_NAME} 看一下这个项目`,
+      });
+      await waitForQuiescent(TEST_UID, cid);
+
+      expect(cliRunMock.calls).toHaveLength(1);
+      expect(cliRunMock.calls[0].cli).toBe(cli);
+      expect(cliRunMock.calls[0].cwd).toBe(projectDir);
+      if (cli === 'codex') expect(cliRunMock.calls[0].prompt).toBe('看一下这个项目');
+      else expect(cliRunMock.calls[0].prompt).toMatch(/看一下这个项目$/);
+      expect(`${cliRunMock.calls[0].systemPrompt || ''}\n${cliRunMock.calls[0].prompt}`).toContain(
+        '## Output protocol — switching project directory',
+      );
+      expect(`${cliRunMock.calls[0].systemPrompt || ''}\n${cliRunMock.calls[0].prompt}`)
+        .toContain('<agent-input-form>');
+      expect(cliRunMock.calls[0].prompt).not.toContain('## Conversation context recovered by Orkas');
+      const st = await state.readState(TEST_UID, cid);
+      expect(st.coding_project_dir).toBe(projectDir);
+      expect(st.coding_project_dir_explicit).toBe(true);
+      const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+      const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      expect(rows.some((row: any) => row.form?.fields?.some((field: any) => field.id === 'project_dir')))
+        .toBe(false);
+    },
+  );
+
+  it.each([
+    { label: 'Project workspace when no Agent override exists', customOverride: false },
+    { label: 'Agent custom directory ahead of the Project workspace', customOverride: true },
+  ])('uses $label as the OpenCode project_dir without a first-turn form', async ({ customOverride }) => {
+    const paths = await import('../../../../src/main/paths');
+    const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+    const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+    spec.runtime = { kind: 'cli', cli: 'opencode' };
+    fs.writeFileSync(agentFile, JSON.stringify(spec));
+
+    const projects = await import('../../../../src/main/features/projects');
+    const createdProject = await projects.createProject(TEST_UID, 'OpenCode default workspace');
+    if (!createdProject.ok) throw new Error('project setup failed');
+    const projectId = createdProject.project.project_id;
+    await projects.addAgentBinding(TEST_UID, projectId, AGENT_ID);
+    const projectDir = path.join(tmpDir, 'project-workspace');
+    fs.mkdirSync(projectDir, { recursive: true });
+    const userWorkspace = await import('../../../../src/main/features/user_workspace');
+    const workspaceResult = userWorkspace.setWorkspacePath(TEST_UID, projectDir, projectId);
+    expect(workspaceResult.ok).toBe(true);
+    const customDir = path.join(tmpDir, 'agent-custom-workspace');
+    if (customOverride) {
+      fs.mkdirSync(customDir, { recursive: true });
+      const agents = await import('../../../../src/main/features/agents');
+      await agents.setAgentCliProjectDir(TEST_UID, AGENT_ID, customDir);
+    }
+    const expectedDir = customOverride ? customDir : projectDir;
+    const chats = await import('../../../../src/main/features/chats');
+    const cid = 'cid-opencode-project-default';
+    const conversation = await chats.createConversation(TEST_UID, {
+      conversationId: cid,
+      projectId,
+      title: 'OpenCode project task',
+    });
+    expect(conversation.project_id).toBe(projectId);
+    expect((await chats.getConversation(TEST_UID, cid))?.project_id).toBe(projectId);
+    expect(userWorkspace.getWorkspacePath(TEST_UID, projectId)).toBe(projectDir);
+
+    cliRunMock.nextResult = {
+      runId: 'opencode-project-default',
+      status: 'completed',
+      output: 'Project inspected.',
+    };
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    await groupChat.send({
+      userId: TEST_UID,
+      cid,
+      text: `@${AGENT_NAME} inspect this project`,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    expect(cliRunMock.calls).toHaveLength(1);
+    expect(cliRunMock.calls[0]).toMatchObject({ cli: 'opencode', cwd: expectedDir });
+    expect(`${cliRunMock.calls[0].systemPrompt || ''}\n${cliRunMock.calls[0].prompt}`).toContain(
+      '## Output protocol — switching project directory',
+    );
+    const current = await state.readState(TEST_UID, cid);
+    expect(current.coding_project_dir).toBe(expectedDir);
+    expect(current.coding_project_dir_explicit).toBe(customOverride ? true : undefined);
+    const mainFile = paths.projectChatJsonlFile(TEST_UID, projectId, cid);
+    const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(rows.some((row: any) => row.form?.fields?.some((field: any) => field.id === 'project_dir')))
+      .toBe(false);
+  });
+
+  it('persists files and process detail from a real result-only OpenCode multi-file write event', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+    const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+    spec.runtime = { kind: 'cli', cli: 'opencode' };
+    fs.writeFileSync(agentFile, JSON.stringify(spec));
+
+    const projectDir = path.join(tmpDir, 'workspace');
+    const agents = await import('../../../../src/main/features/agents');
+    await agents.setAgentCliProjectDir(TEST_UID, AGENT_ID, projectDir);
+    const producedFile = path.join(projectDir, 'snake.html');
+    const outsideFile = path.join(tmpDir, 'outside', 'customer-plan.md');
+    const traversalFile = path.join(tmpDir, 'outside', 'traversal.ts');
+    const misleadingInsideFile = path.join(projectDir, 'customer-plan.md');
+    const misleadingTraversalFile = path.join(projectDir, 'traversal.ts');
+    const nestedRelativeFiles = [
+      'nested/path.ts',
+      'nested/file.ts',
+      'nested/file-path.ts',
+      'nested/filePath.ts',
+      'nested/filename.ts',
+    ];
+    const expectedProduced = [
+      producedFile,
+      ...nestedRelativeFiles.map(file => path.join(projectDir, file)),
+    ];
+    for (const file of expectedProduced) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, file === producedFile ? '<main>snake</main>' : 'export {};');
+    }
+    for (const file of [outsideFile, traversalFile, misleadingInsideFile, misleadingTraversalFile]) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, 'pre-existing, not produced by this turn');
+    }
+    const opencode = await import('../../../../src/main/features/local_agents/backends/opencode');
+    const mapped = opencode.mapOpencodeEvent({
+      type: 'tool_use',
+      part: {
+        tool: 'write',
+        callID: 'write-result-only',
+        state: {
+          status: 'completed',
+          input: {
+            filePath: 'snake.html',
+            files: [
+              { path: nestedRelativeFiles[0] },
+              { file: nestedRelativeFiles[1] },
+              { file_path: nestedRelativeFiles[2] },
+              { filePath: nestedRelativeFiles[3] },
+              { filename: nestedRelativeFiles[4] },
+              { path: outsideFile },
+              { filePath: 'nested/../../outside/traversal.ts' },
+            ],
+            content: '<main>private write body</main>',
+          },
+          output: 'created',
+          time: { start: 100, end: 125 },
+        },
+      },
+    });
+    expect(mapped?.event).toMatchObject({
+      type: 'tool-event',
+      phase: 'result',
+      tool: 'write',
+      callId: 'write-result-only',
+      durationMs: 25,
+      output: 'created',
+    });
+    expect(JSON.stringify(mapped?.event)).not.toContain('private write body');
+    const actualRunner = await vi.importActual<typeof import(
+      '../../../../src/main/features/local_agents/runner'
+    )>('../../../../src/main/features/local_agents/runner');
+    const safeEvent = actualRunner.redactPrivateLocalAgentEvent(mapped!.event, projectDir);
+    expect((safeEvent as any).input.files).toContainEqual({ displayPath: 'customer-plan.md' });
+    expect((safeEvent as any).input.files).toContainEqual({ displayPath: 'traversal.ts' });
+    cliRunMock.nextEvents.push(safeEvent);
+    cliRunMock.nextResult = {
+      runId: 'result-only-write',
+      status: 'completed',
+      output: 'Created the requested file.',
+    };
+
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const cid = 'cid-result-only-write';
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `@${AGENT_NAME} create the file`,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    expect(cliRunMock.calls).toHaveLength(1);
+    expect(cliRunMock.calls[0].cwd).toBe(projectDir);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const rows = fs.readFileSync(mainFile, 'utf8').trim()
+      .split('\n').map(line => JSON.parse(line));
+    const reply = rows.find(row => row.from === AGENT_ID);
+    // Delivery selection intentionally publishes only the primary HTML file;
+    // every nested write still enters conversation ownership for later turns.
+    expect(reply?.produced).toContain(producedFile);
+    const ownedPaths = bus._cidStateForTest(TEST_UID, cid)?.producedPaths;
+    for (const file of expectedProduced) expect(ownedPaths?.has(file)).toBe(true);
+    expect(ownedPaths?.has(outsideFile)).toBe(false);
+    expect(ownedPaths?.has(traversalFile)).toBe(false);
+    expect(ownedPaths?.has(misleadingInsideFile)).toBe(false);
+    expect(ownedPaths?.has(misleadingTraversalFile)).toBe(false);
+    expect(reply?.process).toContainEqual({
+      type: 'event',
+      event: { stream: 'cli', data: safeEvent },
+    });
+  });
+
+  it('publishes a managed Codex image file inline and does not restore it as an unsent attachment', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const layout = await import('../../../../src/main/util/project-layout');
+    const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+    const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+    spec.runtime = { kind: 'cli', cli: 'codex' };
+    fs.writeFileSync(agentFile, JSON.stringify(spec));
+
+    const cid = 'cid-codex-generated-image';
+    const attachmentDir = layout.chatAttachmentDirForConversation(TEST_UID, cid);
+    const generatedPath = path.join(attachmentDir, 'codex-generated-image.png');
+    const outsidePath = path.join(tmpDir, 'outside', 'must-not-be-owned.png');
+    fs.mkdirSync(attachmentDir, { recursive: true });
+    fs.mkdirSync(path.dirname(outsidePath), { recursive: true });
+    fs.writeFileSync(generatedPath, Buffer.from('generated image bytes'));
+    fs.writeFileSync(outsidePath, Buffer.from('outside bytes'));
+
+    cliRunMock.nextEvents.push({
+      type: 'file-change',
+      paths: [generatedPath, outsidePath],
+      scope: 'conversation-media',
+      source: 'image_generation',
+      synthetic: true,
+    });
+    cliRunMock.nextResult = {
+      runId: 'codex-generated-image',
+      status: 'completed',
+      output: 'The image is ready.',
+    };
+
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `@${AGENT_NAME} generate the image`,
+      forceTo: [AGENT_ID],
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    const reply = rows.find(row => row.from === AGENT_ID);
+    expect(reply?.produced).toEqual([generatedPath]);
+    expect(reply?.text).toContain('The image is ready.');
+    expect(reply?.text).toContain(
+      '![generated image](chat-media://cid/cid-codex-generated-image/codex-generated-image.png)',
+    );
+    expect(reply?.process).toContainEqual({
+      type: 'event',
+      event: {
+        stream: 'cli',
+        data: expect.objectContaining({
+          type: 'file-change',
+          scope: 'conversation-media',
+          source: 'image_generation',
+        }),
+      },
+    });
+    expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(generatedPath)).toBe(true);
+    expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(outsidePath)).toBe(false);
+
+    const attachments = await import('../../../../src/main/features/chat_attachments');
+    expect(attachments.listPendingAttachments(TEST_UID, cid)).toEqual([]);
+  });
+
+  it('converts a Codex file citation into the exact produced-file footer selection', async () => {
     const paths = await import('../../../../src/main/paths');
     const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
     const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
     spec.runtime = { kind: 'cli', cli: 'codex' };
     fs.writeFileSync(agentFile, JSON.stringify(spec));
 
-    const projectDir = path.join(tmpDir, 'repo');
-    fs.mkdirSync(projectDir);
+    const projectDir = path.join(tmpDir, 'workspace');
     const agents = await import('../../../../src/main/features/agents');
     await agents.setAgentCliProjectDir(TEST_UID, AGENT_ID, projectDir);
+    const deckPath = path.join(projectDir, 'AI会议助手竞品分析.pptx');
+    const supportingPath = path.join(projectDir, 'analysis-notes.md');
+    fs.writeFileSync(deckPath, 'presentation bytes');
+    fs.writeFileSync(supportingPath, 'supporting notes');
 
+    cliRunMock.nextEvents.push({
+      type: 'file-change',
+      source: 'codex',
+      paths: [deckPath, supportingPath],
+    });
+    cliRunMock.nextResult = {
+      runId: 'codex-file-citation',
+      status: 'completed',
+      output: [
+        '演示文稿已经完成。',
+        '',
+        `:codex-file-citation{path="${deckPath}" purpose="output"}`,
+      ].join('\n'),
+    };
+
+    const cid = 'cid-codex-file-citation';
     const bus = await import('../../../../src/main/features/group_chat/bus');
-    const state = await import('../../../../src/main/features/group_chat/state');
-    const cid = 'cid-coding-dir';
     await bus.enqueue({
-      uid: TEST_UID, cid, fromActorId: 'user',
-      text: `@${AGENT_NAME} 看一下这个项目`,
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `@${AGENT_NAME} create the presentation`,
+      forceTo: [AGENT_ID],
     });
     await waitForQuiescent(TEST_UID, cid);
 
-    expect(cliRunMock.calls).toHaveLength(1);
-    expect(cliRunMock.calls[0].cwd).toBe(projectDir);
-    expect(cliRunMock.calls[0].prompt).toBe('看一下这个项目');
-    expect(cliRunMock.calls[0].systemPrompt).toContain(
-      '## Output protocol — switching project directory',
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    const reply = rows.find(row => row.from === AGENT_ID);
+    expect(reply?.text).toBe('演示文稿已经完成。');
+    // Renderer consumes `produced` for the clickable list under the bubble.
+    // The native citation explicitly selects the deck, while the supporting
+    // file remains owned by the conversation without being presented as final.
+    expect(reply?.produced).toEqual([deckPath]);
+    expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(deckPath)).toBe(true);
+    expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(supportingPath)).toBe(true);
+  });
+
+  it('previews materialized CLI images and videos once and retains remote fallback media', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const layout = await import('../../../../src/main/util/project-layout');
+    const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+    const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+    spec.runtime = { kind: 'cli', cli: 'claude' };
+    fs.writeFileSync(agentFile, JSON.stringify(spec));
+
+    const cid = 'cid-cli-remote-image';
+    const attachmentDir = layout.chatAttachmentDirForConversation(TEST_UID, cid);
+    const generatedPath = path.join(attachmentDir, 'claude-generated-image.png');
+    const generatedVideoPath = path.join(attachmentDir, 'claude-generated-video.mp4');
+    fs.mkdirSync(attachmentDir, { recursive: true });
+    fs.writeFileSync(generatedPath, Buffer.from('generated image bytes'));
+    fs.writeFileSync(generatedVideoPath, Buffer.from('generated video bytes'));
+    cliRunMock.nextEvents.push({
+      type: 'file-change',
+      paths: [generatedPath, generatedVideoPath],
+      scope: 'conversation-media',
+      source: 'cli_media_output',
+      synthetic: true,
+    });
+    cliRunMock.nextEvents.push({
+      type: 'media-output',
+      source: 'claude',
+      items: [
+        {
+          uri: 'https://cdn.example/generated.png?token=signed',
+          mediaType: 'image/png',
+          materializedName: 'claude-generated-image.png',
+        },
+        {
+          uri: 'https://cdn.example/generated.mp4?token=signed',
+          mediaType: 'video/mp4',
+          materializedName: 'claude-generated-video.mp4',
+        },
+        { uri: 'https://cdn.example/fallback.webp?token=signed', mediaType: 'image/webp' },
+        { uri: 'javascript:alert(1)' },
+      ],
+      materializedCount: 2,
+      rejectedCount: 1,
+    });
+    cliRunMock.nextResult = {
+      runId: 'claude-remote-image',
+      status: 'completed',
+      output: '',
+    };
+
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `@${AGENT_NAME} generate the image`,
+      forceTo: [AGENT_ID],
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    const reply = rows.find(row => row.from === AGENT_ID);
+    expect(reply?.text).toBe([
+      '![generated image](chat-media://cid/cid-cli-remote-image/claude-generated-image.png)',
+      '![generated image](chat-media://cid/cid-cli-remote-image/claude-generated-video.mp4)',
+      '![generated image](https://cdn.example/fallback.webp?token=signed "orkas-media-v1:image:https%3A%2F%2Fcdn.example%2Ffallback.webp%3Ftoken%3Dsigned")',
+    ].join('\n\n'));
+    expect(reply?.text).not.toContain('javascript:');
+    expect(reply?.text).not.toContain('https://cdn.example/generated.png');
+    expect(reply?.text).not.toContain('https://cdn.example/generated.mp4');
+    // Normal delivery selection keeps the highest-priority terminal media in
+    // produced while both local copies remain owned and previewed inline.
+    expect(reply?.produced).toEqual([generatedVideoPath]);
+    expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(generatedPath)).toBe(true);
+    expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(generatedVideoPath)).toBe(true);
+    expect(reply?.process).toContainEqual({
+      type: 'event',
+      event: {
+        stream: 'cli',
+        data: expect.objectContaining({ type: 'media-output', source: 'claude' }),
+      },
+    });
+  });
+
+  it('persists a scheduled remote video with a stable local preview and its original fallback URL', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+    const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+    spec.runtime = { kind: 'cli', cli: 'claude' };
+    fs.writeFileSync(agentFile, JSON.stringify(spec));
+
+    const cid = 'cid-cli-background-video';
+    cliRunMock.nextEvents.push({
+      type: 'media-output',
+      source: 'claude',
+      items: [{
+        uri: 'https://cdn.example/render?id=clip-1',
+        mediaType: 'video/mp4',
+        localName: 'cli-remote-aabbccddeeff001122334455.mp4',
+      }],
+      scheduledCount: 1,
+      materializedCount: 0,
+      rejectedCount: 0,
+    });
+    cliRunMock.nextResult = {
+      runId: 'claude-background-video',
+      status: 'completed',
+      output: '',
+    };
+
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `@${AGENT_NAME} generate the video`,
+      forceTo: [AGENT_ID],
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    const reply = rows.find(row => row.from === AGENT_ID);
+    expect(reply?.text).toBe(
+      '![generated video](chat-media://cid/cid-cli-background-video/cli-remote-aabbccddeeff001122334455.mp4'
+      + ' "orkas-media-v1:video:https%3A%2F%2Fcdn.example%2Frender%3Fid%3Dclip-1")',
     );
-    expect(cliRunMock.calls[0].systemPrompt).toContain('<agent-input-form>');
-    expect(cliRunMock.calls[0].prompt).not.toContain('## Conversation context recovered by Orkas');
-    const st = await state.readState(TEST_UID, cid);
-    expect(st.coding_project_dir).toBe(projectDir);
-    expect(st.coding_project_dir_explicit).toBe(true);
+    expect(reply?.process).toContainEqual({
+      type: 'event',
+      event: {
+        stream: 'cli',
+        data: expect.objectContaining({ type: 'media-output', scheduledCount: 1 }),
+      },
+    });
+  });
+
+  it('keeps an OpenCode project-dir form retryable and atomically replays in a fresh cwd', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+    const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+    spec.runtime = { kind: 'cli', cli: 'opencode' };
+    fs.writeFileSync(agentFile, JSON.stringify(spec));
+
+    const oldDir = path.join(tmpDir, 'workspace', 'old-project');
+    const defaultDir = path.join(tmpDir, 'workspace', 'new-project');
+    const nonDirectory = path.join(tmpDir, 'workspace', 'not-a-directory.txt');
+    fs.mkdirSync(oldDir, { recursive: true });
+    fs.mkdirSync(defaultDir, { recursive: true });
+    fs.writeFileSync(nonDirectory, 'file');
+    const agents = await import('../../../../src/main/features/agents');
+    await agents.setAgentCliProjectDir(TEST_UID, AGENT_ID, oldDir);
+
+    cliRunMock.nextResult = {
+      runId: 'project-dir-form',
+      status: 'completed',
+      output: [
+        'Choose the project directory.',
+        '<agent-input-form>',
+        JSON.stringify({
+          fields: [{
+            id: 'project_dir',
+            type: 'directory',
+            label: 'Project directory',
+            required: true,
+            default: defaultDir,
+          }],
+        }),
+        '</agent-input-form>',
+      ].join('\n'),
+    };
+
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const sessions = await import('../../../../src/main/features/local_agents/sessions');
+    const i18n = await import('../../../../src/main/i18n');
+    i18n.setCurrentLang('en');
+    const cid = 'cid-project-dir-form-atomic';
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `@${AGENT_NAME} change projects`,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const formMessage = rows.find((row: any) => row.from === AGENT_ID && row.form);
+    expect(formMessage?.form?.submitted).toBe(false);
+    const sliceFile = paths.groupChatVisibilityFile(TEST_UID, cid, AGENT_ID);
+    const mainBefore = fs.readFileSync(mainFile, 'utf8');
+    const sliceBefore = fs.readFileSync(sliceFile, 'utf8');
+    // isQuiescent covers queues and active workers; the intentionally
+    // fire-and-forget status reconciliation may finish one tick later. Wait
+    // for that durable state before taking the atomicity snapshot.
+    const stateDeadline = Date.now() + 2_000;
+    let stateBefore = await state.readState(TEST_UID, cid);
+    while (stateBefore.status !== 'idle' && Date.now() < stateDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      stateBefore = await state.readState(TEST_UID, cid);
+    }
+    expect(stateBefore.status).toBe('idle');
+    await sessions.setSessionId(TEST_UID, cid, AGENT_ID, 'opencode', 'project-dir-session');
+    const sessionBefore = await sessions.getBinding(TEST_UID, cid, AGENT_ID, 'opencode');
+    const runCountBefore = cliRunMock.calls.length;
+
+    const invalidValues: Array<{ value: unknown; error: string }> = [
+      { value: null, error: 'Directory does not exist' },
+      { value: 'relative/project', error: 'Directory does not exist' },
+      { value: path.join(tmpDir, 'workspace', 'missing-project'), error: 'Directory does not exist' },
+      { value: nonDirectory, error: 'Selected path is not a directory' },
+    ];
+    for (const { value: projectDir, error } of invalidValues) {
+      const result = await groupChat.markFormSubmittedAndDispatch({
+        userId: TEST_UID,
+        cid,
+        msgId: formMessage.id,
+        formId: formMessage.form.form_id,
+        values: { project_dir: projectDir },
+      });
+      expect(result.ok).toBe(false);
+      expect(result.error).toBe(error);
+      expect(result.submission).toBeUndefined();
+      expect(fs.readFileSync(mainFile, 'utf8')).toBe(mainBefore);
+      expect(fs.readFileSync(sliceFile, 'utf8')).toBe(sliceBefore);
+      expect(await state.readState(TEST_UID, cid)).toEqual(stateBefore);
+      expect(await sessions.getBinding(TEST_UID, cid, AGENT_ID, 'opencode')).toEqual(sessionBefore);
+      expect(cliRunMock.calls).toHaveLength(runCountBefore);
+    }
+
+    // A validated path can still fail to persist. That failure must not
+    // consume either transcript copy or clear the cwd-bound session.
+    const setProjectDir = vi.spyOn(state, 'setCodingProjectDir')
+      .mockRejectedValueOnce(new Error('injected state write failure'));
+    const stateWriteFailure = await groupChat.markFormSubmittedAndDispatch({
+      userId: TEST_UID,
+      cid,
+      msgId: formMessage.id,
+      formId: formMessage.form.form_id,
+      values: { project_dir: defaultDir },
+    });
+    expect(stateWriteFailure.ok).toBe(false);
+    expect(fs.readFileSync(mainFile, 'utf8')).toBe(mainBefore);
+    expect(fs.readFileSync(sliceFile, 'utf8')).toBe(sliceBefore);
+    expect((await state.readState(TEST_UID, cid)).coding_project_dir).toBe(oldDir);
+    expect(await sessions.getBinding(TEST_UID, cid, AGENT_ID, 'opencode')).toEqual(sessionBefore);
+    expect(cliRunMock.calls).toHaveLength(runCountBefore);
+    setProjectDir.mockRestore();
+
+    // A compatibility-slice write failure must roll the authoritative main
+    // record and cwd back, leaving the same form safe to retry.
+    const storage = await import('../../../../src/main/storage');
+    const originalRewrite = storage.rewriteJsonlLine.bind(storage);
+    const sliceRewrite = vi.spyOn(storage, 'rewriteJsonlLine').mockImplementation(async (
+      filePath: string,
+      index: number,
+      mutate: (current: any) => any,
+    ) => {
+      if (path.resolve(filePath) === path.resolve(sliceFile)) {
+        return { ok: false as const, error: 'injected visibility slice failure' };
+      }
+      return originalRewrite(filePath, index, mutate);
+    });
+    const sliceWriteFailure = await groupChat.markFormSubmittedAndDispatch({
+      userId: TEST_UID,
+      cid,
+      msgId: formMessage.id,
+      formId: formMessage.form.form_id,
+      values: { project_dir: defaultDir },
+    });
+    sliceRewrite.mockRestore();
+    expect(sliceWriteFailure).toMatchObject({ ok: false, error: 'form submit failed' });
+    expect(fs.readFileSync(mainFile, 'utf8')).toBe(mainBefore);
+    expect(fs.readFileSync(sliceFile, 'utf8')).toBe(sliceBefore);
+    expect((await state.readState(TEST_UID, cid)).coding_project_dir).toBe(oldDir);
+    expect(await sessions.getBinding(TEST_UID, cid, AGENT_ID, 'opencode')).toEqual(sessionBefore);
+    expect(cliRunMock.calls).toHaveLength(runCountBefore);
+
+    // Concurrent retries with identical values are idempotent: exactly one
+    // commit wins, while both callers receive the same replay payload.
+    const submissions = await Promise.all([0, 1].map(() => (
+      groupChat.markFormSubmittedAndDispatch({
+        userId: TEST_UID,
+        cid,
+        msgId: formMessage.id,
+        formId: formMessage.form.form_id,
+        values: { project_dir: defaultDir },
+      })
+    )));
+    const [valid, duplicate] = submissions;
+    expect(valid.ok).toBe(true);
+    expect(duplicate).toEqual(valid);
+    expect((await state.readState(TEST_UID, cid)).coding_project_dir).toBe(defaultDir);
+    expect(await sessions.getSessionId(TEST_UID, cid, AGENT_ID, 'opencode')).toBeNull();
+    const submittedRows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(submittedRows.find((row: any) => row.id === formMessage.id)?.form?.submitted).toBe(true);
+    const submittedSlice = fs.readFileSync(sliceFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(submittedSlice.find((row: any) => row.id === formMessage.id)?.form?.submitted).toBe(true);
+
+    const conflictingRetry = await groupChat.markFormSubmittedAndDispatch({
+      userId: TEST_UID,
+      cid,
+      msgId: formMessage.id,
+      formId: formMessage.form.form_id,
+      values: { project_dir: oldDir },
+    });
+    expect(conflictingRetry).toMatchObject({ ok: false, error: 'form already submitted with different values' });
+
+    cliRunMock.nextResult = {
+      runId: 'project-dir-form-replay',
+      status: 'completed',
+      output: 'Changed projects and completed the original task.',
+    };
+    await groupChat.send({
+      userId: TEST_UID,
+      cid,
+      text: valid.submission!.text,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    expect(cliRunMock.calls).toHaveLength(runCountBefore + 1);
+    const replayCall = cliRunMock.calls.at(-1);
+    expect(replayCall.cwd).toBe(defaultDir);
+    expect(replayCall.resumeSessionId).toBeUndefined();
+    expect(replayCall.prompt).toContain('change projects');
+    expect(replayCall.prompt).not.toContain('<agent-input-submission');
+    expect(replayCall.prompt).not.toContain('- Project directory:');
+    expect(replayCall.prompt).not.toContain(defaultDir);
   });
 
   it('shows localized external-agent failure copy without raw backend diagnostics', async () => {
@@ -2232,6 +3159,38 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(failure?.text).toContain('Confirm that its CLI is signed in and working');
     expect(failure?.text).not.toContain('openclaw exited');
     expect(failure?.text).not.toContain('/Users/alice');
+  });
+
+  it('explains a background-phase timeout as the 24-hour task limit', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+    const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+    spec.runtime = { kind: 'cli', cli: 'claude' };
+    fs.writeFileSync(agentFile, JSON.stringify(spec));
+    cliRunMock.nextResult = {
+      runId: 'background-timeout-run',
+      status: 'timeout',
+      timeoutPhase: 'background',
+      error: 'internal raw timeout detail',
+    };
+
+    const i18n = await import('../../../../src/main/i18n');
+    i18n.setCurrentLang('en');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const cid = 'cid-cli-background-timeout-copy';
+    await bus.enqueue({
+      uid: TEST_UID, cid, fromActorId: 'user',
+      text: `@${AGENT_NAME} run the long background task`,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const failure = rows.find((row: any) => row.from === AGENT_ID && row.failure_kind === 'runtime');
+    expect(failure?.failure_code).toBe('cli_timeout');
+    expect(failure?.text).toContain('reached the 24-hour limit');
+    expect(failure?.text).not.toContain('did not respond for an extended period');
+    expect(failure?.text).not.toContain('internal raw timeout detail');
   });
 
   it('reports an installed CLI version-probe timeout separately from not found', async () => {
@@ -2304,37 +3263,88 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(failure?.text).not.toContain('invalid_request_error');
   });
 
-  it('asks for a project directory instead of silently falling back when a custom coding cwd vanished', async () => {
+  it.each(['codex', 'opencode'] as const)(
+    'asks for a project directory instead of silently falling back when a saved %s coding cwd vanished',
+    async (cli) => {
+      const paths = await import('../../../../src/main/paths');
+      const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+      const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+      spec.runtime = { kind: 'cli', cli };
+      spec.inputs = [{ id: 'project_dir', type: 'directory', label: 'Project directory', required: true, default: '' }];
+      fs.writeFileSync(agentFile, JSON.stringify(spec));
+
+      const projectDir = path.join(tmpDir, 'repo-removed');
+      fs.mkdirSync(projectDir);
+      const agents = await import('../../../../src/main/features/agents');
+      await agents.setAgentCliProjectDir(TEST_UID, AGENT_ID, projectDir);
+      fs.rmSync(projectDir, { recursive: true, force: true });
+
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const state = await import('../../../../src/main/features/group_chat/state');
+      const cid = 'cid-coding-dir-missing';
+      await bus.enqueue({
+        uid: TEST_UID, cid, fromActorId: 'user',
+        text: `@${AGENT_NAME} 修一下这个项目`,
+      });
+      await waitForQuiescent(TEST_UID, cid);
+
+      expect(cliRunMock.calls).toHaveLength(0);
+      const st = await state.readState(TEST_UID, cid);
+      expect(st.coding_project_dir).toBeUndefined();
+
+      const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+      const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      const formMsg = rows.find((row: any) => row?.form?.agent_id === AGENT_ID);
+      expect(formMsg?.form?.fields?.map((f: any) => f.id)).toEqual(['project_dir']);
+    },
+  );
+
+  it('blocks a later OpenCode turn when its conversation cwd disappears instead of falling back', async () => {
     const paths = await import('../../../../src/main/paths');
     const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
     const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
-    spec.runtime = { kind: 'cli', cli: 'codex' };
-    spec.inputs = [{ id: 'project_dir', type: 'directory', label: 'Project directory', required: true, default: '' }];
+    spec.runtime = { kind: 'cli', cli: 'opencode' };
     fs.writeFileSync(agentFile, JSON.stringify(spec));
 
-    const projectDir = path.join(tmpDir, 'repo-removed');
-    fs.mkdirSync(projectDir);
+    const projectDir = path.join(tmpDir, 'later-removed-project');
+    fs.mkdirSync(projectDir, { recursive: true });
     const agents = await import('../../../../src/main/features/agents');
     await agents.setAgentCliProjectDir(TEST_UID, AGENT_ID, projectDir);
-    fs.rmSync(projectDir, { recursive: true, force: true });
 
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const state = await import('../../../../src/main/features/group_chat/state');
-    const cid = 'cid-coding-dir-missing';
+    const sessions = await import('../../../../src/main/features/local_agents/sessions');
+    const cid = 'cid-coding-dir-removed-between-turns';
     await bus.enqueue({
-      uid: TEST_UID, cid, fromActorId: 'user',
-      text: `@${AGENT_NAME} 修一下这个项目`,
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `@${AGENT_NAME} inspect the selected project`,
     });
     await waitForQuiescent(TEST_UID, cid);
 
-    expect(cliRunMock.calls).toHaveLength(0);
-    const st = await state.readState(TEST_UID, cid);
-    expect(st.coding_project_dir).toBeUndefined();
+    expect(cliRunMock.calls).toHaveLength(1);
+    expect(cliRunMock.calls[0]).toMatchObject({ cli: 'opencode', cwd: projectDir });
+    expect((await state.readState(TEST_UID, cid)).coding_project_dir).toBe(projectDir);
+    await sessions.setSessionId(TEST_UID, cid, AGENT_ID, 'opencode', 'stale-cwd-session');
+    fs.rmSync(projectDir, { recursive: true, force: true });
 
-    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
-    const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
-    const formMsg = rows.find((row: any) => row?.form?.agent_id === AGENT_ID);
-    expect(formMsg?.form?.fields?.map((f: any) => f.id)).toEqual(['project_dir']);
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `@${AGENT_NAME} now edit that same project`,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    expect(cliRunMock.calls).toHaveLength(1);
+    expect((await state.readState(TEST_UID, cid)).coding_project_dir).toBeUndefined();
+    expect(await sessions.getSessionId(TEST_UID, cid, AGENT_ID, 'opencode')).toBeNull();
+    const rows = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8')
+      .trim().split('\n').map((line) => JSON.parse(line));
+    const recoveryForm = rows.find((row: any) => row?.form?.agent_id === AGENT_ID
+      && row.form.fields?.some((field: any) => field.id === 'project_dir'));
+    expect(recoveryForm?.form?.submitted).toBe(false);
   });
 
   it('ignores a legacy per-agent model override when dispatching a CLI turn', async () => {
@@ -2914,7 +3924,7 @@ describe('group_chat bus › processItemsAreRoutingOnly (abort promotion guard)'
   it('is routing-only for a prep read + hand_off_to (aborted turn stays silent)', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
     expect(bus.processItemsAreRoutingOnly([
-      toolEvent('read_file'), toolEvent('read_file'), toolEvent('hand_off_to'),
+      toolEvent('read_files'), toolEvent('read_files'), toolEvent('hand_off_to'),
     ])).toBe(true);
     // Runtime "总耗时" + progress lines (no tool name) are ignored.
     expect(bus.processItemsAreRoutingOnly([
@@ -2934,7 +3944,7 @@ describe('group_chat bus › processItemsAreRoutingOnly (abort promotion guard)'
 
   it('is NOT routing-only without a delegation tool (a read-only turn is preserved)', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
-    expect(bus.processItemsAreRoutingOnly([toolEvent('read_file')])).toBe(false);
+    expect(bus.processItemsAreRoutingOnly([toolEvent('read_files')])).toBe(false);
     expect(bus.processItemsAreRoutingOnly([{ type: 'progress', text: 'x' }])).toBe(false);
     expect(bus.processItemsAreRoutingOnly([])).toBe(false);
   });

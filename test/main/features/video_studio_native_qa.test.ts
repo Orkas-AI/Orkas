@@ -9,6 +9,7 @@ import sharp from 'sharp';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  acquireCompositionRenderSlot,
   buildSpeechTranscribeArgs,
   buildInspectScript,
   buildFrameEncoderArgs,
@@ -16,6 +17,7 @@ import {
   buildSceneIsolationProbeScript,
   buildSceneSegmentKey,
   buildVideoTrackRemuxArgs,
+  compareCaptureWithPreviousRun,
   compositionFileUrlForTest,
   computeSceneFrameRanges,
   draftComposition,
@@ -37,7 +39,9 @@ import {
   captureContradictsDom,
   renderComposition,
   resolveSpeechTranscribeBackend,
+  resumableRenderFailureMadeProgress,
   runVideoProcessForTest,
+  sceneIsolationSummary,
   selectSafeFinalRenderFps,
   shouldNormalizeLoudness,
   transcribeSpeech,
@@ -72,6 +76,7 @@ import {
   compareVisualBaseline,
   compileVideoStudioDesignQualityScorecard,
   dedupeInspectIssues,
+  hookPromiseIssue,
   isEnvironmentalDraftFailure,
   isSuspiciousCrossSceneDuplicate,
   loadDesignContract,
@@ -390,6 +395,8 @@ describe('native VideoStudio draft QA parity', () => {
     expect.soft(description).not.toMatch(/preview frames[\s\S]{0,120}keep working/i);
     expect.soft(description).toMatch(/keyframe preview[\s\S]{0,160}end the current turn/i);
     expect.soft(description).toMatch(/(?:subsequent|later) real user (?:reply|turn)/i);
+    expect.soft(description).toMatch(/Retry exhaustion[\s\S]*one fresh turn[\s\S]*one narration materialize call/i);
+    expect.soft(description).toMatch(/never reuse an old turn/i);
     expect.soft(ops).not.toContain('composition.approve_preview');
     expect.soft(knowhow).not.toContain('composition.approve_preview');
     expect.soft(knowhow).toMatch(/ends the current turn/i);
@@ -1518,11 +1525,50 @@ describe('native VideoStudio draft QA parity', () => {
     const hook = result.issues.find((issue) => issue.code === 'HOOK_PROMISE_NOT_VISIBLE');
     expect(hook?.message).toContain('#hook-title');
     expect(hook?.message).toContain('cumulative opacity 0');
+    // Diagnosis alone burned a whole repair budget on 2026-08-22: the model
+    // kept adjusting opacity while the enter animation re-zeroed it at t=0.
+    // The finding carries the passing pattern, not only the measurement.
+    expect(hook?.fixHint).toContain('already-visible base state');
+    expect(hook?.fixHint).toContain('overlay');
 
     // Negative control: a finding must not borrow another element's reason.
     // #hook-title belongs to the hook sample, not to the cta scene finding.
     expect(scene?.message).not.toContain('#hook-title');
     expect(hook?.message).not.toContain('div.clip');
+  });
+
+  it('delivers the frame-0 cover verdict from bare DOM semantics for the inspect shift-left', () => {
+    // The same check the rendered-frame QA runs is now shared with inspect's
+    // pre-render probe (2026-08-22: an invisible cover burned a snapshot
+    // repair budget that inspect could have prevented in seconds). The helper
+    // must judge from semantic evidence alone — no captured pixels.
+    const visible = hookPromiseIssue({
+      visible_roles: ['title', 'visual'],
+      visible_text: 'Abyssal-1 黎明唤醒',
+      hidden_elements: [],
+    }, true);
+    expect(visible).toBeNull();
+
+    const hiddenTitle = hookPromiseIssue({
+      visible_roles: ['visual'],
+      visible_text: '',
+      hidden_elements: [{
+        selector: 'h1#hook-title',
+        role: 'title',
+        reason: 'opacity_zero',
+        detail: 'cumulative opacity 0',
+      } as never],
+    }, true);
+    expect(hiddenTitle).toMatchObject({
+      code: 'HOOK_PROMISE_NOT_VISIBLE',
+      severity: 'error',
+    });
+    expect(hiddenTitle?.message).toContain('h1#hook-title');
+    expect(hiddenTitle?.fixHint).toContain('already-visible base state');
+
+    // A middle segment of an assembled production is advisory, not blocking.
+    const middleSegment = hookPromiseIssue({ visible_roles: [], visible_text: '' }, false);
+    expect(middleSegment).toMatchObject({ severity: 'warning' });
   });
 
   it('says nothing extra when the probe recorded no hidden elements', () => {
@@ -2862,6 +2908,74 @@ describe('native VideoStudio draft QA parity', () => {
     expect(path.dirname(second)).toBe(expectedDir);
     expect(path.basename(first)).toMatch(/^[a-f0-9]{12}-[a-f0-9]{8}$/);
     expect(second).not.toBe(first);
+  });
+
+  it('reports byte-level agreement with the immediately previous capture run', async () => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'vs-capture-compare-'));
+    const prior = path.join(parent, 'aaaaaaaaaaaa-11111111');
+    const current = path.join(parent, 'bbbbbbbbbbbb-22222222');
+    fs.mkdirSync(prior, { recursive: true });
+    fs.mkdirSync(current, { recursive: true });
+    // Different numeric prefixes on the same label must still pair up.
+    fs.writeFileSync(path.join(prior, '03-first-frame.png'), 'same-bytes');
+    fs.writeFileSync(path.join(prior, '04-mid.png'), 'old-bytes');
+    fs.writeFileSync(path.join(current, '01-first-frame.png'), 'same-bytes');
+    fs.writeFileSync(path.join(current, '02-mid.png'), 'new-bytes');
+    const samples = [
+      { label: 'first-frame', path: path.join(current, '01-first-frame.png') },
+      { label: 'mid', path: path.join(current, '02-mid.png') },
+    ];
+    const mixed = await compareCaptureWithPreviousRun(current, samples);
+    expect(mixed).toMatchObject({
+      fresh_capture: true,
+      compared_with_previous_capture: 'aaaaaaaaaaaa-11111111',
+      unchanged_labels: ['first-frame'],
+      changed_labels: ['mid'],
+    });
+    expect(mixed?.note).toBeUndefined();
+
+    // Every frame byte-identical -> the fact is spelled out, in words that
+    // rule out the "stale frame cache" misattribution, before any success
+    // report can claim the revision landed.
+    fs.writeFileSync(path.join(current, '02-mid.png'), 'old-bytes');
+    const identical = await compareCaptureWithPreviousRun(current, samples);
+    expect(identical?.unchanged_labels).toEqual(['first-frame', 'mid']);
+    expect(identical?.changed_labels).toEqual([]);
+    expect(String(identical?.note)).toMatch(/byte-identical/);
+    expect(String(identical?.note)).toMatch(/no frame cache/);
+
+    // Every frame changed is the healthy shape: no block, no token spend.
+    fs.writeFileSync(path.join(current, '01-first-frame.png'), 'fresh-bytes');
+    fs.writeFileSync(path.join(current, '02-mid.png'), 'fresh-bytes-too');
+    expect(await compareCaptureWithPreviousRun(current, samples)).toBeNull();
+
+    // The first capture of a composition has nothing to compare against.
+    const solo = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'vs-capture-solo-')), 'cccccccccccc-33333333');
+    fs.mkdirSync(solo, { recursive: true });
+    expect(await compareCaptureWithPreviousRun(solo, samples)).toBeNull();
+  });
+
+  it('follows capture lineage across renamed snapshot stems', async () => {
+    // 2026-08-23 live run: the model renamed its snapshot output every round
+    // (keyframes -> flashback-fix-v3 -> v5), so each capture family started
+    // empty and the previous-run comparison never fired. Sibling families of
+    // the same snapshot directory are the same composition's lineage.
+    const snapshotDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vs-capture-stems-'));
+    const prior = path.join(snapshotDir, 'keyframes-frames', 'aaaaaaaaaaaa-11111111');
+    const current = path.join(snapshotDir, 'keyframes-fix-v2-frames', 'bbbbbbbbbbbb-22222222');
+    fs.mkdirSync(prior, { recursive: true });
+    fs.mkdirSync(current, { recursive: true });
+    fs.writeFileSync(path.join(prior, '01-first-frame.png'), 'same-bytes');
+    fs.writeFileSync(path.join(current, '01-first-frame.png'), 'same-bytes');
+    const crossStem = await compareCaptureWithPreviousRun(current, [
+      { label: 'first-frame', path: path.join(current, '01-first-frame.png') },
+    ]);
+    expect(crossStem).toMatchObject({
+      fresh_capture: true,
+      compared_with_previous_capture: 'keyframes-frames/aaaaaaaaaaaa-11111111',
+      unchanged_labels: ['first-frame'],
+    });
+    expect(String(crossStem?.note)).toMatch(/byte-identical/);
   });
 
   it('publishes the revisioned contact sheet while keeping the first frame explicit', () => {
@@ -5779,6 +5893,100 @@ describe('P3c R1 scene attribution', () => {
     expect(capped.isolation).toBe(false);
     expect(capped.violations.length).toBe(20);
   });
+
+  it('spells out the scene-switching risk when the isolation summary carries violations', () => {
+    const manifest = attributionManifest();
+    const scaffold = buildCompositionScaffold(manifest);
+    const good = decomposeCompositionSceneAttribution(scaffold, manifest);
+    const dirty = summarizeSceneIsolation({
+      htmlSha256: 'h',
+      decomposition: good,
+      probe: {
+        supported: true,
+        isolation: false,
+        violations: [
+          { reason: 'tween_spans_scene_windows', start: 0.2, end: 14.6, targets: ['div'] },
+          { reason: 'tween_spans_scene_windows', start: 0.2, end: 14.4, targets: ['div'] },
+          { reason: 'target_outside_scenes', start: 0, end: 0, targets: ['div'] },
+        ],
+      },
+    });
+    const summary = sceneIsolationSummary(dirty);
+    expect(summary).toMatchObject({
+      isolation: false,
+      violation_count: 3,
+      violation_reasons: ['tween_spans_scene_windows', 'target_outside_scenes'],
+      record_path: 'qa/scene-isolation.json',
+    });
+    expect(String(summary.risk)).toMatch(/previous scene/);
+    expect(String(summary.risk)).toMatch(/data-start\/data-duration/);
+
+    const clean = summarizeSceneIsolation({
+      htmlSha256: 'h',
+      decomposition: good,
+      probe: { supported: true, isolation: true, violations: [] },
+    });
+    const cleanSummary = sceneIsolationSummary(clean);
+    expect(cleanSummary.risk).toBeUndefined();
+    expect(cleanSummary.violation_reasons).toBeUndefined();
+  });
+});
+
+describe('composition render slot', () => {
+  const tick = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  it('serializes renders FIFO and lets an aborted waiter abandon its place', async () => {
+    // Two concurrent renders halve each other's throughput (2026-08-22); the
+    // gate must hold one render at a time, in arrival order, and an aborted
+    // waiter must not wedge the queue behind it.
+    const order: string[] = [];
+    const first = await acquireCompositionRenderSlot();
+    let secondAcquired = false;
+    const secondPromise = acquireCompositionRenderSlot().then((release) => {
+      secondAcquired = true;
+      order.push('second');
+      return release;
+    });
+    await tick(20);
+    expect(secondAcquired).toBe(false);
+
+    const aborter = new AbortController();
+    const abortedPromise = acquireCompositionRenderSlot({ signal: aborter.signal });
+    aborter.abort();
+    await expect(abortedPromise).rejects.toThrow(/aborted/);
+
+    let thirdAcquired = false;
+    const thirdPromise = acquireCompositionRenderSlot().then((release) => {
+      thirdAcquired = true;
+      order.push('third');
+      return release;
+    });
+    await tick(20);
+    expect(secondAcquired).toBe(false);
+    expect(thirdAcquired).toBe(false);
+
+    first();
+    const secondRelease = await secondPromise;
+    expect(order).toEqual(['second']);
+    secondRelease();
+    const thirdRelease = await thirdPromise;
+    expect(order).toEqual(['second', 'third']);
+    thirdRelease();
+  });
+
+  it('reports queue waits through onWait so the wait stays visible', async () => {
+    const first = await acquireCompositionRenderSlot();
+    const waits: number[] = [];
+    const pending = acquireCompositionRenderSlot({
+      onWait: (waitedMs) => waits.push(waitedMs),
+      waitProgressIntervalMs: 10,
+    });
+    await tick(60);
+    first();
+    (await pending)();
+    expect(waits.length).toBeGreaterThanOrEqual(2);
+    expect(waits.at(-1)!).toBeGreaterThanOrEqual(waits[0]);
+  });
 });
 
 describe('P3c R2 scene segment assembly', () => {
@@ -5815,6 +6023,7 @@ describe('P3c R2 scene segment assembly', () => {
     expect(computeSceneFrameRanges([{ id: 'a', start: 0, duration: 1 }], 0, 60)).toBeNull();
   });
 
+
   it('changes the segment key on every dimension the frames depend on', () => {
     const base = {
       sceneId: 'cover',
@@ -5846,6 +6055,29 @@ describe('P3c R2 scene segment assembly', () => {
       buildSceneSegmentKey({ ...base, format: 'webm' }),
     ];
     expect(new Set([key, ...variants]).size).toBe(variants.length + 1);
+  });
+
+  it('spends the draft repair budget only on zero-progress resumable failures', () => {
+    // A resume that cached at least one NEW segment genuinely advanced, so it
+    // must not burn a content-repair pass; a zero-progress repeat must, or
+    // unchanged-input repetition would be unbounded.
+    const incomplete = (rendered: number) => ({
+      ok: false,
+      op: 'composition.render',
+      errorCode: 'E_SEGMENT_ASSEMBLY_INCOMPLETE',
+      message: 'incomplete',
+      scene_segments: { total: 3, rendered, reused: 1, failed: 1, pending: 0, resumable: true },
+    } as Parameters<typeof resumableRenderFailureMadeProgress>[0]);
+    expect(resumableRenderFailureMadeProgress(incomplete(2))).toBe(true);
+    expect(resumableRenderFailureMadeProgress(incomplete(0))).toBe(false);
+    // Other render failures never skip the budget, whatever counters they carry.
+    expect(resumableRenderFailureMadeProgress({
+      ok: false,
+      op: 'composition.render',
+      errorCode: 'E_RENDER_FAILED',
+      message: 'x',
+      scene_segments: { rendered: 2 },
+    } as Parameters<typeof resumableRenderFailureMadeProgress>[0])).toBe(false);
   });
 
   it('attributes referenced asset changes to the owning visual surface', async () => {
@@ -6093,8 +6325,18 @@ describe('P3c R2 scene segment assembly', () => {
         expect(await renderedFrameDigest(assetChanged.path, 'asset-v2-frame'))
           .not.toBe(beforeAssetChange);
       } else {
-        expect((assetChanged as { scene_segments?: unknown }).scene_segments).toBeUndefined();
+        // Resumable contract: a dirty segment that cannot render here (no
+        // BrowserWindow) fails as a structured incomplete result instead of
+        // silently re-rendering the whole composition; the unchanged segment
+        // stays cached for the retry and no output is produced.
+        expect((assetChanged as { errorCode?: string }).errorCode).toBe('E_SEGMENT_ASSEMBLY_INCOMPLETE');
+        const segState = (assetChanged as {
+          scene_segments?: { reused: number; rendered: number; resumable: boolean };
+        }).scene_segments;
+        expect(segState?.resumable).toBe(true);
+        expect(segState?.reused).toBe(1);
         expect(fs.existsSync(path.join(p.renderDir, 'asset-changed.mp4'))).toBe(false);
+        expect(fs.existsSync(path.join(cacheDir, blueAssetKeys.get('body')!, 'segment.mp4'))).toBe(true);
       }
 
       // Editing one scene's motion region dirties exactly that segment, which
@@ -6127,15 +6369,69 @@ describe('P3c R2 scene segment assembly', () => {
       );
       expect(editedSegmentKeys.get('cover')).toBe(initialSegmentKeys.get('cover'));
       expect(editedSegmentKeys.get('body')).not.toBe(initialSegmentKeys.get('body'));
+      const progressEvents: Array<{ phase: string; message: string; data?: Record<string, unknown> }> = [];
       const missed = await renderComposition({
         compositionDirAbs: p.compositionDir,
         outputAbsPath: path.join(p.renderDir, 'missed.mp4'),
         fps: 30,
         segmentCacheDirAbs: cacheDir,
         visualSignature: await videoStudioVisualCompositionSignature(p.compositionDir),
+        onProgress: (event) => progressEvents.push(event),
       });
       expect(missed.ok).toBe(false);
-      expect((missed as { scene_segments?: unknown }).scene_segments).toBeUndefined();
+      expect((missed as { errorCode?: string }).errorCode).toBe('E_SEGMENT_ASSEMBLY_INCOMPLETE');
+      const missedSegments = (missed as {
+        scene_segments?: { total: number; reused: number; rendered: number; pending: number; resumable: boolean };
+      }).scene_segments;
+      expect(missedSegments).toMatchObject({ total: 2, reused: 1, rendered: 0, pending: 1, resumable: true });
+      expect(fs.existsSync(path.join(p.renderDir, 'missed.mp4'))).toBe(false);
+      // The unchanged cover segment stays cached: the unchanged-input retry
+      // only has to render the edited body segment.
+      expect(fs.existsSync(path.join(cacheDir, editedSegmentKeys.get('cover')!, 'segment.mp4'))).toBe(true);
+      // Assembly is no longer a silent phase: it announces itself before any
+      // window work, so the first progress event no longer waits on the render.
+      const announce = progressEvents.find((event) => event.data?.framePipeline === 'scene_segment_assembly');
+      expect(announce?.message).toContain('1 to render, 1 cached');
     },
   );
+
+  it('routes ineligible compositions to the raw loop and says why on the render profile', async () => {
+    // The pipeline decision is explicit: raw whole-composition rendering is
+    // reserved for compositions with no sound per-scene cache boundary, and a
+    // raw run must be explainable — a regression that silently routes an
+    // attributable composition to raw re-introduces the double-render cost.
+    const manifest = segmentManifest();
+    const p = tmpProject('r2-ineligible-reasons');
+    fs.writeFileSync(path.join(p.compositionDir, 'index.html'), buildCompositionScaffold(manifest), 'utf8');
+    fs.writeFileSync(path.join(p.compositionDir, 'composition-manifest.json'), JSON.stringify({
+      schema_version: 1,
+      composition: { id: 'main', width: 320, height: 180, duration: 2, fps: 30 },
+      scenes: [
+        { id: 'cover', start: 0, duration: 1, approved_copy: ['Hello'], narration_refs: [], source_shots: [], roles: [] },
+        { id: 'body', start: 1, duration: 1, approved_copy: ['World'], narration_refs: [], source_shots: [], roles: [] },
+      ],
+      audio: { owner: 'none', tracks: [] },
+    }), 'utf8');
+    const profileReasons = (result: unknown) => (result as {
+      render_profile?: { segment_assembly_ineligible_reasons?: string[] };
+    }).render_profile?.segment_assembly_ineligible_reasons;
+
+    const unprovisioned = await renderComposition({
+      compositionDirAbs: p.compositionDir,
+      outputAbsPath: p.outputPath,
+      fps: 30,
+    });
+    expect(unprovisioned.ok).toBe(false);
+    expect(profileReasons(unprovisioned)?.[0]).toContain('not provisioned');
+
+    const noIsolation = await renderComposition({
+      compositionDirAbs: p.compositionDir,
+      outputAbsPath: p.outputPath,
+      fps: 30,
+      segmentCacheDirAbs: path.join(p.root, 'segment-cache'),
+      visualSignature: await videoStudioVisualCompositionSignature(p.compositionDir),
+    });
+    expect(noIsolation.ok).toBe(false);
+    expect(profileReasons(noIsolation)?.[0]).toContain('isolation record is missing');
+  });
 });

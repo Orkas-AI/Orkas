@@ -71,6 +71,29 @@ describe('prepare-win-native-deps Windows filesystem behavior', () => {
     expect(rmSync).toHaveBeenCalledWith(localArchive, { force: true });
   });
 
+  it('uses host-native paths when cross-building Windows dependencies', () => {
+    const copyFileSync = vi.fn();
+    const rmSync = vi.fn();
+    const runImpl = vi.fn();
+    const targetDir = '/tmp/orkas-win-build/node_modules/@esbuild/win32-x64';
+    const tarball = '/tmp/orkas-win-native-deps/esbuild-win32-x64-0.28.1.tgz';
+
+    prepare.extractTarballInTarget(
+      targetDir,
+      tarball,
+      { fsImpl: { copyFileSync, rmSync }, runImpl },
+    );
+
+    const localArchive = `${targetDir}/esbuild-win32-x64-0.28.1.tgz`;
+    expect(copyFileSync).toHaveBeenCalledWith(tarball, localArchive);
+    expect(runImpl).toHaveBeenCalledWith(
+      targetDir,
+      'tar',
+      ['-xzf', 'esbuild-win32-x64-0.28.1.tgz', '--strip-components=1'],
+    );
+    expect(rmSync).toHaveBeenCalledWith(localArchive, { force: true });
+  });
+
   it('prunes only matching native package directories', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-win-native-prune-'));
     fixtureDirs.push(root);

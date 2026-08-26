@@ -13,9 +13,8 @@
  * helpers from `paths.ts`. Reading the SKILL.md body would violate
  * PC/CLAUDE.md §3 (model layer doesn't read business data) and is
  * unnecessary — the system label is derivable from the absolute path
- * alone.
- *
- * See `Common/docs/plans/expert-signals-skill-attribution.md` §3.3.
+ * alone. Skill source-domain boundaries are defined by
+ * `docs/architecture/skill-engineering-contract.md`.
  */
 
 import * as path from 'node:path';

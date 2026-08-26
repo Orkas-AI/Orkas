@@ -1,12 +1,8 @@
 {
-  "version": "1.0.41",
-  "updated_at": "2026-08-08T11:44:58.000Z",
+  "version": "1.0.51",
+  "updated_at": "2026-08-20T11:28:00.000Z",
   "reseed_if_deleted_before": "2026-07-29T08:04:00Z",
   "category": "creation",
-  "descriptions": {
-    "zh": "规划、研究、起草、改写、自然化、适配和审核编辑内容：可从一句目标直接完成社媒成稿，也支持文章、博客、newsletter、教程、案例、观点稿和资料型改写，并保留来源边界与作者声音。",
-    "en": "Plan, research, draft, revise, humanize, adapt, and audit social and long-form editorial content with channel-aware structure, evidence boundaries, voice preservation, and publication-readiness gates."
-  },
   "routing": {
     "applicable_domain": [
       "individual social posts, long-form articles, blogs, newsletters, explainers, tutorials, case studies, opinion pieces, and research-backed reports",

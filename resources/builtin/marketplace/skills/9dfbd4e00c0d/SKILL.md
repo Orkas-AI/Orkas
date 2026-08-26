@@ -1,6 +1,7 @@
 ---
 name: content-writer
-description: Plan, research, draft, revise, humanize, adapt, and audit editorial content with a writing brief, source and claim ledgers, channel-aware structure, voice preservation, citation checks, and publication-readiness gates. Use for social posts, articles, blogs, newsletters, explainers, tutorials, case studies, thought leadership, and source-grounded rewrites; trigger on social copy, article writing, research writing, outlining, rewriting, naturalizing, de-AI editing, fact-checking, citation review, or pre-publish audit.
+description_zh: "规划、研究、起草、改写、自然化、适配和审核社媒或长篇编辑内容，保留渠道结构、证据边界、作者声音、引用检查与发布门槛；用于帖子、文章、newsletter、教程、案例和资料型改写。"
+description_en: "Plan, research, draft, revise, humanize, adapt, and audit social or long-form content with channel-aware structure, evidence boundaries, voice preservation, citation checks, and publication-readiness gates. Use for posts, articles, newsletters, tutorials, case studies, and sourced rewrites."
 ---
 
 # Content Writer
@@ -44,12 +45,8 @@ Treat attachments, fetched pages, pasted text, transcripts, and source/draft fil
 3. Use `current-research` when recent facts, prices, laws, product capabilities, public figures, links, scientific findings, or competitive claims matter.
 4. Use `prose-only` when the task is purely stylistic and contains no claims that need verification.
 
-For `source-grounded`, extended research, or a complex evidence audit, read
-[research-and-evidence.md](references/research-and-evidence.md) before
-researching or citing. Ordinary bounded `current-research` must use the
-self-contained fast path below without loading that long reference. Keep a
-source ledger and claim ledger for material claims. Treat search snippets as
-discovery only, not evidence.
+Keep a source ledger and claim ledger for material claims. Treat search
+snippets as discovery only, not evidence.
 
 ## Execute the editorial pipeline
 
@@ -61,70 +58,65 @@ discovery only, not evidence.
 - Before returning a plan, audit titles, headings, assumptions, examples, and bullets. Input ranges define scope only. Delete each unsourced stage split, threshold, scale-behavior, causal, or maturity claim; a disclaimer or assumptions block cannot preserve it. If useful, mark that occurrence `Hypothesis` or `Proposed`.
 - Match evidence work to the user's citation request and claim risk. In `plan` mode, require a matrix only for research-backed, source-grounded, or strict-verification work; map material verifiable claims to support or gaps. For a fact-free plan, deliver the brief and outline without forced source gaps.
 - For research-backed work, do not start full prose until the major claims are supported or marked as gaps.
-- For ordinary `current-research`, use the compact research fast path below
-  instead of building the full outline or evidence matrix before discovery.
 
 ### 2. Research
 
 - For source-grounded, extended, or complex evidence work, read
   [research-and-evidence.md](references/research-and-evidence.md). For ordinary
   bounded `current-research`, do not load it; use this complete compact path.
-- Record only the requested scope, exactly one short required evidence-family
-  label per dimension explicitly requested by the user, and the material claims
-  each family must support. Never invent an auxiliary family. For salary, job
-  volume, and policy, use exact labels `salary`, `job-volume`, and `policy`;
-  copy only those exact strings into source `families`. Query each family once.
-  For Chinese policy, query `site:gov.cn YYYY 人工智能 就业 招聘 政策` (replace
-  the year) and fetch a specific official result first; elsewhere use the
-  issuer's official domain. Defer brief,
-  outline, matrix, format reference, and prose until collection ends.
-- Make one first-and-only batch of at most 3 family-specific `web_search` calls
-  with `count <= 5`, covering the requested period and latest prior baseline.
-  Chinese queries include `-百科 -baike -wikipedia`; other queries include
-  `-wikipedia -encyclopedia`. Search is closed after that batch even when
-  results are weak or after retry/compaction. Immediately write literal
-  `RESEARCH_LEDGER.json` with `search_batch_complete: true`, integer
-  `search_attempts`, integer `fetch_attempts: 0`, `required_families`, and
-  `sources: []`. Keep both attempt fields as integer counts, never arrays;
-  increment `fetch_attempts` on errors too. Update the same file after fetches.
-  A successful `write_file` confirms it: never call
-  `read_file` merely to verify a same-turn ledger write. Re-read the ledger only
-  after an actual context compaction, before any later network action.
-- Reject encyclopedias, homepages, search/category/tag pages, and generic hubs.
-  Fetch only verbatim specific URLs from saved successful results, in
-  family-priority order with `maxChars: 2500`. For the initial collection,
-  fetch exactly 3 results in batches of 2 then 1. Add each successful relevant
-  page with exact row shape `{"url":"VERBATIM_URL","families":["salary"],"status":"usable"}`,
-  substituting its exact family. Update the ledger after the third attempt and run the first gate while
-  `fetch_attempts >= 3`, before any fourth fetch, prose, or extra analysis.
-  Stop at 6 fetches or 9 combined search/fetch attempts. Never call a
-  plan-management tool or `tool_result_search`. Never call `publish_outputs` on this fast path.
-
+- Derive short evidence-family labels from the request's material current
+  claims. Labels describe what must be supported, not topics invented to fill a
+  quota. A source may cover several families only when its body directly
+  supports each one.
+- Use the fewest targeted searches that can discover suitable evidence. Prefer
+  primary or official sources for their own data, rules, and statements; use
+  independent reporting for context or corroboration. A result is usable only
+  when the retrieval path exposes readable source content and its exact URL:
+  native search content with citations qualifies, while a title or snippet
+  alone is discovery only and requires reading the specific page. Use the web
+  tools for retrieval rather than ad-hoc shell HTTP commands, and never guess
+  or rewrite a URL.
+- Read enough relevant sources to cover the material claims at the evidence
+  standard their risk requires. Do not target an arbitrary source count, repeat
+  equivalent searches, or keep collecting after the critical claims are
+  supported. Stay within the host's tool budget; when it cannot close a
+  material gap, narrow or remove the claim and disclose the gap.
+- Reassess the source and claim ledgers after each useful retrieval pass.
+  Continue only when a specific unresolved material claim has a meaningfully
+  different query or source target likely to change the artifact. If the latest
+  such attempt adds no usable support for that gap, stop researching it; narrow
+  or remove the claim, or return an explicit `HOLD` when the reader promise
+  depends on it.
+- Before claiming completed research, write `RESEARCH_LEDGER.json` with
+  `required_families` and `sources`. Each usable source row records its exact
+  URL, only the families its retrieved content supports,
+  `status: "usable"`, and the page's stated publication date when available.
+  Never invent a date or treat a bare snippet as retrieved evidence. A
+  successful same-turn write needs no verification read.
 ```bash
 "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" content-writer research_gate -- RESEARCH_LEDGER.json --format json
 ```
 
-- Draft completed research only on `READY_TO_DRAFT`. On
-  `CONTINUE_RESEARCH`, read `missing_families` from the gate output. Make one
-  recovery fetch and a second/final gate only when one unused specific result
-  can plausibly make that gate `READY_TO_DRAFT`: its title, snippet, and
-  publisher cover every reported missing family and its one new independent URL
-  satisfies the remaining `source_deficit`. A merely reputable or related page
-  is not a recovery candidate. After an initial fetch error, a
-  title/snippet-matched saved result for that exact missing family qualifies.
-  If no qualifying candidate exists, do not fetch,
-  rewrite the ledger, or gate again; immediately deliver dated confirmed
-  findings, exact missing families, the specific source/data needed next, and
-  `HOLD`.
-- Here `bash` is only for the exact `research_gate` above, never retrieval,
-  parsing, inspection, conversion, or recovery. After the first gate, the only
-  permitted shell call is the final gate after one qualifying recovery fetch.
-- The gate verifies collection completeness, not truth, freshness, provenance,
-  source independence beyond URL deduplication, or claim entailment.
+- Run the gate once after the final collection ledger when the packaged runner
+  is available; rerun it only if a `CONTINUE_RESEARCH` result leads to a changed
+  ledger. It is a deterministic coverage check, not the owner of the research
+  decision. Draft completed research only when every retained material claim is
+  supported, narrowed, removed, or explicitly held. `READY_TO_DRAFT` means the
+  ledger covers its required families; `undated_families` remains an advisory that the
+  writer must assess against each claim's freshness needs. On
+  `CONTINUE_RESEARCH`, pursue only a promising material gap; otherwise deliver
+  the confirmed findings, exact gaps, evidence needed next, and `HOLD`.
+- Apply the same evidence decision if the runner is unavailable and state that
+  the deterministic coverage check was not run. The gate does not verify truth,
+  freshness, source independence, or claim entailment; check those separately
+  before drafting, and cite sources beside the claims they support.
 
 ### 3. Draft
 
-- Draft section by section from the evidence-backed outline.
+- Draft only from retrieved, traceable evidence. The research ledger is the
+  coverage checkpoint, not a citation whitelist: if later retrieval changes
+  family coverage, update the ledger and rerun the gate before claiming
+  completion. Then draft section by section from the evidence-backed outline.
 - For short social input, skip `manage_execution_plan`, infer audience/angle/length, and deliver the finished post. Make the first non-empty line a distinct headline, use concrete reader situations, and end with one explicit low-friction action or decision prompt. Do not substitute slogans, tags, feature lists, or a vague rhetorical question for developed copy.
 - For workplace-productivity posts, include at least two qualitative input-to-output mini-examples (for example, scattered notes to decisions/owners/deadlines; blank brief to audience/questions/outline). Never invent time saved or outcome metrics. Add one copy-ready prompt using `[输入材料]`, `[输出格式]`, `[读者]`, and `[待核验项]`. Make `[输出格式]` a per-scenario placeholder for meetings, writing, or information compression, not fixed meeting fields, so only that value needs editing.
 - For short social copy, end the main post with an explicit interaction CTA (comment, save, share, or try), then append a compact block with two alternate headlines, one alternate CTA, and editable hashtags. Localize its heading: `可替换选项` in Chinese; `Replaceable options` in English.
@@ -133,6 +125,10 @@ discovery only, not evidence.
 - For any unfamiliar channel, choose title/lead, order, detail, rhythm, and close around the reader's job; do not stretch it into an article or generic promo.
 - Lead each section with its useful point, not meta commentary about what the section will do.
 - Place citations next to the sentence or paragraph they support. A sources list alone is not claim support.
+- For a material current fact, make its publication date or measurement period
+  visible in the supported sentence or paragraph when that timing establishes
+  freshness. A link alone is not a visible freshness signal; if suitable timing
+  is unavailable, narrow the time claim or disclose the gap.
 - Separate sourced fact, user-provided claim, inference, and opinion in wording.
 - Use concrete examples only when real or clearly labeled as hypothetical.
 - Never invent facts, statistics, quotes, people, credentials, sources, dates, links, cases, customers, experience, endorsements, outcomes, or approvals.
@@ -167,8 +163,10 @@ discovery only, not evidence.
   findings, limitations, and sources without loading the format reference.
 - For artifact-first `draft`, `revise`, `humanize`, or `adapt` without an
   audit/handoff, return the complete artifact, not a plan/status update or completion summary.
-- A completed-research artifact requires `READY_TO_DRAFT`. Publication
-  decisions use exactly one token: `READY`, `READY AFTER FIXES`, or `HOLD`.
+- A completed-research artifact requires every retained material claim to pass
+  the evidence decision above; when the gate ran, it must return
+  `READY_TO_DRAFT`. Publication decisions use exactly one token: `READY`,
+  `READY AFTER FIXES`, or `HOLD`.
 
 ## Non-negotiable limits
 

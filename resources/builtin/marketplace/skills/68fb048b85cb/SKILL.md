@@ -1,6 +1,7 @@
 ---
 name: product-dev
-description: Use for repository-aware product engineering from an accepted requirement to a focused implementation and evidence-backed handoff. Covers repository intake, architecture decisions and spikes, implementation planning, feature work, bug repair, refactoring, engineering tests, code review, migration and dependency safety, debugging, and completion verification. Do not use for vague product discovery, disposable demos, product-level acceptance criteria alone, or repository-maintainer operations.
+description_zh: "在现有代码仓库中实现聚焦的产品工程变更，从已确认需求推进到测试、评审、调试、迁移和证据化交付；用于功能、缺陷、重构和技术决策，不用于模糊需求探索、一次性演示或仓库运营。"
+description_en: "Implement focused product-engineering changes in an existing repository from accepted requirements through tests, review, debugging, migrations, and evidence-backed handoff. Use for features, bugs, refactors, and technical decisions; not vague discovery, disposable demos, or repository operations."
 ---
 
 # 产品研发
@@ -37,26 +38,27 @@ description: Use for repository-aware product engineering from an accepted requi
 ## 执行主线
 
 1. **建立工程合同**：区分 feature、bug/test failure、refactor、review-only、performance、decision/spike、CI/build；明确目标、非目标、不变量和完成证据。
-2. **先建立仓库地图**：读取 `references/repository-intake.md`，确认规则、脏工作区、构建测试入口、相关符号/调用路径和现有模式。
-3. **先决策后编辑**：存在关键取舍时读取 ADR、spike 或 decision review；多文件/跨边界任务先写短计划，小修复直接给出最小变更路径。
-4. **实现与快速反馈**：读取 `references/implementation.md`；先基线或复现，再小步编辑，每个切片后做便宜且聚焦的检查。
-5. **按分支深入**：失败路径读取 debugging；实际工程测试读取 engineering-tests；依赖、迁移、外部副作用或高风险变更读取 change-safety。
-6. **提交前独立复核**：读取 `references/review-and-finish.md`，从完整 diff 和验收—证据矩阵重新判断，不沿用“实现已经正确”的假设。
+2. **先建立仓库地图**：读取[仓库接入检查](references/repository-intake.md)，确认规则、脏工作区、构建测试入口、相关符号/调用路径和现有模式。
+3. **风险分支前置**：仓库地图显示依赖、迁移、兼容、安全、外部副作用、不可逆操作或大影响面时，在首次相关安装或编辑前读取[变更安全](references/change-safety.md)；没有这些风险时跳过。
+4. **先决策后编辑**：存在关键取舍时读取 ADR、spike 或 decision review；多文件/跨边界任务先写短计划，小修复直接给出最小变更路径。
+5. **实现与快速反馈**：读取[实现与快速反馈](references/implementation.md)；先基线或复现，再小步编辑，每个切片后做便宜且聚焦的检查。
+6. **按结果深入**：失败路径读取 debugging；实际工程测试读取 engineering-tests。
+7. **提交前独立复核**：读取[评审与完成门禁](references/review-and-finish.md)，从完整 diff 和验收—证据矩阵重新判断，不沿用“实现已经正确”的假设。
 
 ## 渐进路由
 
 | 场景 | 读取 |
 |---|---|
-| 仓库规则、工作区状态、命令入口、模块/符号/测试地图 | `references/repository-intake.md` |
-| 技术选型、架构边界、不可逆决策、ADR | `references/architecture-decision.md` |
-| 技术预研、POC、spike、可行性结论 | `references/technical-spike.md` |
-| 上线前追问、隐藏假设、方案取舍审查 | `references/decision-review.md` |
-| 阶段、任务、直接依赖、研发交接 | `references/product-dev-template.md` |
-| 编码、TDD、小步实现、快速反馈 | `references/implementation.md` |
-| Bug、失败测试、回归、异常行为 | `references/debugging.md` |
-| 单元/集成/契约/E2E/构建等工程验证 | `references/engineering-tests.md` |
-| 依赖、迁移、兼容、安全、外部副作用、回滚 | `references/change-safety.md` |
-| diff 评审、完成门禁、证据化交付 | `references/review-and-finish.md` |
+| 仓库规则、工作区状态、命令入口、模块/符号/测试地图 | [仓库接入检查](references/repository-intake.md) |
+| 技术选型、架构边界、不可逆决策、ADR | [架构决策](references/architecture-decision.md) |
+| 技术预研、POC、spike、可行性结论 | [技术预研](references/technical-spike.md) |
+| 上线前追问、隐藏假设、方案取舍审查 | [决策复核](references/decision-review.md) |
+| 阶段、任务、直接依赖、研发交接 | [研发模板](references/product-dev-template.md) |
+| 编码、TDD、小步实现、快速反馈 | [实现](references/implementation.md) |
+| Bug、失败测试、回归、异常行为 | [调试](references/debugging.md) |
+| 单元/集成/契约/E2E/构建等工程验证 | [工程测试](references/engineering-tests.md) |
+| 依赖、迁移、兼容、安全、外部副作用、回滚 | [变更安全](references/change-safety.md) |
+| diff 评审、完成门禁、证据化交付 | [评审与完成](references/review-and-finish.md) |
 
 只读取当前分支需要的 reference，不一次加载全部材料。
 

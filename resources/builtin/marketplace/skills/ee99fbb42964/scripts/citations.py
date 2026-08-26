@@ -30,11 +30,13 @@ stdlib only.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import sys
 import unicodedata
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 # A quote shorter than this (after normalization) trivially substring-matches
@@ -126,6 +128,24 @@ _COMPARISON_COLUMNS = (
 )
 
 _COMPARISON_INFERENCE_FIELDS = {"best_for", "ideal_user"}
+_COMPARISON_FACTUAL_FIELDS = tuple(
+    key for key, _ in _COMPARISON_COLUMNS
+    if key not in {"candidate", "evidence", *_COMPARISON_INFERENCE_FIELDS}
+)
+_COMPARISON_DECISION_GROUPS = (
+    ("platform_and_setup", ("os", "setup_ease"), "all"),
+    ("model_capabilities", ("model_capabilities",), "all"),
+    ("privacy_or_offline", ("local_offline", "privacy_data_handling"), "any"),
+    ("pricing", ("pricing_cost",), "all"),
+    ("limitations", ("key_limitations",), "all"),
+)
+_COMPARISON_CORE_GROUPS = {
+    "platform_and_setup", "model_capabilities", "limitations",
+}
+_COMPARISON_TRADEOFF_GROUPS = {"privacy_or_offline", "pricing"}
+_MIN_TRADEOFF_GROUPS = 2
+_TRUSTED_SNAPSHOT_ENV = "ORKAS_DEEP_RESEARCH_EVIDENCE_FILE"
+_MAX_TRUSTED_SNAPSHOT_BYTES = 4 * 1024 * 1024
 _STRUCTURED_COMPARISON_FIELDS = {
     "os": "os",
     "installation": "setup_ease",
@@ -450,6 +470,136 @@ def _is_not_verified(value: str) -> bool:
     return bool(re.match(r"^not verified(?:\s*:|$)", value, re.IGNORECASE))
 
 
+def _comparison_coverage(normalized_rows: list) -> list:
+    """Classify whether verified comparison facts can support a recommendation.
+
+    Citation cleanliness and decision readiness are intentionally separate. An
+    honest ``Not verified`` value is valid delivery data, but it cannot fill a
+    decision group. The canonical product-comparison schema requires platform
+    and setup plus model capability. It also requires at least two of the three
+    decision trade-offs: privacy/local operation and pricing. A material
+    limitation is mandatory rather than an optional trade-off: a product row
+    cannot support a recommendation while its downside remains unevaluated.
+    """
+    coverage = []
+    for row in normalized_rows:
+        verified_fields = [
+            field for field in _COMPARISON_FACTUAL_FIELDS
+            if _inline_markdown(row.get(field))
+            and not _is_not_verified(_inline_markdown(row.get(field)))
+        ]
+        verified_set = set(verified_fields)
+        satisfied_groups = set()
+        for name, fields, mode in _COMPARISON_DECISION_GROUPS:
+            satisfied = (
+                all(field in verified_set for field in fields)
+                if mode == "all"
+                else any(field in verified_set for field in fields)
+            )
+            if satisfied:
+                satisfied_groups.add(name)
+        missing_groups = [
+            name for name, _, _ in _COMPARISON_DECISION_GROUPS
+            if name not in satisfied_groups
+        ]
+        missing_core_groups = [
+            name for name in missing_groups if name in _COMPARISON_CORE_GROUPS
+        ]
+        tradeoff_groups_verified = len(
+            satisfied_groups & _COMPARISON_TRADEOFF_GROUPS
+        )
+        blocking_groups = [
+            name for name in missing_groups
+            if name in _COMPARISON_TRADEOFF_GROUPS
+            and tradeoff_groups_verified < _MIN_TRADEOFF_GROUPS
+        ]
+        blocking_groups = missing_core_groups + blocking_groups
+        ready = not blocking_groups
+        coverage.append({
+            "candidate": row.get("candidate"),
+            "status": "recommendation_ready" if ready else "under_evidenced",
+            "recommendation_ready": ready,
+            "verified_fields": verified_fields,
+            "not_verified_fields": [
+                field for field in _COMPARISON_FACTUAL_FIELDS
+                if field not in verified_set
+            ],
+            "verified_field_count": len(verified_fields),
+            "factual_field_count": len(_COMPARISON_FACTUAL_FIELDS),
+            "tradeoff_groups_verified": tradeoff_groups_verified,
+            "missing_decision_groups": missing_groups,
+            "blocking_decision_groups": blocking_groups,
+        })
+    return coverage
+
+
+def _render_recommendation_markdown(normalized_rows: list, coverage: list) -> str:
+    """Render model-selected analysis while preserving the verification boundary.
+
+    The verifier establishes factual coverage, not whether a model-authored
+    recommendation follows semantically from those facts. Under-evidenced rows
+    therefore keep the model's ``best_for`` choice but name the evidence gaps
+    that prevent a definitive recommendation.
+    """
+    coverage_by_candidate = {
+        str(item.get("candidate") or ""): item for item in coverage
+    }
+    lines = [
+        "## Recommendations",
+        (
+            "Recommendations are analytical inferences. Citation verification "
+            "checks each cited comparison fact, not the recommendation itself."
+        ),
+    ]
+    path_count = 0
+    for row in normalized_rows:
+        candidate = _inline_markdown(row.get("candidate"))
+        item = coverage_by_candidate.get(candidate) or {}
+        best_for = _inline_markdown(row.get("best_for"))
+        ideal_user = _inline_markdown(row.get("ideal_user"))
+        if _is_not_verified(best_for) or _is_not_verified(ideal_user):
+            continue
+        limitation = _inline_markdown(row.get("key_limitations"))
+        evidence = _inline_markdown(row.get("evidence"))
+        if item.get("recommendation_ready"):
+            lines.append(
+                "- **{best_for}: {candidate}** — ideal user: {ideal_user}; "
+                "material limitation: {limitation}; verified comparison "
+                "evidence: {evidence}.".format(
+                    best_for=best_for,
+                    candidate=candidate,
+                    ideal_user=ideal_user,
+                    limitation=limitation,
+                    evidence=evidence,
+                )
+            )
+        else:
+            gaps = item.get("blocking_decision_groups") or []
+            gap_text = ", ".join(
+                str(group).replace("_", " ") for group in gaps
+            ) or "material decision evidence"
+            lines.append(
+                "- Conditional path — **{best_for}: {candidate}** — ideal user: "
+                "{ideal_user}; verify before choosing: {gaps}; current comparison evidence: "
+                "{evidence}.".format(
+                    best_for=best_for,
+                    candidate=candidate,
+                    ideal_user=ideal_user,
+                    gaps=gap_text,
+                    evidence=evidence,
+                )
+            )
+        path_count += 1
+        if path_count >= 5:
+            break
+    if path_count == 0:
+        lines.append(
+            "- No retained candidate has a usable model-selected decision path; "
+            "use the comparison and its named evidence gaps."
+        )
+    return "\n".join(lines)
+
+
 def _render_comparison(payload_rows, evidence_rows: list) -> tuple[list, str, list]:
     """Normalize a model-supplied comparison into one complete, stable table.
 
@@ -557,7 +707,9 @@ def _render_comparison(payload_rows, evidence_rows: list) -> tuple[list, str, li
                     ),
                 })
                 continue
-            normalized[key] = value
+            normalized[key] = "{} [{}]".format(
+                value, ", ".join(field_evidence_ids)
+            )
             row_evidence_ids.extend(field_evidence_ids)
 
         row_evidence_ids = list(dict.fromkeys(row_evidence_ids))
@@ -643,6 +795,7 @@ def verify(payload: dict) -> dict:
     if not sources:
         comparison_rows, comparison_markdown, comparison_warnings = _render_comparison(
             payload.get("comparison"), [])
+        comparison_coverage = _comparison_coverage(comparison_rows)
         return {
             "abstain": True,
             "abstain_reason": "no_sources",
@@ -652,6 +805,8 @@ def verify(payload: dict) -> dict:
             "claims": [], "references": [], "evidence_rows": [],
             "evidence_markdown": "", "comparison_rows": comparison_rows,
             "comparison_markdown": comparison_markdown,
+            "recommendation_markdown": "",
+            "comparison_coverage": comparison_coverage,
             "comparison_warnings": comparison_warnings,
             "flags": [], "warnings": [],
         }
@@ -829,6 +984,13 @@ def verify(payload: dict) -> dict:
     references = [{"ref": i + 1, **ref_meta[k]} for i, k in enumerate(ref_order)]
     comparison_rows, comparison_markdown, comparison_warnings = _render_comparison(
         payload.get("comparison"), evidence_rows)
+    comparison_coverage = _comparison_coverage(comparison_rows)
+    recommendation_markdown = _render_recommendation_markdown(
+        comparison_rows, comparison_coverage
+    )
+    recommendation_ready = sum(
+        1 for row in comparison_coverage if row["recommendation_ready"]
+    )
     return {
         "abstain": False,
         "abstain_reason": None,
@@ -836,13 +998,20 @@ def verify(payload: dict) -> dict:
                     "unsupported": len(out_claims) - n_supported, "citations": n_cit,
                     "verified": n_verified, "weak": n_weak, "flagged": n_flagged,
                     "aligned": n_aligned, "support_unproven": n_unproven,
-                    "structured_evidence_candidates": structured_count},
+                    "structured_evidence_candidates": structured_count,
+                    "comparison_rows": len(comparison_coverage),
+                    "comparison_recommendation_ready": recommendation_ready,
+                    "comparison_under_evidenced": (
+                        len(comparison_coverage) - recommendation_ready
+                    )},
         "claims": out_claims,
         "references": references,
         "evidence_rows": evidence_rows,
         "evidence_markdown": _render_evidence_markdown(evidence_rows),
         "comparison_rows": comparison_rows,
         "comparison_markdown": comparison_markdown,
+        "recommendation_markdown": recommendation_markdown,
+        "comparison_coverage": comparison_coverage,
         "comparison_warnings": comparison_warnings,
         "flags": flags,
         "warnings": warnings,
@@ -883,25 +1052,17 @@ def references(payload: dict) -> dict:
             "references": v["references"]}
 
 
-def _enrich_sources_from_evidence_ledger(payload: dict, input_path) -> dict:
-    """Recover source dates/limits from the durable sibling ledger.
-
-    Agents often build a minimal citations payload containing only id/url/text.
-    The research workflow already persists richer metadata in
-    evidence_ledger.jsonl, so the CLI merges it deterministically instead of
-    asking the model to copy the same fields twice.
-    """
+def _evidence_ledger_rows(input_path) -> tuple[str | None, list[dict]]:
     if not input_path or input_path == "-":
-        return {"matched_sources": 0, "ledger": None}
+        return None, []
     ledger_path = os.path.join(
         os.path.dirname(os.path.abspath(input_path)),
         "evidence_ledger.jsonl",
     )
     if not os.path.isfile(ledger_path):
-        return {"matched_sources": 0, "ledger": None}
+        return None, []
 
-    by_id = {}
-    by_url = {}
+    rows = []
     try:
         with open(ledger_path, encoding="utf-8") as fh:
             for line in fh:
@@ -911,16 +1072,299 @@ def _enrich_sources_from_evidence_ledger(payload: dict, input_path) -> dict:
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if not isinstance(row, dict):
-                    continue
-                source_id = row.get("source_id") or row.get("id")
-                if source_id is not None and str(source_id) not in by_id:
-                    by_id[str(source_id)] = row
-                url_key = _normalize_url(row.get("canonical_url") or row.get("url") or "")
-                if url_key and url_key not in by_url:
-                    by_url[url_key] = row
+                if isinstance(row, dict):
+                    rows.append(row)
     except OSError:
+        return None, []
+    return ledger_path, rows
+
+
+def _ledger_fields(row: dict) -> list[str]:
+    raw = row.get("fields")
+    if not isinstance(raw, list):
+        raw = [row.get("field")]
+    return list(dict.fromkeys(
+        str(item).strip()
+        for item in raw
+        if item is not None and str(item).strip() in _COMPARISON_FACTUAL_FIELDS
+    ))
+
+
+def _trusted_source_snapshots() -> tuple[dict[str, list[str]], dict]:
+    """Load host-captured web_fetch text and reject corrupt snapshot rows."""
+    snapshot_path = str(os.environ.get(_TRUSTED_SNAPSHOT_ENV) or "").strip()
+    diagnostics = {
+        "available": False,
+        "valid_rows": 0,
+        "invalid_rows": 0,
+        "source_urls": 0,
+    }
+    if not snapshot_path or not os.path.isfile(snapshot_path):
+        return {}, diagnostics
+    try:
+        if os.path.getsize(snapshot_path) > _MAX_TRUSTED_SNAPSHOT_BYTES:
+            diagnostics["invalid_rows"] = 1
+            return {}, diagnostics
+    except OSError:
+        return {}, diagnostics
+
+    by_url: dict[str, list[str]] = {}
+    try:
+        with open(snapshot_path, encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    diagnostics["invalid_rows"] += 1
+                    continue
+                if not isinstance(row, dict) or row.get("schema_version") != 1:
+                    diagnostics["invalid_rows"] += 1
+                    continue
+                source_url = _normalize_url(row.get("canonical_url") or "")
+                text = row.get("text")
+                expected_hash = str(row.get("content_sha256") or "").strip().lower()
+                source_parts = urlsplit(source_url)
+                actual_hash = (
+                    hashlib.sha256(text.encode("utf-8")).hexdigest()
+                    if isinstance(text, str)
+                    else ""
+                )
+                if (
+                    source_parts.scheme not in {"http", "https"}
+                    or not source_parts.netloc
+                    or not text
+                    or len(expected_hash) != 64
+                    or actual_hash != expected_hash
+                ):
+                    diagnostics["invalid_rows"] += 1
+                    continue
+                values = by_url.setdefault(source_url, [])
+                if text not in values:
+                    values.append(text)
+                diagnostics["valid_rows"] += 1
+    except OSError:
+        return {}, diagnostics
+    diagnostics["available"] = bool(by_url)
+    diagnostics["source_urls"] = len(by_url)
+    return by_url, diagnostics
+
+
+def _compact_evidence_row_verifies(
+    row: dict,
+    snapshots_by_url: dict[str, list[str]],
+) -> bool:
+    """Whether a compact ledger row passes the existing citation checks."""
+    source_id = _inline_markdown(row.get("source_id"))
+    claim_id = _inline_markdown(row.get("id"))
+    claim = _inline_markdown(row.get("claim"))
+    quote = _inline_markdown(row.get("quote"))
+    source_url = _normalize_url(row.get("canonical_url") or row.get("url") or "")
+    source_parts = urlsplit(source_url)
+    texts = snapshots_by_url.get(source_url) or []
+    if (
+        not source_id
+        or not claim_id
+        or not claim
+        or not quote
+        or source_parts.scheme not in {"http", "https"}
+        or not source_parts.netloc
+        or not texts
+    ):
+        return False
+    source = {
+        "id": source_id,
+        "url": source_url,
+        "text": "\n".join(texts),
+    }
+    info = _classify_citation(
+        {"source": source_id, "quote": quote},
+        claim,
+        {source_id: source},
+        {source_url: source},
+        {},
+    )
+    return (
+        info.get("verdict") == "verified"
+        and info.get("alignment_status") == "aligned"
+    )
+
+
+def _expand_compact_landscape_payload(payload: dict, input_path) -> dict:
+    """Build the verifier payload directly from compact durable evidence.
+
+    The compact path owns one canonical model-authored intermediate: evidence
+    rows tagged with candidate and comparison fields. The verifier derives
+    sources, claims, claim bindings, and factual comparison cells instead of
+    asking the model to copy the same material into a second large JSON file.
+    """
+    spec = payload.get("compact_landscape")
+    if not isinstance(spec, dict):
+        return {"enabled": False, "ledger": None, "selected_evidence_rows": 0}
+    if any(payload.get(key) for key in ("sources", "claims", "comparison")):
+        raise ValueError(
+            "compact_landscape must not be mixed with sources, claims, or comparison"
+        )
+
+    ledger_path, ledger_rows = _evidence_ledger_rows(input_path)
+    if not ledger_path:
+        raise ValueError("compact_landscape requires sibling evidence_ledger.jsonl")
+
+    profiles = spec.get("candidates")
+    if not isinstance(profiles, list) or not profiles:
+        raise ValueError("compact_landscape.candidates must be a non-empty array")
+
+    rows_by_candidate_field: dict[tuple[str, str], list[dict]] = {}
+    for row in ledger_rows:
+        candidate = _inline_markdown(row.get("candidate"))
+        if not candidate:
+            continue
+        for field in _ledger_fields(row):
+            rows_by_candidate_field.setdefault((candidate.casefold(), field), []).append(row)
+
+    snapshots_by_url, snapshot_diagnostics = _trusted_source_snapshots()
+    selected_rows: list[dict] = []
+    comparison = []
+    for index, profile in enumerate(profiles):
+        if not isinstance(profile, dict):
+            raise ValueError("compact_landscape candidate profiles must be objects")
+        candidate = _inline_markdown(profile.get("candidate"))
+        if not candidate:
+            raise ValueError(
+                "compact_landscape candidate {} has no candidate name".format(index)
+            )
+        best_for = _inline_markdown(profile.get("best_for"))
+        ideal_user = _inline_markdown(profile.get("ideal_user"))
+        if not best_for or not ideal_user:
+            raise ValueError(
+                "compact_landscape candidate {!r} requires best_for and ideal_user".format(
+                    candidate
+                )
+            )
+
+        comparison_row = {
+            "candidate": candidate,
+            "best_for": best_for,
+            "ideal_user": ideal_user,
+            "evidence_sources": [],
+            "field_claims": {},
+        }
+        candidate_sources = []
+        for field in _COMPARISON_FACTUAL_FIELDS:
+            matches = rows_by_candidate_field.get((candidate.casefold(), field), [])
+            row = next(
+                (
+                    candidate_row for candidate_row in matches
+                    if _compact_evidence_row_verifies(candidate_row, snapshots_by_url)
+                ),
+                matches[0] if matches else None,
+            )
+            claim = _inline_markdown((row or {}).get("claim"))
+            quote = _inline_markdown((row or {}).get("quote"))
+            source_id = _inline_markdown((row or {}).get("source_id"))
+            claim_id = _inline_markdown((row or {}).get("id"))
+            if not row or not claim or not quote or not source_id or not claim_id:
+                label = dict(_COMPARISON_COLUMNS)[field]
+                comparison_row[field] = "Not verified: {}".format(label)
+                continue
+            comparison_row[field] = claim
+            comparison_row["field_claims"][field] = [claim_id]
+            candidate_sources.append(source_id)
+            selected_rows.append(row)
+        comparison_row["evidence_sources"] = list(dict.fromkeys(candidate_sources))
+        comparison.append(comparison_row)
+
+    unique_rows = []
+    seen_claim_ids = set()
+    for row in selected_rows:
+        claim_id = _inline_markdown(row.get("id"))
+        if not claim_id or claim_id in seen_claim_ids:
+            continue
+        seen_claim_ids.add(claim_id)
+        unique_rows.append(row)
+
+    sources_by_id: dict[str, dict] = {}
+    source_urls_by_id: dict[str, str] = {}
+    claims = []
+    for row in unique_rows:
+        source_id = _inline_markdown(row.get("source_id"))
+        quote = _inline_markdown(row.get("quote"))
+        source_url = _normalize_url(
+            row.get("canonical_url") or row.get("url") or ""
+        )
+        source_parts = urlsplit(source_url)
+        if source_parts.scheme not in {"http", "https"} or not source_parts.netloc:
+            raise ValueError(
+                "compact landscape source {!r} requires an HTTP(S) canonical URL".format(
+                    source_id
+                )
+            )
+        previous_url = source_urls_by_id.get(source_id)
+        if previous_url is not None and previous_url != source_url:
+            raise ValueError(
+                "compact landscape source {!r} maps to multiple canonical URLs".format(
+                    source_id
+                )
+            )
+        source_urls_by_id[source_id] = source_url
+        source = sources_by_id.get(source_id)
+        if source is None:
+            source = {
+                "id": source_id,
+                "url": source_url,
+                "title": row.get("title"),
+                "date": row.get("published_at") or row.get("source_date") or row.get("date"),
+                "accessed_at": row.get("accessed_at") or row.get("access_date"),
+                "publisher": row.get("publisher"),
+                "source_type": row.get("source_type"),
+                "limitations": row.get("limitations") or row.get("limitation"),
+                "text": "\n".join(snapshots_by_url.get(source_url) or []),
+            }
+            sources_by_id[source_id] = source
+        claims.append({
+            "id": _inline_markdown(row.get("id")),
+            "text": _inline_markdown(row.get("claim")),
+            "citations": [{"source": source_id, "quote": quote}],
+        })
+
+    payload["sources"] = list(sources_by_id.values())
+    payload["claims"] = claims
+    payload["comparison"] = comparison
+    return {
+        "enabled": True,
+        "ledger": os.path.basename(ledger_path),
+        "ledger_rows": len(ledger_rows),
+        "selected_evidence_rows": len(unique_rows),
+        "candidate_rows": len(comparison),
+        "trusted_source_snapshots": snapshot_diagnostics,
+        "missing_snapshot_sources": sum(
+            1 for source in sources_by_id.values() if not source.get("text")
+        ),
+    }
+
+
+def _enrich_sources_from_evidence_ledger(payload: dict, input_path) -> dict:
+    """Recover source dates/limits from the durable sibling ledger.
+
+    Agents often build a minimal citations payload containing only id/url/text.
+    The research workflow already persists richer metadata in
+    evidence_ledger.jsonl, so the CLI merges it deterministically instead of
+    asking the model to copy the same fields twice.
+    """
+    ledger_path, ledger_rows = _evidence_ledger_rows(input_path)
+    if not ledger_path:
         return {"matched_sources": 0, "ledger": None}
+
+    by_id = {}
+    by_url = {}
+    for row in ledger_rows:
+        source_id = row.get("source_id") or row.get("id")
+        if source_id is not None and str(source_id) not in by_id:
+            by_id[str(source_id)] = row
+        url_key = _normalize_url(row.get("canonical_url") or row.get("url") or "")
+        if url_key and url_key not in by_url:
+            by_url[url_key] = row
 
     matched = 0
     for source in payload.get("sources") or []:
@@ -960,7 +1404,11 @@ def _enrich_sources_from_evidence_ledger(payload: dict, input_path) -> dict:
 
 
 def _load(path):
-    raw = sys.stdin.read() if not path or path == "-" else open(path, encoding="utf-8").read()
+    if not path or path == "-":
+        raw = sys.stdin.read()
+    else:
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
     return json.loads(raw)
 
 
@@ -969,14 +1417,40 @@ def main(argv):
     ap.add_argument("--op", choices=["verify", "references"], default="verify")
     ap.add_argument("--input", default=None, help="claims+sources payload JSON (default stdin)")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--report-out", default=None)
     args = ap.parse_args(argv)
 
     payload = _load(args.input)
     if not isinstance(payload, dict):
         raise ValueError("input must be a JSON object with 'sources' and 'claims'")
+    compact_expansion = _expand_compact_landscape_payload(payload, args.input)
     enrichment = _enrich_sources_from_evidence_ledger(payload, args.input)
     data = references(payload) if args.op == "references" else verify(payload)
     data["metadata_enrichment"] = enrichment
+    data["compact_landscape_expansion"] = compact_expansion
+
+    if args.report_out:
+        spec = payload.get("compact_landscape")
+        if not isinstance(spec, dict):
+            raise ValueError("--report-out requires compact_landscape input")
+        title = _inline_markdown(spec.get("title")) or "Verified research report"
+        boundary = str(spec.get("boundary") or "").strip()
+        parts = ["# {}".format(title)]
+        if boundary:
+            parts.append(boundary)
+        for key in (
+            "recommendation_markdown", "comparison_markdown", "evidence_markdown"
+        ):
+            value = str(data.get(key) or "").strip()
+            if value:
+                parts.append(value)
+        report_markdown = "\n\n".join(parts) + "\n"
+        with open(args.report_out, "w", encoding="utf-8") as fh:
+            fh.write(report_markdown)
+        data["report"] = {
+            "path": args.report_out,
+            "characters": len(report_markdown),
+        }
 
     result = {"ok": True, "data": data}
     if args.out:
@@ -994,22 +1468,49 @@ def _cli_stdout(result: dict, argv: list[str]) -> dict:
     data = result.get("data") if isinstance(result, dict) else None
     data = data if isinstance(data, dict) else {}
     summary = data.get("summary")
-    return {
+
+    def compact_details(items: Any) -> list[dict]:
+        keys = ("claim", "citation", "row", "candidate", "field", "issue")
+        return [
+            {key: item[key] for key in keys if key in item}
+            for item in (items or [])[:12]
+            if isinstance(item, dict)
+        ]
+
+    coverage = []
+    for item in (data.get("comparison_coverage") or [])[:12]:
+        if not isinstance(item, dict):
+            continue
+        coverage.append({
+            "candidate": item.get("candidate"),
+            "status": item.get("status"),
+            "blocking_decision_groups": item.get("blocking_decision_groups") or [],
+        })
+
+    compact = {
         "ok": bool(result.get("ok")),
         "output": output_path,
         "abstain": bool(data.get("abstain")),
         "summary": summary if isinstance(summary, dict) else {},
         "flags": len(data.get("flags") or []),
         "warnings": len(data.get("warnings") or []),
-        "flag_details": (data.get("flags") or [])[:20],
-        "warning_details": (data.get("warnings") or [])[:20],
+        "flag_details": compact_details(data.get("flags")),
+        "warning_details": compact_details(data.get("warnings")),
         "comparison_warnings": len(data.get("comparison_warnings") or []),
-        "comparison_warning_details": (data.get("comparison_warnings") or [])[:20],
+        "comparison_warning_details": compact_details(data.get("comparison_warnings")),
+        "comparison_coverage_details": coverage,
         "comparison_rows": len(data.get("comparison_rows") or []),
         "evidence_rows": len(data.get("evidence_rows") or []),
-        "comparison_markdown": data.get("comparison_markdown") or "",
-        "evidence_markdown": data.get("evidence_markdown") or "",
+        "compact_landscape_expansion": data.get("compact_landscape_expansion") or {},
+        "report": data.get("report") or {},
     }
+    if "--report-out" not in argv:
+        compact.update({
+            "comparison_markdown": data.get("comparison_markdown") or "",
+            "recommendation_markdown": data.get("recommendation_markdown") or "",
+            "evidence_markdown": data.get("evidence_markdown") or "",
+        })
+    return compact
 
 
 if __name__ == "__main__":

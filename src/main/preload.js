@@ -95,7 +95,9 @@ function logRecord(record) {
 // Push-event subscription — for main-initiated broadcasts where the renderer doesn't drive
 // the lifecycle (unlike `stream` which the renderer starts). Channel names are restricted to
 // a known prefix list so the renderer can't tap into arbitrary internal IPC traffic.
-const PUSH_EVENT_CHANNELS = new Set();
+const PUSH_EVENT_CHANNELS = new Set([
+  'conversation:media_materialized',
+]);
 // Interactive CLI sessions are local-only and remain part of the open build;
 // their scoped lifecycle events must cross the same narrow push bridge as
 // bash and connector permission events.

@@ -35,17 +35,17 @@ describe('createCrossSessionMemoryTool', () => {
     expect((tool.inputSchema as any).required).toEqual(['action']);
   });
 
-  it('keeps routing and language guardrails visible in the provider definition', () => {
+  it('keeps selection in the tool description and scope/list semantics on their parameters', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     try {
       const def = toToolDefinition(createCrossSessionMemoryTool(mockHandler()));
-      expect(def.description).toContain('Three scopes (default "agent")');
-      expect(def.description).toContain('"agent" (DEFAULT): YOUR OWN durable agent memory');
-      expect(def.description).toContain('"shared": durable facts that EVERY agent should know');
-      expect(def.description).toContain('"user": the user\'s global profile/preferences');
-      expect(def.description).toContain('Routing:');
-      expect(def.description).toContain('LANGUAGE:');
-      expect(def.description).toContain('Preserve proper nouns, commands, file paths');
+      const properties = def.inputSchema.properties as Record<string, Record<string, unknown>>;
+      expect(def.description).toContain('durable cross-session memory');
+      expect(properties.target.description).toContain('Defaults to agent');
+      expect(properties.target.description).toContain('shared: rare cross-project facts');
+      expect(properties.target.description).toContain('user: stable user-wide profile/preferences');
+      expect(properties.action.description).toContain('already injected');
+      expect(properties.action.description).toContain('use list only');
     } finally {
       warn.mockRestore();
     }
@@ -210,13 +210,15 @@ describe('cross_session_memory › error handling', () => {
 });
 
 describe('cross_session_memory › project tier', () => {
-  it('adds the "project" target and a routing block only when includeProjectTier', () => {
+  it('adds project selection semantics only when includeProjectTier', () => {
     const withProject = createCrossSessionMemoryTool(mockHandler(), { includeProjectTier: true });
     expect((withProject.inputSchema as any).properties.target.enum).toEqual(['agent', 'project', 'shared', 'user']);
-    expect(withProject.description).toContain('project:');
+    expect((withProject.inputSchema as any).properties.target.description)
+      .toContain('project: project-specific facts and decisions');
 
     const without = createCrossSessionMemoryTool(mockHandler());
     expect((without.inputSchema as any).properties.target.enum).not.toContain('project');
+    expect((without.inputSchema as any).properties.target.description).not.toContain('project:');
   });
 
   it('commander (read+write) can write the project tier', async () => {
@@ -231,10 +233,9 @@ describe('cross_session_memory › project tier', () => {
     const handler = mockHandler();
     const tool = createCrossSessionMemoryTool(handler, { includeProjectTier: true, projectTierReadOnly: true });
 
-    // Description tells the model the project tier is read-only for it.
-    expect(tool.description).toContain('READ-ONLY');
-    expect(tool.description).toContain('already present in your system context');
-    expect(tool.description).toContain('Do not list it merely to reload context');
+    // The relevant target parameter tells this actor it cannot write project memory.
+    expect((tool.inputSchema as any).properties.target.description).toContain('Project is read-only');
+    expect((tool.inputSchema as any).properties.target.description.length).toBeLessThanOrEqual(220);
 
     // list is allowed (read).
     const listed = await tool.execute({ action: 'list', target: 'project' }, dummyCtx);

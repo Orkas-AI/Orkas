@@ -27,7 +27,10 @@ describe('open-source VideoStudio resources', () => {
   it('preserves natural English casing and bounds all-caps accents', () => {
     const agent = JSON.parse(read('agent.json')) as { standards?: string[] };
     const frontendDesign = read('skills', 'frontend-design', 'SKILL.md');
-    const stageCompose = read('skills', 'stage-compose', 'SKILL.md');
+    const stageCompose = [
+      read('skills', 'stage-compose', 'SKILL.md'),
+      read('skills', 'stage-compose', 'references', 'manifest-and-authoring.md'),
+    ].join('\n');
     const compositionDesignReview = read('skills', 'composition-design-review', 'SKILL.md');
     const visualPrimitives = read('skills', 'frontend-design', 'references', 'visual-primitives.md');
     const standards = (agent.standards ?? []).join('\n');
@@ -38,25 +41,27 @@ describe('open-source VideoStudio resources', () => {
     expect(frontendDesign).toMatch(/two(?: or more)? English text roles.*all caps/i);
     expect(stageCompose).toMatch(/Preserve approved English casing/i);
     expect(compositionDesignReview).toMatch(/two or more English text roles.*all caps/i);
-    expect(standards).toMatch(/Preserve approved English casing/i);
+    expect(standards).not.toMatch(/two(?: or more)? English text roles.*all caps/i);
   });
 
   it('uses one canonical gate-control policy instead of line-specific confirmation patches', () => {
     const agent = JSON.parse(read('agent.json')) as { skill_list?: string[]; standards?: string[] };
     const stageCompose = read('skills', 'stage-compose', 'SKILL.md');
-    const gateControl = read('skills', 'gate-control', 'SKILL.md');
+    const gateControl = [
+      read('skills', 'gate-control', 'SKILL.md'),
+      read('skills', 'gate-control', 'references', 'revision-and-recovery.md'),
+    ].join('\n');
     const standards = (agent.standards ?? []).join('\n');
 
     expect(agent.skill_list).toContain('gate-control');
-    expect(stageCompose).toMatch(/gate-control.*single canonical authorization and state-transition policy/is);
-    expect(gateControl).toMatch(/Authority is not the same as recovery/);
-    expect(gateControl).toMatch(/A named change is the complete user authorization/i);
-    expect(gateControl).toMatch(/E_VISUAL_REVISION_EXPLICIT_AUTHORIZATION_REQUIRED.*Query status.*never starts a cycle/is);
-    expect(gateControl).toMatch(/One user decision may produce at most one follow-up authorization request/i);
-    expect(standards).toMatch(/read gate-control and run its bundled transition resolver/i);
-    expect(standards).toMatch(/single authorization source across COMPOSE, AUTO, GENERATE, and EDIT/i);
-    expect(standards).toMatch(/A user revise decision grants bounded edit authority/i);
-    expect(standards).toMatch(/never emit a new visual_recovery_decision form/i);
+    expect(stageCompose).toMatch(/All COMPOSE stops and authorization transitions belong to `gate-control`/i);
+    expect(gateControl).toMatch(/Authority is not recovery/);
+    expect(gateControl).toMatch(/named change to visible artifact.*apply that bounded scope/is);
+    expect(gateControl).toMatch(/E_VISUAL_REVISION_EXPLICIT_AUTHORIZATION_REQUIRED.*requires status.*never starts a cycle/is);
+    expect(gateControl).toMatch(/One user decision creates at most one follow-up authorization request/i);
+    expect(standards).toMatch(/approval.*claims match current durable state/i);
+    expect(standards).toMatch(/changed or failed candidates never inherit stale approval/i);
+    expect(standards).toMatch(/recovery or quality-boundary handoff names current findings/i);
   });
 
   it('resolves post-gate authorization traces without duplicate recovery forms', () => {

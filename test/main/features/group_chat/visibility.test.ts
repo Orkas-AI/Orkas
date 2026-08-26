@@ -133,16 +133,124 @@ describe('group_chat visibility › Commander canonical conversation history', (
     expect(serialized).toContain('VideoStudio');
     expect(serialized).toContain('E_NARRATION_REPAIR_AUTHORIZATION_NOT_PERSISTED');
     expect((history[1].content[0] as any).text).toContain(
-      '[Commander -> VideoStudio (video-agent); dispatch]',
+      'Commander delegated this step to VideoStudio (video-agent):',
     );
     expect((history[1].content[0] as any).text).toContain(
-      '[VideoStudio (video-agent) -> User; failure=operation/narration_authorization_missing]',
+      'VideoStudio (video-agent) replied to User:',
     );
+    expect((history[1].content[0] as any).text).toContain(
+      'Recorded failure: operation/narration_authorization_missing.',
+    );
+    expect(serialized).not.toContain(' -> ');
     expect(serialized).not.toContain('[Historical group conversation');
     expect(serialized).not.toContain('"actor_id"');
     expect(serialized).not.toContain('"dispatch":true');
     expect(serialized).not.toContain('Fix that blocker.');
     expect(serialized).not.toContain('INTERNAL_PROCESS_MUST_NOT_REPLAY');
+  });
+
+  it('uses provider roles without a host route scaffold for ordinary dialogue', async () => {
+    const v = await import('../../../../src/main/features/group_chat/visibility');
+    const rows = [
+      { id: 'u1', ts: 't1', from: 'user', to: ['commander'], text: 'Start the export.' },
+      { id: 'a1', ts: 't2', from: 'commander', to: ['user'], text: 'The export is ready.' },
+      { id: 'u2', ts: 't3', from: 'user', to: ['commander'], text: 'Continue.' },
+    ] as any;
+
+    const history = v.buildCommanderConversationHistory(rows, 'u2');
+
+    expect((history[0].content[0] as any).text).toBe('Start the export.');
+    expect((history[1].content[0] as any).text).toBe('The export is ready.');
+    expect(JSON.stringify(history)).not.toContain('[User -> Commander]');
+    expect(JSON.stringify(history)).not.toContain('[Commander -> User]');
+    expect(v.groupConversationHistorySource('cid42')).toBe('group-main-v2:cid42');
+  });
+
+  it('removes only authoritative leading legacy route headers during actor-history replay', async () => {
+    const v = await import('../../../../src/main/features/group_chat/visibility');
+    const rows = [
+      { id: 'u1', ts: 't1', from: 'user', to: ['commander'], text: 'Finish the report.' },
+      {
+        id: 'a1', ts: 't2', from: 'commander', to: ['user'],
+        text: '[Commander -> User]\n\n[Commander -> User]\n\nThe report is complete.',
+        produced: ['/workspace/report.md'],
+      },
+      { id: 'u2', ts: 't3', from: 'user', to: ['commander'], text: 'Continue.' },
+    ] as any;
+
+    const history = v.buildCommanderConversationHistory(rows, 'u2');
+    const response = (history[1].content[0] as any).text;
+
+    expect(response).toContain('The report is complete.');
+    expect(response).toContain('Produced files: ["/workspace/report.md"]');
+    expect(response).not.toContain('[Commander -> User]');
+  });
+
+  it('normalizes the model-facing body rather than replaying a clean visible fallback', async () => {
+    const v = await import('../../../../src/main/features/group_chat/visibility');
+    const rows = [
+      { id: 'u1', ts: 't1', from: 'user', to: ['commander'], text: 'Resolve the hidden protocol.' },
+      {
+        id: 'a1', ts: 't2', from: 'commander', to: ['user'],
+        text: 'Visible fallback must not replace the model-facing context.',
+        model_text: '[Commander -> User]\n\nThe hidden protocol was resolved.',
+      },
+      { id: 'u2', ts: 't3', from: 'user', to: ['commander'], text: 'Continue.' },
+    ] as any;
+
+    const history = v.buildCommanderConversationHistory(rows, 'u2');
+    const response = (history[1].content[0] as any).text;
+
+    expect(response).toBe('The hidden protocol was resolved.');
+    expect(response).not.toContain('[Commander -> User]');
+    expect(response).not.toContain('Visible fallback');
+  });
+
+  it('does not replay a standalone legacy route header as a substantive response', async () => {
+    const v = await import('../../../../src/main/features/group_chat/visibility');
+    const rows = [
+      { id: 'u1', ts: 't1', from: 'user', to: ['commander'], text: 'Answer the question.' },
+      { id: 'a1', ts: 't2', from: 'commander', to: ['user'], text: '[Commander -> User]' },
+      { id: 'u2', ts: 't3', from: 'user', to: ['commander'], text: 'Continue.' },
+    ] as any;
+
+    const history = v.buildCommanderConversationHistory(rows, 'u2');
+    const response = (history[1].content[0] as any).text;
+
+    expect(response).toBe('No actor response was recorded before the next user message.');
+    expect(response).not.toContain('[Commander -> User]');
+  });
+
+  it('keeps user-authored and rejected legacy-route look-alikes verbatim', async () => {
+    const v = await import('../../../../src/main/features/group_chat/visibility');
+    const rows = [
+      {
+        id: 'u1', ts: 't1', from: 'user', to: ['commander'],
+        text: 'Why did the literal [Commander -> User] appear?',
+      },
+      {
+        id: 'a1', ts: 't2', from: 'commander', to: ['user'],
+        text: 'This inline mention of [Commander -> User] must remain.',
+      },
+      { id: 'u2', ts: 't3', from: 'user', to: ['commander'], text: 'Show a code sample.' },
+      {
+        id: 'a2', ts: 't4', from: 'commander', to: ['user'],
+        text: '```text\n[Commander -> User]\n```',
+      },
+      { id: 'u3', ts: 't5', from: 'user', to: ['commander'], text: 'Keep the unknown route.' },
+      {
+        id: 'a3', ts: 't6', from: 'commander', to: ['user'],
+        text: '[Alice -> Bob]\nThis is ordinary content.',
+      },
+      { id: 'u4', ts: 't7', from: 'user', to: ['commander'], text: 'Continue.' },
+    ] as any;
+
+    const serialized = JSON.stringify(v.buildCommanderConversationHistory(rows, 'u4'));
+
+    expect(serialized).toContain('Why did the literal [Commander -> User] appear?');
+    expect(serialized).toContain('This inline mention of [Commander -> User] must remain.');
+    expect(serialized).toContain('```text\\n[Commander -> User]\\n```');
+    expect(serialized).toContain('[Alice -> Bob]');
   });
 
   it('does not replay a previously leaked internal history serialization', async () => {

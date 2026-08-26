@@ -21,7 +21,8 @@ export interface ProjectInstructionsToolHandler {
   set(instructions: string): Promise<{ ok: boolean; error?: string }>;
 }
 
-const TOOL_DESCRIPTION = `Replace this project's standing instructions (goal + rules). FULL replace, not append: send all text, preserving what still applies. Use for durable, project-specific direction: goals, scope, rules, preferences, constraints. Global preferences (communication style, identity, tech stack) go to cross_session_memory target "user"; learned project facts and decisions use target "project". Concrete tasks and status go to project_tasks. Make deliberate, reviewable edits.`;
+const TOOL_DESCRIPTION =
+  'Replace the project\'s standing goal and rules with the complete supplied text. Preserve applicable existing content; use project_tasks for work status and project memory for durable facts or decisions.';
 
 export function createProjectInstructionsTool(handler: ProjectInstructionsToolHandler): AgentTool {
   return {
@@ -32,7 +33,7 @@ export function createProjectInstructionsTool(handler: ProjectInstructionsToolHa
       properties: {
         instructions: {
           type: 'string',
-          description: 'The full new instructions content (goal + rules). Replaces the current instructions.',
+          description: 'Complete replacement goal/rules text, including any existing content that still applies.',
         },
       },
       required: ['instructions'],

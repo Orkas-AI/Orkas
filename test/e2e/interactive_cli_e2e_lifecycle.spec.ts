@@ -71,7 +71,8 @@ test.describe('interactive CLI lifecycle', () => {
     expect(sessions.sessions[0].output).toContain('received-lines:1');
     expect(sessions.sessions[0].output).toContain('[redacted]');
     expect(sessions.sessions[0].output).not.toContain('secret-code-42');
-    expect(modelOrkas.modelRequests).toHaveLength(1);
-    expect(JSON.stringify(modelOrkas.modelRequests[0])).toContain('interactive_cli_start');
+    expect(modelOrkas.modelRequests).toHaveLength(2);
+    expect(JSON.stringify(modelOrkas.modelRequests[0])).not.toContain('interactive_cli');
+    expect(JSON.stringify(modelOrkas.modelRequests[1])).toContain('interactive_cli');
   });
 });

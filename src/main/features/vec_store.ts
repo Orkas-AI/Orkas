@@ -5,13 +5,17 @@
  * and strings; the store handles chunking, embedding, persistence, search.
  *
  * Two usage tiers:
- *   • High-level — `vectorize(id, {kind, buf})` + `searchByQuery(q)`: one call
- *     per scenario, no manual extract/embed/upsert plumbing. Right for new
- *     consumers ("I just want a RAG over these files").
  *   • Low-level — `setFileStatus` / `upsertFile(chunks + vectors)` / `search`
- *     (with precomputed vector): lets callers drive the pipeline themselves
- *     when they need per-phase events (e.g. KB indexer's status broadcast +
- *     cross-file extract/embed pipelining).
+ *     (with precomputed vector). This is what every product path uses, via
+ *     `library_corpus`: per-phase status events, per-phase timeouts and error
+ *     codes, and the cross-file extract/embed pipeline all need the stages
+ *     kept apart.
+ *   • High-level — `vectorize(id, {kind, buf})` + `searchByQuery(q)`: chunk,
+ *     embed and persist in one call. Convenience for callers that genuinely
+ *     do not care about the stages; in practice that is the offline retrieval
+ *     benchmark, its only consumer. It is NOT the entry point for a new
+ *     product scenario — anything user-facing needs the stage boundaries and
+ *     should register a corpus instead.
  *
  * The embedding model is fixed: `bge-small-zh-v1.5`, 512-dim. Switching
  * models would require a full rebuild — `config.json` enforces this per-dir.

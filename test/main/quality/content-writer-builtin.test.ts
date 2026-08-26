@@ -38,6 +38,11 @@ describe('ContentWriter builtin contract', () => {
     expect(spec.name).toBe('ContentWriter');
     expect(spec.min_app_version).toBeUndefined();
     expect(spec.skill_list).toEqual(['9dfbd4e00c0d']);
+    // The soft delivery guard is spec-selected since 2026-08-12 (it replaced
+    // the host's identity-keyed selector). The declaration and its resolution
+    // are both pinned: a renamed or deleted registry check must fail here, not
+    // silently strip ContentWriter of its guard.
+    expect(spec.delivery_checks).toEqual(['content-delivery']);
     expect(spec.interactive).toBe(false);
     expect(spec.inputs.find((input: any) => input.id === 'task')?.required).toBe(true);
     expect(spec.inputs.find((input: any) => input.id === 'files')?.multiple).toBe(true);
@@ -50,37 +55,22 @@ describe('ContentWriter builtin contract', () => {
     expect(spec.standards.join('\n')).toContain('skip manage_execution_plan');
     expect(spec.standards.join('\n')).toContain('completion summary is not an artifact');
     expect(spec.standards.join('\n')).not.toMatch(/20\s*[-–]\s*100|SaaS|remote collaboration/i);
-    expect(spec.workflow).toContain('silently audit scope');
-    expect(spec.workflow).toContain('a supplied range is audience scope only');
-    expect(spec.workflow).toContain('disclaimers/assumptions cannot preserve them');
-    expect(spec.workflow).toContain('Never ask for a publishing platform');
-    expect(spec.workflow).toContain('if the user names one, apply only material platform rules');
-    expect(spec.workflow).toContain('otherwise use a platform-neutral default');
+    expect(spec.workflow).toContain('Never ask which publishing platform to use');
+    expect(spec.workflow).toContain('apply named platform constraints or use a neutral default');
 
     expect(spec.workflow.length).toBeLessThan(1_500);
     for (const marker of [
-      'Read and use `content-writer` as the governing skill',
-      'smallest useful sequence',
+      'Read `content-writer` as the governing Skill',
+      'smallest applicable mode sequence',
+      'working brief',
+      'evidence policy',
+      'atomic support/limitation pairs',
       'progressive references',
-      'working-brief',
-      'evidence-policy',
-      'source/claim-ledger',
-      'artifact-first',
-      'exact decision-token contract',
-      'Do not publish',
-      'qualified review',
-      'underspecified or unfamiliar',
-      'generic topic summary',
-      'does not support Y” pair as one atomic claim',
-      'before/after performance claims',
-      'alternate headlines',
-      'Adapt: change shape only',
-      'headlines may restate only a supplied proposition',
-      'Use exactly one family per user-required dimension',
-      'fetch an official policy result first',
-      'Fetch exactly 3 results in batches 2 then 1',
-      'before any fourth fetch or prose',
-      'do not persist blocked input',
+      'durable ledger',
+      'deterministic gates',
+      'Return the requested artifact in the current turn',
+      'publishing and platform operation remain out of scope',
+      'qualified-review requirement',
     ]) {
       expect(spec.workflow, marker).toContain(marker);
     }
@@ -93,13 +83,13 @@ describe('ContentWriter builtin contract', () => {
     expect(Date.parse(meta.reseed_if_deleted_before)).not.toBeNaN();
   });
 
-  it('keeps SKILL.md portable and routes every progressive reference', () => {
+  it('keeps the official Skill bilingual with one description source and routes every progressive reference', () => {
     const skill = fs.readFileSync(path.join(skillDir, 'SKILL.md'), 'utf8');
     const frontmatter = skill.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? '';
     const frontmatterKeys = frontmatter.split('\n')
       .map((line) => line.match(/^([a-z_]+):/)?.[1])
       .filter(Boolean);
-    expect(frontmatterKeys).toEqual(['name', 'description']);
+    expect(frontmatterKeys).toEqual(['name', 'description_zh', 'description_en']);
     expect(skill.length).toBeLessThan(15_000);
 
     const actualReferences = fs.readdirSync(path.join(skillDir, 'references'))
@@ -115,8 +105,7 @@ describe('ContentWriter builtin contract', () => {
     expect(meta.min_app_version).toBeUndefined();
     expect(Date.parse(meta.reseed_if_deleted_before)).not.toBeNaN();
     expect(meta.category).toBe('creation');
-    expect(meta.descriptions.zh).toBeTruthy();
-    expect(meta.descriptions.en).toBeTruthy();
+    expect(meta.descriptions).toBeUndefined();
     expect(meta.routing.applicable_domain.length).toBeGreaterThan(0);
     expect(meta.routing.negative_examples.length).toBeGreaterThan(0);
     expect(Array.isArray(meta.routing.prerequisites)).toBe(true);
@@ -196,24 +185,31 @@ describe('ContentWriter builtin contract', () => {
     expect(skill).toContain('A headline is also a claim');
     expect(skill).toContain('make the first line `主题：...`');
     expect(skill).toContain('make the only CTA `[阅读全文](/report)`');
-    expect(skill).toContain('Never invent an auxiliary family');
-    expect(skill).toContain('exact labels `salary`, `job-volume`, and `policy`');
-    expect(skill).toContain('copy only those exact strings into source `families`');
-    expect(skill).toContain('"families":["salary"],"status":"usable"');
-    expect(skill).toContain('fetch a specific official result first');
-    expect(skill).toContain('fetch exactly 3 results in batches of 2 then 1');
-    expect(skill).toContain('before any fourth fetch, prose, or extra analysis');
-    expect(skill).toContain('attempt fields as integer counts, never arrays');
-    expect(skill).toContain('saved result for that exact missing family qualifies');
-    expect(skill).toContain('`bash` is only for the exact `research_gate`');
-    expect(skill).toContain('never retrieval');
-    expect(skill).toContain('parsing, inspection, conversion, or recovery');
+    expect(skill).toMatch(/Derive short evidence-family labels from the request's material current\s+claims/);
+    expect(skill).toContain('Do not target an arbitrary source count');
+    expect(skill).toMatch(/A source may cover several families only when its body directly\s+supports each one/);
+    expect(skill).toContain('Use the fewest targeted searches');
+    expect(skill).toMatch(/meaningfully\s+different query or source target/);
+    expect(skill).toMatch(/latest\s+such attempt adds no usable support/);
+    expect(skill).toMatch(/deterministic coverage check, not the owner of the research\s+decision/);
+    expect(skill).toMatch(/publication date or measurement period[\s\S]*visible/);
+    expect(skill).toMatch(/link alone is not a visible freshness signal/);
+    expect(skill).toMatch(/Draft only from retrieved, traceable evidence/);
+    expect(skill).toMatch(/research ledger is the\s+coverage checkpoint, not a citation whitelist/);
+    expect(skill).toMatch(/later retrieval changes\s+family coverage[\s\S]*update the ledger and rerun the gate/);
+    expect(skill).toMatch(/Run the gate once after the final collection ledger[\s\S]*rerun it only if a `CONTINUE_RESEARCH` result leads to a changed[\s\S]*ledger/);
+    expect(skill).not.toMatch(/deep-research|DeepResearcher/);
+    expect(skill).toContain('native search content with citations qualifies');
+    expect(skill).toContain('rather than ad-hoc shell HTTP commands');
+    expect(skill).toMatch(/never guess\s+or rewrite a URL/);
+    expect(skill).not.toContain('`fetch_attempts`');
+    expect(skill).not.toMatch(/exact labels `salary`|fetch exactly 3|batches of 2 then 1/i);
+    expect(skill).not.toContain('before any fourth fetch, prose, or extra analysis');
     expect(skill).toContain('do not persist the blocked input as `ARTICLE.md`');
     expect(skill).toContain('vague rhetorical question');
     expect(skill).toContain('For an unlisted format');
     expect(skill).toContain('unfamiliar channel');
     expect(skill).toContain('bounded `current-research`, do not load it');
-    expect(skill).toContain('`publish_outputs` on this fast path');
     expect(formats).toContain('roughly 450–700 Chinese characters');
     expect(formats).toContain('Never ask which publishing platform to use');
     expect(formats).toContain('only when they materially change the artifact');
@@ -301,12 +297,9 @@ describe('ContentWriter builtin contract', () => {
         env: { ...process.env, ORKAS_RUN_SKILL_DIR: skillDir },
         encoding: 'utf8',
         input: JSON.stringify({
-          required_families: ['salary', 'job_volume', 'policy'],
-          fetch_attempts: 3,
+          required_families: ['feature-availability', 'pricing'],
           sources: [
-            { url: 'https://one.example/report', families: ['salary'], status: 'usable' },
-            { url: 'https://two.example/jobs', families: ['job_volume'], status: 'usable' },
-            { url: 'https://three.example/policy', families: ['policy'], status: 'usable' },
+            { url: 'https://vendor.example/product-update', families: ['feature-availability', 'pricing'], status: 'usable', published: '2026-07-01' },
           ],
         }),
       },
@@ -316,8 +309,8 @@ describe('ContentWriter builtin contract', () => {
     expect(JSON.parse(result.stdout)).toMatchObject({
       ready: true,
       decision: 'READY_TO_DRAFT',
-      successful_independent_sources: 3,
-      remaining_fetch_attempts: 3,
+      usable_source_count: 1,
+      minimum_distinct_sources: 1,
       missing_families: [],
     });
   });

@@ -290,6 +290,85 @@ describe('UIDesigner fast artifact validator', () => {
     expect(result.report).toMatchObject({ ok: true, errors: [] });
   });
 
+  it('rejects a control that describes every error id on the page', () => {
+    // 2026-08-09 quick-start-ui-personal-finance-login: every input across the
+    // sign-in, register and recovery forms carried the same eight error ids, so
+    // focusing the sign-in email announced the register terms error and the
+    // recovery email error from forms that were not on screen. The check ran one
+    // way only — it counted errors a control failed to reference — so pointing at
+    // all of them satisfied it unconditionally and the artifact passed. The judge
+    // caught it at responsive-and-accessible 76 against a floor of 85.
+    const everyError = [
+      'login-email-error', 'login-password-error',
+      'register-email-error', 'register-terms-error',
+      'recovery-email-error',
+    ].join(' ');
+    const result = run(makeArtifact({
+      html: `<!doctype html><html><head></head><body><main>
+        <h1>Personal finance account access</h1>
+        <form id="login-form">
+          <label for="login-email">Email</label>
+          <input id="login-email" name="email" type="email" aria-invalid="false" aria-describedby="${everyError}">
+          <p id="login-email-error" class="field-error" role="alert">Enter a valid email address.</p>
+          <label for="login-password">Password</label>
+          <input id="login-password" name="password" type="password" aria-invalid="false" aria-describedby="${everyError}">
+          <p id="login-password-error" class="field-error" role="alert">Enter your password.</p>
+          <button type="submit">Sign in</button>
+        </form>
+        <form id="register-form">
+          <label for="register-email">Email</label>
+          <input id="register-email" name="email" type="email" aria-invalid="false" aria-describedby="${everyError}">
+          <p id="register-email-error" class="field-error" role="alert">Enter a valid email address.</p>
+          <label for="register-terms">Accept the terms</label>
+          <input id="register-terms" name="terms" type="checkbox" aria-invalid="false" aria-describedby="${everyError}">
+          <p id="register-terms-error" class="field-error" role="alert">Accept the terms to continue.</p>
+          <button type="submit">Create account</button>
+        </form>
+        <form id="recovery-form">
+          <label for="recovery-email">Email</label>
+          <input id="recovery-email" name="email" type="email" aria-invalid="false" aria-describedby="${everyError}">
+          <p id="recovery-email-error" class="field-error" role="alert">Enter a valid email address.</p>
+          <button type="submit">Send reset link</button>
+        </form>
+      </main></body></html>`,
+    }));
+
+    expect(result.status).toBe(1);
+    expect(result.report.ok).toBe(false);
+    const errors = result.report.errors.join('\n');
+    expect(errors).toMatch(/form-error-accessibility/);
+    // It must name the cross-form reach, not just the first offender it meets.
+    expect(errors).toContain('login-email -> register-terms-error belongs to another form');
+    expect(errors).toContain('recovery-email -> login-email-error belongs to another form');
+    // And the neighbouring field inside the same form.
+    expect(errors).toContain('login-email -> login-password-error belongs to login-password');
+  });
+
+  it('accepts one shared form-level error container referenced by every control in that form', () => {
+    // Negative control for the check above: the fix must reject reaching into
+    // another field's error, not every id more than one control points at. A
+    // single container for the form as a whole is a legitimate pattern and no
+    // control conventionally owns it.
+    const result = run(makeArtifact({
+      html: `<!doctype html><html><head></head><body><main>
+        <h1>Personal finance account access</h1>
+        <form id="login-form">
+          <p id="login-form-error" class="field-error" role="alert">Check the details below.</p>
+          <label for="login-email">Email</label>
+          <input id="login-email" name="email" type="email" aria-invalid="false" aria-describedby="login-form-error login-email-error">
+          <p id="login-email-error" class="field-error" role="alert">Enter a valid email address.</p>
+          <label for="login-password">Password</label>
+          <input id="login-password" name="password" type="password" aria-invalid="false" aria-describedby="login-form-error login-password-error">
+          <p id="login-password-error" class="field-error" role="alert">Enter your password.</p>
+          <button type="submit">Sign in</button>
+        </form>
+      </main></body></html>`,
+    }));
+
+    expect(result.status).toBe(0);
+    expect(result.report).toMatchObject({ ok: true, errors: [] });
+  });
+
   it('does not cross-associate exact field errors when forms reuse id and name tokens', () => {
     const result = run(makeArtifact({
       html: `<!doctype html><html><head></head><body><main>

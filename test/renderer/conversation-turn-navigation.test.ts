@@ -38,6 +38,117 @@ function fakeMessage(role: 'user' | 'assistant', text: string): any {
   };
 }
 
+function fakeClassList() {
+  const values = new Set<string>();
+  return {
+    add(value: string) { values.add(value); },
+    remove(value: string) { values.delete(value); },
+    toggle(value: string, force?: boolean) {
+      const enabled = force === undefined ? !values.has(value) : force;
+      if (enabled) values.add(value);
+      else values.delete(value);
+      return enabled;
+    },
+    contains(value: string) { return values.has(value); },
+  };
+}
+
+function fakeTurnNavElement(tagName = 'div'): any {
+  const attributes = new Map<string, string>();
+  const element: any = {
+    tagName: tagName.toUpperCase(),
+    children: [],
+    dataset: {},
+    className: '',
+    classList: fakeClassList(),
+    hidden: false,
+    clientHeight: 216,
+    scrollHeight: 216,
+    scrollTop: 0,
+    offsetTop: 0,
+    offsetHeight: 18,
+    style: {
+      scrollBehavior: '',
+      setProperty() {},
+    },
+    addEventListener() {},
+    appendChild(child: any) {
+      child.parentElement = element;
+      child.offsetTop = element.children.length * 18;
+      element.children.push(child);
+      element.scrollHeight = Math.max(element.clientHeight, element.children.length * 18);
+      return child;
+    },
+    replaceChildren(...children: any[]) {
+      element.children.forEach((child: any) => { child.parentElement = null; });
+      element.children = [];
+      children.flatMap((child) => child?.isFragment ? child.children : child).forEach((child) => {
+        element.appendChild(child);
+      });
+    },
+    contains(target: any) {
+      return target === element || element.children.some((child: any) => child.contains(target));
+    },
+    querySelectorAll(selector: string) {
+      if (selector !== '.chat-turn-nav-marker') return [];
+      return element.children.filter((child: any) => (
+        String(child.className).split(/\s+/).includes('chat-turn-nav-marker')
+      ));
+    },
+    setAttribute(name: string, value: string) { attributes.set(name, String(value)); },
+    removeAttribute(name: string) { attributes.delete(name); },
+    getAttribute(name: string) { return attributes.get(name) ?? null; },
+  };
+  return element;
+}
+
+function fakeUserTurn(messageId: string, messageIndex: number): any {
+  const element = fakeTurnNavElement();
+  element.dataset.msgId = messageId;
+  element.dataset.msgIndex = String(messageIndex);
+  element.dataset.clientMsgId = `client-${messageId}`;
+  element.matches = (selector: string) => selector === '.chat-message.user';
+  element.querySelector = () => ({ textContent: `request ${messageId}` });
+  return element;
+}
+
+function fakeTurnNavDocument(userTurns: any[]) {
+  const history = fakeTurnNavElement();
+  history.clientHeight = 600;
+  userTurns.forEach((turn) => history.appendChild(turn));
+  const nav = fakeTurnNavElement('nav');
+  const markers = fakeTurnNavElement();
+  const preview = fakeTurnNavElement();
+  const previewTitle = fakeTurnNavElement();
+  const previewBody = fakeTurnNavElement();
+  const elements: Record<string, any> = {
+    'chat-history': history,
+    'chat-turn-nav': nav,
+    'chat-turn-nav-markers': markers,
+    'chat-turn-nav-preview': preview,
+    'chat-turn-nav-preview-title': previewTitle,
+    'chat-turn-nav-preview-body': previewBody,
+  };
+  const documentRef: any = {
+    getElementById(id: string) { return elements[id] || null; },
+    createElement(tagName: string) {
+      const element = fakeTurnNavElement(tagName);
+      element.ownerDocument = documentRef;
+      return element;
+    },
+    createDocumentFragment() {
+      return {
+        isFragment: true,
+        children: [],
+        appendChild(child: any) { this.children.push(child); },
+      };
+    },
+  };
+  Object.values(elements).forEach((element) => { element.ownerDocument = documentRef; });
+  nav.appendChild(markers);
+  return { documentRef, history, markers };
+}
+
 describe('conversation turn navigation', () => {
   it('appears at five indexed user turns, not four', () => {
     expect(turnNav.shouldShowTurnNav(4)).toBe(false);
@@ -221,6 +332,61 @@ describe('conversation turn navigation', () => {
       scrollTop: 27,
       clientHeight: 216,
     }, { before: false, after: false })).toEqual(markers.map(() => 0));
+  });
+
+  it('follows a live turn without duplicate or cross-conversation position drift', async () => {
+    const mounted = Array.from({ length: 15 }, (_, index) => (
+      fakeUserTurn(`u${index + 1}`, index * 2)
+    ));
+    const { documentRef, history, markers } = fakeTurnNavDocument(mounted);
+    turnNav.init({
+      document: documentRef,
+      MutationObserver: class {
+        observe() {}
+      },
+    });
+    await turnNav.open({
+      cid: 'current-conversation',
+      loadPage: async () => ({
+        turns: mounted.map((target, index) => ({
+          turn_no: index + 1,
+          message_id: target.dataset.msgId,
+          message_index: Number(target.dataset.msgIndex),
+        })),
+        total: mounted.length,
+        next_cursor: null,
+      }),
+    });
+
+    const nextTurn = fakeUserTurn('u16', 30);
+    history.appendChild(nextTurn);
+    const appended = turnNav.appendLiveTurn(
+      'current-conversation', nextTurn, 'request u16',
+    );
+
+    let rendered = markers.querySelectorAll('.chat-turn-nav-marker');
+    expect(appended).not.toBeNull();
+    expect(rendered).toHaveLength(16);
+    expect(rendered.filter((marker: any) => (
+      marker.getAttribute('aria-current') === 'location'
+    ))).toEqual([rendered[15]]);
+    expect(markers.scrollTop).toBe(72);
+
+    expect(turnNav.appendLiveTurn(
+      'current-conversation', nextTurn, 'request u16',
+    )).toBe(appended);
+    rendered = markers.querySelectorAll('.chat-turn-nav-marker');
+    expect(rendered).toHaveLength(16);
+    expect(rendered[15].getAttribute('aria-current')).toBe('location');
+
+    const foreignTurn = fakeUserTurn('foreign-u17', 32);
+    history.appendChild(foreignTurn);
+    expect(turnNav.appendLiveTurn(
+      'another-conversation', foreignTurn, 'foreign request',
+    )).toBeNull();
+    rendered = markers.querySelectorAll('.chat-turn-nav-marker');
+    expect(rendered).toHaveLength(16);
+    expect(rendered[15].getAttribute('aria-current')).toBe('location');
   });
 
   it('pages the compact rail independently without adding transcript prefetch', () => {

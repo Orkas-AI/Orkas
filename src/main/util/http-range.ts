@@ -42,6 +42,31 @@ export interface ByteRange {
   end: number;
 }
 
+export type FileRangeHeaderKind = 'none' | 'ignored' | 'satisfiable' | 'unsatisfiable';
+
+/**
+ * Privacy-safe response metadata for protocol diagnostics. Deliberately omits
+ * the URL and resolved file path: callers can log this object in feedback
+ * bundles without exposing a user's filenames or directory layout.
+ */
+export interface FileRangeResponseDiagnostic {
+  requestMethod: string;
+  rangeHeaderKind: FileRangeHeaderKind;
+  status: 200 | 206 | 304 | 416;
+  totalBytes: number;
+  responseBytes: number;
+  rangeStart?: number;
+  rangeEnd?: number;
+  cacheRevalidated: boolean;
+  prepareDurationMs: number;
+}
+
+export interface FileRangeStreamDiagnostic {
+  outcome: 'completed' | 'failed' | 'closed_before_end';
+  bytesRead: number;
+  durationMs: number;
+}
+
 export function parseByteRange(
   header: string | null | undefined,
   total: number,
@@ -124,6 +149,10 @@ export function ifNoneMatchMatches(header: string | null | undefined, etag: stri
  *
  * `onStreamError` is invoked if the read stream errors mid-flight (best-effort
  * logging hook; the partial response is already in flight, nothing to recover).
+ * `onResponsePrepared` receives bounded, path-free metadata immediately before
+ * the response is returned. `onStreamFinished` measures the lazy file stream,
+ * including early closes that commonly mean the consumer cancelled a request.
+ * All hooks are observational: a hook failure must never break media delivery.
  */
 export function serveFileRange(
   request: Request,
@@ -131,8 +160,11 @@ export function serveFileRange(
   contentType: string,
   totalSize: number,
   mtimeMs?: number,
-  onStreamError?: (err: Error) => void,
+  onStreamError?: (err: Error, diagnostic: FileRangeStreamDiagnostic) => void,
+  onResponsePrepared?: (diagnostic: FileRangeResponseDiagnostic) => void,
+  onStreamFinished?: (diagnostic: FileRangeStreamDiagnostic) => void,
 ): Response {
+  const startedAt = Date.now();
   const etag = typeof mtimeMs === 'number' && Number.isFinite(mtimeMs)
     ? `"${Math.floor(mtimeMs)}-${totalSize}"`
     : '';
@@ -142,7 +174,36 @@ export function serveFileRange(
     'Cache-Control': 'no-cache',
     ...(etag ? { ETag: etag } : {}),
   };
-  const range = parseByteRange(request.headers.get('Range'), totalSize);
+  const rangeHeader = request.headers.get('Range');
+  const range = parseByteRange(rangeHeader, totalSize);
+  const rangeHeaderKind: FileRangeHeaderKind = !rangeHeader
+    ? 'none'
+    : range === null
+      ? 'ignored'
+      : range === 'unsatisfiable'
+        ? 'unsatisfiable'
+        : 'satisfiable';
+  const notifyPrepared = (
+    status: FileRangeResponseDiagnostic['status'],
+    responseBytes: number,
+    selectedRange?: ByteRange,
+  ) => {
+    if (!onResponsePrepared) return;
+    try {
+      onResponsePrepared({
+        requestMethod: request.method || 'GET',
+        rangeHeaderKind,
+        status,
+        totalBytes: totalSize,
+        responseBytes,
+        ...(selectedRange ? { rangeStart: selectedRange.start, rangeEnd: selectedRange.end } : {}),
+        cacheRevalidated: status === 304,
+        prepareDurationMs: Math.max(0, Date.now() - startedAt),
+      });
+    } catch {
+      // Diagnostics must not affect a protocol response.
+    }
+  };
 
   // Conditional revalidation for full (non-Range) GETs: when the client's
   // cached ETag still matches the current (mtime,size) it may reuse its copy.
@@ -150,24 +211,46 @@ export function serveFileRange(
   // 304 on a partial fetch would strand the `<video>` (see the Range note
   // above), so partial requests always stream fresh 206 bytes.
   if (etag && range === null && ifNoneMatchMatches(request.headers.get('If-None-Match'), etag)) {
-    return new Response(null, { status: 304, headers: baseHeaders });
+    const response = new Response(null, { status: 304, headers: baseHeaders });
+    notifyPrepared(304, 0);
+    return response;
   }
 
   if (range === 'unsatisfiable') {
-    return new Response('requested range not satisfiable', {
+    const response = new Response('requested range not satisfiable', {
       status: 416,
       headers: { ...baseHeaders, 'Content-Range': `bytes */${totalSize}` },
     });
+    notifyPrepared(416, 0);
+    return response;
   }
 
   const nodeStream = range
     ? fs.createReadStream(absPath, { start: range.start, end: range.end })
     : fs.createReadStream(absPath);
-  nodeStream.on('error', (err) => { onStreamError?.(err as Error); });
+  let streamSettled = false;
+  const finishStream = (outcome: FileRangeStreamDiagnostic['outcome'], err?: Error) => {
+    if (streamSettled) return;
+    streamSettled = true;
+    const diagnostic: FileRangeStreamDiagnostic = {
+      outcome,
+      bytesRead: nodeStream.bytesRead,
+      durationMs: Math.max(0, Date.now() - startedAt),
+    };
+    if (err) {
+      try { onStreamError?.(err, diagnostic); } catch { /* diagnostics only */ }
+    }
+    try { onStreamFinished?.(diagnostic); } catch { /* diagnostics only */ }
+  };
+  nodeStream.once('end', () => { finishStream('completed'); });
+  nodeStream.on('error', (err) => {
+    finishStream('failed', err as Error);
+  });
+  nodeStream.once('close', () => { finishStream('closed_before_end'); });
   const body = Readable.toWeb(nodeStream) as unknown as ReadableStream;
 
   if (range) {
-    return new Response(body, {
+    const response = new Response(body, {
       status: 206,
       headers: {
         ...baseHeaders,
@@ -175,8 +258,12 @@ export function serveFileRange(
         'Content-Length': String(range.end - range.start + 1),
       },
     });
+    notifyPrepared(206, range.end - range.start + 1, range);
+    return response;
   }
-  return new Response(body, {
+  const response = new Response(body, {
     headers: { ...baseHeaders, 'Content-Length': String(totalSize) },
   });
+  notifyPrepared(200, totalSize);
+  return response;
 }

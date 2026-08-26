@@ -100,8 +100,8 @@ export interface ConnectorInstance {
   /** Where the instance came from. Missing/undefined = 'catalog' (pre-existing rows).
    *  'custom' = user-supplied MCP server (id always carries the `custom-` prefix so it can
    *  never collide with a catalog entry id); its transport is used verbatim — no catalog
-   *  template, no OAuth grant, no server-side refresh. See
-   *  docs/plans/open-ecosystem-architecture.md §C. */
+   *  template, no OAuth grant, no server-side refresh. See `CLAUDE.md` under
+   *  "Connectors And Knowledge Base". */
   origin?: 'catalog' | 'custom';
   transport: Transport;
   /** Tool subset to expose. `null` = all reported tools; `string[]` = whitelist of tool names. */

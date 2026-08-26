@@ -57,7 +57,7 @@ describe("Tools", () => {
   });
 
   describe("manage_execution_plan tool", () => {
-    it("exposes outcome-based creation and material-transition guidance", () => {
+    it("separates plan selection from operation and replacement semantics", () => {
       const session = new Session();
       const tool = createExecutionPlanTool({
         get: () => session.getExecutionPlan(),
@@ -65,10 +65,25 @@ describe("Tools", () => {
         clear: () => session.clearExecutionPlan(),
       });
 
-      expect(tool.description).toContain("durable outcome milestones");
-      expect(tool.description).toContain("tool/file count and linear plumbing do not qualify");
-      expect(tool.description).toContain("Prefer set_statuses for known transitions");
-      expect(tool.description).toContain("complete before evidence");
+      const properties = tool.inputSchema.properties as Record<string, Record<string, unknown>>;
+      expect(tool.description).toContain("when a durable anchor is needed");
+      expect(tool.description).toContain("skip work clear in live context");
+      expect(tool.description).toContain("Co-emit necessary changes with a related business tool when available");
+      expect(tool.description).toContain("never ends the run");
+      expect(tool.description).toContain("set_statuses only when stale status could mislead execution or recovery");
+      expect(tool.description).toContain("project_tasks");
+      expect(properties.action.enum).toEqual(["update", "set_statuses"]);
+      expect(properties.action.description).toContain("Legacy operations remain accepted");
+      expect(properties.replace_objective.description).toContain("latest user text");
+      expect(properties.updates.description).toContain("keep the Plan accurate for execution or recovery");
+      expect(properties.updates.description).toContain("Apply them atomically and batch adjacent transitions");
+      expect(properties.plan.description).toContain("Preserve existing step text exactly");
+      expect(properties.plan.description).toContain("only for necessary status-only changes");
+      expect(tool.inputSchema.required).toEqual(["action"]);
+      expect(properties).not.toHaveProperty("finish");
+      expect(properties).not.toHaveProperty("step_id");
+      expect(properties).not.toHaveProperty("step");
+      expect(properties).not.toHaveProperty("status");
     });
 
     it("repairs a missing update action when a complete plan is present", async () => {
@@ -250,17 +265,17 @@ describe("Tools", () => {
           { step: "Verify the result", status: "pending" },
         ],
       }, context);
-      expect(JSON.parse(initial.content).steps).toEqual([
-        { id: 1, step: "Inspect the inputs", status: "in_progress" },
-        { id: 2, step: "Verify the result", status: "pending" },
-      ]);
+      expect(JSON.parse(initial.content)).toMatchObject({
+        step_ids: [1, 2],
+        updated_step_ids: [1, 2],
+      });
+      expect(JSON.parse(initial.content)).not.toHaveProperty("steps");
 
       const status = await tool.execute({ action: "set_status", step_id: 1, status: "completed" }, context);
       expect(status.isError).toBeUndefined();
-      expect(JSON.parse(status.content).steps[0]).toEqual({
-        id: 1,
-        step: "Inspect the inputs",
-        status: "completed",
+      expect(JSON.parse(status.content)).toMatchObject({
+        step_ids: [1, 2],
+        updated_step_ids: [1],
       });
 
       const appended = await tool.execute({
@@ -317,6 +332,102 @@ describe("Tools", () => {
         { id: 2, step: "Verify the evidence", status: "in_progress" },
         { id: 3, step: "Publish the result", status: "completed" },
       ]);
+    });
+
+    it("accepts a legacy completed finish marker without turning Plan into a terminal tool", async () => {
+      const session = new Session();
+      session.beginUserTurn([{ type: "text", text: "Complete and verify the staged task" }]);
+      session.updateExecutionPlan({
+        steps: [
+          { step: "Complete the work", status: "completed" },
+          { step: "Verify the result", status: "in_progress" },
+        ],
+      });
+      const tool = createExecutionPlanTool({
+        get: () => session.getExecutionPlan(),
+        update: (update) => session.updateExecutionPlan(update),
+        clear: () => session.clearExecutionPlan(),
+      });
+
+      const result = await tool.execute({
+        action: "set_status",
+        step_id: 2,
+        status: "completed",
+        finish: "completed",
+      }, { state: {} });
+
+      expect(result.endTurn).toBeUndefined();
+      expect(result.synthesizeIfNoText).toBeUndefined();
+      expect(JSON.parse(result.content)).toMatchObject({
+        ok: true,
+        finish: "completed",
+        updated_step_ids: [2],
+        step_ids: [1, 2],
+      });
+      expect(JSON.parse(result.content)).not.toHaveProperty("terminal");
+      expect(JSON.parse(result.content)).not.toHaveProperty("steps");
+      expect(session.getExecutionPlan()?.steps.map((step) => step.status))
+        .toEqual(["completed", "completed"]);
+    });
+
+    it("rejects an invalid terminal state before changing any plan status", async () => {
+      const session = new Session();
+      session.beginUserTurn([{ type: "text", text: "Complete the staged task" }]);
+      session.updateExecutionPlan({
+        steps: [
+          { step: "Complete the work", status: "in_progress" },
+          { step: "Verify the result", status: "pending" },
+        ],
+      });
+      const tool = createExecutionPlanTool({
+        get: () => session.getExecutionPlan(),
+        update: (update) => session.updateExecutionPlan(update),
+        clear: () => session.clearExecutionPlan(),
+      });
+
+      const result = await tool.execute({
+        action: "set_status",
+        step_id: 1,
+        status: "completed",
+        finish: "completed",
+      }, { state: {} });
+
+      expect(result).toMatchObject({ isError: true });
+      expect(JSON.parse(result.content)).toMatchObject({
+        error_code: "PLAN_FINISH_REJECTED",
+      });
+      expect(session.getExecutionPlan()?.steps.map((step) => step.status))
+        .toEqual(["in_progress", "pending"]);
+    });
+
+    it("accepts a legacy blocked finish marker only when no milestone remains in progress", async () => {
+      const session = new Session();
+      session.beginUserTurn([{ type: "text", text: "Run until an external approval is required" }]);
+      session.updateExecutionPlan({
+        steps: [
+          { step: "Prepare the request", status: "completed" },
+          { step: "Receive external approval", status: "in_progress" },
+        ],
+      });
+      const tool = createExecutionPlanTool({
+        get: () => session.getExecutionPlan(),
+        update: (update) => session.updateExecutionPlan(update),
+        clear: () => session.clearExecutionPlan(),
+      });
+
+      const result = await tool.execute({
+        action: "set_status",
+        step_id: 2,
+        status: "blocked",
+        finish: "blocked",
+      }, { state: {} });
+
+      expect(result.endTurn).toBeUndefined();
+      expect(result.synthesizeIfNoText).toBeUndefined();
+      expect(JSON.parse(result.content)).toMatchObject({ finish: "blocked" });
+      expect(JSON.parse(result.content)).not.toHaveProperty("terminal");
+      expect(session.getExecutionPlan()?.steps.map((step) => step.status))
+        .toEqual(["completed", "blocked"]);
     });
 
     it("infers unambiguous narrow actions without weakening payload validation", async () => {
@@ -551,6 +662,38 @@ describe("Tools", () => {
         .toEqual(["pending", "in_progress"]);
     });
 
+    it("rejects malformed milestone entries without changing the current plan", async () => {
+      const session = new Session();
+      session.beginUserTurn([{ type: "text", text: "Complete the staged task" }]);
+      session.updateExecutionPlan({
+        steps: [
+          { step: "Inspect the inputs", status: "completed" },
+          { step: "Verify the result", status: "in_progress" },
+        ],
+      });
+      const tool = createExecutionPlanTool({
+        get: () => session.getExecutionPlan(),
+        update: (update) => session.updateExecutionPlan(update),
+        clear: () => session.clearExecutionPlan(),
+      });
+      const before = session.getExecutionPlan();
+
+      const result = await tool.execute({
+        action: "update",
+        plan: ["Inspect the inputs", { step: "Verify the result", status: "completed" }],
+      }, { state: {} });
+
+      expect(result).toMatchObject({ isError: true });
+      expect(JSON.parse(result.content)).toMatchObject({
+        ok: false,
+        error_code: "PLAN_UPDATE_REJECTED",
+        current_revision: before?.revision,
+        current_steps: before?.steps,
+      });
+      expect(result.content).toMatch(/step.*object/i);
+      expect(session.getExecutionPlan()).toEqual(before);
+    });
+
     it("accepts detailed milestone labels beyond the model-facing anchor budget", async () => {
       const session = new Session();
       session.beginUserTurn([{ type: "text", text: "Complete the detailed task" }]);
@@ -633,6 +776,27 @@ describe("Tools", () => {
       });
     });
 
+    it("reuses the normalized definition for an unchanged tool identity", () => {
+      let schemaReads = 0;
+      const tool = defineTool({
+        name: "cached_tool",
+        description: "cached description",
+        get inputSchema() {
+          schemaReads += 1;
+          return { type: "object", properties: { value: { type: "string" } } };
+        },
+        async execute() {
+          return { content: "" };
+        },
+      });
+
+      const first = toToolDefinition(tool);
+      const second = toToolDefinition(tool);
+
+      expect(second).toBe(first);
+      expect(schemaReads).toBe(1);
+    });
+
     it("keeps descriptions intact while warning on soft-budget overruns", () => {
       const longDescription = "Use this tool carefully. " + "detail ".repeat(120);
       const modeDescription = "Choose execution mode. " + "extra ".repeat(80);
@@ -711,10 +875,11 @@ describe("Tools", () => {
       expect(names).toContain("write_file");
       expect(names).toContain("apply_patch");
       expect(names).toContain("bash");
-      expect(names).toContain("process_start");
-      expect(names).toContain("process_read");
-      expect(names).toContain("process_write");
-      expect(names).toContain("process_stop");
+      expect(names).toContain("process_session");
+      expect(names).not.toContain("process_start");
+      expect(names).not.toContain("process_read");
+      expect(names).not.toContain("process_write");
+      expect(names).not.toContain("process_stop");
       expect(names).toContain("list_files");
     });
   });
@@ -1051,15 +1216,110 @@ describe("Tools", () => {
       }
     });
 
-    it("does not cache failed fetches", async () => {
+    it("allows one retry for a transient failure, then suppresses the same URL", async () => {
       const fetchMock = vi.fn(async () => new Response("unavailable", { status: 503 }));
       vi.stubGlobal("fetch", fetchMock);
       try {
         const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
         const ctx: ToolContext = { state: {} };
-        await webFetch.execute({ url: "https://example.test/retryable" }, ctx);
-        await webFetch.execute({ url: "https://example.test/retryable" }, ctx);
+        const first = await webFetch.execute({ url: "https://example.test/retryable" }, ctx);
+        const second = await webFetch.execute({ url: "https://example.test/retryable" }, ctx);
+        const third = await webFetch.execute({ url: "https://example.test/retryable" }, ctx);
         expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(first.content).not.toContain("E_WEB_FETCH_RETRY_LIMIT");
+        expect(second.content).toContain("E_WEB_FETCH_RETRY_LIMIT");
+        expect(third.content).toContain("E_WEB_FETCH_NONRETRYABLE_CACHE_HIT");
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("does not retry a permanently missing URL but allows another URL", async () => {
+      const fetchMock = vi.fn(async (input: string | URL | Request) => {
+        const requestUrl = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+        return requestUrl.endsWith("/missing")
+          ? new Response("missing", { status: 404, statusText: "Not Found" })
+          : new Response("useful evidence", {
+              status: 200,
+              headers: { "content-type": "text/plain; charset=utf-8" },
+            });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      try {
+        const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+        const ctx: ToolContext = { state: {} };
+        const missing = await webFetch.execute({ url: "https://example.test/missing" }, ctx);
+        const repeated = await webFetch.execute({ url: "https://example.test/missing" }, ctx);
+        const useful = await webFetch.execute({ url: "https://example.test/useful" }, ctx);
+        expect(missing.isError).toBe(true);
+        expect(repeated.content).toContain("E_WEB_FETCH_NONRETRYABLE_CACHE_HIT");
+        expect(useful.content).toBe("useful evidence");
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("opens a run-scoped origin circuit after repeated access failures", async () => {
+      const fetchMock = vi.fn(async () => new Response("forbidden", {
+        status: 403,
+        statusText: "Forbidden",
+      }));
+      vi.stubGlobal("fetch", fetchMock);
+      try {
+        const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+        const runScopedLedger = new Map<string, unknown>();
+        const first = await webFetch.execute(
+          { url: "https://blocked.example.test/one" },
+          { state: { runScopedLedger } },
+        );
+        const second = await webFetch.execute(
+          { url: "https://blocked.example.test/two" },
+          { state: { runScopedLedger } },
+        );
+        const third = await webFetch.execute(
+          { url: "https://blocked.example.test/three" },
+          { state: { runScopedLedger } },
+        );
+        expect(first.isError).toBe(true);
+        expect(first.content).not.toContain("E_WEB_FETCH_ORIGIN_AUTH_CIRCUIT_OPENED");
+        expect(second.content).toContain("E_WEB_FETCH_ORIGIN_AUTH_CIRCUIT_OPENED");
+        expect(third.content).toContain("E_WEB_FETCH_ORIGIN_AUTH_BLOCKED");
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("does not impose a total-call ceiling on distinct successful sources", async () => {
+      const fetchMock = vi.fn(async (input: string | URL | Request) => {
+        const requestUrl = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+        return new Response(`evidence for ${requestUrl}`, {
+          status: 200,
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      try {
+        const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+        const runScopedLedger = new Map<string, unknown>();
+        const results = [];
+        for (let index = 0; index < 20; index++) {
+          results.push(await webFetch.execute(
+            { url: `https://valuable.example.test/source-${index}` },
+            { state: { runScopedLedger } },
+          ));
+        }
+        expect(results.every((result) => !result.isError)).toBe(true);
+        expect(fetchMock).toHaveBeenCalledTimes(20);
       } finally {
         vi.unstubAllGlobals();
       }

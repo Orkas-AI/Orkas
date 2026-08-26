@@ -112,6 +112,34 @@ describe("SkillLoader", () => {
     expect(list[0].skillFile.endsWith("SKILL.md")).toBe(true);
   });
 
+  it("prefers the platform bilingual frontmatter pair over duplicate legacy sidecar descriptions", () => {
+    const base = path.join(root, "skills");
+    writeSkill(base, "platform", {
+      name: "platform",
+      description_zh: "平台中文",
+      description_en: "Platform English",
+    });
+    fs.writeFileSync(path.join(base, "platform", "_meta.json"), JSON.stringify({
+      descriptions: { zh: "旧中文", en: "Legacy English" },
+    }));
+
+    const [spec] = new SkillLoader({ dirs: [base] }).list();
+    expect(spec.description_zh).toBe("平台中文");
+    expect(spec.description_en).toBe("Platform English");
+  });
+
+  it("keeps sidecar localization as a compatibility fallback for a portable custom Skill", () => {
+    const base = path.join(root, "skills");
+    writeSkill(base, "custom", { name: "custom", description: "Portable English" });
+    fs.writeFileSync(path.join(base, "custom", "_meta.json"), JSON.stringify({
+      descriptions: { zh: "自定义中文", en: "Localized English" },
+    }));
+
+    const [spec] = new SkillLoader({ dirs: [base] }).list();
+    expect(spec.description_zh).toBe("自定义中文");
+    expect(spec.description_en).toBe("Localized English");
+  });
+
   it("parses the `ownerAgent` tag; absent/blank → undefined (agent-private gating)", () => {
     const base = path.join(root, "skills");
     writeSkill(base, "owned",  { name: "owned",  description: "private", ownerAgent: "video-studio" });
@@ -194,7 +222,7 @@ describe("SkillLoader", () => {
     expect(list.find((s) => s.id === "only-in-builtin")).toBeDefined();
   });
 
-  it("caches by mtime and invalidate() forces re-scan", () => {
+  it("caches an unchanged inventory and invalidate() forces re-scan", () => {
     const base = path.join(root, "skills");
     writeSkill(base, "one", { name: "One" });
 
@@ -212,6 +240,42 @@ describe("SkillLoader", () => {
     loader.invalidate();
     const third = loader.list();
     expect(third.map((s) => s.id).sort()).toEqual(["one", "two"]);
+  });
+
+  it("refreshes an in-place SKILL.md edit even when the root mtime is unchanged", () => {
+    const base = path.join(root, "skills");
+    writeSkill(base, "one", { name: "One", description: "old route" });
+    const loader = new SkillLoader({ dirs: [base] });
+    const first = loader.list();
+    expect(first[0]?.description_en).toBe("old route");
+
+    const rootTimes = fs.statSync(base);
+    const skillFile = path.join(base, "one", "SKILL.md");
+    const skillTimes = fs.statSync(skillFile);
+    // Same-length rewrite plus restored mtime defeats a mtime+size cache. The
+    // loader's ctime/inode fingerprint must still observe the external edit.
+    writeSkill(base, "one", { name: "One", description: "new route" });
+    fs.utimesSync(skillFile, skillTimes.atime, skillTimes.mtime);
+    // Recreate the old failure condition explicitly: the root timestamp does
+    // not reveal an in-place child-file rewrite.
+    fs.utimesSync(base, rootTimes.atime, rootTimes.mtime);
+
+    const second = loader.list();
+    expect(second).not.toBe(first);
+    expect(second[0]?.description_en).toBe("new route");
+  });
+
+  it("refreshes an in-place description sidecar edit", () => {
+    const base = path.join(root, "skills");
+    writeSkill(base, "one", { name: "One" });
+    const sidecar = path.join(base, "one", "_meta.json");
+    fs.writeFileSync(sidecar, JSON.stringify({ descriptions: { en: "sidecar one" } }));
+    const loader = new SkillLoader({ dirs: [base] });
+    expect(loader.list()[0]?.description_en).toBe("sidecar one");
+
+    fs.writeFileSync(sidecar, JSON.stringify({ descriptions: { en: "sidecar two, externally updated" } }));
+
+    expect(loader.list()[0]?.description_en).toBe("sidecar two, externally updated");
   });
 
   it("renderSystemPromptBlock lists all skills with source marker", () => {

@@ -155,7 +155,7 @@ export const savedAppDir      = (uid: string, appId: string) => path.join(userSa
 //     The user (or the system on the user's behalf) may continue these
 //     conversations later, so the LLM history must cross devices.
 //   local/sessions/  — "ephemeral" kinds: extract-img / reflect /
-//     memory-extract / anon. One-shot background calls; nobody resumes them,
+//     anon. One-shot background calls; nobody resumes them,
 //     and they're large + worthless to sync. Sessions_sweep GCs by mtime.
 // Routing lives in `model/core-agent/session-store.ts::resolveSessionPath`
 // and is the single place that decides which side an id lands on.
@@ -312,8 +312,8 @@ export const agentStrategiesFile = (uid: string, agentId: string) => path.join(a
 // Agent self-evolved skill store (System B — written by core-agent's SkillStore;
 // `skill_manage` tool creates / patches / deletes). **Visible only to the owning
 // agent**; not included in the SkillLoader's `## Available skills` system prompt
-// block; other agents / commander cannot see it. See CLAUDE.md §6 (dual system
-// boundary).
+// block; other agents / commander cannot see it. See
+// docs/architecture/skill-engineering-contract.md.
 export const agentEvolvedSkillsDir = (uid: string, agentId: string) => path.join(agentDir(uid, agentId), 'skills');
 export const agentPrivateSkillsDir = (uid: string, agentId: string) => path.join(agentDir(uid, agentId), 'private_skills');
 
@@ -395,6 +395,8 @@ export const userRunningConversationsFile = (uid: string) =>
 // Last-known-good product control-plane config fetched from the Server.
 // Local cache only; Server JSON is the authority.
 export const userRemoteConfigFile = (uid: string) => path.join(userLocalConfigDir(uid), 'remote-config.json');
+// Public announcement snapshot plus this device's per-user read cursor.
+export const userAnnouncementsFile = (uid: string) => path.join(userLocalConfigDir(uid), 'announcements.json');
 // Machine-local defaults for external coding agents. Values are absolute
 // project directories, so they must not sync across devices.
 export const userAgentRuntimeConfigFile = (uid: string) => path.join(userLocalConfigDir(uid), 'agent-runtime.json');
@@ -541,7 +543,7 @@ export const localCliSessionsFile = (uid: string, cid: string) =>
 // `features/packages.ts`. Marketplace reconcile must never touch this tree.
 // `.bin/` holds generated shims for CLI-shaped packages; it is injected into
 // the bash tool PATH (see `model/core-agent/client.ts`).
-// See docs/plans/open-ecosystem-architecture.md §A.
+// See docs/architecture/skill-engineering-contract.md.
 export const userPackagesDir          = (uid: string) => path.join(userLocalRoot(uid), 'packages');
 export const userPackageDir           = (uid: string, name: string) => path.join(userPackagesDir(uid), name);
 export const userPackagesRegistryFile = (uid: string) => path.join(userPackagesDir(uid), '_registry.json');
@@ -571,10 +573,16 @@ export const userPackageSkillDir  = (uid: string, name: string) => path.join(use
 // Gated by the `global_skill_roots_enabled` preference and injected only into
 // in-app task/authoring sessions — never through the orkas-bridge, because
 // each CLI reads its own global dir natively (see skill-registry.ts::listSkillsForBridge).
-export const globalSkillRoots = (): string[] => [
-  path.join(os.homedir(), '.claude', 'skills'),
-  path.join(os.homedir(), '.codex', 'skills'),
-];
+export const globalSkillRoots = (): string[] => {
+  // Tests that exercise global-skill discovery must never inspect or mutate
+  // the developer's real cross-host Skill folders.
+  const testRoot = String(process.env.ORKAS_TEST_GLOBAL_SKILLS_ROOT || '').trim();
+  if (testRoot && path.isAbsolute(testRoot)) return [path.resolve(testRoot)];
+  return [
+    path.join(os.homedir(), '.claude', 'skills'),
+    path.join(os.homedir(), '.codex', 'skills'),
+  ];
+};
 
 // ── Global recycle bin (machine-private, user-managed) ──────────────────
 // `<uid>/local/recycle/` stores recoverable snapshots for destructive

@@ -12,7 +12,17 @@ function enabled(): boolean {
 }
 
 function norm(p: string): string {
-  return path.resolve(p || '');
+  const resolved = path.resolve(p || '');
+  if (process.platform !== 'darwin' && process.env.ORKAS_TCC_GUARD_FORCE !== '1') return resolved;
+  // macOS exposes /var, /tmp, and /etc as aliases of /private/* in user-facing
+  // paths. Normalize those aliases without touching the filesystem so a
+  // symlink/canonical path cannot evade a protected-root comparison.
+  for (const alias of ['/var', '/tmp', '/etc']) {
+    if (resolved === alias || resolved.startsWith(`${alias}${path.sep}`)) {
+      return `/private${resolved}`;
+    }
+  }
+  return resolved;
 }
 
 function sameOrInside(candidate: string, root: string): boolean {

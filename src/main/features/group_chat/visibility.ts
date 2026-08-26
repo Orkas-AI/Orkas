@@ -25,10 +25,23 @@ import { createLogger } from '../../logger';
 
 const log = createLogger('group_chat.visibility');
 
+/** Provider-facing canonical-history projection contract. Bump this whenever
+ * the serialized dialogue shape changes so persisted session tails and shared
+ * summaries rebuild from the canonical JSONL instead of retaining an older
+ * prompt-visible format. */
+export const GROUP_HISTORY_SOURCE_VERSION = 2;
+
+export function groupConversationHistorySource(cid: string): string {
+  return `group-main-v${GROUP_HISTORY_SOURCE_VERSION}:${cid}`;
+}
+
 export interface ChatUseSelection {
   kind: 'skill' | 'connector';
   id: string;
   name?: string;
+  /** Stable Skill tier chosen by the user. Older messages omit this and use
+   * compatibility precedence; connectors never carry a Skill source. */
+  source?: 'marketplace' | 'custom' | 'external' | 'global';
 }
 
 /** Immutable snapshot of one visible message referenced from another task.
@@ -105,8 +118,8 @@ export interface GroupMessage {
   /** Attachment filenames (only meaningful for user messages). */
   attachments?: string[];
   /** Structured composer selections captured at send time. The text still
-   * carries the human-readable "use X" wording; this preserves the internal
-   * id so agent skill allowlists can include explicit user choices. */
+   * carries the human-readable "use X" wording; Skill rows retain both their
+   * internal id and selected source so same-id tiers resolve deterministically. */
   use_selections?: ChatUseSelection[];
   /** Structured snapshots quoted from this or another conversation. Kept
    * outside `text` so mentions in historical content never affect routing. */
@@ -141,6 +154,14 @@ export interface GroupMessage {
    * agent's visibility slice has it for context) but hidden from the user
    * view, since the user already saw the plan announcement. */
   dispatch?: boolean;
+  /** Host-owned recovery marker for a synchronous `dispatch_to` source (and
+   * user retries derived from it). If that Agent bubble is retried after the
+   * original Commander call stack was lost, the completed retry must wake a
+   * fresh Commander turn. Never interpreted from message text. */
+  commander_retry?: {
+    source_tool: 'dispatch_to';
+    resume_instruction: string;
+  };
   /** Commander reasoning-segment index within one turn. A commander turn that
    * dispatches visible agents is split into segments at each dispatch boundary
    * (pre-dispatch reasoning → its own bubble, post-handback synthesis → the
@@ -304,10 +325,11 @@ function commanderHistoryActorLabel(actorId: string, actorName: string): string 
   return `${actorName} (${actorId})`;
 }
 
-function commanderHistoryRecordText(
-  record: CommanderHistoryRecord,
-  formatReferences?: GroupHistoryReferenceFormatter,
-): string {
+function commanderHistoryRoute(record: CommanderHistoryRecord): {
+  from: string;
+  recipients: string;
+  attributes: string[];
+} {
   const from = commanderHistoryActorLabel(record.actor_id, record.actor_name);
   const recipients = record.to.length
     ? record.to
@@ -320,7 +342,62 @@ function commanderHistoryRecordText(
       ? `failure=${record.failure_kind}${record.failure_code ? `/${record.failure_code}` : ''}`
       : '',
   ].filter(Boolean);
-  const header = `[${from} -> ${recipients}${attributes.length ? `; ${attributes.join('; ')}` : ''}]`;
+  return { from, recipients, attributes };
+}
+
+/** Remove only the old host-owned prefix that can be derived from this
+ * authoritative non-user record. Canonical JSONL remains untouched. User
+ * examples, embedded mentions, quotes/code fences and unknown look-alikes do
+ * not match this leading-line contract and remain verbatim. */
+function stripLegacyHistoryRoutePrefix(
+  record: CommanderHistoryRecord,
+  body: string,
+): string {
+  if (record.actor_id === USER_ID || !body) return body;
+  const { from, recipients, attributes } = commanderHistoryRoute(record);
+  const legacyHeaders = new Set([
+    `[${from} -> ${recipients}]`,
+    ...(attributes.length ? [`[${from} -> ${recipients}; ${attributes.join('; ')}]`] : []),
+  ]);
+  const lines = body.split(/\r?\n/);
+  let removed = false;
+  while (lines.length && legacyHeaders.has(lines[0].trim())) {
+    removed = true;
+    lines.shift();
+    while (lines.length && !lines[0].trim()) lines.shift();
+  }
+  return removed ? lines.join('\n').trim() : body;
+}
+
+function commanderHistoryAttribution(record: CommanderHistoryRecord): string[] {
+  const { from, recipients } = commanderHistoryRoute(record);
+  const defaultUserRoute = record.actor_id === USER_ID
+    && record.to.length === 1
+    && record.to[0]?.actor_id === COMMANDER_ID;
+  const defaultCommanderReply = record.actor_id === COMMANDER_ID
+    && record.to.length === 1
+    && record.to[0]?.actor_id === USER_ID
+    && !record.dispatch
+    && !record.failure_kind;
+  if (defaultUserRoute || defaultCommanderReply) return [];
+
+  const attribution = record.actor_id === USER_ID
+    ? `This user message was addressed to ${recipients}.`
+    : record.dispatch
+      ? `${from} delegated this step to ${recipients}:`
+      : `${from} replied to ${recipients}:`;
+  return [
+    attribution,
+    ...(record.failure_kind
+      ? [`Recorded failure: ${record.failure_kind}${record.failure_code ? `/${record.failure_code}` : ''}.`]
+      : []),
+  ];
+}
+
+function commanderHistoryRecordText(
+  record: CommanderHistoryRecord,
+  formatReferences?: GroupHistoryReferenceFormatter,
+): string {
   let body = (record.model_text?.trim() || record.text || '').trim();
 
   // Versions before 1.6.5 serialized host-owned history markers and JSON into
@@ -333,6 +410,8 @@ function commanderHistoryRecordText(
     && LEAKED_HISTORY_SCAFFOLD_MARKERS.some((marker) => body.includes(marker))
   ) {
     body = 'Prior response body omitted because it contained internal history serialization.';
+  } else {
+    body = stripLegacyHistoryRoutePrefix(record, body);
   }
 
   const details = [
@@ -349,7 +428,11 @@ function commanderHistoryRecordText(
       : '',
   ].filter(Boolean);
 
-  return [header, body, ...details].filter(Boolean).join('\n');
+  return [
+    ...commanderHistoryAttribution(record),
+    body,
+    ...details,
+  ].filter(Boolean).join('\n');
 }
 
 /**
@@ -387,6 +470,9 @@ function projectCommanderConversationHistory(
       active = null;
       return;
     }
+    const responses = active.responses
+      .map((record) => commanderHistoryRecordText(record, formatReferences))
+      .filter(Boolean);
     result.push({
       role: 'user',
       turnId: active.turnId,
@@ -400,10 +486,8 @@ function projectCommanderConversationHistory(
       turnId: active.turnId,
       content: [{
         type: 'text',
-        text: active.responses.length
-          ? active.responses
-            .map((record) => commanderHistoryRecordText(record, formatReferences))
-            .join('\n\n')
+        text: responses.length
+          ? responses.join('\n\n')
           : 'No actor response was recorded before the next user message.',
       }],
     });

@@ -344,22 +344,15 @@ describe('PC core regression unit coverage', () => {
     expect((await projects.getBindings(TEST_UID, project!.project_id)).agents).toEqual([]);
   });
 
-  it('[PC-MODEL-004][PC-PERM-001] persists local execution permission changes', async () => {
+  it('[PC-MODEL-004][PC-PERM-001] persists local operation access modes', async () => {
     const permissions = await import('../../src/main/features/permissions');
 
-    expect(permissions.getLocalExecGranted()).toBe(true);
-    const revoked = permissions.revokeLocalExec();
-    expect(revoked.granted).toBe(true);
-    expect(revoked.mode).toBe('workspace_approval');
-    expect(permissions.getLocalExecGranted()).toBe(true);
-
-    const granted = permissions.grantLocalExec();
-    expect(granted.granted).toBe(true);
-    expect(permissions.getLocalExecGranted()).toBe(true);
+    expect(permissions.getLocalExecState()).toEqual({ mode: 'all_files_approval' });
+    expect(permissions.setLocalExecMode('workspace_approval')).toEqual({ mode: 'workspace_approval' });
+    expect(permissions.setLocalExecMode('all_files_auto')).toEqual({ mode: 'all_files_auto' });
 
     const file = userPath('cloud', 'config', 'permissions.json');
-    // Persisted shape is now the three-mode access model; grantLocalExec → all_files_auto.
-    expect(JSON.parse(fs.readFileSync(file, 'utf8')).localExec.mode).toBe('all_files_auto');
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).localExec).toEqual({ mode: 'all_files_auto' });
   });
 
   it('[PC-CONN-002] stores connector soft-disable separately from disconnect state', async () => {

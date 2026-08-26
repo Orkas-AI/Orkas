@@ -16,6 +16,8 @@ import {
   providerSubscriptionNote,
   sortProviderIds,
   curatedModelsFor,
+  modelInputFromConfiguredCapabilities,
+  modelInputImageLimit,
   resolveConfiguredPiModel,
   pickLatestGenerations,
 } from '../../../src/main/model/provider_catalog';
@@ -188,6 +190,90 @@ describe('provider_catalog › CURATED_MODELS', () => {
 
   it('curatedModelsFor returns [] for unknown providers (triggers pi-ai fallback)', () => {
     expect(curatedModelsFor('no-such-provider-id')).toEqual([]);
+  });
+
+  it.each([
+    { input: ['text'] as const, configured: {}, expected: ['text'] },
+    { input: ['text', 'image'] as const, configured: {}, expected: ['text', 'image'] },
+    { input: ['text'] as const, configured: { supportsVision: true }, expected: ['text', 'image'] },
+    { input: ['text', 'image'] as const, configured: { supportsVision: false }, expected: ['text'] },
+    { input: ['text'] as const, configured: { maxInputImages: 12 }, expected: ['text', 'image'] },
+    { input: ['text', 'image'] as const, configured: { maxInputImages: 0 }, expected: ['text'] },
+    { input: ['text'] as const, configured: { supportsVision: true, maxInputImages: 12 }, expected: ['text', 'image'] },
+    { input: ['text', 'image'] as const, configured: { supportsVision: false, maxInputImages: 0 }, expected: ['text'] },
+  ])('applies configured vision capabilities: $configured', ({ input, configured, expected }) => {
+    expect(modelInputFromConfiguredCapabilities([...input], configured)).toEqual(expected);
+  });
+
+  it('uses the product image limit for a multimodal model without a provider limit', () => {
+    expect(modelInputImageLimit('unknown-provider', 'vision-next', {
+      id: 'vision-next',
+      input: ['text', 'image'],
+    } as any)).toBe(20);
+  });
+
+  it('accepts the capability-field matrix and rejects conflicts or invalid field types', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = 'configuredcapabilitymatrix';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    const cases: Array<{
+      id: string;
+      supportsVision?: unknown;
+      maxInputImages?: unknown;
+      accepted: boolean;
+    }> = [
+      { id: 'omitted-omitted', accepted: true },
+      { id: 'omitted-zero', maxInputImages: 0, accepted: true },
+      { id: 'omitted-positive', maxInputImages: 12, accepted: true },
+      { id: 'true-omitted', supportsVision: true, accepted: true },
+      { id: 'true-zero', supportsVision: true, maxInputImages: 0, accepted: false },
+      { id: 'true-positive', supportsVision: true, maxInputImages: 12, accepted: true },
+      { id: 'false-omitted', supportsVision: false, accepted: true },
+      { id: 'false-zero', supportsVision: false, maxInputImages: 0, accepted: true },
+      { id: 'false-positive', supportsVision: false, maxInputImages: 12, accepted: false },
+      { id: 'invalid-omitted', supportsVision: 'yes', accepted: false },
+      { id: 'invalid-zero', supportsVision: 'yes', maxInputImages: 0, accepted: false },
+      { id: 'invalid-positive', supportsVision: 'yes', maxInputImages: 12, accepted: false },
+      { id: 'invalid-invalid', supportsVision: 'yes', maxInputImages: '12', accepted: false },
+      { id: 'omitted-invalid', maxInputImages: '12', accepted: false },
+      { id: 'true-invalid', supportsVision: true, maxInputImages: '12', accepted: false },
+      { id: 'false-invalid', supportsVision: false, maxInputImages: '12', accepted: false },
+      { id: 'negative-limit', maxInputImages: -1, accepted: false },
+      { id: 'fractional-limit', maxInputImages: 1.5, accepted: false },
+      { id: 'boolean-limit', maxInputImages: true, accepted: false },
+      { id: 'null-limit', maxInputImages: null, accepted: false },
+      { id: 'object-limit', maxInputImages: { count: 12 }, accepted: false },
+    ];
+    const providers = Object.fromEntries(cases.map((entry) => [entry.id, [{
+      id: `${entry.id}-model`,
+      ...('supportsVision' in entry ? { supportsVision: entry.supportsVision } : {}),
+      ...('maxInputImages' in entry ? { maxInputImages: entry.maxInputImages } : {}),
+    }]]));
+    storage.writeJsonSync(file, {
+      version: 1,
+      active: { immediate: { model_catalog: { providers } } },
+    });
+    try {
+      for (const entry of cases) {
+        const models = curatedModelsFor(entry.id);
+        if (entry.accepted) {
+          expect(models, entry.id).toHaveLength(1);
+        } else {
+          expect(models, entry.id).toEqual([]);
+        }
+      }
+      expect(curatedModelsFor('false-zero')).toEqual([{
+        id: 'false-zero-model',
+        name: 'false-zero-model',
+        supportsVision: false,
+        maxInputImages: 0,
+      }]);
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
   });
 
   it('curatedModelsFor can be overridden by Server remote-config cache', async () => {

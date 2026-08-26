@@ -90,6 +90,7 @@ const PACKAGED_BIN_ENTRYPOINTS = Object.freeze([
 // surfaces themselves. App-owned connector entrypoints load this proxy
 // bootstrap so their fetch can follow the route selected by Electron main.
 const PACKAGED_BIN_HELPERS = Object.freeze([
+  'bridge-skill-runner.cjs',
   'proxy-bootstrap.cjs',
 ]);
 

@@ -329,6 +329,42 @@ describe('settings model authorization add account', () => {
     });
   });
 
+  it('shows a localized validation message when main rejects a custom API key header', async () => {
+    const { context, elements } = loadSettingsClickHarness(async (channel) => (
+      channel === 'auth.addCustomModelEntry'
+        ? { ok: false, code: 'CUSTOM_API_KEY_INVALID', error: 'internal fallback' }
+        : { ok: true }
+    ));
+    const body = elements.get('add-account-body')!;
+    const actions = elements.get('add-account-actions')!;
+    const fields = {
+      '.custom-label-input': '',
+      '.custom-base-url-input': 'https://gateway.example.test/v1',
+      '.custom-model-input': 'acme/reasoner-v2',
+      '.custom-max-tokens-input': '',
+      '.custom-key-input': 'щ-custom-key',
+      '.form-msg': '',
+    };
+    for (const [selector, value] of Object.entries(fields)) {
+      const element = new FakeElement();
+      element.value = value;
+      body.setQueryResult(selector, element);
+    }
+
+    context._settingsShowCustomModelForm({ id: 'custom', label: 'Custom' });
+    await actions.children.at(-1)!.click();
+
+    expect(body.querySelector('.form-msg')?.textContent)
+      .toBe('settings.custom.error_api_key_invalid');
+    for (const locale of ['zh', 'en', 'ja', 'pt']) {
+      const messages = JSON.parse(readFileSync(
+        resolve(__dirname, `../../src/renderer/locales/${locale}.json`),
+        'utf8',
+      ));
+      expect(messages['settings.custom.error_api_key_invalid'], locale).toBeTruthy();
+    }
+  });
+
   it('keeps max output tokens numeric while hiding its native spinner controls', () => {
     const { settingsSource } = loadSettingsClickHarness();
     expect(settingsSource).toMatch(

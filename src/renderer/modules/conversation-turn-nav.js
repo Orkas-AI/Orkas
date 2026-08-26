@@ -422,7 +422,7 @@
     });
   }
 
-  function renderMarkers() {
+  function renderMarkers(options = {}) {
     if (!state.nav || !state.markers) return;
     hidePreview();
     rebindMountedTargets();
@@ -433,7 +433,10 @@
       if (state.intersectionObserver) state.intersectionObserver.disconnect();
       return;
     }
-    const previousActive = state.turns.find((turn) => turnKey(turn) === state.activeKey)
+    const requestedActiveKey = options.activeTurn ? turnKey(options.activeTurn) : '';
+    const previousActive = state.turns.find((turn) => (
+      requestedActiveKey && turnKey(turn) === requestedActiveKey
+    )) || state.turns.find((turn) => turnKey(turn) === state.activeKey)
       || state.turns[state.turns.length - 1];
     const fragment = state.nav.ownerDocument.createDocumentFragment();
     state.turns.forEach((turn) => {
@@ -455,14 +458,14 @@
     ));
     state.nav.hidden = false;
     const activeChanged = turnKey(previousActive) !== state.activeKey;
-    setActiveTurn(previousActive);
+    setActiveTurn(previousActive, { forceCenter: options.forceCenter === true });
     bindIntersectionObserver();
     const requestFrame = root?.requestAnimationFrame || ((callback) => setTimeout(callback, 0));
     requestFrame(() => {
       const activeMarker = Array.from(
         state.markers?.querySelectorAll('.chat-turn-nav-marker') || [],
       ).find((marker) => marker.dataset.turnKey === state.activeKey);
-      if (activeChanged && activeMarker) centerMarker(activeMarker);
+      if ((activeChanged || options.forceCenter === true) && activeMarker) centerMarker(activeMarker);
       else updateOverflowIndicators();
     });
   }
@@ -716,6 +719,7 @@
     ));
     if (existing) {
       existing.target = target;
+      renderMarkers({ activeTurn: existing, forceCenter: true });
       return existing;
     }
     const turn = normalizeTurnDescriptor({
@@ -730,7 +734,7 @@
     });
     state.turns.push(turn);
     state.total += 1;
-    renderMarkers();
+    renderMarkers({ activeTurn: turn, forceCenter: true });
     return turn;
   }
 

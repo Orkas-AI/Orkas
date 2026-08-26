@@ -7,6 +7,8 @@ import {
   parseByteRange,
   ifNoneMatchMatches,
   serveFileRange,
+  type FileRangeResponseDiagnostic,
+  type FileRangeStreamDiagnostic,
 } from '../../../src/main/util/http-range';
 
 // `parseByteRange` is a header parser feeding the `chat-media://` / `kb-file://`
@@ -174,24 +176,55 @@ describe('serveFileRange', () => {
 
   it('full GET: 200 with no-cache, the (mtime,size) ETag, and the whole body', async () => {
     const st = fs.statSync(filePath);
-    const resp = serveFileRange(makeReq(), filePath, 'application/octet-stream', size, st.mtimeMs);
+    let diagnostic: FileRangeResponseDiagnostic | undefined;
+    let streamDiagnostic: FileRangeStreamDiagnostic | undefined;
+    const resp = serveFileRange(
+      makeReq(), filePath, 'application/octet-stream', size, st.mtimeMs, undefined,
+      (value) => { diagnostic = value; },
+      (value) => { streamDiagnostic = value; },
+    );
     expect(resp.status).toBe(200);
     expect(resp.headers.get('Cache-Control')).toBe('no-cache');
     expect(resp.headers.get('Accept-Ranges')).toBe('bytes');
     expect(resp.headers.get('ETag')).toBe(etag);
     expect(resp.headers.get('Content-Length')).toBe(String(size));
     expect(await resp.text()).toBe(CONTENT);
+    expect(diagnostic).toMatchObject({
+      requestMethod: 'GET',
+      rangeHeaderKind: 'none',
+      status: 200,
+      totalBytes: size,
+      responseBytes: size,
+      cacheRevalidated: false,
+    });
+    expect(diagnostic?.rangeStart).toBeUndefined();
+    expect(diagnostic?.rangeEnd).toBeUndefined();
+    expect(diagnostic?.prepareDurationMs).toBeGreaterThanOrEqual(0);
+    expect(streamDiagnostic).toMatchObject({
+      outcome: 'completed',
+      bytesRead: size,
+    });
+    expect(streamDiagnostic?.durationMs).toBeGreaterThanOrEqual(0);
   });
 
   it('matching If-None-Match on a full GET → 304, ETag echoed, empty body', async () => {
     const st = fs.statSync(filePath);
+    let diagnostic: FileRangeResponseDiagnostic | undefined;
     const resp = serveFileRange(
       makeReq({ 'If-None-Match': etag }), filePath, 'application/octet-stream', size, st.mtimeMs,
+      undefined, (value) => { diagnostic = value; },
     );
     expect(resp.status).toBe(304);
     expect(resp.headers.get('ETag')).toBe(etag);
     expect(resp.headers.get('Cache-Control')).toBe('no-cache');
     expect((await resp.arrayBuffer()).byteLength).toBe(0);
+    expect(diagnostic).toMatchObject({
+      rangeHeaderKind: 'none',
+      status: 304,
+      totalBytes: size,
+      responseBytes: 0,
+      cacheRevalidated: true,
+    });
   });
 
   it('stale If-None-Match (overwritten in place) → 200 fresh bytes, NOT 304', async () => {
@@ -207,13 +240,27 @@ describe('serveFileRange', () => {
 
   it('Range GET → 206 with Content-Range and exactly the sliced bytes', async () => {
     const st = fs.statSync(filePath);
+    let diagnostic: FileRangeResponseDiagnostic | undefined;
+    let streamDiagnostic: FileRangeStreamDiagnostic | undefined;
     const resp = serveFileRange(
       makeReq({ Range: 'bytes=0-3' }), filePath, 'application/octet-stream', size, st.mtimeMs,
+      undefined, (value) => { diagnostic = value; },
+      (value) => { streamDiagnostic = value; },
     );
     expect(resp.status).toBe(206);
     expect(resp.headers.get('Content-Range')).toBe(`bytes 0-3/${size}`);
     expect(resp.headers.get('Content-Length')).toBe('4');
     expect(await resp.text()).toBe('ABCD');
+    expect(diagnostic).toMatchObject({
+      rangeHeaderKind: 'satisfiable',
+      status: 206,
+      totalBytes: size,
+      responseBytes: 4,
+      rangeStart: 0,
+      rangeEnd: 3,
+      cacheRevalidated: false,
+    });
+    expect(streamDiagnostic).toMatchObject({ outcome: 'completed', bytesRead: 4 });
   });
 
   it('a matching If-None-Match on a Range GET still streams 206 (no 304 on partial fetch)', async () => {
@@ -229,11 +276,49 @@ describe('serveFileRange', () => {
 
   it('unsatisfiable range → 416 with a `bytes */total` Content-Range', async () => {
     const st = fs.statSync(filePath);
+    let diagnostic: FileRangeResponseDiagnostic | undefined;
     const resp = serveFileRange(
       makeReq({ Range: 'bytes=99999-' }), filePath, 'application/octet-stream', size, st.mtimeMs,
+      undefined, (value) => { diagnostic = value; },
     );
     expect(resp.status).toBe(416);
     expect(resp.headers.get('Content-Range')).toBe(`bytes */${size}`);
+    expect(diagnostic).toMatchObject({
+      rangeHeaderKind: 'unsatisfiable',
+      status: 416,
+      totalBytes: size,
+      responseBytes: 0,
+      cacheRevalidated: false,
+    });
+  });
+
+  it('malformed Range is ignored, serves 200, and is distinguishable in diagnostics', async () => {
+    // Negative control: the diagnostic must not label a look-alike header as
+    // a successful partial response when Chromium received the full file.
+    const st = fs.statSync(filePath);
+    let diagnostic: FileRangeResponseDiagnostic | undefined;
+    const resp = serveFileRange(
+      makeReq({ Range: 'bytes=0-3,8-11' }), filePath, 'application/octet-stream', size, st.mtimeMs,
+      undefined, (value) => { diagnostic = value; },
+    );
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toBe(CONTENT);
+    expect(diagnostic).toMatchObject({
+      rangeHeaderKind: 'ignored',
+      status: 200,
+      totalBytes: size,
+      responseBytes: size,
+    });
+  });
+
+  it('a throwing response diagnostic hook cannot break file delivery', async () => {
+    const st = fs.statSync(filePath);
+    const resp = serveFileRange(
+      makeReq(), filePath, 'application/octet-stream', size, st.mtimeMs, undefined,
+      () => { throw new Error('diagnostic sink failed'); },
+    );
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toBe(CONTENT);
   });
 
   it('no mtime → no ETag, so a conditional request is ignored and the body is served', async () => {
@@ -248,12 +333,18 @@ describe('serveFileRange', () => {
   it('a mid-stream read error fires the onStreamError hook', async () => {
     const missing = path.join(path.dirname(filePath), 'does-not-exist.bin');
     let captured: Error | undefined;
+    let streamDiagnostic: FileRangeStreamDiagnostic | undefined;
     const resp = serveFileRange(
-      makeReq(), missing, 'application/octet-stream', 10, 123, (err) => { captured = err; },
+      makeReq(), missing, 'application/octet-stream', 10, 123,
+      (err, diagnostic) => {
+        captured = err;
+        streamDiagnostic = diagnostic;
+      },
     );
     // Consuming the body pulls from the (failing) read stream; the error
     // propagates to both the web stream (rejects) and our error listener.
     await expect(resp.arrayBuffer()).rejects.toThrow();
     expect(captured).toBeInstanceOf(Error);
+    expect(streamDiagnostic).toMatchObject({ outcome: 'failed', bytesRead: 0 });
   });
 });

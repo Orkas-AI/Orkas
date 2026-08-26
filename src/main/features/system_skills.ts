@@ -41,6 +41,10 @@ export interface SystemSkillReconcileRetryOptions {
   reason?: string;
 }
 
+type SystemSkillManifestRead =
+  | { ok: true; entries: SystemSkillManifestEntry[] }
+  | { ok: false; entries: []; error: string };
+
 function _sourceSkillDir(id: string): string {
   return path.join(packagedSystemSkillsDir(), id);
 }
@@ -55,14 +59,31 @@ function _normaliseManifestEntry(raw: unknown): SystemSkillManifestEntry | null 
   return { id, update_at: updateAt };
 }
 
-function _readManifestEntries(file: string): SystemSkillManifestEntry[] {
+function _readManifest(file: string, opts: { requireNonEmpty?: boolean } = {}): SystemSkillManifestRead {
+  let raw: unknown;
   try {
-    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
-    const items = Array.isArray(raw) ? raw : Array.isArray(raw?.skills) ? raw.skills : [];
-    return items.map(_normaliseManifestEntry).filter((x): x is SystemSkillManifestEntry => !!x);
-  } catch {
-    return [];
+    raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (err) {
+    return { ok: false, entries: [], error: `unable to read manifest: ${(err as Error).message}` };
   }
+  const wrapped = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? raw as { skills?: unknown }
+    : null;
+  const items = Array.isArray(raw) ? raw : Array.isArray(wrapped?.skills) ? wrapped.skills : null;
+  if (!items) return { ok: false, entries: [], error: 'manifest must be an array or contain a skills array' };
+  if (opts.requireNonEmpty && items.length === 0) {
+    return { ok: false, entries: [], error: 'packaged system skill manifest must not be empty' };
+  }
+  const entries: SystemSkillManifestEntry[] = [];
+  const seen = new Set<string>();
+  for (let index = 0; index < items.length; index += 1) {
+    const entry = _normaliseManifestEntry(items[index]);
+    if (!entry) return { ok: false, entries: [], error: `invalid manifest entry at index ${index}` };
+    if (seen.has(entry.id)) return { ok: false, entries: [], error: `duplicate system skill id: ${entry.id}` };
+    seen.add(entry.id);
+    entries.push(entry);
+  }
+  return { ok: true, entries };
 }
 
 function _manifestMap(entries: SystemSkillManifestEntry[]): Map<string, SystemSkillManifestEntry> {
@@ -117,13 +138,21 @@ function _removeLegacyPerSkillManifest(uid: string, id: string): void {
 }
 
 export function listPackagedSystemSkillIds(): string[] {
-  return _readManifestEntries(packagedSystemSkillsManifestFile()).map((entry) => entry.id).sort();
+  const manifest = _readManifest(packagedSystemSkillsManifestFile(), { requireNonEmpty: true });
+  if (manifest.ok === false) {
+    log.warn(`packaged system skill manifest invalid: ${manifest.error}`);
+    return [];
+  }
+  return manifest.entries.map((entry) => entry.id).sort();
 }
 
 export function reconcileSystemSkill(uid: string, id: string): SystemSkillReconcileResult {
   if (!safeId(uid) || !safeId(id)) return { id: String(id || ''), action: 'invalid_manifest', error: 'invalid id' };
-  const sourceEntries = _manifestMap(_readManifestEntries(packagedSystemSkillsManifestFile()));
-  const localEntries = _manifestMap(_readManifestEntries(userSystemSkillsManifestFile(uid)));
+  const sourceManifest = _readManifest(packagedSystemSkillsManifestFile(), { requireNonEmpty: true });
+  if (sourceManifest.ok === false) return { id, action: 'invalid_manifest', error: sourceManifest.error };
+  const localManifest = _readManifest(userSystemSkillsManifestFile(uid));
+  const sourceEntries = _manifestMap(sourceManifest.entries);
+  const localEntries = _manifestMap(localManifest.ok ? localManifest.entries : []);
   const result = _reconcileSystemSkill(uid, id, sourceEntries.get(id), localEntries.get(id));
   if (result.action === 'created' || result.action === 'updated') {
     localEntries.set(id, sourceEntries.get(id)!);
@@ -159,8 +188,22 @@ function _reconcileSystemSkill(
 
 export async function reconcileAllForUser(uid: string): Promise<SystemSkillReconcileResult[]> {
   if (!safeId(uid)) return [];
-  const sourceEntries = _manifestMap(_readManifestEntries(packagedSystemSkillsManifestFile()));
-  const localEntries = _manifestMap(_readManifestEntries(userSystemSkillsManifestFile(uid)));
+  const sourceManifest = _readManifest(packagedSystemSkillsManifestFile(), { requireNonEmpty: true });
+  if (sourceManifest.ok === false) {
+    const failure: SystemSkillReconcileResult = {
+      id: '*',
+      action: 'invalid_manifest',
+      error: sourceManifest.error,
+    };
+    log.warn(`system skill reconcile invalid_manifest id=* error=${sourceManifest.error}`);
+    return [failure];
+  }
+  const localManifest = _readManifest(userSystemSkillsManifestFile(uid));
+  if (localManifest.ok === false && fs.existsSync(userSystemSkillsManifestFile(uid))) {
+    log.warn(`local system skill manifest invalid; rebuilding from packaged source: ${localManifest.error}`);
+  }
+  const sourceEntries = _manifestMap(sourceManifest.entries);
+  const localEntries = _manifestMap(localManifest.ok ? localManifest.entries : []);
   const results: SystemSkillReconcileResult[] = Array.from(sourceEntries.keys())
     .sort()
     .map((id) => _reconcileSystemSkill(uid, id, sourceEntries.get(id), localEntries.get(id)));
@@ -174,10 +217,18 @@ export async function reconcileAllForUser(uid: string): Promise<SystemSkillRecon
       }
     }
   }
-  for (const id of Array.from(localEntries.keys()).sort()) {
+  const localRoot = userSystemSkillsDir(uid);
+  const diskIds = new Set<string>();
+  try {
+    for (const entry of fs.readdirSync(localRoot, { withFileTypes: true })) {
+      if (entry.isDirectory() || entry.isSymbolicLink()) diskIds.add(entry.name);
+    }
+  } catch { /* no local mirror yet */ }
+  const cleanupIds = new Set([...localEntries.keys(), ...diskIds]);
+  for (const id of Array.from(cleanupIds).sort()) {
     if (sourceEntries.has(id)) continue;
     try {
-      fs.rmSync(userSystemSkillDir(uid, id), { recursive: true, force: true });
+      fs.rmSync(path.join(localRoot, id), { recursive: true, force: true });
       localEntries.delete(id);
       manifestChanged = true;
       results.push({ id, action: 'deleted' });

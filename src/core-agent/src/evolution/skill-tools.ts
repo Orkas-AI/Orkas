@@ -22,32 +22,20 @@ export function createSkillManageTool(
 ): AgentTool {
   return defineTool({
     name: "skill_manage",
-    description: [
-      "Manage learned skills — reusable procedures you can create after completing complex tasks.",
-      "",
-      "Actions:",
-      "  create  — Save a new skill after a complex task (5+ tool calls), error recovery, or non-trivial workflow discovery.",
-      "  read    — Load a skill's full instructions before using it.",
-      "  patch   — Fix outdated, incomplete, or wrong instructions in a skill. Do this immediately when issues are found during use.",
-      "  list    — List all available skills with summaries.",
-      "  delete  — Remove a skill that is no longer useful.",
-      "",
-      "Guidelines:",
-      "  - After completing a complex task (5+ tool calls), fixing a tricky error, or discovering a non-trivial workflow, save the approach as a skill.",
-      "  - When using a skill and finding it outdated, incomplete, or wrong, patch it immediately — don't wait to be asked.",
-      "  - Skip for simple one-offs. Confirm with user before creating or deleting.",
-    ].join("\n"),
+    description:
+      "List, read, create, patch, or delete this agent's learned reusable skills. Regular host Skills are loaded with read_files instead.",
     inputSchema: {
       type: "object",
       properties: {
         action: {
           type: "string",
           enum: ["create", "read", "patch", "list", "delete"],
-          description: "The action to perform.",
         },
         id: {
           type: "string",
           description: "Skill identifier (lowercase, hyphens/underscores). Required for create/read/patch/delete.",
+          pattern: "^[a-z0-9][a-z0-9_-]*$",
+          maxLength: 64,
         },
         name: {
           type: "string",
@@ -80,6 +68,7 @@ export function createSkillManageTool(
         },
       },
       required: ["action"],
+      additionalProperties: false,
     },
     async execute(input) {
       const action = input.action as string;
@@ -112,7 +101,7 @@ export function createSkillManageTool(
                 "",
                 skill.body,
               ].join("\n"),
-              // Learned skills use skill_manage instead of read_file, but the
+              // Learned skills use skill_manage instead of read_files, but the
               // returned body has the same load-bearing, read-whole semantics.
               verbatimDocument: true,
             };

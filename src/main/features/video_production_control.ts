@@ -10,6 +10,22 @@ import { assessEstimatedNarrationFit, estimateNarrationDuration, narrationMeasur
 
 export type VideoProductionGenerationKind = 'image' | 'video';
 
+const COMMON_VIDEO_PRODUCTION_GENERATE_SPEC_FIELDS = [
+  'prompt', 'media_kind', 'aspect', 'variation_type', 'characters', 'refs',
+] as const;
+export const VIDEO_PRODUCTION_GENERATE_SPEC_ALLOWED_FIELDS = {
+  image: [
+    ...COMMON_VIDEO_PRODUCTION_GENERATE_SPEC_FIELDS,
+    'size', 'reference_images', 'reference_image_urls',
+  ],
+  video: [
+    ...COMMON_VIDEO_PRODUCTION_GENERATE_SPEC_FIELDS,
+    'operation', 'generation_duration_sec', 'resolution', 'quality', 'generate_audio',
+    'reference_image_urls', 'reference_image_paths', 'reference_video_urls', 'reference_video_paths',
+  ],
+} as const;
+const VIDEO_PRODUCTION_GENERATE_SPEC_REJECTED_ALIASES = new Set(['duration_sec', 'audio']);
+
 export type VideoProductionGenerationIntent = {
   segment_id: string;
   kind: VideoProductionGenerationKind;
@@ -95,6 +111,11 @@ export type VideoProductionSegmentReviewFact = {
   segment_id: string;
   visual_signature: string;
   captured: boolean;
+  /** Why an uncaptured segment has nothing reviewable. One vocabulary for
+   *  every consumer — the 2026-08-23 deadlock stayed undiagnosable because
+   *  "media path does not resolve" and "composition not authored" were
+   *  collapsed into the same silent false. */
+  reason?: 'no_composition' | 'no_snapshot' | 'snapshot_stale' | 'media_path_unresolved' | 'media_unreadable';
 };
 
 /** One narration line the host itself synthesized for this EDL.
@@ -701,7 +722,7 @@ export async function readVideoProductionPlanIdentity(planPath: string): Promise
     throw new Error('E_VIDEO_PRODUCTION_PLAN_INVALID: every plan segment must be an object');
   }
   const segmentIds = new Set<string>();
-  for (const segment of segments) {
+  for (const [segmentIndex, segment] of segments.entries()) {
     if (typeof segment.id !== 'string' || !segment.id.trim() || segmentIds.has(segment.id)) {
       throw new Error('E_VIDEO_PRODUCTION_PLAN_INVALID: every segment needs a unique non-empty id');
     }
@@ -728,6 +749,22 @@ export async function readVideoProductionPlanIdentity(planPath: string): Promise
       }
       if (spec.duration_sec !== undefined || spec.audio !== undefined) {
         throw new Error(`E_VIDEO_PRODUCTION_GENERATE_SETTINGS_ALIAS: segment ${segment.id} must use generation_duration_sec and generate_audio; duration_sec/audio are not provider fields`);
+      }
+      const generateKind: VideoProductionGenerationKind = spec.media_kind;
+      const allowedFields: readonly string[] = VIDEO_PRODUCTION_GENERATE_SPEC_ALLOWED_FIELDS[generateKind];
+      const knownRejectedFields = generateKind === 'image' ? new Set(['operation']) : new Set<string>();
+      const unknownFields = Object.keys(spec).filter((field) => (
+        !allowedFields.includes(field)
+        && !VIDEO_PRODUCTION_GENERATE_SPEC_REJECTED_ALIASES.has(field)
+        && !knownRejectedFields.has(field)
+      ));
+      if (unknownFields.length) {
+        const unknownPaths = unknownFields
+          .map((field) => `segments[${segmentIndex}].spec.${field}`)
+          .join(', ');
+        throw new Error(
+          `E_VIDEO_PRODUCTION_GENERATE_UNKNOWN_FIELD: unsupported field(s): ${unknownPaths}; write only ${generateKind} generation fields directly on spec: ${allowedFields.join(', ')}`,
+        );
       }
       if (spec.aspect !== undefined && spec.aspect !== plan.aspect) {
         throw new Error(`E_VIDEO_PRODUCTION_GENERATE_ASPECT_MISMATCH: segment ${segment.id} spec.aspect conflicts with the plan aspect`);
@@ -1322,6 +1359,7 @@ export type VideoProductionSegmentReviewStatus = {
   visual_signature: string;
   /** The segment has current snapshot evidence — frames matching its bytes. */
   captured: boolean;
+  reason?: VideoProductionSegmentReviewFact['reason'];
 };
 
 /** How far the production's own work has got.
@@ -1351,11 +1389,13 @@ export function videoProductionReviewStatus(input: {
   const factBySegment = new Map(input.facts.map((fact) => [fact.segment_id, fact]));
   const segments = videoProductionSegmentIds(input.identity).map((segmentId) => {
     const fact = factBySegment.get(segmentId);
+    const captured = fact?.captured === true;
     return {
       segment_id: segmentId,
       plan_intent_signature: intents[segmentId] || '',
       visual_signature: fact?.visual_signature || '',
-      captured: fact?.captured === true,
+      captured,
+      ...(!captured && fact?.reason ? { reason: fact.reason } : {}),
     };
   });
   return {

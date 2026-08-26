@@ -10,12 +10,22 @@ repo's text-processing test rule.
 
 import os
 import sys
+import tempfile
 import unittest
+import json
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 import caps  # noqa: E402
-from caps import ABSOLUTE_CAPS, DEFAULT_CAPS, _num, account, effective_caps, plan  # noqa: E402
+from caps import (  # noqa: E402
+    ABSOLUTE_CAPS,
+    DEFAULT_CAPS,
+    _num,
+    account,
+    account_from_files,
+    effective_caps,
+    plan,
+)
 
 
 class EffectiveCaps(unittest.TestCase):
@@ -39,6 +49,10 @@ class EffectiveCaps(unittest.TestCase):
     def test_cost_cap_passthrough(self):
         self.assertEqual(effective_caps({"max_cost_usd": 0.25})["max_cost_usd"], 0.25)
 
+    def test_unknown_cap_field_is_rejected_with_allowed_fields(self):
+        with self.assertRaisesRegex(ValueError, r"unknown caps field\(s\).*allowed fields"):
+            effective_caps({"unexpected_limit": 8})
+
 
 # Genuinely distinct sub-questions (disjoint content words, so dedup does not
 # collapse them — the earlier bug was fixtures whose only difference was a
@@ -54,6 +68,14 @@ POOL = [
 
 
 class Plan(unittest.TestCase):
+    def test_explicit_fetch_caps_control_the_returned_budget(self):
+        out = plan({
+            "subquestions": ["desktop application comparison"],
+            "caps": {"max_fetches": 8, "max_fetches_per_subquestion": 8},
+        })
+        self.assertEqual(out["total_fetch_budget"], 8)
+        self.assertEqual(out["fetch_budget_per_subquestion"], 8)
+
     def test_exact_duplicate_questions_collapse(self):
         out = plan({"subquestions": ["What is X?", "what is x", "How does Y work?"]})
         self.assertEqual(out["subquestions"], ["What is X?", "How does Y work?"])
@@ -101,24 +123,42 @@ class Account(unittest.TestCase):
         self.assertEqual(out["totals"]["model_calls"], 4)
         self.assertAlmostEqual(out["totals"]["cost_usd"], 0.08, places=6)
 
-    def test_stop_when_fetches_exceeded(self):
-        out = account({"steps": [{"step": "g", "fetches": 40}]})
-        self.assertTrue(out["stop"])
-        self.assertIn("max_fetches", out["exceeded"])
-        self.assertEqual(out["remaining"]["fetches"], 0)
+    def test_budget_boundary_reports_spent_not_overrun(self):
+        # 39/40 keeps going; 40/40 stops and is NOT an overrun — the old field
+        # name reported a compliant 4/4 run as `exceeded` and an independent
+        # judge docked it (2026-08-09 E2E). 41/40 was never covered at all, so
+        # the one case that IS an overrun had no test.
+        under = account({"steps": [{"step": "g", "fetches": 39}]})
+        self.assertFalse(under["stop"])
+        self.assertEqual(under["limits_reached"], [])
+        self.assertEqual(under["remaining"]["fetches"], 1)
+
+        spent = account({"steps": [{"step": "g", "fetches": 40}]})
+        self.assertTrue(spent["stop"])
+        self.assertIn("max_fetches", spent["limits_reached"])
+        self.assertEqual(spent["remaining"]["fetches"], 0)
+        # Spent, not overspent: the caller tells the two apart from totals vs
+        # caps, which is why no extra field carries it.
+        self.assertEqual(spent["totals"]["fetches"], spent["caps"]["max_fetches"])
+
+        over = account({"steps": [{"step": "g", "fetches": 41}]})
+        self.assertTrue(over["stop"])
+        self.assertIn("max_fetches", over["limits_reached"])
+        self.assertEqual(over["remaining"]["fetches"], 0)
+        self.assertGreater(over["totals"]["fetches"], over["caps"]["max_fetches"])
 
     def test_stop_when_cost_exceeded_only_if_set(self):
         steps = [{"step": "g", "cost_usd": 0.5}]
         self.assertFalse(account({"steps": steps})["stop"])                       # no cost cap set
         out = account({"steps": steps, "caps": {"max_cost_usd": 0.1}})
         self.assertTrue(out["stop"])
-        self.assertIn("max_cost_usd", out["exceeded"])
+        self.assertIn("max_cost_usd", out["limits_reached"])
         self.assertEqual(out["remaining"]["cost_usd"], 0.0)
 
     def test_no_stop_under_caps(self):
         out = account({"steps": [{"step": "g", "fetches": 3, "model_calls": 2}]})
         self.assertFalse(out["stop"])
-        self.assertEqual(out["exceeded"], [])
+        self.assertEqual(out["limits_reached"], [])
         self.assertEqual(out["remaining"]["fetches"], DEFAULT_CAPS["max_fetches"] - 3)
 
     def test_garbage_counts_coerced(self):
@@ -130,6 +170,88 @@ class Account(unittest.TestCase):
         self.assertEqual(_num("x"), 0.0)
         self.assertEqual(_num(float("nan")), 0.0)
         self.assertEqual(_num(2.5), 2.5)
+
+
+class FileBackedAccount(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.plan_path = os.path.join(self.tmp.name, "caps_plan.json")
+        self.ledger_path = os.path.join(self.tmp.name, "fetch_ledger.jsonl")
+        with open(self.plan_path, "w", encoding="utf-8") as fh:
+            json.dump({"ok": True, "data": {"caps": {
+                "max_fetches": 8,
+                "max_fetches_per_subquestion": 8,
+            }}}, fh)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_ledger(self, rows):
+        with open(self.ledger_path, "w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+
+    def test_counts_persisted_rows_and_reports_remaining_budget(self):
+        self.write_ledger([{"status": "ok", "url": f"https://example.com/{i}"}
+                           for i in range(7)])
+        out = account_from_files(self.plan_path, self.ledger_path)
+        self.assertEqual(out["totals"]["fetches"], 7)
+        self.assertEqual(out["remaining"]["fetches"], 1)
+        self.assertFalse(out["stop"])
+
+    def test_failures_and_cached_attempts_consume_the_budget(self):
+        rows = [{"status": "ok", "url": f"https://example.com/{i}"}
+                for i in range(6)]
+        rows.extend([
+            {"status": "failed", "url": "https://example.com/failed"},
+            {"status": "cached", "url": "https://example.com/cached"},
+        ])
+        self.write_ledger(rows)
+        out = account_from_files(self.plan_path, self.ledger_path)
+        self.assertEqual(out["totals"]["fetches"], 8)
+        self.assertEqual(out["remaining"]["fetches"], 0)
+        self.assertTrue(out["stop"])
+        self.assertIn("max_fetches", out["limits_reached"])
+
+    def test_search_rows_do_not_consume_a_fetch_budget(self):
+        self.write_ledger([
+            {"kind": "search", "query": "official privacy documentation", "status": "ok"},
+            {"kind": "query", "query": "official pricing", "status": "failed"},
+            {"query": "legacy discovery row", "status": "ok"},
+            {"kind": "fetch", "canonical_url": "https://example.com/privacy", "status": "ok"},
+            {"canonical_url": "https://example.com/pricing", "status": "failed"},
+        ])
+        out = account_from_files(self.plan_path, self.ledger_path)
+        self.assertEqual(out["totals"]["fetches"], 2)
+        self.assertEqual(out["remaining"]["fetches"], 6)
+        self.assertFalse(out["stop"])
+
+    def test_cli_file_mode_writes_the_account_result(self):
+        self.write_ledger([{"status": "ok"} for _ in range(8)])
+        out_path = os.path.join(self.tmp.name, "account_output.json")
+        result = caps.main([
+            "--op", "account",
+            "--plan", self.plan_path,
+            "--fetch-ledger", self.ledger_path,
+            "--out", out_path,
+        ])
+        with open(out_path, encoding="utf-8") as fh:
+            persisted = json.load(fh)
+        self.assertEqual(result, persisted)
+        self.assertTrue(persisted["data"]["stop"])
+
+    def test_malformed_ledger_row_is_rejected_with_line_number(self):
+        with open(self.ledger_path, "w", encoding="utf-8") as fh:
+            fh.write('{"status":"ok"}\nnot-json\n')
+        with self.assertRaisesRegex(ValueError, r"line 2 is not valid JSON"):
+            account_from_files(self.plan_path, self.ledger_path)
+
+    def test_plan_without_effective_caps_is_rejected(self):
+        with open(self.plan_path, "w", encoding="utf-8") as fh:
+            json.dump({"ok": True, "data": {"total_fetch_budget": 8}}, fh)
+        self.write_ledger([])
+        with self.assertRaisesRegex(ValueError, r"data must contain a caps object"):
+            account_from_files(self.plan_path, self.ledger_path)
 
 
 if __name__ == "__main__":

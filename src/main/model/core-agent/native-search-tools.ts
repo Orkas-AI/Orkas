@@ -3,9 +3,9 @@
  *
  * pi-ai's provider.stream() calls `options.onPayload?(params, model)` after
  * `buildParams`, allowing the callback to return new params that overwrite
- * the originals. We use this hook to append the vendor's server-side
- * web_search schema to `params.tools` — without modifying pi-ai source or
- * patching node_modules.
+ * the originals. We use this hook to replace the function-style `web_search`
+ * with the vendor's server-side search schema. The model therefore sees one
+ * search route, never two competing routes.
  *
  * Dispatch is keyed by pi-ai's Model.api field (the `model` argument
  * passed to onPayload by provider.stream()).
@@ -16,8 +16,9 @@
 /**
  * Returns the model-native web search tool schema for this pi-ai api;
  * returns undefined when unsupported.
- * The schema is appended verbatim to `params.tools`; pi-ai does not touch
- * it again (it only transforms `type: "function"` entries).
+ * The schema replaces the function-style search entry in `params.tools`;
+ * pi-ai does not touch it again (it only transforms `type: "function"`
+ * entries).
  */
 export function nativeSearchToolForApi(api: string | undefined): Record<string, unknown> | undefined {
   switch (api) {
@@ -105,4 +106,87 @@ export function nativeSearchToolName(tool: Record<string, unknown> | undefined):
   if (typeof t === 'string') return t;
   if ('google_search' in tool) return 'google_search';
   return undefined;
+}
+
+export type SearchPayloadRoute = 'absent' | 'orkas' | 'native';
+
+export type SearchPayloadRouteResult = {
+  tools: unknown[] | undefined;
+  route: SearchPayloadRoute;
+  replacedOrkasSearch: boolean;
+};
+
+function isOrkasWebSearchTool(candidate: unknown): boolean {
+  if (!candidate || typeof candidate !== 'object') return false;
+  const value = candidate as {
+    type?: unknown;
+    name?: unknown;
+    function?: { name?: unknown };
+    functionDeclarations?: Array<{ name?: unknown }>;
+  };
+  return value.name === 'web_search'
+    || value.function?.name === 'web_search'
+    || value.functionDeclarations?.some((item) => item?.name === 'web_search') === true;
+}
+
+function removeOrkasWebSearchTool(candidate: unknown): unknown | undefined {
+  if (!candidate || typeof candidate !== 'object') return candidate;
+  const value = candidate as {
+    name?: unknown;
+    function?: { name?: unknown };
+    functionDeclarations?: Array<{ name?: unknown }>;
+  };
+  if (value.name === 'web_search' || value.function?.name === 'web_search') {
+    return undefined;
+  }
+  if (!Array.isArray(value.functionDeclarations)) return candidate;
+  const remaining = value.functionDeclarations.filter((item) => item?.name !== 'web_search');
+  if (remaining.length === value.functionDeclarations.length) return candidate;
+  if (remaining.length === 0) return undefined;
+  return { ...value, functionDeclarations: remaining };
+}
+
+function sameNativeTool(candidate: unknown, nativeTool: Record<string, unknown>): boolean {
+  if (!candidate || typeof candidate !== 'object') return false;
+  if ('google_search' in nativeTool) return 'google_search' in candidate;
+  return nativeTool.type === 'web_search'
+    && (candidate as { type?: unknown }).type === 'web_search';
+}
+
+/**
+ * Select exactly one search route for a provider payload.
+ *
+ * The Orkas function remains the compatibility path for paid search profiles,
+ * disabled native search, and unsupported APIs. Native search is allowed only
+ * when the scoped surface already activated `web_search`; it replaces that
+ * function instead of being appended beside it.
+ */
+export function routeSearchPayloadTools(input: {
+  tools: unknown[] | undefined;
+  nativeEnabled: boolean;
+  paidSearchConfigured: boolean;
+  nativeTool: Record<string, unknown> | undefined;
+}): SearchPayloadRouteResult {
+  const { tools, nativeEnabled, paidSearchConfigured, nativeTool } = input;
+  if (!Array.isArray(tools)) {
+    return { tools, route: 'absent', replacedOrkasSearch: false };
+  }
+  const hasOrkasSearch = tools.some(isOrkasWebSearchTool);
+  if (!hasOrkasSearch) {
+    return { tools, route: 'absent', replacedOrkasSearch: false };
+  }
+  if (!nativeEnabled || paidSearchConfigured || !nativeTool) {
+    return { tools, route: 'orkas', replacedOrkasSearch: false };
+  }
+
+  const withoutSearchDuplicates = tools.flatMap((candidate) => {
+    if (sameNativeTool(candidate, nativeTool)) return [];
+    const stripped = removeOrkasWebSearchTool(candidate);
+    return stripped === undefined ? [] : [stripped];
+  });
+  return {
+    tools: [...withoutSearchDuplicates, nativeTool],
+    route: 'native',
+    replacedOrkasSearch: true,
+  };
 }

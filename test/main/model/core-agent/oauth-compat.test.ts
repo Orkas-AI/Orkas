@@ -7,7 +7,7 @@ import {
 } from '../../../../src/core-agent/src/auth/oauth-compat';
 
 describe('pi-ai OAuth compatibility bridge', () => {
-  it('exposes provider-owned OAuth flows from pi-ai 0.80.10', async () => {
+  it('exposes provider-owned OAuth flows from pi-ai 0.84.2', async () => {
     const providers = await getOAuthProviders();
     expect(providers.map((provider) => provider.id)).toEqual(expect.arrayContaining([
       'anthropic',

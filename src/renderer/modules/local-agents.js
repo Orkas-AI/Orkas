@@ -50,7 +50,7 @@ const CLI_DEFAULTS = {
     name: 'OpenCode',
     description_zh: '代码研发智能体——在本地项目里做软件开发,支持自选模型(含本地模型),实现功能、修 bug、改文件、跑终端命令,可换模型对比；适合"用本地模型实现这个功能"、"修一下这个 bug"、"换个模型再写一版"、"在终端里跑一下"；触发词：写代码、开发、实现、修 bug、改代码、换模型、本地模型、终端',
     description_en: "Coding agent for software development in your local project with bring-your-own-model (including local models) — builds features, fixes bugs, edits files, and runs terminal commands, swap models to compare; For: 'implement this feature with a local model', 'fix this bug', 'try another model and rewrite', 'run it in the terminal'; Triggers: code, develop, implement, fix bug, edit code, switch model, local model, terminal",
-    isCoding: false,
+    isCoding: true,
   },
   hermes: {
     name: 'Hermes',
@@ -67,8 +67,8 @@ function getCliDefaults(cliType) {
     : null;
 }
 
-/** True when the CLI is one of claude / codex (the coding agents that
- *  expose a project-directory setting). Mirrors
+/** True when the CLI exposes the coding-agent project-directory setting.
+ *  Mirrors
  *  `cliIsCodingAgent` in features/agents.ts — keep in sync. */
 function cliIsCodingAgent(cliType) {
   const d = getCliDefaults(cliType);

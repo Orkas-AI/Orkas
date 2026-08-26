@@ -9,22 +9,17 @@
  * Connectors are now surfaced through the three umbrella meta-tools in
  * `model/core-agent/connector-meta-tools.ts` (`list_connectors` / `list_connector_tools` /
  * `call_connector_tool`). The meta-tools share `resolveVisibleConnectors` here so the actor
- * visibility matrix (commander vs. agent worker, `enabled_connectors` whitelist,
- * `enabled_subtools` instance filter) is single-sourced.
- *
- * Actor scope:
- *   - `agentId === undefined` (commander) → every installed instance
- *   - `agentId` present → respect `agent.enabled_connectors`. `undefined` AND `[]` BOTH mean
- *     "no connectors" (intentionally stricter than `agent.skill_list`'s three-state — see
- *     PC/CLAUDE.md §6.5 "Per-agent scope"). Only a non-empty `string[]` grants access.
+ * visibility rules (`connected` + user-enabled + `enabled_subtools`) are single-sourced.
  *
  * Visibility resolution is intentionally side-effect free. It only reads local connector state;
  * Server/MCP restore, cache refresh, reconnect, and token checks happen during explicit connector
  * management flows or when `manager.callTool` actually needs to use the connector.
  */
 import * as manager from './manager';
-import * as agents from '../agents';
-import { isConnectorEnabled } from '../component_enabled';
+import {
+  isConnectorEnabledFromSnapshot,
+  readEnabledMap,
+} from '../component_enabled';
 import { isConnectorRuntimeEnabled } from './availability';
 import { isConnectorUsable } from './types';
 import type { ConnectorInstance, ToolSchema } from './types';
@@ -61,7 +56,6 @@ export function stringifyMcpResult(raw: unknown): string {
  *  still letting Workspace provide any services the user did not connect separately. */
 export async function resolveVisibleConnectors(
   uid: string,
-  agentId: string | undefined,
 ): Promise<Array<{ instance: ConnectorInstance; tools: ToolSchema[] }>> {
   if (!uid) return [];
   const all = manager.listInstances(uid);
@@ -79,14 +73,16 @@ export async function resolveVisibleConnectors(
   // as connected while `callTool` failed every time.
   const connected = all.filter((i) => isConnectorUsable(i.status) && isConnectorRuntimeEnabled(i.id));
   if (!connected.length) return [];
-  // Per-user soft-disable filter (Connectors panel "停用" button). Separate from `agent.enabled_connectors`:
-  // this filter applies to every actor including the commander; even a disconnected-by-user instance
-  // that's still OAuth-grant-valid and MCP-connected stays hidden from the LLM until re-enabled.
-  // See features/component_enabled.ts + CLAUDE.md §6.5 "Per-user enable toggle".
-  const userEnabled = connected.filter((i) => isConnectorEnabled(uid, i.id));
+  // Per-user soft-disable filter (Connectors panel "停用" button). This applies to every actor;
+  // even a connector with a valid grant and live MCP connection stays hidden until re-enabled.
+  // Runner construction evaluates every instance together, so reuse one local
+  // config snapshot instead of synchronously reading the same file N times.
+  const enabledSnapshot = readEnabledMap(uid);
+  const userEnabled = connected.filter((i) => (
+    isConnectorEnabledFromSnapshot(enabledSnapshot, i.id)
+  ));
   if (!userEnabled.length) return [];
-  const scope = await _enabledInstancesForActor(uid, agentId, userEnabled);
-  const resolved = scope.map((instance) => {
+  const resolved = userEnabled.map((instance) => {
     const allowed = instance.enabled_subtools;
     const tools = allowed === null
       ? instance.tools_cache
@@ -94,19 +90,6 @@ export async function resolveVisibleConnectors(
     return { instance, tools };
   });
   return _dedupeGoogleWorkspaceTools(resolved);
-}
-
-async function _enabledInstancesForActor(
-  uid: string,
-  agentId: string | undefined,
-  allInstances: ConnectorInstance[],
-): Promise<ConnectorInstance[]> {
-  if (!agentId) return allInstances;
-  const agent = await agents.getAgent(agentId);
-  const allowed = agent?.enabled_connectors;
-  if (!Array.isArray(allowed) || allowed.length === 0) return [];
-  const allowSet = new Set(allowed);
-  return allInstances.filter((i) => allowSet.has(i.id));
 }
 
 const GOOGLE_WORKSPACE_ID = 'google-workspace';

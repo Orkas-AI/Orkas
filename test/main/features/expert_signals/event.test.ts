@@ -1,32 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import {
-  buildRetrySignal,
-  buildSkipSignal,
   buildFormLeftBlankSignals,
   buildToolFailureSignal,
   buildSkillAdvertisedSignal,
   buildSkillInvokedSignal,
-  buildAgentDispatchedSignal,
 } from '../../../../src/main/features/expert_signals/extractors/event';
-
-describe('expert_signals.event › retry/skip builders', () => {
-  it('retry: stamps step_index in metadata', () => {
-    const sig = buildRetrySignal({
-      cid: 'c1', aid: 'a1', turn_id: 't1', step_index: 3,
-    });
-    expect(sig.type).toBe('retry');
-    expect(sig.aid).toBe('a1');
-    expect(sig.metadata?.step_index).toBe(3);
-  });
-
-  it('skip: same shape as retry but type=skip', () => {
-    const sig = buildSkipSignal({
-      cid: 'c1', aid: 'a1', turn_id: 't1', step_index: 3,
-    });
-    expect(sig.type).toBe('skip');
-    expect(sig.metadata?.step_index).toBe(3);
-  });
-});
 
 describe('expert_signals.event › form_left_blank', () => {
   const fields = [
@@ -150,48 +128,5 @@ describe('expert_signals.event › skill_invoked builder', () => {
     });
     expect(sig.aid).toBe('agent_x');
     expect(sig.delta?.system).toBe('B');
-  });
-});
-
-describe('expert_signals.event › agent_dispatched builder', () => {
-  it('positive: parallel group, candidates == dispatched (current model)', () => {
-    const sig = buildAgentDispatchedSignal({
-      cid: 'c1',
-      turn_id: 'c1:plan:dispatch:1000000:0',
-      candidates: ['aid_x', 'aid_y'],
-      dispatched: ['aid_x', 'aid_y'],
-      parallel_group: 'g1',
-    });
-    expect(sig.type).toBe('agent_dispatched');
-    expect(sig.aid).toBeNull();           // commander-scope signal
-    expect(sig.delta?.candidates).toEqual(['aid_x', 'aid_y']);
-    expect(sig.delta?.dispatched).toEqual(['aid_x', 'aid_y']);
-    expect(sig.delta?.parallel_group).toBe('g1');
-  });
-
-  it('positive: solo step → parallel_group=null', () => {
-    const sig = buildAgentDispatchedSignal({
-      cid: 'c1',
-      turn_id: 'c1:plan:dispatch:1000000:0',
-      candidates: ['aid_x'],
-      dispatched: ['aid_x'],
-      parallel_group: null,
-    });
-    expect(sig.delta?.parallel_group).toBeNull();
-  });
-
-  it('positive: candidates / dispatched arrays are copied (no shared reference)', () => {
-    const cand = ['aid_x', 'aid_y'];
-    const sig = buildAgentDispatchedSignal({
-      cid: 'c1',
-      turn_id: 't1',
-      candidates: cand,
-      dispatched: cand,
-      parallel_group: null,
-    });
-    cand.push('aid_z');
-    // Builder snapshotted via `.slice()` — mutations after emit don't bleed in.
-    expect(sig.delta?.candidates).toEqual(['aid_x', 'aid_y']);
-    expect(sig.delta?.dispatched).toEqual(['aid_x', 'aid_y']);
   });
 });

@@ -9,11 +9,11 @@
  */
 import type {
   Api,
-  AuthInteraction,
   AuthPrompt,
   Model,
   OAuthCredential,
   OAuthCredentials,
+  ProviderAuthInteraction,
 } from '@earendil-works/pi-ai';
 
 export type { OAuthCredentials } from '@earendil-works/pi-ai';
@@ -66,9 +66,9 @@ function stripCredentialType(credential: OAuthCredential): OAuthCredentials {
   return credentials as OAuthCredentials;
 }
 
-function interactionFromCallbacks(callbacks: OAuthLoginCallbacks): AuthInteraction {
+function interactionFromCallbacks(callbacks: OAuthLoginCallbacks): ProviderAuthInteraction {
   return {
-    signal: callbacks.signal,
+    signal: callbacks.signal ?? new AbortController().signal,
     async prompt(prompt: AuthPrompt): Promise<string> {
       if (prompt.type === 'select') {
         return (await callbacks.onSelect({
@@ -130,7 +130,10 @@ async function builtinProviders(): Promise<Map<string, OAuthProviderInterface>> 
             return stripCredentialType(await oauth.login(interactionFromCallbacks(callbacks)));
           },
           async refreshToken(credentials) {
-            const refreshed = await oauth.refresh({ ...credentials, type: 'oauth' });
+            const refreshed = await oauth.refresh(
+              { ...credentials, type: 'oauth' },
+              new AbortController().signal,
+            );
             return stripCredentialType(refreshed);
           },
           getApiKey(credentials) {

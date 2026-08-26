@@ -1,106 +1,41 @@
 import { describe, it, expect } from 'vitest';
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import {
+  AGENT_FALLBACK_TOOL_GROUP_IDS,
+  AGENT_DEPENDENCY_TOOL_GROUP_IDS,
+  LOADABLE_TOOL_GROUP_IDS,
   TOOL_CATALOG,
-  getToolsSystemPromptBlock,
+  TOOL_GROUPS,
+  canonicalToolGroupId,
+  canonicalizeAgentToolGroups,
+  canonicalizeToolGroups,
+  expandToolGroups,
+  invalidAgentToolGroupRefs,
+  invalidToolGroupRefs,
   isToolVisibleToAgent,
+  toolNamesForAgentGroups,
+  toolNamesForGroups,
 } from '../../../../src/main/model/core-agent/tool-catalog';
 import {
-  getBuiltinTools,
-  createExecutionPlanTool,
   SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS,
   TOOL_DESCRIPTION_SOFT_BUDGET_CHARS,
   toToolDefinition,
   type AgentTool,
 } from '../../../../src/core-agent/src/tools';
-import { createCrossSessionMemoryTool } from '../../../../src/core-agent/src/tools/memory-tool';
-import { createMetacognitionTool } from '../../../../src/core-agent/src/tools/metacognition-tool';
-import { createLocalTools, createFileTools } from '../../../../src/main/model/core-agent/local-tools';
-import { createKbTools } from '../../../../src/main/model/core-agent/kb-tools';
-import { createChatHistoryTools } from '../../../../src/main/model/core-agent/chat-history-tools';
-import { createImageGenTool } from '../../../../src/main/model/core-agent/image-gen-tool';
-import { createOfficeTools } from '../../../../src/main/model/core-agent/office-tools';
+import {
+  enumerateAllInjectedToolNames,
+  enumerateAllInjectedTools,
+} from './injected-tool-fixture';
+import { createToolSurfaceController } from '../../../../src/main/model/core-agent/tool-surface';
+import {
+  BUILTIN_AGENT_TOOL_SURFACE_CASES,
+} from './builtin-agent-tool-surface-fixture';
 
-const SOURCE_DESCRIPTION_BUDGET_EXCEPTIONS = new Set([
+const OPEN_SOURCE_DESCRIPTION_BUDGET_EXCEPTIONS = new Set([
   'generate_image:/inputSchema/properties/output_path',
 ]);
-
-/**
- * Collect the tool names runner.ts injects under "everything available"
- * conditions (uid known + metacognition enabled + permission granted + cid).
- *
- * Avoid buildRunner here because that pulls in auth / session / network; call
- * the same factories runner.ts uses to assemble allTools.
- */
-function enumerateAllInjectedTools(): AgentTool[] {
-  const tools: AgentTool[] = [];
-
-  // core-agent builtins (always merged into AgentRunner's tool map)
-  tools.push(...getBuiltinTools());
-  tools.push(createExecutionPlanTool({
-    get: () => undefined,
-    update: () => ({
-      version: 1,
-      objective: 'task',
-      objectiveTurnId: 1,
-      updatedTurnId: 1,
-      revision: 1,
-      steps: [{ id: 1, step: 'work', status: 'in_progress' }],
-      nextStepId: 2,
-      lastWorkLedgerId: 0,
-      updatedAt: 1,
-    }),
-    clear: () => {},
-  }));
-
-  // injected (memory + metacognition)
-  tools.push(
-    createCrossSessionMemoryTool({
-      add: () => ({ ok: true, entries: [], usage: { current: 0, limit: 1 } }),
-      replace: () => ({ ok: true, entries: [], usage: { current: 0, limit: 1 } }),
-      remove: () => ({ ok: true, entries: [], usage: { current: 0, limit: 1 } }),
-      list: () => ({ ok: true, entries: [], usage: { current: 0, limit: 1 } }),
-    }),
-  );
-  tools.push(
-    createMetacognitionTool({
-      read: () => ({ ok: true, content: '', usage: { current: 0, limit: 1 } }),
-      write: () => ({ ok: true, usage: { current: 0, limit: 1 } }),
-    }, { competence: 3000, strategies: 2500 }),
-  );
-
-  // local + file + kb + image gen.
-  // Pass cid + onArtifactCreated so `create_artifact` is included — runner.ts
-  // wires both through for group-chat turns (see local-tools.createLocalTools).
-  tools.push(...createLocalTools({
-    userId: 'testuid',
-    cid: 'testcid',
-    onArtifactCreated: () => {},
-    onOutputsPublished: (paths) => paths,
-  }));
-  tools.push(...createFileTools({ userId: 'testuid', cid: 'testcid', includeOcrFile: true }));
-  tools.push(...createKbTools({ userId: 'testuid' }));
-  tools.push(...createChatHistoryTools({ userId: 'testuid' }));
-  tools.push(createImageGenTool({ userId: 'testuid', cid: 'testcid' }));
-  tools.push(...createOfficeTools({ userId: 'testuid', cid: 'testcid' }));
-
-  const byName = new Map<string, AgentTool>();
-  for (const tool of tools) byName.set(tool.name, tool);
-  return [...byName.values()];
-}
-
-function enumerateAllInjectedToolNames(): Set<string> {
-  const names = new Set(enumerateAllInjectedTools().map((t) => t.name));
-
-  // Connector umbrella meta-tools: two fixed tools, only injected when ≥1 connector is visible
-  // to the actor. Asserting presence in the catalog independent of runtime visibility — calling
-  // the factory here would short-circuit to [] without a manager mock, defeating the drift
-  // check. Per-connector MCP actions discovered at runtime are NOT enumerated (they vary
-  // per-user / per-install — see tool-catalog.ts header).
-  names.add('list_connector_tools');
-  names.add('call_connector_tool');
-
-  return names;
-}
 
 function walkSchemaDescriptions(
   schema: unknown,
@@ -156,10 +91,26 @@ function normalizedDescription(value: string): string {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
+function withoutDescriptions(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutDescriptions);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => key !== 'description')
+      .map(([key, child]) => [key, withoutDescriptions(child)]),
+  );
+}
+
 function toolByName(name: string): AgentTool {
   const tool = enumerateAllInjectedTools().find((t) => t.name === name);
   if (!tool) throw new Error(`tool not enumerated: ${name}`);
   return tool;
+}
+
+function propertyDescription(tool: AgentTool, name: string): string {
+  const properties = (tool.inputSchema as { properties?: Record<string, { description?: string }> })
+    .properties;
+  return properties?.[name]?.description ?? '';
 }
 
 describe('tool-catalog', () => {
@@ -168,11 +119,263 @@ describe('tool-catalog', () => {
     const catalog = new Set(TOOL_CATALOG.map((e) => e.name));
     const missing = [...injected].filter((n) => !catalog.has(n));
     expect(missing, `Injected tools missing from TOOL_CATALOG: ${missing.join(', ')}`).toEqual([]);
+    const stale = [...catalog].filter((n) => !injected.has(n));
+    expect(stale, `Catalog tools missing from injected fixture: ${stale.join(', ')}`).toEqual([]);
+    expect(catalog.size).toBe(53);
   });
 
   it('TOOL_CATALOG has no duplicate names', () => {
     const names = TOOL_CATALOG.map((e) => e.name);
     expect(names.length).toBe(new Set(names).size);
+  });
+
+  it('keeps the group graph and catalog references valid at the architecture boundary', () => {
+    const groupIds = TOOL_GROUPS.map((group) => group.id);
+    const groupById = new Map(TOOL_GROUPS.map((group) => [group.id, group]));
+    const problems: string[] = [];
+
+    if (new Set(groupIds).size !== groupIds.length) problems.push('duplicate group id');
+    for (const group of TOOL_GROUPS) {
+      if (group.parent && !groupById.has(group.parent)) {
+        problems.push(`${group.id}: unknown parent ${group.parent}`);
+      }
+      if (group.agentDependency && group.activation !== 'loadable') {
+        problems.push(`${group.id}: Agent dependency is not loadable`);
+      }
+      if (group.parent && group.agentDependency && !groupById.get(group.parent)?.agentDependency) {
+        problems.push(`${group.id}: Agent dependency has a non-Agent parent`);
+      }
+      const ancestors = new Set<string>([group.id]);
+      let parent = group.parent;
+      while (parent) {
+        if (ancestors.has(parent)) {
+          problems.push(`${group.id}: group cycle through ${parent}`);
+          break;
+        }
+        ancestors.add(parent);
+        parent = groupById.get(parent)?.parent;
+      }
+    }
+
+    for (const entry of TOOL_CATALOG) {
+      const groups = entry.loadGroups ?? [];
+      if (!groups.length) problems.push(`${entry.name}: no group`);
+      if (new Set(groups).size !== groups.length) {
+        problems.push(`${entry.name}: duplicate group reference`);
+      }
+      for (const group of groups) {
+        if (!groupById.has(group)) problems.push(`${entry.name}: unknown group ${group}`);
+      }
+      const owners = Array.isArray(entry.ownerAgent)
+        ? entry.ownerAgent
+        : entry.ownerAgent ? [entry.ownerAgent] : [];
+      for (const owner of owners) {
+        if (!/^[0-9a-f]{12}$/.test(owner)) problems.push(`${entry.name}: non-canonical owner ${owner}`);
+      }
+    }
+
+    const expectedFallbackLeaves = TOOL_GROUPS
+      .filter((group) => (
+        group.agentDependency
+        && !TOOL_GROUPS.some((child) => child.parent === group.id && child.agentDependency)
+      ))
+      .map((group) => group.id);
+    expect(AGENT_FALLBACK_TOOL_GROUP_IDS).toEqual(expectedFallbackLeaves);
+    expect(problems).toEqual([]);
+  });
+
+  it('every packaged official Agent declares canonical loadable groups', () => {
+    const root = path.join(process.cwd(), 'resources', 'builtin', 'marketplace', 'agents');
+    const files = fs.readdirSync(root)
+      .map((id) => path.join(root, id, 'agent.json'))
+      .filter((file) => fs.existsSync(file));
+    expect(files).toHaveLength(BUILTIN_AGENT_TOOL_SURFACE_CASES.length);
+    const expectedById = new Map(
+      BUILTIN_AGENT_TOOL_SURFACE_CASES.map((item) => [item.agentId, item]),
+    );
+    for (const file of files) {
+      const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as {
+        agent_id?: string;
+        name?: string;
+        tool_list?: unknown;
+      };
+      const expected = expectedById.get(raw.agent_id ?? '');
+      expect(expected, `unexpected packaged Agent ${raw.agent_id ?? raw.name}`).toBeDefined();
+      expect(raw.name).toBe(expected?.name);
+      expect(Array.isArray(raw.tool_list), `${raw.name} is missing tool_list`).toBe(true);
+      const groups = raw.tool_list as unknown[];
+      expect(invalidAgentToolGroupRefs(groups), `${raw.name} has invalid groups`).toEqual([]);
+      expect(groups.every((value) => typeof value === 'string')).toBe(true);
+      expect(groups, `${raw.name} tool_list is not canonical`)
+        .toEqual(canonicalizeAgentToolGroups(groups as string[]));
+      expect(groups, `${raw.name} must declare its reviewed fixed tool groups`)
+        .toEqual(expected?.configuredGroups);
+    }
+  });
+
+  it('separates runtime-loadable groups from Agent dependency groups', () => {
+    expect(LOADABLE_TOOL_GROUP_IDS).toContain('management');
+    expect(AGENT_DEPENDENCY_TOOL_GROUP_IDS).not.toContain('management');
+    expect(TOOL_GROUPS.find((group) => group.id === 'management')).toMatchObject({
+      activation: 'loadable',
+      agentDependency: false,
+    });
+    expect(invalidToolGroupRefs(['management'])).toEqual([]);
+    expect(canonicalizeToolGroups(['management'])).toEqual(['management']);
+    expect(invalidAgentToolGroupRefs(['management'])).toEqual(['management']);
+    expect(canonicalizeAgentToolGroups(['management'])).toEqual([]);
+
+    expect(TOOL_CATALOG.find((entry) => entry.name === 'skill_manage')?.loadGroups)
+      .toEqual(['runtime']);
+    expect(TOOL_CATALOG.find((entry) => entry.name === 'add_custom_connector'))
+      .toMatchObject({ loadGroups: ['connectors'], agentAssignable: false });
+    expect(toolNamesForGroups(['connectors'])).toEqual([
+      'list_connector_tools', 'call_connector_tool', 'add_custom_connector',
+    ]);
+    expect(toolNamesForAgentGroups(['connectors'])).toEqual([
+      'list_connector_tools', 'call_connector_tool',
+    ]);
+    expect(isToolVisibleToAgent('add_custom_connector', 'custom-agent')).toBe(false);
+  });
+
+  it('scopes Office leaves while preserving the parent and pdf alias', () => {
+    expect(TOOL_GROUPS.filter((group) => group.parent === 'office').map((group) => group.id))
+      .toEqual(['office.word', 'office.spreadsheet', 'office.presentation', 'office.pdf']);
+    expect(canonicalToolGroupId('pdf')).toBe('office.pdf');
+    expect(canonicalizeAgentToolGroups(['office', 'office.word'])).toEqual(['office']);
+
+    expect(toolNamesForGroups(['office.presentation'])).toEqual([
+      'create_pptx', 'office_read', 'edit_office', 'office_review',
+    ]);
+    expect(toolNamesForGroups(['pdf'])).toEqual(['create_pdf', 'edit_pdf', 'pdf_render']);
+    expect(toolNamesForGroups(['office'])).toEqual([
+      'create_pdf', 'edit_pdf', 'pdf_render',
+      'create_docx', 'create_xlsx', 'create_pptx',
+      'office_read', 'edit_office', 'office_review',
+    ]);
+  });
+
+  it('splits output, editing, command, session, and media capabilities without weakening parent compatibility', () => {
+    expect(toolNamesForGroups(['workspace.write.output'])).toEqual([
+      'write_file', 'append_file', 'publish_outputs',
+    ]);
+    expect(toolNamesForGroups(['workspace.write.edit'])).toEqual([
+      'apply_patch', 'edit_file', 'delete_file', 'workspace_diff',
+    ]);
+    expect(toolNamesForGroups(['workspace.write'])).toEqual([
+      'write_file', 'append_file', 'publish_outputs',
+      'apply_patch', 'edit_file', 'delete_file', 'workspace_diff',
+    ]);
+    expect(toolNamesForGroups(['workspace.execute.command'])).toEqual(['bash']);
+    expect(toolNamesForGroups(['workspace.execute.session'])).toEqual([
+      'process_session', 'interactive_cli',
+    ]);
+    expect(toolNamesForGroups(['workspace.execute'])).toEqual([
+      'bash', 'process_session', 'interactive_cli',
+    ]);
+    expect(toolNamesForGroups(['media.image'])).toEqual(['generate_image', 'image_studio']);
+    expect(toolNamesForGroups(['media.video'])).toEqual(['video_studio']);
+    expect(toolNamesForGroups(['media.speech'])).toEqual(['generate_speech']);
+    expect(toolNamesForGroups(['media'])).toEqual([
+      'generate_image', 'image_studio', 'video_studio', 'generate_speech',
+    ]);
+
+    expect(expandToolGroups(['workspace'])).toEqual([
+      'workspace',
+      'workspace.read',
+      'workspace.write',
+      'workspace.write.output',
+      'workspace.write.edit',
+      'workspace.execute',
+      'workspace.execute.command',
+      'workspace.execute.session',
+      'workspace.artifact',
+    ]);
+    expect(canonicalizeAgentToolGroups([
+      'workspace', 'workspace.write.output', 'workspace.execute.command',
+    ])).toEqual(['workspace']);
+  });
+
+  it('enforces each built-in Agent fixed capability boundary', () => {
+    const previousMode = process.env.ORKAS_TOOL_LOADING_MODE;
+    process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
+    try {
+      for (const scenario of BUILTIN_AGENT_TOOL_SURFACE_CASES) {
+        const availableToolNames = TOOL_CATALOG
+          .map((entry) => entry.name)
+          .filter((name) => isToolVisibleToAgent(name, scenario.agentId));
+        const surface = createToolSurfaceController({
+          availableToolNames,
+          configuredGroups: scenario.configuredGroups,
+          hostRequiredToolNames: ['read_files'],
+          scopedEligible: true,
+          dynamicLoading: false,
+        });
+
+        expect(surface.isActive('read_files'), `${scenario.name} must retain the host read primitive`)
+          .toBe(true);
+        for (const name of scenario.requiredTools) {
+          expect(surface.isActive(name), `${scenario.name} required tool ${name} is unavailable`)
+            .toBe(true);
+        }
+        for (const name of scenario.forbiddenTools) {
+          expect(surface.isActive(name), `${scenario.name} crossed its fixed boundary with ${name}`)
+            .toBe(false);
+        }
+
+        expect(surface.isActive('image_studio'), `${scenario.name} crossed the ImageStudio owner gate`)
+          .toBe(scenario.agentId === '814b61b027f0');
+        expect(surface.isActive('video_studio'), `${scenario.name} crossed the VideoStudio owner gate`)
+          .toBe(scenario.agentId === '79df9cc89f5f');
+
+        expect(
+          scenario.groupRequirements.map((requirement) => requirement.group),
+          `${scenario.name} must justify every configured group with a user outcome`,
+        ).toEqual(scenario.configuredGroups);
+        for (const requirement of scenario.groupRequirements) {
+          expect(requirement.outcome.trim().length, `${scenario.name}:${requirement.group} lacks an outcome`)
+            .toBeGreaterThan(0);
+          const withoutGroup = createToolSurfaceController({
+            availableToolNames,
+            configuredGroups: scenario.configuredGroups.filter((group) => group !== requirement.group),
+            hostRequiredToolNames: ['read_files'],
+            scopedEligible: true,
+            dynamicLoading: false,
+          });
+          for (const witness of requirement.witnessTools) {
+            expect(surface.isActive(witness), `${scenario.name}:${requirement.group} witness ${witness} is missing`)
+              .toBe(true);
+            expect(
+              withoutGroup.isActive(witness),
+              `${scenario.name}:${requirement.group} is redundant; ${witness} survives its removal`,
+            ).toBe(false);
+          }
+        }
+
+        for (const mutation of scenario.overbroadReplacements ?? []) {
+          expect(
+            surface.isActive(mutation.newlyExposedTool),
+            `${scenario.name} narrow baseline already exposes ${mutation.newlyExposedTool}`,
+          ).toBe(false);
+          const widened = createToolSurfaceController({
+            availableToolNames,
+            configuredGroups: scenario.configuredGroups.map((group) => (
+              group === mutation.narrowGroup ? mutation.broadGroup : group
+            )),
+            hostRequiredToolNames: ['read_files'],
+            scopedEligible: true,
+            dynamicLoading: false,
+          });
+          expect(
+            widened.isActive(mutation.newlyExposedTool),
+            `${scenario.name} negative mutation did not expose ${mutation.newlyExposedTool}`,
+          ).toBe(true);
+        }
+      }
+    } finally {
+      if (previousMode === undefined) delete process.env.ORKAS_TOOL_LOADING_MODE;
+      else process.env.ORKAS_TOOL_LOADING_MODE = previousMode;
+    }
   });
 
   it('describes edit_office preview rendering as explicit and optional', () => {
@@ -197,54 +400,159 @@ describe('tool-catalog', () => {
     expect(lost).toEqual([]);
   });
 
-  it('reports tool descriptions above the soft review budget without failing', () => {
+  it('pins non-description schemas independently from wording changes', () => {
+    const schemas = enumerateAllInjectedTools()
+      .map((tool) => ({ name: tool.name, inputSchema: withoutDescriptions(tool.inputSchema) }))
+      .sort((left, right) => left.name.localeCompare(right.name));
+    const fingerprint = createHash('sha256')
+      .update(JSON.stringify(schemas))
+      .digest('hex');
+    expect(
+      fingerprint,
+      'A model-visible field, enum, bound, default, or required rule changed; review it as a schema change, not description cleanup.',
+    ).toBe('2a3e714b9c485eccabf1da1c0af75dd279fa62f5a959f4fead1f68461a3622bc');
+  });
+
+  it('keeps the reviewed stable tool corpus within the description budgets', () => {
     const overBudget: string[] = [];
     for (const tool of enumerateAllInjectedTools()) {
       if (normalizedDescription(tool.description).length > TOOL_DESCRIPTION_SOFT_BUDGET_CHARS) {
         overBudget.push(`${tool.name}:description=${tool.description.length}`);
       }
       walkSchemaDescriptions(tool.inputSchema, (path, description) => {
-        const key = `${tool.name}:${path}`;
-        if (normalizedDescription(description).length > SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS && !SOURCE_DESCRIPTION_BUDGET_EXCEPTIONS.has(key)) {
+        if (
+          normalizedDescription(description).length > SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS
+          && !OPEN_SOURCE_DESCRIPTION_BUDGET_EXCEPTIONS.has(`${tool.name}:${path}`)
+        ) {
           overBudget.push(`${tool.name}:${path}.description=${description.length}`);
         }
       });
     }
-    if (overBudget.length) {
-      console.warn(
-        `Tool descriptions above soft budget (${TOOL_DESCRIPTION_SOFT_BUDGET_CHARS}/${SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS} chars):`,
-        overBudget,
-      );
-    }
-    expect(overBudget).toEqual(expect.any(Array));
+    expect(
+      overBudget,
+      `Descriptions above the ${TOOL_DESCRIPTION_SOFT_BUDGET_CHARS}/${SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS}-character review budgets need a documented exception.`,
+    ).toEqual([]);
+  });
+
+  it('keeps operation and argument semantics on their owning parameters', () => {
+    const patchTool = toolByName('apply_patch');
+    expect(patchTool.description).not.toContain('*** Add File');
+    expect(propertyDescription(patchTool, 'patch')).toContain('*** Add File');
+    expect(propertyDescription(patchTool, 'patch')).toContain('*** Begin Patch');
+
+    const append = toolByName('append_file');
+    expect(append.description).not.toContain('base_revision');
+    expect(propertyDescription(append, 'base_revision')).toContain('Required unless legacy expected_size');
+    expect(propertyDescription(append, 'base_revision')).toContain('exact replay is idempotent');
+
+    const edit = toolByName('edit_file');
+    expect(edit.description).not.toContain('old_string');
+    expect(propertyDescription(edit, 'old_string')).toContain('trailing-whitespace-insensitive');
+    expect(propertyDescription(edit, 'expected_hash')).toContain('fails without writing');
+
+    const diff = toolByName('workspace_diff');
+    expect(diff.description).not.toContain('Defaults to');
+    expect(propertyDescription(diff, 'scope')).toContain('(default)');
+    expect(propertyDescription(diff, 'format')).toContain('(default)');
+
+    const outputs = toolByName('publish_outputs');
+    expect(outputs.description).not.toContain('Exclude previews');
+    expect(propertyDescription(outputs, 'paths')).toContain('Exclude previews');
+    expect(propertyDescription(outputs, 'paths')).toContain('replaces the prior declaration');
+
+    const artifact = toolByName('create_artifact');
+    expect(artifact.description).toMatch(/Remote and out-of-directory URLs are blocked/i);
+    expect(artifact.description).toMatch(/bundle authorized assets in files or use data\/blob URLs/i);
+    expect(artifact.description).not.toContain('top-level index.html');
+    expect(propertyDescription(artifact, 'files')).toContain('top-level index.html');
+    expect(propertyDescription(artifact, 'files')).toContain('__orkas/bridge.js');
+
+    const html = toolByName('html_preview');
+    expect(html.description).not.toContain('Use target');
+    expect(propertyDescription(html, 'target')).toContain('Defaults to desktop');
+    expect(propertyDescription(html, 'screenshots')).toContain('Defaults to false');
+
+    const image = toolByName('generate_image');
+    expect(image.description).not.toContain('reference images');
+    expect(propertyDescription(image, 'reference_images')).toContain('editing/variations');
+
+    const speech = toolByName('generate_speech');
+    expect(speech.description).not.toContain('target_duration');
+    expect(speech.description).not.toContain('output_path');
+    expect(propertyDescription(speech, 'target_duration')).toContain('Required for timed media');
+    expect(propertyDescription(speech, 'output_path')).toContain('once per turn');
+
+    const pdf = toolByName('create_pdf');
+    expect(pdf.description).not.toContain('ordinary prose');
+    expect(pdf.description).toMatch(/if it fails, report the failure/i);
+    expect(pdf.description).toContain('reportlab');
+    expect(pdf.description).toMatch(/CJK\/font behavior/i);
+    expect(propertyDescription(pdf, 'source_type')).toContain('ordinary prose');
+
+    const editPdf = toolByName('edit_pdf');
+    expect(editPdf.description).not.toContain('page numbers are 1-based');
+    expect(propertyDescription(editPdf, 'pages')).toContain('1-based pages');
+
+    const renderPdf = toolByName('pdf_render');
+    expect(renderPdf.description).not.toContain('1-based PDF page');
+    expect(propertyDescription(renderPdf, 'page')).toContain('1-based page number');
+
+    const memory = toolByName('cross_session_memory');
+    expect(memory.description).not.toContain('entries are already injected');
+    expect(propertyDescription(memory, 'action')).toContain('entries are already injected');
+
+    const metacognition = toolByName('metacognition');
+    expect(metacognition.description).not.toMatch(/\d+ characters/);
+    expect(propertyDescription(metacognition, 'content')).toContain('Maximum 3000 characters');
+
+    const officeRead = toolByName('office_read');
+    expect(officeRead.description).not.toContain('text returns');
+    expect(propertyDescription(officeRead, 'mode')).toContain('text (default)');
+    expect(propertyDescription(officeRead, 'mode')).toContain('query applies selectors');
+
+    const officeReview = toolByName('office_review');
+    expect(officeReview.description).not.toContain('check scans');
+    expect(propertyDescription(officeReview, 'action')).toContain('check scans OpenXML');
+    expect(propertyDescription(officeReview, 'action')).toContain('check_and_render stops');
+
+    const editOffice = toolByName('edit_office');
+    expect(editOffice.description).not.toContain('set(path');
+    expect(propertyDescription(editOffice, 'operations')).toContain('set(path, props)');
+
+    const pptx = toolByName('create_pptx');
+    expect(pptx.description).not.toContain('Positions and sizes use');
+    const slides = ((pptx.inputSchema as any).properties.slides.items.properties);
+    expect(slides.shapes.items.properties.x.description).toContain('unit');
   });
 
   it('critical tools keep enough provider-visible guidance to choose and call them', () => {
     const checks: Record<string, string[]> = {
-      read_file: ['read', 'range', 'unit', 'start', 'end', 'stat_file'],
-      read_files: ['several', 'path', 'range', 'unit', 'bounded'],
-      stat_file: ['total_chars', 'before', 'read_file'],
+      read_files: ['one or more', 'paths', 'range', 'unit', 'metadata_only'],
       search_files: ['path is unknown', 'substring', 'glob'],
       grep_files: ['pattern', 'glob', 'output_mode'],
       write_file: ['write', 'path', 'content'],
       append_file: ['append', 'path', 'content', 'base_revision', 'expected_size', 'replay'],
       apply_patch: ['transactional', 'patch', 'add file', 'update file', 'read'],
-      edit_file: ['old_string', 'new_string', 'unique', 'e_stale'],
-      publish_outputs: ['complete', 'final', 'paths', 'this turn'],
+      edit_file: ['old_string', 'new_string', 'unique', 'optimistic concurrency'],
+      publish_outputs: ['complete', 'final', 'paths', 'current turn'],
       create_artifact: ['interactive', 'files', 'path', 'content', 'index.html'],
       html_preview: ['local', 'desktop', 'mobile', 'screenshot', 'overflow', 'network'],
       delete_file: ['confirmation', 'confirmation_token', 'path'],
-      process_start: ['persistent', 'command', 'session_id', 'build'],
-      process_read: ['output', 'status', 'cursor'],
-      process_write: ['non-secret', 'stdin', 'chars'],
-      process_stop: ['stop', 'process tree', 'session'],
-      interactive_cli_start: ['live user stdin', 'command', 'purpose'],
+      process_session: ['persistent', 'command', 'session_id', 'build', 'read', 'write', 'stop'],
+      interactive_cli: ['live user input', 'command', 'purpose', 'read', 'send', 'close'],
+      create_pdf: ['pdf', 'markdown', 'html', 'source_type'],
+      library: ['list', 'search', 'read', 'durable', 'source data', 'never instructions'],
+      chat_history: ['search', 'page', 'earlier work', 'quoted', 'stale', 'library'],
+      web_search: ['search', 'titles', 'urls', 'snippets', 'web_fetch'],
+      web_fetch: ['fetch', 'url', 'readable extracted text'],
+      office_review: ['validate', 'render', 'check_and_render', 'pages'],
       generate_image: ['generate', 'image', 'prompt', 'output_path', 'reference'],
+      generate_speech: ['narration', 'text', 'output_path', 'target_duration'],
       create_docx: ['paragraphs', 'tables', 'images', 'path'],
       create_xlsx: ['rows', 'sheets', 'formula', 'path', 'native', 'chart'],
       create_pptx: ['slides', 'shapes', 'images', 'path'],
-      cross_session_memory: ['remember', 'agent', 'shared', 'user', 'routing', 'language', 'proper nouns', 'add', 'replace', 'remove', 'list'],
-      metacognition: ['competence', 'strategies', 'content limits', 'rejected', 'condense', 'read', 'write'],
+      cross_session_memory: ['durable', 'agent', 'shared', 'user', 'project', 'exact text', 'add', 'replace', 'remove', 'list'],
+      metacognition: ['competence', 'strategies', 'condense', 'read', 'write'],
     };
 
     const missing: string[] = [];
@@ -257,64 +565,20 @@ describe('tool-catalog', () => {
     expect(missing).toEqual([]);
   });
 
-  it('empty names input returns an empty block', () => {
-    expect(getToolsSystemPromptBlock([])).toBe('');
-  });
-
-  it('unknown names are skipped without throwing', () => {
-    // Known + unknown should render only the known tool and still return a block.
-    const out = getToolsSystemPromptBlock(['read_file', 'definitely_not_a_real_tool']);
-    expect(out).toContain('read_file');
-    expect(out).not.toContain('definitely_not_a_real_tool');
-  });
-
-  it('all unknown names return an empty block', () => {
-    expect(getToolsSystemPromptBlock(['__nope_a__', '__nope_b__'])).toBe('');
-  });
-
-  it('same input produces the same output for KV-cache stability', () => {
-    const names = ['read_file', 'bash', 'kb_search'];
-    const a = getToolsSystemPromptBlock(names);
-    const b = getToolsSystemPromptBlock([...names]);
-    expect(a).toBe(b);
-  });
-
-  it('renders sections in group order and includes only matched groups', () => {
-    // read_file (fs) + bash (shell) + kb_search (kb) -> fs/shell/kb order.
-    const out = getToolsSystemPromptBlock(['kb_search', 'bash', 'read_file']);
-    const fsIdx = out.indexOf('### Files / workspace');
-    const shellIdx = out.indexOf('### Shell');
-    const kbIdx = out.indexOf('### Library');
-    expect(fsIdx).toBeGreaterThan(-1);
-    expect(shellIdx).toBeGreaterThan(fsIdx);
-    expect(kbIdx).toBeGreaterThan(shellIdx);
-    // Unmatched groups are omitted.
-    expect(out).not.toContain('### PDF');
-    expect(out).not.toContain('### Image');
-  });
-
-  it('permission-gated tools include a local-execution permission suffix', () => {
-    const out = getToolsSystemPromptBlock(['bash', 'read_file']);
-    // bash has permission='localExec'; read_file does not.
-    const bashLine = out.split('\n').find((l) => l.includes('**bash**'));
-    const readLine = out.split('\n').find((l) => l.includes('**read_file**'));
-    expect(bashLine).toContain('local-execution permission');
-    expect(readLine).not.toContain('local-execution permission');
-  });
-
   it('keeps delete_file confirmation guidance scoped to outside-workspace deletes', () => {
-    const out = getToolsSystemPromptBlock(['delete_file']);
-    expect(out).toContain('Files inside the current workspace/attachment/editor scope are deleted immediately');
-    expect(out).toContain('files outside that scope use an inline confirmation card');
-    expect(out).not.toContain('The first call shows an inline confirmation card');
+    const summary = TOOL_CATALOG.find((entry) => entry.name === 'delete_file')?.summary || '';
+    expect(summary).toContain('Delete one file');
+    expect(summary).toContain('confirmation only outside the active workspace scope');
+    expect(summary).not.toContain('confirmation for every delete');
   });
 });
 
 describe('isToolVisibleToAgent (ownerAgent gate)', () => {
   it('un-owned catalog tools are visible to every actor', () => {
-    expect(isToolVisibleToAgent('read_file', '')).toBe(true);
-    expect(isToolVisibleToAgent('generate_image', 'image-studio')).toBe(true);
-    expect(isToolVisibleToAgent('generate_image', 'anything')).toBe(true);
+    expect(isToolVisibleToAgent('read_files', '')).toBe(true);
+    expect(isToolVisibleToAgent('generate_speech', '')).toBe(true);
+    expect(isToolVisibleToAgent('generate_speech', 'video-studio')).toBe(true);
+    expect(isToolVisibleToAgent('generate_speech', 'some-other-agent')).toBe(true);
   });
 
   it('tools absent from the catalog (extraTools / builtins) are never gated', () => {

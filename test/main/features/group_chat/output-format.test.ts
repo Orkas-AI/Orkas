@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 
 import {
   _buildOutputFormatHintForTest,
-  _buildInputChannelBlocksForTest,
+  _buildInputChannelProtocolForTest,
   _buildAgentInGroupSystemPromptForTest,
   _buildPlanInteractionHintForTest,
   _redactDispatchToolResult,
@@ -14,7 +14,7 @@ import {
 } from '../../../../src/main/features/local_agents/context';
 
 describe('group-chat response language', () => {
-  it('keeps the selected turn language after an English-authored agent workflow', async () => {
+  it('keeps prompt-internal descriptions in English while the selected turn language stays Chinese', async () => {
     const prompt = await _buildAgentInGroupSystemPromptForTest({
       agent_id: 'language-contract-agent',
       name: 'LanguageContractAgent',
@@ -23,13 +23,33 @@ describe('group-chat response language', () => {
       workflow: 'This workflow is intentionally authored in English.',
     }, '/tmp/language-contract-agent', 'zh');
 
-    expect(prompt).toContain('仅中文运行说明');
-    expect(prompt).not.toContain('ENGLISH_DESCRIPTION_SHOULD_NOT_RENDER');
+    expect(prompt).toContain('ENGLISH_DESCRIPTION_SHOULD_NOT_RENDER');
+    expect(prompt).not.toContain('仅中文运行说明');
     expect(prompt).toContain('User UI language: **Chinese (简体中文)**');
     expect(prompt.lastIndexOf('## User language'))
       .toBeGreaterThan(prompt.lastIndexOf('## Runtime injection'));
     expect(prompt.lastIndexOf('## User language'))
       .toBeGreaterThan(prompt.lastIndexOf('This workflow is intentionally authored in English.'));
+  });
+});
+
+describe('named Agent execution-plan ownership', () => {
+  it('keeps current-task planning with the Agent while group orchestration stays with Commander', async () => {
+    const prompt = await _buildAgentInGroupSystemPromptForTest({
+      agent_id: 'execution-owner-agent',
+      name: 'ExecutionOwnerAgent',
+      workflow: 'Complete the assigned work and verify the result.',
+    }, '/tmp/execution-owner-agent', 'en');
+
+    const ownership = prompt.indexOf('The bus/commander owns cross-actor orchestration;');
+    const sharedAdmission = prompt.indexOf('- Use an execution plan when the user asks');
+
+    expect(ownership).toBeGreaterThanOrEqual(0);
+    expect(prompt).toContain('your current-task execution Plan follows Shared rules.');
+    expect(prompt).not.toContain('Plan/upstream/downstream state belongs to the bus/commander.');
+    expect(sharedAdmission).toBeGreaterThan(ownership);
+    expect(prompt).toContain('Skip simple work or work clear in live context; tool, file, and step counts never decide.');
+    expect(prompt.match(/- Use an execution plan when the user asks/g)).toHaveLength(1);
   });
 });
 
@@ -81,14 +101,29 @@ describe('group_chat output_format prompt hints', () => {
 
       expect(hint).toContain('### Presentation preference');
       expect(hint).not.toContain('### Output format');
-      expect(hint).toContain('automatic output layout');
-      expect(hint).toContain('Use plain text or Markdown');
-      expect(hint).toContain('Use `:::dashboard`');
-      expect(hint).toContain('valid fenced `:::dashboard` JSON block');
-      expect(hint).toContain('Use `create_artifact` only');
-      expect(hint).toContain('operate the result');
-      expect(hint).toContain('Respect explicit user constraints');
+      expect(hint).toMatch(/Automatic layout/i);
+      expect(hint).toContain('text/Markdown');
+      expect(hint).toContain('`:::dashboard` for static structured snapshots');
+      expect(hint).toContain('`create_artifact` only for user-operated results');
+      expect(hint).toMatch(/explicit user constraints win/i);
+      expect(hint.length).toBeLessThanOrEqual(300);
     }
+  });
+
+  it('assembles the output selector before the shared format grammar', async () => {
+    const prompt = await _buildAgentInGroupSystemPromptForTest({
+      agent_id: 'output-contract-agent',
+      name: 'OutputContractAgent',
+      workflow: 'Return the requested result.',
+      output_format: 'auto',
+    }, '/tmp/output-contract-agent', 'en');
+
+    const selector = prompt.indexOf('### Presentation preference');
+    const grammar = prompt.indexOf('## Output formats');
+    expect(selector).toBeGreaterThanOrEqual(0);
+    expect(grammar).toBeGreaterThan(selector);
+    expect(prompt.match(/Automatic layout:/g)).toHaveLength(1);
+    expect(prompt).toContain('{"schema_version":1,"root":{"type":"Stack"');
   });
 
   it('turns text and its legacy alias into a hard standard-reply instruction', () => {
@@ -214,64 +249,82 @@ describe('group_chat plan interaction prompt hints', () => {
     const hint = _buildPlanInteractionHintForTest(true);
 
     expect(hint).toContain('### Plan interaction');
-    expect(hint).toMatch(/Run your own Information sufficiency check/i);
-    expect(hint).toMatch(/output only/i);
-    expect(hint).toMatch(/one `<agent-input-form>`/i);
-    expect(hint).toMatch(/Required open shape/i);
+    expect(hint).toMatch(/insufficient-input reply contains only/i);
+    expect(hint).toMatch(/required internal result marker/i);
+    expect(hint).toMatch(/channel-specific input request above/i);
     expect(hint).toContain('<plan-interaction status="open" />');
-    expect(hint).toMatch(/at most 2-3 focused fields/i);
     expect(hint).toMatch(/recommendation, diagnosis, plan, report/i);
-    expect(hint).toMatch(/form fields are the questions/i);
+    expect(hint).toContain('<plan-interaction status="closed" />');
   });
 
-  it('keeps the pause protocol for a prose-channel agent but asks in plain language', () => {
+  it('keeps the pause protocol for a prose-channel agent without teaching a form mandate', async () => {
     // The pause signal is the plan-interaction marker, which every consumer
     // accepts on its own (`!!form || planInteraction === 'open'`), so a
     // formless agent still pauses a plan step correctly.
-    const hint = _buildPlanInteractionHintForTest(true, 'prose');
-    expect(hint).toContain('### Plan interaction');
-    expect(hint).toContain('<plan-interaction status="open" />');
-    expect(hint).toMatch(/at most 2-3 focused questions in plain prose/i);
-    expect(hint).not.toMatch(/agent-input-form/i);
+    const prompt = await _buildAgentInGroupSystemPromptForTest({
+      agent_id: 'prose-input-agent',
+      name: 'ProseInputAgent',
+      workflow: 'Work interactively with the user.',
+      interactive: true,
+      input_channel: 'prose',
+    }, '/tmp/prose-input-agent', 'en');
+    expect(prompt).toContain('### Plan interaction');
+    expect(prompt).toContain('<plan-interaction status="open" />');
+    expect(prompt).toMatch(/at most 2-3 focused questions/i);
+    expect(prompt).not.toMatch(/output exactly one `<agent-input-form>`/i);
   });
 });
 
 describe('group_chat agent input-channel prompt blocks', () => {
-  it('renders the platform default byte-identical to the pre-template text', () => {
-    // Nine agents minus one keep the form mandate; any drift here silently
-    // rewrites every default agent's asking protocol.
-    const blocks = _buildInputChannelBlocksForTest('form');
-    expect(blocks.ask_channel_rule).toBe(
-      'Ask for the smallest useful missing set (at most 2-3 focused fields) via `<agent-input-form>` and stop.',
-    );
-    expect(blocks.need_input_rule).toBe(
-      'If you need user input, send an `<agent-input-form>` and stop; do not wait in prose.',
-    );
-    expect(blocks.input_channel_protocol).toContain('### Form protocol (only input channel)');
-    expect(blocks.input_channel_protocol).toContain('Plain text questions, numbered lists, and "please confirm/tell me" prose are not input channels.');
-    expect(blocks.input_channel_protocol).toContain('### Form lifecycle');
-    expect(blocks.input_channel_protocol).toContain('Do not replace a form with a "need these details" section.');
+  it('renders one compact platform-default form shape', () => {
+    const protocol = _buildInputChannelProtocolForTest('form');
+    expect(protocol).toContain('### Input channel: form');
+    expect(protocol).toContain('Plain-text questions, numbered question lists, and "please confirm/tell me" prose are not input channels.');
+    expect(protocol).toContain('Ask for at most 2-3 focused missing fields.');
+    expect(protocol).toContain('Prefer one plain question in a field label');
+    expect(protocol).toContain('use multiple fields only for distinct typed values');
+    expect(protocol).toContain('Do not replace the form with a "need these details" section.');
+    expect(protocol.match(/<agent-input-form>/g)).toHaveLength(2);
   });
 
   it('teaches a prose-channel agent to ask in plain language and never emit the form tag', () => {
     // The 2026-08-05 evening regression: VideoStudio's skill forbade forms
     // while this platform prompt mandated them, and the model followed the
     // platform. The prose channel removes the contradiction at its source.
-    const blocks = _buildInputChannelBlocksForTest('prose');
-    expect(blocks.ask_channel_rule).toMatch(/in plain prose and stop/i);
-    expect(blocks.need_input_rule).toMatch(/ordinary message is the input channel/i);
-    expect(blocks.input_channel_protocol).toContain('### Input channel (plain prose)');
-    expect(blocks.input_channel_protocol).toMatch(/retired protocol, not an example/i);
+    const protocol = _buildInputChannelProtocolForTest('prose');
+    expect(protocol).toContain('### Input channel: plain prose');
+    expect(protocol).toMatch(/ask directly in plain language and stop/i);
+    expect(protocol).toMatch(/retired protocol, not an example/i);
     // The tag may appear only inside "never emit" phrasing — every mention
     // must be a prohibition, and none of the form-mandate sentences survive.
-    for (const value of Object.values(blocks)) {
-      for (const line of value.split('\n')) {
-        if (line.includes('<agent-input-form>')) {
-          expect(line, line).toMatch(/never emit/i);
-        }
+    for (const line of protocol.split('\n')) {
+      if (line.includes('<agent-input-form>')) {
+        expect(line, line).toMatch(/never emit/i);
       }
     }
-    expect(JSON.stringify(blocks)).not.toContain('only input channel');
-    expect(JSON.stringify(blocks)).not.toContain('are not input channels');
+    expect(protocol).not.toContain('are not input channels');
+  });
+
+  it('assembles schema extraction, sufficiency, asking, and retry as one ordered flow', async () => {
+    const prompt = await _buildAgentInGroupSystemPromptForTest({
+      agent_id: 'input-flow-agent',
+      name: 'InputFlowAgent',
+      workflow: 'Write a launch brief from declared inputs.',
+      inputs: [
+        { id: 'product', label: 'Product', type: 'text', required: true },
+        { id: 'audience', label: 'Audience', type: 'text', required: true },
+      ],
+    }, '/tmp/input-flow-agent', 'en');
+
+    expect(prompt.match(/## Input decision and channel/g)).toHaveLength(1);
+    expect(prompt).toContain('"id":"product"');
+    expect(prompt).toContain('"id":"audience"');
+    expect(prompt).not.toContain('## Information sufficiency');
+    expect(prompt).not.toContain('### Handling `inputs_schema`');
+    expect(prompt).toMatch(/1\. If `inputs_schema`[\s\S]+2\. Make your own sufficiency decision[\s\S]+3\. If required inputs and context are sufficient[\s\S]+4\. Otherwise request only the smallest useful missing set/);
+    expect(prompt.indexOf('### Input channel: form'))
+      .toBeGreaterThan(prompt.indexOf('4. Otherwise request only the smallest useful missing set'));
+    expect(prompt).toContain('After a user reply or `<agent-input-submission>`, repeat this same decision');
+    expect(prompt).not.toMatch(/\$(?:ask_channel_rule|need_input_rule|input_channel_protocol|plan_interaction_hint)/);
   });
 });

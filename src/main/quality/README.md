@@ -2,6 +2,18 @@
 
 Static "block obvious malice + structural breakage" gate that runs before any skill / agent spec lands on disk. **Not a sandbox** — runtime path-sandbox + permission gates remain the actual security boundary. This is the "first 60-80% of explicit malice" filter and the schema-validity check that prompt rules can't reliably enforce.
 
+Agent field ownership and official-source review rules live in
+`Common/docs/agent-authoring.md`. This module enforces portable structural
+advisories; owning Resource or built-in tests may apply a stricter official
+prompt budget.
+
+Skill description shapes are source-specific and mutually exclusive. A user
+custom or external portable Skill uses one `description`; a repository-managed
+System, Marketplace, or official Agent-private Skill uses both
+`description_zh` and `description_en`. The schema rule reports a mixed triple
+or an incomplete localized pair, while the official resource inventories make
+the bilingual shape a release-blocking contract.
+
 See `docs/plans/validator-phase-0.md` (deleted after acceptance) for the design rationale.
 
 ## Module boundary
@@ -16,7 +28,7 @@ quality/
 ├── rules/
 │   ├── red-flags.ts      9 EXTREME patterns (credential reads, eval, …)
 │   ├── skill-runner.ts   standard Skill Runner invocation contract
-│   └── schema.ts         frontmatter + agent.json shape checks
+│   └── schema.ts         frontmatter + agent.json shape and guidance checks
 └── report.ts             persist / read / delete the per-spec report
                           under <uid>/local/quality_reports/
 ```
@@ -38,6 +50,12 @@ quality/
 | `LOW` | Silent — recorded only in the persisted report. |
 
 The `skill_script_requires_runner` rule is an authoring/publishing contract, not an install migration. Creation, editing, import, and Marketplace upload enforce it. Marketplace installation validates the existing security/schema rules while explicitly omitting this one rule, so historical bundles are restored verbatim rather than rejected or rewritten.
+
+Directory validation is source-aware. Custom and standalone Marketplace Skills
+own `_meta.json`; system freshness belongs to the system manifest, and an
+Agent-private Skill inherits category and freshness from its parent Agent.
+Callers that know the latter sources pass `source: 'system'` or
+`source: 'agent-private'` instead of manufacturing standalone metadata.
 
 There is intentionally NO override for EXTREME. If a real use case triggers a red flag, restructure the spec to remove the pattern (typically: accept the path as a user-provided argument rather than hard-coding a sensitive location).
 

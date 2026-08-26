@@ -94,6 +94,100 @@ describe('group_chat state › active recipient provenance', () => {
   });
 });
 
+describe('group_chat state › scheduled Agent hand-off admission', () => {
+  it('establishes floor and resume ledger together and restores the previous state on admission failure', async () => {
+    const s = await import('../../../../src/main/features/group_chat/state');
+    await s.setActiveRecipient(TEST_UID, TEST_CID, 'agent-old', 'user_selection');
+    await s.setOrchestrationLedger(TEST_UID, TEST_CID, {
+      status: 'waiting_for_agent',
+      blocked_on: 'agent_handoff',
+      source_tool: 'dispatch_to',
+      owner_agent_id: 'agent-old',
+      owner_agent_name: 'OldAgent',
+      user_goal: 'old goal',
+      handoff_message: 'old task',
+      resume_instruction: 'finish old goal',
+    });
+
+    const admission = await s.beginAgentHandoff(TEST_UID, TEST_CID, {
+      ownerAgentId: 'agent-new',
+      ownerAgentName: 'NewAgent',
+      interactive: true,
+      userGoal: 'new goal',
+      handoffMessage: 'new task',
+      resumeInstruction: 'finish new goal',
+    });
+    let current = await s.readState(TEST_UID, TEST_CID);
+    expect(current.active_recipient).toBe('agent-new');
+    expect(current.active_recipient_source).toBe('commander_handoff');
+    expect(current.orchestration_ledger).toMatchObject({
+      id: admission.token,
+      source_tool: 'hand_off_to',
+      owner_agent_id: 'agent-new',
+      resume_instruction: 'finish new goal',
+    });
+
+    current = await s.rollbackAgentHandoff(TEST_UID, TEST_CID, admission);
+    expect(current.active_recipient).toBe('agent-old');
+    expect(current.active_recipient_source).toBe('user_selection');
+    expect(current.orchestration_ledger).toMatchObject({
+      source_tool: 'dispatch_to',
+      owner_agent_id: 'agent-old',
+      resume_instruction: 'finish old goal',
+    });
+  });
+
+  it('rollback never overwrites a newer user floor or orchestration ledger', async () => {
+    const s = await import('../../../../src/main/features/group_chat/state');
+    const admission = await s.beginAgentHandoff(TEST_UID, TEST_CID, {
+      ownerAgentId: 'agent-a',
+      ownerAgentName: 'AgentA',
+      interactive: true,
+      userGoal: 'goal a',
+      handoffMessage: 'task a',
+      resumeInstruction: 'resume a',
+    });
+    await s.setActiveRecipient(TEST_UID, TEST_CID, 'agent-b', 'user_selection');
+    await s.setOrchestrationLedger(TEST_UID, TEST_CID, {
+      status: 'waiting_for_agent',
+      blocked_on: 'agent_handoff',
+      source_tool: 'dispatch_to',
+      owner_agent_id: 'agent-b',
+      user_goal: 'goal b',
+      handoff_message: 'task b',
+      resume_instruction: 'resume b',
+    });
+
+    const current = await s.rollbackAgentHandoff(TEST_UID, TEST_CID, admission);
+    expect(current.active_recipient).toBe('agent-b');
+    expect(current.active_recipient_source).toBe('user_selection');
+    expect(current.orchestration_ledger).toMatchObject({
+      source_tool: 'dispatch_to',
+      owner_agent_id: 'agent-b',
+      resume_instruction: 'resume b',
+    });
+  });
+
+  it('cancellation clears Commander-owned hand-off state but preserves a user-selected floor', async () => {
+    const s = await import('../../../../src/main/features/group_chat/state');
+    await s.setActiveRecipient(TEST_UID, TEST_CID, 'agent-user', 'user_selection');
+    await s.setOrchestrationLedger(TEST_UID, TEST_CID, {
+      status: 'waiting_for_agent',
+      blocked_on: 'agent_handoff',
+      source_tool: 'hand_off_to',
+      owner_agent_id: 'agent-user',
+      user_goal: 'goal',
+      handoff_message: 'task',
+      resume_instruction: 'resume',
+    });
+
+    const current = await s.clearOrchestrationForCancellation(TEST_UID, TEST_CID);
+    expect(current.orchestration_ledger).toBeUndefined();
+    expect(current.active_recipient).toBe('agent-user');
+    expect(current.active_recipient_source).toBe('user_selection');
+  });
+});
+
 describe('group_chat state › renameAgentInMembers', () => {
   // Drive the rename sweep through a seeded `_index.json` + a couple of
   // pre-populated members.json files. The bug this guards: members.name is a

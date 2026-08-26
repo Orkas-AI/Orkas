@@ -24,10 +24,26 @@ export function buildCliSpawnEnv(
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
   home = os.homedir(),
+  cwd?: string,
 ): NodeJS.ProcessEnv {
   const out = { ...env };
+  // Electron process-control markers are Orkas-internal (Electron-as-Node
+  // helpers, entrypoint probes). A CLI agent runs arbitrary user commands, and
+  // any Electron-based app started from its shell inherits this env — with
+  // ELECTRON_RUN_AS_NODE set, that app boots as plain Node and "exits
+  // instantly", a fake failure the agent then debugs for rounds (Hermes case,
+  // 2026-08 weekly review W6-1). The orkas-bridge MCP child does not lose
+  // anything: its env travels scoped inside the MCP server config, never
+  // through the CLI's own environment.
+  delete out.ELECTRON_RUN_AS_NODE;
+  delete out.ELECTRON_NO_ASAR;
   const delimiter = platform === 'win32' ? ';' : ':';
   const pathApi = platform === 'win32' ? path.win32 : path.posix;
+  // Node's `spawn({ cwd })` does not rewrite an explicitly inherited PWD.
+  // Some POSIX CLIs prefer PWD over getcwd(), so give them the same resolved
+  // directory the process will actually start in. PWD has no equivalent
+  // contract on Windows; preserve the caller's environment there.
+  if (platform !== 'win32' && cwd) out.PWD = pathApi.resolve(cwd);
   const rawPath = env.PATH || env.Path || '';
   const candidates = rawPath.split(delimiter).filter(Boolean);
   candidates.push(pathApi.dirname(binPath));

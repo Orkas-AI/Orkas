@@ -335,13 +335,6 @@ export interface ExtractPlanInteractionResult {
   status?: PlanInteractionStatus;
 }
 
-export type ActorResultStatus = 'success' | 'failure';
-
-export interface ExtractActorResultResult {
-  cleanText: string;
-  status?: ActorResultStatus;
-}
-
 /** Strip an `agent-input-form` block (XML primary, legacy fence fallback)
  *  from an actor's final text. The bus calls this after every agent turn
  *  (commander never emits forms; forms are an agent → user channel). */
@@ -461,34 +454,6 @@ export function extractPlanInteractionFromFinal(text: string): ExtractPlanIntera
 
   return status ? { cleanText, status } : { cleanText: text };
 }
-
-const ACTOR_RESULT_RE =
-  /<(?:agent|commander)-result\b([^>]*)\/>|<(?:agent|commander)-result\b([^>]*)>\s*<\/(?:agent|commander)-result>/gi;
-
-/** Strip the actor result marker used for runtime outcome accounting.
- *  Actors can self-report only success/failure; execution exceptions and
- *  aborts are classified by the bus as `error` independently. */
-export function extractActorResultFromFinal(text: string): ExtractActorResultResult {
-  if (!text || typeof text !== 'string') return { cleanText: text || '' };
-  if (!text.includes('<agent-result') && !text.includes('<commander-result')) return { cleanText: text };
-
-  let status: ActorResultStatus | undefined;
-  const cleanText = text.replace(ACTOR_RESULT_RE, (_full, attrs1 = '', attrs2 = '') => {
-    const attrs = String(attrs1 || attrs2 || '');
-    // JSON-only replies must encode the telemetry marker's quotes as \". The
-    // marker is still runtime metadata in that representation, not business
-    // evidence, so recognize and remove both plain and JSON-escaped forms.
-    const m = /\bstatus\s*=\s*\\?["'](success|failure)\\?["']/i.exec(attrs);
-    if (m) status = m[1].toLowerCase() as ActorResultStatus;
-    // A literal newline would invalidate JSON when the marker occupied an
-    // array string; removing it entirely keeps the surrounding JSON parseable.
-    return '';
-  }).replace(/\n{3,}/g, '\n\n').trim();
-
-  return status ? { cleanText, status } : { cleanText };
-}
-
-export const extractAgentResultFromFinal = extractActorResultFromFinal;
 
 export function computeFormId(cid: string, msgId: string, agentId: string, fields: AgentInput[]): string {
   const h = crypto.createHash('sha1');

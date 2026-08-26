@@ -33,9 +33,8 @@ function legacyPermissionsFile(): string {
 describe('permissions › default state', () => {
   it('defaults to all_files_approval when no permissions.json exists', async () => {
     const perm = await import('../../../src/main/features/permissions');
-    expect(perm.getLocalExecGranted()).toBe(true);
     expect(perm.getLocalExecMode()).toBe('all_files_approval');
-    expect(perm.getLocalExecState()).toEqual({ mode: 'all_files_approval', granted: true });
+    expect(perm.getLocalExecState()).toEqual({ mode: 'all_files_approval' });
     expect(perm.localAccessAllowsOutsideWorkspace()).toBe(true);
     expect(perm.localAccessRequiresSensitiveApproval()).toBe(true);
   });
@@ -44,7 +43,6 @@ describe('permissions › default state', () => {
     fs.mkdirSync(path.dirname(permissionsFile()), { recursive: true });
     fs.writeFileSync(permissionsFile(), '{ this is not json');
     const perm = await import('../../../src/main/features/permissions');
-    expect(perm.getLocalExecGranted()).toBe(true);
     expect(perm.getLocalExecMode()).toBe('all_files_approval');
   });
 
@@ -52,37 +50,24 @@ describe('permissions › default state', () => {
     fs.mkdirSync(path.dirname(permissionsFile()), { recursive: true });
     fs.writeFileSync(permissionsFile(), JSON.stringify({ other: 'thing' }));
     const perm = await import('../../../src/main/features/permissions');
-    expect(perm.getLocalExecGranted()).toBe(true);
     expect(perm.getLocalExecMode()).toBe('all_files_approval');
   });
 });
 
-describe('permissions › legacy helpers', () => {
-  it('grantLocalExec maps to all_files_auto and persists', async () => {
+describe('permissions › persistence', () => {
+  it('setLocalExecMode persists mode-only state', async () => {
     const perm = await import('../../../src/main/features/permissions');
-    const state = perm.grantLocalExec();
-    expect(state.granted).toBe(true);
-    expect(state.mode).toBe('all_files_auto');
-    expect(typeof state.grantedAt).toBe('string');
+    const state = perm.setLocalExecMode('all_files_auto');
+    expect(state).toEqual({ mode: 'all_files_auto' });
 
     const parsed = JSON.parse(fs.readFileSync(permissionsFile(), 'utf8'));
-    expect(parsed.localExec.mode).toBe('all_files_auto');
+    expect(parsed.localExec).toEqual({ mode: 'all_files_auto' });
     expect(typeof parsed._field_updated_at.localExec).toBe('number');
-  });
-
-  it('revokeLocalExec maps to workspace_approval because off no longer exists', async () => {
-    const perm = await import('../../../src/main/features/permissions');
-    perm.grantLocalExec();
-    const state = perm.revokeLocalExec();
-    expect(state.granted).toBe(true);
-    expect(state.mode).toBe('workspace_approval');
-    expect(typeof state.revokedAt).toBe('string');
-    expect(state.grantedAt).toBeUndefined();
   });
 
   it('leaves no .tmp file behind after writes', async () => {
     const perm = await import('../../../src/main/features/permissions');
-    perm.grantLocalExec();
+    perm.setLocalExecMode('all_files_auto');
     const dir = path.dirname(permissionsFile());
     const stray = fs.readdirSync(dir).filter((n) => n.endsWith('.tmp'));
     expect(stray).toEqual([]);
@@ -106,7 +91,6 @@ describe('permissions › three-mode model', () => {
     fs.writeFileSync(permissionsFile(), JSON.stringify({ localExec: { granted: true } }));
     const perm = await import('../../../src/main/features/permissions');
     expect(perm.getLocalExecMode()).toBe('all_files_approval');
-    expect(perm.getLocalExecGranted()).toBe(true);
   });
 
   it('legacy granted:false migrates to workspace_approval', async () => {
@@ -114,7 +98,6 @@ describe('permissions › three-mode model', () => {
     fs.writeFileSync(permissionsFile(), JSON.stringify({ localExec: { granted: false } }));
     const perm = await import('../../../src/main/features/permissions');
     expect(perm.getLocalExecMode()).toBe('workspace_approval');
-    expect(perm.getLocalExecGranted()).toBe(true);
   });
 
   it('legacy allow_all mode migrates to all_files_auto', async () => {
@@ -149,7 +132,6 @@ describe('permissions › three-mode model', () => {
 
     let s = perm.setLocalExecMode('workspace_approval');
     expect(s.mode).toBe('workspace_approval');
-    expect(s.granted).toBe(true);
     expect(perm.localAccessAllowsOutsideWorkspace()).toBe(false);
     expect(perm.localAccessRequiresSensitiveApproval()).toBe(true);
 

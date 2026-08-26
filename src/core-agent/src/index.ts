@@ -1,10 +1,10 @@
 // Core Agent — simplified extraction of OpenClaw's core modules.
 // Provides: LLM Provider interaction (via @earendil-works/pi-ai), Agent Harness,
-// Memory System (with SQLite), Sandbox execution, and CLI commands.
+// Sandbox execution, and CLI commands.
 
 // Config
 export { loadConfig, createConfig, CoreAgentConfigSchema } from "./config/index.js";
-export type { CoreAgentConfig, AgentConfig, MemoryConfig, ProviderConfig, ModelConfig, EvolutionConfig } from "./config/index.js";
+export type { CoreAgentConfig, AgentConfig, ProviderConfig, ModelConfig, EvolutionConfig } from "./config/index.js";
 
 // Shared types & utilities
 export type {
@@ -51,8 +51,6 @@ export { ProviderRegistry } from "./providers/index.js";
 export { AgentRunner } from "./agent/index.js";
 export type {
   ReflectionModelCallEvent,
-  SharedHistorySummaryCache,
-  SharedHistorySummaryCheckpoint,
 } from "./agent/index.js";
 export { Session } from "./agent/index.js";
 export { PersistentSession } from "./agent/index.js";
@@ -69,6 +67,7 @@ export type {
   ExecutionPlanUpdate,
   HistoryResource,
   HistoryResourceKind,
+  ToolSurfaceState,
   RepositoryInstructionFile,
   RepositoryInstructions,
   WorkspaceDiffRequest,
@@ -103,6 +102,7 @@ export {
   applyPatchTool,
   createApplyPatchTool,
   getProcessSessionTools,
+  processSessionTool,
   processReadTool,
   processStartTool,
   processStopTool,
@@ -147,14 +147,6 @@ export type {
 export { SkillLoader, parseFrontmatter, pickDescription } from "./skills/index.js";
 export type { SkillSpec, SkillLoaderOptions, FrontmatterParseResult } from "./skills/index.js";
 
-// Memory
-export { MemoryIndexManager } from "./memory/index.js";
-export { SqliteMemoryManager } from "./memory/index.js";
-export type { MemorySearchManager, MemorySearchResult } from "./memory/index.js";
-export { createOpenAIEmbeddingProvider, createGeminiEmbeddingProvider } from "./memory/index.js";
-export type { EmbeddingProvider } from "./memory/index.js";
-export { createMemorySearchTool, createMemoryReadTool } from "./memory/index.js";
-
 // Auth (OAuth & credential management)
 export type { AuthCredential, ApiKeyCredential, OAuthCredential, AuthStore } from "./auth/index.js";
 export {
@@ -179,12 +171,10 @@ export { SkillStore, createSkillManageTool } from "./evolution/index.js";
 export type { Skill, SkillSummary, SkillFrontmatter } from "./evolution/index.js";
 export {
   detectUserCorrection,
-  emptyRunMetrics,
-  shouldReflect,
   buildReviewPrompt,
   REFLECTION_SYSTEM_PROMPT,
 } from "./evolution/index.js";
-export type { MetacognitionConfig, RunMetrics, TriggerSignal, MetacognitiveReflection } from "./evolution/index.js";
+export type { MetacognitionConfig } from "./evolution/index.js";
 
 // CLI
 export { CLI } from "./cli/index.js";

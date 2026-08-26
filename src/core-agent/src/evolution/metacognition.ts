@@ -1,30 +1,19 @@
 /**
- * Metacognitive self-improvement — experience-driven adaptive evolution.
- *
- * Replaces the fixed counter-based nudge mechanism with a multi-signal
- * trigger that considers error recovery, user corrections, task complexity,
- * known weaknesses, and skill effectiveness.
- *
- * The review prompt is dynamically generated based on the trigger reason,
- * the agent's self-assessment (COMPETENCE.md), and available learning
- * strategies (LEARNING_STRATEGIES.md).
+ * Metacognitive self-improvement building blocks: the user-correction
+ * heuristic consumed by the expert-signals pipeline, and the reflection
+ * review prompt used by the host reflection orchestrator and benchmark.
+ * (The unwired multi-signal `shouldReflect` scorer that once lived here was
+ * deleted 2026-08-16 — production triggering is the orchestrator's
+ * `isAgentDirty`, and half the scorer's input signals had lost their
+ * producers with the plan-rail removal.)
  */
-
-import type {
-  RunMetrics,
-  TriggerSignal,
-  MetacognitiveReflection,
-  MetacognitionConfig,
-} from "./types.js";
-import { createLogger } from "../shared/logger.js";
-
-const log = createLogger("metacognition");
 
 /** Stable system role used by the production reflection call and model
  * benchmark. Keep scenario evidence in the user message, not this prefix. */
 export const REFLECTION_SYSTEM_PROMPT =
   'You are a self-improvement assistant. Reflect on the conversation summary and refine your skills and self-knowledge. '
-  + 'Available tools: skill_manage (create / patch / delete skills) and metacognition (update COMPETENCE.md / LEARNING_STRATEGIES.md).';
+  + 'Use only the tools supplied to this reflection. metacognition updates COMPETENCE.md / LEARNING_STRATEGIES.md; '
+  + 'skill_manage is supplied only when reflecting for a named Agent.';
 
 // ── User correction detection (heuristic, no LLM cost) ─────────────────
 
@@ -53,158 +42,6 @@ const ALL_CORRECTION_PATTERNS = [...CORRECTION_PATTERNS_ZH, ...CORRECTION_PATTER
  */
 export function detectUserCorrection(userMessage: string): boolean {
   return ALL_CORRECTION_PATTERNS.some(re => re.test(userMessage));
-}
-
-// ── RunMetrics factory ──────────────────────────────────────────────────
-
-/** Create a fresh RunMetrics with all counters zeroed. */
-export function emptyRunMetrics(): RunMetrics {
-  return {
-    toolCalls: 0,
-    toolNames: [],
-    skillsLoaded: [],
-    hadErrors: false,
-    recovered: false,
-    errorCount: 0,
-    userCorrections: 0,
-    errorKind: 'none',
-    transientErrorCount: 0,
-  };
-}
-
-// ── Multi-signal trigger ────────────────────────────────────────────────
-
-/**
- * Evaluate whether a completed run warrants metacognitive reflection.
- *
- * Uses weighted signals instead of a fixed counter threshold.
- * When COMPETENCE.md content is provided, additional signals
- * (known weakness matching) become available.
- *
- * @param metrics  Collected run metrics
- * @param config   Metacognition config (threshold, etc.)
- * @param competence  Current COMPETENCE.md content (optional)
- */
-export function shouldReflect(
-  metrics: RunMetrics,
-  config: MetacognitionConfig,
-  competence?: string,
-): MetacognitiveReflection {
-  const signals: TriggerSignal[] = [];
-
-  // Signal 1: Error recovery (failure = best learning opportunity)
-  // Gate: recovering from purely transient errors is normal, not worth reflecting on.
-  if (metrics.hadErrors && metrics.recovered && metrics.errorKind !== 'transient') {
-    signals.push({
-      name: 'error_recovery',
-      weight: metrics.errorKind === 'mixed' ? 0.3 : 0.8,
-      reason: `Recovered from ${metrics.errorCount} error(s)`,
-    });
-  }
-
-  // Signal 2: User corrections (direct feedback, highest priority)
-  if (metrics.userCorrections > 0) {
-    signals.push({
-      name: 'user_correction',
-      weight: 0.9,
-      reason: `User corrected approach ${metrics.userCorrections} time(s)`,
-    });
-  }
-
-  // Signal 3: Task complexity (many tool calls = worth capturing)
-  if (metrics.toolCalls > 8) {
-    signals.push({
-      name: 'complexity',
-      weight: 0.5,
-      reason: `Complex task with ${metrics.toolCalls} tool calls`,
-    });
-  }
-
-  // Signal 4: Known weakness hit (from COMPETENCE.md)
-  if (competence && hitsKnownWeakness(metrics, competence)) {
-    if (metrics.hadErrors) {
-      signals.push({
-        name: 'known_weakness',
-        weight: 0.7,
-        reason: 'Task overlaps with a known weakness area',
-      });
-    } else {
-      // Signal 6: Previously marked weakness succeeded — trigger positive update.
-      signals.push({
-        name: 'weakness_succeeded',
-        weight: 0.75,
-        reason: 'Task overlaps with a known weakness but completed without errors',
-      });
-    }
-  }
-
-  // Signal 5: Skill used but ineffective
-  // Gate: transient errors (network, rate-limit) are not the skill's fault.
-  if (metrics.skillsLoaded.length > 0 && metrics.hadErrors && metrics.errorKind !== 'transient') {
-    signals.push({
-      name: 'skill_ineffective',
-      weight: metrics.errorKind === 'mixed' ? 0.3 : 0.85,
-      reason: `Skill(s) loaded but task had errors: ${metrics.skillsLoaded.join(', ')}`,
-    });
-  }
-
-  const score = signals.reduce((sum, s) => sum + s.weight, 0);
-  const trigger = signals.length > 0 && score >= config.reflectThreshold;
-  const primaryFocus = signals.length > 0
-    ? signals.sort((a, b) => b.weight - a.weight)[0].name
-    : '';
-
-  if (signals.length > 0) {
-    const signalSummary = signals.map(s => `${s.name}(${s.weight})`).join(', ');
-    if (trigger) {
-      log.info(`reflect=YES score=${score.toFixed(2)} threshold=${config.reflectThreshold} focus=${primaryFocus} signals=[${signalSummary}] errorKind=${metrics.errorKind}`);
-    } else {
-      log.debug(`reflect=NO score=${score.toFixed(2)} threshold=${config.reflectThreshold} signals=[${signalSummary}] errorKind=${metrics.errorKind}`);
-    }
-  }
-
-  return { shouldReflect: trigger, signals, primaryFocus, score };
-}
-
-/**
- * Check if the current run's tool usage overlaps with known weaknesses
- * listed in COMPETENCE.md. Simple keyword matching.
- */
-function hitsKnownWeakness(metrics: RunMetrics, competence: string): boolean {
-  // Look for a "weaknesses" section (or its Chinese equivalent "已知弱点",
-  // kept so user-authored COMPETENCE.md from earlier zh-default builds still
-  // matches without a migration pass).
-  const weaknessSection = extractSection(competence, ['已知弱点', 'weaknesses', 'weak']);
-  if (!weaknessSection) return false;
-
-  // Check if any tool names or error context overlaps
-  const lower = weaknessSection.toLowerCase();
-  for (const toolName of metrics.toolNames) {
-    // Simplistic: if competence mentions the tool name as a weakness area
-    if (lower.includes(toolName.toLowerCase())) return true;
-  }
-  return false;
-}
-
-/** Extract a markdown section by heading keyword. */
-function extractSection(text: string, headingKeywords: string[]): string | null {
-  const lines = text.split('\n');
-  let capture = false;
-  const captured: string[] = [];
-
-  for (const line of lines) {
-    if (line.startsWith('#')) {
-      if (capture) break; // Next heading → stop
-      const lower = line.toLowerCase();
-      if (headingKeywords.some(k => lower.includes(k))) {
-        capture = true;
-        continue;
-      }
-    }
-    if (capture) captured.push(line);
-  }
-
-  return captured.length > 0 ? captured.join('\n').trim() : null;
 }
 
 // ── Review prompt generation ────────────────────────────────────────────
@@ -304,7 +141,7 @@ export function buildReviewPrompt(
     strategies || '(No strategy log yet — use your own judgment.)',
     '',
     'After reflecting, you can:',
-    '1. Create / patch / delete skills via the skill_manage tool '
+    '1. When skill_manage is available for a named Agent, create / patch / delete learned skills with it '
     + '(no user confirmation needed during reflection — the tool\'s default '
     + '"confirm with user" guidance is for live turns, not for this call).',
     '2. Update COMPETENCE.md via the metacognition tool',

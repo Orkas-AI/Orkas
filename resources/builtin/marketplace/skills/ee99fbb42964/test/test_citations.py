@@ -10,18 +10,20 @@ text-processing test rule.
 """
 
 import os
+import hashlib
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 import citations  # noqa: E402
 from citations import (  # noqa: E402
-    MIN_QUOTE_CHARS, _enrich_sources_from_evidence_ledger, _normalize_url,
-    references, verify,
+    MIN_QUOTE_CHARS, _cli_stdout, _enrich_sources_from_evidence_ledger,
+    _expand_compact_landscape_payload, _normalize_url, references, verify,
 )
 
 
@@ -49,6 +51,98 @@ def _claim(text, *cits):
 
 def _verify(claims, sources=None):
     return verify({"sources": SOURCES if sources is None else sources, "claims": claims})
+
+
+def _write_trusted_snapshot(path, url, text, *, content_hash=None):
+    row = {
+        "schema_version": 1,
+        "canonical_url": url,
+        "captured_at": "2026-08-20T00:00:00.000Z",
+        "content_sha256": (
+            content_hash
+            if content_hash is not None
+            else hashlib.sha256(text.encode("utf-8")).hexdigest()
+        ),
+        "text": text,
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(row) + "\n")
+
+
+def _write_single_compact_case(directory, *, source_url, claim):
+    input_path = os.path.join(directory, "citations_input.json")
+    ledger_path = os.path.join(directory, "evidence_ledger.jsonl")
+    with open(input_path, "w", encoding="utf-8") as fh:
+        json.dump({
+            "compact_landscape": {
+                "candidates": [{
+                    "candidate": "Example app",
+                    "best_for": "Desktop use",
+                    "ideal_user": "Desktop user",
+                }],
+            },
+        }, fh)
+    with open(ledger_path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "id": "claim_os",
+            "candidate": "Example app",
+            "field": "os",
+            "source_id": "official",
+            "canonical_url": source_url,
+            "quote": claim,
+            "claim": claim,
+        }) + "\n")
+    return input_path
+
+
+def _comparison_fixture(*, privacy_field="local_offline"):
+    facts = {
+        "os": "The desktop app supports Windows and macOS.",
+        "setup_ease": "The desktop app provides a signed installer.",
+        "model_capabilities": "The desktop app supports local language models.",
+        privacy_field: (
+            "The desktop app runs fully offline."
+            if privacy_field == "local_offline"
+            else "The desktop app keeps private data on the device."
+        ),
+        "pricing_cost": "The desktop app is free for personal use.",
+        "key_limitations": "The desktop app requires sixteen gigabytes of memory.",
+    }
+    claims = []
+    field_claims = {}
+    for field, text in facts.items():
+        claim_id = "claim_{}".format(field)
+        claims.append({
+            "id": claim_id,
+            "text": text,
+            "citations": [{"source": "official", "quote": text}],
+        })
+        field_claims[field] = [claim_id]
+    row = {
+        "candidate": "Example desktop app",
+        "best_for": "Everyday private use",
+        "os": "Not verified",
+        "setup_ease": "Not verified",
+        "model_capabilities": "Not verified",
+        "local_offline": "Not verified",
+        "privacy_data_handling": "Not verified",
+        "pricing_cost": "Not verified",
+        "key_limitations": "Not verified",
+        "ideal_user": "Everyday desktop user",
+        "evidence_sources": ["official"],
+        "field_claims": field_claims,
+        **facts,
+    }
+    return {
+        "sources": [{
+            "id": "official",
+            "url": "https://example.com/desktop-app",
+            "title": "Official desktop app guide",
+            "text": " ".join(facts.values()),
+        }],
+        "claims": claims,
+        "comparison": [row],
+    }
 
 
 class QuoteVerification(unittest.TestCase):
@@ -224,6 +318,416 @@ class References(unittest.TestCase):
         self.assertEqual(out["claims"][0]["citations"][0]["ref"], 1)
         self.assertEqual(out["claims"][1]["citations"][0]["ref"], 1)
 
+
+class CompactLandscapeInput(unittest.TestCase):
+    def test_expands_tagged_evidence_and_writes_verified_report(self):
+        field_claims = {
+            "os": "The desktop app supports Windows and macOS.",
+            "setup_ease": "The desktop app provides a signed installer.",
+            "model_capabilities": "The desktop app supports local language models.",
+            "local_offline": "The desktop app runs fully offline after setup.",
+            "pricing_cost": "The desktop app is free for personal use.",
+            "key_limitations": "The desktop app requires sixteen gigabytes of memory.",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_path = os.path.join(tmp, "evidence_ledger.jsonl")
+            snapshot_path = os.path.join(tmp, "source_snapshots.jsonl")
+            input_path = os.path.join(tmp, "citations_input.json")
+            output_path = os.path.join(tmp, "citations_output.json")
+            report_path = os.path.join(tmp, "RESEARCH-REPORT.md")
+            with open(ledger_path, "w", encoding="utf-8") as fh:
+                for index, (field, claim) in enumerate(field_claims.items(), 1):
+                    fh.write(json.dumps({
+                        "id": "claim_{}".format(index),
+                        "candidate": "Example desktop app",
+                        "field": field,
+                        "source_id": "official",
+                        "url": "https://example.com/desktop-app",
+                        "title": "Official desktop app guide",
+                        "source_date": "2026-08-20",
+                        "accessed_at": "2026-08-20",
+                        "quote": claim,
+                        "claim": claim,
+                        "limitations": "Official product source only.",
+                    }, ensure_ascii=False) + "\n")
+            payload = {
+                "compact_landscape": {
+                    "title": "Example desktop-app comparison",
+                    "boundary": "Official evidence accessed on 2026-08-20.",
+                    "candidates": [{
+                        "candidate": "Example desktop app",
+                        "best_for": "Everyday private use",
+                        "ideal_user": "Everyday desktop user",
+                    }],
+                },
+            }
+            with open(input_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+
+            _write_trusted_snapshot(
+                snapshot_path,
+                "https://example.com/desktop-app",
+                "\n".join(field_claims.values()),
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {"ORKAS_DEEP_RESEARCH_EVIDENCE_FILE": snapshot_path},
+            ):
+                result = citations.main([
+                    "--op", "verify",
+                    "--input", input_path,
+                    "--out", output_path,
+                    "--report-out", report_path,
+                ])
+
+            data = result["data"]
+            self.assertEqual(data["summary"]["supported"], 6)
+            self.assertEqual(data["summary"]["comparison_recommendation_ready"], 1)
+            self.assertEqual(
+                data["compact_landscape_expansion"]["selected_evidence_rows"], 6
+            )
+            self.assertTrue(os.path.isfile(report_path))
+            with open(report_path, encoding="utf-8") as fh:
+                report = fh.read()
+            self.assertIn("# Example desktop-app comparison", report)
+            self.assertIn("Official evidence accessed on 2026-08-20.", report)
+            self.assertIn("## Recommendations", report)
+            self.assertIn(
+                "Recommendations are analytical inferences",
+                report,
+            )
+            self.assertIn("| Candidate | Best for |", report)
+            self.assertIn("## Evidence used", report)
+            self.assertEqual(
+                data["compact_landscape_expansion"]["missing_snapshot_sources"],
+                0,
+            )
+
+            stdout = _cli_stdout(result, [
+                "--input", input_path,
+                "--out", output_path,
+                "--report-out", report_path,
+            ])
+            self.assertEqual(stdout["report"]["path"], report_path)
+            self.assertNotIn("comparison_markdown", stdout)
+            self.assertNotIn("evidence_markdown", stdout)
+
+    def test_fabricated_compact_quote_is_not_supported_by_host_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = os.path.join(tmp, "citations_input.json")
+            ledger_path = os.path.join(tmp, "evidence_ledger.jsonl")
+            snapshot_path = os.path.join(tmp, "source_snapshots.jsonl")
+            with open(input_path, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "compact_landscape": {
+                        "candidates": [{
+                            "candidate": "Example app",
+                            "best_for": "Desktop use",
+                            "ideal_user": "Desktop user",
+                        }],
+                    },
+                }, fh)
+            with open(ledger_path, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "id": "claim_os",
+                    "candidate": "Example app",
+                    "field": "os",
+                    "source_id": "official",
+                    "canonical_url": "https://example.com/app",
+                    "quote": "The app supports every desktop operating system.",
+                    "claim": "The app supports every desktop operating system.",
+                }) + "\n")
+            _write_trusted_snapshot(
+                snapshot_path,
+                "https://example.com/app",
+                "The official page documents a browser application.",
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {"ORKAS_DEEP_RESEARCH_EVIDENCE_FILE": snapshot_path},
+            ):
+                result = citations.main([
+                    "--op", "verify",
+                    "--input", input_path,
+                ])
+
+            data = result["data"]
+            self.assertEqual(data["summary"]["supported"], 0)
+            self.assertEqual(data["summary"]["flagged"], 1)
+            self.assertEqual(data["claims"][0]["citations"][0]["quote_status"], "not_found")
+
+    def test_tampered_host_snapshot_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = os.path.join(tmp, "citations_input.json")
+            ledger_path = os.path.join(tmp, "evidence_ledger.jsonl")
+            snapshot_path = os.path.join(tmp, "source_snapshots.jsonl")
+            claim = "The app supports Windows and macOS."
+            with open(input_path, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "compact_landscape": {
+                        "candidates": [{
+                            "candidate": "Example app",
+                            "best_for": "Desktop use",
+                            "ideal_user": "Desktop user",
+                        }],
+                    },
+                }, fh)
+            with open(ledger_path, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "id": "claim_os",
+                    "candidate": "Example app",
+                    "field": "os",
+                    "source_id": "official",
+                    "canonical_url": "https://example.com/app",
+                    "quote": claim,
+                    "claim": claim,
+                }) + "\n")
+            _write_trusted_snapshot(
+                snapshot_path,
+                "https://example.com/app",
+                claim,
+                content_hash="0" * 64,
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {"ORKAS_DEEP_RESEARCH_EVIDENCE_FILE": snapshot_path},
+            ):
+                result = citations.main([
+                    "--op", "verify",
+                    "--input", input_path,
+                ])
+
+            expansion = result["data"]["compact_landscape_expansion"]
+            self.assertEqual(result["data"]["summary"]["supported"], 0)
+            self.assertEqual(expansion["trusted_source_snapshots"]["valid_rows"], 0)
+            self.assertEqual(expansion["trusted_source_snapshots"]["invalid_rows"], 1)
+            self.assertEqual(expansion["missing_snapshot_sources"], 1)
+
+    def test_compact_quote_cannot_borrow_matching_text_from_another_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            claim = "The app supports Windows and macOS."
+            input_path = _write_single_compact_case(
+                tmp,
+                source_url="https://claimed.example/app",
+                claim=claim,
+            )
+            snapshot_path = os.path.join(tmp, "source_snapshots.jsonl")
+            _write_trusted_snapshot(
+                snapshot_path,
+                "https://different.example/app",
+                claim,
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {"ORKAS_DEEP_RESEARCH_EVIDENCE_FILE": snapshot_path},
+            ):
+                result = citations.main([
+                    "--op", "verify",
+                    "--input", input_path,
+                ])
+
+            data = result["data"]
+            expansion = data["compact_landscape_expansion"]
+            self.assertEqual(data["summary"]["supported"], 0)
+            self.assertEqual(data["summary"]["flagged"], 1)
+            self.assertEqual(
+                data["claims"][0]["citations"][0]["quote_status"],
+                "not_found",
+            )
+            self.assertEqual(expansion["missing_snapshot_sources"], 1)
+
+    def test_valid_snapshot_survives_a_partial_trailing_jsonl_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            claim = "The app supports Windows and macOS."
+            source_url = "https://example.com/app"
+            input_path = _write_single_compact_case(
+                tmp,
+                source_url=source_url,
+                claim=claim,
+            )
+            snapshot_path = os.path.join(tmp, "source_snapshots.jsonl")
+            _write_trusted_snapshot(snapshot_path, source_url, claim)
+            with open(snapshot_path, "a", encoding="utf-8") as fh:
+                fh.write('{"schema_version":1,"canonical_url":')
+
+            with mock.patch.dict(
+                os.environ,
+                {"ORKAS_DEEP_RESEARCH_EVIDENCE_FILE": snapshot_path},
+            ):
+                result = citations.main([
+                    "--op", "verify",
+                    "--input", input_path,
+                ])
+
+            data = result["data"]
+            diagnostics = data["compact_landscape_expansion"][
+                "trusted_source_snapshots"
+            ]
+            self.assertEqual(data["summary"]["supported"], 1)
+            self.assertEqual(data["summary"]["flagged"], 0)
+            self.assertEqual(diagnostics["valid_rows"], 1)
+            self.assertEqual(diagnostics["invalid_rows"], 1)
+            self.assertEqual(diagnostics["source_urls"], 1)
+
+    def test_compact_field_uses_the_first_evidence_row_that_verifies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = os.path.join(tmp, "citations_input.json")
+            ledger_path = os.path.join(tmp, "evidence_ledger.jsonl")
+            snapshot_path = os.path.join(tmp, "source_snapshots.jsonl")
+            source_url = "https://example.com/app"
+            unsupported = "The app supports every desktop operating system."
+            supported = "The app supports Windows and macOS."
+            with open(input_path, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "compact_landscape": {
+                        "candidates": [{
+                            "candidate": "Example app",
+                            "best_for": "Desktop use",
+                            "ideal_user": "Desktop user",
+                        }],
+                    },
+                }, fh)
+            with open(ledger_path, "w", encoding="utf-8") as fh:
+                for claim_id, claim in (
+                    ("unsupported_os", unsupported),
+                    ("supported_os", supported),
+                ):
+                    fh.write(json.dumps({
+                        "id": claim_id,
+                        "candidate": "Example app",
+                        "field": "os",
+                        "source_id": "official",
+                        "canonical_url": source_url,
+                        "quote": claim,
+                        "claim": claim,
+                    }) + "\n")
+            _write_trusted_snapshot(snapshot_path, source_url, supported)
+
+            with mock.patch.dict(
+                os.environ,
+                {"ORKAS_DEEP_RESEARCH_EVIDENCE_FILE": snapshot_path},
+            ):
+                result = citations.main([
+                    "--op", "verify",
+                    "--input", input_path,
+                ])
+
+            data = result["data"]
+            self.assertEqual(data["summary"]["supported"], 1)
+            self.assertEqual(data["summary"]["flagged"], 0)
+            self.assertEqual(data["claims"][0]["id"], "supported_os")
+            self.assertIn(supported, data["comparison_rows"][0]["os"])
+            self.assertNotIn(unsupported, data["comparison_markdown"])
+
+    def test_compact_field_skips_an_exact_quote_that_does_not_support_its_claim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = os.path.join(tmp, "citations_input.json")
+            ledger_path = os.path.join(tmp, "evidence_ledger.jsonl")
+            snapshot_path = os.path.join(tmp, "source_snapshots.jsonl")
+            source_url = "https://example.com/app"
+            unrelated_quote = "The company was founded in 2018."
+            unsupported = "The app supports every desktop operating system."
+            supported = "The app supports Windows and macOS."
+            with open(input_path, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "compact_landscape": {
+                        "candidates": [{
+                            "candidate": "Example app",
+                            "best_for": "Desktop use",
+                            "ideal_user": "Desktop user",
+                        }],
+                    },
+                }, fh)
+            with open(ledger_path, "w", encoding="utf-8") as fh:
+                for claim_id, claim, quote in (
+                    ("misaligned_os", unsupported, unrelated_quote),
+                    ("supported_os", supported, supported),
+                ):
+                    fh.write(json.dumps({
+                        "id": claim_id,
+                        "candidate": "Example app",
+                        "field": "os",
+                        "source_id": "official",
+                        "canonical_url": source_url,
+                        "quote": quote,
+                        "claim": claim,
+                    }) + "\n")
+            _write_trusted_snapshot(
+                snapshot_path,
+                source_url,
+                "{} {}".format(unrelated_quote, supported),
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {"ORKAS_DEEP_RESEARCH_EVIDENCE_FILE": snapshot_path},
+            ):
+                result = citations.main([
+                    "--op", "verify",
+                    "--input", input_path,
+                ])
+
+            data = result["data"]
+            self.assertEqual(data["summary"]["supported"], 1)
+            self.assertEqual(data["summary"]["flagged"], 0)
+            self.assertEqual(data["claims"][0]["id"], "supported_os")
+            self.assertIn(supported, data["comparison_rows"][0]["os"])
+            self.assertNotIn(unsupported, data["comparison_markdown"])
+
+    def test_rejects_mixed_compact_and_expanded_payloads(self):
+        with self.assertRaisesRegex(ValueError, "must not be mixed"):
+            _expand_compact_landscape_payload({
+                "compact_landscape": {"candidates": [{}]},
+                "sources": [{"id": "s1"}],
+            }, "citations_input.json")
+
+    def test_rejects_one_source_id_bound_to_multiple_urls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_path = os.path.join(tmp, "evidence_ledger.jsonl")
+            input_path = os.path.join(tmp, "citations_input.json")
+            rows = [
+                {
+                    "id": "claim_os",
+                    "candidate": "Example app",
+                    "field": "os",
+                    "source_id": "official",
+                    "canonical_url": "https://example.com/download",
+                    "quote": "The app supports Windows and macOS.",
+                    "claim": "The app supports Windows and macOS.",
+                },
+                {
+                    "id": "claim_pricing",
+                    "candidate": "Example app",
+                    "field": "pricing_cost",
+                    "source_id": "official",
+                    "canonical_url": "https://example.net/pricing",
+                    "quote": "The app is free for personal use.",
+                    "claim": "The app is free for personal use.",
+                },
+            ]
+            with open(ledger_path, "w", encoding="utf-8") as fh:
+                for row in rows:
+                    fh.write(json.dumps(row) + "\n")
+            with open(input_path, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "compact_landscape": {
+                        "candidates": [{
+                            "candidate": "Example app",
+                            "best_for": "Personal use",
+                            "ideal_user": "Desktop user",
+                        }],
+                    },
+                }, fh)
+
+            with self.assertRaisesRegex(ValueError, "multiple canonical URLs"):
+                citations.main(["--op", "verify", "--input", input_path])
+
+
+class ReferencesContinued(unittest.TestCase):
     def test_numbering_is_first_cited_order(self):
         out = _verify([_claim("a",
                               _cite(source="s2", quote="add round-trip latency"),
@@ -430,6 +934,128 @@ class References(unittest.TestCase):
         self.assertIn("Local \\| Agent", table)
         self.assertIn("| E1 |", table)
         self.assertEqual(out["comparison_warnings"], [])
+
+    def test_comparison_coverage_marks_a_complete_decision_row_ready(self):
+        out = verify(_comparison_fixture())
+
+        coverage = out["comparison_coverage"][0]
+        self.assertEqual(coverage["status"], "recommendation_ready")
+        self.assertTrue(coverage["recommendation_ready"])
+        self.assertEqual(coverage["verified_field_count"], 6)
+        self.assertEqual(coverage["factual_field_count"], 7)
+        self.assertEqual(coverage["missing_decision_groups"], [])
+        self.assertEqual(out["summary"]["comparison_recommendation_ready"], 1)
+        self.assertEqual(out["summary"]["comparison_under_evidenced"], 0)
+        self.assertIn(
+            "**Everyday private use: Example desktop app**",
+            out["recommendation_markdown"],
+        )
+        self.assertIn("material limitation:", out["recommendation_markdown"])
+        self.assertIn("[E6]", out["recommendation_markdown"])
+        self.assertIn(
+            "Recommendations are analytical inferences",
+            out["recommendation_markdown"],
+        )
+        self.assertIn(
+            "verified comparison evidence:",
+            out["recommendation_markdown"],
+        )
+        self.assertNotIn("verified recommendation", out["recommendation_markdown"].lower())
+        self.assertNotIn("verified pick", out["recommendation_markdown"].lower())
+
+    def test_comparison_coverage_accepts_privacy_instead_of_offline_evidence(self):
+        out = verify(_comparison_fixture(privacy_field="privacy_data_handling"))
+
+        coverage = out["comparison_coverage"][0]
+        self.assertTrue(coverage["recommendation_ready"])
+        self.assertIn("privacy_data_handling", coverage["verified_fields"])
+        self.assertIn("local_offline", coverage["not_verified_fields"])
+
+    def test_comparison_coverage_requires_a_material_limitation(self):
+        payload = _comparison_fixture()
+        row = payload["comparison"][0]
+        row["key_limitations"] = "Not verified"
+        row["field_claims"].pop("key_limitations")
+
+        out = verify(payload)
+
+        coverage = out["comparison_coverage"][0]
+        self.assertFalse(coverage["recommendation_ready"])
+        self.assertEqual(coverage["tradeoff_groups_verified"], 2)
+        self.assertEqual(coverage["missing_decision_groups"], ["limitations"])
+        self.assertEqual(coverage["blocking_decision_groups"], ["limitations"])
+        self.assertIn(
+            "Conditional path — **Everyday private use: Example desktop app**",
+            out["recommendation_markdown"],
+        )
+        self.assertIn(
+            "verify before choosing: limitations",
+            out["recommendation_markdown"],
+        )
+        self.assertIn(
+            "current comparison evidence:",
+            out["recommendation_markdown"],
+        )
+        self.assertNotIn(
+            "verified comparison evidence:",
+            out["recommendation_markdown"],
+        )
+
+    def test_comparison_coverage_keeps_honest_gaps_but_downgrades_the_row(self):
+        payload = _comparison_fixture()
+        row = payload["comparison"][0]
+        row["pricing_cost"] = "Not verified"
+        row["key_limitations"] = "Not verified"
+        row["field_claims"].pop("pricing_cost")
+        row["field_claims"].pop("key_limitations")
+
+        out = verify(payload)
+
+        self.assertEqual(out["comparison_warnings"], [])
+        coverage = out["comparison_coverage"][0]
+        self.assertEqual(coverage["status"], "under_evidenced")
+        self.assertFalse(coverage["recommendation_ready"])
+        self.assertEqual(coverage["missing_decision_groups"], ["pricing", "limitations"])
+        self.assertEqual(coverage["blocking_decision_groups"], ["limitations", "pricing"])
+        self.assertEqual(out["summary"]["comparison_under_evidenced"], 1)
+        self.assertIn(
+            "verify before choosing: limitations, pricing",
+            out["recommendation_markdown"],
+        )
+        self.assertNotIn(
+            "No retained candidate is recommendation-ready",
+            out["recommendation_markdown"],
+        )
+
+    def test_comparison_markdown_places_claim_ids_on_each_verified_factual_cell(self):
+        out = verify(_comparison_fixture())
+
+        row = out["comparison_rows"][0]
+        for field in (
+            "os", "setup_ease", "model_capabilities", "local_offline",
+            "pricing_cost", "key_limitations",
+        ):
+            self.assertRegex(row[field], r" \[E\d+\]$")
+        self.assertIn(
+            "The desktop app supports Windows and macOS. [E1]",
+            out["comparison_markdown"],
+        )
+
+    def test_comparison_coverage_uses_the_downgraded_normalized_cell(self):
+        payload = _comparison_fixture()
+        payload["comparison"][0]["field_claims"].pop("os")
+
+        out = verify(payload)
+
+        self.assertEqual(out["comparison_rows"][0]["os"], "Not verified: OS")
+        self.assertEqual(
+            out["comparison_coverage"][0]["missing_decision_groups"],
+            ["platform_and_setup"],
+        )
+        self.assertIn(
+            "comparison_field_evidence_missing",
+            {warning["issue"] for warning in out["comparison_warnings"]},
+        )
 
     def test_comparison_downgrades_unmapped_factual_cell(self):
         source = {**SOURCES[0], "accessed_at": "2026-07-28"}
@@ -725,12 +1351,69 @@ class AbstainAndSummary(unittest.TestCase):
         self.assertEqual(stdout["flags"], 0)
         self.assertEqual(stdout["comparison_warnings"], 0)
         self.assertEqual(stdout["comparison_warning_details"], [])
+        self.assertEqual(
+            stdout["comparison_coverage_details"][0]["status"],
+            "under_evidenced",
+        )
+        self.assertEqual(
+            stdout["comparison_coverage_details"][0]["blocking_decision_groups"],
+            ["platform_and_setup", "model_capabilities", "limitations", "pricing"],
+        )
+        self.assertNotIn("verified_fields", stdout["comparison_coverage_details"][0])
         self.assertNotIn("data", stdout)
         self.assertIn("| Candidate |", stdout["comparison_markdown"])
+        self.assertIn("## Recommendations", stdout["recommendation_markdown"])
         self.assertIn("## Evidence used", stdout["evidence_markdown"])
         self.assertTrue(persisted["data"]["claims"][0]["supported"])
+        self.assertEqual(
+            persisted["data"]["comparison_coverage"][0]["missing_decision_groups"],
+            ["platform_and_setup", "model_capabilities", "pricing", "limitations"],
+        )
         self.assertIn("## Evidence used", persisted["data"]["evidence_markdown"])
         self.assertIn("The desktop application keeps private documents", persisted["data"]["evidence_markdown"])
+
+    def test_cli_with_out_compacts_diagnostics_but_persists_full_details(self):
+        script = os.path.join(os.path.dirname(__file__), "..", "scripts", "citations.py")
+        payload = {
+            "sources": [{
+                "id": "s1",
+                "url": "https://example.com/source",
+                "text": "The source discusses desktop installation only.",
+            }],
+            "claims": [{
+                "text": "The application guarantees private offline use.",
+                "citations": [{"source": "s1", "quote": "missing exact quote"}],
+            }],
+            "comparison": [{
+                "candidate": "Example",
+                "os": "Windows",
+                "evidence_sources": ["s1"],
+            }],
+        }
+        with tempfile.TemporaryDirectory() as root:
+            input_path = os.path.join(root, "citations_input.json")
+            output_path = os.path.join(root, "citations_output.json")
+            with open(input_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+            completed = subprocess.run(
+                [sys.executable, script, "--op", "verify", "--input", input_path,
+                 "--out", output_path],
+                check=True,
+                capture_output=True,
+            )
+            stdout = json.loads(completed.stdout.decode("ascii"))
+            with open(output_path, encoding="utf-8") as fh:
+                persisted = json.load(fh)
+
+        self.assertEqual(stdout["flags"], 1)
+        self.assertEqual(stdout["flag_details"][0]["issue"], "quote_not_found_in_source")
+        self.assertNotIn("detail", stdout["flag_details"][0])
+        self.assertGreater(stdout["comparison_warnings"], 0)
+        self.assertNotIn("detail", stdout["comparison_warning_details"][0])
+        self.assertIn("detail", persisted["data"]["flags"][0])
+        self.assertTrue(any(
+            "detail" in item for item in persisted["data"]["comparison_warnings"]
+        ))
 
 
 class UrlNormalization(unittest.TestCase):

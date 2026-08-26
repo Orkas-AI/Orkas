@@ -3,7 +3,6 @@ ownerAgent: bcfcb4921dce
 name: ui-controls-accessibility
 description_zh: "处理复杂表单、复合控件或专项可访问性审查，覆盖控件分类、状态、响应式、文本适配、键盘操作和 A11y；普通界面使用紧凑执行器的基础规则。"
 description_en: "Handle complex forms, composite widgets, or focused accessibility reviews across control taxonomy, states, responsive behavior, text fit, keyboard use, and A11y; ordinary UI uses the compact executor's baseline rules."
-category: rnd
 ---
 
 # ui-controls-accessibility
@@ -89,6 +88,7 @@ Forms:
 - Show required/optional intent clearly.
 - Use inline validation for recoverable errors.
 - Implement the reachable lifecycle: pristine, dirty/touched invalid, submitted-pending with duplicate submission blocked, recoverable server/error feedback, and success. Do not show dirty validation on first render. Every outcome the user explicitly requests (for example import success and import failure) needs its own reachable trigger. With no backend, prefer documented sample inputs or a deterministic local mock resolver exercised by the normal submit action; preview actions are supplementary and must not replace the primary workflow. A conditional branch that is never called with one outcome is dead code and does not count.
+- When a JavaScript parser is unavailable, avoid backslash regex shorthands in generated validators; use `[0-9]`, direct string checks, or `input.validity`. A no-backend prototype may use one explicit Success/Server failure selector, but the normal submit/import action must read it before mutation. Validation errors, post-filter sentinels, or feedback overwritten by render do not prove a requested outcome.
 - Wire field errors with `aria-invalid` and `aria-describedby` where applicable; move or announce focus to the error summary after a failed submit when the form is long.
 
 Data:

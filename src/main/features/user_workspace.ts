@@ -148,6 +148,28 @@ function _isWorkspaceSelectionBlocked(dirPath: string): ReturnType<typeof macosT
   return macosTccWorkspaceBlockedPath(path.resolve(dirPath));
 }
 
+/** Resolve an explicitly selected path before persisting/using it so a
+ * symlink or case-variant alias cannot disguise a protected macOS root. The
+ * direct lexical check runs first and therefore never probes a known TCC
+ * directory merely to reject it. */
+function _resolveWorkspaceSelection(dirPath: string): {
+  path: string;
+  blocked: ReturnType<typeof macosTccWorkspaceBlockedPath>;
+} {
+  const lexicalPath = path.resolve(dirPath);
+  const lexicalBlock = macosTccWorkspaceBlockedPath(lexicalPath);
+  if (lexicalBlock) return { path: lexicalPath, blocked: lexicalBlock };
+  let canonicalPath = lexicalPath;
+  try { canonicalPath = fs.realpathSync.native(lexicalPath); }
+  catch { /* setWorkspacePath/stat below returns the canonical missing-path error */ }
+  return {
+    // Preserve the user-facing spelling (including /var vs /private/var and
+    // safe symlink aliases); canonicalPath is only security-comparison input.
+    path: lexicalPath,
+    blocked: macosTccWorkspaceBlockedPath(canonicalPath),
+  };
+}
+
 /** Effective path for a given scope: project's selection (if any) → default's
  *  selection (if any) → DEFAULT_USER_WORKSPACE. Privacy-protected legacy
  *  selections are never probed and never returned as execution roots. */
@@ -155,14 +177,15 @@ function _effectivePath(cfg: WorkspaceConfig, projectId?: string): string {
   if (projectId) {
     const entry = cfg.projects[projectId];
     if (entry?.selectedPath) {
-      const blocked = _isWorkspaceSelectionBlocked(entry.selectedPath);
+      const selection = _resolveWorkspaceSelection(entry.selectedPath);
+      const blocked = selection.blocked;
       if (blocked) {
         log.warn('project workspace path is privacy-protected — falling back without stat', {
           projectId, path: logPathRef(entry.selectedPath), reason: blocked.reason,
         });
       } else {
         try {
-          if (fs.statSync(entry.selectedPath).isDirectory()) return entry.selectedPath;
+          if (fs.statSync(selection.path).isDirectory()) return selection.path;
         } catch {
           log.warn('project workspace path missing — falling back to default', {
             projectId, path: logPathRef(entry.selectedPath),
@@ -172,14 +195,15 @@ function _effectivePath(cfg: WorkspaceConfig, projectId?: string): string {
     }
   }
   if (cfg.default.selectedPath) {
-    const blocked = _isWorkspaceSelectionBlocked(cfg.default.selectedPath);
+    const selection = _resolveWorkspaceSelection(cfg.default.selectedPath);
+    const blocked = selection.blocked;
     if (blocked) {
       log.warn('default workspace path is privacy-protected — using DEFAULT_USER_WORKSPACE without stat', {
         path: logPathRef(cfg.default.selectedPath), reason: blocked.reason,
       });
     } else {
       try {
-        if (fs.statSync(cfg.default.selectedPath).isDirectory()) return cfg.default.selectedPath;
+        if (fs.statSync(selection.path).isDirectory()) return selection.path;
       } catch {
         log.warn('default workspace path missing — using DEFAULT_USER_WORKSPACE', {
           path: logPathRef(cfg.default.selectedPath),
@@ -260,8 +284,9 @@ export function setWorkspacePath(
   dirPath: string,
   projectId?: string,
 ): { ok: true; path: string } | { ok: false; error: string } {
-  const resolved = path.resolve(dirPath);
-  const protectedSelection = _isWorkspaceSelectionBlocked(resolved);
+  const selection = _resolveWorkspaceSelection(dirPath);
+  const resolved = selection.path;
+  const protectedSelection = selection.blocked;
   if (protectedSelection) {
     log.warn('refused privacy-protected workspace selection', {
       userId, projectId: projectId || '(default)', path: logPathRef(resolved), reason: protectedSelection.reason,

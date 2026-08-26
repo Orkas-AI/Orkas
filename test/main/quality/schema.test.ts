@@ -7,7 +7,7 @@ import {
 } from '../../../src/main/quality/rules/schema';
 
 describe('quality › schema › validateSkillFrontmatter', () => {
-  it('passes a portable skill frontmatter', () => {
+  it('passes a user/custom portable skill frontmatter', () => {
     const v = validateSkillFrontmatter({
       name: 'pdf-summarize',
       description: 'Summarize PDF documents',
@@ -52,15 +52,52 @@ describe('quality › schema › validateSkillFrontmatter', () => {
     expect(v.map((x) => x.rule)).not.toContain('frontmatter_description_missing');
   });
 
-  it('flags overlong description as MEDIUM', () => {
-    const long = 'x'.repeat(900);
+  it('passes the bilingual platform-managed description shape', () => {
     const v = validateSkillFrontmatter({
-      name: 'foo',
-      description: long,
+      name: 'pdf-summarize',
+      description_zh: '总结 PDF 文档',
+      description_en: 'Summarize PDF documents',
     });
-    const long_v = v.find((x) => x.rule === 'frontmatter_description_too_long');
+    expect(v).toEqual([]);
+  });
+
+  it('flags mixed generic and localized description shapes', () => {
+    const v = validateSkillFrontmatter({
+      name: 'pdf-summarize',
+      description: 'Summarize PDF documents',
+      description_zh: '总结 PDF 文档',
+      description_en: 'Summarize PDF documents',
+    });
+    const mixed = v.find((x) => x.rule === 'frontmatter_description_shapes_mixed');
+    expect(mixed?.level).toBe('MEDIUM');
+    expect(mixed?.suggested_fix).toContain('exactly one description shape');
+  });
+
+  it('flags an incomplete platform-managed localized description pair', () => {
+    const v = validateSkillFrontmatter({
+      name: 'pdf-summarize',
+      description_zh: '总结 PDF 文档',
+    });
+    const incomplete = v.find((x) => x.rule === 'frontmatter_localized_description_incomplete');
+    expect(incomplete?.level).toBe('MEDIUM');
+    expect(incomplete?.field).toBe('frontmatter:description_en');
+  });
+
+  it('flags Skill descriptions only above the runtime roster boundary', () => {
+    const atBoundary = validateSkillFrontmatter({
+      name: 'foo',
+      description: 'x'.repeat(512),
+    });
+    expect(atBoundary.map((x) => x.rule)).not.toContain('frontmatter_description_too_long');
+
+    const overBoundary = validateSkillFrontmatter({
+      name: 'foo',
+      description: 'x'.repeat(513),
+    });
+    const long_v = overBoundary.find((x) => x.rule === 'frontmatter_description_too_long');
     expect(long_v?.level).toBe('MEDIUM');
     expect(long_v?.field).toBe('frontmatter:description');
+    expect(long_v?.suggested_fix).toContain('512');
   });
 
   it('flags a name with single-space groups', () => {
@@ -71,12 +108,12 @@ describe('quality › schema › validateSkillFrontmatter', () => {
     expect(v.map((x) => x.rule)).toContain('frontmatter_name_invalid');
   });
 
-  it('tolerates legacy extension fields as advisory', () => {
+  it('treats localized descriptions as standard and other Orkas fields as advisory', () => {
     const v = validateSkillFrontmatter({
       name: 'foo', description_zh: 'x', description_en: 'x', category: 'data',
     });
     expect(v.filter((x) => x.rule === 'frontmatter_extension_field').map((x) => x.level))
-      .toEqual(['LOW', 'LOW', 'LOW']);
+      .toEqual(['LOW']);
   });
 });
 

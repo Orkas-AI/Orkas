@@ -83,6 +83,23 @@ describe('project_tasks › createTask', () => {
     expect((await pt.listTasks(TEST_UID, pid)).map((task) => task.id)).toEqual([first.task.id]);
   });
 
+  it('treats balanced presentation quotes as the same open task title', async () => {
+    const { pt, pid } = await setup();
+    const first = await pt.createTask(TEST_UID, pid, { title: '本周完成支付 webhook 重试机制' });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    for (const quoted of [
+      '“本周完成支付 webhook 重试机制”',
+      '「本周完成支付 webhook 重试机制」',
+      '"本周完成支付 webhook 重试机制"',
+    ]) {
+      const duplicate = await pt.createTask(TEST_UID, pid, { title: quoted, created_by: 'agent' });
+      expect(duplicate).toEqual({ ok: true, task: first.task, alreadyExists: true });
+    }
+    expect(await pt.listTasks(TEST_UID, pid)).toHaveLength(1);
+  });
+
   it('serializes concurrent same-title creates and allows reuse after completion', async () => {
     const { pt, pid } = await setup();
     const [left, right] = await Promise.all([

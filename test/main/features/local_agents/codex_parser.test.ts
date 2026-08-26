@@ -11,6 +11,8 @@ import {
   selectCodexTurnPrompt,
 } from '../../../../src/main/features/local_agents/backends/codex';
 
+const PNG_1X1_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6nKsAAAAASUVORK5CYII=';
+
 describe('local_agents/backends/codex › phased agent messages', () => {
   it('maps item phases onto deltas and resolves only the final answer', () => {
     const messages = new CodexAgentMessageAccumulator();
@@ -145,11 +147,13 @@ describe('local_agents/backends/codex › structured work items', () => {
         id: 'generation-1',
         type: 'imageGeneration',
         prompt: 'a blue square',
-        result: { path: '/tmp/generated.png' },
+        // Real Codex app-server completion payload: raw image bytes encoded
+        // as Base64, not a filesystem path owned by Orkas.
+        result: PNG_1X1_BASE64,
       },
       tool: 'image_generation',
       input: { prompt: 'a blue square' },
-      output: { path: '/tmp/generated.png' },
+      output: PNG_1X1_BASE64,
     },
     {
       name: 'background wait',

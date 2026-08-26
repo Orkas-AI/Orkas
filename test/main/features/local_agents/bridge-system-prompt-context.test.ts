@@ -8,7 +8,7 @@ describe('local_agents/runner › supplied conversation context contract', () =>
 
     expect(prompt).toContain('Use the conversation context supplied in the current prompt');
     expect(prompt).toMatch(/Query only when exact needed context was omitted by the bounded history block/i);
-    expect(prompt).toContain('chat_search / chat_read');
+    expect(prompt).toContain('chat_history actions search / read');
     expect(prompt).not.toContain('unresolved local reference');
   });
 });

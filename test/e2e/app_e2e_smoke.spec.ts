@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { expect, OrkasTestApp, test } from './fixtures/orkas';
@@ -59,9 +59,32 @@ test.describe('desktop shell', () => {
     expect(result.ts).toEqual(expect.any(String));
     expect(orkas.lastLaunchReadyMs).not.toBeNull();
     expect(orkas.lastLaunchReadyMs as number).toBeLessThanOrEqual(30_000);
+    const [agents, skills] = await Promise.all([
+      orkas.invoke<{ agents: Array<{ agent_id: string }> }>('agents.list'),
+      orkas.invoke<{ skills: Array<{ id: string }> }>('skills.list'),
+    ]);
+    expect(agents.agents.map((agent) => agent.agent_id)).toContain('79df9cc89f5f');
+    expect(skills.skills.map((skill) => skill.id)).toContain('ee99fbb42964');
+    // The open build intentionally has no account surface. Resolve the active local
+    // user from the workspace registry while still proving that first-window
+    // publication completed before the renderer became ready.
+    const usersRegistry = JSON.parse(readFileSync(
+      path.join(orkas.workspaceRoot, 'users.json'),
+      'utf8',
+    )) as { current_user_id?: string };
+    expect(usersRegistry.current_user_id).toEqual(expect.any(String));
+    expect(existsSync(path.join(
+      orkas.workspaceRoot,
+      usersRegistry.current_user_id!,
+      'local',
+      'system',
+      'skills',
+      'project-tasks',
+      'SKILL.md',
+    ))).toBe(true);
     const model = await orkas.invoke<{ configured: boolean }>('auth.hasConfiguredModel');
     expect(model.configured).toBe(true);
-    await expect(appPage.locator('#model-guard-banner')).toBeHidden();
+    await expect(appPage.locator('#model-guard-banner')).toHaveCount(0);
 
     const openBuildEnvironment = await appPage.evaluate(async () => {
       const env = await (window as any).orkas.env();

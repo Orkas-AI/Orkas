@@ -31,6 +31,21 @@ function _convTrackError(action, data) {
   try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
+function _conversationMediaHandleMaterialized(payload) {
+  const ownerUid = String(payload?.user_id || '');
+  const cid = String(payload?.conversation_id || '');
+  if (!ownerUid || ownerUid !== String(currentUserId || '')) return;
+  if (!cid || cid !== String(currentCid || '')) return;
+  if (typeof _applyMaterializedMarkdownMedia !== 'function') return;
+  _applyMaterializedMarkdownMedia(payload, document);
+}
+
+try {
+  if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
+    window.orkas.onPushEvent('conversation:media_materialized', _conversationMediaHandleMaterialized);
+  }
+} catch (_) {}
+
 function _trackAgentRunResultTelemetry(cid, evData) {
   void cid;
   void evData;
@@ -196,13 +211,47 @@ function _skillsForDisplayNameRewrite() {
   return (typeof _skillsCache !== 'undefined' && Array.isArray(_skillsCache)) ? _skillsCache : [];
 }
 
+function _skillVirtualRefParts(value) {
+  const normalized = String(value || '').trim();
+  if (normalized.includes('\0') || normalized.includes('\\')) return null;
+  const match = /^@skill\/([^/]+)(?:\/(.+))?$/.exec(normalized);
+  if (!match) return null;
+  const ref = match[1] || '';
+  const file = match[2] || 'SKILL.md';
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:@+-]*$/.test(ref)) return null;
+  if (file.split('/').some((segment) => !segment || segment === '.' || segment === '..')) {
+    return null;
+  }
+  return { ref, file };
+}
+
+function _skillProcessTarget(value, explicitFile = '') {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const virtual = _skillVirtualRefParts(raw);
+  let ref = virtual?.ref || raw;
+  let file = String(explicitFile || virtual?.file || '').trim().replace(/\\/g, '/');
+  if (!virtual && !explicitFile && !raw.startsWith('/') && raw.includes('/')) {
+    const slash = raw.indexOf('/');
+    ref = raw.slice(0, slash);
+    file = raw.slice(slash + 1);
+  }
+  const found = _skillsForDisplayNameRewrite().find((skill) => (
+    skill && (skill.id === ref || skill.name === ref)
+  ));
+  const displayName = String((found && (found.name || found.id)) || ref).trim();
+  const displayFile = _processDisplayPath(file);
+  return displayFile && displayFile !== 'SKILL.md'
+    ? `${displayName} / ${displayFile}`
+    : displayName;
+}
+
 function _skillIdFromKnownSkillMdPath(p) {
-  const s = String(p || '').replace(/\\/g, '/');
-  // The model-facing Skill reference resolves to SKILL.md at execution time,
-  // but process presentation sees the safe logical path from the tool input.
-  // Only the bare entry ref is a Skill load; nested references remain files.
-  const virtual = /^@skill\/([^/]+)(?:\/SKILL\.md)?$/.exec(s);
-  if (virtual) return virtual[1] || '';
+  const raw = String(p || '').trim();
+  // Valid model-facing references were handled by _skillVirtualRefParts.
+  // Do not normalize a malformed virtual ref into a trusted Skill identity.
+  if (raw.startsWith('@skill/')) return '';
+  const s = raw.replace(/\\/g, '/');
   if (!s.endsWith('/SKILL.md')) return '';
   const direct = /\/(?:cloud\/skills|local\/marketplace\/skills|local\/system\/skills)\/([^/]+)\/SKILL\.md$/.exec(s);
   if (direct) return direct[1] || '';
@@ -211,11 +260,11 @@ function _skillIdFromKnownSkillMdPath(p) {
 }
 
 function _skillDisplayNameFromReadFilePath(p) {
+  const virtual = _skillVirtualRefParts(p);
+  if (virtual) return _skillProcessTarget(p);
   const sid = _skillIdFromKnownSkillMdPath(p);
   if (!sid) return '';
-  const skills = _skillsForDisplayNameRewrite();
-  const found = skills.find((s) => s && s.id === sid);
-  return (found && (found.name || found.id)) || sid;
+  return _skillProcessTarget(sid, 'SKILL.md');
 }
 
 function _agentIdFromKnownAgentJsonPath(p) {
@@ -278,12 +327,14 @@ function _processInputPaths(input) {
   };
   const directKeys = [
     'path', 'file_path', 'filePath', 'filename', 'file',
+    'displayPath',
     'output_path', 'outputPath', 'input_path', 'inputPath',
     'source_path', 'sourcePath', 'notebook_path', 'notebookPath',
   ];
   for (const key of directKeys) add(input[key]);
   for (const key of [
     'paths', 'file_paths', 'filePaths', 'files',
+    'displayPaths',
     'output_paths', 'outputPaths', 'input_paths', 'inputPaths', 'changes',
   ]) {
     const values = Array.isArray(input[key]) ? input[key] : [];
@@ -297,14 +348,32 @@ function _processInputPaths(input) {
   return paths;
 }
 
+function _processNormalizeRelativePath(value) {
+  const parts = [];
+  for (const part of String(value || '').split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') {
+      if (parts.length && parts[parts.length - 1] !== '..') parts.pop();
+      else parts.push('..');
+      continue;
+    }
+    parts.push(part);
+  }
+  return parts.join('/');
+}
+
 function _processDisplayPath(value) {
   const raw = String(value || '').trim().replace(/\\/g, '/');
   if (!raw) return '';
   const withoutQuery = raw.split(/[?#]/, 1)[0];
   const absolute = withoutQuery.startsWith('/') || /^[A-Za-z]:\//.test(withoutQuery);
-  const unsafeRelative = withoutQuery === '..' || withoutQuery.startsWith('../');
-  if (absolute || unsafeRelative) return withoutQuery.split('/').filter(Boolean).pop() || '';
-  return withoutQuery.replace(/^\.\//, '');
+  const normalized = withoutQuery.replace(/^[A-Za-z]:\//, '/');
+  const normalizedRelative = normalized.startsWith('/')
+    ? normalized
+    : _processNormalizeRelativePath(normalized);
+  const unsafeRelative = normalizedRelative === '..' || normalizedRelative.startsWith('../');
+  if (absolute || unsafeRelative) return normalizedRelative.split('/').filter(Boolean).pop() || '';
+  return normalizedRelative.replace(/^\.\//, '');
 }
 
 function _processResourceFromInput(data, input) {
@@ -321,9 +390,17 @@ function _processResourceFromInput(data, input) {
       ? input.skill_name || input.skillName || input.skill_id || input.skillId
       : '')
     || '';
-  const skillName = String(explicitSkill
+  const virtualSkillFile = pathValues.length === 1
+    ? (_skillVirtualRefParts(pathValue)?.file || '')
+    : '';
+  const explicitSkillFile = data?.skill_file || data?.skillFile
+    || (input && typeof input === 'object' ? input.skill_file || input.skillFile : '')
+    || virtualSkillFile;
+  const skillName = String(
+    (explicitSkill ? _skillProcessTarget(explicitSkill, explicitSkillFile) : '')
     || (pathValues.length === 1 ? _skillDisplayNameFromReadFilePath(pathValue) : '')
-    || '').trim();
+    || '',
+  ).trim();
   if (skillName) return { type: 'skill', name: skillName };
 
   const explicitAgent = data?.agent_name || data?.agentName || data?.agent_id || data?.agentId
@@ -359,6 +436,8 @@ const _ORKAS_BRIDGE_TOOL_KEYS = new Set([
   'orkas_kb_read',
   'chat_search',
   'chat_read',
+  'library',
+  'chat_history',
   'orkas_handoff_to_commander',
 ]);
 
@@ -486,12 +565,17 @@ function _processResourceAction(resource, mode) {
     : 'chat.process.action_view_file';
 }
 
-function _processConnectorName(name, input) {
+function _processConnectorName(name, input, data) {
+  const eventName = _processFirstText(data, [
+    'connector_name', 'connectorName', 'display_name', 'displayName',
+  ]);
+  if (eventName) return _processBoundedDetail(eventName, 96);
   const explicit = _processFirstText(input, [
     'connector_name', 'connectorName', 'display_name', 'displayName',
     'connector_id', 'connectorId',
   ]);
   if (explicit) return explicit;
+  if (_isOrkasBridgeToolName(name)) return '';
   const raw = String(name || '').trim();
   if (/^mcp__/i.test(raw)) return raw.split('__')[1] || '';
   if (raw.includes('.')) return raw.split('.')[0] || '';
@@ -514,8 +598,8 @@ function _processConnectorOperation(name, input) {
   return '';
 }
 
-function _processConnectorTarget(name, input) {
-  const connector = _processConnectorName(name, input);
+function _processConnectorTarget(name, input, data) {
+  const connector = _processConnectorName(name, input, data);
   const operation = _processConnectorOperation(name, input);
   const sources = [input, input && typeof input === 'object' ? input.args : null];
   let businessTarget = '';
@@ -666,11 +750,17 @@ function _processToolPresentation(name, data, input) {
     return { actionKey: 'chat.process.action_view_skill', target: '' };
   }
   if (key === 'orkas_read_skill') {
-    const skillName = _processFirstText(input, ['id', 'skill_id', 'skillId', 'skill', 'name']);
+    const skillName = _processBoundedDetail(_processFirstText(data, ['skill_name', 'skillName']))
+      || _skillProcessTarget(
+        _processFirstText(input, ['id', 'skill_id', 'skillId', 'skill', 'name']),
+      );
     return { actionKey: 'chat.process.action_view_skill', target: skillName };
   }
   if (key === 'orkas_run_skill') {
-    const skillName = _processFirstText(input, ['skill', 'skill_name', 'skillName', 'id', 'name']);
+    const skillName = _processBoundedDetail(_processFirstText(data, ['skill_name', 'skillName']))
+      || _skillProcessTarget(
+        _processFirstText(input, ['skill', 'skill_name', 'skillName', 'id', 'name']),
+      );
     const script = _processFirstText(input, ['script']);
     return {
       actionKey: 'chat.process.action_use_skill',
@@ -700,7 +790,8 @@ function _processToolPresentation(name, data, input) {
     return { actionKey: _processResourceAction(resource, 'modify'), target };
   }
   if ([
-    'create_docx', 'create_xlsx', 'create_pptx', 'markdown_to_pdf', 'html_to_pdf',
+    'create_docx', 'create_xlsx', 'create_pptx', 'create_pdf',
+    'markdown_to_pdf', 'html_to_pdf',
     'create_artifact',
   ].includes(key)) {
     return { actionKey: 'chat.process.action_create_file', target };
@@ -719,11 +810,18 @@ function _processToolPresentation(name, data, input) {
   if (['view_image', 'imageview'].includes(key)) {
     return { actionKey: 'chat.process.action_view_image', target };
   }
-  if (key === 'office_check') {
-    return { actionKey: 'chat.process.action_check_file', target };
-  }
-  if (key === 'office_render') {
-    return { actionKey: 'chat.process.action_render_file', target };
+  if (['office_review', 'office_check', 'office_render'].includes(key)) {
+    const action = key === 'office_check'
+      ? 'check'
+      : key === 'office_render'
+        ? 'render'
+        : String(
+            _processFirstText(input, ['action']) || data?.action || '',
+          ).trim().toLowerCase();
+    return {
+      actionKey: action === 'check' ? 'chat.process.action_check_file' : 'chat.process.action_render_file',
+      target,
+    };
   }
   if (['pdf_render', 'html_preview'].includes(key)) {
     return { actionKey: _processResourceAction(resource, 'view'), target };
@@ -739,21 +837,30 @@ function _processToolPresentation(name, data, input) {
     const url = typeof input === 'string' ? input : _processFirstText(input, ['url', 'href']);
     return { actionKey: 'chat.process.action_view_web', target: _processDisplayWebTarget(url) };
   }
-  if (['kb_read', 'kb_list', 'orkas_kb_read', 'orkas_kb_list'].includes(key)) {
+  const libraryAction = key === 'library'
+    ? String(_processFirstText(input, ['action']) || '').trim().toLowerCase()
+    : '';
+  if (
+    ['kb_read', 'kb_list', 'orkas_kb_read', 'orkas_kb_list'].includes(key)
+    || (key === 'library' && libraryAction !== 'search')
+  ) {
     const referenceName = _processFirstText(input, ['name', 'title', 'filename', 'path', 'dir']);
     return { actionKey: 'chat.process.action_view_reference', target: _processDisplayPath(referenceName) };
   }
-  if (key === 'kb_search' || key === 'orkas_kb_search') {
+  if (key === 'kb_search' || key === 'orkas_kb_search' || (key === 'library' && libraryAction === 'search')) {
     const query = _processFirstText(input, ['query', 'q']);
     return {
       actionKey: 'chat.process.action_search_reference',
       target: _processStatusDetail(query, 240),
     };
   }
-  if (key === 'chat_read') {
+  const chatHistoryAction = key === 'chat_history'
+    ? String(_processFirstText(input, ['action']) || '').trim().toLowerCase()
+    : '';
+  if (key === 'chat_read' || (key === 'chat_history' && chatHistoryAction !== 'search')) {
     return { actionKey: 'chat.process.action_view_conversation', target: '' };
   }
-  if (key === 'chat_search') {
+  if (key === 'chat_search' || (key === 'chat_history' && chatHistoryAction === 'search')) {
     const query = _processFirstText(input, ['query', 'q']);
     return {
       actionKey: 'chat.process.action_search_conversation',
@@ -763,9 +870,9 @@ function _processToolPresentation(name, data, input) {
   if ([
     'bash', 'exec_command', 'commandexecution', 'command_execution',
     'shell', 'terminal', 'execute',
+    'process_session', 'interactive_cli',
     'process_start', 'process_read', 'process_write', 'process_stop',
-    'interactive_cli_start', 'interactive_cli_read', 'interactive_cli_send',
-    'interactive_cli_close',
+    'interactive_cli_start', 'interactive_cli_read', 'interactive_cli_send', 'interactive_cli_close',
   ].includes(key)) {
     return {
       actionKey: 'chat.process.action_run_command',
@@ -792,10 +899,7 @@ function _processToolPresentation(name, data, input) {
     return { actionKey: 'chat.process.action_handoff_commander', target: '' };
   }
   if (key === 'list_connector_tools' || key === 'orkas_list_connector_tools') {
-    const connectorName = _processFirstText(input, [
-      'connector_name', 'connectorName', 'display_name', 'displayName',
-      'connector_id', 'connectorId',
-    ]);
+    const connectorName = _processConnectorName(name, input, data);
     return { actionKey: 'chat.process.action_view_connector', target: connectorName };
   }
   if (key === 'add_custom_connector') {
@@ -807,7 +911,7 @@ function _processToolPresentation(name, data, input) {
       || (String(name || '').includes('.') && !_isOrkasBridgeToolName(name))) {
     return {
       actionKey: 'chat.process.action_use_connector',
-      target: _processConnectorTarget(name, input),
+      target: _processConnectorTarget(name, input, data),
     };
   }
   if (key.startsWith('collaboration:') || [
@@ -829,7 +933,17 @@ function _processToolPresentation(name, data, input) {
 }
 
 function _createProcessDisplayContext() {
-  return { tools: new Map(), files: new Set(), planSteps: new Map(), planCreated: false };
+  return {
+    tools: new Map(),
+    files: new Set(),
+    planSteps: new Map(),
+    planCreated: false,
+    cliRunningShown: false,
+    cliRetryActive: false,
+    cliRetrySeries: 0,
+    cliIdleActive: false,
+    cliIdleSeries: 0,
+  };
 }
 
 function _processToolPresentationScore(presentation) {
@@ -864,6 +978,17 @@ function _processToolLifecycle(evt) {
   const callId = String(data.callId || data.call_id || data.id || '').trim();
   if (!callId) return null;
 
+  if (evt.stream === 'reasoning') {
+    const phase = String(data.phase || '').toLowerCase();
+    if (['start', 'progress', 'end'].includes(phase)) {
+      return {
+        key: `reasoning:${callId}`,
+        terminal: phase === 'end',
+      };
+    }
+    return null;
+  }
+
   if (evt.stream === 'tool') {
     const phase = String(data.phase || data.status || '').toLowerCase();
     if (['start', 'use', 'progress', 'end', 'result'].includes(phase)) {
@@ -887,6 +1012,64 @@ function _processToolLifecycle(evt) {
   }
   if (type === 'status' && status === 'tool-progress') {
     return { key: `cli:${callId}`, terminal: false };
+  }
+  return null;
+}
+
+// CLI retry notifications describe successive snapshots of one recovery
+// attempt, not separate business actions. Give each contiguous retry series a
+// presentation-only identity so live rendering and restored history both keep
+// one row up to date. A terminal status closes the series and replaces the
+// stale "retrying" text with the actual outcome. Raw events remain untouched.
+function _processCliRetryLifecycle(evt, displayContext) {
+  if (!evt || evt.stream !== 'cli' || !displayContext) return null;
+  const data = evt.data && typeof evt.data === 'object' ? evt.data : {};
+  if (String(data.type || '').toLowerCase() !== 'status') return null;
+  const status = String(data.status || '').toLowerCase();
+  if (status === 'retrying') {
+    if (!displayContext.cliRetryActive) {
+      displayContext.cliRetrySeries = Math.max(0, Number(displayContext.cliRetrySeries) || 0) + 1;
+      displayContext.cliRetryActive = true;
+    }
+    return { key: `cli-retry:${displayContext.cliRetrySeries}`, terminal: false };
+  }
+  if (!displayContext.cliRetryActive || ![
+    'result', 'completed', 'error', 'failed', 'timeout', 'cancelled', 'aborted',
+  ].includes(status)) return null;
+  const key = `cli-retry:${Math.max(1, Number(displayContext.cliRetrySeries) || 1)}`;
+  displayContext.cliRetryActive = false;
+  return { key, terminal: true };
+}
+
+// Runner idle events are periodic snapshots of one contiguous wait, not new
+// actions. Keep updating one presentation row until a real CLI event arrives.
+// A directly following terminal status replaces that same row. Persisted raw
+// events remain unchanged for diagnostics.
+function _processCliIdleLifecycle(evt, displayContext) {
+  if (!evt || evt.stream !== 'cli' || !displayContext) return null;
+  const data = evt.data && typeof evt.data === 'object' ? evt.data : {};
+  const type = String(data.type || '').toLowerCase();
+  if (type === 'idle') {
+    if (!displayContext.cliIdleActive) {
+      displayContext.cliIdleSeries = Math.max(0, Number(displayContext.cliIdleSeries) || 0) + 1;
+      displayContext.cliIdleActive = true;
+    }
+    return { key: `cli-idle:${displayContext.cliIdleSeries}`, terminal: false };
+  }
+  if (!displayContext.cliIdleActive) return null;
+
+  const status = type === 'status' ? String(data.status || '').toLowerCase() : '';
+  if (['timeout', 'error', 'failed', 'cancelled', 'aborted'].includes(status)) {
+    const key = `cli-idle:${Math.max(1, Number(displayContext.cliIdleSeries) || 1)}`;
+    displayContext.cliIdleActive = false;
+    return { key, terminal: true };
+  }
+
+  // Synthetic tool/reasoning pulses are bookkeeping, not new protocol
+  // progress. All other events close this wait series so a later idle period
+  // gets a chronologically separate row.
+  if (data.synthetic !== true && data.heartbeat !== true) {
+    displayContext.cliIdleActive = false;
   }
   return null;
 }
@@ -1001,6 +1184,15 @@ function _processDisplayContextForMessage(msg) {
   return msg._processDisplayContext;
 }
 
+function _processToolResultFailed(data) {
+  return data?.isError === true
+    || data?.is_error === true
+    || data?.success === false
+    || data?.error === true
+    || (typeof data?.error === 'string' && !!data.error.trim())
+    || ['error', 'failed'].includes(String(data?.status || '').toLowerCase());
+}
+
 function _formatKnownToolProcessLine(name, data, input, phase, displayContext, scope = 'tool') {
   const callId = String(data?.callId || data?.call_id || data?.id || '').trim();
   const displayId = callId ? `${scope}:${callId}` : '';
@@ -1058,9 +1250,7 @@ function _formatKnownToolProcessLine(name, data, input, phase, displayContext, s
     && !presentation.target;
   if (pathlessCliPatch) return '';
   const statusKey = terminal
-    ? (data?.isError === true || data?.is_error === true || data?.success === false
-        || data?.error === true || (typeof data?.error === 'string' && !!data.error.trim())
-        || ['error', 'failed'].includes(String(data?.status || '').toLowerCase())
+    ? (_processToolResultFailed(data)
         ? 'chat.process.status_failed'
         : 'chat.process.status_done')
     : '';
@@ -1280,10 +1470,39 @@ function _formatKnownCliDiagnostic(value) {
   if (/(?:rate.?limit|too many requests|http\s*429)/i.test(text)) {
     return t('chat.stream.rate_limit');
   }
+  if (/(?:\boverloaded\b|overload(?:ed|ing)?|http\s*529|\b529\b)/i.test(text)) {
+    return t('chat.stream.service_busy');
+  }
+  if (/(?:service\s+unavailable|temporar(?:y|ily)\s+unavailable|http\s*50[0234]|\b50[0234]\b)/i.test(text)) {
+    return t('chat.stream.service_unavailable');
+  }
   if (/(?:connection|network).{0,24}(?:restored|recovered|reconnected)/i.test(text)) {
     return t('chat.process.connection_recovered');
   }
   return '';
+}
+
+// Retry payloads retain the provider's raw error for diagnostics, while the
+// user-facing row uses a small stable taxonomy. Unknown/new provider errors
+// deliberately fall back to a safe generic reason instead of leaking English
+// internals or requiring an exhaustive provider-specific error catalog.
+function _formatCliRetryReason(data) {
+  const errorStatus = Math.round(Number(data?.errorStatus ?? data?.error_status) || 0);
+  const raw = _processFirstText(data, ['error', 'message', 'reason']);
+  if (errorStatus === 429 || /(?:rate.?limit|too many requests|http\s*429)/i.test(raw)) {
+    return t('chat.stream.request_limited');
+  }
+  if (errorStatus === 529 || /(?:\boverloaded\b|overload(?:ed|ing)?|http\s*529|\b529\b)/i.test(raw)) {
+    return t('chat.stream.service_busy');
+  }
+  if ([500, 502, 503, 504].includes(errorStatus)
+      || /(?:service\s+unavailable|temporar(?:y|ily)\s+unavailable|http\s*50[0234])/i.test(raw)) {
+    return t('chat.stream.service_unavailable');
+  }
+  if (/(?:network|connection|connect|dns|econn|enotfound|socket|tls|timed?\s*out|timeout)/i.test(raw)) {
+    return t('chat.stream.network_unavailable');
+  }
+  return t('chat.stream.service_error');
 }
 
 function _formatCliFileChangeLine(data, displayContext) {
@@ -2355,9 +2574,7 @@ const _SCENARIO_CATALOG = {
     deliverableKey: 'new_chat.quick.deliver.data',
     subjectKey: 'new_chat.quick.subject.data',
     subjectFallback: 'AI desktop apps',
-    thumb: 'research',
     icon: 'search',
-    tone: 'research',
     group: 'knowledge-office',
     agentNames: ['DeepResearcher'],
   },
@@ -2368,9 +2585,7 @@ const _SCENARIO_CATALOG = {
     deliverableKey: 'new_chat.quick.deliver.video',
     subjectKey: 'new_chat.quick.subject.video',
     subjectFallback: 'AI trends',
-    thumb: 'video',
     icon: 'film',
-    tone: 'video',
     group: 'content-creation',
     agentNames: ['VideoStudio'],
   },
@@ -2381,9 +2596,7 @@ const _SCENARIO_CATALOG = {
     deliverableKey: 'new_chat.quick.deliver.image',
     subjectKey: 'new_chat.quick.subject.image',
     subjectFallback: 'City Summer Coffee Festival',
-    thumb: 'poster',
     icon: 'image',
-    tone: 'image',
     group: 'content-creation',
     agentNames: ['ImageStudio'],
   },
@@ -2394,9 +2607,7 @@ const _SCENARIO_CATALOG = {
     deliverableKey: 'new_chat.quick.deliver.ui_design',
     subjectKey: 'new_chat.quick.subject.ui_design',
     subjectFallback: 'a personal finance app',
-    thumb: 'login',
     icon: 'palette',
-    tone: 'ui',
     group: 'product-growth',
     agentNames: ['UIDesigner'],
   },
@@ -2407,9 +2618,7 @@ const _SCENARIO_CATALOG = {
     deliverableKey: 'new_chat.quick.deliver.office',
     subjectKey: 'new_chat.quick.subject.office',
     subjectFallback: 'an ecommerce store',
-    thumb: 'chart',
     icon: 'file-text',
-    tone: 'doc',
     group: 'knowledge-office',
     agentNames: ['OfficeWorker', 'OfficeWriter'],
   },
@@ -2420,9 +2629,7 @@ const _SCENARIO_CATALOG = {
     deliverableKey: 'new_chat.quick.deliver.ppt',
     subjectKey: 'new_chat.quick.subject.ppt',
     subjectFallback: 'an AI office assistant',
-    thumb: 'presentation',
     icon: 'presentation',
-    tone: 'presentation',
     group: 'knowledge-office',
     agentNames: ['PptMaker'],
   },
@@ -2433,9 +2640,7 @@ const _SCENARIO_CATALOG = {
     deliverableKey: 'new_chat.quick.deliver.creation',
     subjectKey: 'new_chat.quick.subject.creation',
     subjectFallback: 'an AI office assistant',
-    thumb: 'article',
     icon: 'edit-pencil',
-    tone: 'writing',
     group: 'content-creation',
     agentNames: ['ContentWriter'],
   },
@@ -2446,9 +2651,7 @@ const _SCENARIO_CATALOG = {
     deliverableKey: 'new_chat.quick.deliver.rnd',
     subjectKey: 'new_chat.quick.subject.rnd',
     subjectFallback: 'a product designer changing careers',
-    thumb: 'web',
     icon: 'code',
-    tone: 'code',
     group: 'product-growth',
     agentNames: ['ProductDeveloper'],
   },
@@ -2459,9 +2662,7 @@ const _SCENARIO_CATALOG = {
     deliverableKey: 'new_chat.quick.deliver.seo_geo',
     subjectKey: 'new_chat.quick.subject.seo_geo',
     subjectFallback: 'the orkas.ai website',
-    thumb: 'seo',
     icon: 'globe',
-    tone: 'search',
     group: 'product-growth',
     agentNames: ['SeoGeoAgent'],
   },
@@ -2753,13 +2954,10 @@ function _renderQuickStartScenarios() {
     const deliverable = _quickStartText(config.deliverableKey, '');
     const deliverableLabel = _quickStartText('new_chat.quick.deliver_label', 'Deliverable:');
     return `
-      <button type="button" class="new-chat-scenario-chip quick-task-card" data-scenario="${escapeHtml(item.id)}" data-tone="${escapeHtml(config.tone || '')}" data-group="${escapeHtml(config.group || '')}">
-        <span class="quick-thumb" data-thumb="${escapeHtml(config.thumb || 'doc')}" aria-hidden="true">${_quickStartThumbHtml(config.thumb)}</span>
+      <button type="button" class="new-chat-scenario-chip quick-task-card" data-scenario="${escapeHtml(item.id)}" data-group="${escapeHtml(config.group || '')}">
+        <span class="quick-tile" aria-hidden="true">${_uiIconHtml(config.icon || 'sparkles', 'new-chat-scenario-icon')}</span>
         <span class="quick-copy">
-          <span class="quick-cat">
-            <span class="quick-icon" aria-hidden="true">${_uiIconHtml(config.icon || 'sparkles', 'new-chat-scenario-icon')}</span>
-            <span class="new-chat-scenario-label quick-cat-name">${escapeHtml(label)}</span>
-          </span>
+          <span class="quick-cat-name">${escapeHtml(label)}</span>
           <span class="quick-task">${escapeHtml(task)}</span>
           <span class="quick-deliver">${escapeHtml(deliverableLabel)} <b>${escapeHtml(deliverable)}</b></span>
         </span>
@@ -3138,6 +3336,14 @@ function onEnterConversationView() {
   if (currentCid) _evaluateAutoRecipient(currentCid);
   if (window.ConversationInfo) window.ConversationInfo.bind(currentCid || null);
   _openConversationTurnNavigation(currentCid);
+  // A panel switch does not always detach #chat-history. If the original
+  // pending row is already mounted again, restore the milestones retained by
+  // its controller immediately; waiting for the next backend event can leave
+  // a quiet long-running step looking frozen indefinitely.
+  const mountedPendingState = currentCid ? pendingConvs.get(currentCid) : null;
+  if (mountedPendingState?.loadingEl?.isConnected) {
+    _replayOffViewGroupProcessEvents(currentCid, mountedPendingState.loadingEl, { archive: true });
+  }
   // Returning to a conversation while its original send-stream is still
   // alive can miss state/process events that fired while another view was
   // active (the cross-cid guard intentionally drops them). Ask main for the
@@ -3214,7 +3420,6 @@ function _isReplayableOffViewGroupProcessEvent(ev) {
   if (!groupEvent || groupEvent.type !== 'process') return false;
   const processData = groupEvent.data;
   if (processData?.type === 'event'
-      && processData.event?.stream === 'cli'
       && processData.event?.data?.heartbeat === true) {
     return false;
   }
@@ -3238,6 +3443,19 @@ function _takeOffViewGroupProcessEvents(cid) {
   const items = _offViewGroupProcessEvents.get(cid) || [];
   _offViewGroupProcessEvents.delete(cid);
   return items;
+}
+
+function _replayOffViewGroupProcessEvents(cid, msgEl, { archive = false } = {}) {
+  // Do not consume the buffer until the owning task's row is actually back in
+  // the document. `onEnterConversationView` runs before an async history load,
+  // and replaying at that point would paint into the previous task's DOM only
+  // to have the history response replace it again.
+  if (!cid || cid !== currentCid || !msgEl?.isConnected) return 0;
+  const items = _takeOffViewGroupProcessEvents(cid);
+  for (const event of items) {
+    _handleStreamEvent(cid, msgEl, event, { archive });
+  }
+  return items.length;
 }
 
 function _clearOffViewGroupProcessEvents(cid) {
@@ -4717,17 +4935,6 @@ function _addReadyDraftAttachment(cid, info) {
   _chatAttachSet(cid, items);
 }
 
-function _chatVideoFloatingTitle() {
-  const key = 'chat.video_open_floating_title';
-  try {
-    if (typeof t === 'function') {
-      const v = t(key);
-      if (v && v !== key) return v;
-    }
-  } catch (_) { /* keep fallback */ }
-  return 'Fullscreen';
-}
-
 // Exposed for the KB "ask the commander about this file" menu actions
 // (contexts.js / project-detail.js). Imports the KB file into `draftCid`'s pool
 // server-side via `channel`, runs `afterNavigate` (navigation must happen BEFORE
@@ -4768,46 +4975,27 @@ async function _chatAttachRefreshFromServer(cid) {
 }
 
 function _renderMessageAttachmentsHtml(names, cid) {
+  const cidAttr = cid ? ` data-attach-cid="${escapeHtml(cid)}"` : '';
+  const previewDisabled = cid ? '' : ' disabled';
   const items = names.map((n) => {
     const ext = _chatAttachExtOf(n);
     const kind = _chatAttachKindFromExt(ext);
-    const icon = _chatFileIconHtml(n, kind);
     const label = escapeHtml(n);
-    if (kind === 'image' && cid) {
-      const url = _chatMediaUrl(cid, n);
-      return `<span class="chat-msg-attach is-image" data-attach-name="${label}" data-attach-cid="${escapeHtml(cid)}" title="${label}">
-        <span class="chat-image-shell chat-msg-attach-thumb-shell is-loading"><img class="chat-msg-attach-thumb" src="${url}" alt="${label}" data-monitor-resource="chat-attachment-image" /></span>
-        <span class="chat-msg-attach-label">${label}</span>
-      </span>`;
-    }
-    if (kind === 'video' && cid) {
-      const url = _chatMediaUrl(cid, n);
-      const floatingTitle = escapeHtml(_chatVideoFloatingTitle());
-      return `<span class="chat-msg-attach is-video" data-attach-name="${label}" data-attach-cid="${escapeHtml(cid)}" title="${label}">
-        <span class="chat-msg-attach-video-shell" data-chat-video-playback-surface="attachment_bubble">
-          <video class="chat-msg-attach-video" width="320" height="180" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${url}" data-monitor-resource="chat-attachment-video"></video>
-          <button type="button" class="chat-msg-attach-video-float" data-attach-video-open="1" aria-label="${floatingTitle}" title="${floatingTitle}">${_uiIconHtml('maximize', 'ui-icon chat-msg-attach-video-float-svg')}</button>
-        </span>
-        <span class="chat-msg-attach-label">${label}</span>
-      </span>`;
-    }
-    if (kind === 'audio' && cid) {
-      const url = _chatMediaUrl(cid, n);
-      return `<span class="chat-msg-attach is-audio" data-attach-name="${label}" data-attach-cid="${escapeHtml(cid)}" title="${label}">
-        <audio class="chat-msg-attach-audio" controls controlslist="nodownload noremoteplayback" preload="metadata" src="${url}"></audio>
-        <span class="chat-msg-attach-label">${label}</span>
-      </span>`;
-    }
-    return `<span class="chat-msg-attach" title="${label}">
-      <span class="chat-msg-attach-icon">${icon}</span>
-      <span class="chat-msg-attach-label">${label}</span>
+    const icon = kind === 'image' && cid
+      ? `<img class="chat-attach-thumb" src="${_chatMediaUrl(cid, n)}" alt="" data-monitor-resource="chat-attachment-image" />`
+      : _chatFileIconHtml(n, kind);
+    return `<span class="chat-attach-chip chat-msg-attach" data-attach-name="${label}"${cidAttr} title="${label}">
+      <button type="button" class="chat-attach-preview" aria-label="${label}"${previewDisabled}>
+        <span class="chat-attach-icon">${icon}</span>
+        <span class="chat-attach-label">${label}</span>
+      </button>
     </span>`;
   });
   return `<div class="chat-msg-attachments">${items.join('')}</div>`;
 }
 
 // ── Produced files (assistant messages only) ─────────────────────────────
-// Files written by the LLM via write_file / markdown_to_pdf / html_to_pdf.
+// Files written by the LLM via write_file / create_pdf.
 // Chips use the same visual language as attachments; clicking opens an
 // in-app preview overlay (chat-file-viewer.js) that renders the file's
 // final form (PDF / Office / HTML / markdown / text) or falls through to a dialog
@@ -5049,103 +5237,17 @@ function _showFileMissingToast(name) {
   else if (typeof uiAlert === 'function') uiAlert(message);
 }
 
-function _hydrateMessageAttachmentThumbs(msgDiv, cid) {
-  // Image chips have a thumb we want to enlarge via the lightbox; the rest
-  // (pdf / office / text / video) get the same kind-aware viewer as produced
-  // chips. Video chips have inline <video> controls in the bubble already;
-  // their explicit floating-player button opens the same file-backed preview
-  // as the conversation sidebar so the header actions stay consistent.
-  // We rely on `_chatMediaUrl(cid, name)` having loaded the bytes for
-  // images so the lightbox can reuse the already-cached resource.
-  const allChips = msgDiv.querySelectorAll('.chat-msg-attach');
-  allChips.forEach((chip) => {
-    if (chip.classList.contains('is-video')) {
-      const btn = chip.querySelector('[data-attach-video-open="1"]');
-      if (!btn || btn.dataset.bound === '1') return;
-      btn.dataset.bound = '1';
-      btn.addEventListener('click', async (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        if (typeof openChatFileViewer !== 'function') return;
-        const name = chip.dataset.attachName || (chip.querySelector('.chat-msg-attach-label')?.textContent || '').trim();
-        const chipCid = chip.dataset.attachCid || cid;
-        if (!name || !chipCid) return;
-        const video = chip.querySelector('video.chat-msg-attach-video');
-        const startTime = video && Number.isFinite(Number(video.currentTime)) ? Math.max(0, Number(video.currentTime) || 0) : 0;
-        const duration = video && Number.isFinite(Number(video.duration)) ? Math.max(0, Number(video.duration) || 0) : 0;
-        const ended = !!(video && video.ended);
-        const playbackOpts = { cid: chipCid, autoplay: true, startTime, duration, ended };
-        try { if (video && typeof video.pause === 'function') video.pause(); } catch (_) {}
-        try { if (window.Monitor) (() => {})('chat_attachment_video_floating_open'); } catch (_) {}
-        try {
-          const res = await window.orkas.invoke('attachments.absPath', { cid: chipCid, name });
-          if (!res || !res.ok || !res.path) {
-            _convLog.warn('attachments.absPath video failed', { cid: chipCid, name, error: res && res.error });
-            _showFileMissingToast(name);
-            return;
-          }
-          openChatFileViewer(res.path, name, playbackOpts);
-        } catch (err) {
-          _convLog.warn('attachments.absPath video threw', { cid: chipCid, name, error: String(err && err.message || err) });
-          _showFileMissingToast(name);
-        }
-      });
-      return;
-    }
-    if (chip.classList.contains('is-audio')) return;
-    if (chip.classList.contains('is-image')) {
-      const img = chip.querySelector('img.chat-msg-attach-thumb');
-      if (!img) return;
-      chip.addEventListener('click', async (e) => {
-        e.stopPropagation();
-        if (typeof openChatImageLightbox === 'function') {
-          const name = chip.dataset.attachName || '';
-          const chipCid = chip.dataset.attachCid || cid;
-          let opts;
-          if (name && chipCid) {
-            try {
-              const res = await window.orkas.invoke('attachments.absPath', { cid: chipCid, name });
-              if (res && res.ok && res.path) opts = { absPath: res.path, cid: chipCid };
-              else {
-                _convLog.warn('attachments.absPath image failed', { cid: chipCid, name, error: res && res.error });
-                _showFileMissingToast(name);
-                return;
-              }
-            } catch (err) {
-              _convLog.warn('attachments.absPath image threw', { cid: chipCid, name, error: String(err && err.message || err) });
-              _showFileMissingToast(name);
-              return;
-            }
-          }
-          openChatImageLightbox(img.src, name, opts);
-        }
-      });
-      return;
-    }
-    // Non-image, non-video attachment chip → open the file viewer. The
-    // chip carries `(cid, name)`, not an absolute path; resolve via
-    // `attachments.absPath` so the viewer keeps a single "abs path in"
-    // contract. cid flows through to the viewer so reveal / read scope
-    // includes the per-conversation attachment dir.
-    const name = chip.dataset.attachName || (chip.querySelector('.chat-msg-attach-label')?.textContent || '').trim();
+function _hydrateMessageAttachments(msgDiv, cid) {
+  msgDiv.querySelectorAll('.chat-msg-attach').forEach((chip) => {
+    const preview = chip.querySelector('.chat-attach-preview:not(:disabled)');
+    if (!preview || preview.dataset.bound === '1') return;
+    const name = chip.dataset.attachName || (chip.querySelector('.chat-attach-label')?.textContent || '').trim();
     const chipCid = chip.dataset.attachCid || cid;
     if (!name || !chipCid) return;
-    chip.classList.add('is-clickable');
-    chip.addEventListener('click', async (e) => {
+    preview.dataset.bound = '1';
+    preview.addEventListener('click', async (e) => {
       e.stopPropagation();
-      if (typeof openChatFileViewer !== 'function') return;
-      try {
-        const res = await window.orkas.invoke('attachments.absPath', { cid: chipCid, name });
-        if (!res || !res.ok || !res.path) {
-          _convLog.warn('attachments.absPath failed', { cid: chipCid, name, error: res && res.error });
-          _showFileMissingToast(name);
-          return;
-        }
-        openChatFileViewer(res.path, name, { cid: chipCid });
-      } catch (err) {
-        _convLog.warn('attachments.absPath threw', { cid: chipCid, name, error: String(err && err.message || err) });
-        _showFileMissingToast(name);
-      }
+      await _chatAttachOpenPreview(chipCid, { name, displayName: name, status: 'ready' });
     });
   });
 }
@@ -5621,14 +5723,20 @@ function _repaintConvRowStatus(cid) {
   });
 }
 
-// A reply counts as "failed" ONLY when the runtime tagged it with a structured
-// failure (`failure_kind`, or an explicit failed/error flag). We deliberately
+function _isRetiredNonFailureCode(value) {
+  const code = String(value || '').trim().toLowerCase();
+  return code === 'claimed_media_missing' || code === 'agent_reported_failure';
+}
+
+// A reply counts as "failed" ONLY when the runtime tagged it with a current
+// structured failure (`failure_kind`, or an explicit failed/error flag). We deliberately
 // do NOT sniff the rendered text or `var(--danger)` styling: a normal, healthy
 // reply that merely discusses errors ("模型调用失败", danger colors — e.g. a chat
 // about this very feature) would otherwise false-flag the whole conversation.
 // The styling-level `_isFailedAssistantContent` still drives the per-bubble
 // retry affordance; it must never drive the conversation-level failed mark.
 function _isStructuredFailure(m) {
+  if (m && _isRetiredNonFailureCode(m.failure_code || m._failure_code)) return false;
   return !!(m && (m.failure_kind || m.failed === true || m.error === true));
 }
 // Cold-load / reopen: re-derive the in-session "failed" mark for a cid from its
@@ -5676,7 +5784,7 @@ function _renderConversationSidebarItem(c, opts = {}) {
     : '';
   const titleNode = editing
     ? `<input type="text" class="conv-item-title-input" data-conv-rename-cid="${cid}"
-              value="${title}" autocomplete="off" spellcheck="false" />`
+              value="${escapeHtml(_conversationInlineRenameDraft)}" autocomplete="off" spellcheck="false" />`
     : `<div class="conv-item-title" title="${title}">${title}</div>`;
   const classes = [
     'conv-item',
@@ -5710,6 +5818,27 @@ function _normaliseConversationTitle(raw) {
   let title = String(raw || '').trim();
   if (typeof window.limitNameDisplayText === 'function') title = window.limitNameDisplayText(title);
   return title;
+}
+
+// Keep background data refreshes running while an inline rename owns a list,
+// but defer that list's structural repaint until the user submits or cancels.
+// Replacing the input would emit blur in Electron and also interrupt an active
+// IME composition even if its value and focus were restored afterward.
+function _conversationInlineRenameBlocksRender(container) {
+  if (!container || !_conversationInlineRenameCid) return false;
+  const input = container.querySelector(
+    `input.conv-item-title-input[data-conv-rename-cid="${CSS.escape(_conversationInlineRenameCid)}"]`,
+  );
+  if (!input) return false;
+  _conversationInlineRenameDraft = input.value;
+  return true;
+}
+
+function _clearConversationInlineRenameState(cid) {
+  if (cid && _conversationInlineRenameCid !== cid) return;
+  _conversationInlineRenameCid = null;
+  _conversationInlineRenameOriginal = '';
+  _conversationInlineRenameDraft = '';
 }
 
 async function _toggleConversationPinned(cid, pinned) {
@@ -5772,7 +5901,7 @@ async function _saveConversationTitle(cid, raw, opts = {}) {
     return false;
   }
   if (title === current) {
-    if (_conversationInlineRenameCid === cid) _conversationInlineRenameCid = null;
+    _clearConversationInlineRenameState(cid);
     if (_conversationHeaderRenameCid === cid) _conversationHeaderRenameCid = null;
     renderConversationList();
     _refreshChatHeader();
@@ -5789,7 +5918,7 @@ async function _saveConversationTitle(cid, raw, opts = {}) {
     }
     const idx = conversations.findIndex((c) => c && c.conversation_id === cid);
     if (idx >= 0) conversations[idx] = { ...conversations[idx], ...data.conversation };
-    if (_conversationInlineRenameCid === cid) _conversationInlineRenameCid = null;
+    _clearConversationInlineRenameState(cid);
     if (_conversationHeaderRenameCid === cid) _conversationHeaderRenameCid = null;
     renderConversationList();
     _refreshChatHeader();
@@ -5819,8 +5948,12 @@ async function _saveConversationTitle(cid, raw, opts = {}) {
 
 function _startConversationInlineRename(cid) {
   if (!cid || !Array.isArray(conversations)) return;
+  const conv = conversations.find((item) => item && item.conversation_id === cid);
+  if (!conv) return;
   _conversationHeaderRenameCid = null;
   _conversationInlineRenameCid = cid;
+  _conversationInlineRenameOriginal = String(conv.title || t('chat.new_conv_title'));
+  _conversationInlineRenameDraft = _conversationInlineRenameOriginal;
   renderConversationList();
   setTimeout(() => {
     const input = document.querySelector(`input.conv-item-title-input[data-conv-rename-cid="${CSS.escape(cid)}"]`);
@@ -5833,14 +5966,14 @@ function _startConversationInlineRename(cid) {
 
 function _cancelConversationInlineRename(cid) {
   if (_conversationInlineRenameCid !== cid) return;
-  _conversationInlineRenameCid = null;
+  _clearConversationInlineRenameState(cid);
   renderConversationList();
   _refreshChatHeader();
 }
 
 function _startConversationHeaderRename(cid) {
   if (!cid || !Array.isArray(conversations)) return;
-  _conversationInlineRenameCid = null;
+  _clearConversationInlineRenameState();
   _conversationHeaderRenameCid = cid;
   _refreshChatHeader();
   setTimeout(() => {
@@ -6024,7 +6157,9 @@ function _bindConversationSidebarItems(container, opts = {}) {
     input.dataset.renameBound = '1';
     if (typeof window.bindNameLimitControl === 'function') window.bindNameLimitControl(input);
     const cid = input.dataset.convRenameCid;
-    const original = input.value;
+    const original = _conversationInlineRenameCid === cid
+      ? _conversationInlineRenameOriginal
+      : input.value;
     let committing = false;
     const commit = async (accept) => {
       if (committing) return;
@@ -6038,8 +6173,13 @@ function _bindConversationSidebarItems(container, opts = {}) {
       const ok = await _saveConversationTitle(cid, next, opts);
       committing = false;
       if (!ok && _conversationInlineRenameCid === cid) {
-        input.focus();
-        input.select();
+        const activeInput = input.isConnected ? input : container.querySelector(
+          `input.conv-item-title-input[data-conv-rename-cid="${CSS.escape(cid)}"]`,
+        );
+        if (activeInput) {
+          activeInput.focus();
+          activeInput.select();
+        }
       }
     };
     input.addEventListener('click', (e) => e.stopPropagation());
@@ -6048,16 +6188,27 @@ function _bindConversationSidebarItems(container, opts = {}) {
       if (e.key === 'Enter') { e.preventDefault(); commit(true); }
       else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
     });
-    input.addEventListener('blur', () => commit(true));
+    input.addEventListener('blur', () => {
+      if (input.isConnected === false) return;
+      return commit(true);
+    });
+    input.addEventListener('input', () => {
+      if (_conversationInlineRenameCid === cid) _conversationInlineRenameDraft = input.value;
+    });
   });
   container.querySelectorAll(selector).forEach(el => {
     el.addEventListener('click', (e) => {
       if (e.target.closest('.conv-item-title-input')) return;
       if (e.target.closest('.conv-item-action')) return;
+      const cid = el.dataset.cid;
+      // The selected task is already mounted. Re-entering it would rebuild
+      // the transcript, reset its scroll position, refresh attachments, and
+      // steal composer focus even though the user's destination did not change.
+      if (currentView === 'conversation' && currentCid === cid) return;
       _convTrackClick('sidebar_conversation_open', {
         scope: selector.includes('nested') ? 'project' : 'unprojected',
       });
-      setView('conversation', el.dataset.cid);
+      setView('conversation', cid);
     });
   });
   container.querySelectorAll('.conv-item-menu').forEach(btn => {
@@ -6075,6 +6226,15 @@ function renderConversationList() {
   _conversationBucketDateKey = _conversationLocalDateKey();
   const container = document.getElementById('conversation-list');
   _sortConversationCacheForSidebar();
+  if (_conversationInlineRenameBlocksRender(container)) {
+    // Other sidebar/task surfaces may still refresh. Only the list that owns
+    // the live editor is frozen until its submit/cancel path renders again.
+    if (typeof renderProjectsSection === 'function') renderProjectsSection();
+    if (typeof _renderProjectAllTasks === 'function') _renderProjectAllTasks();
+    if (typeof _refreshAutoExpandedTaskConvs === 'function') _refreshAutoExpandedTaskConvs();
+    _refreshAllConvBadges();
+    return;
+  }
   // Conversations with a project_id are rendered nested under their project
   // by `projects.js::renderProjectsSection`. The "Conversations" section
   // here only shows the unprojected ones — same data model as the user's
@@ -6784,6 +6944,11 @@ async function loadConversationHistory(cid, opts = {}) {
       }
       state.needsIndicator = false;
       startPolling(cid); // ensure polling is running as backup
+    }
+
+    const activePendingState = pendingConvs.get(cid);
+    if (activePendingState?.loadingEl?.isConnected) {
+      _replayOffViewGroupProcessEvents(cid, activePendingState.loadingEl, { archive: true });
     }
 
 
@@ -7614,7 +7779,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   // Stash chip-tracked produced paths on the DOM so the 引用 handler can
   // attach them to the quote payload without plumbing message into every
   // _attachBubbleArchiveBtn call site. Only chip-tracked files belong here
-  // (write_file / edit_file / markdown_to_pdf / html_to_pdf / generate_image);
+  // (write_file / edit_file / create_pdf / generate_image);
   // bash scratch is intentionally outside this set.
   if (Array.isArray(message.produced) && message.produced.length) {
     msgDiv.dataset.produced = JSON.stringify(message.produced);
@@ -7636,7 +7801,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     const md = msgDiv.querySelector('.markdown-body');
     if (md) typesetMath(md);
   }
-  if (attachmentsHtml) _hydrateMessageAttachmentThumbs(msgDiv, attachmentCid);
+  if (attachmentsHtml) _hydrateMessageAttachments(msgDiv, attachmentCid);
   if (referencesHtml) _hydrateMessageReferenceFiles(msgDiv);
   _hydrateActorHeaderLinks(msgDiv);
   if (createdAgentHtml) _hydrateMessageCreatedAgentChip(msgDiv);
@@ -7801,37 +7966,56 @@ function _mountChatInputForm(host, msgDiv, message, opts) {
       const msgId = msgDiv.dataset.msgId || (message._msg_id || '');
       if (!msgId) {
         _convLog.warn('form submit missing msgId');
-        return;
+        throw new Error(t('chat.form.submit_failed'));
       }
       let submissionText = null;
+      let data;
       try {
         const res = await apiFetch(`/api/conversations/${cid}/form-submitted`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ msgId, formId: message.form.form_id, values }),
         });
-        const data = await res.json();
-        if (!data || data.ok === false) {
-          _convLog.warn('markFormSubmitted failed', data && data.error);
-          return;
-        }
-        submissionText = data.submission && data.submission.text;
+        data = await res.json();
       } catch (err) {
-        _convLog.warn('markFormSubmitted threw', err && err.message ? err.message : err);
-        return;
+        const reason = _processStatusDetail(err && err.message ? err.message : '', 160)
+          || t('chat.form.submit_failed');
+        _convLog.warn('markFormSubmitted threw', reason);
+        throw new Error(reason);
       }
+      if (!data || data.ok === false) {
+        const reason = data && typeof data.error === 'string' && data.error.trim()
+          ? (_processStatusDetail(data.error, 160) || t('chat.form.submit_failed'))
+          : t('chat.form.submit_failed');
+        _convLog.warn('markFormSubmitted failed', reason);
+        throw new Error(reason);
+      }
+      submissionText = data.submission && data.submission.text;
+      if (!submissionText) throw new Error(t('chat.form.submit_failed'));
       // The record is now `form.submitted` on disk. Reflect that on the mounted
       // widget directly: the transcript is no longer rebuilt after every stream
       // to discover such changes, and re-reading the whole history to flip one
       // class is the reconcile pass this pipeline deliberately removed.
       const formHost = msgDiv.querySelector('.chat-input-form');
       if (formHost) formHost.classList.add('is-submitted');
-      if (!submissionText) return;
       const extra = (Array.isArray(attachments) && attachments.length)
         ? { attachments }
         : undefined;
-      try { await sendInConversation(cid, submissionText, extra); }
-      catch (err) { _convLog.error('form replay send failed', err); }
+      try {
+        const replayResult = await sendInConversation(cid, submissionText, extra, {
+          source_view: 'conversation',
+        });
+        if (replayResult?.started === false && replayResult?.queued !== true) {
+          throw new Error(t('chat.form.submit_failed'));
+        }
+      }
+      catch (err) {
+        if (formHost) formHost.classList.remove('is-submitted');
+        const reason = _processStatusDetail(err && err.message ? err.message : '', 160)
+          || t('chat.form.submit_failed');
+        _convLog.warn('form replay send failed');
+        throw new Error(reason);
+      }
     },
   });
 }
@@ -8125,14 +8309,7 @@ function _renderPersistedProcess(msgDiv, items, { expanded = false } = {}) {
       item && item.type === 'progress' ? item.text : '',
     );
     if (!projection) continue;
-    _appendProcessTextLines(
-      body,
-      projection.text,
-      projection.kind,
-      projection.eventName,
-      projection.lifecycleKey,
-      projection.lifecycleTerminal,
-    );
+    _appendProjectedProcessRowToBody(body, projection);
   }
   if (body.childElementCount === 0 && !runtimeText) return;
   if (body.childElementCount === 0) details.classList.add('runtime-only');
@@ -8494,6 +8671,10 @@ function _attachBubbleRetryBtn(actions, msgDiv) {
   });
   actions.appendChild(retryBtn);
 }
+
+// Assistant feedback reporting is hosted-service-only. Preserve the shared
+// action renderer's hook without exposing a dead control in the open build.
+function _attachBubbleReportBtn() {}
 
 function _attachFailedAssistantActions(msgDiv, getContent) {
   if (!msgDiv) return;
@@ -8963,7 +9144,6 @@ function _attachBubbleActions(msgDiv, getContent, opts = {}) {
     const targetScope = projectId ? { type: 'project', projectId } : { type: 'global' };
     const pick = await pickKbLocation({
       defaultName: deriveKbArchiveName(text),
-      title: t('chat.archive_picker_title'),
       scope: targetScope,
     });
     if (!pick) return;
@@ -9547,7 +9727,7 @@ function _taskTurnAddProcessLine(run, evData, lineText, evt) {
   if (!run || !lineText || run.processEvents.length >= _TASK_TURN_PROCESS_MAX_ITEMS) return;
   const text = _processLineText(lineText).replace(/\s+/g, ' ').trim();
   if (!text) return;
-  const key = _groupEventDedupeKey(evData) || [
+  const key = [
     evData && evData.actor || '',
     evt && evt.stream || '',
     text.slice(0, 180),
@@ -9773,6 +9953,11 @@ function _makeConvChatController(cid, options = {}) {
     inputEl: backgroundHistory ? null : 'chat-input',
     sendBtnEl: backgroundHistory ? null : 'chat-send-btn',
     getCurrentId: () => cid,
+    // `getCurrentId` is intentionally fixed to the controller's request
+    // target so its abort/queue lifecycle survives navigation. Rendering has
+    // a different owner: only the task currently mounted in the conversation
+    // panel may receive its live process events.
+    isRenderTargetActive: (id) => currentView === 'conversation' && currentCid === id,
     historyEndpoint: (id) => _historyRequestUrl(id),
     streamEndpoint: (id) => `/api/conversations/${id}/send/stream`,
     features: {
@@ -10746,6 +10931,7 @@ const _PROCESS_KIND_ICON = {
   out: 'output',
   context: 'info',
   meta: 'dot',
+  wait: 'clock',
   warn: 'warning',
   err: 'x-circle',
   info: 'info',
@@ -10804,6 +10990,39 @@ function _setProcessRowPresentation(
   }
   if (lifecycleKey) line.dataset.processCallId = lifecycleKey;
   if (lifecycleTerminal) line.dataset.processTerminal = '1';
+  _setExpandableProcessRowSemantics(line, expandable);
+}
+
+function _setExpandableProcessRowSemantics(line, expandable, expanded = null) {
+  if (!line) return;
+  if (!expandable) {
+    if (typeof line.removeAttribute === 'function') {
+      line.removeAttribute('role');
+      line.removeAttribute('tabindex');
+      line.removeAttribute('aria-expanded');
+    } else {
+      delete line.role;
+      delete line.tabIndex;
+      delete line.ariaExpanded;
+    }
+    return;
+  }
+
+  const next = line.nextElementSibling;
+  const resolvedExpanded = expanded === null
+    ? !!(next && next.classList?.contains('stream-process-line-full'))
+    : expanded === true;
+  if (typeof line.setAttribute === 'function') {
+    line.setAttribute('role', 'button');
+    line.setAttribute('tabindex', '0');
+    line.setAttribute('aria-expanded', resolvedExpanded ? 'true' : 'false');
+  } else {
+    // Keep the lightweight renderer test doubles useful without weakening
+    // the real DOM contract above.
+    line.role = 'button';
+    line.tabIndex = 0;
+    line.ariaExpanded = resolvedExpanded ? 'true' : 'false';
+  }
 }
 
 function _appendProcessTextLines(
@@ -10980,6 +11199,7 @@ function _eventProcessKind(evt, text) {
     return 'meta';
   }
   if (stream === 'item') return 'think';
+  if (stream === 'reasoning') return 'think';
   if (_isProcessPlanEvent(evt)) return 'plan';
   if (stream === 'context' || stream === 'compaction') return 'context';
   if (stream === 'runtime') {
@@ -11003,9 +11223,10 @@ function _eventProcessKind(evt, text) {
     const type = String(data.type || '').toLowerCase();
     if (type === 'thinking') return 'think';
     if (type === 'file-change') return 'patch';
-    if (type === 'tool-event') return 'tool';
+    if (type === 'tool-event') return _processToolResultFailed(data) ? 'err' : 'tool';
     if (type === 'process-info') return 'bound';
-    if (type === 'stderr-line' || type === 'idle') return 'warn';
+    if (type === 'stderr-line') return 'warn';
+    if (type === 'idle') return 'wait';
     if (type === 'permission-request') return 'info';
     if (type === 'raw-line') return 'meta';
     if (type === 'log') {
@@ -11052,7 +11273,7 @@ const _ROUTING_TOOL_NAMES = new Set(['hand_off_to', 'dispatch_to', 'run_worker']
 // Read-only file tools the commander uses to inform routing (e.g. reading the
 // target agent's agent.json before hand_off_to). Routing support, not
 // user-visible "real work", so they don't by themselves keep the freeze path.
-const _ROUTING_SUPPORT_TOOL_NAMES = new Set(['read_file', 'search_files', 'grep_files', 'stat_file']);
+const _ROUTING_SUPPORT_TOOL_NAMES = new Set(['read_files', 'search_files', 'grep_files']);
 
 // True when a silent turn's process trail (one `dataset.eventName` per line, ''
 // for non-tool lines) is nothing but routing: at least one delegation tool, and
@@ -11265,13 +11486,27 @@ function _streamingUpdateActivityFromEvent(msg, evt) {
     return;
   }
   if (cliType === 'status' && phase === 'retrying') {
-    const attempt = Math.max(1, Math.round(Number(data.attempt) || 1));
-    _streamingUpdateActivity(msg, attempt > 1
-      ? t('model.retrying_n', { attempt })
-      : t('model.retrying'));
+    _streamingUpdateActivity(
+      msg,
+      _formatEventLine(evt, _processDisplayContextForMessage(msg)) || t('model.retrying'),
+    );
     return;
   }
   if (cliType === 'thinking') {
+    _streamingUpdateActivity(
+      msg,
+      _formatEventLine(evt, _processDisplayContextForMessage(msg)) || t('chat.stream.thinking'),
+    );
+    return;
+  }
+  if (stream === 'reasoning') {
+    _streamingUpdateActivity(
+      msg,
+      _formatEventLine(evt, _processDisplayContextForMessage(msg)) || t('chat.stream.thinking'),
+    );
+    return;
+  }
+  if (stream === 'reasoning') {
     _streamingUpdateActivity(
       msg,
       _formatEventLine(evt, _processDisplayContextForMessage(msg)) || t('chat.stream.thinking'),
@@ -11628,6 +11863,7 @@ function _pinMessageToTopWithDynamicSpacer(msgEl, container) {
 //   inputEl:         HTMLTextArea  — the send textarea
 //   sendBtnEl:       HTMLElement   — send/stop button
 //   getCurrentId():  returns the target id (cid / skill id / agent id)
+//   isRenderTargetActive(id): (optional) whether this target currently owns the mounted history
 //   streamEndpoint(id): returns the URL string for the streaming POST
 //   historyEndpoint(id): returns the URL for GET history
 //   clearEndpoint(id):   (optional) URL for DELETE history
@@ -12159,10 +12395,11 @@ function createChatController(config) {
             // wasted work. Keep a bounded set of non-delta process milestones
             // for switch-back; never abort, because the turn continues server-side.
             // Scene hooks still run so edit-scene state is intact.
-            if (id === config.getCurrentId()) {
-              for (const bufferedEvent of _takeOffViewGroupProcessEvents(id)) {
-                _handleStreamEvent(id, msgEl, bufferedEvent, { archive: features.archive });
-              }
+            const renderTargetActive = typeof config.isRenderTargetActive === 'function'
+              ? config.isRenderTargetActive(id)
+              : id === config.getCurrentId();
+            if (renderTargetActive) {
+              _replayOffViewGroupProcessEvents(id, msgEl, { archive: features.archive });
               _handleStreamEvent(id, msgEl, ev, { archive: features.archive });
             } else {
               _bufferOffViewGroupProcessEvent(id, ev);
@@ -12210,7 +12447,32 @@ function createChatController(config) {
     } finally {
       const wasAborted = pending?.aborted;
       const wasErrored = pending?.errored;
+      const terminalPending = pending;
       terminalResult = { started: true, aborted: !!wasAborted, errored: !!wasErrored };
+      const telemetrySurface = String(config.telemetrySurface || '');
+      if (telemetrySurface === 'agent_edit' || telemetrySurface === 'skill_edit') {
+        const missingTerminal = !wasAborted && !wasErrored && !terminalPending?.sawFinal;
+        const result = wasAborted ? 'cancelled' : ((wasErrored || missingTerminal) ? 'failure' : 'success');
+        const payload = {
+          surface: telemetrySurface === 'agent_edit' ? 'agent' : 'skill',
+          result,
+          terminal_status: wasAborted ? 'cancelled' : ((wasErrored || missingTerminal) ? 'failed' : 'completed'),
+          duration_ms: Math.max(
+            0,
+            Date.now() - Number(terminalPending?.startedAtMs || Date.now()),
+          ),
+          has_output: !!terminalPending?.sawOutput,
+        };
+        if (result === 'failure') {
+          payload.failure_phase = missingTerminal
+            ? 'result'
+            : String(terminalPending?.failurePhase || 'stream_event');
+          payload.error_code = missingTerminal
+            ? 'missing_terminal'
+            : String(terminalPending?.failureCode || 'interactive_run_failed');
+        }
+        _convTrackEvent('interactive_task_run_result', payload);
+      }
       _clearOffViewGroupProcessEvents(id);
       pending = null;
       _updateSendUI();
@@ -12650,10 +12912,7 @@ function _ensureActorPlaceholder(cid, actorId, fallbackPh, turnId, triggerMsgId,
   // Adopt the controller's initial placeholder for the first actor seen, so we
   // don't waste it on an empty bubble when only one actor runs. Skip adoption
   // once it has been claimed by another row or finalized in a prior turn.
-  if (fallbackPh && fallbackPh.parentElement
-      && fallbackPh.dataset.finalized !== '1'
-      && !fallbackPh.dataset.renderKey
-      && (!fallbackPh.dataset.fromActor || fallbackPh.dataset.fromActor === actorId)) {
+  if (_canAdoptFallbackRow(fallbackPh, actorId)) {
     if (tid) fallbackPh.dataset.turnId = tid;
     _stampRenderKey(fallbackPh, cid, renderKey);
     _stampPlaceholderTriggerMsg(fallbackPh, sourceMsgId);
@@ -12688,6 +12947,57 @@ function _claimRenderNodeForMessage(cid, gm) {
   if (ph.dataset.finalized === '1') return null;
   ph.dataset.finalized = '1';
   return ph;
+}
+
+/**
+ * Is the controller's initial row still free to become this actor's row?
+ *
+ * Shared by the streaming path and the persisted-record path so both adopt on
+ * the same terms. While only the streaming path could adopt, a record whose
+ * stream never opened a keyed row appended beside that row instead — two
+ * bubbles with the same text and the same process rail, surviving until
+ * reload (reported 2026-07-30 and again 2026-08-19).
+ */
+function _canAdoptFallbackRow(fallbackPh, actorId) {
+  return !!fallbackPh
+    && !!fallbackPh.parentElement
+    && fallbackPh.dataset.finalized !== '1'
+    && !fallbackPh.dataset.renderKey
+    && (!fallbackPh.dataset.fromActor || fallbackPh.dataset.fromActor === actorId);
+}
+
+/** Give a persisted record the unkeyed row already showing its text, rather
+ *  than appending a second one beside it. */
+function _adoptFallbackRowForMessage(cid, gm, fallbackPh) {
+  const renderKey = _messageRenderKey(gm);
+  if (!renderKey) return null;
+  if (!_canAdoptFallbackRow(fallbackPh, String((gm && gm.from) || ''))) return null;
+  if (gm && gm.turn_id) fallbackPh.dataset.turnId = String(gm.turn_id);
+  _stampRenderKey(fallbackPh, cid, renderKey);
+  fallbackPh.dataset.finalized = '1';
+  return fallbackPh;
+}
+
+/** Log a record that reached the append fallback, with the identity needed to
+ *  place it and nothing else: no message text, no conversation id.
+ *  `unkeyed_content_rows` is the population such a miss is drawn from, and the
+ *  number that has to stay at zero for the duplicate class to stay closed. */
+function _reportUnclaimedKeyedRecord(cid, gm, renderKey) {
+  try {
+    const existing = _findRenderNode(cid, renderKey);
+    const container = document.getElementById('chat-history');
+    const unkeyed = container
+      ? container.querySelectorAll('.chat-message:not([data-render-key])').length
+      : -1;
+    _convLog.warn('keyed record found no live row', {
+      reason: existing ? 'row_already_finalized' : 'no_live_row',
+      render_key: renderKey,
+      from_kind: String(gm && gm.from) === 'commander' ? 'commander'
+        : String(gm && gm.from) === 'user' ? 'user' : 'agent',
+      seg: gm && gm.seg !== undefined && gm.seg !== null ? Number(gm.seg) : -1,
+      unkeyed_content_rows: unkeyed,
+    });
+  } catch (_) { /* diagnostics must never break rendering */ }
 }
 
 // Transform a streaming placeholder bubble into its finalized form:
@@ -12966,10 +13276,17 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
       if (gm.turn_id && gm.seg !== undefined && gm.seg !== null) {
         _dropSupersededTurnRows(cid, String(gm.from || ''), gm.turn_id, gm.seg);
       }
-      const ph = _claimRenderNodeForMessage(cid, gm);
+      // Identity first, then the controller's initial row. Appending is the
+      // last resort, not the fallback for a lookup miss: a keyed record that
+      // appends beside a row already showing its text is the duplicate-bubble
+      // class this render-key scheme exists to close.
+      const ph = _claimRenderNodeForMessage(cid, gm)
+        || _adoptFallbackRowForMessage(cid, gm, streamingMsg);
       if (ph && ph.parentElement) {
         _finalizeActorPlaceholder(ph, gm, cid, archive);
       } else {
+        const recordKey = _messageRenderKey(gm);
+        if (recordKey) _reportUnclaimedKeyedRecord(cid, gm, recordKey);
         const legacy = _groupMsgToLegacy(gm);
         const bubble = appendChatMessage(legacy, true, { cid, archive });
         if (bubble) bubble.dataset.fromActor = String(gm.from || '');
@@ -13608,6 +13925,14 @@ function _formatEventLine(evt, displayContext) {
     return null;
   }
 
+  if (stream === 'reasoning') {
+    const label = data?.phase === 'end'
+      ? t('chat.stream.reasoning_done')
+      : t('chat.stream.thinking');
+    const detail = String(data?.summary || '').replace(/\s+/g, ' ').trim();
+    return detail ? `${label} · ${detail}` : label;
+  }
+
   if (stream === 'item') {
     const itemType = String(data?.itemType || data?.type || '').toLowerCase();
     // Tool / function / message items duplicate what the dedicated streams
@@ -13727,7 +14052,12 @@ function _formatEventLine(evt, displayContext) {
     if (cliType === 'tool-event') {
       const name = String(data?.tool || 'tool');
       const isResult = data?.phase === 'result';
-      const input = isResult ? null : data?.input;
+      // Some CLI adapters can only recover a completed call from their
+      // durable session, so the first event Orkas sees is the result. Its
+      // input still goes through the same bounded/redacted presentation
+      // helpers below. When a live `use` event was already cached by call id,
+      // `_formatKnownToolProcessLine` deliberately keeps that presentation.
+      const input = data?.input;
       const friendly = _formatKnownToolProcessLine(
         name,
         data,
@@ -13759,16 +14089,15 @@ function _formatEventLine(evt, displayContext) {
       if (st === 'retrying') {
         const attempt = Math.max(1, Math.round(Number(data?.attempt) || 1));
         const maxRetries = Math.max(0, Math.round(Number(data?.maxRetries) || 0));
-        const retry = attempt > 1
-          ? t('model.retrying_n', { attempt })
-          : t('model.retrying');
-        const count = maxRetries ? `/${maxRetries}` : '';
+        const retry = maxRetries
+          ? t('chat.stream.retry_attempt_total', { attempt, total: maxRetries })
+          : t('chat.stream.retry_attempt', { attempt });
         const delayMs = Number(data?.retryDelayMs);
         const wait = Number.isFinite(delayMs) && delayMs > 0
-          ? ` · ${t('chat.stream.retry_wait', { duration: _formatProcessDuration(delayMs) })}`
+          ? t('chat.stream.retry_continue', { duration: _formatProcessDuration(delayMs) })
           : '';
-        const reason = _processFailureSummary(data);
-        return `${retry}${count}${wait}${reason ? ` · ${reason}` : ''}`;
+        const reason = _formatCliRetryReason(data);
+        return `${reason} · ${retry}${wait ? ` · ${wait}` : ''}`;
       }
       if (st === 'plan-updated') {
         const steps = Array.isArray(data?.steps) ? data.steps : [];
@@ -13804,6 +14133,12 @@ function _formatEventLine(evt, displayContext) {
           return failure ? `${line} · ${failure}` : line;
         }
         const detail = taskType || _processStatusDetail(data?.message, 160);
+        if (st === 'background-started' || st === 'background-running') {
+          const key = st === 'background-started'
+            ? 'chat.stream.background_started'
+            : 'chat.stream.background_running';
+          return t(key, { detail: detail ? ` · ${detail}` : '' });
+        }
         return _processActionLine('chat.process.action_background_task', detail, statusKey);
       }
       if (st === 'tool-progress') {
@@ -13830,6 +14165,13 @@ function _formatEventLine(evt, displayContext) {
       }
       if (st === 'authenticating') return t('chat.stream.authenticating');
       if (st === 'rate-limit') {
+        // History can contain Claude events persisted before the backend
+        // distinguished informational limit updates from rejected requests.
+        // A present provider status is authoritative: only exact rejection is
+        // visible. Statuses without this field belong to other CLI adapters
+        // and retain their existing generic rate-limit presentation.
+        const rateLimitStatus = String(data?.rateLimitStatus || '').trim().toLowerCase();
+        if (rateLimitStatus && rateLimitStatus !== 'rejected') return null;
         const delayMs = Number(data?.retryAfterMs ?? data?.retry_after_ms ?? data?.retryDelayMs);
         const wait = Number.isFinite(delayMs) && delayMs > 0
           ? t('chat.stream.retry_wait', { duration: _formatProcessDuration(delayMs) })
@@ -13837,7 +14179,14 @@ function _formatEventLine(evt, displayContext) {
         return `${t('chat.stream.rate_limit')}${wait ? ` · ${wait}` : ''}`;
       }
       if (st === 'session_ready') return t('chat.process.agent_ready');
-      if (st === 'running') return t('chat.process.task_running');
+      if (st === 'running') {
+        // OpenCode emits one step_start/running pulse per internal step. They
+        // all mean the same bubble-level milestone, so keep one concise row
+        // while retaining every raw event in the persisted process trail.
+        if (displayContext?.cliRunningShown) return null;
+        if (displayContext) displayContext.cliRunningShown = true;
+        return t('chat.process.task_running');
+      }
       if (st === 'result' || st === 'completed') return t('chat.process.task_done');
       if (st === 'error' || st === 'failed') {
         const failure = _processFailureSummary(data);
@@ -13914,8 +14263,12 @@ function _projectProcessRow(evt, displayContext, fallbackText = '') {
   const text = (event ? _formatEventLine(event, displayContext) : '')
     || String(fallbackText || '');
   if (!text) return null;
+  // Hidden diagnostics must not split one visible wait into multiple rows.
+  const idleLifecycle = event ? _processCliIdleLifecycle(event, displayContext) : null;
   const kind = event ? _eventProcessKind(event, text) : _processKindOf(text);
-  const lifecycle = kind === 'plan' ? null : _processToolLifecycle(event);
+  const lifecycle = kind === 'plan'
+    ? null
+    : (idleLifecycle || _processToolLifecycle(event) || _processCliRetryLifecycle(event, displayContext));
   const data = event?.data && typeof event.data === 'object' ? event.data : {};
   const cliResult = event?.stream === 'cli'
     && String(data.type || '').toLowerCase() === 'tool-event'
@@ -13924,6 +14277,7 @@ function _projectProcessRow(evt, displayContext, fallbackText = '') {
   const resultPath = cliResult
     ? (typeof data.outputPath === 'string' ? data.outputPath : '')
     : (toolResult && typeof data.result_path === 'string' ? data.result_path : '');
+  const resultRef = cliResult && typeof data.outputRef === 'string' ? data.outputRef : '';
   const fullOutput = (cliResult || toolResult) && typeof data.output === 'string'
     ? data.output
     : '';
@@ -13934,9 +14288,60 @@ function _projectProcessRow(evt, displayContext, fallbackText = '') {
     lifecycleKey: lifecycle?.key || '',
     lifecycleTerminal: lifecycle?.terminal === true,
     resultPath,
+    resultRef,
     fullOutput,
-    expandable: kind !== 'plan' && !!(resultPath || fullOutput),
+    expandable: kind !== 'plan' && !!(resultPath || resultRef || fullOutput),
   };
+}
+
+// Append one process projection into an already-resolved process body. This
+// is the shared DOM boundary for live and restored history, including result
+// expansion metadata and its discoverability affordance.
+function _appendProjectedProcessRowToBody(body, projection) {
+  if (!body || !projection) return 0;
+  if (!projection.expandable) {
+    return _appendProcessTextLines(
+      body,
+      projection.text,
+      projection.kind,
+      projection.eventName,
+      projection.lifecycleKey,
+      projection.lifecycleTerminal,
+    );
+  }
+
+  const kind = projection.kind || _processKindOf(projection.text);
+  const existing = _processLifecycleRow(body, projection.lifecycleKey);
+  const line = existing || document.createElement('div');
+  _setProcessRowPresentation(
+    line,
+    projection.text,
+    kind,
+    projection.eventName,
+    projection.lifecycleKey,
+    true,
+    projection.lifecycleTerminal,
+  );
+  if (projection.resultPath) line.dataset.toolResultPath = projection.resultPath;
+  else if (line.dataset) delete line.dataset.toolResultPath;
+  if (projection.resultRef) line.dataset.toolResultRef = projection.resultRef;
+  else if (line.dataset) delete line.dataset.toolResultRef;
+  line._fullOutput = projection.fullOutput || '';
+  line.title = t('chat.tool_result_expand_hint');
+  line.innerHTML += `<span class="stream-process-expand-hint" aria-hidden="true">${_uiIconHtml('chevron-right', 'ui-icon stream-process-expand-icon')}</span>`;
+  if (!existing) body.appendChild(line);
+
+  // One delegated handler per process body. Persisted messages use the same
+  // handler as the live bubble once the outer process disclosure is opened.
+  if (!body._toolResultClickBound && typeof body.addEventListener === 'function') {
+    body._toolResultClickBound = true;
+    body.addEventListener('click', _onToolResultRowClick);
+  }
+  if (!body._toolResultKeydownBound && typeof body.addEventListener === 'function') {
+    body._toolResultKeydownBound = true;
+    body.addEventListener('keydown', _onToolResultRowKeydown);
+  }
+  return 1;
 }
 
 function _appendProjectedProcessRow(msg, projection) {
@@ -13946,6 +14351,7 @@ function _appendProjectedProcessRow(msg, projection) {
       msg,
       projection.text,
       projection.resultPath,
+      projection.resultRef,
       projection.fullOutput,
       projection.kind,
       projection.eventName,
@@ -13964,11 +14370,45 @@ function _appendProjectedProcessRow(msg, projection) {
   );
 }
 
+// Model reasoning progress uses prefix-replacement patches so the main
+// process never retransmits the complete growing summary on every provider
+// delta. Materialize the safe text at the renderer boundary, then let the
+// ordinary lifecycle-row projection update the same visible row.
+function _materializeReasoningSummary(msg, evt) {
+  if (!msg || evt?.stream !== 'reasoning' || !evt.data || typeof evt.data !== 'object') {
+    return evt;
+  }
+  const data = evt.data;
+  const id = String(data.id || '').trim();
+  if (!id) return evt;
+  if (!msg._reasoningSummaryById) msg._reasoningSummaryById = new Map();
+  const summaries = msg._reasoningSummaryById;
+  const phase = String(data.phase || '').toLowerCase();
+  if (phase === 'start') {
+    summaries.delete(id);
+    return evt;
+  }
+
+  let summary = typeof data.summary === 'string' ? data.summary : null;
+  if (summary === null
+      && Number.isInteger(data.summary_from)
+      && typeof data.summary_delta === 'string') {
+    const current = String(summaries.get(id) || '');
+    const from = Math.max(0, Math.min(current.length, data.summary_from));
+    summary = current.slice(0, from) + data.summary_delta;
+    data.summary = summary;
+  }
+  if (summary !== null) summaries.set(id, summary);
+  if (phase === 'end') summaries.delete(id);
+  return evt;
+}
+
 // Render a live openclaw agent event into the streaming bubble. Assistant
 // text deltas update the single "live" line; everything else becomes a new
 // process-pane line (via _formatEventLine).
 function _renderAgentEvent(msg, evt) {
   if (!evt || typeof evt !== 'object') return;
+  evt = _materializeReasoningSummary(msg, evt);
   const { stream, data } = evt;
   if (!stream) return;
   if (stream === 'runtime' && _runtimeDurationMsFromEvent(evt) != null) {
@@ -13987,9 +14427,15 @@ function _renderAgentEvent(msg, evt) {
     return;
   }
 
-  // Activity heartbeats refresh the concise status strip and watchdog only;
-  // rendering one row per pulse would drown the useful process milestones.
-  if (stream === 'cli' && data?.heartbeat === true) return;
+  // Most activity heartbeats refresh only the concise status strip and
+  // watchdog. A reasoning pulse with a safe summary is allowed through so it
+  // can update the one lifecycle-keyed process row instead of adding rows.
+  if (data?.heartbeat === true) {
+    const hasReasoningDetail = stream === 'reasoning'
+      && (Boolean(String(data?.summary || '').trim())
+        || (Number.isInteger(data?.summary_from) && typeof data?.summary_delta === 'string'));
+    if (!hasReasoningDetail) return;
+  }
 
   // CLI status:'usage' pulses are intentionally hidden from process
   // information. The raw events are still persisted for devtools/debug.
@@ -14008,7 +14454,9 @@ function _renderAgentEvent(msg, evt) {
 
 /** Append a tool-event result row that can expand its full output. Two
  *  storage paths for the full body, decided at append time:
- *    - `outputPath` (string)   → runner spilled to disk; click reads via IPC.
+ *    - `outputRef` (string)    → runner spilled locally; click resolves the
+ *                                 opaque ref for the active user via IPC.
+ *    - `outputPath` (string)   → legacy/local tool path compatibility.
  *    - `fullOutput` (string)   → live event body (<50KB), stash on the
  *                                 row's JS prop; click renders directly.
  *  Exactly one of the two is required — caller (_renderAgentEvent) gates.
@@ -14022,6 +14470,7 @@ function _streamingAppendToolResultRow(
   msg,
   previewText,
   outputPath,
+  outputRef,
   fullOutput,
   kindHint,
   eventName,
@@ -14033,56 +14482,45 @@ function _streamingAppendToolResultRow(
   const body = msg.querySelector('[data-role="process"]');
   if (!body) return;
   _bindProcessStickToBottom(body);
-
-  const kind = kindHint || _processKindOf(previewText);
-  const existing = _processLifecycleRow(body, lifecycleKey);
-  const line = existing || document.createElement('div');
-  _setProcessRowPresentation(
-    line,
-    previewText,
-    kind,
+  _appendProjectedProcessRowToBody(body, {
+    text: previewText,
+    kind: kindHint || _processKindOf(previewText),
     eventName,
     lifecycleKey,
-    true,
     lifecycleTerminal,
-  );
-  if (outputPath) line.dataset.toolResultPath = outputPath;
-  if (fullOutput) line._fullOutput = fullOutput;
-  line.title = t('chat.tool_result_expand_hint');
-  if (!existing) body.appendChild(line);
-
-  // One delegated handler per bubble — cheaper than binding per row.
-  if (!body._toolResultClickBound) {
-    body._toolResultClickBound = true;
-    body.addEventListener('click', _onToolResultRowClick);
-  }
+    resultPath: outputPath,
+    resultRef: outputRef,
+    fullOutput,
+    expandable: true,
+  });
 
   _stickProcessBottomIfPinned(body);
   _stickBottomFromMsg(msg);
 }
 
-async function _onToolResultRowClick(ev) {
-  const row = ev.target.closest('.stream-process-line.is-expandable');
+async function _toggleToolResultRow(row) {
   if (!row) return;
   // Toggle existing expansion.
   const next = row.nextElementSibling;
   if (next && next.classList.contains('stream-process-line-full')) {
     next.remove();
+    _setExpandableProcessRowSemantics(row, true, false);
     return;
   }
+  const ref = row.dataset.toolResultRef;
   const path = row.dataset.toolResultPath;
   const inline = row._fullOutput;
   const pre = document.createElement('pre');
   pre.className = 'stream-process-line-full';
 
-  if (path) {
+  if (ref || path) {
     // window.orkas.invoke is the canonical IPC entry (matches every
     // other feature's pattern — saved-apps / chat-artifact / workspace).
     const inv = window.orkas && window.orkas.invoke;
     if (typeof inv !== 'function') return;
     let res;
     try {
-      res = await inv('localAgents.readToolResult', { path });
+      res = await inv('localAgents.readToolResult', ref ? { ref } : { path });
     } catch (err) {
       res = { ok: false, error: String(err?.message || err) };
     }
@@ -14097,6 +14535,21 @@ async function _onToolResultRowClick(ev) {
     pre.textContent = '[no content recorded for this row]';
   }
   row.insertAdjacentElement('afterend', pre);
+  _setExpandableProcessRowSemantics(row, true, true);
+}
+
+async function _onToolResultRowClick(ev) {
+  const row = ev?.target?.closest?.('.stream-process-line.is-expandable');
+  if (!row) return;
+  await _toggleToolResultRow(row);
+}
+
+async function _onToolResultRowKeydown(ev) {
+  if (!['Enter', ' ', 'Spacebar'].includes(ev?.key)) return;
+  const row = ev?.target?.closest?.('.stream-process-line.is-expandable');
+  if (!row) return;
+  ev.preventDefault?.();
+  await _toggleToolResultRow(row);
 }
 
 // Update or create a single "live" line in the process pane.

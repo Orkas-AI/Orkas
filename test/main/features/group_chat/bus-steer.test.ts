@@ -23,13 +23,29 @@ vi.mock('../../../../src/main/features/chat_attachments', () => ({
   }),
 }));
 
+const getSystemPromptBlockMock = vi.hoisted(() => vi.fn(async ({ forceOpenSkillRefs, runtimeBindings }: {
+  forceOpenSkillRefs?: Array<string | { id: string; source?: string }>;
+  runtimeBindings?: Map<string, Record<string, string>>;
+}) => {
+  const first = forceOpenSkillRefs?.[0];
+  const id = typeof first === 'string' ? first : first?.id;
+  if (id && runtimeBindings) {
+    runtimeBindings.set(id, {
+      id,
+      name: id,
+      root: `/tmp/orkas-rich-steer/skills/${id}`,
+      entry: `/tmp/orkas-rich-steer/skills/${id}/SKILL.md`,
+      source: 'global',
+    });
+  }
+  return id
+    ? `<available_skills><skill id="${id}" read_ref="@skill/${id}"><instructions>Review carefully.</instructions></skill></available_skills>`
+    : '';
+}));
+
 vi.mock('../../../../src/main/model/core-agent/skill-registry', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
-  getSystemPromptBlock: async ({ allowlist }: { allowlist?: string[] }) => (
-    allowlist?.length
-      ? `<available_skills><skill id="${allowlist[0]}"><instructions>Review carefully.</instructions></skill></available_skills>`
-      : ''
-  ),
+  getSystemPromptBlock: getSystemPromptBlockMock,
 }));
 
 import {
@@ -47,7 +63,12 @@ type AnyItem = Record<string, any>;
 let itemSequence = 0;
 function item(o: AnyItem): AnyItem {
   itemSequence++;
-  return { turnId: `t-${itemSequence}`, msgId: `m-${itemSequence}`, ...o };
+  return {
+    turnId: `t-${itemSequence}`,
+    msgId: `m-${itemSequence}`,
+    steerActiveTurn: true,
+    ...o,
+  };
 }
 function fakeW(queue: AnyItem[]): any {
   return { uid: 'user-test', cid: 'cid1', queue };
@@ -68,6 +89,19 @@ async function acknowledge(messages: AnyItem[]): Promise<void> {
 }
 
 describe('group_chat bus › drainSteerInto (interrupt-steer)', () => {
+  it('leaves an ordinary user message in FIFO unless Send now authorized steering', async () => {
+    const queued = item({
+      actor: commander,
+      fromActorId: 'user',
+      llmPayload: 'ORDINARY_FOLLOW_UP',
+      steerActiveTurn: false,
+    });
+    const w = fakeW([queued]);
+
+    expect(await drainSteerInto(w, commander)).toEqual([]);
+    expect(w.queue).toEqual([queued]);
+  });
+
   it('prepares matching rich messages in FIFO order and removes them only after acknowledgement', async () => {
     const w = fakeW([
       item({ actor: commander, fromActorId: 'user', llmPayload: 'U1' }),
@@ -202,7 +236,7 @@ describe('group_chat bus › drainSteerInto (interrupt-steer)', () => {
     },
     {
       label: 'Skill selection',
-      fields: { useSelections: [{ kind: 'skill', id: 'review' }] },
+      fields: { useSelections: [{ kind: 'skill', id: 'review', source: 'global' }] },
       expectedText: '<runtime-skill-selection',
     },
     {
@@ -226,6 +260,60 @@ describe('group_chat bus › drainSteerInto (interrupt-steer)', () => {
     expect(w.queue).toEqual([queued]);
     await acknowledge(folded);
     expect(w.queue).toEqual([]);
+  });
+
+  it('preserves an exact Skill source in an active-turn selection', async () => {
+    const queued = item({
+      actor: commander,
+      fromActorId: 'user',
+      llmPayload: 'USE_EXACT_GLOBAL_SKILL',
+      useSelections: [{ kind: 'skill', id: 'same-id', name: 'Shared Skill', source: 'global' }],
+    });
+    const w = fakeW([queued]);
+    const before = getSystemPromptBlockMock.mock.calls.length;
+
+    const folded = await drainSteerInto(w, commander);
+
+    expect(folded).toHaveLength(1);
+    expect(getSystemPromptBlockMock.mock.calls.slice(before)).toContainEqual([
+      expect.objectContaining({
+        allowlist: [],
+        forceOpenSkillRefs: [{ id: 'same-id', name: 'Shared Skill', source: 'global' }],
+      }),
+    ]);
+    expect(steerText(folded[0])).toContain('<runtime-skill-selection');
+  });
+
+  it('commits selected Skill bindings and the Connector group only after the steer is accepted', async () => {
+    const queued = item({
+      actor: agentX,
+      fromActorId: 'user',
+      llmPayload: 'USE_SELECTED_RESOURCES',
+      useSelections: [
+        { kind: 'skill', id: 'review', source: 'global' },
+        { kind: 'connector', id: 'notion', name: 'Notion' },
+      ],
+    });
+    const w = fakeW([queued]);
+    const runtimeSkillBindings = new Map<string, any>();
+    const runtimeGrantedToolGroups: string[] = [];
+
+    const folded = await drainSteerInto(w, agentX as any, {
+      runtimeSkillBindings,
+      runtimeGrantedToolGroups,
+    });
+
+    expect(folded).toHaveLength(1);
+    expect(steerText(folded[0])).toContain('@skill/review');
+    expect(runtimeSkillBindings.size).toBe(0);
+    expect(runtimeGrantedToolGroups).toEqual([]);
+
+    await acknowledge(folded);
+
+    expect(runtimeSkillBindings.get('review')).toMatchObject({
+      entry: '/tmp/orkas-rich-steer/skills/review/SKILL.md',
+    });
+    expect(runtimeGrantedToolGroups).toEqual(['connectors']);
   });
 
   it('returns [] and leaves the queue intact when nothing matches the running actor', async () => {
@@ -254,6 +342,24 @@ describe('group_chat bus › drainSteerInto (interrupt-steer)', () => {
 });
 
 describe('group_chat bus › native CLI interrupt-steer', () => {
+  it('leaves an ordinary user message in FIFO without calling native ingress', async () => {
+    const queued = item({
+      actor: agentX,
+      fromActorId: 'user',
+      llmPayload: 'ORDINARY_CLI_FOLLOW_UP',
+      steerActiveTurn: false,
+    });
+    const ingress = {
+      submit: vi.fn(async () => ({ mode: 'steered' as const })),
+    };
+    const w = fakeW([queued]);
+    w.currentTurnIngress = ingress;
+
+    expect(await drainCliSteerInto(w, agentX as any, ingress)).toBe(0);
+    expect(ingress.submit).not.toHaveBeenCalled();
+    expect(w.queue).toEqual([queued]);
+  });
+
   it('hydrates and acknowledges text, image attachment, Skill and Connector in one CLI submission', async () => {
     const queued = item({
       actor: agentX,

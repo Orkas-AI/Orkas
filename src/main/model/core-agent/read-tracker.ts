@@ -1,13 +1,13 @@
 /**
  * Read-before-edit + optimistic concurrency control (OCC) for the file tools.
  *
- * `read_file` / `write_file` stamp the file's `{ mtimeMs, size, hash? }` into a
+ * `read_files` / `write_file` stamp the file's `{ mtimeMs, size, hash? }` into a
  * run-scoped map; `edit_file` checks that stamp before it writes:
  *   - read-before-edit — refuse to edit a file the model has not read this run
  *     (its `old_string` would be a guess), and
  *   - OCC — refuse to edit a file that changed on disk since the model read it
  *     (a parallel worker, a bash command, or an external process moved it),
- *     forcing a fresh `read_file` so the edit lands on the real current bytes.
+ *     forcing a fresh `read_files` call so the edit lands on the real current bytes.
  *
  * The map lives on `ctx.state[READ_FILE_STATE_KEY]`, injected once per run by
  * core-agent's runner (so it survives across LLM rounds — read and edit are
@@ -16,7 +16,7 @@
  * tools degrade to their pre-OCC behaviour rather than blocking every edit. The
  * real runner always injects it, so production always enforces.
  *
- * Stamping from `read_file` is concurrency-safe even though `read_file` is
+ * Stamping from `read_files` is concurrency-safe even though `read_files` is
  * `executionMode:'parallel'`: a keyed `Map.set(abs, …)` is atomic in JS, the
  * key is the absolute path (concurrent reads of different files never collide),
  * and same-file reads write an equivalent value. Each worker run has its OWN
@@ -81,11 +81,12 @@ export type EditBlock = { code: 'E_NOT_READ' | 'E_STALE'; msg: string };
  *   - never read this run            → E_NOT_READ
  *   - read, but mtime/size changed   → E_STALE
  *
- * Message contract: every consumer (edit_file, apply_patch) appends bounded
- * current context plus its own executable recovery instruction, and refreshes
- * the read baseline on rejection. Keep these shared messages limited to the
- * failure reason so they cannot prescribe a parameter or workflow that one
- * consumer does not support (2026-08-16 latency review P0-4).
+ * Message contract: every consumer (edit_file, apply_patch) appends a
+ * recovery block with the current bytes and a fresh file_hash, and refreshes
+ * the read baseline on rejection — so the messages steer the model at that
+ * returned context first. A bare "call read_files again" here made models pay
+ * a full re-read round the trailer had already made unnecessary
+ * (2026-08-16 latency review P0-4).
  */
 export function checkEditFreshness(
   ctx: ToolContext,
@@ -108,7 +109,7 @@ export function checkEditFreshness(
   if (!seen) {
     return {
       code: 'E_NOT_READ',
-      msg: `${abs}: not read in this run, so the proposed change cannot be checked against the real current contents. Follow the current-context recovery guidance returned below.`,
+      msg: `${abs}: not read in this run, so old_string cannot be checked against the real current contents. Use the current context and file_hash returned below to retry (pass expected_hash); use one bounded range in read_files paths only if that window misses your target.`,
     };
   }
   if (
@@ -118,7 +119,7 @@ export function checkEditFreshness(
   ) {
     return {
       code: 'E_STALE',
-      msg: `${abs}: file changed on disk since you read it (another worker, a command, or an external edit). Follow the current-context recovery guidance returned below.`,
+      msg: `${abs}: file changed on disk since you read it (another worker, a command, or an external edit). Retry against the current context and file_hash returned below (pass expected_hash); re-read only the affected region with a read_files paths range if that window is insufficient.`,
     };
   }
   return null;

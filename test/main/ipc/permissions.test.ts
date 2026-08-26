@@ -78,47 +78,30 @@ describe('ipc › permissions.* routes', () => {
     expect(res).toMatchObject({ ok: false, code: 'E_IPC_REQUEST' });
   });
 
-  it('permissions.getLocalExec defaults to granted on a fresh install', async () => {
-    const res = await call('permissions.getLocalExec');
-    expect(res.ok).toBe(true);
-    expect(res.granted).toBe(true);
-  });
-
-  it('permissions.grantLocalExec flips the flag and persists', async () => {
-    const res = await call('permissions.grantLocalExec');
-    expect(res.ok).toBe(true);
-    expect(res.granted).toBe(true);
-    expect(res.mode).toBe('all_files_auto');
-    expect(typeof res.grantedAt).toBe('string');
-
-    const after = await call('permissions.getLocalExec');
-    expect(after.granted).toBe(true);
-  });
-
-  it('permissions.revokeLocalExec maps legacy revoke to the safest mode', async () => {
-    await call('permissions.grantLocalExec');
-    const res = await call('permissions.revokeLocalExec');
-    expect(res.ok).toBe(true);
-    expect(res.granted).toBe(true);
-    expect(res.mode).toBe('workspace_approval');
-    expect(typeof res.revokedAt).toBe('string');
-  });
-
   it('permissions.getLocalExec returns the mode and defaults to all_files_approval', async () => {
     const res = await call('permissions.getLocalExec');
     expect(res.ok).toBe(true);
     expect(res.mode).toBe('all_files_approval');
+    expect(res).not.toHaveProperty('granted');
   });
 
   it('permissions.setLocalExecMode persists a valid mode and is read back', async () => {
     const res = await call('permissions.setLocalExecMode', { mode: 'all_files_approval' });
     expect(res.ok).toBe(true);
     expect(res.mode).toBe('all_files_approval');
-    expect(res.granted).toBe(true);
 
     const after = await call('permissions.getLocalExec');
     expect(after.mode).toBe('all_files_approval');
   });
+
+  it.each(['permissions.grantLocalExec', 'permissions.revokeLocalExec'])(
+    'retires the obsolete %s route',
+    async (channel) => {
+      const res = await call(channel);
+      expect(res.ok).toBe(false);
+      expect(res.error).toMatch(/unknown channel/);
+    },
+  );
 
   it('permissions.setLocalExecMode rejects an invalid mode', async () => {
     const res = await call('permissions.setLocalExecMode', { mode: 'bogus' });
@@ -135,11 +118,6 @@ describe('ipc › permissions.* routes', () => {
   });
 
   it('unknown permissions.* channel surfaces the router fallback error', async () => {
-    // Regression guard: this is the exact symptom that made "授权本机工具"
-    // look dead — when a handler is missing, the router returns
-    // { ok: false, error: 'unknown channel: ...' } and settings.js's
-    // `if (res && res.ok)` silently no-ops. Make sure the three real
-    // channels above never hit this path again.
     const res = await call('permissions.doesNotExist');
     expect(res.ok).toBe(false);
     expect(res.error).toMatch(/unknown channel/);

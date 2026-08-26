@@ -176,5 +176,54 @@ class WeightAndBranchTest(unittest.TestCase):
         self.assertEqual(bare["health_score"], 100)
 
 
+class LocalFileEvidenceTest(unittest.TestCase):
+    """Security and indexability must not score 100 off a page never contacted.
+
+    2026-08-09: a local-file crawl produced security 100, indexability 100 and
+    every finding tagged Measured, because scoring deducts for findings and the
+    only security check asks `not https` — a field that had been derived from
+    the scheme of the base URL the caller typed.
+    """
+
+    def _local(self, **over):
+        page = dict(GOOD_PAGE, status_code=None, https=None,
+                    is_indexable=None, source="file", **over)
+        return audit(crawl(page))
+
+    def test_unobserved_dimensions_are_unscored_and_named(self):
+        r = self._local()
+        self.assertIsNone(r["dimension_scores"]["security"])
+        self.assertIsNone(r["dimension_scores"]["indexability"])
+        self.assertEqual(
+            sorted((e["dimension"], e["check"]) for e in r["not_assessed"]),
+            [("indexability", "response_status"), ("security", "https")],
+        )
+        self.assertEqual(r["meta"]["source"], "file")
+        # It must not invent a defect either: no finding may claim the page is
+        # served over http or returning an error.
+        ids = {f["id"] for f in r["findings"]}
+        self.assertNotIn("not_https", ids)
+        self.assertNotIn("server_error", ids)
+        self.assertNotIn("client_error", ids)
+
+    def test_html_derived_checks_still_run_on_a_local_file(self):
+        # The negative control: withholding response dimensions must not stop
+        # the audit reading what the file itself says.
+        r = self._local(canonical="https://elsewhere.example/", noindex=True)
+        ids = {f["id"] for f in r["findings"]}
+        self.assertIn("noindex", ids)
+        self.assertIn("canonical_elsewhere", ids)
+
+    def test_a_real_fetch_is_scored_exactly_as_before(self):
+        clean = audit(crawl(dict(GOOD_PAGE, status_code=200, https=True)))
+        self.assertEqual(clean["dimension_scores"]["security"], 100)
+        self.assertEqual(clean["not_assessed"], [])
+        self.assertEqual(clean["meta"]["source"], "fetch")
+        http = audit(crawl(dict(GOOD_PAGE, status_code=200, https=False)))
+        self.assertEqual(http["dimension_scores"]["security"], 75)
+        self.assertIn("not_https", {f["id"] for f in http["findings"]})
+        self.assertEqual(http["not_assessed"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

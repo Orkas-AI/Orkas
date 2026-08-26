@@ -8,6 +8,7 @@ function makeHandlers() {
     onThinking: vi.fn(),
     onToolUse: vi.fn(),
     onToolResult: vi.fn(),
+    onMediaOutput: vi.fn(),
     onPromptResult: vi.fn(),
     onUnknown: vi.fn(),
   };
@@ -77,6 +78,57 @@ describe('local_agents/backends/_acp › handleAcpMessage', () => {
       params: { update: { kind: 'tool_call_update', tool: { id: 'c1', name: 'read_file', output: { lines: 4 } } } },
     }, h);
     expect(h.onToolResult).toHaveBeenCalledWith({ name: 'read_file', callId: 'c1', output: '{"lines":4}' });
+  });
+
+  it('supports the current ACP root tool fields and standard image content', () => {
+    const h = makeHandlers();
+    handleAcpMessage({
+      method: 'session/update',
+      params: { update: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'image-1',
+        title: 'image_generate',
+        rawInput: { prompt: 'a fox' },
+      } },
+    }, h);
+    handleAcpMessage({
+      method: 'session/update',
+      params: { update: {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'image-1',
+        status: 'completed',
+        content: [{ type: 'content', content: {
+          type: 'image', data: 'AAAA', mimeType: 'image/png', uri: 'file:///tmp/image.png',
+        } }],
+        rawOutput: { ok: true },
+      } },
+    }, h);
+    expect(h.onToolUse).toHaveBeenCalledWith({
+      name: 'image_generate', callId: 'image-1', input: { prompt: 'a fox' },
+    });
+    expect(h.onToolResult).toHaveBeenCalledWith({
+      name: 'tool', callId: 'image-1', output: '{"ok":true}',
+    });
+    expect(h.onMediaOutput).toHaveBeenCalledWith({
+      callId: 'image-1',
+      items: [{ data: 'AAAA', uri: 'file:///tmp/image.png', mediaType: 'image/png' }],
+    });
+  });
+
+  it('extracts the Hermes image_generate URL from rawOutput JSON', () => {
+    const h = makeHandlers();
+    handleAcpMessage({
+      method: 'session/update',
+      params: { update: {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'image-2',
+        rawOutput: '{"success":true,"image":"https://cdn.example/hermes.png"}',
+      } },
+    }, h);
+    expect(h.onMediaOutput).toHaveBeenCalledWith({
+      callId: 'image-2',
+      items: [{ uri: 'https://cdn.example/hermes.png' }],
+    });
   });
 
   it('marks prompt response (id=100) ok=true on end_turn', () => {

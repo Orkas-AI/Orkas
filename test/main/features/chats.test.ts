@@ -124,9 +124,12 @@ describe('chats › message history tombstones', () => {
     fs.mkdirSync(path.dirname(imagePath), { recursive: true });
     fs.writeFileSync(imagePath, 'current-poster');
     const unversioned = mediaUrls.chatMediaLocalUrl(imagePath);
+    const sandboxUrl = `sandbox:${imagePath}`;
     const rows = [
       { id: 'm1', ts: '2026-07-10T10:00:00Z', from: 'commander', to: ['user'], text: `![poster](${unversioned})` },
       { id: 'm2', ts: '2026-07-10T10:01:00Z', from: 'user', to: ['commander'], text: `keep ${unversioned}` },
+      { id: 'm3', ts: '2026-07-10T10:02:00Z', from: 'agent-1', to: ['user'], text: `[poster](${sandboxUrl})` },
+      { id: 'm4', ts: '2026-07-10T10:03:00Z', from: 'user', to: ['commander'], text: `keep [poster](${sandboxUrl})` },
     ];
     fs.writeFileSync(historyFile, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
 
@@ -134,7 +137,91 @@ describe('chats › message history tombstones', () => {
 
     expect(page.history[0].text).toMatch(/\?v=\d+-\d+-14/);
     expect(page.history[1].text).toBe(`keep ${unversioned}`);
+    expect(page.history[2].text).toMatch(/^\[poster\]\(chat-media:\/\/local\/.+\?v=\d+-\d+-14\)$/);
+    expect(page.history[3].text).toBe(`keep [poster](${sandboxUrl})`);
     expect(fs.readFileSync(historyFile, 'utf8')).toContain(`![poster](${unversioned})`);
+    expect(fs.readFileSync(historyFile, 'utf8')).toContain(`[poster](${sandboxUrl})`);
+  });
+
+  it('projects authorized legacy Codex output directives into produced-file footers', async () => {
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID, { title: 'legacy Codex output' });
+    const historyFile = path.join(
+      tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`);
+    const deckPath = path.join(tmpDir, 'workspace', 'analysis.pptx');
+    const recoveredDeckPath = path.join(tmpDir, 'workspace', 'recovered.pptx');
+    const supportingPath = path.join(tmpDir, 'workspace', 'supporting.md');
+    const outsidePath = path.join(tmpDir, 'outside', 'private.pdf');
+    fs.mkdirSync(path.dirname(deckPath), { recursive: true });
+    fs.mkdirSync(path.dirname(outsidePath), { recursive: true });
+    fs.writeFileSync(deckPath, 'deck');
+    fs.writeFileSync(recoveredDeckPath, 'recovered deck');
+    fs.writeFileSync(supportingPath, 'supporting notes');
+    fs.writeFileSync(outsidePath, 'private');
+    const groupState = await import('../../../src/main/features/group_chat/state');
+    await groupState.setCodingProjectDir(
+      TEST_UID,
+      conv.conversation_id,
+      path.dirname(deckPath),
+      { explicit: true },
+    );
+    const backedDirective = `:codex-file-citation{path="${deckPath}" purpose="output"}`;
+    const recoveredDirective = `:codex-file-citation{path="${recoveredDeckPath}" purpose="output"}`;
+    const outsideDirective = `:codex-file-citation{path="${outsidePath}" purpose="output"}`;
+    const recoveredLink = `[recovered.pptx](${recoveredDeckPath})`;
+    const rows = [
+      {
+        id: 'm1', ts: '2026-07-10T10:00:00Z', from: 'codex-agent', to: ['user'],
+        text: `演示文稿已经完成。\n\n${backedDirective}`,
+        produced: [supportingPath, deckPath],
+      },
+      {
+        id: 'm2', ts: '2026-07-10T10:01:00Z', from: 'codex-agent', to: ['user'],
+        text: outsideDirective,
+        produced: [deckPath],
+      },
+      {
+        id: 'm3', ts: '2026-07-10T10:02:00Z', from: 'user', to: ['codex-agent'],
+        text: backedDirective,
+        produced: [deckPath],
+      },
+      {
+        id: 'm4', ts: '2026-07-10T10:03:00Z', from: 'codex-agent', to: ['user'],
+        text: `已恢复旧输出。\n\n${recoveredDirective}`,
+      },
+      {
+        id: 'm5', ts: '2026-07-10T10:04:00Z', from: 'codex-agent', to: ['user'],
+        text: `${recoveredLink}${recoveredDirective}`,
+      },
+    ];
+    fs.writeFileSync(historyFile, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+
+    const page = await chats.getMessagesPage(TEST_UID, conv.conversation_id, 10);
+
+    expect(page.history[0].text).toBe('演示文稿已经完成。');
+    expect(page.history[0].produced).toEqual([deckPath]);
+    expect(page.history[1].text).toBe(outsideDirective);
+    expect(page.history[1].produced).toEqual([deckPath]);
+    expect(page.history[2].text).toBe(backedDirective);
+    expect(page.history[3].text).toBe('已恢复旧输出。');
+    expect(page.history[3].produced).toEqual([recoveredDeckPath]);
+    expect(page.history[4].text).toBe(recoveredLink);
+    expect(page.history[4].produced).toEqual([recoveredDeckPath]);
+
+    const indexed = await chats.getMessagesPageAtIndex(
+      TEST_UID,
+      conv.conversation_id,
+      3,
+      10,
+    );
+    expect(indexed.history[3].text).toBe('已恢复旧输出。');
+    expect(indexed.history[3].produced).toEqual([recoveredDeckPath]);
+
+    const persisted = fs.readFileSync(historyFile, 'utf8').trim()
+      .split('\n').map((line) => JSON.parse(line));
+    expect(persisted[0].text).toContain(backedDirective);
+    expect(persisted[3].text).toContain(recoveredDirective);
+    expect(persisted[3].produced).toBeUndefined();
   });
 
   it('fills each page with visible messages while skipping deleted rows', async () => {

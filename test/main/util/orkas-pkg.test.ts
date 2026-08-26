@@ -134,6 +134,58 @@ describe('orkas-pkg.cjs source invariants', () => {
   });
 });
 
+describe('orkas-pkg.cjs registry lock recovery', () => {
+  it('reclaims a recent lock left by an abruptly terminated package process', () => {
+    const exited = spawnSync(TEST_NODE, ['-e', 'process.stdout.write(String(process.pid))'], {
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+    expect(exited.status).toBe(0);
+
+    fs.mkdirSync(pkgsDir(), { recursive: true });
+    const lockPath = path.join(pkgsDir(), '_registry.lock');
+    const deadPid = exited.stdout.trim();
+    fs.writeFileSync(lockPath, deadPid, 'utf8');
+    const abandonedStaging = path.join(pkgsDir(), `.staging-abandoned-${deadPid}`);
+    const unrelatedStaging = path.join(pkgsDir(), `.staging-unrelated-${process.pid}`);
+    fs.mkdirSync(abandonedStaging);
+    fs.mkdirSync(unrelatedStaging);
+
+    const r = runPkg('remove', 'missing');
+    expect(r.status).toBe(66);
+    expect(r.json.error).toMatch(/is not installed/i);
+    expect(fs.existsSync(lockPath)).toBe(false);
+    expect(fs.existsSync(abandonedStaging)).toBe(false);
+    expect(fs.existsSync(unrelatedStaging)).toBe(true);
+  });
+
+  it('keeps a lock while its owning package process is alive, even after the mtime fallback age', () => {
+    fs.mkdirSync(pkgsDir(), { recursive: true });
+    const lockPath = path.join(pkgsDir(), '_registry.lock');
+    fs.writeFileSync(lockPath, String(process.pid), 'utf8');
+    const old = new Date(Date.now() - 11 * 60 * 1000);
+    fs.utimesSync(lockPath, old, old);
+
+    const r = runPkg('remove', 'missing');
+    expect(r.status).toBe(75);
+    expect(r.json.error).toMatch(/operation is in progress/i);
+    expect(fs.readFileSync(lockPath, 'utf8')).toBe(String(process.pid));
+  });
+
+  it('keeps the mtime fallback for legacy locks without an owner PID', () => {
+    fs.mkdirSync(pkgsDir(), { recursive: true });
+    const lockPath = path.join(pkgsDir(), '_registry.lock');
+    fs.writeFileSync(lockPath, 'legacy-lock', 'utf8');
+    const old = new Date(Date.now() - 11 * 60 * 1000);
+    fs.utimesSync(lockPath, old, old);
+
+    const r = runPkg('remove', 'missing');
+    expect(r.status).toBe(66);
+    expect(r.json.error).toMatch(/is not installed/i);
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+});
+
 describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
   it('installs a skill-shaped repo verbatim and records skill roots', () => {
     const repo = makeRepo('skillpack', {

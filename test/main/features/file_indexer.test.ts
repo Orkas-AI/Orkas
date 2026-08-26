@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import * as fs from 'node:fs';
+import * as crypto from 'node:crypto';
+import fsDefault, * as fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -183,6 +185,51 @@ describe('file_indexer › readRange on text', () => {
     const r = await m.readRange(UID, abs, { charStart: 10 });
     expect(r.content).toBe('');
     expect(r.range).toEqual({ charStart: 5, charEnd: 5 });
+  });
+
+  it('streams bounded reads above 4 MiB without corrupting UTF-8 or line ranges', async () => {
+    // Put a 4-byte UTF-8 character across Node's default 64 KiB stream-chunk
+    // boundary, then make the source large enough to select the streaming path.
+    const firstLine = `${'a'.repeat(65_535)}😀`;
+    const targetLine = '需要保留的目标行🙂';
+    const body = `${firstLine}\n${targetLine}\n${'z'.repeat(4 * 1024 * 1024)}`;
+    const abs = writeWorkspaceFile('large-utf8.log', body);
+    const streamSpy = vi.spyOn(fsDefault, 'createReadStream');
+    syncBuiltinESMExports();
+
+    try {
+      const m = await loadMod();
+      await m.statFile(UID, abs);
+      streamSpy.mockClear();
+      const charStart = firstLine.length - 3;
+      const charEnd = firstLine.length + 4;
+      const chars = await m.readRange(UID, abs, { charStart, charEnd });
+      expect(chars.content).toBe(body.slice(charStart, charEnd));
+      expect(chars.range).toEqual({ charStart, charEnd });
+      expect(chars.startLine).toBe(1);
+      expect(chars.sourceHash).toBe(
+        `sha256:${crypto.createHash('sha256').update(body, 'utf8').digest('hex')}`,
+      );
+      expect(streamSpy.mock.calls.some(([file]) => file === abs)).toBe(true);
+
+      streamSpy.mockClear();
+      const line = await m.readRange(UID, abs, { lineStart: 2, lineEnd: 2 });
+      expect(line.content).toBe(targetLine);
+      expect(line.startLine).toBe(2);
+      expect(line.range).toEqual({
+        charStart: firstLine.length + 1,
+        charEnd: firstLine.length + 1 + targetLine.length,
+      });
+      expect(streamSpy.mock.calls.some(([file]) => file === abs)).toBe(true);
+
+      streamSpy.mockClear();
+      const full = await m.readRange(UID, abs);
+      expect(full.content).toBe(body);
+      expect(streamSpy.mock.calls.some(([file]) => file === abs)).toBe(false);
+    } finally {
+      streamSpy.mockRestore();
+      syncBuiltinESMExports();
+    }
   });
 });
 

@@ -58,7 +58,7 @@ export class SkillAttributionMatcher {
     } catch {
       return null;
     }
-    if (!['skill_advertised', 'skill_invoked', 'agent_dispatched'].includes(signal?.type)) {
+    if (!['skill_advertised', 'skill_invoked'].includes(signal?.type)) {
       return null;
     }
     const turnId = typeof signal.turn_id === 'string' && SAFE_TURN_ID.test(signal.turn_id)

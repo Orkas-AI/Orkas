@@ -163,6 +163,140 @@ describe('global recycle bin', () => {
     expect(JSON.parse(await fsp.readFile(projectFile, 'utf-8')).name).toBe('Project One');
   });
 
+  it('ignores unpublished atomic-write siblings without dropping user .tmp files', async () => {
+    const paths = await import('../../../src/main/paths');
+    const {
+      createAppRecycleBatchForConversation,
+      restoreRecycleBatch,
+    } = await import('../../../src/main/features/recycle_bin');
+
+    const cid = 'task-atomic-write';
+    const relChat = `cloud/chats/${cid}.jsonl`;
+    const relGroupState = `cloud/chats/${cid}/state.json`;
+    const relUserTmp = `cloud/chat_attachments/${cid}/operator-notes.tmp`;
+    const relAtomicTmp = `${relGroupState}.1234.1786579200000.deadbeef.tmp`;
+    const abs = (relPath: string) => path.join(
+      paths.userCloudRoot(UID),
+      ...relPath.slice('cloud/'.length).split('/'),
+    );
+
+    await Promise.all([
+      fsp.mkdir(path.dirname(abs(relGroupState)), { recursive: true }),
+      fsp.mkdir(path.dirname(abs(relUserTmp)), { recursive: true }),
+    ]);
+    await fsp.writeFile(abs(relChat), 'task body\n');
+    await fsp.writeFile(abs(relGroupState), '{"status":"idle"}\n');
+    await fsp.writeFile(abs(relUserTmp), 'user-owned draft\n');
+    await fsp.writeFile(abs(relAtomicTmp), '{"status":"aborted"}\n');
+    const lockChild = process.platform === 'win32'
+      ? await acquireExclusiveWindowsLock(abs(relAtomicTmp))
+      : null;
+    if (!lockChild) await fsp.chmod(abs(relAtomicTmp), 0o000);
+
+    const batch = await (async () => {
+      try {
+        return await createAppRecycleBatchForConversation(UID, cid);
+      } finally {
+        if (lockChild) await releaseExclusiveWindowsLock(lockChild);
+        else await fsp.chmod(abs(relAtomicTmp), 0o600).catch(() => {});
+      }
+    })();
+    const archivedPaths = batch?.items.map((item) => item.path) || [];
+
+    expect(batch).not.toBeNull();
+    expect(archivedPaths).toEqual(expect.arrayContaining([
+      relChat,
+      relGroupState,
+      relUserTmp,
+    ]));
+    expect(archivedPaths).not.toContain(relAtomicTmp);
+
+    await fsp.rm(abs(relChat));
+    await fsp.rm(path.dirname(abs(relGroupState)), { recursive: true, force: true });
+    await fsp.rm(path.dirname(abs(relUserTmp)), { recursive: true, force: true });
+
+    const restored = await restoreRecycleBatch(UID, batch!.id);
+
+    expect(restored.failed_paths).toEqual([]);
+    expect(restored.restored_paths).toEqual(expect.arrayContaining([
+      relChat,
+      relGroupState,
+      relUserTmp,
+    ]));
+    expect(restored.restored_paths).not.toContain(relAtomicTmp);
+    expect(await fsp.readFile(abs(relGroupState), 'utf-8')).toBe('{"status":"idle"}\n');
+    expect(await fsp.readFile(abs(relUserTmp), 'utf-8')).toBe('user-owned draft\n');
+    expect(fs.existsSync(abs(relAtomicTmp))).toBe(false);
+  });
+
+  it('keeps an explicitly selected atomic-looking user file recoverable', async () => {
+    const paths = await import('../../../src/main/paths');
+    const {
+      createAppRecycleBatchForCloudEntry,
+      restoreRecycleBatch,
+    } = await import('../../../src/main/features/recycle_bin');
+
+    const relPath = 'cloud/contexts/user-state.json.1234.1786579200000.deadbeef.tmp';
+    const target = path.join(paths.userCloudRoot(UID), 'contexts', path.basename(relPath));
+    await fsp.mkdir(path.dirname(target), { recursive: true });
+    await fsp.writeFile(target, 'explicit user file\n');
+
+    const batch = await createAppRecycleBatchForCloudEntry(UID, relPath, 'context');
+
+    expect(batch?.items.map((item) => item.path)).toEqual([relPath]);
+    await fsp.rm(target);
+
+    const restored = await restoreRecycleBatch(UID, batch!.id);
+
+    expect(restored.failed_paths).toEqual([]);
+    expect(restored.restored_paths).toEqual([relPath]);
+    expect(await fsp.readFile(target, 'utf-8')).toBe('explicit user file\n');
+  });
+
+  it('aborts a strict snapshot when a nested related directory cannot be enumerated', async () => {
+    const paths = await import('../../../src/main/paths');
+    const cid = 'task-unreadable-related-dir';
+    const relChat = `cloud/chats/${cid}.jsonl`;
+    const relAttachmentDir = `cloud/chat_attachments/${cid}`;
+    const relUnreadableDir = `${relAttachmentDir}/private-nested`;
+    const abs = (relPath: string) => path.join(
+      paths.userCloudRoot(UID),
+      ...relPath.slice('cloud/'.length).split('/'),
+    );
+    await Promise.all([
+      fsp.mkdir(path.dirname(abs(relChat)), { recursive: true }),
+      fsp.mkdir(abs(relUnreadableDir), { recursive: true }),
+    ]);
+    await fsp.writeFile(abs(relChat), 'task body\n');
+    await fsp.writeFile(path.join(abs(relUnreadableDir), 'must-survive.txt'), 'private attachment\n');
+
+    const actualFsp = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    vi.doMock('node:fs/promises', () => ({
+      ...actualFsp,
+      readdir: vi.fn(async (target: fs.PathLike, options?: unknown) => {
+        if (path.resolve(String(target)) === path.resolve(abs(relUnreadableDir))) {
+          throw Object.assign(new Error('simulated directory read failure'), { code: 'EACCES' });
+        }
+        return (actualFsp.readdir as any)(target, options);
+      }),
+    }));
+    vi.resetModules();
+
+    try {
+      const { createAppRecycleBatchForConversation } = await import('../../../src/main/features/recycle_bin');
+
+      await expect(createAppRecycleBatchForConversation(UID, cid)).rejects.toMatchObject({
+        code: 'EACCES',
+      });
+      expect(await fsp.readFile(path.join(abs(relUnreadableDir), 'must-survive.txt'), 'utf-8'))
+        .toBe('private attachment\n');
+      expect(fs.existsSync(paths.userRecycleDir(UID))).toBe(false);
+    } finally {
+      vi.doUnmock('node:fs/promises');
+      vi.resetModules();
+    }
+  });
+
   it('archives and restores project-contained conversations with attachments and sessions', async () => {
     const paths = await import('../../../src/main/paths');
     const {

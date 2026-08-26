@@ -1,9 +1,7 @@
 ---
 name: brand-research
-description_zh: "研究公司、产品或品牌的公开资料，整理 Brand DNA：定位、受众、竞品、语气、定价、社交证明、来源链接和内容缺口；适合\"研究这个品牌网站\"\"生成 Brand DNA\"\"先梳理公司品牌基础\"；触发词：品牌研究、Brand DNA、公司研究、竞品、定位、品牌语气、GTM 基础、内容缺口"
-description_en: "Research public information about a company, product, or brand and produce Brand DNA: positioning, audience, competitors, voice, pricing, social proof, source links, and content gaps; For: \"research this brand website\", \"generate Brand DNA\", \"prepare company brand context\"; Triggers: brand research, Brand DNA, company research, competitors, positioning, brand voice, GTM context, content gaps"
-description: "Research a brand from public sources and produce a sourced Brand DNA brief. Use this skill whenever the user asks to understand a company, product, positioning, competitors, brand voice, social proof, or GTM/content context from public evidence."
-category: "data"
+description_zh: "研究公司、产品或品牌的公开资料并交付带来源的 Brand DNA，覆盖定位、受众、竞品、品牌语气、定价、社交证明和内容缺口；用于品牌网站研究、公司背景梳理和 GTM 内容准备。"
+description_en: "Research public information about a company, product, or brand and deliver sourced Brand DNA covering positioning, audience, competitors, voice, pricing, social proof, and content gaps. Use for brand research, company context, and GTM content preparation."
 ---
 
 # Brand Research
@@ -47,7 +45,7 @@ Do not use for:
    - If competitors are unclear, say so and explain the missing evidence.
 
 5. Synthesize the Brand DNA.
-   - Use `references/brand-dna-template.md`.
+   - Use the [Brand DNA template](references/brand-dna-template.md).
    - Separate sourced facts from interpretation.
    - Use "Not found" or "Not disclosed" when facts cannot be verified.
    - Be opinionated in content gaps, but label them as analysis rather than fact.

@@ -755,6 +755,11 @@ export function buildCompositionNarrationMap(
      *  asserts a span nobody checked against the take it names — a 200s claim
      *  sat beside a 175s file on 2026-08-09 and nothing compared them. */
     audioDurationSec?: number;
+    /** Hash of the synthesis request (text + route/voice/language/speed) that
+     *  produced this audio. Without it a receipt proves only "this text made
+     *  this file" — a same-text different-voice request then reuses the stale
+     *  take: conv b79d406 shipped an old voice three times as "changed". */
+    requestSignature?: string;
   },
 ): Record<string, unknown> {
   const narrationTrack = manifest.audio.tracks.find((track) => track.kind === 'narration');
@@ -784,6 +789,7 @@ export function buildCompositionNarrationMap(
     alignment_method: input.method,
     narration_text_sha256: input.textSha256,
     narration_audio_sha256: input.audioSha256,
+    ...(input.requestSignature ? { request_signature: input.requestSignature } : {}),
     total_duration: manifest.composition.duration,
     narration_audio_start: Math.round(narrationStart * 1000) / 1000,
     ...(typeof input.audioDurationSec === 'number'

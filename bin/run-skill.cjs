@@ -20,8 +20,8 @@
  *   .rb              — spawn `ruby`, inherit stdio, exit with child's code.
  *
  * Resolution order (matches SkillRegistry — see model/core-agent/skill-registry.ts):
- *   1. <uid>/cloud/skills/<id>/scripts/<basename>.<ext>            (custom)
- *   2. <uid>/local/marketplace/skills/<id>/scripts/<basename>.<ext> (installed)
+ *   1. <uid>/local/marketplace/skills/<id>/scripts/<basename>.<ext> (installed)
+ *   2. <uid>/cloud/skills/<id>/scripts/<basename>.<ext>            (custom)
  *   3. Current-agent private installed roots when ORKAS_AGENT_ID is set:
  *      <uid>/local/marketplace/agents/<agent-id>/skills/<id>/scripts/<basename>.<ext>
  *      <uid>/cloud/agents/<agent-id>/private_skills/<id>/scripts/<basename>.<ext>
@@ -51,6 +51,8 @@
  *                           platform default ~/.orkas/data is used.
  *   ORKAS_RUN_SKILL_DIR   — optional trusted caller allow-list override:
  *                           resolve only inside this concrete skill dir.
+ *   ORKAS_GLOBAL_SKILL_ROOTS_ENABLED — `0` disables global Claude/Codex Skill
+ *                           roots for this user turn. Missing/default is on.
  *   ORKAS_PYTHON          — optional bundled Python executable injected by
  *                           the main process when resources/runtime is
  *                           available.
@@ -279,10 +281,10 @@ function collectSkillDirs(skillRef) {
   function addUidDir(uidDir, includeAgentPrivate = false) {
     const cloudRoot = path.join(uidDir, 'cloud', 'skills');
     const marketplaceRoot = path.join(uidDir, 'local', 'marketplace', 'skills');
-    addRoot(cloudRoot);
     addRoot(marketplaceRoot);
-    addDirect(cloudRoot);
+    addRoot(cloudRoot);
     addDirect(marketplaceRoot);
+    addDirect(cloudRoot);
     if (includeAgentPrivate && envAgentId) {
       const marketplaceAgentSkillsRoot = path.join(uidDir, 'local', 'marketplace', 'agents', envAgentId, 'skills');
       const customAgentPrivateSkillsRoot = path.join(uidDir, 'cloud', 'agents', envAgentId, 'private_skills');
@@ -312,14 +314,16 @@ function collectSkillDirs(skillRef) {
     }
   }
   // Global roots last — lowest priority, mirroring SkillRegistry's open tier.
-  // Keep this list in sync with paths.ts::globalSkillRoots(); a root listed
-  // there but missing here is advertised/readable yet its scripts fail to run.
-  for (const globalRoot of [
-    path.join(require('os').homedir(), '.claude', 'skills'),
-    path.join(require('os').homedir(), '.codex', 'skills'),
-  ]) {
-    addRoot(globalRoot);
-    addDirect(globalRoot);
+  // The host injects the account preference on every turn; standalone callers
+  // retain the historical default-on behavior when the variable is absent.
+  if (process.env.ORKAS_GLOBAL_SKILL_ROOTS_ENABLED !== '0') {
+    for (const globalRoot of [
+      path.join(require('os').homedir(), '.claude', 'skills'),
+      path.join(require('os').homedir(), '.codex', 'skills'),
+    ]) {
+      addRoot(globalRoot);
+      addDirect(globalRoot);
+    }
   }
   if (directDirs.length) return directDirs;
 
@@ -851,6 +855,27 @@ function trySpawn(cmd, argv, executionCwd, skillDir, skillId, fatalOnEnoent = fa
   return { spawned: true };
 }
 
+function writeAndFlush(stream, text) {
+  return new Promise((resolve, reject) => {
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    const cleanup = () => stream.removeListener('error', onError);
+    stream.once('error', onError);
+    try {
+      stream.write(text, (error) => {
+        cleanup();
+        if (error) reject(error);
+        else resolve();
+      });
+    } catch (error) {
+      cleanup();
+      reject(error);
+    }
+  });
+}
+
 async function runAsModule(scriptPath, scriptArgs, skillId) {
   registerTsxLoader();
 
@@ -904,12 +929,15 @@ async function runAsModule(scriptPath, scriptArgs, skillId) {
     && !Array.isArray(result)
     && result.ok === false
   ) ? 1 : 0;
-  if (result !== undefined) {
-    try {
-      process.stdout.write(JSON.stringify(result) + '\n');
-    } catch (e) {
-      die(73, `failed to serialize result: ${e && e.message}`);
-    }
+  try {
+    const serialized = result === undefined ? '' : `${JSON.stringify(result)}\n`;
+    // A module may have already filled stdout's pipe before returning. Queue
+    // one final write (empty when there is no return value) and wait for its
+    // callback so process.exit cannot discard the buffered tail.
+    await writeAndFlush(process.stdout, serialized);
+    await writeAndFlush(process.stderr, '');
+  } catch (e) {
+    die(73, `failed to serialize or flush result: ${e && e.message}`);
   }
   process.exit(exitCode);
 }

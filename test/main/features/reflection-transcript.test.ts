@@ -127,6 +127,24 @@ describe('reflection-transcript › estimateTokens', () => {
     const mod = await loadModule();
     expect(mod.estimateTokens('')).toBe(0);
   });
+
+  it('charges CJK punctuation at the CJK rate, not the Latin one', async () => {
+    const mod = await loadModule();
+    // 。、「」 are as common as the ideographs around them in real Chinese
+    // text; the previous local classifier missed that range and billed them
+    // at 4-chars-per-token, under-counting every Chinese transcript.
+    expect(mod.estimateTokens('。、「」')).toBe(mod.estimateTokens('你好世界'));
+  });
+
+  it('stays below the conservative context-budget estimate for the same text', async () => {
+    const mod = await loadModule();
+    const { estimateToolResultTokens } = await import('../../../src/main/util/tool-result-cap');
+    const chinese = '这是一段用于反思的中文记录。';
+    // Two weights on one classifier, by design: the context budget guesses
+    // high because guessing low ends a run, while the transcript cap wants
+    // accuracy because guessing high halves the reflection evidence.
+    expect(mod.estimateTokens(chinese)).toBeLessThan(estimateToolResultTokens(chinese));
+  });
 });
 
 // ── parseMsgWrapper / extractors (pure) ─────────────────────────────────
@@ -226,12 +244,11 @@ describe('reflection-transcript › extractAgentEntries', () => {
 // ── renderSignalEntry ───────────────────────────────────────────────────
 
 describe('reflection-transcript › renderSignalEntry', () => {
-  it('renders retry with step_index', async () => {
+  it('renders silence as a system entry', async () => {
     const { _internals } = await loadModule();
-    const e = _internals.renderSignalEntry(sig({ type: 'retry', metadata: { step_index: 3 } }));
+    const e = _internals.renderSignalEntry(sig({ type: 'silence' }));
     expect(e?.kind).toBe('system');
-    expect(e?.text).toContain('retry');
-    expect(e?.text).toContain('step #3');
+    expect(e?.text).toContain('no user response');
   });
 
   it('renders form_left_blank distinguishing required field', async () => {
@@ -265,6 +282,30 @@ describe('reflection-transcript › buildTranscript', () => {
     const r = await mod.buildTranscript(TEST_UID, '_default', Date.now() - 86400000);
     expect(r.text).toBe('');
     expect(r.stats.convsIncluded).toBe(0);
+  });
+
+  it('flags an unreadable source instead of reporting an empty window', async () => {
+    // An empty transcript drives a terminal decision upstream (the window is
+    // consumed and the baseline advances), so a failed read must be
+    // distinguishable from a genuinely quiet window — otherwise one bad read
+    // silently discards whatever activity it was hiding.
+    vi.doMock('../../../src/main/features/chats', () => ({
+      listConversations: async () => { throw new Error('index unreadable'); },
+    }));
+    const mod = await loadModule();
+    const r = await mod.buildTranscript(TEST_UID, '_default', 0);
+
+    expect(r.text).toBe('');
+    expect(r.unavailable).toBe(true);
+    vi.doUnmock('../../../src/main/features/chats');
+  });
+
+  it('reports a genuinely quiet window as available and empty', async () => {
+    const mod = await loadModule();
+    const r = await mod.buildTranscript(TEST_UID, '_default', Date.now() - 86400000);
+
+    expect(r.text).toBe('');
+    expect(r.unavailable).toBeUndefined();
   });
 
   it('joins gconv user msgs with gmember agent replies in time order', async () => {
@@ -345,34 +386,34 @@ describe('reflection-transcript › buildTranscript', () => {
     expect(r.text).toContain('q6');
   });
 
-  it('injects retry / skip system events at the right cid + ts', async () => {
+  it('injects whitelisted system events at the right cid + ts', async () => {
     const { sessionId, gmemberSessionId } = writeConv(TEST_UID, { cid: 'c1', agentId: 'agent-x' });
     writeSessionJsonl(TEST_UID, sessionId, [userMsg('q', 100, 'user', 'commander')]);
     writeSessionJsonl(TEST_UID, gmemberSessionId, [agentMsg('a', 200)]);
 
-    const retryTs = new Date(150).toISOString();
-    const skipTs = new Date(250).toISOString();
+    const blankTs = new Date(150).toISOString();
+    const silenceTs = new Date(250).toISOString();
     writeSignalsJsonl(TEST_UID, [
-      sig({ type: 'retry', cid: 'c1', aid: 'agent-x', ts: retryTs, metadata: { step_index: 2 } }),
-      sig({ type: 'skip',  cid: 'c1', aid: 'agent-x', ts: skipTs,  metadata: { step_index: 3 } }),
-      sig({ type: 'correction', cid: 'c1', aid: 'agent-x', ts: retryTs }), // NOT inlined
+      sig({ type: 'form_left_blank', cid: 'c1', aid: 'agent-x', ts: blankTs, metadata: { input_id: 'budget', was_required: true } }),
+      sig({ type: 'silence', cid: 'c1', aid: 'agent-x', ts: silenceTs }),
+      sig({ type: 'correction', cid: 'c1', aid: 'agent-x', ts: blankTs }), // NOT inlined
     ]);
 
     const mod = await loadModule();
     const r = await mod.buildTranscript(TEST_UID, 'agent-x', 0);
 
-    expect(r.text).toContain('retry on step #2');
-    expect(r.text).toContain('skip on step #3');
+    expect(r.text).toContain('required field "budget" blank');
+    expect(r.text).toContain('no user response');
     // Correction signal must NOT be inlined (deferred to future critic / weekly review).
     expect(r.text).not.toMatch(/system event.*correction/);
-    // Time order: q(100) → retry(150) → a(200) → skip(250)
+    // Time order: q(100) → form_left_blank(150) → a(200) → silence(250)
     const iQ = r.text.indexOf('q\n') >= 0 ? r.text.indexOf('q\n') : r.text.indexOf('q');
-    const iRetry = r.text.indexOf('retry');
+    const iBlank = r.text.indexOf('blank');
     const iA = r.text.indexOf('a\n') >= 0 ? r.text.indexOf('a\n') : r.text.indexOf(']\na');
-    const iSkip = r.text.indexOf('skip');
-    expect(iQ).toBeLessThan(iRetry);
-    expect(iRetry).toBeLessThan(iA);
-    expect(iA).toBeLessThan(iSkip);
+    const iSilence = r.text.indexOf('no user response');
+    expect(iQ).toBeLessThan(iBlank);
+    expect(iBlank).toBeLessThan(iA);
+    expect(iA).toBeLessThan(iSilence);
   });
 
   it('filters convs by agent_id (different agent gets nothing)', async () => {

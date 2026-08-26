@@ -29,7 +29,6 @@ import { conversationLayout, listProjectIds } from '../../util/project-layout';
 import {
   genId12, nowIso, readJson, writeJson, safeId,
 } from '../../storage';
-import { clearConversationHistorySummary } from './history-summary-cache';
 import { createLogger } from '../../logger';
 
 const log = createLogger('group_chat.state');
@@ -83,6 +82,20 @@ export interface OrchestrationLedger {
   interrupt_message?: string;
 }
 
+/** In-memory receipt for one Commander-created Agent hand-off admission.
+ * The queue write lives in bus.ts, so callers retain this receipt until that
+ * write succeeds and use it to restore the prior floor/ledger on admission
+ * failure or a concurrent user abort. It is deliberately not persisted. */
+export interface AgentHandoffAdmission {
+  token: string;
+  ownerAgentId: string;
+  floorApplied: boolean;
+  ledgerApplied: boolean;
+  previousActiveRecipient?: string;
+  previousActiveRecipientSource?: StateFile['active_recipient_source'];
+  previousLedger?: OrchestrationLedger;
+}
+
 export interface StateFile {
   version: 1;
   status: GroupStatus;
@@ -97,7 +110,7 @@ export interface StateFile {
    *  the directory or update this field. See `conv_workspace.ts` for the
    *  slug rules and the placeholder fallback. */
   workspace_dir?: string;
-  /** Project directory for coding-agent (claude / codex) dispatches in
+  /** Project directory for coding-agent dispatches in
    *  this conversation. Initialised on the first coding-agent turn from
    *  that agent's detail-page project-dir setting; missing setting =
    *  effective workspace path. Absolute path. Missing / empty → coding
@@ -675,6 +688,148 @@ export async function setOrchestrationLedger(
   });
 }
 
+/** Atomically establish the durable state for a scheduled `hand_off_to`.
+ * Agent execution is admitted separately by the conversation FIFO; keeping
+ * the state mutation under one lock prevents a visible floor with no matching
+ * resume ledger. The returned receipt owns rollback until queue admission has
+ * completed. */
+export async function beginAgentHandoff(
+  uid: string,
+  cid: string,
+  params: {
+    ownerAgentId: string;
+    ownerAgentName?: string;
+    interactive: boolean;
+    userGoal: string;
+    handoffMessage: string;
+    resumeInstruction?: string;
+  },
+): Promise<AgentHandoffAdmission> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    if (s.status === 'aborted') {
+      throw Object.assign(new Error('conversation was cancelled before hand-off admission'), {
+        code: 'E_HANDOFF_CANCELLED',
+      });
+    }
+    const token = genId12();
+    const previousLedger = s.orchestration_ledger
+      ? { ...s.orchestration_ledger }
+      : undefined;
+    const receipt: AgentHandoffAdmission = {
+      token,
+      ownerAgentId: params.ownerAgentId,
+      floorApplied: params.interactive,
+      ledgerApplied: !!params.resumeInstruction?.trim(),
+      ...(s.active_recipient ? { previousActiveRecipient: s.active_recipient } : {}),
+      ...(s.active_recipient_source
+        ? { previousActiveRecipientSource: s.active_recipient_source }
+        : {}),
+      ...(previousLedger ? { previousLedger } : {}),
+    };
+    if (params.interactive) {
+      s.active_recipient = params.ownerAgentId;
+      s.active_recipient_source = 'commander_handoff';
+    }
+    const resumeInstruction = _cleanLedgerText(params.resumeInstruction || '');
+    if (resumeInstruction) {
+      const now = nowIso();
+      s.orchestration_ledger = {
+        version: 1,
+        id: token,
+        kind: 'suspended_orchestration',
+        status: 'waiting_for_agent',
+        blocked_on: 'agent_handoff',
+        source_tool: 'hand_off_to',
+        owner_agent_id: params.ownerAgentId,
+        ...(params.ownerAgentName ? { owner_agent_name: params.ownerAgentName } : {}),
+        user_goal: _cleanLedgerText(params.userGoal),
+        handoff_message: _cleanLedgerText(params.handoffMessage),
+        resume_instruction: resumeInstruction,
+        created_at: now,
+        updated_at: now,
+      };
+    }
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return receipt;
+  });
+}
+
+/** Best-effort rollback for a hand-off whose queue admission did not finish.
+ * Restore only state still owned by this receipt; a user-selected floor or a
+ * newer orchestration always wins. An interrupted receipt is removed rather
+ * than resurrecting an older suspended flow after the user's intervention. */
+export async function rollbackAgentHandoff(
+  uid: string,
+  cid: string,
+  receipt: AgentHandoffAdmission,
+): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    let changed = false;
+    if (
+      receipt.floorApplied
+      && s.active_recipient === receipt.ownerAgentId
+      && s.active_recipient_source === 'commander_handoff'
+    ) {
+      if (receipt.previousActiveRecipient) {
+        s.active_recipient = receipt.previousActiveRecipient;
+        if (receipt.previousActiveRecipientSource) {
+          s.active_recipient_source = receipt.previousActiveRecipientSource;
+        } else {
+          delete s.active_recipient_source;
+        }
+      } else {
+        delete s.active_recipient;
+        delete s.active_recipient_source;
+      }
+      changed = true;
+    }
+    if (receipt.ledgerApplied && s.orchestration_ledger?.id === receipt.token) {
+      if (s.orchestration_ledger.status === 'interrupted') {
+        delete s.orchestration_ledger;
+      } else if (receipt.previousLedger) {
+        s.orchestration_ledger = { ...receipt.previousLedger };
+      } else {
+        delete s.orchestration_ledger;
+      }
+      changed = true;
+    }
+    if (changed) {
+      s.last_active_at = nowIso();
+      await writeStateRaw(uid, cid, s);
+    }
+    return s;
+  });
+}
+
+/** Clear only Commander-owned suspended hand-off state on explicit task
+ * cancellation. A floor selected directly by the user remains sticky. */
+export async function clearOrchestrationForCancellation(
+  uid: string,
+  cid: string,
+): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    let changed = false;
+    if (s.orchestration_ledger) {
+      delete s.orchestration_ledger;
+      changed = true;
+    }
+    if (s.active_recipient_source === 'commander_handoff') {
+      delete s.active_recipient;
+      delete s.active_recipient_source;
+      changed = true;
+    }
+    if (changed) {
+      s.last_active_at = nowIso();
+      await writeStateRaw(uid, cid, s);
+    }
+    return s;
+  });
+}
+
 export async function clearOrchestrationLedger(uid: string, cid: string): Promise<StateFile> {
   return _stateLock(uid, cid).runExclusive(async () => {
     const s = await readState(uid, cid);
@@ -907,7 +1062,6 @@ export async function purgeGroupDir(uid: string, cid: string): Promise<void> {
       log.warn(`purge group dir failed user=${uid} cid=${cid}: ${(err as Error).message}`);
     }
   }
-  await clearConversationHistorySummary(uid, cid);
   await untrackRunningConversation(uid, cid);
   // Suppress unused import lint when the function body is the only path consumer.
   void path;

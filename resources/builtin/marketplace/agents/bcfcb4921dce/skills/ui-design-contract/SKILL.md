@@ -3,7 +3,6 @@ ownerAgent: bcfcb4921dce
 name: ui-design-contract
 description_zh: "为多屏、品牌、长期复用或参考冲突的 UIDesigner 任务建立持久设计契约，覆盖 DESIGN.md、source screen contract、tokens、keep/change/do-not-copy 边界和实现交接；普通单屏截图任务使用紧凑执行器即可。"
 description_en: "Create durable UIDesigner design contracts for multi-screen, brand, long-lived, or conflicting-reference work across DESIGN.md, source-screen rules, tokens, keep/change/do-not-copy boundaries, and implementation handoff; ordinary single-screen screenshot work stays on the compact executor."
-category: rnd
 ---
 
 # ui-design-contract
@@ -64,6 +63,8 @@ For screenshot or image-based work, extract this before choosing a new layout:
 ```
 
 The screenshot is the contract for information architecture. Do not replace an input page, landing view, editor, chat surface, form, or simple settings screen with a dashboard, table, chart, sidebar, or operational cockpit unless those elements are visible or explicitly requested.
+
+For a multi-screen source set, keep one contract row per source identity rather than one blended screen summary. Each row maps the source to its target route/component, names must-preserve visible anchors and intentional changes, and carries separate `inspected`, `implemented`, and `compared` status. The contract is incomplete while any promised source is absent from the ledger.
 
 ## DESIGN.md Compatibility
 
@@ -131,6 +132,7 @@ Before rendering or final delivery, check:
 - The next HTML pass has enough concrete token and component guidance to execute without guessing.
 - Tokens and component rules are specific enough to produce HTML/CSS, not only mood adjectives.
 - Public reference systems are treated as structure and quality inspiration, not as copied brand identity.
+- Every promised multi-screen source has a source-to-target row and a fresh post-implementation comparison; partial coverage names every remaining row and cannot be summarized as complete.
 
 ## Output Shape
 

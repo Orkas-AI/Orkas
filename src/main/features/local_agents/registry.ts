@@ -101,7 +101,7 @@ export const LOCAL_CLI_CAPABILITIES = {
     resume: 'native',
     instructionChannel: 'user-message',
     durableInstructionScope: 'session',
-    codingProjectDirectory: false,
+    codingProjectDirectory: true,
     orkasBridge: false,
     activeRunIngress: 'none',
   },

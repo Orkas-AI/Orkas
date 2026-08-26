@@ -7,8 +7,19 @@ import * as path from 'node:path';
 // transport would leave every prior temp workspace file open until the worker
 // exits, which is both unrepresentative and invalidates Windows IO handles when
 // afterEach removes that workspace.
+// Loggers are cached by module name so a test can assert what a module logged
+// (clear the spy first — instances survive vi.resetModules on purpose).
+const loggerSpies = vi.hoisted(() => ({
+  byName: new Map<string, { debug: ReturnType<typeof vi.fn>; info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> }>(),
+}));
 vi.mock('../../../src/main/logger', () => ({
-  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+  createLogger: (name: string) => {
+    const existing = loggerSpies.byName.get(name);
+    if (existing) return existing;
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    loggerSpies.byName.set(name, logger);
+    return logger;
+  },
 }));
 
 // Swap the LLM stream impl per test — mirrors chats.test.ts pattern so
@@ -89,7 +100,10 @@ function writeCustomAgent(agentId: string, fields: Partial<Record<string, any>> 
     updated_at: '2026-04-18T10:00:00',
   };
   if ('skill_list' in fields) data.skill_list = fields.skill_list;
+  if ('tool_list' in fields) data.tool_list = fields.tool_list;
   if ('runtime' in fields) data.runtime = fields.runtime;
+  if ('knowhow' in fields) data.knowhow = fields.knowhow;
+  if ('standards' in fields) data.standards = fields.standards;
   fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify(data));
 }
 
@@ -212,13 +226,35 @@ describe('agents › normalizeAgent', () => {
     expect(norm?.skill_list).toEqual(['ok-one', 'also_ok']);
   });
 
-  it('trims and validates enabled connector ids', async () => {
+  it('normalizes delivery_checks like skill_list: exact array of kebab names, bounded', async () => {
+    const a = await loadAgents();
+    // Present as a clean array → preserved verbatim.
+    expect(a.normalizeAgent({
+      agent_id: 'x', name: 'N', delivery_checks: ['content-delivery'],
+    } as any, 'builtin')?.delivery_checks).toEqual(['content-delivery']);
+    // Omitted → absent (undefined sentinel), same three-state convention.
+    expect('delivery_checks' in (a.normalizeAgent({ agent_id: 'x', name: 'N' }, 'builtin') as any))
+      .toBe(false);
+    // Malformed entries dropped by shape; names are resolved (and warned on)
+    // later at wiring time, so look-alike junk must not survive this layer.
+    expect(a.normalizeAgent({
+      agent_id: 'x', name: 'N',
+      delivery_checks: ['content-delivery', 42, null, '', 'Bad Name', '-leading', 'UPPER'],
+    } as any, 'builtin')?.delivery_checks).toEqual(['content-delivery']);
+    // Bounded at 8 entries.
+    const many = Array.from({ length: 12 }, (_, i) => `check-${i}`);
+    expect(a.normalizeAgent({
+      agent_id: 'x', name: 'N', delivery_checks: many,
+    } as any, 'builtin')?.delivery_checks).toHaveLength(8);
+  });
+
+  it('loads an old Agent definition without exposing its retired connector field', async () => {
     const a = await loadAgents();
     const norm = a.normalizeAgent({
       agent_id: 'x', name: 'N',
       enabled_connectors: [' github ', '', '../evil', 42, 'notion'],
     } as any, 'custom');
-    expect(norm?.enabled_connectors).toEqual(['github', 'notion']);
+    expect(norm).not.toHaveProperty('enabled_connectors');
   });
 
   it('normalizes rich profile fields and design aliases', async () => {
@@ -315,6 +351,32 @@ describe('agents › normalizeAgent', () => {
     expect(a.isCliAgent(norm)).toBe(true);
   });
 
+  it('repairs an existing OpenCode input schema in the read view only', async () => {
+    const a = await loadAgents();
+    const raw = {
+      agent_id: 'legacy-opencode',
+      name: 'Legacy OpenCode',
+      runtime: { kind: 'cli', cli: 'opencode' },
+      inputs: [
+        { id: 'task_note', label: 'Task note', type: 'text', default: '' },
+      ],
+    } as any;
+    const before = JSON.stringify(raw);
+
+    const norm = a.normalizeAgent(raw, 'custom');
+
+    expect(norm?.inputs).toEqual([
+      expect.objectContaining({
+        id: 'project_dir',
+        type: 'directory',
+        required: true,
+        default: '',
+      }),
+      { id: 'task_note', label: 'Task note', type: 'text', default: '' },
+    ]);
+    expect(JSON.stringify(raw)).toBe(before);
+  });
+
   it('drops unsafe CLI runtime override values instead of persisting control text', async () => {
     const a = await loadAgents();
     const norm = a.normalizeAgent({
@@ -385,14 +447,26 @@ describe('agents › normalizeAgent', () => {
 });
 
 describe('agents › CLI project directory settings', () => {
-  it('defaults coding agents to workspace and stores custom dirs in local config only', async () => {
+  it.each(['codex', 'opencode'])('%s defaults to workspace and stores custom dirs in local config only', async (cli) => {
     writeCustomAgent('code-agent', {
       name: 'Code Agent',
-      runtime: { kind: 'cli', cli: 'codex' },
+      runtime: { kind: 'cli', cli },
     } as any);
     const a = await loadAgents();
     const userWorkspace = await import('../../../src/main/features/user_workspace');
     const workspacePath = userWorkspace.getWorkspacePath(TEST_UID);
+
+    const normalized = await a.getAgent('code-agent');
+    expect(normalized?.inputs?.[0]).toMatchObject({
+      id: 'project_dir',
+      type: 'directory',
+      required: true,
+      default: '',
+    });
+    expect(JSON.parse(fs.readFileSync(
+      path.join(customAgentsDir(), 'code-agent', 'agent.json'),
+      'utf8',
+    ))).not.toHaveProperty('inputs');
 
     const initial = await a.getAgentCliProjectDirInfo(TEST_UID, 'code-agent');
     expect(initial).toMatchObject({
@@ -546,6 +620,19 @@ describe('agents › extractAgentFieldBlocks', () => {
     expect(r.cleanText).not.toContain('</agent>');
   });
 
+  it('parses only the closed create/edit operation values', async () => {
+    const a = await loadAgents();
+    expect(a.extractAgentFieldBlocks(
+      '<agent><operation> CREATE </operation><name>A</name></agent>',
+    ).blocks[0].operation).toBe('create');
+    expect(a.extractAgentFieldBlocks(
+      '<agent><operation>edit</operation><agent_id>aaaaaaaaaaaa</agent_id></agent>',
+    ).blocks[0].operation).toBe('edit');
+    expect('operation' in a.extractAgentFieldBlocks(
+      '<agent><operation>upsert</operation><name>B</name></agent>',
+    ).blocks[0]).toBe(false);
+  });
+
   it('extracts every <agent> container in emission order (multi-agent turn)', async () => {
     const a = await loadAgents();
     const text = [
@@ -690,6 +777,50 @@ describe('agents › extractAgentFieldBlocks', () => {
     expect('skill_list' in r.blocks[0]).toBe(false);
   });
 
+  it('parses, canonicalizes, and clears <tools> independently of <skills>', async () => {
+    const a = await loadAgents();
+    const parsed = a.extractAgentFieldBlocks([
+      '<agent>',
+      '<tools>',
+      'workspace',
+      'workspace.read',
+      'pdf',
+      '</tools>',
+      '</agent>',
+    ].join('\n'));
+    expect(parsed.blocks[0].tool_list).toEqual(['workspace', 'office.pdf']);
+    expect(a.extractAgentFieldBlocks('<agent><tools>\n\n</tools></agent>').blocks[0].tool_list)
+      .toEqual([]);
+    const invalid = a.extractAgentFieldBlocks([
+      '<agent><tools>',
+      'web',
+      'context',
+      'management',
+      'not-real',
+      'bad group',
+      '</tools></agent>',
+    ].join('\n')).blocks[0];
+    expect(invalid).not.toHaveProperty('tool_list');
+    expect(invalid.tool_list_invalid_refs).toEqual(['context', 'management', 'not-real', 'bad group']);
+    expect(a.extractAgentFieldBlocks('<agent><name>A</name></agent>').blocks[0])
+      .not.toHaveProperty('tool_list');
+  });
+
+  it('extracts real workflow tool-call shapes while rejecting negated and incidental look-alikes', async () => {
+    const a = await loadAgents();
+    const calls = a.workflowBuiltinToolCalls([
+      '### 1. Inspect',
+      '- `read_files({"paths":[{"path":"source"}]})` inspects the source.',
+      '- Use `web_search` for current evidence.',
+      '- 调用 `office_read` 检查文档。',
+      '- Do not use `bash` for this task.',
+      '- Read `library` as a named Skill rather than invoking it.',
+      '- Mention write_file only as prose.',
+    ].join('\n'));
+
+    expect(calls).toEqual(['read_files', 'web_search', 'office_read']);
+  });
+
   // <interactive> drives the input-box auto-target. Each branch matters:
   // unset must leave the existing flag alone (so unrelated turns don't wipe
   // it), and only literal `true` / `false` count — anything else falls into
@@ -767,6 +898,21 @@ describe('agents › extractAgentFieldBlocks', () => {
     expect(r.blocks[0].knowhow).toEqual(['Task framing']);
     expect(r.blocks[0].standards).toEqual(['Traceable output']);
     expect('profile' in r.blocks[0]).toBe(false);
+  });
+
+  it('retains a sixth guidance item so overflow cannot be silently truncated', async () => {
+    const a = await loadAgents();
+    const items = Array.from({ length: 6 }, (_, index) => `Rule ${index + 1}`);
+    const r = a.extractAgentFieldBlocks([
+      '<agent>',
+      `<knowhow>${JSON.stringify(items)}</knowhow>`,
+      '<standards>',
+      ...items,
+      '</standards>',
+      '</agent>',
+    ].join('\n'));
+    expect(r.blocks[0].knowhow).toEqual(items);
+    expect(r.blocks[0].standards).toEqual(items);
   });
 
   it('keeps legacy <profile> as knowhow/standards-only compatibility', async () => {
@@ -975,8 +1121,70 @@ describe('agents › createCustomAgent', () => {
     expect(agent?.agent_id).toMatch(/^[0-9a-f]{12}$/);
     expect(agent?.name).toBe('Alpha');
     expect(agent?.source).toBe('custom');
+    expect(agent?.tool_list).toEqual([]);
     const file = path.join(customAgentsDir(), agent?.agent_id || '', 'agent.json');
     expect(fs.existsSync(file)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).tool_list).toEqual([]);
+  });
+
+  it('writes an explicit canonical tool list in the initial Agent spec', async () => {
+    const a = await loadAgents();
+    const agent = await a.createCustomAgent({
+      name: 'ScopedAgent',
+      description: 'Reads project files and prepares PDF output.',
+      workflow: 'Inspect the workspace, then create the requested PDF.',
+      category: 'general',
+      tool_list: ['workspace', 'workspace.read', 'pdf'],
+    });
+
+    expect(agent?.tool_list).toEqual(['workspace', 'office.pdf']);
+    const raw = JSON.parse(fs.readFileSync(
+      path.join(customAgentsDir(), agent?.agent_id || '', 'agent.json'),
+      'utf8',
+    ));
+    expect(raw.tool_list).toEqual(['workspace', 'office.pdf']);
+  });
+
+  it('rejects invalid create-time tool groups before writing Agent state', async () => {
+    const a = await loadAgents();
+
+    await expect(a.createCustomAgent({
+      name: 'InvalidScopedAgent',
+      description: 'Should not be created.',
+      workflow: 'Do the work.',
+      category: 'general',
+      tool_list: ['context'],
+    })).rejects.toThrow(/host-managed, or runtime-only tool groups: context/);
+    const entries = fs.existsSync(customAgentsDir()) ? fs.readdirSync(customAgentsDir()) : [];
+    expect(entries).toEqual([]);
+  });
+
+  it('creates OpenCode with the host-owned workspace-inheriting directory input', async () => {
+    const a = await loadAgents();
+    const agent = await a.createCustomAgent({
+      name: 'OpenCodeAgent',
+      description: 'Builds software in the selected project.',
+      category: 'rnd',
+      runtime: { kind: 'cli', cli: 'opencode' },
+    });
+
+    expect(agent?.inputs).toEqual([
+      expect.objectContaining({
+        id: 'project_dir',
+        type: 'directory',
+        required: true,
+        default: '',
+      }),
+    ]);
+    expect(agent).not.toHaveProperty('tool_list');
+    const raw = JSON.parse(fs.readFileSync(
+      path.join(customAgentsDir(), agent?.agent_id || '', 'agent.json'),
+      'utf8',
+    ));
+    expect(raw.inputs).toEqual([
+      expect.objectContaining({ id: 'project_dir', default: '' }),
+    ]);
+    expect(JSON.stringify(raw)).not.toContain(tmpDir);
   });
 
   it('routes a single custom description to the current UI language slot', async () => {
@@ -1030,6 +1238,27 @@ describe('agents › createCustomAgent', () => {
     expect(fs.readdirSync(customAgentsDir())).toEqual([]);
   });
 
+  it('rejects more than five guidance items before creating Agent state', async () => {
+    const a = await loadAgents();
+    await expect(a.createCustomAgent({
+      name: 'OverloadedAgent',
+      description: 'desc',
+      category: 'general',
+      knowhow: Array.from({ length: 6 }, (_, index) => `Capability ${index + 1}`),
+    })).rejects.toThrow(/knowhow exceeds the maximum of 5 items/);
+    const entries = fs.existsSync(customAgentsDir()) ? fs.readdirSync(customAgentsDir()) : [];
+    expect(entries).toEqual([]);
+  });
+
+  it('accepts and persists exactly five guidance items', async () => {
+    const a = await loadAgents();
+    const standards = Array.from({ length: 5 }, (_, index) => `Check ${index + 1}`);
+    const agent = await a.createCustomAgent({
+      name: 'FocusedAgent', description: 'desc', category: 'general', standards,
+    });
+    expect(agent?.profile?.standards).toEqual(standards);
+  });
+
   it('enforces the unified display-width name limit', async () => {
     const a = await loadAgents();
 
@@ -1058,12 +1287,206 @@ describe('agents › createCustomAgent', () => {
 });
 
 describe('agents › createAgentFromBlocks', () => {
+  it('rejects an invalid explicit tool list before creating any Agent state', async () => {
+    const a = await loadAgents();
+    const fields = a.extractAgentFieldBlocks([
+      '<agent>',
+      '<name>UnsafeTools</name>',
+      '<workflow>Do the work.</workflow>',
+      '<tools>context\nmanagement\nnot-real\nbad group</tools>',
+      '</agent>',
+    ].join('\n')).blocks[0];
+
+    await expect(a.createAgentFromBlocks(fields))
+      .rejects.toThrow(/invalid, unknown, host-managed, or runtime-only tool groups: context, management, not-real, <invalid>/);
+    const entries = fs.existsSync(customAgentsDir()) ? fs.readdirSync(customAgentsDir()) : [];
+    expect(entries).toEqual([]);
+  });
+
+  it('rejects parsed guidance overflow before creating any Agent state', async () => {
+    const a = await loadAgents();
+    const fields = a.extractAgentFieldBlocks([
+      '<agent>',
+      '<name>OverloadedAgent</name>',
+      '<workflow>Do the work.</workflow>',
+      '<standards>',
+      ...Array.from({ length: 6 }, (_, index) => `Check ${index + 1}`),
+      '</standards>',
+      '</agent>',
+    ].join('\n')).blocks[0];
+
+    await expect(a.createAgentFromBlocks(fields))
+      .rejects.toThrow(/standards exceeds the maximum of 5 items/);
+    const entries = fs.existsSync(customAgentsDir()) ? fs.readdirSync(customAgentsDir()) : [];
+    expect(entries).toEqual([]);
+  });
+
+  it('rejects a missing tool list instead of creating a functionally incomplete Agent', async () => {
+    const a = await loadAgents();
+    const fields = a.extractAgentFieldBlocks([
+      '<agent>',
+      '<name>MissingTools</name>',
+      '<description>Researches public sources.</description>',
+      '<workflow>Use web sources, then deliver findings.</workflow>',
+      '<category>data</category>',
+      '</agent>',
+    ].join('\n')).blocks[0];
+
+    await expect(a.createAgentFromBlocks(fields))
+      .rejects.toThrow(/requires an explicit <tools> list/);
+    const entries = fs.existsSync(customAgentsDir()) ? fs.readdirSync(customAgentsDir()) : [];
+    expect(entries).toEqual([]);
+  });
+
+  it('creates an Agent whose persisted tool list activates its required runtime capabilities', async () => {
+    const a = await loadAgents();
+    const fields = a.extractAgentFieldBlocks([
+      '<agent>',
+      '<name>WebResearcher</name>',
+      '<description>Researches public sources.</description>',
+      '<workflow>### 1. Research\n- `web_search(query)` finds current sources.\n\n### 2. Deliver\n- Return the findings.</workflow>',
+      '<tools>workspace.read\nweb</tools>',
+      '<category>data</category>',
+      '</agent>',
+    ].join('\n')).blocks[0];
+    const created = await a.createAgentFromBlocks(fields);
+
+    expect(created?.tool_list).toEqual(['workspace.read', 'web']);
+    const file = path.join(customAgentsDir(), created?.agent_id || '', 'agent.json');
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    expect(raw.tool_list).toEqual(['workspace.read', 'web']);
+    expect((await a.getAgent(created?.agent_id || ''))?.tool_list)
+      .toEqual(['workspace.read', 'web']);
+
+    const { createToolSurfaceController, catalogedToolNames } = await import(
+      '../../../src/main/model/core-agent/tool-surface'
+    );
+    const surface = createToolSurfaceController({
+      availableToolNames: catalogedToolNames().filter((name) => name !== 'tool_load'),
+      configuredGroups: created?.tool_list,
+      scopedEligible: true,
+      dynamicLoading: false,
+    });
+    const activeToolNames = surface.activeToolNames();
+    expect(activeToolNames).toEqual(expect.arrayContaining([
+      'read_files', 'grep_files', 'web_search', 'web_fetch',
+    ]));
+    for (const forbidden of ['write_file', 'bash', 'create_xlsx', 'tool_load']) {
+      expect(activeToolNames).not.toContain(forbidden);
+    }
+  });
+
+  it('maps trusted structured tool dependencies through the catalog on create', async () => {
+    const a = await loadAgents();
+    const fields = a.extractAgentFieldBlocks([
+      '<agent>',
+      '<name>ConnectorReporter</name>',
+      '<description>Reads selected Connector data and reports it.</description>',
+      '<workflow>Use the user-selected Connector, then return a report.</workflow>',
+      '<skills></skills>',
+      '<tools>workspace.read</tools>',
+      '<category>data</category>',
+      '</agent>',
+    ].join('\n')).blocks[0];
+
+    const created = await a.createAgentFromBlocks(fields, {
+      dependencyToolNames: ['list_connector_tools', 'call_connector_tool'],
+    });
+
+    expect(created?.tool_list).toEqual(['workspace.read', 'connectors']);
+    const file = path.join(customAgentsDir(), created?.agent_id || '', 'agent.json');
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).tool_list)
+      .toEqual(['workspace.read', 'connectors']);
+    expect(created?.skill_list).toEqual([]);
+  });
+
+  it('infers an unambiguous dependency from an explicit workflow tool call', async () => {
+    const a = await loadAgents();
+    const fields = a.extractAgentFieldBlocks([
+      '<agent>',
+      '<name>IncompleteResearcher</name>',
+      '<description>Researches public sources.</description>',
+      '<workflow>### 1. Research\n- `web_search(query)` finds current sources.</workflow>',
+      '<tools>workspace.read</tools>',
+      '<category>data</category>',
+      '</agent>',
+    ].join('\n')).blocks[0];
+
+    const created = await a.createAgentFromBlocks(fields);
+    expect(created?.tool_list).toEqual(['workspace.read', 'web']);
+  });
+
+  it('requires an authored leaf when one tool maps to several dependency groups', async () => {
+    const a = await loadAgents();
+
+    await expect(a.createAgentFromBlocks({
+      name: 'AmbiguousOfficeReader',
+      description_en: 'Reads one kind of Office file.',
+      workflow: '### 1. Inspect\n- `office_read(path)` inspects the input.',
+      category: 'general',
+      tool_list: [],
+    })).rejects.toThrow(
+      /office_read \(choose office\.word or office\.spreadsheet or office\.presentation\)/,
+    );
+    const entries = fs.existsSync(customAgentsDir()) ? fs.readdirSync(customAgentsDir()) : [];
+    expect(entries).toEqual([]);
+  });
+
+  it('does not turn a negated tool example into an Agent dependency', async () => {
+    const a = await loadAgents();
+    const created = await a.createAgentFromBlocks({
+      name: 'ProseOnly',
+      description_en: 'Returns a direct prose answer.',
+      workflow: '### 1. Answer\n- Do not use `bash`; return the answer as prose.',
+      category: 'general',
+      tool_list: [],
+    });
+
+    expect(created?.tool_list).toEqual([]);
+  });
+
+  it.each([
+    {
+      label: 'runtime-only',
+      workflow: '`tool_load(groups)` expands tools.',
+      toolList: [] as string[],
+      expected: /tool_load \(cannot be declared for a named Agent\)/,
+    },
+    {
+      label: 'owner-scoped',
+      workflow: '`image_studio(operation)` renders the candidate.',
+      toolList: ['media.image'],
+      expected: /image_studio \(owned by another Agent\)/,
+    },
+    {
+      label: 'Commander-only',
+      workflow: '`add_custom_connector(name, transport)` installs a connector.',
+      toolList: ['connectors'],
+      expected: /add_custom_connector \(cannot be declared for a named Agent\)/,
+    },
+  ])('rejects a $label built-in call that a custom Agent cannot receive', async ({
+    workflow, toolList, expected,
+  }) => {
+    const a = await loadAgents();
+
+    await expect(a.createAgentFromBlocks({
+      name: 'UnavailableToolAgent',
+      description_en: 'Attempts an unavailable operation.',
+      workflow: `### 1. Run\n- ${workflow}`,
+      category: 'general',
+      tool_list: toolList,
+    })).rejects.toThrow(expected);
+    const entries = fs.existsSync(customAgentsDir()) ? fs.readdirSync(customAgentsDir()) : [];
+    expect(entries).toEqual([]);
+  });
+
   it('backfills the default category when model-authored creates omit it', async () => {
     const a = await loadAgents();
     const missing = await a.createAgentFromBlocks({
       name: 'NoCategory',
       description_en: 'desc',
       workflow: 'Do the work.',
+      tool_list: [],
     });
     expect(missing?.category).toBe('general');
 
@@ -1072,6 +1495,7 @@ describe('agents › createAgentFromBlocks', () => {
       description_en: 'desc',
       workflow: 'Analyze the data.',
       category: 'data',
+      tool_list: [],
     });
     expect(created?.category).toBe('data');
     const file = path.join(customAgentsDir(), created?.agent_id || '', 'agent.json');
@@ -1083,10 +1507,12 @@ describe('agents › createAgentFromBlocks', () => {
     await expect(a.createAgentFromBlocks({
       name: 'NoWorkflow',
       description_en: 'desc',
+      tool_list: [],
     })).resolves.toBeNull();
     await expect(a.createAgentFromBlocks({
       workflow: 'Do the work.',
       description_en: 'desc',
+      tool_list: [],
     })).resolves.toBeNull();
   });
 
@@ -1101,6 +1527,7 @@ describe('agents › createAgentFromBlocks', () => {
       icon: 'spreadsheet',
       interactive: true,
       skill_list: ['known-skill', 'missing-skill'],
+      tool_list: [],
       inputs: [
         { id: 'topic', label: 'Topic', type: 'text', default: '', required: true },
         { id: 'bad id', label: 'Bad', type: 'text', default: '' } as any,
@@ -1125,6 +1552,7 @@ describe('agents › createAgentFromBlocks', () => {
       category: 'general',
       knowhow: ['Task framing'],
       standards: ['Traceable output'],
+      tool_list: [],
     });
     expect(created?.profile?.knowhow).toEqual(['Task framing']);
     expect(created?.profile?.standards).toEqual(['Traceable output']);
@@ -1246,6 +1674,31 @@ describe('agents › updateCustomAgent', () => {
     expect(updated?.name).toBe('Old');  // preserved
     expect(updated?.description_en).toBe('newDesc');
     expect(updated?.workflow).toBe('wf');  // preserved
+  });
+
+  it('rejects explicit guidance overflow without changing the file', async () => {
+    writeCustomAgent('abc', { name: 'Old', standards: ['Keep'] });
+    const file = path.join(customAgentsDir(), 'abc', 'agent.json');
+    const before = fs.readFileSync(file, 'utf8');
+    const a = await loadAgents();
+
+    await expect(a.updateCustomAgent('abc', {
+      standards: Array.from({ length: 6 }, (_, index) => `Check ${index + 1}`),
+    })).rejects.toThrow(/standards exceeds the maximum of 5 items/);
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
+  });
+
+  it('preserves legacy over-limit guidance during an unrelated update', async () => {
+    const legacy = Array.from({ length: 6 }, (_, index) => `Legacy ${index + 1}`);
+    writeCustomAgent('abc', { name: 'Old', knowhow: legacy });
+    const a = await loadAgents();
+
+    const updated = await a.updateCustomAgent('abc', { description: 'new description' });
+    expect(updated?.profile?.knowhow).toEqual(legacy);
+    const raw = JSON.parse(fs.readFileSync(
+      path.join(customAgentsDir(), 'abc', 'agent.json'), 'utf8',
+    ));
+    expect(raw.knowhow).toEqual(legacy);
   });
 
   it('finishes an in-flight rename against the account that started it', async () => {
@@ -1397,8 +1850,8 @@ describe('agents › updateCustomAgent', () => {
     const updated = await a.updateCustomAgent('abc', {
       workflow: 'should be ignored',
       skill_list: ['x'],
-      knowhow: ['should be ignored'],
-      standards: ['should be ignored'],
+      knowhow: Array.from({ length: 6 }, (_, index) => `Ignored capability ${index + 1}`),
+      standards: Array.from({ length: 6 }, (_, index) => `Ignored check ${index + 1}`),
       profile: {
         knowhow: ['legacy should be ignored'],
         standards: ['legacy should be ignored'],
@@ -1441,6 +1894,69 @@ describe('agents › updateCustomAgent', () => {
     expect(updated?.skill_list).toEqual(['s1', 's2']);
     const reread = await a.getAgent('abc');
     expect(reread?.skill_list).toEqual(['s1', 's2']);
+  });
+
+  it('writes tool_list with replace, explicit-zero, omit, and drop semantics', async () => {
+    writeCustomAgent('abc', { name: 'N', tool_list: ['web'] });
+    const a = await loadAgents();
+
+    const replaced = await a.updateCustomAgent('abc', {
+      tool_list: ['workspace', 'workspace.read', 'pdf'],
+    });
+    expect(replaced?.tool_list).toEqual(['workspace', 'office.pdf']);
+
+    const omitted = await a.updateCustomAgent('abc', { description: 'unchanged tools' });
+    expect(omitted?.tool_list).toEqual(['workspace', 'office.pdf']);
+
+    const zero = await a.updateCustomAgent('abc', { tool_list: [] });
+    expect(zero?.tool_list).toEqual([]);
+
+    const dropped = await a.updateCustomAgent('abc', { tool_list: null });
+    expect(dropped).not.toHaveProperty('tool_list');
+  });
+
+  it('rejects unknown, host-managed, or runtime-only tool groups without changing the file', async () => {
+    writeCustomAgent('abc', { name: 'N', tool_list: ['web'] });
+    const a = await loadAgents();
+
+    await expect(a.updateCustomAgent('abc', { tool_list: ['context', 'management', 'not-real'] }))
+      .rejects.toThrow(/host-managed, or runtime-only tool groups/);
+    expect(JSON.parse(fs.readFileSync(path.join(customAgentsDir(), 'abc', 'agent.json'), 'utf8')).tool_list)
+      .toEqual(['web']);
+  });
+
+  it('rejects a parsed invalid <tools> edit atomically instead of applying sibling fields', async () => {
+    writeCustomAgent('abc', { name: 'Before', workflow: 'Old workflow.', tool_list: ['web'] });
+    const a = await loadAgents();
+    const fields = a.extractAgentFieldBlocks([
+      '<agent>',
+      '<name>After</name>',
+      '<workflow>New workflow.</workflow>',
+      '<tools>workspace.read\nmanagement</tools>',
+      '</agent>',
+    ].join('\n')).blocks[0];
+
+    await expect(a.updateAgentSpec('abc', fields))
+      .rejects.toThrow(/invalid, unknown, host-managed, or runtime-only tool groups: management/);
+    const raw = JSON.parse(fs.readFileSync(
+      path.join(customAgentsDir(), 'abc', 'agent.json'),
+      'utf8',
+    ));
+    expect(raw).toMatchObject({ name: 'Before', workflow: 'Old workflow.', tool_list: ['web'] });
+  });
+
+  it('rejects an edit that adds an undeclared direct tool call without changing the file', async () => {
+    writeCustomAgent('abc', { name: 'Before', workflow: 'Old workflow.', tool_list: ['web'] });
+    const file = path.join(customAgentsDir(), 'abc', 'agent.json');
+    const before = fs.readFileSync(file, 'utf8');
+    const a = await loadAgents();
+
+    await expect(a.updateCustomAgent('abc', {
+      name: 'After',
+      workflow: '### 1. Save\n- `write_file(path, content)` saves the result.',
+    })).rejects.toThrow(/write_file \(add workspace\.write\.output\)/);
+
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
   });
 
   it('writes inputs array and round-trips through normalize', async () => {
@@ -1489,17 +2005,6 @@ describe('agents › updateCustomAgent', () => {
     expect(updated?.skill_list).toEqual(['ok-1', 'ok_2']);
   });
 
-  it('filters invalid enabled connector ids on write', async () => {
-    writeCustomAgent('abc', { name: 'N' });
-    const a = await loadAgents();
-    const updated = await a.updateCustomAgent('abc', {
-      enabled_connectors: [' github ', '../bad', 42 as any, 'notion'],
-    });
-    expect(updated?.enabled_connectors).toEqual(['github', 'notion']);
-    const raw = JSON.parse(fs.readFileSync(path.join(customAgentsDir(), 'abc', 'agent.json'), 'utf8'));
-    expect(raw.enabled_connectors).toEqual(['github', 'notion']);
-  });
-
   it('writes skill_list = [] as explicit zero (kept, not dropped)', async () => {
     writeSkillOnDisk('a');
     writeCustomAgent('abc', { name: 'N', skill_list: ['a'] });
@@ -1535,12 +2040,12 @@ describe('agents › updateCustomAgent', () => {
     expect(updated?.skill_list).toEqual(['known']);
   });
 
-  it('keeps enabled external-package skills in skill_list metadata', async () => {
+  it('drops external-package skills from runtime skill_list metadata', async () => {
     writeExternalPackageSkill('pkg-tools', 'external-helper');
     writeCustomAgent('abc', { name: 'N' });
     const a = await loadAgents();
     const updated = await a.updateCustomAgent('abc', { skill_list: ['external-helper'] });
-    expect(updated?.skill_list).toEqual(['external-helper']);
+    expect(updated?.skill_list).toEqual([]);
   });
 
   it('keeps skill_list verbatim when all ids are known (no closure expansion)', async () => {
@@ -1824,6 +2329,107 @@ describe('agents › streamSendToAgentEditChat synthesized progress', () => {
     expect(events.filter((e) => e.type === 'progress')).toHaveLength(0);
   });
 
+  it('keeps a newly staged Agent unchanged after an invalid edit-chat dependency and applies the corrected retry', async () => {
+    const a = await loadAgents();
+    const staged = await a.createCustomAgent({
+      name: 'EditChatResearcher',
+      description: 'Researches current public sources.',
+      category: 'general',
+    });
+    expect(staged?.tool_list).toEqual([]);
+    const agentId = staged?.agent_id || '';
+    const file = path.join(customAgentsDir(), agentId, 'agent.json');
+    const before = fs.readFileSync(file, 'utf8');
+
+    streamImpl.current = async function* () {
+      yield {
+        type: 'final',
+        text: [
+          'Configured.',
+          '<agent>',
+          '<name>MustNotPersist</name>',
+          '<workflow>### 1. Research\n- `web_search(query)` finds current evidence.</workflow>',
+          '<tools>workspace.read</tools>',
+          '</agent>',
+        ].join('\n'),
+      };
+    };
+    const rejectedEvents: any[] = [];
+    for await (const event of a.streamSendToAgentEditChat(TEST_UID, agentId, '完善网页研究流程')) {
+      rejectedEvents.push(event);
+    }
+
+    expect(rejectedEvents).toContainEqual(expect.objectContaining({
+      type: 'error',
+      text: expect.stringContaining('web_search (add web)'),
+    }));
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
+    expect((await a.getAgent(agentId))?.name).toBe('EditChatResearcher');
+    expect((await a.getAgent(agentId))?.tool_list).toEqual([]);
+
+    let seenOpts: any = null;
+    streamImpl.current = async function* (opts: any) {
+      seenOpts = opts;
+      yield {
+        type: 'final',
+        text: [
+          'The research workflow is ready.',
+          '<agent>',
+          '<workflow>### 1. Research\n- `web_search(query)` finds current evidence.\n\n### 2. Deliver\n- Return cited findings.</workflow>',
+          '<tools>workspace.read\nweb</tools>',
+          '<category>data</category>',
+          '</agent>',
+        ].join('\n'),
+      };
+    };
+    const retryEvents: any[] = [];
+    for await (const event of a.streamSendToAgentEditChat(TEST_UID, agentId, '补齐网页研究能力')) {
+      retryEvents.push(event);
+    }
+
+    expect(retryEvents).toContainEqual(expect.objectContaining({
+      type: 'final',
+      text: 'The research workflow is ready.',
+      updated: expect.objectContaining({
+        tool_list: ['workspace.read', 'web'],
+        category: 'data',
+      }),
+    }));
+    expect(seenOpts.systemSkillList).toEqual(['agent-creator']);
+    expect(seenOpts.agentToolDependencyAuthoring).toBe(true);
+    const stored = await a.getAgent(agentId);
+    expect(stored).toMatchObject({
+      agent_id: agentId,
+      name: 'EditChatResearcher',
+      tool_list: ['workspace.read', 'web'],
+      category: 'data',
+    });
+    expect(stored?.workflow).toContain('web_search(query)');
+    expect(fs.readdirSync(customAgentsDir())).toEqual([agentId]);
+
+    const { createToolSurfaceController, catalogedToolNames } = await import(
+      '../../../src/main/model/core-agent/tool-surface'
+    );
+    const surface = createToolSurfaceController({
+      availableToolNames: catalogedToolNames().filter((name) => name !== 'tool_load'),
+      configuredGroups: stored?.tool_list,
+      scopedEligible: true,
+      dynamicLoading: false,
+    });
+    expect(surface.activeToolNames()).toEqual(expect.arrayContaining([
+      'read_files', 'grep_files', 'web_search', 'web_fetch',
+    ]));
+    for (const forbidden of ['write_file', 'bash', 'create_xlsx', 'tool_load']) {
+      expect(surface.activeToolNames()).not.toContain(forbidden);
+    }
+
+    const chatPath = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'agent', agentId, 'chat.jsonl');
+    const history = fs.readFileSync(chatPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(history.filter((row) => row.role === 'assistant')).toHaveLength(2);
+    expect(history.at(-1)?.content).toBe('The research workflow is ready.');
+    expect(JSON.stringify(history)).not.toContain('<agent>');
+  });
+
   it('normalizes and persists terminal runtime for live and restored edit chat', async () => {
     streamImpl.current = async function* () {
       yield { type: 'final', text: 'done' };
@@ -1919,7 +2525,7 @@ describe('agents › streamSendToAgentEditChat synthesized progress', () => {
     expect(first.model_text).toBe('请基于名称和简介完善智能体工作流。');
   });
 
-  it('exposes open-tier skills and skill_search to the agent edit model call', async () => {
+  it('keeps package/global Skills out of the Agent edit model call', async () => {
     let seenOpts: any = null;
     streamImpl.current = async function* (opts: any) {
       seenOpts = opts;
@@ -1933,8 +2539,28 @@ describe('agents › streamSendToAgentEditChat synthesized progress', () => {
       // drain
     }
 
-    expect(seenOpts.extraTools.map((t: any) => t.name)).toContain('skill_search');
-    expect(seenOpts.readOnlyExtraRoots).toContain(externalRoot);
+    expect((seenOpts.extraTools || []).map((t: any) => t.name)).not.toContain('skill_search');
+    expect(seenOpts.readOnlyExtraRoots).not.toContain(externalRoot);
+    expect(seenOpts.agentToolDependencyAuthoring).toBe(true);
+  });
+
+  it('does not advertise tool dependency authoring in a CLI Agent editor', async () => {
+    let seenOpts: any = null;
+    streamImpl.current = async function* (opts: any) {
+      seenOpts = opts;
+      yield { type: 'final', text: 'done' };
+    };
+    writeCustomAgent('cli-agent', {
+      name: 'CliAgent',
+      runtime: { kind: 'cli', cli: 'codex' },
+    });
+
+    const a = await loadAgents();
+    for await (const _ev of a.streamSendToAgentEditChat('u1', 'cli-agent', '更新说明')) {
+      // drain
+    }
+
+    expect(seenOpts.agentToolDependencyAuthoring).toBeUndefined();
   });
 
   it('passes edit-chat attachments into the model prompt and history', async () => {
@@ -2111,6 +2737,7 @@ describe('agents › buildAgentEditSystemPrompt', () => {
       icon: 'search',
       category: 'rnd',
       workflow: '1. step one\n2. step two',
+      tool_list: ['workspace.read', 'web'],
       knowhow: ['Evidence synthesis'],
       standards: ['Every claim cites its source'],
     });
@@ -2121,6 +2748,7 @@ describe('agents › buildAgentEditSystemPrompt', () => {
     expect(sys).not.toContain('$avatar_icon_catalog');
     expect(sys).not.toContain('sparkle, rocket, brain');
     expect(sys).toContain('step one');
+    expect(sys).toContain('workspace.read\nweb');
     expect(sys).toContain('Evidence synthesis');
     expect(sys).toContain('Every claim cites its source');
     // Migration check: template no longer carries the redundant skills list.
@@ -2141,6 +2769,38 @@ describe('agents › buildAgentEditSystemPrompt', () => {
 });
 
 describe('agents › list cache invalidation', () => {
+  it('rebuilds a v2 OpenCode catalog snapshot with the host-owned project_dir schema', async () => {
+    writeCustomAgent('cached-opencode', {
+      name: 'Cached OpenCode',
+      runtime: { kind: 'cli', cli: 'opencode' },
+    });
+    const first = await loadAgents();
+    const initial = (await first.listAgents()).find((agent) => agent.agent_id === 'cached-opencode');
+    expect(initial?.inputs?.find((input) => input.id === 'project_dir')).toMatchObject({
+      type: 'directory', required: true, default: '',
+    });
+
+    const paths = await import('../../../src/main/paths');
+    const cacheFile = paths.userAgentCatalogCacheFile(TEST_UID);
+    const stale = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+    stale.version = 2;
+    stale.data = stale.data.map((agent: any) => (
+      agent.agent_id === 'cached-opencode' ? { ...agent, inputs: undefined } : agent
+    ));
+    fs.writeFileSync(cacheFile, JSON.stringify(stale));
+
+    vi.resetModules();
+    const users = await import('../../../src/main/features/users');
+    users.activateUser(TEST_UID);
+    const restarted = await loadAgents();
+    const repaired = (await restarted.listAgents())
+      .find((agent) => agent.agent_id === 'cached-opencode');
+    expect(repaired?.inputs?.find((input) => input.id === 'project_dir')).toMatchObject({
+      type: 'directory', required: true, default: '',
+    });
+    expect(JSON.parse(fs.readFileSync(cacheFile, 'utf8')).version).toBe(3);
+  });
+
   it('reuses the persisted catalog after a module restart and honors force invalidation', async () => {
     writeCustomAgent('persisted-agent', { name: 'Persisted Agent' });
     const first = await loadAgents();

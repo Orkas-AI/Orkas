@@ -35,6 +35,7 @@ import {
   buildInspectFrameSamplePlan,
   buildPreviewFrameSamplePlan,
   compareVisualBaseline,
+  hookPromiseIssue,
   initDraftRepairBudget,
   isSuspiciousCrossSceneDuplicate,
   dedupeInspectIssues,
@@ -215,6 +216,9 @@ type NativeRenderProfile = {
   previous_observed_capture_fps?: number;
   previous_realtime_factor?: number;
   frame_pipeline?: 'raw_bgra_pipe' | 'video_track_reuse' | 'scene_segment_assembly';
+  /** Why the scene-segment pipeline did not own this render. Present only on
+   * raw whole-composition renders so a raw run is always explainable. */
+  segment_assembly_ineligible_reasons?: string[];
   capture_pipeline_seconds?: number;
   encoder_finalize_seconds?: number;
   total_render_seconds?: number;
@@ -225,6 +229,16 @@ type NativeRenderProfile = {
   capture_source_width?: number;
   capture_source_height?: number;
   capture_scale_factor?: number;
+};
+
+/** One scene segment this assembly call could not render after its in-call
+ * retry. Carried on the resumable `E_SEGMENT_ASSEMBLY_INCOMPLETE` result so
+ * the caller knows exactly what a same-input retry still has to produce. */
+type FailedSceneSegment = {
+  scene_id: string;
+  frame_range: [number, number];
+  attempts: number;
+  error: string;
 };
 
 type LoudnessReport = {
@@ -247,6 +261,10 @@ const MAX_RENDER_DURATION_SEC = 20 * 60;
 const MAX_FPS = 60;
 const RENDER_TIMEOUT_MS = 20 * 60 * 1000;
 const FFPROBE_TIMEOUT_MS = 30 * 1000;
+// Per-segment attempts inside one assembly call: the initial render plus one
+// retry in a fresh renderer window (the frame timeout handlers destroy the
+// shared window, so a retry always needs a new one).
+const SEGMENT_RENDER_MAX_ATTEMPTS = 2;
 const AUDIO_DURATION_TOLERANCE_SEC = 0.5;
 const MEDIA_DURATION_TOLERANCE_SEC = 0.5;
 const VIDEO_STUDIO_AGENT_ID = '79df9cc89f5f';
@@ -1462,6 +1480,56 @@ export async function withVideoStudioTimeout<T>(
   });
 }
 
+/** Machine-level render gate. Frame-capture rendering saturates the CPU/GPU:
+ * two concurrent renders (observed 2026-08-22 — two videos in one
+ * conversation) roughly halve each other's throughput while pushing both
+ * toward the idle watchdogs, so one render at a time finishes strictly sooner
+ * in aggregate. Process-local FIFO; waiters emit progress so the queue wait
+ * is user-visible and keeps the watchdogs fed. Light work (status, preflight,
+ * inspect, snapshot, audio-only track reuse) is deliberately not gated. */
+let compositionRenderSlotTail: Promise<void> = Promise.resolve();
+const RENDER_SLOT_WAIT_PROGRESS_INTERVAL_MS = 30_000;
+
+export async function acquireCompositionRenderSlot(input: {
+  signal?: AbortSignal;
+  onWait?: (waitedMs: number) => void;
+  waitProgressIntervalMs?: number;
+} = {}): Promise<() => void> {
+  let release!: () => void;
+  const mine = new Promise<void>((resolve) => { release = resolve; });
+  const prior = compositionRenderSlotTail;
+  compositionRenderSlotTail = prior.then(() => mine);
+  let acquired = false;
+  const waitStartedAt = Date.now();
+  const ticker = setInterval(() => {
+    if (!acquired) input.onWait?.(Date.now() - waitStartedAt);
+  }, Math.max(1, input.waitProgressIntervalMs ?? RENDER_SLOT_WAIT_PROGRESS_INTERVAL_MS));
+  if (typeof ticker.unref === 'function') ticker.unref();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = () => reject(new Error('render aborted'));
+      if (input.signal?.aborted) {
+        onAbort();
+        return;
+      }
+      input.signal?.addEventListener('abort', onAbort, { once: true });
+      void prior.then(() => {
+        input.signal?.removeEventListener('abort', onAbort);
+        resolve();
+      });
+    });
+    acquired = true;
+    return release;
+  } catch (err) {
+    // Abandon the queue position without blocking later waiters: this slot
+    // auto-releases the moment the prior holder finishes.
+    void prior.then(() => release());
+    throw err;
+  } finally {
+    clearInterval(ticker);
+  }
+}
+
 async function withCompositionWindow<T>(
   meta: CompositionMeta,
   p: CompositionOptions,
@@ -1908,6 +1976,88 @@ export function previewEvidenceRunDir(snapshotAbsPath: string, sourceHtml: strin
   return path.join(path.dirname(snapshotAbsPath), `${snapshotStem}-frames`, `${sourceHash}-${runId}`);
 }
 
+/** Fact block comparing this run's captured frames, byte for byte, with the
+ * immediately previous capture run of the same snapshot. Exists because a
+ * 2026-08-23 repair loop re-captured three times, produced pixel-identical
+ * frames each time, and the model first reported the revision as applied and
+ * then blamed a host frame cache the snapshot path does not have. Only
+ * sibling run directories are consulted; no prior capture means no
+ * comparison, never a guess. */
+export async function compareCaptureWithPreviousRun(
+  evidenceDirAbs: string,
+  samples: Array<{ label: string; path: string }>,
+): Promise<Record<string, unknown> | null> {
+  try {
+    const parent = path.dirname(evidenceDirAbs);
+    const self = path.basename(evidenceDirAbs);
+    const candidates: Array<{ abs: string; name: string }> = (await fs.readdir(parent, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory() && entry.name !== self)
+      .map((entry) => ({ abs: path.join(parent, entry.name), name: entry.name }));
+    // A re-capture under a renamed snapshot stem must still see its history:
+    // on 2026-08-23 the model wrote keyframes → …-fix-v3 → …-fix-v5, each a
+    // fresh `<stem>-frames` family with no siblings, and the comparison never
+    // ran. Every capture family of the same snapshot directory is lineage.
+    // Only the conventional `<stem>-frames` layout is widened, so direct
+    // callers with bespoke directories keep the sibling-only behavior.
+    const parentName = path.basename(parent);
+    if (parentName.endsWith('-frames')) {
+      const grandparent = path.dirname(parent);
+      for (const family of await fs.readdir(grandparent, { withFileTypes: true })) {
+        if (!family.isDirectory() || !family.name.endsWith('-frames') || family.name === parentName) continue;
+        const familyAbs = path.join(grandparent, family.name);
+        for (const run of await fs.readdir(familyAbs, { withFileTypes: true }).catch(() => [])) {
+          if (!run.isDirectory()) continue;
+          candidates.push({ abs: path.join(familyAbs, run.name), name: `${family.name}/${run.name}` });
+        }
+      }
+    }
+    if (!candidates.length) return null;
+    const priorDirs = (await Promise.all(candidates.map(async (entry) => {
+      const st = await fs.stat(entry.abs).catch(() => null);
+      return st ? { ...entry, mtimeMs: st.mtimeMs } : null;
+    }))).filter((item): item is { abs: string; name: string; mtimeMs: number } => !!item)
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    const prior = priorDirs[0];
+    if (!prior) return null;
+    const priorByLabel = new Map<string, string>();
+    for (const name of await fs.readdir(prior.abs)) {
+      const match = /^\d+-(.+)\.png$/.exec(name);
+      if (match && !priorByLabel.has(match[1])) priorByLabel.set(match[1], path.join(prior.abs, name));
+    }
+    const unchanged: string[] = [];
+    const changed: string[] = [];
+    for (const sample of samples) {
+      const priorPath = priorByLabel.get(sample.label);
+      if (!priorPath) continue;
+      const [current, previous] = await Promise.all([sha256File(sample.path), sha256File(priorPath)]);
+      if (!current || !previous) continue;
+      (current === previous ? unchanged : changed).push(sample.label);
+    }
+    // Every frame differing from the previous run is the healthy shape and
+    // carries no decision value — stay silent. The block exists only for the
+    // fact worth stating: some sampled frame did not change.
+    if (!unchanged.length) return null;
+    return {
+      fresh_capture: true,
+      compared_with_previous_capture: prior.name,
+      unchanged_labels: unchanged,
+      changed_labels: changed,
+      ...(unchanged.length && !changed.length
+        ? {
+          note: 'Every sampled frame is byte-identical to the previous capture. This was a fresh'
+            + ' live capture — the snapshot path has no frame cache — so the composition renders'
+            + ' the same pixels at every sampled time and the last edit changed nothing visible'
+            + ' there. Do not report a visual revision as applied; re-read the frames and make a'
+            + ' different edit.',
+        }
+        : {}),
+    };
+  } catch (err) {
+    logOptionalReadFailure('previous-capture comparison failed', err);
+    return null;
+  }
+}
+
 export function previewArtifactPaths(
   snapshotAbsPath: string,
   contactSheetPath: string,
@@ -2008,7 +2158,18 @@ export async function inspectComposition(p: CompositionOptions): Promise<VideoSt
   let isolationProbe: SceneIsolationProbeResult | null = null;
   try {
     await withCompositionWindow(meta, p, async (win) => {
-      for (const plan of samplePlans) {
+      // Shift-left of the frame-0 cover contract: the semantic facts the
+      // rendered-frame QA reads (visible roles/text/hidden elements) come
+      // straight from the DOM after a seek, no capture needed. Checking here
+      // surfaces the same finding and prescription during authoring
+      // iteration, before any snapshot or draft spends a repair budget on it.
+      if (preflight.manifest) {
+        await seek(win, 0);
+        const coverEvidence = await readFrameSemanticEvidence(win);
+        const coverIssue = hookPromiseIssue(coverEvidence, p.isDeliveredOpening !== false);
+        if (coverIssue) issues.push(coverIssue);
+      }
+      for (const [sampleIndex, plan] of samplePlans.entries()) {
         await seek(win, plan.timeSec);
         const sampleIssues = await withVideoStudioTimeout(
           win.webContents.executeJavaScript(buildInspectScript(meta, plan.timeSec, plan.sceneId), true) as Promise<Issue[]>,
@@ -2021,6 +2182,13 @@ export async function inspectComposition(p: CompositionOptions): Promise<VideoSt
           },
         );
         issues.push(...sampleIssues);
+        // Draft runs inspect before any render: without a signal here the
+        // whole pre-render phase is indistinguishable from a hang.
+        p.onProgress?.({
+          phase: 'composition.inspect',
+          message: `Runtime probe ${sampleIndex + 1}/${samplePlans.length} at ${round2(plan.timeSec)}s.`,
+          data: { sample: sampleIndex + 1, totalSamples: samplePlans.length },
+        });
       }
       if (preflight.manifest) {
         // Advisory attribution probe: failures leave the record unsupported
@@ -2158,12 +2326,30 @@ export async function inspectComposition(p: CompositionOptions): Promise<VideoSt
   return result;
 }
 
-function sceneIsolationSummary(record: SceneIsolationRecord): Record<string, unknown> {
+export function sceneIsolationSummary(record: SceneIsolationRecord): Record<string, unknown> {
+  const reasons = [...new Set(record.violations.map((violation) => violation.reason))];
   return {
     attributable: record.attributable,
     runtime_supported: record.runtime_supported,
     isolation: record.isolation,
     violation_count: record.violations.length,
+    // The verdict used to be a bare count consumed only by segment-assembly
+    // eligibility. On 2026-08-23 the same violations predicted a real defect
+    // the model never connected to them: hand-rolled same-time show/hide sets
+    // left the previous scene rendered on top at a seeked frame. Spell the
+    // behavioral risk out where the model reads it.
+    ...(record.violations.length
+      ? {
+        violation_reasons: reasons,
+        record_path: 'qa/scene-isolation.json',
+        risk: 'Scene visibility is not provably owned by the clip windows. Cross-scene tweens'
+          + ' and manual per-scene show/hide sets at scene boundaries are seek-order-unstable:'
+          + ' a seeked or captured frame can show the previous scene instead of the current'
+          + " one. Let each clip's data-start/data-duration own scene visibility and keep every"
+          + ' tween inside its scene window; this also keeps cached scene-segment rendering'
+          + ' eligible.',
+      }
+      : {}),
   };
 }
 
@@ -2653,6 +2839,7 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
     }
     const previewRevision = path.basename(evidenceDirAbs);
     const contactSheet = await writeFrameContactSheet(evidenceDirAbs, capturedSamples);
+    const captureComparison = await compareCaptureWithPreviousRun(evidenceDirAbs, capturedSamples);
     const publicArtifacts = previewArtifactPaths(p.snapshotAbsPath, contactSheet, capturedSamples);
     const frameEvidence: FrameEvidence = {
       evidence_dir: evidenceDirAbs,
@@ -2705,6 +2892,7 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
         preview_revision: previewRevision,
         frame_paths: frameEvidence.frame_paths,
         frame_evidence: frameEvidence,
+        ...(captureComparison ? { capture_comparison: captureComparison } : {}),
         preview_qa: previewQa,
         preflight: preflight.report,
         preview_completeness: narrationPending ? 'visual_only' : 'complete',
@@ -2740,6 +2928,7 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
         preview_revision: previewRevision,
         frame_paths: frameEvidence.frame_paths,
         frame_evidence: frameEvidence,
+        ...(captureComparison ? { capture_comparison: captureComparison } : {}),
         preview_qa: reviewQa,
         inspect_disposition: inspectDisposition,
         preflight: preflight.report,
@@ -2765,6 +2954,7 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
       preview_revision: previewRevision,
       frame_paths: frameEvidence.frame_paths,
       frame_evidence: frameEvidence,
+      ...(captureComparison ? { capture_comparison: captureComparison } : {}),
       preview_qa: previewQa,
       preflight: preflight.report,
       preview_completeness: narrationPending ? 'visual_only' : 'complete',
@@ -3109,22 +3299,218 @@ export async function pruneSegmentCache(
   }
 }
 
-async function attemptSceneSegmentAssembly(
+/** Render one dirty scene segment frame-by-frame and rename it into the
+ * content-addressed segment cache. Completion is durable: once the rename
+ * lands, a later assembly call — including a resume after a mid-render
+ * failure — reuses the segment instead of re-rendering it. Throws on any
+ * failure; the staging directory is cleared on entry so a retry never
+ * inherits a failed attempt's partial output. */
+async function renderSceneSegmentIntoCache(input: {
+  win: ElectronBrowserWindow;
+  job: { range: SceneFrameRange; key: string; entryDirAbs: string; cachedMeta: SegmentCacheMeta | null };
+  meta: CompositionMeta;
+  p: CompositionOptions;
+  fps: number;
+  ffmpeg: string;
+  ffprobe: string;
+  workDirAbs: string;
+  ownedPlans: FrameSamplePlan[];
+  segmentsToRender: number;
+  segmentIndex: number;
+}): Promise<void> {
+  const { win, job, meta, p, fps, workDirAbs } = input;
+  const frameCount = job.range.endFrame - job.range.startFrame;
+  const stagingDirAbs = path.join(workDirAbs, `render-${job.key.slice(0, 12)}`);
+  await fs.rm(stagingDirAbs, { recursive: true, force: true });
+  await fs.mkdir(path.join(stagingDirAbs, 'samples'), { recursive: true });
+  const segmentTmpAbs = path.join(stagingDirAbs, 'segment.mp4');
+  const planByFrame = new Map<number, FrameSamplePlan>();
+  for (const plan of input.ownedPlans) {
+    if (!planByFrame.has(plan.frameIndex)) planByFrame.set(plan.frameIndex, plan);
+  }
+  const segmentSamples: SegmentCacheSample[] = [];
+  const encoder = startRawFrameEncoder({
+    ffmpeg: input.ffmpeg,
+    outputAbsPath: segmentTmpAbs,
+    width: meta.width,
+    height: meta.height,
+    fps,
+    format: p.format ?? 'mp4',
+    quality: p.quality,
+    audioTracks: [],
+    durationSec: frameCount / fps,
+    signal: p.signal,
+  });
+  try {
+    for (let frame = job.range.startFrame; frame < job.range.endFrame; frame += 1) {
+      if (p.signal?.aborted) throw new Error('render aborted');
+      const t = Math.min(frame / fps, Math.max(0, meta.durationSec - 0.001));
+      await seek(win, t);
+      const plan = planByFrame.get(frame);
+      const semanticEvidence = plan ? await readFrameSemanticEvidence(win) : null;
+      const capturedImage = await withVideoStudioTimeout(
+        win.webContents.capturePage({ x: 0, y: 0, width: meta.width, height: meta.height }),
+        COMPOSITION_RENDER_FRAME_TIMEOUT_MS,
+        'E_RENDER_CAPTURE_TIMEOUT',
+        `segment render timed out while capturing frame ${frame + 1}.`,
+        () => {
+          try { win.destroy(); }
+          catch (err) { log.warn('segment render window cleanup failed', { error: logErrorSummary(err) }); }
+        },
+      );
+      const normalized = normalizeCapturedFrame(capturedImage, meta.width, meta.height);
+      await withVideoStudioTimeout(
+        encoder.writeFrame(normalized.image.toBitmap()),
+        COMPOSITION_RENDER_FRAME_TIMEOUT_MS,
+        'E_RENDER_PIPE_TIMEOUT',
+        `segment render timed out while streaming frame ${frame + 1}.`,
+        () => encoder.cancel(),
+      );
+      if (plan) {
+        const stats = analyzeNativeImage(normalized.image);
+        const relative = path.join('samples', `${plan.label}.png`);
+        await fs.writeFile(path.join(stagingDirAbs, relative), normalized.image.toPNG());
+        segmentSamples.push({
+          label: plan.label,
+          time_seconds: round2(plan.timeSec),
+          frame_index: frame,
+          ...(plan.sceneId ? { expected_scene_id: plan.sceneId } : {}),
+          capture_source_width: normalized.sourceWidth,
+          capture_source_height: normalized.sourceHeight,
+          capture_scale_factor: normalized.scaleFactor,
+          ...(semanticEvidence || {}),
+          ...stats,
+          cache_relative_path: relative,
+        });
+      }
+      if ((frame - job.range.startFrame) % Math.max(1, Math.floor(fps * 2)) === 0) {
+        p.onProgress?.({
+          phase: 'composition.render.capture',
+          message: `Segment ${job.range.sceneId} (${input.segmentIndex}/${input.segmentsToRender}): captured frame ${frame - job.range.startFrame + 1}/${frameCount}.`,
+          data: {
+            framePipeline: 'scene_segment_assembly',
+            sceneId: job.range.sceneId,
+            frame: frame - job.range.startFrame + 1,
+            totalFrames: frameCount,
+            segmentIndex: input.segmentIndex,
+            segmentsToRender: input.segmentsToRender,
+          },
+        });
+      }
+    }
+    const encoded = await encoder.finish();
+    if (encoded.aborted || encoded.timedOut || encoded.code !== 0) {
+      throw new Error(`segment encode failed (code ${encoded.code}).`);
+    }
+  } catch (err) {
+    encoder.cancel();
+    await encoder.wait().catch((waitErr) => {
+      log.warn('segment encoder cleanup failed', { error: logErrorSummary(waitErr) });
+      return null;
+    });
+    throw err;
+  }
+  const segmentProbe = await probeMedia(input.ffprobe, segmentTmpAbs, p.signal);
+  if (!segmentProbe?.video) throw new Error('segment media could not be probed.');
+  await fs.writeFile(path.join(stagingDirAbs, 'meta.json'), JSON.stringify({
+    version: SEGMENT_CACHE_META_VERSION,
+    scene_id: job.range.sceneId,
+    frame_range: [job.range.startFrame, job.range.endFrame],
+    fps,
+    samples: segmentSamples,
+  } satisfies SegmentCacheMeta, null, 2), 'utf8');
+  await fs.rm(job.entryDirAbs, { recursive: true, force: true }).catch((err) => {
+    log.warn('stale segment cache cleanup failed', { error: logErrorSummary(err) });
+  });
+  await fs.mkdir(path.dirname(job.entryDirAbs), { recursive: true });
+  await fs.rename(stagingDirAbs, job.entryDirAbs);
+  job.cachedMeta = await readSegmentCacheMeta(job.entryDirAbs);
+  if (!job.cachedMeta) throw new Error('segment cache entry did not persist.');
+}
+
+/** Capture the sample plans that are not anchored to any scene (first-frame,
+ * quarter, midpoint, …) into the assembly work directory. */
+async function captureGlobalAssemblySamples(input: {
+  win: ElectronBrowserWindow;
+  meta: CompositionMeta;
+  p: CompositionOptions;
+  globalPlans: FrameSamplePlan[];
+  workDirAbs: string;
+  collected: Map<string, { evidence: FrameSampleEvidence; reused: boolean }>;
+}): Promise<void> {
+  const { win, meta, p } = input;
+  for (const plan of input.globalPlans) {
+    await seek(win, plan.timeSec);
+    await settleCompositionPaint(win);
+    const semanticEvidence = await readFrameSemanticEvidence(win);
+    const capturedImage = await withVideoStudioTimeout(
+      win.webContents.capturePage({ x: 0, y: 0, width: meta.width, height: meta.height }),
+      COMPOSITION_RENDER_FRAME_TIMEOUT_MS,
+      'E_RENDER_CAPTURE_TIMEOUT',
+      `sample capture timed out at ${round2(plan.timeSec)}s.`,
+      () => {
+        try { win.destroy(); }
+        catch (err) { log.warn('sample capture window cleanup failed', { error: logErrorSummary(err) }); }
+      },
+    );
+    const normalized = normalizeCapturedFrame(capturedImage, meta.width, meta.height);
+    const stats = analyzeNativeImage(normalized.image);
+    const evidence: FrameSampleEvidence = {
+      label: plan.label,
+      time_seconds: round2(plan.timeSec),
+      frame_index: plan.frameIndex,
+      path: '',
+      capture_source_width: normalized.sourceWidth,
+      capture_source_height: normalized.sourceHeight,
+      capture_scale_factor: normalized.scaleFactor,
+      ...(semanticEvidence || {}),
+      ...stats,
+    } as FrameSampleEvidence;
+    input.collected.set(plan.label, {
+      reused: false,
+      evidence: { ...evidence, path: path.join(input.workDirAbs, `${plan.label}.png`) },
+    });
+    await fs.writeFile(path.join(input.workDirAbs, `${plan.label}.png`), normalized.image.toPNG());
+  }
+}
+
+/** The explicit pipeline decision for one render: either the scene-segment
+ * pipeline owns the composition (with the per-segment dependency keys already
+ * computed), or the raw whole-composition loop does — with the structural
+ * reasons why no sound per-scene cache boundary exists. Mid-render failures
+ * are not this function's concern: an eligible composition never falls back
+ * to raw. */
+export type SceneSegmentAssemblyPlan =
+  | { eligible: false; reasons: string[] }
+  | {
+    eligible: true;
+    segmentCacheDirAbs: string;
+    outputAbsPath: string;
+    visualSignature: string;
+    windows: RenderWindowVector;
+    segments: Array<{ range: SceneFrameRange; key: string }>;
+  };
+
+export async function resolveSceneSegmentAssemblyPlan(
   p: CompositionOptions,
   meta: CompositionMeta,
-  ctx: {
-    fps: number;
-    totalFrames: number;
-    ffmpeg: string;
-    ffprobe: string;
-    renderProfile: NativeRenderProfile;
-  },
-): Promise<VideoStudioResult | null> {
-  if (!p.segmentCacheDirAbs || !p.outputAbsPath || !p.visualSignature) return null;
+  ctx: { fps: number; totalFrames: number },
+): Promise<SceneSegmentAssemblyPlan> {
+  const ineligible = (reason: string, extra: string[] = []): SceneSegmentAssemblyPlan => (
+    { eligible: false, reasons: [reason, ...extra] }
+  );
+  if (!p.segmentCacheDirAbs || !p.outputAbsPath || !p.visualSignature) {
+    return ineligible('segment cache, output path, or visual signature not provisioned for this operation');
+  }
   const windows = await readCompositionWindowVector(p.compositionDirAbs);
-  if (!windows || windows.length < 2) return null;
+  if (!windows || windows.length < 2) {
+    return ineligible('composition declares fewer than two scene windows');
+  }
   const ranges = computeSceneFrameRanges(windows, ctx.fps, ctx.totalFrames);
-  if (!ranges) return null;
+  if (!ranges) return ineligible('scene windows do not form a valid frame partition');
+  if (!ranges.some((range) => range.endFrame > range.startFrame)) {
+    return ineligible('every scene window is below one frame');
+  }
 
   // Isolation must be proven for the exact current HTML bytes.
   const htmlSha = sha256Text(meta.html);
@@ -3133,10 +3519,13 @@ async function attemptSceneSegmentAssembly(
     isolation = JSON.parse(await fs.readFile(sceneIsolationPath(p.compositionDirAbs), 'utf8')) as SceneIsolationRecord;
   } catch (err) {
     logOptionalReadFailure('scene isolation record read failed', err);
-    return null;
+    return ineligible('scene isolation record is missing or unreadable');
   }
-  if (!isolation || isolation.version !== 1 || isolation.isolation !== true || isolation.html_sha256 !== htmlSha) {
-    return null;
+  if (!isolation || isolation.version !== 1 || isolation.isolation !== true) {
+    return ineligible('scene isolation is not proven for this composition');
+  }
+  if (isolation.html_sha256 !== htmlSha) {
+    return ineligible('scene isolation record does not match the current composition bytes');
   }
 
   let manifest: CompositionManifest;
@@ -3144,23 +3533,24 @@ async function attemptSceneSegmentAssembly(
     const parsed = CompositionManifestSchema.safeParse(
       JSON.parse(await fs.readFile(path.join(p.compositionDirAbs, 'composition-manifest.json'), 'utf8')),
     );
-    if (!parsed.success) return null;
+    if (!parsed.success) return ineligible('composition manifest does not validate');
     manifest = parsed.data;
   } catch (err) {
     logOptionalReadFailure('segment assembly manifest read failed', err);
-    return null;
+    return ineligible('composition manifest is missing or unreadable');
   }
   const decomposition = decomposeCompositionSceneAttribution(meta.html, manifest);
-  if (!decomposition.attributable) return null;
+  if (!decomposition.attributable) {
+    return ineligible('scene attribution decomposition failed', decomposition.reasons.slice(0, 4));
+  }
 
   const sharedSha = sha256Text(decomposition.shared_surface);
-  let segments: Array<{ range: SceneFrameRange; key: string }>;
   try {
     const sharedAssetsSha256 = await videoStudioReferencedVisualAssetSignature(
       p.compositionDirAbs,
       decomposition.shared_surface,
     );
-    segments = await Promise.all(ranges.map(async (range) => {
+    const segments = await Promise.all(ranges.map(async (range) => {
       const subtree = decomposition.scene_subtrees[range.sceneId] ?? '';
       const motionRegion = decomposition.scene_motion_regions[range.sceneId] ?? '';
       return {
@@ -3185,13 +3575,35 @@ async function attemptSceneSegmentAssembly(
         }),
       };
     }));
+    return {
+      eligible: true,
+      segmentCacheDirAbs: p.segmentCacheDirAbs,
+      outputAbsPath: p.outputAbsPath,
+      visualSignature: p.visualSignature,
+      windows,
+      segments,
+    };
   } catch (err) {
-    log.warn('scene segment dependency fingerprint failed; falling back to full render', {
+    log.warn('scene segment dependency fingerprint failed; raw render owns this composition', {
       error: logErrorSummary(err),
     });
-    return null;
+    return ineligible('scene dependency fingerprint could not be computed');
   }
+}
 
+async function renderSceneSegmentAssembly(
+  p: CompositionOptions,
+  meta: CompositionMeta,
+  ctx: {
+    fps: number;
+    totalFrames: number;
+    ffmpeg: string;
+    ffprobe: string;
+    renderProfile: NativeRenderProfile;
+  },
+  plan: Extract<SceneSegmentAssemblyPlan, { eligible: true }>,
+): Promise<VideoStudioResult> {
+  const { windows, segments } = plan;
   const evidenceDirAbs = p.frameEvidenceDirAbs;
   const requestedSampleTimes = p.frameSampleTimes || [];
   const samplePlans: FrameSamplePlan[] = evidenceDirAbs
@@ -3209,7 +3621,7 @@ async function attemptSceneSegmentAssembly(
   type SegmentJob = typeof segments[number] & { entryDirAbs: string; cachedMeta: SegmentCacheMeta | null };
   const jobs: SegmentJob[] = [];
   for (const segment of segments) {
-    const entryDirAbs = path.join(p.segmentCacheDirAbs, segment.key);
+    const entryDirAbs = path.join(plan.segmentCacheDirAbs, segment.key);
     let cachedMeta = await readSegmentCacheMeta(entryDirAbs);
     if (cachedMeta && !(await fs.stat(path.join(entryDirAbs, 'segment.mp4')).then((st) => st.isFile(), () => false))) {
       cachedMeta = null;
@@ -3228,10 +3640,56 @@ async function attemptSceneSegmentAssembly(
   const dirty = jobs.filter((job) => !job.cachedMeta);
   const globalPlans = samplePlans.filter((plan) => !plan.sceneId);
   const needsWindow = dirty.length > 0 || globalPlans.length > 0;
+  const releaseRenderSlot = needsWindow
+    ? await acquireCompositionRenderSlot({
+      ...(p.signal ? { signal: p.signal } : {}),
+      onWait: (waitedMs) => p.onProgress?.({
+        phase: 'composition.render.queue',
+        message: `Waiting for another composition render to finish (queued ${Math.round(waitedMs / 1000)}s).`,
+        data: { queued: true, waitedMs },
+      }),
+    })
+    : null;
   const startedAt = Date.now();
-  const outputDir = path.dirname(p.outputAbsPath);
+  const outputDir = path.dirname(plan.outputAbsPath);
   const workDirAbs = path.join(outputDir, `.segment-assembly-${crypto.randomUUID()}`);
   const collected = new Map<string, { evidence: FrameSampleEvidence; reused: boolean }>();
+  // Mid-render bookkeeping lives outside the try so the failure path can
+  // report an accurate resumable state: completed segments are durable in the
+  // cache the moment they land, so a mid-assembly failure loses at most the
+  // segment that was in flight — never the whole render.
+  const reusedCount = jobs.length - dirty.length;
+  const failedSegments: FailedSceneSegment[] = [];
+  let renderedCount = 0;
+  let assemblyStage = 'segment_render';
+  const incompleteResult = (err: unknown): VideoStudioResult => {
+    const cachedNow = reusedCount + renderedCount;
+    const code = videoStudioErrorCode(err, 'E_RENDER_FAILED');
+    const detail = failedSegments.length
+      ? `${failedSegments.length} of ${jobs.length} scene segment(s) failed to render after a fresh-renderer retry`
+      : `scene segment assembly failed during ${assemblyStage} (${code}: ${String((err as Error)?.message || err).slice(0, 300)})`;
+    return {
+      ok: false,
+      op: 'composition.render',
+      errorCode: 'E_SEGMENT_ASSEMBLY_INCOMPLETE',
+      message: `${detail}. ${cachedNow} of ${jobs.length} segment(s) are already rendered and cached; retry the same render with unchanged inputs to resume from the cache — only the missing segment(s) will render.`,
+      failed_stage: assemblyStage,
+      render_profile: {
+        ...ctx.renderProfile,
+        frame_pipeline: 'scene_segment_assembly',
+        total_render_seconds: round2(Math.max(0.001, (Date.now() - startedAt) / 1000)),
+      },
+      scene_segments: {
+        total: jobs.length,
+        rendered: renderedCount,
+        reused: reusedCount,
+        failed: failedSegments.length,
+        pending: Math.max(0, jobs.length - reusedCount - renderedCount - failedSegments.length),
+        resumable: true,
+      },
+      ...(failedSegments.length ? { failed_segments: failedSegments } : {}),
+    };
+  };
 
   try {
     await fs.mkdir(outputDir, { recursive: true });
@@ -3239,146 +3697,134 @@ async function attemptSceneSegmentAssembly(
     if (evidenceDirAbs) await fs.mkdir(evidenceDirAbs, { recursive: true });
 
     if (needsWindow) {
-      await withCompositionWindow(meta, p, async (win) => {
-        for (const job of dirty) {
-          const frameCount = job.range.endFrame - job.range.startFrame;
-          if (frameCount <= 0) continue;
-          const stagingDirAbs = path.join(workDirAbs, `render-${job.key.slice(0, 12)}`);
-          await fs.mkdir(path.join(stagingDirAbs, 'samples'), { recursive: true });
-          const segmentTmpAbs = path.join(stagingDirAbs, 'segment.mp4');
-          const ownedPlans = evidenceDirAbs
-            ? samplePlans.filter((plan) => plan.sceneId && planSegmentOf(plan)?.key === job.key)
-            : [];
-          const planByFrame = new Map<number, FrameSamplePlan>();
-          for (const plan of ownedPlans) {
-            if (!planByFrame.has(plan.frameIndex)) planByFrame.set(plan.frameIndex, plan);
-          }
-          const segmentSamples: SegmentCacheSample[] = [];
-          const encoder = startRawFrameEncoder({
-            ffmpeg: ctx.ffmpeg,
-            outputAbsPath: segmentTmpAbs,
-            width: meta.width,
-            height: meta.height,
-            fps: ctx.fps,
-            format: p.format ?? 'mp4',
-            quality: p.quality,
-            audioTracks: [],
-            durationSec: frameCount / ctx.fps,
-            signal: p.signal,
-          });
-          try {
-            for (let frame = job.range.startFrame; frame < job.range.endFrame; frame += 1) {
-              if (p.signal?.aborted) throw new Error('render aborted');
-              const t = Math.min(frame / ctx.fps, Math.max(0, meta.durationSec - 0.001));
-              await seek(win, t);
-              const plan = planByFrame.get(frame);
-              const semanticEvidence = plan ? await readFrameSemanticEvidence(win) : null;
-              const capturedImage = await withVideoStudioTimeout(
-                win.webContents.capturePage({ x: 0, y: 0, width: meta.width, height: meta.height }),
-                COMPOSITION_RENDER_FRAME_TIMEOUT_MS,
-                'E_RENDER_CAPTURE_TIMEOUT',
-                `segment render timed out while capturing frame ${frame + 1}.`,
-                () => {
-                  try { win.destroy(); }
-                  catch (err) { log.warn('segment render window cleanup failed', { error: logErrorSummary(err) }); }
-                },
-              );
-              const normalized = normalizeCapturedFrame(capturedImage, meta.width, meta.height);
-              await withVideoStudioTimeout(
-                encoder.writeFrame(normalized.image.toBitmap()),
-                COMPOSITION_RENDER_FRAME_TIMEOUT_MS,
-                'E_RENDER_PIPE_TIMEOUT',
-                `segment render timed out while streaming frame ${frame + 1}.`,
-                () => encoder.cancel(),
-              );
-              if (plan) {
-                const stats = analyzeNativeImage(normalized.image);
-                const relative = path.join('samples', `${plan.label}.png`);
-                await fs.writeFile(path.join(stagingDirAbs, relative), normalized.image.toPNG());
-                segmentSamples.push({
-                  label: plan.label,
-                  time_seconds: round2(plan.timeSec),
-                  frame_index: frame,
-                  ...(plan.sceneId ? { expected_scene_id: plan.sceneId } : {}),
-                  capture_source_width: normalized.sourceWidth,
-                  capture_source_height: normalized.sourceHeight,
-                  capture_scale_factor: normalized.scaleFactor,
-                  ...(semanticEvidence || {}),
-                  ...stats,
-                  cache_relative_path: relative,
-                });
-              }
-            }
-            const encoded = await encoder.finish();
-            if (encoded.aborted || encoded.timedOut || encoded.code !== 0) {
-              throw new Error(`segment encode failed (code ${encoded.code}).`);
-            }
-          } catch (err) {
-            encoder.cancel();
-            await encoder.wait().catch((waitErr) => {
-              log.warn('segment encoder cleanup failed', { error: logErrorSummary(waitErr) });
-              return null;
-            });
-            throw err;
-          }
-          const segmentProbe = await probeMedia(ctx.ffprobe, segmentTmpAbs, p.signal);
-          if (!segmentProbe?.video) throw new Error('segment media could not be probed.');
-          await fs.writeFile(path.join(stagingDirAbs, 'meta.json'), JSON.stringify({
-            version: SEGMENT_CACHE_META_VERSION,
-            scene_id: job.range.sceneId,
-            frame_range: [job.range.startFrame, job.range.endFrame],
-            fps: ctx.fps,
-            samples: segmentSamples,
-          } satisfies SegmentCacheMeta, null, 2), 'utf8');
-          await fs.rm(job.entryDirAbs, { recursive: true, force: true }).catch((err) => {
-            log.warn('stale segment cache cleanup failed', { error: logErrorSummary(err) });
-          });
-          await fs.mkdir(path.dirname(job.entryDirAbs), { recursive: true });
-          await fs.rename(stagingDirAbs, job.entryDirAbs);
-          job.cachedMeta = await readSegmentCacheMeta(job.entryDirAbs);
-          if (!job.cachedMeta) throw new Error('segment cache entry did not persist.');
-        }
-        if (evidenceDirAbs) {
-          for (const plan of globalPlans) {
-            await seek(win, plan.timeSec);
-            await settleCompositionPaint(win);
-            const semanticEvidence = await readFrameSemanticEvidence(win);
-            const capturedImage = await withVideoStudioTimeout(
-              win.webContents.capturePage({ x: 0, y: 0, width: meta.width, height: meta.height }),
-              COMPOSITION_RENDER_FRAME_TIMEOUT_MS,
-              'E_RENDER_CAPTURE_TIMEOUT',
-              `sample capture timed out at ${round2(plan.timeSec)}s.`,
-              () => {
-                try { win.destroy(); }
-                catch (err) { log.warn('sample capture window cleanup failed', { error: logErrorSummary(err) }); }
-              },
-            );
-            const normalized = normalizeCapturedFrame(capturedImage, meta.width, meta.height);
-            const stats = analyzeNativeImage(normalized.image);
-            const evidence: FrameSampleEvidence = {
-              label: plan.label,
-              time_seconds: round2(plan.timeSec),
-              frame_index: plan.frameIndex,
-              path: '',
-              capture_source_width: normalized.sourceWidth,
-              capture_source_height: normalized.sourceHeight,
-              capture_scale_factor: normalized.scaleFactor,
-              ...(semanticEvidence || {}),
-              ...stats,
-            } as FrameSampleEvidence;
-            collected.set(plan.label, {
-              reused: false,
-              evidence: { ...evidence, path: path.join(workDirAbs, `${plan.label}.png`) },
-            });
-            await fs.writeFile(path.join(workDirAbs, `${plan.label}.png`), normalized.image.toPNG());
-          }
-        }
+      p.onProgress?.({
+        phase: 'composition.render',
+        message: `Assembling ${jobs.length} scene segment(s): ${dirty.length} to render, ${reusedCount} cached.`,
+        data: {
+          framePipeline: 'scene_segment_assembly',
+          segmentsTotal: jobs.length,
+          segmentsToRender: dirty.length,
+          segmentsCached: reusedCount,
+        },
       });
+      // One window session renders as many pending segments as it can. A
+      // segment failure usually destroys the shared window (the capture and
+      // pipe timeout handlers do exactly that), so the loop re-enters with a
+      // fresh window: first to retry the failed segment once, then — if it
+      // fails again — to record it and continue with the remaining segments.
+      // Failures never fall back to the whole-composition raw render: that
+      // fallback silently re-rendered every frame a second time with no
+      // progress signal (measured at 17–27 minutes on 2026-08-22), while the
+      // cache already held the completed segments.
+      const pending = dirty.filter((job) => job.range.endFrame - job.range.startFrame > 0);
+      const segmentsToRender = pending.length;
+      const attemptsByKey = new Map<string, number>();
+      let globalSamplesPending = !!evidenceDirAbs && globalPlans.length > 0;
+      let consecutiveSetupFailures = 0;
+      while (pending.length || globalSamplesPending) {
+        if (p.signal?.aborted) throw new Error('render aborted');
+        let sessionEntered = false;
+        try {
+          await withCompositionWindow(meta, p, async (win) => {
+            sessionEntered = true;
+            while (pending.length) {
+              if (p.signal?.aborted) throw new Error('render aborted');
+              const job = pending[0];
+              await renderSceneSegmentIntoCache({
+                win,
+                job,
+                meta,
+                p,
+                fps: ctx.fps,
+                ffmpeg: ctx.ffmpeg,
+                ffprobe: ctx.ffprobe,
+                workDirAbs,
+                ownedPlans: evidenceDirAbs
+                  ? samplePlans.filter((plan) => plan.sceneId && planSegmentOf(plan)?.key === job.key)
+                  : [],
+                segmentsToRender,
+                segmentIndex: renderedCount + failedSegments.length + 1,
+              });
+              pending.shift();
+              renderedCount += 1;
+            }
+            if (globalSamplesPending) {
+              assemblyStage = 'sample_capture';
+              await captureGlobalAssemblySamples({ win, meta, p, globalPlans, workDirAbs, collected });
+              globalSamplesPending = false;
+            }
+          });
+          consecutiveSetupFailures = 0;
+        } catch (err) {
+          if (p.signal?.aborted) throw err;
+          if (!sessionEntered) {
+            // The window never came up — an environment problem, not a
+            // segment problem. A second consecutive setup failure ends the
+            // attempt; retrying per segment would only multiply it.
+            consecutiveSetupFailures += 1;
+            if (consecutiveSetupFailures >= 2) throw err;
+            continue;
+          }
+          consecutiveSetupFailures = 0;
+          const code = videoStudioErrorCode(err, 'E_RENDER_FAILED');
+          const job = pending[0];
+          if (!job) {
+            // Global sample capture failed after every segment rendered; the
+            // segments themselves are already cached. One fresh-window retry.
+            const attempts = (attemptsByKey.get('::global-samples') || 0) + 1;
+            attemptsByKey.set('::global-samples', attempts);
+            if (attempts >= SEGMENT_RENDER_MAX_ATTEMPTS) throw err;
+            p.onProgress?.({
+              phase: 'composition.render.capture',
+              message: `Global sample capture failed (${code}); retrying in a fresh renderer.`,
+              data: { framePipeline: 'scene_segment_assembly', retry: true },
+            });
+            continue;
+          }
+          const attempts = (attemptsByKey.get(job.key) || 0) + 1;
+          attemptsByKey.set(job.key, attempts);
+          if (attempts >= SEGMENT_RENDER_MAX_ATTEMPTS) {
+            pending.shift();
+            failedSegments.push({
+              scene_id: job.range.sceneId,
+              frame_range: [job.range.startFrame, job.range.endFrame],
+              attempts,
+              error: `${code}: ${String((err as Error).message || err).slice(0, 300)}`,
+            });
+            p.onProgress?.({
+              phase: 'composition.render.capture',
+              message: `Segment ${job.range.sceneId} failed ${attempts} times (${code}); continuing with the remaining segments.`,
+              data: { framePipeline: 'scene_segment_assembly', sceneId: job.range.sceneId, failed: true },
+            });
+          } else {
+            p.onProgress?.({
+              phase: 'composition.render.capture',
+              message: `Segment ${job.range.sceneId} failed (${code}); retrying in a fresh renderer.`,
+              data: { framePipeline: 'scene_segment_assembly', sceneId: job.range.sceneId, retry: true },
+            });
+          }
+        }
+      }
+      if (failedSegments.length) {
+        log.warn('scene segment assembly incomplete', {
+          total: jobs.length,
+          rendered: renderedCount,
+          reused: reusedCount,
+          failed: failedSegments.length,
+        });
+        return incompleteResult(new Error('segment render incomplete'));
+      }
     }
 
+    assemblyStage = 'evidence';
     if (evidenceDirAbs) {
       for (const job of jobs) {
-        if (!job.cachedMeta) throw new Error('segment unexpectedly missing after render.');
+        if (!job.cachedMeta) {
+          // A zero-frame segment (a scene retimed below one frame) renders
+          // nothing and owns no samples; it must not read as a missing render.
+          if (job.range.endFrame <= job.range.startFrame) continue;
+          throw new Error('segment unexpectedly missing after render.');
+        }
         const wasReused = dirty.every((candidate) => candidate.key !== job.key);
         for (const sample of job.cachedMeta.samples) {
           const { cache_relative_path: relative, ...rest } = sample;
@@ -3390,8 +3836,9 @@ async function attemptSceneSegmentAssembly(
       }
     }
 
+    assemblyStage = 'concat';
+    // Eligibility already proved at least one scene window holds a frame.
     const parts = jobs.filter((job) => job.range.endFrame > job.range.startFrame);
-    if (!parts.length) return null;
     const concatListAbs = path.join(workDirAbs, 'segments.txt');
     await fs.writeFile(concatListAbs, parts.map((job) => (
       `file '${path.join(job.entryDirAbs, 'segment.mp4').replace(/'/g, "'\\''")}'`
@@ -3402,10 +3849,11 @@ async function attemptSceneSegmentAssembly(
     ], { timeoutMs: VIDEO_TRACK_REMUX_TIMEOUT_MS, ...(p.signal ? { signal: p.signal } : {}) });
     if (concatRun.code !== 0) throw new Error(`segment concat failed (code ${concatRun.code}).`);
 
-    const outputExt = path.extname(p.outputAbsPath) || (p.format === 'webm' ? '.webm' : '.mp4');
+    assemblyStage = 'audio_remux';
+    const outputExt = path.extname(plan.outputAbsPath) || (p.format === 'webm' ? '.webm' : '.mp4');
     const tempOutputAbsPath = path.join(
       outputDir,
-      `.${path.basename(p.outputAbsPath, path.extname(p.outputAbsPath))}.assembling-${crypto.randomUUID()}${outputExt}`,
+      `.${path.basename(plan.outputAbsPath, path.extname(plan.outputAbsPath))}.assembling-${crypto.randomUUID()}${outputExt}`,
     );
     const remux = await runProcess(ctx.ffmpeg, buildVideoTrackRemuxArgs({
       priorVideoAbsPath: concatVideoAbs,
@@ -3420,6 +3868,7 @@ async function attemptSceneSegmentAssembly(
       });
       throw new Error(`segment assembly remux failed (code ${remux.code}).`);
     }
+    assemblyStage = 'probe';
     const probe = await probeMedia(ctx.ffprobe, tempOutputAbsPath, p.signal);
     if (!probe?.video || probe.duration_seconds === null) {
       await fs.rm(tempOutputAbsPath, { force: true }).catch((err) => {
@@ -3428,6 +3877,7 @@ async function attemptSceneSegmentAssembly(
       throw new Error('assembled media could not be probed.');
     }
 
+    assemblyStage = 'finalize';
     let frameEvidence: FrameEvidence | undefined;
     if (evidenceDirAbs) {
       const ordered: FrameSampleEvidence[] = [];
@@ -3451,14 +3901,14 @@ async function attemptSceneSegmentAssembly(
       };
     }
 
-    await fs.rename(tempOutputAbsPath, p.outputAbsPath);
-    const st = await fs.stat(p.outputAbsPath);
-    if (p.visualSignature) {
-      const videoSha = await sha256File(p.outputAbsPath);
+    await fs.rename(tempOutputAbsPath, plan.outputAbsPath);
+    const st = await fs.stat(plan.outputAbsPath);
+    {
+      const videoSha = await sha256File(plan.outputAbsPath);
       if (videoSha) {
         await upsertRenderProvenance(p.compositionDirAbs, {
           key: buildRenderReuseKey({
-            visualSignature: p.visualSignature,
+            visualSignature: plan.visualSignature,
             windows,
             width: meta.width,
             height: meta.height,
@@ -3466,14 +3916,14 @@ async function attemptSceneSegmentAssembly(
             quality: p.quality,
             format: p.format,
           }),
-          visual_signature: p.visualSignature,
+          visual_signature: plan.visualSignature,
           windows,
           width: meta.width,
           height: meta.height,
           fps: ctx.fps,
           quality: p.quality ?? 'unset',
           format: p.format ?? 'mp4',
-          video_path: p.outputAbsPath,
+          video_path: plan.outputAbsPath,
           video_sha256: videoSha,
           ...(frameEvidence
             ? {
@@ -3488,7 +3938,7 @@ async function attemptSceneSegmentAssembly(
         });
       }
     }
-    await pruneSegmentCache(p.segmentCacheDirAbs);
+    await pruneSegmentCache(plan.segmentCacheDirAbs);
     const totalSeconds = Math.max(0.001, (Date.now() - startedAt) / 1000);
     const renderProfile: NativeRenderProfile = {
       ...ctx.renderProfile,
@@ -3503,9 +3953,9 @@ async function attemptSceneSegmentAssembly(
     return {
       ok: true,
       op: 'composition.render',
-      path: p.outputAbsPath,
+      path: plan.outputAbsPath,
       bytes: st.size,
-      media: versionedChatMediaLocalUrl(p.outputAbsPath),
+      media: versionedChatMediaLocalUrl(plan.outputAbsPath),
       probe,
       engine: 'orkas-native',
       fps: ctx.fps,
@@ -3521,9 +3971,14 @@ async function attemptSceneSegmentAssembly(
     };
   } catch (err) {
     if (p.signal?.aborted) throw err;
-    log.warn('scene segment assembly failed; falling back to full render', { error: logErrorSummary(err) });
-    return null;
+    // No raw-render fallback: an eligible composition's mid-assembly failure
+    // returns a resumable result instead. The silent fallback used to re-render
+    // every frame a second time inside the same call while the cache already
+    // held the completed segments.
+    log.warn('scene segment assembly failed', { stage: assemblyStage, error: logErrorSummary(err) });
+    return incompleteResult(err);
   } finally {
+    releaseRenderSlot?.();
     await fs.rm(workDirAbs, { recursive: true, force: true }).catch((err) => {
       log.warn('segment assembly workspace cleanup failed', { error: logErrorSummary(err) });
     });
@@ -3652,14 +4107,22 @@ export async function renderComposition(p: CompositionOptions): Promise<VideoStu
     renderProfile,
   });
   if (reused) return reused;
-  const assembled = await attemptSceneSegmentAssembly(p, loaded.meta, {
-    fps,
-    totalFrames,
-    ffmpeg: bins.ffmpeg,
-    ffprobe: bins.ffprobe,
-    renderProfile,
-  });
-  if (assembled) return assembled;
+  // The pipeline decision is explicit: a scene-attributable composition is
+  // owned by the segment pipeline (resumable, per-scene cached), and its
+  // mid-render failures return structured results instead of falling through.
+  // The raw whole-composition loop serves only compositions with no sound
+  // per-scene cache boundary, and says why on its render profile.
+  const assemblyPlan = await resolveSceneSegmentAssemblyPlan(p, loaded.meta, { fps, totalFrames });
+  if (assemblyPlan.eligible === true) {
+    return renderSceneSegmentAssembly(p, loaded.meta, {
+      fps,
+      totalFrames,
+      ffmpeg: bins.ffmpeg,
+      ffprobe: bins.ffprobe,
+      renderProfile,
+    }, assemblyPlan);
+  }
+  renderProfile.segment_assembly_ineligible_reasons = assemblyPlan.reasons;
   const evidenceDirAbs = p.frameEvidenceDirAbs;
   const requestedSampleTimes: Array<{ label: string; timeSec: number; sceneId?: string }> = p.frameSampleTimes
     || sampleTimes(loaded.meta.durationSec).map((timeSec, index) => ({ label: `sample-${index + 1}`, timeSec }));
@@ -3676,6 +4139,14 @@ export async function renderComposition(p: CompositionOptions): Promise<VideoStu
     if (!sampleByFrame.has(sample.frameIndex)) sampleByFrame.set(sample.frameIndex, sample);
   }
   const capturedSamples: FrameSampleEvidence[] = [];
+  const releaseRenderSlot = await acquireCompositionRenderSlot({
+    ...(p.signal ? { signal: p.signal } : {}),
+    onWait: (waitedMs) => p.onProgress?.({
+      phase: 'composition.render.queue',
+      message: `Waiting for another composition render to finish (queued ${Math.round(waitedMs / 1000)}s).`,
+      data: { queued: true, waitedMs },
+    }),
+  });
   const renderStartedAt = Date.now();
   let encoder: ReturnType<typeof startRawFrameEncoder> | null = null;
   const outputDir = path.dirname(p.outputAbsPath);
@@ -3912,6 +4383,8 @@ export async function renderComposition(p: CompositionOptions): Promise<VideoStu
       message: (err as Error).message,
       render_profile: renderProfile,
     };
+  } finally {
+    releaseRenderSlot();
   }
 }
 
@@ -4423,6 +4896,16 @@ async function buildMediaQa(
   };
 }
 
+/** Did a resumable segment-assembly failure cache at least one NEW segment?
+ * Forward progress means an unchanged-input retry genuinely advances, so the
+ * draft repair budget must not count it as a repeated failure; zero-progress
+ * repetition still spends the budget and stays bounded. */
+export function resumableRenderFailureMadeProgress(render: VideoStudioResult): boolean {
+  if (render.ok !== false || render.errorCode !== 'E_SEGMENT_ASSEMBLY_INCOMPLETE') return false;
+  const rendered = (render.scene_segments as { rendered?: unknown } | undefined)?.rendered;
+  return typeof rendered === 'number' && rendered > 0;
+}
+
 async function failDraft(
   report: Record<string, unknown>,
   p: CompositionOptions,
@@ -4430,6 +4913,7 @@ async function failDraft(
   message: string,
   extra: Record<string, unknown>,
   repairBudget: DraftRepairBudget,
+  opts: { skipRepairBudget?: boolean } = {},
 ): Promise<VideoStudioResult> {
   report.error = {
     code,
@@ -4439,7 +4923,9 @@ async function failDraft(
   // Environmental failures fail fast but do not spend a repair pass — there is
   // nothing in the composition to repair, so counting them would brick a
   // constrained machine after a few identical machine-side failures.
-  const budgetSummary = isEnvironmentalDraftFailure(code)
+  // A caller may also skip the budget for a resumable failure that made real
+  // forward progress: the retry genuinely advances, so it is not a repeat.
+  const budgetSummary = isEnvironmentalDraftFailure(code) || opts.skipRepairBudget === true
     ? repairBudget.summary
     : await recordDraftFailure(repairBudget, p.reportAbsPath, code, message, extra);
   const steps = report.steps as Record<string, unknown>;
@@ -4577,9 +5063,23 @@ export async function draftComposition(p: CompositionOptions): Promise<VideoStud
     steps.render_profile = (render as { render_profile?: unknown }).render_profile;
   }
   if (render.ok === false) {
+    // A resumable segment-assembly failure keeps its completed segments in the
+    // cache: an unchanged-input retry renders only what is missing. Surface
+    // that recovery at the top level, and spend a repair pass only when the
+    // attempt made no forward progress — zero-progress repetition stays
+    // bounded by the budget while a genuine resume is never counted as a
+    // wasted identical attempt.
+    const resumable = render.errorCode === 'E_SEGMENT_ASSEMBLY_INCOMPLETE';
     return failDraft(report, p, render.errorCode, render.message, {
       render,
-    }, repairBudget);
+      ...(resumable ? {
+        scene_segments: render.scene_segments,
+        ...(render.failed_segments ? { failed_segments: render.failed_segments } : {}),
+        resumable: true,
+        same_input_retry_allowed: true,
+        next_action: 'retry_draft_to_resume_cached_segments',
+      } : {}),
+    }, repairBudget, { skipRepairBudget: resumableRenderFailureMadeProgress(render) });
   }
 
   const renderPath = String(render.path || p.outputAbsPath || '');

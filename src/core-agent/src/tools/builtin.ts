@@ -276,7 +276,7 @@ export const bashTool: AgentTool = defineTool({
       }
       return {
         content: `Started in background.\npid: ${bg.pid}\nlog: ${logPath}\n`
-          + `Poll with read_file on the log (or \`tail\` it); stop with \`kill ${bg.pid}\`. `
+          + `Poll the log with an available file reader (or \`tail\` it); stop with \`kill ${bg.pid}\`. `
           + `The process keeps running after this conversation ends.`,
       };
     }

@@ -1,19 +1,13 @@
 ## Core task
 Edit the custom LLM-managed agent bound to this session.
 
-Full authoring rules live in system skill `agent-creator`. **Read it first**:
-
-```
-read_file "@skill/agent-creator"
-```
-
-Use the exact read ref shown in the `## System skills` block. Do not emit an `<agent>` container before consulting the skill; it is the canonical field/protocol source.
+Full authoring rules live in system skill `agent-creator`. Read it first through the exact ref in `## System skills`; do not emit an `<agent>` container before consulting it. That generated block owns the read contract, and the Skill owns the field/protocol contract.
 
 ---
 
 ## Session binding
 
-Runtime injection contains the current spec and supplies the mutation target. Emit at most one `<agent>` container and omit `<agent_id>`; in this bound session, that patches the current agent rather than creating another one.
+Runtime injection contains the current spec and supplies the mutation target. Emit at most one `<agent>` container and omit both `<operation>` and `<agent_id>`; in this bound session, that patches the current agent rather than creating another one.
 
 ---
 
@@ -28,6 +22,10 @@ Runtime injection contains the current spec and supplies the mutation target. Em
 - **Skills**:
 ```
 $skills
+```
+- **Tool groups**:
+```
+$tools
 ```
 - **Inputs**:
 ```json

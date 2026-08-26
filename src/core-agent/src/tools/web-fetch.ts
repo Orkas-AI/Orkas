@@ -32,8 +32,19 @@ type WebFetchCacheEntry = {
   result: Promise<ToolResult>;
 };
 
+type WebFetchFailurePolicyState = {
+  authFailuresByOrigin: Map<string, number>;
+  successfulOrigins: Set<string>;
+  blockedAuthOrigins: Set<string>;
+  transientFailuresByRequest: Map<string, number>;
+};
+
 const fetchCacheByRunState = new WeakMap<object, Map<string, WebFetchCacheEntry>>();
+const failurePolicyByRunState = new WeakMap<object, WebFetchFailurePolicyState>();
 const WEB_FETCH_RUN_CACHE_KEY = "webFetchCache";
+const WEB_FETCH_FAILURE_POLICY_KEY = "webFetchFailurePolicy";
+const AUTH_FAILURES_BEFORE_ORIGIN_BLOCK = 2;
+const TRANSIENT_FAILURES_BEFORE_REQUEST_BLOCK = 2;
 
 function fetchCacheForState(state: Record<string, unknown>): Map<string, WebFetchCacheEntry> {
   // AgentRunner rebuilds ToolContext.state after every model round and context
@@ -58,6 +69,33 @@ function fetchCacheForState(state: Record<string, unknown>): Map<string, WebFetc
   return fallback;
 }
 
+function newFailurePolicyState(): WebFetchFailurePolicyState {
+  return {
+    authFailuresByOrigin: new Map(),
+    successfulOrigins: new Set(),
+    blockedAuthOrigins: new Set(),
+    transientFailuresByRequest: new Map(),
+  };
+}
+
+function failurePolicyForState(state: Record<string, unknown>): WebFetchFailurePolicyState {
+  const runScopedLedger = state.runScopedLedger;
+  if (runScopedLedger instanceof Map) {
+    const saved = runScopedLedger.get(WEB_FETCH_FAILURE_POLICY_KEY);
+    if (saved && typeof saved === "object") return saved as WebFetchFailurePolicyState;
+    const created = newFailurePolicyState();
+    runScopedLedger.set(WEB_FETCH_FAILURE_POLICY_KEY, created);
+    return created;
+  }
+
+  let fallback = failurePolicyByRunState.get(state);
+  if (!fallback) {
+    fallback = newFailurePolicyState();
+    failurePolicyByRunState.set(state, fallback);
+  }
+  return fallback;
+}
+
 function contextEpoch(state: Record<string, unknown>): number {
   const ledger = state.toolResultReadLedger;
   if (!ledger || typeof ledger !== "object") return 0;
@@ -73,6 +111,104 @@ function normalizedFetchUrl(rawUrl: string): string {
   } catch {
     return rawUrl;
   }
+}
+
+function fetchOrigin(rawUrl: string): string {
+  try {
+    return new URL(rawUrl).origin;
+  } catch {
+    return rawUrl;
+  }
+}
+
+type FetchFailureDisposition = "auth_origin" | "permanent_url" | "transient";
+
+function fetchFailureDisposition(result: ToolResult): FetchFailureDisposition | null {
+  if (!result.isError) return null;
+  if (/\bHTTP\s+(?:401|403)\b|\bWAF_OR_BOT_CHECK\b/i.test(result.content)) {
+    return "auth_origin";
+  }
+  if (
+    /\bHTTP\s+(?:404|410)\b|\b(?:PAGE_NOT_FOUND|JS_OR_NAV_SHELL|E_FETCH_RESPONSE_TOO_LARGE)\b/i
+      .test(result.content)
+  ) {
+    return "permanent_url";
+  }
+  return "transient";
+}
+
+function failedCacheReplay(result: ToolResult): ToolResult {
+  const original = result.content.replace(/\s+/g, " ").trim().slice(0, 320);
+  return {
+    content:
+      "E_WEB_FETCH_NONRETRYABLE_CACHE_HIT: this normalized URL already failed "
+      + "with a non-retryable result in this run; no network request was made. "
+      + `Use a different source or strategy. Original result: ${original}`,
+    isError: true,
+  };
+}
+
+type WebFetchNetworkFailureCategory =
+  | "dns"
+  | "timeout"
+  | "connection_refused"
+  | "network_unreachable"
+  | "connection_reset"
+  | "tls"
+  | "transport"
+  | "network";
+
+const SAFE_WEB_FETCH_NETWORK_CODE_RE = /\b(?:UND_ERR_[A-Z0-9_]+|EAI_AGAIN|ENOTFOUND|ETIMEDOUT|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|ENETDOWN|ECONNRESET|ECONNABORTED|EPIPE|ERR_STREAM_PREMATURE_CLOSE|ERR_TLS_[A-Z0-9_]+|ERR_SSL_[A-Z0-9_]+|CERT_[A-Z0-9_]+|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|UNABLE_TO_VERIFY_LEAF_SIGNATURE)\b/g;
+const MAX_WEB_FETCH_ERROR_NODES = 16;
+const MAX_WEB_FETCH_ERROR_CODES = 4;
+
+function webFetchNetworkFailureCategory(codes: readonly string[]): WebFetchNetworkFailureCategory {
+  if (codes.some((code) => /^(?:ERR_(?:TLS|SSL)_|CERT_|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|UNABLE_TO_VERIFY_LEAF_SIGNATURE)/.test(code))) return "tls";
+  if (codes.some((code) => /^(?:EAI_AGAIN|ENOTFOUND)$/.test(code))) return "dns";
+  if (codes.some((code) => /(?:TIMEOUT|ETIMEDOUT)/.test(code))) return "timeout";
+  if (codes.includes("ECONNREFUSED")) return "connection_refused";
+  if (codes.some((code) => /^(?:ENETUNREACH|EHOSTUNREACH|ENETDOWN)$/.test(code))) return "network_unreachable";
+  if (codes.some((code) => /^(?:ECONNRESET|ECONNABORTED|EPIPE|UND_ERR_SOCKET|ERR_STREAM_PREMATURE_CLOSE)$/.test(code))) return "connection_reset";
+  if (codes.some((code) => code.startsWith("UND_ERR_"))) return "transport";
+  return "network";
+}
+
+function collectSafeWebFetchNetworkCodes(error: unknown): string[] {
+  const queue: unknown[] = [error];
+  const seen = new Set<object>();
+  const codes = new Set<string>();
+  let visited = 0;
+
+  while (queue.length && visited < MAX_WEB_FETCH_ERROR_NODES) {
+    const current = queue.shift();
+    visited += 1;
+    if (!current || typeof current !== "object") continue;
+    if (seen.has(current)) continue;
+    seen.add(current);
+
+    const record = current as Record<string, unknown>;
+    for (const value of [record.code, record.message]) {
+      if (typeof value !== "string") continue;
+      for (const match of value.toUpperCase().matchAll(SAFE_WEB_FETCH_NETWORK_CODE_RE)) {
+        codes.add(match[0]);
+        if (codes.size >= MAX_WEB_FETCH_ERROR_CODES) return [...codes];
+      }
+    }
+    if (record.cause) queue.push(record.cause);
+    if (Array.isArray(record.errors)) queue.push(...record.errors.slice(0, 8));
+  }
+  return [...codes];
+}
+
+/** Format a bounded network diagnostic without exposing socket addresses,
+ * proxy details, certificate subjects, local paths, or arbitrary cause text. */
+export function formatWebFetchNetworkFailure(error: unknown): string {
+  const codes = collectSafeWebFetchNetworkCodes(error);
+  const category = webFetchNetworkFailureCategory(codes);
+  const summary = error instanceof Error && /^fetch failed$/i.test(error.message.trim())
+    ? "fetch failed"
+    : "request failed";
+  return `${summary} [network_diagnostic category=${category}; codes=${codes.length ? codes.join(",") : "unavailable"}]`;
 }
 
 function applyExplicitCharacterLimit(result: ToolResult, maxChars: number | null): ToolResult {
@@ -284,7 +420,7 @@ async function fetchGeneralUrl(url: string): Promise<ToolResult> {
         isError: true,
       };
     }
-    return { content: `Error fetching ${url}: ${message}`, isError: true };
+    return { content: `Error fetching ${url}: ${formatWebFetchNetworkFailure(error)}`, isError: true };
   } finally {
     clearTimeout(timer);
   }
@@ -294,11 +430,7 @@ export const webFetchTool: AgentTool = defineTool({
   name: "web_fetch",
   executionMode: "parallel",
   description:
-    "Fetch a web page by URL and return its content as readable text. " +
-    "Use this to read articles, documentation, or any web page content. " +
-    "Returns the page title and extracted text. A GitHub repository root is " +
-    "resolved to a structured metadata + official README snapshot, so do not " +
-    "make follow-up requests to its API or raw README aliases.",
+    "Fetch one web URL and return its title and readable extracted text. A GitHub repository root returns structured metadata plus its official README snapshot. Run-scoped duplicate and repeated access failures are suppressed; switch sources instead of retrying them.",
   inputSchema: {
     type: "object",
     properties: {
@@ -325,10 +457,12 @@ export const webFetchTool: AgentTool = defineTool({
     }
 
     const fetchCache = fetchCacheForState(ctx.state);
+    const failurePolicy = failurePolicyForState(ctx.state);
     const githubResource = identifyGitHubRepositoryResource(url);
     const requestKey = githubResource?.kind === "repository"
       ? `github:${githubResource.key}`
       : normalizedFetchUrl(url);
+    const origin = fetchOrigin(url);
     const epoch = contextEpoch(ctx.state);
     const cached = fetchCache.get(requestKey);
     if (cached) {
@@ -337,6 +471,7 @@ export const webFetchTool: AgentTool = defineTool({
         compactReplay: epoch > cached.epoch,
       });
       const result = await cached.result;
+      if (result.isError) return failedCacheReplay(result);
       return epoch > cached.epoch
         ? compactCacheReplay(result)
         : applyExplicitCharacterLimit(result, maxChars);
@@ -353,14 +488,60 @@ export const webFetchTool: AgentTool = defineTool({
       return compactGitHubSnapshotReplay(githubResource);
     }
 
+    if (failurePolicy.blockedAuthOrigins.has(origin)) {
+      return {
+        content:
+          `E_WEB_FETCH_ORIGIN_AUTH_BLOCKED: ${origin} repeatedly returned authentication, `
+          + "authorization, or anti-bot failures in this run. No network request was made. "
+          + "Use a different source, search strategy, or an available browser capability.",
+        isError: true,
+      };
+    }
+
     const request = githubResource?.kind === "repository"
       ? fetchGitHubRepositorySnapshot(githubResource)
       : fetchGeneralUrl(url);
     const cacheEntry = { epoch, result: request };
     fetchCache.set(requestKey, cacheEntry);
-    const result = await request;
-    if (result.isError) {
-      fetchCache.delete(requestKey);
+    let result = await request;
+    const disposition = fetchFailureDisposition(result);
+    if (disposition === null) {
+      failurePolicy.successfulOrigins.add(origin);
+      failurePolicy.authFailuresByOrigin.delete(origin);
+      failurePolicy.blockedAuthOrigins.delete(origin);
+      failurePolicy.transientFailuresByRequest.delete(requestKey);
+    } else if (disposition === "auth_origin") {
+      const failures = (failurePolicy.authFailuresByOrigin.get(origin) ?? 0) + 1;
+      failurePolicy.authFailuresByOrigin.set(origin, failures);
+      if (
+        failures >= AUTH_FAILURES_BEFORE_ORIGIN_BLOCK
+        && !failurePolicy.successfulOrigins.has(origin)
+      ) {
+        failurePolicy.blockedAuthOrigins.add(origin);
+        result = {
+          ...result,
+          content:
+            `${result.content}\n\nE_WEB_FETCH_ORIGIN_AUTH_CIRCUIT_OPENED: ${origin} has now failed `
+            + `${failures} distinct access attempts in this run. Switch sources instead of `
+            + "trying more URLs from this origin.",
+        };
+      }
+      // Authentication, authorization, and WAF failures are not made useful by
+      // retrying the same normalized URL. Keep this failed promise in the cache.
+    } else if (disposition === "transient") {
+      const failures = (failurePolicy.transientFailuresByRequest.get(requestKey) ?? 0) + 1;
+      failurePolicy.transientFailuresByRequest.set(requestKey, failures);
+      if (failures < TRANSIENT_FAILURES_BEFORE_REQUEST_BLOCK) {
+        fetchCache.delete(requestKey);
+      } else {
+        result = {
+          ...result,
+          content:
+            `${result.content}\n\nE_WEB_FETCH_RETRY_LIMIT: this URL has failed ${failures} `
+            + "transient attempts in this run. Switch sources or strategy.",
+        };
+        cacheEntry.result = Promise.resolve(result);
+      }
     }
     return applyExplicitCharacterLimit(result, maxChars);
   },

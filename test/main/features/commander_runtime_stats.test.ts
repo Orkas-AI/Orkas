@@ -32,6 +32,7 @@ describe('commander runtime stats', () => {
     expect(res.stats.attempts).toBe(1);
     expect(res.stats.successes).toBe(1);
     expect(res.stats.deliveries).toBe(1);
+    expect(res.stats.execution_failures).toBe(0);
     expect(res.stats.failures).toBe(0);
     expect(res.stats.errors).toBe(0);
     expect(res.stats.total_duration_ms).toBe(1_500);

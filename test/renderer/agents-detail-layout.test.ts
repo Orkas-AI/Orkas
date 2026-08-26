@@ -1,11 +1,34 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import vm from 'node:vm';
 
 import { describe, expect, it } from 'vitest';
 
 const rendererRoot = path.resolve(__dirname, '../../src/renderer');
 
 describe('external CLI Agent detail layout', () => {
+  it('calculates success rate from completed runs and explicit execution errors only', () => {
+    const source = fs.readFileSync(path.join(rendererRoot, 'modules/agents.js'), 'utf8');
+    const match = source.match(/function _agentExecutionSuccessRate\(runtime\) \{[\s\S]*?\n\}/);
+    expect(match).not.toBeNull();
+    const successRate = vm.runInNewContext(`(${match?.[0]})`) as (runtime: Record<string, number>) => number;
+
+    expect(successRate({
+      attempts: 100,
+      successes: 8,
+      executionFailures: 2,
+      failures: 70,
+      errors: 20,
+    })).toBe(80);
+    expect(successRate({
+      attempts: 12,
+      successes: 0,
+      executionFailures: 0,
+      failures: 5,
+      errors: 7,
+    })).toBe(0);
+  });
+
   it('keeps the requested detail-section order', () => {
     const html = fs.readFileSync(path.join(rendererRoot, 'index.html'), 'utf8');
     const sectionIds = [
@@ -92,6 +115,7 @@ describe('external CLI Agent detail layout', () => {
       expect(table['agents.cli_settings_loading']).toBeTruthy();
       expect(table['agents.cli_settings_unavailable']).toBeTruthy();
       expect(table['agents.cli_settings_partial']).toBeTruthy();
+      expect(table['agents.cli_thinking_unsupported']).toBeTruthy();
     }
 
     const source = fs.readFileSync(path.join(rendererRoot, 'modules/agents.js'), 'utf8');
@@ -101,12 +125,20 @@ describe('external CLI Agent detail layout', () => {
     expect(settings).toContain("value: isDefault ? '' : id");
     expect(settings).toContain("hint: isDefault ? t('agents.cli_default') : ''");
     expect(settings).toContain("if (!modelOptions.some(option => option.value === ''))");
-    expect(settings).toContain("modelOptions.unshift({ value: '', label: t('agents.cli_default') })");
+    // The inherit-default row names the model that choice runs today when the
+    // CLI reports it, instead of a bare "Default" the user cannot act on.
+    expect(settings).toContain("const resolvedDefault = String(info.default_model_resolved || '').trim()");
+    expect(settings).toContain("? `${t('agents.cli_default')} · ${resolvedDefault}`");
     expect(settings).toContain("if (!thinkingOptions.some(option => option.value === ''))");
     expect(settings).toContain("thinkingOptions.unshift({ value: '', label: t('agents.cli_default') })");
     expect(settings).not.toContain('cli_current_default');
     expect(settings).not.toContain('cli_default_model_hint');
     expect(settings).not.toContain('cli_default_thinking_hint');
+    // A model the CLI says takes no thinking level offers none, and stays
+    // editable only while a value saved for another model is still set.
+    expect(settings).toContain('const thinkingUnsupported = activeModel?.supports_thinking === false');
+    expect(settings).toContain("thinkingOptions.push({ value: '', label: t('agents.cli_thinking_unsupported') })");
+    expect(settings).toContain('(!info.can_select_thinking || thinkingUnsupported) && !currentThinking');
     expect(settings).toContain('_mergeAgentIntoCache(saved.agent)');
     expect(settings).not.toContain('_agentsCache = null');
   });

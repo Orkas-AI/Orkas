@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
+  mapClaudeModelList,
   mapCodexModelList,
   mapOpenclawModels,
   parseBannerJson,
@@ -105,6 +106,100 @@ describe('local_agents/runtime_options discovery parsing', () => {
     expect(result.thinking_levels).toHaveLength(32);
   });
 
+  // Captured from `claude --print --input-format stream-json --output-format
+  // stream-json --verbose --bare` (Claude Code 2.1.234) answering list_models.
+  const CLAUDE_LIST_MODELS = {
+    models: [
+      {
+        value: 'default',
+        resolvedModel: 'claude-opus-5[1m]',
+        displayName: 'Default (recommended)',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+      },
+      {
+        value: 'opus[1m]',
+        resolvedModel: 'claude-opus-5[1m]',
+        displayName: 'Opus (1M context)',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+      },
+      {
+        value: 'claude-fable-5[1m]',
+        resolvedModel: 'claude-fable-5',
+        displayName: 'Fable',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+      },
+      {
+        value: 'sonnet',
+        resolvedModel: 'claude-sonnet-5',
+        displayName: 'Sonnet',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+      },
+      {
+        value: 'haiku',
+        resolvedModel: 'claude-haiku-4-5-20251001',
+        displayName: 'Haiku',
+      },
+    ],
+  };
+
+  it('offers every model Claude Code advertises and marks only the family aliases', () => {
+    const result = mapClaudeModelList(CLAUDE_LIST_MODELS);
+
+    // A model added by a future Claude Code release reaches the picker without
+    // a PC change; `default` is dropped because an empty override means it.
+    expect(result.models.map(model => model.id)).toEqual([
+      'opus[1m]', 'claude-fable-5[1m]', 'sonnet', 'haiku',
+    ]);
+    expect(result.models[0]).toEqual({
+      id: 'opus[1m]',
+      label: 'Opus (1M context)',
+      is_alias: true,
+      thinking_levels: [{ id: 'low' }, { id: 'medium' }, { id: 'high' }, { id: 'xhigh' }, { id: 'max' }],
+    });
+    // A pinned model id keeps its version, so it is not an alias; the context
+    // variant suffix alone must not make it look like one.
+    expect(result.models[1]).toMatchObject({ id: 'claude-fable-5[1m]', label: 'Fable' });
+    expect(result.models[1].is_alias).toBeUndefined();
+    // Haiku advertises no effort support, so it takes no thinking level at all
+    // rather than inheriting the levels its siblings advertise.
+    expect(result.models[3]).toEqual({
+      id: 'haiku', label: 'Haiku', is_alias: true, supports_thinking: false,
+    });
+    expect(result.thinking_levels.map(level => level.id))
+      .toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+    // The dropped `default` row still names the model that choice runs today.
+    expect(result.default_model_resolved).toBe('claude-opus-5[1m]');
+  });
+
+  it('rejects list_models look-alikes instead of publishing unusable rows', () => {
+    const empty = { models: [], thinking_levels: [], default_model_resolved: null };
+    expect(mapClaudeModelList(null)).toEqual(empty);
+    expect(mapClaudeModelList('{"models":[]}')).toEqual(empty);
+    expect(mapClaudeModelList({ data: [{ value: 'sonnet' }] })).toEqual(empty);
+    expect(mapClaudeModelList({
+      models: [
+        { resolvedModel: 'claude-sonnet-5', displayName: 'No value' },
+        { value: 'bad\u0000value', displayName: 'Control chars' },
+        { value: 'sonnet', resolvedModel: 'claude-sonnet-5', displayName: 'Sonnet' },
+        { value: 'sonnet', resolvedModel: 'claude-sonnet-5', displayName: 'Duplicate' },
+        { value: 'plain', supportedEffortLevels: 'high' },
+      ],
+    })).toEqual({
+      // A payload that never mentions effort support says nothing about it, so
+      // no model is marked unsupported and the global levels still apply.
+      models: [
+        { id: 'sonnet', label: 'Sonnet', is_alias: true },
+        { id: 'plain', label: 'plain' },
+      ],
+      thinking_levels: [],
+      default_model_resolved: null,
+    });
+  });
+
   it('accepts OpenClaw banner-prefixed JSON and adds a missing resolved default', () => {
     const mapped = mapOpenclawModels(
       '[startup] ready\n{"resolvedDefault":"openai/gpt-default"}',
@@ -175,15 +270,82 @@ process.exit(2);
       can_select_thinking: true,
       thinking_kind: 'effort',
     });
-    expect(first.models.map(model => model.id)).toEqual(['sonnet', 'opus', 'haiku']);
+    // This build answers no model list, so the documented aliases stand in.
     expect(first.models).toEqual([
       { id: 'sonnet', label: 'Sonnet', is_alias: true },
       { id: 'opus', label: 'Opus', is_alias: true },
       { id: 'haiku', label: 'Haiku', is_alias: true },
     ]);
+    expect(first.thinking_levels.map(level => level.id))
+      .toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
     expect(second).toBe(first);
     expect(refreshed).not.toBe(first);
-    expect(fs.readFileSync(counter, 'utf8')).toBe('11');
+    // Two spawns per discovery (flag probe + model list), and the middle call
+    // is served from cache.
+    expect(fs.readFileSync(counter, 'utf8')).toBe('1111');
+  });
+
+  it('publishes the models Claude Code advertises over the control protocol', async () => {
+    const dir = makeTempDir();
+    const binPath = writeFakeCli(dir, `
+const args = process.argv.slice(2);
+if (args.includes('--help')) {
+  process.stdout.write('Usage: fake --model <id> --effort <level>\\n');
+  process.exit(0);
+}
+let buf = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => {
+  buf += chunk;
+  let index;
+  while ((index = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, index);
+    buf = buf.slice(index + 1);
+    let message;
+    try { message = JSON.parse(line); } catch (_) { continue; }
+    if (message && message.request && message.request.subtype === 'list_models') {
+      process.stdout.write(JSON.stringify({
+        type: 'control_response',
+        response: {
+          subtype: 'success',
+          request_id: message.request_id,
+          response: {
+            models: [
+              { value: 'default', resolvedModel: 'claude-newest-9', displayName: 'Default' },
+              {
+                value: 'newest',
+                resolvedModel: 'claude-newest-9',
+                displayName: 'Newest',
+                supportsEffort: true,
+                supportedEffortLevels: ['low', 'max'],
+              },
+            ],
+          },
+        },
+      }) + '\\n');
+    }
+  }
+});
+`);
+
+    const options = await getLocalCliRuntimeOptions(entry('claude', binPath), dir);
+
+    // A model this build never heard of reaches the picker, and `default` stays
+    // out because the empty override already means it.
+    expect(options.models).toEqual([
+      {
+        id: 'newest',
+        label: 'Newest',
+        is_alias: true,
+        thinking_levels: [{ id: 'low' }, { id: 'max' }],
+      },
+    ]);
+    expect(options.thinking_levels).toEqual([{ id: 'low' }, { id: 'max' }]);
+    expect(options).toMatchObject({
+      status: 'ready',
+      can_select_model: true,
+      default_model_resolved: 'claude-newest-9',
+    });
   });
 
   it('kills an oversized catalog and returns only sanitized partial metadata', async () => {

@@ -1,6 +1,6 @@
 /**
  * On-demand file indexer — lazy cache + unified char-offset reader behind the
- * file tools (read_file / stat_file / search_files / grep_files). The model
+ * file tools (read_files / search_files / grep_files). The model
  * drives reading via explicit `charStart` / `charEnd` regardless of file
  * kind; nothing is pre-split.
  *
@@ -57,7 +57,7 @@ export { EXTRACT_CACHE_VERSION };
  *  an error to the model. */
 export class NeedStatError extends Error {
   constructor(public readonly absPath: string, public readonly kind: FileKind) {
-    super(`cache missing — call stat_file first: ${absPath}`);
+    super(`cache missing — prepare extraction before readRange: ${absPath}`);
     this.name = 'NeedStatError';
   }
 }
@@ -126,7 +126,7 @@ export interface TextReadResult {
    *  `[0, totalChars)`). */
   range: { charStart: number; charEnd: number };
   /** 1-based line number of the first returned character (the line `charStart`
-   *  falls on). Lets `read_file` show absolute line numbers even for a slice
+   *  falls on). Lets `read_files` show absolute line numbers even for a slice
    *  that begins mid-file. Always 1 for a whole-file read. */
   startLine: number;
 }
@@ -188,6 +188,9 @@ interface OnDiskMeta {
   source: SourceScope;
   cid?: string;
   totalChars?: number;
+  /** Complete UTF-8 text hash for editable plain-text files. Rich-document
+   *  caches deliberately omit it because their extracted text is read-only. */
+  sourceHash?: string;
   /** pdf only — see FileMeta.extractionEmpty. */
   extractionEmpty?: boolean;
   /** Per-page [charStart, charEnd) offsets into text.md. Populated for pdf only.
@@ -257,6 +260,197 @@ function statSource(absPath: string): { size: number; mtime: number; stat: fs.St
   return { size: stat.size, mtime: Math.floor(stat.mtimeMs), stat };
 }
 
+// Whole-file async reads are faster for small text. Above this internal
+// performance cutoff, metadata scans and bounded slices stream so a paged read
+// never retains the complete source in memory. This is not a model-visible
+// limit and does not change range semantics.
+const TEXT_STREAM_THRESHOLD_BYTES = 4 * 1024 * 1024;
+
+interface Utf8Analysis {
+  totalChars: number;
+  sourceHash: string;
+}
+
+interface Utf8Slice {
+  content: string;
+  charStart: number;
+  charEnd: number;
+  startLine: number;
+}
+
+function hashUtf8Text(body: string): string {
+  return `sha256:${crypto.createHash('sha256').update(body, 'utf8').digest('hex')}`;
+}
+
+/** Count characters and hash decoded UTF-8 text without retaining a large
+ * source. Hashing decoded text preserves the existing edit_file hash contract. */
+async function analyseUtf8File(absPath: string, sizeBytes: number): Promise<Utf8Analysis> {
+  if (sizeBytes <= TEXT_STREAM_THRESHOLD_BYTES) {
+    const body = await fs.promises.readFile(absPath, 'utf8');
+    return { totalChars: body.length, sourceHash: hashUtf8Text(body) };
+  }
+
+  const hash = crypto.createHash('sha256');
+  let totalChars = 0;
+  const stream = fs.createReadStream(absPath, { encoding: 'utf8' });
+  for await (const chunk of stream) {
+    const text = String(chunk);
+    totalChars += text.length;
+    hash.update(text, 'utf8');
+  }
+  return { totalChars, sourceHash: `sha256:${hash.digest('hex')}` };
+}
+
+function startLineFor(body: string, charStart: number): number {
+  let line = 1;
+  for (let i = 0; i < charStart; i++) {
+    if (body.charCodeAt(i) === 10) line++;
+  }
+  return line;
+}
+
+async function readUtf8CharSlice(
+  absPath: string,
+  sizeBytes: number,
+  totalChars: number,
+  charStart: number,
+  charEnd: number,
+): Promise<Utf8Slice> {
+  // A genuine whole-file consumer still needs the whole body. Streaming and
+  // then joining it would add chunk/event overhead without reducing memory.
+  const wholeFile = charStart === 0 && charEnd === totalChars;
+  if (sizeBytes <= TEXT_STREAM_THRESHOLD_BYTES || wholeFile) {
+    const body = await fs.promises.readFile(absPath, 'utf8');
+    return {
+      content: body.slice(charStart, charEnd),
+      charStart,
+      charEnd,
+      startLine: startLineFor(body, charStart),
+    };
+  }
+
+  if (charEnd === 0) {
+    return { content: '', charStart, charEnd, startLine: 1 };
+  }
+
+  const content: string[] = [];
+  let absoluteChar = 0;
+  let startLine = 1;
+  const stream = fs.createReadStream(absPath, { encoding: 'utf8' });
+  for await (const chunk of stream) {
+    const text = String(chunk);
+    const chunkStart = absoluteChar;
+    const chunkEnd = chunkStart + text.length;
+
+    const prefixEnd = Math.max(0, Math.min(text.length, charStart - chunkStart));
+    for (let i = 0; i < prefixEnd; i++) {
+      if (text.charCodeAt(i) === 10) startLine++;
+    }
+
+    const takeStart = Math.max(0, charStart - chunkStart);
+    const takeEnd = Math.min(text.length, charEnd - chunkStart);
+    if (takeEnd > takeStart) content.push(text.slice(takeStart, takeEnd));
+
+    absoluteChar = chunkEnd;
+    if (absoluteChar >= charEnd) break;
+  }
+
+  return { content: content.join(''), charStart, charEnd, startLine };
+}
+
+function sliceUtf8Lines(
+  body: string,
+  requestedStart: number,
+  requestedEnd: number,
+): Utf8Slice {
+  let currentLine = 1;
+  let charStart = requestedStart === 1 ? 0 : body.length;
+  let charEnd = body.length;
+  for (let index = 0; index < body.length; index++) {
+    if (body.charCodeAt(index) !== 10) continue;
+    currentLine++;
+    if (currentLine === requestedStart) charStart = index + 1;
+    if (currentLine === requestedEnd + 1) {
+      charEnd = index;
+      break;
+    }
+  }
+  if (requestedStart > currentLine) charStart = body.length;
+  return {
+    content: body.slice(charStart, charEnd),
+    charStart,
+    charEnd,
+    startLine: Math.min(requestedStart, currentLine),
+  };
+}
+
+async function readUtf8LineSlice(
+  absPath: string,
+  sizeBytes: number,
+  totalChars: number,
+  requestedStart: number,
+  requestedEnd: number,
+): Promise<Utf8Slice> {
+  if (sizeBytes <= TEXT_STREAM_THRESHOLD_BYTES) {
+    return sliceUtf8Lines(
+      await fs.promises.readFile(absPath, 'utf8'),
+      requestedStart,
+      requestedEnd,
+    );
+  }
+
+  const content: string[] = [];
+  let currentLine = 1;
+  let absoluteChar = 0;
+  let charStart: number | undefined = requestedStart === 1 ? 0 : undefined;
+  let charEnd: number | undefined;
+  const stream = fs.createReadStream(absPath, { encoding: 'utf8' });
+
+  for await (const chunk of stream) {
+    const text = String(chunk);
+    const chunkStart = absoluteChar;
+    const chunkEnd = chunkStart + text.length;
+
+    for (let searchFrom = 0; searchFrom < text.length;) {
+      const newline = text.indexOf('\n', searchFrom);
+      if (newline === -1) break;
+      const newlineChar = chunkStart + newline;
+      if (charStart !== undefined && currentLine === requestedEnd) {
+        charEnd = newlineChar;
+        break;
+      }
+      currentLine++;
+      if (charStart === undefined && currentLine === requestedStart) {
+        charStart = newlineChar + 1;
+      }
+      searchFrom = newline + 1;
+    }
+
+    if (charStart !== undefined) {
+      const takeStart = Math.max(0, charStart - chunkStart);
+      const takeEnd = Math.min(text.length, (charEnd ?? chunkEnd) - chunkStart);
+      if (takeEnd > takeStart) content.push(text.slice(takeStart, takeEnd));
+    }
+
+    absoluteChar = chunkEnd;
+    if (charEnd !== undefined) break;
+  }
+
+  if (charStart === undefined) {
+    charStart = totalChars;
+    charEnd = totalChars;
+  } else if (charEnd === undefined) {
+    charEnd = totalChars;
+  }
+
+  return {
+    content: content.join(''),
+    charStart,
+    charEnd,
+    startLine: Math.min(requestedStart, currentLine),
+  };
+}
+
 // ── Materialisation (rich docs build text.md + pdf pageMap) ─────────────
 
 async function materialise(
@@ -281,7 +475,7 @@ async function materialise(
   };
 
   if (kind === 'pdf') {
-    const buf = fs.readFileSync(absPath);
+    const buf = await fs.promises.readFile(absPath);
     const pages = await pdfBufferToPages(buf);
     // Build text.md with page delimiters + pageMap [charStart, charEnd).
     const pageMap: Array<{ page: number; charStart: number; charEnd: number }> = [];
@@ -303,17 +497,17 @@ async function materialise(
       base.extractionEmpty = true;
     }
   } else if (kind === 'docx') {
-    const buf = fs.readFileSync(absPath);
+    const buf = await fs.promises.readFile(absPath);
     const md = await docxBufferToMarkdown(buf);
     fs.writeFileSync(path.join(dir, 'text.md'), md, 'utf8');
     base.totalChars = md.length;
   } else if (kind === 'spreadsheet') {
-    const buf = fs.readFileSync(absPath);
+    const buf = await fs.promises.readFile(absPath);
     const md = xlsxBufferToMarkdown(buf);
     fs.writeFileSync(path.join(dir, 'text.md'), md, 'utf8');
     base.totalChars = md.length;
   } else if (kind === 'presentation') {
-    const buf = fs.readFileSync(absPath);
+    const buf = await fs.promises.readFile(absPath);
     const md = pptxBufferToMarkdown(buf);
     fs.writeFileSync(path.join(dir, 'text.md'), md, 'utf8');
     base.totalChars = md.length;
@@ -322,7 +516,9 @@ async function materialise(
   } else if (kind === 'text') {
     // No text.md for text kind — source IS the text.
     try {
-      base.totalChars = fs.readFileSync(absPath, 'utf8').length;
+      const analysis = await analyseUtf8File(absPath, stat.size);
+      base.totalChars = analysis.totalChars;
+      base.sourceHash = analysis.sourceHash;
     } catch {
       base.totalChars = 0;
     }
@@ -410,16 +606,21 @@ export async function statFile(userId: string, absPath: string): Promise<FileMet
  *  to `totalChars`. The returned `range` echoes the clamped values.
  *
  *  Contract by kind:
- *   - text        → always works (materialise is cheap: fs.read + .length)
+ *   - text        → always works (metadata preparation is async and bounded)
  *   - rich docs   → throws `NeedStatError` when no cache exists. Callers
  *                   must `statFile` first (which extracts) and then retry.
- *                   This keeps extract side-effects out of read_file.
+ *                   This keeps extract side-effects out of readRange.
  *   - image       → throws `NoTextError`. Caller must branch to
  *                   `readImageAsGrayJpeg`. */
 export async function readRange(
   userId: string,
   absPath: string,
-  opts: { charStart?: number; charEnd?: number } = {},
+  opts: {
+    charStart?: number;
+    charEnd?: number;
+    lineStart?: number;
+    lineEnd?: number;
+  } = {},
 ): Promise<TextReadResult> {
   const kind = kindOf(absPath);
   if (kind === 'image') throw new NoTextError(absPath);
@@ -427,14 +628,24 @@ export async function readRange(
 
   let meta: OnDiskMeta;
   if (kind === 'text') {
-    // Text materialisation is a single fs.readFileSync — safe to trigger on
-    // every read. Keeps the "first read_file on a plain .md" path to one tool
-    // call instead of forcing the model through stat_file first.
+    // Keeps the first read_files call on a plain .md to one model tool call
+    // without a separate metadata preparation step. Large-file metadata is
+    // streamed once and cached; later pages do not rescan the whole file.
     meta = await ensureFresh(userId, absPath);
+    // Compatible lazy upgrade for caches written before sourceHash became a
+    // materialisation by-product. No cache-version bump or eager migration.
+    if (!meta.sourceHash) {
+      const analysis = await analyseUtf8File(absPath, meta.size);
+      meta = { ...meta, totalChars: analysis.totalChars, sourceHash: analysis.sourceHash };
+      touchMeta(cacheDirFor(userId, absPath), {
+        totalChars: analysis.totalChars,
+        sourceHash: analysis.sourceHash,
+      });
+    }
   } else {
-    // Rich documents require an existing fresh cache. Do NOT extract here — the
-    // model is expected to call stat_file first when the manifest / search
-    // result didn't include total_chars.
+    // Rich documents require an existing fresh cache. Do NOT extract here.
+    // The model-facing read_files wrapper prepares rich-document extraction
+    // through statFile before reaching this cache-only branch.
     const peeked = peekMeta(userId, absPath);
     if (!peeked) throw new NeedStatError(absPath, kind);
     meta = peeked;
@@ -443,27 +654,42 @@ export async function readRange(
   }
 
   const total = meta.totalChars ?? 0;
-  const csRaw = typeof opts.charStart === 'number' ? Math.floor(opts.charStart) : 0;
-  const ceRaw = typeof opts.charEnd === 'number' ? Math.floor(opts.charEnd) : total;
-  const start = Math.max(0, Math.min(csRaw, total));
-  const end = Math.max(start, Math.min(ceRaw, total));
+  const textPath = kind === 'text'
+    ? absPath
+    : path.join(cacheDirFor(userId, absPath), 'text.md');
+  const textBytes = kind === 'text'
+    ? meta.size
+    : (await fs.promises.stat(textPath)).size;
 
-  const body = kind === 'text'
-    ? fs.readFileSync(absPath, 'utf8')
-    : fs.readFileSync(path.join(cacheDirFor(userId, absPath), 'text.md'), 'utf8');
-
-  // 1-based line of the slice's first char: count newlines in [0, start).
-  let startLine = 1;
-  for (let i = 0; i < start; i++) if (body.charCodeAt(i) === 10) startLine++;
+  const hasLineRange = opts.lineStart !== undefined || opts.lineEnd !== undefined;
+  let slice: Utf8Slice;
+  if (hasLineRange) {
+    const requestedStart = Math.max(1, Math.trunc(Number(opts.lineStart) || 1));
+    const requestedEnd = Math.max(
+      requestedStart,
+      Math.trunc(Number(opts.lineEnd) || requestedStart + 399),
+    );
+    slice = await readUtf8LineSlice(
+      textPath,
+      textBytes,
+      total,
+      requestedStart,
+      requestedEnd,
+    );
+  } else {
+    const csRaw = typeof opts.charStart === 'number' ? Math.floor(opts.charStart) : 0;
+    const ceRaw = typeof opts.charEnd === 'number' ? Math.floor(opts.charEnd) : total;
+    const start = Math.max(0, Math.min(csRaw, total));
+    const end = Math.max(start, Math.min(ceRaw, total));
+    slice = await readUtf8CharSlice(textPath, textBytes, total, start, end);
+  }
 
   return {
-    content: body.slice(start, end),
+    content: slice.content,
     meta: metaToPublic(meta),
-    ...(kind === 'text'
-      ? { sourceHash: `sha256:${crypto.createHash('sha256').update(body, 'utf8').digest('hex')}` }
-      : {}),
-    range: { charStart: start, charEnd: end },
-    startLine,
+    ...(kind === 'text' && meta.sourceHash ? { sourceHash: meta.sourceHash } : {}),
+    range: { charStart: slice.charStart, charEnd: slice.charEnd },
+    startLine: slice.startLine,
   };
 }
 
@@ -474,7 +700,7 @@ export async function readImageAsGrayJpeg(
   void userId; // image kind bypasses cache; userId only used for future per-user policy
   const kind = kindOf(absPath);
   if (kind !== 'image') throw new Error(`readImageAsGrayJpeg: not an image: ${absPath}`);
-  const buf = fs.readFileSync(absPath);
+  const buf = await fs.promises.readFile(absPath);
   const out = await toCompressedGrayJpeg(buf, { maxDim: 1024, quality: 70, grayscale: true });
   return {
     base64: out.buf.toString('base64'),
@@ -494,9 +720,12 @@ export async function getExtractedText(
   const meta = await ensureFresh(userId, absPath);
   if (meta.kind === 'image') throw new Error(`getExtractedText: image not supported: ${absPath}`);
   if (meta.kind === 'legacy_office') throw new UnsupportedFileKindError(absPath, meta.kind);
-  const text = meta.kind === 'text'
-    ? fs.readFileSync(absPath, 'utf8')
-    : fs.readFileSync(path.join(cacheDirFor(userId, absPath), 'text.md'), 'utf8');
+  const text = await fs.promises.readFile(
+    meta.kind === 'text'
+      ? absPath
+      : path.join(cacheDirFor(userId, absPath), 'text.md'),
+    'utf8',
+  );
   return { text, meta: metaToPublic(meta) };
 }
 

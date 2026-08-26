@@ -41,7 +41,11 @@ function runSkill(
         ...process.env,
         ORKAS_PC_DIR: dir,
         ORKAS_RUN_SKILL_DIR: skillDir(skillId),
-        ORKAS_WORKSPACE_ROOT: path.dirname(dir),
+        ORKAS_WORKSPACE_ROOT: path.join(
+          os.tmpdir(),
+          `orkas-video-media-skill-${process.pid}`,
+          'data',
+        ),
         ...extraEnv,
       },
     },

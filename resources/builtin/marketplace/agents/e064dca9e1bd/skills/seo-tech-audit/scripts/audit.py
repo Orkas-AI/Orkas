@@ -45,6 +45,15 @@ def _page_of(crawl_obj: dict) -> tuple[dict, dict]:
 def audit(crawl_obj: dict) -> dict:
     page, site = _page_of(crawl_obj)
     findings: list[dict] = []
+    # A check whose input was never measured must not run. Scoring here works by
+    # deducting for findings, so a check that silently does not fire reads as a
+    # clean result: a local-file crawl used to score security 100 because the
+    # only security check asks `not https`, and https had been derived from the
+    # scheme of the base URL the caller typed. Not-assessed is its own outcome.
+    not_assessed: list[dict] = []
+
+    def unassessed(dim, what, why):
+        not_assessed.append({"dimension": dim, "check": what, "reason": why})
 
     def add(fid, dim, sev, title, evidence, rec, lead, fail):
         findings.append({
@@ -61,8 +70,12 @@ def audit(crawl_obj: dict) -> dict:
     h1c = page.get("h1_count", 0)
     order = page.get("heading_order") or []
 
+    local_only = "no request was made (local file crawl)"
+
     # ── security ──
-    if not page.get("https"):
+    if page.get("https") is None:
+        unassessed("security", "https", local_only)
+    elif not page.get("https"):
         add("not_https", "security", "critical", "Page is not served over HTTPS",
             "scheme is http for {}".format(page.get("url")),
             "Serve the page over HTTPS and redirect http→https.",
@@ -70,6 +83,8 @@ def audit(crawl_obj: dict) -> dict:
             "recrawl still reports https=false")
 
     # ── indexability ──
+    if status is None:
+        unassessed("indexability", "response_status", local_only)
     if isinstance(status, int) and status >= 500:
         add("server_error", "indexability", "critical", "Server error response",
             "HTTP {}".format(status), "Fix the server error so crawlers receive 200.",
@@ -195,10 +210,12 @@ def audit(crawl_obj: dict) -> dict:
             "Declare the sitemap URL in robots.txt so crawlers discover all pages.",
             "robots.txt lists a Sitemap on recrawl", "recrawl still has no Sitemap line")
 
-    return _score(findings, page, site)
+    return _score(findings, page, site, not_assessed)
 
 
-def _score(findings: list[dict], page: dict, site: dict) -> dict:
+def _score(findings: list[dict], page: dict, site: dict,
+           not_assessed: list[dict] | None = None) -> dict:
+    not_assessed = not_assessed or []
     dim_penalty = {d: 0 for d in _DIMENSIONS}
     counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
     total_penalty = 0
@@ -208,11 +225,21 @@ def _score(findings: list[dict], page: dict, site: dict) -> dict:
         dim_penalty[f.get("dimension", "indexability")] = dim_penalty.get(f.get("dimension"), 0) + w
         counts[f["severity"]] += 1
     health = max(0, min(100, 100 - total_penalty))
-    dim_scores = {d: max(0, 100 - p) for d, p in dim_penalty.items()}
+    # A dimension with an unrun check has no score. 100 would claim it was
+    # examined and found clean; a penalty would invent a defect. Neither is true.
+    blind = {entry["dimension"] for entry in not_assessed}
+    dim_scores = {
+        d: (None if d in blind else max(0, 100 - p)) for d, p in dim_penalty.items()
+    }
     severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     findings_sorted = sorted(findings, key=lambda f: severity_rank[f["severity"]])
     return {
         "health_score": health,
+        # The overall score covers the checks that ran. `not_assessed` names the
+        # rest, and `source` says why, so a reader is never left to infer that a
+        # number this narrow described the live site.
+        "assessed_dimensions": sorted(d for d in _DIMENSIONS if d not in blind),
+        "not_assessed": not_assessed,
         "dimension_scores": dim_scores,
         "summary": {**counts, "total": len(findings)},
         "findings": findings_sorted,
@@ -221,6 +248,7 @@ def _score(findings: list[dict], page: dict, site: dict) -> dict:
             "final_url": page.get("final_url"),
             "fetched_at": site.get("fetched_at") or page.get("fetched_at"),
             "origin": site.get("origin"),
+            "source": page.get("source") or site.get("source") or "fetch",
         },
     }
 
