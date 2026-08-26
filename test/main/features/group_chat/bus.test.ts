@@ -2746,6 +2746,59 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(attachments.listPendingAttachments(TEST_UID, cid)).toEqual([]);
   });
 
+  it('converts a Codex file citation into the exact produced-file footer selection', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+    const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+    spec.runtime = { kind: 'cli', cli: 'codex' };
+    fs.writeFileSync(agentFile, JSON.stringify(spec));
+
+    const projectDir = path.join(tmpDir, 'workspace');
+    const agents = await import('../../../../src/main/features/agents');
+    await agents.setAgentCliProjectDir(TEST_UID, AGENT_ID, projectDir);
+    const deckPath = path.join(projectDir, 'AI会议助手竞品分析.pptx');
+    const supportingPath = path.join(projectDir, 'analysis-notes.md');
+    fs.writeFileSync(deckPath, 'presentation bytes');
+    fs.writeFileSync(supportingPath, 'supporting notes');
+
+    cliRunMock.nextEvents.push({
+      type: 'file-change',
+      source: 'codex',
+      paths: [deckPath, supportingPath],
+    });
+    cliRunMock.nextResult = {
+      runId: 'codex-file-citation',
+      status: 'completed',
+      output: [
+        '演示文稿已经完成。',
+        '',
+        `:codex-file-citation{path="${deckPath}" purpose="output"}`,
+      ].join('\n'),
+    };
+
+    const cid = 'cid-codex-file-citation';
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `@${AGENT_NAME} create the presentation`,
+      forceTo: [AGENT_ID],
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    const reply = rows.find(row => row.from === AGENT_ID);
+    expect(reply?.text).toBe('演示文稿已经完成。');
+    // Renderer consumes `produced` for the clickable list under the bubble.
+    // The native citation explicitly selects the deck, while the supporting
+    // file remains owned by the conversation without being presented as final.
+    expect(reply?.produced).toEqual([deckPath]);
+    expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(deckPath)).toBe(true);
+    expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(supportingPath)).toBe(true);
+  });
+
   it('previews materialized CLI images and videos once and retains remote fallback media', async () => {
     const paths = await import('../../../../src/main/paths');
     const layout = await import('../../../../src/main/util/project-layout');

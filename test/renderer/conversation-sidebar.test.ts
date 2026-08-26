@@ -4473,6 +4473,71 @@ describe('conversation process metadata formatting', () => {
     });
   });
 
+  it('updates one row for a continuous agent-response wait and replaces it when stopped', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+    const body: any = {
+      children: [],
+      appendChild(node: any) { this.children.push(node); },
+    };
+    context.document.createElement = () => ({ dataset: {}, className: '', innerHTML: '' });
+    const append = (data: Record<string, unknown>) => {
+      const projection = context._projectProcessRow({ stream: 'cli', data }, displayContext);
+      context._appendProjectedProcessRowToBody(body, projection);
+      return projection;
+    };
+
+    append({ type: 'idle', stalledMs: 289_000 });
+    expect(append({ type: 'log', level: 'debug', message: 'internal pulse' })).toBeNull();
+    const latestWait = append({ type: 'idle', stalledMs: 709_000 });
+
+    expect(body.children).toHaveLength(1);
+    expect(latestWait).toMatchObject({
+      lifecycleKey: 'cli-idle:1',
+      lifecycleTerminal: false,
+      text: 'Wait for agent response · 11m 49s',
+    });
+    expect(body.children[0].dataset.processText)
+      .toBe('Wait for agent response · 11m 49s');
+
+    const stopped = append({ type: 'status', status: 'cancelled' });
+    expect(body.children).toHaveLength(1);
+    expect(stopped).toMatchObject({
+      lifecycleKey: 'cli-idle:1',
+      lifecycleTerminal: true,
+      kind: 'warn',
+      text: 'Stopped',
+    });
+    expect(body.children[0].dataset).toMatchObject({
+      processCallId: 'cli-idle:1',
+      processTerminal: '1',
+      processText: 'Stopped',
+    });
+  });
+
+  it('starts a new wait row after genuine CLI activity resumes', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+
+    const firstWait = context._projectProcessRow({
+      stream: 'cli', data: { type: 'idle', stalledMs: 90_000 },
+    }, displayContext);
+    const activity = context._projectProcessRow({
+      stream: 'cli',
+      data: {
+        type: 'tool-event', phase: 'use', tool: 'web_fetch', callId: 'fetch-1',
+        input: { url: 'https://example.com' },
+      },
+    }, displayContext);
+    const secondWait = context._projectProcessRow({
+      stream: 'cli', data: { type: 'idle', stalledMs: 120_000 },
+    }, displayContext);
+
+    expect(firstWait.lifecycleKey).toBe('cli-idle:1');
+    expect(activity.lifecycleKey).toBe('cli:fetch-1');
+    expect(secondWait.lifecycleKey).toBe('cli-idle:2');
+  });
+
   it('keeps safe duration and error details without exposing credentials or absolute paths', () => {
     const context = loadConversationRenderer();
     const displayContext = context._createProcessDisplayContext();

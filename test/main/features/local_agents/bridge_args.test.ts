@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 
 import { buildClaudeArgs } from '../../../../src/main/features/local_agents/backends/claude';
 import {
+  buildCodexArgs,
   buildCodexBridgeOverrides,
+  CODEX_OPENAI_HTTP_TRANSPORT_OVERRIDE,
   codexDeveloperInstructions,
   codexThreadDeveloperInstructionParams,
 } from '../../../../src/main/features/local_agents/backends/codex';
@@ -62,6 +64,21 @@ describe('claude bridge args', () => {
 });
 
 describe('codex bridge overrides', () => {
+  it('uses the recoverable HTTP response stream while leaving user overrides last', () => {
+    const userOverride = 'model_providers.openai.supports_websockets=true';
+    const args = buildCodexArgs({
+      ...BASE,
+      customArgs: ['-c', userOverride],
+    });
+
+    expect(args.slice(0, 5)).toEqual([
+      'app-server', '--listen', 'stdio://',
+      '-c', CODEX_OPENAI_HTTP_TRANSPORT_OVERRIDE,
+    ]);
+    expect(args.lastIndexOf(userOverride))
+      .toBeGreaterThan(args.indexOf(CODEX_OPENAI_HTTP_TRANSPORT_OVERRIDE));
+  });
+
   it('emits TOML-quoted -c overrides for command/args and non-secret env', () => {
     const overrides = buildCodexBridgeOverrides({
       command: '/usr/local/bin/node',
