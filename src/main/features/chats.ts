@@ -27,6 +27,7 @@ import {
 } from '../paths';
 import {
   conversationLayout,
+  chatAttachmentDirForConversation,
   conversationMessageFile,
   conversationMessageReadFile,
   listProjectIds,
@@ -52,6 +53,11 @@ import {
 } from '../util/record_sync_fields';
 import { limitNameDisplayText } from '../util/name-limit';
 import { versionChatMediaLocalUrlsInText } from '../util/chat-media-url';
+import { isPathAllowed } from '../util/path-sandbox';
+import {
+  persistedCodexOutputCitationPaths,
+  sanitizePersistedCodexFileCitations,
+} from './local_agents/public-output';
 
 const log = createLogger('chats');
 // A boot-time stale-state sweep may run twice: once before the first window
@@ -163,10 +169,83 @@ export interface Conversation {
  *  canonical type is `GroupMessage` from `group_chat/visibility`. */
 export type MessageRecord = GroupMessage;
 
-function _messageForDisplay(message: MessageRecord): MessageRecord {
+interface MessageDisplayContext {
+  citationWorkingDir?: string;
+  allowedCitationRoots: string[];
+}
+
+async function _messageDisplayContext(
+  userId: string,
+  cid: string,
+  projectIdHint?: string | null,
+): Promise<MessageDisplayContext> {
+  const layout = conversationLayout(userId, cid, projectIdHint);
+  const state = await readState(userId, cid, layout.projectId);
+  const allowedCitationRoots = [
+    state.coding_project_dir,
+    ...(state.tool_extra_roots || []),
+    chatAttachmentDirForConversation(userId, cid, layout.projectId),
+  ].filter((root): root is string => typeof root === 'string' && path.isAbsolute(root));
+
+  let workspaceRoot: string | undefined;
+  try {
+    const userWorkspace = await import('./user_workspace');
+    workspaceRoot = userWorkspace.getWorkspacePath(userId, layout.projectId || undefined);
+    if (path.isAbsolute(workspaceRoot)) allowedCitationRoots.push(workspaceRoot);
+  } catch (err) {
+    log.warn(`resolve workspace for legacy Codex output cid=${maskId(cid)}: ${(err as Error).message}`);
+  }
+
+  return {
+    citationWorkingDir: state.coding_project_dir && path.isAbsolute(state.coding_project_dir)
+      ? state.coding_project_dir
+      : workspaceRoot,
+    allowedCitationRoots,
+  };
+}
+
+function _isAuthorizedLegacyOutputFile(candidate: string, allowedRoots: readonly string[]): boolean {
+  if (!path.isAbsolute(candidate) || !isPathAllowed(candidate, allowedRoots)) return false;
+  try { return fs.statSync(candidate).isFile(); }
+  catch { return false; }
+}
+
+function _messageForDisplay(message: MessageRecord, context: MessageDisplayContext): MessageRecord {
   if (message.from === 'user') return message;
-  const text = versionChatMediaLocalUrlsInText(message.text);
-  return text === message.text ? message : { ...message, text };
+  const storedProduced = Array.isArray(message.produced)
+    ? message.produced.filter((item): item is string => typeof item === 'string' && !!item.trim())
+    : [];
+  const produced = [...storedProduced];
+  const producedKeys = new Set(produced.map((item) => path.resolve(item)));
+  const citedOutputs: string[] = [];
+  for (const candidate of persistedCodexOutputCitationPaths(
+    message.text,
+    context.citationWorkingDir,
+  )) {
+    const resolved = path.resolve(candidate);
+    if (!producedKeys.has(resolved)) {
+      if (!_isAuthorizedLegacyOutputFile(resolved, context.allowedCitationRoots)) continue;
+      produced.push(resolved);
+      producedKeys.add(resolved);
+    }
+    citedOutputs.push(resolved);
+  }
+  // A native output citation is an exact publication declaration. Historical
+  // rows predate a separate `published` field, so project only the cited files
+  // into the renderer footer while retaining the complete list as sanitizer
+  // backing. Without a trusted citation, preserve the stored footer verbatim.
+  const displayProduced = citedOutputs.length ? citedOutputs : storedProduced;
+  const text = versionChatMediaLocalUrlsInText(
+    sanitizePersistedCodexFileCitations(message.text, produced, context.citationWorkingDir),
+  );
+  const producedUnchanged = displayProduced.length === storedProduced.length
+    && displayProduced.every((item, index) => item === storedProduced[index]);
+  if (text === message.text && producedUnchanged) return message;
+  return {
+    ...message,
+    text,
+    ...(displayProduced.length ? { produced: displayProduced } : {}),
+  };
 }
 
 // ── CRUD ─────────────────────────────────────────────────────────────────
@@ -2025,7 +2104,8 @@ export async function getMessagesPage(
     if (page.nextCursor === null) break;
     cursor = page.nextCursor;
   }
-  return { history: history.map(_messageForDisplay), nextCursor };
+  const displayContext = await _messageDisplayContext(userId, cid, projectIdHint);
+  return { history: history.map((message) => _messageForDisplay(message, displayContext)), nextCursor };
 }
 
 /** Load from the fixed-size page containing a search hit through the newest
@@ -2053,8 +2133,9 @@ export async function getMessagesPageAtIndex(
   const visible = page.records
     .map((message, offset) => ({ message, index: pageStart + offset }))
     .filter(({ message }) => !message.deleted_at);
+  const displayContext = await _messageDisplayContext(userId, cid, projectIdHint);
   return {
-    history: visible.map(({ message }) => _messageForDisplay(message)),
+    history: visible.map(({ message }) => _messageForDisplay(message, displayContext)),
     // Keep the source JSONL indexes aligned with `history`. The renderer uses
     // this as the final navigation identity for old records that predate
     // stable message ids/timestamps; filtering a tombstone must not shift the

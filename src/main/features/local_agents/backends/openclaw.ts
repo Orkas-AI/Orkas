@@ -33,6 +33,7 @@
  */
 
 import * as crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { createLogger } from '../../../logger.js';
 import { logErrorSummary } from '../../../util/log-redact.js';
 import {
@@ -124,6 +125,7 @@ export const openclawBackend: LocalBackend = {
         const parsed = parseOpenclawReply(fullStderr);
         const replyText = parsed?.text || '';
         const media = parsed?.media || [];
+        const files = parsed?.files || [];
         const sid = parsed?.sessionId || sessionId;
 
         if (replyText) {
@@ -139,12 +141,24 @@ export const openclawBackend: LocalBackend = {
             items: media.map(uri => ({ uri })),
           });
         }
+        if (files.length) {
+          // OpenClaw's structured attachment envelope can point at arbitrary
+          // documents (PDF/Office/etc.), not only previewable image/video
+          // media. Keep those paths on the generic produced-file channel; the
+          // group-chat boundary validates cwd ownership and existence before
+          // exposing them in the deliverable footer.
+          opts.onEvent({
+            type: 'file-change',
+            source: 'openclaw_attachment',
+            paths: files,
+          });
+        }
 
         const usage = parsed?.usage;
-        if (code === 0 && (replyText || media.length)) {
+        if (code === 0 && (replyText || media.length || files.length)) {
           return finish('completed', { output: replyText, sessionId: sid, ...(usage ? { usage } : {}) });
         }
-        if (code === 0 && !replyText && !media.length) {
+        if (code === 0 && !replyText && !media.length && !files.length) {
           // Exit clean but no parseable reply → treat as failed so
           // the user sees an error bubble instead of an empty turn.
           return finish('failed', {
@@ -206,7 +220,7 @@ function hasOpenclawTimeoutArg(args: string[] | undefined): boolean {
  */
 export function parseOpenclawReply(stderrText: string):
   | null
-  | { text: string; media: string[]; sessionId?: string; error?: string; usage?: Record<string, number | string> } {
+  | { text: string; media: string[]; files: string[]; sessionId?: string; error?: string; usage?: Record<string, number | string> } {
   if (!stderrText) return null;
   const clean = stripAnsi(stderrText);
 
@@ -230,17 +244,28 @@ export function parseOpenclawReply(stderrText: string):
         .map(p => (p && typeof p.text === 'string') ? p.text : '')
         .filter(s => s.length)
         .join('\n');
-      const media = Array.from(new Set((obj.payloads as any[]).flatMap((payload): string[] => {
+      const mediaCandidates = (obj.payloads as any[]).flatMap((payload): string[] => {
         if (!payload || typeof payload !== 'object') return [];
-        const candidates = [
-          typeof payload.mediaUrl === 'string' ? payload.mediaUrl : '',
-          ...(Array.isArray(payload.mediaUrls) ? payload.mediaUrls : []),
-        ];
-        return candidates
-          .filter((value): value is string => typeof value === 'string')
+        return [payload.media, payload.mediaUrl, payload.mediaUrls]
+          .flatMap(openclawStringValues)
           .map(value => value.trim())
           .filter(Boolean);
-      })));
+      });
+      const explicitFileCandidates = (obj.payloads as any[]).flatMap((payload): string[] => {
+        if (!payload || typeof payload !== 'object') return [];
+        return [payload.path, payload.filePath]
+          .flatMap(openclawStringValues)
+          .map(value => value.trim())
+          .filter(Boolean);
+      });
+      const media: string[] = [];
+      const files: string[] = [];
+      for (const candidate of mediaCandidates) {
+        const localPath = openclawLocalAttachmentPath(candidate);
+        if (localPath) files.push(localPath);
+        else media.push(candidate);
+      }
+      files.push(...explicitFileCandidates);
       const sessionId = obj.meta?.agentMeta?.sessionId
         || obj.meta?.sessionId
         || undefined;
@@ -248,13 +273,40 @@ export function parseOpenclawReply(stderrText: string):
         obj.meta?.agentMeta?.usage || obj.meta?.usage,
         obj.meta?.agentMeta?.model || obj.meta?.agentMeta?.provider,
       );
-      return { text, media, sessionId, ...(usage ? { usage } : {}) };
+      return {
+        text,
+        media: Array.from(new Set(media)),
+        files: Array.from(new Set(files)),
+        sessionId,
+        ...(usage ? { usage } : {}),
+      };
     }
     if (obj && typeof obj === 'object' && typeof obj.error === 'string') {
-      return { text: '', media: [], error: String(obj.error) };
+      return { text: '', media: [], files: [], error: String(obj.error) };
     }
   }
   return null;
+}
+
+function openclawStringValues(value: unknown): string[] {
+  if (typeof value === 'string') return [value];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === 'string');
+}
+
+function openclawLocalAttachmentPath(value: string): string | null {
+  const candidate = value.trim();
+  if (!candidate) return null;
+  if (/^file:/iu.test(candidate)) {
+    try { return fileURLToPath(candidate); } catch { return candidate; }
+  }
+  if (/^(?:https?:|data:)/iu.test(candidate)) return null;
+  // Treat another URI scheme as media rather than resolving it relative to
+  // cwd. Exclude Windows drive paths (`C:\...`) from the scheme check.
+  if (/^[A-Za-z][A-Za-z\d+.-]*:/u.test(candidate) && !/^[A-Za-z]:[\\/]/u.test(candidate)) {
+    return null;
+  }
+  return candidate;
 }
 
 /** Normalize openclaw's `meta.agentMeta.usage` block (or a fallback at

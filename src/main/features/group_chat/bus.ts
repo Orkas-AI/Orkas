@@ -135,7 +135,10 @@ import {
   createPhasedTextState,
   resolvedPhasedText,
 } from '../local_agents/text-phase';
-import { sanitizeLocalAgentPublicOutput } from '../local_agents/public-output';
+import {
+  CodexFileCitationStreamFilter,
+  normalizeLocalAgentPublicOutput,
+} from '../local_agents/public-output';
 import {
   buildCliConversationContext,
   buildCliDurableInstructions,
@@ -4470,6 +4473,7 @@ async function runActorTurn(
         },
       });
       for (const p of cliOut.produced || []) await onFileWritten(p);
+      if (cliOut.published?.length) onOutputsPublished(cliOut.published);
       finalText = cliOut.text;
       streamingText = cliOut.text;
       cliCommanderHandoff = cliOut.commanderHandoff || null;
@@ -7513,6 +7517,7 @@ async function _runCliAgentTurn(opts: {
   error?: string;
   aborted?: boolean;
   produced?: string[];
+  published?: string[];
   commanderHandoff?: import('../local_agents/bridge').CommanderHandoffRequest;
   failureKind?: GroupMessageFailureKind;
   failureCode?: string;
@@ -7628,6 +7633,9 @@ async function _runCliAgentTurn(opts: {
 
   const textState = createPhasedTextState();
   const bufferPublicOutput = runtime.cli === 'hermes';
+  const codexStreamFilter = runtime.cli === 'codex'
+    ? new CodexFileCitationStreamFilter()
+    : null;
   let resultText = '';
   let aborted = false;
   let backendSessionId: string | undefined;
@@ -7676,6 +7684,7 @@ async function _runCliAgentTurn(opts: {
           if (typeof (e as any).text === 'string') {
             const text = (e as any).text as string;
             const phased = appendPhasedText(textState, text, (e as any).phase);
+            const streamText = codexStreamFilter ? codexStreamFilter.push(text) : text;
             // Slash-command turns: buffer text-delta in `textState` instead
             // of streaming to the bubble. The success-return path below
             // either swaps the body for "已发送命令 …" (CLI returned
@@ -7692,11 +7701,13 @@ async function _runCliAgentTurn(opts: {
                   to: 'final_answer',
                 });
               }
-              opts.onProcess({
-                type: 'delta',
-                text,
-                ...(phased.phase ? { phase: phased.phase } : {}),
-              });
+              if (streamText) {
+                opts.onProcess({
+                  type: 'delta',
+                  text: streamText,
+                  ...(phased.phase ? { phase: phased.phase } : {}),
+                });
+              }
             }
           }
           break;
@@ -7810,6 +7821,10 @@ async function _runCliAgentTurn(opts: {
           opts.onProcess({ type: 'event', event: { stream: 'cli', data: e as unknown as Record<string, unknown> } });
           break;
         case 'done':
+          if (codexStreamFilter && !slashCommandName) {
+            const streamTail = codexStreamFilter.flush();
+            if (streamTail) opts.onProcess({ type: 'delta', text: streamTail });
+          }
           if ((e as any).resumeRejected === true) resumeRejected = true;
           if (runtime.cli === 'claude') {
             const reportedModel = (e as any).usage?.model;
@@ -7935,18 +7950,26 @@ async function _runCliAgentTurn(opts: {
       failureCode: result.cliError || 'missing_cli',
     };
   }
-  const publicText = () => appendCliGeneratedMediaMarkdown(
-    sanitizeLocalAgentPublicOutput({
-      cli: runtime.cli as LocalCliType,
-      text: resolvedPhasedText(textState, resultText),
-      userTask: publicTaskBody,
-    }),
+  const publicOutput = normalizeLocalAgentPublicOutput({
+    cli: runtime.cli as LocalCliType,
+    text: resolvedPhasedText(textState, resultText),
+    userTask: publicTaskBody,
+    workingDir: opts.workingDir,
+    producedPaths: Array.from(produced),
+  });
+  const publicText = appendCliGeneratedMediaMarkdown(
+    publicOutput.text,
     inlineGeneratedImages,
     opts.cid,
     inlineRemoteMedia.values(),
   );
   if (result.status === 'cancelled') {
-    return { text: publicText(), aborted: true, produced: Array.from(produced) };
+    return {
+      text: publicText,
+      aborted: true,
+      produced: Array.from(produced),
+      published: publicOutput.publishedPaths,
+    };
   }
   if (result.status === 'failed' || result.status === 'timeout') {
     const vars = { name: opts.agent.name || runtime.cli, cli: runtime.cli };
@@ -7966,9 +7989,10 @@ async function _runCliAgentTurn(opts: {
           ? t('cli_agent.upgrade_required_detail', vars)
           : t('cli_agent.run_failed_detail', vars);
     return {
-      text: publicText(),
+      text: publicText,
       error: detail,
       produced: Array.from(produced),
+      published: publicOutput.publishedPaths,
       failureKind: runtimeFailure === 'upgrade_required' ? 'dependency' : 'runtime',
       failureCode: result.status === 'timeout'
         ? 'cli_timeout'
@@ -7977,17 +8001,19 @@ async function _runCliAgentTurn(opts: {
           : 'cli_failed',
     };
   }
-  const finalText = publicText();
+  const finalText = publicText;
   if (slashCommandName && _looksLikeNoOutput(finalText)) {
     return {
       text: t('cli_agent.slash_no_output', { cmd: slashCommandName }),
       produced: Array.from(produced),
+      published: publicOutput.publishedPaths,
       ...(result.commanderHandoff ? { commanderHandoff: result.commanderHandoff } : {}),
     };
   }
   return {
     text: finalText,
     produced: Array.from(produced),
+    published: publicOutput.publishedPaths,
     historySyncEligible: !contextPlan.passthrough,
     ...(result.commanderHandoff ? { commanderHandoff: result.commanderHandoff } : {}),
   };
