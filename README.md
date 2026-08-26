@@ -19,7 +19,7 @@ Orkas is an open-source, local-first multi-agent desktop app. Describe a goal; i
 
 **Orkas:** the Commander breaks the goal into steps and runs them across specialists — **DeepResearcher** gathers and verifies the sources, **ContentWriter** drafts the report, **PptMaker** builds the slides. One chat, one shared plan, finished files on your disk.
 
-![Orkas demo: the Commander turns a goal into a step-by-step plan, dispatches it to specialist agents, and delivers the finished file](./resources/app-ui/demo.gif)
+![Orkas demo: the Commander turns a goal into a step-by-step plan, dispatches it to specialist agents, and delivers the finished file](./resources/app-ui/demo-en.gif)
 
 ---
 
