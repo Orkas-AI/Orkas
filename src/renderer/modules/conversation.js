@@ -941,6 +941,8 @@ function _createProcessDisplayContext() {
     cliRunningShown: false,
     cliRetryActive: false,
     cliRetrySeries: 0,
+    cliIdleActive: false,
+    cliIdleSeries: 0,
   };
 }
 
@@ -1037,6 +1039,39 @@ function _processCliRetryLifecycle(evt, displayContext) {
   const key = `cli-retry:${Math.max(1, Number(displayContext.cliRetrySeries) || 1)}`;
   displayContext.cliRetryActive = false;
   return { key, terminal: true };
+}
+
+// Runner idle events are periodic snapshots of one contiguous wait, not new
+// actions. Keep updating one presentation row until a real CLI event arrives.
+// A directly following terminal status replaces that same row. Persisted raw
+// events remain unchanged for diagnostics.
+function _processCliIdleLifecycle(evt, displayContext) {
+  if (!evt || evt.stream !== 'cli' || !displayContext) return null;
+  const data = evt.data && typeof evt.data === 'object' ? evt.data : {};
+  const type = String(data.type || '').toLowerCase();
+  if (type === 'idle') {
+    if (!displayContext.cliIdleActive) {
+      displayContext.cliIdleSeries = Math.max(0, Number(displayContext.cliIdleSeries) || 0) + 1;
+      displayContext.cliIdleActive = true;
+    }
+    return { key: `cli-idle:${displayContext.cliIdleSeries}`, terminal: false };
+  }
+  if (!displayContext.cliIdleActive) return null;
+
+  const status = type === 'status' ? String(data.status || '').toLowerCase() : '';
+  if (['timeout', 'error', 'failed', 'cancelled', 'aborted'].includes(status)) {
+    const key = `cli-idle:${Math.max(1, Number(displayContext.cliIdleSeries) || 1)}`;
+    displayContext.cliIdleActive = false;
+    return { key, terminal: true };
+  }
+
+  // Synthetic tool/reasoning pulses are bookkeeping, not new protocol
+  // progress. All other events close this wait series so a later idle period
+  // gets a chronologically separate row.
+  if (data.synthetic !== true && data.heartbeat !== true) {
+    displayContext.cliIdleActive = false;
+  }
+  return null;
 }
 
 function _isProcessPlanToolName(name) {
@@ -14228,10 +14263,12 @@ function _projectProcessRow(evt, displayContext, fallbackText = '') {
   const text = (event ? _formatEventLine(event, displayContext) : '')
     || String(fallbackText || '');
   if (!text) return null;
+  // Hidden diagnostics must not split one visible wait into multiple rows.
+  const idleLifecycle = event ? _processCliIdleLifecycle(event, displayContext) : null;
   const kind = event ? _eventProcessKind(event, text) : _processKindOf(text);
   const lifecycle = kind === 'plan'
     ? null
-    : (_processToolLifecycle(event) || _processCliRetryLifecycle(event, displayContext));
+    : (idleLifecycle || _processToolLifecycle(event) || _processCliRetryLifecycle(event, displayContext));
   const data = event?.data && typeof event.data === 'object' ? event.data : {};
   const cliResult = event?.stream === 'cli'
     && String(data.type || '').toLowerCase() === 'tool-event'
