@@ -427,9 +427,17 @@ afterEach(async () => {
 async function waitForQuiescent(uid: string, cid: string, timeoutMs = 2000) {
   cidsToDrop.add(cid);
   const bus = await import('../../../../src/main/features/group_chat/bus');
+  const state = await import('../../../../src/main/features/group_chat/state');
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    if (bus.isQuiescent(uid, cid)) return;
+    if (bus.isQuiescent(uid, cid)) {
+      // The bus deliberately reconciles durable status in a tracked
+      // background write after the final worker releases its running claim.
+      // Do not let tests capture the transient `running` + empty `in_flight`
+      // snapshot between those two lifecycle boundaries.
+      const durable = await state.readState(uid, cid);
+      if (durable.status !== 'running' && durable.in_flight.length === 0) return;
+    }
     await new Promise((r) => setTimeout(r, 20));
   }
   throw new Error(`bus did not quiesce for ${uid}/${cid}`);
