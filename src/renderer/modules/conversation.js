@@ -3662,15 +3662,13 @@ async function _syncPendingActorsFromRuntime(cid, opts = {}) {
   if (hasActiveTurnsField) {
     const activeCommander = activeTurns.some((t) => t.actor === 'commander');
     if (!activeCommander) _removeEmptyActorPlaceholder(cid, 'commander');
-    for (const turn of activeTurns) {
-      _ensureActorPlaceholder(cid, turn.actor, loadingEl, turn.turn_id, turn.msg_id, turn.started_at_ms);
-    }
   } else {
     if (!inFlight.includes('commander')) _removeEmptyActorPlaceholder(cid, 'commander');
-    for (const actorId of inFlight) {
-      _ensureActorPlaceholder(cid, actorId, loadingEl);
-    }
   }
+  const primary = _ensureRuntimeActorPlaceholders(
+    cid, loadingEl, activeTurns, inFlight, hasActiveTurnsField,
+  );
+  if (primary && pendingConvs.get(cid) === state) state.loadingEl = primary;
   return true;
 }
 
@@ -6687,6 +6685,66 @@ function _ensureCreateAgentInlineObserver() {
   _ensureConvCreateAgentInline();
 }
 
+/**
+ * A pending controller outlives whichever actor first adopted its loading row.
+ * History recovery may only reattach that row when it is still a live target
+ * for the runtime snapshot. Persisted/finalized rows are owned by canonical
+ * history, and actor/turn mismatches belong to an earlier orchestration step.
+ */
+function _canReattachPendingLoadingEl(
+  loadingEl,
+  activeTurns = [],
+  inFlightActors = [],
+  hasActiveTurnsField = false,
+) {
+  if (!loadingEl) return false;
+  const data = loadingEl.dataset || {};
+  if (data.finalized === '1' || data.msgId) return false;
+
+  const actorId = String(data.fromActor || '');
+  const turnId = _normaliseTurnId(data.turnId);
+  const renderKey = String(data.renderKey || '');
+  // The controller's untouched hidden row is actor-neutral and safe to adopt
+  // after the snapshot identifies the current worker.
+  if (!actorId && !turnId && !renderKey) return true;
+
+  if (hasActiveTurnsField) {
+    return activeTurns.some((turn) => {
+      if (String(turn?.actor || '') !== actorId) return false;
+      const activeTurnId = _normaliseTurnId(turn?.turn_id);
+      return !turnId || !activeTurnId || turnId === activeTurnId;
+    });
+  }
+  if (inFlightActors.length && actorId) return inFlightActors.includes(actorId);
+  // Legacy/stale snapshots without actor identity cannot disprove ownership.
+  // Keep the live row so the controller closure does not lose direct deltas.
+  return true;
+}
+
+function _ensureRuntimeActorPlaceholders(
+  cid,
+  fallbackPh,
+  activeTurns,
+  inFlightActors,
+  hasActiveTurnsField,
+) {
+  let primary = null;
+  if (hasActiveTurnsField) {
+    for (const turn of activeTurns) {
+      const ph = _ensureActorPlaceholder(
+        cid, turn.actor, fallbackPh, turn.turn_id, turn.msg_id, turn.started_at_ms,
+      );
+      if (!primary && ph) primary = ph;
+    }
+  } else {
+    for (const actorId of inFlightActors) {
+      const ph = _ensureActorPlaceholder(cid, actorId, fallbackPh);
+      if (!primary && ph) primary = ph;
+    }
+  }
+  return primary;
+}
+
 async function loadConversationHistory(cid, opts = {}) {
   const perfStartedAt = performance.now();
   const container = document.getElementById('chat-history');
@@ -6889,15 +6947,11 @@ async function loadConversationHistory(cid, opts = {}) {
         needsIndicator: false,
         startedAtMs: Math.max(0, new Date(convMeta.processing_since).getTime() || 0),
       });
-      if (hasActiveTurnsField) {
-        for (const turn of activeTurns) {
-          _ensureActorPlaceholder(cid, turn.actor, loadingEl, turn.turn_id, turn.msg_id, turn.started_at_ms);
-        }
-      } else {
-        for (const actorId of inFlightActors) {
-          _ensureActorPlaceholder(cid, actorId, loadingEl);
-        }
-      }
+      const recoveredState = pendingConvs.get(cid);
+      const primary = _ensureRuntimeActorPlaceholders(
+        cid, loadingEl, activeTurns, inFlightActors, hasActiveTurnsField,
+      );
+      if (primary && recoveredState) recoveredState.loadingEl = primary;
       // Opening/reloading into an already-running plan still needs the
       // group event stream; runtime polling can recover placeholders, but
       // it cannot replay live text deltas.
@@ -6905,36 +6959,34 @@ async function loadConversationHistory(cid, opts = {}) {
       _startRuntimeActorRecovery(cid);
       _updateConvSendUI(cid);
     } else if (isConvPending(cid)) {
-      // User navigated away and back during an in-flight request. The stream
-      // reader loop in createChatController.send() holds the original msgEl
-      // in closure and keeps dispatching deltas/final to that *specific* node
-      // — so we must re-attach the original node, not mint a fresh bubble.
-      // Minting a new one here (as before) stranded the stream: events kept
-      // landing on the orphaned node and the new bubble stayed at "thinking…"
-      // until stream end / polling rescue.
+      // User navigated away and back during an in-flight request. Preserve a
+      // still-live controller row, but never revive a row already finalized by
+      // history or owned by an earlier actor/turn. A terminal Commander hand-
+      // off keeps the whole conversation pending while the Agent runs; blindly
+      // reattaching the original Commander row creates the duplicate loading
+      // bubble beside its canonical history record.
       let state = pendingConvs.get(cid);
       if (!state) {
         state = { loadingEl: null, needsIndicator: false, controller: null, aborted: false };
         pendingConvs.set(cid, state);
       }
       pollMsgCounts.set(cid, String(lastMsg?._msg_id || ''));
-      if (state.loadingEl) {
+      const reusableLoadingEl = _canReattachPendingLoadingEl(
+        state.loadingEl, activeTurns, inFlightActors, hasActiveTurnsField,
+      ) ? state.loadingEl : null;
+      if (reusableLoadingEl) {
         const emptyEl = container.querySelector('.empty');
         if (emptyEl) emptyEl.remove();
-        _appendBeforeSpacer(container, state.loadingEl);
+        _appendBeforeSpacer(container, reusableLoadingEl);
+        state.loadingEl = reusableLoadingEl;
       } else {
         const loadingEl = _createStreamingAssistantMessage(container, { hiddenUntilActor: true });
         state.loadingEl = loadingEl;
       }
-      if (hasActiveTurnsField) {
-        for (const turn of activeTurns) {
-          _ensureActorPlaceholder(cid, turn.actor, state.loadingEl, turn.turn_id, turn.msg_id, turn.started_at_ms);
-        }
-      } else {
-        for (const actorId of inFlightActors) {
-          _ensureActorPlaceholder(cid, actorId, state.loadingEl);
-        }
-      }
+      const primary = _ensureRuntimeActorPlaceholders(
+        cid, state.loadingEl, activeTurns, inFlightActors, hasActiveTurnsField,
+      );
+      if (primary) state.loadingEl = primary;
       if (!state.controller) {
         // Same recovery path for a detached pending state: reconnect to the
         // live group event stream so the bubble streams instead of waiting
@@ -13476,16 +13528,11 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     // handed-off agent's reply.
     _serverFloorByCid.set(cid, typeof st.active_recipient === 'string' ? st.active_recipient : '');
     setGroupConversationBusy(cid, st.status === 'running' || inFlight.length > 0 || activeTurns.length > 0);
-    if (hasActiveTurnsField) {
-      for (const turn of activeTurns) {
-        _ensureActorPlaceholder(cid, turn.actor, streamingMsg, turn.turn_id, turn.msg_id, turn.started_at_ms);
-      }
-    } else if (inFlight.length) {
-      for (const actorId of inFlight) {
-        if (!actorId) continue;
-        _ensureActorPlaceholder(cid, actorId, streamingMsg);
-      }
-    }
+    const primary = _ensureRuntimeActorPlaceholders(
+      cid, streamingMsg, activeTurns, inFlight, hasActiveTurnsField,
+    );
+    const pendingState = pendingConvs.get(cid);
+    if (primary && pendingState && !pendingState.aborted) pendingState.loadingEl = primary;
     // Reconcile against the snapshot. `state` is level-triggered — the relay
     // Server stores it last-write-wins and replays it on every WS reconnect —
     // so an actor that has dropped out of `in_flight` is no longer running.

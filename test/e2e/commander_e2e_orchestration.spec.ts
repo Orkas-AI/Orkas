@@ -68,6 +68,22 @@ test.describe('Commander orchestration', () => {
       const runningConversationId = await page.locator('#conversation-list .conv-item').first()
         .getAttribute('data-cid');
       expect(runningConversationId).toBeTruthy();
+      // Switch away and back WITHOUT recreating the renderer. Unlike reload,
+      // this preserves pendingConvs.loadingEl — exactly the field report where
+      // the settled Commander row used to be reattached beside its canonical
+      // history row while ContentWriter was still the active turn.
+      await page.locator('#new-chat-btn').click();
+      await page.locator(`.conv-item[data-cid="${runningConversationId}"]`).click();
+      await expect(page.locator(
+        '#chat-history .chat-message.assistant[data-from-actor="commander"]',
+      )).toHaveCount(1);
+      await expect(page.locator(
+        '#chat-history .chat-message.assistant[data-from-actor="commander"]',
+      )).toContainText(commanderNarration);
+      await expect(page.locator(
+        `#chat-history .chat-message.assistant[data-from-actor="${CONTENT_WRITER_ID}"]`,
+      )).toHaveCount(1);
+
       // Recreate the renderer while the delegated Agent is still running.
       // This exercises active-turn recovery plus history rendering together,
       // the path that a terminal-only assertion completely misses.
@@ -147,6 +163,16 @@ test.describe('Commander orchestration', () => {
         () => modelOrkas.hasPendingAgentHandoffReply(),
         { timeout: 30_000 },
       ).toBe(true);
+      await expect(page.locator(
+        `#chat-history .chat-message.assistant[data-from-actor="${CONTENT_WRITER_ID}"]`,
+      )).toHaveCount(1);
+      await expect(commanderBubbles).toHaveCount(0);
+
+      const runningConversationId = await page.locator('#conversation-list .conv-item').first()
+        .getAttribute('data-cid');
+      expect(runningConversationId).toBeTruthy();
+      await page.locator('#new-chat-btn').click();
+      await page.locator(`.conv-item[data-cid="${runningConversationId}"]`).click();
       await expect(page.locator(
         `#chat-history .chat-message.assistant[data-from-actor="${CONTENT_WRITER_ID}"]`,
       )).toHaveCount(1);

@@ -572,6 +572,154 @@ describe('conversation history initial window', () => {
     expect(context._takeOffViewGroupProcessEvents('c1')).toEqual([]);
   });
 
+  it('does not revive a completed Commander row when history reports an active Agent turn', async () => {
+    const context = loadConversationRenderer();
+    const appended: any[] = [];
+    const ensured: any[] = [];
+    const staleCommander = {
+      dataset: {
+        finalized: '1',
+        fromActor: 'commander',
+        msgId: 'commander-seg-0',
+        renderKey: 's:commander-turn:0',
+        turnId: 'commander-turn',
+      },
+      isConnected: false,
+      parentElement: null,
+    } as any;
+    const activeAgent = {
+      dataset: {},
+      isConnected: true,
+      parentElement: {},
+    } as any;
+    const history = {
+      isConnected: true,
+      classList: { remove() {} },
+      innerHTML: '',
+      scrollHeight: 100,
+      scrollTop: 0,
+      style: {
+        scrollBehavior: '',
+        removeProperty() {},
+      },
+      addEventListener() {},
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      appendChild(node: any) { node.isConnected = true; },
+      insertBefore(node: any) { node.isConnected = true; },
+    } as any;
+    context.currentCid = 'c1';
+    context.performance = performance;
+    context.convAgentEnabledByCid = new Map();
+    context.pollMsgCounts = new Map();
+    context.messageQueues = new Map();
+    context.pendingConvs.set('c1', {
+      loadingEl: staleCommander,
+      needsIndicator: true,
+      controller: { abort() {} },
+      aborted: false,
+    });
+    context.document.getElementById = (id: string) => (id === 'chat-history' ? history : null);
+    context._ensureCreateAgentInlineObserver = () => {};
+    context._ensureConvCreateAgentInline = () => {};
+    context._refreshGroupMembers = async () => [];
+    context._evaluateAutoRecipient = async () => {};
+    context._renderConvDisabledBanner = () => {};
+    context._updateConvSendUI = () => {};
+    context.startPolling = () => {};
+    context._appendBeforeSpacer = (_container: any, node: any) => {
+      appended.push(node);
+      node.isConnected = true;
+    };
+    context._createStreamingAssistantMessage = () => activeAgent;
+    context._ensureActorPlaceholder = (...args: any[]) => {
+      ensured.push(args);
+      return args[2];
+    };
+    context.apiFetch = async () => ({
+      json: async () => ({
+        ok: true,
+        history: [],
+        conversation: {
+          agent_enabled: true,
+          processing: true,
+          processing_since: new Date().toISOString(),
+          in_flight: ['agent-a'],
+          active_recipient: 'agent-a',
+          active_turns: [{ actor: 'agent-a', turn_id: 'agent-turn' }],
+        },
+        next_cursor: null,
+      }),
+    });
+
+    await context.loadConversationHistory('c1');
+
+    expect(appended, 'settled history-owned rows must never be reattached').not.toContain(staleCommander);
+    expect(ensured).toHaveLength(1);
+    expect(ensured[0][1]).toBe('agent-a');
+    expect(ensured[0][2], 'the active Agent must receive a fresh reusable row').toBe(activeAgent);
+    expect(context.pendingConvs.get('c1').loadingEl).toBe(activeAgent);
+  });
+
+  it.each([
+    {
+      name: 'persisted row',
+      dataset: { finalized: '1', msgId: 'msg-1', fromActor: 'agent-a', turnId: 'turn-a' },
+      activeTurns: [{ actor: 'agent-a', turn_id: 'turn-a' }],
+      inFlight: ['agent-a'],
+      authoritative: true,
+      expected: false,
+    },
+    {
+      name: 'previous actor',
+      dataset: { fromActor: 'commander', turnId: 'turn-c', renderKey: 's:turn-c:0' },
+      activeTurns: [{ actor: 'agent-a', turn_id: 'turn-a' }],
+      inFlight: ['agent-a'],
+      authoritative: true,
+      expected: false,
+    },
+    {
+      name: 'previous turn of the same actor',
+      dataset: { fromActor: 'agent-a', turnId: 'turn-old', renderKey: 's:turn-old:0' },
+      activeTurns: [{ actor: 'agent-a', turn_id: 'turn-new' }],
+      inFlight: ['agent-a'],
+      authoritative: true,
+      expected: false,
+    },
+    {
+      name: 'matching active turn',
+      dataset: { fromActor: 'agent-a', turnId: 'turn-a', renderKey: 's:turn-a:0' },
+      activeTurns: [{ actor: 'agent-a', turn_id: 'turn-a' }],
+      inFlight: ['agent-a'],
+      authoritative: true,
+      expected: true,
+    },
+    {
+      name: 'unclaimed controller row',
+      dataset: {},
+      activeTurns: [{ actor: 'agent-a', turn_id: 'turn-a' }],
+      inFlight: ['agent-a'],
+      authoritative: true,
+      expected: true,
+    },
+    {
+      name: 'legacy snapshot without actor identity',
+      dataset: { fromActor: 'agent-a', turnId: 'turn-a', renderKey: 's:turn-a:0' },
+      activeTurns: [],
+      inFlight: [],
+      authoritative: false,
+      expected: true,
+    },
+  ])('classifies a $name for pending history recovery', ({
+    dataset, activeTurns, inFlight, authoritative, expected,
+  }) => {
+    const context = loadConversationRenderer();
+
+    expect(context._canReattachPendingLoadingEl(
+      { dataset }, activeTurns, inFlight, authoritative,
+    )).toBe(expected);
+  });
+
   it('recognizes a stale deleted-conversation result as recoverable', () => {
     const context = loadConversationRenderer();
 
