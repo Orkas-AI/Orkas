@@ -598,6 +598,22 @@ describe('chat-history-tools › shape', () => {
     expect(crossActionField.content).toContain('unsupported field(s): query');
   });
 
+  it('accepts schema-valid read paging metadata on search and ignores it', async () => {
+    writeConversation('search-page-compat', 'Search paging compatibility', [
+      { id: 'm0', ts: '2026-01-01T00:00:00Z', from: 'user', text: 'find schemaunionword here' },
+    ]);
+    const [, , chatHistory] = await createChatHistoryActions({ userId: TEST_UID });
+
+    const result = await chatHistory.execute({
+      action: 'search',
+      query: 'schemaunionword',
+      page: { mode: 'latest', count: 10 },
+    }, ctxFor());
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toContain('cid=search-page-compat');
+  });
+
   it('fails current scope closed when the host omitted the turn boundary', async () => {
     const [chatSearch, chatRead] = await createChatHistoryActions({
       userId: TEST_UID,
