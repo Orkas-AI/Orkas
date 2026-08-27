@@ -603,7 +603,10 @@ function createChatReadTool(opts: ChatHistoryToolsOpts): AgentTool {
 type ChatHistoryAction = 'search' | 'read';
 
 const CHAT_HISTORY_ACTION_FIELDS: Readonly<Record<ChatHistoryAction, ReadonlySet<string>>> = {
-  search: new Set(['action', 'query', 'k', 'scope', 'include_current']),
+  // `page` is part of the consolidated provider-visible schema. Some
+  // providers populate that schema-valid field even for search, so tolerate
+  // and ignore it instead of rejecting an otherwise valid search call.
+  search: new Set(['action', 'query', 'k', 'scope', 'include_current', 'page']),
   // Legacy flat paging fields remain execution-only for model calls copied
   // from an older conversation. The provider-visible schema advertises only
   // the tagged `page` contract.

@@ -396,6 +396,26 @@ describe('keyed rendering › silent turns', () => {
 });
 
 describe('keyed rendering › level-triggered placeholder reconciliation', () => {
+  it('moves pending recovery ownership to the actor in the latest active snapshot', () => {
+    const { context, container } = loadRenderer(CID);
+    const staleCommander = new FakeNode();
+    staleCommander.dataset.fromActor = 'commander';
+    staleCommander.dataset.turnId = TURN;
+    staleCommander.dataset.renderKey = `s:${TURN}:0`;
+    context.pendingConvs.set(CID, { loadingEl: staleCommander, aborted: false });
+
+    context._handleGroupBusEvent(CID, staleCommander, {
+      type: 'state_changed',
+      cid: CID,
+      state: { status: 'running', in_flight: ['agent-a'], active_recipient: 'agent-a' },
+      active_turns: [{ actor: 'agent-a', turn_id: 'turn-a' }],
+    });
+
+    const agentRow = container.rows.find((row) => row.dataset.fromActor === 'agent-a');
+    expect(agentRow).toBeTruthy();
+    expect(context.pendingConvs.get(CID).loadingEl).toBe(agentRow);
+  });
+
   it('removes an empty placeholder after its actor leaves the active snapshot', () => {
     const { context, container } = loadRenderer(CID);
 
