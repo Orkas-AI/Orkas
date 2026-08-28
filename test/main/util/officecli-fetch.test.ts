@@ -50,6 +50,21 @@ describe('fetch-officecli.cjs', () => {
     expect(`${r.stdout}\n${r.stderr}`).toContain('officecli-mac-arm64 missing');
   });
 
+  it('resolves the linux platform keys to pinned upstream assets', () => {
+    const r = spawnSync(TEST_NODE, [
+      path.join(process.cwd(), 'scripts', 'fetch-officecli.cjs'),
+      `--root=${tmpDir}`,
+      '--platform=linux-x64',
+      '--check',
+    ], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+    });
+
+    expect(r.status).toBe(1);
+    expect(`${r.stdout}\n${r.stderr}`).toContain('officecli-linux-x64 missing');
+  });
+
   it('resumes an existing partial download with a Range request', async () => {
     const ranges: Array<string | undefined> = [];
     fs.writeFileSync(path.join(tmpDir, 'LICENSE'), 'Apache-2.0');

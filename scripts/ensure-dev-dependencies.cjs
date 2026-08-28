@@ -4,6 +4,8 @@
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
+const { WHISPER_RUNTIME_CONTRACT } = require('../bin/runtime-gate.cjs');
+
 const pcRoot = path.resolve(__dirname, '..');
 
 function run(label, script, args = []) {
@@ -37,10 +39,18 @@ function main() {
       '--arch', process.arch,
     ]);
   }
-  run('Whisper', 'scripts/fetch-whisper.cjs', [
-    '--platform', process.platform,
-    '--arch', process.arch,
-  ]);
+  // Whisper ships pinned prebuilt CLIs for a fixed target list only. On hosts
+  // without a contract target the fetch script must keep failing (packaging
+  // gates rely on that strictness); here it is simply not required — speech
+  // transcription degrades to an actionable error at runtime instead.
+  if (WHISPER_RUNTIME_CONTRACT.targets[`${process.platform}-${process.arch}`]) {
+    run('Whisper', 'scripts/fetch-whisper.cjs', [
+      '--platform', process.platform,
+      '--arch', process.arch,
+    ]);
+  } else {
+    console.log(`[dev-deps] Whisper not provisioned for ${process.platform}-${process.arch}; skipping (local speech transcription unavailable)`);
+  }
   console.log('[dev-deps] built-in dependencies ready');
 }
 
