@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { createRequire } from 'node:module';
 import * as fs from 'node:fs';
+import * as crypto from 'node:crypto';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -18,6 +19,7 @@ const fetchWhisper = require('../../../scripts/fetch-whisper.cjs') as {
   runtimeVersion: (target: any) => string;
   targetOptions: (argv: string[]) => { platform: string; arch: string; force: boolean };
   writeCapabilityState: (dir: string, capability: { status: string; reason?: string }) => void;
+  writeLinuxFiles: (archive: string, dir: string, target: any) => void;
 };
 const { WHISPER_RUNTIME_CONTRACT } = require('../../../bin/runtime-gate.cjs') as {
   WHISPER_RUNTIME_CONTRACT: any;
@@ -63,6 +65,65 @@ describe('fetch-whisper', () => {
     expect(fetchWhisper.noticeForTarget(windows)).toContain('see LICENSE.openblas');
     expect(fetchWhisper.noticeForTarget(darwin)).toContain(`runtime version is ${WHISPER_RUNTIME_CONTRACT.version}`);
     expect(fetchWhisper.noticeForTarget(darwin)).not.toContain('LICENSE.openblas');
+  });
+
+  it.each(['x64', 'arm64'])('pins the official Linux %s archive and application-local runtime libraries', (arch) => {
+    const target = WHISPER_RUNTIME_CONTRACT.targets[`linux-${arch}`];
+    expect(fetchWhisper.runtimeVersion(target)).toBe('1.9.1');
+    expect(target.minimumGlibc).toBe('2.34');
+    expect(target.archive.url).toContain(`whisper-bin-ubuntu-${arch}.tar.gz`);
+    expect(target.archive.bytes).toBeGreaterThan(1_000_000);
+    expect(target.archive.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(Object.keys(fetchWhisper.expectedFiles(target))).toEqual(expect.arrayContaining([
+      'bin/whisper-cli',
+      'bin/libwhisper.so.1',
+      'bin/libggml.so.0',
+      'bin/libggml-base.so.0',
+      'models/ggml-base-q5_1.bin',
+      'LICENSE.whisper.cpp',
+      'LICENSE.model',
+    ]));
+    expect(fetchWhisper.noticeForTarget(target)).toContain('official whisper.cpp Ubuntu');
+  });
+
+  it('extracts only contracted Linux archive files and verifies them before installation', async () => {
+    const tar = await import('tar');
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-whisper-linux-archive-'));
+    tempDirs.push(root);
+    const sourceRoot = path.join(root, 'source');
+    const archiveRoot = path.join(sourceRoot, 'whisper-bin-ubuntu-x64');
+    fs.mkdirSync(archiveRoot, { recursive: true });
+    const cli = Buffer.from('fake linux whisper cli');
+    const library = Buffer.from('fake linux whisper library');
+    fs.writeFileSync(path.join(archiveRoot, 'whisper-cli'), cli);
+    fs.writeFileSync(path.join(archiveRoot, 'libwhisper.so.1.9.1'), library);
+    fs.writeFileSync(path.join(archiveRoot, 'unregistered'), 'must not be extracted');
+    const archive = path.join(root, 'runtime.tar.gz');
+    tar.c({ cwd: sourceRoot, file: archive, gzip: true, sync: true }, ['whisper-bin-ubuntu-x64']);
+    const record = (value: Buffer) => ({
+      bytes: value.length,
+      sha256: crypto.createHash('sha256').update(value).digest('hex'),
+      executable: true,
+    });
+    const target = {
+      files: {
+        'bin/whisper-cli': {
+          archivePath: 'whisper-bin-ubuntu-x64/whisper-cli',
+          ...record(cli),
+        },
+        'bin/libwhisper.so.1': {
+          archivePath: 'whisper-bin-ubuntu-x64/libwhisper.so.1.9.1',
+          ...record(library),
+        },
+      },
+    };
+    const destination = path.join(root, 'destination');
+
+    fetchWhisper.writeLinuxFiles(archive, destination, target);
+
+    expect(fs.readFileSync(path.join(destination, 'bin', 'whisper-cli'))).toEqual(cli);
+    expect(fs.readFileSync(path.join(destination, 'bin', 'libwhisper.so.1'))).toEqual(library);
+    expect(fs.existsSync(path.join(destination, 'unregistered'))).toBe(false);
   });
 
   it('persists an unsupported-CPU capability state without changing verified file records', () => {

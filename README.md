@@ -121,7 +121,7 @@ Yes. Beyond its own Commander and specialist agents, Orkas can drive external CL
 Claude Desktop is a single assistant; CrewAI and LangChain are code-first frameworks. Orkas is a local-first multi-agent desktop app: the Commander coordinates specialist agents, keeps data and keys local, and gives each agent its own private skills and memory. See the [full comparisons](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas).
 
 **Which platforms does Orkas support?**
-macOS (Apple Silicon and Intel) and Windows 10+ have packaged installers. glibc-based Linux x64/arm64 runs from source today, with no installer yet. Local speech transcription is not currently available on Linux. Alpine and other musl-based distributions are not supported. The source build needs Node 20+ and Python 3.
+macOS (Apple Silicon and Intel) and Windows 10+ have packaged installers. glibc 2.34+ Linux x64/arm64 runs from source today, with no installer yet. Local speech transcription is supported on Linux through the pinned whisper.cpp runtime prepared on first launch. Alpine and other musl-based distributions are not supported. The source bootstrap needs Node 20+; Python 3 and a C/C++ build toolchain are needed only when a native npm package has no compatible prebuilt binary and must be rebuilt locally.
 
 **Is Orkas free and open source?**
 Yes — the app is MIT licensed and free to use. Bring your own model keys and you pay only your model providers; Orkas never takes a cut. Optionally, the desktop app also offers a built-in **Orkas model** for people who don't want to manage API keys — that one is billed by Orkas in credits (membership or credit packs). It is entirely opt-in, and every other feature works on your own keys. [Pricing →](https://orkas.ai/pricing/?source=gh-orkas)
@@ -132,7 +132,7 @@ Yes — the app is MIT licensed and free to use. Bring your own model keys and y
 
 Want a packaged installer instead? See [Download](#download) above. To run from source — currently the way to run Orkas on Linux:
 
-**Requirements**: Node 20+ · Python 3 · macOS / Windows 10+ / glibc-based Linux x64 or arm64
+**Requirements**: Node 20+ · macOS / Windows 10+ / glibc 2.34+ Linux x64 or arm64. Keep Python 3 and a C/C++ build toolchain available for the uncommon native-module source-build fallback.
 
 ```bash
 git clone https://github.com/Orkas-AI/Orkas.git
@@ -141,9 +141,9 @@ cd Orkas
 run.cmd            # Windows
 ```
 
-Linux source runs currently require glibc. Alpine and other musl-based distributions are not supported, and local speech transcription is unavailable on Linux.
+Linux source runs require glibc 2.34+. Alpine and other musl-based distributions are not supported. Local speech transcription downloads and verifies the target-native whisper.cpp runtime and multilingual model during the first source launch.
 
-`run.sh` / `run.cmd` auto-installs dependencies and downloads the embedding model (~95 MB). First launch creates a workspace under `~/.orkas/` (macOS / Linux) or `<smallest non-system drive>:\.orkas\` (Windows). Then open **Settings → AI Providers** to add an API key or OAuth.
+`run.sh` / `run.cmd` installs the locked npm dependency tree and prepares the pinned Python, uv, Node, embedding model (~95 MB), OfficeCLI, FFmpeg, whisper.cpp, and multilingual speech model resources on first launch. Linux startup then verifies the platform-native modules and Whisper runtime under Electron's ABI before opening the app. OCR and Skill-specific Python packages are installed into isolated local environments when those features are first used. First launch creates a workspace under `~/.orkas/` (macOS / Linux) or `<smallest non-system drive>:\.orkas\` (Windows). Then open **Settings → AI Providers** to add an API key or OAuth.
 
 ---
 

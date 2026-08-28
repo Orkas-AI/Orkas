@@ -24,6 +24,9 @@ function shouldProvisionWhisper(platform = process.platform, arch = process.arch
 
 function main() {
   console.log(`[dev-deps] preparing built-in dependencies for ${process.platform}-${process.arch}`);
+  if (process.platform === 'linux') {
+    run('Linux host preflight', 'scripts/verify-linux-source-dependencies.cjs', ['--host-only']);
+  }
   run('notification permission addon', 'scripts/build-notification-permission-addon.cjs', [
     '--platform', process.platform,
     '--arch', process.arch,
@@ -54,6 +57,9 @@ function main() {
     ]);
   } else {
     console.log(`[dev-deps] Whisper not provisioned for ${process.platform}-${process.arch}; skipping (local speech transcription unavailable)`);
+  }
+  if (process.platform === 'linux') {
+    run('Linux source dependencies', 'scripts/verify-linux-source-dependencies.cjs');
   }
   console.log('[dev-deps] built-in dependencies ready');
 }

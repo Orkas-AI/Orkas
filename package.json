@@ -32,6 +32,9 @@
     "test:platform-native": "node scripts/run-platform-native-tests.mjs",
     "test:windows-native": "node scripts/run-windows-native-tests.mjs",
     "test:windows-stability": "node scripts/run-windows-stability-tests.mjs",
+    "test:linux-source": "node scripts/verify-linux-source-dependencies.cjs --full-embedding --gui",
+    "test:linux-ocr": "tsx scripts/verify-linux-ocr-runtime.mjs",
+    "test:linux-whisper": "ORKAS_REAL_WHISPER_TEST=1 node scripts/run-tests.mjs run --maxWorkers=1 -t \"Linux real bundled whisper transcribes within the performance budget\" test/main/features/video_studio_native_qa.test.ts",
     "runtime:ensure": "node bin/ensure-runtime.cjs --root resources/runtime",
     "officecli:policy-check": "node bin/officecli-policy-gate.cjs",
     "officecli:fetch": "node scripts/fetch-officecli.cjs && node bin/officecli-policy-gate.cjs --require-host-binary",
@@ -59,6 +62,7 @@
     "electron": "42.8.0",
     "ffmpeg-static": "^5.3.0",
     "semver": "7.8.5",
+    "tar": "7.5.21",
     "typescript": "^6.0.3",
     "vitest": "^4.1.5"
   },
@@ -82,6 +86,7 @@
     "zod": "^3.24.0"
   },
   "overrides": {
+    "@anush008/tokenizers": "0.6.0",
     "@hono/node-server": "2.0.11",
     "esbuild": "0.28.1",
     "tar": "7.5.21"
@@ -265,10 +270,6 @@
         ],
         "rfc3161TimeStampServer": "http://ts.ssl.com"
       }
-    },
-    "linux": {
-      "target": "AppImage",
-      "category": "Utility"
     }
   },
   "license": "MIT"

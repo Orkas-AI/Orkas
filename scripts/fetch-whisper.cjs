@@ -15,6 +15,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const AdmZip = require('adm-zip');
+const tar = require('tar');
 const { WHISPER_RUNTIME_CONTRACT } = require('../bin/runtime-gate.cjs');
 const { installWindowsVcRuntime } = require('./fetch-win-vc-runtime.cjs');
 
@@ -29,6 +30,24 @@ function runtimeVersion(target) {
 
 function noticeForTarget(target) {
   const version = runtimeVersion(target);
+  const windowsNotice = target.source?.startsWith('official-release-openblas') ? `
+The Windows CLI is the official whisper.cpp x64 release. Its required Microsoft
+Visual C++ runtime DLLs are deployed application-locally beside whisper-cli;
+Orkas does not install or modify the machine-wide Visual C++ Redistributable.
+Microsoft redistributable terms apply:
+  https://visualstudio.microsoft.com/license-terms/
+` : '';
+  const linuxNotice = target.source?.startsWith('official-release-ubuntu') ? `
+The Linux CLI and its CPU runtime libraries are the official whisper.cpp Ubuntu
+release for the target architecture. They are deployed application-locally
+beside whisper-cli and selected by the dynamic loader through the executable's
+origin-relative run path.
+` : '';
+  const macNotice = target.source === 'vendored-static-cli' ? `
+The macOS CLI is a static target-native build whose pinned source, toolchain,
+flags, size, and hash are documented in
+vendor/whisper/v${WHISPER_RUNTIME_CONTRACT.version}/BUILD.md.
+` : '';
   const openBlasNotice = target.openBlasVersion ? `
 Windows OpenBLAS acceleration:
   https://github.com/OpenMathLib/OpenBLAS/tree/v${target.openBlasVersion}
@@ -48,15 +67,10 @@ Multilingual Whisper base-q5_1 model:
   https://huggingface.co/ggerganov/whisper.cpp
   Derived from OpenAI Whisper; MIT; see LICENSE.model.
 
-The Windows CLI is the official whisper.cpp x64 release. Its required Microsoft
-Visual C++ runtime DLLs are deployed application-locally beside whisper-cli;
-Orkas does not install or modify the machine-wide Visual C++ Redistributable.
-Microsoft redistributable terms apply:
-  https://visualstudio.microsoft.com/license-terms/
-
+${windowsNotice}
+${linuxNotice}
+${macNotice}
 ${openBlasNotice}
-The macOS CLIs are static target-native builds whose pinned source, toolchain,
-flags, sizes, and hashes are documented in vendor/whisper/v${WHISPER_RUNTIME_CONTRACT.version}/BUILD.md.
 `;
 }
 
@@ -284,6 +298,38 @@ function writeWindowsFiles(archiveFile, tempDir, target) {
   }
 }
 
+function safeArchivePath(value) {
+  const normalized = String(value || '').replaceAll('\\', '/');
+  if (!normalized || normalized.startsWith('/') || normalized.split('/').includes('..')) {
+    throw new Error(`unsafe whisper.cpp archive path: ${value}`);
+  }
+  return normalized;
+}
+
+function writeLinuxFiles(archiveFile, tempDir, target) {
+  const extractDir = path.join(tempDir, '.archive');
+  const archivePaths = new Set(Object.values(target.files).map(expected => (
+    safeArchivePath(expected.archivePath)
+  )));
+  fs.mkdirSync(extractDir, { recursive: true });
+  try {
+    tar.x({
+      cwd: extractDir,
+      file: archiveFile,
+      filter: entryPath => archivePaths.has(safeArchivePath(entryPath)),
+      preservePaths: false,
+      strict: true,
+      sync: true,
+    });
+    for (const [relativePath, expected] of Object.entries(target.files)) {
+      const source = rel(extractDir, safeArchivePath(expected.archivePath));
+      copyPinned(source, rel(tempDir, relativePath), expected, expected.executable === true);
+    }
+  } finally {
+    fs.rmSync(extractDir, { recursive: true, force: true });
+  }
+}
+
 function writeWindowsAppLocalFiles(vcRuntimeDir, tempDir, target) {
   for (const [relativePath, expected] of Object.entries(target.appLocalFiles || {})) {
     copyPinned(path.join(vcRuntimeDir, path.basename(relativePath)), rel(tempDir, relativePath), expected, true);
@@ -376,6 +422,9 @@ async function installWhisper(options = targetOptions()) {
       const archive = await cachedDownload(target.archive.cacheName || `whisper-bin-x64-v${version}.zip`, target.archive);
       writeWindowsFiles(archive, tempDir, target);
       writeWindowsAppLocalFiles(vcRuntimeDir, tempDir, target);
+    } else if (options.platform === 'linux') {
+      const archive = await cachedDownload(target.archive.cacheName || `whisper-bin-ubuntu-${options.arch}-v${version}.tar.gz`, target.archive);
+      writeLinuxFiles(archive, tempDir, target);
     }
 
     const model = await cachedDownload('ggml-base-q5_1.bin', WHISPER_RUNTIME_CONTRACT.model);
@@ -413,5 +462,6 @@ module.exports = {
   runtimeVersion,
   targetOptions,
   writeCapabilityState,
+  writeLinuxFiles,
   writeWindowsAppLocalFiles,
 };

@@ -10,9 +10,18 @@ permissions:
   contents: read
 
 jobs:
-  linux-x64:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  linux-source:
+    name: Linux ${{ matrix.arch }} source
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
 
     steps:
       - name: Check out source
@@ -24,21 +33,50 @@ jobs:
           node-version: 24
           cache: npm
 
-      - name: Install JavaScript dependencies
-        run: npm ci --ignore-scripts
+      - name: Restore verified built-in dependency cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            resources/embedding-model
+            resources/officecli
+            resources/runtime/python
+            resources/runtime/uv
+            resources/runtime/node
+            resources/runtime/ffmpeg
+            resources/runtime/whisper
+          key: linux-source-${{ matrix.arch }}-${{ hashFiles('package-lock.json', 'resources/runtime/manifest.json', 'bin/runtime-gate.cjs', 'bin/packaged-resource-gate.cjs', 'scripts/fetch-embedding-model.mjs', 'scripts/fetch-officecli.cjs', 'scripts/fetch-ffmpeg.cjs', 'scripts/fetch-whisper.cjs') }}
 
-      - name: Run Linux dependency regressions
-        run: >-
-          node node_modules/vitest/vitest.mjs run
-          test/main/util/officecli-fetch.test.ts
-          test/main/util/ensure-dev-dependencies.test.ts
-          test/main/paths.test.ts
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Install Xvfb when the runner image does not provide it
+        run: |
+          if ! command -v xvfb-run >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes xvfb
+          fi
+
+      - name: Prepare and verify built-in Linux dependencies
+        run: node scripts/ensure-dev-dependencies.cjs
+
+      - name: Run Linux platform-native test lane
+        run: xvfb-run --auto-servernum npm run test:platform-native
 
       - name: Type-check
         run: node node_modules/typescript/bin/tsc --noEmit
 
-      - name: Fetch pinned Linux OfficeCLI
-        run: node scripts/fetch-officecli.cjs --platform=linux-x64
+      - name: Launch the real Orkas application and renderer
+        run: >-
+          ORKAS_E2E_SHOW_WINDOW=1 xvfb-run --auto-servernum
+          npm run test:e2e --
+          test/e2e/app_e2e_smoke.spec.ts
+          --grep "launches the hidden real renderer and preload bridge"
 
-      - name: Verify native OfficeCLI contract
-        run: node bin/officecli-policy-gate.cjs --require-host-binary
+      - name: Run native inference and Electron GUI smoke
+        run: xvfb-run --auto-servernum npm run test:linux-source
+
+      - name: Run real Linux local transcription smoke
+        run: npm run test:linux-whisper
+
+      - name: Verify first-use Linux OCR runtime
+        run: npm run test:linux-ocr

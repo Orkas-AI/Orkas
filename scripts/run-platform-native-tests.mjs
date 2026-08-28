@@ -8,17 +8,17 @@ const here = dirname(fileURLToPath(import.meta.url));
 const pcRoot = resolve(here, '..');
 const runner = resolve(here, 'run-tests.mjs');
 
-if (process.platform !== 'win32' && process.platform !== 'darwin') {
+if (!['win32', 'darwin', 'linux'].includes(process.platform)) {
   console.log(`[platform-native-tests] skipped: unsupported host ${process.platform}`);
   process.exit(0);
 }
 
 // Keep system/native tests explicit and serial. This lane intentionally
-// overlaps the general suite: a Windows-only process-tree or PowerShell case
-// must remain visible as a dedicated CI failure instead of being buried among
-// hundreds of platform-neutral tests. Real bundled Whisper remains the
-// release-only `test:windows-native` lane because it requires downloaded
-// FFmpeg, model, VC runtime, and CPU-dispatch payloads.
+// overlaps the general suite: host-specific process, native-module, and OS
+// integration cases must remain visible as a dedicated CI failure instead of
+// being buried among hundreds of platform-neutral tests. Real bundled Whisper
+// runs after dependency provisioning in the platform-specific Windows and
+// Linux lanes because it requires downloaded FFmpeg, model, and native payloads.
 const commonSuites = [
   'src/core-agent/test/oauth-flow.test.ts',
   'src/core-agent/test/tools.test.ts',
@@ -57,12 +57,19 @@ const platformSuites = process.platform === 'win32'
       'test/main/util/prepare-win-native-deps.test.ts',
       'test/main/util/fetch-win-vc-runtime.test.ts',
     ]
-  : [
-      'test/main/features/platform-foundations.test.ts',
-      'test/main/features/user_workspace.test.ts',
-      'test/main/conversation-files.test.ts',
-      'test/main/native/notification-permissions-darwin.test.ts',
-    ];
+  : process.platform === 'darwin'
+    ? [
+        'test/main/features/platform-foundations.test.ts',
+        'test/main/features/user_workspace.test.ts',
+        'test/main/conversation-files.test.ts',
+        'test/main/native/notification-permissions-darwin.test.ts',
+      ]
+    : [
+        'test/main/util/linux-source-dependencies.test.ts',
+        'test/main/util/officecli-fetch.test.ts',
+        'test/main/util/ensure-dev-dependencies.test.ts',
+        'test/main/util/ensure-sqlite-electron-abi.test.ts',
+      ];
 
 console.log(`[platform-native-tests] host=${process.platform}; suites=${commonSuites.length + platformSuites.length}`);
 const result = spawnSync(process.execPath, [

@@ -4920,13 +4920,22 @@ describe('native VideoStudio draft QA parity', () => {
     expect(resolveSpeechTranscribeBackend()).toEqual({ cli, model, source: 'bundled' });
   });
 
-  it.runIf(process.platform === 'win32' && process.env.ORKAS_REAL_WHISPER_TEST === '1')(
-    'Windows real bundled whisper transcribes within the performance budget', async () => {
+  const realWhisperPlatform = process.platform === 'win32'
+    ? 'Windows'
+    : process.platform === 'linux' ? 'Linux' : process.platform;
+  it.runIf(['win32', 'linux'].includes(process.platform) && process.env.ORKAS_REAL_WHISPER_TEST === '1')(
+    `${realWhisperPlatform} real bundled whisper transcribes within the performance budget`, async () => {
       const p = tmpProject('bundled-whisper');
       const input = path.join(p.root, 'raw.mp4');
       const transcript = path.join(p.root, 'project', 'transcript.json');
       const runtimeRoot = path.resolve(process.cwd(), 'resources', 'runtime');
-      const ffmpeg = path.join(runtimeRoot, 'ffmpeg', 'win32-x64', 'ffmpeg.exe');
+      const runtimeKey = `${process.platform}-${process.arch}`;
+      const ffmpeg = path.join(
+        runtimeRoot,
+        'ffmpeg',
+        runtimeKey,
+        process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg',
+      );
       const generated = spawnSync(ffmpeg, [
         '-hide_banner', '-loglevel', 'error', '-y',
         '-f', 'lavfi', '-i', 'anullsrc=r=16000:cl=mono:d=0.2', input,
