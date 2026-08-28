@@ -49,21 +49,21 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
-      - name: Run Linux platform-native test lane
-        run: npm run test:platform-native
-
-      - name: Type-check
-        run: node node_modules/typescript/bin/tsc --noEmit
-
-      - name: Prepare and verify built-in Linux dependencies
-        run: node scripts/ensure-dev-dependencies.cjs
-
       - name: Install Xvfb when the runner image does not provide it
         run: |
           if ! command -v xvfb-run >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install --yes xvfb
           fi
+
+      - name: Prepare and verify built-in Linux dependencies
+        run: node scripts/ensure-dev-dependencies.cjs
+
+      - name: Run Linux platform-native test lane
+        run: xvfb-run --auto-servernum npm run test:platform-native
+
+      - name: Type-check
+        run: node node_modules/typescript/bin/tsc --noEmit
 
       - name: Run native inference and Electron GUI smoke
         run: xvfb-run --auto-servernum npm run test:linux-source

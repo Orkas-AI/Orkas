@@ -148,6 +148,7 @@ describe('Linux source dependency contract', () => {
     expect(workflow).toMatch(/run:\s+npm ci\s*$/m);
     expect(workflow).not.toContain('npm ci --ignore-scripts');
     expect(workflow).toContain('node scripts/ensure-dev-dependencies.cjs');
+    expect(workflow).toContain('xvfb-run --auto-servernum npm run test:platform-native');
     expect(workflow).toContain('xvfb-run --auto-servernum npm run test:linux-source');
     expect(workflow).toContain('npm run test:linux-whisper');
     expect(workflow).toContain('npm run test:linux-ocr');
@@ -165,6 +166,10 @@ describe('Linux source dependency contract', () => {
     );
     expect(dependencyProvisioner).toContain("run('Linux host preflight'");
     expect(dependencyProvisioner).toContain("run('Linux source dependencies'");
+
+    expect(workflow.indexOf('node scripts/ensure-dev-dependencies.cjs')).toBeLessThan(
+      workflow.indexOf('xvfb-run --auto-servernum npm run test:platform-native'),
+    );
 
     const launcher = fs.readFileSync(path.join(process.cwd(), 'run.sh'), 'utf8');
     expect(launcher).toContain('Node.js 20+ is required to bootstrap the source checkout');
