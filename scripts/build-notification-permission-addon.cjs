@@ -37,6 +37,10 @@ function removeDarwinOutputs(exceptArch = null, root = outputDir) {
  * binary, whose dist ships no headers. `npm_node_execpath` is the Node that
  * launched the npm script, which is where a nvm/fnm install keeps its headers
  * — without it, a machine with no Homebrew or system Node cannot build at all.
+ * `ORKAS_TEST_NODE` is the same outer Node, stamped by `scripts/run-tests.mjs`
+ * itself: it covers the runner being invoked directly (`node
+ * scripts/run-tests.mjs ...`), where npm sets no variables at all and the
+ * whole macOS suite would otherwise fail to build for the wrong reason.
  */
 function findNodeHeaders({
   env = process.env,
@@ -48,6 +52,7 @@ function findNodeHeaders({
     env.npm_config_nodedir && path.resolve(env.npm_config_nodedir, 'include', 'node'),
     includeDirOf(execPath),
     env.npm_node_execpath && includeDirOf(env.npm_node_execpath),
+    env.ORKAS_TEST_NODE && includeDirOf(env.ORKAS_TEST_NODE),
     '/opt/homebrew/include/node',
     '/usr/local/include/node',
     '/usr/include/node',
