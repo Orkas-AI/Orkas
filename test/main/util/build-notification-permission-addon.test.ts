@@ -194,6 +194,16 @@ describe('notification permission native addon build', () => {
       exists: has(nodedirHeaders, nvmHeaders),
     })).toBe(nodedirHeaders);
 
+    // Invoking `scripts/run-tests.mjs` directly sets none of npm's variables,
+    // so the runner's own record of the outer Node has to carry the lookup —
+    // otherwise the macOS native suite fails on the harness rather than on the
+    // behavior it covers.
+    expect(addonBuilder.findNodeHeaders({
+      env: { ORKAS_TEST_NODE: nvmNode },
+      execPath: electron,
+      exists: has(nvmHeaders),
+    })).toBe(nvmHeaders);
+
     // Negative control: with nothing available it must fail loudly and name
     // the escape hatch, never hand the compiler a directory that is not there.
     expect(() => addonBuilder.findNodeHeaders({

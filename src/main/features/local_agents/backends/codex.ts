@@ -1102,21 +1102,16 @@ export function buildCodexTurnRuntimeOverrides(
   };
 }
 
-export const CODEX_OPENAI_HTTP_TRANSPORT_OVERRIDE =
-  'model_providers.openai.supports_websockets=false';
-
 export function buildCodexArgs(opts: BackendRunOptions): string[] {
   // Per multica: `codex app-server --listen stdio://` is the entry
   // point for the JSON-RPC protocol. customArgs trail.
-  // Keep the provider stream on HTTPS/SSE. A Responses WebSocket can remain
-  // half-open after an output-item start: Codex then emits neither app-server
-  // progress nor a transport failure, so its built-in HTTPS fallback never
-  // runs. SSE retains Codex's own idle detection/retry without imposing an
-  // Orkas-side deadline or cancelling a turn that may still recover.
-  const args = [
-    'app-server', '--listen', 'stdio://',
-    '-c', CODEX_OPENAI_HTTP_TRANSPORT_OVERRIDE,
-  ];
+  // Keep Codex's built-in OpenAI provider intact. Current Codex versions
+  // reserve that provider id and reject `model_providers.openai.*` overrides
+  // before JSON-RPC initialization; ChatGPT login also relies on the built-in
+  // provider owning its WebSocket-to-HTTPS fallback. Orkas observes Codex
+  // retry events and applies its process watchdog, but does not select the
+  // provider transport itself.
+  const args = ['app-server', '--listen', 'stdio://'];
   // orkas-bridge: codex takes config-layer overrides (`-c key=value`,
   // TOML-parsed) instead of a config file. Codex spawns stdio MCP servers
   // with a sanitized env (PATH/HOME only) — it does NOT inherit this Codex
