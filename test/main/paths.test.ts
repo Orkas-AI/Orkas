@@ -81,6 +81,22 @@ describe('paths › top-level (users.json / device.json / logs / venv)', () => {
   });
 });
 
+describe('paths › OfficeCLI runtime', () => {
+  it.each([
+    ['linux', 'x64', 'officecli-linux-x64'],
+    ['linux', 'arm64', 'officecli-linux-arm64'],
+  ])('resolves the bundled %s-%s asset', async (platform, arch, asset) => {
+    const p = await import('../../src/main/paths');
+    expect(p.officeCliBinaryPath(platform, arch))
+      .toBe(path.join(p.PC_ROOT, 'resources', 'officecli', asset));
+  });
+
+  it('returns null for an unsupported platform target', async () => {
+    const p = await import('../../src/main/paths');
+    expect(p.officeCliBinaryPath('freebsd', 'x64')).toBeNull();
+  });
+});
+
 describe('paths › cloud-synced per-user', () => {
   it('chats / attachments / sessions / contexts / memory land under <uid>/cloud/', async () => {
     const p = await import('../../src/main/paths');

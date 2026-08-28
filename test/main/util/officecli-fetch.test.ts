@@ -6,6 +6,10 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+const OFFICECLI_SPEC = require(path.join(process.cwd(), 'scripts', 'fetch-officecli.cjs')) as {
+  ASSETS: Readonly<Record<string, string>>;
+  SHA256: Readonly<Record<string, string>>;
+};
 
 let tmpDir: string;
 
@@ -50,11 +54,17 @@ describe('fetch-officecli.cjs', () => {
     expect(`${r.stdout}\n${r.stderr}`).toContain('officecli-mac-arm64 missing');
   });
 
-  it('resolves the linux platform keys to pinned upstream assets', () => {
+  it.each([
+    ['linux-x64', 'officecli-linux-x64', 'da07d4f787d7c85724104294ac023c89971ddfaee93ebb183b289282b8f869cc'],
+    ['linux-arm64', 'officecli-linux-arm64', '39008c7f76d202858637810553ef14e2cd3e7f61485fdcf2011f26967a7babd1'],
+  ])('resolves %s to its pinned upstream asset', (platform, asset, sha256) => {
+    expect(OFFICECLI_SPEC.ASSETS[platform]).toBe(asset);
+    expect(OFFICECLI_SPEC.SHA256[asset]).toBe(sha256);
+
     const r = spawnSync(TEST_NODE, [
       path.join(process.cwd(), 'scripts', 'fetch-officecli.cjs'),
       `--root=${tmpDir}`,
-      '--platform=linux-x64',
+      `--platform=${platform}`,
       '--check',
     ], {
       cwd: process.cwd(),
@@ -62,7 +72,7 @@ describe('fetch-officecli.cjs', () => {
     });
 
     expect(r.status).toBe(1);
-    expect(`${r.stdout}\n${r.stderr}`).toContain('officecli-linux-x64 missing');
+    expect(`${r.stdout}\n${r.stderr}`).toContain(`${asset} missing`);
   });
 
   it('resumes an existing partial download with a Range request', async () => {

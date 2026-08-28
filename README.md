@@ -57,7 +57,7 @@ Installed and ready the first time you launch Orkas — each with its own skills
 
 ## Download
 
-Packaged installers for macOS and Windows. Linux runs from source today — see [Quick start](#quick-start).
+Packaged installers for macOS and Windows. glibc-based Linux x64/arm64 runs from source today — see [Quick start](#quick-start).
 
 - **macOS Apple Silicon** → [Orkas-mac-arm64.dmg](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=mac&arch=arm64&download=1)
 - **macOS Intel** → [Orkas-mac-x64.dmg](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=mac&arch=x64&download=1)
@@ -121,7 +121,7 @@ Yes. Beyond its own Commander and specialist agents, Orkas can drive external CL
 Claude Desktop is a single assistant; CrewAI and LangChain are code-first frameworks. Orkas is a local-first multi-agent desktop app: the Commander coordinates specialist agents, keeps data and keys local, and gives each agent its own private skills and memory. See the [full comparisons](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas).
 
 **Which platforms does Orkas support?**
-macOS (Apple Silicon and Intel) and Windows 10+ have packaged installers. Linux runs from source today — same app, no installer yet. The source build needs Node 20+ and Python 3.
+macOS (Apple Silicon and Intel) and Windows 10+ have packaged installers. glibc-based Linux x64/arm64 runs from source today, with no installer yet. Local speech transcription is not currently available on Linux. Alpine and other musl-based distributions are not supported. The source build needs Node 20+ and Python 3.
 
 **Is Orkas free and open source?**
 Yes — the app is MIT licensed and free to use. Bring your own model keys and you pay only your model providers; Orkas never takes a cut. Optionally, the desktop app also offers a built-in **Orkas model** for people who don't want to manage API keys — that one is billed by Orkas in credits (membership or credit packs). It is entirely opt-in, and every other feature works on your own keys. [Pricing →](https://orkas.ai/pricing/?source=gh-orkas)
@@ -132,7 +132,7 @@ Yes — the app is MIT licensed and free to use. Bring your own model keys and y
 
 Want a packaged installer instead? See [Download](#download) above. To run from source — currently the way to run Orkas on Linux:
 
-**Requirements**: Node 20+ · Python 3 · macOS / Windows 10+ / recent Linux
+**Requirements**: Node 20+ · Python 3 · macOS / Windows 10+ / glibc-based Linux x64 or arm64
 
 ```bash
 git clone https://github.com/Orkas-AI/Orkas.git
@@ -140,6 +140,8 @@ cd Orkas
 ./run.sh           # macOS / Linux
 run.cmd            # Windows
 ```
+
+Linux source runs currently require glibc. Alpine and other musl-based distributions are not supported, and local speech transcription is unavailable on Linux.
 
 `run.sh` / `run.cmd` auto-installs dependencies and downloads the embedding model (~95 MB). First launch creates a workspace under `~/.orkas/` (macOS / Linux) or `<smallest non-system drive>:\.orkas\` (Windows). Then open **Settings → AI Providers** to add an API key or OAuth.
 

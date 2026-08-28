@@ -708,15 +708,19 @@ const OFFICECLI_ASSETS: Readonly<Record<string, string>> = {
   'win32-arm64': 'officecli-win-arm64.exe',
 };
 
-/** Absolute path to the OfficeCLI binary for the current platform/arch, or
- *  null when no asset ships for it. Shipped via electron-builder
+/** Absolute path to the OfficeCLI binary for the requested platform/arch
+ *  (the current host by default), or null when no asset ships for it. Shipped
+ *  via electron-builder
  *  `extraResources`:
  *    dev:    PC/resources/officecli/
  *    packed: <app>/Contents/Resources/officecli/   (darwin)
  *            <app>/resources/officecli/             (win/linux)
  */
-export function officeCliBinaryPath(): string | null {
-  const asset = OFFICECLI_ASSETS[`${process.platform}-${process.arch}`];
+export function officeCliBinaryPath(
+  platform: string = process.platform,
+  arch: string = process.arch,
+): string | null {
+  const asset = OFFICECLI_ASSETS[`${platform}-${arch}`];
   if (!asset) return null;
   const rp = (process as unknown as { resourcesPath?: string }).resourcesPath;
   const dir = (rp && !rp.includes(`${path.sep}node_modules${path.sep}electron${path.sep}`))

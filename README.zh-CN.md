@@ -57,7 +57,7 @@ Orkas 是一个开源、本地优先的多智能体桌面应用。你描述目�
 
 ## 下载
 
-macOS 和 Windows 提供安装包。Linux 目前需从源码运行 —— 见 [快速开始](#快速开始)。
+macOS 和 Windows 提供安装包。基于 glibc 的 Linux x64/arm64 目前需从源码运行 —— 见 [快速开始](#快速开始)。
 
 - **macOS Apple 芯片** → [Orkas-mac-arm64.dmg](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=mac&arch=arm64&download=1)
 - **macOS Intel** → [Orkas-mac-x64.dmg](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=mac&arch=x64&download=1)
@@ -121,7 +121,7 @@ Orkas 是一个开源、本地优先的多智能体桌面应用。一个超强�
 Claude Desktop 是单个助理；CrewAI 和 LangChain 是代码优先的框架。Orkas 是一个本地优先的多智能体桌面应用：指挥官协调多个专业智能体，数据与 key 留在本地，每个智能体拥有私有技能与记忆。见[逐项对比](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas)。
 
 **支持哪些平台？**
-macOS（Apple 芯片与 Intel）和 Windows 10+ 提供安装包。Linux 目前从源码运行 —— 功能相同，只是还没有安装包。源码运行需要 Node 20+ 与 Python 3。
+macOS（Apple 芯片与 Intel）和 Windows 10+ 提供安装包。基于 glibc 的 Linux x64/arm64 目前从源码运行，暂时没有安装包，且本地语音转写功能不可用。当前不支持 Alpine 及其他基于 musl 的发行版。源码运行需要 Node 20+ 与 Python 3。
 
 **Orkas 免费且开源吗？**
 是的 —— 应用本身 MIT 许可证、免费使用。自带模型 key 时，你只需为你的模型服务商付费，Orkas 不抽成。此外，桌面版还提供一个可选的内置 **Orkas 模型**，供不想自己配置 key 的用户使用 —— 这部分由 Orkas 按 credits 计费（会员或 credits 包）。它完全可选，其余所有功能用你自己的 key 即可。[价格 →](https://orkas.ai/pricing/?source=gh-orkas)
@@ -132,7 +132,7 @@ macOS（Apple 芯片与 Intel）和 Windows 10+ 提供安装包。Linux 目前�
 
 想直接用安装包？见上方 [下载](#下载)。以下是从源码运行的方式 —— 也是目前在 Linux 上运行 Orkas 的方式：
 
-**环境要求**：Node 20+ · Python 3 · macOS / Windows 10+ / 较新的 Linux
+**环境要求**：Node 20+ · Python 3 · macOS / Windows 10+ / 基于 glibc 的 Linux x64 或 arm64
 
 ```bash
 git clone https://github.com/Orkas-AI/Orkas.git
@@ -140,6 +140,8 @@ cd Orkas
 ./run.sh           # macOS / Linux
 run.cmd            # Windows
 ```
+
+Linux 源码运行目前需要 glibc，不支持 Alpine 及其他基于 musl 的发行版；本地语音转写功能在 Linux 上也暂不可用。
 
 `run.sh` / `run.cmd` 会自动安装依赖并下载嵌入模型（约 95 MB）。首次启动会在 `~/.orkas/`（macOS / Linux）或 `<最小的非系统盘>:\.orkas\`（Windows）下创建工作区。随后进入 **设置 → AI 服务商** 配置 API key 或 OAuth。
 
