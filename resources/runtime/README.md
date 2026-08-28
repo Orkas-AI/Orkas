@@ -35,6 +35,8 @@ runtime/
       python/python.exe         # Windows python-build-standalone
     darwin-arm64/
     darwin-x64/
+    linux-arm64/
+    linux-x64/
     win32-x64/
   uv/
     current/
@@ -42,6 +44,8 @@ runtime/
       uv.exe
     darwin-arm64/
     darwin-x64/
+    linux-arm64/
+    linux-x64/
     win32-x64/
   node/
     current/
@@ -51,7 +55,19 @@ runtime/
       node.exe                 # Windows official Node archive
     darwin-arm64/
     darwin-x64/
+    linux-arm64/
+    linux-x64/
     win32-x64/
+  ffmpeg/
+    linux-arm64/
+    linux-x64/
+  whisper/
+    linux-arm64/
+      bin/whisper-cli
+      models/ggml-base-q5_1.bin
+    linux-x64/
+      bin/whisper-cli
+      models/ggml-base-q5_1.bin
 ```
 
 The app resolves `current` first, then `<platform>-<arch>`. It injects

@@ -12,13 +12,13 @@ describe('ensure-dev-dependencies.cjs', () => {
     ['darwin', 'arm64'],
     ['darwin', 'x64'],
     ['win32', 'x64'],
+    ['linux', 'x64'],
+    ['linux', 'arm64'],
   ])('keeps Whisper required for supported target %s-%s', (platform, arch) => {
     expect(shouldProvisionWhisper(platform, arch)).toBe(true);
   });
 
   it.each([
-    ['linux', 'x64'],
-    ['linux', 'arm64'],
     ['win32', 'arm64'],
   ])('does not provision Whisper for unsupported target %s-%s', (platform, arch) => {
     expect(shouldProvisionWhisper(platform, arch)).toBe(false);
