@@ -4,7 +4,6 @@ import { buildClaudeArgs } from '../../../../src/main/features/local_agents/back
 import {
   buildCodexArgs,
   buildCodexBridgeOverrides,
-  CODEX_OPENAI_HTTP_TRANSPORT_OVERRIDE,
   codexDeveloperInstructions,
   codexThreadDeveloperInstructionParams,
 } from '../../../../src/main/features/local_agents/backends/codex';
@@ -64,19 +63,16 @@ describe('claude bridge args', () => {
 });
 
 describe('codex bridge overrides', () => {
-  it('uses the recoverable HTTP response stream while leaving user overrides last', () => {
-    const userOverride = 'model_providers.openai.supports_websockets=true';
+  it('keeps the reserved OpenAI provider intact while leaving user overrides last', () => {
+    const userOverride = 'model="gpt-5.6-sol"';
     const args = buildCodexArgs({
       ...BASE,
       customArgs: ['-c', userOverride],
     });
 
-    expect(args.slice(0, 5)).toEqual([
-      'app-server', '--listen', 'stdio://',
-      '-c', CODEX_OPENAI_HTTP_TRANSPORT_OVERRIDE,
-    ]);
-    expect(args.lastIndexOf(userOverride))
-      .toBeGreaterThan(args.indexOf(CODEX_OPENAI_HTTP_TRANSPORT_OVERRIDE));
+    expect(args.slice(0, 3)).toEqual(['app-server', '--listen', 'stdio://']);
+    expect(args.filter(arg => arg.startsWith('model_providers.openai'))).toEqual([]);
+    expect(args.slice(-2)).toEqual(['-c', userOverride]);
   });
 
   it('emits TOML-quoted -c overrides for command/args and non-secret env', () => {
