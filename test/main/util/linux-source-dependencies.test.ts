@@ -149,6 +149,8 @@ describe('Linux source dependency contract', () => {
     expect(workflow).not.toContain('npm ci --ignore-scripts');
     expect(workflow).toContain('node scripts/ensure-dev-dependencies.cjs');
     expect(workflow).toContain('xvfb-run --auto-servernum npm run test:platform-native');
+    expect(workflow).toContain('ORKAS_E2E_SHOW_WINDOW=1 xvfb-run --auto-servernum');
+    expect(workflow).toContain('test/e2e/app_e2e_smoke.spec.ts');
     expect(workflow).toContain('xvfb-run --auto-servernum npm run test:linux-source');
     expect(workflow).toContain('npm run test:linux-whisper');
     expect(workflow).toContain('npm run test:linux-ocr');

@@ -65,6 +65,13 @@ jobs:
       - name: Type-check
         run: node node_modules/typescript/bin/tsc --noEmit
 
+      - name: Launch the real Orkas application and renderer
+        run: >-
+          ORKAS_E2E_SHOW_WINDOW=1 xvfb-run --auto-servernum
+          npm run test:e2e --
+          test/e2e/app_e2e_smoke.spec.ts
+          --grep "launches the hidden real renderer and preload bridge"
+
       - name: Run native inference and Electron GUI smoke
         run: xvfb-run --auto-servernum npm run test:linux-source
 
