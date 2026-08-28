@@ -18,6 +18,10 @@ function run(label, script, args = []) {
   if (result.status !== 0) throw new Error(`${label} failed with status ${result.status}`);
 }
 
+function shouldProvisionWhisper(platform = process.platform, arch = process.arch) {
+  return Boolean(WHISPER_RUNTIME_CONTRACT.targets[`${platform}-${arch}`]);
+}
+
 function main() {
   console.log(`[dev-deps] preparing built-in dependencies for ${process.platform}-${process.arch}`);
   run('notification permission addon', 'scripts/build-notification-permission-addon.cjs', [
@@ -43,7 +47,7 @@ function main() {
   // without a contract target the fetch script must keep failing (packaging
   // gates rely on that strictness); here it is simply not required — speech
   // transcription degrades to an actionable error at runtime instead.
-  if (WHISPER_RUNTIME_CONTRACT.targets[`${process.platform}-${process.arch}`]) {
+  if (shouldProvisionWhisper(process.platform, process.arch)) {
     run('Whisper', 'scripts/fetch-whisper.cjs', [
       '--platform', process.platform,
       '--arch', process.arch,
@@ -54,9 +58,13 @@ function main() {
   console.log('[dev-deps] built-in dependencies ready');
 }
 
-try {
-  main();
-} catch (err) {
-  console.error(`[dev-deps] failed: ${err.message}`);
-  process.exit(1);
+module.exports = Object.freeze({ shouldProvisionWhisper });
+
+if (require.main === module) {
+  try {
+    main();
+  } catch (err) {
+    console.error(`[dev-deps] failed: ${err.message}`);
+    process.exit(1);
+  }
 }

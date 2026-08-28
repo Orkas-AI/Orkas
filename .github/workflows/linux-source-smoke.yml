@@ -1,0 +1,44 @@
+name: Linux source smoke
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install JavaScript dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Run Linux dependency regressions
+        run: >-
+          node node_modules/vitest/vitest.mjs run
+          test/main/util/officecli-fetch.test.ts
+          test/main/util/ensure-dev-dependencies.test.ts
+          test/main/paths.test.ts
+
+      - name: Type-check
+        run: node node_modules/typescript/bin/tsc --noEmit
+
+      - name: Fetch pinned Linux OfficeCLI
+        run: node scripts/fetch-officecli.cjs --platform=linux-x64
+
+      - name: Verify native OfficeCLI contract
+        run: node bin/officecli-policy-gate.cjs --require-host-binary
