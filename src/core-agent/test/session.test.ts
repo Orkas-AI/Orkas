@@ -1908,6 +1908,58 @@ describe("Session execution plan anchor", () => {
     expect(session.estimateModelTokens()).toBe(tokensBeforeCommandObservation);
   });
 
+  it("keeps workspace state outside a parallel tool-result cluster", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Write the manifest and render the image" }]);
+    session.addAssistantMessage([
+      {
+        type: "tool_use",
+        id: "write-manifest",
+        name: "write_file",
+        input: { path: "/workspace/manifest.json" },
+      },
+      {
+        type: "tool_use",
+        id: "render-image",
+        name: "image_studio",
+        input: { manifest: "/workspace/manifest.json" },
+      },
+    ]);
+    session.recordToolObservations({
+      toolCallId: "write-manifest",
+      tool: "write_file",
+      observations: {
+        fileChanges: [{
+          operation: "create",
+          sourcePath: "/workspace/manifest.json",
+          beforeExists: false,
+          afterExists: true,
+          afterHash: "sha256:manifest",
+          coverage: "exact",
+        }],
+      },
+    });
+    session.addToolResult("write-manifest", "MANIFEST_WRITTEN", undefined, false);
+    session.addToolResult("render-image", "E_MANIFEST_REFERENCE_ROLE", undefined, true);
+
+    const modelView = session.getMessagesForModel();
+    const indexOfContent = (predicate: (content: typeof modelView[number]["content"][number]) => boolean) => (
+      modelView.findIndex((message) => message.content.some(predicate))
+    );
+    const writeResultIndex = indexOfContent((content) => (
+      content.type === "tool_result" && content.toolUseId === "write-manifest"
+    ));
+    const renderResultIndex = indexOfContent((content) => (
+      content.type === "tool_result" && content.toolUseId === "render-image"
+    ));
+    const workspaceIndex = indexOfContent((content) => (
+      content.type === "text" && content.text.startsWith("[Workspace changes")
+    ));
+
+    expect(renderResultIndex).toBe(writeResultIndex + 1);
+    expect(workspaceIndex).toBe(renderResultIndex + 1);
+  });
+
   it("moves the workspace anchor only after the latest causal file change", () => {
     const session = new Session();
     session.beginUserTurn([{ type: "text", text: "Update both files in order" }]);

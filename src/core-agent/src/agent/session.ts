@@ -1176,10 +1176,11 @@ export class Session {
 
       // Workspace state is persistent structured evidence. When its latest
       // file change has a visible causal tool result, place the net state
-      // immediately after that result so later read/command rounds can reuse it
-      // as prefix. If checkpointing hides the result, place it after the
-      // checkpoint; unattributed reconciliation remains conservatively at the
-      // tail. Visible command results are not repeated in this projection.
+      // immediately after that result's complete provider tool-result cluster
+      // so later read/command rounds can reuse it as prefix without splitting
+      // parallel tool responses. If checkpointing hides the result, place it
+      // after the checkpoint; unattributed reconciliation remains
+      // conservatively at the tail. Visible command results are not repeated.
       //
       // Completed work and the plan remain deterministic tail state.
       // Completed-work entries whose exact raw tool_result is still present in
@@ -1202,7 +1203,7 @@ export class Session {
             content: [{ type: "text", text: markPrivateRuntimeContext(workspace.text) }],
           };
           const anchoredIndex = workspace.anchorToolCallId
-            ? insertionIndexAfterToolResult(result, workspace.anchorToolCallId)
+            ? insertionIndexAfterToolResultCluster(result, workspace.anchorToolCallId)
             : undefined;
           const insertionIndex = anchoredIndex
             ?? (workspace.anchorToolCallId && checkpointContextIndex !== undefined
@@ -2891,7 +2892,7 @@ function visibleToolResultIds(messages: readonly Message[]): Set<string> {
   return ids;
 }
 
-function insertionIndexAfterToolResult(
+function insertionIndexAfterToolResultCluster(
   messages: readonly Message[],
   toolCallId: string,
 ): number | undefined {
@@ -2900,14 +2901,18 @@ function insertionIndexAfterToolResult(
   )));
   if (resultIndex < 0) return undefined;
   let insertionIndex = resultIndex + 1;
-  // Tool-result images are separate user messages by provider contract. Keep
-  // those trailers attached to the result rather than inserting runtime state
-  // between the text result and its image evidence.
+  // A single assistant message can declare several tool calls. Session stores
+  // each result (and any image trailer) as a separate user message, but the
+  // provider protocol treats the entire consecutive sequence as one atomic
+  // response cluster. Inserting host runtime context after only the anchored
+  // result would detach every later tool result from assistant.tool_calls.
   while (
     insertionIndex < messages.length
     && messages[insertionIndex].role === "user"
     && messages[insertionIndex].content.length > 0
-    && messages[insertionIndex].content.every((content) => content.type === "image")
+    && messages[insertionIndex].content.every((content) => (
+      content.type === "tool_result" || content.type === "image"
+    ))
   ) {
     insertionIndex++;
   }
