@@ -19,6 +19,7 @@ import {
 } from '../../../../src/main/features/local_agents/registry';
 
 const isWindows = process.platform === 'win32';
+const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 
 describe('local CLI context capabilities', () => {
   it('declares the complete conversation contract for every registered backend', () => {
@@ -229,7 +230,9 @@ function writeArgAwareMockCli(
 // script must not use a `#!/usr/bin/env node` shebang — env would have no PATH
 // to resolve `node` from, every probe would produce no output, and the CLIs
 // would all report `version_unknown` instead of exercising coalescing. The
-// Windows branch is unaffected because it invokes `process.execPath` directly.
+// The Windows fixture must use the runner-owned Node executable. Vitest runs
+// under Electron, while production intentionally strips ELECTRON_RUN_AS_NODE
+// before probing a CLI child.
 function writeCountingMockCli(basePath: string, logPath: string): string {
   if (isWindows) {
     const scriptPath = `${basePath}.js`;
@@ -244,7 +247,7 @@ function writeCountingMockCli(basePath: string, logPath: string): string {
     const binPath = `${basePath}.cmd`;
     fs.writeFileSync(
       binPath,
-      `@echo off\r\n"${process.execPath}" "${scriptPath}" %*\r\n`,
+      `@echo off\r\n"${TEST_NODE}" "${scriptPath}" %*\r\n`,
     );
     return binPath;
   }

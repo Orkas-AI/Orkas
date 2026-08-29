@@ -318,6 +318,7 @@ describe('CLI bridge Skill runner', () => {
       const results = await Promise.all(runPromises);
 
       expect(results.map((result) => result.status)).toEqual(['aborted', 'aborted']);
+      expect(fs.existsSync(path.join(tempDirs[0], 'output'))).toBe(false);
       await waitFor(() => processTrees.every(({ parent, child }) => (
         !processIsAlive(parent) && !processIsAlive(child)
       )));

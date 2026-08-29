@@ -139,8 +139,12 @@ describe('chats › message history tombstones', () => {
     expect(page.history[1].text).toBe(`keep ${unversioned}`);
     expect(page.history[2].text).toMatch(/^\[poster\]\(chat-media:\/\/local\/.+\?v=\d+-\d+-14\)$/);
     expect(page.history[3].text).toBe(`keep [poster](${sandboxUrl})`);
-    expect(fs.readFileSync(historyFile, 'utf8')).toContain(`![poster](${unversioned})`);
-    expect(fs.readFileSync(historyFile, 'utf8')).toContain(`[poster](${sandboxUrl})`);
+    const persistedRows = fs.readFileSync(historyFile, 'utf8')
+      .trimEnd()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    expect(persistedRows[0].text).toBe(`![poster](${unversioned})`);
+    expect(persistedRows[2].text).toBe(`[poster](${sandboxUrl})`);
   });
 
   it('projects authorized legacy Codex output directives into produced-file footers', async () => {

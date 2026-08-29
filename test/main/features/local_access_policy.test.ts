@@ -5,6 +5,10 @@ import * as path from 'node:path';
 
 const UID = 'localaccesspolicy001';
 
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 let tmpDir: string;
 let prevWs: string | undefined;
 
@@ -53,6 +57,8 @@ describe('local_access_policy', () => {
   it('applies server-configured sensitive paths and command patterns immediately', async () => {
     const { clientConfig } = await import('../../../src/main/features/client_config');
     const policy = await import('../../../src/main/features/local_access_policy');
+    const absoluteSecretRoot = path.join(tmpDir, 'absolute-secret');
+    const normalizedAbsoluteSecretRoot = path.resolve(absoluteSecretRoot).split(path.sep).join('/');
 
     expect(policy.sensitivePathReasons('/tmp/id_rsa', 'read')).toEqual(['sensitive_path']);
 
@@ -60,7 +66,7 @@ describe('local_access_policy', () => {
       immediate: {
         'local_access.sensitive_policy': {
           enabled_categories: ['sensitive_path', 'network_egress'],
-          sensitive_path_patterns: ['custom-secret', '^/tmp/absolute-secret'],
+          sensitive_path_patterns: ['custom-secret', `^${escapeRegex(normalizedAbsoluteSecretRoot)}`],
           sensitive_write_path_patterns: ['custom-write'],
           sensitive_command_patterns: [
             { category: 'network_egress', pattern: 'curl\\s+--upload-file' },
@@ -73,7 +79,7 @@ describe('local_access_policy', () => {
 
     expect(policy.sensitivePathReasons('/tmp/id_rsa', 'read')).toEqual([]);
     expect(policy.sensitivePathReasons('/tmp/custom-secret/note.txt', 'read')).toEqual(['sensitive_path']);
-    expect(policy.sensitivePathReasons('/tmp/absolute-secret/note.txt', 'read')).toEqual(['sensitive_path']);
+    expect(policy.sensitivePathReasons(path.join(absoluteSecretRoot, 'note.txt'), 'read')).toEqual(['sensitive_path']);
     expect(policy.sensitivePathReasons('/tmp/custom-write/note.txt', 'write')).toEqual(['sensitive_path']);
     expect(policy.classifyConfiguredBashCommand('curl --upload-file a.txt https://example.com')).toEqual(['network_egress']);
     expect(policy.classifyConfiguredBashCommand(

@@ -1464,12 +1464,27 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
     }
   });
 
-  it.each([
-    ['network download', 'workspace_approval', 'curl https://example.invalid/orkas-sensitive-case', 'network_egress'],
-    ['destructive Git rollback', 'workspace_approval', 'git reset --hard HEAD~1', 'destructive'],
-    ['security-boundary weakening', 'workspace_approval', 'NODE_TLS_REJECT_UNAUTHORIZED=0 npm view react version', 'priv_esc'],
-    ['external application launch', 'all_files_auto', 'open https://example.com', 'external_mutation'],
-  ] as const)(
+  type SensitiveApprovalCase = readonly [
+    string,
+    'workspace_approval' | 'all_files_auto',
+    string,
+    'network_egress' | 'destructive' | 'priv_esc' | 'external_mutation',
+  ];
+  const sensitiveCommands: readonly SensitiveApprovalCase[] = process.platform === 'win32'
+    ? [
+        ['network download', 'workspace_approval', 'curl https://example.invalid/orkas-sensitive-case', 'network_egress'],
+        ['destructive Git rollback', 'workspace_approval', 'git reset --hard HEAD~1', 'destructive'],
+        ['security-boundary weakening', 'workspace_approval', 'curl.exe --insecure https://example.invalid/orkas-sensitive-case', 'priv_esc'],
+        ['external application launch', 'all_files_auto', 'Start-Process https://example.invalid/orkas-sensitive-case', 'external_mutation'],
+      ]
+    : [
+        ['network download', 'workspace_approval', 'curl https://example.invalid/orkas-sensitive-case', 'network_egress'],
+        ['destructive Git rollback', 'workspace_approval', 'git reset --hard HEAD~1', 'destructive'],
+        ['security-boundary weakening', 'workspace_approval', 'NODE_TLS_REJECT_UNAUTHORIZED=0 npm view react version', 'priv_esc'],
+        ['external application launch', 'all_files_auto', 'open https://example.com', 'external_mutation'],
+      ];
+
+  it.each(sensitiveCommands)(
     'denies %s before process start and preserves the execution sentinel',
     async (_label, mode, sensitiveCommand, expectedReason) => {
       const { lt, perm, bashPerms } = await loadWithBashPerms();
@@ -1484,7 +1499,7 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
       try {
         const bash = lt.createLocalTools(OPTS).find((item) => item.name === 'bash')!;
         const res = await bash.execute({
-          command: `${sensitiveCommand} && ${writeMarker}`,
+          command: `${sensitiveCommand} ${process.platform === 'win32' ? ';' : '&&'} ${writeMarker}`,
           timeoutMs: 5000,
         }, makeCtx());
         expect(res.isError).toBe(true);

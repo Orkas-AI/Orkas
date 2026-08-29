@@ -14,6 +14,7 @@ const DEFAULT_KILL_GRACE_MS = 5_000;
 const DEFAULT_SETTLE_MS = 6_000;
 const DEFAULT_SHUTDOWN_SETTLE_MS = 1_000;
 const OUTPUT_REF_RE = /^[a-f0-9]{32}$/;
+const WINDOWS_OUTPUT_CLEANUP_DELAYS_MS = [0, 25, 75, 150, 300];
 
 function positiveInt(value, fallback) {
   return Number.isFinite(value) && value > 0 ? Math.max(1, Math.trunc(value)) : fallback;
@@ -26,6 +27,10 @@ function assertSafeScriptBase(scriptBase) {
   if (scriptBase.includes('/') || scriptBase.includes('\\') || scriptBase === '.' || scriptBase === '..') {
     throw new Error('script must be a basename, not a path');
   }
+}
+
+function wait(delayMs) {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
 function windowsSystem32Tool(name) {
@@ -200,6 +205,20 @@ function createBridgeSkillRunner(options) {
   function removeOutput(outputRef) {
     for (const stream of ['stdout', 'stderr']) {
       try { fs.unlinkSync(streamPath(outputRef, stream)); } catch { /* best effort */ }
+    }
+  }
+
+  async function removeOutputDirectory() {
+    const delays = process.platform === 'win32' ? WINDOWS_OUTPUT_CLEANUP_DELAYS_MS : [0];
+    for (const delayMs of delays) {
+      if (delayMs > 0) await wait(delayMs);
+      try {
+        fs.rmSync(outputDir, { recursive: true, force: true });
+        return;
+      } catch (error) {
+        if (error && error.code === 'ENOENT') return;
+        if (!error || (error.code !== 'EPERM' && error.code !== 'EBUSY')) return;
+      }
     }
   }
 
@@ -395,7 +414,8 @@ function createBridgeSkillRunner(options) {
     shuttingDown = true;
     const pending = Array.from(activeRuns);
     for (const entry of pending) entry.terminate();
-    shutdownPromise = Promise.allSettled(pending.map((entry) => entry.completion)).then(() => {});
+    shutdownPromise = Promise.allSettled(pending.map((entry) => entry.completion))
+      .then(removeOutputDirectory);
     return shutdownPromise;
   }
 

@@ -36,6 +36,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { fileURLToPath } from "node:url";
 
 /** Fixed gate messages: the extracted header message must EQUAL the key.
  *  Substring matching is deliberately avoided — a future "context compaction
@@ -532,5 +533,5 @@ function main() {
 }
 
 const invokedDirectly = process.argv[1]
-  && path.resolve(process.argv[1]) === new URL(import.meta.url).pathname;
+  && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (invokedDirectly) main();

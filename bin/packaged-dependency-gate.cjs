@@ -40,16 +40,16 @@ function sameJson(left, right) {
 }
 
 function packageRootFromManifestPath(manifestPath) {
-  const normalized = String(manifestPath).replace(/^\/+/, '');
+  const normalized = String(manifestPath).replace(/\\/g, '/').replace(/^\/+/, '');
   if (normalized === 'package.json') return '';
   if (!normalized.endsWith('/package.json')) return null;
   const packageRoot = normalized.slice(0, -'/package.json'.length);
   return PACKAGE_ROOT_PATTERN.test(packageRoot) ? packageRoot : null;
 }
 
-function readAsarJson(appAsar, manifestPath) {
+function readAsarJson(appAsar, archivePath, manifestPath) {
   try {
-    return JSON.parse(asar.extractFile(appAsar, manifestPath).toString('utf8'));
+    return JSON.parse(asar.extractFile(appAsar, archivePath).toString('utf8'));
   } catch (err) {
     fail(`invalid ${manifestPath} in ${appAsar}: ${err.message}`);
   }
@@ -69,13 +69,14 @@ function readPackagedManifests(appAsar) {
 
   const manifests = new Map();
   for (const entry of entries) {
-    const manifestPath = String(entry).replace(/^\/+/, '');
+    const archivePath = String(entry).replace(/^[\\/]+/, '');
+    const manifestPath = archivePath.replace(/\\/g, '/').replace(/^\/+/, '');
     const packageRoot = packageRootFromManifestPath(manifestPath);
     if (packageRoot === null) continue;
     if (manifests.has(packageRoot)) {
       fail(`duplicate package manifest root in app.asar: ${packageRoot || '(app root)'}`);
     }
-    const manifest = readAsarJson(appAsar, manifestPath);
+    const manifest = readAsarJson(appAsar, archivePath, manifestPath);
     if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
       fail(`package manifest is not an object: ${manifestPath}`);
     }
