@@ -242,6 +242,8 @@ export interface BuildRunnerParams {
   /** Stable inbound message id used as the exclusive upper bound for
    * current-conversation history tools. */
   historyBoundaryMessageId?: string;
+  /** Host-side post-success hook for a user-confirmed custom Connector. */
+  onCustomConnectorAdded?: (connectorId: string) => void;
   /** Current real user text, used by tools that must bind an approval action
    * to explicit user intent rather than merely to the existence of a turn. */
   userMessage?: string;
@@ -1052,6 +1054,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
           ...(params.cid ? { cid: params.cid } : {}),
           ...(params.richSteerEnabled ? { allowRuntimeRefresh: true } : {}),
           ...(isCommander ? { allowCustomConnectorInstall: true } : {}),
+          ...(params.onCustomConnectorAdded ? { onCustomConnectorAdded: params.onCustomConnectorAdded } : {}),
         },
         exposure === 'discover+block' ? 'discover' : 'full',
       )
@@ -1193,10 +1196,11 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       : [
           'read_files',
           'tool_result',
-          // Global Skills are deliberately absent from the initial file scope.
-          // Commander needs this small discovery gate active so a successful
-          // search can grant read access to only the returned Skill directories.
-          ...(isCommander && availableToolNames.includes('skill_search') ? ['skill_search'] : []),
+          // App navigation is the one resident Commander support affordance:
+          // it is broadly useful, closed-set, and remains side-effect-free
+          // until the user clicks the staged card. Skill discovery and app
+          // diagnosis stay behind their focused Management child groups.
+          ...(isCommander && availableToolNames.includes('open_app_view') ? ['open_app_view'] : []),
           ...(params.onOutputsPublished ? ['publish_outputs'] : []),
         ],
     restoredState: session.getToolSurfaceState(),

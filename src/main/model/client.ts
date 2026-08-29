@@ -234,6 +234,10 @@ export interface ChatOptions {
    *  and attaches a `artifacts[]` list to the assistant message so the
    *  renderer embeds each interactive web-app artifact in the bubble. */
   onArtifactCreated?: (a: { id: string; title: string }) => void;
+  /** Fired only after the custom-connector manager has durably accepted a
+   * user-confirmed server. Group chat uses the stable id to offer a review
+   * shortcut; the callback is not part of installation authorization. */
+  onCustomConnectorAdded?: (connectorId: string) => void;
   /** Fired at turn start with each skill id that entered the system-prompt
    *  index, split by source system (`A.custom` / `A.platform` / `B`).
    *  `features/group_chat` buffers per turn and emits `skill_advertised`

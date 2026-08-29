@@ -2067,6 +2067,54 @@ export class AgentRunner {
         // Check for tool use
         const toolCalls = result.content.filter((c) => c.type === "tool_use");
 
+        // A user can steer while the provider is deciding which tools to run.
+        // Reconcile that newer instruction before any proposed side effect,
+        // not only after the whole tool batch has already executed. The
+        // assistant tool_use blocks are already committed, so pair each with a
+        // synthetic skipped result before appending the steer and re-running
+        // inference; this preserves provider protocol without executing stale
+        // work.
+        if (toolCalls.length > 0) {
+          const preExecutionSteer = await this.drainSteer(params);
+          if (this.hasUnappliedSteer(preExecutionSteer, appliedSteerIds)) {
+            const skipped = "Tool call skipped because a newer user instruction arrived before execution.";
+            for (const call of toolCalls as ReadonlyArray<ToolUseCall>) {
+              yield { type: "tool_start", id: call.id, name: call.name, input: call.input };
+              this.session.withContextMutationBatch(() => {
+                this.session.addToolResult(call.id, skipped, undefined, true);
+                recordCompletedToolWork(
+                  this.session,
+                  call,
+                  { content: skipped, isError: true },
+                  "skipped",
+                  compactionCount,
+                );
+              });
+              yield {
+                type: "tool_end",
+                id: call.id,
+                name: call.name,
+                result: skipped,
+                isError: true,
+                durationMs: 0,
+              };
+            }
+            toolBoundarySynthesisPending = false;
+            await this.appendSteerMessages(preExecutionSteer, false, appliedSteerIds);
+            log.info("interrupt-steer: skipped stale proposed tool calls before execution", {
+              toolCalls: toolCalls.length,
+            });
+            attempt = -1;
+            continue;
+          }
+          // An acknowledgement may have failed after the structured message
+          // was already accepted on an earlier boundary. Retry only the ACK;
+          // do not suppress this tool batch or duplicate the user message.
+          if (preExecutionSteer.length > 0) {
+            await this.appendSteerMessages(preExecutionSteer, false, appliedSteerIds);
+          }
+        }
+
         // Tools were intentionally withheld for a boundary synthesis. A
         // provider/model that nevertheless emits a tool call must never regain
         // side effects or turn this one-shot explanation into another loop.

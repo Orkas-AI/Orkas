@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "d9031626322133bc758ef086eacf147f3bd2d82ec9509e80922814f3ee249607",
+  "content_tree_sha256": "535d923aa8eb9ed696a3b24f31edf5711076bdb835eb010270ebb3df6e74a131",
   "files": [
     {
       "path": "marketplace/agents/173d4235a431/_meta.json",
@@ -19,8 +19,8 @@
     },
     {
       "path": "marketplace/agents/78900d8758bc/agent.json",
-      "bytes": 4331,
-      "sha256": "056511550346c82163b65428aa936cf6dd69cc79f97e934356e1e33b4c007dc0"
+      "bytes": 4344,
+      "sha256": "da67a5e0092a547ea28cbe0f4ddf4f3181fe500328152112665ee17541b90fa3"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/agent.json",
@@ -945,7 +945,7 @@
     {
       "path": "marketplace/skills/ee99fbb42964/_meta.json",
       "bytes": 146,
-      "sha256": "f501c5f987c76087a2668c4a1ced3c375e1b467941abed344cfda44b590a53d9"
+      "sha256": "ed65a6445bbe4eb2b34cdeb7ff40972e1f42b07ee965ea9e1cc635b493db4b99"
     },
     {
       "path": "marketplace/skills/ee99fbb42964/references/citation-style.md",
@@ -954,8 +954,8 @@
     },
     {
       "path": "marketplace/skills/ee99fbb42964/references/compact-landscape.md",
-      "bytes": 12357,
-      "sha256": "c7084f55f4078af94a638034016e6d533e577fcdbe21b9d1fe33c78381f48201"
+      "bytes": 12358,
+      "sha256": "4df1f9428340ff8aff1c334767222b72cb2dfbb310859fe059e245fe73385ff8"
     },
     {
       "path": "marketplace/skills/ee99fbb42964/references/evidence-standards.md",
@@ -964,8 +964,8 @@
     },
     {
       "path": "marketplace/skills/ee99fbb42964/references/operations-and-report.md",
-      "bytes": 10005,
-      "sha256": "08337e2a15441bb826926cd32e53ae9b35abd29bd0720de265cc1351565e76ed"
+      "bytes": 10309,
+      "sha256": "0f4d73d08f0661a7310e46c088e1a5af6232807cb02e1c25a2ab437a6ef70798"
     },
     {
       "path": "marketplace/skills/ee99fbb42964/references/report-structure.md",
@@ -1004,8 +1004,8 @@
     },
     {
       "path": "marketplace/skills/ee99fbb42964/scripts/citations.py",
-      "bytes": 61326,
-      "sha256": "7d99bf9ea0679ce7bbf993eb6f59ceffc4d90c35495d8c70b742c9e0cb4118a0"
+      "bytes": 62055,
+      "sha256": "c43aca918b093887d3a55ef824b10cb490fbb2d8cbab1166a2182c6a8c29a66a"
     },
     {
       "path": "marketplace/skills/ee99fbb42964/scripts/compress.py",
@@ -1014,8 +1014,8 @@
     },
     {
       "path": "marketplace/skills/ee99fbb42964/SKILL.md",
-      "bytes": 9009,
-      "sha256": "e6be318ea6fa499092f91a9d691397c28e95c04915bac1664a63a1a43e23e518"
+      "bytes": 9211,
+      "sha256": "417cee8df9160d150ecbe35eeff2aa21cd28b833a31158cc9f02824b64b437d7"
     },
     {
       "path": "marketplace/skills/ee99fbb42964/test/test_academic.py",
@@ -1029,8 +1029,8 @@
     },
     {
       "path": "marketplace/skills/ee99fbb42964/test/test_citations.py",
-      "bytes": 63468,
-      "sha256": "c7b6ac8f87c3780d078f99d2359ed06cd91b1189da21770c5148563250b9c1ae"
+      "bytes": 64694,
+      "sha256": "fed9abed91b4841ec602bb8ffa5467e54350648c9fab61b2b8de0a345cd75915"
     },
     {
       "path": "marketplace/skills/ee99fbb42964/test/test_compress.py",
@@ -1369,8 +1369,8 @@
     },
     {
       "path": "system/skills/agent-creator/references/cli-and-prose.md",
-      "bytes": 1993,
-      "sha256": "d8e29fa21a88615c6e545c7493ed141a51421bbe8e6771855785953741f1aa27"
+      "bytes": 1850,
+      "sha256": "2682012568ee3144844820cb4cbd0ef9bb58ec89f96bd33f619a91eab7042e2a"
     },
     {
       "path": "system/skills/agent-creator/references/llm-agent-fields.md",
@@ -1379,13 +1379,13 @@
     },
     {
       "path": "system/skills/agent-creator/references/source-and-editing.md",
-      "bytes": 3702,
-      "sha256": "f4999737cdcb18faa3b38de0bcc0cad13033a29b5b9ba665f24a5b373f9a77fd"
+      "bytes": 3193,
+      "sha256": "7a114a05d1e6b91d6f755050b6306dca0911a5944e9043a2a40ee5a0d784d5c1"
     },
     {
       "path": "system/skills/agent-creator/SKILL.md",
-      "bytes": 6526,
-      "sha256": "00f5decc6cbd73e7c71a8a201e334fa9394a2b1c90f5c40e2965b9e50ee3845a"
+      "bytes": 6429,
+      "sha256": "d9df1fdcafb0be2870f6165ab1752564190f9476237dc25cf717f9f1758a8b4a"
     },
     {
       "path": "system/skills/autotask-creator/SKILL.md",
@@ -1394,8 +1394,8 @@
     },
     {
       "path": "system/skills/memory-manager/SKILL.md",
-      "bytes": 3654,
-      "sha256": "a124936ec7a7c29c878c7970001f208db871f9407063f3998cc97bb1388ffa8a"
+      "bytes": 3764,
+      "sha256": "6f6dc8f418c5327a3a4c0f455d84db81dea627e78fdfacf614ba453ee5d2ee73"
     },
     {
       "path": "system/skills/package-installer/SKILL.md",
@@ -1409,8 +1409,8 @@
     },
     {
       "path": "system/skills/skill-creator/references/authoring.md",
-      "bytes": 6229,
-      "sha256": "ce5ab09738177d77b9fd70e107aa8b7f176879157f3818c41d1b868d02b912a8"
+      "bytes": 6461,
+      "sha256": "e6404f3f688f18c4d3e40e08ecafdc8301f65d4cf8ca77c5e5ba902807582b29"
     },
     {
       "path": "system/skills/skill-creator/references/file-deletion.md",
@@ -1429,8 +1429,8 @@
     },
     {
       "path": "system/skills/skill-creator/SKILL.md",
-      "bytes": 7238,
-      "sha256": "19e3b573aded1c409cf90a645b5c11b4a4ec9a232f6d47fc627e746ab9aa993d"
+      "bytes": 7281,
+      "sha256": "587b246c0584c90d37096ff2862d19512b0e689c9abb69085d91ad5479c72bdf"
     }
   ],
   "inventory": {
@@ -1476,10 +1476,10 @@
       {
         "id": "78900d8758bc",
         "name": "DeepResearcher",
-        "version": "1.0.60",
+        "version": "1.0.61",
         "icon": "search",
         "color": "sky",
-        "updated_at": "2026-08-21T09:33:00.000Z",
+        "updated_at": "2026-08-29T05:04:02.000Z",
         "skill_list": [
           "6743aa0797a2",
           "9be6fda271a5",
@@ -1746,8 +1746,8 @@
       {
         "id": "ee99fbb42964",
         "name": "deep-research",
-        "version": "1.0.49",
-        "updated_at": "2026-08-23T09:48:36.000Z"
+        "version": "1.0.50",
+        "updated_at": "2026-08-27T22:10:00.000Z"
       },
       {
         "id": "f283632103ba",

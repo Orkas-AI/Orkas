@@ -180,9 +180,26 @@ async function loadProjectDetail(pid) {
     _stopProjectKbEventSubscription();
   }
   try {
+    // The project composer's recipient chip is one ephemeral value shared by
+    // every project, so a pick made in another project — or an agent unbound
+    // while this page stayed open — can leave it aimed at an agent this project
+    // does not have. The send path turns that chip into an `@name` prefix and
+    // the bus resolves mentions against the global agent registry, so the stale
+    // pick would really dispatch an out-of-project agent into the new
+    // conversation. Same rule the auto-task dialog applies when its project
+    // scope changes (`auto.js::_autoClearRecipientIfOutsideProject`). Decided
+    // off the bindings response alone rather than the whole batch below:
+    // waiting for a large library's file tree would leave the stale target
+    // sendable for that long.
+    const bindingsCall = window.orkas.invoke('projects.bindings.list', { projectId: pid });
+    bindingsCall.then((res) => {
+      if (loadSeq !== _projectDetailLoadSeq || pid !== _projectDetailPid) return;
+      if (!res?.ok || typeof validateRecipientAgainstProject !== 'function') return;
+      validateRecipientAgainstProject('project', pid, (res.bindings && res.bindings.agents) || []);
+    }).catch(() => { /* the batch below owns the load failure */ });
     const [getRes, listRes, filesRes, kbRes, instrRes, autoRes] = await Promise.all([
       window.orkas.invoke('projects.get', { projectId: pid }),
-      window.orkas.invoke('projects.bindings.list', { projectId: pid }),
+      bindingsCall,
       window.orkas.invoke('projects.files.tree', { projectId: pid }),
       window.orkas.invoke('projects.files.status', { projectId: pid, skipReconcile: true }).catch((err) => ({ ok: false, error: err?.message || String(err) })),
       window.orkas.invoke('projects.instructions.get', { projectId: pid }).catch((err) => ({ ok: false, error: err?.message || String(err) })),

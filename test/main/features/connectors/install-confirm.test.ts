@@ -84,13 +84,14 @@ describe('connectors/install_confirm', () => {
 });
 
 describe('add_custom_connector tool', () => {
-  async function buildTool() {
+  async function buildTool(onCustomConnectorAdded?: (connectorId: string) => void) {
     const ic = await import('../../../../src/main/features/connectors/install_confirm');
     const metaMod = await import('../../../../src/main/model/core-agent/connector-meta-tools');
     const tools = await metaMod.createConnectorMetaTools({
       userId: TEST_UID,
       cid: 'c1',
       allowCustomConnectorInstall: true,
+      ...(onCustomConnectorAdded ? { onCustomConnectorAdded } : {}),
     }, 'full');
     const tool = tools.find((t) => t.name === 'add_custom_connector');
     return { ic, tool };
@@ -102,6 +103,15 @@ describe('add_custom_connector tool', () => {
     expect(tool).toBeTruthy();
   });
 
+  it('keeps missing secrets in the protected Connectors flow', async () => {
+    mockMcpClient();
+    const { tool } = await buildTool();
+    expect(tool?.description).toContain('Never ask the user to paste a missing credential');
+    const transport = (tool?.inputSchema as any)?.properties?.transport?.description || '';
+    expect(transport).toContain('never invent or solicit secret values in chat');
+    expect(transport).not.toContain('Put API keys in');
+  });
+
   it('is NOT exposed in discover (agent-edit) mode', async () => {
     mockMcpClient();
     const metaMod = await import('../../../../src/main/model/core-agent/connector-meta-tools');
@@ -111,7 +121,8 @@ describe('add_custom_connector tool', () => {
 
   it('installs only after the user approves the confirm dialog', async () => {
     mockMcpClient();
-    const { ic, tool } = await buildTool();
+    const added: string[] = [];
+    const { ic, tool } = await buildTool((connectorId) => added.push(connectorId));
     const pushed: any[] = [];
     ic._setBroadcastForTest((_ch, payload) => pushed.push(payload));
     try {
@@ -130,6 +141,7 @@ describe('add_custom_connector tool', () => {
       const conns = registry.load(TEST_UID).connections;
       const custom = Object.values(conns).find((c) => c.origin === 'custom');
       expect(custom).toBeTruthy();
+      expect(added).toEqual([custom?.id]);
     } finally {
       ic._setBroadcastForTest(null);
     }
@@ -137,7 +149,8 @@ describe('add_custom_connector tool', () => {
 
   it('does not install when the user declines', async () => {
     mockMcpClient();
-    const { ic, tool } = await buildTool();
+    const added: string[] = [];
+    const { ic, tool } = await buildTool((connectorId) => added.push(connectorId));
     const pushed: any[] = [];
     ic._setBroadcastForTest((_ch, payload) => pushed.push(payload));
     try {
@@ -152,6 +165,7 @@ describe('add_custom_connector tool', () => {
 
       const registry = await import('../../../../src/main/features/connectors/registry');
       expect(Object.keys(registry.load(TEST_UID).connections)).toHaveLength(0);
+      expect(added).toEqual([]);
     } finally {
       ic._setBroadcastForTest(null);
     }

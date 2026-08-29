@@ -86,7 +86,7 @@ describe('i18n › t() lookup', () => {
       .toBe('技能「arxiv-reader」已被停用，请重新启用后再使用。');
   });
 
-  it('localizes the managed Pro fallback notice in every supported language', () => {
+  it('localizes the fallback notice in every supported language', () => {
     const vars = { from: 'Orkas-1.5 Pro', to: 'Orkas-1.5' };
     expect(t('model.server_model_fallback', vars, 'zh'))
       .toBe('Orkas-1.5 Pro 暂不可用，已由 Orkas-1.5 处理。');

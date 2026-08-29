@@ -190,12 +190,18 @@ export function buildPlanInteractionHint(interactive: boolean): string {
   ].join('\n');
 }
 
-/** Build the final response-language instruction without loading user state. */
+/** Build the final response-language precedence without loading user state. */
 export function buildLanguageDirectiveText(languageName: string): string {
   return [
     '## User language',
     '',
-    `User UI language: **${languageName}**. Write all human-readable prose in ${languageName}, including replies, status text, form labels, plan titles/inputs, and natural-language text inside XML/JSON fields.`,
+    `Fallback UI language: **${languageName}**.`,
+    '',
+    "Choose the response language in this order: (1) a current explicit user language request; (2) otherwise, the clear language of the user's latest substantive prose; (3) otherwise, the fallback UI language above.",
+    '',
+    'Quoted text, code, file contents, proper nouns, and earlier assistant messages do not switch the response language.',
+    '',
+    'Write all human-readable prose in the chosen language, including replies, status text, form labels, plan titles/inputs, and natural-language text inside XML/JSON fields.',
     '',
     'Keep protocol tokens unchanged: XML tag names, JSON keys, tool/skill ids or names, file paths, code, and `select` / `multiselect` `value` strings.',
     '',

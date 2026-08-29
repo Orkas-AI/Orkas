@@ -13,7 +13,7 @@ Create or edit a custom Agent by emitting one inline `<agent>...</agent>` contai
 The root file is the execution gate. Before emitting a container, read the matching reference through this Skill's read ref:
 
 - New LLM-managed Agent, or an edit to its name, icon, description, workflow, guidance, Skills, tools, inputs, interaction mode, or category → [llm-agent-fields.md](references/llm-agent-fields.md).
-- Creation from supplied files/prompts/specs, conversation crystallization, similarity checking, or an unbound edit of an existing Agent → also read [source-and-editing.md](references/source-and-editing.md).
+- Creation from supplied files/prompts/specs, conversation crystallization, or an unbound edit of an existing Agent → also read [source-and-editing.md](references/source-and-editing.md). Current-turn requirements for inputs, checks, workflow, outputs, or non-goals count as a supplied spec, so this reference is required.
 - CLI-backed Agent edit or a request about its external runtime boundary → read [cli-and-prose.md](references/cli-and-prose.md).
 
 Do not read unrelated references. A simple bound edit normally needs only `llm-agent-fields.md`; a CLI-backed edit normally needs only `cli-and-prose.md`.
@@ -21,10 +21,10 @@ Do not read unrelated references. A simple bound edit normally needs only `llm-a
 ## Non-negotiable protocol
 
 - **Mutation only via the inline container.** Never use `edit_file`, `write_file`, or `bash` to change `agent.json`. Never dump the container into a workspace file.
-- **No container, no mutation, no success claim.** An Agent exists or changes only after this reply contains a valid container for that Agent and the host applies it. Without one, describe the result only as a proposal, clarification, or blocker; never say the Agent is ready, created, updated, installed, or available.
+- **No container, no mutation, no success claim.** Without a valid container, describe the result only as a proposal, clarification, or blocker; never say the Agent is ready, created, updated, installed, or available. A valid container only requests a mutation; only the host result proves it was applied. Until then, use pending wording such as “将创建” or “已提交，等待应用”.
 - **One container per Agent.** Multiple containers are legal only when the user asked to create or edit multiple distinct Agents, and the number of valid containers must equal the number of Agents you claim to have created. End the turn after emitting them; do not dispatch the Agent.
 - **Validate every container independently before sending.** Read its tags in order: every opening tag must have the exact matching closing tag, with no crossed, missing, or reused closer. For a multi-Agent reply, repeat this structural check for each container rather than copying an unchecked suffix.
-- **Preserve source material.** If the user supplied a prompt, spec, examples, files, or an Agent directory, read the relevant source before authoring and preserve its role, goals, workflow order, tool rules, outputs, examples, safety rules, and stop points. For an attachment path, missing inline body text is not a missing source: call `read_files` with the exact supplied path in `paths` and ask for another upload only if that read fails. Adapt only what Orkas requires unless the user requests a rewrite.
+- **Read attachment sources.** For an injected attachment, missing inline body text is not a missing source; call `read_files` with the exact supplied path in `paths` and ask for another upload only if that read fails.
 - **Use the user's current UI language** for display copy and user-visible prose. Keep XML tags, tool/Skill names, paths, JSON keys, and closed-set values unchanged. Use localized description tags only when the user explicitly requests multilingual descriptions.
 - **Keep user-visible prose outcome-based.** State what the Agent does, when to use it, and the substantive change; do not expose XML/field/schema/id mechanics or source provenance by default.
 - **Agent roles are not model runtimes.** Do not imitate or claim an unavailable provider by naming an ordinary role Agent after a model. Real external CLI runtimes are handled by their smaller editable contract.
@@ -51,7 +51,7 @@ For a new Agent, first compare its name and its typical objects/actions with the
 3. Read any required current Agent spec or user-supplied source.
 4. Validate the intended fields, category, capability dependencies, interaction shape, and safety boundary.
 5. Emit concise user-facing prose plus the smallest valid patch container. On create, include every required creation field. On edit, omit unchanged fields; list-like fields replace the entire list when present.
-6. Stop. The host applies the container and supplies persistence evidence.
+6. Stop after emitting the container; the host supplies persistence evidence.
 
 ## Safety gate
 

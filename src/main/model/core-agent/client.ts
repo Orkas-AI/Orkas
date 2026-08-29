@@ -1542,6 +1542,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     getPublishableOutputPaths,
     hasProducedPath,
     onArtifactCreated,
+    onCustomConnectorAdded,
     onSkillAdvertised,
     onSkillInvoked,
     cacheRetention,
@@ -1811,6 +1812,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(getPublishableOutputPaths ? { getPublishableOutputPaths } : {}),
       ...(hasProducedPath ? { hasProducedPath } : {}),
       ...(onArtifactCreated ? { onArtifactCreated } : {}),
+      ...(onCustomConnectorAdded ? { onCustomConnectorAdded } : {}),
       ...(onSkillAdvertised ? { onSkillAdvertised } : {}),
       ...(onSkillInvoked ? { onSkillInvoked } : {}),
       onNativeSearchInjected: (info) => {

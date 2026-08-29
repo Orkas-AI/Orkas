@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -6,6 +7,8 @@ import * as path from 'node:path';
 import { makeMinimalPdf } from '../../../fixtures/make-minimal-pdf';
 import { makeMinimalDocx } from '../../../fixtures/make-minimal-docx';
 import { makeMinimalXlsx, makeMinimalPptx } from '../../../fixtures/make-minimal-office';
+
+const nodeRequire = createRequire(import.meta.url);
 
 vi.mock('../../../../src/main/logger', () => ({
   createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
@@ -20,6 +23,55 @@ let tmpDir: string;
 let prevWs: string | undefined;
 let prevHome: string | undefined;
 let prevGuard: string | undefined;
+
+function faultStatForPath(targetPath: string, code: 'EACCES' | 'EPERM'): {
+  statAttempts: string[];
+  parentReaddirAttempts: string[];
+  restore(): void;
+} {
+  const mutableFs = nodeRequire('node:fs') as Record<string, any>;
+  const originalStatSync = mutableFs.statSync;
+  const originalReaddirSync = mutableFs.readdirSync;
+  const target = path.resolve(targetPath);
+  const parent = path.dirname(target);
+  const statAttempts: string[] = [];
+  const parentReaddirAttempts: string[] = [];
+  const resolveArg = (value: unknown): string => {
+    if (typeof value === 'string') return path.resolve(value);
+    if (Buffer.isBuffer(value)) return path.resolve(value.toString());
+    return '';
+  };
+
+  mutableFs.statSync = function injectedStatFailure(this: unknown, ...args: any[]) {
+    const requested = resolveArg(args[0]);
+    if (requested === target) {
+      statAttempts.push(requested);
+      throw Object.assign(new Error(`${code}: permission denied, stat '${target}'`), {
+        code,
+        errno: code === 'EACCES' ? -13 : -1,
+        path: target,
+        syscall: 'stat',
+      });
+    }
+    return Reflect.apply(originalStatSync, this, args);
+  };
+  mutableFs.readdirSync = function recordParentRead(this: unknown, ...args: any[]) {
+    const requested = resolveArg(args[0]);
+    if (requested === parent) parentReaddirAttempts.push(requested);
+    return Reflect.apply(originalReaddirSync, this, args);
+  };
+  syncBuiltinESMExports();
+
+  return {
+    statAttempts,
+    parentReaddirAttempts,
+    restore() {
+      mutableFs.statSync = originalStatSync;
+      mutableFs.readdirSync = originalReaddirSync;
+      syncBuiltinESMExports();
+    },
+  };
+}
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-filetools-'));
@@ -1247,6 +1299,33 @@ describe('file-tools › read_files', () => {
     expect(r.content).toContain('E_NOT_FOUND');
   });
 
+  it.each(['EACCES', 'EPERM'] as const)(
+    'reports %s as permission denied without scanning the parent directory for renamed siblings',
+    async (osCode) => {
+      const { tools, wsDir } = await buildTools();
+      const denied = path.join(wsDir, 'permission-denied.txt');
+      fs.writeFileSync(denied, 'must not be read');
+      const fault = faultStatForPath(denied, osCode);
+
+      try {
+        const result = await run(getTool(tools, 'read_files'), {
+          paths: [{ path: denied }],
+        });
+
+        expect(result.isError).toBe(true);
+        expect(result.content).toContain('E_PERMISSION_DENIED');
+        expect(result.content).toContain(`os_code=${osCode}`);
+        expect(result.content).not.toContain('E_NOT_FOUND');
+        expect(result.content).not.toContain('<missing-file-recovery>');
+        expect(result.content).not.toContain('<file-renamed-earlier>');
+        expect(fault.statAttempts).toEqual([denied]);
+        expect(fault.parentReaddirAttempts).toEqual([]);
+      } finally {
+        fault.restore();
+      }
+    },
+  );
+
   it('bounds omitted ranges to a 24K-character slice', async () => {
     const { tools, wsDir } = await buildTools();
     const large = path.join(wsDir, 'large.txt');
@@ -1587,7 +1666,7 @@ describe('file-tools › search_files', () => {
     expect(r.content).toContain('MOCK_SYNC_CONFLICT.md');
   });
 
-  it.runIf(process.platform === 'darwin')('does not recursively scan a legacy privacy-protected workspace root', async () => {
+  it.runIf(process.platform === 'darwin')('keeps a legacy privacy-protected workspace active without recursively scanning it', async () => {
     process.env.ORKAS_TCC_GUARD_FORCE = '1';
     const home = path.join(tmpDir, 'home');
     const downloads = path.join(home, 'Downloads');
@@ -1598,8 +1677,6 @@ describe('file-tools › search_files', () => {
     const users = await import('../../../../src/main/features/users');
     users.activateUser(UID);
     const paths = await import('../../../../src/main/paths');
-    fs.mkdirSync(paths.DEFAULT_USER_WORKSPACE, { recursive: true });
-    fs.writeFileSync(path.join(paths.DEFAULT_USER_WORKSPACE, 'public-note.md'), 'public');
     const cfgFile = paths.userWorkspaceConfigFile(UID);
     fs.mkdirSync(path.dirname(cfgFile), { recursive: true });
     fs.writeFileSync(cfgFile, JSON.stringify({
@@ -1608,7 +1685,7 @@ describe('file-tools › search_files', () => {
       recentPaths: [],
     }), 'utf8');
     const ws = await import('../../../../src/main/features/user_workspace');
-    expect(ws.getWorkspacePath(UID)).toBe(paths.DEFAULT_USER_WORKSPACE);
+    expect(ws.getWorkspacePath(UID)).toBe(downloads);
     fs.mkdirSync(attachmentDir(), { recursive: true });
     const mod = await import('../../../../src/main/model/core-agent/file-tools');
     const tools = mod.createFileTools({ userId: UID, cid: CID });
@@ -1616,7 +1693,7 @@ describe('file-tools › search_files', () => {
     const r = await run(getTool(tools, 'search_files'), { query: '' });
 
     expect(r.isError).toBeFalsy();
-    expect(r.content).toContain('public-note.md');
+    expect(r.content).toContain('No files were scanned in the privacy-protected workspace');
     expect(r.content).not.toContain('secret-contract.md');
   });
 

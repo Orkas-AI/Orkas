@@ -133,7 +133,7 @@
 
   const SIDECAR_FIELDS = [
     'attachments', 'produced', 'references', 'form', 'created_agents', 'created_skills',
-    'artifacts', 'marketplace_requests', 'plan_announcement', 'failure_kind', 'failure_code',
+    'artifacts', 'marketplace_requests', 'app_nav_requests', 'plan_announcement', 'failure_kind', 'failure_code',
     'model_text', 'source_message_id', 'unknown_mentions', 'mentions', 'to',
   ];
 

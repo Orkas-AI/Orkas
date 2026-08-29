@@ -1008,6 +1008,26 @@ export async function setCodingProjectDir(
   });
 }
 
+/** Initialise the coding-agent project directory only if the conversation has
+ *  none yet. The already-set check runs inside the state lock so concurrent
+ *  first turns converge on one working directory. */
+export async function setCodingProjectDirOnce(
+  uid: string, cid: string, dir: string,
+  opts: { explicit: boolean },
+): Promise<{ state: StateFile; applied: boolean }> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    const trimmed = String(dir || '').trim();
+    if (s.coding_project_dir || !trimmed) return { state: s, applied: false };
+    s.coding_project_dir = trimmed;
+    if (opts.explicit) s.coding_project_dir_explicit = true;
+    else delete s.coding_project_dir_explicit;
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return { state: s, applied: true };
+  });
+}
+
 export async function setToolExtraRoots(uid: string, cid: string, roots: readonly string[]): Promise<StateFile> {
   return _stateLock(uid, cid).runExclusive(async () => {
     const s = await readState(uid, cid);

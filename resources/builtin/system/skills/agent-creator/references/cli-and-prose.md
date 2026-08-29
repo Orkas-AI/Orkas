@@ -19,7 +19,6 @@ The host hides the container. The prose outside it is what the user sees.
 - Describe concepts rather than implementation fields: say “what it asks before running”, “what capabilities it uses”, “the steps it follows”, or “it now runs autonomously”.
 - Do not expose XML tags, field names, schema/config terminology, ids, internal source mechanics, or data-structure jargon.
 - For CLI-backed Agents, do not mention the selected CLI, vendor, or model in success prose.
-- Claim success only when a valid container is present for the exact Agent. Otherwise call the response a proposal, clarification, or blocker.
 
 Example:
 

@@ -374,12 +374,93 @@ function mapUsage(u: PiAssistantMessage["usage"]): Usage {
   };
 }
 
+type MapContentOptions = {
+  stripLeadingThinkText?: boolean;
+};
+
+type LeadingThinkTextFilter = {
+  push(text: string): string;
+  finish(): string;
+};
+
+const LEADING_THINK_OPEN = "<think>";
+const LEADING_THINK_CLOSE = "</think>";
+
+/**
+ * Some user-configured OpenAI-compatible endpoints serialize private
+ * reasoning as a literal leading `<think>...</think>` text block instead of
+ * the protocol's structured reasoning field. Hold only the ambiguous prefix
+ * while streaming, suppress each block in a consecutive leading sequence,
+ * and pass every non-leading lookalike through unchanged.
+ */
+function createLeadingThinkTextFilter(): LeadingThinkTextFilter {
+  let state: "detect" | "suppress" | "pass" = "detect";
+  let pending = "";
+  let suppressedLeadingBlock = false;
+
+  return {
+    push(text: string): string {
+      if (!text) return "";
+      if (state === "pass") return text;
+      pending += text;
+
+      while (true) {
+        if (state === "detect") {
+          const candidate = pending.replace(/^\s+/, "");
+          if (!candidate || LEADING_THINK_OPEN.startsWith(candidate)) return "";
+          if (!candidate.startsWith(LEADING_THINK_OPEN)) {
+            state = "pass";
+            const visible = suppressedLeadingBlock ? candidate : pending;
+            pending = "";
+            return visible;
+          }
+          state = "suppress";
+          pending = candidate.slice(LEADING_THINK_OPEN.length);
+        }
+
+        if (state === "suppress") {
+          const closeIndex = pending.indexOf(LEADING_THINK_CLOSE);
+          if (closeIndex < 0) {
+            pending = pending.slice(-(LEADING_THINK_CLOSE.length - 1));
+            return "";
+          }
+          pending = pending.slice(closeIndex + LEADING_THINK_CLOSE.length);
+          suppressedLeadingBlock = true;
+          state = "detect";
+        }
+      }
+    },
+
+    finish(): string {
+      const visible = state === "detect"
+        ? (suppressedLeadingBlock ? pending.replace(/^\s+/, "") : pending)
+        : "";
+      pending = "";
+      state = "pass";
+      return visible;
+    },
+  };
+}
+
+function stripLeadingThinkText(text: string): string {
+  const filter = createLeadingThinkTextFilter();
+  return filter.push(text) + filter.finish();
+}
+
 /** Convert pi-ai AssistantMessage content to our MessageContent[]. */
-function mapContent(content: PiAssistantMessage["content"]): MessageContent[] {
+function mapContent(
+  content: PiAssistantMessage["content"],
+  options: MapContentOptions = {},
+): MessageContent[] {
   const result: MessageContent[] = [];
+  let atTextStart = options.stripLeadingThinkText === true;
   for (const block of content) {
     if (block.type === "text") {
-      result.push({ type: "text", text: block.text });
+      const text = atTextStart ? stripLeadingThinkText(block.text) : block.text;
+      if (text) {
+        result.push({ type: "text", text });
+        atTextStart = false;
+      }
     } else if (block.type === "toolCall") {
       result.push({
         type: "tool_use",
@@ -405,9 +486,15 @@ function mapContent(content: PiAssistantMessage["content"]): MessageContent[] {
   return result;
 }
 
-export function mapContentForTest(content: PiAssistantMessage["content"]): MessageContent[] {
-  return mapContent(content);
+export function mapContentForTest(
+  content: PiAssistantMessage["content"],
+  options: MapContentOptions = {},
+): MessageContent[] {
+  return mapContent(content, options);
 }
+
+export const createLeadingThinkTextFilterForTest = createLeadingThinkTextFilter;
+export const stripLeadingThinkTextForTest = stripLeadingThinkText;
 
 const REASONING_LEVELS = ["minimal", "low", "medium", "high"] as const;
 type PiReasoningLevel = typeof REASONING_LEVELS[number];
@@ -470,6 +557,7 @@ export function createPiProvider(config: {
   supportedReasoning?: ReadonlyArray<"minimal" | "low" | "medium" | "high">;
 }): LLMProvider {
   const providerId = config.provider as KnownProvider;
+  const shouldStripLeadingThinkText = config.provider === "custom";
 
   // Resolve the model object. `customModel` shortcuts pi-ai's catalog
   // lookup for providers pi-ai doesn't know about.
@@ -552,7 +640,9 @@ export function createPiProvider(config: {
         }
 
         return {
-          content: mapContent(result.content),
+          content: mapContent(result.content, {
+            stripLeadingThinkText: shouldStripLeadingThinkText,
+          }),
           stopReason: mapStopReason(result.stopReason),
           usage: mapUsage(result.usage),
           model: resolvedResponseModel(result, model.id),
@@ -574,6 +664,9 @@ export function createPiProvider(config: {
       log.debug(`stream ${providerId}/${model.id}`);
 
       try {
+        const leadingThinkFilter = shouldStripLeadingThinkText
+          ? createLeadingThinkTextFilter()
+          : null;
         const eventStream = reasoning
           ? piStreamSimple(model, context, {
               apiKey: config.apiKey,
@@ -603,9 +696,16 @@ export function createPiProvider(config: {
               yield { type: "message_start" };
               break;
             case "text_delta":
-              yield { type: "text_delta", text: event.delta };
+              {
+                const text = leadingThinkFilter?.push(event.delta) ?? event.delta;
+                if (text) yield { type: "text_delta", text };
+              }
               break;
             case "toolcall_start":
+              {
+                const text = leadingThinkFilter?.finish() ?? "";
+                if (text) yield { type: "text_delta", text };
+              }
               yield {
                 type: "tool_use_start",
                 id: event.partial.content[event.contentIndex]?.type === "toolCall"
@@ -623,12 +723,18 @@ export function createPiProvider(config: {
               yield { type: "tool_use_end", id: event.toolCall.id };
               break;
             case "done":
+              {
+                const text = leadingThinkFilter?.finish() ?? "";
+                if (text) yield { type: "text_delta", text };
+              }
               const serverFallbackReason = serverFallbackReasonFromResponseId(event.message.responseId);
               yield {
                 type: "message_end",
                 stopReason: mapStopReason(event.reason),
                 usage: mapUsage(event.message.usage),
-                content: mapContent(event.message.content),
+                content: mapContent(event.message.content, {
+                  stripLeadingThinkText: shouldStripLeadingThinkText,
+                }),
                 model: resolvedResponseModel(event.message, model.id),
                 ...(serverFallbackReason ? { serverFallbackReason } : {}),
                 providerTermination: {
@@ -640,6 +746,10 @@ export function createPiProvider(config: {
               };
               break;
             case "error":
+              {
+                const text = leadingThinkFilter?.finish() ?? "";
+                if (text) yield { type: "text_delta", text };
+              }
               const errorServerFallbackReason = serverFallbackReasonFromResponseId(event.error.responseId);
               const responseModel = resolvedResponseModel(event.error, model.id);
               // Surface everything we can from the stream error event.

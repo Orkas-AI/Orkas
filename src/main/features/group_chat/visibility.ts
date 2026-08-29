@@ -147,6 +147,15 @@ export interface GroupMessage {
    * official marketplace and request a user decision, but the install only
    * happens after the human clicks the rendered card. */
   marketplace_requests?: MarketplaceInstallRequest[];
+  /** Commander-staged navigation cards (`open_app_view`). The renderer shows
+   * a click-to-open button; navigation happens only on the user's click, so
+   * the record carries only the validated surface/action/target request. */
+  app_nav_requests?: Array<{
+    surface_id: string;
+    action: 'open' | 'create' | 'add_custom' | 'configure';
+    target_id?: string;
+    requested_at: string;
+  }>;
   /** Marks this message as a plan announcement (rendered with a folded
    * plan card in UI). Set by `plan_set` first-time emission. */
   plan_announcement?: boolean;
@@ -345,7 +354,7 @@ function commanderHistoryRoute(record: CommanderHistoryRecord): {
   return { from, recipients, attributes };
 }
 
-/** Remove only the old host-owned prefix that can be derived from this
+/** Remove only a host-owned prefix that can be derived from this
  * authoritative non-user record. Canonical JSONL remains untouched. User
  * examples, embedded mentions, quotes/code fences and unknown look-alikes do
  * not match this leading-line contract and remain verbatim. */
@@ -358,6 +367,9 @@ function stripLegacyHistoryRoutePrefix(
   const legacyHeaders = new Set([
     `[${from} -> ${recipients}]`,
     ...(attributes.length ? [`[${from} -> ${recipients}; ${attributes.join('; ')}]`] : []),
+    record.dispatch
+      ? `${from} delegated this step to ${recipients}:`
+      : `${from} replied to ${recipients}:`,
   ]);
   const lines = body.split(/\r?\n/);
   let removed = false;

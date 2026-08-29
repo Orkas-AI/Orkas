@@ -116,11 +116,14 @@ bounded result.
 
 On the compact path, after the final fetch batch emit the final fetch-ledger
 write, field-tagged evidence-ledger write, compact citations-input write, and
-canonical citations command with `--report-out RESEARCH-REPORT.md` as ordered
-calls in one model response. The verifier builds the report from that compact
-state; do not transform ledgers, read its full audit, or assemble the report
-with shell code. Then emit the final plan update and publication together; add
-final caps accounting only when a user, cost, resume, or task budget applies.
+canonical citations command with `--report-out RESEARCH-<topic>.md` as ordered
+calls in one model response. `<topic>` is a short slug of this research
+question; never reuse a report filename that already exists in the workspace,
+because a later research run is a new report, not a revision of an earlier one.
+The verifier builds the report from that compact state; do not transform
+ledgers, read its full audit, or assemble the report with shell code. Then
+emit the final plan update and publication together; add final caps
+accounting only when a user, cost, resume, or task budget applies.
 On other paths, keep the equivalent known writes and deterministic command
 batched.
 

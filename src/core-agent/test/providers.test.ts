@@ -1,6 +1,15 @@
 import { describe, it, expect } from "vitest";
 import { ProviderRegistry } from "../src/providers/registry.js";
-import { createAnthropicProvider, createOpenAIProvider, createPiProvider, listPiProviders, listPiModels } from "../src/providers/pi-provider.js";
+import {
+  createAnthropicProvider,
+  createLeadingThinkTextFilterForTest,
+  createOpenAIProvider,
+  createPiProvider,
+  listPiProviders,
+  listPiModels,
+  mapContentForTest,
+  stripLeadingThinkTextForTest,
+} from "../src/providers/pi-provider.js";
 import { createConfig } from "../src/config/loader.js";
 
 describe("Providers (pi-ai backed)", () => {
@@ -43,6 +52,38 @@ describe("Providers (pi-ai backed)", () => {
     it("creates google provider", () => {
       const provider = createPiProvider({ provider: "google" });
       expect(provider.id).toBe("google");
+    });
+
+    it("removes leading private think blocks from custom-provider content", () => {
+      const raw = "<think>private chain of thought</think>\n\nUser-facing result";
+      expect(mapContentForTest([{ type: "text", text: raw }], { stripLeadingThinkText: true }))
+        .toEqual([{ type: "text", text: "User-facing result" }]);
+      expect(mapContentForTest([{ type: "text", text: raw }]))
+        .toEqual([{ type: "text", text: raw }]);
+    });
+
+    it("suppresses consecutive leading think blocks split across deltas", () => {
+      expect(stripLeadingThinkTextForTest(
+        "<think>first</think>\n<think>second</think>\nVisible result",
+      )).toBe("Visible result");
+      const filter = createLeadingThinkTextFilterForTest();
+      expect(filter.push("<think>first</think>\n<th")).toBe("");
+      expect(filter.push("ink>second</thi")).toBe("");
+      expect(filter.push("nk>\nVisible result")).toBe("Visible result");
+      expect(filter.finish()).toBe("");
+    });
+
+    it("preserves non-leading and partial think-tag lookalikes", () => {
+      for (const text of [
+        "Answer with an inline <think> example",
+        "<thinker>visible element</thinker>",
+        "\n<thin",
+      ]) {
+        expect(stripLeadingThinkTextForTest(text)).toBe(text);
+      }
+      const afterBlock = createLeadingThinkTextFilterForTest();
+      expect(afterBlock.push("<think>private</think>\n<thin")).toBe("");
+      expect(afterBlock.finish()).toBe("<thin");
     });
 
   });

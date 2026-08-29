@@ -332,6 +332,10 @@ describe('prompts ↔ code contract', () => {
     // Language rule: write in the user's current language, preserving literals.
     expect(memoryTool).toContain('use project_tasks for task progress');
 
+    expect(memoryManager).toMatch(/description_zh:.*未来对话持续生效/);
+    expect(memoryManager).toMatch(/description_en:.*across future conversations/i);
+    expect(memoryManager).toMatch(/description_en:.*ordinary file saving/i);
+
     expect(agentPrompt).toMatch(/only for durable information useful in future conversations/i);
     expect(agentPrompt).toMatch(/Never store current task progress, temporary plans, one-off status, or TODO\/dependency state/i);
     expect(agentPrompt).toMatch(/Use `agent` for a convention limited to this Agent/i);
@@ -358,20 +362,26 @@ describe('prompts ↔ code contract', () => {
     expect(readFile('src/main/features/group_chat/bus.ts')).toContain("prompts.load('chat_shared_rules'");
   });
 
-  it('group-chat system prompts inject the current User UI language directive', () => {
+  it('group-chat system prompts prefer the user language and keep the UI language as fallback', () => {
     const i18n = readFile('src/main/i18n.ts');
     const composer = readFile('src/main/prompts/chat_prompt_composer.ts');
 
     expect(i18n).toContain('buildLanguageDirectiveText(name)');
-    expect(composer).toContain('User UI language: **${languageName}**');
-    expect(composer).toContain('Write all human-readable prose in ${languageName}');
-    expect(buildLanguageDirectiveText('Chinese (简体中文)')).toContain(
-      'User UI language: **Chinese (简体中文)**',
-    );
+    expect(composer).toContain('Fallback UI language: **${languageName}**');
+    const directive = buildLanguageDirectiveText('Chinese (简体中文)');
+    expect(directive).toContain('a current explicit user language request');
+    expect(directive).toContain("the clear language of the user's latest substantive prose");
+    expect(directive).toContain('Fallback UI language: **Chinese (简体中文)**');
+    expect(directive.indexOf('a current explicit user language request'))
+      .toBeLessThan(directive.indexOf("the clear language of the user's latest substantive prose"));
+    expect(directive.indexOf("the clear language of the user's latest substantive prose"))
+      .toBeLessThan(directive.indexOf('fallback UI language'));
+    expect(directive).toMatch(/Quoted text, code, file contents, proper nouns,[\s\S]*do not switch/i);
+    expect(directive).toContain('Write all human-readable prose in the chosen language');
     const composed = composeChatPrompt({
       main: 'ROLE\n\n## Runtime injection\nRUNTIME',
       stableFragments: ['SHARED'],
-      languageDirective: '## User language\nUser UI language: **Chinese**.',
+      languageDirective: '## User language\nFallback UI language: **Chinese**.',
       runtimeDatetimeBlock: '## Current date\nCurrent date: 2026-07-23',
     });
     expect(composed).toMatch(
@@ -477,6 +487,21 @@ describe('prompts ↔ code contract', () => {
     expect(skillPrompt).toContain('If imported docs, references, scripts, or examples are present, inspect them and write the best skill you can without asking for confirmation');
   });
 
+  it('skill edit URL routing uses the injected owner skills without a Commander mirror', () => {
+    const skillPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_skill_setup.md'), 'utf-8');
+    const start = skillPrompt.indexOf('## Installing a skill from a URL');
+    const end = skillPrompt.indexOf('\n\n---\n\n## Runtime injection', start);
+    const section = skillPrompt.slice(start, end);
+
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    expect(section).toContain('skill-creator');
+    expect(section).toContain('package-installer');
+    expect(section).toContain('<skill-as-package name="<installed-name>"/>');
+    expect(section).not.toMatch(/mirror of the commander|keep in sync with `chat_commander\.md`/i);
+    expect(section).not.toContain('consent-deps');
+  });
+
   it('commander prompt routes automation CRUD through autotask-creator', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
     const automationCreator = readFile('resources/builtin/system/skills/autotask-creator/SKILL.md');
@@ -496,6 +521,8 @@ describe('prompts ↔ code contract', () => {
     expect(memorySection.length).toBeLessThan(1_800);
     expect(memorySection).toMatch(/Use injected memory and project instructions directly as read-only context/i);
     expect(memorySection).toMatch(/mutations are owned by the matching System Skill/i);
+    expect(memorySection).toMatch(/select and read that System Skill before answering or calling its mutation tool/i);
+    expect(memorySection).toMatch(/intended future effect, not exact phrasing/i);
     expect(memorySection).toMatch(/Never persist current task progress/i);
     expect(memorySection).not.toContain('target: "agent"');
     expect(memorySection).not.toContain('Project instructions vs project memory');

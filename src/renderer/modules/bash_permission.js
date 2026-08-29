@@ -2,8 +2,9 @@
 // in-process agent wants to run a command or access a path the classifier
 // flagged as sensitive, main pushes `bash:permission` and this module shows an
 // allow-once / deny choice, plus a task-scoped choice only when main marks the
-// category and actor eligible. Waiting for a human click is kept alive on the
-// main side with progress heartbeats; Renderer never widens main's boundary.
+// category and actor eligible, alongside the durable local-access mode switch.
+// Waiting for a human click is kept alive on the main side with progress
+// heartbeats; Renderer never widens main's operation-approval boundary.
 //
 // Requests queue FIFO so concurrent workers can't stack overlapping dialogs.
 
@@ -362,10 +363,11 @@ function _showBashPermissionModeDialog({
       btn.addEventListener('click', () => finish(btn.dataset.id || 'deny'));
     });
     const cancelBtn = overlay.querySelector('[data-act="cancel"]');
+    const allowOnceBtn = overlay.querySelector('[data-id="allow_once"]');
     cancelBtn.addEventListener('click', () => finish('deny'));
     document.addEventListener('keydown', onKey, true);
     document.addEventListener('click', onDocClick, true);
-    setTimeout(() => cancelBtn.focus(), 0);
+    setTimeout(() => allowOnceBtn?.focus(), 0);
   });
 }
 
@@ -407,7 +409,7 @@ async function _showBashPermissionDialog(info) {
     currentMode,
     requestId,
     allowRun: canAllowRun,
-    showModeControl: !isSensitiveApproval,
+    showModeControl: true,
     onPresented: () => {
       if (presented) return;
       presented = true;
@@ -425,7 +427,7 @@ async function _showBashPermissionDialog(info) {
     return;
   }
   const choice = result && typeof result === 'object' ? result.choice : result;
-  const selectedMode = !isSensitiveApproval && _bashIsMode(result && result.mode)
+  const selectedMode = _bashIsMode(result && result.mode)
     ? result.mode
     : currentMode;
   const requestedDecision = (choice === 'allow_once' || choice === 'allow_run' || choice === 'allow_always')

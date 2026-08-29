@@ -1014,7 +1014,7 @@ describe('runner › scoped tool loading', () => {
     expect(after.content).toContain('Use this exact Skill.');
   });
 
-  it('preloads Commander web and global-Skill discovery, not the whole management group', async () => {
+  it('preloads Commander web and app navigation while support diagnostics stay focused and dormant', async () => {
     process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
     const uid = 'runner-scoped-global-skill-discovery';
     await configureUser(uid);
@@ -1035,11 +1035,25 @@ describe('runner › scoped tool loading', () => {
           inputSchema: { type: 'object', properties: {}, additionalProperties: false },
           async execute() { return { content: JSON.stringify({ ok: true, rows: [] }) }; },
         },
+        {
+          name: 'open_app_view',
+          description: 'Stage app navigation.',
+          inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+          async execute() { return { content: JSON.stringify({ ok: true }) }; },
+        },
+        {
+          name: 'app_health',
+          description: 'Inspect sanitized app health.',
+          inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+          async execute() { return { content: JSON.stringify({ ok: true }) }; },
+        },
       ],
     });
 
     const toolNames = commander.toolDefs.map((tool) => tool.name);
-    expect(toolNames).toContain('skill_search');
+    expect(toolNames).not.toContain('skill_search');
+    expect(toolNames).toContain('open_app_view');
+    expect(toolNames).not.toContain('app_health');
     expect(toolNames).toEqual(expect.arrayContaining(['web_search', 'web_fetch']));
     expect(toolNames).toContain('tool_load');
     expect(toolNames).toContain('manage_execution_plan');
@@ -1050,12 +1064,56 @@ describe('runner › scoped tool loading', () => {
     expect(commander.resolvedSystemPrompt).toContain('## Loadable tool groups');
     expect(commander.resolvedSystemPrompt).not.toContain('Tools:');
     expect(commander.resolvedSystemPrompt).not.toContain('`marketplace_search`');
+    expect(commander.resolvedSystemPrompt).toContain('`management.app`');
+    expect(commander.resolvedSystemPrompt).toContain('`management.skills`');
     expect(commander.resolvedSystemPrompt).toContain('runtime only; not an Agent dependency');
     expect(commander.toolSurfaceTelemetry(['web_search'])).toMatchObject({
       loadCallCount: 0,
       loadedGroupCount: 0,
       loadedSchemaChars: 0,
       webToolUsed: true,
+    });
+    const runner = commander.runner as unknown as {
+      tools: Map<string, {
+        execute: (input: unknown, ctx: unknown) => Promise<{ content: string }>;
+      }>;
+      getActiveToolDefinitions(): Array<{ name: string }>;
+    };
+    const loadResult = await runner.tools.get('tool_load')?.execute(
+      { groups: ['management.skills'] },
+      { workingDir: tmpDir, state: {}, signal: undefined },
+    );
+    expect(JSON.parse(loadResult?.content || '{}')).toMatchObject({
+      ok: true,
+      newly_loaded: ['management.skills'],
+    });
+    const loadedNames = runner.getActiveToolDefinitions().map((tool) => tool.name);
+    expect(loadedNames).toContain('skill_search');
+    expect(loadedNames).not.toContain('marketplace_search');
+    expect(loadedNames).not.toContain('app_health');
+    expect(commander.toolSurfaceTelemetry(['tool_load', 'skill_search'])).toMatchObject({
+      loadCallCount: 1,
+      loadedGroupCount: 1,
+      loadedUnusedGroupCount: 0,
+    });
+
+    const appLoadResult = await runner.tools.get('tool_load')?.execute(
+      { groups: ['management.app'] },
+      { workingDir: tmpDir, state: {}, signal: undefined },
+    );
+    expect(JSON.parse(appLoadResult?.content || '{}')).toMatchObject({
+      ok: true,
+      newly_loaded: ['management.app'],
+    });
+    const appLoadedNames = runner.getActiveToolDefinitions().map((tool) => tool.name);
+    expect(appLoadedNames).toContain('open_app_view');
+    expect(appLoadedNames).toContain('app_health');
+    expect(appLoadedNames).toContain('skill_search');
+    expect(appLoadedNames).not.toContain('marketplace_search');
+    expect(commander.toolSurfaceTelemetry(['tool_load', 'skill_search', 'app_health'])).toMatchObject({
+      loadCallCount: 2,
+      loadedGroupCount: 2,
+      loadedUnusedGroupCount: 0,
     });
   });
 
@@ -1342,21 +1400,21 @@ describe('runner › scoped tool loading', () => {
 
     expect(runner.activeTools().map((tool) => tool.name)).not.toContain('marketplace_search');
     expect(built.resolvedSystemPrompt)
-      .toContain('`management` (runtime only; not an Agent dependency)');
+      .toContain('`management.marketplace` (runtime only; not an Agent dependency)');
+    expect(built.resolvedSystemPrompt)
+      .toContain('`management.automation` (runtime only; not an Agent dependency)');
     expect(managementCalls).toEqual([]);
 
     const loadResult = await runner.tools.get('tool_load')?.execute(
-      { groups: ['management'] },
+      { groups: ['management.marketplace'] },
       { workingDir: tmpDir, state: {}, signal: undefined },
     );
     expect(JSON.parse(loadResult?.content || '{}')).toMatchObject({
       ok: true,
-      newly_loaded: ['management'],
+      newly_loaded: ['management.marketplace'],
     });
-    expect(runner.activeTools().map((tool) => tool.name)).toEqual(expect.arrayContaining([
-      'marketplace_search',
-      'auto_tasks_list',
-    ]));
+    expect(runner.activeTools().map((tool) => tool.name)).toContain('marketplace_search');
+    expect(runner.activeTools().map((tool) => tool.name)).not.toContain('auto_tasks_list');
     expect(managementCalls).toEqual([]);
 
     const searchResult = await runner.tools.get('marketplace_search')?.execute(
@@ -1386,7 +1444,7 @@ describe('runner › scoped tool loading', () => {
       .getToolSurfaceState()).toMatchObject({
         version: 3,
         loadedGroups: [],
-        catalogRevision: '10',
+        catalogRevision: '12',
       });
 
     const nextTurn = await buildRunner({
@@ -1473,7 +1531,7 @@ describe('runner › scoped tool loading', () => {
     expect(migrated.resolvedSystemPrompt).not.toContain('(loaded)');
     expect(migrated.turnEphemeral).not.toContain('`web`');
     expect((await sessions.getSessionForUser(uid, sessionId)).getToolSurfaceState())
-      .toMatchObject({ version: 3, loadedGroups: [], catalogRevision: '10' });
+      .toMatchObject({ version: 3, loadedGroups: [], catalogRevision: '12' });
   });
 
   it('drops restored dynamic groups when an Agent uses a fixed dependency list', async () => {

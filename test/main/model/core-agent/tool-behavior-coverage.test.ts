@@ -65,6 +65,8 @@ const BEHAVIOR_SUITE_BY_TOOL: Record<string, string> = {
   dispatch_to: 'test/main/features/group_chat/bus-integration.test.ts',
   hand_off_to: 'test/main/features/group_chat/bus-integration.test.ts',
   run_worker: 'test/main/features/group_chat/bus-integration.test.ts',
+  open_app_view: 'test/main/features/group_chat/bus-integration.test.ts',
+  app_health: 'test/main/features/group_chat/bus-integration.test.ts',
   tool_load: 'test/main/model/core-agent/tool-surface.test.ts',
 };
 

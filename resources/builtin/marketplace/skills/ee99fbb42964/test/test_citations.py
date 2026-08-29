@@ -404,6 +404,31 @@ class CompactLandscapeInput(unittest.TestCase):
                 0,
             )
 
+            # A later research run is a new report, not a revision: rerunning
+            # onto an existing target must fail instead of truncating it.
+            with mock.patch.dict(
+                os.environ,
+                {"ORKAS_DEEP_RESEARCH_EVIDENCE_FILE": snapshot_path},
+            ):
+                with self.assertRaises(ValueError) as caught:
+                    citations.main([
+                        "--op", "verify",
+                        "--input", input_path,
+                        "--out", output_path,
+                        "--report-out", report_path,
+                    ])
+            self.assertIn("already exists", str(caught.exception))
+            with open(report_path, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), report)
+
+            # The no-overwrite contract must be one filesystem operation, not
+            # exists()+write(), or concurrent runs can both pass the probe.
+            with mock.patch("builtins.open", mock.mock_open()) as report_open:
+                citations._write_new_report("RESEARCH-atomic.md", "# report\n")
+            report_open.assert_called_once_with(
+                "RESEARCH-atomic.md", "x", encoding="utf-8"
+            )
+
             stdout = _cli_stdout(result, [
                 "--input", input_path,
                 "--out", output_path,

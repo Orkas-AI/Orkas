@@ -252,7 +252,9 @@ describe('renderer lazy feature loader', () => {
     const end = source.indexOf('async function refreshSelectedAgentDetail', start);
     const detailOpen = source.slice(start, end);
 
-    expect(detailOpen).toContain('await selectAgent(agentId, { refreshCliOptions: true })');
+    expect(detailOpen).toMatch(
+      /return\s+(?:await\s+)?selectAgent\(agentId, \{ refreshCliOptions: true \}\)/,
+    );
     expect(detailOpen).not.toContain('loadAgents(true)');
   });
 

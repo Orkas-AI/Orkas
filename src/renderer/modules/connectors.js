@@ -377,6 +377,19 @@ function listUsableConnectorsForPicker() {
     .sort((a, b) => (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base', numeric: true }));
 }
 
+window.focusConnectorById = async function focusConnectorById(id) {
+  const targetId = String(id || '').trim();
+  if (!targetId) return false;
+  await loadConnectors();
+  const card = Array.from(document.querySelectorAll('.connector-card[data-id]'))
+    .find((candidate) => candidate.dataset.id === targetId);
+  if (!card) return false;
+  card.setAttribute('tabindex', '-1');
+  card.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  card.focus({ preventScroll: true });
+  return true;
+};
+
 // Brand color hex per PC/docs/design/README §Surface E. Used as background
 // for the 32×32 letter square in `_renderCatalogCard` when no `icon_svg` is
 // shipped. Lookup is by `entry.id` (catalog id, stable across releases) with

@@ -81,7 +81,7 @@ retained comparison cells; when evidence does not support a field, expose the
 gap instead of manufacturing another claim. Audit every canonical comparison
 column before running citations.
 
-On the compact landscape path, let the verifier write `RESEARCH-REPORT.md`
+On the compact landscape path, let the verifier write `RESEARCH-<topic>.md`
 directly from the field-tagged evidence ledger and compact candidate profiles.
 Do not read `citations_output.json`, author another recommendation list or
 comparison table, reconstruct fields from memory, or use shell code to assemble
@@ -168,8 +168,13 @@ rewrite the payload merely to remove non-material warnings.
 Generate the compact verified report once with:
 
 ```bash
-"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" deep-research citations -- --op verify --input citations_input.json --out citations_output.json --report-out RESEARCH-REPORT.md
+"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" deep-research citations -- --op verify --input citations_input.json --out citations_output.json --report-out RESEARCH-<topic>.md
 ```
+
+Replace `<topic>` with a short slug of this research question, so the report
+carries a name a reader can recognise in the file list. The command refuses an
+existing target: a second research run in the same conversation is a new report,
+not a revision of the earlier one, and must never overwrite it.
 
 The report contains the supplied title and boundary, then evidence-informed
 model-selected paths with complete or partial factual coverage, the only

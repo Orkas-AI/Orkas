@@ -1874,3 +1874,89 @@ describe('bash path refusal wording', () => {
     expect(truncateForMessage('project/render/run.sh')).toBe('project/render/run.sh');
   });
 });
+
+// Two parallel agent turns in one conversation share the workspace cwd, and
+// identical instructions make identical basenames likely. The wrapped tool
+// must route probe+write through the per-path lock so neither delivery is
+// silently clobbered (plain check-then-act loses one — the owning-boundary
+// mutation control lives in test/main/util/uniquify-path.test.ts).
+describe('local-tools › write_file › concurrent same-target writers', () => {
+  it('two agents writing one basename both keep their delivery', async () => {
+    await allFilesAuto();
+    const { write: writeA, wsDir } = await buildWriteTool();
+    const { write: writeB } = await buildWriteTool();
+    const p = path.join(wsDir, 'deliverable.md');
+    const [ra, rb] = await Promise.all([
+      writeA.execute({ path: p, content: 'agent-A content' }, { workingDir: '.', signal: undefined, state: {} } as any),
+      writeB.execute({ path: p, content: 'agent-B content' }, { workingDir: '.', signal: undefined, state: {} } as any),
+    ]);
+    expect(ra.isError).toBeFalsy();
+    expect(rb.isError).toBeFalsy();
+    const expected = [p, path.join(wsDir, 'deliverable-2.md')];
+    for (const f of expected) expect(fs.existsSync(f)).toBe(true);
+    expect(expected.map((f) => fs.readFileSync(f, 'utf8')).sort()).toEqual(
+      ['agent-A content', 'agent-B content'],
+    );
+    expect([ra, rb].filter((r) => String(r.content).includes('<file-renamed>'))).toHaveLength(1);
+  });
+});
+
+// The PDF writers render INSIDE the probe+write lock (the render is what
+// materializes the file), and this restructure moved their scope-reject and
+// render-failure paths into the locked closure. Wiring evidence with the
+// render mocked: success carries the receipt, a failed render surfaces the
+// error without a file, and two concurrent same-target renders suffix instead
+// of clobbering (the real-render path stays covered by manual smoke — mock
+// blind spot recorded).
+describe('local-tools › markdown_to_pdf › locked probe+render wiring', () => {
+  it('renders to the decided path, maps render failure to isError, and keeps concurrent deliveries apart', async () => {
+    await allFilesAuto();
+    vi.resetModules();
+    vi.doMock('../../../../src/main/util/md-to-pdf', () => ({
+      markdownToPdf: vi.fn(async (_md: string, outPath: string) => {
+        fs.writeFileSync(outPath, `%PDF-fake:${path.basename(outPath)}`);
+      }),
+      htmlToPdf: vi.fn(async () => { throw new Error('boom'); }),
+    }));
+    try {
+      // vi.resetModules dropped the module-level active user + permission
+      // mode — re-establish both against the freshly loaded module graph.
+      const users = await import('../../../../src/main/features/users');
+      users.activateUser(UID);
+      await allFilesAuto();
+      const localTools = await import('../../../../src/main/model/core-agent/local-tools');
+      const ws = await import('../../../../src/main/features/user_workspace');
+      const wsDir = path.join(tmpDir, 'ws');
+      fs.mkdirSync(wsDir, { recursive: true });
+      const r = ws.setWorkspacePath(UID, wsDir);
+      if (!r.ok) throw new Error(`setWorkspacePath failed: ${r.error}`);
+      const mkTools = () => localTools.createLocalTools({ userId: UID, cid: CID });
+      const ctx = () => ({ workingDir: '.', signal: undefined, state: {} } as any);
+      const pdfA = mkTools().find((t) => t.name === 'create_pdf')!;
+      const pdfB = mkTools().find((t) => t.name === 'create_pdf')!;
+
+      const target = path.join(wsDir, 'summary.pdf');
+      const [ra, rb] = await Promise.all([
+        pdfA.execute({ source_type: 'markdown', path: target, content: '# A' }, ctx()),
+        pdfB.execute({ source_type: 'markdown', path: target, content: '# B' }, ctx()),
+      ]);
+      expect(ra.isError).toBeFalsy();
+      expect(rb.isError).toBeFalsy();
+      expect(fs.existsSync(target)).toBe(true);
+      expect(fs.existsSync(path.join(wsDir, 'summary-2.pdf'))).toBe(true);
+      expect([ra, rb].filter((res) => String(res.content).includes('<file-renamed>'))).toHaveLength(1);
+
+      // Failed render: the html branch's mock throws — the user gets an
+      // actionable error result, not a crash, and no file appears.
+      const failed = await pdfA.execute(
+        { source_type: 'html', path: path.join(wsDir, 'broken.pdf'), content: '<h1>x</h1>' }, ctx(),
+      );
+      expect(failed.isError).toBe(true);
+      expect(String(failed.content)).toContain('Error generating PDF');
+      expect(fs.existsSync(path.join(wsDir, 'broken.pdf'))).toBe(false);
+    } finally {
+      vi.doUnmock('../../../../src/main/util/md-to-pdf');
+      vi.resetModules();
+    }
+  });
+});
