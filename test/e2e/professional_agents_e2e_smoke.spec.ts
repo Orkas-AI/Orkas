@@ -370,9 +370,9 @@ test.describe('shipped professional agents', () => {
     expect(request).toContain('image-router');
     expect(request).toContain('image-manifest.json');
     expect(request).toContain('project.export');
-    expect(request).toContain('User UI language: **Chinese (简体中文)**');
-    expect(request).toContain('Write all human-readable prose in Chinese (简体中文)');
-    expect(request.lastIndexOf('User UI language: **Chinese (简体中文)**'))
+    expect(request).toContain('Fallback UI language: **Chinese (简体中文)**');
+    expect(request).toContain('Write all human-readable prose in the chosen language');
+    expect(request.lastIndexOf('Fallback UI language: **Chinese (简体中文)**'))
       .toBeGreaterThan(request.lastIndexOf('chat prose follows the current UI language'));
   });
 

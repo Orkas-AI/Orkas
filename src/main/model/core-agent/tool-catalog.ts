@@ -35,6 +35,10 @@ export type ToolGroupId =
   | 'context'
   | 'orchestration'
   | 'management'
+  | 'management.app'
+  | 'management.skills'
+  | 'management.marketplace'
+  | 'management.automation'
   | 'runtime';
 
 export interface ToolGroupEntry {
@@ -91,7 +95,11 @@ export const TOOL_GROUPS: readonly ToolGroupEntry[] = [
   { id: 'connectors', title: 'Connectors', summary: 'Discover and call enabled third-party connector actions.', activation: 'loadable', agentDependency: true },
   { id: 'context', title: 'Context', summary: 'Conversation, plan, memory, and project context managed by the host.', activation: 'host-managed', agentDependency: false },
   { id: 'orchestration', title: 'Orchestration', summary: 'Commander delegation, handoff, and anonymous worker controls.', activation: 'host-managed', agentDependency: false },
-  { id: 'management', title: 'Management', summary: 'Skill, marketplace, and automation management controls.', activation: 'loadable', agentDependency: false },
+  { id: 'management', title: 'Management', summary: 'App support, Skill, marketplace, and automation management controls.', activation: 'loadable', agentDependency: false },
+  { id: 'management.app', title: 'App support', summary: 'Navigate supported Orkas screens and inspect sanitized app health.', parent: 'management', activation: 'loadable', agentDependency: false },
+  { id: 'management.skills', title: 'Skill management', summary: 'Discover global-folder Skills or import a user-requested Skill package.', parent: 'management', activation: 'loadable', agentDependency: false },
+  { id: 'management.marketplace', title: 'Marketplace management', summary: 'Search the Marketplace and request a confirmed installation.', parent: 'management', activation: 'loadable', agentDependency: false },
+  { id: 'management.automation', title: 'Automation management', summary: 'Inspect scheduled and recurring automation tasks.', parent: 'management', activation: 'loadable', agentDependency: false },
   { id: 'runtime', title: 'Runtime', summary: 'Tool-surface, learned-skill, and oversized-result runtime controls.', activation: 'host-managed', agentDependency: false },
 ] as const;
 
@@ -179,12 +187,14 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
   { name: 'hand_off_to', loadGroups: ['orchestration'], summary: 'Transfer terminal ownership to another Agent.' },
   { name: 'run_worker', loadGroups: ['orchestration'], summary: 'Run an anonymous private worker.' },
 
-  { name: 'skill_search', loadGroups: ['management'], summary: 'Search available open-tier skills.' },
-  { name: 'import_skill_package', loadGroups: ['management'], summary: 'Import a user-requested skill package.' },
+  { name: 'skill_search', loadGroups: ['management.skills'], summary: 'Search available global-folder skills.' },
+  { name: 'import_skill_package', loadGroups: ['management.skills'], summary: 'Import a user-requested skill package.' },
   { name: 'skill_manage', loadGroups: ['runtime'], summary: 'Manage an Agent-owned learned skill.' },
-  { name: 'marketplace_search', loadGroups: ['management'], summary: 'Search the marketplace.' },
-  { name: 'marketplace_request_install', loadGroups: ['management'], summary: 'Request a user-confirmed marketplace installation.' },
-  { name: 'auto_tasks_list', loadGroups: ['management'], summary: 'List automation tasks.' },
+  { name: 'marketplace_search', loadGroups: ['management.marketplace'], summary: 'Search the marketplace.' },
+  { name: 'marketplace_request_install', loadGroups: ['management.marketplace'], summary: 'Request a user-confirmed marketplace installation.' },
+  { name: 'auto_tasks_list', loadGroups: ['management.automation'], summary: 'List automation tasks.' },
+  { name: 'open_app_view', loadGroups: ['management.app'], summary: 'Stage a click-to-open navigation card to an app surface.' },
+  { name: 'app_health', loadGroups: ['management.app'], summary: 'Read-only sanitized app diagnosis snapshot.' },
 
   { name: 'tool_load', loadGroups: ['runtime'], summary: 'Activate one or more loadable tool groups.' },
   { name: 'tool_result', loadGroups: ['runtime'], summary: 'Search, aggregate, or page a persisted oversized tool result.' },

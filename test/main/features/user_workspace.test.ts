@@ -1,7 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const nodeRequire = createRequire(import.meta.url);
 
 vi.mock('../../../src/main/logger', () => ({
   createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
@@ -52,6 +56,85 @@ vi.mock('electron', () => ({
 async function _pinZh() {
   const i18n = await import('../../../src/main/i18n');
   i18n.setCurrentLang('zh');
+}
+
+function _recordSensitiveFsCalls(sensitiveRoot: string): {
+  calls: string[];
+  restore(): void;
+} {
+  const mutableFs = nodeRequire('node:fs') as Record<string, any>;
+  const root = path.resolve(sensitiveRoot);
+  const calls: string[] = [];
+  const originals = new Map<string, (...args: any[]) => any>();
+  const promiseOriginals = new Map<string, (...args: any[]) => any>();
+  const operationNames = [
+    'accessSync',
+    'existsSync',
+    'lstatSync',
+    'openSync',
+    'opendirSync',
+    'readFileSync',
+    'readdirSync',
+    'realpathSync',
+    'statSync',
+  ];
+
+  const resolveTarget = (value: unknown): string => {
+    try {
+      if (typeof value === 'string') return path.resolve(value);
+      if (Buffer.isBuffer(value)) return path.resolve(value.toString());
+      if (value instanceof URL && value.protocol === 'file:') return path.resolve(fileURLToPath(value));
+    } catch { /* malformed inputs are not relevant to this probe */ }
+    return '';
+  };
+  const record = (operation: string, value: unknown): void => {
+    const target = resolveTarget(value);
+    if (!target) return;
+    const rel = path.relative(root, target);
+    if (rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel))) {
+      calls.push(`${operation}:${rel || '.'}`);
+    }
+  };
+
+  for (const name of operationNames) {
+    const original = mutableFs[name];
+    if (typeof original !== 'function') continue;
+    originals.set(name, original);
+    mutableFs[name] = function sensitiveFsProbe(this: unknown, ...args: any[]) {
+      record(name, args[0]);
+      return Reflect.apply(original, this, args);
+    };
+  }
+  for (const name of ['access', 'lstat', 'open', 'opendir', 'readFile', 'readdir', 'realpath', 'stat']) {
+    const original = mutableFs.promises?.[name];
+    if (typeof original !== 'function') continue;
+    promiseOriginals.set(name, original);
+    mutableFs.promises[name] = function sensitivePromiseFsProbe(this: unknown, ...args: any[]) {
+      record(`promises.${name}`, args[0]);
+      return Reflect.apply(original, this, args);
+    };
+  }
+  const wrappedRealpath = mutableFs.realpathSync;
+  const originalRealpathNative = originals.get('realpathSync')?.native;
+  if (typeof originalRealpathNative === 'function') {
+    wrappedRealpath.native = function sensitiveNativeRealpathProbe(this: unknown, ...args: any[]) {
+      record('realpathSync.native', args[0]);
+      return Reflect.apply(originalRealpathNative, this, args);
+    };
+  }
+  syncBuiltinESMExports();
+
+  return {
+    calls,
+    restore() {
+      for (const [name, original] of originals) mutableFs[name] = original;
+      for (const [name, original] of promiseOriginals) mutableFs.promises[name] = original;
+      if (typeof originalRealpathNative === 'function') {
+        mutableFs.realpathSync.native = originalRealpathNative;
+      }
+      syncBuiltinESMExports();
+    },
+  };
 }
 
 describe('user_workspace › getWorkspacePath', () => {
@@ -119,8 +202,7 @@ describe('user_workspace › setWorkspacePath', () => {
     if (result.ok) expect(result.path).toBe(dir);
   });
 
-  it.runIf(process.platform === 'darwin')('rejects macOS privacy-protected workspace roots selected by the user', async () => {
-    await _pinZh();
+  it.runIf(process.platform === 'darwin')('persists user-selected macOS privacy-protected workspace roots without probing them again', async () => {
     process.env.ORKAS_TCC_GUARD_FORCE = '1';
     const home = path.join(tmpDir, 'fake-home');
     const protectedRoots = [
@@ -144,17 +226,25 @@ describe('user_workspace › setWorkspacePath', () => {
       const userId = `userProtected${idx}`;
       const result = ws.setWorkspacePath(userId, protectedRoot);
 
-      expect(result.ok).toBe(false);
-      if (!result.ok) expect(result.error).toContain('隐私保护');
-
-      expect(ws.getWorkspacePath(userId)).toBe(p.DEFAULT_USER_WORKSPACE);
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.path).toBe(protectedRoot);
+      expect(ws.getWorkspacePath(userId)).toBe(protectedRoot);
       const info = ws.getWorkspaceInfo(userId);
-      expect(info.currentPath).toBe(p.DEFAULT_USER_WORKSPACE);
+      expect(info.currentPath).toBe(protectedRoot);
+      expect(info.defaultPath).toBe(p.DEFAULT_USER_WORKSPACE);
+      expect(info.isDefault).toBe(false);
+
+      const cfgFile = path.join(tmpDir, userId, 'local', 'workspace.json');
+      const persisted = JSON.parse(fs.readFileSync(cfgFile, 'utf-8'));
+      expect(persisted.default.macosTccSensitive).toBe(true);
     }
+
+    const downloads = path.join(home, 'Downloads');
+    fs.rmSync(downloads, { recursive: true, force: true });
+    expect(ws.getWorkspacePath('userProtected1')).toBe(downloads);
   });
 
-  it.runIf(process.platform === 'darwin')('rejects a symlink alias that resolves into a protected macOS workspace root', async () => {
-    await _pinZh();
+  it.runIf(process.platform === 'darwin')('classifies a selected symlink alias into a protected macOS root once and keeps the user-facing path', async () => {
     process.env.ORKAS_TCC_GUARD_FORCE = '1';
     const home = path.join(tmpDir, 'fake-home');
     const desktopProject = path.join(home, 'Desktop', 'project');
@@ -166,8 +256,13 @@ describe('user_workspace › setWorkspacePath', () => {
 
     const result = ws.setWorkspacePath('userSymlinkProtected', alias);
 
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error).toContain('隐私保护');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.path).toBe(alias);
+    const cfgFile = path.join(tmpDir, 'userSymlinkProtected', 'local', 'workspace.json');
+    const persisted = JSON.parse(fs.readFileSync(cfgFile, 'utf-8'));
+    expect(persisted.default.macosTccSensitive).toBe(true);
+    fs.rmSync(alias);
+    expect(ws.getWorkspacePath('userSymlinkProtected')).toBe(alias);
   });
 
   it.runIf(process.platform !== 'win32')('accepts a symlink to an ordinary project without rewriting the selected path', async () => {
@@ -269,8 +364,7 @@ describe('user_workspace › selectDirectory (mocked)', () => {
     expect(result).toBe(dir);
   });
 
-  it.runIf(process.platform === 'darwin')('does not persist a protected directory returned by the native picker', async () => {
-    await _pinZh();
+  it.runIf(process.platform === 'darwin')('persists a protected directory returned by the native picker', async () => {
     process.env.ORKAS_TCC_GUARD_FORCE = '1';
     const home = path.join(tmpDir, 'fake-home');
     const downloads = path.join(home, 'Downloads');
@@ -288,8 +382,71 @@ describe('user_workspace › selectDirectory (mocked)', () => {
     expect(selected).toBe(downloads);
     const result = ws.setWorkspacePath('userPickerProtected', selected!);
 
-    expect(result.ok).toBe(false);
-    expect(ws.getWorkspacePath('userPickerProtected')).toBe(p.DEFAULT_USER_WORKSPACE);
+    expect(result.ok).toBe(true);
+    expect(ws.getWorkspacePath('userPickerProtected')).toBe(downloads);
+    expect(ws.consumePickerFirstOpenDefault('userPickerProtected')).toBe(p.DEFAULT_USER_WORKSPACE);
+  });
+
+  it.runIf(process.platform === 'darwin')('does not issue prompt-triggering filesystem probes after selecting or restoring a protected workspace', async () => {
+    process.env.ORKAS_TCC_GUARD_FORCE = '1';
+    const home = path.join(tmpDir, 'fake-home');
+    const documents = path.join(home, 'Documents', 'active-project');
+    fs.mkdirSync(documents, { recursive: true });
+    process.env.HOME = home;
+    vi.resetModules();
+    const { dialog } = await import('electron');
+    (dialog.showOpenDialog as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      canceled: false,
+      filePaths: [documents],
+    });
+    const probe = _recordSensitiveFsCalls(path.join(home, 'Documents'));
+
+    try {
+      const ws = await import('../../../src/main/features/user_workspace');
+      const p = await import('../../../src/main/paths');
+      const selected = await ws.selectDirectory();
+
+      expect(selected).toBe(documents);
+      expect(ws.setWorkspacePath('userNoTccPrompt', selected!).ok).toBe(true);
+      expect(ws.getWorkspacePath('userNoTccPrompt')).toBe(documents);
+      expect(ws.getWorkspaceInfo('userNoTccPrompt')).toMatchObject({
+        currentPath: documents,
+        isDefault: false,
+      });
+      expect(ws.consumePickerFirstOpenDefault('userNoTccPrompt')).toBe(p.DEFAULT_USER_WORKSPACE);
+      expect(ws.sweepEmptyConvDirs('userNoTccPrompt')).toEqual({ swept: 0 });
+
+      // Reload the feature module to model a fresh app process reading the
+      // persisted workspace classification. Passive boot/UI reads must still
+      // avoid the selected TCC root.
+      vi.resetModules();
+      const relaunched = await import('../../../src/main/features/user_workspace');
+      expect(relaunched.getWorkspacePath('userNoTccPrompt')).toBe(documents);
+      expect(relaunched.getWorkspaceInfo('userNoTccPrompt').currentPath).toBe(documents);
+      expect(relaunched.consumePickerFirstOpenDefault('userNoTccPrompt')).toBe(p.DEFAULT_USER_WORKSPACE);
+
+      expect(probe.calls).toEqual([]);
+    } finally {
+      probe.restore();
+    }
+  });
+
+  it.runIf(process.platform === 'darwin')('fails the TCC probe oracle when sensitive filesystem access occurs', async () => {
+    const documents = path.join(tmpDir, 'fake-home', 'Documents', 'negative-control');
+    fs.mkdirSync(documents, { recursive: true });
+    const probe = _recordSensitiveFsCalls(documents);
+    try {
+      fs.statSync(documents);
+      fs.realpathSync.native(documents);
+      await fs.promises.stat(documents);
+      expect(probe.calls).toEqual([
+        'statSync:.',
+        'realpathSync.native:.',
+        'promises.stat:.',
+      ]);
+    } finally {
+      probe.restore();
+    }
   });
 });
 
@@ -390,7 +547,7 @@ describe('user_workspace › scoped (projects)', () => {
     expect(info.recentPaths).toContain(protectedRecent);
   });
 
-  it.runIf(process.platform === 'darwin')('falls back from a legacy protected selectedPath without statting it', async () => {
+  it.runIf(process.platform === 'darwin')('restores a legacy protected selectedPath without statting it', async () => {
     process.env.ORKAS_TCC_GUARD_FORCE = '1';
     const home = path.join(tmpDir, 'fake-home');
     const desktop = path.join(home, 'Desktop');
@@ -405,16 +562,19 @@ describe('user_workspace › scoped (projects)', () => {
       updatedAt: '2026-06-03T00:00:00.000Z',
       recentPaths: [path.join(home, 'Downloads')],
     }));
+    fs.rmSync(desktop, { recursive: true, force: true });
 
-    expect(ws.getWorkspacePath('userLegacyProtected')).toBe(p.DEFAULT_USER_WORKSPACE);
+    expect(ws.getWorkspacePath('userLegacyProtected')).toBe(desktop);
     const info = ws.getWorkspaceInfo('userLegacyProtected');
-    expect(info.currentPath).toBe(p.DEFAULT_USER_WORKSPACE);
+    expect(info.currentPath).toBe(desktop);
     expect(info.defaultPath).toBe(p.DEFAULT_USER_WORKSPACE);
-    expect(info.isDefault).toBe(true);
+    expect(info.isDefault).toBe(false);
     expect(info.recentPaths).toEqual([]);
+    const migrated = JSON.parse(fs.readFileSync(cfgFile, 'utf-8'));
+    expect(migrated.default.macosTccSensitive).toBe(true);
   });
 
-  it.runIf(process.platform === 'darwin')('falls back from a legacy symlink that resolves into a protected workspace root', async () => {
+  it.runIf(process.platform === 'darwin')('restores a legacy symlink that resolves into a protected workspace root', async () => {
     process.env.ORKAS_TCC_GUARD_FORCE = '1';
     const home = path.join(tmpDir, 'fake-home');
     const downloadsProject = path.join(home, 'Downloads', 'legacy-project');
@@ -423,7 +583,6 @@ describe('user_workspace › scoped (projects)', () => {
     fs.symlinkSync(downloadsProject, alias, 'dir');
     process.env.HOME = home;
     const ws = await import('../../../src/main/features/user_workspace');
-    const p = await import('../../../src/main/paths');
     const cfgFile = path.join(tmpDir, 'userLegacySymlink', 'local', 'workspace.json');
     fs.mkdirSync(path.dirname(cfgFile), { recursive: true });
     fs.writeFileSync(cfgFile, JSON.stringify({
@@ -432,7 +591,9 @@ describe('user_workspace › scoped (projects)', () => {
       recentPaths: [],
     }));
 
-    expect(ws.getWorkspacePath('userLegacySymlink')).toBe(p.DEFAULT_USER_WORKSPACE);
+    expect(ws.getWorkspacePath('userLegacySymlink')).toBe(alias);
+    const migrated = JSON.parse(fs.readFileSync(cfgFile, 'utf-8'));
+    expect(migrated.default.macosTccSensitive).toBe(true);
   });
 
   it('reset on project scope falls through to default; default scope intact', async () => {
@@ -558,6 +719,31 @@ describe('user_workspace › openWorkspaceInFileManager', () => {
     const result = await ws.openWorkspaceInFileManager('userErr');
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toBe('boom');
+  });
+
+  it.runIf(process.platform === 'darwin')('opens a user-selected protected workspace without a preflight filesystem probe', async () => {
+    process.env.ORKAS_TCC_GUARD_FORCE = '1';
+    const home = path.join(tmpDir, 'fake-home');
+    const downloads = path.join(home, 'Downloads', 'active-workspace');
+    fs.mkdirSync(downloads, { recursive: true });
+    process.env.HOME = home;
+    vi.resetModules();
+    const { shell } = await import('electron');
+    (shell.openPath as ReturnType<typeof vi.fn>).mockClear();
+    const probe = _recordSensitiveFsCalls(path.join(home, 'Downloads'));
+
+    try {
+      const ws = await import('../../../src/main/features/user_workspace');
+      expect(ws.setWorkspacePath('userOpenProtected', downloads).ok).toBe(true);
+
+      const result = await ws.openWorkspaceInFileManager('userOpenProtected');
+
+      expect(result).toEqual({ ok: true, path: downloads });
+      expect(shell.openPath).toHaveBeenCalledWith(downloads);
+      expect(probe.calls).toEqual([]);
+    } finally {
+      probe.restore();
+    }
   });
 
   it('refuses to open when the workspace directory is gone (falls back to default)', async () => {

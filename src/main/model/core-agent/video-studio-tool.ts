@@ -5860,6 +5860,7 @@ async function startVideoStudioOperationState(input: {
   statePath: string;
   compositionDirAbs: string;
   op: string;
+  renderQuality?: 'unset' | RenderQuality;
   turnId?: string;
   outputPath?: string;
   reportPath?: string;
@@ -5875,6 +5876,7 @@ async function startVideoStudioOperationState(input: {
       ...(artifacts.composition_signature
         ? { input_hash: artifacts.composition_signature }
         : {}),
+      ...(input.renderQuality ? { render_quality: input.renderQuality } : {}),
       stage: state.stage,
       revision: state.revision + 1,
       ...(input.turnId ? { turn_id: input.turnId } : {}),
@@ -5891,6 +5893,7 @@ async function startVideoStudioOperationState(input: {
         ...(artifacts.composition_signature
           ? { input_hash: artifacts.composition_signature }
           : {}),
+        ...(input.renderQuality ? { render_quality: input.renderQuality } : {}),
         status: 'started' as const,
         ...(input.turnId ? { turn_id: input.turnId } : {}),
         ...(input.outputPath ? { output_path: input.outputPath } : {}),
@@ -11739,9 +11742,21 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         const renderInputSignature = (op === 'composition.draft' || op === 'composition.export')
           ? (await videoProductionArtifacts(compositionDirAbs)).composition_signature || 'missing-signature'
           : '';
+        // The breaker must identify the render request, not just its authored
+        // bytes. A failed preview-quality delivery does not predict a failed
+        // high-quality delivery (and vice versa). `unset` is deliberate for
+        // draft: the renderer gives an omitted quality its own fps/CRF profile.
+        const renderQualityIdentity: 'unset' | RenderQuality | undefined = op === 'composition.export'
+          ? quality ?? 'high'
+          : op === 'composition.draft'
+            ? quality ?? 'unset'
+            : undefined;
         const identicalRenderFailures = (stateBefore.operation_journal || []).filter(
           (entry) => entry.op === op
             && entry.input_hash === renderInputSignature
+            // Legacy entries carry no quality. Fail open because they cannot
+            // prove the current render request is actually identical.
+            && entry.render_quality === renderQualityIdentity
             && entry.status === 'failed'
             && entry.consumes_same_input_attempt === true,
         );
@@ -11771,6 +11786,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             next_action: 'repair_inputs_then_retry_render',
             operation_journal_evidence: {
               input_hash: renderInputSignature,
+              render_quality: renderQualityIdentity,
               same_input_attempts: identicalRenderAttempts,
               ...(identicalQaVerdicts ? { same_input_deterministic_qa_failures: identicalQaVerdicts } : {}),
               durable: true,
@@ -11800,6 +11816,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           statePath: gateStatePath,
           compositionDirAbs,
           op,
+          ...(renderQualityIdentity ? { renderQuality: renderQualityIdentity } : {}),
           turnId: opts.turnId,
           ...(outputAbsPath ? { outputPath: outputAbsPath } : {}),
           ...(effectiveReportPath ? { reportPath: effectiveReportPath } : {}),

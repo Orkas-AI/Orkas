@@ -2,6 +2,17 @@ import { describe, it, expect, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import {
+  AgentRunner,
+  createConfig,
+  defineTool,
+  ProviderRegistry,
+  type AgentRunEvent,
+  type CompletionParams,
+  type CompletionResult,
+  type LLMProvider,
+  type Message,
+} from '#core-agent';
 
 vi.mock('../../../../src/main/features/chat_attachments', () => ({
   resolveAttachmentAbsPath: (_uid: string, _cid: string, name: string) => ({
@@ -89,6 +100,107 @@ async function acknowledge(messages: AnyItem[]): Promise<void> {
 }
 
 describe('group_chat bus › drainSteerInto (interrupt-steer)', () => {
+  it('acknowledges a Send now update before any stale side-effect tool executes', async () => {
+    const requests: Message[][] = [];
+    let streamCalls = 0;
+    const provider: LLMProvider = {
+      id: 'mock',
+      name: 'Mock',
+      async complete(): Promise<CompletionResult> { throw new Error('unused'); },
+      async *stream(params: CompletionParams) {
+        streamCalls++;
+        requests.push([...params.messages]);
+        yield { type: 'message_start' as const };
+        if (streamCalls === 1) {
+          yield { type: 'tool_use_start' as const, id: 'send-1', name: 'send_external_message' };
+          yield { type: 'tool_use_delta' as const, id: 'send-1', input: '{"body":"old draft"}' };
+          yield { type: 'tool_use_end' as const, id: 'send-1' };
+          yield {
+            type: 'message_end' as const,
+            stopReason: 'tool_use' as const,
+            usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+            content: [{
+              type: 'tool_use' as const,
+              id: 'send-1',
+              name: 'send_external_message',
+              input: { body: 'old draft' },
+            }],
+            model: 'mock-model',
+          };
+          return;
+        }
+        yield { type: 'text_delta' as const, text: 'Kept the message as a draft.' };
+        yield {
+          type: 'message_end' as const,
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 5, outputTokens: 4, totalTokens: 9 },
+          content: [{ type: 'text' as const, text: 'Kept the message as a draft.' }],
+          model: 'mock-model',
+        };
+      },
+      async validateAuth() { return true; },
+    };
+    const registry = new ProviderRegistry();
+    registry.registerFactory('mock', () => provider);
+    let sideEffects = 0;
+    const sendExternalMessage = defineTool({
+      name: 'send_external_message',
+      description: 'Send an external message.',
+      inputSchema: {
+        type: 'object',
+        properties: { body: { type: 'string' } },
+        required: ['body'],
+      },
+      async execute() {
+        sideEffects++;
+        return { content: 'sent' };
+      },
+    });
+    const runner = new AgentRunner({
+      config: createConfig({ agent: { defaultProvider: 'mock', defaultModel: 'mock-model' } }),
+      providers: registry,
+      tools: [sendExternalMessage],
+    });
+    const queued = item({
+      actor: commander,
+      fromActorId: 'user',
+      llmPayload: 'Do not send it. Keep it as a draft instead.',
+    });
+    const w = fakeW([queued]);
+
+    const events: AgentRunEvent[] = [];
+    for await (const event of runner.runStream({
+      message: 'Send the external message now.',
+      drainSteer: () => drainSteerInto(w, commander),
+    })) {
+      events.push(event);
+    }
+
+    const done = events.at(-1) as Extract<AgentRunEvent, { type: 'done' }>;
+    expect(done.result.text).toBe('Kept the message as a draft.');
+    expect(streamCalls).toBe(2);
+    expect(sideEffects).toBe(0);
+    expect(w.queue).toEqual([]);
+    expect(events.find((event) => event.type === 'tool_start')).toMatchObject({
+      id: 'send-1',
+      name: 'send_external_message',
+    });
+    expect(events.find((event) => event.type === 'tool_end')).toMatchObject({
+      id: 'send-1',
+      name: 'send_external_message',
+      result: 'Tool call skipped because a newer user instruction arrived before execution.',
+      isError: true,
+      durationMs: 0,
+    });
+    expect(JSON.stringify(requests[1])).toContain('Do not send it. Keep it as a draft instead.');
+    expect(requests[1].flatMap((message) => message.content)).toContainEqual({
+      type: 'tool_result',
+      toolUseId: 'send-1',
+      content: 'Tool call skipped because a newer user instruction arrived before execution.',
+      isError: true,
+    });
+  });
+
   it('leaves an ordinary user message in FIFO unless Send now authorized steering', async () => {
     const queued = item({
       actor: commander,

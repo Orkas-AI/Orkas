@@ -28,6 +28,7 @@ import {
   armKillWatchdog,
   LineSplitter,
   levelOrInfo,
+  isFileReadToolName,
 } from './base.js';
 
 const log = createLogger('local-agents:claude');
@@ -86,7 +87,10 @@ export const claudeBackend: LocalBackend = {
     // versions that ignore `--include-partial-messages` never emit
     // stream_events; in that case we fall back to emitting from the
     // assistant block so the user still sees the final text.
-    const partialState = { sawTextStreamEvent: false };
+    const partialState: ClaudeParseState = {
+      sawTextStreamEvent: false,
+      toolNamesByCallId: new Map<string, string>(),
+    };
 
     opts.onEvent({
       type: 'process-info',
@@ -492,6 +496,9 @@ export const claudeBackend: LocalBackend = {
           // stream-json process. A later self-woken turn may fall back to full
           // assistant blocks even when the previous turn streamed deltas.
           partialState.sawTextStreamEvent = false;
+          // Tool calls never span turns; drop any callId whose result
+          // never arrived so the map stays turn-scoped.
+          partialState.toolNamesByCallId?.clear();
           if (liveTasks.size > 0) {
             enterBackground();
             // `result` would otherwise be the latest activity row. Reassert the
@@ -665,10 +672,19 @@ export function buildClaudeArgs(opts: Pick<BackendRunOptions,
  *      tool_use blocks because the partial input_json deltas alone
  *      aren't enough to render a useful tool-event.
  */
+export type ClaudeParseState = {
+  sawTextStreamEvent: boolean;
+  /** callId -> tool name, captured from the assistant `tool_use` block so the
+   *  `tool_result` branch can tell agent-produced media apart from a file the
+   *  agent merely read. Optional: callers that only care about text (and the
+   *  parser tests) may pass a bare `{ sawTextStreamEvent }`. */
+  toolNamesByCallId?: Map<string, string>;
+};
+
 export function mapClaudeEvent(
   obj: any,
   _sessionIdSoFar: string | undefined,
-  partialState: { sawTextStreamEvent: boolean } = { sawTextStreamEvent: false },
+  partialState: ClaudeParseState = { sawTextStreamEvent: false },
 ):
   | undefined
   | {
@@ -921,10 +937,17 @@ export function mapClaudeEvent(
         continue;
       }
       if (part?.type === 'tool_use') {
+        const useCallId = String(part.id || '');
+        const useToolName = String(part.name || 'unknown');
+        // Recorded so the matching tool_result can classify any image it
+        // carries. Consumed (and deleted) there; cleared at turn end.
+        if (useCallId && partialState.toolNamesByCallId) {
+          partialState.toolNamesByCallId.set(useCallId, useToolName);
+        }
         events.push({
             type: 'tool-event',
-            tool: String(part.name || 'unknown'),
-            callId: String(part.id || ''),
+            tool: useToolName,
+            callId: useCallId,
             phase: 'use',
             input: part.input ?? {},
         });
@@ -951,7 +974,14 @@ export function mapClaudeEvent(
             output: out,
         });
         const mediaItems = claudeToolResultImages(part.content);
-        if (mediaItems.length) {
+        const originTool = callId
+          ? partialState.toolNamesByCallId?.get(callId) || ''
+          : '';
+        if (callId) partialState.toolNamesByCallId?.delete(callId);
+        // `Read` returns the file itself as an image block. Publishing that
+        // republished whatever the agent looked at — including the user's own
+        // upload — as `![generated image]`.
+        if (mediaItems.length && !isFileReadToolName(originTool)) {
           events.push({
             type: 'media-output',
             source: 'claude',

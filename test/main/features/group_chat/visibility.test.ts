@@ -186,6 +186,29 @@ describe('group_chat visibility › Commander canonical conversation history', (
     expect(response).not.toContain('[Commander -> User]');
   });
 
+  it('collapses repeated current actor attribution before adding one authoritative history label', async () => {
+    const v = await import('../../../../src/main/features/group_chat/visibility');
+    const attribution = 'VideoStudio (video-agent) replied to User:';
+    const rows = [
+      { id: 'u1', ts: 't1', from: 'user', to: ['video-agent'], text: 'Render the clip.' },
+      {
+        id: 'a1', ts: 't2', from: 'video-agent', to: ['user'],
+        text: `${attribution}\n\n${attribution}\n\nThe render is ready.`,
+      },
+      { id: 'u2', ts: 't3', from: 'user', to: ['commander'], text: 'Continue.' },
+    ] as any;
+
+    const history = v.buildCommanderConversationHistory(
+      rows,
+      'u2',
+      new Map([['video-agent', 'VideoStudio']]),
+    );
+    const response = (history[1].content[0] as any).text;
+
+    expect(response).toContain('The render is ready.');
+    expect(response.match(/VideoStudio \(video-agent\) replied to User:/g)).toHaveLength(1);
+  });
+
   it('normalizes the model-facing body rather than replaying a clean visible fallback', async () => {
     const v = await import('../../../../src/main/features/group_chat/visibility');
     const rows = [
@@ -240,7 +263,13 @@ describe('group_chat visibility › Commander canonical conversation history', (
       { id: 'u3', ts: 't5', from: 'user', to: ['commander'], text: 'Keep the unknown route.' },
       {
         id: 'a3', ts: 't6', from: 'commander', to: ['user'],
-        text: '[Alice -> Bob]\nThis is ordinary content.',
+        text: [
+          '[Alice -> Bob]',
+          'This inline mention of Commander replied to User: must remain.',
+          '```text',
+          'Commander replied to User:',
+          '```',
+        ].join('\n'),
       },
       { id: 'u4', ts: 't7', from: 'user', to: ['commander'], text: 'Continue.' },
     ] as any;
@@ -251,6 +280,8 @@ describe('group_chat visibility › Commander canonical conversation history', (
     expect(serialized).toContain('This inline mention of [Commander -> User] must remain.');
     expect(serialized).toContain('```text\\n[Commander -> User]\\n```');
     expect(serialized).toContain('[Alice -> Bob]');
+    expect(serialized).toContain('This inline mention of Commander replied to User: must remain.');
+    expect(serialized).toContain('```text\\nCommander replied to User:\\n```');
   });
 
   it('does not replay a previously leaked internal history serialization', async () => {

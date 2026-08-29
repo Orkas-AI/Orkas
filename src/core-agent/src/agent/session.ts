@@ -2102,12 +2102,20 @@ export class Session {
     const objectiveNote = plan.objectiveTruncated || objective !== plan.objective
       ? " (bounded deterministic excerpts; raw user messages remain canonical)"
       : " (deterministically anchored from user instructions)";
-    const latestUserDigest = this.latestUserTextInActiveTurn()?.digest;
+    const latestUser = this.latestUserTextInActiveTurn();
+    const latestUserDigest = latestUser?.digest;
     const needsReconciliation = plan.updatedTurnId !== activeTurnId
       || !plan.updatedUserMessageDigest
       || plan.updatedUserMessageDigest !== latestUserDigest;
     const lines = [
       "[Execution plan anchor — authoritative runtime state, not a summary]",
+      ...(needsReconciliation && latestUser
+        ? [
+            "Latest user instruction — authoritative; replaces conflicting earlier requirements:",
+            truncateMiddle(latestUser.text, EXECUTION_PLAN_MAX_ANCHOR_OBJECTIVE_CHARS),
+            "The prior objective and steps below are stale until reconciled; retain only non-conflicting requirements.",
+          ]
+        : []),
       `Objective${objectiveNote}:`,
       objective,
       `Revision: ${plan.revision}`,

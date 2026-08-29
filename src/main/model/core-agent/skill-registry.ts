@@ -666,7 +666,7 @@ export function openSkillReadRoots(uid: string): string[] {
  *  and keeping them search-only with no count keeps the cache prefix stable. */
 const OPEN_TIER_SKILL_HINT =
   'More skills may be available from your global skill folders — these are NOT listed '
-  + 'above. Call the `skill_search` tool with a capability query to find them, then '
+  + 'above. Load `management.skills`, call `skill_search` with a capability query, then '
   + '`read_files` the returned run-scoped Skill ref before invoking.';
 
 const OPEN_SEARCH_DEFAULT_LIMIT = 5;
@@ -1136,7 +1136,7 @@ export async function getSystemSkillsPromptBlock(
     '',
     'System skills are product protocols. They are not marketplace or custom skills.',
     '',
-    'Match the whole request against every description. Before other work, read the smallest complete set of matching SKILL.md files; never load nonmatches.',
+    'Treat each description as an activation contract. Decide from the whole request\'s intended outcome and context, not keyword overlap. Before answering or calling another tool, read the smallest complete set whose use conditions apply; never load nonmatches.',
     '',
     'Read one match:',
     runtimeRefBySpec

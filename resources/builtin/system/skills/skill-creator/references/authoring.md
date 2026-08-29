@@ -12,6 +12,7 @@ A Skill is an independent reusable capability, not a tutorial or an Agent.
 - Prefer a guide using existing tools. Add a script only for deterministic repeated logic or a real integration boundary.
 - Keep the root SKILL.md as the routing and common execution spine. Move conditional variants, long schemas, detailed examples, and deep domain material into one-level `references/` files. In the root, retain only each branch's discriminator/read condition; do not repeat branch checklists, branch schemas, or empty branch templates there.
 - Aim to keep a newly authored root comfortably below 12,000 characters. This is a context budget, not a reason to omit required safety or execution rules; move conditional depth rather than compressing it into ambiguity.
+- A straightforward single-path guide should be much shorter than that ceiling. Do not expand a compact request into a tutorial: cover the required boundaries, preconditions, 3–7 execution steps, and output shape once, then stop.
 
 ## Design workflow
 

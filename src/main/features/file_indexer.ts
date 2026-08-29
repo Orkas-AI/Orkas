@@ -38,6 +38,7 @@
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { finished } from 'node:stream/promises';
 
 import { userChatAttachmentsDir, userFileCacheDir, projectChatAttachmentsDir } from '../paths';
 import { listProjectIds } from '../util/project-layout';
@@ -282,6 +283,16 @@ function hashUtf8Text(body: string): string {
   return `sha256:${crypto.createHash('sha256').update(body, 'utf8').digest('hex')}`;
 }
 
+async function closeReadStream(stream: fs.ReadStream): Promise<void> {
+  if (stream.closed) return;
+  stream.destroy();
+  try {
+    await finished(stream);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ABORT_ERR') throw error;
+  }
+}
+
 /** Count characters and hash decoded UTF-8 text without retaining a large
  * source. Hashing decoded text preserves the existing edit_file hash contract. */
 async function analyseUtf8File(absPath: string, sizeBytes: number): Promise<Utf8Analysis> {
@@ -337,22 +348,26 @@ async function readUtf8CharSlice(
   let absoluteChar = 0;
   let startLine = 1;
   const stream = fs.createReadStream(absPath, { encoding: 'utf8' });
-  for await (const chunk of stream) {
-    const text = String(chunk);
-    const chunkStart = absoluteChar;
-    const chunkEnd = chunkStart + text.length;
+  try {
+    for await (const chunk of stream) {
+      const text = String(chunk);
+      const chunkStart = absoluteChar;
+      const chunkEnd = chunkStart + text.length;
 
-    const prefixEnd = Math.max(0, Math.min(text.length, charStart - chunkStart));
-    for (let i = 0; i < prefixEnd; i++) {
-      if (text.charCodeAt(i) === 10) startLine++;
+      const prefixEnd = Math.max(0, Math.min(text.length, charStart - chunkStart));
+      for (let i = 0; i < prefixEnd; i++) {
+        if (text.charCodeAt(i) === 10) startLine++;
+      }
+
+      const takeStart = Math.max(0, charStart - chunkStart);
+      const takeEnd = Math.min(text.length, charEnd - chunkStart);
+      if (takeEnd > takeStart) content.push(text.slice(takeStart, takeEnd));
+
+      absoluteChar = chunkEnd;
+      if (absoluteChar >= charEnd) break;
     }
-
-    const takeStart = Math.max(0, charStart - chunkStart);
-    const takeEnd = Math.min(text.length, charEnd - chunkStart);
-    if (takeEnd > takeStart) content.push(text.slice(takeStart, takeEnd));
-
-    absoluteChar = chunkEnd;
-    if (absoluteChar >= charEnd) break;
+  } finally {
+    await closeReadStream(stream);
   }
 
   return { content: content.join(''), charStart, charEnd, startLine };
@@ -406,34 +421,38 @@ async function readUtf8LineSlice(
   let charEnd: number | undefined;
   const stream = fs.createReadStream(absPath, { encoding: 'utf8' });
 
-  for await (const chunk of stream) {
-    const text = String(chunk);
-    const chunkStart = absoluteChar;
-    const chunkEnd = chunkStart + text.length;
+  try {
+    for await (const chunk of stream) {
+      const text = String(chunk);
+      const chunkStart = absoluteChar;
+      const chunkEnd = chunkStart + text.length;
 
-    for (let searchFrom = 0; searchFrom < text.length;) {
-      const newline = text.indexOf('\n', searchFrom);
-      if (newline === -1) break;
-      const newlineChar = chunkStart + newline;
-      if (charStart !== undefined && currentLine === requestedEnd) {
-        charEnd = newlineChar;
-        break;
+      for (let searchFrom = 0; searchFrom < text.length;) {
+        const newline = text.indexOf('\n', searchFrom);
+        if (newline === -1) break;
+        const newlineChar = chunkStart + newline;
+        if (charStart !== undefined && currentLine === requestedEnd) {
+          charEnd = newlineChar;
+          break;
+        }
+        currentLine++;
+        if (charStart === undefined && currentLine === requestedStart) {
+          charStart = newlineChar + 1;
+        }
+        searchFrom = newline + 1;
       }
-      currentLine++;
-      if (charStart === undefined && currentLine === requestedStart) {
-        charStart = newlineChar + 1;
+
+      if (charStart !== undefined) {
+        const takeStart = Math.max(0, charStart - chunkStart);
+        const takeEnd = Math.min(text.length, (charEnd ?? chunkEnd) - chunkStart);
+        if (takeEnd > takeStart) content.push(text.slice(takeStart, takeEnd));
       }
-      searchFrom = newline + 1;
-    }
 
-    if (charStart !== undefined) {
-      const takeStart = Math.max(0, charStart - chunkStart);
-      const takeEnd = Math.min(text.length, (charEnd ?? chunkEnd) - chunkStart);
-      if (takeEnd > takeStart) content.push(text.slice(takeStart, takeEnd));
+      absoluteChar = chunkEnd;
+      if (charEnd !== undefined) break;
     }
-
-    absoluteChar = chunkEnd;
-    if (charEnd !== undefined) break;
+  } finally {
+    await closeReadStream(stream);
   }
 
   if (charStart === undefined) {

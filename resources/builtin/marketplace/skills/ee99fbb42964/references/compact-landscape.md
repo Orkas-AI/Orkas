@@ -24,7 +24,7 @@ omits one:
 4. Keep newly written unchanged plan and ledger state in memory; do not reread it
    merely to continue the next known step.
 5. Persist exact evidence, run `citations --op verify`, assemble and validate
-   `RESEARCH-REPORT.md`, then publish it.
+   `RESEARCH-<topic>.md`, then publish it.
 6. Make one final plan-status update after verified assembly. Prefer a batched
    update when several statuses are already known, but one isolated update stays
    valid and work never waits merely to form a batch.

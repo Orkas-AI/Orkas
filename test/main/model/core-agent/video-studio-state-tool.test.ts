@@ -8057,6 +8057,7 @@ describe('VideoStudio production-state tool protocol', () => {
       op: 'composition.draft',
       composition_dir: 'project/composition',
       output_path: 'project/render/draft.mp4',
+      quality: 'draft',
     };
 
     const firstFailedDraft = await tool.execute(input, ctx);
@@ -8085,6 +8086,15 @@ describe('VideoStudio production-state tool protocol', () => {
     expect(frozenDraftPath).not.toBe(failedDraftPath);
     expect(fs.readFileSync(frozenDraftPath, 'utf8')).toBe('reviewable failed draft');
     expect(published).toContainEqual([frozenDraftPath]);
+    // Same authored bytes at another quality are a distinct render request.
+    // The draft-quality QA verdict must not block a high-quality attempt.
+    const highQualityAttempt = await tool.execute({
+      ...input,
+      quality: 'high',
+    }, ctx);
+    expect(highQualityAttempt.isError).toBe(true);
+    expect(parseResult(highQualityAttempt.content).errorCode).toBe('E_VIDEO_QA_BLOCKED');
+    expect(draft).toHaveBeenCalledTimes(2);
     // A deterministic QA verdict blocks the SECOND identical attempt: on
     // 2026-08-22 the old two-attempt allowance let a model burn a 37.9-minute
     // re-render of unchanged input into the exact same verdict.
@@ -8108,18 +8118,25 @@ describe('VideoStudio production-state tool protocol', () => {
       requires_user_decision: false,
       next_action: 'repair_inputs_then_retry_render',
       operation_journal_evidence: {
+        render_quality: 'draft',
         same_input_attempts: 1,
         same_input_deterministic_qa_failures: 1,
         durable: true,
       },
     });
-    expect(draft).toHaveBeenCalledTimes(1);
+    expect(draft).toHaveBeenCalledTimes(2);
+
+    const stateAfterQualitySplit = await stateMod.readVideoProductionState(draftStatePath, compositionDir);
+    expect(stateAfterQualitySplit.operation_journal?.slice(-2)).toEqual([
+      expect.objectContaining({ status: 'failed', render_quality: 'draft' }),
+      expect.objectContaining({ status: 'failed', render_quality: 'high' }),
+    ]);
 
     fs.appendFileSync(path.join(compositionDir, 'index.html'), '\n<!-- materially different repair -->\n');
     const afterEdit = await tool.execute(input, ctx);
     expect(afterEdit.isError).toBe(true);
     expect(parseResult(afterEdit.content).errorCode).toBe('E_VIDEO_QA_BLOCKED');
-    expect(draft).toHaveBeenCalledTimes(2);
+    expect(draft).toHaveBeenCalledTimes(3);
 
     // An ambiguous render/infrastructure failure is NOT deterministic — it
     // keeps the second identical attempt (a retry can genuinely pass) and
@@ -8139,7 +8156,7 @@ describe('VideoStudio production-state tool protocol', () => {
     expect(transientBlocked.errorCode).toBe('E_FULL_RENDER_RETRY_NO_CHANGE');
     expect(transientBlocked.operation_journal_evidence).toMatchObject({ same_input_attempts: 2 });
     expect(transientBlocked.operation_journal_evidence.same_input_deterministic_qa_failures).toBeUndefined();
-    expect(draft).toHaveBeenCalledTimes(4);
+    expect(draft).toHaveBeenCalledTimes(5);
   });
 
   it('finalizes an approved export before registering or publishing its path', async () => {

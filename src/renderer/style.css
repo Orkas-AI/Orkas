@@ -7482,6 +7482,75 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   color: var(--muted);
 }
 
+/* Commander navigation card (open_app_view): a distinct action footer at the
+   bottom of the bubble; navigation still happens only on the user's click. */
+.chat-app-nav-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+}
+.chat-app-nav-row .chat-app-nav-btn {
+  width: fit-content;
+  max-width: 100%;
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
+  text-align: left;
+  box-shadow: none;
+  transition: transform 140ms ease, border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
+}
+.chat-app-nav-row .chat-app-nav-btn:hover {
+  border-color: color-mix(in srgb, var(--primary) 28%, var(--border));
+  background: transparent;
+  color: var(--text);
+  box-shadow: 0 7px 18px rgba(15, 23, 42, 0.08);
+  transform: translateY(-1px);
+}
+.chat-app-nav-row .chat-app-nav-btn:active {
+  box-shadow: 0 2px 7px rgba(15, 23, 42, 0.05);
+  transform: translateY(0);
+}
+.chat-app-nav-row .chat-app-nav-btn:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--primary) 42%, transparent);
+  outline-offset: 2px;
+}
+.chat-app-nav-btn-page-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.chat-app-nav-btn-page-icon {
+  order: -1;
+  width: 16px;
+  height: 20px;
+  flex: 0 0 16px;
+  background: transparent;
+  color: var(--primary);
+}
+.chat-app-nav-btn-page-icon-svg {
+  width: 16px;
+  height: 16px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-app-nav-row .chat-app-nav-btn {
+    transition: none;
+  }
+}
+
+
 /* Marketplace install request card. Same inline-panel scale as input forms:
    the user explicitly approves before any marketplace resource is installed. */
 .chat-marketplace-request {
@@ -9227,9 +9296,11 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   transition: background 0.15s, border-color 0.15s, color 0.15s;
 }
 
-.chat-recipient-chip:hover {
-  background: var(--surface-3);
-  color: var(--text);
+.chat-recipient-chip:hover,
+.chat-recipient-chip.is-open {
+  background: var(--primary-soft);
+  border-color: rgba(91, 87, 214, 0.18);
+  color: var(--primary-text);
 }
 
 .chat-recipient-chip .chat-recipient-prefix {

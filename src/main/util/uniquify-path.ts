@@ -27,6 +27,8 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
+import { fileEditLock } from './locks';
+
 export interface UniquifyResult {
   finalPath: string;
   renamed: boolean;
@@ -51,6 +53,29 @@ export async function uniquifyPath(
     if (!(await pathExists(candidate))) return { finalPath: candidate, renamed: true };
   }
   throw new Error(`uniquifyPath: exhausted ${MAX_ATTEMPTS} attempts under ${dir}`);
+}
+
+/** Decide the unique path AND perform the write under one per-path mutex.
+ *
+ *  `uniquifyPath` alone is check-then-act: between its existence probe and the
+ *  caller's eventual write, a concurrent writer aimed at the same path (two
+ *  parallel agent turns sharing one conversation workspace) passes the same
+ *  probe, and both write one file — the silent overwrite this module exists to
+ *  prevent. Serializing probe+write on the mutex keyed by the REQUESTED path
+ *  (the only key both contenders share up front) makes the loser's probe see
+ *  the winner's file and suffix correctly.
+ *
+ *  `write` runs with the lock held, so keep it to the write itself — do not
+ *  run model calls or long renders inside unless the file only materializes
+ *  there. It must not acquire `fileEditLock` on the same path again. */
+export async function uniquifyPathForWrite<T>(
+  absPath: string,
+  isMine: (p: string) => boolean,
+  write: (decision: UniquifyResult) => Promise<T>,
+): Promise<T> {
+  return fileEditLock(path.resolve(absPath)).runExclusive(async () => (
+    write(await uniquifyPath(absPath, isMine))
+  ));
 }
 
 async function pathExists(p: string): Promise<boolean> {

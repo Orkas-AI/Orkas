@@ -553,28 +553,60 @@ function createReadFileTool(
       let sourceStat: fs.Stats;
       try { sourceStat = fs.statSync(abs); }
       catch (err) {
-        const siblings = findUniquifySiblings(abs);
-        log.warn('read_files not found', {
+        const osCode = typeof (err as NodeJS.ErrnoException)?.code === 'string'
+          ? (err as NodeJS.ErrnoException).code!
+          : '';
+        const detail = `${displayPath}: ${displayErrorMessage(err, abs, displayPath)}`;
+        if (osCode === 'ENOENT' || osCode === 'ENOTDIR') {
+          const siblings = osCode === 'ENOENT' ? findUniquifySiblings(abs) : [];
+          log.warn('read_files not found', {
+            user_id: maskId(opts.userId),
+            path: logPathRef(abs),
+            os_code: osCode,
+            sibling_count: siblings.length,
+            error: logErrorRef(err),
+          });
+          let content = errText('E_NOT_FOUND', detail);
+          content +=
+            '\n\n<missing-file-recovery>\n'
+            + 'Do not infer this file\'s contents. If the user supplied this exact path, ask for the correct accessible path or an attachment. '
+            + 'If you inferred the path, use search_files to locate the source before asking the user.\n'
+            + '</missing-file-recovery>';
+          if (siblings.length) {
+            content +=
+              '\n\n<file-renamed-earlier>\n'
+              + 'This name was uniquified earlier in this conversation. Existing variants in the same directory:\n'
+              + siblings.map((b) => `  - ${b}`).join('\n')
+              + '\nUse one of those paths instead — the original requested name was never written.\n'
+              + '</file-renamed-earlier>';
+          }
+          return { content, isError: true };
+        }
+        if (osCode === 'EACCES' || osCode === 'EPERM') {
+          log.warn('read_files permission denied', {
+            user_id: maskId(opts.userId),
+            path: logPathRef(abs),
+            os_code: osCode,
+            error: logErrorRef(err),
+          });
+          return {
+            content: errText(
+              'E_PERMISSION_DENIED',
+              `${detail}\nos_code=${osCode}\nThe operating system denied access. Do not retry automatically or treat the file as missing; ask the user to grant access or choose an accessible file.`,
+            ),
+            isError: true,
+          };
+        }
+        log.warn('read_files stat failed', {
           user_id: maskId(opts.userId),
           path: logPathRef(abs),
-          sibling_count: siblings.length,
+          ...(osCode ? { os_code: osCode } : {}),
           error: logErrorRef(err),
         });
-        let content = errText('E_NOT_FOUND', `${displayPath}: ${displayErrorMessage(err, abs, displayPath)}`);
-        content +=
-          '\n\n<missing-file-recovery>\n'
-          + 'Do not infer this file\'s contents. If the user supplied this exact path, ask for the correct accessible path or an attachment. '
-          + 'If you inferred the path, use search_files to locate the source before asking the user.\n'
-          + '</missing-file-recovery>';
-        if (siblings.length) {
-          content +=
-            '\n\n<file-renamed-earlier>\n'
-            + 'This name was uniquified earlier in this conversation. Existing variants in the same directory:\n'
-            + siblings.map((b) => `  - ${b}`).join('\n')
-            + '\nUse one of those paths instead — the original requested name was never written.\n'
-            + '</file-renamed-earlier>';
-        }
-        return { content, isError: true };
+        return {
+          content: errText('E_READ_FAILED', `${detail}${osCode ? `\nos_code=${osCode}` : ''}`),
+          isError: true,
+        };
       }
 
       const kind = kindOf(abs);

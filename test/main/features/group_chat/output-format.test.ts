@@ -14,7 +14,7 @@ import {
 } from '../../../../src/main/features/local_agents/context';
 
 describe('group-chat response language', () => {
-  it('keeps prompt-internal descriptions in English while the selected turn language stays Chinese', async () => {
+  it('keeps prompt-internal descriptions in English while user language outranks the Chinese UI fallback', async () => {
     const prompt = await _buildAgentInGroupSystemPromptForTest({
       agent_id: 'language-contract-agent',
       name: 'LanguageContractAgent',
@@ -25,7 +25,10 @@ describe('group-chat response language', () => {
 
     expect(prompt).toContain('ENGLISH_DESCRIPTION_SHOULD_NOT_RENDER');
     expect(prompt).not.toContain('仅中文运行说明');
-    expect(prompt).toContain('User UI language: **Chinese (简体中文)**');
+    expect(prompt).toContain('Fallback UI language: **Chinese (简体中文)**');
+    expect(prompt).toContain('a current explicit user language request');
+    expect(prompt).toContain("the clear language of the user's latest substantive prose");
+    expect(prompt).toContain('Write all human-readable prose in the chosen language');
     expect(prompt.lastIndexOf('## User language'))
       .toBeGreaterThan(prompt.lastIndexOf('## Runtime injection'));
     expect(prompt.lastIndexOf('## User language'))

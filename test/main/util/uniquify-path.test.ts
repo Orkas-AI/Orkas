@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-import { uniquifyPath, renderRenameSignal } from '../../../src/main/util/uniquify-path';
+import { uniquifyPath, uniquifyPathForWrite, renderRenameSignal } from '../../../src/main/util/uniquify-path';
 
 let tmpDir: string;
 
@@ -92,5 +92,45 @@ describe('renderRenameSignal', () => {
     expect(out).toContain('You requested: app.py');
     expect(out).toContain('Saved as:      app-2.py');
     expect(out).not.toContain('/abs/dir/');
+  });
+});
+
+// Two parallel agent turns sharing one conversation workspace both deliver a
+// file under the same requested name. The contract is that neither delivery is
+// silently lost: probe+write are serialized per requested path, so the loser's
+// probe sees the winner's file and suffixes. Plain uniquifyPath is
+// check-then-act and deterministically fails this scenario (both probes run
+// before either write) — verified as the mutation control for this case.
+describe('uniquifyPathForWrite › concurrent same-target writers', () => {
+  it('keeps both concurrent deliveries: one original, one suffixed, no clobber', async () => {
+    const target = path.join(tmpDir, 'plan.md');
+    const writeVia = (content: string) => uniquifyPathForWrite(
+      target, NEVER_MINE,
+      async (decision) => {
+        fs.writeFileSync(decision.finalPath, content);
+        return decision;
+      },
+    );
+    const [a, b] = await Promise.all([writeVia('from-agent-A'), writeVia('from-agent-B')]);
+    const finals = [a.finalPath, b.finalPath].sort();
+    expect(finals).toEqual([path.join(tmpDir, 'plan-2.md'), target].sort());
+    expect([a.renamed, b.renamed].filter(Boolean)).toHaveLength(1);
+    const contents = finals.map((f) => fs.readFileSync(f, 'utf8')).sort();
+    expect(contents).toEqual(['from-agent-A', 'from-agent-B']);
+  });
+
+  it('releases the lock when the write throws, so the path recovers for the next writer', async () => {
+    const target = path.join(tmpDir, 'report.md');
+    await expect(uniquifyPathForWrite(target, NEVER_MINE, async () => {
+      throw new Error('render blew up');
+    })).rejects.toThrow('render blew up');
+    // The failed attempt left nothing on disk and holds nothing: the retry
+    // gets the ORIGINAL path back, not a stale suffix or a hang.
+    const retry = await uniquifyPathForWrite(target, NEVER_MINE, async (decision) => {
+      fs.writeFileSync(decision.finalPath, 'second try');
+      return decision;
+    });
+    expect(retry).toEqual({ finalPath: target, renamed: false });
+    expect(fs.readFileSync(target, 'utf8')).toBe('second try');
   });
 });

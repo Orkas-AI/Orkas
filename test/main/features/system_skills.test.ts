@@ -399,7 +399,8 @@ describe('system skill contracts', () => {
     expect(fm).toMatch(/^description_zh:\s*/m);
     expect(fm).toMatch(/^description_en:\s*/m);
     expect(fm).toMatch(/remember this/i);
-    expect(fm).toMatch(/read-only questions/i);
+    expect(fm).toMatch(/across future conversations/i);
+    expect(fm).toMatch(/read-only recall/i);
     expect(md).toContain('target: "agent"');
     expect(md).toContain('target: "user"');
     expect(md).toContain('target: "shared"');

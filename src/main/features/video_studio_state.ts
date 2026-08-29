@@ -395,6 +395,10 @@ export type VideoProductionActiveOperation = {
   operation_id: string;
   op: string;
   input_hash?: string;
+  /** Effective renderer quality for draft/export. Kept separate from the
+   * authored-input hash because identical bytes can have different render
+   * costs and deterministic QA outcomes at different quality tiers. */
+  render_quality?: 'unset' | 'draft' | 'standard' | 'high';
   stage: VideoProductionStage;
   revision: number;
   turn_id?: string;
@@ -408,6 +412,9 @@ export type VideoProductionOperationJournalEntry = {
   operation_id: string;
   op: string;
   input_hash?: string;
+  /** Effective renderer quality for draft/export. Legacy entries omit it and
+   * therefore cannot prove that a new render is an identical attempt. */
+  render_quality?: 'unset' | 'draft' | 'standard' | 'high';
   status: 'started' | 'passed' | 'failed' | 'interrupted';
   turn_id?: string;
   output_path?: string;

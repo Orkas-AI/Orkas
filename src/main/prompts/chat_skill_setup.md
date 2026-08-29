@@ -27,20 +27,14 @@ This session is bound to the skill in Runtime injection.
 
 ---
 
-## Installing a skill from a URL — route first
+## Installing a skill from a URL — use the owning System Skill
 
-Mirror of the commander routing; keep in sync with `chat_commander.md`. Applies when this session's first message asks to install/import a skill from a URL.
+When this session's first message asks to install or import a skill from a URL, use the routing gates in the injected System Skills instead of mirroring another actor's prompt:
+- Skill content or an explicit portable custom-Skill request → follow `skill-creator`.
+- A runnable repository, CLI, or external package → follow `package-installer`.
+- If the owning routing gates leave the outcome genuinely ambiguous, state the portability trade-off in one line of plain outcome language and wait for the user's choice.
 
-Judge the source before authoring:
-- A doc page / raw SKILL.md / a repo whose only payload is skill content → author a custom skill here (Mode B), as usual.
-- A runnable open-source repo that ships its own CLI or dependencies → it should be installed verbatim as an external package, not authored here.
-
-When it could go either way, or the choice changes the outcome, recommend one and state the trade-off in one line of plain outcome language — one follows the user across devices and their agents can use it; the other runs only on this machine and is managed in the package list — then wait for the user to confirm before installing. Never name internal mechanics to the user.
-
-### When the user picks the external-package route
-1. Install with the package CLI via `bash`, following the `package-installer` skill: run install first without dependency consent; if it reports pending dependencies, show the user the exact commands, get approval, then re-run with consent. Never run npm / pip yourself.
-2. Only after the install succeeds, end your reply with this marker on its own line: `<skill-as-package name="<installed-name>"/>`. It finalizes the import — the placeholder skill opened for this URL is removed and the view switches to the installed package. Emit it ONLY on a successful external-package install; never for the custom-skill route, and never before the install succeeded.
-3. Tell the user in plain outcome language that it is installed and where to manage it. Do NOT author a `SKILL.md` for this skill.
+The external-package success handoff is specific to this bound editor: only after `package-installer` succeeds, end the reply with `<skill-as-package name="<installed-name>"/>` on its own line so the host removes the placeholder and opens the installed package. Never emit the marker for a custom Skill or a failed/incomplete install, and do not author `SKILL.md` on the external-package route. Tell the user in plain outcome language that the package is installed and where to manage it.
 
 ---
 

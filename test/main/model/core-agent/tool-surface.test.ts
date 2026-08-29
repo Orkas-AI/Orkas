@@ -108,7 +108,8 @@ describe('tool-surface', () => {
     process.env.ORKAS_TOOL_LOADING_MODE = 'legacy';
     const surface = createToolSurfaceController({
       availableToolNames: [
-        'read_files', 'write_file', 'web_search', 'marketplace_search', 'tool_load',
+        'read_files', 'write_file', 'web_search', 'open_app_view', 'app_health',
+        'skill_search', 'marketplace_search', 'auto_tasks_list', 'tool_load',
       ],
       configuredGroups: ['workspace.read'],
       scopedEligible: true,
@@ -124,12 +125,23 @@ describe('tool-surface', () => {
     expect(surface.mode).toBe('scoped');
     expect(surface.activeToolNames()).toEqual(expect.arrayContaining(['read_files', 'tool_load']));
     expect(surface.isActive('write_file')).toBe(false);
-    expect(surface.load(['management'])).toMatchObject({ isError: true });
+    for (const group of [
+      'management',
+      'management.app',
+      'management.skills',
+      'management.marketplace',
+      'management.automation',
+    ]) {
+      expect(surface.load([group as any])).toMatchObject({ isError: true });
+      expect(groupEnum).not.toContain(group);
+    }
+    expect(surface.isActive('open_app_view')).toBe(false);
+    expect(surface.isActive('app_health')).toBe(false);
+    expect(surface.isActive('skill_search')).toBe(false);
     expect(surface.isActive('marketplace_search')).toBe(false);
     expect(groupEnum).toContain('workspace.write.output');
     expect(groupEnum).not.toContain('workspace');
     expect(groupEnum).not.toContain('workspace.write');
-    expect(groupEnum).not.toContain('management');
     expect(groupEnum).not.toContain('runtime');
 
     expect(surface.load(['workspace.write'])).toMatchObject({ isError: true });
@@ -307,7 +319,7 @@ describe('tool-surface', () => {
       version: 3,
       mode: 'scoped',
       loadedGroups: [],
-      catalogRevision: '10',
+      catalogRevision: '12',
     })]);
     expect(surface.runtimeStats()).toEqual({
       loadCalls: 2,
@@ -359,12 +371,13 @@ describe('tool-surface', () => {
     expect(JSON.parse(rejected.content)).not.toHaveProperty('loaded_group_context');
   });
 
-  it('keeps Management out of Agent dependencies but activates it at runtime', () => {
+  it('keeps Management out of Agent dependencies and isolates focused runtime children', () => {
     process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
     const states: Array<{ loadedGroups: string[] }> = [];
     const surface = createToolSurfaceController({
       availableToolNames: [
-        'skill_search', 'marketplace_search', 'skill_manage', 'tool_load',
+        'open_app_view', 'app_health', 'skill_search', 'marketplace_search',
+        'auto_tasks_list', 'skill_manage', 'tool_load',
       ],
       // A stale or bypassed Agent config must not preload a runtime-only group.
       configuredGroups: ['management'],
@@ -374,22 +387,48 @@ describe('tool-surface', () => {
 
     expect(surface.isActive('skill_manage')).toBe(true);
     expect(surface.isActive('tool_load')).toBe(true);
+    expect(surface.isActive('open_app_view')).toBe(false);
+    expect(surface.isActive('app_health')).toBe(false);
     expect(surface.isActive('skill_search')).toBe(false);
     expect(surface.isActive('marketplace_search')).toBe(false);
+    expect(surface.isActive('auto_tasks_list')).toBe(false);
     expect(states.at(-1)?.loadedGroups).toEqual([]);
 
-    expect(JSON.parse(surface.load(['management']).content)).toMatchObject({
+    expect(JSON.parse(surface.load(['management.skills']).content)).toMatchObject({
       ok: true,
-      newly_loaded: ['management'],
+      newly_loaded: ['management.skills'],
       unavailable: [],
     });
     expect(surface.isActive('skill_search')).toBe(true);
-    expect(surface.isActive('marketplace_search')).toBe(true);
+    expect(surface.isActive('app_health')).toBe(false);
+    expect(surface.isActive('marketplace_search')).toBe(false);
+    expect(surface.isActive('auto_tasks_list')).toBe(false);
     expect(states.at(-1)?.loadedGroups).toEqual([]);
+
+    expect(JSON.parse(surface.load(['management.app']).content)).toMatchObject({
+      ok: true,
+      newly_loaded: ['management.app'],
+      unavailable: [],
+    });
+    expect(surface.isActive('open_app_view')).toBe(true);
+    expect(surface.isActive('app_health')).toBe(true);
+    expect(surface.isActive('skill_search')).toBe(true);
+    expect(surface.isActive('marketplace_search')).toBe(false);
+    expect(surface.isActive('auto_tasks_list')).toBe(false);
+
+    expect(JSON.parse(surface.load(['management.automation']).content)).toMatchObject({
+      ok: true,
+      newly_loaded: ['management.automation'],
+      unavailable: [],
+    });
+    expect(surface.isActive('auto_tasks_list')).toBe(true);
+    expect(surface.isActive('marketplace_search')).toBe(false);
     expect(surface.runtimeStats()).toEqual({
-      loadCalls: 1,
-      newlyLoadedGroups: ['management'],
-      newlyActivatedToolNames: ['skill_search', 'marketplace_search'],
+      loadCalls: 3,
+      newlyLoadedGroups: ['management.app', 'management.skills', 'management.automation'],
+      newlyActivatedToolNames: [
+        'skill_search', 'open_app_view', 'app_health', 'auto_tasks_list',
+      ],
     });
   });
 
@@ -476,7 +515,7 @@ describe('tool-surface', () => {
     expect(states).toEqual([expect.objectContaining({
       version: 3,
       loadedGroups: [],
-      catalogRevision: '10',
+      catalogRevision: '12',
     })]);
 
     const unchangedWrites: unknown[] = [];
@@ -486,7 +525,7 @@ describe('tool-surface', () => {
         version: 3,
         mode: 'scoped',
         loadedGroups: [],
-        catalogRevision: '10',
+        catalogRevision: '12',
       },
       scopedEligible: true,
       persist: (state) => unchangedWrites.push(state),

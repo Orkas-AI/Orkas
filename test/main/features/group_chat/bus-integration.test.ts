@@ -327,6 +327,103 @@ describe('group_chat bus integration › conversation search freshness', () => {
   });
 });
 
+describe('group_chat bus integration › durable-memory write claims', () => {
+  it('preserves an ordinary project-file delivery without memory-write evidence', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const storage = await import('../../../../src/main/storage');
+    const delivery = '项目档案已保存到 report.json。';
+    _setScript(state.buildGconvSessionId(cid), [
+      { type: 'final', text: delivery },
+    ]);
+
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: '请生成并保存项目档案' });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const messages = await storage.readJsonl<any>(
+      path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`),
+    );
+    const reply = messages.find((message: any) => message.from === 'commander');
+    expect(reply.text).toBe(delivery);
+    expect(reply.failure_kind).toBeUndefined();
+    expect(reply.failure_code).toBeUndefined();
+  });
+
+  it('replaces a Commander success claim when no memory write completed', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const storage = await import('../../../../src/main/storage');
+    _setScript(state.buildGconvSessionId(cid), [
+      {
+        type: 'final',
+        text: '六条全部写入项目长期笔记。\n\n其余分析仍然有效。',
+      },
+    ]);
+
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: '请记住这六条规则' });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const messages = await storage.readJsonl<any>(
+      path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`),
+    );
+    const reply = messages.find((message: any) => message.from === 'commander');
+    expect(reply.text).not.toContain('全部写入项目长期笔记');
+    expect(reply.text).toContain('其余分析仍然有效');
+    expect(reply.text).toMatch(/持久记忆未保存|Durable memory was not saved/);
+    expect(reply).toMatchObject({
+      failure_kind: 'validation',
+      failure_code: 'memory_write_unconfirmed',
+    });
+  });
+
+  it('preserves the success claim after an observed memory write', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const storage = await import('../../../../src/main/storage');
+    const sid = state.buildGconvSessionId(cid);
+    _setScript(sid, [
+      {
+        type: 'event',
+        event: {
+          stream: 'tool',
+          data: {
+            phase: 'start', id: 'memory-1', name: 'cross_session_memory',
+            arguments: { action: 'add', target: 'project', content: 'six stable rules' },
+          },
+        },
+      },
+      {
+        type: 'event',
+        event: {
+          stream: 'tool',
+          data: {
+            phase: 'end', id: 'memory-1', name: 'cross_session_memory',
+            isError: false, output: '{"ok":true}',
+          },
+        },
+      },
+      { type: 'final', text: '六条全部写入项目长期笔记。' },
+    ]);
+
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: '请记住这六条规则' });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const messages = await storage.readJsonl<any>(
+      path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`),
+    );
+    const reply = messages.find((message: any) => message.from === 'commander');
+    expect(reply.text).toBe('六条全部写入项目长期笔记。');
+    expect(reply.failure_kind).toBeUndefined();
+    expect(reply.failure_code).toBeUndefined();
+  });
+});
+
 describe('group_chat bus integration › generated-media URL freshness', () => {
   it('versions assistant URLs at persistence while preserving user-authored text', async () => {
     const cid = newCid();
@@ -1046,6 +1143,173 @@ describe('group_chat bus integration › Commander utility tools', () => {
       ok: false,
       error: '`kind` must be agent or skill',
     });
+  }, 12_000);
+
+  it('stages open_app_view navigation cards and returns a sanitized app_health snapshot', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const storage = await import('../../../../src/main/storage');
+    const sid = state.buildGconvSessionId(cid);
+
+    _setScript(sid, [
+      { type: '__call_tool__', name: 'open_app_view', input: { surface_id: 'settings.models' } },
+      // A repeated stage of the same surface must not duplicate the card.
+      { type: '__call_tool__', name: 'open_app_view', input: { surface_id: 'settings.models' } },
+      { type: '__call_tool__', name: 'open_app_view', input: {
+        surface_id: 'agents', action: 'configure', target_id: 'agent-123',
+      } },
+      { type: '__call_tool__', name: 'open_app_view', input: {
+        surface_id: 'agents', action: 'configure', target_id: 'agent-123',
+      } },
+      { type: '__call_tool__', name: 'open_app_view', input: {
+        surface_id: 'settings.models', action: 'create',
+      } },
+      { type: '__call_tool__', name: 'open_app_view', input: {
+        surface_id: 'agents', action: 'configure',
+      } },
+      { type: '__call_tool__', name: 'open_app_view', input: { surface_id: 'not-a-surface' } },
+      { type: '__call_tool__', name: 'app_health', input: { domain: 'credentials' } },
+      { type: '__call_tool__', name: 'app_health', input: { domain: 'kb' } },
+      { type: '__call_tool__', name: 'app_health', input: {} },
+      { type: 'final', text: 'Open Models settings from the card below.' },
+    ]);
+
+    bus.subscribe(TEST_UID, cid, () => {});
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: '@commander help me set up a model and check app status',
+    });
+    await waitForQuiescent(TEST_UID, cid, 6000);
+
+    const offered = _recordedCalls.find((call) => call.sid === sid)?.extraToolNames ?? [];
+    expect(offered).toEqual(expect.arrayContaining(['open_app_view', 'app_health']));
+    const contracts = _recordedCalls.find((call) => call.sid === sid)?.extraToolContracts ?? [];
+    const navContract = contracts.find((tool) => tool.name === 'open_app_view');
+    expect(navContract?.inputSchema).toMatchObject({
+      type: 'object',
+      required: ['surface_id'],
+      additionalProperties: false,
+      properties: {
+        surface_id: { enum: [
+          'settings.models', 'settings.general', 'settings.data',
+          'connectors', 'library', 'projects', 'agents', 'skills', 'auto', 'apps', 'marketplace',
+        ] },
+        action: { enum: ['open', 'add_custom', 'configure', 'create'] },
+        target_id: { type: 'string', maxLength: 160 },
+      },
+    });
+    expect(contracts.find((tool) => tool.name === 'app_health')?.inputSchema).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        domain: { enum: ['model', 'connectors', 'kb', 'tasks'] },
+      },
+    });
+
+    const navResults = _recordedToolResults
+      .filter((result) => result.name === 'open_app_view')
+      .map((result) => JSON.parse(result.content));
+    expect(navResults[0]).toMatchObject({
+      ok: true,
+      status: 'navigation_card_staged',
+      surface_id: 'settings.models',
+      action: 'open',
+    });
+    expect(navResults[1]).toMatchObject({ ok: true, surface_id: 'settings.models', action: 'open' });
+    expect(navResults[2]).toMatchObject({
+      ok: true, surface_id: 'agents', action: 'configure', target_id: 'agent-123',
+    });
+    expect(navResults[3]).toMatchObject({
+      ok: true, surface_id: 'agents', action: 'configure', target_id: 'agent-123',
+    });
+    expect(navResults[4]).toMatchObject({ ok: false, error: expect.stringContaining('not supported') });
+    expect(navResults[5]).toMatchObject({ ok: false, error: expect.stringContaining('target_id is required') });
+    expect(navResults[6]).toMatchObject({ ok: false, error: expect.stringContaining('unknown surface_id') });
+
+    const healthResults = _recordedToolResults
+      .filter((result) => result.name === 'app_health')
+      .map((result) => JSON.parse(result.content));
+    // A forged/bypassed enum value must not accidentally widen into a full
+    // snapshot. Runtime validation is authoritative even when schema
+    // validation did not run.
+    expect(healthResults[0]).toEqual({
+      ok: false,
+      error: 'domain must be one of: model, connectors, kb, tasks',
+    });
+    // Domain filter returns exactly that probe.
+    expect(Object.keys(healthResults[1]).sort()).toEqual(['kb', 'ok']);
+    expect(healthResults[1].kb).toMatchObject({ total: expect.any(Number), ready: expect.any(Number) });
+    // Full snapshot covers every domain and stays sanitized: no credential or
+    // secret-shaped keys may appear anywhere in the payload.
+    const full = healthResults[2];
+    expect(Object.keys(full).sort()).toEqual(['connectors', 'kb', 'model', 'ok', 'tasks']);
+    expect(full.tasks).toMatchObject({
+      active_work: expect.any(Boolean),
+      active_conversation_count: expect.any(Number),
+      other_active_conversation_count: expect.any(Number),
+      current_conversation: {
+        processing: expect.any(Boolean),
+        in_flight_actor_count: expect.any(Number),
+        active_turn_count: expect.any(Number),
+      },
+    });
+    expect(JSON.stringify(full)).not.toMatch(/api[_-]?key|authorization|secret|token/i);
+
+    // The deduped card rides the final commander message for the renderer.
+    const messages = await storage.readJsonl<any>(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`));
+    const finalMsg = messages.find((m: any) => m.from === 'commander' && Array.isArray(m.app_nav_requests));
+    expect(finalMsg?.app_nav_requests).toEqual([
+      { surface_id: 'settings.models', action: 'open', requested_at: expect.any(String) },
+      {
+        surface_id: 'agents',
+        action: 'configure',
+        target_id: 'agent-123',
+        requested_at: expect.any(String),
+      },
+    ]);
+  }, 12_000);
+
+  it('offers the saved Automation for review after the owning workflow succeeds', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const sid = state.buildGconvSessionId(cid);
+    _setScript(sid, [{
+      type: 'final',
+      text: [
+        'Automation ready.',
+        '<auto-task>',
+        '<action>create</action>',
+        '<title>Morning review</title>',
+        '<content>Summarize yesterday and plan today.</content>',
+        '<schedule>{"type":"daily","hour":9,"minute":0}</schedule>',
+        '<recipient>{"kind":"commander"}</recipient>',
+        '</auto-task>',
+      ].join('\n'),
+    }]);
+
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: 'Create a daily morning review automation',
+    });
+    await waitForQuiescent(TEST_UID, cid, 6000);
+
+    const rows = await (await import('../../../../src/main/features/group_chat'))
+      .readMessages(TEST_UID, cid);
+    const reply = rows.find((row: any) => row.from === 'commander' && !row.dispatch);
+    expect(reply?.text).not.toContain('<auto-task>');
+    expect(reply?.app_nav_requests).toEqual([{
+      surface_id: 'auto',
+      action: 'configure',
+      target_id: expect.stringMatching(/^at_[a-z0-9]+$/),
+      requested_at: expect.any(String),
+    }]);
   }, 12_000);
 });
 

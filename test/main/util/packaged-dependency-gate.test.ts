@@ -222,6 +222,9 @@ describe('packaged-dependency-gate', () => {
   });
 
   it('recognizes only real node_modules package roots, not fixture package.json files', () => {
+    expect(gate.packageRootFromManifestPath('\\package.json')).toBe('');
+    expect(gate.packageRootFromManifestPath('\\node_modules\\@scope\\pkg\\package.json'))
+      .toBe('node_modules/@scope/pkg');
     expect(gate.packageRootFromManifestPath('/node_modules/@scope/pkg/package.json'))
       .toBe('node_modules/@scope/pkg');
     expect(gate.packageRootFromManifestPath('/node_modules/pkg/test/fixture/package.json')).toBeNull();

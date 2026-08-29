@@ -949,8 +949,16 @@ async function openAgentDetail(agentId, options = {}) {
     : _captureAgentDetailReturnTarget();
   const panel = document.getElementById('panel-agents');
   panel?.classList.toggle('resource-detail-overlay', _agentDetailReturnTarget.view !== 'agents');
-  await _showAgentsDetailView(agentId);
+  const opened = await _showAgentsDetailView(agentId);
+  if (opened === false) {
+    _agentDetailReturnTarget = null;
+    _showAgentsGridView();
+    return false;
+  }
+  return true;
 }
+
+window.openAgentDetail = openAgentDetail;
 
 function _isAgentDetailReturnTargetCurrent(target) {
   if (!target || target.view !== currentView) return false;
@@ -993,7 +1001,7 @@ async function _showAgentsDetailView(agentId) {
   if (detail) detail.style.display = 'flex';
   // Detail has a target-scoped API below. Do not refresh/enrich the complete
   // Agent catalog merely to open one agent.json.
-  await selectAgent(agentId, { refreshCliOptions: true });
+  return selectAgent(agentId, { refreshCliOptions: true });
 }
 
 async function refreshSelectedAgentDetail() {
@@ -1187,12 +1195,12 @@ async function selectAgent(agentId, { refreshCliOptions = false } = {}) {
   if (_isCommanderAgent(agentId)) {
     await _renderCommanderAgentDetail(false);
     _resetAgentDetailScroll();
-    return;
+    return true;
   }
   try {
     const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}`);
     const data = await res.json();
-    if (!data.ok || !data.agent) return;
+    if (!data.ok || !data.agent) return false;
     data.agent.source = _agentSource(data.agent.source);
     await _maybeLoadAgentSkillNames(_agentSkillIds(data.agent), data.agent.agent_id, { refresh: false });
     _selectedAgent = { id: data.agent.agent_id, name: data.agent.name, source: data.agent.source };
@@ -1203,8 +1211,10 @@ async function selectAgent(agentId, { refreshCliOptions = false } = {}) {
     // (style.css:4190). Without resetting the inner two the previous
     // agent's mid-scroll position bleeds into the next agent's view.
     _resetAgentDetailScroll();
+    return true;
   } catch (e) {
     _agentsLog.error('load agent failed', e);
+    return false;
   }
 }
 
@@ -4000,6 +4010,9 @@ async function refreshAgentPickerContext(anchorId) {
 async function _openAgentPicker(anchorBtn, entryPoint = 'unknown') {
   const picker = document.getElementById('agent-picker');
   if (!anchorBtn || !picker) return;
+  if (typeof _closeOtherComposerPopovers === 'function') {
+    _closeOtherComposerPopovers('recipient');
+  }
   if (anchorBtn.id === 'new-chat-recipient-chip') {
     _agentsTrackClick('new_chat_recipient_picker_open', {
       entry_point: entryPoint === 'recipient_chip' || entryPoint === 'at_key'
@@ -4007,7 +4020,12 @@ async function _openAgentPicker(anchorBtn, entryPoint = 'unknown') {
         : 'unknown',
     });
   }
+  const previousAnchorId = picker.dataset.anchorId || '';
+  if (previousAnchorId && previousAnchorId !== anchorBtn.id) {
+    _setAgentPickerAnchorOpen(document.getElementById(previousAnchorId), false);
+  }
   picker.dataset.anchorId = anchorBtn.id;
+  _setAgentPickerAnchorOpen(anchorBtn, true);
   const openSeq = ++_agentPickerOpenSeq;
   _agentPickerLoadedTabs = new Set();
   // Reset project scope synchronously before painting. For project-bound
@@ -4030,13 +4048,22 @@ async function _openAgentPicker(anchorBtn, entryPoint = 'unknown') {
   }).catch(() => {});
 }
 
-function _closeAgentPicker() {
+function _setAgentPickerAnchorOpen(anchor, open) {
+  if (!anchor) return;
+  anchor.classList.toggle('is-open', !!open);
+  anchor.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+function _closeAgentPicker({ preserveAtKey = false } = {}) {
   const picker = document.getElementById('agent-picker');
-  if (picker) picker.style.display = 'none';
-  // NOTE: callers that close-without-selection (Esc / click-outside) must
-  // also clear `_atKeyMark` — otherwise the next picker open would consume
-  // a stale `@`. Selection callers leave the mark so _triggerPickerItem can
-  // use it before clearing.
+  if (picker) {
+    _setAgentPickerAnchorOpen(document.getElementById(picker.dataset.anchorId || ''), false);
+    picker.style.display = 'none';
+  }
+  // A selection closes before routing the selected item, so it preserves the
+  // typed `@` marker just long enough for _triggerPickerItem to consume it.
+  // Every other close path owns cancellation and clears the marker here.
+  if (!preserveAtKey) _atKeyMark = null;
 }
 
 function _renderAgentPickerList(filterText) {
@@ -4395,7 +4422,7 @@ function _bindAgentPickerListItems(listEl, anchorId) {
     el.addEventListener('click', async () => {
       const sourceType = el.dataset.pickerSourceType === 'keyboard' ? 'keyboard' : 'mouse';
       delete el.dataset.pickerSourceType;
-      _closeAgentPicker();
+      _closeAgentPicker({ preserveAtKey: true });
       await _triggerPickerItem(
         el.dataset.kind || 'agent',
         el.dataset.id,
@@ -4715,6 +4742,8 @@ function bindRecipientAnchor(chipId, inputId) {
   const btn = document.getElementById(chipId);
   if (btn && btn.dataset.bound !== '1') {
     btn.dataset.bound = '1';
+    btn.setAttribute('aria-haspopup', 'dialog');
+    btn.setAttribute('aria-expanded', 'false');
     btn.addEventListener('click', async (e) => {
       e.stopPropagation();
       _atKeyMark = null; // chip click is not a `@`-keystroke trigger

@@ -801,6 +801,12 @@ process.stdin.on('data', (buf) => {
   /** The initial foreground wall clock must be disabled while background work
    *  waits, then restarted from zero when Claude resumes model output. */
   itPosix('restores a fresh foreground watchdog after background work wakes Claude', async () => {
+    // Leave enough headroom for the fake CLI process to receive its first CPU
+    // slice under the full parallel suite. The background delay still exceeds
+    // the cap plus one watchdog polling quantum, so a stale foreground
+    // watchdog would deterministically kill the process before it can resume.
+    const foregroundTimeoutMs = 2_000;
+    const backgroundDelayMs = foregroundTimeoutMs + Math.floor(foregroundTimeoutMs / 4) + 200;
     const fake = writeNodeExecutable(tmpDir, 'claude', `
 let started = false;
 const w = (line) => process.stdout.write(line + '\\n');
@@ -814,7 +820,7 @@ process.stdin.on('data', (buf) => {
     w('{"type":"system","subtype":"task_notification","task_id":"bg-1","status":"completed","summary":"slow job done"}');
     w('{"type":"assistant","message":{"content":[{"type":"text","text":"foreground resumed"}]}}');
     // No result follows. The newly armed foreground wall cap must stop us.
-  }, 1_100);
+  }, ${backgroundDelayMs});
 });
 `);
     const events: any[] = [];
@@ -830,7 +836,7 @@ process.stdin.on('data', (buf) => {
           if (event.type === 'process-info') pid = Number(event.pid);
         },
         onBackgroundRun: () => {},
-        timeoutMs: 800,
+        timeoutMs: foregroundTimeoutMs,
       });
       expect(events).toContainEqual(expect.objectContaining({
         type: 'text-delta',

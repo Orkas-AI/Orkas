@@ -49,7 +49,7 @@ import type {
 import {
   Actor, ActorKind, COMMANDER_ID, USER_ID, RESERVED_IDS,
   actorSessionId, addMember, ensureAgentMember, readMembers, seedReservedActors,
-  setStatus, markInFlight, readState, transitionStatus, setCodingProjectDir, touchActivity,
+  setStatus, markInFlight, readState, transitionStatus, setCodingProjectDir, setCodingProjectDirOnce, touchActivity,
   setActiveRecipient, setOrchestrationLedger, markOrchestrationInterrupted,
   takeOrchestrationLedgerForAgent, takeOrchestrationLedgerForForm, clearOrchestrationLedger,
   beginAgentHandoff, rollbackAgentHandoff, clearOrchestrationForCancellation,
@@ -57,6 +57,10 @@ import {
 import type { StateFile } from './state';
 import { maxToolLoopsForActorKind } from './actor-budgets';
 import { resolveDeliveryChecks } from './terminal-checks';
+import {
+  DurableMemoryWriteEvidence,
+  scrubCompletedDurableMemoryWriteClaims,
+} from './memory-write-verification';
 import {
   GroupMessage, appendVisible, readSlice,
   buildGroupConversationHistory, buildGroupConversationHistoryTail,
@@ -98,6 +102,14 @@ import { buildLanguageDirective, normalizeLang, t, type Lang } from '../../i18n'
 import { resolveLanguageForUser } from '../config';
 import * as marketplaceFeat from '../marketplace';
 import { readInstalls } from '../marketplace_installs';
+import {
+  APP_NAV_ACTIONS,
+  APP_NAV_SURFACES,
+  appNavSurfaceDescription,
+  validateAppNavRequest,
+  type AppNavRequest,
+} from './app_nav';
+import { APP_HEALTH_DOMAINS, collectAppHealth, isAppHealthDomain } from './app_health';
 import { createSkillTurnBuffer, onAgentTurnEnd, onUserMessage } from '../expert_signals/turn_hooks';
 import {
   bindRuntimeSkillTarget,
@@ -878,6 +890,28 @@ interface WorkerState {
    *  metadata such as agent avatar tokens without relying on the model to
    *  copy every field back. */
   marketplaceSearchResults?: Map<string, Partial<MarketplaceInstallRequest>>;
+  /** Navigation cards staged by `open_app_view` during a commander turn.
+   * Attached to the final message; the renderer navigates only on user
+   * click, so staging has no side effect. */
+  pendingAppNavRequests?: AppNavRequest[];
+}
+
+function stageAppNavRequest(
+  w: WorkerState,
+  input: { surface_id: string; action?: string; target_id?: string },
+): ReturnType<typeof validateAppNavRequest> {
+  const checked = validateAppNavRequest(input);
+  if (!checked.ok) return checked;
+  const request = checked.request;
+  if (!w.pendingAppNavRequests) w.pendingAppNavRequests = [];
+  if (!w.pendingAppNavRequests.some((existing) => (
+    existing.surface_id === request.surface_id
+    && existing.action === request.action
+    && (existing.target_id || '') === (request.target_id || '')
+  ))) {
+    w.pendingAppNavRequests.push({ ...request, requested_at: nowIso() });
+  }
+  return checked;
 }
 
 interface CidState {
@@ -1339,6 +1373,17 @@ export function hasActiveWork(uid?: string): boolean {
   return false;
 }
 
+/** Number of non-quiescent conversations for one user. App support exposes
+ * only this aggregate so Commander can distinguish the current task from
+ * work elsewhere without receiving conversation ids or content. */
+export function activeConversationCount(uid: string): number {
+  let count = 0;
+  for (const state of _cids.values()) {
+    if (state.uid === uid && !isQuiescent(state.uid, state.cid)) count += 1;
+  }
+  return count;
+}
+
 export function runtimeSnapshot(uid: string, cid: string): { processing: boolean; inFlight: string[]; activeTurns: ActiveTurn[] } {
   const s = _cids.get(cidKey(uid, cid));
   if (!s) return { processing: false, inFlight: [], activeTurns: [] };
@@ -1712,6 +1757,7 @@ export interface EnqueueParams {
    * interaction result back to it. */
   artifacts?: Array<{ id: string; title: string; agent_id: string }>;
   marketplace_requests?: MarketplaceInstallRequest[];
+  app_nav_requests?: AppNavRequest[];
   plan_announcement?: boolean;
   /** Override resolved recipients (commander emitting plan announcement
    *  uses this to force `to=[user]`). Otherwise router decides. */
@@ -2119,6 +2165,9 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     ...(params.artifacts && params.artifacts.length ? { artifacts: params.artifacts } : {}),
     ...(params.marketplace_requests && params.marketplace_requests.length
       ? { marketplace_requests: params.marketplace_requests }
+      : {}),
+    ...(params.app_nav_requests && params.app_nav_requests.length
+      ? { app_nav_requests: params.app_nav_requests }
       : {}),
     ...(params.plan_announcement ? { plan_announcement: true } : {}),
     ...(params.dispatch ? { dispatch: true } : {}),
@@ -4153,6 +4202,10 @@ async function runActorTurn(
     turnFailurePhase = _taskFailurePhase(phase);
   };
   let agentRunTimingData: Record<string, unknown> | undefined;
+  // Durable-memory success is a host-observed fact, never a prose inference.
+  // Keep the evidence across the one allowed channel retry because both
+  // attempts belong to the same persisted turn.
+  const durableMemoryWriteEvidence = new DurableMemoryWriteEvidence();
   // Wire the commander segment flush now that `streamingText` exists. Called
   // from a visible-dispatch tool BEFORE the dispatched agent runs, so the
   // commander's reasoning since the last flush is persisted as its own `seg`
@@ -4535,6 +4588,15 @@ async function runActorTurn(
         getPublishableOutputPaths,
         hasProducedPath,
         onArtifactCreated,
+        ...(isCommander ? {
+          onCustomConnectorAdded: (connectorId: string) => {
+            stageAppNavRequest(w, {
+              surface_id: 'connectors',
+              action: 'configure',
+              target_id: connectorId,
+            });
+          },
+        } : {}),
         onSkillAdvertised: (id, sys) => skillBuffer.recordAdvertised(id, sys),
         onSkillInvoked: (id, sys, trig) => skillBuffer.recordInvoked(id, sys, trig),
         cacheRetention: 'short',
@@ -4575,6 +4637,7 @@ async function runActorTurn(
         // Skills are NOT project-scoped this round; agent skillList still
         // gates in-process agents' rendered skills and SkillStore.
       })) {
+      if (isCommander) durableMemoryWriteEvidence.observe(ev);
       // Stream events → process channel.
       if (ev.type === 'final') {
         finalText = ev.text || '';
@@ -4744,6 +4807,25 @@ async function runActorTurn(
   } // end LLM branch (paired with `if (cliAgent) { ... } else {` above)
 
   let workingText = finalText || '';
+  let correctedUnsupportedMemoryClaim = false;
+  if (isCommander
+      && workingText
+      && !errText
+      && !aborted
+      && !durableMemoryWriteEvidence.hasSuccessfulWrite()) {
+    const scrubbed = scrubCompletedDurableMemoryWriteClaims(workingText);
+    if (scrubbed.removedClaims > 0) {
+      correctedUnsupportedMemoryClaim = true;
+      const notice = t('chat.memory_write_unconfirmed', undefined, turnLanguage);
+      workingText = scrubbed.text ? `${notice}\n\n${scrubbed.text}` : notice;
+      markTurnFailure('validation', 'memory_write_unconfirmed');
+      log.warn('removed unsupported durable-memory success claim', {
+        cid: maskId(cid),
+        actor: actor.id,
+        removed_claims: scrubbed.removedClaims,
+      });
+    }
+  }
   if (turnSyncConflictResolution.length && workingText && !errText && !aborted) {
     const results = extractSyncConflictResults(workingText);
     const allowedIds = new Set(turnSyncConflictResolution.map((item) => item.id));
@@ -5228,6 +5310,17 @@ async function runActorTurn(
                   : verb === 'enabled' ? 'enabled'
                     : 'disabled';
             appendCommanderMutationNotice(`<span>Automation ${label}: ${name}</span>`);
+            // Keep a successful direct operation inspectable. Creation and
+            // updates run through the full auto_tasks feature above; this
+            // sidecar only offers the user a click-to-open route to the
+            // resulting business object after that workflow has succeeded.
+            if (result.taskId && result.kind !== 'deleted') {
+              stageAppNavRequest(w, {
+                surface_id: 'auto',
+                action: 'configure',
+                target_id: result.taskId,
+              });
+            }
           } else {
             markTurnFailure('operation', 'auto_task_operation_failed');
             appendCommanderMutationNotice(`<span style="color:var(--danger)">⚠️ Automation operation failed: ${escapeHtmlForBubble(result.error || 'unknown error')}</span>`);
@@ -5332,8 +5425,17 @@ async function runActorTurn(
   const turnMarketplaceRequests = actor.kind === 'commander' && w.pendingMarketplaceRequests?.length
     ? w.pendingMarketplaceRequests.slice()
     : [];
-  if (actor.kind === 'commander') w.pendingMarketplaceRequests = undefined;
-  if (turnMarketplaceRequests.length > 0 && outcome.kind === 'silent') {
+  // Navigation cards staged by `open_app_view` follow the same flush shape:
+  // attached to the final commander message so the renderer can show the
+  // click-to-open button; the card itself is the visible outcome.
+  const turnAppNavRequests = actor.kind === 'commander' && w.pendingAppNavRequests?.length
+    ? w.pendingAppNavRequests.slice()
+    : [];
+  if (actor.kind === 'commander') {
+    w.pendingMarketplaceRequests = undefined;
+    w.pendingAppNavRequests = undefined;
+  }
+  if ((turnMarketplaceRequests.length > 0 || turnAppNavRequests.length > 0) && outcome.kind === 'silent') {
     outcome = { kind: 'persist', text: '' };
   }
 
@@ -5379,6 +5481,34 @@ async function runActorTurn(
       || turnMarketplaceRequests.length
     );
     outcome = (!tail.trim() && !hasSide) ? { kind: 'silent' } : { ...outcome, text: tail };
+  }
+
+  // Segment-tail replacement above reads the raw streamed text and can
+  // otherwise reintroduce a success claim removed from `workingText`. Make the
+  // correction the last authority for this non-aborted turn. If the claim was
+  // in a segment already persisted before a dispatch boundary, the terminal
+  // notice still corrects it explicitly instead of leaving the user with a
+  // false durable-write confirmation.
+  if (correctedUnsupportedMemoryClaim) {
+    const notice = t('chat.memory_write_unconfirmed', undefined, turnLanguage);
+    const current = outcome.kind === 'persist' ? outcome.text : '';
+    const scrubbed = scrubCompletedDurableMemoryWriteClaims(current);
+    const body = scrubbed.text === notice || scrubbed.text.startsWith(`${notice}\n`)
+      ? scrubbed.text
+      : scrubbed.text ? `${notice}\n\n${scrubbed.text}` : notice;
+    outcome = outcome.kind === 'persist'
+      ? {
+          ...outcome,
+          text: body,
+          failureKind: 'validation',
+          failureCode: 'memory_write_unconfirmed',
+        }
+      : {
+          kind: 'persist',
+          text: body,
+          failureKind: 'validation',
+          failureCode: 'memory_write_unconfirmed',
+        };
   }
 
   if (aborted) {
@@ -5491,6 +5621,7 @@ async function runActorTurn(
         ? { artifacts: turnArtifacts.map((a) => ({ id: a.id, title: a.title, agent_id: actor.id })) }
         : {}),
       ...(turnMarketplaceRequests.length ? { marketplace_requests: turnMarketplaceRequests } : {}),
+      ...(turnAppNavRequests.length ? { app_nav_requests: turnAppNavRequests } : {}),
       ...(tailProcessItems.length ? { process: tailProcessItems } : {}),
       // Segment this reply closes. Always present, including for turns that
       // were never split — an unsplit turn is simply segment 0. The renderer
@@ -7266,6 +7397,91 @@ async function buildCommanderExtraTools(
     },
   });
 
+  tools.push({
+    name: 'open_app_view',
+    description:
+      'Stage a click-to-open card for a supported Orkas destination. The renderer navigates only after the user clicks.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        surface_id: {
+          type: 'string',
+          enum: APP_NAV_SURFACES.map((s) => s.id),
+          description: appNavSurfaceDescription(),
+        },
+        action: {
+          type: 'string',
+          enum: APP_NAV_ACTIONS,
+          description: 'Defaults to open for a list or landing page. Use create for a new resource, add_custom for a custom MCP server, and configure with target_id for one existing Project, Agent, connector, or automation.',
+        },
+        target_id: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 160,
+          description: 'Required with action=configure for one existing Project, Agent, connector, or automation. If target_id is present, action must be configure even when the user says open or view.',
+        },
+      },
+      required: ['surface_id'],
+      additionalProperties: false,
+    },
+    async execute(input: Record<string, unknown>) {
+      const surfaceId = String(input.surface_id ?? '').trim();
+      const checked = stageAppNavRequest(w, {
+        surface_id: surfaceId,
+        action: String(input.action ?? '').trim(),
+        target_id: String(input.target_id ?? '').trim(),
+      });
+      if ('error' in checked) return _toolError(checked.error);
+      const request = checked.request;
+      return _toolJson({
+        ok: true,
+        status: 'navigation_card_staged',
+        ...request,
+        instruction: 'A click-to-open card appears with your reply. Tell the user in one line what to click and what to do on that screen.',
+      });
+    },
+  });
+
+  tools.push({
+    name: 'app_health',
+    description:
+      'Return a sanitized read-only snapshot of supported Orkas app-health domains. It never returns credentials, paths, provider error text, or user content.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        domain: {
+          type: 'string',
+          enum: [...APP_HEALTH_DOMAINS],
+          description: 'Optional single domain; omit for the full snapshot.',
+        },
+      },
+      additionalProperties: false,
+    },
+    executionMode: 'parallel',
+    async execute(input: Record<string, unknown>) {
+      const domainRaw = String(input.domain ?? '').trim();
+      if (domainRaw && !isAppHealthDomain(domainRaw)) {
+        return _toolError(`domain must be one of: ${APP_HEALTH_DOMAINS.join(', ')}`);
+      }
+      const domains = isAppHealthDomain(domainRaw) ? [domainRaw] : APP_HEALTH_DOMAINS;
+      const snapshot = await collectAppHealth(uid, domains, () => {
+        const s = runtimeSnapshot(uid, cid);
+        const activeCount = activeConversationCount(uid);
+        return {
+          active_work: activeCount > 0,
+          active_conversation_count: activeCount,
+          other_active_conversation_count: Math.max(0, activeCount - (s.processing ? 1 : 0)),
+          current_conversation: {
+            processing: s.processing,
+            in_flight_actor_count: s.inFlight.length,
+            active_turn_count: s.activeTurns.length,
+          },
+        };
+      });
+      return _toolJson({ ok: true, ...snapshot });
+    },
+  });
+
   return tools;
 }
 
@@ -7457,11 +7673,18 @@ async function _initializeCodingProjectDir(
   }
   const target = info.effective_path;
   if (!target) return;
-  await setCodingProjectDir(uid, cid, target, { explicit: info.mode === 'custom' && info.exists });
-  log.info('coding project directory initialized', {
-    cid: maskId(cid),
-    source: info.mode,
+  // Set-once under the state lock: two coding agents' first turns can race
+  // this initialisation, and both must converge on ONE winner (the read above
+  // is only a fast path). The caller re-reads state and uses the recorded dir.
+  const { applied } = await setCodingProjectDirOnce(uid, cid, target, {
+    explicit: info.mode === 'custom' && info.exists,
   });
+  if (applied) {
+    log.info('coding project directory initialized', {
+      cid: maskId(cid),
+      source: info.mode,
+    });
+  }
 }
 
 /** Build an `<agent-input-form>` block listing the agent's required

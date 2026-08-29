@@ -31,6 +31,7 @@ import {
   bindAbort,
   armKillWatchdog,
   LineSplitter,
+  isFileReadToolName,
 } from './base.js';
 
 const log = createLogger('local-agents:opencode');
@@ -243,7 +244,9 @@ export function mapOpencodeEvent(obj: any):
           ...(isError ? { isError: true } : {}),
         };
         const mediaItems = opencodeImageAttachments(state.attachments);
-        if (mediaItems.length) {
+        // Same guard as the claude backend: a file-read tool's attachments are
+        // the file it read, not media the agent produced.
+        if (mediaItems.length && !isFileReadToolName(part.tool)) {
           out!.event = toolEvent;
           out!.events = [toolEvent, {
             type: 'media-output',

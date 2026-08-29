@@ -104,6 +104,22 @@ function assertContains(output, expected, label) {
   assert(output.includes(expected), `${label} did not contain ${JSON.stringify(expected)}:\n${output}`);
 }
 
+function firstOfficeReadMatch(result, label) {
+  let payload;
+  try {
+    payload = JSON.parse(result.content);
+  } catch {
+    throw new Error(`${label} did not return JSON:\n${result.content}`);
+  }
+  const batchResult = payload?.results?.[0];
+  const match = batchResult?.data?.results?.[0];
+  assert(
+    payload?.status === 'complete' && batchResult?.ok === true && match,
+    `${label} did not return one successful match:\n${result.content}`,
+  );
+  return match;
+}
+
 function assertRenderedHtml(file, officeFile) {
   const html = fs.readFileSync(file, 'utf8');
   assert(html.length > 1_000, `${path.basename(officeFile)} rendered HTML is unexpectedly small (${html.length} chars)`);
@@ -272,20 +288,31 @@ try {
   const editedTextCell = await officeRead.execute({
     path: workbook,
     mode: 'get',
-    target: '/数据/A2',
+    targets: ['/数据/A2'],
   }, { workingDir: tempDir, state: {} });
   assert(!editedTextCell.isError, `office_read XLSX text cell failed: ${editedTextCell.content}`);
-  assertContains(editedTextCell.content, '00999', 'edited XLSX text value');
-  assertContains(editedTextCell.content, '"numberformat": "@"', 'edited XLSX text number format');
+  const editedTextMatch = firstOfficeReadMatch(editedTextCell, 'edited XLSX text cell');
+  assert(editedTextMatch.text === '00999', `edited XLSX text value was ${JSON.stringify(editedTextMatch.text)}`);
+  assert(
+    editedTextMatch.format?.numberformat === '@',
+    `edited XLSX text number format was ${JSON.stringify(editedTextMatch.format?.numberformat)}`,
+  );
 
   const editedFormulaCell = await officeRead.execute({
     path: workbook,
     mode: 'get',
-    target: '/数据/B2',
+    targets: ['/数据/B2'],
   }, { workingDir: tempDir, state: {} });
   assert(!editedFormulaCell.isError, `office_read XLSX formula cell failed: ${editedFormulaCell.content}`);
-  assertContains(editedFormulaCell.content, '"formula": "SUM(40,2)"', 'edited XLSX formula');
-  assertContains(editedFormulaCell.content, '"numberformat": "0.00"', 'edited XLSX formula number format');
+  const editedFormulaMatch = firstOfficeReadMatch(editedFormulaCell, 'edited XLSX formula cell');
+  assert(
+    editedFormulaMatch.format?.formula === 'SUM(40,2)',
+    `edited XLSX formula was ${JSON.stringify(editedFormulaMatch.format?.formula)}`,
+  );
+  assert(
+    editedFormulaMatch.format?.numberformat === '0.00',
+    `edited XLSX formula number format was ${JSON.stringify(editedFormulaMatch.format?.numberformat)}`,
+  );
 
   run(binary, ['create', deck, '--force', '--json']);
   await batch(binary, deck, [

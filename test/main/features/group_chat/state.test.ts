@@ -385,3 +385,43 @@ describe('group_chat facade › runtimeStatus orphan recovery', () => {
     expect(healed.in_flight).toEqual([]);
   });
 });
+
+// Two coding agents' FIRST turns in one conversation race the lazy
+// coding-project-dir initialisation. The conversation contract is one frozen
+// dir for its whole lifetime, so exactly one initialiser may win and both
+// racers must converge on the winner — a check-then-set outside the state
+// lock let the loser overwrite the winner while each turn ran in its own cwd.
+describe('group_chat state › setCodingProjectDirOnce', () => {
+  it('concurrent first-turn initialisers converge on exactly one winner', async () => {
+    const s = await import('../../../../src/main/features/group_chat/state');
+    const [a, b] = await Promise.all([
+      s.setCodingProjectDirOnce(TEST_UID, TEST_CID, '/proj/from-agent-a', { explicit: true }),
+      s.setCodingProjectDirOnce(TEST_UID, TEST_CID, '/proj/from-agent-b', { explicit: false }),
+    ]);
+    const winners = [a, b].filter((r) => r.applied);
+    expect(winners).toHaveLength(1);
+    const winnerDir = winners[0].state.coding_project_dir;
+    expect(['/proj/from-agent-a', '/proj/from-agent-b']).toContain(winnerDir);
+    // Both racers observe the SAME recorded dir, and disk agrees.
+    expect(a.state.coding_project_dir).toBe(winnerDir);
+    expect(b.state.coding_project_dir).toBe(winnerDir);
+    const persisted = await s.readState(TEST_UID, TEST_CID);
+    expect(persisted.coding_project_dir).toBe(winnerDir);
+    // The explicit flag belongs to the winner, not the loser.
+    expect(persisted.coding_project_dir_explicit === true)
+      .toBe(winnerDir === '/proj/from-agent-a');
+  });
+
+  it('never overwrites an existing dir and ignores a blank one', async () => {
+    const s = await import('../../../../src/main/features/group_chat/state');
+    await s.setCodingProjectDir(TEST_UID, TEST_CID, '/proj/user-chosen', { explicit: true });
+    const later = await s.setCodingProjectDirOnce(TEST_UID, TEST_CID, '/proj/other', { explicit: false });
+    expect(later.applied).toBe(false);
+    expect(later.state.coding_project_dir).toBe('/proj/user-chosen');
+    expect(later.state.coding_project_dir_explicit).toBe(true);
+
+    const blank = await s.setCodingProjectDirOnce(TEST_UID, 'cid-fresh', '   ', { explicit: false });
+    expect(blank.applied).toBe(false);
+    expect((await s.readState(TEST_UID, 'cid-fresh')).coding_project_dir).toBeUndefined();
+  });
+});

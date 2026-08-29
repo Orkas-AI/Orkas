@@ -6840,10 +6840,10 @@ describe("AgentRunner", () => {
     expect(result.meta.error?.kind).not.toBe("context_overflow");
   });
 
-  it("interrupt-steer: folds drainSteer messages into the next LLM round", async () => {
-    // round 1 calls a no-op tool → loop boundary → drainSteer yields a steer →
-    // round 2 must see it as a user message; round 1 must NOT (folded only after
-    // the tool round).
+  it("interrupt-steer: skips stale proposed tools before folding the newer instruction", async () => {
+    // A steer lands while round 1 is deciding to call a tool. The old proposal
+    // must receive a protocol-safe synthetic result without executing, and
+    // round 2 must see the newer user instruction.
     const captured: Message[][] = [];
     let streamCalls = 0;
     const provider: LLMProvider = {
@@ -6854,16 +6854,23 @@ describe("AgentRunner", () => {
         streamCalls++;
         captured.push([...params.messages]);
         if (streamCalls === 1) {
-          const id = "c1";
+          const firstId = "c1";
+          const secondId = "c2";
           yield { type: "message_start" as const };
-          yield { type: "tool_use_start" as const, id, name: "noop" };
-          yield { type: "tool_use_delta" as const, id, input: "{}" };
-          yield { type: "tool_use_end" as const, id };
+          yield { type: "tool_use_start" as const, id: firstId, name: "noop" };
+          yield { type: "tool_use_delta" as const, id: firstId, input: "{}" };
+          yield { type: "tool_use_end" as const, id: firstId };
+          yield { type: "tool_use_start" as const, id: secondId, name: "noop" };
+          yield { type: "tool_use_delta" as const, id: secondId, input: "{}" };
+          yield { type: "tool_use_end" as const, id: secondId };
           yield {
             type: "message_end" as const,
             stopReason: "tool_use" as const,
             usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
-            content: [{ type: "tool_use" as const, id, name: "noop", input: {} }],
+            content: [
+              { type: "tool_use" as const, id: firstId, name: "noop", input: {} },
+              { type: "tool_use" as const, id: secondId, name: "noop", input: {} },
+            ],
             model: "mock-model",
           };
         } else {
@@ -6883,11 +6890,15 @@ describe("AgentRunner", () => {
 
     const registry = new ProviderRegistry();
     registry.registerFactory("mock", () => provider);
+    let executions = 0;
     const noop = defineTool({
       name: "noop",
       description: "no-op",
       inputSchema: { type: "object", properties: {} },
-      async execute() { return { content: "ok" }; },
+      async execute() {
+        executions++;
+        return { content: "ok" };
+      },
     });
     const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
     const runner = new AgentRunner({ config, providers: registry, tools: [noop] });
@@ -6908,7 +6919,14 @@ describe("AgentRunner", () => {
       msgs.some((m) => m.role === "user"
         && m.content.some((c) => c.type === "text" && c.text.includes(STEER)));
     expect(sawSteer(captured[1])).toBe(true);  // round 2 sees the folded steer
-    expect(sawSteer(captured[0])).toBe(false); // round 1 (pre-tool) does not
+    expect(sawSteer(captured[0])).toBe(false); // round 1 predates the steer
+    expect(executions).toBe(0);
+    const skippedResults = captured[1]
+      .flatMap((message) => message.content)
+      .filter((content) => content.type === "tool_result"
+        && content.content === "Tool call skipped because a newer user instruction arrived before execution.");
+    expect(skippedResults.map((content) => content.type === "tool_result" ? content.toolUseId : null))
+      .toEqual(["c1", "c2"]);
   });
 
   it("interrupt-steer: persists structured text, image, and resource context before acknowledging", async () => {
@@ -6951,11 +6969,15 @@ describe("AgentRunner", () => {
     };
     const registry = new ProviderRegistry();
     registry.registerFactory("mock", () => provider);
+    let executions = 0;
     const noop = defineTool({
       name: "noop",
       description: "no-op",
       inputSchema: { type: "object", properties: {} },
-      async execute() { return { content: "ok" }; },
+      async execute() {
+        executions++;
+        return { content: "ok" };
+      },
     });
     const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
     const session = new Session();
@@ -6983,6 +7005,7 @@ describe("AgentRunner", () => {
 
     expect(result.text).toBe("used rich update");
     expect(streamCalls).toBe(2);
+    expect(executions).toBe(0);
     expect(captured[0].some((message) => message.content.some((content) => content.type === "image")))
       .toBe(false);
     expect(captured[1]).toContainEqual(expect.objectContaining({
@@ -7202,7 +7225,7 @@ describe("AgentRunner", () => {
       message: "do the task",
       drainSteer: () => {
         drainCalls++;
-        return drainCalls === 2 ? [STEER] : [];
+        return drainCalls === 3 ? [STEER] : [];
       },
     });
 
@@ -7277,11 +7300,15 @@ describe("AgentRunner", () => {
 
     const registry = new ProviderRegistry();
     registry.registerFactory("mock", () => provider);
+    let executions = 0;
     const noop = defineTool({
       name: "noop",
       description: "no-op",
       inputSchema: { type: "object", properties: {} },
-      async execute() { return { content: "ok" }; },
+      async execute() {
+        executions++;
+        return { content: "ok" };
+      },
     });
     const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
     const runner = new AgentRunner({ config, providers: registry, tools: [noop] });
@@ -7289,6 +7316,7 @@ describe("AgentRunner", () => {
     await runner.run({ message: "do the task", drainSteer: () => [] });
 
     expect(streamCalls).toBe(2);
+    expect(executions).toBe(1);
     // No steer is folded. The visible tool_result is not duplicated into the
     // completed-work projection, so the only added user-text block is the
     // deterministic execution objective anchor.

@@ -1412,6 +1412,19 @@ def _load(path):
     return json.loads(raw)
 
 
+def _write_new_report(report_path: str, report_markdown: str) -> None:
+    """Create one report atomically; never replace an earlier deliverable."""
+    try:
+        with open(report_path, "x", encoding="utf-8") as fh:
+            fh.write(report_markdown)
+    except FileExistsError:
+        raise ValueError(
+            "--report-out target already exists: {}. Pass a topic-specific "
+            "RESEARCH-<topic>.md name that does not exist yet; a previous "
+            "report is never overwritten.".format(report_path)
+        ) from None
+
+
 def main(argv):
     ap = argparse.ArgumentParser(prog="deep-research/citations")
     ap.add_argument("--op", choices=["verify", "references"], default="verify")
@@ -1445,8 +1458,10 @@ def main(argv):
             if value:
                 parts.append(value)
         report_markdown = "\n\n".join(parts) + "\n"
-        with open(args.report_out, "w", encoding="utf-8") as fh:
-            fh.write(report_markdown)
+        # A later research run in the same workspace is a new report, not a
+        # revision of the earlier one. Exclusive creation makes that guarantee
+        # atomic even when two same-topic runs finish concurrently.
+        _write_new_report(args.report_out, report_markdown)
         data["report"] = {
             "path": args.report_out,
             "characters": len(report_markdown),

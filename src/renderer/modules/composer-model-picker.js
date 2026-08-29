@@ -20,6 +20,29 @@ const _COMPOSER_MODEL_PICKER_TARGETS = [
 
 const _COMPOSER_RECIPIENT_TARGETS = ['new-chat', 'conversation', 'project', 'auto'];
 
+/** Keep the three composer-level pickers mutually exclusive. Their anchors
+ * stop click propagation, so independent outside-click listeners cannot close
+ * a picker when another composer control opens. Centralizing that transition
+ * also keeps every anchor's visual/ARIA open state in sync with its panel. */
+function _closeOtherComposerPopovers(activeKind) {
+  if (activeKind !== 'model' && typeof _closeComposerModelMenu === 'function') {
+    _closeComposerModelMenu();
+  }
+  if (activeKind !== 'recipient' && typeof _closeAgentPicker === 'function') {
+    _closeAgentPicker();
+  }
+  if (activeKind !== 'workspace') {
+    const workspaceMenu = document.getElementById('workspace-menu');
+    if (workspaceMenu) {
+      if (typeof workspaceMenu._closeWorkspaceMenu === 'function') {
+        workspaceMenu._closeWorkspaceMenu();
+      } else {
+        workspaceMenu.remove();
+      }
+    }
+  }
+}
+
 function _composerRecipientForTarget(target) {
   try {
     if (target === 'auto') {
@@ -591,6 +614,7 @@ async function _toggleComposerModelMenu(anchor) {
     _closeComposerModelMenu();
     if (wasSameAnchor) return;
   }
+  _closeOtherComposerPopovers('model');
 
   await _refreshComposerModelEntries();
   await _refreshComposerModelOptions(_composerModelEntries);

@@ -121,7 +121,7 @@ describe('tool-catalog', () => {
     expect(missing, `Injected tools missing from TOOL_CATALOG: ${missing.join(', ')}`).toEqual([]);
     const stale = [...catalog].filter((n) => !injected.has(n));
     expect(stale, `Catalog tools missing from injected fixture: ${stale.join(', ')}`).toEqual([]);
-    expect(catalog.size).toBe(53);
+    expect(catalog.size).toBe(55);
   });
 
   it('TOOL_CATALOG has no duplicate names', () => {
@@ -215,11 +215,28 @@ describe('tool-catalog', () => {
 
   it('separates runtime-loadable groups from Agent dependency groups', () => {
     expect(LOADABLE_TOOL_GROUP_IDS).toContain('management');
+    expect(LOADABLE_TOOL_GROUP_IDS).toEqual(expect.arrayContaining([
+      'management.app',
+      'management.skills',
+      'management.marketplace',
+      'management.automation',
+    ]));
     expect(AGENT_DEPENDENCY_TOOL_GROUP_IDS).not.toContain('management');
     expect(TOOL_GROUPS.find((group) => group.id === 'management')).toMatchObject({
       activation: 'loadable',
       agentDependency: false,
     });
+    expect(TOOL_GROUPS.filter((group) => group.parent === 'management').map((group) => group.id))
+      .toEqual([
+        'management.app',
+        'management.skills',
+        'management.marketplace',
+        'management.automation',
+      ]);
+    expect(TOOL_GROUPS.filter((group) => group.parent === 'management'))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ activation: 'loadable', agentDependency: false }),
+      ]));
     expect(invalidToolGroupRefs(['management'])).toEqual([]);
     expect(canonicalizeToolGroups(['management'])).toEqual(['management']);
     expect(invalidAgentToolGroupRefs(['management'])).toEqual(['management']);
@@ -236,6 +253,32 @@ describe('tool-catalog', () => {
       'list_connector_tools', 'call_connector_tool',
     ]);
     expect(isToolVisibleToAgent('add_custom_connector', 'custom-agent')).toBe(false);
+    expect(toolNamesForGroups(['management.skills'])).toEqual([
+      'skill_search', 'import_skill_package',
+    ]);
+    expect(toolNamesForGroups(['management.marketplace'])).toEqual([
+      'marketplace_search', 'marketplace_request_install',
+    ]);
+    expect(toolNamesForGroups(['management.automation'])).toEqual(['auto_tasks_list']);
+    expect(toolNamesForGroups(['management.app'])).toEqual(['open_app_view', 'app_health']);
+    // Keep the broad parent as an explicit compatibility alias while new
+    // runtime calls can load only the focused child they need.
+    expect(expandToolGroups(['management'])).toEqual([
+      'management',
+      'management.app',
+      'management.skills',
+      'management.marketplace',
+      'management.automation',
+    ]);
+    expect(toolNamesForGroups(['management'])).toEqual([
+      'skill_search',
+      'import_skill_package',
+      'marketplace_search',
+      'marketplace_request_install',
+      'auto_tasks_list',
+      'open_app_view',
+      'app_health',
+    ]);
   });
 
   it('scopes Office leaves while preserving the parent and pdf alias', () => {

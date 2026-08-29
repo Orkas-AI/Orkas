@@ -40,6 +40,28 @@ export type LocalEventType =
   | 'idle'
   | 'done';
 
+/** Tool names whose result carries an image because the agent READ a file,
+ *  not because it produced one. CLI file readers hand the file back as an
+ *  image block, which is indistinguishable from generated media at the
+ *  event layer — without this gate a plain "read that screenshot" bounces
+ *  the user's own attachment back into the conversation as
+ *  `![generated image]`. */
+const FILE_READ_TOOL_NAMES = new Set([
+  'read',
+  'read_file',
+  'readfile',
+  'notebookread',
+  'view',
+]);
+
+/** True when a tool result's media came from reading a file rather than
+ *  producing one. Unknown tool names return false so genuinely generated
+ *  media is never dropped. */
+export function isFileReadToolName(name: unknown): boolean {
+  if (typeof name !== 'string') return false;
+  return FILE_READ_TOOL_NAMES.has(name.trim().toLowerCase());
+}
+
 export interface LocalEvent {
   type: LocalEventType;
   /** Free-form payload — exact keys vary per type. Documented inline at

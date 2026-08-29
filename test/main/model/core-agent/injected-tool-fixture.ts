@@ -99,6 +99,8 @@ export function enumerateAllInjectedToolNames(): Set<string> {
     'dispatch_to',
     'hand_off_to',
     'run_worker',
+    'open_app_view',
+    'app_health',
     'skill_manage',
     'tool_load',
   ]) names.add(name);

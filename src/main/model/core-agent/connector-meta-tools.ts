@@ -58,6 +58,9 @@ export interface ConnectorMetaToolsOpts {
   allowRuntimeRefresh?: boolean;
   /** Only the commander may offer installation of a custom MCP server. */
   allowCustomConnectorInstall?: boolean;
+  /** Host-side post-success hook. It may expose a review shortcut but must
+   * never authorize or perform the installation itself. */
+  onCustomConnectorAdded?: (connectorId: string) => void;
   /** UI-only display metadata refreshed by the same visibility checks. */
   connectorDisplayNameById?: Map<string, string>;
 }
@@ -329,7 +332,7 @@ function createAddCustomConnectorTool(opts: ConnectorMetaToolsOpts & { cid: stri
   return {
     name: 'add_custom_connector',
     description:
-      'Add a specific custom MCP server only when explicitly requested by the user. Installation requires user confirmation; approved servers are then used through list_connector_tools and call_connector_tool.',
+      'Add a specific custom MCP server only when the user explicitly requested it and already supplied the exact non-secret configuration. Installation requires user confirmation. Never ask the user to paste a missing credential, API key, or token into chat; when protected input is still required, navigate to Connectors > Add MCP server instead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -338,8 +341,8 @@ function createAddCustomConnectorTool(opts: ConnectorMetaToolsOpts & { cid: stri
           type: 'object',
           description:
             'Either { kind: "streamable-http", url, headers? } for a remote server, or '
-            + '{ kind: "stdio", command, args?, env? } for a local command. Put API keys in '
-            + 'headers (http) or env (stdio).',
+            + '{ kind: "stdio", command, args?, env? } for a local command. Use only exact '
+            + 'values already supplied in the current user request; never invent or solicit secret values in chat.',
         },
       },
       required: ['name', 'transport'],
@@ -362,15 +365,14 @@ function createAddCustomConnectorTool(opts: ConnectorMetaToolsOpts & { cid: stri
       }
       try {
         const inst = await manager.addCustomInstance(opts.userId, { display_name: displayName, transport });
+        try { opts.onCustomConnectorAdded?.(inst.id); }
+        catch { /* post-success navigation is best-effort */ }
         if (inst.status.kind === 'connected') {
           return { content: `Connected "${inst.display_name}" (id: ${inst.id}). Its tools are now available via list_connector_tools({connector_id: "${inst.id}"}).` };
         }
-        const msg = (inst.status.kind === 'error' || inst.status.kind === 'degraded')
-          ? inst.status.message
-          : inst.status.kind;
-        return { content: `Added "${inst.display_name}" (id: ${inst.id}) but it could not connect yet: ${msg}. The user can retry it from the Connectors panel.` };
+        return { content: `Added "${inst.display_name}" (id: ${inst.id}) but it could not connect yet. Ask the user to review the protected configuration in Connectors and retry there.` };
       } catch (err) {
-        return errResult('E_INSTALL_FAILED', `could not add connector: ${(err as Error).message}`);
+        return errResult('E_INSTALL_FAILED', 'could not add connector. Ask the user to review the protected Connectors form and retry there.');
       }
     },
   };

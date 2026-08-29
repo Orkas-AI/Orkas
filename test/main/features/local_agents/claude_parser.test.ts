@@ -137,6 +137,51 @@ describe('local_agents/backends/claude › mapClaudeEvent', () => {
     ]);
   });
 
+  it('does NOT publish images that came back from a file-read tool', () => {
+    // Read hands the file back as an image block. Treating that as generated
+    // media bounced whatever the agent looked at — including the user's own
+    // upload — into the reply as `![generated image]`.
+    const state = { sawTextStreamEvent: false, toolNamesByCallId: new Map<string, string>() };
+    mapClaudeEvent({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'read-1', name: 'Read', input: { file_path: '/tmp/shot.png' } }] },
+    }, 'sess', state);
+    const r = mapClaudeEvent({
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'read-1', content: [
+        { type: 'text', text: 'read ok' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } },
+      ] }] },
+    }, 'sess', state);
+    // packClaudeEvents collapses a single event onto `event`; normalize.
+    const emitted = r?.events ?? (r?.event ? [r.event] : []);
+    expect(emitted).toEqual([
+      { type: 'tool-event', tool: 'tool_result', callId: 'read-1', phase: 'result', output: 'read ok' },
+    ]);
+    expect(state.toolNamesByCallId.has('read-1')).toBe(false);
+  });
+
+  it('still publishes images from a non-read tool', () => {
+    const state = { sawTextStreamEvent: false, toolNamesByCallId: new Map<string, string>() };
+    mapClaudeEvent({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'gen-1', name: 'mcp__image__generate', input: {} }] },
+    }, 'sess', state);
+    const r = mapClaudeEvent({
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'gen-1', content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'BBBB' } },
+      ] }] },
+    }, 'sess', state);
+    const emitted = r?.events ?? (r?.event ? [r.event] : []);
+    expect(emitted).toContainEqual({
+      type: 'media-output',
+      source: 'claude',
+      callId: 'gen-1',
+      items: [{ data: 'BBBB', mediaType: 'image/png' }],
+    });
+  });
+
   it('keeps every tool result in a multi-result user message', () => {
     const r = mapClaudeEvent({
       type: 'user',

@@ -324,6 +324,9 @@ function _showWorkspaceDropdown(anchor, target) {
     else old.remove();
     return;
   }
+  if (typeof _closeOtherComposerPopovers === 'function') {
+    _closeOtherComposerPopovers('workspace');
+  }
 
   const info = _wsInfoByTarget[target] || _wsInfoByTarget['conversation'];
 

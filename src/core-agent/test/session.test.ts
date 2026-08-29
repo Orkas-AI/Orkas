@@ -1445,6 +1445,13 @@ describe("Session execution plan anchor", () => {
     session.beginUserTurn([{ type: "text", text: "Actually switch to the replacement task" }]);
     let view = JSON.stringify(session.getMessagesForModel());
     expect(view).toContain("Reconciliation required");
+    const stalePlanTail = JSON.stringify(session.getMessagesForModel().at(-1));
+    expect(stalePlanTail).toContain(
+      "Latest user instruction — authoritative; replaces conflicting earlier requirements",
+    );
+    expect(stalePlanTail).toContain("Actually switch to the replacement task");
+    expect(stalePlanTail.indexOf("Actually switch to the replacement task"))
+      .toBeLessThan(stalePlanTail.indexOf("Objective"));
     expect(session.getExecutionPlan()?.objective).toBe("Original task");
 
     session.updateExecutionPlan({
@@ -1474,7 +1481,11 @@ describe("Session execution plan anchor", () => {
     session.updateExecutionPlan({ steps: [{ step: "Work", status: "in_progress" }] });
 
     session.addMessage("user", [{ type: "text", text: "Pause that and account for this new constraint" }]);
-    expect(JSON.stringify(session.getMessagesForModel())).toContain("Reconciliation required");
+    const stalePlanTail = JSON.stringify(session.getMessagesForModel().at(-1));
+    expect(stalePlanTail).toContain("Reconciliation required");
+    expect(stalePlanTail).toContain("Pause that and account for this new constraint");
+    expect(stalePlanTail.indexOf("Pause that and account for this new constraint"))
+      .toBeLessThan(stalePlanTail.indexOf("Initial in-flight goal"));
 
     session.updateExecutionPlan({ steps: [{ step: "Account for constraint", status: "in_progress" }] });
     const view = JSON.stringify(session.getMessagesForModel());

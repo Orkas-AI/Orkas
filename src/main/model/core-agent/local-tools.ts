@@ -97,7 +97,7 @@ import {
 } from './external-mutation-risk';
 import { requestBashDecision } from './bash-permissions';
 import { markdownToPdf, htmlToPdf } from '../../util/md-to-pdf';
-import { uniquifyPath, renderRenameSignal } from '../../util/uniquify-path';
+import { uniquifyPathForWrite, renderRenameSignal } from '../../util/uniquify-path';
 import { isPathAllowed } from '../../util/path-sandbox';
 import { kindOf } from '../../features/file_indexer';
 import { getWorkspacePath } from '../../features/user_workspace';
@@ -4115,11 +4115,20 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
         log.warn('write_file scope reject', { user_id: maskId(opts.userId), path: logPathRef(inputAbs) });
         return { content: scopeErr, isError: true };
       }
-      const { finalPath, renamed } = await uniquifyPath(inputAbs, isMineFor(opts));
+      const { finalPath, renamed, result } = await uniquifyPathForWrite(
+        inputAbs,
+        isMineFor(opts),
+        async (decision) => ({
+          ...decision,
+          result: await coreWriteFileTool.execute(
+            decision.finalPath !== inputAbs ? { ...input, path: decision.finalPath } : input,
+            ctx,
+          ),
+        }),
+      );
       const rewritten = finalPath !== inputAbs
         ? { ...input, path: finalPath }
         : input;
-      const result = await coreWriteFileTool.execute(rewritten, ctx);
       if (!result.isError) {
         // Stamp the just-written bytes so a follow-up edit_file accepts an edit
         // without an intervening read_files call (the model already knows the content
@@ -4757,28 +4766,43 @@ function createMarkdownToPdfTool(opts: LocalToolsOpts): AgentTool {
         log.warn('markdown_to_pdf scope reject', { user_id: maskId(opts.userId), path: logPathRef(inputAbs) });
         return { content: scopeErr, isError: true };
       }
-      const { finalPath, renamed } = await uniquifyPath(inputAbs, isMineFor(opts));
-      if (finalPath !== inputAbs) {
-        const finalScopeErr = await gateEditPath(opts, finalPath, ctx);
-        if (finalScopeErr) {
-          log.warn('markdown_to_pdf final scope reject', { user_id: maskId(opts.userId), path: logPathRef(finalPath) });
-          return { content: finalScopeErr, isError: true };
-        }
+      const markdown = String(input.markdown ?? '');
+      const footerText = producedDocumentFooterText({ userId: opts.userId, cid: opts.cid, source: 'markdown_to_pdf' });
+      const renderOptions = {
+        ...(typeof input.title === 'string' ? { title: input.title } : {}),
+        ...(typeof input.pageSize === 'string' ? { pageSize: input.pageSize as any } : {}),
+        ...(typeof input.landscape === 'boolean' ? { landscape: input.landscape } : {}),
+        ...(footerText ? { footerText } : {}),
+      };
+      const outcome = await uniquifyPathForWrite(
+        inputAbs,
+        isMineFor(opts),
+        async (decision): Promise<
+          { kind: 'scope'; err: string }
+          | { kind: 'render'; err: string }
+          | ({ kind: 'ok' } & typeof decision)
+        > => {
+          if (decision.finalPath !== inputAbs) {
+            const finalScopeErr = await gateEditPath(opts, decision.finalPath, ctx);
+            if (finalScopeErr) return { kind: 'scope', err: finalScopeErr };
+          }
+          try {
+            await markdownToPdf(markdown, decision.finalPath, renderOptions);
+          } catch (err) {
+            return { kind: 'render', err: `Error generating PDF: ${(err as Error).message}` };
+          }
+          return { kind: 'ok', ...decision };
+        },
+      );
+      if (outcome.kind === 'scope') {
+        log.warn('markdown_to_pdf final scope reject', { user_id: maskId(opts.userId), path: logPathRef(inputAbs) });
+        return { content: outcome.err, isError: true };
       }
-      try {
-        const footerText = producedDocumentFooterText({ userId: opts.userId, cid: opts.cid, source: 'markdown_to_pdf' });
-        await markdownToPdf(String(input.markdown ?? ''), finalPath, {
-          ...(typeof input.title === 'string' ? { title: input.title } : {}),
-          ...(typeof input.pageSize === 'string' ? { pageSize: input.pageSize as any } : {}),
-          ...(typeof input.landscape === 'boolean' ? { landscape: input.landscape } : {}),
-          ...(footerText ? { footerText } : {}),
-        });
-        if (opts.onFileWritten) await opts.onFileWritten(finalPath);
-        const base = `PDF written: ${finalPath}`;
-        return { content: renamed ? `${base}${renderRenameSignal(inputAbs, finalPath)}` : base };
-      } catch (err) {
-        return { content: `Error generating PDF: ${(err as Error).message}`, isError: true };
-      }
+      if (outcome.kind === 'render') return { content: outcome.err, isError: true };
+      const { finalPath, renamed } = outcome;
+      if (opts.onFileWritten) await opts.onFileWritten(finalPath);
+      const base = `PDF written: ${finalPath}`;
+      return { content: renamed ? `${base}${renderRenameSignal(inputAbs, finalPath)}` : base };
     },
   };
 }
@@ -4813,27 +4837,42 @@ function createHtmlToPdfTool(opts: LocalToolsOpts): AgentTool {
         log.warn('html_to_pdf scope reject', { user_id: maskId(opts.userId), path: logPathRef(inputAbs) });
         return { content: scopeErr, isError: true };
       }
-      const { finalPath, renamed } = await uniquifyPath(inputAbs, isMineFor(opts));
-      if (finalPath !== inputAbs) {
-        const finalScopeErr = await gateEditPath(opts, finalPath, ctx);
-        if (finalScopeErr) {
-          log.warn('html_to_pdf final scope reject', { user_id: maskId(opts.userId), path: logPathRef(finalPath) });
-          return { content: finalScopeErr, isError: true };
-        }
+      const html = String(input.html ?? '');
+      const footerText = producedDocumentFooterText({ userId: opts.userId, cid: opts.cid, source: 'html_to_pdf' });
+      const renderOptions = {
+        ...(typeof input.pageSize === 'string' ? { pageSize: input.pageSize as any } : {}),
+        ...(typeof input.landscape === 'boolean' ? { landscape: input.landscape } : {}),
+        ...(footerText ? { footerText } : {}),
+      };
+      const outcome = await uniquifyPathForWrite(
+        inputAbs,
+        isMineFor(opts),
+        async (decision): Promise<
+          { kind: 'scope'; err: string }
+          | { kind: 'render'; err: string }
+          | ({ kind: 'ok' } & typeof decision)
+        > => {
+          if (decision.finalPath !== inputAbs) {
+            const finalScopeErr = await gateEditPath(opts, decision.finalPath, ctx);
+            if (finalScopeErr) return { kind: 'scope', err: finalScopeErr };
+          }
+          try {
+            await htmlToPdf(html, decision.finalPath, renderOptions);
+          } catch (err) {
+            return { kind: 'render', err: `Error generating PDF: ${(err as Error).message}` };
+          }
+          return { kind: 'ok', ...decision };
+        },
+      );
+      if (outcome.kind === 'scope') {
+        log.warn('html_to_pdf final scope reject', { user_id: maskId(opts.userId), path: logPathRef(inputAbs) });
+        return { content: outcome.err, isError: true };
       }
-      try {
-        const footerText = producedDocumentFooterText({ userId: opts.userId, cid: opts.cid, source: 'html_to_pdf' });
-        await htmlToPdf(String(input.html ?? ''), finalPath, {
-          ...(typeof input.pageSize === 'string' ? { pageSize: input.pageSize as any } : {}),
-          ...(typeof input.landscape === 'boolean' ? { landscape: input.landscape } : {}),
-          ...(footerText ? { footerText } : {}),
-        });
-        if (opts.onFileWritten) await opts.onFileWritten(finalPath);
-        const base = `PDF written: ${finalPath}`;
-        return { content: renamed ? `${base}${renderRenameSignal(inputAbs, finalPath)}` : base };
-      } catch (err) {
-        return { content: `Error generating PDF: ${(err as Error).message}`, isError: true };
-      }
+      if (outcome.kind === 'render') return { content: outcome.err, isError: true };
+      const { finalPath, renamed } = outcome;
+      if (opts.onFileWritten) await opts.onFileWritten(finalPath);
+      const base = `PDF written: ${finalPath}`;
+      return { content: renamed ? `${base}${renderRenameSignal(inputAbs, finalPath)}` : base };
     },
   };
 }

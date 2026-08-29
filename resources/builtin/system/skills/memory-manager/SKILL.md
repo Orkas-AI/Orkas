@@ -1,7 +1,7 @@
 ---
 name: memory-manager
-description_zh: "添加、替换或删除持久的 Commander、用户、共享或项目记忆及项目指令；用于“记住这个”、长期偏好、持久决策、项目规则，以及遗忘或更新请求，不用于只读询问已提供的上下文。"
-description_en: "Add, replace, or remove durable Commander, user, shared, or project memories and project instructions. Use for “remember this,” standing preferences, durable decisions, project rules, and forget or update requests; not for read-only questions about context already supplied."
+description_zh: "当用户要求让信息、偏好、决定或规则在未来对话持续生效，或要求更新、纠正、遗忘这些持久信息时，先读取本 Skill，再通过实际工具完成添加、替换或删除；覆盖 Commander、用户、共享、项目记忆及项目指令。不用于只读回忆或保存普通文件。"
+description_en: "Read this Skill before “remember this” or any request to preserve facts, preferences, decisions, or rules across future conversations, or correct/forget durable state. It governs mutations to Commander, user, shared, and project memory/instructions; exclude read-only recall and ordinary file saving."
 ---
 
 # memory-manager

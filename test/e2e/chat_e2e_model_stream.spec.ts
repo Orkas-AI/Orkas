@@ -842,6 +842,7 @@ test.describe('real chat pipeline with a local model', () => {
     const page = await sendNewChat(modelOrkas, 'E2E allow one command, then ask me again.');
     const dialog = page.locator('.bash-permission-dialog');
     await expect(dialog).toContainText('first.txt', { timeout: 20_000 });
+    await expect(dialog.locator('[data-id="allow_once"]')).toBeFocused();
     await dialog.locator('[data-id="allow_once"]').click();
     await expect.poll(() => existsSync(firstPath)).toBe(false);
 

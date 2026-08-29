@@ -474,8 +474,10 @@ describe('skill-registry › getSystemSkillsPromptBlock', () => {
     expect(systemText).toContain('## System skills');
     expect(systemText).toContain('SYSTEM_SKILLS_ROOT');
     expect(systemText).toContain(path.resolve(systemDir()));
-    expect(systemText).toContain('Match the whole request against every description.');
-    expect(systemText).toContain('Before other work, read the smallest complete set of matching SKILL.md files');
+    expect(systemText).toContain('Treat each description as an activation contract.');
+    expect(systemText).toContain('intended outcome and context, not keyword overlap.');
+    expect(systemText).toContain('Before answering or calling another tool');
+    expect(systemText).toContain('read the smallest complete set whose use conditions apply');
     expect(systemText).toContain('never load nonmatches.');
     expect(systemText).toContain('Read 2+ matches together first:');
     expect(systemText).toContain('read_files({"paths"');

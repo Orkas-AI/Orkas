@@ -2208,6 +2208,15 @@ if (typeof window !== 'undefined') {
   window.loadAutoList = loadAutoList;
   window.loadProjectAutoList = loadProjectAutoList;
   window.openAutoTaskDialog = openAutoTaskDialog;
+  window.openAutoTaskById = async function openAutoTaskById(taskId) {
+    const id = String(taskId || '').trim();
+    if (!id) return false;
+    await loadAutoTasks();
+    const task = _autoTasks.find((candidate) => candidate && candidate.id === id);
+    if (!task) return false;
+    openAutoTaskDialog({ task });
+    return true;
+  };
   window.refreshAutoProjectOptions = _autoRefreshProjectOptions;
   window._autoUploadFilesFromComposer = _autoUploadFiles;
   window._autoAttachLibraryFile = _autoAttachLibraryFile;

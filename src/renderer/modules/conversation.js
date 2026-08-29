@@ -2443,15 +2443,22 @@ function _clearQueueEditRecipient(cid) {
  *  current recipient may no longer be a valid agent for the new scope.
  *  Reset to commander silently — the user will see the chip flip on next
  *  render. Called from `projects.js` post project-pick. No-op for `commander`
- *  recipients and for orphan contexts (pid empty). */
-async function validateRecipientAgainstProject(target, pid) {
+ *  recipients and for orphan contexts (pid empty).
+ *  `boundAgentIds` lets a caller that already holds this project's bindings
+ *  (project detail load) skip the second IPC and decide inside its own
+ *  load-sequence guard, so a slow response for a project the user already
+ *  left cannot clear the chip of the one they are on. */
+async function validateRecipientAgainstProject(target, pid, boundAgentIds) {
   const cur = _activeRecipient(target);
   if (!cur || cur.kind !== 'agent') return;
   if (!pid) return;
   try {
-    const res = await window.orkas.invoke('projects.bindings.list', { projectId: pid });
-    if (!res || !res.ok) return;
-    const bound = new Set((res.bindings && res.bindings.agents) || []);
+    let bound = boundAgentIds ? new Set(boundAgentIds) : null;
+    if (!bound) {
+      const res = await window.orkas.invoke('projects.bindings.list', { projectId: pid });
+      if (!res || !res.ok) return;
+      bound = new Set((res.bindings && res.bindings.agents) || []);
+    }
     if (!bound.has(cur.id)) {
       setChatRecipient(target, { kind: 'commander' });
       _renderRecipientChip(target);
@@ -4270,6 +4277,7 @@ function _groupMsgToLegacy(gm) {
     ...(_normalizeCreatedSkills(gm) ? { created_skills: _normalizeCreatedSkills(gm) } : {}),
     ...(Array.isArray(gm.artifacts) && gm.artifacts.length ? { artifacts: gm.artifacts } : {}),
     ...(Array.isArray(gm.marketplace_requests) && gm.marketplace_requests.length ? { marketplace_requests: gm.marketplace_requests } : {}),
+    ...(Array.isArray(gm.app_nav_requests) && gm.app_nav_requests.length ? { app_nav_requests: gm.app_nav_requests } : {}),
     ...(gm.plan_announcement ? { _plan_announcement: true } : {}),
     ...(Array.isArray(gm.process) && gm.process.length ? { process: gm.process } : {}),
     ...(gm.turn_id ? { _turn_id: gm.turn_id } : {}),
@@ -7875,6 +7883,11 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     const bubble = msgDiv.querySelector('.chat-bubble');
     if (bubble) _mountMarketplaceInstallRequests(bubble, msgDiv, message, opts);
   }
+  // Commander navigation cards are inert until the user clicks one.
+  if (role === 'assistant' && Array.isArray(message.app_nav_requests) && message.app_nav_requests.length) {
+    const bubble = msgDiv.querySelector('.chat-bubble');
+    if (bubble) _mountAppNavRequests(bubble, message);
+  }
   // Interactive web-app artifacts (assistant messages only) — sandboxed
   // `<iframe>` over the `chat-app://` protocol, appended after the form so it
   // reads as "reply text → embedded app". See chat-artifact.js.
@@ -8258,6 +8271,193 @@ function _renderMarketplaceInstallCard(card, req, cid, msgId) {
     });
   }
   _hydrateMarketplaceRequestMeta(card, { ...req, kind }, cid, msgId);
+}
+
+// ── Commander navigation cards (open_app_view) ──────────────────────────
+// Maps each staged surface_id to its renderer action plus a localized display
+// name reused from the owning surface's existing keys. Must cover exactly the
+// ids in src/main/features/group_chat/app_nav.ts — parity is pinned by
+// test/main/features/group_chat/app-nav-registry.test.ts.
+const _APP_NAV_SURFACES = {
+  'settings.models': { nameKey: 'settings.section.models', fallback: 'Models & credentials', actions: ['open'], open: () => _appNavOpenSettingsTab('credentials') },
+  'settings.general': { nameKey: 'settings.tab.general', fallback: 'General', actions: ['open'], open: () => _appNavOpenSettingsTab('general') },
+  'settings.data': { nameKey: 'settings.tab.data', fallback: 'Data', actions: ['open'], open: () => _appNavOpenSettingsTab('data') },
+  connectors: {
+    nameKey: 'sidebar.connectors',
+    fallback: 'Connectors',
+    actions: ['open', 'add_custom', 'configure'],
+    open: (req) => _appNavOpenFeatureView('connectors', 'connectors', async () => {
+      if (req.action === 'add_custom') {
+        const addButton = document.getElementById('connectors-add-custom-btn');
+        if (!addButton) return false;
+        addButton.click();
+      } else if (req.action === 'configure' && typeof window.focusConnectorById === 'function') {
+        return window.focusConnectorById(req.target_id);
+      }
+      return req.action === 'open' || req.action === 'add_custom';
+    }),
+  },
+  library: { nameKey: 'sidebar.contexts', fallback: 'Library', actions: ['open'], open: () => { setView('contexts'); return true; } },
+  projects: {
+    nameKey: 'sidebar.projects',
+    fallback: 'Projects',
+    actions: ['open', 'create', 'configure'],
+    open: (req) => {
+      if (typeof window.openProjectsSurface !== 'function') return false;
+      return window.openProjectsSurface(req);
+    },
+  },
+  agents: {
+    nameKey: 'sidebar.agents',
+    fallback: 'AI Team',
+    actions: ['open', 'create', 'configure'],
+    open: (req) => _appNavOpenFeatureView('agents', 'agents', async () => {
+      if (req.action === 'create' && typeof window.openAgentModal === 'function') {
+        window.openAgentModal();
+        return true;
+      } else if (req.action === 'configure' && typeof window.openAgentDetail === 'function') {
+        return window.openAgentDetail(req.target_id);
+      }
+      return req.action === 'open';
+    }),
+  },
+  skills: {
+    nameKey: 'sidebar.skills',
+    fallback: 'Skills',
+    actions: ['open', 'create'],
+    open: (req) => _appNavOpenFeatureView('skills', 'skills', () => {
+      if (req.action === 'create' && typeof window.openSkillModal === 'function') {
+        window.openSkillModal();
+        return true;
+      }
+      return req.action === 'open';
+    }),
+  },
+  auto: {
+    nameKey: 'sidebar.auto',
+    fallback: 'Auto',
+    actions: ['open', 'create', 'configure'],
+    open: (req) => _appNavOpenFeatureView('auto', 'auto', async () => {
+      if (req.action === 'create' && typeof window.openAutoTaskDialog === 'function') {
+        window.openAutoTaskDialog({});
+        return true;
+      } else if (req.action === 'configure' && typeof window.openAutoTaskById === 'function') {
+        return window.openAutoTaskById(req.target_id);
+      }
+      return req.action === 'open';
+    }),
+  },
+  apps: { nameKey: 'sidebar.apps', fallback: 'My Apps', actions: ['open'], open: () => { setView('apps'); return true; } },
+  marketplace: {
+    nameKey: 'marketplace.title',
+    fallback: 'Marketplace',
+    actions: ['open'],
+    open: () => _appNavLoadFeature('marketplace', () => {
+      if (typeof openMarketplace !== 'function') return false;
+      openMarketplace('agent', { returnView: 'conversation' });
+      return true;
+    }),
+  },
+};
+
+function _appNavLoadFeature(feature, afterLoad) {
+  const load = typeof loadRendererFeature === 'function'
+    ? loadRendererFeature
+    : window.loadRendererFeature;
+  const ready = typeof load === 'function' ? Promise.resolve(load(feature)) : Promise.resolve();
+  return ready.then(async () => {
+    const result = await afterLoad?.();
+    if (result === false) throw new Error(`app navigation target unavailable: ${feature}`);
+    return true;
+  });
+}
+
+function _appNavOpenFeatureView(view, feature, afterLoad) {
+  setView(view);
+  return _appNavLoadFeature(feature, afterLoad);
+}
+
+function _appNavOpenSettingsTab(tab) {
+  setView('settings');
+  // Settings initializes lazily with the default Account tab; wait for the
+  // owning feature when necessary, then repeat on the next turn to win its
+  // initial-render race (same shape as model-guard's credentials CTA).
+  const activate = () => {
+    if (typeof window.activateSettingsTab !== 'function') return false;
+    window.activateSettingsTab(tab);
+    return true;
+  };
+  return _appNavLoadFeature('settings', async () => {
+    if (!activate()) return false;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return activate();
+  });
+}
+
+function _appNavReportFailure(surfaceId, action, error) {
+  try { _convLog.warn('app navigation failed', { surface_id: surfaceId, action, error: String(error?.message || error || '') }); } catch (_) {}
+  if (typeof uiToast !== 'function') return;
+  const key = 'chat.app_nav_failed';
+  const localized = t(key);
+  uiToast(localized && localized !== key
+    ? localized
+    : 'Could not open this page. Try again or open it from the sidebar.', { variant: 'error' });
+}
+
+function _mountAppNavRequests(host, message) {
+  if (!host || !message) return;
+  const requests = Array.isArray(message.app_nav_requests) ? message.app_nav_requests : [];
+  for (const req of requests) {
+    const surfaceId = req && typeof req.surface_id === 'string' ? req.surface_id : '';
+    const surface = _APP_NAV_SURFACES[surfaceId];
+    if (!surface) continue;
+    const action = req && typeof req.action === 'string' ? req.action : 'open';
+    const targetId = req && typeof req.target_id === 'string' ? req.target_id.trim() : '';
+    if (!surface.actions.includes(action)) continue;
+    if (action === 'configure' && !targetId) continue;
+    if (action !== 'configure' && targetId) continue;
+    if (targetId.length > 160 || /[\u0000-\u001f\u007f]/.test(targetId)) continue;
+    const requestKey = JSON.stringify([surfaceId, action, targetId]);
+    if (host.querySelector(`[data-app-nav="${CSS.escape(requestKey)}"]`)) continue;
+    let row = host.querySelector('.chat-app-nav-row');
+    if (!row) {
+      row = document.createElement('div');
+      row.className = 'chat-app-nav-row';
+      host.appendChild(row);
+    }
+    const name = _quickStartText(surface.nameKey, surface.fallback);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn-sm chat-app-nav-btn';
+    btn.dataset.appNav = requestKey;
+    const labelKey = action === 'create'
+      ? 'chat.app_nav_create'
+      : action === 'add_custom'
+        ? 'chat.app_nav_add_custom'
+        : action === 'configure'
+          ? 'chat.app_nav_configure'
+          : 'chat.app_nav_open';
+    const label = t(labelKey, { name });
+    btn.textContent = label && label !== labelKey ? label : `Open ${name}`;
+    if (typeof window.uiIconHtml === 'function') {
+      const pageIcon = document.createElement('span');
+      pageIcon.className = 'chat-app-nav-btn-page-icon';
+      pageIcon.innerHTML = window.uiIconHtml('panel-list', 'ui-icon chat-app-nav-btn-page-icon-svg');
+      btn.appendChild(pageIcon);
+    }
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      try {
+        const opened = await surface.open({ surface_id: surfaceId, action, target_id: targetId });
+        if (opened === false) throw new Error('app navigation target unavailable');
+      } catch (error) {
+        _appNavReportFailure(surfaceId, action, error);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    row.appendChild(btn);
+  }
 }
 
 function _mountMarketplaceInstallRequests(host, msgDiv, message, opts) {
@@ -13179,6 +13379,10 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
       };
       _mountMarketplaceInstallRequests(bubble, ph, reqMessage, { cid });
     }
+  }
+  if (Array.isArray(gm.app_nav_requests) && gm.app_nav_requests.length) {
+    const bubble = ph.querySelector('.chat-bubble');
+    if (bubble) _mountAppNavRequests(bubble, { app_nav_requests: gm.app_nav_requests });
   }
 
   // Interactive web-app artifacts (chat-app:// iframe). Idempotent — skips

@@ -993,6 +993,38 @@ function getCommanderProjectIdName(pid) {
   return (p && p.name) || '';
 }
 
+// Commander navigation uses the same sidebar/create/detail workflows as a
+// manual click. The helper resolves business ids before opening a detail so a
+// stale conversation card cannot leave the user on an empty Project shell.
+window.openProjectsSurface = async function openProjectsSurface(request) {
+  request = request || {};
+  const action = String(request.action || 'open');
+  const toggle = document.getElementById('projects-section-toggle');
+  if (!toggle) return false;
+  if (toggle.getAttribute('aria-expanded') === 'false') toggle.click();
+
+  if (action === 'open') {
+    toggle.scrollIntoView?.({ block: 'nearest' });
+    toggle.focus?.();
+    return true;
+  }
+  if (action === 'create') {
+    _startProjectInlineCreate();
+    return _projectsInlineCreate === true;
+  }
+  if (action === 'configure') {
+    const projectId = String(request.target_id || '').trim();
+    if (!projectId) return false;
+    const projects = await loadProjects(true);
+    const exists = Array.isArray(projects)
+      && projects.some((project) => project && project.project_id === projectId);
+    if (!exists || typeof setView !== 'function') return false;
+    setView('project', projectId);
+    return true;
+  }
+  return false;
+};
+
 // ── Init ────────────────────────────────────────────────────────────────
 
 document.addEventListener('DOMContentLoaded', () => {
