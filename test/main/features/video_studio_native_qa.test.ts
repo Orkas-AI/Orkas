@@ -6066,7 +6066,7 @@ describe('P3c R2 scene segment assembly', () => {
     expect(new Set([key, ...variants]).size).toBe(variants.length + 1);
   });
 
-  it('spends the draft repair budget only on zero-progress resumable failures', () => {
+  it('spends the draft repair budget only when resumable evidence shows no content progress', () => {
     // A resume that cached at least one NEW segment genuinely advanced, so it
     // must not burn a content-repair pass; a zero-progress repeat must, or
     // unchanged-input repetition would be unbounded.
@@ -6079,6 +6079,30 @@ describe('P3c R2 scene segment assembly', () => {
     } as Parameters<typeof resumableRenderFailureMadeProgress>[0]);
     expect(resumableRenderFailureMadeProgress(incomplete(2))).toBe(true);
     expect(resumableRenderFailureMadeProgress(incomplete(0))).toBe(false);
+    // A complete cache hit means all content segments already rendered. A
+    // later concat/remux/probe failure is environmental and budget-neutral.
+    expect(resumableRenderFailureMadeProgress({
+      ok: false,
+      op: 'composition.render',
+      errorCode: 'E_SEGMENT_ASSEMBLY_INCOMPLETE',
+      message: 'concat failed',
+      scene_segments: { total: 3, rendered: 0, reused: 3, failed: 0, pending: 0, resumable: true },
+    } as Parameters<typeof resumableRenderFailureMadeProgress>[0])).toBe(true);
+    // Near-misses remain bounded: partial reuse, contradictory counters, and
+    // missing post-render counters cannot claim a completed content render.
+    for (const scene_segments of [
+      { total: 3, rendered: 0, reused: 2, failed: 0, pending: 1, resumable: true },
+      { total: 3, rendered: 0, reused: 3, failed: 1, pending: 0, resumable: true },
+      { total: 3, rendered: 0, reused: 3, resumable: true },
+    ]) {
+      expect(resumableRenderFailureMadeProgress({
+        ok: false,
+        op: 'composition.render',
+        errorCode: 'E_SEGMENT_ASSEMBLY_INCOMPLETE',
+        message: 'incomplete',
+        scene_segments,
+      } as Parameters<typeof resumableRenderFailureMadeProgress>[0])).toBe(false);
+    }
     // Other render failures never skip the budget, whatever counters they carry.
     expect(resumableRenderFailureMadeProgress({
       ok: false,
