@@ -4896,14 +4896,28 @@ async function buildMediaQa(
   };
 }
 
-/** Did a resumable segment-assembly failure cache at least one NEW segment?
- * Forward progress means an unchanged-input retry genuinely advances, so the
- * draft repair budget must not count it as a repeated failure; zero-progress
- * repetition still spends the budget and stays bounded. */
+/** Did a resumable segment-assembly failure preserve useful render progress?
+ * A newly rendered segment advances the retry. A complete cache hit also
+ * proves that content rendering already succeeded and the failure happened in
+ * a later assembly/environment stage. Both are budget-neutral; incomplete or
+ * contradictory counters stay bounded by the ordinary repair budget. */
 export function resumableRenderFailureMadeProgress(render: VideoStudioResult): boolean {
   if (render.ok !== false || render.errorCode !== 'E_SEGMENT_ASSEMBLY_INCOMPLETE') return false;
-  const rendered = (render.scene_segments as { rendered?: unknown } | undefined)?.rendered;
-  return typeof rendered === 'number' && rendered > 0;
+  const segments = render.scene_segments as {
+    total?: unknown;
+    rendered?: unknown;
+    reused?: unknown;
+    failed?: unknown;
+    pending?: unknown;
+  } | undefined;
+  if (typeof segments?.rendered === 'number' && segments.rendered > 0) return true;
+  return typeof segments?.total === 'number'
+    && Number.isInteger(segments.total)
+    && segments.total > 0
+    && typeof segments.reused === 'number'
+    && segments.reused === segments.total
+    && segments.failed === 0
+    && segments.pending === 0;
 }
 
 async function failDraft(
