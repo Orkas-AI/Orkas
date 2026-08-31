@@ -3564,6 +3564,29 @@ const streamHandlers: Record<string, StreamHandler> = {
 
 interface StreamState { cancelled: boolean; controller: AbortController; sender: WebContents }
 const activeStreams = new Map<string, StreamState>();
+interface SettledStreamState { sender: WebContents; settledAt: number }
+const recentlySettledStreams = new Map<string, SettledStreamState>();
+const SETTLED_STREAM_TTL_MS = 60_000;
+const SETTLED_STREAM_MAX = 512;
+
+function pruneSettledStreams(now = Date.now()): void {
+  for (const [requestId, state] of recentlySettledStreams) {
+    if (now - state.settledAt <= SETTLED_STREAM_TTL_MS) break;
+    recentlySettledStreams.delete(requestId);
+  }
+  while (recentlySettledStreams.size > SETTLED_STREAM_MAX) {
+    const oldest = recentlySettledStreams.keys().next().value;
+    if (typeof oldest !== 'string') break;
+    recentlySettledStreams.delete(oldest);
+  }
+}
+
+function rememberSettledStream(requestId: string, sender: WebContents): void {
+  const settledAt = Date.now();
+  recentlySettledStreams.delete(requestId);
+  recentlySettledStreams.set(requestId, { sender, settledAt });
+  pruneSettledStreams(settledAt);
+}
 
 /**
  * Resolve the current user context for an IPC request. `user.init` must be
@@ -3724,6 +3747,7 @@ export function register(): void {
       out({ type: 'error', text: (err as Error).message || String(err) });
     } finally {
       activeStreams.delete(requestId);
+      rememberSettledStream(requestId, event.sender);
       log.info(`streamDone channel=${channel} requestId=${requestId} cancelled=${state.cancelled}`);
       out({ type: 'done' });
     }
@@ -3735,6 +3759,19 @@ export function register(): void {
     if (!requestId) return;
     const state = activeStreams.get(requestId);
     if (!state) {
+      pruneSettledStreams();
+      const settled = recentlySettledStreams.get(requestId);
+      if (settled?.sender === event.sender) {
+        // Renderer cleanup may race the terminal `done` delivery by a few
+        // milliseconds. Cancellation is idempotent: a request that this same
+        // renderer already completed has nothing left to abort.
+        log.debug(`streamCancel: already settled requestId=${requestId}`);
+        return;
+      }
+      if (settled) {
+        log.warn(`streamCancel: sender mismatch requestId=${requestId}`);
+        return;
+      }
       log.warn(`streamCancel: unknown requestId=${requestId}`);
       return;
     }

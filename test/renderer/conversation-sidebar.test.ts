@@ -1878,6 +1878,101 @@ describe('conversation sticky scroll', () => {
   });
 });
 
+describe('conversation stream lifecycle idempotency', () => {
+  it('reserves a recovery observer before activity so concurrent triggers cannot double-subscribe', async () => {
+    const context = loadConversationRenderer();
+    context.AbortController = AbortController;
+    let streamStarts = 0;
+    context.apiFetch = (_url: string, options: any) => {
+      streamStarts += 1;
+      return new Promise((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => {
+          reject(Object.assign(new Error('cancelled'), { name: 'AbortError' }));
+        }, { once: true });
+      });
+    };
+
+    const first = context._observeConversationRunFromPlanAction('c1');
+    const duplicate = context._observeConversationRunFromPlanAction('c1');
+
+    expect(first).not.toBeNull();
+    expect(duplicate).toBeNull();
+    expect(streamStarts).toBe(1);
+
+    first.cancel();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(vm.runInContext('_groupObserverReservations.size', context)).toBe(0);
+  });
+
+  it('treats a duplicate terminal message as an idempotent replay of its finalized row', () => {
+    const context = loadConversationRenderer();
+    context.currentCid = 'c1';
+    context.__existing = {
+      dataset: {
+        finalized: '1',
+        msgId: 'message-1',
+        renderKey: 's:turn-1:0',
+      },
+    };
+    context.__syncCalls = 0;
+    context.__autoRecipientCalls = 0;
+    context.document.getElementById = () => ({});
+    vm.runInContext(`
+      _findRenderedGroupMessage = function() { return __existing; };
+      _syncRenderedGroupMessageIdentity = function() { __syncCalls += 1; };
+      _claimRenderNodeForMessage = function() { throw new Error('replay claimed the row again'); };
+      appendChatMessage = function() { throw new Error('replay appended a duplicate row'); };
+      _evaluateAutoRecipient = function() { __autoRecipientCalls += 1; };
+      _scheduleConversationInfoFileRefresh = function() {};
+    `, context);
+
+    context._handleGroupBusEvent('c1', null, {
+      type: 'message',
+      turn_id: 'turn-1',
+      turn_end: true,
+      msg: {
+        id: 'message-1',
+        from: 'commander',
+        to: ['user'],
+        turn_id: 'turn-1',
+        seg: 0,
+        text: 'Canonical final answer',
+        ts: '2026-08-27T22:40:16.745Z',
+      },
+    });
+
+    expect(context.__syncCalls).toBe(1);
+    expect(context.__autoRecipientCalls).toBe(0);
+  });
+
+  it('drops a terminal-late process event instead of reopening or warning on the finalized row', () => {
+    const context = loadConversationRenderer();
+    context.currentCid = 'c1';
+    context.groupBusyConvs.set('c1', true);
+    context.__settledRow = { dataset: { finalized: '1' } };
+    context.__warnCalls = 0;
+    vm.runInContext(`
+      _ensureActorPlaceholder = function() { return null; };
+      _findRenderNode = function() { return __settledRow; };
+      _convLog.warn = function() { __warnCalls += 1; };
+    `, context);
+
+    context._handleGroupBusEvent('c1', null, {
+      type: 'process',
+      actor: 'commander',
+      turn_id: 'turn-1',
+      seg: 0,
+      data: {
+        type: 'event',
+        event: { stream: 'tool', data: { phase: 'end', id: 'tool-1' } },
+      },
+    });
+
+    expect(context.__warnCalls).toBe(0);
+    expect(context.__settledRow.dataset).toEqual({ finalized: '1' });
+  });
+});
+
 describe('conversation history reconcile', () => {
   // Matching used to fall back to a sender+second-timestamp+text-hash
   // signature, which two genuinely different replies can share. Identity is now
@@ -6156,9 +6251,9 @@ describe('conversation controller settlement', () => {
     context._updateConvSidebarBadge = () => {};
     context.startPolling = () => {};
     context._startRuntimeActorRecovery = () => {};
-    // Sending now attaches the bus observer (the turn's only event source);
-    // this case is about controller settlement, so stub it like the other
-    // onAssistantStart side effects above.
+    // Sending now attaches the recovery bus observer beside the primary send
+    // stream; this case is about controller settlement, so stub it like the
+    // other onAssistantStart side effects above.
     context._observeConversationRunFromPlanAction = () => {};
 
     const ctrl = context._makeConvChatController('c1');
