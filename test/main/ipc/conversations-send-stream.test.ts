@@ -4,6 +4,18 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+const loggerMocks = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}));
+
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: () => loggerMocks,
+  logFromRenderer: vi.fn(),
+}));
+
 type StreamStartFn = (
   event: { sender: { getURL: () => string; isDestroyed: () => boolean; send: (channel: string, payload: unknown) => void } },
   req: { requestId: string; channel: string; payload?: unknown },
@@ -87,6 +99,10 @@ beforeEach(async () => {
   groupChatMock.releaseSend = null;
   groupChatMock.sendCalls.length = 0;
   groupChatMock.retryCalls.length = 0;
+  loggerMocks.debug.mockReset();
+  loggerMocks.info.mockReset();
+  loggerMocks.warn.mockReset();
+  loggerMocks.error.mockReset();
   groupChatMock.sendStarted = new Promise<void>((resolve) => { groupChatMock.resolveSendStarted = resolve; });
   groupChatMock.sendFinished = new Promise<void>((resolve) => { groupChatMock.resolveSendFinished = resolve; });
   vi.resetModules();
@@ -286,6 +302,28 @@ describe('ipc › conversations.sendStream', () => {
     await run;
     expect(settled).toBe(true);
     groupChatMock.releaseSend?.();
+  });
+
+  it('treats a late cancel from the completed stream owner as idempotent cleanup', async () => {
+    if (!streamStartHandler || !streamCancelHandler) throw new Error('stream handlers not registered');
+    const sender = trustedIpcSender({ isDestroyed: () => false, send: vi.fn() });
+
+    await streamStartHandler(
+      { sender },
+      {
+        requestId: 'already-settled',
+        channel: 'groupChat.events',
+        payload: { cid: 'c123abc' },
+      },
+    );
+    loggerMocks.warn.mockClear();
+
+    streamCancelHandler({ sender }, 'already-settled');
+
+    expect(loggerMocks.warn).not.toHaveBeenCalled();
+    expect(loggerMocks.debug).toHaveBeenCalledWith(
+      'streamCancel: already settled requestId=already-settled',
+    );
   });
 
   it('rejects a duplicate request id without replacing the original owner', async () => {

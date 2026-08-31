@@ -3417,6 +3417,11 @@ function _renderMessageQueueForRuntimeState(cid) {
 const _runtimeRecoveryTimers = new Map(); // cid → timeout id
 const _lastGroupWorkEventAt = new Map(); // cid → ms timestamp of process/artifact/assistant message
 const _groupObserverCtrls = new Map();   // cid → recovery observer controller
+// Reserve an observer before its asynchronous IPC stream is connected. The
+// lifecycle controller map is populated only after activity is observed, which
+// left a pre-activity window where two recovery triggers could subscribe to the
+// same bus and replay every event twice.
+const _groupObserverReservations = new Map(); // cid → observer controller
 const _conversationInfoFileRefreshTimers = new Map(); // cid → timeout id
 const _offViewGroupProcessEvents = new Map(); // cid → bounded non-delta process events
 const _MAX_OFF_VIEW_GROUP_PROCESS_EVENTS = 300;
@@ -3643,9 +3648,9 @@ async function _syncPendingActorsFromRuntime(cid, opts = {}) {
   }
   if (hasLiveController) {
     // Re-arm the bus observer if this snapshot found a live run without one.
-    // The observer is the conversation's only event source (the send stream
-    // carries lifecycle only) and is idempotent per cid, so re-arming is safe
-    // and losing it would silently stop the live rail.
+    // The primary send stream and this observer are redundant delivery paths;
+    // the observer keeps terminal recovery alive if the primary renderer path
+    // disconnects. Its reservation makes re-arming idempotent per cid.
     _observeConversationRunFromPlanAction(cid, {
       attachExisting: true,
       allowWithController: true,
@@ -10261,12 +10266,11 @@ function _makeConvChatController(cid, options = {}) {
         _lastGroupWorkEventAt.set(id, Date.now());
         _updateConvSendUI(id);
         _updateConvSidebarBadge(id, true);
-        // The send stream carries lifecycle only (see ipc `conversations.sendStream`),
-        // so the bus observer must be attached here — it is the only source of
-        // process/delta/message events for this turn. Attaching at send time
-        // rather than waiting for a `state_changed` also removes the old
-        // bootstrap dependency: that event used to arrive over the send stream,
-        // which no longer relays anything.
+        // Keep a recovery observer beside the primary `conversations.sendStream`.
+        // The primary owns append-semantics process events; the observer keeps
+        // idempotent terminal/state delivery alive if the primary renderer path
+        // disconnects. Attach at send time so neither path depends on first
+        // observing `state_changed` before it can recover the turn.
         _observeConversationRunFromPlanAction(id, {
           attachExisting: true,
           allowWithController: true,
@@ -10563,7 +10567,7 @@ function _observeConversationRunFromPlanAction(cid, opts = {}) {
   const attachExisting = !!opts.attachExisting;
   const allowWithController = !!opts.allowWithController;
   if (_convChatCtrls.has(cid) && !allowWithController) return null;
-  if (allowWithController && _groupObserverCtrls.has(cid)) return null;
+  if (_groupObserverReservations.has(cid)) return null;
   if (!attachExisting && (pendingConvs.has(cid) || isGroupConversationBusy(cid))) return null;
 
   const controller = new AbortController();
@@ -10571,12 +10575,20 @@ function _observeConversationRunFromPlanAction(cid, opts = {}) {
   let sawActivity = attachExisting;
   let settled = false;
   let activated = false;
+  // Capture ownership at subscription time. A paired observer must keep
+  // ignoring append-semantics process events even after the primary controller
+  // settles, because its IPC buffer can drain a few milliseconds later.
+  const pairedWithPrimary = allowWithController && _convChatCtrls.has(cid);
 
   const ctrl = {
     abort: () => {
+      if (_groupObserverReservations.get(cid) === ctrl) {
+        _groupObserverReservations.delete(cid);
+      }
       try { controller.abort(); } catch (_) {}
     },
   };
+  _groupObserverReservations.set(cid, ctrl);
   if (allowWithController) _groupObserverCtrls.set(cid, ctrl);
 
   const activate = () => {
@@ -10653,8 +10665,11 @@ function _observeConversationRunFromPlanAction(cid, opts = {}) {
             if (st.status === 'running' || inFlight.length > 0 || activeTurns.length > 0) sawActivity = true;
           }
           if (sawActivity) activate();
-          // The primary send stream owns the process rail while it is alive.
-          if (allowWithController && _convChatCtrls.has(cid) && _isPrimaryOwnedLiveEvent(evData)) {
+          // A paired primary send stream owns the process rail for this entire
+          // observer subscription. Checking the live-controller map here was
+          // racy: main could finish the primary first while this observer still
+          // had duplicate terminal process events buffered.
+          if (pairedWithPrimary && _isPrimaryOwnedLiveEvent(evData)) {
             continue;
           }
           _handleGroupBusEvent(cid, msgEl, evData, { archive: true });
@@ -10675,7 +10690,9 @@ function _observeConversationRunFromPlanAction(cid, opts = {}) {
       // Whether this observer is still the conversation's current one. A newer
       // send registers its own observer, and once that happens every global
       // teardown below belongs to that newer run, not to this finishing one.
-      const supersededByNewerRun = allowWithController && _groupObserverCtrls.get(cid) !== ctrl;
+      const currentReservation = _groupObserverReservations.get(cid);
+      const supersededByNewerRun = !!currentReservation && currentReservation !== ctrl;
+      if (currentReservation === ctrl) _groupObserverReservations.delete(cid);
       if (allowWithController) {
         if (_groupObserverCtrls.get(cid) === ctrl) _groupObserverCtrls.delete(cid);
       } else if (_convChatCtrls.get(cid) === ctrl) {
@@ -13252,6 +13269,20 @@ function _reportUnclaimedKeyedRecord(cid, gm, renderKey) {
   } catch (_) { /* diagnostics must never break rendering */ }
 }
 
+/** A second event stream can deliver the same persisted terminal record after
+ * its first delivery already finalized the row. Treat that as an idempotent
+ * replay only when the durable message id matches; a finalized silent row with
+ * no message id still has to be replaced if a real record arrives later. */
+function _isFinalizedGroupMessageReplay(cid, gm) {
+  if (!gm || !gm.id) return false;
+  const container = document.getElementById('chat-history');
+  const existing = _findRenderedGroupMessage(container, gm);
+  if (!existing || existing.dataset.finalized !== '1') return false;
+  if (String(existing.dataset.msgId || '') !== String(gm.id)) return false;
+  _syncRenderedGroupMessageIdentity(existing, gm);
+  return true;
+}
+
 // Transform a streaming placeholder bubble into its finalized form:
 // freeze the process rail (keep visible + collapsed by default),
 // render markdown into [data-role="final"], append produced-files chip /
@@ -13522,6 +13553,11 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     const isCommanderSegment = !isTurnEnd
       && gm.seg !== undefined && String(gm.from || '') === 'commander';
     if (isTurnEnd || isCommanderSegment) {
+      // `conversations.sendStream` and its recovery observer both carry
+      // persisted messages. Whichever reaches the DOM first owns finalization;
+      // the second is a replay, not a missing-row failure and not another
+      // auto-recipient trigger.
+      if (_isFinalizedGroupMessageReplay(cid, gm)) return;
       // Finalize THIS actor's placeholder in place — preserves the process
       // rail (tool calls, progress lines) accumulated during the turn so
       // it stays readable after the reply settles. If we don't have a
@@ -13619,6 +13655,12 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
       cid, actor, streamingMsg, turnId, undefined, undefined, evData.seg,
     );
     if (!target) {
+      // Terminal content is authoritative. A process event buffered by a
+      // redundant stream can arrive after that row is finalized; dropping it
+      // preserves the final text and makes terminal-late delivery idempotent.
+      const renderKey = turnId ? _segmentRenderKey(turnId, evData.seg) : _pendingRenderKey(actor);
+      const settledTarget = renderKey ? _findRenderNode(cid, renderKey) : null;
+      if (settledTarget?.dataset?.finalized === '1') return;
       _convLog.warn('group process target missing', {
         cid,
         actor,
