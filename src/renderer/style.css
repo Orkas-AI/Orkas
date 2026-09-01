@@ -6135,6 +6135,11 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 .composer-model-menu-item.is-active {
   background: color-mix(in srgb, var(--primary-soft) 56%, var(--surface));
 }
+.composer-model-menu-group + .composer-model-menu-group {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
 .composer-model-menu-group-header {
   padding: 4px 10px 3px;
   display: flex;
@@ -12897,6 +12902,73 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   margin-bottom: 14px;
 }
 .settings-group-head { margin-bottom: 14px; }
+.settings-orkas-api-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+.settings-orkas-api-head .settings-group-title {
+  font-size: 14px;
+  line-height: 1.4;
+}
+.settings-orkas-api-head .settings-group-sub {
+  max-width: 720px;
+}
+.settings-orkas-api-head .btn {
+  flex: 0 0 auto;
+  min-height: 34px;
+  padding-inline: 14px;
+}
+.settings-orkas-api-group .settings-orkas-api-configure-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  gap: 10px;
+  margin-bottom: 0;
+}
+.settings-orkas-api-group .settings-orkas-api-configure-row .form-input {
+  flex: none;
+  min-width: 0;
+  height: 40px;
+  padding: 0 12px;
+  line-height: 38px;
+  background: var(--surface);
+}
+.settings-orkas-api-configure-row .btn {
+  height: 40px;
+  min-width: 156px;
+  padding: 0 18px;
+  line-height: 38px;
+  white-space: nowrap;
+  box-shadow: 0 2px 5px rgba(73, 69, 192, 0.16);
+}
+.settings-orkas-api-status {
+  display: block;
+  min-height: 0;
+  margin-top: 10px;
+  line-height: 1.5;
+}
+.settings-orkas-api-status:empty {
+  display: none;
+}
+@media (max-width: 720px) {
+  .settings-orkas-api-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .settings-orkas-api-group .settings-orkas-api-configure-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .settings-orkas-api-head .btn,
+  .settings-orkas-api-configure-row .btn {
+    width: 100%;
+  }
+  .settings-orkas-api-configure-row .btn {
+    min-width: 0;
+  }
+}
 .settings-group-head-main {
   min-width: 0;
 }
@@ -13353,6 +13425,17 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   flex-direction: column;
   gap: 8px;
 }
+.entry-included-models {
+  display: block;
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
 .entry-row {
   display: flex;
   align-items: center;
@@ -13422,6 +13505,19 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 }
 .entry-sep { color: var(--border-strong); }
 .entry-model { color: var(--text); }
+.entry-model-static {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text);
+}
+.entry-model-static-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .entry-account-chip {
   margin-left: 6px;
   padding: 1px 8px;
@@ -13438,6 +13534,7 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 
 .entry-meta {
   display: flex;
+  min-width: 0;
   align-items: center;
   gap: 8px;
   font-size: 11px;

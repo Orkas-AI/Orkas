@@ -169,6 +169,7 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
 
   { name: 'generate_image', loadGroups: ['media.image'], permission: 'localExec', summary: 'Generate an image into the workspace.' },
   { name: 'image_studio', loadGroups: ['media.image'], permission: 'localExec', ownerAgent: IMAGE_STUDIO_AGENT_ID, summary: 'ImageStudio-owned QA and export runtime.' },
+  { name: 'generate_video', loadGroups: ['media.video'], permission: 'localExec', summary: 'Generate or edit a short video into the workspace.' },
   { name: 'video_studio', loadGroups: ['media.video'], permission: 'localExec', ownerAgent: VIDEO_STUDIO_AGENT_ID, summary: 'VideoStudio-owned production runtime.' },
   { name: 'generate_speech', loadGroups: ['media.speech'], permission: 'localExec', summary: 'Generate speech audio.' },
 

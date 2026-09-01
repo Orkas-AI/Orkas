@@ -74,6 +74,7 @@ import { officeCliAvailable } from '../../features/office/office_engine';
 import { createLibraryTool } from './kb-tools';
 import { createChatHistoryTool } from './chat-history-tools';
 import { createImageGenTool } from './image-gen-tool';
+import { createVideoGenTool } from './video-gen-tool';
 import { createGenerateSpeechTool } from './generate-speech-tool';
 import {
   AGENT_DEPENDENCY_TOOL_GROUP_IDS,
@@ -98,6 +99,8 @@ import {
 } from '../../util/tool-result-cap';
 import { createToolResultTools } from './tool-result-tools';
 import {
+  buildOrkasApiModel,
+  createOrkasApiProvider,
   buildMoonshotModel,
   buildDeepSeekModel,
   buildDoubaoModel,
@@ -115,6 +118,7 @@ import {
   modelInputImageLimit,
 } from '../provider_catalog';
 import { readDisabledSets } from '../../features/component_enabled';
+import type { OrkasApiUsageContext } from '../../features/orkas_api';
 import {
   nativeSearchToolForApi,
   nativeSearchToolName,
@@ -154,6 +158,8 @@ function buildExternalProviderModel(
   customConfig?: ChatEntryChoice['customConfig'],
 ): Model<Api> | null {
   switch (providerId) {
+    case 'orkas-api':
+      return buildOrkasApiModel(modelId);
     case 'moonshot':
       return buildMoonshotModel(modelId);
     case 'deepseek':
@@ -928,6 +934,20 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
       })]
     : [];
+  const videoGenTools: AgentTool[] = uid
+    ? [createVideoGenTool({
+        userId: uid,
+        ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.conversationTitle ? { conversationTitle: params.conversationTitle } : {}),
+        ...(params.conversationTitleUpdatedAt ? { conversationTitleUpdatedAt: params.conversationTitleUpdatedAt } : {}),
+        ...(params.turnId ? { turnId: params.turnId } : {}),
+        ...(agentId ? { agentId } : {}),
+        ...(agentName ? { agentName } : {}),
+        ...(params.projectId ? { projectId: params.projectId } : {}),
+        ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
+        ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
+      })]
+    : [];
   const speechGenTools: AgentTool[] = uid
     ? [createGenerateSpeechTool({
         userId: uid,
@@ -1088,6 +1108,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...kbTools,
     ...chatHistoryTools,
     ...imageGenTools,
+    ...videoGenTools,
     ...speechGenTools,
     ...videoStudioTools,
     ...imageStudioTools,
@@ -1473,6 +1494,10 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       params.onCandidateChosen,
       params.onCandidatesObserved,
       params.providerFirstEventTimeoutMs,
+      {
+        conversationId: params.cid,
+        turnId: params.turnId,
+      },
     );
     // Inject the rotating provider into BOTH the factory slot AND the
     // pre-built instance cache. ProviderRegistry.get() short-circuits on
@@ -1672,9 +1697,14 @@ export function openSkillSourcesExposureFromSessionId(sessionId: string): boolea
  * Extend the switch when a new id is added to `EXTERNAL_API_PROVIDERS`.
  * Async because the underlying factories await core-agent dynamic import.
  */
-async function buildExternalProvider(choice: ChatEntryChoice): Promise<LLMProvider> {
+async function buildExternalProvider(
+  choice: ChatEntryChoice,
+  usageContext?: OrkasApiUsageContext,
+): Promise<LLMProvider> {
   const { provider: providerId, apiKey, model: modelId } = choice;
   switch (providerId) {
+    case 'orkas-api':
+      return await createOrkasApiProvider({ apiKey, modelId, usageContext });
     case 'moonshot':
       return await createMoonshotProvider({ apiKey, modelId });
     case 'deepseek':
@@ -1721,6 +1751,7 @@ async function buildRotatingProvider(
   onCandidateChosen?: (info: { profileId: string; providerId: string; modelId: string }) => void,
   onCandidatesObserved?: (info: { candidateCount: number; availableCandidateCount: number }) => void,
   firstEventTimeoutMs?: number,
+  usageContext?: OrkasApiUsageContext,
 ): Promise<LLMProvider> {
   const candidates: RotatingCandidate[] = group.map((choice) => {
     const candProviderId = choice.provider;
@@ -1747,7 +1778,7 @@ async function buildRotatingProvider(
         : {}),
       build: async () => {
         if (isExternal) {
-          return buildExternalProvider(choice);
+          return buildExternalProvider(choice, usageContext);
         }
         if (resolvedModel?.isConfiguredFallback) {
           log.info('using configured model fallback', {

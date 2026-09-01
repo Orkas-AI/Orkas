@@ -149,6 +149,55 @@ describe('image_gen › pickImageGenProfile', () => {
   });
 });
 
+// ── callOrkasImage (mock fetch) ──────────────────────────────────────────
+
+describe('image_gen › callOrkasImage', () => {
+  it('uses the public image contract without exposing a provider model id', async () => {
+    const captured: { url?: string; init?: RequestInit } = {};
+    vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
+      captured.url = url;
+      captured.init = init;
+      const b64 =
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+      return new Response(JSON.stringify({
+        id: 'img_public_test',
+        status: 'succeeded',
+        data: [{ b64_json: b64 }],
+      }), { status: 202 });
+    });
+    try {
+      const m = await import('../../../src/main/features/image_gen');
+      const res = await m.callOrkasImage({
+        apiKey: 'orkas-user-key',
+        model: 'orkas-image',
+        prompt: 'a blue circle',
+        size: '1024x1024',
+        usageContext: { conversationId: 'conv_123', turnId: 'turn-456' },
+      });
+
+      expect(captured.url).toBe('https://orkas.ai/v1/images/generations');
+      expect(captured.init?.method).toBe('POST');
+      expect(captured.init?.headers).toMatchObject({
+        Authorization: 'Bearer orkas-user-key',
+        'Content-Type': 'application/json',
+        'X-Orkas-Conversation-Id': 'conv_123',
+        'X-Orkas-Turn-Id': 'turn-456',
+      });
+      const body = JSON.parse(String(captured.init?.body));
+      expect(body).toEqual({
+        prompt: 'a blue circle',
+        size: '2k',
+        response_format: 'url',
+        async: true,
+      });
+      expect(body).not.toHaveProperty('model');
+      expect(res).toMatchObject({ mimeType: 'image/png', width: 1, height: 1 });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 // ── callOpenAIImage (mock fetch) ─────────────────────────────────────────
 
 describe('image_gen › callOpenAIImage', () => {

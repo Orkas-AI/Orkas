@@ -6,6 +6,7 @@ vi.mock('../../../../src/main/logger', () => ({
 
 import {
   runSearchAdapter,
+  SEARCH_PROVIDER_LABEL,
   searchAdaptersByProvider,
 } from '../../../../src/main/model/core-agent/search-adapters';
 
@@ -14,6 +15,48 @@ afterEach(() => {
 });
 
 describe('open-source BYO search adapters', () => {
+  it('labels the official provider with its concrete service', () => {
+    expect(SEARCH_PROVIDER_LABEL['orkas-api']).toBe('Orkas · Search');
+  });
+
+  it('uses the public Orkas search contract without a capabilities request', async () => {
+    const fetchStub = vi.fn(async () => new Response(JSON.stringify({
+      results: [{ title: 'Orkas', url: 'https://orkas.ai/docs', snippet: 'Official result' }],
+    }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchStub);
+
+    const result = await runSearchAdapter({
+      id: 'orkas-a',
+      provider: 'orkas-api',
+      apiKey: 'orkas-user-key',
+      label: 'Orkas',
+      createdAt: 0,
+    }, 'public api', 4, {
+      conversationId: 'conv_123',
+      turnId: 'turn-456',
+    });
+
+    expect(result.results).toEqual([
+      { title: 'Orkas', url: 'https://orkas.ai/docs', snippet: 'Official result' },
+    ]);
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    expect(fetchStub).toHaveBeenCalledWith(
+      'https://orkas.ai/v1/search',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({
+          Authorization: 'Bearer orkas-user-key',
+          'X-Orkas-Conversation-Id': 'conv_123',
+          'X-Orkas-Turn-Id': 'turn-456',
+        }),
+      }),
+    );
+    expect(JSON.parse(String(fetchStub.mock.calls[0]?.[1]?.body))).toEqual({
+      query: 'public api',
+      max_results: 4,
+    });
+  });
+
   it('normalizes Tavily results and bounds the requested count', async () => {
     const fetchStub = vi.fn(async () => new Response(JSON.stringify({
       results: [
@@ -79,6 +122,7 @@ describe('open-source BYO search adapters', () => {
       'baidu-ai-search',
       'brave-search',
       'metaso',
+      'orkas-api',
       'serper',
       'tavily',
     ]);

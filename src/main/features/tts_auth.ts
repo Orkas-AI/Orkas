@@ -1,13 +1,20 @@
 /**
  * Text-to-speech provider management for user-owned keys.
  *
- * Open-source builds do not ship a hosted Orkas speech API. Users configure
- * their own provider credentials here, and downstream speech tools read the
- * ordered `ttsProfiles` list from auth.ts.
+ * Open-source builds use user-supplied provider credentials here, including
+ * public Orkas API keys. Downstream speech tools read the ordered
+ * `ttsProfiles` list from auth.ts.
  */
 
 import { loadTtsProfiles, saveTtsProfiles, type TtsProfile } from './auth';
 import { createLogger } from '../logger';
+import {
+  ORKAS_API_BASE_URL,
+  ORKAS_API_DEFAULT_VOICE,
+  ORKAS_API_KEYS_URL,
+  ORKAS_API_PROVIDER,
+  ORKAS_API_TTS_MODEL,
+} from './orkas_api';
 
 const log = createLogger('tts-auth');
 
@@ -144,6 +151,15 @@ export function listTtsProviderPresets(): Array<{
   defaultModel?: string; defaultVoice?: string; defaultFormat?: string; docs?: string;
 }> {
   return [
+    {
+      id: ORKAS_API_PROVIDER,
+      label: 'Orkas · Voice',
+      baseUrl: ORKAS_API_BASE_URL,
+      defaultModel: ORKAS_API_TTS_MODEL,
+      defaultVoice: ORKAS_API_DEFAULT_VOICE,
+      defaultFormat: DEFAULT_TTS_FORMAT,
+      docs: ORKAS_API_KEYS_URL,
+    },
     { id: 'doubao', label: 'DouBao · Voice', baseUrl: DOUBAO_TTS_BASE_URL, defaultVoice: DOUBAO_DEFAULT_VOICE, defaultFormat: DEFAULT_TTS_FORMAT, docs: 'https://www.volcengine.com/docs/6561/1598757' },
     { id: 'elevenlabs', label: 'ElevenLabs', baseUrl: 'https://api.elevenlabs.io/v1', defaultModel: 'eleven_multilingual_v2', docs: 'https://elevenlabs.io/docs' },
     { id: 'openai', label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', defaultModel: 'tts-1', defaultVoice: 'alloy', defaultFormat: DEFAULT_TTS_FORMAT, docs: 'https://platform.openai.com/api-keys' },

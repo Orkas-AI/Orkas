@@ -1101,6 +1101,20 @@
 
             <!-- ───────────────────────── 配置 ───────────────────────── -->
             <div class="settings-tab-pane" data-settings-pane="credentials" hidden>
+              <div class="settings-group settings-orkas-api-group" id="settings-orkas-api-group">
+                <div class="settings-group-head settings-orkas-api-head">
+                  <div class="settings-group-head-main">
+                    <div class="settings-group-title" data-i18n="settings.orkas_api.title">Orkas official services</div>
+                    <div class="settings-group-sub" data-i18n="settings.orkas_api.sub">Use one API Key to quickly configure models, search, images, speech, and video.</div>
+                  </div>
+                  <button type="button" class="btn btn-sm" id="settings-orkas-api-create-key" data-i18n="settings.orkas_api.create_key">Create API Key</button>
+                </div>
+                <div class="settings-row settings-orkas-api-configure-row">
+                  <input type="password" class="form-input" id="settings-orkas-api-key-input" autocomplete="new-password" spellcheck="false" data-i18n-placeholder="settings.orkas_api.key_placeholder" placeholder="Enter API Key" />
+                  <button type="button" class="btn btn-primary" id="settings-orkas-api-configure" data-i18n="settings.orkas_api.configure">Configure</button>
+                </div>
+                <div class="settings-status settings-orkas-api-status" id="settings-orkas-api-status" aria-live="polite"></div>
+              </div>
               <div class="settings-section-note" data-i18n="settings.section.models_note">API keys and authorization data are stored only on this device — never synced or sent elsewhere.</div>
 
               <div class="settings-group settings-model-auth-group">

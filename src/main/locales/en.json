@@ -41,6 +41,7 @@
   "process.skill.final_imported": "Skill import complete. Created {count} skills.",
   "process.skill.final_no_changes": "No skill content was written. Check the process details.",
   "image_gen.no_capable_model": "No image-generation capable model is configured. Please add an OpenAI or Google API key (subscription/OAuth credentials cannot access image generation).",
+  "video_gen.no_capable_model": "No video generation service is configured. Configure Orkas API in Settings.",
   "oauth.minimax.requesting": "Requesting authorization from MiniMax…",
   "oauth.minimax.waiting": "Waiting for MiniMax authorization to complete…",
   "oauth.minimax.instructions": "Enter the following code on the opened page:\n\n    {code}\n\nAfter authorization, Orkas will continue automatically. No action is needed.",

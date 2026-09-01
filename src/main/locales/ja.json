@@ -41,6 +41,7 @@
   "process.skill.final_imported": "スキルのインポートが完了しました。{count} 個のスキルを作成しました。",
   "process.skill.final_no_changes": "スキル内容は書き込まれませんでした。過程情報を確認してください。",
   "image_gen.no_capable_model": "画像生成に対応したモデルが設定されていません。OpenAI または Google の API キーを追加してください（サブスクリプション / OAuth 認証情報では画像生成を利用できません）。",
+  "video_gen.no_capable_model": "動画生成サービスが設定されていません。「設定」で Orkas API を設定してください。",
   "oauth.minimax.requesting": "MiniMax に認証をリクエストしています…",
   "oauth.minimax.waiting": "MiniMax の認証完了を待っています…",
   "oauth.minimax.instructions": "開いたページで次のコードを入力してください:\n\n    {code}\n\n認証が完了すると、Orkas が自動で続行します。操作は不要です。",

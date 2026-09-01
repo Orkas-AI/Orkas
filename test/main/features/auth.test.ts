@@ -102,6 +102,7 @@ describe('auth › FEATURED_PROVIDERS', () => {
     // / Kimi-Coding / MiniMax / Doubao；去掉 oauthOnly 的 minimax-portal*）
     // → 聚合器 OpenRouter。必须严格跟 CATALOG 对齐（减 oauthOnly 项）。
     expect(a.FEATURED_PROVIDERS).toEqual([
+      'orkas-api',
       'deepseek',
       'openai',
       'google',
@@ -117,6 +118,103 @@ describe('auth › FEATURED_PROVIDERS', () => {
     // excluded from the API-key docs list (FEATURED_PROVIDERS). They still
     // appear in CATALOG / VISIBLE_PROVIDERS.
   });
+});
+
+describe('auth › Orkas API quick setup', () => {
+  it('configures all five public services idempotently with the documented model ids', async () => {
+    const a = await import('../../../src/main/features/auth');
+    await a.addApiKeyEntry('anthropic', 'claude-opus-4-8', 'third-party-key-xxxxxxxx', 'work');
+
+    expect(a.configureAllOrkasApiServices('  orkas-key-first-xxxxxxxx  ')).toEqual({ configured: true });
+    a.saveImageProfiles(a.loadImageProfiles().map((profile) => (
+      profile.provider === 'orkas-api' ? { ...profile, model: 'old-image-model' } : profile
+    )));
+    a.saveVideoProfiles(a.loadVideoProfiles().map((profile) => (
+      profile.provider === 'orkas-api' ? { ...profile, model: 'old-video-model' } : profile
+    )));
+    a.saveTtsProfiles(a.loadTtsProfiles().map((profile) => (
+      profile.provider === 'orkas-api'
+        ? { ...profile, baseUrl: 'https://legacy.example/v1', model: 'old-tts-model' }
+        : profile
+    )));
+    expect(a.configureAllOrkasApiServices('orkas-key-second-xxxxxxxx')).toEqual({ configured: true });
+
+    const entries = (await a.listEntries({ includeUnavailable: true })).entries;
+    expect(entries.filter((entry) => entry.provider === 'orkas-api')).toEqual([
+      expect.objectContaining({
+        model: 'orkas-llm-1.5',
+        modelName: 'Orkas-1.5',
+        official: true,
+        profileLabel: 'Orkas',
+        profileMasked: 'orka…xxxx',
+        recommended: true,
+        includedModels: ['DeepSeek V4', 'GPT-5.6 Luna', 'Claude-Sonnet-5', 'Gemini-3.6 Flash'],
+      }),
+      expect.objectContaining({
+        model: 'orkas-llm-1.5-pro',
+        modelName: 'Orkas-1.5 Pro',
+        official: true,
+        profileLabel: 'Orkas',
+        profileMasked: 'orka…xxxx',
+        includedModels: ['GPT-5.6 Sol', 'Claude Opus 5', 'Kimi K3'],
+      }),
+    ]);
+    expect((await a.listComposerEntries()).entries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          provider: 'orkas-api',
+          model: 'orkas-llm-1.5',
+          modelName: 'Orkas-1.5',
+          official: true,
+        }),
+        expect.objectContaining({
+          provider: 'orkas-api',
+          model: 'orkas-llm-1.5-pro',
+          modelName: 'Orkas-1.5 Pro',
+          official: true,
+        }),
+      ]),
+    );
+    expect(entries[0]).toMatchObject({ provider: 'anthropic', model: 'claude-opus-4-8' });
+
+    expect(a.loadSearchProfiles().filter((profile) => profile.provider === 'orkas-api')).toHaveLength(1);
+    expect(a.loadImageProfiles().filter((profile) => profile.provider === 'orkas-api')).toEqual([
+      expect.objectContaining({ model: 'orkas-image' }),
+    ]);
+    expect(a.loadVideoProfiles().filter((profile) => profile.provider === 'orkas-api')).toEqual([
+      expect.objectContaining({ model: 'orkas-video' }),
+    ]);
+    expect(a.loadTtsProfiles().filter((profile) => profile.provider === 'orkas-api')).toEqual([
+      expect.objectContaining({
+        baseUrl: 'https://orkas.ai/v1',
+        model: 'orkas-tts-1',
+        voice: 'zh_female_vv_uranus_bigtts',
+      }),
+    ]);
+
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const raw = fs.readFileSync(file, 'utf8');
+    expect(localSecrets.isEncryptedSecret(raw)).toBe(true);
+    expect(raw).not.toContain('orkas-key-second-xxxxxxxx');
+    const persisted = JSON.parse(localSecrets.decryptLocalSecret(
+      { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' },
+      raw,
+      { legacySeeds: [TEST_UID] },
+    ));
+    const orkasKeys = [
+      ...Object.values(persisted.profiles as Record<string, any>)
+        .filter((profile: any) => profile.provider === 'orkas-api')
+        .map((profile: any) => profile.key),
+      ...persisted.searchProfiles.filter((profile: any) => profile.provider === 'orkas-api').map((profile: any) => profile.apiKey),
+      ...persisted.imageProfiles.filter((profile: any) => profile.provider === 'orkas-api').map((profile: any) => profile.apiKey),
+      ...persisted.videoProfiles.filter((profile: any) => profile.provider === 'orkas-api').map((profile: any) => profile.apiKey),
+      ...persisted.ttsProfiles.filter((profile: any) => profile.provider === 'orkas-api').map((profile: any) => profile.apiKey),
+    ];
+    expect(new Set(orkasKeys)).toEqual(new Set(['orkas-key-second-xxxxxxxx']));
+  });
+
 });
 
 describe('auth › multi-profile store (addApiKey / removeCredential / renameProfile)', () => {

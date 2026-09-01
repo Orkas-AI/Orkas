@@ -86,7 +86,7 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-async function createTool(opts: { cid?: string; projectId?: string; agentId?: string }) {
+async function createTool(opts: { cid?: string; turnId?: string; projectId?: string; agentId?: string }) {
   const mod = await import('../../../../src/main/model/core-agent/generate-speech-tool');
   return mod.createGenerateSpeechTool({ userId: UID, ...opts });
 }
@@ -388,7 +388,7 @@ describe('generate_speech output paths', () => {
 
   it('writes relative output_path to the current conversation attachment dir', async () => {
     const paths = await import('../../../../src/main/paths');
-    const tool = await createTool({ cid: CID });
+    const tool = await createTool({ cid: CID, turnId: 'turn-456' });
     const cwd = path.join(tmpDir, 'PC', 'bin');
     fs.mkdirSync(cwd, { recursive: true });
 
@@ -399,6 +399,9 @@ describe('generate_speech output paths', () => {
 
     expect(result.isError).toBeFalsy();
     expect(speechMock.generateSpeech).toHaveBeenCalledTimes(1);
+    expect(speechMock.generateSpeech.mock.calls[0]?.[0]).toMatchObject({
+      usageContext: { conversationId: CID, turnId: 'turn-456' },
+    });
     expect(lastOutputPath())
       .toBe(path.join(paths.chatAttachmentDir(UID, CID), 'morning.mp3'));
   });

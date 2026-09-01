@@ -28,6 +28,11 @@ import { probeMediaDurationSec } from '../util/media_probe';
 import { redactPaths } from '../util/redact';
 import { createLogger } from '../logger';
 import { resolveTtsSelection } from './tts_capabilities';
+import {
+  ORKAS_API_PROVIDER,
+  orkasApiUsageHeaders,
+  type OrkasApiUsageContext,
+} from './orkas_api';
 
 const log = createLogger('tts');
 
@@ -52,6 +57,7 @@ export interface TtsParams {
   format?: string;
   signal?: AbortSignal;
   onProgress?: (event: { phase: string; message: string }) => void;
+  usageContext?: OrkasApiUsageContext;
 }
 
 export type TtsResult =
@@ -432,7 +438,15 @@ function combineSignal(signal: AbortSignal | undefined, timeoutMs: number): Abor
 
 class OpenAICompatibleTtsBackend implements TtsBackend {
   readonly id = 'openai-compatible';
-  constructor(private readonly profile: { baseUrl: string; apiKey: string; model: string; voice?: string; format?: string; label?: string }) {}
+  constructor(private readonly profile: {
+    baseUrl: string;
+    apiKey: string;
+    model: string;
+    provider?: string;
+    voice?: string;
+    format?: string;
+    label?: string;
+  }) {}
 
   async synthesize(p: TtsParams): Promise<TtsResult> {
     const base = this.profile.baseUrl.replace(/\/+$/, '');
@@ -452,7 +466,13 @@ class OpenAICompatibleTtsBackend implements TtsBackend {
     try {
       resp = await fetch(url, {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${this.profile.apiKey}`, 'Content-Type': 'application/json' },
+        headers: {
+          'Authorization': `Bearer ${this.profile.apiKey}`,
+          'Content-Type': 'application/json',
+          ...(this.profile.provider === ORKAS_API_PROVIDER
+            ? orkasApiUsageHeaders(p.usageContext)
+            : {}),
+        },
         body: JSON.stringify(body),
         signal: combineSignal(p.signal, TTS_TIMEOUT_MS),
       });

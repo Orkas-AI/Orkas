@@ -41,6 +41,7 @@
   "process.skill.final_imported": "已完成技能导入，共创建 {count} 个技能。",
   "process.skill.final_no_changes": "未写入技能内容，请查看过程信息。",
   "image_gen.no_capable_model": "当前模型列表无图像生成能力。请添加 OpenAI / Google 任一 API Key（订阅/OAuth 授权不提供图像生成）。",
+  "video_gen.no_capable_model": "尚未配置可用的视频生成服务。请在「设置」中配置 Orkas API。",
   "oauth.minimax.requesting": "向 MiniMax 申请授权…",
   "oauth.minimax.waiting": "等待 MiniMax 授权完成…",
   "oauth.minimax.instructions": "请在打开的页面中输入验证码：\n\n    {code}\n\n授权完成后，Orkas 会自动继续，无需手动操作。",

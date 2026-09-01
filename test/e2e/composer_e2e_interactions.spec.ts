@@ -27,6 +27,47 @@ test.describe('persistent sidebar', () => {
 });
 
 test.describe('new chat composer', () => {
+  test('groups both public Orkas API-key models as official models', async ({ appPage, orkas }) => {
+    const configured = await orkas.invoke<{ ok: boolean; configured: boolean }>(
+      'orkasApi.configureAll',
+      { apiKey: 'orkas-e2e-public-key-xxxxxxxx' },
+    );
+    expect(configured).toMatchObject({ ok: true, configured: true });
+
+    const modelChip = appPage.locator('[data-composer-model-chip="new-chat"]');
+    await modelChip.click();
+    const officialGroup = appPage.locator(
+      '.composer-model-menu-group[data-model-group="official"]',
+    );
+    await expect(officialGroup.locator('.composer-model-menu-group-label'))
+      .toHaveText('Official models');
+    const officialRows = officialGroup.locator('.composer-model-menu-item');
+    await expect(officialRows).toHaveCount(2);
+    await expect(officialRows.locator('.composer-model-menu-title-name'))
+      .toHaveText(['Orkas-1.5', 'Orkas-1.5 Pro']);
+    await expect(officialRows.nth(0).locator('.composer-model-menu-recommended'))
+      .toHaveText('Recommended');
+    await expect(officialRows.nth(0).locator('.composer-model-menu-description'))
+      .toContainText('DeepSeek V4 · GPT-5.6 Luna · Claude-Sonnet-5 · Gemini-3.6 Flash');
+    await expect(officialRows.nth(1).locator('.composer-model-menu-description'))
+      .toContainText('GPT-5.6 Sol · Claude Opus 5 · Kimi K3');
+    const customGroup = appPage.locator(
+      '.composer-model-menu-group[data-model-group="custom"]',
+    );
+    await expect(customGroup.locator('.composer-model-menu-group-label'))
+      .toHaveText('User-configured models');
+    await appPage.keyboard.press('Escape');
+
+    await appPage.locator('#settings-btn').click();
+    await appPage.locator('.settings-tab[data-settings-tab="credentials"]').click();
+    const settingsOfficialRows = appPage.locator('#settings-entries .entry-row').filter({
+      has: appPage.locator('.entry-provider', { hasText: /^Orkas$/ }),
+    });
+    await expect(settingsOfficialRows).toHaveCount(2);
+    await expect(settingsOfficialRows.locator('.entry-model-static-name'))
+      .toHaveText(['Orkas-1.5', 'Orkas-1.5 Pro']);
+  });
+
   test('keeps CLI separate and shares BYO model priority selection across composers', async ({ appPage, orkas }) => {
     await expect(appPage.locator('.new-chat-model-choices')).toHaveCount(0);
 
@@ -131,7 +172,7 @@ test.describe('new chat composer', () => {
     await expect(modelGroup).toHaveCount(1);
     await expect(modelGroup).toHaveAttribute('data-model-group', 'custom');
     await expect(modelGroup.locator('.composer-model-menu-group-label'))
-      .toHaveText('Custom models');
+      .toHaveText('User-configured models');
     await expect(modelGroup.locator('.composer-model-menu-item'))
       .toHaveCount(entriesBefore.entries.length);
 

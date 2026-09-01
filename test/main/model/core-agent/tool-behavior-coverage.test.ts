@@ -44,6 +44,7 @@ const BEHAVIOR_SUITE_BY_TOOL: Record<string, string> = {
   chat_history: 'test/main/model/core-agent/chat-history-tools.test.ts',
   generate_image: 'test/main/model/core-agent/image-gen-tool.test.ts',
   generate_speech: 'test/main/model/core-agent/generate-speech-tool.test.ts',
+  generate_video: 'test/main/model/core-agent/video-gen-tool.test.ts',
   video_studio: 'test/main/model/core-agent/video-studio-state-tool.test.ts',
   image_studio: 'test/main/model/core-agent/image-studio-tool.test.ts',
   web_search: 'test/main/model/core-agent/search-tools.test.ts',

@@ -119,9 +119,9 @@ describe('injected tool surface budget', () => {
     // A silent empty/short corpus would make every assertion below vacuous:
     // a factory signature change that returns [] must fail here, not pass
     // quietly with a 0-char surface.
-    // The open build intentionally omits the release-only video generation tool;
-    // the remaining 36-tool corpus must still be complete and non-vacuous.
-    expect(tools).toHaveLength(36);
+    // The open build includes its public API-key video generation tool;
+    // the 37-tool corpus must still be complete and non-vacuous.
+    expect(tools).toHaveLength(37);
     expect(tools.some((tool) => tool.name === 'create_xlsx')).toBe(true);
     expect(tools.some((tool) => tool.name === 'read_files')).toBe(true);
   });

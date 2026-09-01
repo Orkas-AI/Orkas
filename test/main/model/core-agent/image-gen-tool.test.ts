@@ -51,7 +51,12 @@ afterEach(() => {
 describe('generate_image tool in the open build', () => {
   it('dispatches a configured BYO provider and publishes the generated path', async () => {
     const published: string[] = [];
-    const tool = createImageGenTool({ userId: 'user-a', onFileWritten: (file) => published.push(file) });
+    const tool = createImageGenTool({
+      userId: 'user-a',
+      cid: 'conv_123',
+      turnId: 'turn-456',
+      onFileWritten: (file) => published.push(file),
+    });
     const result = await tool.execute(
       { prompt: 'a small red dot', output_path: 'image.png', size: '1024x1024' },
       { workingDir: root } as any,
@@ -62,6 +67,7 @@ describe('generate_image tool in the open build', () => {
       prompt: 'a small red dot',
       outputAbsPath: path.join(root, 'image.png'),
       size: '1024x1024',
+      usageContext: { conversationId: 'conv_123', turnId: 'turn-456' },
     }));
     expect(published).toEqual([path.join(root, 'image.png')]);
     expect(String(result.content)).toContain('test-provider/test-model');

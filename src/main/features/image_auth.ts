@@ -25,10 +25,12 @@ import {
   callDoubaoImage,
   callGeminiImage,
   callOpenAIImage,
+  callOrkasImage,
   isImageProviderModelAllowed,
 } from './image_gen';
 import { createLogger } from '../logger';
 import { logErrorSummary } from '../util/log-redact';
+import { ORKAS_API_KEYS_URL } from './orkas_api';
 
 const log = createLogger('image-auth');
 
@@ -145,6 +147,7 @@ export interface ImageProviderPickerOption {
 
 export function listImageProviderOptions(): Array<{ id: string; label: string; docs?: string }> {
   return [
+    { id: 'orkas-api', label: 'Orkas · Image', docs: ORKAS_API_KEYS_URL },
     { id: 'openai', label: 'OpenAI', docs: 'https://platform.openai.com/api-keys' },
     { id: 'google', label: 'Google', docs: 'https://aistudio.google.com/app/apikey' },
     {
@@ -206,6 +209,7 @@ export async function testImageProfile(id: string): Promise<TestImageProfileResu
     if (cap.api === 'openai')      await callOpenAIImage(req);
     else if (cap.api === 'gemini') await callGeminiImage(req);
     else if (cap.api === 'doubao') await callDoubaoImage(req);
+    else if (cap.api === 'orkas')  await callOrkasImage(req);
     else throw new Error(`unknown image-gen api: ${cap.api}`);
     return { ok: true, durationMs: Date.now() - t0, provider: target.provider, model };
   } catch (err) {

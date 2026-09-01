@@ -51,8 +51,10 @@ describe('main process child-process ownership', () => {
       'utf8',
     );
     expect(shellLauncher).toContain('ORKAS_RELAUNCH_OWNER_PID');
+    expect(shellLauncher).toContain('scripts/stop-source-instance.cjs');
     expect(shellLauncher).not.toMatch(/pkill[^\n]+electron\/dist/i);
     expect(windowsLauncher).toContain('ORKAS_RELAUNCH_OWNER_PID');
+    expect(windowsLauncher).toContain('scripts\\stop-source-instance.cjs');
     expect(windowsLauncher).not.toMatch(/taskkill[^\n]+electron\.exe/i);
   });
 });

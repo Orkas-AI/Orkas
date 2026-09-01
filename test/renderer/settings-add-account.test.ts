@@ -64,6 +64,10 @@ class FakeElement {
     return this.attributes.get(name) || null;
   }
 
+  removeAttribute(name: string) {
+    this.attributes.delete(name);
+  }
+
   querySelector(selector: string) {
     return this.queryResults.get(selector) || null;
   }

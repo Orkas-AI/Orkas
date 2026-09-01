@@ -45,6 +45,12 @@ import {
   type CustomOpenAICompatibleRuntimeConfig,
 } from '../provider_catalog';
 import { repairOpenAIToolMessageOrder } from './openai-payload';
+import {
+  ORKAS_API_BASE_URL,
+  ORKAS_API_PROVIDER,
+  orkasApiUsageHeaders,
+  type OrkasApiUsageContext,
+} from '../../features/orkas_api';
 
 // core-agent is an ESM package and the Orkas main process is CJS, so
 // **static import is not allowed**. Reuse the dynamic-import + lazy cache
@@ -98,6 +104,48 @@ function configuredModelVisionDeclaration(model: {
 
 export function repairOpenAICompatiblePayload(params: unknown): unknown {
   return repairOpenAIToolMessageOrder(params);
+}
+
+// ── Orkas public API ───────────────────────────────────────────────────
+
+export function buildOrkasApiModel(modelId: string): Model<'openai-completions'> {
+  const curated = curatedModelsFor(ORKAS_API_PROVIDER).find((model) => model.id === modelId);
+  return {
+    id: modelId,
+    name: curated?.name || modelId,
+    api: 'openai-completions',
+    provider: ORKAS_API_PROVIDER as any,
+    baseUrl: ORKAS_API_BASE_URL,
+    reasoning: true,
+    compat: {
+      supportsDeveloperRole: false,
+      supportsStore: false,
+      thinkingFormat: 'deepseek',
+      requiresReasoningContentOnAssistantMessages: true,
+    },
+    input: ['text', 'image'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: configuredPositiveInteger(curated?.contextWindow, 1_048_576),
+    maxTokens: configuredPositiveInteger(curated?.maxTokens, 32_000),
+  };
+}
+
+export async function createOrkasApiProvider(config: {
+  apiKey: string;
+  modelId: string;
+  usageContext?: OrkasApiUsageContext;
+}): Promise<LLMProvider> {
+  if (!config.apiKey) throw new Error('orkas-api: apiKey required');
+  if (!isBearerTokenHeaderSafe(config.apiKey)) throw new Error('orkas-api: invalid API key');
+  if (!config.modelId) throw new Error('orkas-api: modelId required');
+  const mod = await ca();
+  return mod.createPiProvider({
+    provider: ORKAS_API_PROVIDER,
+    apiKey: config.apiKey,
+    customModel: buildOrkasApiModel(config.modelId),
+    defaultReasoning: 'low',
+    headers: orkasApiUsageHeaders(config.usageContext),
+  });
 }
 
 // ── Moonshot open-platform (https://api.moonshot.cn/v1) ─────────────────
