@@ -8,6 +8,16 @@ import * as path from 'node:path';
 import { makeMinimalPdf } from '../../fixtures/make-minimal-pdf';
 import { makeMinimalDocx } from '../../fixtures/make-minimal-docx';
 
+const loggerMocks = vi.hoisted(() => ({ info: vi.fn() }));
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: () => ({
+    debug: vi.fn(),
+    info: loggerMocks.info,
+    warn: vi.fn(),
+    error: vi.fn(),
+  }),
+}));
+
 const UID = 'u-fi-001';
 
 let tmpDir: string;
@@ -65,6 +75,25 @@ async function makePng(): Promise<Buffer> {
 }
 
 describe('file_indexer › statFile', () => {
+  it('logs only masked account and path references when materialising', async () => {
+    const m = await loadMod();
+    loggerMocks.info.mockClear();
+    const abs = writeWorkspaceFile('private-customer-filename.md', 'private body');
+    await m.statFile(UID, abs);
+
+    expect(loggerMocks.info).toHaveBeenCalledWith('materialise', expect.objectContaining({
+      user_id: 'u-***01',
+      kind: 'text',
+      chars: 12,
+      path: expect.objectContaining({ domain: 'absolute', ext: '.md' }),
+    }));
+    const serialized = JSON.stringify(loggerMocks.info.mock.calls);
+    expect(serialized).not.toContain(UID);
+    expect(serialized).not.toContain(tmpDir);
+    expect(serialized).not.toContain('private-customer-filename.md');
+    expect(serialized).not.toContain('private body');
+  });
+
   it('returns totalChars for text', async () => {
     const m = await loadMod();
     const body = 'line one\nline two\nline three';

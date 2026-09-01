@@ -43,6 +43,7 @@ import { finished } from 'node:stream/promises';
 import { userChatAttachmentsDir, userFileCacheDir, projectChatAttachmentsDir } from '../paths';
 import { listProjectIds } from '../util/project-layout';
 import { createLogger } from '../logger';
+import { logPathRef, maskId } from '../util/log-redact';
 import { macosTccSensitivePath } from '../util/macos-tcc';
 import { pdfBufferToPages, EXTRACT_CACHE_VERSION } from '../util/extract-pdf';
 import { docxBufferToMarkdown } from '../util/extract-docx';
@@ -545,12 +546,15 @@ async function materialise(
   // image: no cache payload at all.
 
   writeMeta(dir, base);
-  log.info(
-    `materialise user=${userId} kind=${kind} chars=${base.totalChars ?? 0}`
-    + (kind === 'pdf' ? ` pages=${base.pageMap?.length ?? 0}` : '')
-    + (base.extractionEmpty ? ' extraction=empty_pages' : '')
-    + ` ms=${Date.now() - t0} path=${absPath}`,
-  );
+  log.info('materialise', {
+    user_id: maskId(userId),
+    kind,
+    chars: base.totalChars ?? 0,
+    ...(kind === 'pdf' ? { pages: base.pageMap?.length ?? 0 } : {}),
+    ...(base.extractionEmpty ? { extraction: 'empty_pages' } : {}),
+    duration_ms: Date.now() - t0,
+    path: logPathRef(absPath),
+  });
   return base;
 }
 
