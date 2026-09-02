@@ -8,8 +8,8 @@ const read = (rel: string) => fs.readFileSync(path.join(root, rel), 'utf8');
 
 describe('public connector boundary', () => {
   it('keeps every catalog connector on a public OAuth mode without credit metering', () => {
-    expect(CONNECTOR_CATALOG).toHaveLength(21);
-    expect(CONNECTOR_CATALOG.filter((entry) => entry.auth_mode === 'mcp_dcr')).toHaveLength(11);
+    expect(CONNECTOR_CATALOG).toHaveLength(22);
+    expect(CONNECTOR_CATALOG.filter((entry) => entry.auth_mode === 'mcp_dcr')).toHaveLength(12);
     expect(CONNECTOR_CATALOG.filter((entry) => entry.auth_mode === 'server_bridge')).toHaveLength(10);
     for (const entry of CONNECTOR_CATALOG) {
       expect(['server_bridge', 'mcp_dcr']).toContain(entry.auth_mode);

@@ -217,6 +217,25 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
   },
   ...GOOGLE_ENTRIES,
   {
+    id: 'you',
+    display_name: 'You.com',
+    // Simple "Y" glyph in You.com's brand purple rather than a traced logo mark.
+    icon_svg: '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#4E00F0" d="M12 1.5C6.201 1.5 1.5 6.201 1.5 12S6.201 22.5 12 22.5 22.5 17.799 22.5 12 17.799 1.5 12 1.5zm0 2.437a1.2 1.2 0 0 1 1.038.602l3.3 5.716a1.2 1.2 0 1 1-2.076 1.2L13 8.566V16.8a1.2 1.2 0 1 1-2.4 0V8.566l-1.262 2.889a1.2 1.2 0 1 1-2.076-1.2l3.3-5.716A1.2 1.2 0 0 1 12 3.937z" fill-rule="evenodd"/></svg>',
+    category: 'search',
+    description_zh: '连接 You.com MCP，为智能体提供实时网页搜索、URL 内容提取与带引用的研究综合。',
+    description_en: 'Connect the You.com MCP server for live web search, URL content extraction, and cited research synthesis.',
+    auth_mode: 'mcp_dcr',
+    // You.com hosts an MCP-spec OAuth authorization server (auth.you.com, Descope-backed) with
+    // RFC 7591 dynamic client registration — same mcp_dcr pathway as Notion/Linear. PRM at
+    // https://api.you.com/mcp/.well-known/oauth-protected-resource advertises the AS and the
+    // RFC 8707 resource; no Orkas-side pre-registration is needed.
+    transport_template: {
+      kind: 'streamable-http',
+      url: 'https://api.you.com/mcp',
+      oauth_header_key: 'Authorization',
+    },
+  },
+  {
     id: 'bing-webmaster',
     display_name: 'Bing Webmaster Tools',
     icon_svg: '<svg xmlns="http://www.w3.org/2000/svg" xml:space="preserve" viewBox="86.7 -0.45 338.46 512.29"><radialGradient id="bing-a" cx="-49.449" cy="651.998" r=".5" gradientTransform="matrix(-346.4626 -399.8405 -287.7029 249.2952 170863.313 -181950.234)" gradientUnits="userSpaceOnUse"><stop offset="0" style="stop-color:#00cacc"/><stop offset="1" style="stop-color:#048fce"/></radialGradient><path d="M257.9 161.5c-9.4 1.1-16.6 8.8-17.3 18.4c-.3 4.2-.2 4.4 9.2 28.7c21.5 55.3 26.7 68.6 27.6 70.4c2.1 4.5 5.1 8.8 8.8 12.6c2.9 2.9 4.7 4.5 7.9 6.6c5.6 3.7 8.4 4.8 30.2 11.2c21.2 6.3 32.8 10.5 42.8 15.4c13 6.4 22 13.7 27.7 22.4c4.1 6.2 7.7 17.4 9.3 28.6c.6 4.4.6 14.1 0 18.1c-1.3 8.6-4 15.8-8.1 21.9c-2.2 3.2-1.4 2.7 1.7-1.2c8.9-11.1 18-30 22.6-47.2c5.6-20.8 6.4-43.1 2.2-64.3c-8.1-41.2-34.1-76.7-70.7-96.7c-2.3-1.3-11.1-5.8-22.9-12c-1.8-.9-4.3-2.2-5.5-2.9c-1.2-.6-3.7-1.9-5.5-2.9c-1.8-.9-7-3.6-11.5-6s-9.6-5-11.3-5.9c-5.1-2.7-8.5-4.4-11-5.8c-11.8-6.2-16.7-8.6-18.2-9.1s-5.3-1-6.2-1c0 .5-.9.6-1.8.7" style="fill-rule:evenodd;clip-rule:evenodd;fill:url(#bing-a)"/><radialGradient id="bing-b" cx="-49.633" cy="652.268" r=".5" gradientTransform="matrix(526.0025 -225.395 -375.6281 -876.6003 271248.438 561048.813)" gradientUnits="userSpaceOnUse"><stop offset="0" style="stop-color:#00bbec"/><stop offset="1" style="stop-color:#2756a9"/></radialGradient><path d="M283.5 367.8c-.7.4-1.6.9-2 1.2c-.5.3-1.5.9-2.3 1.4c-2.9 1.8-10.8 6.6-17.5 10.8c-4.4 2.7-5.1 3.1-10.7 6.6c-2 1.2-4.1 2.6-4.7 2.9c-.6.4-3.2 1.9-5.7 3.5s-7 4.3-9.8 6.1c-2.9 1.8-8 4.9-11.4 7s-7.9 4.9-9.9 6.1c-2.1 1.3-4 2.5-4.2 2.7c-.4.3-18.8 11.7-28 17.4c-7 4.3-15.1 7.1-23.4 8.2c-3.9.5-11.2.5-15 0c-10.5-1.4-20.1-5.3-28.3-11.5c-3.2-2.4-9.3-8.5-11.7-11.6c-5.5-7.4-9-15.3-10.9-24.3c-.4-2.1-.8-3.8-.9-3.9c-.2-.2.1 3 .7 7c.6 4.2 1.8 10.4 3.2 15.6c10.3 40.7 39.8 73.8 79.6 89.5c11.5 4.5 23 7.4 35.6 8.8c4.7.5 18.1.7 23.1.4c22.6-1.7 42.4-8.4 62.6-21.2c1.8-1.1 5.2-3.3 7.5-4.7c2.3-1.5 5.3-3.3 6.6-4.2c1.3-.8 2.8-1.8 3.4-2.1c.6-.4 1.8-1.1 2.7-1.7s4.6-2.9 8.2-5.2l14.7-9.3l5-3.2l.2-.1l.6-.4l.3-.2l3.7-2.3l12.8-8.1c16.3-10.3 21.2-13.9 28.8-21.3c3.2-3.1 7.9-8.4 8.2-9.1c0-.1.9-1.4 1.9-2.9c4-5.9 6.7-13.2 8-21.8c.6-4 .6-13.7 0-18.1c-1.2-8.5-3.9-18.1-6.8-24.3c-4.8-10.1-15-19.2-29.7-26.6c-4.1-2-8.2-3.9-8.7-3.9c-.2 0-13.9 8.4-30.4 18.6s-30.8 19-31.8 19.7c-1 .6-2.7 1.7-3.8 2.3z" style="fill:url(#bing-b)"/><linearGradient id="bing-c" x1="145.867" x2="145.867" y1="512" y2="69.801" gradientTransform="matrix(1 0 0 -1 0 512)" gradientUnits="userSpaceOnUse"><stop offset="0" style="stop-color:#00bbec"/><stop offset="1" style="stop-color:#2756a9"/></linearGradient><path d="m86.7 318.8l.1 71l.9 4.1c2.9 12.9 7.9 22.2 16.5 30.8c4.1 4.1 7.2 6.5 11.6 9.1c9.3 5.5 19.4 8.3 30.4 8.2c11.5 0 21.5-2.9 31.8-9.2c1.7-1.1 8.5-5.2 15.1-9.3l11.9-7.4V170.4c0-49.2-.1-78.4-.2-80.7c-1-14.4-7-27.6-17.1-37.7c-3.1-3.1-5.8-5.1-13.7-10.6c-3.9-2.7-11.1-7.7-16-11c-4.9-3.4-12.9-8.9-17.8-12.3s-12-8.3-15.6-10.8C117 2 116.4 1.7 114 .8c-3-1.1-6.2-1.5-9.2-1.1c-8.8 1-15.9 7.3-17.7 16c-.3 1.3-.3 19.3-.3 116.7v115.1z" style="fill:url(#bing-c)"/></svg>',
