@@ -15,6 +15,19 @@ const _OPENROUTER_CUSTOM_MODEL_VALUE = '__openrouter_custom_model__';
 const _ORKAS_API_PROVIDER_ID = 'orkas-api';
 const _ORKAS_API_KEYS_URL = 'https://orkas.ai/views/account/account.html#api-keys';
 
+function _settingsLocalizedOrkasWebUrl(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ''));
+    if (url.origin !== 'https://orkas.ai') return String(rawUrl || '');
+    const current = String(typeof getLang === 'function' ? getLang() : 'en').trim().toLowerCase();
+    const lang = ['zh', 'en', 'ja', 'pt'].includes(current) ? current : 'en';
+    url.searchParams.set('lang', lang);
+    return url.toString();
+  } catch (_) {
+    return String(rawUrl || '');
+  }
+}
+
 function _settingsIsOpenRouterCustomModel(providerId, modelId) {
   return providerId === 'openrouter' && modelId === _OPENROUTER_CUSTOM_MODEL_VALUE;
 }
@@ -1032,7 +1045,8 @@ function _settingsBindOrkasApiOnce() {
   _settingsState.orkasApiBound = true;
 
   createBtn.addEventListener('click', async () => {
-    const res = await window.orkas.invoke('auth.openExternal', { url: _ORKAS_API_KEYS_URL });
+    const url = _settingsLocalizedOrkasWebUrl(_ORKAS_API_KEYS_URL);
+    const res = await window.orkas.invoke('auth.openExternal', { url });
     if (!res || !res.ok) {
       _settingsSetI18nStatus('settings-orkas-api-status', 'error', 'settings.orkas_api.open_failed');
     }

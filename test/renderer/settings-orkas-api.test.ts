@@ -37,7 +37,7 @@ class FakeElement {
   click() { return this.dispatch('click'); }
 }
 
-function loadQuickSetupHarness() {
+function loadQuickSetupHarness(language = 'en') {
   const source = readFileSync(resolve(__dirname, '../../src/renderer/modules/settings.js'), 'utf8');
   const html = readFileSync(resolve(__dirname, '../../src/renderer/index.html'), 'utf8');
   const elements = new Map<string, FakeElement>();
@@ -60,6 +60,7 @@ function loadQuickSetupHarness() {
     createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }),
     escapeHtml: (value: unknown) => String(value ?? ''),
     t: (key: string) => key,
+    getLang: () => language,
     document: {
       getElementById: (id: string) => elements.get(id) || null,
       createElement: () => new FakeElement(),
@@ -196,7 +197,7 @@ describe('Orkas public API quick setup', () => {
     await elements.get('settings-orkas-api-configure')!.click();
 
     expect(invoke).toHaveBeenCalledWith('auth.openExternal', {
-      url: 'https://orkas.ai/views/account/account.html#api-keys',
+      url: 'https://orkas.ai/views/account/account.html?lang=en#api-keys',
     });
     expect(invoke).toHaveBeenCalledWith('orkasApi.configureAll', {
       apiKey: 'public-orkas-key',
@@ -204,6 +205,29 @@ describe('Orkas public API quick setup', () => {
     expect(elements.get('settings-orkas-api-key-input')!.value).toBe('');
     expect(vm.runInContext('window.__orkasApiRefreshes', context)).toBe(1);
     expect(refreshModelGuard).toHaveBeenCalledOnce();
+  });
+
+  it.each(['zh', 'en', 'ja', 'pt'])('carries the %s desktop language to the API-key page', async (language) => {
+    const { elements, invoke } = loadQuickSetupHarness(language);
+
+    await elements.get('settings-orkas-api-create-key')!.click();
+
+    expect(invoke).toHaveBeenCalledWith('auth.openExternal', {
+      url: `https://orkas.ai/views/account/account.html?lang=${language}#api-keys`,
+    });
+  });
+
+  it('preserves existing query parameters and fragments while localizing Orkas Web URLs', () => {
+    const { context } = loadQuickSetupHarness('ja');
+
+    expect(vm.runInContext(
+      "_settingsLocalizedOrkasWebUrl('https://orkas.ai/views/account/account.html?source=settings#api-keys')",
+      context,
+    )).toBe('https://orkas.ai/views/account/account.html?source=settings&lang=ja#api-keys');
+    expect(vm.runInContext(
+      "_settingsLocalizedOrkasWebUrl('https://example.com/account?source=settings#api-keys')",
+      context,
+    )).toBe('https://example.com/account?source=settings#api-keys');
   });
 
   it('keeps dynamic setup status bound to an i18n key after language changes', async () => {
