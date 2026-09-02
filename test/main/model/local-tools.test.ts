@@ -942,6 +942,38 @@ describe('local-tools › interactive_cli lifecycle', () => {
     await interactive.execute({ action: 'close', session_id: started.session_id, force: true, reason: 'test cleanup' }, makeCtx());
   }, 10000);
 
+  it('hands the Codex stdin API-key prompt to the user', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const interactive = toolByName(
+      lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' }),
+      'interactive_cli',
+    );
+    const command = testNodeCommand(
+      "process.stdout.write('Reading API key from stdin...'); setInterval(() => {}, 1000);",
+    );
+
+    const startResult = await interactive.execute({
+      action: 'start',
+      command,
+      max_lifetime_ms: 30000,
+    }, makeCtx());
+    const started = parseToolJson(startResult);
+
+    expect(started.output).toContain('Reading API key from stdin...');
+    expect(started.prompt_kind).toBe('secret');
+    expect(started.user_action_required).toBe(true);
+    expect(started.agent_should_stop).toBe(true);
+    expect(startResult.endTurn).toBe(true);
+
+    await interactive.execute({
+      action: 'close',
+      session_id: started.session_id,
+      force: true,
+      reason: 'test cleanup',
+    }, makeCtx());
+  }, 10000);
+
   it('keeps interactive CLI available in workspace_approval mode', async () => {
     const { lt, perm } = await loadModules();
     perm.setLocalExecMode('workspace_approval');

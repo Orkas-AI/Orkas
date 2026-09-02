@@ -184,6 +184,7 @@ function detectPrompt(text: string): { kind: InteractiveCliPromptKind; sensitive
   if (
     /\b(?:enter|paste|input|provide|type)\b.{0,60}\b(?:password|passcode|client\s+secret|secret|token|api\s*key|private\s+key)\b/i.test(tail)
     || /\b(?:password|passcode|client\s+secret|secret|token|api\s*key|private\s+key)\s*[:?]\s*$/i.test(tail)
+    || /\breading\b.{0,60}\b(?:password|passcode|client\s+secret|secret|token|api\s*key|private\s+key)\b.{0,30}\bfrom\s+stdin\b/i.test(tail)
   ) {
     return { kind: 'secret', sensitive: true };
   }
