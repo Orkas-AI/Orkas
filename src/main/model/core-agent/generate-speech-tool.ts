@@ -299,6 +299,10 @@ export function createGenerateSpeechTool(opts: GenerateSpeechToolOpts): AgentToo
         ...(typeof speed === 'number' ? { speed } : {}),
         ...(format ? { format } : {}),
         ...(ctx.signal ? { signal: ctx.signal } : {}),
+        usageContext: {
+          conversationId: opts.cid,
+          turnId: opts.turnId,
+        },
         onProgress: (event) => ctx.emitProgress?.({ phase: event.phase, message: event.message }),
       });
       if (result.ok === false) {

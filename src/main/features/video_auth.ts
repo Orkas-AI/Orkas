@@ -1,8 +1,9 @@
 /**
  * Video-generation API key management for BYO providers.
  *
- * This is only the local credential/configuration layer. It deliberately does
- * not expose any Orkas-managed video provider or Server proxy.
+ * This is only the local credential/configuration layer. The open-source app
+ * can use the public Orkas API with a user-supplied API key, but never exposes
+ * the commercial app's managed provider or server-owned credentials.
  */
 
 import {
@@ -11,10 +12,18 @@ import {
   type VideoProfile,
 } from './auth';
 import { createLogger } from '../logger';
+import {
+  ORKAS_API_KEYS_URL,
+  ORKAS_API_PROVIDER,
+  ORKAS_API_VIDEO_MODEL,
+} from './orkas_api';
 
 const log = createLogger('video-auth');
 
 const VIDEO_AUTH_MODELS_BY_PROVIDER: Readonly<Record<string, Array<{ id: string; name: string }>>> = {
+  [ORKAS_API_PROVIDER]: [
+    { id: ORKAS_API_VIDEO_MODEL, name: 'Video' },
+  ],
   doubao: [
     { id: 'doubao-seedance-2-0-260128', name: 'Seedance 2.0' },
   ],
@@ -96,6 +105,11 @@ export function reorderVideoProfiles(orderedIds: string[]): { ok: boolean } {
 
 export function listVideoProviderOptions(): Array<{ id: string; label: string; docs?: string }> {
   return [
+    {
+      id: ORKAS_API_PROVIDER,
+      label: 'Orkas',
+      docs: ORKAS_API_KEYS_URL,
+    },
     {
       id: 'doubao',
       label: 'DouBao · Seedance',

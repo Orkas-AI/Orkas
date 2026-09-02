@@ -78,6 +78,10 @@ function _syncComposerModelChipAvailability(target) {
 }
 
 function _composerModelEntryLabel(entry) {
+  if (_composerModelEntryIsOfficial(entry)) {
+    const officialModelName = String((entry && (entry.modelName || entry.model)) || '').trim();
+    if (officialModelName) return officialModelName;
+  }
   const model = String((entry && (entry.modelName || entry.model)) || '');
   const modelName = model
     .split(/\s*·\s*/)
@@ -89,10 +93,24 @@ function _composerModelEntryLabel(entry) {
     || t('new_chat.model_picker.configure');
 }
 
-function _composerModelEntryIsOfficial(_entry) {
-  // Managed/official subscription entries are filtered from the open build;
-  // every remaining composer entry is configured by the user.
-  return false;
+function _composerModelEntryIsOfficial(entry) {
+  return !!entry && entry.official === true && entry.provider === 'orkas-api';
+}
+
+function _composerModelMenuGroups(entries) {
+  const list = Array.isArray(entries) ? entries : [];
+  return [
+    {
+      key: 'official',
+      labelKey: 'new_chat.model_picker.group_official',
+      entries: list.filter(_composerModelEntryIsOfficial),
+    },
+    {
+      key: 'custom',
+      labelKey: 'new_chat.model_picker.group_custom',
+      entries: list.filter((entry) => !_composerModelEntryIsOfficial(entry)),
+    },
+  ].filter((group) => group.entries.length > 0);
 }
 
 function _composerModelProviderLabel(entry) {
@@ -429,6 +447,34 @@ function _openComposerModelSettings() {
   if (typeof _activateModelCredentialsTab === 'function') _activateModelCredentialsTab();
 }
 
+function _composerModelOfficialIncludedBody(entry) {
+  const included = _composerModelEntryIsOfficial(entry) && Array.isArray(entry.includedModels)
+    ? entry.includedModels.filter((item) => typeof item === 'string' && item.trim())
+    : [];
+  return included.join(' · ');
+}
+
+function _composerModelOfficialDescription(entry) {
+  if (!_composerModelEntryIsOfficial(entry)) return '';
+  const configured = String((entry && entry.description) || '').trim();
+  if (configured) return configured;
+  let key = '';
+  if (entry.model === 'orkas-llm-1.5') {
+    key = 'new_chat.model_picker.official_standard_description';
+  } else if (entry.model === 'orkas-llm-1.5-pro') {
+    key = 'new_chat.model_picker.official_pro_description';
+  }
+  if (!key) return '';
+  const taskDescription = t(key);
+  const included = _composerModelOfficialIncludedBody(entry);
+  return included
+    ? t('new_chat.model_picker.official_detail', {
+      description: taskDescription,
+      includes: t('new_chat.model_picker.includes', { models: included }),
+    })
+    : taskDescription;
+}
+
 function _buildComposerModelMenuItem(entry, activeEntryId, anchor) {
   const isActive = entry.entryId === activeEntryId;
   const item = document.createElement('div');
@@ -445,37 +491,59 @@ function _buildComposerModelMenuItem(entry, activeEntryId, anchor) {
   select.disabled = disabled;
   select.setAttribute('aria-disabled', disabled ? 'true' : 'false');
 
+  const official = _composerModelEntryIsOfficial(entry);
   const copy = document.createElement('span');
   copy.className = 'composer-model-menu-copy';
   const title = document.createElement('span');
   title.className = 'composer-model-menu-title';
   const titleName = document.createElement('span');
   titleName.className = 'composer-model-menu-title-name';
-  titleName.textContent = _composerModelProviderLabel(entry) || _composerModelEntryLabel(entry);
+  titleName.textContent = official
+    ? _composerModelEntryLabel(entry)
+    : (_composerModelProviderLabel(entry) || _composerModelEntryLabel(entry));
   title.appendChild(titleName);
+  if (official && entry && entry.recommended === true) {
+    const recommended = document.createElement('span');
+    recommended.className = 'composer-model-menu-recommended';
+    recommended.textContent = t('new_chat.model_picker.recommended');
+    title.appendChild(recommended);
+  }
   copy.appendChild(title);
-  const account = String((entry && entry.profileLabel) || '').trim();
-  const currentModelName = _composerModelEntryLabel(entry);
-  if (account || currentModelName) {
+  const officialDescription = _composerModelOfficialDescription(entry);
+  const account = official
+    ? _composerModelOfficialIncludedBody(entry)
+    : String((entry && entry.profileLabel) || '').trim();
+  const currentModelName = official ? '' : _composerModelEntryLabel(entry);
+  if (officialDescription) {
+    const description = document.createElement('span');
+    description.className = 'composer-model-menu-description';
+    description.textContent = officialDescription;
+    copy.appendChild(description);
+  }
+  if ((account || currentModelName) && !officialDescription) {
     const meta = document.createElement('span');
     meta.className = 'composer-model-menu-meta';
-    if (account) {
-      const accountLabel = document.createElement('span');
-      accountLabel.className = 'composer-model-menu-account-label';
-      accountLabel.textContent = account;
-      meta.appendChild(accountLabel);
-    }
-    if (account && currentModelName) {
-      const separator = document.createElement('span');
-      separator.className = 'composer-model-menu-meta-separator';
-      separator.textContent = ' · ';
-      meta.appendChild(separator);
-    }
-    if (currentModelName) {
-      const modelLabel = document.createElement('span');
-      modelLabel.className = 'composer-model-menu-current-model';
-      modelLabel.textContent = currentModelName;
-      meta.appendChild(modelLabel);
+    if (official) {
+      meta.textContent = t('new_chat.model_picker.includes', { models: account });
+    } else {
+      if (account) {
+        const accountLabel = document.createElement('span');
+        accountLabel.className = 'composer-model-menu-account-label';
+        accountLabel.textContent = account;
+        meta.appendChild(accountLabel);
+      }
+      if (account && currentModelName) {
+        const separator = document.createElement('span');
+        separator.className = 'composer-model-menu-meta-separator';
+        separator.textContent = ' · ';
+        meta.appendChild(separator);
+      }
+      if (currentModelName) {
+        const modelLabel = document.createElement('span');
+        modelLabel.className = 'composer-model-menu-current-model';
+        modelLabel.textContent = currentModelName;
+        meta.appendChild(modelLabel);
+      }
     }
     copy.appendChild(meta);
   }
@@ -506,7 +574,7 @@ function _buildComposerModelMenuItem(entry, activeEntryId, anchor) {
   });
   item.appendChild(select);
 
-  const versions = entry.modelEditable !== false
+  const versions = !official && entry.modelEditable !== false
     ? _composerModelVersionOptions(entry)
     : [];
   if (!disabled && versions.length > 1) {
@@ -585,23 +653,23 @@ function _buildComposerModelMenuItem(entry, activeEntryId, anchor) {
   return item;
 }
 
-function _buildComposerModelMenuGroup(entries, activeEntryId, anchor) {
+function _buildComposerModelMenuGroup(group, activeEntryId, anchor) {
   const section = document.createElement('div');
   section.className = 'composer-model-menu-group';
-  section.dataset.modelGroup = 'custom';
+  section.dataset.modelGroup = group.key;
   section.setAttribute('role', 'group');
-  section.setAttribute('aria-label', t('new_chat.model_picker.group_custom'));
+  section.setAttribute('aria-label', t(group.labelKey));
 
   const header = document.createElement('div');
   header.className = 'composer-model-menu-group-header';
   const label = document.createElement('span');
   label.className = 'composer-model-menu-group-label';
-  label.textContent = t('new_chat.model_picker.group_custom');
+  label.textContent = t(group.labelKey);
   label.setAttribute('aria-hidden', 'true');
   header.appendChild(label);
   section.appendChild(header);
 
-  entries.forEach((entry) => {
+  group.entries.forEach((entry) => {
     section.appendChild(_buildComposerModelMenuItem(entry, activeEntryId, anchor));
   });
   return section;
@@ -626,11 +694,9 @@ async function _toggleComposerModelMenu(anchor) {
 
   if (_composerModelEntries.length) {
     const activeEntryId = _composerModelEntries[0]?.entryId || '';
-    menu.appendChild(_buildComposerModelMenuGroup(
-      _composerModelEntries,
-      activeEntryId,
-      anchor,
-    ));
+    _composerModelMenuGroups(_composerModelEntries).forEach((group) => {
+      menu.appendChild(_buildComposerModelMenuGroup(group, activeEntryId, anchor));
+    });
   } else {
     const empty = document.createElement('div');
     empty.className = 'composer-model-menu-empty';

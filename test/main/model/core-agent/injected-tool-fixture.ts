@@ -10,6 +10,7 @@ import { createFileTools, createLocalTools } from '../../../../src/main/model/co
 import { createGenerateSpeechTool } from '../../../../src/main/model/core-agent/generate-speech-tool';
 import { createImageGenTool } from '../../../../src/main/model/core-agent/image-gen-tool';
 import { createImageStudioTool } from '../../../../src/main/model/core-agent/image-studio-tool';
+import { createVideoGenTool } from '../../../../src/main/model/core-agent/video-gen-tool';
 import { createLibraryTool } from '../../../../src/main/model/core-agent/kb-tools';
 import { createOfficeTools } from '../../../../src/main/model/core-agent/office-tools';
 import { createPdfTools } from '../../../../src/main/model/core-agent/pdf-tools';
@@ -68,6 +69,7 @@ export function enumerateAllInjectedTools(): AgentTool[] {
   tools.push(createChatHistoryTool({ userId }));
   tools.push(createImageGenTool({ userId, cid }));
   tools.push(createGenerateSpeechTool({ userId, cid }));
+  tools.push(createVideoGenTool({ userId, cid }));
   tools.push(createImageStudioTool({ userId, cid }));
   tools.push(...createOfficeTools({ userId, cid }));
   tools.push(...createPdfTools({ userId, cid }));

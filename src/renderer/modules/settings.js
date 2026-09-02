@@ -12,6 +12,21 @@
 
 const _settingsLog = createLogger('settings');
 const _OPENROUTER_CUSTOM_MODEL_VALUE = '__openrouter_custom_model__';
+const _ORKAS_API_PROVIDER_ID = 'orkas-api';
+const _ORKAS_API_KEYS_URL = 'https://orkas.ai/views/account/account.html#api-keys';
+
+function _settingsLocalizedOrkasWebUrl(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ''));
+    if (url.origin !== 'https://orkas.ai') return String(rawUrl || '');
+    const current = String(typeof getLang === 'function' ? getLang() : 'en').trim().toLowerCase();
+    const lang = ['zh', 'en', 'ja', 'pt'].includes(current) ? current : 'en';
+    url.searchParams.set('lang', lang);
+    return url.toString();
+  } catch (_) {
+    return String(rawUrl || '');
+  }
+}
 
 function _settingsIsOpenRouterCustomModel(providerId, modelId) {
   return providerId === 'openrouter' && modelId === _OPENROUTER_CUSTOM_MODEL_VALUE;
@@ -102,6 +117,7 @@ async function loadSettings() {
   _settingsBindTaskNotificationsOnce();
   _settingsBindClientConfigOnce();
   _settingsBindRecycleBinOnce();
+  _settingsBindOrkasApiOnce();
   _settingsSyncLanguageRadio();
   await Promise.all([
     _settingsSafeCall('settings providers refresh', _settingsRefreshProviders),
@@ -979,6 +995,8 @@ window.addEventListener('i18n-change', () => {
   _settingsRenderSearchSection();
   _settingsRenderImageSection();
   _settingsRenderVideoSection();
+  _settingsRenderTtsEntries();
+  _settingsRenderOrkasApiCard();
   _settingsRenderMetacognition();
 });
 
@@ -991,6 +1009,89 @@ async function _settingsRefreshEntries() {
   const res = await window.orkas.invoke('auth.listEntries', { includeUnavailable: true });
   _settingsState.entries = (res && res.ok && Array.isArray(res.entries)) ? res.entries : [];
   if (typeof trackModelConfigSnapshot === 'function') trackModelConfigSnapshot(_settingsState.entries);
+  _settingsRenderOrkasApiCard();
+}
+
+function _settingsRenderOrkasApiCard() {
+  const status = document.getElementById('settings-orkas-api-status');
+  const key = status && status.getAttribute('data-i18n');
+  if (status && key) status.textContent = t(key);
+}
+
+async function _settingsRefreshAllCredentialSections() {
+  await Promise.all([
+    _settingsRefreshProviders(),
+    _settingsRefreshEntries(),
+    _settingsRefreshSearchProfiles(),
+    _settingsRefreshImageProfiles(),
+    _settingsRefreshVideoProfiles(),
+    _settingsRefreshTtsProfiles(),
+  ]);
+  await _settingsRenderPicker();
+  await _settingsRenderEntries();
+  _settingsRenderSearchSection();
+  _settingsRenderImageSection();
+  _settingsRenderVideoSection();
+  _settingsRenderTtsEntries();
+  _settingsRenderOrkasApiCard();
+}
+
+function _settingsBindOrkasApiOnce() {
+  if (_settingsState.orkasApiBound) return;
+  const createBtn = document.getElementById('settings-orkas-api-create-key');
+  const configureBtn = document.getElementById('settings-orkas-api-configure');
+  const keyInput = document.getElementById('settings-orkas-api-key-input');
+  if (!createBtn || !configureBtn || !keyInput) return;
+  _settingsState.orkasApiBound = true;
+
+  createBtn.addEventListener('click', async () => {
+    const url = _settingsLocalizedOrkasWebUrl(_ORKAS_API_KEYS_URL);
+    const res = await window.orkas.invoke('auth.openExternal', { url });
+    if (!res || !res.ok) {
+      _settingsSetI18nStatus('settings-orkas-api-status', 'error', 'settings.orkas_api.open_failed');
+    }
+  });
+
+  const configure = async () => {
+    const apiKey = String(keyInput.value || '').trim();
+    if (!apiKey) {
+      _settingsSetI18nStatus('settings-orkas-api-status', 'error', 'settings.orkas_api.key_required');
+      return;
+    }
+    configureBtn.disabled = true;
+    _settingsSetI18nStatus('settings-orkas-api-status', 'busy', 'settings.orkas_api.configuring');
+    try {
+      const res = await window.orkas.invoke('orkasApi.configureAll', { apiKey });
+      if (!res || !res.ok) {
+        if (res && res.error) {
+          _settingsSetStatus('settings-orkas-api-status', 'error', res.error);
+        } else {
+          _settingsSetI18nStatus('settings-orkas-api-status', 'error', 'settings.orkas_api.configure_failed');
+        }
+        return;
+      }
+      keyInput.value = '';
+      await _settingsRefreshAllCredentialSections();
+      if (typeof refreshModelGuard === 'function') {
+        await Promise.resolve(refreshModelGuard()).catch(() => {});
+      }
+      _settingsSetI18nStatus('settings-orkas-api-status', 'ok', 'settings.orkas_api.configure_ok');
+    } catch (err) {
+      if (err && err.message) {
+        _settingsSetStatus('settings-orkas-api-status', 'error', err.message);
+      } else {
+        _settingsSetI18nStatus('settings-orkas-api-status', 'error', 'settings.orkas_api.configure_failed');
+      }
+    } finally {
+      configureBtn.disabled = false;
+    }
+  };
+  configureBtn.addEventListener('click', configure);
+  keyInput.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' || event.isComposing) return;
+    event.preventDefault();
+    void configure();
+  });
 }
 
 async function _settingsGetModels(providerId) {
@@ -1764,7 +1865,7 @@ function _settingsRenderEntries() {
   }
 
   const displayedEntries = _settingsState.entries.filter((entry) => (
-    entry && entry.official !== true && entry.profileType !== 'managed'
+    entry && entry.profileType !== 'managed'
   ));
   displayedEntries.forEach((entry, idx) => {
     container.appendChild(_settingsRenderEntryRow(entry, idx));
@@ -1853,8 +1954,12 @@ function _settingsRenderEntryRow(entry, priorityIdx) {
   const primary = document.createElement('div');
   primary.className = 'entry-primary';
   const providerName = entry.providerLabelKey ? t(entry.providerLabelKey) : (entry.providerLabel || entry.provider);
+  const isOrkasApi = entry.provider === _ORKAS_API_PROVIDER_ID;
+  const recommendedModelTag = isOrkasApi && entry.recommended === true
+    ? `<span class="entry-model-recommended">${escapeHtml(t('settings.orkas_api.recommended'))}</span>`
+    : '';
   const modelControl = entry.modelEditable === false
-    ? `<span class="entry-model-static">${escapeHtml(entry.modelName || entry.model)}</span>`
+    ? `<span class="entry-model-static"><span class="entry-model-static-name">${escapeHtml(entry.modelName || entry.model)}</span>${recommendedModelTag}</span>`
     : '<div class="ai-select ai-select-compact entry-model-select"></div>';
   primary.innerHTML = `
     <span class="entry-provider">${escapeHtml(providerName)}</span>
@@ -1894,7 +1999,10 @@ function _settingsRenderEntryRow(entry, priorityIdx) {
   const meta = document.createElement('div');
   meta.className = 'entry-meta';
   const badge = document.createElement('span');
-  if (entry.profileType === 'oauth') {
+  if (isOrkasApi) {
+    badge.className = 'account-type-badge';
+    badge.textContent = 'Orkas';
+  } else if (entry.profileType === 'oauth') {
     badge.className = 'account-type-badge oauth' + (entry.oauthExpired ? ' expired' : '');
     badge.textContent = entry.oauthExpired ? t('settings.entries.oauth_expired') : t('settings.entries.oauth_badge');
   } else {
@@ -1903,7 +2011,16 @@ function _settingsRenderEntryRow(entry, priorityIdx) {
   }
   meta.appendChild(badge);
 
-  if (entry.profileMasked) {
+  if (isOrkasApi && Array.isArray(entry.includedModels) && entry.includedModels.length) {
+    const included = document.createElement('span');
+    included.className = 'entry-included-models';
+    included.textContent = t('settings.orkas_api.includes', {
+      models: entry.includedModels.join(' · '),
+    });
+    meta.appendChild(included);
+  }
+
+  if (entry.profileMasked && !isOrkasApi) {
     const mask = document.createElement('span');
     mask.className = 'account-mask';
     mask.textContent = entry.profileMasked;
@@ -2075,7 +2192,16 @@ async function _settingsReload() {
 function _settingsSetStatus(id, kind, text) {
   const el = document.getElementById(id);
   if (!el) return;
+  el.removeAttribute('data-i18n');
   el.textContent = text || '';
+  el.className = 'settings-status' + (kind ? ` ${kind}` : '');
+}
+
+function _settingsSetI18nStatus(id, kind, key) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.setAttribute('data-i18n', key);
+  el.textContent = t(key);
   el.className = 'settings-status' + (kind ? ` ${kind}` : '');
 }
 
@@ -2098,7 +2224,12 @@ function _settingsVisibleApiProfiles(profiles) {
   ));
 }
 
+function _settingsOrkasServiceLabel(service) {
+  return `Orkas · ${service}`;
+}
+
 const _SEARCH_PROVIDER_OPTIONS = [
+  { id: 'orkas-api',          label: _settingsOrkasServiceLabel('Search'), docs: _ORKAS_API_KEYS_URL },
   { id: 'tavily',            label: 'Tavily', docs: 'https://tavily.com/' },
   { id: 'serper',            label: 'Serper', docs: 'https://serper.dev/' },
   { id: 'brave-search',      label: 'Brave', docs: 'https://brave.com/search/api/' },
@@ -2114,6 +2245,7 @@ function _searchProviderLabel(id) {
 async function _settingsRefreshSearchProfiles() {
   const res = await window.orkas.invoke('searchAuth.list');
   _settingsState.searchProfiles = (res && res.ok && Array.isArray(res.profiles)) ? res.profiles : [];
+  _settingsRenderOrkasApiCard();
 }
 
 function _settingsRenderSearchSection() {
@@ -2188,10 +2320,14 @@ function _settingsRenderSearchEntries() {
     main.className = 'entry-main';
     const primary = document.createElement('div');
     primary.className = 'entry-primary';
+    const isOrkasApi = p.provider === _ORKAS_API_PROVIDER_ID;
+    const providerLabel = isOrkasApi
+      ? _settingsOrkasServiceLabel('Search')
+      : _searchProviderLabel(p.provider);
     primary.innerHTML = `
-      <span class="entry-provider">${escapeHtml(_searchProviderLabel(p.provider))}</span>
+      <span class="entry-provider">${escapeHtml(providerLabel)}</span>
       <span class="entry-sep">·</span>
-      <span class="entry-account-chip">@ ${escapeHtml(p.label || 'default')}</span>
+      <span class="entry-account-chip">@ ${escapeHtml(isOrkasApi ? 'Orkas' : (p.label || 'default'))}</span>
       ${p.apiKeyMasked ? `<span class="account-mask">${escapeHtml(p.apiKeyMasked)}</span>` : ''}
     `;
     main.appendChild(primary);
@@ -2236,6 +2372,7 @@ function _settingsRenderSearchEntries() {
 // still persists provider=doubao plus the selected model id.
 
 const _IMAGE_PROVIDER_OPTIONS = [
+  { id: 'orkas-api', label: _settingsOrkasServiceLabel('Image'), docs: _ORKAS_API_KEYS_URL },
   { id: 'openai',  label: 'OpenAI · GPT Image 2', docs: 'https://platform.openai.com/api-keys' },
   { id: 'google',  label: 'Google · Nano Banana 2', docs: 'https://aistudio.google.com/app/apikey' },
   { id: 'doubao',  label: 'DouBao · Seedream', docs: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey' },
@@ -2249,6 +2386,7 @@ function _imageProviderLabel(id) {
 async function _settingsRefreshImageProfiles() {
   const res = await window.orkas.invoke('imageAuth.list');
   _settingsState.imageProfiles = (res && res.ok && Array.isArray(res.profiles)) ? res.profiles : [];
+  _settingsRenderOrkasApiCard();
 }
 
 function _settingsRenderImageSection() {
@@ -2284,7 +2422,7 @@ async function _settingsClickAddImageKey() {
   if (!apiKey)   { _settingsSetStatus('settings-image-status', 'error', t('settings.image.error_key_needed')); return; }
   _settingsSetStatus('settings-image-status', 'busy', t('settings.image.adding'));
   try {
-    const res = await window.orkas.invoke('imageAuth.add', { provider, model, apiKey, label: 'default' });
+    const res = await window.orkas.invoke('imageAuth.add', { provider, apiKey, label: 'default' });
     if (!res || !res.ok) {
       _settingsSetStatus('settings-image-status', 'error', (res && res.error) || t('settings.image.add_failed'));
       return;
@@ -2321,10 +2459,14 @@ function _settingsRenderImageEntries() {
     main.className = 'entry-main';
     const primary = document.createElement('div');
     primary.className = 'entry-primary';
+    const isOrkasApi = p.provider === _ORKAS_API_PROVIDER_ID;
+    const providerLabel = isOrkasApi
+      ? _settingsOrkasServiceLabel('Image')
+      : _imageProviderLabel(p.provider);
     primary.innerHTML = `
-      <span class="entry-provider">${escapeHtml(_imageProviderLabel(p.provider))}</span>
+      <span class="entry-provider">${escapeHtml(providerLabel)}</span>
       <span class="entry-sep">·</span>
-      <span class="entry-account-chip">@ ${escapeHtml(p.label || 'default')}</span>
+      <span class="entry-account-chip">@ ${escapeHtml(isOrkasApi ? 'Orkas' : (p.label || 'default'))}</span>
       ${p.apiKeyMasked ? `<span class="account-mask">${escapeHtml(p.apiKeyMasked)}</span>` : ''}
     `;
     main.appendChild(primary);
@@ -2368,6 +2510,7 @@ function _settingsRenderImageEntries() {
 // User-owned provider keys only; bundled video providers stay stripped.
 
 const _VIDEO_AUTH_PROVIDER_OPTIONS = [
+  { id: 'orkas-api', label: _settingsOrkasServiceLabel('Video'), docs: _ORKAS_API_KEYS_URL },
   { id: 'doubao', label: 'DouBao · Seedance', docs: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey' },
 ];
 
@@ -2394,6 +2537,7 @@ async function _settingsRefreshVideoProfiles() {
   _settingsState.videoAuthProviderOptions = (res && res.ok && Array.isArray(res.providers) && res.providers.length)
     ? res.providers
     : _VIDEO_AUTH_PROVIDER_OPTIONS;
+  _settingsRenderOrkasApiCard();
 }
 
 function _settingsRenderVideoSection() {
@@ -2474,10 +2618,14 @@ function _settingsRenderVideoEntries() {
     main.className = 'entry-main';
     const primary = document.createElement('div');
     primary.className = 'entry-primary';
+    const isOrkasApi = p.provider === _ORKAS_API_PROVIDER_ID;
+    const providerLabel = isOrkasApi
+      ? _settingsOrkasServiceLabel('Video')
+      : _videoProviderLabel(p.provider);
     primary.innerHTML = `
-      <span class="entry-provider">${escapeHtml(_videoProviderLabel(p.provider))}</span>
+      <span class="entry-provider">${escapeHtml(providerLabel)}</span>
       <span class="entry-sep">·</span>
-      <span class="entry-account-chip">@ ${escapeHtml(p.label || 'default')}</span>
+      <span class="entry-account-chip">@ ${escapeHtml(isOrkasApi ? 'Orkas' : (p.label || 'default'))}</span>
       ${p.apiKeyMasked ? `<span class="account-mask">${escapeHtml(p.apiKeyMasked)}</span>` : ''}
     `;
     main.appendChild(primary);
@@ -2522,6 +2670,7 @@ async function _settingsRefreshTtsProfiles() {
   if (!res || !res.ok) return;
   _settingsState.ttsPresets = Array.isArray(res.presets) ? res.presets : [];
   _settingsState.ttsProfiles = Array.isArray(res.profiles) ? res.profiles : [];
+  _settingsRenderOrkasApiCard();
   const providerEl = document.getElementById('settings-tts-provider');
   if (providerEl && !_settingsState.ttsProviderSel) {
     _settingsState.ttsProviderSel = _aiSelectMount(providerEl, { placeholder: t('settings.tts.pick_provider') });
@@ -2552,7 +2701,7 @@ function _settingsTtsPreset(providerId) {
 }
 
 function _ttsProviderLabel(id) {
-  if (id === 'orkas-voice') return 'Orkas · Voice';
+  if (id === _ORKAS_API_PROVIDER_ID || id === 'orkas-voice') return _settingsOrkasServiceLabel('Voice');
   const hit = (_settingsState.ttsPresets || []).find((p) => p.id === id);
   return hit ? hit.label : (id || 'custom');
 }
@@ -2667,13 +2816,18 @@ function _settingsRenderTtsEntries() {
     main.className = 'entry-main';
     const primary = document.createElement('div');
     primary.className = 'entry-primary';
-    const detail = p.provider === 'doubao' ? (p.resourceId || '') : (p.model || '');
+    const isOrkasApi = p.provider === _ORKAS_API_PROVIDER_ID;
+    const detail = isOrkasApi
+      ? ''
+      : (p.provider === 'doubao' ? (p.resourceId || '') : (p.model || ''));
+    const providerLabel = isOrkasApi
+      ? _settingsOrkasServiceLabel('Voice')
+      : _ttsProviderLabel(p.provider);
     primary.innerHTML = `
-      <span class="entry-provider">${escapeHtml(_ttsProviderLabel(p.provider))}</span>
+      <span class="entry-provider">${escapeHtml(providerLabel)}</span>
       ${detail ? `<span class="entry-sep">·</span><span class="entry-model">${escapeHtml(detail)}</span>` : ''}
-      ${p.voice ? `<span class="entry-sep">·</span><span class="entry-model">${escapeHtml(p.voice)}</span>` : ''}
       <span class="entry-sep">·</span>
-      <span class="entry-account-chip">@ ${escapeHtml(p.label || 'default')}</span>
+      <span class="entry-account-chip">@ ${escapeHtml(isOrkasApi ? 'Orkas' : (p.label || 'default'))}</span>
       ${p.apiKeyMasked ? `<span class="account-mask">${escapeHtml(p.apiKeyMasked)}</span>` : ''}
     `;
     main.appendChild(primary);

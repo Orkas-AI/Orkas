@@ -30,6 +30,7 @@ describe('provider_catalog › CATALOG', () => {
     // OpenAI / Google / Anthropic），CN 主流（Zhipu / Moonshot / Kimi-Coding /
     // MiniMax × 3 / Doubao），最后聚合器（OpenRouter）。
     expect(ids).toEqual([
+      'orkas-api',
       'deepseek',
       'openai-codex',
       'openai',
@@ -83,6 +84,23 @@ describe('provider_catalog › CATALOG', () => {
 });
 
 describe('provider_catalog › CURATED_MODELS', () => {
+  it('describes both Orkas official models with their product-facing names', () => {
+    expect(providerLabel('orkas-api')).toBe('Orkas');
+    expect(curatedModelsFor('orkas-api')).toEqual([
+      expect.objectContaining({
+        id: 'orkas-llm-1.5',
+        name: 'Orkas-1.5',
+        recommended: true,
+        includedModels: ['DeepSeek V4', 'GPT-5.6 Luna', 'Claude-Sonnet-5', 'Gemini-3.6 Flash'],
+      }),
+      expect.objectContaining({
+        id: 'orkas-llm-1.5-pro',
+        name: 'Orkas-1.5 Pro',
+        includedModels: ['GPT-5.6 Sol', 'Claude Opus 5', 'Kimi K3'],
+      }),
+    ]);
+  });
+
   it('curates every visible non-oauth-only provider', () => {
     // Every visible provider should have a curated list — no silent fall-
     // through to pickLatestGenerations for providers we advertise.
@@ -464,9 +482,14 @@ describe('provider_catalog › EXTERNAL_API_PROVIDERS', () => {
     // `auth.ts::testConnection` 的分发依据——名单必须和 CATALOG 里真实
     // 标记为"外部"的 provider 严格一致，否则会出现"能选但调用报
     // No model found for provider"。
-    // 当前外部适配层支持：moonshot（OpenAI 兼容 endpoint）+ deepseek（pi-ai
-    // 0.68.1 不带）+ doubao（火山方舟）。
-    expect([...EXTERNAL_API_PROVIDERS]).toEqual(['moonshot', 'deepseek', 'doubao', 'custom']);
+    // 当前外部适配层还包含公开 Orkas API（OpenAI-compatible chat）。
+    expect([...EXTERNAL_API_PROVIDERS]).toEqual([
+      'orkas-api',
+      'moonshot',
+      'deepseek',
+      'doubao',
+      'custom',
+    ]);
   });
 
   it('每个外部 provider 都在 CATALOG + CURATED_MODELS 有对应条目', () => {

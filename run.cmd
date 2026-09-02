@@ -1,7 +1,7 @@
 @echo off
 REM Windows counterpart of run.sh. An in-app relaunch waits for its exact
-REM owner process; it never terminates every electron.exe process because
-REM other tasks can share the same bundled runtime.
+REM owner process. A direct launch closes only the previous source instance
+REM owned by this checkout.
 setlocal EnableExtensions EnableDelayedExpansion
 set "APP_DIR=%~dp0"
 if "%APP_DIR:~-1%"=="\" set "APP_DIR=%APP_DIR:~0,-1%"
@@ -38,6 +38,9 @@ if defined ORKAS_RELAUNCH_OWNER_PID (
   )
   set "ORKAS_RELAUNCH_OWNER_PID="
 )
+
+call node "%APP_DIR%\scripts\stop-source-instance.cjs" --root "%APP_DIR%"
+if errorlevel 1 exit /b 1
 
 call node "%APP_DIR%\scripts\ensure-deps.cjs"
 if errorlevel 1 exit /b 1

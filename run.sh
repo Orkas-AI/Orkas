@@ -1,9 +1,8 @@
 #!/bin/bash
-# Orkas PC launcher. Lives under PC/; the script's own directory is the PC root.
-# Behavior: an in-app relaunch waits for its exact owner process to exit, then
-# starts a new instance in the foreground. It never kills Electron processes
-# by image name or install-directory prefix because other tasks can share the
-# same bundled runtime.
+# Open-source Orkas launcher. The script's own directory is the checkout root.
+# Behavior: an in-app relaunch waits for its exact owner process to exit. A
+# direct launch closes only the previous source instance owned by this checkout,
+# then starts a new instance in the foreground.
 #
 # Usage:
 #   ./run.sh
@@ -14,7 +13,7 @@ set -e
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 if [ ! -f "$APP_DIR/package.json" ]; then
-  echo "[Orkas] $APP_DIR/package.json not found; check the PC/ directory layout." >&2
+  echo "[Orkas] $APP_DIR/package.json not found; check the source directory layout." >&2
   exit 1
 fi
 
@@ -73,6 +72,8 @@ if ! command -v node >/dev/null 2>&1; then
   echo "[Orkas] Node.js 20+ is required to bootstrap the source checkout. Install Node.js, then run ./run.sh again." >&2
   exit 1
 fi
+
+node "$APP_DIR/scripts/stop-source-instance.cjs" --root "$APP_DIR"
 
 if [ "$(uname -s)" = "Linux" ]; then
   node "$APP_DIR/scripts/verify-linux-source-dependencies.cjs" --host-only

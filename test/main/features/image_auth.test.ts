@@ -60,6 +60,7 @@ vi.mock('../../../src/main/logger', () => ({
 import {
   addImageProfile,
   flattenImageProviderOptions,
+  listImageProviderOptions,
   listImageProfiles,
   removeImageProfile,
   reorderImageProfiles,
@@ -190,5 +191,11 @@ describe('image auth profiles', () => {
         model: 'doubao-seedream-5-0-pro-260628',
       }),
     ]);
+  });
+
+  it('labels the official picker option with its concrete service', () => {
+    expect(listImageProviderOptions().find((option) => option.id === 'orkas-api')).toMatchObject({
+      label: 'Orkas · Image',
+    });
   });
 });

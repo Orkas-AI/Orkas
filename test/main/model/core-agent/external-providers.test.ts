@@ -4,6 +4,7 @@ import {
   buildDeepSeekModel,
   buildDoubaoModel,
   buildMoonshotModel,
+  buildOrkasApiModel,
   createMoonshotProvider,
 } from '../../../../src/main/model/core-agent/external-providers';
 import { modelInputImageLimit } from '../../../../src/main/model/provider_catalog';
@@ -55,6 +56,18 @@ describe('external-providers › custom OpenAI-compatible model', () => {
     })).toMatchObject({
       reasoning: true,
       compat: { supportsReasoningEffort: true },
+    });
+  });
+});
+
+describe('external-providers › Orkas API model', () => {
+  it('uses the public chat endpoint and preserves the selected public model id', () => {
+    expect(buildOrkasApiModel('orkas-llm-1.5-pro')).toMatchObject({
+      api: 'openai-completions',
+      provider: 'orkas-api',
+      id: 'orkas-llm-1.5-pro',
+      baseUrl: 'https://orkas.ai/v1',
+      input: ['text', 'image'],
     });
   });
 });

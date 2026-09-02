@@ -121,7 +121,7 @@ describe('tool-catalog', () => {
     expect(missing, `Injected tools missing from TOOL_CATALOG: ${missing.join(', ')}`).toEqual([]);
     const stale = [...catalog].filter((n) => !injected.has(n));
     expect(stale, `Catalog tools missing from injected fixture: ${stale.join(', ')}`).toEqual([]);
-    expect(catalog.size).toBe(55);
+    expect(catalog.size).toBe(56);
   });
 
   it('TOOL_CATALOG has no duplicate names', () => {
@@ -317,10 +317,10 @@ describe('tool-catalog', () => {
       'bash', 'process_session', 'interactive_cli',
     ]);
     expect(toolNamesForGroups(['media.image'])).toEqual(['generate_image', 'image_studio']);
-    expect(toolNamesForGroups(['media.video'])).toEqual(['video_studio']);
+    expect(toolNamesForGroups(['media.video'])).toEqual(['generate_video', 'video_studio']);
     expect(toolNamesForGroups(['media.speech'])).toEqual(['generate_speech']);
     expect(toolNamesForGroups(['media'])).toEqual([
-      'generate_image', 'image_studio', 'video_studio', 'generate_speech',
+      'generate_image', 'image_studio', 'generate_video', 'video_studio', 'generate_speech',
     ]);
 
     expect(expandToolGroups(['workspace'])).toEqual([
@@ -453,7 +453,7 @@ describe('tool-catalog', () => {
     expect(
       fingerprint,
       'A model-visible field, enum, bound, default, or required rule changed; review it as a schema change, not description cleanup.',
-    ).toBe('2a3e714b9c485eccabf1da1c0af75dd279fa62f5a959f4fead1f68461a3622bc');
+    ).toBe('03aebb7d2ce9f2b428830abcdc07d5898f409d455d540b1ed5b6d3e6cac0026b');
   });
 
   it('keeps the reviewed stable tool corpus within the description budgets', () => {

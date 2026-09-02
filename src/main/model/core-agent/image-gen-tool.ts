@@ -34,6 +34,7 @@ export interface ImageGenToolOpts {
   /** Conversation id — extends the path sandbox to allow writing into
    *  the conv's attachment dir (and reading reference images from it). */
   cid?: string;
+  turnId?: string;
   /** Project id of the current conversation, when it belongs to one.
    *  Threaded through from group_chat so workspace resolution picks up
    *  the project-scoped selection (per CLAUDE.md projects feature). */
@@ -152,6 +153,11 @@ export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
         outputAbsPath: outputAbs,
         ...(refAbs.length ? { referenceImagePaths: refAbs } : {}),
         ...(sizeRaw ? { size: sizeRaw } : {}),
+        ...(ctx.signal ? { signal: ctx.signal } : {}),
+        usageContext: {
+          conversationId: opts.cid,
+          turnId: opts.turnId,
+        },
       });
 
       if (result.ok === false) {

@@ -62,4 +62,10 @@ describe('TTS settings failure display', () => {
     expect(addFlow).not.toContain('res.error');
     expect(addFlow).not.toContain('err.message');
   });
+
+  it('does not display a configured voice identifier in speech rows', () => {
+    const renderFlow = extractFunction('_settingsRenderTtsEntries');
+    expect(renderFlow).not.toContain('p.voice');
+    expect(renderFlow).toContain("_settingsOrkasServiceLabel('Voice')");
+  });
 });

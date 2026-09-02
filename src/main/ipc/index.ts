@@ -2689,12 +2689,18 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // consent page renders where the user is already logged in).
   'auth.openExternal':     async ({ url }) => auth.openExternalUrl(url),
   // Priority list (entries) — ordered (provider, model, profile) tuples.
-  'auth.listEntries':     async () => auth.listEntries(),
+  'auth.listEntries':     async ({ includeUnavailable } = {}) => (
+    auth.listEntries({ includeUnavailable: !!includeUnavailable })
+  ),
+  'auth.listComposerEntries': async () => auth.listComposerEntries(),
   'auth.addEntry':        async ({ provider, model, profileId }) => auth.addEntry({ provider, model, profileId }),
   'auth.removeEntry':     async ({ entryId }) => auth.removeEntry(entryId),
   'auth.reorderEntries':  async ({ orderedIds }) => auth.reorderEntries(orderedIds || []),
   'auth.selectEntry':     async ({ entryId, model }) => auth.selectEntry(entryId, model),
   'auth.updateEntryModel':async ({ entryId, model }) => auth.updateEntryModel(entryId, model),
+
+  // ── Orkas public API key quick setup (open-source build only) ──
+  'orkasApi.configureAll': async ({ apiKey }) => auth.configureAllOrkasApiServices(apiKey),
 
   // ── Image-generation API key (independent from chat entries) ──
   // `list` strips raw apiKey and replaces it with `apiKeyMasked` so

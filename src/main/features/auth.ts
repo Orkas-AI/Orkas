@@ -94,6 +94,15 @@ import type { KeyFailureKind } from '../model/core-agent/auth-error';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
 import { sanitizeLogTextForUpload } from '../util/log-sanitize';
+import {
+  ORKAS_API_BASE_URL,
+  ORKAS_API_DEFAULT_VOICE,
+  ORKAS_API_IMAGE_MODEL,
+  ORKAS_API_LLM_MODELS,
+  ORKAS_API_PROVIDER,
+  ORKAS_API_TTS_MODEL,
+  ORKAS_API_VIDEO_MODEL,
+} from './orkas_api';
 
 const log = createLogger('auth');
 
@@ -437,6 +446,7 @@ function parseImageProfilesArray(arr: unknown): ImageProfile[] {
     out.push({
       id: String(p.id),
       provider: String(p.provider),
+      ...(p.model ? { model: String(p.model) } : {}),
       apiKey: String(p.apiKey),
       label: String(p.label || 'default'),
       createdAt: typeof p.createdAt === 'number' ? p.createdAt : Date.now(),
@@ -535,6 +545,133 @@ export function saveTtsProfiles(list: TtsProfile[]): void {
   const store = loadProfiles();
   store.ttsProfiles = [...list];
   saveProfiles(store);
+}
+
+function nextOrkasServiceProfileId(prefix: 's' | 'img' | 'vid' | 'tts'): string {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function updateOrAppendOrkasServiceProfile<T extends { provider: string; apiKey: string }>(
+  list: T[],
+  create: () => T,
+  update: (profile: T) => T,
+): T[] {
+  let found = false;
+  const updated = list.map((profile) => {
+    if (profile.provider !== ORKAS_API_PROVIDER) return profile;
+    found = true;
+    return update(profile);
+  });
+  if (!found) updated.push(create());
+  return updated;
+}
+
+/** Configure every public Orkas API surface using the same user-supplied key.
+ * The data remains in the existing five profile collections; this function
+ * only batches their normal auth-profiles.json write. Existing provider order
+ * is preserved, and newly-created Orkas rows are appended as fallbacks. */
+export function configureAllOrkasApiServices(rawApiKey: string): { configured: true } {
+  const apiKey = String(rawApiKey || '').trim();
+  if (!apiKey) throw new Error('api key required');
+
+  const store = loadProfiles();
+  const now = Date.now();
+  const existingProfileEntries = Object.entries(store.profiles)
+    .filter(([, profile]) => profile.provider === ORKAS_API_PROVIDER);
+  let chatProfileId = existingProfileEntries[0]?.[0] || '';
+
+  for (const [profileId, profile] of existingProfileEntries) {
+    if (profile.type !== 'api_key') continue;
+    store.profiles[profileId] = { ...profile, key: apiKey, lastUsed: 0 };
+  }
+  if (!chatProfileId || store.profiles[chatProfileId]?.type !== 'api_key') {
+    chatProfileId = makeProfileId(ORKAS_API_PROVIDER, 'default');
+    const existing = store.profiles[chatProfileId];
+    store.profiles[chatProfileId] = {
+      type: 'api_key',
+      provider: ORKAS_API_PROVIDER,
+      label: 'default',
+      key: apiKey,
+      createdAt: existing?.createdAt ?? now,
+      lastUsed: 0,
+    };
+  }
+  for (const model of ORKAS_API_LLM_MODELS) {
+    if (store.entries.some((entry) => (
+      entry.provider === ORKAS_API_PROVIDER
+      && entry.model === model.id
+    ))) continue;
+    store.entries.push({
+      entryId: nextEntryId(),
+      provider: ORKAS_API_PROVIDER,
+      model: model.id,
+      profileId: chatProfileId,
+      lastUsed: 0,
+      createdAt: now,
+    });
+  }
+
+  store.searchProfiles = updateOrAppendOrkasServiceProfile(
+    store.searchProfiles || [],
+    () => ({
+      id: nextOrkasServiceProfileId('s'),
+      provider: ORKAS_API_PROVIDER,
+      apiKey,
+      label: 'Orkas',
+      createdAt: now,
+    }),
+    (profile) => ({ ...profile, apiKey }),
+  );
+  store.imageProfiles = updateOrAppendOrkasServiceProfile(
+    store.imageProfiles || [],
+    () => ({
+      id: nextOrkasServiceProfileId('img'),
+      provider: ORKAS_API_PROVIDER,
+      model: ORKAS_API_IMAGE_MODEL,
+      apiKey,
+      label: 'Orkas',
+      createdAt: now,
+    }),
+    (profile) => ({ ...profile, model: ORKAS_API_IMAGE_MODEL, apiKey }),
+  );
+  store.videoProfiles = updateOrAppendOrkasServiceProfile(
+    store.videoProfiles || [],
+    () => ({
+      id: nextOrkasServiceProfileId('vid'),
+      provider: ORKAS_API_PROVIDER,
+      model: ORKAS_API_VIDEO_MODEL,
+      apiKey,
+      label: 'Orkas',
+      createdAt: now,
+    }),
+    (profile) => ({ ...profile, model: ORKAS_API_VIDEO_MODEL, apiKey }),
+  );
+  store.ttsProfiles = updateOrAppendOrkasServiceProfile(
+    store.ttsProfiles || [],
+    () => ({
+      id: nextOrkasServiceProfileId('tts'),
+      provider: ORKAS_API_PROVIDER,
+      baseUrl: ORKAS_API_BASE_URL,
+      model: ORKAS_API_TTS_MODEL,
+      apiKey,
+      voice: ORKAS_API_DEFAULT_VOICE,
+      format: 'mp3',
+      label: 'Orkas',
+      createdAt: now,
+    }),
+    (profile) => ({
+      ...profile,
+      baseUrl: ORKAS_API_BASE_URL,
+      model: ORKAS_API_TTS_MODEL,
+      apiKey,
+    }),
+  );
+
+  saveProfiles(store);
+  for (const [profileId] of existingProfileEntries) clearCooldown(profileId);
+  clearCooldown(chatProfileId);
+  invalidateCoreAgentRunner();
+  return { configured: true };
 }
 
 function saveProfiles(store: ProfilesFile): void {
@@ -1210,6 +1347,9 @@ export interface EntryView {
   modelName: string;
   modelEditable: boolean;
   modelAvailable: boolean;
+  includedModels: string[];
+  official?: boolean;
+  recommended?: boolean;
   profileId: string;
   profileAvailable: boolean;
   profileLabel: string;
@@ -1227,6 +1367,7 @@ function entryToView(
   runtimeResolvable = true,
 ): EntryView {
   const prof = store.profiles[e.profileId];
+  const catalogModel = curatedModelsFor(e.provider).find((model) => model.id === e.model);
   const base = {
     entryId: e.entryId,
     provider: e.provider,
@@ -1234,11 +1375,16 @@ function entryToView(
     providerLabelKey: providerLabelKey(e.provider),
     model: e.model,
     modelName: modelNameLookup(e.provider, e.model),
-    modelEditable: !providerUsesCustomOpenAIConfig(e.provider),
+    modelEditable: e.provider !== ORKAS_API_PROVIDER && !providerUsesCustomOpenAIConfig(e.provider),
     modelAvailable: isSelectableModel(e.provider, e.model) && runtimeResolvable,
+    includedModels: catalogModel?.includedModels ? [...catalogModel.includedModels] : [],
+    ...(e.provider === ORKAS_API_PROVIDER && catalogModel ? { official: true } : {}),
+    ...(catalogModel?.recommended ? { recommended: true } : {}),
     profileId: e.profileId,
     profileAvailable: !!prof,
-    profileLabel: prof?.label || e.profileId.split(':').slice(1).join(':') || '(missing)',
+    profileLabel: e.provider === ORKAS_API_PROVIDER
+      ? 'Orkas'
+      : (prof?.label || e.profileId.split(':').slice(1).join(':') || '(missing)'),
     profileType: (prof?.type as 'api_key' | 'oauth') || 'api_key',
     createdAt: e.createdAt,
     lastUsed: e.lastUsed,
@@ -1290,6 +1436,13 @@ export async function listEntries(
         runtimeResolvable(entry.provider, entry.model),
       )),
   };
+}
+
+/** Composer model list for the open-source build. Every visible row is a
+ * locally configured, runtime-selectable entry, so it shares the same filter
+ * as the normal rotation list returned by listEntries(). */
+export async function listComposerEntries(): Promise<{ entries: EntryView[] }> {
+  return listEntries();
 }
 
 export async function addEntry({
@@ -2031,6 +2184,8 @@ export async function testConnection(
       let probeModel = modelForTest;
       if (pid === 'moonshot') {
         provider = await ext.createMoonshotProvider({ apiKey, modelId: probeModel });
+      } else if (pid === ORKAS_API_PROVIDER) {
+        provider = await ext.createOrkasApiProvider({ apiKey, modelId: probeModel });
       } else if (pid === 'deepseek') {
         provider = await ext.createDeepSeekProvider({ apiKey, modelId: probeModel });
       } else if (pid === 'doubao') {

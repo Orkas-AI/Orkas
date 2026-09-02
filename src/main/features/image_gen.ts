@@ -27,6 +27,14 @@ import { listApiKeyEntries, loadImageProfiles, type ApiKeyEntryChoice } from './
 import { findImageGenCapability, type ImageGenCapability } from '../model/provider_catalog';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
+import { composeAbortSignal, fetchWithTimeout, throwIfAborted } from '../util/abort';
+import { downloadBinaryWithProxyPolicy } from '../util/proxy-dispatcher';
+import {
+  ORKAS_API_BASE_URL,
+  ORKAS_API_PROVIDER,
+  orkasApiUsageHeaders,
+  type OrkasApiUsageContext,
+} from './orkas_api';
 
 const log = createLogger('image-gen');
 
@@ -97,6 +105,8 @@ export interface GenerateImageInput {
   referenceImagePaths?: string[];
   /** Provider-side size hint. Default `1024x1024`. */
   size?: string;
+  signal?: AbortSignal;
+  usageContext?: OrkasApiUsageContext;
 }
 
 export type GenerateImageResult =
@@ -165,6 +175,8 @@ export async function generateImage(input: GenerateImageInput): Promise<Generate
     model: capability.model,
     prompt: input.prompt,
     size,
+    ...(input.signal ? { signal: input.signal } : {}),
+    ...(input.usageContext ? { usageContext: input.usageContext } : {}),
     ...(referenceBuffers ? { referenceImages: referenceBuffers } : {}),
   };
 
@@ -176,6 +188,8 @@ export async function generateImage(input: GenerateImageInput): Promise<Generate
       adapterRes = await callGeminiImage(adapterReq);
     } else if (capability.api === 'doubao') {
       adapterRes = await callDoubaoImage(adapterReq);
+    } else if (capability.api === 'orkas') {
+      adapterRes = await callOrkasImage(adapterReq);
     } else {
       return {
         ok: false,
@@ -228,6 +242,8 @@ export interface AdapterRequest {
   prompt: string;
   size: string;
   referenceImages?: Buffer[];
+  signal?: AbortSignal;
+  usageContext?: OrkasApiUsageContext;
 }
 
 export interface AdapterResult {
@@ -240,6 +256,9 @@ export interface AdapterResult {
 }
 
 export const IMAGE_MODELS_BY_PROVIDER: Readonly<Record<string, Array<{ id: string; name: string }>>> = {
+  [ORKAS_API_PROVIDER]: [
+    { id: 'orkas-image', name: 'Image' },
+  ],
   openai: [
     { id: 'gpt-image-2', name: 'GPT Image 2' },
   ],
@@ -261,6 +280,148 @@ export function isImageProviderModelAllowed(provider: string, model: string): bo
 const OPENAI_BASE = 'https://api.openai.com';
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com';
 const DOUBAO_BASE = 'https://ark.cn-beijing.volces.com';
+
+const ORKAS_IMAGE_CREATE_TIMEOUT_MS = 60_000;
+const ORKAS_IMAGE_POLL_TIMEOUT_MS = 20_000;
+const ORKAS_IMAGE_TOTAL_TIMEOUT_MS = 15 * 60_000;
+const ORKAS_IMAGE_DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
+
+async function readOrkasImageResponse(resp: Response, phase: string): Promise<any> {
+  const text = await resp.text();
+  let data: any = {};
+  try { data = text ? JSON.parse(text) : {}; } catch { /* handled below */ }
+  if (!resp.ok) {
+    const message = data?.error?.message || text || `request failed with HTTP ${resp.status}`;
+    throw new Error(`Orkas Image ${phase} ${resp.status}: ${truncate(String(message), 500)}`);
+  }
+  return data;
+}
+
+function orkasImageDataUrl(buffer: Buffer): string {
+  const mime = detectMimeType(buffer) || 'image/png';
+  return `data:${mime};base64,${buffer.toString('base64')}`;
+}
+
+async function waitForOrkasImageTask(
+  taskId: string,
+  apiKey: string,
+  signal: AbortSignal,
+  usageContext?: OrkasApiUsageContext,
+): Promise<any> {
+  let data: any = {};
+  while (!signal.aborted) {
+    await sleepWithSignal(3_000, signal);
+    const resp = await fetchWithTimeout(
+      `${ORKAS_API_BASE_URL}/images/generations/${encodeURIComponent(taskId)}`,
+      {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          ...orkasApiUsageHeaders(usageContext),
+        },
+      },
+      ORKAS_IMAGE_POLL_TIMEOUT_MS,
+      signal,
+      'Orkas Image status request timed out',
+    );
+    data = await readOrkasImageResponse(resp, 'status');
+    const status = String(data?.status || '').toLowerCase();
+    if (['failed', 'cancelled', 'canceled'].includes(status)) {
+      throw new Error(`Orkas Image task ${taskId} ${status}: ${truncate(JSON.stringify(data?.error || data), 500)}`);
+    }
+    if (status === 'succeeded' || data?.data?.[0]?.url || data?.data?.[0]?.b64_json) return data;
+  }
+  throw new Error('operation aborted');
+}
+
+function sleepWithSignal(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error('operation aborted'));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+}
+
+export async function callOrkasImage(req: AdapterRequest): Promise<AdapterResult> {
+  throwIfAborted(req.signal);
+  const overall = composeAbortSignal(
+    req.signal,
+    ORKAS_IMAGE_TOTAL_TIMEOUT_MS,
+    `Orkas Image timed out after ${Math.round(ORKAS_IMAGE_TOTAL_TIMEOUT_MS / 60_000)} minutes`,
+  );
+  try {
+    const response = await fetchWithTimeout(
+      `${ORKAS_API_BASE_URL}/images/generations`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${req.apiKey}`,
+          'Content-Type': 'application/json',
+          ...orkasApiUsageHeaders(req.usageContext),
+        },
+        body: JSON.stringify({
+          prompt: req.prompt,
+          size: req.size === '1024x1024' ? '2k' : req.size,
+          response_format: 'url',
+          async: true,
+          ...(req.referenceImages?.length
+            ? { reference_images: req.referenceImages.map(orkasImageDataUrl) }
+            : {}),
+        }),
+      },
+      ORKAS_IMAGE_CREATE_TIMEOUT_MS,
+      overall.signal,
+      'Orkas Image create request timed out',
+    );
+    let data = await readOrkasImageResponse(response, 'create');
+    const taskId = String(data?.id || '').trim();
+    if (!data?.data?.[0]?.url && !data?.data?.[0]?.b64_json) {
+      if (!taskId) throw new Error('Orkas Image create returned no task id');
+      data = await waitForOrkasImageTask(taskId, req.apiKey, overall.signal, req.usageContext);
+    }
+
+    const b64 = String(data?.data?.[0]?.b64_json || '');
+    let buffer: Buffer;
+    if (b64) {
+      buffer = Buffer.from(b64, 'base64');
+    } else {
+      const url = String(data?.data?.[0]?.url || '').trim();
+      if (!url) throw new Error(`Orkas Image task ${taskId || '(sync)'} succeeded without image data`);
+      const download = composeAbortSignal(
+        overall.signal,
+        ORKAS_IMAGE_DOWNLOAD_TIMEOUT_MS,
+        'Orkas Image download timed out',
+      );
+      try {
+        const result = await downloadBinaryWithProxyPolicy(url, {
+          label: 'Orkas Image download',
+          signal: download.signal,
+          maxBytes: 64 * 1024 * 1024,
+          validate: (body) => {
+            if (!body.length || !detectMimeType(body)) {
+              throw new Error('Orkas Image download returned unsupported image bytes');
+            }
+          },
+        });
+        buffer = result.body;
+      } finally {
+        download.cleanup();
+      }
+    }
+    const mimeType = detectMimeType(buffer) || 'image/png';
+    const dim = parseImageDimensions(buffer, mimeType);
+    return { buffer, mimeType, width: dim.width, height: dim.height };
+  } finally {
+    overall.cleanup();
+  }
+}
 
 export async function callOpenAIImage(req: AdapterRequest): Promise<AdapterResult> {
   const hasRefs = !!(req.referenceImages && req.referenceImages.length);

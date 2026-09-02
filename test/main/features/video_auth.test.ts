@@ -86,10 +86,17 @@ describe('video auth profiles', () => {
 
   it('exposes the concrete open-source video model in the picker', () => {
     const options = flattenVideoProviderOptions([
+      { id: 'orkas-api', label: 'Orkas' },
       { id: 'doubao', label: 'DouBao' },
     ]);
 
     expect(options[0]).toMatchObject({
+      id: 'orkas-api',
+      provider: 'orkas-api',
+      model: 'orkas-video',
+      label: 'Orkas · Video',
+    });
+    expect(options[1]).toMatchObject({
       id: 'doubao',
       provider: 'doubao',
       model: 'doubao-seedance-2-0-260128',

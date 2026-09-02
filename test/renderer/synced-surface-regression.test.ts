@@ -162,7 +162,7 @@ describe('synced PC surface regressions', () => {
     }
   });
 
-  it('restores user-owned speech key configuration without exposing managed Orkas voice', () => {
+  it('restores user-owned speech key configuration with the public Orkas voice preset', () => {
     const html = read('src/renderer/index.html');
     const settings = read('src/renderer/modules/settings.js');
     const auth = read('src/main/features/auth.ts');
@@ -189,8 +189,9 @@ describe('synced PC surface regressions', () => {
     expect(ipc).toContain("'ttsAuth.list'");
     expect(ttsAuth).toContain("id: 'doubao'");
     expect(ttsAuth).toContain("id: 'openai'");
+    expect(ttsAuth).toContain('ORKAS_API_PROVIDER');
+    expect(ttsAuth).toContain('Orkas · Voice');
     expect(ttsAuth).not.toContain('ORKAS_VOICE');
-    expect(ttsAuth).not.toContain('Orkas · Voice');
   });
 
   it('keeps Settings local execution modes and edits the commander avatar from AI Team', () => {
