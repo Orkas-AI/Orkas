@@ -112,6 +112,14 @@ describe('Orkas public API quick setup', () => {
     expect(css).not.toMatch(/\.settings-orkas-api-group\s*{[^}]*(?:linear-gradient|border-color)/s);
   });
 
+  it('keeps the configure action as wide as the create-key action', () => {
+    const css = readFileSync(resolve(__dirname, '../../src/renderer/style.css'), 'utf8');
+    expect(css).toMatch(/\.settings-orkas-api-group\s*{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+max-content;/s);
+    expect(css).toMatch(/\.settings-orkas-api-head\s*{[^}]*display:\s*contents;/s);
+    expect(css).toMatch(/\.settings-orkas-api-group\s+\.settings-orkas-api-configure-row\s*{[^}]*display:\s*contents;/s);
+    expect(css).toMatch(/\.settings-orkas-api-configure-row\s+\.btn\s*{[^}]*grid-column:\s*2;[^}]*width:\s*100%;/s);
+  });
+
   it('uses the complete Orkas service labels in pickers and configured rows', () => {
     const { context, elements, source } = loadQuickSetupHarness();
     expect(source).not.toContain("label: 'Orkas API'");
