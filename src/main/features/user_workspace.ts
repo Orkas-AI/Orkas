@@ -42,7 +42,7 @@ import { DEFAULT_USER_WORKSPACE, userWorkspaceConfigFile } from '../paths';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
 import { macosTccSensitivePath } from '../util/macos-tcc';
-import { logPathRef, logPathRefs } from '../util/log-redact';
+import { logErrorSummary, logPathRef, logPathRefs, maskId } from '../util/log-redact';
 import { pruneOrphans } from './file_indexer';
 
 const log = createLogger('user-workspace');
@@ -231,7 +231,7 @@ function _effectivePath(cfg: WorkspaceConfig, projectId?: string): string {
           if (fs.statSync(entry.selectedPath).isDirectory()) return path.resolve(entry.selectedPath);
         } catch {
           log.warn('project workspace path missing — falling back to default', {
-            projectId, path: logPathRef(entry.selectedPath),
+            project_id: maskId(projectId), path: logPathRef(entry.selectedPath),
           });
         }
       }
@@ -314,7 +314,10 @@ export async function resolveProjectIdForCid(userId: string, cid?: string): Prom
     const pid = (conv as any)?.project_id;
     return typeof pid === 'string' && pid ? pid : undefined;
   } catch (err) {
-    log.warn(`resolveProjectIdForCid cid=${cid}: ${(err as Error).message}`);
+    log.warn('resolve project id for conversation failed', {
+      cid: maskId(cid),
+      error: logErrorSummary(err),
+    });
     return undefined;
   }
 }
@@ -359,7 +362,11 @@ export function setWorkspacePath(
     ...(selection.macosTccSensitive ? { macosTccSensitive: true } : {}),
   });
   writeConfig(userId, next);
-  log.info('workspace path updated', { userId, projectId: projectId || '(default)', path: logPathRef(resolved) });
+  log.info('workspace path updated', {
+    user_id: maskId(userId),
+    project_id: projectId ? maskId(projectId) : '(default)',
+    path: logPathRef(resolved),
+  });
   _sweepFileCacheForWorkspace(userId, resolved);
   return { ok: true, path: resolved };
 }
@@ -386,7 +393,11 @@ export function resetWorkspacePath(userId: string, projectId?: string): { ok: tr
   writeConfig(userId, next);
 
   const effective = _effectivePath(next, projectId);
-  log.info('workspace path reset', { userId, projectId: projectId || '(default)', effective: logPathRef(effective) });
+  log.info('workspace path reset', {
+    user_id: maskId(userId),
+    project_id: projectId ? maskId(projectId) : '(default)',
+    effective: logPathRef(effective),
+  });
   _sweepFileCacheForWorkspace(userId, effective);
   return { ok: true, path: effective };
 }
@@ -395,11 +406,19 @@ function _sweepFileCacheForWorkspace(userId: string, workspacePath: string): voi
   pruneOrphans(userId, { workspacePath })
     .then((r) => {
       if (r.deleted > 0) {
-        log.info(`file_cache sweep on workspace switch deleted=${r.deleted}`, { userId, workspacePath: logPathRef(workspacePath) });
+        log.info('file cache sweep on workspace switch completed', {
+          user_id: maskId(userId),
+          deleted: r.deleted,
+          workspace_path: logPathRef(workspacePath),
+        });
       }
     })
     .catch((err) => {
-      log.warn(`file_cache sweep on workspace switch failed: ${(err as Error).message}`, { userId, workspacePath: logPathRef(workspacePath) });
+      log.warn('file cache sweep on workspace switch failed', {
+        user_id: maskId(userId),
+        workspace_path: logPathRef(workspacePath),
+        error: logErrorSummary(err),
+      });
     });
 }
 
@@ -501,7 +520,11 @@ export function sweepEmptyConvDirs(userId: string): { swept: number } {
       } catch { /* best-effort */ }
     }
   }
-  if (swept > 0) log.info('swept empty workspace subdirs', { userId, swept, roots: logPathRefs(Array.from(roots)) });
+  if (swept > 0) log.info('swept empty workspace subdirs', {
+    user_id: maskId(userId),
+    swept,
+    roots: logPathRefs(Array.from(roots)),
+  });
   return { swept };
 }
 
@@ -538,7 +561,11 @@ export async function openWorkspaceInFileManager(
   // macOS Files & Folders authorization before Finder opens.
   const err = await shell.openPath(target);
   if (err) {
-    log.warn('failed to open workspace path', { userId, path: logPathRef(target), err });
+    log.warn('failed to open workspace path', {
+      user_id: maskId(userId),
+      path: logPathRef(target),
+      error: logErrorSummary(new Error(err)),
+    });
     return { ok: false, error: err };
   }
   if (fallbackUsed) {
@@ -561,5 +588,11 @@ export function purgeProjectWorkspace(userId: string, projectId: string): void {
   const next: WorkspaceConfig = { ...cfg, projects: { ...cfg.projects }, updatedAt: new Date().toISOString() };
   delete next.projects[projectId];
   try { writeConfig(userId, next); }
-  catch (err) { log.warn(`purge project ws user=${userId} pid=${projectId}: ${(err as Error).message}`); }
+  catch (err) {
+    log.warn('purge project workspace failed', {
+      user_id: maskId(userId),
+      project_id: maskId(projectId),
+      error: logErrorSummary(err),
+    });
+  }
 }
