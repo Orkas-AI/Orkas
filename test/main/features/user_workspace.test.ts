@@ -7,8 +7,14 @@ import { fileURLToPath } from 'node:url';
 
 const nodeRequire = createRequire(import.meta.url);
 
+const loggerMocks = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn() }));
 vi.mock('../../../src/main/logger', () => ({
-  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+  createLogger: () => ({
+    debug: vi.fn(),
+    info: loggerMocks.info,
+    warn: loggerMocks.warn,
+    error: vi.fn(),
+  }),
 }));
 
 let tmpDir: string;
@@ -200,6 +206,30 @@ describe('user_workspace › setWorkspacePath', () => {
     const result = ws.setWorkspacePath('user123', dir);
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.path).toBe(dir);
+  });
+
+  it('logs only masked account, project, and path references', async () => {
+    const ws = await import('../../../src/main/features/user_workspace');
+    const dir = path.join(tmpDir, 'private-customer-workspace');
+    fs.mkdirSync(dir, { recursive: true });
+    loggerMocks.info.mockClear();
+
+    expect(ws.setWorkspacePath(
+      'private-user-123456',
+      dir,
+      'private-project-123456',
+    ).ok).toBe(true);
+
+    expect(loggerMocks.info).toHaveBeenCalledWith('workspace path updated', {
+      user_id: 'priv...3456',
+      project_id: 'priv...3456',
+      path: expect.objectContaining({ domain: 'absolute' }),
+    });
+    const serialized = JSON.stringify(loggerMocks.info.mock.calls);
+    expect(serialized).not.toContain('private-user-123456');
+    expect(serialized).not.toContain('private-project-123456');
+    expect(serialized).not.toContain(tmpDir);
+    expect(serialized).not.toContain('private-customer-workspace');
   });
 
   it.runIf(process.platform === 'darwin')('persists user-selected macOS privacy-protected workspace roots without probing them again', async () => {
