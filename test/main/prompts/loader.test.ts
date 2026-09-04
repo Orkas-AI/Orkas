@@ -1,9 +1,15 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { PromptManager, safeSubstitute, prompts } from '../../../src/main/prompts/loader';
 import { buildRuntimeDatetimeBlock, formatCurrentDate } from '../../../src/main/prompts/runtime_context';
+
+const loggerMocks = vi.hoisted(() => ({ warn: vi.fn() }));
+
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: loggerMocks.warn, error: vi.fn() }),
+}));
 
 describe('prompts › safeSubstitute', () => {
   it('substitutes $identifier', () => {
@@ -67,6 +73,7 @@ describe('prompts › PromptManager (custom root)', () => {
   let mgr: PromptManager;
 
   beforeEach(() => {
+    loggerMocks.warn.mockClear();
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-prompts-'));
     mgr = new PromptManager(tmpDir);
   });
@@ -88,6 +95,11 @@ describe('prompts › PromptManager (custom root)', () => {
 
   it('load() returns empty string for missing template', () => {
     expect(mgr.load('missing')).toBe('');
+    expect(loggerMocks.warn).toHaveBeenCalledWith(
+      'prompt template missing',
+      { path: expect.objectContaining({ path_hash: expect.any(String), domain: 'absolute' }) },
+    );
+    expect(JSON.stringify(loggerMocks.warn.mock.calls)).not.toContain(tmpDir);
   });
 
   it('caches body — when mtime is held constant, load returns cached body even after content rewrite', () => {
