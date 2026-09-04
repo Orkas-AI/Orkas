@@ -19,6 +19,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { createLogger } from '../logger';
+import { logErrorSummary, logPathRef } from '../util/log-redact';
 import {
   safeSubstitute,
   type TemplateArgs,
@@ -49,13 +50,16 @@ export class PromptManager {
     const p = this._pathFor(template);
     let stat: fs.Stats;
     try { stat = fs.statSync(p); }
-    catch { log.warn(`template missing: ${p}`); return ''; }
+    catch { log.warn('prompt template missing', { path: logPathRef(p) }); return ''; }
     const mtime = stat.mtimeMs;
     const cached = this._cache.get(template);
     if (cached && cached.mtime === mtime) return cached.body;
     let body: string;
     try { body = fs.readFileSync(p, 'utf8'); }
-    catch (err) { log.warn(`failed to read ${p}: ${(err as Error).message}`); return ''; }
+    catch (err) {
+      log.warn('prompt template read failed', { path: logPathRef(p), error: logErrorSummary(err) });
+      return '';
+    }
     this._cache.set(template, { mtime, body });
     return body;
   }
