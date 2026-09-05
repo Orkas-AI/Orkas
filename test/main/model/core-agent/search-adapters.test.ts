@@ -128,3 +128,24 @@ describe('open-source BYO search adapters', () => {
     ]);
   });
 });
+
+describe('search transfer deadlines', () => {
+  it.each(['orkas-api', 'tavily', 'serper', 'brave-search', 'baidu-ai-search', 'metaso'])('keeps the %s deadline active while reading the response body', async (provider) => {
+    vi.useFakeTimers();
+    try {
+      let responseSignal: AbortSignal | undefined;
+      const readBody = () => new Promise<string>((_resolve, reject) => {
+        responseSignal!.addEventListener('abort', () => reject(new Error('body aborted')), { once: true });
+      });
+      vi.stubGlobal('fetch', vi.fn(async (_url, init) => {
+        responseSignal = init.signal;
+        return { ok: true, status: 200, text: readBody, json: readBody };
+      }));
+      const pending = runSearchAdapter({ id: 'test', provider, apiKey: 'fixture', label: '', createdAt: 0 } as any, 'query', 1);
+      const outcome = pending.then(() => 'success', () => 'failed');
+      await vi.advanceTimersByTimeAsync(30_001);
+      expect(responseSignal?.aborted).toBe(true);
+      expect(await outcome).toBe('failed');
+    } finally { vi.useRealTimers(); }
+  });
+});

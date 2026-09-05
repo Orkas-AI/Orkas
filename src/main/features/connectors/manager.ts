@@ -54,7 +54,12 @@ let _runtimeEpoch = 0;
  *  request; subsequent calls await the same Promise, get the same new grant, and proceed
  *  identically. Lock entries auto-clear in the `finally` block so a failed refresh doesn't
  *  jam the slot. */
-const _refreshLocks = new Map<string, Promise<OAuthGrant>>();
+interface RefreshLock {
+  promise: Promise<OAuthGrant>;
+  force: boolean;
+  attemptedRemote: boolean;
+}
+const _refreshLocks = new Map<string, RefreshLock>();
 
 function _accountChangedError(): Error & { code: string } {
   return Object.assign(new Error('connector account changed'), {
@@ -482,12 +487,21 @@ async function _refreshGrantIfStale(
   instId: string,
   opts: { force?: boolean } = {},
 ): Promise<OAuthGrant> {
-  const lockKey = opts.force ? `${instId}:force` : instId;
+  const lockKey = _runtimeKey(uid, instId);
   const existing = _refreshLocks.get(lockKey);
   if (existing) {
-    log.info('refresh dedupe hit', { id: instId });
-    return existing;
+    log.info('refresh dedupe hit', { id: instId, force: !!opts.force, existing_force: existing.force });
+    const grant = await existing.promise;
+    if (opts.force && !existing.force && !existing.attemptedRemote) {
+      return _refreshGrantIfStale(uid, entry, instId, opts);
+    }
+    return grant;
   }
+  const lock: RefreshLock = {
+    promise: Promise.resolve(null as never),
+    force: !!opts.force,
+    attemptedRemote: false,
+  };
   let p: Promise<OAuthGrant>;
   p = Promise.resolve().then(async () => {
     try {
@@ -517,6 +531,7 @@ async function _refreshGrantIfStale(
         && inst.oauth_grant.expires_at - Date.now() > REFRESH_BUFFER_MS) {
         return inst.oauth_grant;
       }
+      lock.attemptedRemote = true;
       const oldRt = inst.oauth_grant.refresh_token;
       log.info('refresh attempt', {
         id: instId,
@@ -598,12 +613,13 @@ async function _refreshGrantIfStale(
       }
       return next;
     } finally {
-      if (_refreshLocks.get(lockKey) === p) {
+      if (_refreshLocks.get(lockKey) === lock) {
         _refreshLocks.delete(lockKey);
       }
     }
   });
-  _refreshLocks.set(lockKey, p);
+  lock.promise = p;
+  _refreshLocks.set(lockKey, lock);
   return p;
 }
 
@@ -697,7 +713,7 @@ async function _connectAndCacheTools(
     }
     const entry = findCatalogEntry(inst.id);
     if (_isMissingRequiredScopesError(err) || (entry && !_isTransientConnectorFailure(err) && _isGoogleAuthFailure(entry, err))) {
-      return inst;
+      return registry.load(uid).connections[inst.id] || inst;
     }
     const degraded = await _markDegradedOnTransientFailure(
       uid, inst, err, 'resolve_transport', statusPatches,

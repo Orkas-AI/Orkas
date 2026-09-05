@@ -1944,3 +1944,253 @@ describe('rotating-provider › complete calls and per-call stream policy', () =
     expect(fallbackBuilds).toBe(0);
   });
 });
+
+describe("rotation shared run lifecycle", () => {
+it('commits on reasoning activity before answer text and clears the first-event deadline', async () => {
+    let fallbackBuilds = 0;
+    const p = createRotatingProvider({
+      providerId: 'test',
+      firstEventTimeoutMs: 20,
+      candidates: [
+        {
+          profileId: 'reasoner',
+          providerId: 'reasoner',
+          modelId: 'reasoner-model',
+          build: async () => ({
+            id: 'reasoner',
+            name: 'reasoner',
+            async *stream(): AsyncIterable<StreamEvent> {
+              yield { type: 'message_start' };
+              yield { type: 'thinking_start' };
+              await new Promise((resolve) => setTimeout(resolve, 50));
+              yield { type: 'thinking_delta', chars: 12 };
+              yield { type: 'thinking_end' };
+              yield { type: 'text_delta', text: 'answer' };
+            },
+            async complete() { throw new Error('unused'); },
+            async validateAuth() { return true; },
+          }),
+        },
+        {
+          profileId: 'fallback',
+          providerId: 'fallback',
+          modelId: 'fallback-model',
+          build: async () => {
+            fallbackBuilds += 1;
+            return fakeProvider('fallback', { streamEvents: [{ type: 'text_delta', text: 'wrong' }] });
+          },
+        },
+      ],
+    });
+
+    const events = await collect(p.stream(PARAMS));
+    expect(events.map((event) => event.type)).toEqual([
+      'message_start', 'thinking_start', 'thinking_delta', 'thinking_end', 'text_delta',
+    ]);
+    expect(fallbackBuilds).toBe(0);
+  });
+it('latches a network-exhausted candidate out of later model rounds once a fallback commits, without cooldown', async () => {
+    // 2026-08-16 latency review P0-1: stream() runs once per tool-loop round.
+    // Without the run-local latch, a candidate whose endpoint is dead in a
+    // candidate-specific way (e.g. its fetch path ignores the proxy) re-pays
+    // the full timeout/retry ladder on every remaining round of the turn
+    // before reaching the fallback that actually serves the reply.
+    const netErr = new TypeError('fetch failed');
+    let p1Builds = 0;
+    let p2Builds = 0;
+    const p = createRotatingProvider({
+      providerId: 'test',
+      networkRetryDelayMs: () => 0,
+      candidates: [
+        {
+          profileId: 'p1',
+          providerId: 'test',
+          modelId: 'test-model',
+          build: async () => {
+            p1Builds += 1;
+            return fakeProvider('p1', { throwBefore: netErr });
+          },
+        },
+        {
+          profileId: 'p2',
+          providerId: 'test',
+          modelId: 'test-model',
+          build: async () => {
+            p2Builds += 1;
+            return fakeProvider('p2', { streamEvents: [{ type: 'text_delta', text: 'ok' } as any] });
+          },
+        },
+      ],
+    });
+
+    const firstRound = await collect(p.stream(PARAMS));
+    const secondRound = await collect(p.stream(PARAMS));
+
+    expect(p1Builds).toBe(4); // round 1 keeps the full same-candidate retry ladder
+    expect(p2Builds).toBe(2);
+    expect((firstRound.at(-1) as any).text).toBe('ok');
+    expect(secondRound.some((ev: any) => ev.type === 'retry')).toBe(false); // round 2 skips p1 entirely
+    expect((secondRound.at(-1) as any).text).toBe('ok');
+    // Run-local only: a fresh run (new provider instance) must retry p1, so
+    // the network failure must not enter the persisted cooldown.
+    expect(getCooldown('p1')).toBeUndefined();
+  });
+it('does not latch anything when every candidate fails network-class, so recovery after a full blip retries them all', async () => {
+    // Counterexample guarding the deferred-latch design: compaction shares
+    // this provider instance and swallows the exhausted error, so a transient
+    // machine-local outage must leave the next call free to retry every
+    // candidate. Only a sweep where a later candidate commits may latch.
+    const netErr = new TypeError('fetch failed');
+    let p1Builds = 0;
+    let p2Builds = 0;
+    let blip = true;
+    const p = createRotatingProvider({
+      providerId: 'test',
+      networkRetryDelayMs: () => 0,
+      candidates: [
+        {
+          profileId: 'p1',
+          providerId: 'test',
+          modelId: 'test-model',
+          build: async () => {
+            p1Builds += 1;
+            return blip
+              ? fakeProvider('p1', { throwBefore: netErr })
+              : fakeProvider('p1', { streamEvents: [{ type: 'text_delta', text: 'back' } as any] });
+          },
+        },
+        {
+          profileId: 'p2',
+          providerId: 'test',
+          modelId: 'test-model',
+          build: async () => {
+            p2Builds += 1;
+            return fakeProvider('p2', { throwBefore: netErr });
+          },
+        },
+      ],
+    });
+
+    await expect(collect(p.stream(PARAMS))).rejects.toMatchObject({ code: 'PROVIDER_NETWORK_EXHAUSTED' });
+    blip = false;
+    const events = await collect(p.stream(PARAMS));
+
+    expect(p1Builds).toBe(5); // 4 during the blip + 1 recovered attempt
+    expect(p2Builds).toBe(4); // only the blip round
+    expect((events.at(-1) as any).text).toBe('back');
+  });
+it('announces omitted images when the committed candidate is text-only', async () => {
+    // W4-2: a text-only model silently lost every attached image and the
+    // only visible symptom was the model claiming it cannot see. The commit
+    // must be preceded by an images_omitted event naming the count.
+    const messages: CompletionParams['messages'] = [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'read this screenshot' },
+        { type: 'image', data: 'shot-1', mediaType: 'image/jpeg' },
+        { type: 'image', data: 'shot-2', mediaType: 'image/jpeg' },
+      ],
+    }];
+    const provider = createRotatingProvider({
+      providerId: 'custom',
+      candidates: [{
+        profileId: 'text-only',
+        providerId: 'custom',
+        modelId: 'tiny-8b',
+        maxInputImages: 0,
+        build: async () => ({
+          id: 'custom',
+          name: 'custom',
+          async *stream() {
+            yield { type: 'text_delta', text: 'I cannot see any image.' } as any;
+          },
+          async complete() { throw new Error('unused'); },
+          async validateAuth() { return true; },
+        }),
+      }],
+    });
+
+    const events = await collect(provider.stream({ ...PARAMS, messages }));
+    const omitted = events.find((ev: any) => ev.type === 'images_omitted');
+    expect(omitted).toMatchObject({ count: 2, providerId: 'custom' });
+    expect(events.findIndex((ev: any) => ev.type === 'images_omitted'))
+      .toBeLessThan(events.findIndex((ev: any) => ev.type === 'text_delta'));
+  });
+it('announces omitted images once per run, not on every tool-loop round', async () => {
+    // The agent runner calls stream() once per tool-loop round with the full
+    // history; a per-call announcement repeated the same notice ten times in
+    // a ten-round turn and persisted every copy into the process rail.
+    const messages: CompletionParams['messages'] = [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'read this screenshot' },
+        { type: 'image', data: 'shot-1', mediaType: 'image/jpeg' },
+      ],
+    }];
+    const provider = createRotatingProvider({
+      providerId: 'custom',
+      candidates: [{
+        profileId: 'text-only',
+        providerId: 'custom',
+        modelId: 'tiny-8b',
+        maxInputImages: 0,
+        build: async () => ({
+          id: 'custom',
+          name: 'custom',
+          async *stream() {
+            yield { type: 'text_delta', text: 'round output' } as any;
+          },
+          async complete() { throw new Error('unused'); },
+          async validateAuth() { return true; },
+        }),
+      }],
+    });
+
+    const round1 = await collect(provider.stream({ ...PARAMS, messages }));
+    const round2 = await collect(provider.stream({ ...PARAMS, messages }));
+    expect(round1.filter((ev: any) => ev.type === 'images_omitted')).toHaveLength(1);
+    expect(round2.filter((ev: any) => ev.type === 'images_omitted')).toHaveLength(0);
+  });
+it('complete() latches a network-exhausted candidate after a fallback succeeds, without cooldown', async () => {
+    // Equivalent-path invariant with stream(): auxiliary complete() callers
+    // repeat within one run too, and must not re-pay a dead candidate's
+    // retry ladder once a fallback has proven the failure candidate-specific.
+    const netErr = new TypeError('fetch failed');
+    let p1Builds = 0;
+    let p2Builds = 0;
+    const okResult = { content: [{ type: 'text', text: 'ok' }], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, model: 'test' };
+    const p = createRotatingProvider({
+      providerId: 'test',
+      networkRetryDelayMs: () => 0,
+      candidates: [
+        {
+          profileId: 'p1',
+          providerId: 'test',
+          modelId: 'test-model',
+          build: async () => {
+            p1Builds += 1;
+            return fakeProvider('p1', { completeError: netErr });
+          },
+        },
+        {
+          profileId: 'p2',
+          providerId: 'test',
+          modelId: 'test-model',
+          build: async () => {
+            p2Builds += 1;
+            return fakeProvider('p2', { completeResult: okResult });
+          },
+        },
+      ],
+    });
+
+    const first = await p.complete(PARAMS);
+    const second = await p.complete(PARAMS);
+
+    expect((first.content[0] as any).text).toBe('ok');
+    expect((second.content[0] as any).text).toBe('ok');
+    expect(p1Builds).toBe(4); // full retry ladder in call 1, skipped in call 2
+    expect(p2Builds).toBe(2);
+    expect(getCooldown('p1')).toBeUndefined();
+  });
+});

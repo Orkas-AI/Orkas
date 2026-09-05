@@ -33,6 +33,7 @@ import {
   listVideoProfiles,
   removeVideoProfile,
   reorderVideoProfiles,
+  listVideoProviderOptions,
 } from '../../../src/main/features/video_auth';
 
 beforeEach(() => {
@@ -50,8 +51,8 @@ describe('video auth profiles', () => {
       error: 'unsupported video model "doubao/retired-model"',
     });
     expect(addVideoProfile({
-      provider: 'doubao',
-      model: 'doubao-seedance-2-0-260128',
+      provider: 'orkas-api',
+      model: 'orkas-video',
       apiKey: '',
     })).toEqual({ ok: false, error: 'apiKey required' });
     expect(mocks.profiles).toEqual([]);
@@ -59,14 +60,14 @@ describe('video auth profiles', () => {
 
   it('keeps explicit ordering and bounded labels deterministic', () => {
     const first = addVideoProfile({
-      provider: 'doubao',
-      model: 'doubao-seedance-2-0-260128',
+      provider: 'orkas-api',
+      model: 'orkas-video',
       apiKey: 'first',
       label: `  ${'x'.repeat(60)}  `,
     });
     const second = addVideoProfile({
-      provider: 'doubao',
-      model: 'doubao-seedance-2-0-260128',
+      provider: 'orkas-api',
+      model: 'orkas-video',
       apiKey: 'second',
       label: 'second',
     });
@@ -96,10 +97,16 @@ describe('video auth profiles', () => {
       model: 'orkas-video',
       label: 'Orkas · Video',
     });
-    expect(options[1]).toMatchObject({
-      id: 'doubao',
-      provider: 'doubao',
-      model: 'doubao-seedance-2-0-260128',
-    });
+    expect(options).toHaveLength(1);
+    expect(listVideoProviderOptions().map((option) => option.id)).toEqual(['orkas-api']);
   });
 });
+
+ it('retains legacy credentials for removal but refuses new unsupported video profiles', () => {
+    mocks.profiles = [{ id: 'legacy', provider: 'doubao', model: 'doubao-seedance-2-0-260128', apiKey: 'legacy-key', label: 'Legacy', createdAt: 1 }];
+    expect(addVideoProfile({ provider: 'doubao', model: 'doubao-seedance-2-0-260128', apiKey: 'new-key' })).toMatchObject({ ok: false });
+    expect(listVideoProfiles()).toEqual(mocks.profiles);
+    expect(listVideoProfiles()).toHaveLength(1);
+    expect(removeVideoProfile('legacy')).toEqual({ ok: true });
+    expect(listVideoProfiles()).toEqual([]);
+ });

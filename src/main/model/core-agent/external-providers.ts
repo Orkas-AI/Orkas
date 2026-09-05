@@ -1,6 +1,6 @@
 /**
- * External providers — factories for chat providers that pi-ai 0.68.1
- * doesn't ship out of the box.
+ * External providers — factories for chat providers with app-specific ids
+ * and endpoint configuration.
  *
  * Each factory hand-builds a pi-ai `Model<TApi>` object and passes it to
  * `createPiProvider({ customModel })`. That route bypasses pi-ai's
@@ -102,6 +102,31 @@ function configuredModelVisionDeclaration(model: {
   return undefined;
 }
 
+function alignDeepSeekReasoningPayload(params: unknown): unknown {
+  try {
+    const p = params as { reasoning_effort?: string; messages?: Array<{ role?: string; reasoning_content?: unknown; reasoning?: unknown }> };
+    const priorAssistants = (p.messages || []).filter((m) => m && m.role === 'assistant');
+    if (priorAssistants.length === 0) {
+      // No prior turns — nothing to be inconsistent with. Preserve an
+      // explicitly requested reasoning_effort; an omitted control remains
+      // omitted so DeepSeek applies the selected model's official defaults.
+      return params;
+    }
+    const allHaveReasoning = priorAssistants.every(
+      (m) => (typeof m.reasoning_content === 'string' && m.reasoning_content.length > 0)
+        || (typeof m.reasoning === 'string' && (m.reasoning as string).length > 0),
+    );
+    if (!allHaveReasoning && p.reasoning_effort !== undefined) {
+      delete p.reasoning_effort;
+    }
+  } catch { /* never let onPayload throw — pi-ai treats throw as fatal */ }
+  return params;
+}
+
+export function repairDeepSeekPayload(params: unknown): unknown {
+  return repairOpenAIToolMessageOrder(alignDeepSeekReasoningPayload(params));
+}
+
 export function repairOpenAICompatiblePayload(params: unknown): unknown {
   return repairOpenAIToolMessageOrder(params);
 }
@@ -145,6 +170,7 @@ export async function createOrkasApiProvider(config: {
     customModel: buildOrkasApiModel(config.modelId),
     defaultReasoning: 'low',
     headers: orkasApiUsageHeaders(config.usageContext),
+    onPayload: repairOpenAICompatiblePayload,
   });
 }
 
@@ -156,12 +182,13 @@ const MOONSHOT_BASE_URL = 'https://api.moonshot.cn/v1';
  * Context windows by Moonshot model id. Numbers come from
  * platform.kimi.com/docs/models (checked 2026-06). Fallback 131072 for
  * ids we haven't catalogued — safe lower bound given every current kimi
- * model is at least 128k. Legacy ids still resolve via fallback if a stale
- * credential references them.
+ * model is at least 128k. Legacy K2 preview ids still resolve via fallback
+ * if a stale credential references them.
  */
 const MOONSHOT_CONTEXT_WINDOW: Record<string, number> = {
   'kimi-k3': 1048576,
   'kimi-k2.7-code': 262144,
+  'kimi-k2.7-code-highspeed': 262144,
   'kimi-k2.6': 262144,
   'kimi-k2.5': 262144,
 };
@@ -172,8 +199,8 @@ function moonshotContextWindow(modelId: string): number {
 
 // Per-model max output tokens. Why this needs a per-model table: pi-ai's
 // `simple-options.buildBaseOptions` reads `model.maxTokens` as the default
-// `max_tokens` request param (clamped at 32000 ceiling); a single hard-coded
-// value caps every model at the lowest common denominator and complex
+// `max_tokens` request param and fits it to the remaining context; a single
+// hard-coded value caps every model at the lowest common denominator and complex
 // structured replies get cut mid-stream with `stopReason: "length"` while
 // the renderer just shows whatever streamed before the cap. Numbers from
 // platform.kimi.com/docs/models (2026-06). Unknown ids fall back to 8192
@@ -181,7 +208,8 @@ function moonshotContextWindow(modelId: string): number {
 const MOONSHOT_MAX_OUTPUT_TOKENS: Record<string, number> = {
   'kimi-k3': 131072,
   'kimi-k2.7-code': 32768,
-  'kimi-k2.6': 16384,
+  'kimi-k2.7-code-highspeed': 32768,
+  'kimi-k2.6': 32768,
   'kimi-k2.5': 16384,
 };
 
@@ -189,6 +217,10 @@ function moonshotMaxOutputTokens(modelId: string): number {
   return MOONSHOT_MAX_OUTPUT_TOKENS[modelId] ?? 8192;
 }
 
+// K3 was added to pi-ai in 0.80.9. Keep this small local fallback so the
+// synchronous catalog/window path remains accurate, but use pi-ai's native
+// model at runtime (see buildRuntimeMoonshotModel) so future protocol changes
+// do not have to be mirrored here before requests can work.
 const MOONSHOT_K3_PROTOCOL_FALLBACK: Pick<
   Model<'openai-completions'>,
   'reasoning' | 'thinkingLevelMap' | 'input' | 'compat'
@@ -201,6 +233,7 @@ const MOONSHOT_K3_PROTOCOL_FALLBACK: Pick<
     medium: null,
     high: null,
     xhigh: null,
+    max: 'max',
   },
   input: ['text', 'image'],
   compat: {
@@ -211,17 +244,33 @@ const MOONSHOT_K3_PROTOCOL_FALLBACK: Pick<
     supportsStrictMode: false,
     thinkingFormat: 'deepseek',
     requiresReasoningContentOnAssistantMessages: true,
+    deferredToolsMode: 'kimi',
   },
 };
+
+type PiBuiltinCatalog = typeof import('@earendil-works/pi-ai/providers/all');
+let _piBuiltinCatalogPromise: Promise<PiBuiltinCatalog> | null = null;
+function piBuiltinCatalog(): Promise<PiBuiltinCatalog> {
+  if (!_piBuiltinCatalogPromise) {
+    _piBuiltinCatalogPromise = import('@earendil-works/pi-ai/providers/all');
+  }
+  return _piBuiltinCatalogPromise;
+}
 
 /**
  * Build a `Model<"openai-completions">` object for a Moonshot model.
  * Exported for tests — production code usually goes through
  * `createMoonshotProvider()`.
  */
-export function buildMoonshotModel(modelId: string): Model<'openai-completions'> {
+export function buildMoonshotModel(
+  modelId: string,
+  nativeModel?: Model<'openai-completions'>,
+): Model<'openai-completions'> {
+  // Server model_catalog metadata is authoritative when present. The local
+  // tables remain conservative fallbacks for offline/stale configurations.
   const curated = curatedModelsFor('moonshot').find((m) => m.id === modelId);
-  const protocol = modelId === 'kimi-k3' ? MOONSHOT_K3_PROTOCOL_FALLBACK : null;
+  const fallbackProtocol = modelId === 'kimi-k3' ? MOONSHOT_K3_PROTOCOL_FALLBACK : null;
+  const protocol = nativeModel || fallbackProtocol;
   return {
     id: modelId,
     name: curated?.name || modelId,
@@ -231,7 +280,9 @@ export function buildMoonshotModel(modelId: string): Model<'openai-completions'>
     provider: 'moonshot' as any,
     baseUrl: MOONSHOT_BASE_URL,
     reasoning: protocol?.reasoning ?? false,
-    ...(protocol?.thinkingLevelMap ? { thinkingLevelMap: { ...protocol.thinkingLevelMap } } : {}),
+    ...(protocol?.thinkingLevelMap
+      ? { thinkingLevelMap: { ...protocol.thinkingLevelMap } }
+      : {}),
     input: modelInputFromConfiguredCapabilities(
       protocol ? [...protocol.input] : ['text', 'image'],
       curated,
@@ -243,8 +294,19 @@ export function buildMoonshotModel(modelId: string): Model<'openai-completions'>
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: configuredPositiveInteger(curated?.contextWindow, moonshotContextWindow(modelId)),
     maxTokens: configuredPositiveInteger(curated?.maxTokens, moonshotMaxOutputTokens(modelId)),
+    ...(nativeModel?.headers ? { headers: { ...nativeModel.headers } } : {}),
     ...(protocol?.compat ? { compat: { ...protocol.compat } } : {}),
   };
+}
+
+/** Build the request-time model with pi-ai's native Moonshot protocol data. */
+export async function buildRuntimeMoonshotModel(modelId: string): Promise<Model<'openai-completions'>> {
+  const catalog = await piBuiltinCatalog();
+  const nativeModel = (catalog.getBuiltinModel as (
+    providerId: string,
+    requestedModelId: string,
+  ) => Model<'openai-completions'> | undefined)('moonshotai-cn', modelId);
+  return buildMoonshotModel(modelId, nativeModel);
 }
 
 export interface CreateMoonshotProviderConfig {
@@ -264,12 +326,15 @@ export interface CreateMoonshotProviderConfig {
 export async function createMoonshotProvider(config: CreateMoonshotProviderConfig): Promise<LLMProvider> {
   if (!config.apiKey) throw new Error('moonshot: apiKey required');
   if (!config.modelId) throw new Error('moonshot: modelId required');
-  const mod = await ca();
-  const model = buildMoonshotModel(config.modelId);
+  const [mod, model] = await Promise.all([
+    ca(),
+    buildRuntimeMoonshotModel(config.modelId),
+  ]);
   return mod.createPiProvider({
     provider: 'moonshot',
     apiKey: config.apiKey,
     customModel: model,
+    onPayload: repairOpenAICompatiblePayload,
   });
 }
 
@@ -372,29 +437,9 @@ export async function createDeepSeekProvider(config: CreateDeepSeekProviderConfi
     // Fix: `onPayload` decides reasoning_effort dynamically — inspect
     // every prior assistant turn for reasoning_content
     // ("reasoning consistent"):
-    //   - all have  → keep reasoning_effort  (covers A in reverse)
-    //   - not all   → drop reasoning_effort  (covers B)
-    onPayload: (params) => {
-      try {
-        const p = params as { reasoning_effort?: string; messages?: Array<{ role?: string; reasoning_content?: unknown; reasoning?: unknown }> };
-        const priorAssistants = (p.messages || []).filter((m) => m && m.role === 'assistant');
-        if (priorAssistants.length === 0) {
-          // No prior turns — nothing to be inconsistent with. Default
-          // direction: keep reasoning_effort if model.reasoning=true so a
-          // fresh thinking-mode session works.
-          return params;
-        }
-        const allHaveReasoning = priorAssistants.every(
-          (m) => (typeof m.reasoning_content === 'string' && m.reasoning_content.length > 0)
-            || (typeof m.reasoning === 'string' && (m.reasoning as string).length > 0),
-        );
-        if (!allHaveReasoning && p.reasoning_effort !== undefined) {
-          delete p.reasoning_effort;
-        }
-      } catch { /* never let onPayload throw — pi-ai treats throw as fatal */ }
-      return params;
-    },
-    ...(model.reasoning ? { defaultReasoning: 'low' as const } : {}),
+    //   - all have  → keep an explicitly requested reasoning_effort
+    //   - not all   → drop only that explicit effort
+    onPayload: repairDeepSeekPayload,
   });
 }
 
@@ -468,6 +513,7 @@ export async function createDoubaoProvider(config: CreateDoubaoProviderConfig): 
     provider: 'doubao',
     apiKey: config.apiKey,
     customModel: model,
+    onPayload: repairOpenAICompatiblePayload,
   });
 }
 

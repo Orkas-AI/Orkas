@@ -37,9 +37,10 @@ import {
 import { validateCustomTransport, validateDisplayName, CustomTransportError } from '../../features/connectors/custom-transport';
 import { requestInstallConfirm } from '../../features/connectors/install_confirm';
 import { findCatalogEntry } from '../../features/connectors/catalog';
-import { getLanguageForUser } from '../../features/config';
+import { resolveLanguageForUser } from '../../features/config';
 import { descriptionLang } from '../../i18n';
 import { createLogger } from '../../logger';
+import { logErrorRef, maskId } from '../../util/log-redact';
 import type { ConnectorInstance, ToolSchema } from '../../features/connectors/types';
 
 const log = createLogger('connector-meta-tools');
@@ -85,7 +86,7 @@ function errResult(code: string, msg: string): ToolResult {
 
 function _descriptionLangForUser(uid: string): 'zh' | 'en' {
   try {
-    return descriptionLang(getLanguageForUser(uid));
+    return descriptionLang(resolveLanguageForUser(uid));
   } catch {
     return 'en';
   }
@@ -115,6 +116,58 @@ function _renderConnectorLine(instance: ConnectorInstance, lang: 'zh' | 'en'): s
     : `- **${instance.id}** — ${instance.display_name}${acct}${warn}`;
 }
 
+const MAX_INLINE_CONNECTOR_TOOLS_CHARS = 30_000;
+function _jsonStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value ?? {}, null, 2);
+  } catch {
+    return '{}';
+  }
+}
+
+function _schemaArgSummary(schema: Record<string, unknown> | undefined): string {
+  const props = schema?.properties && typeof schema.properties === 'object' && !Array.isArray(schema.properties)
+    ? schema.properties as Record<string, unknown>
+    : {};
+  const required = Array.isArray(schema?.required) ? new Set(schema.required.map(String)) : new Set<string>();
+  const keys = Object.keys(props).slice(0, 12).map((key) => required.has(key) ? key : `${key}?`);
+  const suffix = Object.keys(props).length > keys.length ? ', ...' : '';
+  return keys.length ? ` args: ${keys.join(', ')}${suffix}` : ' args: {}';
+}
+
+function _shortDescription(text: string | undefined): string {
+  const compact = String(text || '(no description)').replace(/\s+/g, ' ').trim();
+  return compact.length > 220 ? `${compact.slice(0, 217)}...` : compact;
+}
+
+function _renderSingleToolSchema(cid: string, tool: ToolSchema): string {
+  return [
+    `Action on connector "${cid}": ${tool.name}`,
+    tool.description || '(no description)',
+    '',
+    'Invoke via:',
+    `\`call_connector_tool({connector_id: "${cid}", tool_name: "${tool.name}", args: {…}})\``,
+    '',
+    'Input schema:',
+    '```json',
+    _jsonStringify(tool.input_schema ?? {}),
+    '```',
+  ].join('\n').trimEnd();
+}
+
+function _renderCompactToolList(cid: string, tools: ToolSchema[]): string {
+  const lines: string[] = [
+    `Actions on connector "${cid}" (${tools.length}).`,
+    `Call \`list_connector_tools({connector_id: "${cid}", tool_name: "<name>"})\` to expand one action's JSON input schema, then invoke it via ` +
+      `\`call_connector_tool({connector_id: "${cid}", tool_name: "<name>", args: {…}})\`.`,
+    '',
+  ];
+  for (const t of tools) {
+    lines.push(`- **${t.name}** — ${_shortDescription(t.description)} (${_schemaArgSummary(t.input_schema)})`);
+  }
+  return lines.join('\n').trimEnd();
+}
+
 const MAX_RECOVERY_ACTIONS = 24;
 const MAX_RECOVERY_ACTION_LIST_CHARS = 3_000;
 
@@ -138,7 +191,11 @@ function _unavailableActionMessage(cid: string, requestedTool: string, tools: To
     ...names.map((name) => `- ${name}`),
   ];
   if (omitted) lines.push(`- ... ${omitted} more actions omitted`);
-  lines.push('Choose an exact action name, then inspect its input schema before invoking it.');
+  lines.push(
+    'Choose an exact action name. Call ' +
+      `list_connector_tools({connector_id: "${cid}", tool_name: "<exact-name>"}) ` +
+      'to obtain its input schema before invoking it.',
+  );
   return lines.join('\n');
 }
 
@@ -171,17 +228,17 @@ function createListConnectorToolsTool(opts: ConnectorMetaToolsOpts): AgentTool {
     // discovery is read-only, aligning with the documented rule avoids a future
     // side-effectful connector tool inheriting `parallel` by copy-paste.
     description:
-      'Discover the actions available on a specific connector (the system prompt\'s `## Connectors` ' +
-      'block lists which connector ids exist for this conversation). Returns each action\'s name, ' +
-      'description, and JSON input schema — use the schema verbatim to construct the `args` for ' +
-      '`call_connector_tool`. Errors when the connector id is not visible to this actor or is ' +
-      'currently disconnected.',
+      'List visible connector ids when connector_id is omitted. With a connector_id, list its actions; add tool_name to return one action\'s full input schema before calling call_connector_tool.',
     inputSchema: {
       type: 'object',
       properties: {
         connector_id: {
           type: 'string',
           description: 'Optional visible connector id. Omit to discover valid ids.',
+        },
+        tool_name: {
+          type: 'string',
+          description: 'Optional action name. When provided, returns only that action with its full input schema.',
         },
       },
       additionalProperties: false,
@@ -190,9 +247,27 @@ function createListConnectorToolsTool(opts: ConnectorMetaToolsOpts): AgentTool {
       const cid = typeof (input as { connector_id?: unknown }).connector_id === 'string'
         ? ((input as { connector_id: string }).connector_id).trim()
         : '';
-      if (!cid) return errResult('E_BAD_INPUT', '`connector_id` is required (a non-empty string)');
-
+      const requestedTool = typeof (input as { tool_name?: unknown }).tool_name === 'string'
+        ? ((input as { tool_name: string }).tool_name).trim()
+        : '';
+      if (!cid && requestedTool) {
+        return errResult('E_BAD_INPUT', '`connector_id` is required when `tool_name` is provided');
+      }
       const visible = await resolveVisibleConnectors(opts.userId);
+      _recordVisibleConnectorDisplayNames(opts, visible);
+      if (!cid) {
+        const content = visible.length
+          ? [
+            'Visible connectors. Choose an exact id, then call `list_connector_tools` again with `connector_id`.',
+            '',
+            ...visible.map(({ instance }) => _renderConnectorLine(
+              instance,
+              _descriptionLangForUser(opts.userId),
+            )),
+          ].join('\n')
+          : 'No connectors are currently visible to this Agent. Ask the user to select or enable one.';
+        return { content };
+      }
       const match = visible.find((v) => v.instance.id === cid);
       if (!match) {
         // resolveVisibleConnectors already filters to `status.kind === 'connected'`, so a miss
@@ -209,11 +284,22 @@ function createListConnectorToolsTool(opts: ConnectorMetaToolsOpts): AgentTool {
           content: `Connector "${cid}" reports no actions. Ask the user to refresh it from the Connectors panel.`,
         };
       }
+      if (requestedTool) {
+        const tool = match.tools.find((t) => t.name === requestedTool);
+        if (!tool) {
+          return errResult(
+            'E_TOOL_NOT_AVAILABLE',
+            _unavailableActionMessage(cid, requestedTool, match.tools),
+          );
+        }
+        return { content: _renderSingleToolSchema(cid, tool) };
+      }
 
       const lines: string[] = [
         `Actions on connector "${cid}". Invoke any of them via ` +
         `\`call_connector_tool({connector_id: "${cid}", tool_name: "<name>", args: {…}})\` — ` +
-        '`args` MUST match the listed input_schema verbatim.',
+        '`args` MUST match the listed input_schema verbatim. If this response is compact, call ' +
+        `\`list_connector_tools({connector_id: "${cid}", tool_name: "<name>"})\` for one action's schema.`,
         '',
       ];
       for (const t of match.tools) {
@@ -222,15 +308,14 @@ function createListConnectorToolsTool(opts: ConnectorMetaToolsOpts): AgentTool {
         lines.push('');
         lines.push('Input schema:');
         lines.push('```json');
-        try {
-          lines.push(JSON.stringify(t.input_schema ?? {}, null, 2));
-        } catch {
-          lines.push('{}');
-        }
+        lines.push(_jsonStringify(t.input_schema ?? {}));
         lines.push('```');
         lines.push('');
       }
-      return { content: lines.join('\n').trimEnd() };
+      const full = lines.join('\n').trimEnd();
+      const compact = full.length > MAX_INLINE_CONNECTOR_TOOLS_CHARS;
+      const content = compact ? _renderCompactToolList(cid, match.tools) : full;
+      return { content };
     },
   };
 }
@@ -258,7 +343,7 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
       },
       required: ['connector_id', 'tool_name', 'args'],
     },
-    async execute(input) {
+    async execute(input, ctx) {
       const i = input as { connector_id?: unknown; tool_name?: unknown; args?: unknown };
       const cid = typeof i.connector_id === 'string' ? i.connector_id.trim() : '';
       const toolName = typeof i.tool_name === 'string' ? i.tool_name.trim() : '';
@@ -308,11 +393,14 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
       }
 
       try {
-        const raw = await manager.callTool(opts.userId, cid, toolName, args);
-        return { content: stringifyMcpResult(raw) };
+        const normalizedArgs = normalizeConnectorArgs(args, toolMatch.input_schema);
+        const raw = await manager.callTool(opts.userId, cid, toolName, normalizedArgs, { signal: ctx.signal });
+        const content = stringifyMcpResult(raw);
+        const protocolError = !!raw && typeof raw === 'object' && (raw as { isError?: unknown }).isError === true;
+        return protocolError ? { content, isError: true } : { content };
       } catch (err) {
         const msg = (err as Error).message;
-        log.warn(`call_connector_tool failed connector=${cid} tool=${toolName}: ${msg}`);
+        log.warn('call_connector_tool failed', { connector_id: maskId(cid), tool: toolName, error: logErrorRef(err) });
         return {
           content: `Error calling ${cid}/${toolName}: ${msg}`,
           isError: true,
@@ -320,6 +408,25 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
       }
     },
   };
+}
+
+function normalizeConnectorArgs(
+  args: Record<string, unknown>,
+  schema: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  const properties = schema?.properties && typeof schema.properties === 'object' && !Array.isArray(schema.properties)
+    ? schema.properties as Record<string, unknown>
+    : {};
+  const out: Record<string, unknown> = { ...args };
+  for (const key of Object.keys(properties)) {
+    if (!key.includes('_') || Object.prototype.hasOwnProperty.call(out, key)) continue;
+    const camel = key.replace(/_([a-z])/g, (_m: string, ch: string) => ch.toUpperCase());
+    if (Object.prototype.hasOwnProperty.call(out, camel)) {
+      out[key] = out[camel];
+      delete out[camel];
+    }
+  }
+  return out;
 }
 
 /** Task-session tool: install a user-described custom MCP server. The

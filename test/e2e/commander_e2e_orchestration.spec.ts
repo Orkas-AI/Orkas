@@ -25,7 +25,7 @@ test.describe('Commander orchestration', () => {
 
   test('hands a finished deliverable to a shipped agent without an empty Commander tail', async ({
     modelOrkas,
-  }) => {
+  }, testInfo) => {
     if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
     let page = modelOrkas.page;
     const delegatedTask = 'Write the final launch announcement with a concise title and two paragraphs.';
@@ -64,6 +64,14 @@ test.describe('Commander orchestration', () => {
       // narrated segment is the only Commander bubble. A process replay or
       // active-turn snapshot must not recreate the duplicate live placeholder.
       await expect(commanderBubbles).toHaveCount(1);
+      await expect(commanderBubbles.locator('.stream-process-body')).toContainText('ContentWriter');
+      await expect(commanderBubbles.locator('.stream-process-body')).not.toContainText(CONTENT_WRITER_ID);
+      const process = commanderBubbles.locator('.stream-process');
+      if (!(await process.evaluate((element) => (element as HTMLDetailsElement).open))) {
+        await process.locator('summary').click();
+      }
+      await expect(commanderBubbles.locator('.stream-process-body')).toBeVisible();
+      await commanderBubbles.screenshot({ path: testInfo.outputPath('delegation-agent-name.png') });
 
       const runningConversationId = await page.locator('#conversation-list .conv-item').first()
         .getAttribute('data-cid');
@@ -131,6 +139,8 @@ test.describe('Commander orchestration', () => {
     );
     await expect(restoredCommanderBubble).toHaveCount(1);
     await expect(restoredCommanderBubble).toContainText(commanderNarration);
+    await expect(restoredCommanderBubble.locator('.stream-process-body')).toContainText('ContentWriter');
+    await expect(restoredCommanderBubble.locator('.stream-process-body')).not.toContainText(CONTENT_WRITER_ID);
     expect(modelOrkas.modelRequests).toHaveLength(requestsBeforeRelaunch);
   });
 

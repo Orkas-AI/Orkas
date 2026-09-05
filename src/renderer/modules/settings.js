@@ -118,6 +118,9 @@ async function loadSettings() {
   _settingsBindClientConfigOnce();
   _settingsBindRecycleBinOnce();
   _settingsBindOrkasApiOnce();
+  _settingsBindMetacognitionOnce();
+  _settingsRenderTaskNotifications();
+  _settingsRenderLocalExec();
   _settingsSyncLanguageRadio();
   await Promise.all([
     _settingsSafeCall('settings providers refresh', _settingsRefreshProviders),
@@ -385,7 +388,22 @@ function _settingsRenderTaskNotifications() {
   }
 }
 
-function _settingsBindClientConfigOnce() {}
+function _settingsBindClientConfigOnce() {
+  if (_settingsState.clientConfigBound || typeof window.orkas?.onPushEvent !== 'function') return;
+  _settingsState.clientConfigBound = true;
+  window.orkas.onPushEvent('client-config:changed', (payload) => {
+    const keys = Array.isArray(payload?.keys) ? payload.keys : [];
+    if (!keys.includes('model_catalog') && !keys.includes('model.deepseek.enabled')) return;
+    _settingsState.modelsCache = {};
+    if (typeof refreshModelGuard === 'function') void refreshModelGuard().catch(() => {});
+    if (currentView !== 'settings') return;
+    void _settingsSafeCall('client config model refresh', async () => {
+      await Promise.all([_settingsRefreshProviders(), _settingsRefreshEntries()]);
+      await _settingsRenderPicker();
+      _settingsRenderEntries();
+    });
+  });
+}
 
 // ── Local recycle bin ──
 
@@ -644,8 +662,13 @@ function _settingsBindRecycleBinOnce() {
         _settingsRecycleExpandedIds.delete(id);
       } else {
         await window.orkas.recycleBin.restore(id);
-        if (typeof loadProjects === 'function') await loadProjects(true);
-        if (typeof loadConversations === 'function') await loadConversations();
+        // The restore has committed; refresh failures must not report that it failed.
+        await Promise.all([
+          _settingsSafeCall('restored Agents refresh', typeof loadAgents === 'function' ? () => loadAgents(true) : null),
+          _settingsSafeCall('restored Skills refresh', typeof loadSkills === 'function' ? () => loadSkills(true) : null),
+          _settingsSafeCall('restored projects refresh', typeof loadProjects === 'function' ? () => loadProjects(true) : null),
+          _settingsSafeCall('restored conversations refresh', typeof loadConversations === 'function' ? () => loadConversations() : null),
+        ]);
       }
     } catch (err) {
       _settingsLog.warn(`recycle bin ${deleting ? 'delete' : 'restore'} failed`, {
@@ -849,36 +872,7 @@ function _settingsRenderMetacognition() {
   if (status) {
     status.textContent = s.envForcedOff ? t('settings.metacognition.env_forced_off') : '';
   }
-  if (!cb.dataset.bound) {
-    cb.addEventListener('change', async () => {
-      if (cb.disabled) return;
-      const next = !!cb.checked;
-      try {
-        const res = await window.orkas.invoke('prefs.setMetacognition', { enabled: next });
-        if (res && res.ok) {
-          _settingsState.metacognition = { ..._settingsState.metacognition, enabled: !!res.enabled };
-        } else {
-          // Roll back the UI on write failure.
-          cb.checked = !next;
-          _settingsLog.warn('setMetacognition rejected', res);
-          _settingsTrackEvent('metacognition_toggle_result', { result: 'failure', enabled: !next });
-          _settingsTrackError('metacognition_toggle', {
-            error_type: 'operation',
-            error_message: 'metacognition_toggle_rejected',
-          });
-        }
-      } catch (err) {
-        cb.checked = !next;
-        _settingsLog.warn('setMetacognition failed', err);
-        _settingsTrackEvent('metacognition_toggle_result', { result: 'failure', enabled: !next });
-        _settingsTrackError('metacognition_toggle', {
-          error_type: 'operation',
-          error_message: 'metacognition_toggle_failed',
-        });
-      }
-    });
-    cb.dataset.bound = '1';
-  }
+  _settingsBindMetacognitionOnce();
 }
 
 // ── Data root row ──
@@ -904,7 +898,7 @@ function _settingsRenderDataRoot() {
       const startedAt = Date.now();
       let res;
       try {
-        await window.orkas.invoke('app.openDataRoot');
+        res = await window.orkas.invoke('app.openDataRoot');
       } catch (err) {
         _settingsLog.warn('open data root failed', {
           error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
@@ -967,10 +961,13 @@ function _settingsBindLanguageOnce() {
   _settingsLanguageSel.onChange(async (next) => {
     if (typeof isSupportedLang === 'function' && !isSupportedLang(next)) return;
     try {
-      await setLang(next);
-      _settingsLog.info('language changed', { lang: next });
-    } catch (err) {
-      _settingsLog.warn('setLang failed', { error: (err && err.message) || String(err) });
+      const applied = await setLang(next);
+      if (applied !== next) return; // superseded by a newer user choice
+      _settingsLog.info('language changed', { lang: applied });
+    } catch {
+      _settingsSyncLanguageRadio();
+      _settingsLog.warn('language change failed');
+      await uiAlert(t('settings.language.change_failed'));
     }
   });
 }
@@ -1010,6 +1007,7 @@ async function _settingsRefreshEntries() {
   _settingsState.entries = (res && res.ok && Array.isArray(res.entries)) ? res.entries : [];
   if (typeof trackModelConfigSnapshot === 'function') trackModelConfigSnapshot(_settingsState.entries);
   _settingsRenderOrkasApiCard();
+  _settingsEmitModelEntriesChanged();
 }
 
 function _settingsRenderOrkasApiCard() {
@@ -1665,7 +1663,9 @@ async function _settingsStartOAuthFlow(provider, modelId) {
   document.addEventListener('keydown', onKey, true);
 
   _settingsLog.info('oauth start', { provider: oauthProviderId });
-  const startRes = await window.orkas.invoke('auth.startOAuth', { provider: oauthProviderId });
+  let startRes;
+  try { startRes = await window.orkas.invoke('auth.startOAuth', { provider: oauthProviderId }); }
+  catch (_) { startRes = { ok: false, code: 'invoke_failed' }; }
   if (!startRes || !startRes.ok) {
     body.innerHTML = `<div class="oauth-flow-stage error">${escapeHtml((startRes && startRes.error) || t('settings.oauth.start_failed'))}</div>`;
     _settingsLog.warn('oauth start failed', { provider: oauthProviderId, error: startRes && startRes.error });
@@ -2062,6 +2062,7 @@ function _settingsRenderEntryRow(entry, priorityIdx) {
     ipcName: 'auth.reorderEntries',
     onSuccess: (res) => {
       _settingsState.entries = Array.isArray(res.entries) ? res.entries : _settingsState.entries;
+      _settingsEmitModelEntriesChanged();
       _settingsRenderEntries();
     },
   });
@@ -2158,7 +2159,9 @@ async function _settingsRemoveEntry(entry) {
     provider: entry.provider,
     model: entry.model,
   });
-  const res = await window.orkas.invoke('auth.removeEntry', { entryId: entry.entryId });
+  let res;
+  try { res = await window.orkas.invoke('auth.removeEntry', { entryId: entry.entryId }); }
+  catch (_) { res = { ok: false, code: 'invoke_failed' }; }
   if (!res || !res.ok) {
     _settingsLog.warn('remove entry failed', { entry_id: entry.entryId, error: res && res.error });
     _settingsTrackModelConfigResult(
@@ -2378,14 +2381,19 @@ const _IMAGE_PROVIDER_OPTIONS = [
   { id: 'doubao',  label: 'DouBao · Seedream', docs: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey' },
 ];
 
-function _imageProviderLabel(id) {
-  const hit = _IMAGE_PROVIDER_OPTIONS.find((p) => p.id === id);
-  return hit ? hit.label : id;
+function _imageProviderLabel(provider, model) {
+  if (provider === 'orkas-image') return 'Orkas · Image';
+  const hit = _settingsImageProviderOptions().find((option) => (
+    (option.provider || option.id) === provider
+    && (!model || !option.model || option.model === model)
+  ));
+  return hit ? hit.label : provider;
 }
 
 async function _settingsRefreshImageProfiles() {
   const res = await window.orkas.invoke('imageAuth.list');
   _settingsState.imageProfiles = (res && res.ok && Array.isArray(res.profiles)) ? res.profiles : [];
+  _settingsState.imageProviderOptions = res?.ok && res.providers?.length ? res.providers : _IMAGE_PROVIDER_OPTIONS;
   _settingsRenderOrkasApiCard();
 }
 
@@ -2404,7 +2412,7 @@ function _settingsRenderImagePicker() {
   }
   const prev = _settingsState.imageProviderSel.getValue();
   _settingsState.imageProviderSel.setOptions(
-    _IMAGE_PROVIDER_OPTIONS.map((p) => ({ value: p.id, label: p.label, hint: p.docs })),
+    _settingsImageProviderOptions().map((p) => ({ value: p.id, label: p.label, hint: p.docs })),
     { value: prev || '', placeholder: t('settings.image.pick_provider') },
   );
   const addBtn = document.getElementById('settings-image-add-btn');
@@ -2415,14 +2423,16 @@ function _settingsRenderImagePicker() {
 }
 
 async function _settingsClickAddImageKey() {
-  const provider = _settingsState.imageProviderSel?.getValue() || '';
+  const providerOpt = _imageProviderOption(_settingsSelectedImageOptionId());
+  const provider = providerOpt?.provider || providerOpt?.id || '';
+  const model = providerOpt?.model || '';
   const input = document.getElementById('settings-image-key-input');
   const apiKey = (input?.value || '').trim();
   if (!provider) { _settingsSetStatus('settings-image-status', 'error', t('settings.image.error_provider_needed')); return; }
   if (!apiKey)   { _settingsSetStatus('settings-image-status', 'error', t('settings.image.error_key_needed')); return; }
   _settingsSetStatus('settings-image-status', 'busy', t('settings.image.adding'));
   try {
-    const res = await window.orkas.invoke('imageAuth.add', { provider, apiKey, label: 'default' });
+    const res = await window.orkas.invoke('imageAuth.add', { provider, model, apiKey, label: 'default' });
     if (!res || !res.ok) {
       _settingsSetStatus('settings-image-status', 'error', (res && res.error) || t('settings.image.add_failed'));
       return;
@@ -2462,7 +2472,7 @@ function _settingsRenderImageEntries() {
     const isOrkasApi = p.provider === _ORKAS_API_PROVIDER_ID;
     const providerLabel = isOrkasApi
       ? _settingsOrkasServiceLabel('Image')
-      : _imageProviderLabel(p.provider);
+      : _imageProviderLabel(p.provider, p.model);
     primary.innerHTML = `
       <span class="entry-provider">${escapeHtml(providerLabel)}</span>
       <span class="entry-sep">·</span>
@@ -2511,7 +2521,6 @@ function _settingsRenderImageEntries() {
 
 const _VIDEO_AUTH_PROVIDER_OPTIONS = [
   { id: 'orkas-api', label: _settingsOrkasServiceLabel('Video'), docs: _ORKAS_API_KEYS_URL },
-  { id: 'doubao', label: 'DouBao · Seedance', docs: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey' },
 ];
 
 function _settingsVideoProviderOptions() {
@@ -2606,12 +2615,15 @@ function _settingsRenderVideoEntries() {
   }
   list.forEach((p, idx) => {
     const row = document.createElement('div');
-    row.className = 'entry-row' + (idx === 0 ? ' is-default' : '');
+    const available = p.available !== false;
+    const isDefault = available && list.find((profile) => profile.available !== false)?.id === p.id;
+    row.className = 'entry-row' + (isDefault ? ' is-default' : '');
     row.dataset.profileId = p.id;
 
     const rank = document.createElement('div');
     rank.className = 'entry-rank';
-    rank.textContent = idx === 0 ? t('settings.video.active_tag') : `#${idx + 1}`;
+    rank.textContent = !available ? t('new_chat.model_picker.unavailable')
+      : isDefault ? t('settings.video.active_tag') : `#${idx + 1}`;
     row.appendChild(rank);
 
     const main = document.createElement('div');
@@ -2629,6 +2641,12 @@ function _settingsRenderVideoEntries() {
       ${p.apiKeyMasked ? `<span class="account-mask">${escapeHtml(p.apiKeyMasked)}</span>` : ''}
     `;
     main.appendChild(primary);
+    if (!available) {
+      const reason = document.createElement('div');
+      reason.className = 'form-hint';
+      reason.textContent = t('settings.video.provider_unavailable');
+      main.appendChild(reason);
+    }
     row.appendChild(main);
 
     const actions = document.createElement('div');
@@ -2860,4 +2878,28 @@ function _settingsRenderTtsEntries() {
 
     container.appendChild(row);
   });
+}
+
+function _settingsEmitModelEntriesChanged() {
+  try {
+    window.dispatchEvent(new CustomEvent('orkas:model-entries-changed', {
+      detail: {},
+    }));
+  } catch (_) { /* renderer may be tearing down */ }
+}
+
+function _settingsImageProviderOptions() {
+  return Array.isArray(_settingsState.imageProviderOptions) && _settingsState.imageProviderOptions.length
+    ? _settingsState.imageProviderOptions
+    : _IMAGE_PROVIDER_OPTIONS;
+}
+
+function _imageProviderOption(id) {
+  return _settingsImageProviderOptions().find((p) => p.id === id) || null;
+}
+
+function _settingsSelectedImageOptionId() {
+  return _settingsState.imageProviderSel?.getValue()
+    || document.getElementById('settings-image-provider')?.dataset?.value
+    || '';
 }

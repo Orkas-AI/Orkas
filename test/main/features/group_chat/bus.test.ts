@@ -1613,11 +1613,12 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(fs.existsSync(shotlistPath)).toBe(true);
   });
 
-  it('hides process-dispatch files while keeping their paths in the commander handback', async () => {
+  it.each(['shotlist.json', 'metadata.json', 'working/shotlist.json'])(
+    'hides process-dispatch file %s while keeping its path in the commander handback', async (filename) => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const paths = await import('../../../../src/main/paths');
     const cid = 'cid-process-output-hidden';
-    const processPath = path.join(tmpDir, 'workspace', 'shotlist.json');
+    const processPath = path.join(tmpDir, 'workspace', filename);
     fs.mkdirSync(path.dirname(processPath), { recursive: true });
     fs.writeFileSync(processPath, '{}');
 

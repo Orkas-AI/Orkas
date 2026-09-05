@@ -7,11 +7,12 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
 import { prepareFeedbackUploadImage } from '../util/image-transform';
-import { fetchWithTimeout, throwIfAborted } from '../util/abort';
+import { composeAbortSignal, throwIfAborted } from '../util/abort';
 import { logPathRef } from '../util/log-redact';
 import { createLogger } from '../logger';
 import { killProcessTree } from '../../core-agent/src/sandbox/executor';
 import { getDeviceId } from './machine_device_id';
+import { downloadBinaryWithProxyPolicy } from '../util/proxy-dispatcher';
 
 const log = createLogger('generation-reference-assets');
 
@@ -19,7 +20,7 @@ const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const IMAGE_MAX_BYTES = 12 * 1024 * 1024;
 const MAX_REFERENCE_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 const VIDEO_COMPRESS_TRIGGER_BYTES = 8 * 1024 * 1024;
-const REFERENCE_UPLOAD_TIMEOUT_MS = 5 * 60 * 1000;
+const REFERENCE_TRANSFER_TIMEOUT_MS = 10 * 60 * 1000;
 const VIDEO_COMPRESS_TIMEOUT_MS = 10 * 60 * 1000;
 const PROGRESS_HEARTBEAT_MS = 15 * 1000;
 
@@ -145,15 +146,26 @@ export async function loadImageReferenceBuffersWithProgress(
       index,
       total,
     });
-    const resp = await fetchWithTimeout(
-      url,
-      { method: 'GET' },
-      REFERENCE_UPLOAD_TIMEOUT_MS,
-      opts.signal,
-      `reference image download timed out after ${Math.round(REFERENCE_UPLOAD_TIMEOUT_MS / 1000)}s`,
-    );
-    if (!resp.ok) throw new Error(`reference image download failed ${resp.status}: ${url}`);
-    const buf = Buffer.from(await resp.arrayBuffer());
+    const timeoutMessage = `reference image download timed out after ${Math.round(REFERENCE_TRANSFER_TIMEOUT_MS / 1000)}s`;
+    const composed = composeAbortSignal(opts.signal, REFERENCE_TRANSFER_TIMEOUT_MS, timeoutMessage);
+    let buf: Buffer;
+    try {
+      const downloaded = await downloadBinaryWithProxyPolicy(url, {
+        label: 'reference image download',
+        signal: composed.signal,
+        maxBytes: MAX_REFERENCE_DOWNLOAD_BYTES,
+        validate: (body) => {
+          if (!body.length) throw new Error('reference image download returned an empty body');
+        },
+      });
+      buf = downloaded.body;
+    } catch (err) {
+      if (opts.signal?.aborted) throw new Error('operation aborted');
+      if (composed.signal.aborted) throw new Error(timeoutMessage);
+      throw err;
+    } finally {
+      composed.cleanup();
+    }
     throwIfAborted(opts.signal);
     out.push(buf);
   }

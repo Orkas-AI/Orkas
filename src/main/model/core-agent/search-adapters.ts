@@ -14,6 +14,7 @@
 
 import type { SearchProfile } from '../../features/auth';
 import { createLogger } from '../../logger';
+import { fetchAndReadWithTimeout } from '../../util/abort';
 import {
   ORKAS_API_BASE_URL,
   ORKAS_API_KEYS_URL,
@@ -43,16 +44,26 @@ export class SearchAccountError extends Error {
   }
 }
 
-const REQUEST_TIMEOUT_MS = 15_000;
+const REQUEST_TIMEOUT_MS = 30_000;
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...init, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
+async function fetchTextWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number = REQUEST_TIMEOUT_MS,
+): Promise<{ response: Response; text: string }> {
+  const { response, body } = await fetchAndReadWithTimeout(
+    url,
+    init,
+    timeoutMs,
+    null,
+    `Search request timed out after ${timeoutMs}ms`,
+    (resp) => resp.text(),
+  );
+  return { response, text: body };
+}
+
+function parseJson<T>(text: string): T {
+  return (text ? JSON.parse(text) : {}) as T;
 }
 
 function clamp(n: number, min: number, max: number): number {
@@ -67,7 +78,7 @@ async function orkasApiSearch(
   count: number,
   context?: OrkasApiUsageContext,
 ): Promise<SearchAdapterResult> {
-  const resp = await fetchWithTimeout(`${ORKAS_API_BASE_URL}/search`, {
+  const { response: resp, text } = await fetchTextWithTimeout(`${ORKAS_API_BASE_URL}/search`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${profile.apiKey}`,
@@ -77,10 +88,9 @@ async function orkasApiSearch(
     body: JSON.stringify({ query, max_results: clamp(count, 1, 20) }),
   });
   if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
     throw new Error(`Orkas Search ${resp.status}: ${text.slice(0, 300)}`);
   }
-  const data = (await resp.json()) as {
+  const data = parseJson(text) as {
     results?: Array<{ title?: string; url?: string; snippet?: string }>;
   };
   return {
@@ -102,16 +112,15 @@ async function tavilySearch(profile: SearchProfile, query: string, count: number
     max_results: clamp(count, 1, 20),
     search_depth: 'basic',
   });
-  const resp = await fetchWithTimeout('https://api.tavily.com/search', {
+  const { response: resp, text } = await fetchTextWithTimeout('https://api.tavily.com/search', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body,
   });
   if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
     throw new Error(`Tavily ${resp.status}: ${text.slice(0, 300)}`);
   }
-  const data = (await resp.json()) as { results?: Array<{ title?: string; url?: string; content?: string }> };
+  const data = parseJson(text) as { results?: Array<{ title?: string; url?: string; content?: string }> };
   return {
     provider: 'tavily',
     results: (data.results || []).map((r) => ({
@@ -126,7 +135,7 @@ async function tavilySearch(profile: SearchProfile, query: string, count: number
 
 async function serperSearch(profile: SearchProfile, query: string, count: number): Promise<SearchAdapterResult> {
   const body = JSON.stringify({ q: query, num: clamp(count, 1, 20) });
-  const resp = await fetchWithTimeout('https://google.serper.dev/search', {
+  const { response: resp, text } = await fetchTextWithTimeout('https://google.serper.dev/search', {
     method: 'POST',
     headers: {
       'X-API-KEY': profile.apiKey,
@@ -135,10 +144,9 @@ async function serperSearch(profile: SearchProfile, query: string, count: number
     body,
   });
   if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
     throw new Error(`Serper ${resp.status}: ${text.slice(0, 300)}`);
   }
-  const data = (await resp.json()) as {
+  const data = parseJson(text) as {
     organic?: Array<{ title?: string; link?: string; snippet?: string }>;
   };
   return {
@@ -158,7 +166,7 @@ async function braveApiSearch(profile: SearchProfile, query: string, count: numb
     q: query,
     count: String(clamp(count, 1, 20)),
   }).toString()}`;
-  const resp = await fetchWithTimeout(url, {
+  const { response: resp, text } = await fetchTextWithTimeout(url, {
     method: 'GET',
     headers: {
       Accept: 'application/json',
@@ -166,10 +174,9 @@ async function braveApiSearch(profile: SearchProfile, query: string, count: numb
     },
   });
   if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
     throw new Error(`Brave Search ${resp.status}: ${text.slice(0, 300)}`);
   }
-  const data = (await resp.json()) as {
+  const data = parseJson(text) as {
     web?: { results?: Array<{ title?: string; url?: string; description?: string }> };
   };
   return {
@@ -200,7 +207,7 @@ async function baiduAiSearch(profile: SearchProfile, query: string, count: numbe
     messages: [{ role: 'user', content: query }],
     resource_type_filter: [{ type: 'web', top_k: clamp(count, 1, 20) }],
   });
-  const resp = await fetchWithTimeout('https://qianfan.baidubce.com/v2/ai_search', {
+  const { response: resp, text } = await fetchTextWithTimeout('https://qianfan.baidubce.com/v2/ai_search', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -209,10 +216,9 @@ async function baiduAiSearch(profile: SearchProfile, query: string, count: numbe
     body,
   });
   if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
     throw new Error(`Baidu AI Search ${resp.status}: ${text.slice(0, 300)}`);
   }
-  const data = (await resp.json()) as {
+  const data = parseJson(text) as {
     references?: Array<{ title?: string; url?: string; web_anchor?: string; snippet?: string; content?: string }>;
   };
   return {
@@ -252,7 +258,7 @@ async function metasoSearch(profile: SearchProfile, query: string, count: number
     size: clamp(count, 1, 20),
     includeSummary: false,
   });
-  const resp = await fetchWithTimeout('https://api.metaso.cn/search', {
+  const { response: resp, text } = await fetchTextWithTimeout('https://api.metaso.cn/search', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -261,10 +267,9 @@ async function metasoSearch(profile: SearchProfile, query: string, count: number
     body,
   });
   if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
     throw new Error(`Metaso ${resp.status}: ${text.slice(0, 300)}`);
   }
-  const data = (await resp.json()) as Record<string, unknown>;
+  const data = parseJson(text) as Record<string, unknown>;
   const list: any[] = Array.isArray((data as any).references) ? (data as any).references
                     : Array.isArray((data as any).results)    ? (data as any).results
                     : Array.isArray((data as any).data)       ? (data as any).data

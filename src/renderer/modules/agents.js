@@ -1772,6 +1772,7 @@ function _renderAgentDetailKnowhow(agent, editing = false) {
 function _renderAgentDetail(agent, editing, { refreshCliOptions = false } = {}) {
   agent = { ...agent, source: _agentSource(agent.source) };
   const isCommander = _isCommanderAgent(agent);
+  const canEditDefinition = _canEditAgentDefinition(agent);
   document.getElementById('agents-detail-content').style.display = '';
 
   const nameEl = document.getElementById('agents-detail-name');
@@ -1817,7 +1818,7 @@ function _renderAgentDetail(agent, editing, { refreshCliOptions = false } = {}) 
   const unsetHtml = `<span class="agents-detail-placeholder">${escapeHtml(t('agents.placeholder_unset'))}</span>`;
   // Workflow renders markdown in readonly mode; raw text in edit mode so user
   // can edit source directly.
-  if (editing && !isCommander) {
+  if (editing && !isCommander && canEditDefinition) {
     workflowEl.textContent = agent.workflow || '';
   } else {
     const workflowMarkdown = structuredWorkflow.length
@@ -1837,7 +1838,6 @@ function _renderAgentDetail(agent, editing, { refreshCliOptions = false } = {}) 
   const delBtn = document.getElementById('agent-delete-btn');
   const isMock = _isAgentProfileMock(agent);
   const isCustom = agent.source === 'custom' && !isMock;
-  const canEditDefinition = !isMock && isCustom;
   const canEdit = isCommander || canEditDefinition || _canEditAgentMemory(agent);
   if (useBtn) {
     useBtn.style.display = editing ? 'none' : '';
@@ -1876,7 +1876,7 @@ function _renderAgentDetail(agent, editing, { refreshCliOptions = false } = {}) 
 
   _renderAgentOutputFormatSection(agent, editing);
 
-  _toggleAgentFieldEditable(editing && !isCommander);
+  _toggleAgentFieldEditable(editing && !isCommander && canEditDefinition);
 }
 
 /** Render the output-format preference dropdown (auto / text /
@@ -2861,7 +2861,6 @@ async function _flushAgentFieldSave({ validate = false } = {}) {
       const localised = _agentCreateErrorMessage(data);
       throw new Error(localised || data.error || 'save failed');
     }
-    trackResult('success');
     if (field === 'name') {
       const nextName = data.agent?.name || String(value || '').trim();
       _selectedAgent = { ..._selectedAgent, name: nextName };
@@ -3594,7 +3593,7 @@ function _ensureAgentChatController() {
     historyEndpoint: (id) => `/api/agents/${encodeURIComponent(id)}/chat`,
     streamEndpoint: (id) => `/api/agents/${encodeURIComponent(id)}/chat/send/stream`,
     clearEndpoint: (id) => `/api/agents/${encodeURIComponent(id)}/chat`,
-    features: { archive: false, scrollPin: true, queue: true },
+    features: { archive: false, scrollPin: true, queue: true, messageActions: 'errors-only' },
     queue: {
       keyPrefix: 'agent',
       panelId: 'agents-chat-queue',

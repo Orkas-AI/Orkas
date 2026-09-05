@@ -53,6 +53,7 @@ type OrkasOptions = {
   updateStub?: boolean;
   voiceStub?: boolean;
   metacognitionEnabled?: boolean;
+  enableSystemProxy?: boolean;
 };
 
 export type CliStubInvocation = {
@@ -788,6 +789,7 @@ export class OrkasTestApp {
   readonly updateStub: boolean;
   readonly voiceStub: boolean;
   readonly metacognitionEnabled: boolean;
+  readonly enableSystemProxy: boolean;
   readonly cliStatePath: string;
   readonly fakeOpenCodePath: string | null;
   readonly fakeHermesPath: string | null;
@@ -872,6 +874,7 @@ export class OrkasTestApp {
     this.updateStub = options.updateStub === true;
     this.voiceStub = options.voiceStub === true;
     this.metacognitionEnabled = options.metacognitionEnabled === true;
+    this.enableSystemProxy = options.enableSystemProxy === true;
     this.root = mkdtempSync(path.join(tmpdir(), 'orkas-e2e-'));
     this.workspaceRoot = path.join(this.root, 'workspace');
     this.userWorkspaceRoot = path.join(this.root, 'userWorkSpace');
@@ -955,7 +958,7 @@ export class OrkasTestApp {
       ORKAS_ACCOUNT_API_BASE: this.apiBaseUrl,
       ORKAS_E2E_MARKETPLACE_API_BASE: this.marketplaceStub ? this.apiBaseUrl : '',
       ORKAS_METACOGNITION: this.metacognitionEnabled ? '1' : '0',
-      ORKAS_NO_AUTO_PROXY: '1',
+      ORKAS_NO_AUTO_PROXY: this.enableSystemProxy ? '0' : '1',
       ORKAS_PROFILE: 'global',
       NO_PROXY: 'localhost,127.0.0.1,::1',
       no_proxy: 'localhost,127.0.0.1,::1',

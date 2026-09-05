@@ -706,7 +706,9 @@ test.describe('real chat pipeline with a local model', () => {
   });
 
   test('deletes a queued message from composer edit without ever sending it', async ({ modelOrkas }) => {
-    modelOrkas.setModelMode('slow');
+    // Establish the edit lock before the local response ends, including on a
+    // loaded runner. The ordinary 2.4s fixture can drain the row during click.
+    modelOrkas.setModelMode('very-slow');
     const page = await sendNewChat(modelOrkas, 'E2E active turn while deleting a queue edit.');
     await expect.poll(
       () => modelOrkas.modelRequests.length,
@@ -733,7 +735,7 @@ test.describe('real chat pipeline with a local model', () => {
 
     // Let the active slow turn settle while the edit lock is held. If the
     // regression returns, the queued text would already reach the model here.
-    await page.waitForTimeout(2_800);
+    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]')).toBeVisible({ timeout: 30_000 });
     expect(modelOrkas.modelRequests).toHaveLength(1);
 
     await page.locator('#chat-queue-edit-delete-btn').click();

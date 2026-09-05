@@ -134,3 +134,30 @@ describe('settings sidebar navigation', () => {
     expect(loadSettings).toHaveBeenCalledOnce();
   });
 });
+
+it('restores unread state after the real user initialization boundary', async () => {
+  const { context } = loadRendererNavigation();
+  context.apiFetch = vi.fn(async () => ({ json: async () => ({ ok: true, user_id: 'local-owner' }) }));
+  const owners: string[] = [];
+  context._restoreUnreadTaskState = () => { owners.push(vm.runInContext('currentUserId', context)); };
+  await context.initUser();
+  expect(owners).toEqual(['local-owner']);
+  expect(context.currentUserId).toBe('local-owner');
+});
+
+it('does not drain restored queues before conversation history resolves', () => {
+  const { context } = loadRendererNavigation();
+  const history = Promise.withResolvers<void>();
+  context.loadConversationHistory = vi.fn(() => history.promise);
+  context._restoreDraft = vi.fn();
+  context.renderMessageQueue = vi.fn();
+  context.isConvPending = () => false;
+  context._dispatchNextQueued = vi.fn();
+  context._updateConvSendUI = vi.fn();
+  context.focusChatComposerIfIdle = vi.fn();
+  vm.runInContext("messageQueues.set('queued-task', [{ id: 'q1', content: 'follow up' }]);", context);
+  context.setView('conversation', 'queued-task');
+  expect(context.loadConversationHistory).toHaveBeenCalledWith('queued-task', undefined);
+  expect(context._dispatchNextQueued).not.toHaveBeenCalled();
+  history.resolve();
+});

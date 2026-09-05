@@ -14,7 +14,7 @@ import {
 import { prepareReferenceUrls, registerGeneratedMediaUrl } from './generation_reference_assets';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
-import { composeAbortSignal, fetchWithTimeout, throwIfAborted } from '../util/abort';
+import { composeAbortSignal, fetchAndReadWithTimeout, throwIfAborted } from '../util/abort';
 import { downloadBinaryWithProxyPolicy } from '../util/proxy-dispatcher';
 import { logErrorSummary, logPathRef } from '../util/log-redact';
 import { sanitizeLogTextForUpload } from '../util/log-sanitize';
@@ -282,7 +282,7 @@ function normalizeVideoInput(input: GenerateVideoInput): NormalizedVideoInput {
 async function callOrkasApiVideo(req: OrkasVideoRequest): Promise<OrkasVideoResult> {
   throwIfAborted(req.signal);
   emitProgress(req.onProgress, 'create_task', 'Creating Orkas API video task');
-  const create = await fetchWithTimeout(
+  const { body: createdData } = await fetchAndReadWithTimeout(
     `${ORKAS_API_BASE_URL}/videos`,
     {
       method: 'POST',
@@ -307,8 +307,9 @@ async function callOrkasApiVideo(req: OrkasVideoRequest): Promise<OrkasVideoResu
     CREATE_TIMEOUT_MS,
     req.signal,
     'Orkas API video create request timed out',
+    (response) => readOrkasVideoResponse(response, 'create'),
   );
-  let data = await readOrkasVideoResponse(create, 'create');
+  let data = createdData;
   const taskId = String(data?.id || '').trim();
   if (!taskId) throw new Error('Orkas API video create returned no task id');
   emitProgress(req.onProgress, 'task_created', `Video task created: ${taskId}`, { taskId });
@@ -341,7 +342,7 @@ async function callOrkasApiVideo(req: OrkasVideoRequest): Promise<OrkasVideoResu
     emitProgress(req.onProgress, 'poll_wait', 'Waiting before checking video status', { taskId, attempt: attempts });
     await sleep(req.pollIntervalMs, req.signal);
     try {
-      const poll = await fetchWithTimeout(
+      const { body: statusData } = await fetchAndReadWithTimeout(
         `${ORKAS_API_BASE_URL}/videos/${encodeURIComponent(taskId)}`,
         {
           method: 'GET',
@@ -353,8 +354,9 @@ async function callOrkasApiVideo(req: OrkasVideoRequest): Promise<OrkasVideoResu
         POLL_TIMEOUT_MS,
         req.signal,
         'Orkas API video status request timed out',
+        (response) => readOrkasVideoResponse(response, 'status'),
       );
-      data = await readOrkasVideoResponse(poll, 'status');
+      data = statusData;
       consecutiveTimeouts = 0;
       emitProgress(req.onProgress, 'poll_result', `Video task status: ${data?.status || 'processing'}`, {
         taskId,

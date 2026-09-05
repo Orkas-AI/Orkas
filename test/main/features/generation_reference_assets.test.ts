@@ -239,3 +239,11 @@ describe('generation reference assets', () => {
     }
   });
 });
+
+describe('reference image transfer guards', () => {
+  it('rejects an empty successful response', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new Uint8Array(0))));
+    const { loadImageReferenceBuffersWithProgress } = await import('../../../src/main/features/generation_reference_assets');
+    await expect(loadImageReferenceBuffersWithProgress(['https://cdn.example/empty.png'], [], {})).rejects.toThrow(/empty body/);
+  });
+});

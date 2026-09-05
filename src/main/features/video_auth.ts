@@ -24,9 +24,6 @@ const VIDEO_AUTH_MODELS_BY_PROVIDER: Readonly<Record<string, Array<{ id: string;
   [ORKAS_API_PROVIDER]: [
     { id: ORKAS_API_VIDEO_MODEL, name: 'Video' },
   ],
-  doubao: [
-    { id: 'doubao-seedance-2-0-260128', name: 'Seedance 2.0' },
-  ],
 };
 
 let _idCounter = 0;
@@ -110,11 +107,6 @@ export function listVideoProviderOptions(): Array<{ id: string; label: string; d
       label: 'Orkas',
       docs: ORKAS_API_KEYS_URL,
     },
-    {
-      id: 'doubao',
-      label: 'DouBao · Seedance',
-      docs: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey',
-    },
   ];
 }
 
@@ -144,6 +136,7 @@ export function flattenVideoProviderOptions(
 ): VideoProviderPickerOption[] {
   return providers.flatMap((provider) => {
     const models = listVideoModelOptions(provider.id);
+    if (!models.length) return [];
     if (models.length <= 1) {
       return [{
         ...provider,

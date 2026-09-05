@@ -2048,7 +2048,6 @@ async function _flushSkillFieldSave({ validate = false } = {}) {
       if (!data || data.ok === false) {
         throw new Error(data?.error || 'save failed');
       }
-      trackResult('success');
       if (field === 'name') {
         const nextName = data.skill?.name || newName || currentId;
         _skillsCache = null;
@@ -2083,7 +2082,6 @@ async function _flushSkillFieldSave({ validate = false } = {}) {
     if (!data.ok) {
       throw new Error(data.error || 'save failed');
     }
-    trackResult('success');
     if (validate && field === 'name' && !skipRename) {
       // Directory was renamed — refresh caches + update _selectedSkill.id
       // so subsequent calls (selectSkillFile / chat dir lookup) hit the
@@ -2309,7 +2307,7 @@ function _ensureSkillChatController() {
     historyEndpoint: (id) => `/api/skills/${encodeURIComponent(id)}/chat`,
     streamEndpoint: (id) => `/api/skills/${encodeURIComponent(id)}/chat/send/stream`,
     clearEndpoint: (id) => `/api/skills/${encodeURIComponent(id)}/chat`,
-    features: { archive: false, scrollPin: true, queue: true },
+    features: { archive: false, scrollPin: true, queue: true, messageActions: 'errors-only' },
     queue: {
       keyPrefix: 'skill',
       panelId: 'skills-chat-queue',

@@ -619,6 +619,7 @@ export async function* mapCoreAgentEvents(
   let failureDetails: Pick<StreamEvent, 'failureKind' | 'failureCode' | 'failurePhase'> | null = null;
   const skillReadByToolId = new Map<string, SkillReadEventMetadata>();
   const agentReadByToolId = new Map<string, AgentReadEventMetadata>();
+  const delegationByToolId = new Map<string, { agent_id: string; agent_name: string }>();
   const connectorByToolId = new Map<string, ConnectorEventMetadata>();
   const earlyToolStarts = new Set<string>();
   const toolDeltaNames = new Map<string, string>();
@@ -859,6 +860,13 @@ export async function* mapCoreAgentEvents(
         toolDeltaNames.delete(ev.id);
         const skillMeta = skillReadMetadataForToolStart(ev.name, ev.input, opts);
         if (skillMeta) skillReadByToolId.set(ev.id, skillMeta);
+        // Persist UI identity separately from agent.json read metadata so
+        // replay does not depend on the currently selected conversation.
+        if ((ev.name === 'dispatch_to' || ev.name === 'hand_off_to') && ev.input && typeof ev.input === 'object') {
+          const id = String((ev.input as { to?: unknown }).to || '').trim();
+          const name = opts.agentDisplayNameById?.get(id);
+          if (id && name) delegationByToolId.set(ev.id, { agent_id: id, agent_name: name });
+        }
         const agentMeta = agentReadMetadataForToolStart(ev.name, ev.input, opts);
         if (agentMeta) agentReadByToolId.set(ev.id, agentMeta);
         const connectorMeta = connectorMetadataForToolStart(ev.name, ev.input);
@@ -880,6 +888,7 @@ export async function* mapCoreAgentEvents(
               ...(resourceScope ? { resource_scope: resourceScope } : {}),
               ...skillReadEventFields(skillMeta),
               ...agentReadEventFields(agentMeta),
+              ...delegationByToolId.get(ev.id),
               ...connectorEventFields(connectorMeta, opts.connectorDisplayNameById),
             },
           },
@@ -905,6 +914,7 @@ export async function* mapCoreAgentEvents(
               message: ev.message,
               ...(ev.phase ? { progress_phase: ev.phase } : {}),
               ...(ev.data ? { progress_data: ev.data } : {}),
+              ...delegationByToolId.get(ev.id),
             },
           },
         };
@@ -934,6 +944,8 @@ export async function* mapCoreAgentEvents(
         skillReadByToolId.delete(ev.id);
         const agentMeta = agentReadByToolId.get(ev.id) || null;
         agentReadByToolId.delete(ev.id);
+        const delegationMeta = delegationByToolId.get(ev.id);
+        delegationByToolId.delete(ev.id);
         const connectorMeta = connectorByToolId.get(ev.id) || null;
         connectorByToolId.delete(ev.id);
         // Two click-to-expand storage paths, decided here:
@@ -962,6 +974,7 @@ export async function* mapCoreAgentEvents(
           ...(ev.errorSeverity ? { errorSeverity: ev.errorSeverity } : {}),
           ...skillReadEventFields(skillMeta),
           ...agentReadEventFields(agentMeta),
+          ...delegationMeta,
           ...connectorEventFields(connectorMeta, opts.connectorDisplayNameById),
         };
         if (spill) {

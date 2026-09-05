@@ -598,6 +598,24 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     expect(endEvent.event.data.agent_file).toBe('agent.json');
   });
 
+  it.each(['dispatch_to', 'hand_off_to'])(
+    '%s persists the delegated Agent identity after an early tool announcement', async (name) => {
+      const agentId = 'd76b91de8c7b';
+      const out = await collect([
+        { type: 'tool_delta', id: 'delegate-1', name, inputDelta: '' } as AgentRunEvent,
+        { type: 'tool_start', id: 'delegate-1', name, input: { to: agentId, message: 'Build a game' } },
+        { type: 'tool_progress', id: 'delegate-1', name, message: 'Agent running' },
+        { type: 'tool_end', id: 'delegate-1', name, result: 'done' },
+      ], { agentDisplayNameById: new Map([[agentId, 'ProductDemoBuilder']]) });
+      const events = out.filter((event) => event.type === 'event').map((event) => event.event.data);
+      expect(events.map((event) => event.phase)).toEqual(['start', 'progress', 'progress', 'end']);
+      for (const event of events.slice(1)) {
+        expect(event).toMatchObject({ agent_id: agentId, agent_name: 'ProductDemoBuilder' });
+        expect(event).not.toHaveProperty('agent_file');
+      }
+    },
+  );
+
   it.each([
     ['list_connector_tools', { connector_id: 'connector-instance-91f0' }],
     ['call_connector_tool', {

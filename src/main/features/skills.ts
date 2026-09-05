@@ -3465,17 +3465,13 @@ export async function* streamSendToSkillChat(
     for await (let event of streamChatWithModel({
       userId, message: attachmentCtx.message, sessionId, systemPrompt,
       agentName: 'orkas_chat',
+      skillList: [],
+      systemSkillList: ['skill-creator', 'package-installer'],
       cacheRetention: 'short',
       readOnlyExtraRoots: [
-      ...(skill.dir ? [skill.dir] : []),
-      userMarketplaceSkillsDir(getActiveUserId()),
-      userSkillsDir(userId),
-      // System skills root so a URL-import chat can read `package-installer`
-      // before driving `orkas-pkg`; ordinary SkillRegistry no longer loads
-      // repo-shipped builtin skills.
-      userSystemSkillsDir(userId),
-      ...(attachmentCtx.attachmentNames.length ? [chatAttachmentDirForConversation(userId, attachmentCtx.attachmentCid)] : []),
-    ],
+        ...(skill.dir ? [skill.dir] : []),
+        ...(attachmentCtx.attachmentNames.length ? [chatAttachmentDirForConversation(userId, attachmentCtx.attachmentCid)] : []),
+      ],
       attachmentMetadata: attachmentCtx.attachmentMetadata,
       ...(attachmentCtx.images.length ? { images: attachmentCtx.images } : {}),
       ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),

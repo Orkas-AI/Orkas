@@ -453,7 +453,10 @@ describe('tool-catalog', () => {
     expect(
       fingerprint,
       'A model-visible field, enum, bound, default, or required rule changed; review it as a schema change, not description cleanup.',
-    ).toBe('03aebb7d2ce9f2b428830abcdc07d5898f409d455d540b1ed5b6d3e6cac0026b');
+    // Reviewed 168 parity additions: image URL/role/negative-prompt inputs and
+    // ImageStudio/VideoStudio production transaction identifiers. Existing
+    // required inputs and tool visibility remain unchanged.
+    ).toBe('68660ba57a038f6c2ad728e822af5ae70abe13d2b1410a9e8a5d2443b84ed05e');
   });
 
   it('keeps the reviewed stable tool corpus within the description budgets', () => {

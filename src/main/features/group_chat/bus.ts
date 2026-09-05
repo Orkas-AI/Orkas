@@ -5844,7 +5844,8 @@ async function runActorTurn(
   return {
     kind: 'completed',
     text: workingText,
-    produced,
+    // Handback needs all real outputs; footer filtering is presentation only.
+    produced: turnFinalCandidates,
     outcome,
     persistedMsg,
     errText: errText || undefined,

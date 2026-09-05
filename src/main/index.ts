@@ -163,8 +163,12 @@ installSdkTimeoutPatch();
 import { installSseHeaderTimeoutPatch } from './model/core-agent/sse-header-timeout-patch';
 installSseHeaderTimeoutPatch();
 
-// Provider-fetch diagnostics: dump the real undici cause chain for model
-// endpoint failures.
+// Install the stable router before diagnostics wrap fetch. Explicit launch
+// proxy settings apply now; Electron system routes become available at ready.
+import { installEnvProxyDispatcher, installSystemProxyDispatcher } from './util/proxy-dispatcher';
+void installEnvProxyDispatcher();
+
+// Provider-fetch diagnostics preserve the router installed above.
 import { installFetchDiag } from './model/core-agent/fetch-diag';
 installFetchDiag();
 
@@ -569,7 +573,20 @@ async function runBootSelfCheck(): Promise<void> {
 
 }
 
+async function sweepOfficeResidents(reason: 'startup' | 'quit'): Promise<void> {
+  // Test profiles may coexist with a real application using the same bundled
+  // binary. Only the regular single-instance application owns its residents.
+  if (E2E_USER_DATA_DIR || IS_PACKAGED_LAUNCH_SMOKE) return;
+  try {
+    const office = await import('./features/office/office_engine');
+    office.closeAllOfficeResidents();
+  } catch (err) {
+    createLogger('office-engine').warn(`resident sweep on ${reason} failed`, { error: (err as Error).message });
+  }
+}
+
 async function runBootMaintenanceSweeps(): Promise<void> {
+  await sweepOfficeResidents('startup');
   // Full cross-user/unindexed recovery stays out of the pre-window self-check.
   try {
     const { swept } = await chatsFeature.sweepStaleProcessing();
@@ -1223,6 +1240,7 @@ if (!gotLock) {
   registerConnectorProtocol();
   app.whenReady().then(async () => {
     await runBootSelfCheck();
+    await installSystemProxyDispatcher();
     // Publish packaged, local-only content before the first window so the
     // first task can see every shipped System Skill and Marketplace resource.
     // The open build has no account bootstrap that can provide this boundary,
@@ -1436,22 +1454,28 @@ if (!gotLock) {
     if (process.platform !== 'darwin') app.quit();
   });
 
-  // Flush pending search-index writes + close KB vector DBs before exit.
+  // Repeated quit events share one flush, including the Open lifecycle request.
   let shutdownFlushed = false;
+  let shutdownFlushPromise: Promise<void> | null = null;
   app.on('before-quit', async (e) => {
     if (shutdownFlushed) return;
     e.preventDefault();
-    // Begin the network request before slower disk cleanup and do not release
-    // the Electron process until Server has acknowledged the lifecycle request.
-    const lifecycleFlush = openLifecycleTracking?.flushQuit();
-    try { await searchFeature.flushAll(); }
-    catch (err) { createLogger('search').warn('final flush failed', { error: (err as Error).message }); }
-    try {
-      const kb = await import('./features/kb_vector');
-      kb.closeAllKb();
-    } catch (err) { createLogger('kb_vector').warn('close failed', { error: (err as Error).message }); }
-    await lifecycleFlush;
-    shutdownFlushed = true;
-    app.quit();
+    if (shutdownFlushPromise) return;
+    shutdownFlushPromise = (async () => {
+      const lifecycleFlush = openLifecycleTracking?.flushQuit();
+      try { await searchFeature.flushAll(); }
+      catch (err) { createLogger('search').warn('final flush failed', { error: (err as Error).message }); }
+      try {
+        const kb = await import('./features/kb_vector');
+        kb.closeAllKb();
+      } catch (err) { createLogger('kb_vector').warn('close failed', { error: (err as Error).message }); }
+      await sweepOfficeResidents('quit');
+      await lifecycleFlush;
+    })();
+    try { await shutdownFlushPromise; }
+    finally {
+      shutdownFlushed = true;
+      app.quit();
+    }
   });
 }

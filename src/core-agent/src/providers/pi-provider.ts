@@ -168,6 +168,7 @@ function buildPiContext(
           toolCallId: tr.toolUseId,
           toolName,
           content: [{ type: "text", text: tr.content }],
+          ...(tr.addedToolNames?.length ? { addedToolNames: tr.addedToolNames } : {}),
           isError: tr.isError ?? false,
           timestamp: Date.now(),
         });
@@ -381,22 +382,51 @@ type MapContentOptions = {
 type LeadingThinkTextFilter = {
   push(text: string): string;
   finish(): string;
+  takeThinkingActivity(): {
+    started: boolean;
+    chars: number;
+    text: string;
+    ended: boolean;
+  };
 };
 
 const LEADING_THINK_OPEN = "<think>";
 const LEADING_THINK_CLOSE = "</think>";
 
 /**
- * Some user-configured OpenAI-compatible endpoints serialize private
- * reasoning as a literal leading `<think>...</think>` text block instead of
- * the protocol's structured reasoning field. Hold only the ambiguous prefix
- * while streaming, suppress each block in a consecutive leading sequence,
- * and pass every non-leading lookalike through unchanged.
+ * Some provider endpoints serialize private reasoning as a literal leading
+ * `<think>...</think>` text block instead of the protocol's structured
+ * reasoning field. Hold only the ambiguous prefix while streaming, suppress
+ * each block in a consecutive leading sequence, and pass every non-leading
+ * lookalike through unchanged.
  */
 function createLeadingThinkTextFilter(): LeadingThinkTextFilter {
   let state: "detect" | "suppress" | "pass" = "detect";
   let pending = "";
   let suppressedLeadingBlock = false;
+  let thinkingActive = false;
+  let activityStarted = false;
+  let activityChars = 0;
+  let activityText = "";
+  let activityEnded = false;
+
+  const beginThinking = () => {
+    if (thinkingActive) return;
+    thinkingActive = true;
+    activityStarted = true;
+  };
+
+  const recordThinking = (text: string) => {
+    if (!text) return;
+    activityChars += text.length;
+    activityText += text;
+  };
+
+  const endThinking = () => {
+    if (!thinkingActive) return;
+    thinkingActive = false;
+    activityEnded = true;
+  };
 
   return {
     push(text: string): string {
@@ -415,18 +445,33 @@ function createLeadingThinkTextFilter(): LeadingThinkTextFilter {
             return visible;
           }
           state = "suppress";
+          beginThinking();
           pending = candidate.slice(LEADING_THINK_OPEN.length);
         }
 
         if (state === "suppress") {
           const closeIndex = pending.indexOf(LEADING_THINK_CLOSE);
           if (closeIndex < 0) {
-            pending = pending.slice(-(LEADING_THINK_CLOSE.length - 1));
+            // Retain only the suffix that could still become a split closing
+            // tag. Everything before it is confirmed private reasoning and can
+            // be recorded as reasoning without forwarding it as answer text.
+            let suffixLength = 0;
+            const maxSuffix = Math.min(pending.length, LEADING_THINK_CLOSE.length - 1);
+            for (let length = maxSuffix; length > 0; length -= 1) {
+              if (LEADING_THINK_CLOSE.startsWith(pending.slice(-length))) {
+                suffixLength = length;
+                break;
+              }
+            }
+            recordThinking(pending.slice(0, pending.length - suffixLength));
+            pending = suffixLength > 0 ? pending.slice(-suffixLength) : "";
             return "";
           }
+          recordThinking(pending.slice(0, closeIndex));
           pending = pending.slice(closeIndex + LEADING_THINK_CLOSE.length);
           suppressedLeadingBlock = true;
           state = "detect";
+          endThinking();
         }
       }
     },
@@ -435,9 +480,27 @@ function createLeadingThinkTextFilter(): LeadingThinkTextFilter {
       const visible = state === "detect"
         ? (suppressedLeadingBlock ? pending.replace(/^\s+/, "") : pending)
         : "";
+      if (state === "suppress") {
+        recordThinking(pending);
+        endThinking();
+      }
       pending = "";
       state = "pass";
       return visible;
+    },
+
+    takeThinkingActivity() {
+      const activity = {
+        started: activityStarted,
+        chars: activityChars,
+        text: activityText,
+        ended: activityEnded,
+      };
+      activityStarted = false;
+      activityChars = 0;
+      activityText = "";
+      activityEnded = false;
+      return activity;
     },
   };
 }
@@ -493,6 +556,15 @@ export function mapContentForTest(
   return mapContent(content, options);
 }
 
+/** Provider-boundary content is never allowed to expose a literal leading
+ * private-reasoning block, regardless of whether the route is managed,
+ * built-in, or user-configured. */
+function mapProviderContent(content: PiAssistantMessage["content"]): MessageContent[] {
+  return mapContent(content, { stripLeadingThinkText: true });
+}
+
+export const mapProviderContentForTest = mapProviderContent;
+
 export const createLeadingThinkTextFilterForTest = createLeadingThinkTextFilter;
 export const stripLeadingThinkTextForTest = stripLeadingThinkText;
 
@@ -516,6 +588,119 @@ export function normalizeReasoningForProvider(
 }
 
 // ─── Provider creation ────────────────────────────────────────────────────
+
+/**
+ * Pi-ai's raw adapters historically turn an omitted reasoning option into an
+ * explicit provider-specific "off" value. Omission has a different meaning:
+ * the selected model should retain its official thinking toggle and effort.
+ * Remove only those synthesized-off controls; explicit caller choices use a
+ * separate path and remain untouched.
+ */
+function restoreOfficialReasoningDefaults(
+  payload: unknown,
+  model: Model<Api>,
+): unknown {
+  if (!model.reasoning || !payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return payload;
+  }
+
+  const next: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
+  const compat = model.compat as (Record<string, unknown> & {
+    thinkingFormat?: string;
+    chatTemplateKwargs?: Record<string, unknown>;
+  }) | undefined;
+  const thinkingFormat = compat?.thinkingFormat
+    || (model.provider === "deepseek" || model.baseUrl?.includes("deepseek.com") ? "deepseek" : undefined);
+  const removeSynthesizedReasoningFields = (
+    effort: unknown,
+    enabled?: unknown,
+  ): void => {
+    const rawReasoning = next.reasoning;
+    if (!rawReasoning || typeof rawReasoning !== "object" || Array.isArray(rawReasoning)) return;
+    const reasoning = { ...(rawReasoning as Record<string, unknown>) };
+    if (reasoning.effort === effort) delete reasoning.effort;
+    if (enabled !== undefined && reasoning.enabled === enabled) delete reasoning.enabled;
+    if (Object.keys(reasoning).length > 0) next.reasoning = reasoning;
+    else delete next.reasoning;
+  };
+
+  if (thinkingFormat === "zai" || thinkingFormat === "deepseek") {
+    const thinking = next.thinking as { type?: unknown } | undefined;
+    if (thinking?.type === "disabled") delete next.thinking;
+  } else if (thinkingFormat === "qwen") {
+    if (next.enable_thinking === false) delete next.enable_thinking;
+  } else if (thinkingFormat === "qwen-chat-template") {
+    delete next.chat_template_kwargs;
+  } else if (thinkingFormat === "chat-template") {
+    const rawKwargs = next.chat_template_kwargs;
+    if (rawKwargs && typeof rawKwargs === "object" && !Array.isArray(rawKwargs)) {
+      const kwargs = { ...(rawKwargs as Record<string, unknown>) };
+      for (const [key, descriptor] of Object.entries(compat?.chatTemplateKwargs || {})) {
+        if (descriptor && typeof descriptor === "object" && "$var" in descriptor) delete kwargs[key];
+      }
+      if (Object.keys(kwargs).length > 0) next.chat_template_kwargs = kwargs;
+      else delete next.chat_template_kwargs;
+    }
+  } else if (thinkingFormat === "openrouter" || thinkingFormat === "together") {
+    const reasoning = next.reasoning as { effort?: unknown; enabled?: unknown } | undefined;
+    if (reasoning?.enabled === false || reasoning?.effort === "none") {
+      removeSynthesizedReasoningFields("none", false);
+    }
+  } else if (thinkingFormat === "string-thinking") {
+    const offValue = model.thinkingLevelMap?.off;
+    if (next.thinking === "none" || (typeof offValue === "string" && next.thinking === offValue)) {
+      delete next.thinking;
+    }
+  }
+
+  // OpenAI Responses and generic OpenAI-compatible reasoners use these
+  // shapes rather than a named thinkingFormat.
+  const reasoning = next.reasoning as { effort?: unknown } | undefined;
+  const mappedOff = model.thinkingLevelMap?.off;
+  if (reasoning?.effort === "none" || (typeof mappedOff === "string" && reasoning?.effort === mappedOff)) {
+    removeSynthesizedReasoningFields(reasoning.effort);
+  }
+  if (typeof mappedOff === "string" && next.reasoning_effort === mappedOff) {
+    delete next.reasoning_effort;
+  }
+
+  return next;
+}
+
+export const restoreOfficialReasoningDefaultsForTest = restoreOfficialReasoningDefaults;
+
+/** Read the explicit output ceiling from known provider wire shapes. */
+function effectiveMaxTokensFromPayload(payload: unknown): number | undefined {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  const root = payload as Record<string, unknown>;
+  const generationConfig = root.generationConfig && typeof root.generationConfig === "object"
+    && !Array.isArray(root.generationConfig)
+    ? root.generationConfig as Record<string, unknown>
+    : undefined;
+  const inferenceConfig = root.inferenceConfig && typeof root.inferenceConfig === "object"
+    && !Array.isArray(root.inferenceConfig)
+    ? root.inferenceConfig as Record<string, unknown>
+    : undefined;
+  const options = root.options && typeof root.options === "object" && !Array.isArray(root.options)
+    ? root.options as Record<string, unknown>
+    : undefined;
+  const candidates = [
+    root.max_tokens,
+    root.max_completion_tokens,
+    root.max_output_tokens,
+    root.maxTokens,
+    generationConfig?.maxOutputTokens,
+    inferenceConfig?.maxTokens,
+    options?.maxTokens,
+  ];
+  const limits = candidates
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .map((value) => Math.trunc(value));
+  return limits.length ? Math.min(...limits) : undefined;
+}
+
+export const effectiveMaxTokensFromPayloadForTest = effectiveMaxTokensFromPayload;
 
 /**
  * Create an LLMProvider backed by pi-ai for the given provider/model.
@@ -557,7 +742,6 @@ export function createPiProvider(config: {
   supportedReasoning?: ReadonlyArray<"minimal" | "low" | "medium" | "high">;
 }): LLMProvider {
   const providerId = config.provider as KnownProvider;
-  const shouldStripLeadingThinkText = config.provider === "custom";
 
   // Resolve the model object. `customModel` shortcuts pi-ai's catalog
   // lookup for providers pi-ai doesn't know about.
@@ -598,8 +782,18 @@ export function createPiProvider(config: {
       const context = buildPiContext(params.messages, params.systemPrompt, params.tools, model);
       const reasoning = effectiveReasoning(params.reasoning);
       const sessionId = cacheSafeSessionId(params.sessionId);
-      const onPayload = config.onPayload
-        ? ((payload: unknown, hookModel: Model<Api>) => config.onPayload!(payload, hookModel, params.requestMetadata))
+      const useOfficialReasoningDefaults = model.reasoning === true
+        && params.reasoning === undefined
+        && config.defaultReasoning === undefined;
+      const onPayload = (useOfficialReasoningDefaults || config.onPayload)
+        ? ((payload: unknown, hookModel: Model<Api>) => {
+            const normalized = useOfficialReasoningDefaults
+              ? restoreOfficialReasoningDefaults(payload, hookModel)
+              : payload;
+            return config.onPayload
+              ? config.onPayload(normalized, hookModel, params.requestMetadata)
+              : normalized;
+          })
         : undefined;
 
       log.debug(`complete ${providerId}/${model.id}`);
@@ -610,6 +804,7 @@ export function createPiProvider(config: {
         if (reasoning) {
           result = await piCompleteSimple(model, context, {
             apiKey: config.apiKey,
+            headers: config.headers,
             transport: CORE_AGENT_TRANSPORT,
             signal: params.signal,
             maxTokens: params.maxTokens,
@@ -622,6 +817,7 @@ export function createPiProvider(config: {
         } else {
           result = await piComplete(model, context, {
             apiKey: config.apiKey,
+            headers: config.headers,
             transport: CORE_AGENT_TRANSPORT,
             signal: params.signal,
             maxTokens: params.maxTokens,
@@ -640,9 +836,7 @@ export function createPiProvider(config: {
         }
 
         return {
-          content: mapContent(result.content, {
-            stripLeadingThinkText: shouldStripLeadingThinkText,
-          }),
+          content: mapProviderContent(result.content),
           stopReason: mapStopReason(result.stopReason),
           usage: mapUsage(result.usage),
           model: resolvedResponseModel(result, model.id),
@@ -657,19 +851,42 @@ export function createPiProvider(config: {
       const context = buildPiContext(params.messages, params.systemPrompt, params.tools, model);
       const reasoning = effectiveReasoning(params.reasoning);
       const sessionId = cacheSafeSessionId(params.sessionId);
-      const onPayload = config.onPayload
-        ? ((payload: unknown, hookModel: Model<Api>) => config.onPayload!(payload, hookModel, params.requestMetadata))
-        : undefined;
+      const useOfficialReasoningDefaults = model.reasoning === true
+        && params.reasoning === undefined
+        && config.defaultReasoning === undefined;
+      let effectiveMaxTokens: number | undefined;
+      const onPayload = async (payload: unknown, hookModel: Model<Api>): Promise<unknown> => {
+        const normalized = useOfficialReasoningDefaults
+          ? restoreOfficialReasoningDefaults(payload, hookModel)
+          : payload;
+        const transformed = config.onPayload
+          ? await config.onPayload(normalized, hookModel, params.requestMetadata)
+          : normalized;
+        // pi-ai treats an undefined hook result as "keep the original payload".
+        // Observe that exact final shape so this is an on-wire value, not a
+        // model-catalog guess made before context and adapter adjustments.
+        effectiveMaxTokens = effectiveMaxTokensFromPayload(
+          transformed === undefined ? payload : transformed,
+        );
+        return transformed;
+      };
 
       log.debug(`stream ${providerId}/${model.id}`);
 
       try {
-        const leadingThinkFilter = shouldStripLeadingThinkText
-          ? createLeadingThinkTextFilter()
-          : null;
+        const leadingThinkFilter = createLeadingThinkTextFilter();
+        const takeLeadingThinkEvents = function* (): Generator<StreamEvent> {
+          const activity = leadingThinkFilter.takeThinkingActivity();
+          if (activity.started) yield { type: "thinking_start" };
+          if (activity.chars > 0) {
+            yield { type: "thinking_delta", chars: activity.chars, text: activity.text };
+          }
+          if (activity.ended) yield { type: "thinking_end" };
+        };
         const eventStream = reasoning
           ? piStreamSimple(model, context, {
               apiKey: config.apiKey,
+              headers: config.headers,
               transport: CORE_AGENT_TRANSPORT,
               signal: params.signal,
               maxTokens: params.maxTokens,
@@ -677,17 +894,18 @@ export function createPiProvider(config: {
               reasoning,
               cacheRetention: params.cacheRetention,
               sessionId,
-              ...(onPayload ? { onPayload: onPayload as any } : {}),
+              onPayload: onPayload as any,
             })
           : piStream(model, context, {
               apiKey: config.apiKey,
+              headers: config.headers,
               transport: CORE_AGENT_TRANSPORT,
               signal: params.signal,
               maxTokens: params.maxTokens,
               temperature: params.temperature,
               cacheRetention: params.cacheRetention,
               sessionId,
-              ...(onPayload ? { onPayload: onPayload as any } : {}),
+              onPayload: onPayload as any,
             });
 
         for await (const event of eventStream) {
@@ -697,13 +915,24 @@ export function createPiProvider(config: {
               break;
             case "text_delta":
               {
-                const text = leadingThinkFilter?.push(event.delta) ?? event.delta;
+                const text = leadingThinkFilter.push(event.delta);
+                yield* takeLeadingThinkEvents();
                 if (text) yield { type: "text_delta", text };
               }
               break;
+            case "thinking_start":
+              yield { type: "thinking_start" };
+              break;
+            case "thinking_delta":
+              yield { type: "thinking_delta", chars: event.delta.length, text: event.delta };
+              break;
+            case "thinking_end":
+              yield { type: "thinking_end" };
+              break;
             case "toolcall_start":
               {
-                const text = leadingThinkFilter?.finish() ?? "";
+                const text = leadingThinkFilter.finish();
+                yield* takeLeadingThinkEvents();
                 if (text) yield { type: "text_delta", text };
               }
               yield {
@@ -724,7 +953,8 @@ export function createPiProvider(config: {
               break;
             case "done":
               {
-                const text = leadingThinkFilter?.finish() ?? "";
+                const text = leadingThinkFilter.finish();
+                yield* takeLeadingThinkEvents();
                 if (text) yield { type: "text_delta", text };
               }
               const serverFallbackReason = serverFallbackReasonFromResponseId(event.message.responseId);
@@ -732,10 +962,9 @@ export function createPiProvider(config: {
                 type: "message_end",
                 stopReason: mapStopReason(event.reason),
                 usage: mapUsage(event.message.usage),
-                content: mapContent(event.message.content, {
-                  stripLeadingThinkText: shouldStripLeadingThinkText,
-                }),
+                content: mapProviderContent(event.message.content),
                 model: resolvedResponseModel(event.message, model.id),
+                ...(effectiveMaxTokens !== undefined ? { effectiveMaxTokens } : {}),
                 ...(serverFallbackReason ? { serverFallbackReason } : {}),
                 providerTermination: {
                   category: providerTerminationCategory(
@@ -747,7 +976,8 @@ export function createPiProvider(config: {
               break;
             case "error":
               {
-                const text = leadingThinkFilter?.finish() ?? "";
+                const text = leadingThinkFilter.finish();
+                yield* takeLeadingThinkEvents();
                 if (text) yield { type: "text_delta", text };
               }
               const errorServerFallbackReason = serverFallbackReasonFromResponseId(event.error.responseId);
@@ -793,6 +1023,7 @@ export function createPiProvider(config: {
           messages: [{ role: "user", content: "ping", timestamp: Date.now() }],
         }, {
           apiKey: config.apiKey,
+          headers: config.headers,
           transport: CORE_AGENT_TRANSPORT,
           maxTokens: 1,
         });

@@ -223,15 +223,16 @@ describe('CLI bridge Skill runner', () => {
       const child = spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], {
         stdio: ['ignore', 'inherit', 'inherit'],
       });
-      fs.writeFileSync(
-        path.join(process.env.ORKAS_RUN_SKILL_DIR, 'timeout-pids.json'),
-        JSON.stringify({ parent: process.pid, child: child.pid }),
-      );
+      const marker = path.join(process.env.ORKAS_RUN_SKILL_DIR, 'timeout-pids.json');
+      fs.writeFileSync(marker + '.tmp', JSON.stringify({ parent: process.pid, child: child.pid }));
+      fs.renameSync(marker + '.tmp', marker);
       process.stdout.write('started');
       setInterval(() => {}, 1000);
     `;
     const runner = fixture(source, {
-      timeoutMs: 500,
+      // Electron-as-Node plus the grandchild must finish starting before the
+      // timeout can exercise a TERM-resistant process tree on a loaded host.
+      timeoutMs: 2000,
       previewBytes: 100,
       hardOutputBytes: 4096,
       killGraceMs: 60,
@@ -255,7 +256,7 @@ describe('CLI bridge Skill runner', () => {
       expect(result.status).toBe('timed_out');
       expect(result.timedOut).toBe(true);
       expect(result.stdout.text).toContain('started');
-      expect(Date.now() - startedAt).toBeLessThan(2500);
+      expect(Date.now() - startedAt).toBeLessThan(4000);
       await waitFor(() => processTree !== null
         && !processIsAlive(processTree.parent)
         && !processIsAlive(processTree.child));
@@ -280,10 +281,9 @@ describe('CLI bridge Skill runner', () => {
       const child = spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], {
         stdio: 'ignore',
       });
-      fs.writeFileSync(
-        path.join(process.env.ORKAS_RUN_SKILL_DIR, 'active-pids-' + label + '.json'),
-        JSON.stringify({ parent: process.pid, child: child.pid }),
-      );
+      const marker = path.join(process.env.ORKAS_RUN_SKILL_DIR, 'active-pids-' + label + '.json');
+      fs.writeFileSync(marker + '.tmp', JSON.stringify({ parent: process.pid, child: child.pid }));
+      fs.renameSync(marker + '.tmp', marker);
       process.on('SIGTERM', () => {});
       setInterval(() => {}, 1000);
     `;

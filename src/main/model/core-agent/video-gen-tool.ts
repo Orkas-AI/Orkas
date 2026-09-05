@@ -267,7 +267,9 @@ export function createVideoGenTool(opts: VideoGenToolOpts): AgentTool {
         }
       }
 
-      const result = await generateVideo({
+      let result: Awaited<ReturnType<typeof generateVideo>>;
+      try {
+        result = await generateVideo({
         prompt,
         outputAbsPath: outputAbs,
         ...(referenceImageUrls.length ? { referenceImageUrls } : {}),
@@ -291,6 +293,15 @@ export function createVideoGenTool(opts: VideoGenToolOpts): AgentTool {
           ...(event.data ? { data: event.data } : {}),
         }),
       });
+      } catch (err) {
+        const safeError = sanitizeLogTextForUpload((err as Error).message || String(err));
+        return {
+          content: productionTransaction
+            ? `E_VIDEO_PRODUCTION_GENERATION_UNCERTAIN: provider dispatch ended without a terminal result (${safeError}); keep the pending transaction and do not retry without a new explicit Gate C approval.`
+            : `[PROVIDER_EXCEPTION] ${safeError}`,
+          isError: true,
+        } as ToolResult;
+      }
 
       if (result.ok === false) {
         if (productionTransaction) {

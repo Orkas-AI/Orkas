@@ -77,6 +77,12 @@ function loadNavigation(initialView: string, initialId = '') {
     _selectedAgent: null,
     _exitAgentEditMode: vi.fn(async () => {}),
     _closeAgentRowMenu: vi.fn(),
+    GROUP_RESERVED: new Set(['user', 'commander']),
+    window: {},
+    _convLog: { warn: vi.fn() },
+    uiAlert: vi.fn(),
+    t: (key: string) => key,
+    apiFetch: vi.fn(async () => ({ json: async () => ({ ok: true, agent: { agent_id: 'agent-a' } }) })),
     document: {
       getElementById: (id: string) => element(id),
     },
@@ -93,11 +99,52 @@ function loadNavigation(initialView: string, initialId = '') {
     extractFunction(agentsSource, '_isAgentDetailReturnTargetCurrent'),
     extractFunction(agentsSource, '_returnFromAgentsDetailView'),
     extractFunction(agentsSource, '_resetAgentsDetailForNavigation'),
+    extractFunction(conversationSource, '_isAgentActor'),
+    extractFunction(conversationSource, '_isActorDetailTarget'),
+    extractFunction(conversationSource, '_openActorAgentDetail'),
+    extractFunction(conversationSource, '_hydrateMessageCreatedAgentChip'),
   ].join('\n'), context);
   return { context, element, selectAgent, setView };
 }
 
 describe('agent detail return navigation', () => {
+  async function openConversationEntry(context: any, entry: string) {
+    if (entry !== 'created-chip') return context._openActorAgentDetail(entry);
+    let click: (() => Promise<void>) | undefined;
+    const chip = {
+      dataset: { agentId: 'agent-a' },
+      addEventListener: (_event: string, handler: () => Promise<void>) => { click = handler; },
+    };
+    context._hydrateMessageCreatedAgentChip({ querySelectorAll: () => [chip] });
+    await click!();
+  }
+
+  it.each(['commander', 'agent-a', 'created-chip'])(
+    'opens the real conversation %s entry and dismisses back to the same conversation', async (entry) => {
+      const { context, element, selectAgent, setView } = loadNavigation('conversation', 'conversation-a');
+      await openConversationEntry(context, entry);
+      expect(selectAgent).toHaveBeenCalledWith(entry === 'commander' ? 'commander' : 'agent-a', { refreshCliOptions: true });
+      expect(element('panel-agents').classList.contains('resource-detail-overlay')).toBe(true);
+      expect(context.currentCid).toBe('conversation-a');
+      context._returnFromAgentsDetailView();
+      expect(element('panel-agents').classList.contains('resource-detail-overlay')).toBe(false);
+      expect(context.currentView).toBe('conversation');
+      expect(context.currentCid).toBe('conversation-a');
+      expect(setView).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['agent-a', 'created-chip'])(
+    'keeps the conversation visible when %s refers to an unavailable Agent', async (entry) => {
+      const { context, selectAgent, setView } = loadNavigation('conversation', 'conversation-a');
+      context.apiFetch.mockResolvedValue({ json: async () => ({ ok: false }) });
+      await openConversationEntry(context, entry);
+      expect(selectAgent).not.toHaveBeenCalled();
+      expect(setView).not.toHaveBeenCalled();
+      expect(context.currentCid).toBe('conversation-a');
+    },
+  );
+
   it('returns a viewed agent to the conversation that opened it', async () => {
     const { context, element, selectAgent, setView } = loadNavigation('conversation', 'conversation-a');
 
@@ -155,9 +202,6 @@ describe('agent detail return navigation', () => {
   });
 
   it('routes every cross-page entry and both back gestures through the shared helpers', () => {
-    expect(conversationSource).toContain("await openAgentDetail('commander', { returnTarget })");
-    expect(conversationSource).toContain('await openAgentDetail(aid, { returnTarget })');
-    expect(conversationSource).toContain('openAgentDetail(aid, { returnTarget })');
     expect(projectDetailSource).toContain('await openAgentDetail(agentId)');
     expect(searchSource).toContain('await openAgentDetail(r.id, { returnTarget: agentReturnTarget })');
     expect(stateSource).toContain(

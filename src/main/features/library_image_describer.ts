@@ -56,6 +56,8 @@ export async function describeLibraryImage(
     message,
     images: [{ data: compressed.buf.toString('base64'), mediaType: 'image/jpeg' }],
     skillList: [],
+    // This one-shot vision operation must not receive the default tool set.
+    toolList: [],
     idleTimeout: Math.ceil(timeoutMs / 1000),
     abortSignal: controller.signal,
   }).catch((err) => ({

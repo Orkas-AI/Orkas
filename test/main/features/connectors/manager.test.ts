@@ -1300,3 +1300,58 @@ describe('features/connectors/manager authorization recovery', () => {
   });
 
 });
+
+describe('OAuth refresh ownership', () => {
+  it('shares one rotating grant between an ordinary refresh and a forced retry', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const instance = notionInstance();
+    instance.oauth_grant.expires_at = Date.now() + 3_600_000;
+    instance.dcr_client = { client_id: 'local-client', token_endpoint: 'https://example.test/token' } as any;
+    await registry.upsert(TEST_UID, instance);
+    let rejectFirstConnect!: (error: Error) => void;
+    let firstConnectStarted!: () => void;
+    const firstConnect = new Promise<void>((resolve) => { firstConnectStarted = resolve; });
+    mocks.mcp.connect = vi.fn().mockImplementationOnce(() => new Promise<void>((_resolve, reject) => {
+      rejectFirstConnect = reject;
+      firstConnectStarted();
+    })).mockResolvedValue(undefined);
+    let releaseRefresh!: () => void;
+    let refreshStarted!: () => void;
+    const refreshGate = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+    const refreshing = new Promise<void>((resolve) => { refreshStarted = resolve; });
+    mocks.dcr.refreshDcrIfStale = vi.fn(async (_client, grant) => {
+      refreshStarted();
+      await refreshGate;
+      return { ...grant, access_token: 'rotated-access', refresh_token: 'rotated-once', expires_at: Date.now() + 3_600_000 };
+    });
+    const first = manager.refreshTools(TEST_UID, 'notion');
+    await firstConnect;
+    await registry.update(TEST_UID, 'notion', (current) => ({ ...current, oauth_grant: { ...current.oauth_grant!, expires_at: 1 } }));
+    const second = manager.refreshTools(TEST_UID, 'notion');
+    await refreshing;
+    rejectFirstConnect(new Error('401 Unauthorized'));
+    // Allow the rejected connect to enter its forced-refresh path while the
+    // ordinary remote request remains held at the explicit fixture gate.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    releaseRefresh();
+    await Promise.all([first, second]);
+    expect(mocks.dcr.refreshDcrIfStale).toHaveBeenCalledTimes(1);
+    expect(registry.load(TEST_UID).connections.notion.oauth_grant?.refresh_token).toBe('rotated-once');
+    expect(registry.load(TEST_UID).connections.notion.status.kind).toBe('connected');
+  });
+
+  it('does not count a Google grant rejected during verification as connected', async () => {
+    await writeGoogleConnectorsConfig(true);
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const instance = googleInstance('gmail', ['https://www.googleapis.com/auth/gmail.modify']);
+    instance.oauth_grant.expires_at = 1;
+    instance.tools_cache = [{ name: 'search', description: '', input_schema: {} }] as any;
+    await registry.upsert(TEST_UID, instance);
+    mocks.oauth.refreshIfStale = vi.fn(async () => { throw Object.assign(new Error('connector_reconnect_required'), { code: 'connector_reconnect_required' }); });
+    expect(await manager.verifyUsableConnectors(TEST_UID)).toBe(0);
+    expect(registry.load(TEST_UID).connections.gmail.status.kind).toBe('error');
+    expect(mocks.mcp.connect).not.toHaveBeenCalled();
+  });
+});

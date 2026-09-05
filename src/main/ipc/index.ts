@@ -1319,7 +1319,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'projects.files.pickAndUpload': async ({ projectId, targetDir } = {}, ctx) => {
     if (!safeId(projectId)) throw new Error('invalid projectId');
     if (!await projects.projectExists(ctx.userId, projectId)) throw new Error('not_found');
-    const picked = await _pickLocalFiles('Choose files', PROJECT_PICK_EXTENSIONS, true);
+    const picked = await _pickLocalFiles('Choose files', PROJECT_PICK_EXTENSIONS, true, /* seedWorkspaceOnFirstOpen */ true);
     if (!picked.length) return { ok: true, cancelled: true, files: [] };
     const results = [];
     for (const filePath of picked) {
@@ -1394,6 +1394,12 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!safeId(projectId)) throw new Error('invalid projectId');
     if (typeof name !== 'string' || !name) throw new Error('invalid name');
     return projectFiles.readProjectDocxHtml(ctx.userId, projectId, name);
+  },
+
+  'projects.files.officeHtml': async ({ projectId, name }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (typeof name !== 'string' || !name) throw new Error('invalid name');
+    return projectFiles.readProjectOfficeHtml(ctx.userId, projectId, name);
   },
 
   'projects.files.status': async ({ projectId, skipReconcile }, ctx) => {
@@ -1807,6 +1813,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const parent = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
     const opts: Electron.OpenDialogOptions = {
       properties: ['openDirectory'],
+      defaultPath: _safeDialogDefaultPath(),
       title: typeof title === 'string' && title ? title : t('dialog.choose_directory'),
     };
     const res = parent
@@ -2030,8 +2037,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { agent };
   },
 
-  'agents.create': async ({ name = '', description = '', description_zh, description_en, workflow = '', icon, color, runtime, category, output_format } = {}) => {
-    return { agent: await agents.createCustomAgent({ name, description, description_zh, description_en, workflow, icon, color, runtime, category, output_format }) };
+  'agents.create': async ({ name = '', description = '', description_zh, description_en, workflow = '', icon, color, profile, runtime, category, output_format } = {}) => {
+    return { agent: await agents.createCustomAgent({ name, description, description_zh, description_en, workflow, icon, color, profile, runtime, category, output_format }) };
   },
 
 
@@ -2040,6 +2047,21 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const data = await agents.updateCustomAgent(agent_id, updates || {});
     if (!data) throw new Error('agent not found or read-only');
     return { agent: data };
+  },
+
+  'agents.memory.add': async ({ agent_id, content }) => {
+    if (!agents.isValidAgentId(agent_id)) throw new Error('invalid agent_id');
+    return agents.addCustomAgentMemory(agent_id, String(content || ''));
+  },
+
+  'agents.memory.remove': async ({ agent_id, old_text }) => {
+    if (!agents.isValidAgentId(agent_id)) throw new Error('invalid agent_id');
+    return agents.removeCustomAgentMemory(agent_id, String(old_text || ''));
+  },
+
+  'agents.memory.update': async ({ agent_id, old_text, content }) => {
+    if (!agents.isValidAgentId(agent_id)) throw new Error('invalid agent_id');
+    return agents.updateCustomAgentMemory(agent_id, String(old_text || ''), String(content || ''));
   },
 
   'agents.delete': async ({ agent_id }, ctx) => {
@@ -2135,6 +2157,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const parent = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
     const opts: Electron.OpenDialogOptions = {
       properties: ['openDirectory'],
+      defaultPath: _safeDialogDefaultPath(),
       title: t('dialog.choose_skill_source_directory'),
     };
     const res = parent
@@ -2510,6 +2533,10 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // Read an image file's bytes for inline viewer display.
+  'contexts.officeHtml': async ({ path }) => {
+    return contexts.readContextOfficeHtml(path || '');
+  },
+
   'contexts.image': async ({ path }) => {
     return contexts.readContextImage(path || '');
   },
@@ -2735,6 +2762,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     providers: videoAuth.flattenVideoProviderOptions(videoAuth.listVideoProviderOptions()),
     profiles: videoAuth.listVideoProfiles().map((p) => ({
       id: p.id, provider: p.provider, model: p.model, label: p.label, createdAt: p.createdAt,
+      available: videoAuth.isVideoProviderModelAllowed(p.provider, p.model),
       apiKeyMasked: auth.maskKey(p.apiKey),
     })),
   }),

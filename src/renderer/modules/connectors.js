@@ -77,6 +77,7 @@ const CONNECT_CANCEL_CODES = new Set(['user_cancelled', 'superseded']);
 function _isConnectCancel(errLike) {
   const code = errLike && typeof errLike.code === 'string' ? errLike.code : '';
   if (code && CONNECT_CANCEL_CODES.has(code)) return true;
+  if (code && code !== 'unknown' && code !== 'E_UNKNOWN') return false;
   const msg = String((errLike && (errLike.error || errLike.message)) || '').toLowerCase();
   return msg.includes('superseded') || msg.includes('cancelled') || msg.includes('canceled');
 }
@@ -1255,6 +1256,7 @@ function _formatConnectError(errLike) {
   if (code === 'connector_unsupported' || /connector_unsupported/i.test(String(msg))) {
     return t('connectors.toast.unsupported');
   }
+  if (code === 'storage_unavailable') return t('connectors.errors.storage_unavailable');
   if (code === 'missing_required_scopes' || /missing_required_scopes|missing required scopes/i.test(String(msg))) {
     return t('connectors.errors.missing_required_scopes');
   }

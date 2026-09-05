@@ -1960,3 +1960,32 @@ describe('local-tools › markdown_to_pdf › locked probe+render wiring', () =>
     }
   });
 });
+
+describe('PDF output publication', () => {
+  it.each(['markdown', 'html'])('keeps a successfully rendered %s PDF successful when the publication callback fails', async (sourceType) => {
+    vi.resetModules();
+    const render = vi.fn(async (_content: string, outPath: string) => { fs.writeFileSync(outPath, '%PDF-fixture'); });
+    vi.doMock('../../../../src/main/util/md-to-pdf', () => ({ markdownToPdf: render, htmlToPdf: render }));
+    try {
+      const users = await import('../../../../src/main/features/users');
+      users.activateUser(UID);
+      await allFilesAuto();
+      const ws = await import('../../../../src/main/features/user_workspace');
+      const wsDir = path.join(tmpDir, 'ws');
+      fs.mkdirSync(wsDir, { recursive: true });
+      expect(ws.setWorkspacePath(UID, wsDir).ok).toBe(true);
+      const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+      const onFileWritten = vi.fn(async () => { throw new Error('publication fixture failed'); });
+      const tool = createLocalTools({ userId: UID, cid: CID, onFileWritten }).find((item) => item.name === 'create_pdf')!;
+      const target = path.join(wsDir, 'report.pdf');
+      const result = await tool.execute({ source_type: sourceType, path: target, content: '<h1>Report</h1>' }, { workingDir: wsDir, state: {} } as any);
+      expect(result.isError).toBeFalsy();
+      expect(String(result.content)).toContain('PDF written:');
+      expect(fs.readFileSync(target, 'utf8')).toBe('%PDF-fixture');
+      expect(onFileWritten).toHaveBeenCalledWith(target);
+    } finally {
+      vi.doUnmock('../../../../src/main/util/md-to-pdf');
+      vi.resetModules();
+    }
+  });
+});

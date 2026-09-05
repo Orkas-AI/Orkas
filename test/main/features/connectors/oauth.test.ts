@@ -338,3 +338,18 @@ describe('features/connectors/oauth', () => {
     expect(err.message).toMatch(/refresh HTTP 503/);
   });
 });
+
+describe('server-managed Bing grants', () => {
+  it('refreshes an expired grant by its server id without a local refresh token', async () => {
+    const request = vi.fn(async () => ({ ok: true, json: async () => ({ code: 0, access_token: 'new-access', grant_id: 'bing-grant', expires_in: 3600 }) }));
+    vi.stubGlobal('fetch', request);
+    const oauth = await import('../../../../src/main/features/connectors/oauth');
+    const catalog = await import('../../../../src/main/features/connectors/catalog');
+    const result = await oauth.refreshIfStale('u1', catalog.findCatalogEntry('bing-webmaster')!, {
+      access_token: 'expired', refresh_token: null, server_managed: true, server_grant_id: 'bing-grant', expires_at: 1,
+      scopes: ['webmaster.read'], token_type: 'Bearer',
+    });
+    expect(result).toMatchObject({ access_token: 'new-access', refresh_token: null, server_grant_id: 'bing-grant' });
+    expect(JSON.parse(String(request.mock.calls[0]?.[1]?.body))).toMatchObject({ provider: 'bing', grant_id: 'bing-grant', device_id: 'device-1' });
+  });
+});

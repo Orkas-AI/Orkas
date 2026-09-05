@@ -132,6 +132,7 @@ function loadSettingsClickHarness(
       },
       getValue: () => value,
       getOptions: () => options,
+      setAriaLabel() {},
       setValue(next: string) {
         value = next || '';
         element.dataset.value = value;
@@ -190,6 +191,47 @@ function loadSettingsClickHarness(
 }
 
 describe('settings model authorization add account', () => {
+  it('uses the model options returned by imageAuth and preserves the selected model on save', async () => {
+    const model = 'doubao-seedream-5-0-pro-260628';
+    const option = { id: `doubao:${model}`, provider: 'doubao', model, label: 'DouBao · Seedream 5.0 Pro' };
+    const { context, elements, invoke } = loadSettingsClickHarness(async (channel) => (
+      channel === 'imageAuth.list' ? { ok: true, profiles: [], providers: [option] } : { ok: true }
+    ));
+    const key = new FakeElement();
+    key.value = 'fixture-image-key';
+    elements.set('settings-image-key-input', key);
+    elements.set('settings-image-provider', new FakeElement());
+    elements.set('settings-image-status', new FakeElement());
+    await context._settingsRefreshImageProfiles();
+    context._settingsRenderImagePicker();
+    expect(vm.runInContext('_settingsState.imageProviderSel.getOptions()', context)).toEqual([
+      expect.objectContaining({ value: option.id, label: option.label }),
+    ]);
+    context.__selected = option.id;
+    vm.runInContext('_settingsState.imageProviderSel.setValue(__selected)', context);
+    await context._settingsClickAddImageKey();
+    expect(invoke).toHaveBeenCalledWith('imageAuth.add', { provider: 'doubao', model, apiKey: 'fixture-image-key', label: 'default' });
+  });
+
+  it('turns a rejected OAuth start IPC into the visible error state', async () => {
+    const { context, elements } = loadSettingsClickHarness(async () => { throw new Error('fixture IPC failure'); });
+    await expect(context._settingsStartOAuthFlow({ id: 'openai-codex', label: 'Codex' }, 'gpt-5.5')).resolves.toBeUndefined();
+    expect(elements.get('oauth-flow-body')!.innerHTML).toContain('settings.oauth.start_failed');
+  });
+
+  it('resets the language picker and explains a failed language change', async () => {
+    const { context, elements } = loadSettingsClickHarness();
+    elements.set('settings-language-select', new FakeElement());
+    context.getLang = () => 'en';
+    context.isSupportedLang = () => true;
+    context.setLang = vi.fn(async () => { throw new Error('fixture preference failure'); });
+    context.getSupportedLangs = () => ['en', 'zh'];
+    context._settingsBindLanguageOnce();
+    await vm.runInContext("_settingsLanguageSel.emitChange('zh')", context);
+    expect(context.uiAlert).toHaveBeenCalledWith('settings.language.change_failed');
+    expect(vm.runInContext('_settingsLanguageSel.getValue()', context)).toBe('en');
+  });
+
   it('updates existing-entry models and reverts failed selections', async () => {
     const success = loadSettingsClickHarness();
     vm.runInContext('window.__settingsReloaded = false; _settingsReload = async () => { window.__settingsReloaded = true; };', success.context);
@@ -674,4 +716,21 @@ describe('settings model authorization add account', () => {
     expect(invoke).not.toHaveBeenCalledWith('auth.addEntry', expect.anything());
     expect(context.__closeFlow).not.toHaveBeenCalled();
   });
+});
+
+it('shows legacy unsupported video profiles as unavailable instead of active', async () => {
+  const { context, elements } = loadSettingsClickHarness(async (channel) => (
+    channel === 'videoAuth.list' ? {
+      ok: true,
+      providers: [{ id: 'orkas-api', provider: 'orkas-api', model: 'orkas-video', label: 'Orkas · Video' }],
+      profiles: [{ id: 'legacy', provider: 'doubao', model: 'doubao-seedance-2-0-260128', available: false, label: 'Legacy', apiKeyMasked: '***' }],
+    } : { ok: true }
+  ));
+  await context._settingsRefreshVideoProfiles();
+  context._settingsRenderVideoEntries();
+  const row = elements.get('settings-video-entries')!.children[0];
+  expect(row.className).not.toContain('is-default');
+  expect(row.children.find((child) => child.className === 'entry-rank')?.textContent).toBe('new_chat.model_picker.unavailable');
+  const main = row.children.find((child) => child.className === 'entry-main');
+  expect(main?.children.find((child) => child.className === 'form-hint')?.textContent).toBe('settings.video.provider_unavailable');
 });

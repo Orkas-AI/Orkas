@@ -480,11 +480,12 @@ describe('util/proxy-dispatcher per-request system routing', () => {
 });
 
 describe('util/proxy-dispatcher startup ordering', () => {
-  it('uses Electron network routing without a hosted account bootstrap', () => {
+  it('installs system routing before opening the window without a hosted account bootstrap', () => {
     const source = fs.readFileSync(new URL('../../../src/main/index.ts', import.meta.url), 'utf8');
     expect(source).toContain('setFetchImplementation((input, init) => net.fetch');
     expect(source).not.toContain('const accountBoot = account.bootstrap();');
-    expect(source).not.toContain('await installSystemProxyDispatcher();');
+    expect(source.indexOf('await installSystemProxyDispatcher();')).toBeGreaterThan(0);
+    expect(source.indexOf('await installSystemProxyDispatcher();')).toBeLessThan(source.lastIndexOf('    createWindow();'));
     expect(source).not.toContain("registerImmediate('net:system-proxy'");
   });
 });

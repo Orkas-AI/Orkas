@@ -86,6 +86,7 @@ describe('Library image describer', () => {
         mediaType: 'image/jpeg',
       }],
       skillList: [],
+      toolList: [],
       idleTimeout: 240,
       abortSignal: expect.any(AbortSignal),
     }));

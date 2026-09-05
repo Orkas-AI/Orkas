@@ -854,3 +854,17 @@ test.describe('new chat composer', () => {
     );
   });
 });
+
+test('keeps all four recipient tabs on one row, including Library', async ({ appPage }) => {
+  await appPage.locator('#new-chat-recipient-chip').click();
+  const tabs = appPage.locator('.skill-picker-tabs [data-agent-picker-tab]');
+  await expect(tabs).toHaveCount(4);
+  const boxes = await tabs.evaluateAll((elements) => elements.map((element) => {
+    const rect = element.getBoundingClientRect();
+    return { top: rect.top, width: rect.width, height: rect.height };
+  }));
+  expect(boxes.every((box) => box.width > 0 && box.height > 0)).toBe(true);
+  expect(Math.max(...boxes.map((box) => box.top)) - Math.min(...boxes.map((box) => box.top))).toBeLessThan(2);
+  await tabs.filter({ hasText: 'Library' }).click();
+  await expect(appPage.locator('[data-agent-picker-tab="library"]')).toHaveClass(/\bactive\b/);
+});
