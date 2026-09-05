@@ -883,6 +883,9 @@ function _processToolPresentation(name, data, input) {
     const skillName = _processFirstText(input, ['skill_name', 'skillName', 'skill', 'name']);
     return { actionKey: 'chat.process.action_use_skill', target: skillName };
   }
+  if (key === 'generate_video') {
+    return { actionKey: 'chat.process.action_generate_video', target };
+  }
   if (['generate_image', 'image_generation'].includes(key)) {
     return { actionKey: 'chat.process.action_generate_image', target };
   }
@@ -917,12 +920,22 @@ function _processToolPresentation(name, data, input) {
   if (key.startsWith('collaboration:') || [
     'agent', 'task', 'background_agent', 'dispatch_to', 'hand_off_to', 'run_worker',
   ].includes(key)) {
+    const persistedName = _processFirstText(data, ['agent_name', 'agentName']);
+    if (persistedName) return { actionKey: 'chat.process.action_call_agent', target: persistedName };
     const agentName = _processFirstText(input, [
       'agent_name', 'agentName', 'recipient_name', 'recipientName',
       'subagent_type', 'subagentType', 'agent_type', 'agentType',
       'to', 'recipient', 'agent', 'name',
     ]);
-    return { actionKey: 'chat.process.action_call_agent', target: agentName };
+    // New events persist the display name; older history can resolve its id
+    // through the existing Agent cache. Never present opaque local ids as names.
+    const localAgent = typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)
+      ? _agentsCache.find((agent) => agent.agent_id === agentName || agent.id === agentName)
+      : null;
+    const label = localAgent?.name || (/^[a-f0-9]{12}$/i.test(agentName)
+      ? _groupActorLabel(agentName)
+      : agentName);
+    return { actionKey: 'chat.process.action_call_agent', target: label };
   }
   if (_isOrkasBridgeToolName(name)) {
     // Future bridge tools must remain internal actions rather than silently
@@ -3983,8 +3996,9 @@ function _actorLinkAttrs(fromId) {
 async function _openActorAgentDetail(actorId) {
   const aid = String(actorId || '').trim();
   if (!_isActorDetailTarget(aid)) return;
+  const returnTarget = typeof _captureAgentDetailReturnTarget === 'function'
+    ? _captureAgentDetailReturnTarget() : null;
   if (window.Monitor) (() => {})('message_actor_open', { agent_id: aid });
-  setView('agents');
   if (aid === 'commander') {
     if (typeof openAgentDetail === 'function') await openAgentDetail('commander', { returnTarget });
     else if (typeof selectAgent === 'function') await selectAgent('commander');
@@ -5132,7 +5146,8 @@ function _hydrateMessageCreatedAgentChip(msgDiv) {
       const aid = chip.dataset.agentId;
       if (!aid) return;
       if (window.Monitor) (() => {})('created_agent_chip_open', { agent_id: aid });
-      setView('agents');
+      const returnTarget = typeof _captureAgentDetailReturnTarget === 'function'
+        ? _captureAgentDetailReturnTarget() : null;
       // Pre-check the agent is still loadable; if it was deleted (or its
       // record is broken) the detail view would render an empty shell. Keep
       // the user on the entry page instead.
@@ -10400,7 +10415,10 @@ async function sendInConversation(cid, content, extra, options = {}) {
         success: !aborted && !errored,
       });
     }
-    if (!started && _convChatCtrls.get(cid) === ctrl) _convChatCtrls.delete(cid);
+    if (!started && _convChatCtrls.get(cid) === ctrl) {
+      _clearSentComposerSnapshot(cid);
+      _convChatCtrls.delete(cid);
+    }
     return { ...terminal, started, aborted, errored, result };
   } catch (err) {
     const durationMs = Math.round(performance.now() - startedAt);
@@ -10434,7 +10452,10 @@ async function sendInConversation(cid, content, extra, options = {}) {
     if (taskStarted && _convChatCtrls.get(cid) === ctrl) {
       _finishStreamingMsg(cid);
     }
-    if (_convChatCtrls.get(cid) === ctrl) _convChatCtrls.delete(cid);
+    if (_convChatCtrls.get(cid) === ctrl) {
+      if (!taskStarted) _clearSentComposerSnapshot(cid);
+      _convChatCtrls.delete(cid);
+    }
     throw err;
   }
 }

@@ -164,13 +164,29 @@ async function _selectAndSetWorkspace(target, dirPath) {
     let selectedPath = dirPath;
     if (!selectedPath) {
       const dirResult = await window.orkas.invoke('workspace.selectDirectory', {});
-      if (!dirResult || !dirResult.ok || !dirResult.path) return;
+      if (!dirResult || dirResult.ok === false) {
+        _showWorkspaceSetFailure(t('workspace.set_failed'));
+        return;
+      }
+      if (!dirResult.path) {
+        return;
+      }
       selectedPath = dirResult.path;
     }
     const setResult = await window.orkas.invoke('workspace.set', { path: selectedPath, ...hint });
     if (setResult && setResult.ok && setResult.path) {
-      await _refreshAllWorkspaceInfo();
-      _wsLog.info('workspace selected', { target, path: setResult.path });
+      // The authoritative mutation has already completed. Keep the terminal
+      // row independent from the follow-up chip refresh: a slow or failed
+      // read-back must not hide success or append a contradictory failure.
+      _wsLog.info('workspace selected', { target });
+      try {
+        await _refreshAllWorkspaceInfo();
+      } catch (err) {
+        _wsLog.warn('workspace refresh after selection failed', {
+          target,
+          error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+        });
+      }
     } else {
       _showWorkspaceSetFailure((setResult && setResult.error) || t('workspace.set_failed'));
       _wsLog.warn('workspace selection rejected', { target, error_code: 'set_failed' });
@@ -189,11 +205,25 @@ async function _resetWorkspace(target) {
   try {
     const result = await window.orkas.invoke('workspace.reset', hint);
     if (result && result.ok && result.path) {
-      await _refreshAllWorkspaceInfo();
-      _wsLog.info('workspace reset', { target, path: result.path });
+      // Reset persistence is the terminal boundary; UI read-back is a
+      // separate best-effort refresh and cannot change that result.
+      _wsLog.info('workspace reset', { target });
+      try {
+        await _refreshAllWorkspaceInfo();
+      } catch (err) {
+        _wsLog.warn('workspace refresh after reset failed', {
+          target,
+          error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+        });
+      }
+    } else {
+      _wsLog.warn('workspace reset rejected', { target, error_code: 'reset_failed' });
     }
   } catch (err) {
-    _wsLog.error('workspace reset failed', err);
+    _wsLog.error('workspace reset failed', {
+      target,
+      error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+    });
   }
 }
 

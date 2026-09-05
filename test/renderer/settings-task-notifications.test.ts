@@ -403,3 +403,19 @@ describe('Settings → General task notification toggle', () => {
     expect(event).not.toHaveBeenCalled();
   });
 });
+
+it('binds the visible notification toggle before slow settings reads finish', async () => {
+  const pending = Promise.withResolvers<any>();
+  const h = loadHarness({ ok: true }, undefined, true, pending.promise);
+  const opening = h.sandbox.loadSettings();
+  try {
+    expect(h.listeners.has('change')).toBe(true);
+    h.checkbox.checked = false;
+    await h.listeners.get('change')!();
+    expect(h.invoke).toHaveBeenCalledWith('prefs.setTaskNotifications', { enabled: false });
+  } finally {
+    pending.resolve({ ok: true, enabled: true });
+    await opening;
+  }
+  expect(h.checkbox.checked).toBe(false);
+});

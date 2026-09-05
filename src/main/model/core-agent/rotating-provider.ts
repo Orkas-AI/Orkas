@@ -42,7 +42,12 @@
  *
  * On a credential/account rotatable failure: `markCooldown(profileId, kind, reason)`.
  * Network failures are never cooled down; each new user request starts from
- * the configured entries list again.
+ * the configured entries list again. Within one run, though, a candidate whose
+ * network failure exhausted its retry budget while a LATER candidate committed
+ * is latched out of the remaining model rounds (run-local only) — otherwise
+ * every tool-loop round re-pays the dead candidate's full timeout/retry
+ * ladder. A sweep where every candidate fails network-class latches nothing,
+ * so a transient machine-local outage keeps full retry on the next call.
  * On a successful first-event-yield: `onSuccess(profileId)` fires so
  * callers can clear any prior cooldown + bump lastUsed.
  */
@@ -183,8 +188,8 @@ export function boundMessagesForImageLimit(
   }
   const omittedImages = totalImages - limit;
   const notice = limit > 0
-    ? `<model-image-limit max_images="${limit}" omitted_images="${omittedImages}">Only the retained image blocks in this request are visually available. Use attachment manifest paths with read_file one image at a time for omitted images; do not claim visual processing from a listed path alone.</model-image-limit>`
-    : `<model-image-limit max_images="0" omitted_images="${omittedImages}" vision_supported="false">This model cannot receive image blocks, including read_file image previews. Do not claim visual analysis. When ocr_file is available it may extract text; otherwise explain that a vision-capable model is required.</model-image-limit>`;
+    ? `<model-image-limit max_images="${limit}" omitted_images="${omittedImages}">Only the retained image blocks in this request are visually available. Use attachment manifest paths with read_files one image at a time for omitted images; do not claim visual processing from a listed path alone.</model-image-limit>`
+    : `<model-image-limit max_images="0" omitted_images="${omittedImages}" vision_supported="false">This model cannot receive image blocks, including read_files image previews. Do not claim visual analysis. When ocr_file is available it may extract text; otherwise explain that a vision-capable model is required.</model-image-limit>`;
   projected.push({
     role: 'user',
     content: [{ type: 'text', text: notice }],
@@ -245,10 +250,16 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     0,
     Math.trunc(config.normalEmptyRetryAttempts ?? NORMAL_EMPTY_RETRY_ATTEMPTS),
   );
-  // A credential/account failure or a provider that never produced its first
-  // usable event is kept out of later model rounds in this agent run. This is
-  // run-local only; only credential failures enter the persisted cooldown.
+  // A credential/account failure, a provider that never produced its first
+  // usable event, or a network-exhausted candidate that a later candidate
+  // outlived (see the per-call networkFailedThisCall sets) is kept out of
+  // later model rounds in this agent run. This is run-local only; only
+  // credential failures enter the persisted cooldown.
   const unavailableProfiles = new Set<string>();
+  // W4-2: stream() runs once per tool-loop round with the full history, so
+  // without this run-local latch the same "images omitted" notice repeats on
+  // every remaining round of the turn.
+  let imagesOmittedAnnounced = false;
 
   const cooldownIdFor = (candidate: RotatingCandidate): string => (
     candidate.cooldownId || candidate.profileId
@@ -293,6 +304,23 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     const next = { ...params, model: cand.modelId };
     if (typeof cand.maxInputImages === 'number' && Number.isFinite(cand.maxInputImages)) {
       next.messages = boundMessagesForImageLimit(params.messages, cand.maxInputImages);
+      // W4-2 evidence: a text-only model silently loses every attached image
+      // here, and the visible symptom is the model "admitting" it cannot see
+      // — sampled users debugged that as their own mistake. Log the drop so
+      // diagnosis has a recorded fact; the user-facing notice needs the
+      // provider_fallback-style event plumbing (recorded in the plan doc).
+      if (cand.maxInputImages === 0) {
+        const dropped = params.messages.reduce(
+          (sum, message) => sum + message.content.filter((content) => content.type === 'image').length,
+          0,
+        );
+        if (dropped > 0) {
+          log.warn('image attachments dropped for text-only model', {
+            provider_id: cand.providerId,
+            dropped_images: dropped,
+          });
+        }
+      }
     }
     const metadata = params.requestMetadata;
     const usesModelDefault = !!metadata
@@ -411,6 +439,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
   type EmptyObservation = {
     kind: ProviderEmptyKind;
     terminalEventSeen: boolean;
+    terminationCategory?: ProviderTerminationCategory;
     usage?: Partial<Usage>;
   };
 
@@ -594,6 +623,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
             empty: {
               kind,
               terminalEventSeen: true,
+              terminationCategory: category ?? 'unknown',
               ...((ev as Extract<StreamEvent, { type: 'message_end' }>).usage
                 ? { usage: (ev as Extract<StreamEvent, { type: 'message_end' }>).usage }
                 : {}),
@@ -619,6 +649,9 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
       let lastFailure: PreCommitFailure | null = null;
       let exhaustedNetwork = false;
       const retryAttempts = retryAttemptsFor(params);
+      // Deferred network latch — same contract as stream(); see the comment
+      // there for why promotion only happens after a later candidate succeeds.
+      const networkFailedThisCall = new Set<string>();
       reportCandidates();
       if (params.signal?.aborted) {
         throw abortError(params.signal);
@@ -640,6 +673,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
             throwIfAborted((params as { signal?: AbortSignal }).signal);
             config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
             config.onSuccess?.(cand.profileId, cand);
+            for (const id of networkFailedThisCall) unavailableProfiles.add(id);
             return result;
           } catch (err) {
             const signal = (params as { signal?: AbortSignal }).signal;
@@ -671,6 +705,8 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
             if (failure.cooldownKind && failure.cooldownKind !== 'network') {
               markCooldown(cooldownIdFor(cand), failure.cooldownKind, reason);
               unavailableProfiles.add(cooldownIdFor(cand));
+            } else if (failure.kind === 'network') {
+              networkFailedThisCall.add(cooldownIdFor(cand));
             }
             exhaustedNetwork = !failure.cooldownKind || failure.kind === 'network';
             log.warn('complete trying next candidate', {
@@ -697,6 +733,14 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
       let exhaustedNetwork = false;
       const retryAttempts = retryAttemptsFor(params);
       const allowedNormalEmptyRetries = normalEmptyRetriesFor(params);
+      // Candidates whose network-class failure exhausted the same-candidate
+      // retry budget in THIS call. Promoted into `unavailableProfiles` only at
+      // the commit point — a later candidate working is the proof the failure
+      // was candidate-specific rather than a machine-local outage. An
+      // exhausted sweep latches nothing: compaction shares this instance and
+      // swallows the terminal error, so a full-network blip must leave the
+      // next call free to retry every candidate.
+      const networkFailedThisCall = new Set<string>();
       reportCandidates();
 
       for (let i = 0; i < candidates.length; i++) {
@@ -721,6 +765,9 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
               candidateIndex: i + 1,
               candidateCount: candidates.length,
               terminalEventSeen: attempt.empty.terminalEventSeen,
+              ...(attempt.empty.terminationCategory
+                ? { terminationCategory: attempt.empty.terminationCategory }
+                : {}),
               ...(attempt.empty.usage ? { usage: attempt.empty.usage } : {}),
             };
 
@@ -819,6 +866,8 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
             };
           } else if (isProviderNoFirstEventTimeout(attempt.err)) {
             unavailableProfiles.add(cooldownIdFor(cand));
+          } else if (failure.kind === 'network') {
+            networkFailedThisCall.add(cooldownIdFor(cand));
           }
           exhaustedNetwork = !failure.cooldownKind || failure.kind === 'network';
           log.warn('stream trying next candidate', {
@@ -836,6 +885,26 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
         const { iterator, buffered, cleanup } = attempt;
         config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
         config.onSuccess?.(cand.profileId, cand);
+        // This candidate works, so the network failures collected above were
+        // candidate-specific: keep those candidates out of the remaining
+        // model rounds of this run. Deliberately no markCooldown — the next
+        // run starts from the full candidate list again.
+        for (const id of networkFailedThisCall) unavailableProfiles.add(id);
+
+        // W4-2: the committed candidate is text-only, so paramsFor stripped
+        // every attached image. Say so — the visible alternative is the model
+        // "admitting" it cannot see, which sampled users debugged as their
+        // own mistake.
+        if (cand.maxInputImages === 0 && !imagesOmittedAnnounced) {
+          const omitted = params.messages.reduce(
+            (sum, message) => sum + message.content.filter((content) => content.type === 'image').length,
+            0,
+          );
+          if (omitted > 0) {
+            imagesOmittedAnnounced = true;
+            yield { type: 'images_omitted', count: omitted, providerId: cand.providerId } as StreamEvent;
+          }
+        }
 
         for (const ev of buffered) yield ev;
 

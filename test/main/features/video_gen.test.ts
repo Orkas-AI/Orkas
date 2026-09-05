@@ -153,3 +153,31 @@ describe('video_gen › Orkas public API', () => {
     expect(() => validateDownloadedVideo(Buffer.from('not a video'))).toThrow(/invalid or unsupported MP4/);
   });
 });
+
+describe('video request body lifetime', () => {
+  it.each(['cancel', 'deadline'] as const)('keeps %s active after create response headers arrive', async (mode) => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    let bodyRead!: () => void;
+    const reading = new Promise<void>((resolve) => { bodyRead = resolve; });
+    const fetchStub = vi.fn(async (_url, init) => ({
+      ok: true,
+      status: 202,
+      text: () => new Promise<string>((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+        bodyRead();
+      }),
+    }));
+    vi.stubGlobal('fetch', fetchStub);
+    try {
+      const pending = generateVideo({ prompt: 'test', outputAbsPath: path.join(tmpDir, 'pending.mp4'), signal: controller.signal });
+      await reading;
+      if (mode === 'cancel') controller.abort();
+      else await vi.advanceTimersByTimeAsync(60_001);
+      expect(await pending).toMatchObject({ ok: false, message: expect.stringMatching(mode === 'cancel' ? /abort/i : /timed out/i) });
+      expect(fetchStub).toHaveBeenCalledTimes(1);
+      expect(mocks.downloadBinaryWithProxyPolicy).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(tmpDir, 'pending.mp4'))).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+});

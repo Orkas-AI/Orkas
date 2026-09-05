@@ -4800,7 +4800,8 @@ function createMarkdownToPdfTool(opts: LocalToolsOpts): AgentTool {
       }
       if (outcome.kind === 'render') return { content: outcome.err, isError: true };
       const { finalPath, renamed } = outcome;
-      if (opts.onFileWritten) await opts.onFileWritten(finalPath);
+      try { await opts.onFileWritten?.(finalPath); }
+      catch (err) { log.warn('PDF publication callback failed', { error: logErrorRef(err) }); }
       const base = `PDF written: ${finalPath}`;
       return { content: renamed ? `${base}${renderRenameSignal(inputAbs, finalPath)}` : base };
     },
@@ -4870,7 +4871,8 @@ function createHtmlToPdfTool(opts: LocalToolsOpts): AgentTool {
       }
       if (outcome.kind === 'render') return { content: outcome.err, isError: true };
       const { finalPath, renamed } = outcome;
-      if (opts.onFileWritten) await opts.onFileWritten(finalPath);
+      try { await opts.onFileWritten?.(finalPath); }
+      catch (err) { log.warn('PDF publication callback failed', { error: logErrorRef(err) }); }
       const base = `PDF written: ${finalPath}`;
       return { content: renamed ? `${base}${renderRenameSignal(inputAbs, finalPath)}` : base };
     },

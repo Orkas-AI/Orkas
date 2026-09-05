@@ -71,6 +71,19 @@ describe('client_config', () => {
     expect(manager.get('feature.local-default')).toBe(true);
   });
 
+  it('preserves the wire-format image editing flag through normalization and cache reads', async () => {
+    const { clientConfig, getConfiguredImageGenCapability, DEFAULT_IMAGE_GEN_BY_PROVIDER } = await import('../../../src/main/features/client_config');
+    const users = await import('../../../src/main/features/users');
+    users.activateUser('clientconfigimageparity');
+    clientConfig.applyServerPayload({ immediate: { model_catalog: { image_generation: {
+      google: { model: 'fixture-image', api: 'gemini', supports_edit: true },
+    } } }, restart: {}, config_hash: 'fixture-image-edit' }, 'fixture-image-edit');
+    expect(getConfiguredImageGenCapability('google')).toMatchObject({ model: 'fixture-image', supportsEdit: true });
+    expect(DEFAULT_IMAGE_GEN_BY_PROVIDER.doubao.model).toBe('doubao-seedream-5-0-lite-260128');
+    // The normalized camelCase form is read again through the same catalog path.
+    expect(getConfiguredImageGenCapability('google')).toMatchObject({ supportsEdit: true });
+  });
+
   it('ships the synchronized public model catalog with compatibility metadata', () => {
     expect(DEFAULT_PROVIDER_MODELS['openai-codex']).toEqual([
       { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', template: 'gpt-5.5', contextWindow: 372000, maxTokens: 128000, maxInputImages: 20 },

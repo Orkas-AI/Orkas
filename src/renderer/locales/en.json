@@ -318,7 +318,7 @@
   "chat.recipient_commander_hint": "Default recipient, no @ needed",
   "chat.recipient_picker_title": "Choose agent, skill, or connector",
   "chat.recipient_picker_title_with_library": "Choose agent, skill, connector, or Library file",
-  "chat.attach_title": "Upload attachment (text / PDF / Word / image / video)",
+  "chat.attach_title": "Upload attachment (documents, spreadsheets, presentations, archives, images, audio, and video)",
   "chat.chip_remove_title": "Remove",
   "chat.send_title": "Send",
   "chat.attach_uploading": "Uploading",
@@ -2096,5 +2096,6 @@
   "skills.source_global": "Global",
   "settings.commander_avatar.title": "Commander avatar",
   "settings.commander_avatar.sub": "Click the avatar to pick a new color.",
-  "settings.commander_avatar.hint": "Click the avatar on the left to change it"
+  "settings.commander_avatar.hint": "Click the avatar on the left to change it",
+  "settings.video.provider_unavailable": "This video provider is not supported in this build. The saved key is retained and can be removed. Configure Orkas API to generate videos."
 }

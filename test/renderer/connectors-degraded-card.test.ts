@@ -613,3 +613,18 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     expect(ctx._renderCatalogCard(entry, null).innerHTML).not.toContain('is-loading');
   });
 });
+
+describe('explicit connector failure codes', () => {
+  it.each([
+    [{ code: 'user_cancelled', error: 'User cancelled' }, false],
+    [{ code: 'superseded', error: 'A newer request replaced it' }, false],
+    [{ code: 'E_UNKNOWN', error: 'Operation canceled' }, false],
+    [{ code: 'storage_unavailable', error: 'Storage failed after another request was cancelled' }, true],
+    [{ code: 'invalid_grant', error: 'Previous operation canceled; grant invalid' }, true],
+  ])('shows hard failures without mistaking incidental cancel text for user cancellation: %j', (error, shouldAlert) => {
+    const context = loadConnectorsRenderer();
+    context._handleConnectFailure({}, 0, error);
+    expect(context.__alerts.length).toBe(shouldAlert ? 1 : 0);
+    if (error.code === 'storage_unavailable') expect(context.__alerts[0]).toBe(context.t('connectors.errors.storage_unavailable'));
+  });
+});

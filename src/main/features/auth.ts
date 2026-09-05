@@ -76,6 +76,7 @@ import {
   curatedModelsFor,
   isSelectableModel,
   resolveConfiguredPiModel,
+  resolveModelUpgrade,
   providerLabel,
   providerLabelKey,
   providerDocsUrl,
@@ -93,6 +94,7 @@ import { isCooledDown, getCooldown, clearCooldown } from '../model/core-agent/pr
 import type { KeyFailureKind } from '../model/core-agent/auth-error';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
+import { logErrorSummary } from '../util/log-redact';
 import { sanitizeLogTextForUpload } from '../util/log-sanitize';
 import {
   ORKAS_API_BASE_URL,
@@ -165,7 +167,6 @@ export async function warmup(): Promise<void> {
 
 // ── File paths ───────────────────────────────────────────────────────────
 function profilesFile(): string { return userAuthProfilesFile(getActiveUserId()); }
-function authDir(): string { return userLocalConfigDir(getActiveUserId()); }
 
 // Legacy compat for tests/callers that expect this shape.
 export const FEATURED_PROVIDERS: readonly string[] =
@@ -298,8 +299,7 @@ const AUTH_SECRET_RECORD_ID = 'auth-profiles.json';
 
 // ── Profiles store IO ────────────────────────────────────────────────────
 
-function ensureAuthDir(): void {
-  const d = authDir();
+function ensureAuthDir(d: string): void {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 }
 
@@ -357,7 +357,7 @@ function decryptProfilesPayload(raw: string, localId: string): { json: string; n
   throw new Error('auth-profiles decrypt failed');
 }
 
-function loadProfiles(): ProfilesFile {
+function loadProfiles(opts: { throwOnInvalidExisting?: boolean } = {}): ProfilesFile {
   try {
     const raw = fs.readFileSync(profilesFile(), 'utf-8');
     // Decrypt current Hosted/Open fallback payloads, or the previous crypto-vault whole-file
@@ -389,29 +389,57 @@ function loadProfiles(): ProfilesFile {
           lastUsed: typeof prof.lastUsed === 'number' ? prof.lastUsed : 0,
         } as StoredProfile;
       }
-      const entries: Entry[] = Array.isArray(data.entries)
-        ? data.entries
-            .filter((e: any) => e && e.entryId && e.provider && e.model && e.profileId)
-            .map((e: any) => ({
-              entryId: String(e.entryId),
-              provider: String(e.provider),
-              model: String(e.model),
-              profileId: String(e.profileId),
-              lastUsed: typeof e.lastUsed === 'number' ? e.lastUsed : 0,
-              createdAt: typeof e.createdAt === 'number' ? e.createdAt : Date.now(),
-            }))
-        : [];
+      const entries: Entry[] = [];
+      const seenEntryKeys = new Set<string>();
+      if (Array.isArray(data.entries)) {
+        for (const e of data.entries as any[]) {
+          if (!e || !e.entryId || !e.provider || !e.model || !e.profileId) continue;
+          const provider = String(e.provider);
+          const upgraded = resolveModelUpgrade(provider, String(e.model));
+          if (upgraded.upgraded) {
+            shouldRewrite = true;
+            log.info('upgraded saved model entry', {
+              provider,
+              from: upgraded.previousModelId,
+              to: upgraded.modelId,
+            });
+          }
+          const entry: Entry = {
+            entryId: String(e.entryId),
+            provider,
+            model: upgraded.modelId,
+            profileId: String(e.profileId),
+            lastUsed: typeof e.lastUsed === 'number' ? e.lastUsed : 0,
+            createdAt: typeof e.createdAt === 'number' ? e.createdAt : Date.now(),
+          };
+          const key = `${entry.provider}::${entry.model}::${entry.profileId}`;
+          if (seenEntryKeys.has(key)) {
+            shouldRewrite = true;
+            continue;
+          }
+          seenEntryKeys.add(key);
+          entries.push(entry);
+        }
+      }
       const searchProfiles = parseSearchProfilesArray((data as any).searchProfiles);
       const imageProfiles = parseImageProfilesArray((data as any).imageProfiles);
       const videoProfiles = parseVideoProfilesArray((data as any).videoProfiles);
       const ttsProfiles = parseTtsProfilesArray((data as any).ttsProfiles);
       const store = { version: PROFILES_FILE_VERSION, profiles, entries, searchProfiles, imageProfiles, videoProfiles, ttsProfiles };
-      if (shouldRewrite || Number((data as any).version) !== PROFILES_FILE_VERSION) saveProfiles(store);
+      if (shouldRewrite || Number((data as any).version) !== PROFILES_FILE_VERSION) {
+        try { saveProfiles(store); }
+        catch (err) {
+          // Migration is best-effort: a valid parsed store remains usable when disk writes fail.
+          log.warn('auth profiles migration rewrite failed; using parsed store', { error: logErrorSummary(err) });
+        }
+      }
       return store;
     }
+    throw new Error('auth-profiles schema invalid');
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log.warn('failed to load profiles store:', (err as Error).message);
+      log.warn('failed to load profiles store', { error: logErrorSummary(err) });
+      if (opts.throwOnInvalidExisting) throw err;
     }
   }
   return { version: PROFILES_FILE_VERSION, profiles: {}, entries: [], searchProfiles: [], imageProfiles: [], videoProfiles: [], ttsProfiles: [] };
@@ -478,7 +506,7 @@ function parseTtsProfilesArray(arr: unknown): TtsProfile[] {
   const out: TtsProfile[] = [];
   for (const raw of arr) {
     const p = raw as any;
-    if (!p || typeof p !== 'object' || !p.id || !p.provider || !p.apiKey) continue;
+    if (!p || typeof p !== 'object' || !p.id || !p.apiKey) continue;
     const provider = String(p.provider || 'custom');
     if (provider === 'orkas-voice') continue;
     if (provider !== 'doubao' && !p.baseUrl) continue;
@@ -512,7 +540,7 @@ export function loadSearchProfiles(): SearchProfile[] {
 }
 
 export function saveSearchProfiles(list: SearchProfile[]): void {
-  const store = loadProfiles();
+  const store = loadProfiles({ throwOnInvalidExisting: true });
   store.searchProfiles = [...list];
   saveProfiles(store);
 }
@@ -522,7 +550,7 @@ export function loadImageProfiles(): ImageProfile[] {
 }
 
 export function saveImageProfiles(list: ImageProfile[]): void {
-  const store = loadProfiles();
+  const store = loadProfiles({ throwOnInvalidExisting: true });
   store.imageProfiles = [...list];
   saveProfiles(store);
 }
@@ -532,7 +560,7 @@ export function loadVideoProfiles(): VideoProfile[] {
 }
 
 export function saveVideoProfiles(list: VideoProfile[]): void {
-  const store = loadProfiles();
+  const store = loadProfiles({ throwOnInvalidExisting: true });
   store.videoProfiles = [...list];
   saveProfiles(store);
 }
@@ -542,7 +570,7 @@ export function loadTtsProfiles(): TtsProfile[] {
 }
 
 export function saveTtsProfiles(list: TtsProfile[]): void {
-  const store = loadProfiles();
+  const store = loadProfiles({ throwOnInvalidExisting: true });
   store.ttsProfiles = [...list];
   saveProfiles(store);
 }
@@ -574,7 +602,7 @@ export function configureAllOrkasApiServices(rawApiKey: string): { configured: t
   const apiKey = String(rawApiKey || '').trim();
   if (!apiKey) throw new Error('api key required');
 
-  const store = loadProfiles();
+  const store = loadProfiles({ throwOnInvalidExisting: true });
   const now = Date.now();
   const existingProfileEntries = Object.entries(store.profiles)
     .filter(([, profile]) => profile.provider === ORKAS_API_PROVIDER);
@@ -675,12 +703,26 @@ export function configureAllOrkasApiServices(rawApiKey: string): { configured: t
 }
 
 function saveProfiles(store: ProfilesFile): void {
-  ensureAuthDir();
-  const json = JSON.stringify(store, null, 2);
   const localId = getActiveUserId();
+  const target = userAuthProfilesFile(localId);
+  const targetDir = path.dirname(target);
+  const tmp = `${target}.tmp`;
   const ownerId = authSecretOwner(localId);
+  const json = JSON.stringify(store, null, 2);
   const out = ownerId ? localSecrets.encryptLocalSecret(authSecretContext(ownerId), json) : json;
-  fs.writeFileSync(profilesFile(), out, { encoding: 'utf-8', mode: 0o600 });
+  // Capture one account and atomically publish its complete encrypted store.
+  // Retry a disappearing directory/temp path once; preserve the original on failure.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      ensureAuthDir(targetDir);
+      fs.writeFileSync(tmp, out, { encoding: 'utf-8', mode: 0o600 });
+      fs.renameSync(tmp, target);
+      return;
+    } catch (err) {
+      try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort cleanup */ }
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT' || attempt > 0) throw err;
+    }
+  }
 }
 
 function isStoredProfileBlocked(profile: StoredProfile | undefined): boolean {
@@ -900,6 +942,19 @@ export function getConfiguredModelCooldown(): {
 }
 
 export function getConfiguredModelOAuthExpiredMessage(): string | null {
+  const store = loadProfiles();
+  const now = Date.now();
+  for (const entry of store.entries) {
+    if (!isEntryAllowed(store, entry)) continue;
+    const prof = store.profiles[entry.profileId];
+    if (!prof || prof.type !== 'oauth') continue;
+    if (now < prof.expires) {
+      clearOAuthRefreshFailure(entry.profileId);
+      continue;
+    }
+    if (!oauthRefreshFailures.has(entry.profileId) && prof.refresh) continue;
+    return t('errors.model_oauth_expired', { provider: providerLabel(prof.provider) });
+  }
   return null;
 }
 
@@ -1120,7 +1175,7 @@ export async function addApiKey(
   if (providerUsesCustomOpenAIConfig(id)) {
     throw customConfigError('CUSTOM_CONFIG_REQUIRED', 'Use the custom model configuration flow');
   }
-  const store = loadProfiles();
+  const store = loadProfiles({ throwOnInvalidExisting: true });
   const chosenLabel = label ? sanitizeLabel(label) : autoLabel(store, id);
   const profileId = makeProfileId(id, chosenLabel);
   const now = Date.now();
@@ -1150,7 +1205,7 @@ export async function addApiKeyEntry(
   label?: string,
 ): Promise<{ profileId: string; entryId: string }> {
   const id = String(providerId || '').trim();
-  const model = String(modelId || '').trim();
+  const model = resolveModelUpgrade(id, String(modelId || '').trim()).modelId;
   const key = String(apiKey || '').trim();
   if (!id) throw new Error('provider required');
   if (!model) throw new Error('model required');
@@ -1161,7 +1216,7 @@ export async function addApiKeyEntry(
   }
   await assertRuntimeSelectableModel(id, model);
 
-  const store = loadProfiles();
+  const store = loadProfiles({ throwOnInvalidExisting: true });
   const chosenLabel = label ? sanitizeLabel(label) : autoLabel(store, id);
   const profileId = makeProfileId(id, chosenLabel);
   const now = Date.now();
@@ -1254,7 +1309,7 @@ export async function addCustomModelEntry(
     );
   }
 
-  const store = loadProfiles();
+  const store = loadProfiles({ throwOnInvalidExisting: true });
   const chosenLabel = rawLabel
     ? sanitizeCustomLabel(rawLabel)
     : autoLabel(store, CUSTOM_MODEL_PROVIDER);
@@ -1303,7 +1358,7 @@ export async function addCustomModelEntry(
 export async function removeCredential(profileId: string): Promise<{ removed: boolean }> {
   const id = String(profileId || '').trim();
   if (!id) throw new Error('profileId required');
-  const store = loadProfiles();
+  const store = loadProfiles({ throwOnInvalidExisting: true });
   if (!store.profiles[id]) return { removed: false };
   delete store.profiles[id];
   // Cascade: any entry referencing this profile is now dangling; drop those
@@ -1321,7 +1376,7 @@ export async function renameProfile(
   const id = String(profileId || '').trim();
   const label = sanitizeLabel(newLabel);
   if (!id) throw new Error('profileId required');
-  const store = loadProfiles();
+  const store = loadProfiles({ throwOnInvalidExisting: true });
   const prof = store.profiles[id];
   if (!prof) throw new Error('profile not found');
   const newId = makeProfileId(prof.provider, label);
@@ -1451,12 +1506,12 @@ export async function addEntry({
   profileId,
 }: { provider: string; model: string; profileId: string }): Promise<{ entryId: string }> {
   const p = String(provider || '').trim();
-  const m = String(model || '').trim();
+  const m = resolveModelUpgrade(p, String(model || '').trim()).modelId;
   const pid = String(profileId || '').trim();
   if (!p || !m || !pid) throw new Error('provider / model / profileId required');
   assertModelProviderAllowed(p, m);
   await assertRuntimeSelectableModel(p, m);
-  const store = loadProfiles();
+  const store = loadProfiles({ throwOnInvalidExisting: true });
   if (!store.profiles[pid]) throw new Error('profile not found');
   if (store.profiles[pid].provider !== p) throw new Error('profile does not belong to provider');
 
@@ -1483,11 +1538,15 @@ export async function addEntry({
 
 export async function updateEntryModel(entryId: string, model: string): Promise<{ entryId: string; model: string }> {
   const id = String(entryId || '').trim();
-  const m = String(model || '').trim();
-  if (!id || !m) throw new Error('entryId and model required');
-  const store = loadProfiles();
+  const rawModel = String(model || '').trim();
+  if (!id || !rawModel) throw new Error('entryId and model required');
+  const store = loadProfiles({ throwOnInvalidExisting: true });
   const target = store.entries.find((e) => e.entryId === id);
   if (!target) throw new Error('entry not found');
+  const m = resolveModelUpgrade(target.provider, rawModel).modelId;
+  if (providerUsesCustomOpenAIConfig(target.provider) && m !== target.model) {
+    throw new Error('custom endpoint model is fixed');
+  }
   assertModelProviderAllowed(target.provider, m);
   await assertRuntimeSelectableModel(target.provider, m);
   // Deduplicate: if another entry with the same (provider, model, profileId)
@@ -1505,7 +1564,7 @@ export async function updateEntryModel(entryId: string, model: string): Promise<
 export async function removeEntry(entryId: string): Promise<{ removed: boolean }> {
   const id = String(entryId || '').trim();
   if (!id) throw new Error('entryId required');
-  const store = loadProfiles();
+  const store = loadProfiles({ throwOnInvalidExisting: true });
   const before = store.entries.length;
   store.entries = store.entries.filter((e) => e.entryId !== id);
   if (store.entries.length === before) return { removed: false };
@@ -1516,7 +1575,7 @@ export async function removeEntry(entryId: string): Promise<{ removed: boolean }
 
 export async function reorderEntries(orderedIds: string[]): Promise<{ entries: EntryView[] }> {
   if (!Array.isArray(orderedIds)) throw new Error('orderedIds must be an array');
-  const store = loadProfiles();
+  const store = loadProfiles({ throwOnInvalidExisting: true });
   const runtimeResolvable = await buildRuntimeModelResolver(store.entries);
   const byId = new Map(store.entries.map((e) => [e.entryId, e]));
   const reordered: Entry[] = [];
@@ -1545,18 +1604,53 @@ export async function reorderEntries(orderedIds: string[]): Promise<{ entries: E
  * different model for that same user-owned credential first. */
 export async function selectEntry(
   entryId: string,
-  model?: string,
+  requestedModel?: string,
 ): Promise<{ entries: EntryView[] }> {
   const id = String(entryId || '').trim();
   if (!id) throw new Error('entryId required');
-  const requestedModel = String(model || '').trim();
-  if (requestedModel) await updateEntryModel(id, requestedModel);
-  const store = loadProfiles();
+  const store = loadProfiles({ throwOnInvalidExisting: true });
   const selected = store.entries.find((entry) => entry.entryId === id);
-  if (!selected) throw new Error('entry not found');
-  if (!isEntryAllowed(store, selected)) throw modelNotAvailableError();
-  await assertRuntimeSelectableModel(selected.provider, selected.model);
-  return reorderEntries([id]);
+  if (!selected) throw modelNotAvailableError();
+
+  const rawModel = String(requestedModel || '').trim();
+  if (rawModel && rawModel !== selected.model) {
+    if (providerUsesCustomOpenAIConfig(selected.provider)) {
+      throw new Error('custom endpoint model is fixed');
+    }
+    const model = resolveModelUpgrade(selected.provider, rawModel).modelId;
+    assertModelProviderAllowed(selected.provider, model);
+    await assertRuntimeSelectableModel(selected.provider, model);
+    const collision = store.entries.find((entry) => (
+      entry.entryId !== id
+      && entry.provider === selected.provider
+      && entry.model === model
+      && entry.profileId === selected.profileId
+    ));
+    if (collision) throw new Error('same (provider, model, profile) entry already exists');
+    selected.model = model;
+  }
+  const runtimeResolvable = await buildRuntimeModelResolver(store.entries);
+  if (
+    !isEntryAllowed(store, selected)
+    || !runtimeResolvable(selected.provider, selected.model)
+  ) throw modelNotAvailableError();
+
+  const runnable = store.entries.filter((entry) => (
+    isEntryAllowed(store, entry) && runtimeResolvable(entry.provider, entry.model)
+  ));
+  const ordered = [selected, ...runnable.filter((entry) => entry.entryId !== id)];
+  const runnableIds = new Set(runnable.map((entry) => entry.entryId));
+  let orderedIndex = 0;
+  store.entries = store.entries.map((entry) => (
+    runnableIds.has(entry.entryId) ? ordered[orderedIndex++] : entry
+  ));
+  saveProfiles(store);
+  invalidateCoreAgentRunner();
+
+  const lookup = await buildModelNameLookup();
+  return { entries: store.entries.filter((entry) => (
+    isEntryAllowed(store, entry) && runtimeResolvable(entry.provider, entry.model)
+  )).map((entry) => entryToView(entry, store, lookup, true)) };
 }
 
 // ── OAuth flow orchestration ─────────────────────────────────────────────
@@ -1668,7 +1762,7 @@ export async function startOAuth(
   }
 
   const flowId = nextFlowId();
-  const chosenLabel = label ? sanitizeLabel(label) : autoLabel(loadProfiles(), id);
+  const chosenLabel = label ? sanitizeLabel(label) : autoLabel(loadProfiles({ throwOnInvalidExisting: true }), id);
   // Device-code style flows (MiniMax) don't bind a local port — the UI must
   // hide its "paste callback URL" input in that case.
   const usesCallbackServer = provider.usesCallbackServer !== false;
@@ -1751,7 +1845,7 @@ export async function startOAuth(
       },
     })
     .then((credentials) => {
-      const store = loadProfiles();
+      const store = loadProfiles({ throwOnInvalidExisting: true });
       // Prefer a human-identifiable label from the token if the caller
       // didn't supply one — email local-part, then accountId prefix —
       // so multi-account rows don't all read "default".
@@ -1872,11 +1966,17 @@ async function resolveEntryApiKey(store: ProfilesFile, entry: Entry): Promise<st
   const prof = store.profiles[entry.profileId];
   if (!prof || !isStoredProfileAllowed(prof)) return undefined;
   if (prof.type === 'api_key') return prof.key;
-  if (Date.now() < prof.expires) return prof.access;
+  if (Date.now() < prof.expires) {
+    clearOAuthRefreshFailure(entry.profileId);
+    return prof.access;
+  }
   try {
-    return await refreshOAuthProfile(entry.profileId);
+    const refreshed = await refreshOAuthProfile(entry.profileId);
+    if (!refreshed) rememberOAuthRefreshFailure(entry.profileId, prof);
+    return refreshed;
   } catch (err) {
-    log.warn(`OAuth refresh failed for ${entry.profileId}:`, (err as Error).message);
+    rememberOAuthRefreshFailure(entry.profileId, prof);
+    log.warn('OAuth refresh failed', { profileId: entry.profileId, error: logErrorSummary(err) });
     return undefined;
   }
 }
@@ -1929,11 +2029,17 @@ export function listApiKeyEntries(): ApiKeyEntryChoice[] {
  * clobbering concurrent writes). Safe no-op if the entry disappeared.
  */
 export function bumpEntryLastUsed(entryId: string): void {
-  const fresh = loadProfiles();
-  const target = fresh.entries.find((e) => e.entryId === entryId);
-  if (target) {
-    target.lastUsed = Date.now();
-    saveProfiles(fresh);
+  try {
+    const fresh = loadProfiles({ throwOnInvalidExisting: true });
+    const target = fresh.entries.find((e) => e.entryId === entryId);
+    if (target) {
+      target.lastUsed = Date.now();
+      saveProfiles(fresh);
+    }
+  } catch (err) {
+    // Usage bookkeeping is best-effort. Never overwrite an unreadable store,
+    // and never fail an otherwise successful model run for this timestamp.
+    log.warn('failed to persist model entry usage', { error: logErrorSummary(err) });
   }
 }
 
@@ -2033,7 +2139,7 @@ export async function pickRotationKey(providerId: string): Promise<{
   const id = String(providerId || '').trim();
   if (!id) return null;
   if (!isModelProviderAllowed(id)) return null;
-  const store = loadProfiles();
+  const store = loadProfiles({ throwOnInvalidExisting: true });
   const candidates = Object.entries(store.profiles)
     .filter(([, p]) => p.provider === id)
     .sort(([, a], [, b]) => (a.lastUsed || 0) - (b.lastUsed || 0));
@@ -2049,7 +2155,7 @@ export async function pickRotationKey(providerId: string): Promise<{
     if (!apiKey) continue;
     const customConfig = customRuntimeConfigFromProfile(prof);
     if (providerUsesCustomOpenAIConfig(id) && !customConfig) continue;
-    const fresh = loadProfiles();
+    const fresh = loadProfiles({ throwOnInvalidExisting: true });
     const target = fresh.profiles[pid];
     if (target) { target.lastUsed = Date.now(); saveProfiles(fresh); }
     return {
@@ -2068,9 +2174,18 @@ async function refreshOAuthProfile(profileId: string): Promise<string | undefine
   const prof = store.profiles[profileId];
   if (!prof || prof.type !== 'oauth') return undefined;
 
-  const oauth = await piOauth();
+  let oauth: PiOauthModule;
+  try {
+    oauth = await piOauth();
+  } catch (err) {
+    rememberOAuthRefreshFailure(profileId, prof);
+    throw err;
+  }
   const provider = await oauth.getOAuthProvider(prof.provider);
-  if (!provider) return undefined;
+  if (!provider) {
+    rememberOAuthRefreshFailure(profileId, prof);
+    return undefined;
+  }
 
   const creds = {
     access: prof.access,
@@ -2082,8 +2197,14 @@ async function refreshOAuthProfile(profileId: string): Promise<string | undefine
       ),
     ),
   };
-  const newCreds = await provider.refreshToken(creds as any);
-  const fresh = loadProfiles();
+  let newCreds: any;
+  try {
+    newCreds = await provider.refreshToken(creds as any);
+  } catch (err) {
+    rememberOAuthRefreshFailure(profileId, prof);
+    throw err;
+  }
+  const fresh = loadProfiles({ throwOnInvalidExisting: true });
   const target = fresh.profiles[profileId];
   if (target && target.type === 'oauth') {
     target.access = newCreds.access;
@@ -2096,6 +2217,7 @@ async function refreshOAuthProfile(profileId: string): Promise<string | undefine
     }
     saveProfiles(fresh);
   }
+  clearOAuthRefreshFailure(profileId);
   return provider.getApiKey(newCreds);
 }
 
@@ -2131,7 +2253,7 @@ export async function testConnection(
 ): Promise<TestConnectionResult> {
   const pid = String(providerId || '').trim();
   if (!pid) return { ok: false, error: 'provider required' };
-  const selectedModel = String(modelId || '').trim() || curatedModelsFor(pid)[0]?.id || '';
+  const selectedModel = resolveModelUpgrade(pid, String(modelId || '').trim()).modelId || curatedModelsFor(pid)[0]?.id || '';
   if (!isModelProviderAllowed(pid, selectedModel || undefined)) {
     return { ok: false, error: 'DeepSeek is disabled in this build' };
   }
@@ -2259,7 +2381,7 @@ export async function testConnection(
   } catch (err) {
     return {
       ok: false,
-      error: (err as Error).message || String(err),
+      error: sanitizeConnectionError(err, { apiKey }),
       durationMs: Date.now() - t0,
       profileId: chosenProfileId,
     };
@@ -2269,3 +2391,12 @@ export async function testConnection(
 // ── Legacy aliases ───────────────────────────────────────────────────────
 export const saveApiKey = (providerId: string, apiKey: string, label?: string) =>
   addApiKey(providerId, apiKey, label);
+
+const oauthRefreshFailures = new Set<string>();
+function rememberOAuthRefreshFailure(profileId: string, prof: OAuthProfile): void {
+  if (!profileId || Date.now() < prof.expires) return;
+  oauthRefreshFailures.add(profileId);
+}
+function clearOAuthRefreshFailure(profileId: string): void {
+  if (profileId) oauthRefreshFailures.delete(profileId);
+}

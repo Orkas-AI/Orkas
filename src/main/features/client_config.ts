@@ -579,7 +579,7 @@ export const DEFAULT_PROVIDER_MODELS = PUBLIC_PROVIDER_MODELS;
 export const DEFAULT_IMAGE_GEN_BY_PROVIDER: Readonly<Record<string, ImageGenCapability>> = {
   openai: { model: 'gpt-image-2', api: 'openai', supportsEdit: true },
   google: { model: 'gemini-3.1-flash-image-preview', api: 'gemini', supportsEdit: true },
-  doubao: { model: 'doubao-seedream-4-5-251128', api: 'doubao', supportsEdit: true },
+  doubao: { model: 'doubao-seedream-5-0-lite-260128', api: 'doubao', supportsEdit: true },
 };
 
 /**
@@ -710,7 +710,7 @@ function normalizeImageGenCapability(value: unknown): ImageGenCapability | null 
     ? r.api as ImageGenCapability['api']
     : '';
   if (!model || !api) return null;
-  return { model, api, supportsEdit: r.supportsEdit === true };
+  return { model, api, supportsEdit: (r.supports_edit ?? r.supportsEdit) === true };
 }
 
 function mergeProviderSection(target: Record<string, ProviderModelEntry[]>, value: unknown): void {

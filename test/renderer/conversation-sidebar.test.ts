@@ -127,6 +127,8 @@ function loadConversationRenderer() {
       'chat.process.action_search_conversation': 'Search conversation',
       'chat.process.action_run_command': 'Run command',
       'chat.process.action_generate_image': 'Generate image',
+      'chat.process.action_generate_video': 'Generate video',
+      'chat.from_agent_unknown': 'Agent',
       'chat.process.action_generate_audio': 'Generate audio',
       'chat.process.action_create_plan': 'Create plan',
       'chat.process.action_execute_plan': 'Execute plan',
@@ -227,6 +229,62 @@ function loadConversationRenderer() {
   vm.runInContext(source, context);
   return context;
 }
+
+describe('delegation and video process presentation', () => {
+  it.each(['dispatch_to', 'hand_off_to'])(
+    'renders persisted %s identity in live progress and history without the registry cache', (name) => {
+      const context = loadConversationRenderer();
+      const events = [
+        { stream: 'tool', data: { phase: 'start', id: 'delegate-1', name } },
+        { stream: 'tool', data: { phase: 'progress', id: 'delegate-1', name,
+          arguments: { to: 'd76b91de8c7b' }, agent_name: 'ProductDemoBuilder' } },
+        { stream: 'tool', data: { phase: 'end', id: 'delegate-1', name,
+          agent_name: 'ProductDemoBuilder', duration_ms: 8000 } },
+      ];
+      const lines: string[] = [];
+      context._streamingAppendProgress = (_msg: unknown, line: string) => lines.push(line);
+      const message = {};
+      for (const event of events) context._renderAgentEvent(message, event);
+      expect(lines.slice(1).every((line) => line.includes('Call agent · ProductDemoBuilder'))).toBe(true);
+      expect(lines.join('\n')).not.toContain('d76b91de8c7b');
+      const replay = context._createProcessDisplayContext();
+      for (const event of JSON.parse(JSON.stringify(events)).slice(1)) {
+        expect(context._formatEventLine(event, replay)).toContain('Call agent · ProductDemoBuilder');
+      }
+      expect(context._formatEventLine(events[2])).toContain('Call agent · ProductDemoBuilder');
+    },
+  );
+
+  it.each(['registry', 'members', 'unknown', 'explicit'])(
+    'resolves legacy delegation ids using %s identity information', (source) => {
+      const context = loadConversationRenderer();
+      context.currentCid = 'c1';
+      if (source === 'registry') context._agentsCache = [{ agent_id: 'd76b91de8c7b', name: 'ProductDemoBuilder' }];
+      if (source === 'members') vm.runInContext(
+        '_groupMembersCache.set("c1", [{ id: "d76b91de8c7b", name: "ProductDemoBuilder" }])', context,
+      );
+      const line = context._formatEventLine({ stream: 'tool', data: {
+        phase: 'start', name: 'dispatch_to', arguments: { to: 'd76b91de8c7b' },
+        ...(source === 'explicit' ? { agent_name: 'aabbccddeeff' } : {}),
+      } });
+      const expectedName = source === 'explicit' ? 'aabbccddeeff' : source === 'unknown' ? 'Agent' : 'ProductDemoBuilder';
+      expect(line).toContain(`Call agent · ${expectedName}`);
+      expect(line).not.toContain('d76b91de8c7b');
+    },
+  );
+
+  it('preserves the video action through terminal events and a fresh replay', () => {
+    const context = loadConversationRenderer();
+    const events = [
+      { stream: 'tool', data: { phase: 'start', id: 'video-1', name: 'generate_video', arguments: { output_path: 'demo.mp4' } } },
+      { stream: 'tool', data: { phase: 'end', id: 'video-1', name: 'generate_video' } },
+    ];
+    for (let pass = 0; pass < 2; pass += 1) {
+      const display = context._createProcessDisplayContext();
+      for (const event of events) expect(context._formatEventLine(event, display)).toContain('Generate video · demo.mp4');
+    }
+  });
+});
 
 describe('conversation form submission boundary', () => {
   it('rejects a failed form mark with the backend error so the widget can retry', async () => {
@@ -3566,6 +3624,7 @@ describe('conversation process metadata formatting', () => {
     ['office_render', { path: 'reports/summary.docx' }, 'Render file · reports/summary.docx'],
     ['pdf_render', { path: 'reports/summary.pdf' }, 'View file · reports/summary.pdf'],
     ['generate_image', { output_path: 'images/cover.png' }, 'Generate image · images/cover.png'],
+    ['generate_video', { output_path: 'video/demo.mp4' }, 'Generate video · video/demo.mp4'],
     ['generate_speech', { output_path: 'audio/voice.mp3' }, 'Generate audio · audio/voice.mp3'],
     ['call_connector_tool', { connector_id: 'Notion' }, 'Use connector · Notion'],
     ['add_custom_connector', { display_name: 'Internal Docs' }, 'Add connector · Internal Docs'],
@@ -6160,7 +6219,7 @@ describe('conversation controller settlement', () => {
     ]);
   });
 
-  it('retries a failed edit reply through its owning controller with the original request metadata', async () => {
+  it.each(['agent', 'skill'])('retries a failed %s edit reply through its owning controller with the original request metadata', async (owner) => {
     const context = loadConversationRenderer();
     const historyEl: any = { innerHTML: '', dataset: {} };
     const capturedRequests: Array<{ url: string; body: any }> = [];
@@ -6197,15 +6256,16 @@ describe('conversation controller settlement', () => {
       };
     };
 
-    const controller = context.createChatController({
-      historyEl,
-      getCurrentId: () => 'skill-a1',
-      historyEndpoint: () => '/skill/history',
-      streamEndpoint: () => '/skill/send',
-      telemetrySurface: 'skill_edit',
-      features: { bindInput: false, scrollPin: false, queue: true, messageActions: 'errors-only' },
-      queue: { keyPrefix: 'skill' },
-    });
+    context.window.addEventListener = () => {};
+    context.document.getElementById = (id: string) => id === `${owner}s-chat-messages` ? historyEl : null;
+    context._setChatScrollOffset = () => {};
+    context._pinMessageToTopWithDynamicSpacer = () => {};
+    context._chatAttachList = () => [];
+    vm.runInContext(fs.readFileSync(path.join(process.cwd(), `src/renderer/modules/${owner}s.js`), 'utf8'), context);
+    vm.runInContext(owner === 'agent'
+      ? "_selectedAgent = { id: 'resource-a1', source: 'custom' }; _bindAgentEditAttachments = () => {};"
+      : "_skillEditSkillId = 'resource-a1'; _bindSkillEditAttachments = () => {};", context);
+    const controller = owner === 'agent' ? context._ensureAgentChatController() : context._ensureSkillChatController();
     await controller.loadHistory();
 
     const userMessage = {
@@ -6225,7 +6285,7 @@ describe('conversation controller settlement', () => {
 
     expect(capturedRequests).toHaveLength(1);
     expect(capturedRequests[0]).toEqual({
-      url: '/skill/send',
+      url: `/api/${owner}s/resource-a1/chat/send/stream`,
       body: expect.objectContaining({
         content: 'Refine this skill',
         attachments: ['brief.md'],
@@ -6412,19 +6472,39 @@ describe('conversation controller settlement', () => {
     expect(result.result).toBe(expected);
   });
 
-  it('returns failure for a controller preflight rejection', async () => {
+  it.each(['rejected', 'thrown'])(
+    'discards a sent composer snapshot when preflight is %s', async (failure) => {
     const context = loadConversationRenderer();
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/queue-draft.js'), 'utf8'), context);
+    context._rememberSentComposerSnapshot('c1', { text: 'old unsent attempt' });
     context.performance = performance;
     context._makeConvChatController = () => ({
       abort() {},
       async send() {
+        if (failure === 'thrown') throw new Error('preflight failed');
         return { started: false, aborted: false, errored: false, reason: 'model_not_configured' };
       },
     });
 
-    const result = await context.sendInConversation('c1', 'hello');
+    if (failure === 'thrown') {
+      await expect(context.sendInConversation('c1', 'hello')).rejects.toThrow('preflight failed');
+    } else {
+      expect((await context.sendInConversation('c1', 'hello')).result).toBe('failure');
+    }
+    expect(vm.runInContext('_sentComposerSnapshots.has("c1")', context)).toBe(false);
+    expect(context._restoreSentComposerSnapshot('c1')).toBe(false);
+  });
 
-    expect(result.result).toBe('failure');
+  it('keeps the active turn snapshot when a new message is queued', async () => {
+    const context = loadConversationRenderer();
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/queue-draft.js'), 'utf8'), context);
+    context.performance = performance;
+    context._rememberSentComposerSnapshot('c1', { text: 'active turn' });
+    context.pendingConvs.set('c1', {});
+    context.enqueueMessage = vi.fn();
+
+    expect(await context.sendInConversation('c1', 'queued turn')).toMatchObject({ queued: true });
+    expect(vm.runInContext('_sentComposerSnapshots.get("c1").text', context)).toBe('active turn');
   });
 });
 

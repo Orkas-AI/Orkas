@@ -2572,6 +2572,9 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
     }
 
     expect(seenOpts.message).toBe('请读取 SKILL.md 和导入资料，并直接整理完整技能。');
+    expect(seenOpts.skillList).toEqual([]);
+    expect(seenOpts.systemSkillList).toEqual(['skill-creator', 'package-installer']);
+    expect(seenOpts.readOnlyExtraRoots).toEqual([path.join(customSkillsDir(), 'alpha')]);
     const chatPath = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'skill', 'alpha', 'chat.jsonl');
     const first = JSON.parse(fs.readFileSync(chatPath, 'utf8').trim().split('\n')[0]);
     expect(first.role).toBe('user');

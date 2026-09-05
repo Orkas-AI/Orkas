@@ -337,10 +337,10 @@ describe('auth › multi-profile store (addApiKey / removeCredential / renamePro
     const a = await import('../../../src/main/features/auth');
     const { entries } = await a.listEntries();
     expect(entries).toHaveLength(1);
-    expect(entries[0].model).toBe('k2p6');
+    expect(entries[0].model).toBe('k2p7');
 
     const rewritten = JSON.parse(localSecrets.decryptLocalSecret(ctx, fs.readFileSync(file, 'utf8')));
-    expect(rewritten.entries[0].model).toBe('k2p6');
+    expect(rewritten.entries[0].model).toBe('k2p7');
   });
 
   it('removeCredential drops the profile', async () => {
@@ -772,7 +772,7 @@ describe('auth › entries (priority list)', () => {
     await a.addEntry({ provider: 'kimi-coding', model: 'k2p6', profileId: p.profileId });
     const { entries } = await a.listEntries();
     expect(entries).toHaveLength(1);
-    expect(entries[0].model).toBe('k2p6');
+    expect(entries[0].model).toBe('k2p7');
   });
 
   it('addEntry rejects a profileId belonging to a different provider', async () => {
@@ -1152,4 +1152,333 @@ describe('auth › getConfig', () => {
     await a.addEntry({ provider: 'anthropic', model: 'claude-opus-5', profileId: profiles.profileId });
     expect(await a.getConfig()).toEqual({ provider: 'anthropic', model: 'claude-opus-5' });
   });
+});
+
+describe('auth › durable shared profile contracts', () => {
+  it('keeps a successfully parsed profile available when its migration rewrite fails', async () => {
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, localSecrets.encryptLocalSecret({
+      namespace: 'auth.profiles',
+      ownerId: TEST_UID,
+      recordId: 'auth-profiles.json',
+    }, JSON.stringify({
+      version: 4,
+      profiles: {
+        'openai:default': {
+          type: 'api_key',
+          provider: 'openai',
+          label: 'default',
+          key: 'sk-readable-during-migration-xxxxxxxx',
+          createdAt: 1,
+          lastUsed: 0,
+        },
+      },
+      entries: [],
+      searchProfiles: [],
+      imageProfiles: [],
+    })), 'utf8');
+
+    vi.doMock('node:fs', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs')>();
+      return {
+        ...actual,
+        renameSync: (from: fs.PathLike, to: fs.PathLike) => {
+          if (String(from) === `${file}.tmp` && String(to) === file) {
+            throw Object.assign(new Error('migration rename denied'), { code: 'EACCES' });
+          }
+          return actual.renameSync(from, to);
+        },
+      };
+    });
+
+    const a = await import('../../../src/main/features/auth');
+    const { providers } = await a.listProviders();
+
+    expect(providers.find((provider) => provider.id === 'openai')?.profiles)
+      .toEqual([expect.objectContaining({ masked: 'sk-r…xxxx' })]);
+    expect(localSecrets.isEncryptedSecret(fs.readFileSync(file, 'utf8'))).toBe(true);
+  });
+
+  it('recreates a missing credentials directory before the first profile write', async () => {
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    fs.rmSync(path.dirname(file), { recursive: true, force: true });
+
+    const a = await import('../../../src/main/features/auth');
+    await a.addApiKey('openai', 'sk-created-after-missing-dir-xxxxxxxx');
+
+    expect(fs.statSync(path.dirname(file)).isDirectory()).toBe(true);
+    expect(localSecrets.decryptLocalSecret(ctx, fs.readFileSync(file, 'utf8')))
+      .toContain('sk-created-after-missing-dir-xxxxxxxx');
+  });
+
+  it('recovers one transient ENOENT while writing the temporary profile file', async () => {
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    let writeAttempts = 0;
+    vi.doMock('node:fs', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs')>();
+      return {
+        ...actual,
+        writeFileSync: (target: fs.PathOrFileDescriptor, data: string | NodeJS.ArrayBufferView, options?: fs.WriteFileOptions) => {
+          if (String(target) === `${file}.tmp`) {
+            writeAttempts += 1;
+            if (writeAttempts === 1) {
+              actual.rmSync(path.dirname(file), { recursive: true, force: true });
+              throw Object.assign(new Error('transient missing profile directory'), { code: 'ENOENT' });
+            }
+          }
+          return actual.writeFileSync(target, data, options);
+        },
+      };
+    });
+
+    const a = await import('../../../src/main/features/auth');
+    await a.addApiKey('openai', 'sk-new-after-write-retry-xxxxxxxx');
+
+    expect(writeAttempts).toBe(2);
+    expect(localSecrets.decryptLocalSecret(ctx, fs.readFileSync(file, 'utf8')))
+      .toContain('sk-new-after-write-retry-xxxxxxxx');
+  });
+
+  it('recovers one transient ENOENT while atomically publishing auth profiles', async () => {
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, localSecrets.encryptLocalSecret(ctx, JSON.stringify({
+      version: 6,
+      profiles: {
+        'openai:default': {
+          type: 'api_key',
+          provider: 'openai',
+          label: 'default',
+          key: 'sk-existing-must-survive-xxxxxxxx',
+          createdAt: 1,
+          lastUsed: 0,
+        },
+      },
+      entries: [],
+      searchProfiles: [],
+      imageProfiles: [],
+      videoProfiles: [],
+      ttsProfiles: [],
+      disabledManagedProviders: [],
+      disabledManagedModels: [],
+    })), 'utf8');
+
+    let publishAttempts = 0;
+    vi.doMock('node:fs', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs')>();
+      return {
+        ...actual,
+        renameSync: (from: fs.PathLike, to: fs.PathLike) => {
+          if (String(from) === `${file}.tmp` && String(to) === file) {
+            publishAttempts += 1;
+            if (publishAttempts === 1) {
+              actual.rmSync(from, { force: true });
+              throw Object.assign(new Error('transient missing temp file'), { code: 'ENOENT' });
+            }
+          }
+          return actual.renameSync(from, to);
+        },
+      };
+    });
+
+    const a = await import('../../../src/main/features/auth');
+
+    await a.addApiKey('anthropic', 'sk-new-after-retry-xxxxxxxx');
+
+    expect(publishAttempts).toBe(2);
+    const saved = localSecrets.decryptLocalSecret(ctx, fs.readFileSync(file, 'utf8'));
+    expect(saved).toContain('sk-existing-must-survive-xxxxxxxx');
+    expect(saved).toContain('sk-new-after-retry-xxxxxxxx');
+  });
+
+  it('rethrows repeated ENOENT without replacing the existing auth profiles', async () => {
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const original = localSecrets.encryptLocalSecret(ctx, JSON.stringify({
+      version: 6,
+      profiles: {
+        'openai:default': {
+          type: 'api_key',
+          provider: 'openai',
+          label: 'default',
+          key: 'sk-existing-must-remain-xxxxxxxx',
+          createdAt: 1,
+          lastUsed: 0,
+        },
+      },
+      entries: [],
+      searchProfiles: [],
+      imageProfiles: [],
+      videoProfiles: [],
+      ttsProfiles: [],
+      disabledManagedProviders: [],
+      disabledManagedModels: [],
+    }));
+    fs.writeFileSync(file, original, 'utf8');
+
+    let publishAttempts = 0;
+    vi.doMock('node:fs', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs')>();
+      return {
+        ...actual,
+        renameSync: (from: fs.PathLike, to: fs.PathLike) => {
+          if (String(from) === `${file}.tmp` && String(to) === file) {
+            publishAttempts += 1;
+            actual.rmSync(from, { force: true });
+            throw Object.assign(new Error('persistent missing temp file'), { code: 'ENOENT' });
+          }
+          return actual.renameSync(from, to);
+        },
+      };
+    });
+
+    const a = await import('../../../src/main/features/auth');
+    await expect(a.addApiKey('anthropic', 'sk-must-not-persist-xxxxxxxx'))
+      .rejects.toMatchObject({ code: 'ENOENT' });
+
+    expect(publishAttempts).toBe(2);
+    expect(fs.readFileSync(file, 'utf8')).toBe(original);
+    expect(fs.existsSync(`${file}.tmp`)).toBe(false);
+  });
+
+  it('does not retry a non-ENOENT publish failure or replace existing profiles', async () => {
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const original = localSecrets.encryptLocalSecret(ctx, JSON.stringify({
+      version: 6,
+      profiles: {
+        'openai:default': {
+          type: 'api_key', provider: 'openai', label: 'default',
+          key: 'sk-existing-before-eacces-xxxxxxxx', createdAt: 1, lastUsed: 0,
+        },
+      },
+      entries: [], searchProfiles: [], imageProfiles: [], videoProfiles: [], ttsProfiles: [],
+      disabledManagedProviders: [], disabledManagedModels: [],
+    }));
+    fs.writeFileSync(file, original, 'utf8');
+    let publishAttempts = 0;
+    vi.doMock('node:fs', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs')>();
+      return {
+        ...actual,
+        renameSync: (from: fs.PathLike, to: fs.PathLike) => {
+          if (String(from) === `${file}.tmp` && String(to) === file) {
+            publishAttempts += 1;
+            throw Object.assign(new Error('profile publish denied'), { code: 'EACCES' });
+          }
+          return actual.renameSync(from, to);
+        },
+      };
+    });
+
+    const a = await import('../../../src/main/features/auth');
+    await expect(a.addApiKey('anthropic', 'sk-must-not-persist-xxxxxxxx'))
+      .rejects.toMatchObject({ code: 'EACCES' });
+
+    expect(publishAttempts).toBe(1);
+    expect(fs.readFileSync(file, 'utf8')).toBe(original);
+    expect(fs.existsSync(`${file}.tmp`)).toBe(false);
+  });
+
+  it.each([
+    ['addApiKeyEntry', async (a: typeof import('../../../src/main/features/auth')) => {
+      await a.addApiKeyEntry('openai', 'gpt-5.5', 'sk-must-not-overwrite-xxxxxxxx');
+    }],
+    ['addCustomModelEntry', async (a: typeof import('../../../src/main/features/auth')) => {
+      await a.addCustomModelEntry({
+        baseUrl: 'https://example.com/v1',
+        model: 'private-model',
+        apiKey: 'sk-must-not-overwrite-xxxxxxxx',
+      });
+    }],
+    ['reorderEntries', async (a: typeof import('../../../src/main/features/auth')) => {
+      await a.reorderEntries([]);
+    }],
+  ])('refuses %s when the existing credential store is unreadable', async (_name, mutate) => {
+    const paths = await import('../../../src/main/paths');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const corrupt = 'credential-store-must-be-preserved';
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, corrupt, 'utf8');
+    const a = await import('../../../src/main/features/auth');
+
+    await expect(mutate(a)).rejects.toThrow();
+    expect(fs.readFileSync(file, 'utf8')).toBe(corrupt);
+    expect(loggerMocks.warn).toHaveBeenCalledWith(
+      'failed to load profiles store',
+      expect.objectContaining({
+        error: expect.objectContaining({
+          name: 'SyntaxError',
+          message_hash: expect.any(String),
+          message_chars: expect.any(Number),
+        }),
+      }),
+    );
+    expect(JSON.stringify(loggerMocks.warn.mock.calls)).not.toContain(corrupt);
+  });
+  it('atomically changes a Composer model version and promotes that entry', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const openai = await a.addApiKey('openai', 'sk-composer-version-xxxxxxxx', 'versioned');
+    const target = await a.addEntry({
+      provider: 'openai', model: 'gpt-5.6-sol', profileId: openai.profileId,
+    });
+    const anthropic = await a.addApiKey('anthropic', 'sk-composer-priority-xxxxxxxx', 'priority');
+    const first = await a.addEntry({
+      provider: 'anthropic', model: 'claude-opus-5', profileId: anthropic.profileId,
+    });
+
+    expect((await a.listEntries()).entries.map((entry) => entry.entryId))
+      .toEqual([first.entryId, target.entryId]);
+    const selected = await a.selectEntry(target.entryId, 'gpt-5.6-terra');
+    expect(selected.entries).toMatchObject([{
+      entryId: target.entryId,
+      model: 'gpt-5.6-terra',
+      modelName: 'GPT-5.6 Terra',
+    }, {
+      entryId: first.entryId,
+    }]);
+    expect((await a.listEntries()).entries[0]).toMatchObject({
+      entryId: target.entryId,
+      model: 'gpt-5.6-terra',
+    });
+  });
+
+  it('does not partially change or promote an invalid Composer model version', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const openai = await a.addApiKey('openai', 'sk-composer-invalid-xxxxxxxx', 'versioned');
+    const target = await a.addEntry({
+      provider: 'openai', model: 'gpt-5.6-sol', profileId: openai.profileId,
+    });
+    const anthropic = await a.addApiKey('anthropic', 'sk-composer-first-xxxxxxxx', 'priority');
+    const first = await a.addEntry({
+      provider: 'anthropic', model: 'claude-opus-5', profileId: anthropic.profileId,
+    });
+
+    await expect(a.selectEntry(target.entryId, 'gpt-not-listed'))
+      .rejects.toMatchObject({ code: 'MODEL_NOT_AVAILABLE' });
+    expect((await a.listEntries()).entries.map((entry) => [entry.entryId, entry.model]))
+      .toEqual([
+        [first.entryId, 'claude-opus-5'],
+        [target.entryId, 'gpt-5.6-sol'],
+      ]);
+  });
+
 });

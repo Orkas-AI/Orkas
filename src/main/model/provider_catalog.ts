@@ -207,6 +207,9 @@ const PI_MODEL_TEMPLATE_ALIAS_LABEL: Readonly<Record<string, Readonly<Record<str
 };
 
 const MODEL_UPGRADE_ALIAS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  zai: {
+    'glm-5.1': 'glm-5.2',
+  },
   anthropic: {
     'claude-opus-4-7': 'claude-opus-5',
     'claude-opus-4-8': 'claude-opus-5',

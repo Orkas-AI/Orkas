@@ -18,8 +18,8 @@ vi.mock('../../../../src/main/features/image_gen', () => ({
 vi.mock('../../../../src/main/features/user_workspace', () => ({
   getWorkspacePath: () => h.workspace,
 }));
-vi.mock('../../../../src/main/paths', () => ({
-  chatAttachmentDir: () => path.join(h.workspace, 'attachments'),
+vi.mock('../../../../src/main/util/project-layout', () => ({
+  chatAttachmentDirForConversation: () => path.join(h.workspace, 'attachments'),
 }));
 vi.mock('../../../../src/main/logger', () => ({
   createLogger: () => ({ warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() }),

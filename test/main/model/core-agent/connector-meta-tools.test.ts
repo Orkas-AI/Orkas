@@ -20,7 +20,7 @@ const fixtures: {
   instances: ConnectorInstance[];
   agents: Record<string, AgentMock>;
   analyticsEvents: { event: string; payload: Record<string, unknown> }[];
-  callTool: (uid: string, id: string, name: string, args: Record<string, unknown>) => Promise<unknown>;
+  callTool: (uid: string, id: string, name: string, args: Record<string, unknown>, opts?: { signal?: AbortSignal }) => Promise<unknown>;
 } = {
   instances: [],
   agents: {},
@@ -32,8 +32,8 @@ vi.mock('../../../../src/main/features/connectors/manager', () => ({
   listInstances: (uid: string) => (uid ? fixtures.instances : []),
   restoreComposioConnectionsFromServer: async () => 0,
   refreshStaleToolCaches: async () => 0,
-  callTool: (uid: string, id: string, name: string, args: Record<string, unknown>) =>
-    fixtures.callTool(uid, id, name, args),
+  callTool: (uid: string, id: string, name: string, args: Record<string, unknown>, opts?: { signal?: AbortSignal }) =>
+    fixtures.callTool(uid, id, name, args, opts),
 }));
 
 vi.mock('../../../../src/main/features/analytics/connectors', () => ({
@@ -428,13 +428,13 @@ describe('list_connector_tools', () => {
     expect(r.content).toContain('E_CONNECTOR_NOT_VISIBLE');
   });
 
-  it('missing connector_id → E_BAD_INPUT', async () => {
+  it('discovers valid connector ids without requiring a prior id', async () => {
     fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
     const { createConnectorMetaTools } = await loadModule();
     const [listTools] = await createConnectorMetaTools({ userId: UID });
     const r = await runTool(listTools, {});
-    expect(r.isError).toBe(true);
-    expect(r.content).toContain('E_BAD_INPUT');
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('**notion**');
   });
 
   it('does not apply diagnostic actor metadata as an execution-time filter', async () => {
@@ -628,5 +628,76 @@ describe('stringifyMcpResult (via call_connector_tool)', () => {
     const [, call] = await createConnectorMetaTools({ userId: UID });
     const r = await runTool(call, { connector_id: 'notion', tool_name: 'search', args: { query: 'x' } });
     expect(r.content).toContain('"type":"image"');
+  });
+});
+
+describe('connector lazy discovery and invocation parity', () => {
+  it('compacts a large catalog and expands only the requested schema', async () => {
+    const tools = Array.from({ length: 40 }, (_, index) => ({
+      name: `action_${index}`, description: 'Search an indexed collection',
+      input_schema: { type: 'object', properties: { query: { type: 'string', description: 'detail '.repeat(200) } } },
+    }));
+    fixtures.instances = [makeInstance({ id: 'notion', tools })];
+    const { createConnectorMetaTools } = await loadModule();
+    const [list] = await createConnectorMetaTools({ userId: UID });
+    const catalog = await runTool(list, { connector_id: 'notion' });
+    expect(catalog.isError).toBeFalsy();
+    expect(catalog.content.length).toBeLessThan(30_000);
+    expect(catalog.content).toContain('action_39');
+    expect(catalog.content).not.toContain('detail '.repeat(200));
+    const expanded = await runTool(list, { connector_id: 'notion', tool_name: 'action_3' });
+    expect(expanded.content).toContain('detail '.repeat(200));
+    expect(expanded.content).not.toContain('action_39');
+    const unknown = await runTool(list, { connector_id: 'notion', tool_name: 'missing' });
+    expect(unknown.isError).toBe(true);
+    expect(unknown.content).toContain('E_TOOL_NOT_AVAILABLE');
+  });
+
+  it('refreshes display identity during live discovery after a connector is added', async () => {
+    const names = new Map<string, string>();
+    const { createConnectorMetaTools } = await loadModule();
+    const [list] = await createConnectorMetaTools({ userId: UID, allowRuntimeRefresh: true, connectorDisplayNameById: names });
+    expect((await runTool(list)).isError).toBeFalsy();
+    fixtures.instances = [makeInstance({ id: 'notion', display_name: 'Notes', tools: NOTION_TOOLS })];
+    expect((await runTool(list)).content).toContain('Notes');
+    expect(names.get('notion')).toBe('Notes');
+  });
+
+  it('preserves a returned MCP failure instead of announcing success', async () => {
+    fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
+    fixtures.callTool = async () => ({ isError: true, content: [{ type: 'text', text: 'Permission denied' }] });
+    const { createConnectorMetaTools } = await loadModule();
+    const [, call] = await createConnectorMetaTools({ userId: UID });
+    expect(await runTool(call, { connector_id: 'notion', tool_name: 'search', args: {} })).toMatchObject({ isError: true, content: expect.stringContaining('Permission denied') });
+  });
+
+  it('forwards Stop cancellation to the active connector request', async () => {
+    fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
+    const controller = new AbortController();
+    fixtures.callTool = async (_uid, _id, _name, _args, opts) => {
+      expect(opts?.signal).toBe(controller.signal);
+      controller.abort();
+      if (opts?.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      return 'unexpected success';
+    };
+    const { createConnectorMetaTools } = await loadModule();
+    const [, call] = await createConnectorMetaTools({ userId: UID });
+    const result = await call.execute({ connector_id: 'notion', tool_name: 'search', args: {} }, { signal: controller.signal, workingDir: '.' } as any);
+    expect(controller.signal.aborted).toBe(true);
+    expect(result.isError).toBe(true);
+  });
+
+  it('maps only schema-declared camelCase aliases while preserving explicit values and the input object', async () => {
+    fixtures.instances = [makeInstance({ id: 'notion', tools: [{ name: 'search', description: '', input_schema: { properties: { page_size: {}, user_id: {} } } }] })];
+    const args = { pageSize: 10, user_id: 'explicit', userId: 'alias', unknownKey: 'keep' };
+    fixtures.callTool = async (_uid, _id, _name, actual) => {
+      expect(actual).toEqual({ page_size: 10, user_id: 'explicit', userId: 'alias', unknownKey: 'keep' });
+      return 'OK';
+    };
+    const { createConnectorMetaTools } = await loadModule();
+    const [, call] = await createConnectorMetaTools({ userId: UID });
+    expect((await runTool(call, { connector_id: 'notion', tool_name: 'search', args })).isError).toBeFalsy();
+    expect(args.pageSize).toBe(10);
+    expect(args).not.toHaveProperty('page_size');
   });
 });

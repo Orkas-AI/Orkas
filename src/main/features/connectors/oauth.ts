@@ -397,8 +397,8 @@ export async function refreshIfStale(
   grant: OAuthGrant,
   opts: { force?: boolean } = {},
 ): Promise<OAuthGrant> {
-  if (entry.oauth?.provider_id === 'github') {
-    return refreshGithubServerManaged(entry, grant, opts);
+  if (entry.oauth?.provider_id && ['github', 'bing'].includes(entry.oauth.provider_id)) {
+    return refreshServerManaged(entry, grant, opts);
   }
   if (!grant.expires_at) return grant;
   if (grant.expires_at - Date.now() > REFRESH_BUFFER_MS) return grant;
@@ -446,7 +446,7 @@ export async function refreshIfStale(
   return next;
 }
 
-async function fetchGithubRefresh(body: Record<string, unknown>): Promise<Response> {
+async function fetchServerManagedRefresh(body: Record<string, unknown>): Promise<Response> {
   return postConnectorBridgeJson(
     'connector OAuth refresh',
     `${accountApiBase()}/connectors/oauth/refresh`,
@@ -454,7 +454,7 @@ async function fetchGithubRefresh(body: Record<string, unknown>): Promise<Respon
   );
 }
 
-async function refreshGithubServerManaged(
+async function refreshServerManaged(
   entry: CatalogEntry,
   grant: OAuthGrant,
   opts: { force?: boolean } = {},
@@ -468,12 +468,12 @@ async function refreshGithubServerManaged(
   // stop racing on GitHub's rotating refresh token.
   if (!hasServerGrant && !hasLegacyRefresh) {
     if (!grant.expires_at || !stale) return grant;
-    throw new Error('github grant expired and has no server grant; reconnect required');
+    throw new Error('connector grant expired and has no server grant; reconnect required');
   }
   if (hasServerGrant && !stale && !opts.force) return grant;
 
   if (!entry.oauth) throw new Error('no oauth config');
-  const res = await fetchGithubRefresh({
+  const res = await fetchServerManagedRefresh({
     provider: entry.oauth.provider_id,
     device_id: tokenStore.getDeviceId(),
     ...(opts.force ? { force_refresh: true } : {}),
@@ -503,8 +503,8 @@ async function refreshGithubServerManaged(
     scope?: string;
     account_label?: string;
   };
-  if (body.code !== 0) throw _refreshErrorFromBody(body, 'invalid github refresh response');
-  if (!body.access_token || !body.grant_id) throw new Error('invalid github refresh response');
+  if (body.code !== 0) throw _refreshErrorFromBody(body, 'invalid server-managed refresh response');
+  if (!body.access_token || !body.grant_id) throw new Error('invalid server-managed refresh response');
   const expires_at = typeof body.expires_in === 'number' ? Date.now() + body.expires_in * 1000 : null;
   return {
     access_token: body.access_token,

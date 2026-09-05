@@ -360,3 +360,60 @@ describe('image_gen › callGeminiImage', () => {
     }
   });
 });
+
+// Keep the body pending after headers so cancellation/deadline tests exercise
+// the actual adapter's response consumption, not merely fetch dispatch.
+describe('image generation transfer and artifact boundaries', () => {
+  const names = ['callOpenAIImage', 'callGeminiImage', 'callDoubaoImage', 'callOrkasImage'] as const;
+  it.each(names)('%s cancels a response body after headers have arrived', async (name) => {
+    const m = await import('../../../src/main/features/image_gen');
+    const controller = new AbortController();
+    let release!: (value: string) => void;
+    let reading!: () => void;
+    const bodyStarted = new Promise<void>((resolve) => { reading = resolve; });
+    const fetchStub = vi.fn(async (_url, init) => {
+      const body = new Promise<string>((resolve, reject) => {
+        release = resolve;
+        init?.signal?.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+      });
+      return { ok: true, status: 200, text: () => { reading(); return body; }, json: () => { reading(); return body.then(JSON.parse); } };
+    });
+    vi.stubGlobal('fetch', fetchStub);
+    const result = m[name]({ apiKey: 'fixture-key', model: 'fixture', prompt: 'a circle', size: '1024x1024', signal: controller.signal })
+      .then(() => 'success', (error) => error.message);
+    try {
+      await bodyStarted;
+      controller.abort();
+      await new Promise((resolve) => setImmediate(resolve));
+      release('{}');
+      expect(await result).toMatch(/aborted/i);
+      expect(fetchStub).toHaveBeenCalledTimes(1);
+    } finally { release?.('{}'); vi.unstubAllGlobals(); }
+  });
+
+  it.each(names)('%s rejects invalid decoded bytes despite an HTTP success', async (name) => {
+    const m = await import('../../../src/main/features/image_gen');
+    const invalid = Buffer.from('<html>upstream error</html>').toString('base64');
+    vi.stubGlobal('fetch', async () => new Response(JSON.stringify(name === 'callGeminiImage'
+      ? { candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: invalid } }] } }] }
+      : { data: [{ b64_json: invalid }] }), { status: 200 }));
+    try {
+      await expect(m[name]({ apiKey: 'fixture-key', model: 'fixture', prompt: 'a circle', size: '1024x1024' }))
+        .rejects.toThrow(/invalid|unsupported|malformed/i);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('does not submit or write an already cancelled image generation', async () => {
+    writeProfilesFile({ 'openai:default': apiKeyProfile('openai', 'fixture-key') }, [entry('openai', 'gpt-5.4', 'openai:default', 'e1')]);
+    const m = await import('../../../src/main/features/image_gen');
+    const fetchStub = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchStub);
+    const controller = new AbortController(); controller.abort();
+    try {
+      await expect(m.generateImage({ prompt: 'a circle', outputAbsPath: path.join(tmpDir, 'cancelled.png'), signal: controller.signal }))
+        .rejects.toThrow(/aborted/i);
+      expect(fetchStub).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(tmpDir, 'cancelled.png'))).toBe(false);
+    } finally { vi.unstubAllGlobals(); }
+  });
+});

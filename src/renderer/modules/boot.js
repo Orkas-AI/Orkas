@@ -352,14 +352,13 @@ async function initUser() {
     const data = await res.json();
     if (data.ok && data.user_id) {
       currentUserId = data.user_id;
+      try { globalThis.currentUserId = currentUserId; } catch (_) {}
+      if (typeof _restoreUnreadTaskState === 'function') _restoreUnreadTaskState();
       _bootLog.info('user init', { user_id: currentUserId });
-      // Bind the telemetry identity as soon as we have a user_id;
-      // Monitor handles dedupe + queueing internally, so no need to
-      // check whether umami has finished initializing.
-          }
+    }
   } catch (e) {
     _bootLog.error('init user failed', { error: (e && e.message) || String(e) });
-      }
+  }
 }
 
 // ─── View routing ───
@@ -463,11 +462,7 @@ function setView(view, cid, opts = {}) {
     if (!opts.skipLoad && typeof _chatAttachRefreshFromServer === 'function') {
       _chatAttachRefreshFromServer(cid);
     }
-    // If we returned to a conversation with queued items and nothing is
-    // streaming, kick off the next one automatically.
-    if (!isConvPending(cid) && (messageQueues.get(cid) || []).length) {
-      _dispatchNextQueued(cid);
-    }
+    // History hydration owns queue dispatch after restoring active_recipient.
     _updateConvSendUI(cid);
     setTimeout(() => focusChatComposerIfIdle('chat-input'), 50);
   } else if (view === 'new-chat') {

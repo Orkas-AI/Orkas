@@ -306,7 +306,7 @@
   "chat.recipient_commander_hint": "デフォルトの宛先です。@ は不要です",
   "chat.recipient_picker_title": "エージェント、スキル、コネクターを選択",
   "chat.recipient_picker_title_with_library": "エージェント、スキル、コネクター、ライブラリファイルを選択",
-  "chat.attach_title": "添付ファイルをアップロード（テキスト / PDF / Word / 画像 / 動画）",
+  "chat.attach_title": "添付ファイルをアップロード（文書 / 表計算 / プレゼンテーション / 圧縮ファイル / 画像 / 音声 / 動画）",
   "chat.chip_remove_title": "削除",
   "chat.send_title": "送信",
   "chat.attach_uploading": "アップロード中",
@@ -2096,5 +2096,6 @@
   "skills.source_global": "グローバル",
   "settings.commander_avatar.title": "コマンダーのアバター",
   "settings.commander_avatar.sub": "アバターをクリックして色を変更できます。",
-  "settings.commander_avatar.hint": "左のアバターをクリックして変更"
+  "settings.commander_avatar.hint": "左のアバターをクリックして変更",
+  "settings.video.provider_unavailable": "このビルドではこの動画プロバイダーは利用できません。保存済みのキーは保持され、削除できます。動画を生成するには Orkas API を設定してください。"
 }

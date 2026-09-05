@@ -260,7 +260,9 @@
                        the recipient chip — see initUserWorkspace(). -->
                   <div class="chat-skill-chip" id="chat-skill-chip" data-target="conversation" style="display:none">
                     <span class="chip-label"></span>
-                    <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
+                    <button type="button" class="chip-close" data-i18n-title="chat.chip_remove_title" data-i18n-aria-label="chat.chip_remove_title" title="Remove" aria-label="Remove">
+                      <span data-ui-icon="x" data-ui-icon-class="chip-close-icon"></span>
+                    </button>
                   </div>
                   <button type="button" class="chat-queue-edit-delete-btn" id="chat-queue-edit-delete-btn"
                           data-i18n-title="chat.queue_delete_editing" data-i18n-aria-label="chat.queue_delete_editing"
@@ -662,7 +664,9 @@
                          the recipient chip — see initUserWorkspace(). -->
                     <div class="chat-skill-chip" id="project-chat-skill-chip" data-target="project" style="display:none">
                       <span class="chip-label"></span>
-                      <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
+                      <button type="button" class="chip-close" data-i18n-title="chat.chip_remove_title" data-i18n-aria-label="chat.chip_remove_title" title="Remove" aria-label="Remove">
+                        <span data-ui-icon="x" data-ui-icon-class="chip-close-icon"></span>
+                      </button>
                     </div>
                     <button type="button" class="chat-send-btn" id="project-chat-send-btn" data-i18n-title="chat.send_title" title="Send">
                       <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>

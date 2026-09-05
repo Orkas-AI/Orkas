@@ -314,7 +314,7 @@
   "chat.recipient_commander_hint": "Destinatário padrão, não é necessário @",
   "chat.recipient_picker_title": "Escolha agente, habilidade ou conector",
   "chat.recipient_picker_title_with_library": "Escolha agente, habilidade, conector ou arquivo de biblioteca",
-  "chat.attach_title": "Carregar anexo (texto/PDF/Word/imagem/vídeo)",
+  "chat.attach_title": "Carregar anexo (documentos, planilhas, apresentações, arquivos compactados, imagens, áudio e vídeo)",
   "chat.chip_remove_title": "Remover",
   "chat.send_title": "Enviar",
   "chat.attach_uploading": "Enviando",
@@ -2096,5 +2096,6 @@
   "bash.permission.reason_sep": ", ",
   "settings.commander_avatar.title": "Avatar do comandante",
   "settings.commander_avatar.sub": "Clique no avatar para escolher uma nova cor.",
-  "settings.commander_avatar.hint": "Clique no avatar à esquerda para alterar"
+  "settings.commander_avatar.hint": "Clique no avatar à esquerda para alterar",
+  "settings.video.provider_unavailable": "Este provedor de vídeo não está disponível nesta versão. A chave salva foi mantida e pode ser removida. Configure a API Orkas para gerar vídeos."
 }

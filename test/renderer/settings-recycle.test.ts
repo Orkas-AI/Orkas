@@ -73,6 +73,23 @@ function loadHarness(batches: Array<Record<string, unknown>>) {
 }
 
 describe('Settings recycle bin', () => {
+  it('refreshes Agent and Skill caches after a successful restore', async () => {
+    const { sandbox, getClickListener, recycleBin } = loadHarness([]);
+    sandbox.uiAlert = vi.fn();
+    sandbox.uiConfirm = vi.fn(async () => true);
+    sandbox.loadAgents = vi.fn(async () => {});
+    sandbox.loadSkills = vi.fn(async () => {});
+    sandbox._settingsBindRecycleBinOnce();
+    const button = { disabled: false, getAttribute: () => 'fixture-batch', hasAttribute: () => false };
+    await getClickListener()!({ target: { closest: (selector: string) => selector === '[data-recycle-restore], [data-recycle-delete]' ? button : null } });
+    expect(recycleBin.restore).toHaveBeenCalled();
+    expect(sandbox.loadAgents).toHaveBeenCalledWith(true);
+    expect(sandbox.loadSkills).toHaveBeenCalledWith(true);
+    sandbox.loadAgents.mockRejectedValueOnce(new Error('fixture refresh failure'));
+    await getClickListener()!({ target: { closest: (selector: string) => selector === '[data-recycle-restore], [data-recycle-delete]' ? button : null } });
+    expect(sandbox.uiAlert).not.toHaveBeenCalled();
+  });
+
   const repeatedTitle = '@ContentWriter 最近关于模型即应用';
   const batch = {
     id: 'batch-1',

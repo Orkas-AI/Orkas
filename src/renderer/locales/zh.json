@@ -318,7 +318,7 @@
   "chat.recipient_commander_hint": "默认接收者，无需 @",
   "chat.recipient_picker_title": "选择智能体、技能或连接器",
   "chat.recipient_picker_title_with_library": "选择智能体、技能、连接器或资料库文件",
-  "chat.attach_title": "上传附件（文本/PDF/Word/图片/视频）",
+  "chat.attach_title": "上传附件（文档、表格、演示文稿、压缩包、图片、音频、视频）",
   "chat.chip_remove_title": "移除",
   "chat.send_title": "发送",
   "chat.attach_uploading": "上传中",
@@ -2096,5 +2096,6 @@
   "skills.source_global": "全局",
   "settings.commander_avatar.title": "指挥官头像",
   "settings.commander_avatar.sub": "点击头像可更换颜色。",
-  "settings.commander_avatar.hint": "点击左侧头像进行更换"
+  "settings.commander_avatar.hint": "点击左侧头像进行更换",
+  "settings.video.provider_unavailable": "此版本不支持该视频供应商。已保存的密钥会保留，可自行删除；生成视频请配置 Orkas API。"
 }

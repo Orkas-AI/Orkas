@@ -27,7 +27,7 @@ import { listApiKeyEntries, loadImageProfiles, type ApiKeyEntryChoice } from './
 import { findImageGenCapability, type ImageGenCapability } from '../model/provider_catalog';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
-import { composeAbortSignal, fetchWithTimeout, throwIfAborted } from '../util/abort';
+import { composeAbortSignal, fetchAndReadWithTimeout, throwIfAborted } from '../util/abort';
 import { downloadBinaryWithProxyPolicy } from '../util/proxy-dispatcher';
 import {
   ORKAS_API_BASE_URL,
@@ -36,7 +36,14 @@ import {
   type OrkasApiUsageContext,
 } from './orkas_api';
 
+import { loadImageReferenceBuffersWithProgress, registerGeneratedMediaUrl, type GenerationReferenceProgressReporter } from './generation_reference_assets';
+import type { ImageReferenceBinding } from './image_prompt_contract';
+
 const log = createLogger('image-gen');
+const DIRECT_IMAGE_HTTP_TIMEOUT_MS = 10 * 60_000;
+const IMAGE_DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
+const MAX_IMAGE_DOWNLOAD_BYTES = 100 * 1024 * 1024;
+type ImageProgressReporter = GenerationReferenceProgressReporter;
 
 // ── Picker ───────────────────────────────────────────────────────────────
 
@@ -103,9 +110,13 @@ export interface GenerateImageInput {
   /** Already-validated absolute paths to reference images for editing /
    *  variations. The picked capability must have `supportsEdit: true`. */
   referenceImagePaths?: string[];
+  referenceImageUrls?: string[];
+  referenceBindings?: ImageReferenceBinding[];
+  negativePrompt?: string[];
   /** Provider-side size hint. Default `1024x1024`. */
   size?: string;
   signal?: AbortSignal;
+  onProgress?: ImageProgressReporter;
   usageContext?: OrkasApiUsageContext;
 }
 
@@ -118,6 +129,7 @@ export type GenerateImageResult =
       bytes: number;
       provider: string;
       model: string;
+      sourceUrl?: string;
     }
   | {
       ok: false;
@@ -131,6 +143,7 @@ export type GenerateImageResult =
     };
 
 export async function generateImage(input: GenerateImageInput): Promise<GenerateImageResult> {
+  throwIfAborted(input.signal);
   if (!input.prompt || !input.prompt.trim()) {
     return { ok: false, errorCode: 'BAD_INPUT', message: 'prompt is required' };
   }
@@ -146,8 +159,9 @@ export async function generateImage(input: GenerateImageInput): Promise<Generate
 
   const { entry, capability } = picked;
   const refPaths = input.referenceImagePaths || [];
+  const refUrls = input.referenceImageUrls || [];
 
-  if (refPaths.length && !capability.supportsEdit) {
+  if ((refPaths.length || refUrls.length) && !capability.supportsEdit) {
     return {
       ok: false,
       errorCode: 'EDIT_NOT_SUPPORTED',
@@ -156,10 +170,11 @@ export async function generateImage(input: GenerateImageInput): Promise<Generate
   }
 
   let referenceBuffers: Buffer[] | undefined;
-  if (refPaths.length) {
+  if (refPaths.length || refUrls.length) {
     try {
-      referenceBuffers = await Promise.all(refPaths.map((p) => fs.readFile(p)));
+      referenceBuffers = await loadImageReferenceBuffersWithProgress(refUrls, refPaths, { signal: input.signal, onProgress: input.onProgress });
     } catch (err) {
+      throwIfAborted(input.signal);
       log.warn(`failed reading reference image: ${(err as Error).message}`);
       return {
         ok: false,
@@ -175,6 +190,7 @@ export async function generateImage(input: GenerateImageInput): Promise<Generate
     model: capability.model,
     prompt: input.prompt,
     size,
+    onProgress: input.onProgress,
     ...(input.signal ? { signal: input.signal } : {}),
     ...(input.usageContext ? { usageContext: input.usageContext } : {}),
     ...(referenceBuffers ? { referenceImages: referenceBuffers } : {}),
@@ -198,16 +214,23 @@ export async function generateImage(input: GenerateImageInput): Promise<Generate
       };
     }
   } catch (err) {
+    if (err instanceof ImageGenerationDeliveryError) throw err;
+    throwIfAborted(input.signal);
     const msg = (err as Error).message;
     log.error(`image gen API call failed (${entry.provider}/${capability.model}): ${msg}`);
     return { ok: false, errorCode: 'PROVIDER_API_ERROR', message: msg };
   }
 
+  throwIfAborted(input.signal);
+  adapterRes = validateImageAdapterResult(adapterRes);
+  emitProgress(input.onProgress, 'save_image', 'Saving generated image');
   let finalPath: string;
   try {
     finalPath = ensureExtension(input.outputAbsPath, adapterRes.mimeType);
     await fs.mkdir(path.dirname(finalPath), { recursive: true });
+    throwIfAborted(input.signal);
     await fs.writeFile(finalPath, adapterRes.buffer);
+    registerGeneratedMediaUrl(finalPath, adapterRes.sourceUrl);
   } catch (err) {
     const msg = (err as Error).message;
     log.error(`image write failed (${input.outputAbsPath}): ${msg}`);
@@ -231,6 +254,7 @@ export async function generateImage(input: GenerateImageInput): Promise<Generate
     bytes: adapterRes.buffer.length,
     provider: entry.provider,
     model: capability.model,
+    ...(adapterRes.sourceUrl ? { sourceUrl: adapterRes.sourceUrl } : {}),
   };
 }
 
@@ -243,14 +267,15 @@ export interface AdapterRequest {
   size: string;
   referenceImages?: Buffer[];
   signal?: AbortSignal;
+  onProgress?: ImageProgressReporter;
   usageContext?: OrkasApiUsageContext;
 }
 
 export interface AdapterResult {
+  sourceUrl?: string;
   buffer: Buffer;
   mimeType: string;
-  /** 0 if dimensions could not be parsed — non-fatal, the file is still
-   *  on disk. */
+  /** Dimensions verified from the returned bytes before publication. */
   width: number;
   height: number;
 }
@@ -311,7 +336,7 @@ async function waitForOrkasImageTask(
   let data: any = {};
   while (!signal.aborted) {
     await sleepWithSignal(3_000, signal);
-    const resp = await fetchWithTimeout(
+    const { body: statusData } = await fetchAndReadWithTimeout(
       `${ORKAS_API_BASE_URL}/images/generations/${encodeURIComponent(taskId)}`,
       {
         method: 'GET',
@@ -323,8 +348,9 @@ async function waitForOrkasImageTask(
       ORKAS_IMAGE_POLL_TIMEOUT_MS,
       signal,
       'Orkas Image status request timed out',
+      (resp) => readOrkasImageResponse(resp, 'status'),
     );
-    data = await readOrkasImageResponse(resp, 'status');
+    data = statusData;
     const status = String(data?.status || '').toLowerCase();
     if (['failed', 'cancelled', 'canceled'].includes(status)) {
       throw new Error(`Orkas Image task ${taskId} ${status}: ${truncate(JSON.stringify(data?.error || data), 500)}`);
@@ -357,7 +383,7 @@ export async function callOrkasImage(req: AdapterRequest): Promise<AdapterResult
     `Orkas Image timed out after ${Math.round(ORKAS_IMAGE_TOTAL_TIMEOUT_MS / 60_000)} minutes`,
   );
   try {
-    const response = await fetchWithTimeout(
+    const { body: createdData } = await fetchAndReadWithTimeout(
       `${ORKAS_API_BASE_URL}/images/generations`,
       {
         method: 'POST',
@@ -379,14 +405,17 @@ export async function callOrkasImage(req: AdapterRequest): Promise<AdapterResult
       ORKAS_IMAGE_CREATE_TIMEOUT_MS,
       overall.signal,
       'Orkas Image create request timed out',
+      (resp) => readOrkasImageResponse(resp, 'create'),
     );
-    let data = await readOrkasImageResponse(response, 'create');
+    let data = createdData;
     const taskId = String(data?.id || '').trim();
     if (!data?.data?.[0]?.url && !data?.data?.[0]?.b64_json) {
       if (!taskId) throw new Error('Orkas Image create returned no task id');
       data = await waitForOrkasImageTask(taskId, req.apiKey, overall.signal, req.usageContext);
     }
 
+    emitProgress(req.onProgress, 'decode_image', 'Decoding Orkas image response');
+    const sourceUrl = String(data?.data?.[0]?.url || '').trim();
     const b64 = String(data?.data?.[0]?.b64_json || '');
     let buffer: Buffer;
     if (b64) {
@@ -405,26 +434,28 @@ export async function callOrkasImage(req: AdapterRequest): Promise<AdapterResult
           signal: download.signal,
           maxBytes: 64 * 1024 * 1024,
           validate: (body) => {
-            if (!body.length || !detectMimeType(body)) {
-              throw new Error('Orkas Image download returned unsupported image bytes');
-            }
+            validateImageAdapterResult({ buffer: body, mimeType: '', width: 0, height: 0 });
           },
         });
         buffer = result.body;
+      } catch (err) {
+        throw new ImageGenerationDeliveryError(`Orkas Image download failed after generation completed. Do not submit another generation task. ${errorMessage(err)}`, { cause: err });
       } finally {
         download.cleanup();
       }
     }
     const mimeType = detectMimeType(buffer) || 'image/png';
     const dim = parseImageDimensions(buffer, mimeType);
-    return { buffer, mimeType, width: dim.width, height: dim.height };
+    return validateImageAdapterResult({ buffer, mimeType, width: dim.width, height: dim.height, ...(sourceUrl ? { sourceUrl } : {}) });
   } finally {
     overall.cleanup();
   }
 }
 
 export async function callOpenAIImage(req: AdapterRequest): Promise<AdapterResult> {
-  const hasRefs = !!(req.referenceImages && req.referenceImages.length);
+  throwIfAborted(req.signal);
+  const referenceImages = (req.referenceImages || []);
+  const hasRefs = referenceImages.length > 0;
   const url = hasRefs
     ? `${OPENAI_BASE}/v1/images/edits`
     : `${OPENAI_BASE}/v1/images/generations`;
@@ -438,7 +469,7 @@ export async function callOpenAIImage(req: AdapterRequest): Promise<AdapterResul
     form.append('prompt', req.prompt);
     form.append('size', req.size);
     form.append('n', '1');
-    req.referenceImages!.forEach((buf, i) => {
+    referenceImages.forEach((buf, i) => {
       const mime = detectMimeType(buf) || 'image/png';
       const ext = mime === 'image/png' ? 'png' : mime === 'image/jpeg' ? 'jpg' : 'webp';
       // OpenAI's edits endpoint expects `image[]` for multi-ref; gpt-image-1
@@ -460,25 +491,40 @@ export async function callOpenAIImage(req: AdapterRequest): Promise<AdapterResul
     };
   }
 
-  const resp = await fetch(url, { method: 'POST', headers, body });
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
-    throw new Error(`OpenAI image API ${resp.status}: ${truncate(text, 500)}`);
-  }
-  const data = (await resp.json()) as { data?: Array<{ b64_json?: string; url?: string }> };
+  emitProgress(req.onProgress, 'create_image', `Calling OpenAI image ${hasRefs ? 'edit' : 'generation'} API`, {
+    provider: 'openai',
+    model: req.model,
+  });
+  const { body: data } = await fetchAndReadWithTimeout<{ data?: Array<{ b64_json?: string; url?: string }> }>(
+    url,
+    { method: 'POST', headers, body },
+    DIRECT_IMAGE_HTTP_TIMEOUT_MS,
+    req.signal,
+    `OpenAI image API timed out after ${Math.round(DIRECT_IMAGE_HTTP_TIMEOUT_MS / 1000)}s`,
+    async (response) => {
+      if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        throw new Error(`OpenAI image API ${response.status}: ${truncate(text, 500)}`);
+      }
+      return await response.json() as { data?: Array<{ b64_json?: string; url?: string }> };
+    },
+  );
+  emitProgress(req.onProgress, 'decode_image', 'Decoding OpenAI image response', { provider: 'openai' });
   const b64 = data.data?.[0]?.b64_json;
   if (!b64) throw new Error('OpenAI image API returned no b64_json data');
   const buffer = Buffer.from(b64, 'base64');
   const mimeType = detectMimeType(buffer) || 'image/png';
   const dim = parseImageDimensions(buffer, mimeType);
-  return { buffer, mimeType, width: dim.width, height: dim.height };
+  return validateImageAdapterResult({ buffer, mimeType, width: dim.width, height: dim.height });
 }
 
 export async function callGeminiImage(req: AdapterRequest): Promise<AdapterResult> {
+  throwIfAborted(req.signal);
   const url = `${GEMINI_BASE}/v1beta/models/${encodeURIComponent(req.model)}:generateContent`;
   const parts: unknown[] = [{ text: req.prompt }];
-  if (req.referenceImages?.length) {
-    for (const buf of req.referenceImages) {
+  const referenceImages = (req.referenceImages || []);
+  if (referenceImages.length) {
+    for (const buf of referenceImages) {
       parts.push({
         inline_data: {
           mime_type: detectMimeType(buf) || 'image/png',
@@ -491,19 +537,11 @@ export async function callGeminiImage(req: AdapterRequest): Promise<AdapterResul
     contents: [{ parts }],
     generationConfig: { responseModalities: ['IMAGE'] },
   });
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-goog-api-key': req.apiKey,
-    },
-    body,
+  emitProgress(req.onProgress, 'create_image', 'Calling Gemini image API', {
+    provider: 'google',
+    model: req.model,
   });
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
-    throw new Error(`Gemini image API ${resp.status}: ${truncate(text, 500)}`);
-  }
-  const data = (await resp.json()) as {
+  const { body: data } = await fetchAndReadWithTimeout<{
     candidates?: Array<{
       content?: {
         parts?: Array<
@@ -512,7 +550,37 @@ export async function callGeminiImage(req: AdapterRequest): Promise<AdapterResul
         >;
       };
     }>;
-  };
+  }>(
+    url,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': req.apiKey,
+      },
+      body,
+    },
+    DIRECT_IMAGE_HTTP_TIMEOUT_MS,
+    req.signal,
+    `Gemini image API timed out after ${Math.round(DIRECT_IMAGE_HTTP_TIMEOUT_MS / 1000)}s`,
+    async (response) => {
+      if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        throw new Error(`Gemini image API ${response.status}: ${truncate(text, 500)}`);
+      }
+      return await response.json() as {
+        candidates?: Array<{
+          content?: {
+            parts?: Array<
+              | { text?: string }
+              | { inline_data?: { mime_type?: string; data?: string }; inlineData?: { mimeType?: string; data?: string } }
+            >;
+          };
+        }>;
+      };
+    },
+  );
+  emitProgress(req.onProgress, 'decode_image', 'Decoding Gemini image response', { provider: 'google' });
   const candParts = data.candidates?.[0]?.content?.parts ?? [];
   for (const p of candParts) {
     // Gemini API responses use both snake_case (`inline_data` / `mime_type`)
@@ -525,7 +593,7 @@ export async function callGeminiImage(req: AdapterRequest): Promise<AdapterResul
     const buffer = Buffer.from(inline.data, 'base64');
     const mimeType = inline.mime_type ?? inline.mimeType ?? detectMimeType(buffer) ?? 'image/png';
     const dim = parseImageDimensions(buffer, mimeType);
-    return { buffer, mimeType, width: dim.width, height: dim.height };
+    return validateImageAdapterResult({ buffer, mimeType, width: dim.width, height: dim.height });
   }
   throw new Error('Gemini image API returned no inline image data');
 }
@@ -579,51 +647,72 @@ function bufferToDataUri(buf: Buffer): string {
 }
 
 export async function callDoubaoImage(req: AdapterRequest): Promise<AdapterResult> {
-  const refs = req.referenceImages ?? [];
+  throwIfAborted(req.signal);
+  const refs = (req.referenceImages || []);
   const isEdit = refs.length > 0;
-  const size = isEdit && req.size === SEEDREAM_DEFAULT_SIZE
-    ? 'adaptive'
-    : normaliseSeedreamSize(req.size);
+  const size = isEdit && req.size === SEEDREAM_DEFAULT_SIZE ? 'adaptive' : normaliseSeedreamSize(req.size);
   const bodyObj: Record<string, unknown> = {
     model: req.model,
     prompt: req.prompt,
     size,
-    n: 1,
-    response_format: 'url',
+    response_format: 'b64_json',
+    output_format: 'jpeg',
+    watermark: false,
+    sequential_image_generation: 'disabled',
   };
   if (isEdit) {
     const dataUris = refs.map(bufferToDataUri);
     bodyObj.image = dataUris.length === 1 ? dataUris[0] : dataUris;
   }
   const body = JSON.stringify(bodyObj);
-  const resp = await fetch(`${DOUBAO_BASE}/api/v3/images/generations`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${req.apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body,
+  emitProgress(req.onProgress, 'create_image', `Calling Doubao image ${isEdit ? 'edit' : 'generation'} API`, {
+    provider: 'doubao',
+    model: req.model,
   });
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
-    throw new Error(`Doubao image API ${resp.status}: ${truncate(text, 500)}`);
-  }
-  const data = (await resp.json()) as {
+  const { body: data } = await fetchAndReadWithTimeout<{
     data?: Array<{ url?: string; b64_json?: string }>;
-  };
+  }>(
+    `${DOUBAO_BASE}/api/v3/images/generations`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${req.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body,
+    },
+    DIRECT_IMAGE_HTTP_TIMEOUT_MS,
+    req.signal,
+    `Doubao image API timed out after ${Math.round(DIRECT_IMAGE_HTTP_TIMEOUT_MS / 1000)}s`,
+    async (response) => {
+      if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        throw new Error(`Doubao image API ${response.status}: ${truncate(text, 500)}`);
+      }
+      return await response.json() as { data?: Array<{ url?: string; b64_json?: string }> };
+    },
+  );
+  emitProgress(req.onProgress, 'decode_image', 'Decoding Doubao image response', { provider: 'doubao' });
   const item = data.data?.[0];
   let buffer: Buffer | null = null;
+  let sourceUrl = '';
   if (item?.b64_json) {
     buffer = Buffer.from(item.b64_json, 'base64');
   } else if (item?.url) {
-    const imgResp = await fetch(item.url);
-    if (!imgResp.ok) throw new Error(`Doubao image fetch failed ${imgResp.status}`);
-    buffer = Buffer.from(await imgResp.arrayBuffer());
+    sourceUrl = item.url;
+    emitProgress(req.onProgress, 'download_image', 'Downloading Doubao image output', { provider: 'doubao' });
+    buffer = await downloadGeneratedImageBytes(sourceUrl, req, 'Doubao image output download');
   }
   if (!buffer) throw new Error('Doubao image API returned no image payload');
   const mimeType = detectMimeType(buffer) || 'image/png';
   const dim = parseImageDimensions(buffer, mimeType);
-  return { buffer, mimeType, width: dim.width, height: dim.height };
+  return validateImageAdapterResult({
+    buffer,
+    mimeType,
+    width: dim.width,
+    height: dim.height,
+    ...(sourceUrl ? { sourceUrl } : {}),
+  });
 }
 
 // ── Image format helpers ─────────────────────────────────────────────────
@@ -714,4 +803,76 @@ function ensureExtension(p: string, mimeType: string): string {
     return p;
   }
   return p + ext;
+}
+
+export function validateImageAdapterResult(result: AdapterResult): AdapterResult {
+  const mimeType = detectMimeType(result.buffer);
+  if (!mimeType) {
+    throw new Error('Image provider returned invalid or unsupported image bytes');
+  }
+  const dimensions = parseImageDimensions(result.buffer, mimeType);
+  if (dimensions.width <= 0 || dimensions.height <= 0) {
+    throw new Error(`Image provider returned malformed ${mimeType} data`);
+  }
+  return {
+    ...result,
+    mimeType,
+    width: dimensions.width,
+    height: dimensions.height,
+  };
+}
+
+async function downloadGeneratedImageBytes(
+  sourceUrl: string,
+  req: AdapterRequest,
+  label: string,
+): Promise<Buffer> {
+  const timeoutMessage = `${label} timed out after ${Math.round(IMAGE_DOWNLOAD_TIMEOUT_MS / 1000)}s`;
+  const composed = composeAbortSignal(req.signal, IMAGE_DOWNLOAD_TIMEOUT_MS, timeoutMessage);
+  try {
+    const downloaded = await downloadBinaryWithProxyPolicy(sourceUrl, {
+      label,
+      signal: composed.signal,
+      maxBytes: MAX_IMAGE_DOWNLOAD_BYTES,
+      validate: (body) => {
+        validateImageAdapterResult({
+          buffer: body,
+          mimeType: detectMimeType(body) || 'application/octet-stream',
+          width: 0,
+          height: 0,
+        });
+      },
+    });
+    return downloaded.body;
+  } catch (err) {
+    const message = req.signal?.aborted
+      ? 'operation aborted after the provider completed generation'
+      : composed.signal.aborted
+        ? timeoutMessage
+        : errorMessage(err);
+    throw new ImageGenerationDeliveryError(`${label} failed after generation completed and bounded download retries. Do not submit another generation task. ${message}`, { cause: err });
+  } finally {
+    composed.cleanup();
+  }
+}
+
+export class ImageGenerationDeliveryError extends Error {
+  override readonly name = 'ImageGenerationDeliveryError';
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+  }
+}
+
+function emitProgress(
+  onProgress: ImageProgressReporter | undefined,
+  phase: string,
+  message: string,
+  data?: Record<string, unknown>,
+): void {
+  onProgress?.({ phase, message, ...(data ? { data } : {}) });
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err || '');
 }
