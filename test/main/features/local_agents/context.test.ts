@@ -186,6 +186,17 @@ describe('local_agents/context › semantic CLI context', () => {
     expect(isCliResumeRejectedMessage('No conversation found with session ID abc')).toBe(true);
     expect(isCliResumeRejectedMessage('session does not exist')).toBe(true);
     expect(isCliResumeRejectedMessage('unknown session abc')).toBe(true);
+    expect(isCliResumeRejectedMessage('Error: session abc123 not found')).toBe(true);
+    expect(isCliResumeRejectedMessage('session id 0f3a is invalid')).toBe(true);
+    expect(isCliResumeRejectedMessage('resume failed: no such session')).toBe(true);
     expect(isCliResumeRejectedMessage('tests failed in session-manager.ts')).toBe(false);
+    // Ordinary stderr from a healthy resumed session must not drop its binding:
+    // a compiler, linter, or the task's own output routinely pairs "session"
+    // with "unknown"/"invalid"/"not found" somewhere on the same line.
+    expect(isCliResumeRejectedMessage('src/session-manager.ts(12,3): error TS2339: unknown property')).toBe(false);
+    expect(isCliResumeRejectedMessage('invalid JSON in ~/.config/app/session.json')).toBe(false);
+    expect(isCliResumeRejectedMessage('Unknown flag --session-timeout')).toBe(false);
+    expect(isCliResumeRejectedMessage('404 not found: /api/sessions/list while session was active')).toBe(false);
+    expect(isCliResumeRejectedMessage('expired token; refreshing before the next session call')).toBe(false);
   });
 });

@@ -44,10 +44,15 @@ export interface CliContextMaterialization {
   resumeFallbackPrompt: string;
 }
 
+// A rejected resume drops the native session binding and restarts the CLI
+// from bounded recovery, so a false match costs the user their working
+// context. Match only the CLI's own stale-session phrasings: the failure
+// word must sit next to the word "session" (optionally its id), not anywhere
+// on a line that merely mentions a session file, flag, or module.
 const CLI_RESUME_REJECTED_PATTERNS = [
   /No conversation found with session ID/i,
-  /session.*(not found|does not exist|expired|invalid|unknown)/i,
-  /(not found|does not exist|expired|invalid|unknown).*session/i,
+  /\bsession(?: id)?\b(?: [^\s]+)? (?:was |is |has )?(?:not found|does not exist|no longer exists|expired|invalid|unknown)\b/i,
+  /\b(?:unknown|invalid|expired|stale|no such|missing) session(?: id)?\b/i,
 ];
 
 export function isCliResumeRejectedMessage(value: unknown): boolean {
