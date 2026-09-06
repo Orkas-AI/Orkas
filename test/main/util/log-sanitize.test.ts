@@ -75,6 +75,14 @@ describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
     expect(out).not.toContain('Secret Project');
   });
 
+  it('masks an absolute path that ends at a newline (child_process error shape)', () => {
+    const out = sanitizeLogTextForUpload('Command failed: node /Users/test/Secret Project/tool.js\nError: boom');
+    expect(out).toContain('<abs-path:');
+    expect(out).not.toContain('/Users/test');
+    expect(out).not.toContain('Secret Project');
+    expect(out).toContain('\nError: boom');
+  });
+
   it('masks Windows absolute paths', () => {
     const out = sanitizeLogTextForUpload('copy C:\\Users\\Alice\\Private\\token.txt failed');
     expect(out).toContain('<abs-path:');

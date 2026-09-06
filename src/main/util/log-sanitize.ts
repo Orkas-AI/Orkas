@@ -40,7 +40,9 @@ const QUERY_SECRET_FIELD_RE = new RegExp(
   'gi',
 );
 
-const PATH_END = '(?=\\s+(?:then|while|failed|failure|error|at|from|to|for|because|with)\\b|$|[\'",);])';
+// A newline ends a path too: child_process errors ("Command failed: node
+// /Users/x/tool.js\nError: …") would otherwise leave the path unmasked.
+const PATH_END = '(?=\\s+(?:then|while|failed|failure|error|at|from|to|for|because|with)\\b|$|[\\r\\n\'",);])';
 const CLOUD_PATH_RE = new RegExp(`\\bcloud\\/[^\\n\\r'",);]+?${PATH_END}`, 'g');
 const FILE_URL_RE = new RegExp(`\\bfile:\\/\\/\\/?[^\\n\\r'",);]+?${PATH_END}`, 'gi');
 const POSIX_ABS_PATH_RE = new RegExp(`(^|[\\s'",(])((?:\\/Users|\\/private|\\/var|\\/tmp|\\/Volumes|\\/home|\\/opt)\\/[^\\n\\r'",);]+?)${PATH_END}`, 'g');

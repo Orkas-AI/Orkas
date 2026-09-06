@@ -99,12 +99,17 @@ export class McpConnection {
         argCount: this.transport.args.length,
         proxyMode: proxyEnv.ORKAS_PROXY_MODE || 'unmanaged',
       });
-      transport = new sdk.StdioClientTransport({
+      const stdioTransport = new sdk.StdioClientTransport({
         command: this.transport.command,
         args: this.transport.args,
         env: envFull,
+        stderr: 'pipe',
         ...(this.transport.cwd ? { cwd: this.transport.cwd } : {}),
       });
+      // Provider diagnostics can contain credentials or user data. Drain without
+      // retaining them; lifecycle and request errors use the host's structured logs.
+      stdioTransport.stderr?.on('data', () => {});
+      transport = stdioTransport;
     } else {
       const url = new URL(this.transport.url);
       // A custom URL may carry credentials in the query string (`?key=…`); log
