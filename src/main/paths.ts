@@ -15,6 +15,7 @@
  *   <container>/                  ← ~/.orkas (mac/linux) or <drive>:\.orkas (Windows, pinned)
  *     data/                       ← WS_ROOT
  *       users.json                ← Local uid registry + current_user_id / dev_current_user_id
+ *       open-users.json           ← Open-source registry + open_current_user_id
  *       window-state.json         ← Last desktop window bounds (machine-local)
  *       logs/                     ← Local logs (rolled daily, global)
  *       venv/                     ← Machine-global dependency envs/caches
@@ -80,6 +81,8 @@ export const WS_ROOT = path.resolve(process.env.ORKAS_WORKSPACE_ROOT);
 // Dev builds use dev_current_user_id so they do not overwrite the packaged
 // active profile pointer in the shared install-container users.json.
 export const USERS_FILE        = path.join(WS_ROOT, 'users.json');
+// OpenSource owns a separate pointer so older hosted builds cannot discard it.
+export const OPEN_USERS_FILE   = path.join(WS_ROOT, 'open-users.json');
 export const DEVICE_FILE       = path.join(WS_ROOT, 'device.json');
 export const WINDOW_STATE_FILE = path.join(WS_ROOT, 'window-state.json');
 // Machine-local logs (daily rolling, single global file shared across uids).

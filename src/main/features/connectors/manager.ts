@@ -7,29 +7,36 @@
  * so stdio subprocesses exit instead of leaking. Tool calls route here from the AgentRunner's
  * meta-tools via `tools-adapter.ts`.
  *
- * Every instance uses OAuth — there is no API-key path. The `connectViaOAuth` entry point runs
- * the full PKCE/browser/code-exchange flow, persists the grant, applies the catalog's transport
- * template (which substitutes the fresh access_token into env / headers), and brings the live
- * MCP connection up. Tokens are lazily refreshed at boot / refresh-tools / reconnect; mid-call
- * expiry surfaces as a tool error and the user re-clicks "刷新工具".
+ * Provider OAuth grants and API-key-backed Composio grants share `connectViaOAuth`. The manager
+ * persists only opaque grants, applies the catalog transport, and brings the live MCP connection
+ * up. Tokens are lazily refreshed at boot / refresh-tools / reconnect; mid-call expiry surfaces
+ * as a tool error and the user re-clicks "刷新工具".
  */
 import * as crypto from 'node:crypto';
+import * as path from 'node:path';
+import { app } from 'electron';
 
 import * as registry from './registry';
+import * as paths from '../../paths';
 import { McpConnection } from './mcp-client';
 import { findCatalogEntry } from './catalog';
 import { applyTemplate } from './apply-template';
 import { assertConnectorRuntimeEnabled, isConnectorRuntimeEnabled } from './availability';
-import { startOAuth, refreshIfStale, startGoogleSheetsPicker } from './oauth';
+import { startComposioConnect, startOAuth, refreshIfStale, startGoogleSheetsPicker } from './oauth';
 import { startMcpDcrOAuth, refreshDcrIfStale } from './oauth-dcr';
 import { createLogger } from '../../logger';
 import { logErrorSummary } from '../../util/log-redact';
 import { resolveBackgroundNodeRuntime, withBackgroundNodeEnv } from '../../util/background-node';
+import { fetchWithTimeout } from '../../util/abort';
+import { commonHeaders, withCommonHeaders } from '../api_common';
+import { accountApiBase } from './_server_bridge';
+import { connectorApiKeyHeaders } from './api-key';
+import { preflightConnectorCredits } from './usage-metering';
 import { registerUserSwitchHook } from '../user-switch-hooks';
 import { broadcastOAuthConnectOutcome } from './oauth-events';
 import { deriveCustomId, validateCustomTransport, validateDisplayName, type CustomConnectorInput } from './custom-transport';
 import { isConnectorUsable } from './types';
-import type { CatalogEntry, ConnectorInstance, OAuthGrant, ToolSchema, Transport } from './types';
+import type { CatalogEntry, ComposioGrant, ConnectorInstance, OAuthGrant, ToolSchema, Transport } from './types';
 
 const log = createLogger('connectors:manager');
 
@@ -114,6 +121,7 @@ const BOOTSTRAP_CONNECT_CONCURRENCY = 3;
 const VERIFY_TTL_MS = 5 * 60 * 1000;
 const RETRY_BACKOFF_BASE_MS = 30 * 1000;
 const RETRY_BACKOFF_MAX_MS = 30 * 60 * 1000;
+const COMPOSIO_CALL_TOOL_TIMEOUT_MS = 110 * 1000;
 
 type StatusPatchCollector = Map<string, registry.ConnectorInstancePatch[]>;
 
@@ -147,6 +155,71 @@ function _sleep(ms: number): Promise<void> {
 function _tokPrefix(t: string | null | undefined): string {
   if (!t) return 'none';
   return crypto.createHash('sha256').update(t).digest('hex').slice(0, 12);
+}
+
+function _pcDirForChild(): string {
+  return app?.isPackaged
+    ? paths.PC_ROOT.replace(/\bapp\.asar\b/, 'app.asar.unpacked')
+    : paths.PC_ROOT;
+}
+
+function _composioTransport(inst: ConnectorInstance): Transport {
+  if (!inst.composio_grant?.connection_id) throw new Error('no composio_grant');
+  const nodeRuntime = resolveBackgroundNodeRuntime();
+  return {
+    kind: 'stdio',
+    command: nodeRuntime.executable,
+    args: [path.join(_pcDirForChild(), 'bin/composio-mcp-server.cjs')],
+    proxyTargetUrl: accountApiBase(),
+    env: withBackgroundNodeEnv({
+      ORKAS_API_BASE: accountApiBase(),
+      ORKAS_API_KEY: connectorApiKeyHeaders().Authorization.slice('Bearer '.length),
+      ORKAS_CLIENT_HEADERS_JSON: JSON.stringify(commonHeaders()),
+      COMPOSIO_CONNECTION_ID: inst.composio_grant.connection_id,
+      COMPOSIO_CONNECTOR_ID: inst.id,
+    }, nodeRuntime),
+  };
+}
+
+function _composioInstanceDraft(entry: CatalogEntry, grant: ComposioGrant): ConnectorInstance {
+  const nodeRuntime = resolveBackgroundNodeRuntime();
+  const draft: ConnectorInstance = {
+    id: entry.id,
+    display_name: entry.display_name,
+    transport: {
+      kind: 'stdio',
+      command: nodeRuntime.executable,
+      args: [path.join(_pcDirForChild(), 'bin/composio-mcp-server.cjs')],
+      env: {},
+    },
+    enabled_subtools: null,
+    tools_cache: [],
+    tools_cached_at: 0,
+    status: { kind: 'connecting' },
+    composio_grant: grant,
+    created_at: _nowIso(),
+    updated_at: _nowIso(),
+  };
+  draft.transport = _composioTransport(draft);
+  return draft;
+}
+
+async function _deleteComposioConnectionOnServer(id: string): Promise<void> {
+  if (findCatalogEntry(id)?.auth_mode !== 'composio') return;
+  try {
+    const response = await fetchWithTimeout(`${accountApiBase()}/connectors/composio/disconnect`, {
+      method: 'POST',
+      headers: withCommonHeaders({
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        ...connectorApiKeyHeaders(),
+      }),
+      body: JSON.stringify({ connector_id: id }),
+    }, 60_000, undefined, 'Composio disconnect timed out after 60s');
+    if (!response.ok) log.warn('Composio disconnect failed', { id, status: response.status });
+  } catch (err) {
+    log.warn('Composio disconnect failed', { id, error: logErrorSummary(err) });
+  }
 }
 
 function _missingRequiredScopes(entry: CatalogEntry, grant: OAuthGrant | undefined): string[] {
@@ -639,6 +712,9 @@ async function _resolveTransport(uid: string, inst: ConnectorInstance): Promise<
     log.warn('catalog entry missing for instance', { id: inst.id });
     return null;
   }
+  if (entry.auth_mode === 'composio') {
+    return { transport: _composioTransport(inst), grant: null };
+  }
   if (!inst.oauth_grant) {
     log.warn('instance has no oauth_grant', { id: inst.id });
     return null;
@@ -998,9 +1074,9 @@ export function getInstance(uid: string, id: string): ConnectorInstance | null {
   return inst;
 }
 
-/** Drive the full OAuth flow for a catalog entry and bring the resulting MCP connection up.
- *  This is the **only** public install path — there is no free-form / API-key entry point.
- *  Dispatches to server-bridge or DCR depending on `entry.auth_mode`. */
+/** Drive the provider authorization flow for a catalog entry and bring its MCP connection up.
+ *  Composio rows use the shared Orkas API Key for the Server hop; ordinary rows dispatch to the
+ *  existing server-bridge or DCR provider flow. */
 export async function connectViaOAuth(
   uid: string,
   catalogId: string,
@@ -1010,8 +1086,16 @@ export async function connectViaOAuth(
   const entry = findCatalogEntry(catalogId);
   if (!entry) throw new Error('unknown catalog id');
   assertConnectorRuntimeEnabled(catalogId);
+  await preflightConnectorCredits(entry, 'connect');
 
   log.info('connectViaOAuth: starting OAuth', { catalog_id: catalogId, auth_mode: entry.auth_mode });
+  if (entry.auth_mode === 'composio') {
+    const composioGrant = await startComposioConnect(
+      entry,
+      opts.attemptId ? { attemptId: opts.attemptId } : {},
+    );
+    return _provisionComposioInstance(uid, entry, composioGrant);
+  }
   let grant: OAuthGrant;
   let dcrClient: ConnectorInstance['dcr_client'];
   if (entry.auth_mode === 'mcp_dcr') {
@@ -1138,6 +1222,22 @@ export function beginOAuthConnect(uid: string, catalogId: string): OAuthConnectS
   return { attempt_id: attemptId };
 }
 
+async function _provisionComposioInstance(
+  uid: string,
+  entry: CatalogEntry,
+  grant: ComposioGrant,
+): Promise<ConnectorInstance> {
+  const runtimeKey = _runtimeKey(uid, entry.id);
+  const prior = _conns.get(runtimeKey);
+  if (prior) {
+    try { await prior.close(); } catch { /* swallow */ }
+    _conns.delete(runtimeKey);
+  }
+  const draft = _composioInstanceDraft(entry, grant);
+  await registry.upsert(uid, draft);
+  return _connectAndCacheTools(uid, draft);
+}
+
 /** Provision (or replace) a single instance for a non-bundle catalog entry. Pulled out of
  *  `connectViaOAuth` so the bundle branch can loop over members. Caller has already obtained
  *  the OAuth grant. */
@@ -1229,7 +1329,9 @@ export async function addCustomInstance(uid: string, input: CustomConnectorInput
   return _connectAndCacheTools(uid, draft);
 }
 
-export async function removeInstance(uid: string, id: string): Promise<boolean> {
+export async function removeInstance(
+  uid: string, id: string, options: { disconnectRemote?: boolean } = {},
+): Promise<boolean> {
   if (!uid) return false;
   const runtimeKey = _runtimeKey(uid, id);
   const conn = _conns.get(runtimeKey);
@@ -1237,7 +1339,21 @@ export async function removeInstance(uid: string, id: string): Promise<boolean> 
     try { await conn.close(); } catch { /* swallow */ }
     _conns.delete(runtimeKey);
   }
+  if (options.disconnectRemote !== false) await _deleteComposioConnectionOnServer(id);
   return registry.remove(uid, id);
+}
+
+/** Clear local API-key connections without network access when changing credentials. */
+export async function removeApiKeyConnectors(uid: string): Promise<number> {
+  if (!uid) return 0;
+  const ids = Object.values(registry.load(uid).connections)
+    .filter((instance) => findCatalogEntry(instance.id)?.auth_mode === 'composio')
+    .map((instance) => instance.id);
+  let removed = 0;
+  for (const id of ids) {
+    if (await removeInstance(uid, id, { disconnectRemote: false })) removed += 1;
+  }
+  return removed;
 }
 
 export async function refreshTools(uid: string, id: string): Promise<ToolSchema[]> {
@@ -1246,6 +1362,8 @@ export async function refreshTools(uid: string, id: string): Promise<ToolSchema[
   const inst = getInstance(uid, id);
   if (!inst) throw new Error('instance not found');
   if (registry.hasUnavailableSecrets(inst)) throw _secretsUnavailableError(id);
+  const entry = findCatalogEntry(id);
+  if (entry) await preflightConnectorCredits(entry, 'tool_call');
   // Force refresh-token check by tearing the live conn down and reconnecting through
   // _connectAndCacheTools (which re-resolves transport with a fresh access_token).
   const runtimeKey = _runtimeKey(uid, id);
@@ -1311,6 +1429,8 @@ export async function callTool(
   const inst = getInstance(uid, id);
   if (!inst) throw new Error('instance not found');
   if (registry.hasUnavailableSecrets(inst)) throw _secretsUnavailableError(id);
+  const entry = findCatalogEntry(id);
+  if (entry) await preflightConnectorCredits(entry, 'tool_call');
   const runtimeKey = _runtimeKey(uid, id);
   const liveConn = _conns.get(runtimeKey);
   const grantForCooldown = inst.oauth_grant;
@@ -1366,8 +1486,12 @@ export async function callTool(
   }
   const startedAt = Date.now();
   try {
-    const result = opts.signal
-      ? await conn.callTool(name, args, { signal: opts.signal })
+    const requestOpts = {
+      ...(opts.signal ? { signal: opts.signal } : {}),
+      ...(inst.composio_grant ? { timeoutMs: COMPOSIO_CALL_TOOL_TIMEOUT_MS } : {}),
+    };
+    const result = Object.keys(requestOpts).length
+      ? await conn.callTool(name, args, requestOpts)
       : await conn.callTool(name, args);
     log.info('connector tool call completed', {
       id,
@@ -1378,7 +1502,6 @@ export async function callTool(
   } catch (err) {
     const cancelled = opts.signal?.aborted || (err as Error)?.name === 'AbortError';
     const transient = !cancelled && _isTransientConnectorFailure(err);
-    const entry = findCatalogEntry(id);
     const hardAuth = !cancelled && !!entry
       && (_isGoogleAuthFailure(entry, err) || _isDcrAuthFailure(entry, err));
     if (cancelled || transient || hardAuth) {

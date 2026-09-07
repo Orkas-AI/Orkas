@@ -13,6 +13,7 @@
  * call surfaces a 401.
  */
 import { GOOGLE_ENTRIES } from './catalog-google';
+import { getServerConnectorCatalogConfig } from '../client_config';
 import type { CatalogEntry } from './types';
 
 export const CONNECTOR_CATALOG: CatalogEntry[] = [
@@ -240,7 +241,13 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
 ];
 
 export function connectorCatalog(): CatalogEntry[] {
-  return CONNECTOR_CATALOG;
+  const byId = new Map(CONNECTOR_CATALOG.map((entry) => [entry.id, entry]));
+  for (const entry of getServerConnectorCatalogConfig()) {
+    const existing = byId.get(entry.id);
+    if (existing && existing.auth_mode !== 'composio') continue;
+    byId.set(entry.id, existing ? { ...existing, ...entry } : entry);
+  }
+  return Array.from(byId.values());
 }
 
 export function findCatalogEntry(id: string): CatalogEntry | null {

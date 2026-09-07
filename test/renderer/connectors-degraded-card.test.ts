@@ -60,6 +60,10 @@ function loadConnectorsRenderer(
   const clicks: Array<[string, Record<string, unknown>]> = [];
   const events: Array<[string, Record<string, unknown>]> = [];
   const errors: Array<[string, Record<string, unknown>]> = [];
+  const views: string[] = [];
+  const settingsTabs: string[] = [];
+  const toasts: string[] = [];
+  const apiKeyInput = { focus: vi.fn() };
   const pushHandlers = new Map<string, (payload: any) => void>();
   const windowHandlers = new Map<string, Array<(payload?: any) => void>>();
   const timers = new Map<number, { at: number; handler: () => void }>();
@@ -93,7 +97,7 @@ function loadConnectorsRenderer(
     },
     document: {
       createElement: (tag: string) => makeElement(tag),
-      getElementById: () => null,
+      getElementById: (id: string) => id === 'settings-orkas-api-key-input' ? apiKeyInput : null,
       querySelectorAll: () => [],
       body: { appendChild: () => {} },
       addEventListener: () => {},
@@ -111,6 +115,7 @@ function loadConnectorsRenderer(
       innerWidth: 1200,
       innerHeight: 800,
       Monitor: monitor,
+      activateSettingsTab: (tab: string) => { settingsTabs.push(tab); },
       orkas: {
         invoke,
         onPushEvent: (channel: string, handler: (payload: any) => void) => { pushHandlers.set(channel, handler); },
@@ -120,7 +125,8 @@ function loadConnectorsRenderer(
     uiAlert: (message: string) => { alerts.push(message); },
     uiConfirmDanger: async () => true,
     uiConfirm: confirmInstall,
-    setView: () => {},
+    uiToast: (message: string) => { toasts.push(message); },
+    setView: (view: string) => { views.push(view); },
     setChatRecipient: () => {},
     setChatConnector: () => {},
     // Echo the key so assertions can match on it without depending on locale copy.
@@ -146,6 +152,10 @@ function loadConnectorsRenderer(
   context.__clicks = clicks;
   context.__events = events;
   context.__errors = errors;
+  context.__views = views;
+  context.__settingsTabs = settingsTabs;
+  context.__toasts = toasts;
+  context.__apiKeyInput = apiKeyInput;
   context.__emitPush = (channel: string, payload: any) => pushHandlers.get(channel)?.(payload);
   context.__emitWindow = (name: string, payload?: any) => {
     for (const handler of windowHandlers.get(name) || []) handler(payload);
@@ -189,6 +199,40 @@ function degradedGscInstance(lastVerifiedAt: number) {
 }
 
 describe('connectors panel — degraded cards never claim 已连接', () => {
+  it('routes a paid connector to Settings → Models before OAuth when the API key is missing', async () => {
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'orkasApi.getStatus') {
+        return { ok: true, configured: false, connectorAccess: false };
+      }
+      return { ok: true };
+    });
+    const ctx = loadConnectorsRenderer(invoke);
+
+    await ctx._runConnect({
+      id: 'composio-mail',
+      display_name: 'Mail',
+      auth_mode: 'composio',
+      requires_credits: true,
+    });
+    ctx.__advanceTimers(0);
+
+    expect(ctx.__views).toEqual(['settings']);
+    expect(ctx.__settingsTabs).toEqual(['credentials']);
+    expect(ctx.__apiKeyInput.focus).toHaveBeenCalledOnce();
+    expect(ctx.__toasts).toEqual(['connectors.errors.api_key_required']);
+    expect(invoke).not.toHaveBeenCalledWith('connectors.start_oauth', expect.anything());
+  });
+
+  it('starts a paid connection with a locally configured key without requiring cached permissions', async () => {
+    const invoke = vi.fn(async (channel: string) => channel === 'orkasApi.getStatus'
+      ? { ok: true, configured: true, scopes: [] }
+      : { ok: true, started: true, attempt_id: 'offline-configured' });
+    const ctx = loadConnectorsRenderer(invoke);
+    await ctx._runConnect({ id: 'composio-mail', auth_mode: 'composio', requires_credits: true });
+    expect(invoke).toHaveBeenCalledWith('connectors.start_oauth', { catalog_id: 'composio-mail' });
+    expect(ctx.__views).toEqual([]);
+  });
+
   it('renders the failure reason and staleness instead of the connected treatment', () => {
     const ctx = loadConnectorsRenderer();
     const sixDaysAgo = Date.now() - 6 * 24 * 60 * 60 * 1000;

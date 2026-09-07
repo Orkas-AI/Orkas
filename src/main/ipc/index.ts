@@ -65,7 +65,10 @@ import {
 import * as userWorkspace from '../features/user_workspace';
 import { invokeHandlers as localAgentsHandlers } from './local_agents';
 import { invokeHandlers as qualityHandlers } from './quality';
-import { invokeHandlers as connectorsHandlers } from './connectors';
+import {
+  invokeHandlers as connectorsHandlers,
+  removeApiKeyConnectorsForCredentialChange,
+} from './connectors';
 import { invokeHandlers as memoryHandlers } from './memory';
 import { safeId } from '../storage';
 import { createLogger, logFromRenderer } from '../logger';
@@ -2727,6 +2730,19 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 
   // ── Orkas public API key quick setup (open-source build only) ──
   'orkasApi.configureAll': async ({ apiKey }) => auth.configureAllOrkasApiServices(apiKey),
+  'orkasApi.getStatus': async () => auth.getOrkasApiCredentialStatus(),
+  'orkasApi.save': async ({ apiKey }, ctx) => {
+    const credential = auth.prepareOrkasApiCredential(apiKey);
+    const previousKey = auth.getOrkasApiKey();
+    if (previousKey && previousKey !== credential.key) {
+      await removeApiKeyConnectorsForCredentialChange(ctx.userId);
+    }
+    return auth.saveOrkasApiCredential(credential);
+  },
+  'orkasApi.remove': async (_payload, ctx) => {
+    await removeApiKeyConnectorsForCredentialChange(ctx.userId);
+    return auth.removeOrkasApiCredential();
+  },
 
   // ── Image-generation API key (independent from chat entries) ──
   // `list` strips raw apiKey and replaces it with `apiKeyMasked` so

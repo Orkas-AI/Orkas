@@ -282,6 +282,27 @@ export interface TtsProfile {
   createdAt: number;
 }
 
+export interface OrkasApiCredential {
+  key: string;
+  keyId: string;
+  name: string;
+  prefix: string;
+  scopes: string[];
+  expiresAt: number;
+  ownerRef: string;
+  updatedAt: number;
+}
+
+export interface OrkasApiCredentialStatus {
+  configured: boolean;
+  keyMasked: string;
+  keyId: string;
+  name: string;
+  scopes: string[];
+  expiresAt: number;
+  updatedAt: number;
+}
+
 interface ProfilesFile {
   /** v3 = chat profiles only. v4 adds BYO search / image / video / speech profiles. */
   version: number;
@@ -291,8 +312,13 @@ interface ProfilesFile {
   imageProfiles?: ImageProfile[];
   videoProfiles?: VideoProfile[];
   ttsProfiles?: TtsProfile[];
+  /** One user-owned Orkas credential shared by every public API feature. */
+  orkasApiCredential?: OrkasApiCredential;
 }
 
+// The shared credential is optional, so it remains wire-compatible with the v6 profiles file.
+// Keeping the version stable avoids rewriting every existing installation solely to add an
+// absent optional field; legacy Orkas rows are still promoted and rewritten on first read.
 const PROFILES_FILE_VERSION = 6;
 const AUTH_SECRET_NAMESPACE = 'auth.profiles';
 const AUTH_SECRET_RECORD_ID = 'auth-profiles.json';
@@ -425,7 +451,42 @@ function loadProfiles(opts: { throwOnInvalidExisting?: boolean } = {}): Profiles
       const imageProfiles = parseImageProfilesArray((data as any).imageProfiles);
       const videoProfiles = parseVideoProfilesArray((data as any).videoProfiles);
       const ttsProfiles = parseTtsProfilesArray((data as any).ttsProfiles);
-      const store = { version: PROFILES_FILE_VERSION, profiles, entries, searchProfiles, imageProfiles, videoProfiles, ttsProfiles };
+      let orkasApiCredential = parseOrkasApiCredential((data as any).orkasApiCredential);
+      if (!orkasApiCredential) {
+        const legacyKeys = new Set<string>();
+        for (const profile of Object.values(profiles)) {
+          if (profile.provider === ORKAS_API_PROVIDER && profile.type === 'api_key' && profile.key) {
+            legacyKeys.add(profile.key);
+          }
+        }
+        for (const profile of [...searchProfiles, ...imageProfiles, ...videoProfiles, ...ttsProfiles]) {
+          if (profile.provider === ORKAS_API_PROVIDER && profile.apiKey) legacyKeys.add(profile.apiKey);
+        }
+        if (legacyKeys.size === 1) {
+          const [key] = legacyKeys;
+          orkasApiCredential = {
+            key,
+            keyId: '',
+            name: '',
+            prefix: maskKey(key),
+            scopes: [],
+            expiresAt: 0,
+            ownerRef: '',
+            updatedAt: Date.now(),
+          };
+          shouldRewrite = true;
+        }
+      }
+      const store = {
+        version: PROFILES_FILE_VERSION,
+        profiles,
+        entries,
+        searchProfiles,
+        imageProfiles,
+        videoProfiles,
+        ttsProfiles,
+        ...(orkasApiCredential ? { orkasApiCredential } : {}),
+      };
       if (shouldRewrite || Number((data as any).version) !== PROFILES_FILE_VERSION) {
         try { saveProfiles(store); }
         catch (err) {
@@ -443,6 +504,25 @@ function loadProfiles(opts: { throwOnInvalidExisting?: boolean } = {}): Profiles
     }
   }
   return { version: PROFILES_FILE_VERSION, profiles: {}, entries: [], searchProfiles: [], imageProfiles: [], videoProfiles: [], ttsProfiles: [] };
+}
+
+function parseOrkasApiCredential(raw: unknown): OrkasApiCredential | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  const key = typeof value.key === 'string' ? value.key.trim() : '';
+  if (!key) return undefined;
+  return {
+    key,
+    keyId: typeof value.keyId === 'string' ? value.keyId : '',
+    name: typeof value.name === 'string' ? value.name : '',
+    prefix: typeof value.prefix === 'string' && value.prefix ? value.prefix : maskKey(key),
+    scopes: Array.isArray(value.scopes)
+      ? value.scopes.filter((scope): scope is string => typeof scope === 'string')
+      : [],
+    expiresAt: typeof value.expiresAt === 'number' ? value.expiresAt : 0,
+    ownerRef: typeof value.ownerRef === 'string' ? value.ownerRef : '',
+    updatedAt: typeof value.updatedAt === 'number' ? value.updatedAt : Date.now(),
+  };
 }
 
 function parseSearchProfilesArray(arr: unknown): SearchProfile[] {
@@ -601,6 +681,7 @@ function updateOrAppendOrkasServiceProfile<T extends { provider: string; apiKey:
 export function configureAllOrkasApiServices(rawApiKey: string): { configured: true } {
   const apiKey = String(rawApiKey || '').trim();
   if (!apiKey) throw new Error('api key required');
+  if (!isBearerTokenHeaderSafe(apiKey)) throw new Error('api key contains invalid characters');
 
   const store = loadProfiles({ throwOnInvalidExisting: true });
   const now = Date.now();
@@ -694,12 +775,111 @@ export function configureAllOrkasApiServices(rawApiKey: string): { configured: t
       apiKey,
     }),
   );
+  const existingCredential = store.orkasApiCredential;
+  store.orkasApiCredential = {
+    key: apiKey,
+    keyId: existingCredential?.key === apiKey ? existingCredential.keyId : '',
+    name: existingCredential?.key === apiKey ? existingCredential.name : '',
+    prefix: existingCredential?.key === apiKey ? existingCredential.prefix : maskKey(apiKey),
+    scopes: existingCredential?.key === apiKey ? existingCredential.scopes : [],
+    expiresAt: existingCredential?.key === apiKey ? existingCredential.expiresAt : 0,
+    ownerRef: existingCredential?.key === apiKey ? existingCredential.ownerRef : '',
+    updatedAt: now,
+  };
 
   saveProfiles(store);
   for (const [profileId] of existingProfileEntries) clearCooldown(profileId);
   clearCooldown(chatProfileId);
   invalidateCoreAgentRunner();
   return { configured: true };
+}
+
+function orkasApiCredentialError(code: string, message: string): Error & { code: string } {
+  return Object.assign(new Error(message), { code });
+}
+
+export function getOrkasApiKey(): string {
+  return loadProfiles().orkasApiCredential?.key || '';
+}
+
+export function getOrkasApiCredentialStatus(): OrkasApiCredentialStatus {
+  const credential = loadProfiles().orkasApiCredential;
+  if (!credential?.key) {
+    return {
+      configured: false,
+      keyMasked: '',
+      keyId: '',
+      name: '',
+      scopes: [],
+      expiresAt: 0,
+      updatedAt: 0,
+    };
+  }
+  return {
+    configured: true,
+    keyMasked: credential.prefix || maskKey(credential.key),
+    keyId: credential.keyId,
+    name: credential.name,
+    scopes: [...credential.scopes],
+    expiresAt: credential.expiresAt,
+    updatedAt: credential.updatedAt,
+  };
+}
+
+/** Prepare a local credential; authentication happens only when a service is used. */
+export function prepareOrkasApiCredential(rawApiKey: string): OrkasApiCredential {
+  const apiKey = String(rawApiKey || '').trim();
+  if (!apiKey) throw orkasApiCredentialError('api_key_required', 'api key required');
+  if (!isBearerTokenHeaderSafe(apiKey)) {
+    throw orkasApiCredentialError('invalid_api_key', 'api key contains invalid characters');
+  }
+  return {
+    key: apiKey,
+    keyId: '',
+    name: '',
+    prefix: maskKey(apiKey),
+    scopes: [],
+    expiresAt: 0,
+    ownerRef: '',
+    updatedAt: Date.now(),
+  };
+}
+
+export function saveOrkasApiCredential(credential: OrkasApiCredential): OrkasApiCredentialStatus {
+  configureAllOrkasApiServices(credential.key);
+  return getOrkasApiCredentialStatus();
+}
+
+export function removeOrkasApiCredential(): { removed: boolean } {
+  const store = loadProfiles({ throwOnInvalidExisting: true });
+  const removed = !!store.orkasApiCredential
+    || Object.values(store.profiles).some((profile) => profile.provider === ORKAS_API_PROVIDER)
+    || (store.searchProfiles || []).some((profile) => profile.provider === ORKAS_API_PROVIDER)
+    || (store.imageProfiles || []).some((profile) => profile.provider === ORKAS_API_PROVIDER)
+    || (store.videoProfiles || []).some((profile) => profile.provider === ORKAS_API_PROVIDER)
+    || (store.ttsProfiles || []).some((profile) => profile.provider === ORKAS_API_PROVIDER);
+  const removedProfileIds = new Set(
+    Object.entries(store.profiles)
+      .filter(([, profile]) => profile.provider === ORKAS_API_PROVIDER)
+      .map(([profileId]) => profileId),
+  );
+  for (const profileId of removedProfileIds) {
+    delete store.profiles[profileId];
+    clearCooldown(profileId);
+  }
+  store.entries = store.entries.filter((entry) => (
+    entry.provider !== ORKAS_API_PROVIDER && !removedProfileIds.has(entry.profileId)
+  ));
+  store.searchProfiles = (store.searchProfiles || []).filter((profile) => profile.provider !== ORKAS_API_PROVIDER);
+  store.imageProfiles = (store.imageProfiles || []).filter((profile) => profile.provider !== ORKAS_API_PROVIDER);
+  store.videoProfiles = (store.videoProfiles || []).filter((profile) => profile.provider !== ORKAS_API_PROVIDER);
+  store.ttsProfiles = (store.ttsProfiles || []).filter((profile) => profile.provider !== ORKAS_API_PROVIDER);
+  delete store.orkasApiCredential;
+  if (removed) {
+    saveProfiles(store);
+    invalidateCoreAgentRunner();
+  }
+  return { removed };
 }
 
 function saveProfiles(store: ProfilesFile): void {

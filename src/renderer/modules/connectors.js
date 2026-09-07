@@ -618,7 +618,10 @@ function _renderCatalogCard(entry, instance) {
       ${menuHtml}
     </div>
     <div class="connector-card-desc muted"></div>
-    <div class="connector-card-foot">${action}</div>
+    <div class="connector-card-foot">
+      ${e.requires_credits === true ? `<span class="connector-credit-badge">${escapeHtml(t('connectors.badge.credits_required'))}</span>` : ''}
+      ${action}
+    </div>
   `;
   card.querySelector('.connector-card-name').textContent = e.display_name;
   card.querySelector('.connector-card-desc').textContent = desc;
@@ -876,6 +879,18 @@ async function _runConnect(entry) {
       || (activeLaunch && activeLaunch.throttled)
       || _oauthCallbackAttempts.has(entry.id)) return;
 
+  if (entry.requires_credits === true || entry.auth_mode === 'composio') {
+    const credential = await window.orkas.invoke('orkasApi.getStatus');
+    if (!credential || !credential.ok || !credential.configured) {
+      setView('settings');
+      if (typeof window.activateSettingsTab === 'function') window.activateSettingsTab('credentials');
+      const input = document.getElementById('settings-orkas-api-key-input');
+      setTimeout(() => input && input.focus(), 0);
+      if (typeof uiToast === 'function') uiToast(t('connectors.errors.api_key_required'));
+      return;
+    }
+  }
+
   const payload = _connectorTrackPayload(entry, null);
   const startedAt = performance.now();
   const launchToken = ++_oauthLaunchToken;
@@ -905,6 +920,12 @@ async function _runConnect(entry) {
       // The browser can take focus before IPC returns. Do not recreate feedback already cleared by
       // that blur; only correlate a launch phase that is still visible.
       if (launch && launch.token === launchToken) launch.attemptId = res.attempt_id;
+    } else if (res && !res.ok && res.requires_api_key) {
+      setView('settings');
+      if (typeof window.activateSettingsTab === 'function') window.activateSettingsTab('credentials');
+      const input = document.getElementById('settings-orkas-api-key-input');
+      setTimeout(() => input && input.focus(), 0);
+      if (typeof uiToast === 'function') uiToast(t('connectors.errors.api_key_required'));
     } else if (res && !res.ok) {
       _handleConnectFailure(payload, startedAt, res);
     } else {

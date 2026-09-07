@@ -509,7 +509,7 @@ function registerIpc(): void {
         appRoot: paths.APP_ROOT,
         pcRoot: paths.PC_ROOT,
         wsRoot: paths.WS_ROOT,
-        usersFile: paths.USERS_FILE,
+        usersFile: paths.OPEN_USERS_FILE,
       },
       storage: sample,
       prompts: {
@@ -548,7 +548,7 @@ async function runBootSelfCheck(): Promise<void> {
   // feature touches user-scoped paths (every feature goes through
   // `getActiveUserId()`).
   try {
-    const rec = users.initActiveUser();
+    const rec = users.initActiveUser({ openSource: true });
     log.info('active user', { user_id: rec.user_id });
   } catch (err) {
     log.error('failed to activate user', { error: (err as Error).message });

@@ -6,6 +6,7 @@ export {
   connectViaOAuth,
   addCustomInstance,
   removeInstance,
+  removeApiKeyConnectors,
   refreshTools,
   verifyUsableConnectors,
   setEnabledSubtools,
@@ -16,8 +17,8 @@ export {
 export { CustomTransportError } from './custom-transport';
 export { resolveVisibleConnectors, stringifyMcpResult } from './tools-adapter';
 export { isValidInstanceId } from './registry';
-export { CONNECTOR_CATALOG, findCatalogEntry } from './catalog';
-export { handleCallbackUrl, cancelInFlightOAuth, startGoogleSheetsPicker } from './oauth';
+export { CONNECTOR_CATALOG, connectorCatalog, findCatalogEntry } from './catalog';
+export { handleCallbackUrl, cancelInFlightOAuth, startComposioConnect, startGoogleSheetsPicker } from './oauth';
 export { handleDcrCallbackUrl } from './oauth-dcr';
 export type {
   Transport,
@@ -31,4 +32,6 @@ export type {
   TransportTemplate,
   OAuthConfig,
   OAuthGrant,
+  ComposioConfig,
+  ComposioGrant,
 } from './types';

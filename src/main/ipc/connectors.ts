@@ -10,9 +10,9 @@
  *   connectors.refresh       → { tools, instance }
  *   connectors.set_subtools  → { instance }
  *
- * Catalog installs are OAuth-only — no API-key fallback. Server-bridge providers use an
- * Orkas-registered OAuth app; MCP DCR providers issue a per-device client whose credentials stay
- * in the encrypted local registry. Custom MCP servers are the separate, explicitly user-authored
+ * Catalog installs use provider OAuth. Paid Composio rows authenticate Orkas Server with the
+ * user's shared Orkas API Key, while ordinary server-bridge and MCP DCR providers keep their
+ * existing open-device flow. Custom MCP servers are the separate, explicitly user-authored
  * path: `connectors.add_custom` is the single validated route
  * (features/connectors/custom-transport.ts), the renderer form is the consent surface, and the
  * stored transport lives inside `secrets_enc`. See docs/plans/open-ecosystem-architecture.md §C.
@@ -23,6 +23,7 @@ import * as connectors from '../features/connectors';
 import type { ConnectorInstance, ConnectorStatus, ToolSchema } from '../features/connectors';
 import { isConnectorEnabled, setConnectorEnabled } from '../features/component_enabled';
 import { catalogWithAvailability, isConnectorRuntimeEnabled } from '../features/connectors/availability';
+import { requireConnectorApiKey } from '../features/connectors/api-key';
 
 /**
  * Renderer-safe view of a connector instance. The hydrated `ConnectorInstance`
@@ -89,6 +90,8 @@ function toClientInstance(inst: ConnectorInstance, enabled?: boolean): ClientCon
   };
   if (inst.oauth_grant?.account_label) {
     out.oauth_grant = { account_label: inst.oauth_grant.account_label };
+  } else if (inst.composio_grant?.account_label) {
+    out.oauth_grant = { account_label: inst.composio_grant.account_label };
   }
   if (typeof enabled === 'boolean') out.enabled = enabled;
   return out;
@@ -96,8 +99,12 @@ function toClientInstance(inst: ConnectorInstance, enabled?: boolean): ClientCon
 
 export const _toClientInstanceForTest = toClientInstance;
 
+export async function removeApiKeyConnectorsForCredentialChange(userId: string): Promise<number> {
+  return connectors.removeApiKeyConnectors(userId);
+}
+
 export const invokeHandlers = {
-  'connectors.catalog': async () => ({ catalog: catalogWithAvailability(connectors.CONNECTOR_CATALOG) }),
+  'connectors.catalog': async () => ({ catalog: catalogWithAvailability(connectors.connectorCatalog()) }),
 
   'connectors.list': async (_payload: unknown, ctx: { userId: string }) => {
     // Attach the per-user `enabled` flag so the renderer can render the "停用 / 启用" toggle
@@ -132,6 +139,20 @@ export const invokeHandlers = {
 
   'connectors.start_oauth': async (payload: { catalog_id?: unknown }, ctx: { userId: string }) => {
     if (typeof payload?.catalog_id !== 'string') throw new Error('invalid catalog_id');
+    const entry = connectors.findCatalogEntry(payload.catalog_id);
+    if (entry?.auth_mode === 'composio' || entry?.requires_credits) {
+      try {
+        requireConnectorApiKey();
+      } catch (err) {
+        return {
+          ok: false,
+          code: String((err as { code?: unknown }).code || 'orkas_api_key_required'),
+          error: String((err as Error).message || 'Configure an Orkas API Key first.'),
+          requires_api_key: true,
+          settings_tab: 'credentials',
+        };
+      }
+    }
     const started = connectors.beginOAuthConnect(ctx.userId, payload.catalog_id);
     return { started: true, attempt_id: started.attempt_id };
   },

@@ -19,6 +19,7 @@ afterEach(() => {
   vi.doUnmock('../../../src/main/features/connectors');
   vi.doUnmock('../../../src/main/features/component_enabled');
   vi.doUnmock('../../../src/main/features/connectors/availability');
+  vi.doUnmock('../../../src/main/features/connectors/api-key');
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -46,7 +47,10 @@ function baseInstance(transport: any): any {
 describe('ipc/connectors renderer DTO', () => {
   it('accepts OAuth start without waiting for the browser callback', async () => {
     const beginOAuthConnect = vi.fn(() => ({ attempt_id: 'attempt-1' }));
-    vi.doMock('../../../src/main/features/connectors', () => ({ beginOAuthConnect }));
+    vi.doMock('../../../src/main/features/connectors', () => ({
+      beginOAuthConnect,
+      findCatalogEntry: () => ({ id: 'github', auth_mode: 'server_bridge' }),
+    }));
     vi.doMock('../../../src/main/features/component_enabled', () => ({
       isConnectorEnabled: vi.fn(() => true),
       setConnectorEnabled: vi.fn(),
@@ -64,6 +68,41 @@ describe('ipc/connectors renderer DTO', () => {
 
     expect(beginOAuthConnect).toHaveBeenCalledWith('u-ipc', 'github');
     expect(out).toEqual({ started: true, attempt_id: 'attempt-1' });
+  });
+
+  it('returns a settings redirect contract before starting a paid connector without an API key', async () => {
+    const beginOAuthConnect = vi.fn();
+    vi.doMock('../../../src/main/features/connectors', () => ({
+      beginOAuthConnect,
+      findCatalogEntry: () => ({ id: 'composio-mail', auth_mode: 'composio', requires_credits: true }),
+    }));
+    vi.doMock('../../../src/main/features/connectors/api-key', () => ({
+      requireConnectorApiKey: () => {
+        throw Object.assign(new Error('Configure an Orkas API Key first.'), {
+          code: 'orkas_api_key_required',
+        });
+      },
+    }));
+    vi.doMock('../../../src/main/features/component_enabled', () => ({
+      isConnectorEnabled: vi.fn(() => true),
+      setConnectorEnabled: vi.fn(),
+    }));
+    vi.doMock('../../../src/main/features/connectors/availability', () => ({
+      catalogWithAvailability: vi.fn((catalog) => catalog),
+      isConnectorRuntimeEnabled: vi.fn(() => true),
+    }));
+
+    const { invokeHandlers } = await import('../../../src/main/ipc/connectors');
+    await expect(invokeHandlers['connectors.start_oauth'](
+      { catalog_id: 'composio-mail' },
+      { userId: 'u-ipc' },
+    )).resolves.toMatchObject({
+      ok: false,
+      code: 'orkas_api_key_required',
+      requires_api_key: true,
+      settings_tab: 'credentials',
+    });
+    expect(beginOAuthConnect).not.toHaveBeenCalled();
   });
 
   it('lists local connector state without triggering Composio restore', async () => {

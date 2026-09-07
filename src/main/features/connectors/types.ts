@@ -110,6 +110,7 @@ export interface ConnectorInstance {
    *  reconnect. Refreshed on every successful `list_tools` call. */
   tools_cache: ToolSchema[];
   tools_cached_at: number;
+  tools_cache_key?: string;
   status: ConnectorStatus;
   /** Sticky non-sensitive auth failure marker. When a provider has definitively
    *  rejected a grant, boot/list/refresh paths must not keep retrying it. */
@@ -122,6 +123,8 @@ export interface ConnectorInstance {
    *  stores this with the grant inside the encrypted local registry and never uploads it to the
    *  Orkas account service. */
   dcr_client?: DcrClientCredentials;
+  /** Opaque Server connection handle. Provider credentials never leave Composio/Orkas Server. */
+  composio_grant?: ComposioGrant;
   created_at: string;
   updated_at: string;
 }
@@ -232,14 +235,40 @@ export interface OAuthGrant {
   account_label?: string;
 }
 
+export interface ComposioGrant {
+  connection_id: string;
+  toolkit: string;
+  auth_config_id: string;
+  account_label?: string;
+}
+
+export interface ComposioToolConfig {
+  slug: string;
+  name?: string;
+  description?: string;
+  input_schema?: Record<string, unknown>;
+}
+
+export interface ComposioConfig {
+  toolkit: string;
+  auth_config_id: string;
+  tools?: ComposioToolConfig[];
+}
+
+export interface ConnectorUsageMetering {
+  provider: 'composio';
+  credits_milli_per_call: number;
+}
+
 export type CatalogCategory =
   | 'developer'
   | 'productivity'
   | 'communication'
   | 'search'
-  | 'data';
+  | 'data'
+  | 'commerce';
 
-export type AuthMode = 'server_bridge' | 'mcp_dcr';
+export type AuthMode = 'server_bridge' | 'mcp_dcr' | 'composio';
 
 export interface CatalogEntry {
   /** Stable id; doubles as the installed instance id (one install per catalog entry in Phase 0).
@@ -257,10 +286,15 @@ export interface CatalogEntry {
   category: CatalogCategory;
   description_zh: string;
   description_en: string;
+  description_ja?: string;
+  description_pt?: string;
+  requires_credits?: boolean;
   /** Which OAuth pathway this provider needs — see the `// ── OAuth ──` section above. */
   auth_mode: AuthMode;
   /** Required when `auth_mode === 'server_bridge'`; absent for `'mcp_dcr'` (no pre-registration). */
   oauth?: OAuthConfig;
+  composio?: ComposioConfig;
+  usage_metering?: ConnectorUsageMetering;
   /** OAuth scopes that must be present in the provider's returned grant for the connector to
    *  function. Google lets users uncheck individual requested permissions on the consent screen;
    *  when that happens the token exchange still succeeds but downstream APIs fail with 403s.

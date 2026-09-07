@@ -12895,8 +12895,12 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   line-height: 38px;
   background: var(--surface);
 }
-.settings-orkas-api-configure-row .btn {
+.settings-orkas-api-editor-actions {
   grid-column: 2;
+  display: flex;
+  gap: 8px;
+}
+.settings-orkas-api-configure-row .btn {
   width: 100%;
   height: 40px;
   padding: 0 18px;
@@ -12904,6 +12908,34 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   white-space: nowrap;
   box-shadow: 0 2px 5px rgba(73, 69, 192, 0.16);
 }
+.settings-orkas-api-saved {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 44px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-subtle, var(--surface));
+}
+.settings-orkas-api-saved[hidden] { display: none; }
+.settings-orkas-api-key-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.settings-orkas-api-key-summary code {
+  color: var(--text);
+  font-size: 13px;
+}
+.settings-orkas-api-key-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+.settings-orkas-api-actions { display: flex; gap: 8px; }
 .settings-orkas-api-status {
   grid-column: 1 / -1;
   display: block;
@@ -12934,6 +12966,12 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
     grid-template-columns: minmax(0, 1fr);
     gap: 10px;
   }
+  .settings-orkas-api-saved {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .settings-orkas-api-actions,
+  .settings-orkas-api-editor-actions { width: 100%; }
   .settings-orkas-api-head .btn,
   .settings-orkas-api-configure-row .btn {
     width: 100%;
@@ -12941,6 +12979,7 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   .settings-orkas-api-configure-row .btn {
     grid-column: 1;
   }
+  .settings-orkas-api-editor-actions { grid-column: 1; }
 }
 .settings-group-head-main {
   min-width: 0;
@@ -15417,6 +15456,18 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   gap: 8px;
   align-items: center;
   min-width: 0;
+}
+.connector-credit-badge {
+  margin-right: auto;
+  padding: 3px 7px;
+  border: 1px solid color-mix(in srgb, var(--warn) 42%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+  color: color-mix(in srgb, var(--warn) 78%, var(--text));
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
 }
 .connector-card-foot .btn {
   flex: 0 0 auto;

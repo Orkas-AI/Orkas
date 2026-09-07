@@ -11,8 +11,9 @@
  *   - `anonymous` while logged out.
  *   - the server account uid while logged in.
  *
- * the open-source build still calls `initActiveUser()` without options, so first boot
- * creates a random 32-character local id.
+ * Open-source boot uses `open-users.json::open_current_user_id`. The shared
+ * registry is only a read-only source for the first migration; hosted markers
+ * cause a fresh 32-character local id instead of adopting another product's data.
  *
  * Boot sequence:
  *   1. Read users.json; if absent, create the first profile id and point the
@@ -31,6 +32,7 @@ import * as path from 'node:path';
 
 import {
   USERS_FILE,
+  OPEN_USERS_FILE,
   WS_ROOT,
   userLocalConfigDir,
   userToolResultsDir,
@@ -67,7 +69,9 @@ interface UsersRegistry {
 }
 
 export interface InitActiveUserOptions {
-  /** Hosted Orkas passes `anonymous`; the open-source build omits this and gets a generated 32-character uid. */
+  /** Use the independent open-source registry and migrate compatible legacy profiles. */
+  openSource?: boolean;
+  /** Hosted Orkas passes `anonymous`; open-source first boot generates a 32-character uid. */
   defaultLocalId?: string;
 }
 
@@ -91,6 +95,7 @@ export interface LegacyAccountLocalIdMigrationResult {
 let ACTIVE_UID: string | null = null;
 type CurrentUserField = 'current_user_id' | 'dev_current_user_id';
 let CURRENT_USER_FIELD: CurrentUserField = 'current_user_id';
+let USE_OPEN_REGISTRY = false;
 
 function rollbackUserRootAfterRekeyFailure(toRoot: string, fromRoot: string): void {
   try {
@@ -135,6 +140,7 @@ export function hasActiveUser(): boolean {
 // ── Registry IO ──────────────────────────────────────────────────────────
 
 function readRegistry(): UsersRegistry | null {
+  if (USE_OPEN_REGISTRY) return readOpenRegistry();
   if (!fs.existsSync(USERS_FILE)) return null;
   const data = readJsonSync<Partial<UsersRegistry>>(USERS_FILE);
   if (!data || typeof data !== 'object') return null;
@@ -180,7 +186,62 @@ function isValidRecord(v: unknown): v is UserRecord {
 }
 
 function writeRegistry(reg: UsersRegistry): void {
+  if (USE_OPEN_REGISTRY) {
+    writeJsonSync(OPEN_USERS_FILE, {
+      open_current_user_id: reg.current_user_id,
+      users: reg.users,
+    });
+    return;
+  }
   writeJsonSync(USERS_FILE, reg);
+}
+
+/** Inspect format markers only; never decrypt or rewrite a hosted user's secrets. */
+function hasHostedProfileData(uid: string): boolean {
+  if (uid === ANONYMOUS_LOCAL_ID) return true;
+  const configDir = userLocalConfigDir(uid);
+  if (fs.existsSync(path.join(configDir, ACCOUNT_FILE_NAME))) return true;
+  const authFile = path.join(configDir, 'auth-profiles.json');
+  try {
+    const fd = fs.openSync(authFile, 'r');
+    try {
+      const prefix = Buffer.alloc(9);
+      fs.readSync(fd, prefix, 0, prefix.length, 0);
+      if (prefix.toString('utf8') === 'ORKLSEC1:') return true;
+    } finally { fs.closeSync(fd); }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw new Error('Cannot inspect existing credentials. Restore access to the profile and restart.');
+    }
+  }
+  return false;
+}
+
+function readOpenRegistry(): UsersRegistry | null {
+  if (fs.existsSync(OPEN_USERS_FILE)) {
+    let data: any;
+    try { data = JSON.parse(fs.readFileSync(OPEN_USERS_FILE, 'utf8')); }
+    catch { throw new Error('Cannot read the open-source user registry. Restore open-users.json and restart.'); }
+    const uid = data?.open_current_user_id;
+    if (!safeId(uid) || !Array.isArray(data?.users)
+        || !data.users.every(isValidRecord)
+        || !data.users.some((user: UserRecord) => user.user_id === uid)) {
+      throw new Error('Invalid open-source user registry. Restore open-users.json and restart.');
+    }
+    return { current_user_id: uid, dev_current_user_id: uid, users: data.users };
+  }
+
+  // The shared registry is a read-only migration source. An absent login record
+  // alone is not enough: hosted-format credentials also make a profile ineligible.
+  const legacy = readJsonSync<Partial<UsersRegistry>>(USERS_FILE);
+  const uid = legacy?.current_user_id;
+  const record = Array.isArray(legacy?.users)
+    ? legacy.users.find((user) => isValidRecord(user) && user.user_id === uid)
+    : undefined;
+  if (!record || !safeId(uid) || hasHostedProfileData(record.user_id)) return null;
+  const reg = { current_user_id: record.user_id, dev_current_user_id: record.user_id, users: [record] };
+  writeRegistry(reg);
+  return reg;
 }
 
 function recordForLocalId(localId: string): UserRecord {
@@ -443,6 +504,10 @@ export function activateUser(uid: string): void {
  * anonymous) or generate a random 32-character uid (the open-source build).
  */
 export function initActiveUser(opts: InitActiveUserOptions = {}): UserRecord {
+  if (opts.openSource) {
+    USE_OPEN_REGISTRY = true;
+    CURRENT_USER_FIELD = 'current_user_id';
+  }
   const reg = readRegistry();
   if (reg) {
     const activeUid = reg[CURRENT_USER_FIELD];

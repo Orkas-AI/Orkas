@@ -532,6 +532,31 @@ export interface GoogleConnectorsConfig {
   gmail: ConnectorSwitchState;
 }
 
+export interface ServerComposioConnectorConfig {
+  id: string;
+  display_name: string;
+  icon_svg?: string;
+  category: 'developer' | 'productivity' | 'communication' | 'search' | 'data' | 'commerce';
+  description_zh: string;
+  description_en: string;
+  description_ja?: string;
+  description_pt?: string;
+  requires_credits: true;
+  auth_mode: 'composio';
+  composio: {
+    toolkit: string;
+    auth_config_id: string;
+    tools?: Array<{
+      slug: string;
+      name?: string;
+      description?: string;
+      input_schema?: Record<string, unknown>;
+    }>;
+  };
+  transport_template: null;
+  usage_metering: { provider: 'composio'; credits_milli_per_call: number };
+}
+
 export interface AppUpdatePolicyConfig {
   min_version: string;
 }
@@ -779,6 +804,79 @@ function mergeGoogleConnectorsConfig(baseRaw: unknown, overrideRaw: unknown): Go
   };
 }
 
+const CONNECTOR_CATEGORIES = new Set([
+  'developer', 'productivity', 'communication', 'search', 'data', 'commerce',
+]);
+
+function normalizeServerComposioConnector(raw: unknown): ServerComposioConnectorConfig | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const value = raw as Record<string, unknown>;
+  const id = typeof value.id === 'string' ? value.id.trim().toLowerCase() : '';
+  const category = typeof value.category === 'string' ? value.category.trim() : '';
+  if (!/^[a-z0-9][a-z0-9_-]{1,62}$/.test(id) || !CONNECTOR_CATEGORIES.has(category)) return null;
+  if (value.auth_mode !== 'composio') return null;
+  const composio = value.composio && typeof value.composio === 'object' && !Array.isArray(value.composio)
+    ? value.composio as Record<string, unknown>
+    : value;
+  const toolkit = typeof composio.toolkit === 'string' ? composio.toolkit.trim().toLowerCase() : '';
+  const authConfigId = typeof composio.auth_config_id === 'string' ? composio.auth_config_id.trim() : '';
+  if (!/^[a-z0-9][a-z0-9_-]{0,80}$/.test(toolkit) || !/^ac_[A-Za-z0-9_-]{6,}$/.test(authConfigId)) {
+    return null;
+  }
+  const tools = Array.isArray(composio.tools)
+    ? composio.tools.flatMap((item) => {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
+        const tool = item as Record<string, unknown>;
+        const slug = typeof tool.slug === 'string' ? tool.slug.trim() : '';
+        if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(slug)) return [];
+        return [{
+          slug,
+          ...(typeof tool.name === 'string' && tool.name.trim() ? { name: tool.name.trim() } : {}),
+          ...(typeof tool.description === 'string' && tool.description.trim()
+            ? { description: tool.description.trim() }
+            : {}),
+          ...(tool.input_schema && typeof tool.input_schema === 'object' && !Array.isArray(tool.input_schema)
+            ? { input_schema: tool.input_schema as Record<string, unknown> }
+            : {}),
+        }];
+      })
+    : [];
+  return {
+    id,
+    display_name: typeof value.display_name === 'string' && value.display_name.trim()
+      ? value.display_name.trim()
+      : id,
+    ...(typeof value.icon_svg === 'string' && value.icon_svg.trim() ? { icon_svg: value.icon_svg.trim() } : {}),
+    category: category as ServerComposioConnectorConfig['category'],
+    description_zh: typeof value.description_zh === 'string' ? value.description_zh.trim() : '',
+    description_en: typeof value.description_en === 'string' ? value.description_en.trim() : '',
+    ...(typeof value.description_ja === 'string' ? { description_ja: value.description_ja.trim() } : {}),
+    ...(typeof value.description_pt === 'string' ? { description_pt: value.description_pt.trim() } : {}),
+    requires_credits: true,
+    auth_mode: 'composio',
+    composio: { toolkit, auth_config_id: authConfigId, ...(tools.length ? { tools } : {}) },
+    transport_template: null,
+    usage_metering: { provider: 'composio', credits_milli_per_call: 250 },
+  };
+}
+
+function normalizeServerComposioCatalog(raw: unknown): ServerComposioConnectorConfig[] {
+  if (!Array.isArray(raw)) return [];
+  const byId = new Map<string, ServerComposioConnectorConfig>();
+  for (const item of raw) {
+    const entry = normalizeServerComposioConnector(item);
+    if (entry) byId.set(entry.id, entry);
+  }
+  return Array.from(byId.values());
+}
+
+function mergeServerComposioCatalog(baseRaw: unknown, overrideRaw: unknown): ServerComposioConnectorConfig[] {
+  const byId = new Map<string, ServerComposioConnectorConfig>();
+  for (const entry of normalizeServerComposioCatalog(baseRaw)) byId.set(entry.id, entry);
+  for (const entry of normalizeServerComposioCatalog(overrideRaw)) byId.set(entry.id, entry);
+  return Array.from(byId.values());
+}
+
 function normalizeAppUpdatePolicyConfig(raw: unknown): Partial<AppUpdatePolicyConfig> {
   if (typeof raw === 'string') return { min_version: raw.trim() };
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
@@ -886,6 +984,11 @@ clientConfig.registerDefault<GoogleConnectorsConfig>('google_connectors', DEFAUL
   merge: mergeGoogleConnectorsConfig,
 });
 
+clientConfig.registerDefault<ServerComposioConnectorConfig[]>('connectors.catalog', [], {
+  effect: 'immediate',
+  merge: mergeServerComposioCatalog,
+});
+
 clientConfig.registerDefault<boolean>('model.deepseek.enabled', true, {
   effect: 'immediate',
 });
@@ -943,6 +1046,10 @@ export function getGoogleConnectorsConfig(): GoogleConnectorsConfig {
     DEFAULT_GOOGLE_CONNECTORS_CONFIG,
     clientConfig.get('google_connectors', DEFAULT_GOOGLE_CONNECTORS_CONFIG),
   );
+}
+
+export function getServerConnectorCatalogConfig(): ServerComposioConnectorConfig[] {
+  return mergeServerComposioCatalog([], clientConfig.get('connectors.catalog', []));
 }
 
 export function isDeepSeekModelConfigEnabled(): boolean {

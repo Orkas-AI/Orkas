@@ -21,6 +21,7 @@ class FakeElement {
   removeAttribute(name: string) { this.attributes.delete(name); }
   appendChild(child: FakeElement) { this.children.push(child); return child; }
   querySelector() { return null; }
+  focus() { this.setAttribute('data-focused', 'true'); }
 
   addEventListener(type: string, handler: (event?: any) => unknown) {
     const handlers = this.listeners.get(type) || [];
@@ -46,6 +47,13 @@ function loadQuickSetupHarness(language = 'en') {
     'settings-orkas-api-key-input',
     'settings-orkas-api-configure',
     'settings-orkas-api-status',
+    'settings-orkas-api-saved',
+    'settings-orkas-api-key-masked',
+    'settings-orkas-api-key-meta',
+    'settings-orkas-api-edit',
+    'settings-orkas-api-delete',
+    'settings-orkas-api-editor',
+    'settings-orkas-api-cancel',
     'settings-entries',
     'settings-search-entries',
     'settings-image-entries',
@@ -53,7 +61,24 @@ function loadQuickSetupHarness(language = 'en') {
     'settings-tts-entries',
   ]) elements.set(id, new FakeElement());
 
-  const invoke = vi.fn(async () => ({ ok: true }));
+  const invoke = vi.fn(async (channel: string) => {
+    if (channel === 'orkasApi.getStatus') return {
+      ok: true,
+      configured: false,
+      keyMasked: '',
+      name: '',
+      connectorAccess: false,
+    };
+    if (channel === 'orkasApi.save') return {
+      ok: true,
+      configured: true,
+      keyMasked: 'orka…-key',
+      name: 'Desktop key',
+      connectorAccess: true,
+    };
+    if (channel === 'orkasApi.remove') return { ok: true, removed: true };
+    return { ok: true };
+  });
   const refreshModelGuard = vi.fn(async () => true);
   const context: any = {
     console,
@@ -78,6 +103,7 @@ function loadQuickSetupHarness(language = 'en') {
     clearInterval,
     URL,
     refreshModelGuard,
+    uiConfirm: vi.fn(async () => true),
   };
   vm.createContext(context);
   vm.runInContext(source, context, { filename: 'settings.js' });
@@ -112,12 +138,13 @@ describe('Orkas public API quick setup', () => {
     expect(css).not.toMatch(/\.settings-orkas-api-group\s*{[^}]*(?:linear-gradient|border-color)/s);
   });
 
-  it('keeps the configure action as wide as the create-key action', () => {
+  it('lays out saved credentials and editing actions without exposing the raw key', () => {
     const css = readFileSync(resolve(__dirname, '../../src/renderer/style.css'), 'utf8');
     expect(css).toMatch(/\.settings-orkas-api-group\s*{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+max-content;/s);
     expect(css).toMatch(/\.settings-orkas-api-head\s*{[^}]*display:\s*contents;/s);
-    expect(css).toMatch(/\.settings-orkas-api-group\s+\.settings-orkas-api-configure-row\s*{[^}]*display:\s*contents;/s);
-    expect(css).toMatch(/\.settings-orkas-api-configure-row\s+\.btn\s*{[^}]*grid-column:\s*2;[^}]*width:\s*100%;/s);
+    expect(css).toContain('.settings-orkas-api-saved');
+    expect(css).toContain('.settings-orkas-api-key-summary code');
+    expect(css).toContain('.settings-orkas-api-actions');
   });
 
   it('uses the complete Orkas service labels in pickers and configured rows', () => {
@@ -189,15 +216,16 @@ describe('Orkas public API quick setup', () => {
       .toContain('GPT-5.6 Sol · Claude Opus 5 · Kimi K3');
   });
 
-  it('configures all services from the real card click binding without exposing a clear action', async () => {
+  it('validates and saves the shared credential from the real card click binding', async () => {
     const { context, elements, html, source, invoke, refreshModelGuard } = loadQuickSetupHarness();
     for (const id of [
       'settings-orkas-api-group',
       'settings-orkas-api-key-input',
       'settings-orkas-api-configure',
+      'settings-orkas-api-edit',
+      'settings-orkas-api-delete',
     ]) expect(html).toContain(`id="${id}"`);
-    expect(html).not.toContain('settings-orkas-api-clear');
-    expect(source).not.toContain('orkasApi.clearAll');
+    expect(source).toContain('orkasApi.remove');
     expect(source).not.toContain('/v1/capabilities');
 
     elements.get('settings-orkas-api-key-input')!.value = '  public-orkas-key  ';
@@ -207,12 +235,39 @@ describe('Orkas public API quick setup', () => {
     expect(invoke).toHaveBeenCalledWith('auth.openExternal', {
       url: 'https://orkas.ai/views/account/account.html?lang=en#api-keys',
     });
-    expect(invoke).toHaveBeenCalledWith('orkasApi.configureAll', {
+    expect(invoke).toHaveBeenCalledWith('orkasApi.save', {
       apiKey: 'public-orkas-key',
     });
     expect(elements.get('settings-orkas-api-key-input')!.value).toBe('');
     expect(vm.runInContext('window.__orkasApiRefreshes', context)).toBe(1);
     expect(refreshModelGuard).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the masked credential visible and supports edit and delete', async () => {
+    const { context, elements, invoke } = loadQuickSetupHarness();
+    vm.runInContext(`
+      _settingsState.orkasApiCredential = {
+        configured: true,
+        keyMasked: 'orka…1234',
+        name: 'Desktop key',
+        connectorAccess: true,
+      };
+      _settingsRenderOrkasApiCard();
+    `, context);
+
+    expect(elements.get('settings-orkas-api-saved')!.hidden).toBe(false);
+    expect(elements.get('settings-orkas-api-editor')!.hidden).toBe(true);
+    expect(elements.get('settings-orkas-api-key-masked')!.textContent).toBe('orka…1234');
+    expect(elements.get('settings-orkas-api-key-meta')!.textContent).toBe('Desktop key');
+
+    await elements.get('settings-orkas-api-edit')!.click();
+    expect(elements.get('settings-orkas-api-editor')!.hidden).toBe(false);
+    expect(elements.get('settings-orkas-api-key-input')!.getAttribute('data-focused')).toBe('true');
+
+    await elements.get('settings-orkas-api-delete')!.click();
+    expect(invoke).toHaveBeenCalledWith('orkasApi.remove');
+    expect(elements.get('settings-orkas-api-status')!.getAttribute('data-i18n'))
+      .toBe('settings.orkas_api.delete_ok');
   });
 
   it.each(['zh', 'en', 'ja', 'pt'])('carries the %s desktop language to the API-key page', async (language) => {
@@ -254,10 +309,10 @@ describe('Orkas public API quick setup', () => {
     const { elements, invoke } = loadQuickSetupHarness();
     const keyInput = elements.get('settings-orkas-api-key-input')!;
     await keyInput.dispatch('keydown', { key: 'Enter', isComposing: false });
-    expect(invoke).not.toHaveBeenCalledWith('orkasApi.configureAll', expect.anything());
+    expect(invoke).not.toHaveBeenCalledWith('orkasApi.save', expect.anything());
 
     keyInput.value = 'enter-key';
     await keyInput.dispatch('keydown', { key: 'Enter', isComposing: false });
-    expect(invoke).toHaveBeenCalledWith('orkasApi.configureAll', { apiKey: 'enter-key' });
+    expect(invoke).toHaveBeenCalledWith('orkasApi.save', { apiKey: 'enter-key' });
   });
 });

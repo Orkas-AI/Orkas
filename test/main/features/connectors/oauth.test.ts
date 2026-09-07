@@ -31,6 +31,9 @@ beforeEach(() => {
   vi.doMock('../../../../src/main/features/connectors/oauth-events', () => ({
     broadcastOAuthConnectProgress: oauthProgress,
   }));
+  vi.doMock('../../../../src/main/features/connectors/api-key', () => ({
+    connectorApiKeyHeaders: () => ({ Authorization: 'Bearer orkas-connector-key' }),
+  }));
   vi.doMock('../../../../src/main/logger', () => ({
     createLogger: () => ({
       error: vi.fn(),
@@ -47,9 +50,47 @@ afterEach(() => {
   vi.doUnmock('../../../../src/main/features/connectors/_server_bridge');
   vi.doUnmock('../../../../src/main/features/config');
   vi.doUnmock('../../../../src/main/features/connectors/oauth-events');
+  vi.doUnmock('../../../../src/main/features/connectors/api-key');
 });
 
 describe('features/connectors/oauth', () => {
+  it('uses Bearer auth for the existing Composio start and exchange routes', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        code: 0,
+        redirect_url: 'https://provider.example/connect',
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        code: 0,
+        connection_id: 'conn-1',
+        toolkit: 'gmail',
+        auth_config_id: 'auth-config-public-id',
+        account_label: 'user@example.com',
+      }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const oauth = await import('../../../../src/main/features/connectors/oauth');
+    const { shell } = await import('electron');
+    const pending = oauth.startComposioConnect({
+      id: 'gmail',
+      display_name: 'Gmail',
+      auth_mode: 'composio',
+      composio: { toolkit: 'gmail', auth_config_id: 'auth-config-public-id', tools: [] },
+    } as any);
+    await vi.waitFor(() => expect(shell.openExternal).toHaveBeenCalledWith('https://provider.example/connect'));
+    await oauth.handleCallbackUrl('orkas://connectors/oauth/callback?exchange_code=exchange-1');
+
+    await expect(pending).resolves.toMatchObject({
+      connection_id: 'conn-1',
+      toolkit: 'gmail',
+      auth_config_id: 'auth-config-public-id',
+      account_label: 'user@example.com',
+    });
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(init.headers).toMatchObject({ Authorization: 'Bearer orkas-connector-key' });
+    }
+  });
+
   it('rejects a server-bridge connector grant when the user unchecked a required scope', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({
       ok: true,

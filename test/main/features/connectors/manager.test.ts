@@ -40,6 +40,9 @@ const mocks = vi.hoisted(() => ({
   events: {
     broadcastOAuthConnectOutcome: undefined as any,
   },
+  metering: {
+    preflightConnectorCredits: undefined as any,
+  },
 }));
 
 vi.mock('../../../../src/main/features/connectors/mcp-client', () => ({
@@ -72,6 +75,14 @@ vi.mock('../../../../src/main/features/connectors/oauth-events', () => ({
   broadcastOAuthConnectOutcome: (...args: any[]) => mocks.events.broadcastOAuthConnectOutcome(...args),
 }));
 
+vi.mock('../../../../src/main/features/connectors/usage-metering', () => ({
+  preflightConnectorCredits: (...args: any[]) => mocks.metering.preflightConnectorCredits(...args),
+}));
+
+vi.mock('../../../../src/main/features/connectors/api-key', () => ({
+  connectorApiKeyHeaders: () => ({ Authorization: 'Bearer orkas-connector-key' }),
+}));
+
 vi.mock('../../../../src/main/util/bundled-runtime', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../../../src/main/util/bundled-runtime')>();
   return {
@@ -92,6 +103,7 @@ function resetMockBehaviors() {
   mocks.oauth.refreshIfStale = vi.fn(async (_uid: string, _entry: unknown, grant: unknown) => grant);
   mocks.dcr.startMcpDcrOAuth = vi.fn();
   mocks.dcr.refreshDcrIfStale = vi.fn(async (_client: unknown, grant: unknown) => grant);
+  mocks.metering.preflightConnectorCredits = vi.fn(async () => null);
 }
 
 async function writeGoogleConnectorsConfig(value: unknown): Promise<void> {
@@ -103,6 +115,33 @@ async function writeGoogleConnectorsConfig(value: unknown): Promise<void> {
     version: 1,
     active: {
       immediate: { google_connectors: value },
+      restart: {},
+    },
+  });
+}
+
+async function writeComposioCatalog(): Promise<void> {
+  const users = await import('../../../../src/main/features/users');
+  const paths = await import('../../../../src/main/paths');
+  const storage = await import('../../../../src/main/storage');
+  users.activateUser(TEST_UID);
+  storage.writeJsonSync(paths.userRemoteConfigFile(TEST_UID), {
+    version: 1,
+    active: {
+      immediate: {
+        'connectors.catalog': [{
+          id: 'composio-mail',
+          display_name: 'Mail',
+          icon_svg: '<svg viewBox="0 0 24 24"></svg>',
+          category: 'productivity',
+          description_zh: '邮件',
+          description_en: 'Mail',
+          auth_mode: 'composio',
+          toolkit: 'gmail',
+          auth_config_id: 'ac_public_123',
+          tools: [{ slug: 'GMAIL_FETCH_EMAILS' }],
+        }],
+      },
       restart: {},
     },
   });
@@ -344,6 +383,39 @@ afterEach(() => {
 });
 
 describe('features/connectors/manager authorization recovery', () => {
+  it('connects a server-catalog Composio connector through the API-key adapter', async () => {
+    await writeComposioCatalog();
+    mocks.oauth.startComposioConnect.mockResolvedValue({
+      connection_id: 'connection-1',
+      toolkit: 'gmail',
+      auth_config_id: 'ac_public_123',
+      account_label: 'user@example.com',
+    });
+    mocks.mcp.listTools.mockResolvedValue([
+      { name: 'GMAIL_FETCH_EMAILS', description: 'Fetch email', input_schema: {} },
+    ]);
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    await expect(manager.connectViaOAuth(TEST_UID, 'composio-mail')).resolves.toMatchObject({
+      id: 'composio-mail',
+      composio_grant: { connection_id: 'connection-1', toolkit: 'gmail' },
+      status: { kind: 'connected' },
+      transport: {
+        kind: 'stdio',
+        env: {
+          ORKAS_API_KEY: 'orkas-connector-key',
+          COMPOSIO_CONNECTION_ID: 'connection-1',
+          COMPOSIO_CONNECTOR_ID: 'composio-mail',
+        },
+      },
+    });
+    expect(mocks.metering.preflightConnectorCredits).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'composio-mail', auth_mode: 'composio' }),
+      'connect',
+    );
+    expect(mocks.oauth.startComposioConnect).toHaveBeenCalledOnce();
+  });
+
   it('keeps persisted server-bridge auth error rows visible for reconnect', async () => {
     const registry = await import('../../../../src/main/features/connectors/registry');
     const manager = await import('../../../../src/main/features/connectors/manager');

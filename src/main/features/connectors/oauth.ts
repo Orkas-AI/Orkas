@@ -32,8 +32,10 @@ import { withCommonHeaders } from '../api_common';
 import { getLanguage } from '../config';
 import { createLogger } from '../../logger';
 import { fetchWithTimeout } from '../../util/abort';
+import { safeExternalHttpUrl } from '../../util/window-security';
 import { broadcastOAuthConnectProgress } from './oauth-events';
-import type { CatalogEntry, OAuthGrant } from './types';
+import { connectorApiKeyHeaders } from './api-key';
+import type { CatalogEntry, ComposioGrant, OAuthGrant } from './types';
 
 const log = createLogger('connectors:oauth');
 
@@ -46,11 +48,11 @@ const OAUTH_RETRY_MAX_ATTEMPTS = 3;
 const OAUTH_RETRY_BASE_DELAY_MS = 400;
 
 interface PendingFlow {
-  kind: 'connector_oauth' | 'google_picker';
+  kind: 'connector_oauth' | 'google_picker' | 'composio';
   catalogId: string;
   attemptId?: string;
   requiredScopes: string[];
-  resolve: (result: OAuthGrant | GooglePickerResult) => void;
+  resolve: (result: OAuthGrant | GooglePickerResult | ComposioGrant) => void;
   reject: (err: Error) => void;
   timer: NodeJS.Timeout;
 }
@@ -82,6 +84,18 @@ function _isRetryableBridgeStatus(status: number): boolean {
 
 function _exchangeHttpCode(status: number): string {
   return _isRetryableBridgeStatus(status) ? 'exchange_http_5xx' : 'exchange_http_4xx';
+}
+
+function _parseJsonObject(raw: string): Record<string, any> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, any>
+      : {};
+  } catch {
+    return {};
+  }
 }
 
 function _cancelPending(reason: string, code?: string): void {
@@ -152,6 +166,7 @@ async function postConnectorBridgeJson(
   label: string,
   url: string,
   body: Record<string, unknown>,
+  extraHeaders: Record<string, string> = {},
 ): Promise<Response> {
   for (let attempt = 1; attempt <= OAUTH_RETRY_MAX_ATTEMPTS; attempt += 1) {
     const last = attempt === OAUTH_RETRY_MAX_ATTEMPTS;
@@ -163,6 +178,7 @@ async function postConnectorBridgeJson(
           'Content-Type': 'application/json',
           Accept: 'application/json',
           ...tokenStore.authHeaders(),
+          ...extraHeaders,
         }),
         body: JSON.stringify(body),
       });
@@ -181,6 +197,56 @@ async function postConnectorBridgeJson(
     return res;
   }
   throw new Error(`${label} exhausted attempts`);
+}
+
+/** Start the same Server-owned Composio flow used by the hosted desktop, authenticated with the
+ * user-owned Orkas API Key instead of an Orkas login session. */
+export async function startComposioConnect(
+  entry: CatalogEntry,
+  opts: { attemptId?: string } = {},
+): Promise<ComposioGrant> {
+  if (entry.auth_mode !== 'composio') throw new Error(`catalog entry ${entry.id} is not Composio-backed`);
+  _cancelPending('superseded by a new OAuth start', 'superseded');
+  const headers = connectorApiKeyHeaders();
+  const res = await postConnectorBridgeJson(
+    'Composio connector start',
+    `${accountApiBase()}/connectors/composio/start`,
+    {
+      catalog_id: entry.id,
+      device_id: tokenStore.getDeviceId(),
+      lang: getLanguage(),
+    },
+    headers,
+  );
+  const raw = await res.text();
+  const body = _parseJsonObject(raw);
+  if (!res.ok || Number(body.code || 0) !== 0 || typeof body.redirect_url !== 'string') {
+    const nested = body.error && typeof body.error === 'object' && !Array.isArray(body.error)
+      ? body.error as Record<string, unknown>
+      : {};
+    throw _flowError(
+      String(nested.message || body.msg || `Composio start HTTP ${res.status}`),
+      String(nested.code || 'composio_start_failed'),
+    );
+  }
+  const redirectUrl = safeExternalHttpUrl(body.redirect_url);
+  if (!redirectUrl) throw _flowError('invalid Composio redirect URL', 'invalid_redirect_url');
+  return new Promise<ComposioGrant>((resolve, reject) => {
+    const timer = setTimeout(() => _cancelPending('OAuth flow timed out', 'flow_timeout'), FLOW_TIMEOUT_MS);
+    timer.unref?.();
+    _pending = {
+      kind: 'composio',
+      catalogId: entry.id,
+      ...(opts.attemptId ? { attemptId: opts.attemptId } : {}),
+      requiredScopes: [],
+      resolve: resolve as PendingFlow['resolve'],
+      reject,
+      timer,
+    };
+    shell.openExternal(redirectUrl).catch((err) => {
+      _cancelPending(`failed to open browser: ${(err as Error).message}`, 'browser_open_failed');
+    });
+  });
 }
 
 /** Externally callable cancel — wired to the renderer's "取消" link so a user who closed the
@@ -304,6 +370,38 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
   }
 
   try {
+    if (pending.kind === 'composio') {
+      const res = await postConnectorBridgeJson(
+        'Composio connector exchange',
+        `${accountApiBase()}/connectors/composio/exchange`,
+        { exchange_code: exchangeCode, device_id: tokenStore.getDeviceId() },
+        connectorApiKeyHeaders(),
+      );
+      const raw = await res.text();
+      const body = _parseJsonObject(raw);
+      if (!res.ok || Number(body.code || 0) !== 0) {
+        throw _flowError(
+          String(body.msg || `Composio exchange HTTP ${res.status}`),
+          _exchangeHttpCode(res.status),
+        );
+      }
+      const connectionId = String(body.connection_id || '');
+      const toolkit = String(body.toolkit || '');
+      const authConfigId = String(body.auth_config_id || '');
+      if (!connectionId || !toolkit || !authConfigId) {
+        throw _flowError('invalid Composio exchange response', 'invalid_exchange_response');
+      }
+      const grant: ComposioGrant = {
+        connection_id: connectionId,
+        toolkit,
+        auth_config_id: authConfigId,
+        ...(body.account_label ? { account_label: String(body.account_label) } : {}),
+      };
+      _pending = null;
+      clearTimeout(pending.timer);
+      pending.resolve(grant);
+      return;
+    }
     const res = await postConnectorBridgeJson(
       'connector OAuth exchange',
       `${accountApiBase()}/connectors/oauth/exchange`,

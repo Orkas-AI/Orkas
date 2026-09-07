@@ -32,18 +32,16 @@ describe('connectors card surface', () => {
     expect(js).not.toContain('connectors.google_sheets_authorize_files');
   });
 
-  it('continues filtering PC credit-gated connector UI', () => {
+  it('renders the API-key-backed credit connector marker and settings guard', () => {
     const js = read('src/renderer/modules/connectors.js');
     const css = read('src/renderer/style.css');
     const locales = ['en', 'zh', 'ja', 'pt'].map((lang) => read(`src/renderer/locales/${lang}.json`)).join('\n');
-    const meteringKey = ['usage', '_metering'].join('');
-    const pricingKey = ['credits', '_milli_per_call'].join('');
     const copyKey = ['connectors.badge.', 'credits', '_required'].join('');
 
-    expect(js).not.toContain(meteringKey);
-    expect(js).not.toContain(pricingKey);
-    expect(js).not.toContain('_connectorCreditBadge');
-    expect(css).not.toContain('connector-card-credit-badge');
-    expect(locales).not.toContain(copyKey);
+    expect(js).toContain('entry.requires_credits === true');
+    expect(js).toContain("window.orkas.invoke('orkasApi.getStatus')");
+    expect(js).toContain("window.activateSettingsTab('credentials')");
+    expect(css).toContain('.connector-credit-badge');
+    expect(locales).toContain(copyKey);
   });
 });
