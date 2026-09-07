@@ -12931,10 +12931,6 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   color: var(--text);
   font-size: 13px;
 }
-.settings-orkas-api-key-meta {
-  color: var(--muted);
-  font-size: 12px;
-}
 .settings-orkas-api-actions { display: flex; gap: 8px; }
 .settings-orkas-api-status {
   grid-column: 1 / -1;

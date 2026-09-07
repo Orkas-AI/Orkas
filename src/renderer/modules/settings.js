@@ -1019,16 +1019,11 @@ function _settingsRenderOrkasApiCard() {
   const saved = document.getElementById('settings-orkas-api-saved');
   const editor = document.getElementById('settings-orkas-api-editor');
   const masked = document.getElementById('settings-orkas-api-key-masked');
-  const meta = document.getElementById('settings-orkas-api-key-meta');
   const cancel = document.getElementById('settings-orkas-api-cancel');
   if (saved) saved.hidden = !configured;
   if (editor) editor.hidden = configured && !_settingsState.orkasApiEditing;
   if (cancel) cancel.hidden = !configured || !_settingsState.orkasApiEditing;
   if (masked) masked.textContent = configured ? String(credential.keyMasked || '') : '';
-  if (meta) {
-    const name = configured && credential.name ? String(credential.name) : t('settings.orkas_api.saved');
-    meta.textContent = configured ? name : '';
-  }
   const status = document.getElementById('settings-orkas-api-status');
   const key = status && status.getAttribute('data-i18n');
   if (status && key) status.textContent = t(key);
@@ -1140,7 +1135,7 @@ function _settingsBindOrkasApiOnce() {
       if (typeof refreshModelGuard === 'function') {
         await Promise.resolve(refreshModelGuard()).catch(() => {});
       }
-      _settingsSetI18nStatus('settings-orkas-api-status', 'ok', 'settings.orkas_api.configure_ok');
+      _settingsSetStatus('settings-orkas-api-status', '', '');
     } catch (err) {
       if (err && err.message) {
         _settingsSetStatus('settings-orkas-api-status', 'error', err.message);
