@@ -64,7 +64,7 @@ function corpusFor(uid: string): LibraryCorpus {
     imageSessionPrefix: 'extract-img',
     // Root-level `_INDEX.md` is generated for Finder browsing, and subdirectory
     // copies are pre-vector-store legacy — neither is KB content.
-    skipRelPath: (relPath) => relPath.endsWith('_INDEX.md'),
+    skipRelPath: (relPath) => path.posix.basename(relPath) === '_INDEX.md',
     emit: (event: CorpusStatusEvent) => {
       const out: KbStatusEvent = {
         userId: uid,

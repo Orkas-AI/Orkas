@@ -491,17 +491,35 @@ describe('kb_indexer › reconcile', () => {
     writeCtx('.hidden/junk.md', 'should be skipped');   // dot-dir (same rule as .kb/)
     writeCtx('_INDEX.md', '# index');                   // generated file
     writeCtx('sub/_INDEX.md', '# sub index');           // legacy subdir index (also .md but name-filtered)
+    writeCtx('docs/API_INDEX.md', '# a user document whose name merely ends in _INDEX.md');
 
     const idx = await import('../../../src/main/features/kb_indexer');
     const r = await idx.reconcile(TEST_UID);
-    expect(r.enqueuedUpsert).toBe(1);
+    expect(r.enqueuedUpsert).toBe(2);
 
     await idx.drain(TEST_UID);
     const kb = await import('../../../src/main/features/kb_vector');
     expect(kb.getFileByPath(TEST_UID, 'a.md')).not.toBeNull();
+    expect(kb.getFileByPath(TEST_UID, 'docs/API_INDEX.md')).not.toBeNull();
     expect(kb.getFileByPath(TEST_UID, '_INDEX.md')).toBeNull();
     expect(kb.getFileByPath(TEST_UID, 'sub/_INDEX.md')).toBeNull();
     expect(kb.getFileByPath(TEST_UID, '.hidden/junk.md')).toBeNull();
+  });
+
+  it('still deletes a previously indexed row whose path the skip rule now excludes', async () => {
+    // A row indexed under an older rule must not stay searchable forever just
+    // because new upserts of that path are skipped.
+    const kb = await import('../../../src/main/features/kb_vector');
+    const idx = await import('../../../src/main/features/kb_indexer');
+    await kb.setFileStatus(TEST_UID, 'sub/_INDEX.md', 'ready', {
+      kind: 'text', bytes: 1, mtime: 1, sha1: 'stale', error: '',
+    });
+    expect(kb.getFileByPath(TEST_UID, 'sub/_INDEX.md')).not.toBeNull();
+
+    const r = await idx.reconcile(TEST_UID);
+    expect(r.enqueuedDelete).toBe(1);
+    await idx.drain(TEST_UID);
+    expect(kb.getFileByPath(TEST_UID, 'sub/_INDEX.md')).toBeNull();
   });
 
   it('re-enqueues files previously marked failed', async () => {
