@@ -307,7 +307,10 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
     if (discarded()) return;
     const safe = safeCorpusRelPath(relPath);
     if (!safe) return;
-    if (spec.skipRelPath?.(safe)) return;
+    // Skipped paths are never indexed, but a row indexed before the skip rule
+    // (or under an older rule) must still be deletable, or reconcile keeps a
+    // stale searchable row forever.
+    if (op === 'upsert' && spec.skipRelPath?.(safe)) return;
     if (op === 'upsert' && !libraryKindFor(safe)) return;
     const existing = queue.jobs.find((job) => job.relPath === safe && job.op === op);
     if (existing) {
