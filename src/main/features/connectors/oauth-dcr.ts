@@ -281,7 +281,7 @@ export async function startMcpDcrOAuth(
   });
 
   // Register with the same Server environment that will exchange the callback.
-  // Source runs use the local dev bridge; packaged builds use the production bridge.
+  // Source and packaged builds both use the production bridge.
   const redirectUri = `${accountApiBase().replace(/\/+$/, '')}/connectors/oauth/dcr-callback`;
   const registered = await _registerClient(meta.registration_endpoint, redirectUri, tokenEndpointAuthMethod);
   log.info('DCR registration done', { client_id_tail: registered.client_id.slice(-6) });

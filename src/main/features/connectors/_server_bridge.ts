@@ -13,22 +13,19 @@
  * separately stored Orkas API Key in their own connector modules.
  *
  * Where each piece comes from:
- *   - `accountApiBase` uses the local dev Server for source runs and the global production
- *     Server for packaged builds. Marketplace routing is independent.
+ *   - `accountApiBase` uses the global production Server for source and packaged builds.
  *   - `getDeviceId()` persists a UUID at `<uid>/local/config/device.json` on first call. Stable
  *     across runs on the same machine; resets if the user wipes the local config dir.
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
-import { app } from 'electron';
 
 import { userLocalConfigDir } from '../../paths';
 import { getActiveUserId } from '../users';
 import { apiBase } from '../marketplace';
 
 export function accountApiBase(): string {
-  if (app?.isPackaged === false) return 'http://localhost:8888/api';
   return apiBase();
 }
 

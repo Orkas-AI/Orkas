@@ -37,9 +37,9 @@ describe('public connector boundary', () => {
   });
 
   it.each([
-    [false, 'http://localhost:8888/api'],
+    [false, 'https://orkas.ai/api'],
     [true, 'https://orkas.ai/api'],
-  ])('routes connectors for isPackaged=%s without changing marketplace routing', async (isPackaged, expected) => {
+  ])('routes connectors to production for isPackaged=%s', async (isPackaged, expected) => {
     vi.resetModules();
     vi.doMock('electron', () => ({ app: { isPackaged } }));
     const marketplaceBase = vi.fn(() => 'https://orkas.ai/api');
@@ -48,7 +48,7 @@ describe('public connector boundary', () => {
       const { accountApiBase, tokenStore } = await import('../../../../src/main/features/connectors/_server_bridge');
       expect(accountApiBase()).toBe(expected);
       expect(tokenStore.authHeaders()).toEqual({});
-      expect(marketplaceBase).toHaveBeenCalledTimes(isPackaged ? 1 : 0);
+      expect(marketplaceBase).toHaveBeenCalledOnce();
     } finally {
       vi.doUnmock('electron');
       vi.doUnmock('../../../../src/main/features/marketplace');
