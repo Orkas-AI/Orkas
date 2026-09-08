@@ -280,9 +280,8 @@ export async function startMcpDcrOAuth(
     token_auth: tokenEndpointAuthMethod,
   });
 
-  // The public build has one Server environment. `accountApiBase()` is pinned to the global
-  // production HTTPS base by `_server_bridge.ts`, so source and packaged runs register the same
-  // stable callback URI.
+  // Register with the same Server environment that will exchange the callback.
+  // Source runs use the local dev bridge; packaged builds use the production bridge.
   const redirectUri = `${accountApiBase().replace(/\/+$/, '')}/connectors/oauth/dcr-callback`;
   const registered = await _registerClient(meta.registration_endpoint, redirectUri, tokenEndpointAuthMethod);
   log.info('DCR registration done', { client_id_tail: registered.client_id.slice(-6) });

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { CONNECTOR_CATALOG } from '../../../../src/main/features/connectors/catalog';
@@ -30,17 +30,32 @@ describe('public connector boundary', () => {
     }
   });
 
-  it('pins connector OAuth to the global HTTPS bridge with no loopback or environment override', () => {
-    const bridge = read('src/main/features/connectors/_server_bridge.ts');
-    const marketplace = read('src/main/features/marketplace.ts');
+  it.each([
+    [false, 'http://localhost:8888/api'],
+    [true, 'https://orkas.ai/api'],
+  ])('routes connectors for isPackaged=%s without changing marketplace routing', async (isPackaged, expected) => {
+    vi.resetModules();
+    vi.doMock('electron', () => ({ app: { isPackaged } }));
+    const marketplaceBase = vi.fn(() => 'https://orkas.ai/api');
+    vi.doMock('../../../../src/main/features/marketplace', () => ({ apiBase: marketplaceBase }));
+    try {
+      const { accountApiBase, tokenStore } = await import('../../../../src/main/features/connectors/_server_bridge');
+      expect(accountApiBase()).toBe(expected);
+      expect(tokenStore.authHeaders()).toEqual({});
+      expect(marketplaceBase).toHaveBeenCalledTimes(isPackaged ? 1 : 0);
+    } finally {
+      vi.doUnmock('electron');
+      vi.doUnmock('../../../../src/main/features/marketplace');
+      vi.resetModules();
+    }
+  });
+
+  it('keeps connector endpoint selection centralized without arbitrary environment overrides', () => {
     const oauthSources = [
-      bridge,
       read('src/main/features/connectors/oauth.ts'),
       read('src/main/features/connectors/oauth-dcr.ts'),
+      read('src/main/features/connectors/manager.ts'),
     ].join('\n');
-
-    expect(bridge).toContain('return apiBase();');
-    expect(marketplace).toContain("const GLOBAL_PROD_API_BASE = 'https://orkas.ai' + '/api';");
     expect(oauthSources).not.toMatch(/http:\/\/(?:localhost|127\.0\.0\.1)|ORKAS_API_BASE_URL|OAUTH_REDIRECT_BASE/);
   });
 
