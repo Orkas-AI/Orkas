@@ -8,6 +8,7 @@ const { ListToolsRequestSchema, CallToolRequestSchema } = require('@modelcontext
 const API_BASE = (process.env.ORKAS_API_BASE || '').replace(/\/+$/, '');
 const API_KEY = process.env.ORKAS_API_KEY || '';
 const CONNECTION_ID = process.env.COMPOSIO_CONNECTION_ID || '';
+const CONNECTION_TOKEN = process.env.COMPOSIO_CONNECTION_TOKEN || '';
 const CONNECTOR_ID = process.env.COMPOSIO_CONNECTOR_ID || '';
 const TOOLS_REQUEST_TIMEOUT_MS = 25000;
 const EXECUTE_REQUEST_TIMEOUT_MS = 100000;
@@ -56,6 +57,7 @@ function clientHeaders() {
 function assertConfigured() {
   if (!API_BASE) throw new Error('ORKAS_API_BASE env var not set');
   if (!API_KEY) throw new Error('ORKAS_API_KEY env var not set');
+  if (!CONNECTION_TOKEN) throw new OrkasProxyResponseError('Reconnect this connector to authorize access', 403, 'connector_reconnect_required');
   if (!CONNECTION_ID || !CONNECTOR_ID) throw new Error('Composio connector env vars not set');
 }
 
@@ -83,6 +85,7 @@ async function orkasRequest(path, body, timeoutMs) {
       'Content-Type': 'application/json',
       ...clientHeaders(),
       Authorization: `Bearer ${API_KEY}`,
+      'X-Orkas-Connection-Token': CONNECTION_TOKEN,
     },
     body: JSON.stringify({
       connection_id: CONNECTION_ID,

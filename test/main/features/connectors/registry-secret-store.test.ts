@@ -48,6 +48,25 @@ function sampleInstance() {
 }
 
 describe('connectors registry secret storage', () => {
+  it('keeps the one-time Composio credential encrypted across restart and metadata updates', async () => {
+    let registry = await import('../../../../src/main/features/connectors/registry');
+    const paths = await import('../../../../src/main/paths');
+    const inst = { ...sampleInstance(), id: 'paid-mail', composio_grant: {
+      connection_id: 'connection-1', toolkit: 'gmail', auth_config_id: 'ac_public', connection_token: 'a'.repeat(43),
+    } };
+    await registry.upsert(TEST_UID, inst);
+    const file = paths.userConnectorsConfigFile(TEST_UID);
+    const raw = fs.readFileSync(file, 'utf8');
+    expect(raw).not.toContain(inst.composio_grant.connection_token);
+    expect(JSON.parse(raw).connections['paid-mail'].composio_grant).toBeUndefined();
+    vi.resetModules();
+    registry = await import('../../../../src/main/features/connectors/registry');
+    expect(registry.load(TEST_UID).connections['paid-mail'].composio_grant).toEqual(inst.composio_grant);
+    await registry.update(TEST_UID, 'paid-mail', (value) => ({ ...value, tools_cached_at: 42 }));
+    expect(fs.readFileSync(file, 'utf8')).not.toContain(inst.composio_grant.connection_token);
+    expect(registry.load(TEST_UID).connections['paid-mail'].composio_grant).toEqual(inst.composio_grant);
+  });
+
   it('writes token-bearing fields as local-secret ciphertext', async () => {
     const registry = await import('../../../../src/main/features/connectors/registry');
     const paths = await import('../../../../src/main/paths');

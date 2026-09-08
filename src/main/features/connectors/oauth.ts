@@ -49,6 +49,7 @@ const OAUTH_RETRY_BASE_DELAY_MS = 400;
 
 interface PendingFlow {
   kind: 'connector_oauth' | 'google_picker' | 'composio';
+  callbackStarted?: boolean;
   catalogId: string;
   attemptId?: string;
   requiredScopes: string[];
@@ -167,9 +168,10 @@ async function postConnectorBridgeJson(
   url: string,
   body: Record<string, unknown>,
   extraHeaders: Record<string, string> = {},
+  maxAttempts = OAUTH_RETRY_MAX_ATTEMPTS,
 ): Promise<Response> {
-  for (let attempt = 1; attempt <= OAUTH_RETRY_MAX_ATTEMPTS; attempt += 1) {
-    const last = attempt === OAUTH_RETRY_MAX_ATTEMPTS;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const last = attempt === maxAttempts;
     let res: Response;
     try {
       res = await fetchOAuthJson(label, url, {
@@ -371,13 +373,17 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
 
   try {
     if (pending.kind === 'composio') {
+      if (pending.callbackStarted) return;
+      pending.callbackStarted = true;
       const res = await postConnectorBridgeJson(
         'Composio connector exchange',
         `${accountApiBase()}/connectors/composio/exchange`,
         { exchange_code: exchangeCode, device_id: tokenStore.getDeviceId() },
         connectorApiKeyHeaders(),
+        1, // A lost one-time credential response requires reconnect, never a retrieval retry.
       );
       const raw = await res.text();
+      if (_pending !== pending) return;
       const body = _parseJsonObject(raw);
       if (!res.ok || Number(body.code || 0) !== 0) {
         throw _flowError(
@@ -386,13 +392,18 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
         );
       }
       const connectionId = String(body.connection_id || '');
+      const connectionToken = typeof body.connection_token === 'string' ? body.connection_token : '';
       const toolkit = String(body.toolkit || '');
       const authConfigId = String(body.auth_config_id || '');
       if (!connectionId || !toolkit || !authConfigId) {
         throw _flowError('invalid Composio exchange response', 'invalid_exchange_response');
       }
+      if (!/^[A-Za-z0-9_-]{43}$/.test(connectionToken)) {
+        throw _flowError('connector_reconnect_required', 'connector_reconnect_required');
+      }
       const grant: ComposioGrant = {
         connection_id: connectionId,
+        connection_token: connectionToken,
         toolkit,
         auth_config_id: authConfigId,
         ...(body.account_label ? { account_label: String(body.account_label) } : {}),
@@ -475,6 +486,7 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
       pending.resolve(grant);
     }
   } catch (err) {
+    if (pending.kind === 'composio' && _pending !== pending) return;
     log.warn('connector OAuth exchange failed', { error: (err as Error).message });
     const code = (err as { code?: unknown }).code;
     // A thrown network/timeout error carries no code of its own — still tag the stage so these do

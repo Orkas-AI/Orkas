@@ -237,6 +237,8 @@ export interface OAuthGrant {
 
 export interface ComposioGrant {
   connection_id: string;
+  /** One-time-issued local credential; absent on legacy connections that must reconnect. */
+  connection_token?: string;
   toolkit: string;
   auth_config_id: string;
   account_label?: string;

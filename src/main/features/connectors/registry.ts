@@ -36,7 +36,7 @@ import { Mutex } from 'async-mutex';
 import { userConnectorsConfigFile } from '../../paths';
 import { createLogger } from '../../logger';
 import * as localSecrets from '../../util/local-secret-store';
-import type { ConnectorInstance, ConnectorsFile, OAuthGrant, DcrClientCredentials, Transport } from './types';
+import type { ConnectorInstance, ConnectorsFile, OAuthGrant, DcrClientCredentials, ComposioGrant, Transport } from './types';
 
 const log = createLogger('connectors:registry');
 const _writeMutex = new Mutex();
@@ -54,12 +54,12 @@ const _readCache = new Map<string, { file: string; mtimeMs: number; size: number
 // re-runs `applyTemplate` from the catalog template + fresh `oauth_grant` on every connect, so
 // the persisted transport is purely vestigial at runtime — sealing it has zero runtime cost.
 // Only this module is aware of the disk form.
-type InstanceOnDisk = Omit<ConnectorInstance, 'oauth_grant' | 'dcr_client' | 'transport'> & {
+type InstanceOnDisk = Omit<ConnectorInstance, 'oauth_grant' | 'dcr_client' | 'composio_grant' | 'transport'> & {
   secrets_enc?: string;
   // Kept optional in the disk type so a hydrate failure can still surface a row (with `transport`
   // unset and oauth_grant unset) — manager will mark it `status:error` and the user re-OAuths.
 };
-interface SecretsBlob { oauth_grant?: OAuthGrant; dcr_client?: DcrClientCredentials; transport?: Transport }
+interface SecretsBlob { oauth_grant?: OAuthGrant; dcr_client?: DcrClientCredentials; composio_grant?: ComposioGrant; transport?: Transport }
 
 const PRESERVED_SECRETS = Symbol('preservedConnectorSecrets');
 const UNAVAILABLE_SECRETS = Symbol('unavailableConnectorSecrets');
@@ -205,6 +205,7 @@ function _hydrateSecrets(uid: string, disk: InstanceOnDisk): { instance: Connect
     const blob = JSON.parse(dec.json) as SecretsBlob;
     if (blob.oauth_grant) out.oauth_grant = blob.oauth_grant;
     if (blob.dcr_client) out.dcr_client = blob.dcr_client;
+    if (blob.composio_grant) out.composio_grant = blob.composio_grant;
     if (blob.transport) out.transport = blob.transport;
     // Metadata-only writes dominate connector startup. Keep the exact sealed
     // value when its plaintext is unchanged so status/tool-cache updates do
@@ -227,14 +228,15 @@ function _hydrateSecrets(uid: string, disk: InstanceOnDisk): { instance: Connect
 }
 
 function _dehydrateSecrets(uid: string, inst: ConnectorInstance): InstanceOnDisk {
-  const { oauth_grant, dcr_client, transport, ...rest } = inst;
+  const { oauth_grant, dcr_client, composio_grant, transport, ...rest } = inst;
   const onDisk = { ...rest } as InstanceOnDisk;
   const unavailable = (inst as ConnectorInstanceWithLocalSecretState)[UNAVAILABLE_SECRETS];
   if (unavailable) onDisk.status = _cloneJson(unavailable.persistedStatus);
-  if (oauth_grant || dcr_client || transport) {
+  if (oauth_grant || dcr_client || composio_grant || transport) {
     const blob: SecretsBlob = {};
     if (oauth_grant) blob.oauth_grant = oauth_grant;
     if (dcr_client) blob.dcr_client = dcr_client;
+    if (composio_grant) blob.composio_grant = composio_grant;
     if (transport) blob.transport = transport;
     const plaintext = JSON.stringify(blob);
     const preserved = (inst as ConnectorInstanceWithLocalSecretState)[PRESERVED_SECRETS];

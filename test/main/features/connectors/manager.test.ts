@@ -387,6 +387,7 @@ describe('features/connectors/manager authorization recovery', () => {
     await writeComposioCatalog();
     mocks.oauth.startComposioConnect.mockResolvedValue({
       connection_id: 'connection-1',
+      connection_token: 'a'.repeat(43),
       toolkit: 'gmail',
       auth_config_id: 'ac_public_123',
       account_label: 'user@example.com',
@@ -405,6 +406,7 @@ describe('features/connectors/manager authorization recovery', () => {
         env: {
           ORKAS_API_KEY: 'orkas-connector-key',
           COMPOSIO_CONNECTION_ID: 'connection-1',
+          COMPOSIO_CONNECTION_TOKEN: 'a'.repeat(43),
           COMPOSIO_CONNECTOR_ID: 'composio-mail',
         },
       },
@@ -414,6 +416,65 @@ describe('features/connectors/manager authorization recovery', () => {
       'connect',
     );
     expect(mocks.oauth.startComposioConnect).toHaveBeenCalledOnce();
+  });
+
+  it('marks a legacy paid connection for reconnect without fetching a replacement credential', async () => {
+    await writeComposioCatalog();
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const now = new Date().toISOString();
+    await registry.upsert(TEST_UID, {
+      id: 'composio-mail', display_name: 'Mail',
+      transport: { kind: 'stdio', command: 'node', args: [] },
+      composio_grant: { connection_id: 'legacy', toolkit: 'gmail', auth_config_id: 'ac_public_123' },
+      enabled_subtools: null, tools_cache: [], tools_cached_at: Date.now(),
+      status: { kind: 'connected', since: Date.now() }, created_at: now, updated_at: now,
+    });
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      expect(manager.listInstances(TEST_UID)[0].status).toMatchObject({ kind: 'error', message: 'connector_reconnect_required' });
+      await manager.bootstrap(TEST_UID);
+      expect(mocks.mcp.connect).not.toHaveBeenCalled();
+      expect(mocks.oauth.startComposioConnect).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
+      await manager.removeInstance(TEST_UID, 'composio-mail');
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('sends the connection credential on explicit remote disconnect', async () => {
+    await writeComposioCatalog();
+    mocks.oauth.startComposioConnect.mockResolvedValue({
+      connection_id: 'connection-1', connection_token: 'a'.repeat(43), toolkit: 'gmail', auth_config_id: 'ac_public_123',
+    });
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    await manager.connectViaOAuth(TEST_UID, 'composio-mail');
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ code: 0, removed: true })));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      expect(await manager.removeInstance(TEST_UID, 'composio-mail')).toBe(true);
+      expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/composio/disconnect'), expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer orkas-connector-key', 'X-Orkas-Connection-Token': 'a'.repeat(43) }),
+      }));
+      expect(manager.listInstances(TEST_UID)).toEqual([]);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('does not start a connector or recover the credential remotely when local persistence fails', async () => {
+    await writeComposioCatalog();
+    mocks.oauth.startComposioConnect.mockResolvedValue({
+      connection_id: 'connection-1', connection_token: 'a'.repeat(43), toolkit: 'gmail', auth_config_id: 'ac_public_123',
+    });
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const save = vi.spyOn(registry, 'upsert').mockRejectedValueOnce(new Error('local write failed'));
+    try {
+      await expect(manager.connectViaOAuth(TEST_UID, 'composio-mail')).rejects.toThrow('local write failed');
+      expect(mocks.mcp.connect).not.toHaveBeenCalled();
+      expect(manager.listInstances(TEST_UID)).toEqual([]);
+      expect(mocks.oauth.startComposioConnect).toHaveBeenCalledOnce();
+    } finally { save.mockRestore(); }
   });
 
   it('keeps persisted server-bridge auth error rows visible for reconnect', async () => {

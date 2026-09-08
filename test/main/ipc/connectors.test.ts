@@ -39,6 +39,7 @@ function baseInstance(transport: any): any {
       access_token: 'oauth-access-secret',
       refresh_token: 'oauth-refresh-secret',
     },
+    composio_grant: { connection_id: 'conn-1', connection_token: 'connection-private-secret', toolkit: 'gmail', auth_config_id: 'ac_public' },
     created_at: now,
     updated_at: now,
   };
@@ -147,6 +148,8 @@ describe('ipc/connectors renderer DTO', () => {
     expect(json).not.toContain('env-secret');
     expect(json).not.toContain('oauth-access-secret');
     expect(json).not.toContain('oauth-refresh-secret');
+    expect(json).not.toContain('connection-private-secret');
+    expect(dto).not.toHaveProperty('composio_grant');
   });
 
   it('strips credentials, query, and fragment from streamable-http URLs', async () => {

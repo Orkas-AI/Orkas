@@ -165,6 +165,9 @@ function _pcDirForChild(): string {
 
 function _composioTransport(inst: ConnectorInstance): Transport {
   if (!inst.composio_grant?.connection_id) throw new Error('no composio_grant');
+  if (!inst.composio_grant.connection_token) {
+    throw Object.assign(new Error('connector_reconnect_required'), { code: 'connector_reconnect_required' });
+  }
   const nodeRuntime = resolveBackgroundNodeRuntime();
   return {
     kind: 'stdio',
@@ -176,6 +179,7 @@ function _composioTransport(inst: ConnectorInstance): Transport {
       ORKAS_API_KEY: connectorApiKeyHeaders().Authorization.slice('Bearer '.length),
       ORKAS_CLIENT_HEADERS_JSON: JSON.stringify(commonHeaders()),
       COMPOSIO_CONNECTION_ID: inst.composio_grant.connection_id,
+      COMPOSIO_CONNECTION_TOKEN: inst.composio_grant.connection_token,
       COMPOSIO_CONNECTOR_ID: inst.id,
     }, nodeRuntime),
   };
@@ -204,8 +208,10 @@ function _composioInstanceDraft(entry: CatalogEntry, grant: ComposioGrant): Conn
   return draft;
 }
 
-async function _deleteComposioConnectionOnServer(id: string): Promise<void> {
+async function _deleteComposioConnectionOnServer(id: string, grant?: ComposioGrant): Promise<void> {
   if (findCatalogEntry(id)?.auth_mode !== 'composio') return;
+  // Legacy/lost credentials can only be removed locally; reconnect obtains a new one.
+  if (!grant?.connection_token) return;
   try {
     const response = await fetchWithTimeout(`${accountApiBase()}/connectors/composio/disconnect`, {
       method: 'POST',
@@ -213,6 +219,7 @@ async function _deleteComposioConnectionOnServer(id: string): Promise<void> {
         'Content-Type': 'application/json',
         Accept: 'application/json',
         ...connectorApiKeyHeaders(),
+        'X-Orkas-Connection-Token': grant.connection_token,
       }),
       body: JSON.stringify({ connector_id: id }),
     }, 60_000, undefined, 'Composio disconnect timed out after 60s');
@@ -233,6 +240,9 @@ function _missingRequiredScopes(entry: CatalogEntry, grant: OAuthGrant | undefin
 function _storedAuthorizationProblem(inst: ConnectorInstance): { message: string; reason: string } | null {
   const entry = findCatalogEntry(inst.id);
   if (!entry) return null;
+  if (entry.auth_mode === 'composio' && !inst.composio_grant?.connection_token) {
+    return { message: 'connector_reconnect_required', reason: 'missing_connection_credential' };
+  }
   if (inst.auth_error?.message) {
     return {
       message: inst.auth_error.message,
@@ -1339,7 +1349,9 @@ export async function removeInstance(
     try { await conn.close(); } catch { /* swallow */ }
     _conns.delete(runtimeKey);
   }
-  if (options.disconnectRemote !== false) await _deleteComposioConnectionOnServer(id);
+  if (options.disconnectRemote !== false) {
+    await _deleteComposioConnectionOnServer(id, registry.load(uid).connections[id]?.composio_grant);
+  }
   return registry.remove(uid, id);
 }
 

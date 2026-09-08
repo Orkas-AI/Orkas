@@ -25,6 +25,7 @@ const ORIGINAL_ENV = {
   ORKAS_API_KEY: process.env.ORKAS_API_KEY,
   ORKAS_CLIENT_HEADERS_JSON: process.env.ORKAS_CLIENT_HEADERS_JSON,
   COMPOSIO_CONNECTION_ID: process.env.COMPOSIO_CONNECTION_ID,
+  COMPOSIO_CONNECTION_TOKEN: process.env.COMPOSIO_CONNECTION_TOKEN,
   COMPOSIO_CONNECTOR_ID: process.env.COMPOSIO_CONNECTOR_ID,
 };
 
@@ -38,6 +39,7 @@ function configureAdapterEnv(): void {
     session_id: 'must-not-forward',
   });
   process.env.COMPOSIO_CONNECTION_ID = 'connection-1';
+  process.env.COMPOSIO_CONNECTION_TOKEN = 'a'.repeat(43);
   process.env.COMPOSIO_CONNECTOR_ID = 'gmail';
 }
 
@@ -148,7 +150,7 @@ describe('Composio stdio proxy adapter', () => {
     ]);
   });
 
-  it('calls the reused connector API with Bearer auth and no account-session headers', async () => {
+  it('calls the reused connector API with both credentials outside provider arguments', async () => {
     configureAdapterEnv();
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({
       code: 0,
@@ -162,12 +164,15 @@ describe('Composio stdio proxy adapter', () => {
     const init = fetchMock.mock.calls[0][1];
     expect(init.headers).toMatchObject({
       Authorization: 'Bearer orkas-user-key',
+      'X-Orkas-Connection-Token': 'a'.repeat(43),
       'Orkas-Channel': 'open',
       'Orkas-App-Version': '2026.9.7',
     });
     expect(init.headers).not.toHaveProperty('session_id');
     expect(init.headers).not.toHaveProperty('user_id');
     expect(init.headers).not.toHaveProperty('Accept-Language');
+    expect(init.body).not.toContain('a'.repeat(43));
+    expect(init.body).not.toContain('orkas-user-key');
   });
 
   it('returns a completed Server failure as an MCP tool error with a stable safe code', async () => {
@@ -190,6 +195,17 @@ describe('Composio stdio proxy adapter', () => {
           }),
         }],
       });
+  });
+
+  it('blocks a legacy connection before any network call and asks to reconnect', async () => {
+    configureAdapterEnv();
+    delete process.env.COMPOSIO_CONNECTION_TOKEN;
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const result = await loadAdapter().callComposioTool('GMAIL_FETCH_EMAILS', {});
+    expect(result).toMatchObject({ isError: true });
+    expect(JSON.stringify(result)).toContain('connector_reconnect_required');
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('still throws when no Server response exists so the transport circuit can react', async () => {
