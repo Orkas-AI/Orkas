@@ -1864,8 +1864,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     for (const filePath of picked) {
       const name = path.basename(filePath);
       try {
-        const buf = fs.readFileSync(filePath);
-        const res = await chatAttachments.uploadAttachment(ctx.userId, cid, name, buf);
+        const res = await chatAttachments.importAttachmentFromPath(ctx.userId, cid, filePath, name);
         if (res.ok) items.push({ displayName: name, info: res.info, reused: !!res.reused });
         else failed.push({ name, error: (res as any).error });
       } catch (err) {

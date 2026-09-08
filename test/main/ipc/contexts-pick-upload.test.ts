@@ -190,4 +190,35 @@ describe('conversations.attachments.pickAndUpload', () => {
       failed: [],
     });
   });
+
+  it('imports a text file above 5 MiB through the native picker', async () => {
+    const source = path.join(tmpDir, 'large-events.csv');
+    const bytes = 6 * 1024 * 1024;
+    fs.writeFileSync(source, Buffer.alloc(bytes, 0x61));
+    const electron = await import('electron') as any;
+    electron.dialog.showOpenDialog.mockResolvedValueOnce({
+      canceled: false,
+      filePaths: [source],
+    });
+
+    const res = await invoke('conversations.attachments.pickAndUpload', {
+      cid: 'chat_picker_large_text',
+    });
+
+    expect(res).toMatchObject({
+      ok: true,
+      cancelled: false,
+      failed: [],
+      items: [
+        expect.objectContaining({
+          displayName: 'large-events.csv',
+          info: expect.objectContaining({
+            name: 'large-events.csv',
+            kind: 'text',
+            bytes,
+          }),
+        }),
+      ],
+    });
+  });
 });

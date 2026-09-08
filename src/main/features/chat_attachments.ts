@@ -87,7 +87,12 @@ export const ALLOWED_EXTENSIONS: ReadonlySet<string> = new Set([
   ...IMAGE_EXTS, ...VIDEO_EXTS, ...AUDIO_EXTS, ...ARCHIVE_EXTS,
 ]);
 
-const MAX_BYTES_TEXT  = 5   * 1024 * 1024;
+// Text attachments are path-addressed and read by the model in bounded slices,
+// so their composer cap does not need to mirror a prompt/body upload limit.
+// Keep this aligned with the existing context/task local-file ceiling while
+// leaving Project Library's eager indexing boundary unchanged.
+export const MAX_TEXT_ATTACHMENT_BYTES = 200 * 1024 * 1024;
+const MAX_BYTES_TEXT = MAX_TEXT_ATTACHMENT_BYTES;
 const MAX_BYTES_DOCX  = 20  * 1024 * 1024;
 const MAX_BYTES_OFFICE = 50 * 1024 * 1024;
 export const MAX_IMAGE_ATTACHMENT_BYTES = 20 * 1024 * 1024;
@@ -482,6 +487,22 @@ function hashFile(absPath: string): Promise<string> {
   });
 }
 
+async function isUtf8File(absPath: string): Promise<boolean> {
+  const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+  try {
+    for await (const chunk of fs.createReadStream(absPath)) {
+      decoder.decode(chunk as Buffer, { stream: true });
+    }
+    decoder.decode();
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ERR_ENCODING_INVALID_ENCODED_DATA') {
+      return false;
+    }
+    throw err;
+  }
+}
+
 async function findDuplicateByHash(
   dir: string,
   bytes: number,
@@ -618,11 +639,10 @@ export async function importAttachmentFromPath(
     return { ok: false, error: t('errors.file_too_large_mb', { mb: Math.round(cap / 1024 / 1024) }) };
   }
   if (TEXT_EXTS.has(ext)) {
-    let buf: Buffer;
-    try { buf = fs.readFileSync(absSource); }
+    let validUtf8: boolean;
+    try { validUtf8 = await isUtf8File(absSource); }
     catch (err) { return { ok: false, error: (err as Error).message }; }
-    const s = buf.toString('utf8');
-    if (Buffer.from(s, 'utf8').length !== buf.length) {
+    if (!validUtf8) {
       return { ok: false, error: t('errors.not_utf8') };
     }
   }
@@ -651,7 +671,7 @@ export async function importAttachmentFromPath(
 
     const target = uniqueTarget(dir, safeName);
     const finalName = path.basename(target);
-    try { fs.copyFileSync(absSource, target); }
+    try { await fs.promises.copyFile(absSource, target); }
     catch (err) {
       try {
         if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);

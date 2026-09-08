@@ -360,6 +360,38 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(fs.readFileSync(path.join(attDir(), 'workspace-note.md'), 'utf8')).toBe('# hello\n');
   });
 
+  it('imports text files above the legacy 5 MiB cap by path', async () => {
+    const m = await loadMod();
+    const source = path.join(tmpDir, 'large-events.csv');
+    const bytes = 6 * 1024 * 1024;
+    fs.writeFileSync(source, Buffer.alloc(bytes, 0x61));
+
+    const r = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.info).toMatchObject({
+      name: 'large-events.csv',
+      kind: 'text',
+      bytes,
+    });
+    expect(fs.statSync(path.join(attDir(), 'large-events.csv')).size).toBe(bytes);
+  });
+
+  it('keeps the text attachment boundary at 200 MiB', async () => {
+    const m = await loadMod();
+    const source = path.join(tmpDir, 'too-large.csv');
+    fs.closeSync(fs.openSync(source, 'w'));
+    fs.truncateSync(source, 200 * 1024 * 1024 + 1);
+
+    const r = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.error).toContain('200');
+    expect(fs.existsSync(path.join(attDir(), 'too-large.csv'))).toBe(false);
+  });
+
   it('reuses an existing attachment when imported file hash matches', async () => {
     const m = await loadMod();
     const r1 = await m.uploadAttachment(UID, CID, 'kept.md', Buffer.from('same body'));
@@ -416,7 +448,9 @@ describe('chat_attachments › uploadAttachment', () => {
     if (!results.every((r) => r.ok)) return;
     expect(new Set(results.map((r) => r.info.name)).size).toBe(1);
     expect(results.filter((r) => r.reused).length).toBe(1);
-    expect(fs.readdirSync(attDir()).filter((n) => !n.startsWith('.'))).toEqual(['source-a.md']);
+    const canonicalName = results[0].info.name;
+    expect(['source-a.md', 'source-b.md']).toContain(canonicalName);
+    expect(fs.readdirSync(attDir()).filter((n) => !n.startsWith('.'))).toEqual([canonicalName]);
   });
 
   it('validates text encoding when importing by path', async () => {
@@ -428,6 +462,21 @@ describe('chat_attachments › uploadAttachment', () => {
 
     expect(r.ok).toBe(false);
     expect(fs.existsSync(path.join(attDir(), 'bad.txt'))).toBe(false);
+  });
+
+  it('detects invalid UTF-8 after the legacy 5 MiB boundary', async () => {
+    const m = await loadMod();
+    const source = path.join(tmpDir, 'large-invalid.txt');
+    const body = Buffer.alloc(6 * 1024 * 1024, 0x61);
+    body[body.length - 1] = 0xFF;
+    fs.writeFileSync(source, body);
+
+    const r = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.error.toLowerCase()).toContain('utf-8');
+    expect(fs.existsSync(path.join(attDir(), 'large-invalid.txt'))).toBe(false);
   });
 });
 
