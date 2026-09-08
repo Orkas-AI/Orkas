@@ -270,8 +270,12 @@ describe('Orkas public API quick setup', () => {
 
     await elements.get('settings-orkas-api-delete')!.click();
     expect(invoke).toHaveBeenCalledWith('orkasApi.remove');
-    expect(elements.get('settings-orkas-api-status')!.getAttribute('data-i18n'))
-      .toBe('settings.orkas_api.delete_ok');
+    const status = elements.get('settings-orkas-api-status')!;
+    expect(status.textContent).toBe('');
+    expect(status.getAttribute('data-i18n')).toBeNull();
+    context.t = (key: string) => `translated:${key}`;
+    vm.runInContext('_settingsRenderOrkasApiCard()', context);
+    expect(status.textContent).toBe('');
   });
 
   it.each(['zh', 'en', 'ja', 'pt'])('carries the %s desktop language to the API-key page', async (language) => {

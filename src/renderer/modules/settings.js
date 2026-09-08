@@ -1098,7 +1098,7 @@ function _settingsBindOrkasApiOnce() {
       if (typeof refreshModelGuard === 'function') {
         await Promise.resolve(refreshModelGuard()).catch(() => {});
       }
-      _settingsSetI18nStatus('settings-orkas-api-status', 'ok', 'settings.orkas_api.delete_ok');
+      _settingsSetStatus('settings-orkas-api-status', '', '');
     } catch (err) {
       _settingsSetStatus(
         'settings-orkas-api-status',
