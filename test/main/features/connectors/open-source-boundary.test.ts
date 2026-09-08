@@ -7,13 +7,19 @@ const root = path.join(__dirname, '../../../..');
 const read = (rel: string) => fs.readFileSync(path.join(root, rel), 'utf8');
 
 describe('public connector boundary', () => {
-  it('keeps every catalog connector on a public OAuth mode without credit metering', () => {
-    expect(CONNECTOR_CATALOG).toHaveLength(21);
-    expect(CONNECTOR_CATALOG.filter((entry) => entry.auth_mode === 'mcp_dcr')).toHaveLength(11);
-    expect(CONNECTOR_CATALOG.filter((entry) => entry.auth_mode === 'server_bridge')).toHaveLength(10);
+  it('keeps public OAuth modes and confines credit metering to Composio', () => {
     for (const entry of CONNECTOR_CATALOG) {
-      expect(['server_bridge', 'mcp_dcr']).toContain(entry.auth_mode);
+      expect(['server_bridge', 'mcp_dcr', 'composio']).toContain(entry.auth_mode);
       expect(entry.icon_svg).toMatch(/^<svg\b/);
+      if (entry.auth_mode === 'composio') {
+        expect(entry).toMatchObject({
+          requires_credits: true,
+          transport_template: null,
+          usage_metering: { provider: 'composio' },
+        });
+        expect(entry.oauth).toBeUndefined();
+        continue;
+      }
       if (entry.auth_mode === 'mcp_dcr') {
         expect(entry.transport_template?.kind).toBe('streamable-http');
         expect(entry.transport_template && 'url' in entry.transport_template

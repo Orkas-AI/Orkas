@@ -383,6 +383,43 @@ afterEach(() => {
 });
 
 describe('features/connectors/manager authorization recovery', () => {
+  it('requires reconnect for legacy Google Gmail and replaces it with an API-key Composio grant', async () => {
+    await writeGoogleConnectorsConfig({ google: 'disabled', gmail: 'disabled' });
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    await registry.upsert(TEST_UID, googleInstance('gmail', ['https://www.googleapis.com/auth/gmail.modify']));
+
+    await manager.bootstrap(TEST_UID);
+    expect(manager.getInstance(TEST_UID, 'gmail')?.status).toMatchObject({
+      kind: 'error', message: 'connector_reconnect_required',
+    });
+    expect(mocks.mcp.connect).not.toHaveBeenCalled();
+    expect(mocks.oauth.refreshIfStale).not.toHaveBeenCalled();
+    expect(mocks.oauth.startOAuth).not.toHaveBeenCalled();
+
+    mocks.oauth.startComposioConnect.mockResolvedValue({
+      connection_id: 'gmail-connection', connection_token: 'a'.repeat(43), toolkit: 'gmail',
+    });
+    mocks.mcp.listTools.mockResolvedValue([
+      { name: 'GMAIL_FETCH_EMAILS', description: 'Fetch email', input_schema: {} },
+    ]);
+    await expect(manager.connectViaOAuth(TEST_UID, 'gmail')).resolves.toMatchObject({
+      id: 'gmail', status: { kind: 'connected' },
+      transport: { env: {
+        ORKAS_API_KEY: 'orkas-connector-key', COMPOSIO_CONNECTION_ID: 'gmail-connection',
+        COMPOSIO_CONNECTION_TOKEN: 'a'.repeat(43),
+      } },
+    });
+    expect(mocks.oauth.startOAuth).not.toHaveBeenCalled();
+    expect(mocks.metering.preflightConnectorCredits).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'gmail', auth_mode: 'composio', requires_credits: true }), 'connect',
+    );
+    const saved = registry.load(TEST_UID).connections.gmail;
+    expect(saved.oauth_grant).toBeUndefined();
+    expect(saved.composio_grant?.connection_token).toBe('a'.repeat(43));
+    expect(saved.transport.kind === 'stdio' && saved.transport.env?.GOOGLE_ACCESS_TOKEN).toBeUndefined();
+  });
+
   it('connects a server-catalog Composio connector through the API-key adapter', async () => {
     await writeComposioCatalog();
     mocks.oauth.startComposioConnect.mockResolvedValue({
@@ -1478,13 +1515,13 @@ describe('OAuth refresh ownership', () => {
     await writeGoogleConnectorsConfig(true);
     const registry = await import('../../../../src/main/features/connectors/registry');
     const manager = await import('../../../../src/main/features/connectors/manager');
-    const instance = googleInstance('gmail', ['https://www.googleapis.com/auth/gmail.modify']);
+    const instance = googleInstance('gsheets', ['https://www.googleapis.com/auth/drive.file']);
     instance.oauth_grant.expires_at = 1;
     instance.tools_cache = [{ name: 'search', description: '', input_schema: {} }] as any;
     await registry.upsert(TEST_UID, instance);
     mocks.oauth.refreshIfStale = vi.fn(async () => { throw Object.assign(new Error('connector_reconnect_required'), { code: 'connector_reconnect_required' }); });
     expect(await manager.verifyUsableConnectors(TEST_UID)).toBe(0);
-    expect(registry.load(TEST_UID).connections.gmail.status.kind).toBe('error');
+    expect(registry.load(TEST_UID).connections.gsheets.status.kind).toBe('error');
     expect(mocks.mcp.connect).not.toHaveBeenCalled();
   });
 });

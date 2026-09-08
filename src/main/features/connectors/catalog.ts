@@ -216,6 +216,18 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
       oauth_header_key: 'Authorization',
     },
   },
+  {
+    id: 'gmail',
+    display_name: 'Gmail',
+    icon_svg: '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#4285f4" d="M24 5.457v13.909c0 .904-.732 1.636-1.636 1.636h-3.819V11.73L12 16.64l-6.545-4.91v9.273H1.636A1.636 1.636 0 0 1 0 19.366V5.457c0-2.023 2.309-3.178 3.927-1.964L5.455 4.64 12 9.548l6.545-4.91 1.528-1.145C21.69 2.28 24 3.434 24 5.457z"/><path fill="#34a853" d="M5.455 21.003V11.73l-3.819-2.864v10.5c0 .904.732 1.637 1.636 1.637z"/><path fill="#ea4335" d="M18.545 21.003V11.73l3.819-2.864v10.5a1.636 1.636 0 0 1-1.636 1.637z"/><path fill="#fbbc04" d="M5.455 11.73 12 16.64l6.545-4.91V4.64L12 9.548 5.455 4.64z"/><path fill="#c5221f" d="M0 5.457v3.41l5.455 4.092V4.64L3.927 3.494C2.309 2.28 0 3.434 0 5.457z"/></svg>',
+    category: 'communication',
+    description_zh: '读 / 发邮件、整理收件箱。',
+    description_en: 'Read and send mail, organize the inbox.',
+    requires_credits: true,
+    auth_mode: 'composio',
+    transport_template: null,
+    usage_metering: { provider: 'composio', credits_milli_per_call: 250 },
+  },
   ...GOOGLE_ENTRIES,
   {
     id: 'bing-webmaster',
