@@ -211,6 +211,14 @@ Reflection is not a fixed counter. A weighted trigger scores six signals — `er
 
 ---
 
+## Contributors
+
+Thanks to the people who help improve Orkas:
+
+- [BlueSkyID666](https://github.com/BlueSkyID666)
+
+---
+
 ## Acknowledgments
 
 Some core modules draw on these open-source projects — special thanks to:
