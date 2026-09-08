@@ -52,11 +52,11 @@ describe('connector API-key metering', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('uses a locally saved key and reports scope rejection from the service', async () => {
+  it('uses a locally saved key and reports revocation from the service', async () => {
     state.status = { configured: true, scopes: [], connectorAccess: false };
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({
-      error: { code: 'insufficient_scope', message: 'Connector access required' },
-    }), { status: 403 }));
+      error: { code: 'invalid_api_key', message: 'Invalid API key' },
+    }), { status: 401 }));
     vi.stubGlobal('fetch', fetchMock);
     const { preflightConnectorCredits } = await import(
       '../../../../src/main/features/connectors/usage-metering'
@@ -65,11 +65,12 @@ describe('connector API-key metering', () => {
     await expect(preflightConnectorCredits({
       id: 'gmail',
       usage_metering: { provider: 'composio', credits_milli_per_call: 250 },
-    } as any, 'connect')).rejects.toMatchObject({ code: 'insufficient_scope' });
+    } as any, 'connect')).rejects.toMatchObject({ code: 'invalid_api_key' });
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it('reuses the connector preflight route with Bearer auth and open client headers', async () => {
+    state.status = { configured: true, scopes: [], connectorAccess: false };
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({
       code: 0,
       credits_milli_per_call: 250,
