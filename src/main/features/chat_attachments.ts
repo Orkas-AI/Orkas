@@ -555,7 +555,7 @@ export async function uploadAttachment(
   }
   if (TEXT_EXTS.has(ext)) {
     const s = buf.toString('utf8');
-    if (Buffer.from(s, 'utf8').length !== buf.length) {
+    if (!Buffer.from(s, 'utf8').equals(buf)) {
       return { ok: false, error: t('errors.not_utf8') };
     }
   }

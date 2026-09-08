@@ -242,10 +242,31 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(fs.existsSync(path.join(attDir(), 'huge.mp4'))).toBe(false);
   });
 
-  it('rejects non-UTF-8 content for text types', async () => {
+  it.each([
+    { label: 'invalid leading bytes', bytes: [0xFF, 0xFE] },
+    { label: 'truncated four-byte character', bytes: [0xF0, 0x9F, 0x92] },
+    { label: 'interrupted four-byte character', bytes: [0xF0, 0x90, 0x80, 0x41] },
+    { label: 'truncated three-byte character', bytes: [0xE2, 0x82] },
+    { label: 'surrogate encoding', bytes: [0xED, 0xA0, 0x80] },
+  ])('rejects non-UTF-8 content for text types: $label', async ({ bytes }) => {
     const m = await loadMod();
-    const r = await m.uploadAttachment(UID, CID, 'bad.txt', Buffer.from([0xFF, 0xFE]));
+    const buffer = Buffer.from(bytes);
+    const r = await m.uploadAttachment(UID, CID, 'bad.txt', buffer);
     expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.toLowerCase()).toContain('utf-8');
+    expect(m.listAttachments(UID, CID)).toEqual([]);
+    const source = path.join(tmpDir, 'bad.txt');
+    fs.writeFileSync(source, buffer);
+    expect((await m.importAttachmentFromPath(UID, CID, source)).ok).toBe(false);
+    expect(fs.readFileSync(source)).toEqual(buffer);
+    expect(m.listAttachments(UID, CID)).toEqual([]);
+  });
+
+  it('preserves valid Unicode and an authored replacement character byte for byte', async () => {
+    const m = await loadMod();
+    const buffer = Buffer.from('\uFEFF中文 📝 \uFFFD');
+    expect((await m.uploadAttachment(UID, CID, 'unicode.txt', buffer)).ok).toBe(true);
+    expect(fs.readFileSync(path.join(attDir(), 'unicode.txt'))).toEqual(buffer);
   });
 
   it('rejects unknown extensions', async () => {
