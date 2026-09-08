@@ -67,6 +67,46 @@ describe('connectors registry secret storage', () => {
     expect(registry.load(TEST_UID).connections['paid-mail'].composio_grant).toEqual(inst.composio_grant);
   });
 
+  it.each(['tampered', 'other_owner', 'other_connector'])('preserves unavailable %s connection ciphertext and recovers after restoring the original', async (variation) => {
+    let registry = await import('../../../../src/main/features/connectors/registry');
+    const paths = await import('../../../../src/main/paths');
+    const inst = { ...sampleInstance(), id: 'paid-mail', composio_grant: {
+      connection_id: 'connection-1', toolkit: 'gmail', auth_config_id: 'ac_public', connection_token: 'a'.repeat(43),
+    } };
+    await registry.upsert(TEST_UID, inst);
+    const originalFile = paths.userConnectorsConfigFile(TEST_UID);
+    const original = fs.readFileSync(originalFile, 'utf8');
+    const disk = JSON.parse(original);
+    const uid = variation === 'other_owner' ? 'another-owner' : TEST_UID;
+    const id = variation === 'other_connector' ? 'other-mail' : inst.id;
+    const row = disk.connections[inst.id];
+    if (variation === 'tampered') {
+      const bytes = Buffer.from(row.secrets_enc, 'base64');
+      bytes[bytes.length - 1] ^= 1;
+      row.secrets_enc = bytes.toString('base64');
+    }
+    disk.connections = { [id]: { ...row, id } };
+    const file = paths.userConnectorsConfigFile(uid);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(disk));
+    vi.resetModules();
+    registry = await import('../../../../src/main/features/connectors/registry');
+    const unavailable = registry.load(uid).connections[id];
+    expect(registry.hasUnavailableSecrets(unavailable)).toBe(true);
+    expect(unavailable.status).toMatchObject({ kind: 'error', message: 'connector_secrets_unavailable' });
+    expect(unavailable.composio_grant).toBeUndefined();
+    expect(unavailable.transport).toBeUndefined();
+    await registry.update(uid, id, (value) => ({ ...value, tools_cached_at: 42 }));
+    const after = JSON.parse(fs.readFileSync(file, 'utf8'));
+    expect(after.connections[id].secrets_enc).toBe(row.secrets_enc);
+    expect(JSON.stringify(after)).not.toContain(inst.composio_grant.connection_token);
+    // Restoring the original encrypted file in its original context remains usable.
+    fs.writeFileSync(originalFile, original);
+    vi.resetModules();
+    registry = await import('../../../../src/main/features/connectors/registry');
+    expect(registry.load(TEST_UID).connections[inst.id].composio_grant).toEqual(inst.composio_grant);
+  });
+
   it('writes token-bearing fields as local-secret ciphertext', async () => {
     const registry = await import('../../../../src/main/features/connectors/registry');
     const paths = await import('../../../../src/main/paths');

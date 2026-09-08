@@ -94,10 +94,13 @@ describe('features/connectors/oauth', () => {
     expect(JSON.stringify(logInfo.mock.calls)).not.toContain('a'.repeat(43));
   });
 
-  it('requires reconnect when a consumed exchange has no connection credential', async () => {
+  it.each([
+    ['missing', undefined], ['empty', ''], ['short', 'a'.repeat(42)], ['long', 'a'.repeat(44)],
+    ['whitespace', 'a'.repeat(42) + ' '], ['non-ASCII', 'a'.repeat(42) + '中'], ['non-string', { token: 'a'.repeat(43) }],
+  ])('requires reconnect when a consumed exchange credential is %s', async (_kind, connectionToken) => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ code: 0, redirect_url: 'https://provider.example/connect' })))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ code: 0, connection_id: 'legacy', toolkit: 'gmail', auth_config_id: 'ac_public' })));
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: 0, connection_id: 'legacy', toolkit: 'gmail', auth_config_id: 'ac_public', connection_token: connectionToken })));
     vi.stubGlobal('fetch', fetchMock);
     const oauth = await import('../../../../src/main/features/connectors/oauth');
     const { shell } = await import('electron');
@@ -107,6 +110,42 @@ describe('features/connectors/oauth', () => {
     await oauth.handleCallbackUrl('orkas://connectors/oauth/callback?exchange_code=consumed-code');
     await rejected;
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(oauth.cancelInFlightOAuth()).toBe(false);
+  });
+
+  it.each(['http_503', 'truncated_body'])('requires fresh authorization after %s without retrying the consumed exchange', async (failure) => {
+    const start = () => new Response(JSON.stringify({ code: 0, redirect_url: 'https://provider.example/connect' }));
+    const broken = failure === 'http_503'
+      ? new Response(JSON.stringify({ code: 1, msg: 'Temporarily unavailable' }), { status: 503 })
+      : { ok: true, status: 200, text: async () => { throw new Error('response body interrupted'); } };
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(start)
+      .mockResolvedValueOnce(broken)
+      .mockImplementationOnce(start)
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        code: 0, connection_id: 'replacement', connection_token: 'b'.repeat(43), toolkit: 'gmail', auth_config_id: 'ac_public',
+      })));
+    vi.stubGlobal('fetch', fetchMock);
+    const oauth = await import('../../../../src/main/features/connectors/oauth');
+    const { shell } = await import('electron');
+    const entry = { id: 'gmail', auth_mode: 'composio' } as any;
+    const first = oauth.startComposioConnect(entry);
+    const failed = expect(first).rejects.toMatchObject({ code: failure === 'http_503' ? 'exchange_http_5xx' : 'exchange_failed' });
+    await vi.waitFor(() => expect(shell.openExternal).toHaveBeenCalledTimes(1));
+    await oauth.handleCallbackUrl('orkas://connectors/oauth/callback?exchange_code=consumed');
+    await failed;
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(oauth.cancelInFlightOAuth()).toBe(false);
+    const replacement = oauth.startComposioConnect(entry);
+    await vi.waitFor(() => expect(shell.openExternal).toHaveBeenCalledTimes(2));
+    await oauth.handleCallbackUrl('orkas://connectors/oauth/callback?exchange_code=fresh');
+    await expect(replacement).resolves.toMatchObject({ connection_id: 'replacement', connection_token: 'b'.repeat(43) });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock.mock.calls.map(([url]) => new URL(url).pathname)).toEqual([
+      '/connectors/composio/start', '/connectors/composio/exchange',
+      '/connectors/composio/start', '/connectors/composio/exchange',
+    ]);
+    expect(JSON.parse(fetchMock.mock.calls[3][1].body).exchange_code).toBe('fresh');
   });
 
   it('does not retry a lost credential exchange response or duplicate callback', async () => {
