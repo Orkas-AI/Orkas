@@ -5,6 +5,7 @@
 
 let _composerModelEntries = [];
 let _composerModelMenu = null;
+let _composerModelOpening = null;
 let _composerModelBusy = false;
 let _composerModelOptionsByProvider = new Map();
 const _composerModelLog = createLogger('composer-model-picker');
@@ -228,6 +229,7 @@ async function _refreshComposerModelOptions(entries) {
 }
 
 function _closeComposerModelMenu() {
+  _composerModelOpening = null;
   if (!_composerModelMenu) return;
   _closeComposerModelVersionMenu();
   const {
@@ -677,15 +679,21 @@ function _buildComposerModelMenuGroup(group, activeEntryId, anchor) {
 
 async function _toggleComposerModelMenu(anchor) {
   if (!anchor || anchor.disabled) return;
-  if (_composerModelMenu) {
-    const wasSameAnchor = _composerModelMenu.anchor === anchor;
+  if (_composerModelMenu || _composerModelOpening) {
+    const wasSameAnchor = (_composerModelMenu || _composerModelOpening).anchor === anchor;
     _closeComposerModelMenu();
     if (wasSameAnchor) return;
   }
   _closeOtherComposerPopovers('model');
 
+  const opening = { anchor };
+  _composerModelOpening = opening;
   await _refreshComposerModelEntries();
+  if (_composerModelOpening !== opening) return;
   await _refreshComposerModelOptions(_composerModelEntries);
+  if (_composerModelOpening !== opening) return;
+  _composerModelOpening = null;
+  if (anchor.disabled || !anchor.isConnected) return;
   const menu = document.createElement('div');
   menu.id = 'composer-model-menu';
   menu.className = 'composer-model-menu';
@@ -766,7 +774,9 @@ async function _toggleComposerModelMenu(anchor) {
     versionOwner: null,
     versionCloseTimer: null,
   };
-  setTimeout(() => document.addEventListener('mousedown', onOutside), 0);
+  setTimeout(() => {
+    if (_composerModelMenu?.element === menu) document.addEventListener('mousedown', onOutside);
+  }, 0);
   document.addEventListener('keydown', onKeydown);
   window.addEventListener('resize', onViewportChange);
   window.addEventListener('scroll', onViewportChange, true);
@@ -794,14 +804,14 @@ document.addEventListener('DOMContentLoaded', () => {
       window.orkas.onPushEvent('client-config:changed', (payload) => {
         const keys = Array.isArray(payload && payload.keys) ? payload.keys : [];
         if (!keys.includes('model_catalog')) return;
-        if (_composerModelMenu) _closeComposerModelMenu();
+        _closeComposerModelMenu();
         _refreshComposerModelEntries().catch(() => {});
       });
     }
   } catch (_) {}
   window.addEventListener('i18n-change', () => {
     _renderComposerModelChips();
-    if (_composerModelMenu) _closeComposerModelMenu();
+    _closeComposerModelMenu();
   });
   _refreshComposerModelEntries().catch(() => {});
 });
