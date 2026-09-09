@@ -1469,8 +1469,9 @@ function _settingsShowCustomModelForm(provider) {
   const actions = document.getElementById('add-account-actions');
   if (!overlay || !title || !body || !actions) return;
 
+  const preset = provider.customPreset || {};
   title.innerHTML = `
-    <span class="modal-title-text">${escapeHtml(t('settings.custom.title'))}</span>
+    <span class="modal-title-text">${escapeHtml(preset.label || t('settings.custom.title'))}</span>
     <span class="form-hint custom-model-intro">${escapeHtml(t('settings.custom.compat_hint'))}</span>
   `;
   body.innerHTML = `
@@ -1505,6 +1506,12 @@ function _settingsShowCustomModelForm(provider) {
   const maxTokensInput = body.querySelector('.custom-max-tokens-input');
   const keyInput = body.querySelector('.custom-key-input');
   const msg = body.querySelector('.form-msg');
+
+  if (provider.customPreset) {
+    labelInput.value = preset.label;
+    baseUrlInput.value = preset.baseUrl;
+    modelInput.value = preset.model;
+  }
 
   const cancelBtn = document.createElement('button');
   cancelBtn.className = 'btn';
@@ -1593,7 +1600,7 @@ function _settingsShowCustomModelForm(provider) {
   actions.appendChild(cancelBtn);
   actions.appendChild(saveBtn);
   _settingsOpenModal(overlay);
-  setTimeout(() => labelInput.focus(), 0);
+  setTimeout(() => (provider.customPreset ? keyInput : labelInput).focus(), 0);
 }
 
 function _settingsOpenModal(overlay) {

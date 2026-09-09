@@ -83,6 +83,7 @@ import {
   providerSubscriptionNote,
   providerRecommended,
   providerUsesCustomOpenAIConfig,
+  providerCustomPreset,
   sortProviderIds,
   type CustomOpenAICompatibleRuntimeConfig,
 } from '../model/provider_catalog';
@@ -1003,6 +1004,11 @@ export interface ProviderEntry {
   supportsApiKey: boolean;
   supportsOAuth: boolean;
   customOpenAICompatible?: boolean;
+  customPreset?: {
+    label: string;
+    baseUrl: string;
+    model: string;
+  };
   /** If OAuth on this provider actually logs in via a different pi-ai
    *  provider (e.g. `openai` → `openai-codex`), this carries the target id
    *  so the renderer can call `startOAuth(oauthProvider)` accordingly. */
@@ -1116,7 +1122,8 @@ export async function listProviders(): Promise<{ providers: ProviderEntry[] }> {
     const directOAuth = oauthIds.has(id);
     const aliasOAuth  = OAUTH_ALIAS_FOR[id];
     const supportsOAuth = directOAuth || (!!aliasOAuth && oauthIds.has(aliasOAuth));
-    const supportsApiKey = apiCapable.has(id) && !oauthOnlyIds.has(id);
+    const supportsApiKey = (apiCapable.has(id) || providerUsesCustomOpenAIConfig(id))
+      && !oauthOnlyIds.has(id);
     return {
       id,
       label: providerLabel(id),
@@ -1125,6 +1132,7 @@ export async function listProviders(): Promise<{ providers: ProviderEntry[] }> {
       supportsApiKey,
       supportsOAuth,
       customOpenAICompatible: providerUsesCustomOpenAIConfig(id),
+      customPreset: providerCustomPreset(id),
       oauthProvider: directOAuth ? id : (supportsOAuth ? aliasOAuth : undefined),
       docsUrl: providerDocsUrl(id),
       subscriptionNote: providerSubscriptionNote(id),

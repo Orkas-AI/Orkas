@@ -375,6 +375,47 @@ describe('settings model authorization add account', () => {
     });
   });
 
+  it('prefills the API Route custom provider preset', async () => {
+    const { context, elements, invoke } = loadSettingsClickHarness();
+    const body = elements.get('add-account-body')!;
+    const actions = elements.get('add-account-actions')!;
+    const fields = {
+      '.custom-label-input': '',
+      '.custom-base-url-input': '',
+      '.custom-model-input': '',
+      '.custom-max-tokens-input': '',
+      '.custom-key-input': 'sk-route-test',
+      '.form-msg': '',
+    };
+    for (const [selector, value] of Object.entries(fields)) {
+      const element = new FakeElement();
+      element.value = value;
+      body.setQueryResult(selector, element);
+    }
+
+    context._settingsShowCustomModelForm({
+      id: 'api-route',
+      label: 'API Route',
+      customPreset: {
+        label: 'API Route',
+        baseUrl: 'https://global.api-route.com/v1',
+        model: 'gpt-5.4-mini',
+      },
+    });
+
+    expect(body.querySelector('.custom-label-input')?.value).toBe('API Route');
+    expect(body.querySelector('.custom-base-url-input')?.value)
+      .toBe('https://global.api-route.com/v1');
+    expect(body.querySelector('.custom-model-input')?.value).toBe('gpt-5.4-mini');
+    await actions.children.at(-1)!.click();
+    expect(invoke).toHaveBeenCalledWith('auth.addCustomModelEntry', {
+      label: 'API Route',
+      baseUrl: 'https://global.api-route.com/v1',
+      model: 'gpt-5.4-mini',
+      apiKey: 'sk-route-test',
+    });
+  });
+
   it('shows a localized validation message when main rejects a custom API key header', async () => {
     const { context, elements } = loadSettingsClickHarness(async (channel) => (
       channel === 'auth.addCustomModelEntry'

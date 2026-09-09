@@ -58,6 +58,11 @@ export interface CatalogEntry {
   oauthOnly?: boolean;        // if true, hide the API-key path entirely
   managedByOrkas?: boolean;   // if true, Orkas Server brokers the model; no user API key is needed
   customOpenAICompatible?: boolean; // user supplies base URL + model metadata
+  customPreset?: {
+    label: string;
+    baseUrl: string;
+    model: string;
+  };
   /** Per-provider prerequisite note shown on the card + the add-key form.
    *  Used when the same "brand" has two independent billing/auth surfaces
    *  (e.g. Moonshot pay-as-you-go open platform vs. Kimi Coding Plan
@@ -80,7 +85,7 @@ export interface CatalogEntry {
 // default via provider_policy.ts; dev builds keep it for local testing.
 // Group 1: global frontier labs (Anthropic, OpenAI, Google)
 // Group 2: China mainstream (Zhipu GLM, Moonshot Kimi, MiniMax)
-// Group 3: aggregators (OpenRouter)
+// Group 3: aggregators (API Route, OpenRouter)
 
 export const CATALOG: readonly CatalogEntry[] = [
   {
@@ -122,6 +127,17 @@ export const CATALOG: readonly CatalogEntry[] = [
   { id: 'doubao',             label: 'Doubao',  docsUrl: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey', region: 'cn',
     subscriptionNote: '' },
 
+  {
+    id: 'api-route',
+    label: 'API Route',
+    docsUrl: 'https://www.api-route.com/api-keys',
+    customOpenAICompatible: true,
+    customPreset: {
+      label: 'API Route',
+      baseUrl: 'https://global.api-route.com/v1',
+      model: 'gpt-5.4-mini',
+    },
+  },
   { id: 'openrouter',         label: 'OpenRouter',    docsUrl: 'https://openrouter.ai/keys' },
   {
     id: 'custom',
@@ -704,6 +720,10 @@ export function providerManagedByOrkas(id: string): boolean {
 
 export function providerUsesCustomOpenAIConfig(id: string): boolean {
   return CATALOG.find((p) => p.id === id)?.customOpenAICompatible === true;
+}
+
+export function providerCustomPreset(id: string): CatalogEntry['customPreset'] {
+  return CATALOG.find((p) => p.id === id)?.customPreset;
 }
 
 export interface CustomOpenAICompatibleRuntimeConfig {

@@ -2,7 +2,7 @@
 
 **在一个桌面对话里指挥一支 AI 智能体团队 —— 而不是单个聊天机器人。**
 
-Orkas 是一个开源、本地优先的多智能体桌面应用。你描述目标，**指挥官**规划路径、亲自完成通用部分，并调度专业智能体并行或串行执行。**9 个专业智能体随应用内置**，启动即可用，marketplace 中共有 30 个。自带模型 key —— Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · Doubao。支持 macOS · Windows · Linux。
+Orkas 是一个开源、本地优先的多智能体桌面应用。你描述目标，**指挥官**规划路径、亲自完成通用部分，并调度专业智能体并行或串行执行。**9 个专业智能体随应用内置**，启动即可用，marketplace 中共有 30 个。自带模型 key —— Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · Doubao · API Route。支持 macOS · Windows · Linux。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![Stars](https://img.shields.io/github/stars/Orkas-AI/Orkas?style=social)](https://github.com/Orkas-AI/Orkas/stargazers)

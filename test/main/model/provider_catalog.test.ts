@@ -13,6 +13,7 @@ import {
   isVisibleProvider,
   providerLabel,
   providerDocsUrl,
+  providerCustomPreset,
   providerSubscriptionNote,
   sortProviderIds,
   curatedModelsFor,
@@ -28,7 +29,7 @@ describe('provider_catalog › CATALOG', () => {
     expect(new Set(ids).size).toBe(ids.length);
     // DeepSeek 直连先（pi-ai 不带，自建适配），然后全球前沿（OpenAI Codex /
     // OpenAI / Google / Anthropic），CN 主流（Zhipu / Moonshot / Kimi-Coding /
-    // MiniMax × 3 / Doubao），最后聚合器（OpenRouter）。
+    // MiniMax × 3 / Doubao），最后聚合器（API Route / OpenRouter）。
     expect(ids).toEqual([
       'orkas-api',
       'deepseek',
@@ -43,6 +44,7 @@ describe('provider_catalog › CATALOG', () => {
       'minimax-portal-cn',
       'minimax-cn',
       'doubao',
+      'api-route',
       'openrouter',
       'custom',
     ]);
@@ -455,6 +457,14 @@ describe('provider_catalog › labels and docs', () => {
 
   it('providerDocsUrl is undefined for orphan providers', () => {
     expect(providerDocsUrl('huggingface')).toBeUndefined();
+  });
+
+  it('provides the fixed API Route OpenAI-compatible preset', () => {
+    expect(providerCustomPreset('api-route')).toEqual({
+      label: 'API Route',
+      baseUrl: 'https://global.api-route.com/v1',
+      model: 'gpt-5.4-mini',
+    });
   });
 
   it('providerSubscriptionNote 在两条 Moonshot endpoint 上都给出明确前提', () => {

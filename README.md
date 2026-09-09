@@ -2,7 +2,7 @@
 
 **Command a team of AI agents from one desktop chat — not one chatbot.**
 
-Orkas is an open-source, local-first multi-agent desktop app. Describe a goal; its **Commander** plans the work, handles the general parts itself, and coordinates specialist agents in parallel or in sequence. **Nine specialist agents ship with the app**, ready the moment you launch it, out of 30 in the marketplace. Bring your own model keys — Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · Doubao. macOS · Windows · Linux.
+Orkas is an open-source, local-first multi-agent desktop app. Describe a goal; its **Commander** plans the work, handles the general parts itself, and coordinates specialist agents in parallel or in sequence. **Nine specialist agents ship with the app**, ready the moment you launch it, out of 30 in the marketplace. Bring your own model keys — Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · Doubao · API Route. macOS · Windows · Linux.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![Stars](https://img.shields.io/github/stars/Orkas-AI/Orkas?style=social)](https://github.com/Orkas-AI/Orkas/stargazers)
