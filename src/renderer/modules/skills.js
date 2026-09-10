@@ -2474,14 +2474,13 @@ function _switchSkillTab(tab) {
   // Clear error msg when switching tabs
   const msgEl = document.getElementById('skill-form-msg');
   if (msgEl) { msgEl.textContent = ''; msgEl.className = 'form-msg'; }
-  // Focus primary input of the new tab
-  setTimeout(() => {
-    const focusId = tab === 'url' ? 'skill-url-input'
-                  : tab === 'dir' ? 'skill-dir-pick-btn'
-                  : 'skill-name';
-    const el = document.getElementById(focusId);
-    if (el) el.focus();
-  }, 30);
+  // The panel is visible now. A delayed focus can interrupt the user's next
+  // field selection and redirect their input into the wrong field.
+  const focusId = tab === 'url' ? 'skill-url-input'
+                : tab === 'dir' ? 'skill-dir-pick-btn'
+                : 'skill-name';
+  const el = document.getElementById(focusId);
+  if (el) el.focus();
 }
 window._switchSkillTab = _switchSkillTab;
 
@@ -2513,7 +2512,6 @@ async function openSkillModal(editId) {
     saveBtn.textContent = t('common.confirm');
     editIdInput.value = editId;
     if (tabBar) tabBar.style.display = 'none'; // edit mode: no tabs, manual only
-    _switchSkillTab('manual');
     const cached = _skillsCache?.find(s => s.id === editId && s.source === 'custom');
     if (cached) {
       document.getElementById('skill-name').value = cached.name || '';
@@ -2528,7 +2526,6 @@ async function openSkillModal(editId) {
     saveBtn.textContent = t('common.confirm');
     editIdInput.value = '';
     if (tabBar) tabBar.style.display = '';
-    _switchSkillTab('manual');
   }
 
   // Wire tab buttons (idempotent — checks a flag)
@@ -2540,6 +2537,7 @@ async function openSkillModal(editId) {
   }
 
   modal.classList.add('open');
+  _switchSkillTab('manual');
   if (typeof window.bindNameLimitControl === 'function') {
     window.bindNameLimitControl(document.getElementById('skill-name'));
   }
