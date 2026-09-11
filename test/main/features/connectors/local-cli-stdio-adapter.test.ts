@@ -21,7 +21,7 @@ const adapter = require('../../../../bin/local-cli-mcp-server.cjs') as {
   classifyXeroAction: (action: string) => string;
   invocationRisk: (baseRisk: string, parameters: unknown, env?: NodeJS.ProcessEnv) => string;
   redact: (value: unknown) => string;
-  validatedParameters: (value: unknown, env?: NodeJS.ProcessEnv) => Record<string, unknown>;
+  validatedParameters: (value: unknown, env?: NodeJS.ProcessEnv, inspection?: unknown) => Record<string, unknown>;
   invocationFor: (action: string, params: unknown, risk: string, env: NodeJS.ProcessEnv) => string[];
   executeAction: (
     risk: string,
@@ -67,11 +67,17 @@ describe('official local CLI MCP adapter', () => {
     fs.mkdirSync(workDir);
     const schemaStarted = path.join(runtimeDir, 'schema-started');
     const mutation = path.join(runtimeDir, 'mutation');
+    const descendantMutation = path.join(runtimeDir, 'descendant-mutation');
+    const descendantPid = path.join(runtimeDir, 'descendant-pid');
     const fakeCli = path.join(runtimeDir, 'npx-cli.cjs');
     fs.writeFileSync(fakeCli, [
       "const fs = require('node:fs');",
       "if (process.argv.includes('--schema')) {",
-      `  fs.writeFileSync(${JSON.stringify(schemaStarted)}, 'started');`,
+      `  require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify([
+        `require('node:fs').writeFileSync(${JSON.stringify(descendantPid)}, String(process.pid));`,
+        `require('node:fs').writeFileSync(${JSON.stringify(schemaStarted)}, 'started');`,
+        `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(descendantMutation)}, 'unexpected late effect'), 450);`,
+      ].join('\n'))}], { stdio: 'inherit' });`,
       `  setTimeout(() => process.stdout.write(JSON.stringify({ effect: 'write' })), 350);`,
       '} else {',
       `  fs.writeFileSync(${JSON.stringify(mutation)}, 'unexpected mutation');`,
@@ -102,7 +108,8 @@ describe('official local CLI MCP adapter', () => {
       const pending = client.callTool({
         name: 'execute_write', arguments: { action: 'todo.task.create', parameters: { title: 'fixture' } },
       }, undefined, { signal: controller.signal }).catch((error) => error);
-      await vi.waitFor(() => expect(fs.existsSync(schemaStarted)).toBe(true));
+      // Wait for real child readiness; process startup is not the cancellation deadline.
+      await vi.waitFor(() => expect(fs.existsSync(schemaStarted)).toBe(true), { timeout: 5_000 });
       if (abandon === 'cancel') controller.abort();
       else if (abandon === 'disconnect') await client.close();
       const result = await pending;
@@ -113,6 +120,8 @@ describe('official local CLI MCP adapter', () => {
         await new Promise((resolve) => setTimeout(resolve, 550));
       }
       expect(fs.existsSync(mutation)).toBe(abandon === 'continue');
+      expect(fs.existsSync(descendantMutation)).toBe(abandon === 'continue');
+      await vi.waitFor(() => expect(() => process.kill(Number(fs.readFileSync(descendantPid, 'utf8')), 0)).toThrow());
     } finally {
       await client.close();
       fs.rmSync(runtimeDir, { recursive: true, force: true });
@@ -377,7 +386,7 @@ describe('official local CLI MCP adapter', () => {
       const runner = vi.fn((_command: string, argv: string[]) => argv[4] === 'schema'
         ? result({
             name: 'drive.file.upload',
-            inputSchema: { type: 'object', properties: { file: { type: 'string' } } },
+            inputSchema: { type: 'object', properties: { file: { type: 'string', format: 'binary' } } },
             _meta: { risk: 'write' },
           })
         : result({ ok: true }));
@@ -542,7 +551,9 @@ describe('official local CLI MCP adapter', () => {
     expect(() => adapter.validatedParameters({ output_path: '/tmp/leak' })).toThrow(/not allowed/);
     expect(() => adapter.validatedParameters({ file: '/tmp/leak' }, envFor('lark')))
       .toThrow(/outside|does not exist/);
-    expect(() => adapter.validatedParameters({ source: '../credential.json' }, envFor('lark')))
+    expect(() => adapter.validatedParameters({ source: '../credential.json' }, envFor('lark'), {
+      provider: 'lark', schema: { inputSchema: { properties: { source: { type: 'string', format: 'binary' } } } },
+    }))
       .toThrow(/outside|does not exist/);
     const approvedFile = path.join(process.cwd(), 'package.json');
     expect(adapter.validatedParameters({ file: approvedFile }, envFor('lark')))

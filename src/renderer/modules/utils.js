@@ -2192,7 +2192,7 @@ function _aiSelectPopoverZIndexFor(el) {
 function _aiSelectMount(el, config) {
   if (!el) return null;
   const state = {
-    options: [],        // [{value, label, hint?, iconName?, disabled?}]
+    options: [],        // [{value, label, hint?, iconName?, avatar?, disabled?}]
     value: '',
     placeholder: (t('ai_select.placeholder')),
     onChange: () => {},
@@ -2234,7 +2234,15 @@ function _aiSelectMount(el, config) {
 
   const renderOptionLabel = (target, opt) => {
     target.innerHTML = '';
-    if (opt && opt.iconName && typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+    if (opt && opt.avatar && typeof renderAvatarHtml === 'function') {
+      const avatar = document.createElement('span');
+      avatar.className = 'ai-select-option-icon';
+      avatar.setAttribute('aria-hidden', 'true');
+      avatar.innerHTML = renderAvatarHtml(opt.avatar.icon, opt.avatar.color, {
+        size: 18, seed: opt.avatar.seed,
+      });
+      target.appendChild(avatar);
+    } else if (opt && opt.iconName && typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
       const iconWrap = document.createElement('span');
       iconWrap.className = 'ai-select-option-icon';
       iconWrap.innerHTML = window.uiIconHtml(opt.iconName, 'ui-icon ai-select-svg-icon');
@@ -2480,17 +2488,7 @@ function _aiSelectPick(api, value) {
   if (prev !== api.state.value) {
     try { api.state.onChange(api.state.value); } catch (_) {}
   }
-  const labelEl = api.el.querySelector('.ai-select-label');
-  const opt = api.state.options.find(o => o.value === api.state.value);
-  if (labelEl) {
-    if (opt) {
-      labelEl.textContent = opt.label;
-      labelEl.classList.remove('placeholder');
-    } else {
-      labelEl.textContent = api.state.placeholder;
-      labelEl.classList.add('placeholder');
-    }
-  }
+  api.setValue(api.state.value);
 }
 
 // Test bridge — guarded CommonJS export of pure helpers. No-op in the

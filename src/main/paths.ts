@@ -566,6 +566,9 @@ export const userLocalCliSessionsDir = (uid: string) =>
   path.join(userLocalRoot(uid), 'cli-sessions');
 export const localCliSessionsFile = (uid: string, cid: string) =>
   path.join(userLocalCliSessionsDir(uid), `${cid}.json`);
+// User selections are durable device state, independent of resumable sessions.
+export const localCliDirectoryFile = (uid: string, cid: string) =>
+  path.join(userLocalRoot(uid), 'cli-directories', `${assertProjectSegment(cid)}.json`);
 
 // ── External packages (machine-private, verbatim third-party repos) ─────
 // `<uid>/local/packages/<name>/` hosts a cloned open-source repo UNMODIFIED

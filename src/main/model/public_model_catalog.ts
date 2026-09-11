@@ -83,6 +83,7 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'MiniMax-M2.7', name: 'MiniMax 2.7' },
   ],
   deepseek: [
+    { id: 'deepseek-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 1_048_576, maxTokens: 384_000, supportsVision: true, maxInputImages: 600 },
     { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', contextWindow: 1_048_576, maxTokens: 384_000, supportsVision: false },
     { id: 'deepseek-v4-flash-vision-exp', name: 'DeepSeek V4 Flash Vision', contextWindow: 1_048_576, maxTokens: 384_000, supportsVision: true, maxInputImages: 600 },
     { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', contextWindow: 1_048_576, maxTokens: 384_000, supportsVision: false },
@@ -109,6 +110,7 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'google/gemini-3.7-flash', name: 'Gemini 3.7 Flash', maxInputImages: 20 },
     { id: 'google/gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro (preview)', maxInputImages: 20 },
     { id: 'google/gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash Lite', maxInputImages: 20 },
+    { id: 'deepseek/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', template: 'deepseek/deepseek-v4-flash-vision-exp', contextWindow: 1_048_576, maxTokens: 384_000, supportsVision: true, maxInputImages: 20 },
     { id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
     { id: 'deepseek/deepseek-v4-flash-0731', name: 'DeepSeek V4 Flash 0731', template: 'deepseek/deepseek-v4-flash', contextWindow: 1048576, maxTokens: 384000 },
     { id: 'moonshotai/kimi-k3', name: 'Kimi K3', maxInputImages: 20 },

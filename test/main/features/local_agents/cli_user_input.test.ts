@@ -31,6 +31,61 @@ function request(overrides: Record<string, unknown> = {}) {
 }
 
 describe('local_agents/cli_user_input', () => {
+  it('retains a failed cancellation for retry and settles only after native confirmation', async () => {
+    let requestId = '';
+    userInput._setBroadcastForTest((channel, payload: any) => {
+      if (channel === 'local-agent:user-input') requestId = payload.request_id;
+    });
+    let confirm!: (value: 'cancelled') => void;
+    const cancel = vi.fn<() => Promise<'cancelled' | 'closed' | 'failed'>>()
+      .mockResolvedValueOnce('failed')
+      .mockImplementationOnce(() => new Promise(resolve => { confirm = resolve; }));
+    const response = request({ request: { questions: [{ id: 'scope', question: 'Choose scope' }], cancel } });
+    let settled = false;
+    void response.then(() => { settled = true; });
+    expect(await userInput.cancelRequest(requestId, 'other-account')).toEqual({ handled: false });
+    expect(cancel).not.toHaveBeenCalled();
+    expect(await userInput.cancelRequest(requestId, 'u1')).toEqual({ handled: false, cancel_failed: true });
+    expect(settled).toBe(false);
+    const first = userInput.cancelRequest(requestId, 'u1');
+    const duplicate = userInput.cancelRequest(requestId, 'u1');
+    expect(cancel).toHaveBeenCalledTimes(2);
+    expect(userInput.respond(requestId, 'u1', { scope: ['racing answer'] })).toEqual({ handled: false });
+    confirm('cancelled');
+    expect(await first).toEqual({ handled: true, cancelled: true });
+    expect(await duplicate).toEqual({ handled: true, cancelled: true });
+    expect(await response).toEqual({ cancelled: true, answers: { scope: [] } });
+    expect(await userInput.cancelRequest(requestId, 'u1')).toEqual({ handled: false, closed: true });
+    expect(cancel).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['unknown', 'exception'])('never retries or accepts a second answer after an uncertain cancellation: %s', async outcome => {
+    let requestId = '';
+    userInput._setBroadcastForTest((channel, payload: any) => {
+      if (channel === 'local-agent:user-input') requestId = payload.request_id;
+    });
+    const cancel = vi.fn(async () => 'unknown' as const);
+    if (outcome === 'exception') cancel.mockRejectedValueOnce(new Error('delivery unknown'));
+    const controller = new AbortController();
+    const response = request({ request: { questions: [{ id: 'scope', question: 'Choose scope' }], cancel, signal: controller.signal } });
+    expect(await userInput.cancelRequest(requestId, 'u1')).toEqual({ handled: false, unknown: true });
+    expect(await userInput.cancelRequest(requestId, 'u1')).toEqual({ handled: false, unknown: true });
+    expect(userInput.respond(requestId, 'u1', { scope: ['late answer'] })).toEqual({ handled: false });
+    expect(cancel).toHaveBeenCalledOnce();
+    controller.abort();
+    await expect(response).resolves.toMatchObject({ cancelled: true });
+    expect(await userInput.cancelRequest(requestId, 'u1')).toEqual({ handled: false, closed: true });
+  });
+
+  it('does not claim native cancellation when the adapter cannot confirm it', async () => {
+    let requestId = '';
+    userInput._setBroadcastForTest((_channel, payload: any) => { requestId = payload.request_id || requestId; });
+    const response = request();
+    expect(await userInput.cancelRequest(requestId, 'u1')).toEqual({ handled: false, cancel_failed: true });
+    expect(userInput.respond(requestId, 'u1', { environment: ['staging'] })).toEqual({ handled: true, cancelled: false });
+    expect(await response).toEqual({ cancelled: false, answers: { environment: ['staging'] } });
+  });
+
   it('returns empty answers immediately when no renderer can receive the request', async () => {
     userInput._setBroadcastForTest(() => false);
 

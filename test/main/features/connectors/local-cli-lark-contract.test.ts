@@ -216,7 +216,11 @@ describe('Lark user journeys against the pinned official command contract', () =
     fs.writeFileSync(approved, '# Contract fixture');
     try {
       const execute = vi.fn((args: string[]) => {
-        expect(args).toContain(`@${approved}`);
+        const reference = args[args.indexOf('--content') + 1];
+        expect(reference.startsWith('@')).toBe(true);
+        expect(path.isAbsolute(reference.slice(1))).toBe(false);
+        const options = (runner.mock.calls.at(-1) as unknown[])[2] as { cwd: string };
+        expect(fs.readFileSync(path.join(options.cwd, reference.slice(1)), 'utf8')).toBe('# Contract fixture');
         return { ok: true };
       });
       const args = { action: 'docs.+update', parameters: { doc: 'fixture-doc', command: 'append', content: `@${approved}` } };

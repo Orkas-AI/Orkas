@@ -1,4 +1,7 @@
 {
+  "errors.cli_directory_storage": "The project directory setting could not be read or saved. Check disk access and try again.",
+  "errors.cli_directory_denied": "Access to the project directory was denied. Restore folder access and try again; your directory selection has been kept.",
+  "errors.cli_directory_unavailable": "The project directory is temporarily unavailable. Check the folder or drive and try again; your directory selection has been kept.",
   "agent.execution_idle_timeout_seconds": "The agent made no progress for {seconds}s, so the run was stopped. Try again or ask the agent to continue.",
   "agent.execution_wall_timeout": "The run reached the 24-hour limit and was stopped. Ask the agent to continue unfinished work.",
   "agent.execution_idle_timeout": "The agent made no progress for 30 minutes, so the run was stopped. Try again or ask the agent to continue.",

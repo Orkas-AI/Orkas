@@ -41,6 +41,7 @@ import { writeTextAtomicSync } from '../../storage';
 import { createLogger } from '../../logger';
 import { logErrorSummary } from '../../util/log-redact';
 import * as localSecrets from '../../util/local-secret-store';
+import { cancelForConnector } from './action_confirm';
 import { connectorRecordsForScope, prepareDeviceLocalConnectorStorage } from './device-local';
 import type {
   ConnectorInstance,
@@ -425,6 +426,7 @@ export async function upsert(uid: string, inst: ConnectorInstance): Promise<void
       rt_after: _rt(inst.oauth_grant),
       had_existing: !!before,
     });
+    cancelForConnector(uid, inst.id);
     cur.connections[inst.id] = inst;
     if (cur._deleted_at?.[inst.id]) {
       const deleted = { ...(cur._deleted_at || {}) };
@@ -442,6 +444,7 @@ export async function remove(uid: string, id: string): Promise<boolean> {
     const cur = _readSync(uid);
     if (!cur.connections[id]) return false;
     log.info('registry.remove', { id, rt_before: _rt(cur.connections[id].oauth_grant) });
+    cancelForConnector(uid, id);
     delete cur.connections[id];
     if (cur.oauth_hints?.[id]) {
       const hints = { ...(cur.oauth_hints || {}) };

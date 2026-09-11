@@ -10027,10 +10027,89 @@ body.is-conversation-info-resizing * { cursor: col-resize !important; }
   background: var(--surface);
   box-shadow: 0 6px 20px rgba(15, 23, 42, 0.08);
 }
-.cli-question-panel .form-field { margin-bottom: 8px; }
-.cli-question-panel .form-field-label { color: var(--text); overflow-wrap: anywhere; }
+/* The card is read top down before anything is clicked — who is asking, the
+   question, then one line per option — so each step gets its own size and its
+   own air. The inherited form styling was built for short field labels: it
+   packs a 12px label against an 11px description with a negative margin, which
+   collapses the three steps into one grey block. */
+.cli-question-panel .form-title {
+  font-size: 14px;
+  line-height: 1.5;
+  margin-bottom: 12px;
+}
+.cli-question-panel .form-field { gap: 8px; margin-bottom: 8px; }
+.cli-question-panel .form-field-label {
+  font-size: 13.5px;
+  font-weight: 500;
+  line-height: 1.55;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
 .cli-question-panel .form-field-checkgroup .btn { white-space: normal; text-align: left; }
 .cli-question-panel .form-field-textarea { resize: none; }
+/* Option descriptions arrive as one line per option, so line-height is the only
+   thing separating one option's reason from the next. `--text-2` keeps them
+   legible beside the buttons they explain instead of fading into the card. */
+.cli-question-panel .form-field-desc {
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--text-2);
+  margin-top: 0;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+/* Real space between options, not line-height: at a narrow dock a description
+   wraps, and leading alone cannot say whether the next line continues this
+   option or starts the next one. The name carries the card's text colour so a
+   description can be matched back to the button that bears the same label. */
+.cli-question-panel .form-field-desc-option + .form-field-desc-option {
+  margin-top: 6px;
+}
+.cli-question-panel .form-field-desc-name {
+  margin-right: 5px;
+  color: var(--text);
+  font-weight: 500;
+}
+/* Send sits under the answer box, with decline beside it: a blocking request
+   must stay declinable, and the CLI is holding its turn until one is pressed. */
+.cli-question-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+/* The card sits inside the composer dock, a few pixels from the app's own send
+   control, so it stays in the tinted register the rest of the app uses for a
+   selected state (see `.project-driver-toggle[aria-pressed="true"]`) instead of
+   the full-strength fill a modal's confirm button gets. Two tiers of the one
+   hue: a picked option is the lighter one, send carries the solid border and
+   the heavier weight so it still reads as the affirmative action. */
+.cli-question-panel .form-field-checkgroup .btn.is-selected {
+  background: var(--primary-soft);
+  border-color: color-mix(in srgb, var(--primary) 38%, #fff);
+  color: var(--primary-text);
+}
+.cli-question-panel .form-field-checkgroup .btn.is-selected:hover {
+  background: color-mix(in srgb, var(--primary) 16%, #fff);
+}
+.cli-question-panel .btn-primary {
+  background: color-mix(in srgb, var(--primary) 16%, #fff);
+  border-color: var(--primary);
+  color: var(--primary-text);
+  font-weight: 600;
+}
+.cli-question-panel .btn-primary:hover {
+  background: color-mix(in srgb, var(--primary) 26%, #fff);
+}
+/* `.btn-primary:disabled` re-asserts the solid fill, so the disabled send needs
+   selectors that outrank it — including its `:disabled:hover` pair. */
+.cli-question-panel .btn-primary:disabled,
+.cli-question-panel .btn-primary:disabled:hover {
+  background: color-mix(in srgb, var(--primary) 14%, #fff);
+  border-color: color-mix(in srgb, var(--primary) 45%, #fff);
+  color: var(--primary-text);
+}
 
 
 .chat-skill-btn,
@@ -11613,6 +11692,11 @@ body.is-conversation-info-resizing * { cursor: col-resize !important; }
 
 .modal-actions {
   display: flex;
+  /* `min-width` below replaces the flex default `min-width: auto`, so without
+     wrapping a row of several buttons shrinks every label into a narrow
+     column. Wrap instead: each action keeps its own width and moves to the
+     next line when the row is full. */
+  flex-wrap: wrap;
   gap: 10px;
   justify-content: flex-end;
   margin-top: 20px;
@@ -11621,9 +11705,33 @@ body.is-conversation-info-resizing * { cursor: col-resize !important; }
 .memory-modal-foot .btn {
   min-width: 76px;
   min-height: 36px;
+  max-width: 100%;
   padding: 0 16px;
   font-size: 13px;
   line-height: 34px;
+  /* A label longer than the dialog (a branch or file name) breaks instead of
+     spilling out of its button. */
+  overflow-wrap: anywhere;
+}
+
+/* Choice list for a question dialog. Same visual contract as the native
+   question card in the composer dock (`.chat-input-form .form-field-checkgroup`):
+   options wrap, each one is as wide as its own label, and they stay separate
+   from cancel/confirm on the action row. */
+.ui-dialog-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-top: 14px;
+}
+.ui-dialog-choices .btn {
+  max-width: 100%;
+  min-height: 32px;
+  padding: 6px 12px;
+  font-size: 13px;
+  line-height: 1.45;
+  text-align: left;
+  overflow-wrap: anywhere;
 }
 
 .modal-actions .ui-choice-leading {
@@ -11705,12 +11813,31 @@ body.is-conversation-info-resizing * { cursor: col-resize !important; }
   max-height: min(34vh, 260px);
   overflow: auto;
 }
+.bash-permission-details {
+  margin-top: 12px;
+  white-space: normal;
+}
+.bash-permission-details summary {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  list-style: none;
+  cursor: pointer;
+  color: var(--text-2);
+}
+.bash-permission-details summary::-webkit-details-marker { display: none; }
+.bash-permission-details:not([open]) .sidebar-section-chevron { transform: rotate(-90deg); }
+.bash-permission-details pre {
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .bash-permission-footer {
   margin-top: 20px;
 }
 .bash-permission-actions {
   align-items: center;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   gap: 10px;
   margin-top: 0;
 }
@@ -16668,6 +16795,10 @@ body.is-conversation-info-resizing * { cursor: col-resize !important; }
   background: var(--warn);
   margin-right: 4px;
   vertical-align: middle;
+}
+.connector-card-unverified[data-role="permission-notice"] {
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .connector-card-desc {
   font-size: 12px;

@@ -40,6 +40,7 @@ import { sanitizeAuthorizationDetail } from './local-cli-auth-error';
 import { deriveCustomId, validateCustomTransport, validateDisplayName, type CustomConnectorInput } from './custom-transport';
 import {
   authorizeLocalCli,
+  checkLocalCliPermissions,
   localCliTransport,
   removeLocalCliAuthorization,
 } from './local-cli';
@@ -144,6 +145,11 @@ const VERIFY_TTL_MS = 5 * 60 * 1000;
 const RETRY_BACKOFF_BASE_MS = 30 * 1000;
 const RETRY_BACKOFF_MAX_MS = 30 * 60 * 1000;
 const COMPOSIO_CALL_TOOL_TIMEOUT_MS = 110 * 1000;
+// Allow schema inspection and local staging around the CLI's ten-minute transfer deadline.
+// The adapter enforces 60s ordinary / 10min transfer deadlines. Progress keeps
+// only an active transfer alive across this transport inactivity window.
+const LOCAL_CLI_IDLE_TIMEOUT_MS = 90 * 1000;
+const LOCAL_CLI_TOTAL_TIMEOUT_MS = 13 * 60 * 1000;
 
 type StatusPatchCollector = Map<string, registry.ConnectorInstancePatch[]>;
 
@@ -1430,6 +1436,8 @@ export async function connectViaOAuth(
   if (entry.auth_mode === 'local_cli') {
     await authorizeLocalCli(uid, entry);
     _assertRuntimeEpoch(runtimeEpoch);
+    await checkLocalCliPermissions(uid, entry, true);
+    _assertRuntimeEpoch(runtimeEpoch);
     // Official CLIs complete authorization without the desktop OAuth deep-link callback.
     // Keep the card busy while the authorized runtime connects and discovers its tools.
     if (opts.attemptId) {
@@ -1689,15 +1697,16 @@ async function _provisionLocalCliInstance(
   _assertRuntimeEpoch(runtimeEpoch);
   await _closeDiscoveredConnection(uid, entry.id, runtimeEpoch);
   _assertRuntimeEpoch(runtimeEpoch);
+  const prior = getInstance(uid, entry.id);
   const draft: ConnectorInstance = {
     id: entry.id,
     display_name: entry.display_name,
     transport: localCliTransport(uid, entry),
-    enabled_subtools: null,
+    enabled_subtools: prior?.enabled_subtools ?? null,
     tools_cache: [],
     tools_cached_at: 0,
     status: { kind: 'connecting' },
-    created_at: _nowIso(),
+    created_at: prior?.created_at ?? _nowIso(),
     updated_at: _nowIso(),
   };
   await registry.upsert(uid, draft);
@@ -1939,6 +1948,9 @@ export async function callTool(
     const requestOpts = {
       ...(opts.signal ? { signal: opts.signal } : {}),
       ...(inst.composio_grant ? { timeoutMs: COMPOSIO_CALL_TOOL_TIMEOUT_MS } : {}),
+      ...(entry?.auth_mode === 'local_cli'
+        && ['execute_read', 'execute_write', 'execute_high_impact', 'execute_destructive'].includes(name)
+        ? { timeoutMs: LOCAL_CLI_IDLE_TIMEOUT_MS, maxTotalTimeoutMs: LOCAL_CLI_TOTAL_TIMEOUT_MS } : {}),
     };
     const result = Object.keys(requestOpts).length
       ? await conn.callTool(name, args, requestOpts)

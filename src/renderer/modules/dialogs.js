@@ -283,7 +283,13 @@ function uiConfirmDanger({ title, message, dangerLabel, cancelLabel } = {}) {
 // `choices: [{ id, label, style? }]` — `style` may be 'primary' (default),
 // 'danger', or '' for the neutral .btn look. `leadingChoices` renders one
 // or more neutral/contextual choices on the left edge of the actions row.
-function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLabel, signal, multiple = false } = {}) {
+/** `choiceLayout: 'group'` lays the choices out as a wrapping group above the
+ * action row, the way the native-question card in the composer dock renders
+ * its options. Prose labels (a CLI question's options) need it: the action
+ * row is one non-wrapping line, so more than a few of them collapse to their
+ * min-width and the labels wrap into unreadable columns. The default keeps
+ * short confirm choices beside cancel on the action row. */
+function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLabel, signal, multiple = false, choiceLayout = 'actions' } = {}) {
   return new Promise((resolve) => {
     if (signal && signal.aborted) {
       resolve(null);
@@ -307,15 +313,20 @@ function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLab
     };
     const leadingChoiceHtml = leadingChoices.map((c) => renderChoice(c, 'ui-choice-leading')).join('');
     const choiceHtml = choices.map((c) => renderChoice(c)).join('');
+    const groupedChoices = choiceLayout === 'group';
+    const choiceGroupHtml = groupedChoices
+      ? `<div class="ui-dialog-choices" role="group" aria-labelledby="${messageId}">${choiceHtml}</div>`
+      : '';
     const selectedIds = new Set();
     overlay.innerHTML = `
       <div class="modal ui-dialog modal-standard" role="dialog" aria-modal="true" aria-labelledby="${title ? titleId : messageId}"${title ? ` aria-describedby="${messageId}"` : ''}>
         ${titleHtml}
         <div class="modal-body ui-dialog-message" id="${messageId}">${msgHtml}</div>
+        ${choiceGroupHtml}
         <div class="modal-actions">
           ${leadingChoiceHtml}
           <button class="btn" data-act="cancel">${cancelText}</button>
-          ${choiceHtml}
+          ${groupedChoices ? '' : choiceHtml}
           ${multiple ? `<button class="btn btn-primary" data-act="confirm" disabled>${escapeHtml(_dialogLabel('common.confirm', 'Confirm'))}</button>` : ''}
         </div>
       </div>

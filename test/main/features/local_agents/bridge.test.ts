@@ -46,7 +46,8 @@ vi.mock('../../../../src/main/features/connectors', async (importOriginal) => {
     callTool: bridgeConnectorMock.callTool,
   };
 });
-vi.mock('../../../../src/main/features/connectors/action_confirm', () => ({
+vi.mock('../../../../src/main/features/connectors/action_confirm', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../../../src/main/features/connectors/action_confirm')>(),
   requestActionConfirm: bridgeActionConfirmMock.request,
 }));
 

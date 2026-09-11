@@ -24,6 +24,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   userChatsDir, userLocalConfigDir, projectChatsDir, projectChatIndexFile,
   userConversationTurnIndexPath, WS_ROOT,
+  localCliDirectoryFile,
 } from '../paths';
 import {
   conversationLayout,
@@ -38,6 +39,7 @@ import {
   nowIso, genConversationId, genId12, safeId,
   readJson, writeJson, invalidateLineCount, readJsonl, readJsonlPage, readJsonlWindow, appendJsonlAtomic,
 } from '../storage';
+import { removeCodingDirectory } from './local_agents/project-directory';
 import { createLogger } from '../logger';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { t } from '../i18n';
@@ -232,7 +234,8 @@ async function _messageDisplayContext(
   } catch (err) {
     log.warn(`resolve workspace for legacy Codex output cid=${maskId(cid)}: ${(err as Error).message}`);
   }
-  const stamp = JSON.stringify([layout.stateFile, _fileStamp(layout.stateFile), workspaceRoot]);
+  const stamp = JSON.stringify([layout.stateFile, _fileStamp(layout.stateFile),
+    _fileStamp(localCliDirectoryFile(userId, cid)), workspaceRoot]);
   const remembered = _messageDisplayContextMemo.get(memoKey);
   if (remembered && remembered.stamp === stamp) return remembered.context;
   const context = await _computeMessageDisplayContext(userId, cid, layout, workspaceRoot);
@@ -2195,6 +2198,7 @@ async function _purgeDeletedConversationFiles(userId: string, cid: string, remov
     }
   } catch (err) { log.warn(`purge cli sessions user=${userId} cid=${cid}: ${(err as Error).message}`); }
 
+  removeCodingDirectory(userId, cid);
   log.info(`deleted user=${userId} cid=${cid}`);
 }
 

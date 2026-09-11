@@ -527,6 +527,74 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
     }
   });
 
+  it.each(['confirmed', 'late', 'host-closed'])('claude decline is sent once across %s completion', async boundary => {
+    const trace = path.join(tmpDir, 'declined-input.json');
+    const fake = writeNodeExecutable(tmpDir, 'claude-decline-input', `
+const fs = require('node:fs');
+const replies = [];
+const send = msg => process.stdout.write(JSON.stringify(msg) + '\\n');
+let users = 0;
+require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.type === 'user' && ++users === 1) {
+    send({ type: 'system', subtype: 'init', session_id: 'test-input-decline' });
+    send({ type: 'control_request', request_id: 'ask-1', request: {
+      subtype: 'can_use_tool', tool_name: 'AskUserQuestion', tool_use_id: 'question-tool',
+      input: { questions: [{ question: 'Choose scope', options: [{ label: 'Current' }] }] },
+    } });
+  } else if (msg.type === 'user') {
+    send({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'question-tool', is_error: true, content: 'Declined' }] } });
+    send({ type: 'result', subtype: 'success', result: 'CLI continued.' });
+  } else if (msg.type === 'control_response') {
+    replies.push(msg);
+    send({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'unrelated-tool', is_error: true, content: 'Declined' }] } });
+    send({ type: 'assistant', message: { content: [{ type: 'text', text: 'Unrelated receipt delivered.' }] } });
+    fs.writeFileSync(${JSON.stringify(trace)}, JSON.stringify(replies));
+  }
+});
+`);
+    let requestId = '';
+    let ingress: any;
+    const events: any[] = [];
+    userInput._setBroadcastForTest((channel, payload: any) => {
+      if (channel === 'local-agent:user-input') requestId = payload.request_id;
+    });
+    const run = claudeBackend.run({
+      binPath: fake, prompt: 'inspect', cwd: tmpDir, signal: new AbortController().signal,
+      timeoutMs: 15000, onEvent: event => events.push(event), onActiveRunIngress: value => { ingress = value; },
+      requestUserInput: request => userInput.requestUserInput({ uid: 'u-input', cid: 'c-input', runId: 'claude-input', agentId: 'claude', agentName: 'Claude', cli: 'claude', request }),
+    });
+    try {
+      await vi.waitFor(() => expect(requestId).not.toBe(''), { timeout: 5000 });
+      let finished = false;
+      const cancel = userInput.cancelRequest(requestId, 'u-input').then(result => { finished = true; return result; });
+      await vi.waitFor(() => expect(events).toContainEqual({ type: 'text-delta', text: 'Unrelated receipt delivered.' }));
+      expect(finished).toBe(false);
+      if (boundary !== 'confirmed') {
+        // The real child has consumed our reply. Withhold its receipt through
+        // the host's receipt timeout; a second reply must never reach stdin.
+        if (boundary === 'host-closed') userInput.cancelForRun('claude-input');
+        await expect(cancel).resolves.toEqual({ handled: false, unknown: true });
+        await expect(userInput.cancelRequest(requestId, 'u-input')).resolves.toEqual(
+          boundary === 'host-closed' ? { handled: false, closed: true } : { handled: false, unknown: true },
+        );
+        expect(userInput.respond(requestId, 'u-input', { scope: ['Late answer'] })).toEqual({ handled: false });
+      }
+      await ingress.submit({ id: 'test-control', text: 'continue' });
+      if (boundary === 'confirmed') await expect(cancel).resolves.toEqual({ handled: true, cancelled: true });
+      await run;
+      await expect(userInput.cancelRequest(requestId, 'u-input')).resolves.toEqual({ handled: false, closed: true });
+      expect(JSON.parse(fs.readFileSync(trace, 'utf8'))).toEqual([{
+        type: 'control_response', response: { subtype: 'success', request_id: 'ask-1',
+          response: { behavior: 'deny', message: 'The user did not answer this question.' } },
+      }]);
+      expect(events.at(-1)).toMatchObject({ type: 'done', status: 'completed' });
+    } finally {
+      await run;
+      userInput._resetForTest();
+    }
+  });
+
   it('bridges a control_request to the host and returns the user decision', async () => {
     // fake CLI: reads the prompt, emits init + a control_request, then
     // reads ONE more line from stdin (our control_response) and only

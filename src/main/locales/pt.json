@@ -1,4 +1,7 @@
 {
+  "errors.cli_directory_storage": "Não foi possível ler ou salvar a configuração do diretório do projeto. Verifique o acesso ao disco e tente novamente.",
+  "errors.cli_directory_denied": "O acesso ao diretório do projeto foi negado. Restaure o acesso à pasta e tente novamente; sua seleção foi mantida.",
+  "errors.cli_directory_unavailable": "O diretório do projeto está temporariamente indisponível. Verifique a pasta ou unidade e tente novamente; sua seleção foi mantida.",
   "agent.execution_idle_timeout_seconds": "O agente ficou {seconds}s sem progresso, e a execução foi interrompida. Tente novamente ou peça ao agente para continuar.",
   "agent.execution_wall_timeout": "A execução atingiu o limite de 24 horas e foi interrompida. Peça ao agente para continuar o trabalho pendente.",
   "agent.execution_idle_timeout": "O agente ficou 30 minutos sem progresso, e a execução foi interrompida. Tente novamente ou peça ao agente para continuar.",

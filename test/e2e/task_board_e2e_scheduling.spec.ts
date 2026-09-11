@@ -113,7 +113,7 @@ test.describe('task board scheduling (D18 serial chain)', () => {
 
   });
 
-  test('keeps ordinary admission hidden and surfaces a later queued send', async ({ modelOrkas, boardPage }) => {
+  test('keeps ordinary admission hidden despite delayed prior-turn events and surfaces a real queue', async ({ modelOrkas, boardPage }) => {
     const app = modelOrkas;
     const page = boardPage;
     const board = page.locator('#chat-task-board');
@@ -136,19 +136,67 @@ test.describe('task board scheduling (D18 serial chain)', () => {
       probe.observer.observe(board, { attributes: true, attributeFilter: ['style', 'class'] });
       inspect();
       (window as any).__orkasTaskBoardFlashProbe = probe;
+      const taskBoard = (window as any).TaskBoard;
+      const original = taskBoard.onEvent;
+      const captured: Array<{ cid: string; event: any }> = [];
+      taskBoard.onEvent = (cid: string, event: any) => {
+        if (event.task?.status === 'running') captured.push({ cid, event: JSON.parse(JSON.stringify(event)) });
+        return original(cid, event);
+      };
+      (window as any).__orkasTaskBoardEventProbe = { original, captured };
     });
     await input.fill('@ContentWriter start a later long draft.');
     await input.dispatchEvent('input');
     await page.locator('#chat-send-btn').click();
     await expect.poll(() => app.modelRequests.length, { timeout: 15_000 }).toBe(afterFirstBatch + 1);
-    const ordinarySendFlashedBoard = await page.evaluate(async () => {
+    app.setModelMode('success');
+    app.releaseControlledModelChunk();
+    app.finishControlledModelStream();
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/, { timeout: 20_000 });
+    const priorCid = await page.locator('#conversation-list .conv-item').first().getAttribute('data-cid');
+    const priorTaskId = await page.evaluate(() => (
+      (window as any).__orkasTaskBoardEventProbe.captured[0]?.event.task.task_id
+    ));
+    expect(priorTaskId).toBeTruthy();
+    await expect.poll(async () => {
+      const data = await app.invoke<{ tasks: Array<{ task_id: string; status: string }> }>('groupChat.tasks.list', { cid: priorCid });
+      return data.tasks.find((task) => task.task_id === priorTaskId)?.status;
+    }).toBe('done');
+    // Replay the actual running snapshot from a completed turn, as a slow
+    // redundant observer can do after the primary stream or list has settled
+    // it. The next ordinary send must not see a phantom concurrent task.
+    await page.evaluate(() => {
+      const probe = (window as any).__orkasTaskBoardEventProbe;
+      const delayed = probe.captured[0];
+      if (!delayed) throw new Error('missing captured running task event');
+      // Deliver immediately before the new task event, after any reconnect
+      // resync. Otherwise resync could repair the injected defect before the
+      // assertion ever exercises the competing event streams.
+      (window as any).TaskBoard.onEvent = (cid: string, event: any) => {
+        if (cid === delayed.cid && event.type === 'task_created'
+          && event.task?.task_id !== delayed.event.task.task_id) {
+          (window as any).TaskBoard.onEvent = probe.original;
+          probe.original(delayed.cid, delayed.event);
+          probe.replayed = true;
+        }
+        return probe.original(cid, event);
+      };
+    });
+    app.setModelMode('controlled-slow');
+    await input.fill('@ContentWriter start the next independent draft.');
+    await input.press('Enter');
+    await expect.poll(() => app.modelRequests.length, { timeout: 15_000 }).toBe(afterFirstBatch + 2);
+    const admissionProbe = await page.evaluate(async () => {
       await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
       const probe = (window as any).__orkasTaskBoardFlashProbe;
       probe?.observer?.disconnect();
       delete (window as any).__orkasTaskBoardFlashProbe;
-      return probe?.becameVisible === true;
+      const eventProbe = (window as any).__orkasTaskBoardEventProbe;
+      (window as any).TaskBoard.onEvent = eventProbe.original;
+      delete (window as any).__orkasTaskBoardEventProbe;
+      return { flashed: probe?.becameVisible === true, replayed: eventProbe.replayed === true };
     });
-    expect(ordinarySendFlashedBoard).toBe(false);
+    expect(admissionProbe).toEqual({ flashed: false, replayed: true });
     await expect(board).toBeHidden();
 
     await input.fill('@ContentWriter queue a later revision.');
@@ -160,7 +208,7 @@ test.describe('task board scheduling (D18 serial chain)', () => {
     app.setModelMode('success');
     app.releaseControlledModelChunk();
     app.finishControlledModelStream();
-    await expect.poll(() => app.modelRequests.length, { timeout: 20_000 }).toBe(afterFirstBatch + 2);
+    await expect.poll(() => app.modelRequests.length, { timeout: 20_000 }).toBe(afterFirstBatch + 3);
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/, { timeout: 20_000 });
     await expect(board).toBeHidden({ timeout: 10_000 });
   });
@@ -308,6 +356,10 @@ test.describe('task board scheduling (D18 serial chain)', () => {
     await expect.poll(() => app.modelRequests.length).toBe(before + 1);
     await send('@UIDesigner draft the layout.');
     await expect.poll(() => app.modelRequests.length).toBe(before + 2);
+    // Two actual unfinished tasks still surface the execution controls even
+    // without queued work; stale event protection must preserve this rule.
+    await expect(page.locator('#chat-task-board')).toBeVisible();
+    await expect(rows).toHaveCount(2);
     await send('@ContentWriter queued first revision.');
     await send('@UIDesigner queued layout revision.');
     await send('@ContentWriter queued second revision.');
@@ -422,8 +474,19 @@ test.describe('task board scheduling (D18 serial chain)', () => {
     await page.mouse.move(0, 0);
     await page.locator('#chat-task-board').screenshot({ path: testInfo.outputPath('agent-groups-collapsed.png') });
     await secondToggle.focus();
-    await secondToggle.press('Space');
+    // A task event can replace the group between Space down and up. Keep
+    // keyboard ownership and activate once even across that live repaint.
+    await page.keyboard.down('Space');
+    await page.evaluate((conversationId) => { (window as any).TaskBoard.render(conversationId); }, cid);
+    await expect(secondToggle).toBeFocused();
+    await page.keyboard.down('Space'); // Holding the key must not toggle twice.
+    await page.keyboard.up('Space');
     await expect(groups.nth(1).locator('.chat-queue-agent-items')).toBeVisible();
+    await secondToggle.press('Space');
+    await expect(groups.nth(1).locator('.chat-queue-agent-items')).toBeHidden();
+    await secondToggle.press('Enter');
+    await expect(groups.nth(1).locator('.chat-queue-agent-items')).toBeVisible();
+    await expect(groups.nth(0).locator('.chat-queue-agent-items')).toBeVisible();
 
     app.setModelMode('success');
     app.releaseControlledModelChunk();

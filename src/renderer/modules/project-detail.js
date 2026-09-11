@@ -1333,7 +1333,7 @@ async function _loadTodoEditorAgents(task) {
   const options = [{ value: '', label: t('todo.unassigned') }];
   // Keep historical owners visible without re-saving them on title-only edits.
   const ownerValue = task?.owner_agent_id || task?.owner_agent || '';
-  if (ownerValue) options.push({ value: ownerValue, label: task.owner_agent || ownerValue });
+  if (ownerValue) options.push({ value: ownerValue, label: task.owner_agent || ownerValue, avatar: { seed: ownerValue } });
   _todoEditorAgentSelect.setOptions(options, { value: ownerValue });
   _updateProjectTodoEditor();
   try {
@@ -1347,8 +1347,11 @@ async function _loadTodoEditorAgents(task) {
     const owner = _findProjectAgent(task?.owner_agent_id, task?.owner_agent, _todoEditorAgents);
     const value = owner?.agent_id || ownerValue;
     const next = [{ value: '', label: t('todo.unassigned') },
-      ..._todoEditorAgents.map((a) => ({ value: a.agent_id, label: a.name || a.agent_id }))];
-    if (value && !next.some((a) => a.value === value)) next.push({ value, label: task.owner_agent || value });
+      ..._todoEditorAgents.map((a) => ({
+        value: a.agent_id, label: a.name || a.agent_id,
+        avatar: { icon: a.icon, color: a.color, seed: a.agent_id },
+      }))];
+    if (value && !next.some((a) => a.value === value)) next.push({ value, label: task.owner_agent || value, avatar: { seed: value } });
     _todoEditorAgentSelect.setOptions(next, { value });
   } catch {
     if (seq === _todoEditorAgentLoadSeq && generation === _todoEditorGeneration) {

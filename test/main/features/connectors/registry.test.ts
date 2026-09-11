@@ -45,6 +45,38 @@ afterEach(() => {
 });
 
 describe('features/connectors/registry', () => {
+  it.each(['replace', 'remove'] as const)('revokes connector-account task grants and pending dialogs on %s', async (operation) => {
+    const uid = 'approval-account';
+    const users = await import('../../../../src/main/features/users');
+    users.activateUser(uid);
+    const permissions = await import('../../../../src/main/features/permissions');
+    permissions.setLocalExecMode('all_files_approval');
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const confirm = await import('../../../../src/main/features/connectors/action_confirm');
+    const instance = sampleInstance();
+    await registry.upsert(uid, instance);
+    let info: any;
+    confirm._setBroadcastForTest((channel, payload) => { if (channel === 'connectors:action-confirm') info = payload; });
+    const opts = { userId: uid, cid: 'grant-task', connectorId: instance.id, displayName: 'GitHub', toolName: 'publish', risk: 'H' as const, args: {} };
+    const granted = confirm.requestActionConfirm(opts);
+    confirm.respond(info.request_id, true, 'task');
+    await expect(granted).resolves.toBe(true);
+    // Ordinary tool-cache/status refresh is not account replacement.
+    await registry.update(uid, instance.id, (current) => ({ ...current, tools_cached_at: 123 }));
+    await expect(confirm.requestActionConfirm(opts)).resolves.toBe(true);
+    const waiting = confirm.requestActionConfirm({ ...opts, cid: 'waiting-task' });
+    const staleId = info.request_id;
+    if (operation === 'replace') await registry.upsert(uid, instance);
+    else await registry.remove(uid, instance.id);
+    await expect(waiting).resolves.toBe(false);
+    expect(confirm.respond(staleId, true, 'task')).toBe(false);
+    const next = confirm.requestActionConfirm(opts);
+    expect(info.request_id).not.toBe(staleId);
+    confirm.respond(info.request_id, false);
+    await expect(next).resolves.toBe(false);
+    confirm._setBroadcastForTest(null);
+  });
+
   it('writes a tombstone on remove and clears it when reconnecting the same id', async () => {
     const uid = 'uid-delete';
     const file = path.join(tmpDir, uid, 'cloud', 'config', 'connectors.json');

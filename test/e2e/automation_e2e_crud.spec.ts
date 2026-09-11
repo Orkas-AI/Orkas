@@ -517,6 +517,9 @@ test.describe('automation', () => {
   });
 
   test('supports project-bound hourly, weekly, monthly, and one-time schedules with optional ends', async ({ orkas }) => {
+    // This journey validates four schedules and persists project/global changes across several relaunches.
+    // Budget the whole journey separately; individual UI and operation deadlines stay unchanged.
+    test.setTimeout(120_000);
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     const createdProject = await orkas.invoke<{ project: { project_id: string; name: string } }>('projects.create', {
       name: 'E2E Scheduled Project',

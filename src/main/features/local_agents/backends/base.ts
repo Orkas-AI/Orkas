@@ -141,6 +141,8 @@ export interface LocalCliUserInputRequest {
   autoResolutionMs?: number;
   /** Aborted when the CLI clears this specific request or its run ends. */
   signal?: AbortSignal;
+  /** Send a native decline and wait for request-specific protocol evidence. */
+  cancel?: () => Promise<'cancelled' | 'closed' | 'failed' | 'unknown'>;
 }
 
 export interface LocalCliUserInputResponse {

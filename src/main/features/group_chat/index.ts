@@ -8,6 +8,7 @@
  *   - Abort group + drop on conv delete
  */
 
+import { inspectCodingDirectory } from '../local_agents/project-directory';
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
@@ -957,6 +958,7 @@ type CodingProjectDirFormUpdate = {
   projectDir: string;
   oldDir: string;
   oldExplicit: boolean;
+  oldPending?: string;
 };
 
 async function _prepareCodingProjectDirFormUpdate(
@@ -994,11 +996,11 @@ async function _prepareCodingProjectDirFormUpdate(
     return { ok: false, error: t('errors.dir_not_exists') };
   }
   const projectDir = path.resolve(raw.trim());
-  try {
-    const stat = await fsp.stat(projectDir);
-    if (!stat.isDirectory()) return { ok: false, error: t('errors.path_not_dir') };
-  } catch {
-    return { ok: false, error: t('errors.dir_not_exists') };
+  const inspection = inspectCodingDirectory(projectDir);
+  if (inspection.kind !== 'available') {
+    return { ok: false, error: t(inspection.kind === 'denied' ? 'errors.cli_directory_denied'
+      : inspection.kind === 'unavailable' ? 'errors.cli_directory_unavailable'
+      : inspection.code === 'ENOTDIR' ? 'errors.path_not_dir' : 'errors.dir_not_exists') };
   }
 
   try {
@@ -1009,6 +1011,7 @@ async function _prepareCodingProjectDirFormUpdate(
         projectDir,
         oldDir: previous.coding_project_dir || '',
         oldExplicit: previous.coding_project_dir_explicit === true,
+        oldPending: previous.coding_project_dir_pending,
       },
     };
   } catch (err) {
@@ -1081,7 +1084,9 @@ async function _restoreProjectDirAfterFailedFormCommit(
 ): Promise<void> {
   if (!update) return;
   try {
-    await setCodingProjectDir(userId, cid, update.oldDir, { explicit: update.oldExplicit });
+    await setCodingProjectDir(userId, cid, update.oldDir || update.oldPending || '', {
+      explicit: update.oldExplicit, needsConfirmation: !!update.oldPending,
+    });
   } catch (err) {
     log.error('form-submit project directory rollback failed', { error: logErrorSummary(err) });
   }

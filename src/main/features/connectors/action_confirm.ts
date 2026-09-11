@@ -1,8 +1,9 @@
 /** Host-owned confirmation gate for one sensitive connector action.
  *
  * Sensitive actions use the account's operation permission mode. Approval
- * modes wait for one exact-action decision; trusted mode executes without a
- * dialog. Connector availability and prohibited actions are separate gates.
+ * modes accept a one-time or task-scoped connector-account decision; trusted
+ * mode executes without a dialog. Connector availability and prohibited actions
+ * are separate gates.
  */
 
 import * as crypto from 'node:crypto';
@@ -11,6 +12,8 @@ import { createLogger } from '../../logger';
 import { getLocalExecMode } from '../permissions';
 import { getActiveUserId } from '../users';
 import { registerUserSwitchHook } from '../user-switch-hooks';
+import { findCatalogEntry } from './catalog';
+import type { ConnectorInstance } from './types';
 
 const log = createLogger('connector-action-confirm');
 const RESPONSE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -25,22 +28,45 @@ export interface ActionConfirmInfo {
   display_name: string;
   account_label: string;
   tool_name: string;
+  action_name: string;
   risk: 'H' | 'D';
   sensitive_operation: string;
   arguments_preview: string;
   cid: string;
+  can_allow_run: boolean;
 }
 
-interface Pending {
+interface GrantScope {
   uid: string;
+  cid: string;
+  connectorId: string;
+  accountLabel: string;
+  accountKey: string;
+}
+
+interface Pending extends GrantScope {
   heartbeat?: NodeJS.Timeout;
   resolve: (approved: boolean) => void;
   timer: NodeJS.Timeout;
-  cid: string;
   removeAbortListener?: () => void;
 }
 
 const _pending = new Map<string, Pending>();
+// One connection slot owns one account. Registry replacement/removal invalidates
+// these grants, including local CLI accounts with no display label or OAuth id.
+const _taskGrants = new Map<string, GrantScope>();
+
+function grantKey(scope: GrantScope): string {
+  return JSON.stringify([scope.uid, scope.cid, scope.connectorId, scope.accountLabel, scope.accountKey]);
+}
+
+/** Stable host-owned identity, unaffected by token refresh or tool-cache updates.
+ * Registry replacement additionally revokes local CLI grants without account ids.
+ */
+export function connectorAccountKey(instance: ConnectorInstance): string {
+  return JSON.stringify([instance.created_at, instance.composio_grant?.connection_id,
+    instance.oauth_grant?.server_grant_id, instance.connection_parameters]);
+}
 
 let _broadcastOverride: ((channel: string, payload: unknown) => void | boolean) | null = null;
 export function _setBroadcastForTest(fn: ((channel: string, payload: unknown) => void | boolean) | null): void {
@@ -91,6 +117,18 @@ export function previewArguments(argumentsValue: Record<string, unknown>): strin
     : preview;
 }
 
+function actionName(connectorId: string, toolName: string, args: Record<string, unknown>): string {
+  const entry = findCatalogEntry(connectorId);
+  // First-party CLI and direct API adapters dispatch these lanes by `action`.
+  // Other MCP tools may have unrelated action/actions parameters: keep their tool name.
+  if ((entry?.auth_mode === 'local_cli' || entry?.auth_mode === 'local_api')
+    && ['execute_high_impact', 'execute_destructive'].includes(toolName)
+    && typeof args.action === 'string' && args.action.trim()) {
+    return _previewValue(args.action.trim()) as string;
+  }
+  return toolName;
+}
+
 function _settle(requestId: string, approved: boolean): boolean {
   const pending = _pending.get(requestId);
   if (!pending) return false;
@@ -109,6 +147,7 @@ export async function requestActionConfirm(opts: {
   connectorId: string;
   displayName: string;
   accountLabel?: string;
+  accountKey?: string;
   toolName: string;
   risk: 'H' | 'D';
   sensitiveOperation?: string;
@@ -119,6 +158,11 @@ export async function requestActionConfirm(opts: {
   const uid = opts.userId || getActiveUserId();
   if (uid !== getActiveUserId()) return false;
   if (getLocalExecMode() === 'all_files_auto') return true;
+  const scope: GrantScope = {
+    uid, cid: opts.cid || '', connectorId: opts.connectorId, accountLabel: opts.accountLabel || '',
+    accountKey: opts.accountKey || '',
+  };
+  if (scope.cid && _taskGrants.has(grantKey(scope))) return true;
   const requestId = crypto.randomBytes(12).toString('hex');
   const info: ActionConfirmInfo = {
     request_id: requestId,
@@ -126,10 +170,12 @@ export async function requestActionConfirm(opts: {
     display_name: opts.displayName,
     account_label: opts.accountLabel || '',
     tool_name: opts.toolName,
+    action_name: actionName(opts.connectorId, opts.toolName, opts.args),
     risk: opts.risk,
     sensitive_operation: opts.sensitiveOperation || '',
     arguments_preview: previewArguments(opts.args),
-    cid: opts.cid || '',
+    cid: scope.cid,
+    can_allow_run: !!scope.cid,
   };
   return new Promise<boolean>((resolve) => {
     const timer = setTimeout(() => {
@@ -141,7 +187,7 @@ export async function requestActionConfirm(opts: {
       _broadcast('connectors:action-confirm-cancelled', { request_ids: [requestId], cid: info.cid });
     }, RESPONSE_TIMEOUT_MS);
     timer.unref?.();
-    const pending: Pending = { uid, resolve, timer, cid: info.cid };
+    const pending: Pending = { ...scope, resolve, timer };
     if (opts.signal) {
       const abort = () => {
         if (!_settle(requestId, false)) return;
@@ -173,29 +219,54 @@ export async function requestActionConfirm(opts: {
   });
 }
 
-export function respond(requestId: string, approved: boolean): boolean {
-  if (_pending.get(requestId)?.uid !== getActiveUserId()) return false;
-  return _settle(requestId, approved);
+export function respond(requestId: string, approved: boolean, scope: 'once' | 'task' = 'once'): boolean {
+  const pending = _pending.get(requestId);
+  if (!pending || pending.uid !== getActiveUserId()) return false;
+  if (!approved || scope === 'once') return _settle(requestId, approved);
+  if (scope !== 'task' || !pending.cid) return false;
+  const key = grantKey(pending);
+  _taskGrants.set(key, {
+    uid: pending.uid, cid: pending.cid, connectorId: pending.connectorId,
+    accountLabel: pending.accountLabel, accountKey: pending.accountKey,
+  });
+  _settle(requestId, true);
+  // Concurrent callers may already be waiting in the renderer queue. Resolve
+  // them under the same grant and dismiss their stale dialogs as approved.
+  const requestIds: string[] = [];
+  for (const [id, other] of _pending) {
+    if (grantKey(other) !== key) continue;
+    requestIds.push(id);
+    _settle(id, true);
+  }
+  if (requestIds.length) {
+    _broadcast('connectors:action-confirm-cancelled', { request_ids: requestIds, cid: pending.cid, approved: true });
+  }
+  return true;
 }
 
-export function cancelForCid(cid: string): void {
+function cancelMatching(matches: (scope: GrantScope) => boolean, context: { cid?: string } = {}): void {
+  for (const [key, grant] of _taskGrants) {
+    if (matches(grant)) _taskGrants.delete(key);
+  }
   const requestIds: string[] = [];
   for (const [requestId, pending] of _pending) {
-    if (pending.cid !== cid) continue;
+    if (!matches(pending)) continue;
     requestIds.push(requestId);
     _settle(requestId, false);
   }
   if (requestIds.length) {
-    _broadcast('connectors:action-confirm-cancelled', { request_ids: requestIds, cid });
+    _broadcast('connectors:action-confirm-cancelled', { request_ids: requestIds, ...context });
   }
 }
 
+export function cancelForCid(cid: string): void {
+  cancelMatching((scope) => scope.cid === cid, { cid });
+}
+
+export function cancelForConnector(uid: string, connectorId: string): void {
+  cancelMatching((scope) => scope.uid === uid && scope.connectorId === connectorId);
+}
+
 registerUserSwitchHook('connector-action-confirm', (previousUid) => {
-  const requestIds: string[] = [];
-  for (const [requestId, pending] of _pending) {
-    if (pending.uid !== previousUid) continue;
-    requestIds.push(requestId);
-    _settle(requestId, false);
-  }
-  if (requestIds.length) _broadcast('connectors:action-confirm-cancelled', { request_ids: requestIds });
+  cancelMatching((scope) => scope.uid === previousUid);
 });

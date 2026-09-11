@@ -904,8 +904,10 @@ test.describe('real chat pipeline with a local model', () => {
     );
 
     const page = await sendNewChat(modelOrkas, 'E2E create a temporary file, then clean up that same task output.');
-    await expect.poll(() => existsSync(generatedPath), { timeout: 20_000 }).toBe(true);
-    expect(readFileSync(generatedPath, 'utf8')).toBe(generatedContent);
+    // Creation is visible before the asynchronous write completes. Wait for
+    // the exact content, not merely an opened (still empty) output file.
+    await expect.poll(() => existsSync(generatedPath) ? readFileSync(generatedPath, 'utf8') : null,
+      { timeout: 20_000 }).toBe(generatedContent);
 
     await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
       hasText: 'E2E same-task cleanup completed without approval.',

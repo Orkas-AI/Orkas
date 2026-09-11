@@ -35,6 +35,9 @@ interface Pending {
   heartbeat?: NodeJS.Timeout;
   autoResolve?: NodeJS.Timeout;
   detachAbort?: () => void;
+  cancel?: LocalCliUserInputRequest['cancel'];
+  cancelUncertain?: boolean;
+  cancelling?: Promise<{ handled: boolean; cancelled?: boolean; closed?: boolean; cancel_failed?: boolean; unknown?: boolean }>;
 }
 
 const pending = new Map<string, Pending>();
@@ -156,7 +159,7 @@ export async function requestUserInput(opts: {
         });
       }
     };
-    const entry: Pending = { uid: opts.uid, runId: opts.runId, questionIds, resolve };
+    const entry: Pending = { uid: opts.uid, runId: opts.runId, questionIds, resolve, cancel: opts.request.cancel };
     pending.set(requestId, entry);
     const cancel = () => {
       if (settle(requestId, emptyResponse(questionIds))) {
@@ -197,6 +200,7 @@ export function respond(
 ): { handled: boolean; cancelled?: boolean } {
   const entry = pending.get(requestId);
   if (!entry || entry.uid !== uid) return { handled: false };
+  if (entry.cancelling || entry.cancelUncertain) return { handled: false };
   const record = rawAnswers && typeof rawAnswers === 'object' && !Array.isArray(rawAnswers)
     ? rawAnswers as Record<string, unknown>
     : {};
@@ -210,6 +214,34 @@ export function respond(
   }
   settle(requestId, { cancelled, answers });
   return { handled: true, cancelled };
+}
+
+/** Keep ownership until the native question is confirmed closed. A retry after
+ * a lost IPC response may find no pending request; report closed, not success. */
+export async function cancelRequest(requestId: string, uid: string): Promise<{
+  handled: boolean; cancelled?: boolean; closed?: boolean; cancel_failed?: boolean; unknown?: boolean;
+}> {
+  const entry = pending.get(requestId);
+  if (!entry) return { handled: false, closed: true };
+  if (entry.uid !== uid) return { handled: false };
+  if (!entry.cancel) return { handled: false, cancel_failed: true };
+  if (entry.cancelUncertain) return { handled: false, unknown: true };
+  if (entry.cancelling) return entry.cancelling;
+  entry.cancelling = (async () => {
+    let result: 'cancelled' | 'closed' | 'failed' | 'unknown';
+    try { result = await entry.cancel!(); } catch { result = 'unknown'; }
+    if (result === 'failed') return { handled: false, cancel_failed: true };
+    if (result !== 'cancelled' && result !== 'closed') {
+      entry.cancelUncertain = true;
+      return { handled: false, unknown: true };
+    }
+    settle(requestId, emptyResponse(entry.questionIds));
+    return result === 'cancelled'
+      ? { handled: true, cancelled: true }
+      : { handled: false, closed: true };
+  })();
+  try { return await entry.cancelling; }
+  finally { entry.cancelling = undefined; }
 }
 
 export function cancelForRun(runId: string): void {

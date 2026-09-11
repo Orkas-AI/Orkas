@@ -48,21 +48,29 @@ describe('public model catalog', () => {
     ]);
   });
 
-  it('publishes the DeepSeek V4 vision model with its official limits', () => {
+  it('publishes DeepSeek V4.1 Flash and the V4 models with their official limits', () => {
     expect(PUBLIC_PROVIDER_MODELS.deepseek?.map((model) => model.id)).toEqual([
+      'deepseek-flash',
       'deepseek-v4-pro',
       'deepseek-v4-flash-vision-exp',
       'deepseek-v4-flash',
     ]);
-    expect(PUBLIC_PROVIDER_MODELS.deepseek?.[1]).toMatchObject({
+    expect(PUBLIC_PROVIDER_MODELS.deepseek?.[0]).toMatchObject({
+      name: 'DeepSeek V4.1 Flash',
+      contextWindow: 1_048_576,
+      maxTokens: 384_000,
+      supportsVision: true,
+      maxInputImages: 600,
+    });
+    expect(PUBLIC_PROVIDER_MODELS.deepseek?.[2]).toMatchObject({
       name: 'DeepSeek V4 Flash Vision',
       contextWindow: 1_048_576,
       maxTokens: 384_000,
       supportsVision: true,
       maxInputImages: 600,
     });
-    expect(PUBLIC_PROVIDER_MODELS.deepseek?.[0]).toMatchObject({ supportsVision: false });
-    expect(PUBLIC_PROVIDER_MODELS.deepseek?.[2]).toMatchObject({ supportsVision: false });
+    expect(PUBLIC_PROVIDER_MODELS.deepseek?.[1]).toMatchObject({ supportsVision: false });
+    expect(PUBLIC_PROVIDER_MODELS.deepseek?.[3]).toMatchObject({ supportsVision: false });
   });
 
   it('keeps the explicitly curated OpenRouter shortcut set', () => {
@@ -79,6 +87,7 @@ describe('public model catalog', () => {
       'google/gemini-3.7-flash',
       'google/gemini-3.1-pro-preview',
       'google/gemini-3.5-flash-lite',
+      'deepseek/deepseek-v4.1-flash',
       'deepseek/deepseek-v4-pro',
       'deepseek/deepseek-v4-flash-0731',
       'moonshotai/kimi-k3',

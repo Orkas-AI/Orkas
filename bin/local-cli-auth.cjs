@@ -2,11 +2,12 @@
 'use strict';
 
 /** Interactive authorization driver for reviewed official provider CLIs.
- * This file accepts no model/user command arguments: every executable, package and OAuth scope
- * is pinned by Orkas-owned constants below. */
+ * This file accepts no model/user command arguments. Executables and packages are pinned;
+ * incremental scopes come from verified grants and structured provider recovery state. */
 const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const permissions = require('./local-cli-permissions.cjs');
 
 const MANIFESTS = Object.freeze({
   wecom: Object.freeze({
@@ -87,7 +88,7 @@ function fail(error) {
   process.exitCode = 1;
 }
 
-function run(node, npxCli, packageSpec, args, env, allowExisting = false, offline = true) {
+function run(node, npxCli, packageSpec, args, env, allowExisting = false, offline = true, captureStdout = false) {
   return new Promise((resolve, reject) => {
     const child = spawn(node, [npxCli, ...(offline ? ['--offline'] : []), '-y', packageSpec, ...args], {
       cwd: env.ORKAS_LOCAL_CLI_WORK_DIR,
@@ -96,7 +97,16 @@ function run(node, npxCli, packageSpec, args, env, allowExisting = false, offlin
       windowsHide: true,
     });
     let outputForwarded = false;
+    let stdout = '';
+    let overflow = false;
     for (const [source, target] of [[child.stdout, process.stdout], [child.stderr, process.stderr]]) {
+      if (captureStdout && source === child.stdout) {
+        source.on('data', chunk => {
+          if (!overflow && stdout.length + chunk.length <= 64 * 1024) stdout += chunk.toString();
+          else { overflow = true; stdout = ''; }
+        });
+        continue;
+      }
       source.on('data', () => { outputForwarded = true; });
       source.pipe(target, { end: false });
     }
@@ -109,7 +119,7 @@ function run(node, npxCli, packageSpec, args, env, allowExisting = false, offlin
     child.once('close', (code, signal) => {
       process.removeListener('SIGTERM', forward);
       process.removeListener('SIGINT', forward);
-      if (code === 0 || allowExisting) resolve();
+      if (code === 0 || allowExisting) resolve(captureStdout && !overflow ? stdout : undefined);
       else reject(Object.assign(new Error(`official CLI exited with ${code ?? signal ?? 'unknown'}`), {
         outputForwarded,
       }));
@@ -132,7 +142,7 @@ function commandSucceeds(node, npxCli, manifest, args, env, runner = spawnSync) 
   return !result.error && result.status === 0;
 }
 
-function larkAuthorizationReady(node, npxCli, manifest, env, runner = spawnSync) {
+function larkUserScopes(node, npxCli, manifest, env, runner = spawnSync) {
   const verify = manifest.verify(env);
   const result = runner(
     node,
@@ -146,14 +156,40 @@ function larkAuthorizationReady(node, npxCli, manifest, env, runner = spawnSync)
       windowsHide: true,
     },
   );
-  if (result.error) return false;
+  if (result.error || result.status !== 0) return null;
   try {
     const status = JSON.parse(String(result.stdout || ''));
-    return status?.identities?.user?.available === true
-      && status?.identities?.user?.verified === true;
+    const user = status?.identities?.user;
+    const scopes = typeof user?.scope === 'string' ? user.scope.split(/\s+/)
+      : Array.isArray(user?.scope) ? user.scope : [];
+    return user?.available === true && user?.verified === true
+      ? scopes.filter(permissions.isScopeName) : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+function larkAuthorizationReady(node, npxCli, manifest, env, runner = spawnSync, requiredScopes = []) {
+  const scopes = larkUserScopes(node, npxCli, manifest, env, runner);
+  return scopes !== null && requiredScopes.every((scope) => scopes.includes(scope));
+}
+
+function checkLarkPermissions(node, npxCli, manifest, env, runner = spawnSync) {
+  const pending = permissions.readPermissionRequest(env);
+  let scopeReported = false;
+  const scopes = larkUserScopes(node, npxCli, manifest, env, (...args) => {
+    const result = runner(...args);
+    try {
+      const value = JSON.parse(String(result.stdout || '')).identities?.user?.scope;
+      scopeReported = typeof value === 'string'
+        ? value.split(/\s+/).filter(Boolean).every(permissions.isScopeName)
+        : Array.isArray(value) && value.every(permissions.isScopeName);
+    } catch { /* An unavailable scope report is not proof of missing permission. */ }
+    return result;
+  });
+  if (scopes === null || !scopeReported) return false;
+  permissions.recordUserScopeCheck(env, scopes, pending, ['im:message.send_as_user']);
+  return true;
 }
 
 function wecomAuthorizationReady(node, npxCli, manifest, env, runner = spawnSync) {
@@ -169,7 +205,7 @@ function wecomAuthorizationReady(node, npxCli, manifest, env, runner = spawnSync
       windowsHide: true,
     },
   );
-  if (result.error) return false;
+  if (result.error || result.status !== 0) return false;
   try {
     const identity = JSON.parse(String(result.stdout || ''));
     return typeof identity?.extra_identity_context === 'string'
@@ -192,7 +228,7 @@ function dingtalkAuthorizationReady(node, npxCli, manifest, env, runner = spawnS
       windowsHide: true,
     },
   );
-  if (result.error) return false;
+  if (result.error || result.status !== 0) return false;
   try {
     const status = JSON.parse(String(result.stdout || ''));
     return status?.success === true && status?.authenticated === true;
@@ -207,16 +243,65 @@ async function authorizeSingleStep(node, npxCli, manifest, env, authorizationRea
   const ready = dependencies.authorizationReady
     || (() => authorizationReady(node, npxCli, manifest, env));
 
-  if (ready()) return;
+  const pending = permissions.readPermissionRequest(env);
+  if (!pending && ready()) return;
   let loginError = null;
   try {
     await execute(manifest.login(env)[0]);
   } catch (error) {
     loginError = error;
   }
-  if (ready()) return;
+  if (pending && loginError) throw loginError;
+  if (ready()) {
+    // Identity verification cannot attest to resource or business permissions.
+    // Preserve the advisory request and the existing usable connection.
+    if (pending) throw new Error('requested permissions could not be verified');
+    return;
+  }
   if (loginError) throw loginError;
   throw new Error('official CLI authorization did not produce a verified identity');
+}
+
+// DWS login verifies identity only. PAT grants are additive and must acknowledge
+// the requested scopes; a successful old login cannot resolve business denial.
+async function authorizeDingtalk(node, npxCli, manifest, env, dependencies = {}) {
+  const execute = dependencies.execute
+    || ((args, capture = false) => run(node, npxCli, manifest.package, args, env, false, true, capture));
+  const ready = dependencies.authorizationReady
+    || (() => dingtalkAuthorizationReady(node, npxCli, manifest, env));
+  const pending = permissions.readPermissionRequest(env);
+  if (!pending) return authorizeSingleStep(node, npxCli, manifest, env, dingtalkAuthorizationReady, dependencies);
+  const loginNeeded = !ready();
+  if (loginNeeded) await execute(manifest.login(env)[0]);
+  if (!ready()) throw new Error('official CLI authorization did not produce a verified identity');
+  const scopes = pending.pat_scopes || [];
+  // Recheck known PAT scopes after administrator changes; a cached policy denial
+  // must not permanently prevent a user-initiated recovery attempt.
+  if (pending.admin_required && !scopes.length) throw new Error('organization administrator approval is required');
+  if (scopes.length) {
+    const grantArgs = ['pat', 'chmod', ...scopes, '--grant-type', 'permanent', '--yes'];
+    // Table mode lets the official CLI own consent/polling. DWS may return only
+    // {ok:true} after consent; repeat the same additive grant in JSON mode to
+    // obtain granted/already-granted scope evidence, never a business replay.
+    await execute([...grantArgs, '--format', 'table']);
+    const output = await execute([...grantArgs, '--format', 'json'], true);
+    let receipt;
+    try { receipt = JSON.parse(output); } catch { /* no verified grant receipt */ }
+    const data = receipt?.data || receipt?.result;
+    const granted = [...(Array.isArray(data?.grantedScopes) ? data.grantedScopes : []),
+      ...(Array.isArray(data?.alreadyGrantedScopes) ? data.alreadyGrantedScopes : [])];
+    if (receipt?.success === true) permissions.recordPatScopeGrant(env, pending, granted);
+    if (receipt?.success !== true || !scopes.every(scope => granted.includes(scope))) {
+      throw new Error('requested permissions are still unavailable');
+    }
+  }
+  // DWS 1.0.61 declares --scopes but does not read it in auth login. Do not
+  // silently claim an OAuth scope or an unknown resource denial was repaired.
+  if (pending.scopes.length || pending.unresolved_access || !scopes.length) {
+    if (!scopes.length && !loginNeeded) await execute(manifest.login(env)[0]);
+    throw new Error('requested permissions could not be verified');
+  }
+  permissions.clearPermissionRequest(env, pending);
 }
 
 async function authorizeLark(node, npxCli, manifest, env, dependencies = {}) {
@@ -231,13 +316,36 @@ async function authorizeLark(node, npxCli, manifest, env, dependencies = {}) {
       env,
     ));
   const authorizationReady = dependencies.authorizationReady
-    || (() => larkAuthorizationReady(node, npxCli, manifest, env));
-
-  if (authorizationReady()) return;
+    || ((scopes = []) => larkAuthorizationReady(node, npxCli, manifest, env, spawnSync, scopes));
+  const pendingPermissions = permissions.readPermissionRequest(env);
+  const authorizationScopes = dependencies.authorizationScopes
+    || (() => larkUserScopes(node, npxCli, manifest, env));
+  const ready = authorizationReady();
+  if (ready && !pendingPermissions) return;
   const commands = manifest.login(env);
-  if (!profileConfigured()) {
+  if (!ready && !profileConfigured()) {
     await execute(commands[0]);
-    if (authorizationReady()) return;
+    if (!pendingPermissions && authorizationReady()) return;
+  }
+  if (pendingPermissions) {
+    const existingScopes = authorizationScopes();
+    if (ready && !existingScopes) throw new Error('current user permissions could not be verified');
+    const requestedScopes = [...new Set([...(existingScopes || []), ...pendingPermissions.scopes])].sort();
+    // A permission failure requires a real interactive login, including when the
+    // current token is valid or the provider supplied no missing scope list.
+    await execute(pendingPermissions.scopes.length
+      ? ['auth', 'login', '--profile', env.ORKAS_LOCAL_CLI_PROFILE, '--scope', requestedScopes.join(' ')]
+      : [...commands[1], ...(requestedScopes.length ? ['--scope', requestedScopes.join(' ')] : [])]);
+    if (!authorizationReady(requestedScopes)) {
+      throw new Error('requested permissions are still unavailable');
+    }
+    // Verified user scopes cannot establish bot visibility or unknown resource
+    // access. Keep that advisory, just as a read-only scope check does.
+    if (pendingPermissions.unresolved_access || !pendingPermissions.scopes.length) {
+      throw new Error('requested permissions could not be verified');
+    }
+    permissions.clearPermissionRequest(env, pendingPermissions);
+    return;
   }
 
   let loginError = null;
@@ -334,6 +442,10 @@ async function main() {
   }
 
   assertIntegrityMarker(manifest, process.env);
+  if (process.env.ORKAS_LOCAL_CLI_CHECK_PERMISSIONS_ONLY === '1') {
+    if (provider === 'lark') checkLarkPermissions(node, npxCli, manifest, process.env);
+    return;
+  }
   // The host's session-start event owns progress; stdout/stderr carry provider output.
   // The pinned Lark CLI starts discovery on Feishu, reads tenant_brand from the scanned account,
   // and persists the final Feishu/Lark brand in the profile. Orkas therefore does not ask the
@@ -345,10 +457,9 @@ async function main() {
       node, npxCli, manifest, process.env, wecomAuthorizationReady,
     );
   } else if (provider === 'dingtalk') {
-    await authorizeSingleStep(
-      node, npxCli, manifest, process.env, dingtalkAuthorizationReady,
-    );
+    await authorizeDingtalk(node, npxCli, manifest, process.env);
   } else {
+    const pending = permissions.readPermissionRequest(process.env);
     const commands = manifest.login(process.env);
     for (let index = 0; index < commands.length; index++) {
       // Xero profile creation may report that the deterministic profile already exists during
@@ -358,6 +469,7 @@ async function main() {
     }
     const verify = typeof manifest.verify === 'function' ? manifest.verify(process.env) : manifest.verify;
     await run(node, npxCli, manifest.package, verify, process.env);
+    if (pending) permissions.clearPermissionRequest(process.env, pending);
   }
   writeIntegrityMarker(manifest, process.env);
   process.stdout.write(`[Orkas] ${process.env.ORKAS_LOCAL_CLI_MESSAGE_DONE || 'Authorization complete. You can close this terminal.'}\n`);
@@ -367,10 +479,13 @@ module.exports = {
   MANIFESTS,
   assertIntegrityMarker,
   authorizeLark,
+  authorizeDingtalk,
   authorizeSingleStep,
   commandSucceeds,
   dingtalkAuthorizationReady,
   larkAuthorizationReady,
+  larkUserScopes,
+  checkLarkPermissions,
   main,
   run,
   verifyRegistryIntegrity,

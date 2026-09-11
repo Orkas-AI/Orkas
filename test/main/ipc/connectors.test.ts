@@ -20,6 +20,7 @@ afterEach(() => {
   vi.doUnmock('../../../src/main/features/component_enabled');
   vi.doUnmock('../../../src/main/features/connectors/availability');
   vi.doUnmock('../../../src/main/features/connectors/api-key');
+  vi.doUnmock('../../../src/main/features/connectors/local-cli');
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -46,6 +47,72 @@ function baseInstance(transport: any): any {
 }
 
 describe('ipc/connectors renderer DTO', () => {
+  it('accepts one-time and task approval responses and rejects unknown scopes', async () => {
+    // IPC deliberately uses CJS for the gate; share that module instance.
+    const users = require('../../../src/main/features/users') as typeof import('../../../src/main/features/users');
+    users.activateUser('approval-ipc');
+    const permissions = require('../../../src/main/features/permissions') as typeof import('../../../src/main/features/permissions');
+    permissions.setLocalExecMode('all_files_approval');
+    const confirm = require('../../../src/main/features/connectors/action_confirm') as typeof import('../../../src/main/features/connectors/action_confirm');
+    const { invokeHandlers } = await import('../../../src/main/ipc/connectors');
+    let info: any;
+    confirm._setBroadcastForTest((_channel, payload) => { info = payload; });
+    const opts = { cid: 'ipc-task', connectorId: 'feishu', displayName: 'Feishu', toolName: 'send', risk: 'H' as const, args: {} };
+    const once = confirm.requestActionConfirm(opts);
+    const answer = invokeHandlers['connectors.action_confirm_response'];
+    await expect(answer({ request_id: info.request_id, approved: true, scope: 'forever' })).rejects.toThrow('invalid approval scope');
+    await expect(answer({ request_id: info.request_id, approved: true })).resolves.toEqual({ handled: true });
+    await expect(once).resolves.toBe(true);
+    const task = confirm.requestActionConfirm(opts);
+    await expect(answer({ request_id: info.request_id, approved: true, scope: 'task' })).resolves.toEqual({ handled: true });
+    await expect(task).resolves.toBe(true);
+    await expect(confirm.requestActionConfirm({ ...opts, toolName: 'delete', risk: 'D' })).resolves.toBe(true);
+    confirm.cancelForCid(opts.cid);
+    confirm._setBroadcastForTest(null);
+  });
+
+  it('checks permissions on page verification and explicit refresh, while ordinary listing remains passive', async () => {
+    const instance = { ...baseInstance({ kind: 'stdio' }), id: 'feishu', origin: undefined };
+    const entry = { id: 'feishu', auth_mode: 'local_cli' };
+    const check = vi.fn(async () => undefined);
+    vi.doMock('../../../src/main/features/connectors/local-cli', () => ({
+      checkLocalCliPermissions: check, localCliMissingPermissions: () => ['im:message.send_as_user'],
+    }));
+    vi.doMock('../../../src/main/features/connectors', () => ({
+      connectorCatalog: () => [entry], listInstances: () => [instance],
+      verifyUsableConnectors: async () => 0, refreshTools: async () => [],
+      getInstance: () => instance, isValidInstanceId: () => true,
+    }));
+    const { invokeHandlers } = await import('../../../src/main/ipc/connectors');
+    await invokeHandlers['connectors.list']({}, { userId: 'page-user' });
+    expect(check).not.toHaveBeenCalled();
+    const result = await invokeHandlers['connectors.verify']({}, { userId: 'page-user' });
+    expect(check).toHaveBeenCalledWith('page-user', entry);
+    expect(result.instances[0]).toMatchObject({ status: { kind: 'connected' }, reauthorization_required: true,
+      missing_permissions: ['im:message.send_as_user'] });
+    await invokeHandlers['connectors.refresh']({ id: 'feishu' }, { userId: 'page-user' });
+    expect(check).toHaveBeenLastCalledWith('page-user', entry, true);
+  });
+
+  it('projects missing permissions for a usable Feishu card without exposing identity or granted permissions', async () => {
+    const runtime = await import('../../../src/main/features/connectors/local-cli');
+    const { _toClientInstanceForTest } = await import('../../../src/main/ipc/connectors');
+    const directory = runtime.localCliRuntimeDir('u-ipc', 'feishu');
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, '.orkas-user-permissions.json'), JSON.stringify({
+      profile: runtime.localCliProfileName('u-ipc', 'feishu'), scopes: ['im:message.send_as_user'],
+    }));
+    const instance = { ...baseInstance({ kind: 'stdio', command: 'node' }), id: 'feishu', origin: undefined };
+    const dto = _toClientInstanceForTest(instance, true, 'u-ipc');
+    expect(dto.reauthorization_required).toBe(true);
+    expect(dto.status.kind).toBe('connected');
+    expect(dto.missing_permissions).toEqual(['im:message.send_as_user']);
+    expect(JSON.stringify(dto)).not.toContain('orkas-');
+    expect(_toClientInstanceForTest(instance, true, 'another-account').reauthorization_required).toBeUndefined();
+    expect(_toClientInstanceForTest({ ...instance, id: 'lark' }, true, 'u-ipc').reauthorization_required).toBeUndefined();
+    expect(_toClientInstanceForTest({ ...instance, origin: 'custom' }, true, 'u-ipc').reauthorization_required).toBeUndefined();
+  });
+
   it('accepts OAuth start without waiting for the browser callback', async () => {
     const beginOAuthConnect = vi.fn(() => ({ attempt_id: 'attempt-1' }));
     vi.doMock('../../../src/main/features/connectors', () => ({

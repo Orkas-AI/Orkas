@@ -1207,6 +1207,7 @@ if (scenario.endsWith('-lingers') || scenario === 'hang' || scenario === 'bootst
     expect(requestUserInput).toHaveBeenCalledWith({
       id: 'user-input-1',
       signal: expect.any(AbortSignal),
+      cancel: expect.any(Function),
       questions: [{
         id: 'environment',
         header: 'Environment',
@@ -1276,6 +1277,81 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
       expect(userInput.respond(ids[1], 'u-input', { scope: ['Late'] })).toEqual({ handled: false });
       const replies = JSON.parse(fs.readFileSync(trace, 'utf8')).filter((row: any) => !row.method && [94, 95].includes(row.id));
       expect(replies).toEqual(boundary === 'resolved' ? [{ jsonrpc: '2.0', id: 95, result: { answers: { scope: { answers: ['Current'] } } } }] : []);
+      expect(events.at(-1)).toMatchObject({ type: 'done', status: 'completed' });
+    } finally {
+      await run;
+      userInput._resetForTest();
+    }
+  });
+
+  it.each(['confirmed', 'late', 'host-closed'])('codex decline is sent once across %s completion', async boundary => {
+    const executable = path.join(tempDir, 'question-decline');
+    const trace = path.join(tempDir, 'question-decline.json');
+    fs.writeFileSync(executable, `#!/usr/bin/env node
+const fs = require('node:fs');
+const replies = [];
+const send = msg => process.stdout.write(JSON.stringify(msg) + '\\n');
+require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') send({ id: msg.id, result: {} });
+  if (msg.method === 'thread/start') send({ id: msg.id, result: { threadId: 'fresh-thread' } });
+  if (msg.method === 'turn/start') {
+    send({ id: msg.id, result: { turn: { id: 'turn-1' } } });
+    send({ method: 'turn/started', params: { threadId: 'fresh-thread', turn: { id: 'turn-1' } } });
+    send({ id: 94, method: 'item/tool/requestUserInput', params: {
+      threadId: 'fresh-thread', turnId: 'turn-1', itemId: 'question-94',
+      questions: [{ id: 'scope', question: 'Choose scope' }], isBlocking: true,
+    } });
+  }
+  if (msg.id === 94 && msg.result) {
+    replies.push(msg);
+    send({ method: 'serverRequest/resolved', params: { requestId: 94 } });
+    send({ method: 'serverRequest/resolved', params: { threadId: 'other-thread', requestId: 94 } });
+    send({ method: 'serverRequest/resolved', params: { threadId: 'fresh-thread', requestId: 95 } });
+    send({ method: 'item/agentMessage/delta', params: { threadId: 'fresh-thread', turnId: 'turn-1', itemId: 'barrier', delta: 'Unrelated receipts delivered.' } });
+    fs.writeFileSync(${JSON.stringify(trace)}, JSON.stringify(replies));
+  }
+  if (msg.method === 'turn/steer') {
+    send({ method: 'serverRequest/resolved', params: { threadId: 'fresh-thread', requestId: 94 } });
+    send({ id: msg.id, result: { turnId: 'turn-1' } });
+    send({ method: 'turn/completed', params: { threadId: 'fresh-thread', turn: { id: 'turn-1', status: 'completed' } } });
+  }
+});
+`, { mode: 0o755 });
+    let requestId = '';
+    let ingress: any;
+    const events: any[] = [];
+    userInput._setBroadcastForTest((channel, payload: any) => {
+      if (channel === 'local-agent:user-input') requestId = payload.request_id;
+    });
+    const run = codexBackend.run({
+      binPath: executable, prompt: 'inspect', cwd: tempDir, signal: new AbortController().signal,
+      timeoutMs: 15000, onEvent: event => events.push(event), onActiveRunIngress: value => { ingress = value; },
+      requestUserInput: request => userInput.requestUserInput({ uid: 'u-input', cid: 'c-input', runId: 'codex-input', agentId: 'codex', agentName: 'Codex', cli: 'codex', request }),
+    });
+    try {
+      await vi.waitFor(() => expect(requestId).not.toBe(''), { timeout: 5000 });
+      let finished = false;
+      const cancel = userInput.cancelRequest(requestId, 'u-input').then(result => { finished = true; return result; });
+      await vi.waitFor(() => expect(events).toContainEqual(expect.objectContaining({ type: 'text-delta', text: 'Unrelated receipts delivered.' })));
+      expect(finished).toBe(false);
+      if (boundary !== 'confirmed') {
+        // The real child has consumed our reply. Withhold its receipt through
+        // the host's receipt timeout; a second reply must never reach stdin.
+        if (boundary === 'host-closed') userInput.cancelForRun('codex-input');
+        await expect(cancel).resolves.toEqual({ handled: false, unknown: true });
+        await expect(userInput.cancelRequest(requestId, 'u-input')).resolves.toEqual(
+          boundary === 'host-closed' ? { handled: false, closed: true } : { handled: false, unknown: true },
+        );
+        expect(userInput.respond(requestId, 'u-input', { scope: ['Late answer'] })).toEqual({ handled: false });
+      }
+      await ingress.submit({ id: 'test-control', text: 'continue' });
+      if (boundary === 'confirmed') await expect(cancel).resolves.toEqual({ handled: true, cancelled: true });
+      await run;
+      await expect(userInput.cancelRequest(requestId, 'u-input')).resolves.toEqual({ handled: false, closed: true });
+      expect(JSON.parse(fs.readFileSync(trace, 'utf8'))).toEqual([
+        { jsonrpc: '2.0', id: 94, result: { answers: {} } },
+      ]);
       expect(events.at(-1)).toMatchObject({ type: 'done', status: 'completed' });
     } finally {
       await run;

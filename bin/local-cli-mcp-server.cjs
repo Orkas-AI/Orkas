@@ -11,7 +11,9 @@ const { spawn } = require('node:child_process');
 const { killProcessTree } = require('./bridge-skill-runner.cjs');
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
 const larkContract = require('./local-cli-lark.cjs');
+const permissions = require('./local-cli-permissions.cjs');
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const { ListToolsRequestSchema, CallToolRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
@@ -80,7 +82,7 @@ const ACTION_SCHEMA = Object.freeze({
     },
     parameters: {
       type: 'object',
-      description: 'Named parameters from describe_action. Raw CLI flags and local file/output paths are rejected.',
+      description: 'Named parameters from describe_action. Local file inputs require absolute paths in Orkas-approved roots; raw CLI flags and output paths are rejected.',
       additionalProperties: true,
     },
   },
@@ -333,8 +335,8 @@ function xeroInputHasDestructiveStatus(filePath) {
   }
 }
 
-function invocationRisk(baseRisk, parameters, env = process.env) {
-  const validated = validatedParameters(parameters, env);
+function invocationRisk(baseRisk, parameters, env = process.env, inspection) {
+  const validated = validatedParameters(parameters, env, inspection);
   if (env.ORKAS_LOCAL_CLI_PROVIDER === 'xero') {
     let risk = containsDestructiveStatus(validated) ? 'D' : baseRisk;
     for (const [key, value] of Object.entries(validated)) {
@@ -373,7 +375,104 @@ function isWithin(root, candidate) {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
-function validatedParameters(value, env = process.env) {
+// Normalize provider parameter contracts at one boundary. Neither action names
+// nor path-looking literal values determine whether the CLI may read a file.
+function parameterSchema(inspection) {
+  const schema = inspection?.schema || {};
+  if (inspection?.provider === 'wecom') return schema.schemas?.[schema.request?.$ref] || schema.request || {};
+  if (inspection?.provider === 'dingtalk') return { type: 'object', properties: schema.parameters || {} };
+  return schema.inputSchema || {};
+}
+
+function fileContract(property, provider) {
+  const description = typeof property?.description === 'string' ? property.description : '';
+  // Pinned Lark shortcut help is its official introspection format; API methods
+  // and WeCom expose binary markers, while DWS also exposes format/input facts.
+  const localPath = property?.format === 'binary' || property?.format === 'file-path'
+    || property?.['x-wecom-octet-stream'] === true
+    || (provider === 'lark' && (description.includes('cwd-relative local path') || description.startsWith('local file path')))
+    || (provider === 'dingtalk' && description.startsWith('本地文件路径'));
+  const reference = (Array.isArray(property?.input) && property.input.includes('file')) || description.includes('supports @file')
+    || (provider === 'dingtalk' && (property?.format === 'json' || description.includes('@file')));
+  return {
+    localPath, reference,
+    url: localPath && description.includes('URL'),
+    keyPrefixes: localPath ? ['file', 'img'].filter(prefix => description.includes(`${prefix}_xxx`)) : [],
+  };
+}
+
+function localInputs(value, env, inspection) {
+  const inputs = [];
+  const provider = env.ORKAS_LOCAL_CLI_PROVIDER;
+  const root = parameterSchema(inspection);
+  function visit(raw, property, keys) {
+    if (property?.$ref && provider === 'wecom') property = inspection?.schema?.schemas?.[property.$ref] || property;
+    const contract = fileContract(property, provider);
+    if (Array.isArray(raw)) {
+      if (property?.type === 'object') throw new Error('object parameter requires an object');
+      raw.forEach((item, index) => visit(item, { ...property, ...property?.items, type: property?.items?.type }, [...keys, index]));
+      return;
+    }
+    if (property?.type === 'object') {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('object parameter requires an object');
+      if (property.carrier === '--file') {
+        for (const field of property.required || []) {
+          if (!Object.hasOwn(raw, field)) throw new Error(`missing binary file field: ${field}`);
+        }
+        if (Object.keys(raw).some(field => property.properties?.[field]?.format !== 'binary')) {
+          throw new Error('unknown binary file field');
+        }
+      }
+      for (const [field, child] of Object.entries(raw)) visit(child, property.properties?.[field], [...keys, field]);
+      return;
+    }
+    if (contract.localPath) {
+      if (typeof raw === 'string' && ((contract.url && /^https:\/\//i.test(raw))
+        || contract.keyPrefixes.some(prefix => new RegExp(`^${prefix}_[A-Za-z0-9_-]+$`).test(raw)))) return;
+      inputs.push({ keys, value: raw });
+      return;
+    }
+    if (typeof raw === 'string' && contract.reference) {
+      if (raw === '-' || raw === '@-') throw new Error('stdin input is not available through this connector');
+      if (raw.startsWith('@')) inputs.push({ keys, value: raw.slice(1), prefix: '@' });
+      return;
+    }
+    // DWS has legacy @file readers that are absent from some leaf contracts.
+    // Fail closed for their ASCII file-reference syntax; literal mentions stay text.
+    if (typeof raw === 'string' && provider === 'dingtalk' && /^@[A-Za-z0-9./~_-]/.test(raw)) {
+      throw new Error('indirect file input is not declared by this action; use inline content');
+    }
+    // Xero's existing full-JSON input inspection also serves callers that have
+    // no introspection result yet. Do not infer files from arbitrary strings.
+    if ((!inspection || provider === 'xero') && LOCAL_INPUT_PARAMETER_KEYS.test(String(keys.at(-1)))) {
+      if (typeof raw === 'string' && /^https:\/\//i.test(raw)) return;
+      inputs.push({ keys, value: raw });
+    }
+  }
+  for (const [key, raw] of Object.entries(value)) {
+    const property = root.properties?.[key] || root.properties?.[key.replace(/-/g, '_')]
+      || root.properties?.[key.replace(/_/g, '-')];
+    visit(raw, property, [key]);
+  }
+  return inputs;
+}
+
+function approvedInputPath(input, env) {
+  if (typeof input !== 'string') throw new Error('local input parameter must be a path or HTTPS URL');
+  let candidate;
+  let stat;
+  try { candidate = fs.realpathSync(input); stat = fs.statSync(candidate); }
+  catch { throw new Error('local input file does not exist'); }
+  if (!path.isAbsolute(input) || !allowedFileRoots(env).some((root) => isWithin(root, candidate))) {
+    throw new Error('local input path is outside Orkas-approved roots');
+  }
+  if (env.ORKAS_LOCAL_CLI_PROVIDER !== 'xero' && !stat.isFile()) {
+    throw new Error('local input must be a regular file');
+  }
+  return candidate;
+}
+
+function validatedParameters(value, env = process.env, inspection) {
   if (value == null) return {};
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('parameters must be an object');
   const serialized = JSON.stringify(value);
@@ -400,25 +499,73 @@ function validatedParameters(value, env = process.env) {
     if (raw === undefined || typeof raw === 'function' || typeof raw === 'symbol') {
       throw new Error(`invalid parameter value: ${key}`);
     }
-    const pathLikeValue = typeof raw === 'string' && (
-      path.isAbsolute(raw)
-      || path.win32.isAbsolute(raw)
-      || /^file:\/\//i.test(raw)
-      || /^\.\.?[\\/]/.test(raw)
-    );
-    if (LOCAL_INPUT_PARAMETER_KEYS.test(key) || pathLikeValue) {
-      if (typeof raw !== 'string') throw new Error(`local input parameter must be a path or HTTPS URL: ${key}`);
-      if (!/^https:\/\//i.test(raw)) {
-        let candidate = '';
-        try { candidate = fs.realpathSync(raw); } catch { throw new Error(`local input file does not exist: ${key}`); }
-        if (!path.isAbsolute(raw) || !allowedFileRoots(env).some((root) => isWithin(root, candidate))) {
-          throw new Error(`local input path is outside Orkas-approved roots: ${key}`);
-        }
-      }
-    }
     out[key] = raw;
   }
+  for (const input of localInputs(out, env, inspection)) approvedInputPath(input.value, env);
   return out;
+}
+
+async function prepareLocalInputs(parameters, inspection, env, signal) {
+  const inputs = localInputs(parameters, env, inspection);
+  // Xero reads absolute JSON input and owns full-payload destructive-state
+  // inspection. Do not replace that existing contract with a binary upload path.
+  if (!inputs.length || inspection.provider === 'xero') return { parameters, cleanup() {} };
+  // Provider config trees contain credentials. Lark rejects every upload from
+  // that tree, including runtime/work. Stage approved bytes in a private,
+  // per-call OS temporary directory and remove it on every terminal outcome.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-cli-input-'));
+  const cleanup = () => fs.rmSync(directory, { recursive: true, force: true });
+  const prepared = structuredClone(parameters);
+  try {
+    for (const [index, input] of inputs.entries()) {
+      throwIfCancelled(signal);
+      const source = approvedInputPath(input.value, env);
+      const relative = path.join(String(index), path.basename(input.value));
+      const destination = path.join(directory, relative);
+      fs.mkdirSync(path.dirname(destination), { mode: 0o700 });
+      // Bound host staging; stricter media-specific limits belong to the provider.
+      const limit = input.prefix ? 8 * 1024 * 1024 : 5 * 1024 * 1024 * 1024;
+      const reader = await fs.promises.open(source, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW || 0));
+      try {
+        const stat = await reader.stat();
+        if (!stat.isFile() || stat.size > limit) throw new Error('local input is not a regular file within the action size limit');
+        const current = fs.statSync(source);
+        if (approvedInputPath(source, env) !== source || current.dev !== stat.dev || current.ino !== stat.ino) {
+          throw new Error('local input changed while opening');
+        }
+        const writer = await fs.promises.open(destination, 'wx', 0o600);
+        try {
+          const buffer = Buffer.alloc(1024 * 1024);
+          let total = 0;
+          while (true) {
+            throwIfCancelled(signal);
+            const { bytesRead } = await reader.read(buffer, 0, buffer.length, null);
+            if (!bytesRead) break;
+            total += bytesRead;
+            if (total > limit) throw new Error('local input exceeds the action size limit');
+            let offset = 0;
+            while (offset < bytesRead) {
+              const { bytesWritten } = await writer.write(buffer, offset, bytesRead - offset, null);
+              if (!bytesWritten) throw new Error('local input staging failed');
+              offset += bytesWritten;
+            }
+          }
+          const after = await reader.stat();
+          if (after.size !== total || after.size !== stat.size || after.mtimeMs !== stat.mtimeMs) {
+            throw new Error('local input changed while copying');
+          }
+        } finally { await writer.close(); }
+      } finally { await reader.close(); }
+      let target = prepared;
+      for (const key of input.keys.slice(0, -1)) target = target[key];
+      target[input.keys.at(-1)] = `${input.prefix || ''}${relative}`;
+    }
+    return { parameters: prepared, cwd: directory, cleanup };
+  } catch (error) {
+    cleanup();
+    if (error.code === 'E_TOOL_CALL_CANCELLED') throw error;
+    throw new Error('local input could not be prepared; check file access and size');
+  }
 }
 
 function parameterArgs(parameters) {
@@ -443,7 +590,10 @@ function redact(value) {
 }
 
 function throwIfCancelled(signal) {
-  if (signal?.aborted) throw Object.assign(new Error('local CLI call was cancelled'), { code: 'E_TOOL_CALL_CANCELLED' });
+  if (signal?.aborted) {
+    if (signal.reason?.name === 'TimeoutError') throw Object.assign(new Error('local CLI call timed out'), { code: 'ETIMEDOUT' });
+    throw Object.assign(new Error('local CLI call was cancelled'), { code: 'E_TOOL_CALL_CANCELLED' });
+  }
 }
 
 function runOfficialProcess(command, args, options) {
@@ -507,24 +657,33 @@ function runOfficialProcess(command, args, options) {
 
 async function runOfficial(args, options = {}, env = process.env) {
   throwIfCancelled(options.signal);
+  await options.onProgress?.();
   const manifest = configuredManifest(env);
   const runner = options.runner || runOfficialProcess;
   const result = await runner(env.ORKAS_NODE, [
     env.ORKAS_LOCAL_CLI_NPX_CLI, '--offline', '-y', manifest.package, ...args,
   ], {
-    cwd: env.ORKAS_LOCAL_CLI_WORK_DIR,
+    cwd: options.cwd || env.ORKAS_LOCAL_CLI_WORK_DIR,
     env,
     encoding: 'utf8',
-    timeout: options.timeoutMs || 120_000,
+    timeout: options.timeoutMs || 60_000,
     maxBuffer: MAX_OUTPUT_CHARS,
     windowsHide: true,
     signal: options.signal,
   });
   throwIfCancelled(options.signal);
   const stdout = redact(result.stdout);
+  const permissionError = permissions.structuredPermissionFailure(result, manifest.provider);
   if (manifest.provider === 'lark' && !result.error) {
     const structured = larkContract.structuredFailure(result);
-    if (structured) throw structured;
+    if (structured && (structured.code === 'connector_permission_denied' || !permissionError)) {
+      permissions.rememberPermissionRequest(structured, env);
+      throw structured;
+    }
+  }
+  if (permissionError) {
+    permissions.rememberPermissionRequest(permissionError, env);
+    throw permissionError;
   }
   if (result.error || result.status !== 0) {
     const rawFailure = [result.error?.message, result.stderr, result.stdout].filter(Boolean).join('\n');
@@ -615,7 +774,11 @@ async function inspectCapabilities(pathValue, options = {}, env = process.env) {
 
 function invocationFor(action, parameters, risk, env = process.env, inspection) {
   const validated = validateAction(action, env);
-  const params = validatedParameters(parameters, env);
+  const params = validatedParameters(parameters, env, inspection);
+  return providerInvocation(validated, params, risk, env, inspection);
+}
+
+function providerInvocation(validated, params, risk, env, inspection) {
   const args = validated.manifest.provider === 'lark' && inspection
     ? [...inspection.cli_path.split(' '), ...larkContract.parameterArgs(params, inspection.schema)]
     : validated.manifest.provider === 'wecom'
@@ -636,7 +799,7 @@ function invocationFor(action, parameters, risk, env = process.env, inspection) 
 async function executeAction(expectedRisk, args, options = {}, env = process.env) {
   const inspection = await inspectAction(args.action, options, env);
   let parameters = args.parameters;
-  const effectiveRisk = invocationRisk(inspection.risk, parameters, env);
+  const effectiveRisk = invocationRisk(inspection.risk, parameters, env, inspection);
   if (effectiveRisk !== expectedRisk) {
     throw new Error(`action risk mismatch: ${inspection.action} is ${effectiveRisk}, use ${
       effectiveRisk === 'R' ? 'execute_read'
@@ -646,15 +809,42 @@ async function executeAction(expectedRisk, args, options = {}, env = process.env
     }`);
   }
   if (inspection.provider === 'lark' && inspection.schema._meta.source === 'cli-help') {
-    parameters = larkContract.shortcutParameters(validatedParameters(parameters, env), inspection.schema,
+    parameters = larkContract.shortcutParameters(validatedParameters(parameters, env, inspection), inspection.schema,
       (file) => validatedParameters({ file }, env));
   }
-  const invocation = invocationFor(inspection.action, parameters, effectiveRisk, env, inspection);
-  return {
-    action: inspection.action,
-    risk: effectiveRisk,
-    result: await runOfficial(invocation, options, env),
-  };
+  parameters = validatedParameters(parameters, env, inspection);
+  const inputs = localInputs(parameters, env, inspection);
+  const properties = parameterSchema(inspection).properties || {};
+  const transfer = inputs.some(input => !input.prefix)
+    || Object.entries(parameters).some(([key, value]) => {
+      const property = properties[key] || properties[key.replace(/-/g, '_')];
+      return fileContract(property, inspection.provider).url && typeof value === 'string' && /^https:\/\//i.test(value);
+    })
+    || actionTokens(inspection.action).at(-1).split(/[-_+]/).some(token => ['upload', 'download', 'import', 'export'].includes(token));
+  const timeoutMs = transfer ? 10 * 60_000 : 60_000;
+  const deadline = new AbortController();
+  const signal = options.signal ? AbortSignal.any([options.signal, deadline.signal]) : deadline.signal;
+  const timer = setTimeout(() => deadline.abort(new DOMException('Execution deadline exceeded', 'TimeoutError')), timeoutMs);
+  timer.unref?.();
+  // MCP progress is a liveness heartbeat during a bounded transfer, not a
+  // completion percentage. Ordinary commands retain their shorter deadline.
+  const heartbeat = transfer && options.onProgress ? setInterval(() => { void options.onProgress(); }, 15_000) : null;
+  heartbeat?.unref?.();
+  let prepared;
+  try {
+    prepared = await prepareLocalInputs(parameters, inspection, env, signal);
+    throwIfCancelled(signal);
+    const invocation = providerInvocation(validateAction(inspection.action, env), prepared.parameters, effectiveRisk, env, inspection);
+    return {
+      action: inspection.action,
+      risk: effectiveRisk,
+      result: await runOfficial(invocation, { ...options, signal, timeoutMs, ...(prepared.cwd ? { cwd: prepared.cwd } : {}) }, env),
+    };
+  } finally {
+    clearTimeout(timer);
+    clearInterval(heartbeat);
+    prepared?.cleanup();
+  }
 }
 
 async function callTool(name, args = {}, options = {}, env = process.env) {
@@ -672,7 +862,19 @@ async function callTool(name, args = {}, options = {}, env = process.env) {
       guidance: 'Call list_capabilities again with a domain or subgroup path, then call describe_action with an exact leaf action.',
     };
   }
-  if (name === 'describe_action') return inspectAction(args.action, options, env);
+  if (name === 'describe_action') {
+    const inspection = await inspectAction(args.action, options, env);
+    if (inspection.provider === 'lark') {
+      for (const property of Object.values(inspection.schema.inputSchema.properties)) {
+        if (fileContract(property, 'lark').localPath && typeof property.description === 'string') {
+          property.description = property.description
+            .replace('cwd-relative local path', 'absolute local path in Orkas-approved roots')
+            .replace(' (absolute paths and .. are rejected)', '');
+        }
+      }
+    }
+    return inspection;
+  }
   if (name === 'execute_read') return executeAction('R', args, options, env);
   if (name === 'execute_write') return executeAction('W', args, options, env);
   if (name === 'execute_high_impact') return executeAction('H', args, options, env);
@@ -708,7 +910,12 @@ async function main() {
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     try {
       const signal = AbortSignal.any([lifetime.signal, extra.signal]);
-      const result = await runInOrder(() => callTool(request.params.name, request.params.arguments || {}, { signal }));
+      let progress = 0;
+      const progressToken = request.params._meta?.progressToken;
+      const onProgress = progressToken == null ? undefined : () => extra.sendNotification({
+        method: 'notifications/progress', params: { progressToken, progress: ++progress },
+      }).catch(() => {});
+      const result = await runInOrder(() => callTool(request.params.name, request.params.arguments || {}, { signal, onProgress }));
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     } catch (error) {
       return {

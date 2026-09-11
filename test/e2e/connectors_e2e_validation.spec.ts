@@ -255,7 +255,10 @@ test.describe('connectors', () => {
     await expect(custom).toHaveCount(0);
   });
 
-  test('connects to a real local MCP server, approves once, changes operation trust, toggles it, and disconnects', async ({ modelOrkas }, testInfo) => {
+  test('connects to a real local MCP server, approves a task, changes operation trust, toggles it, and disconnects', async ({ modelOrkas }, testInfo) => {
+    // This journey includes multiple model/tool rounds, permission changes and disconnect.
+    // Budget the whole journey separately; individual UI and operation deadlines stay unchanged.
+    test.setTimeout(120_000);
     if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
     const page = modelOrkas.page;
     expect(await modelOrkas.invoke('permissions.setLocalExecMode', { mode: 'all_files_approval' }))
@@ -349,20 +352,45 @@ rl.on('line', (line) => {
     await startConnectorChat();
 
     modelOrkas.setConnectorToolScenario(instance.id);
+    await page.evaluate(() => (window as any).setLang('zh'));
     await page.locator('#new-chat-input').type('Call the deterministic echo connector.');
     await page.locator('#new-chat-send-btn').click();
     // Custom tool claims do not grant read-only trust. Complete the account's
     // normal approval flow and prove that the local peer sees no early call.
-    const actionConfirmation = page.getByRole('dialog', { name: 'Allow this sensitive action?' });
+    const actionConfirmation = page.locator('.bash-permission-dialog');
     await expect(actionConfirmation).toBeVisible();
-    await expect(actionConfirmation).toContainText('e2e_echo');
-    await expect(actionConfirmation).toContainText('roundtrip');
+    await expect(actionConfirmation.locator('.bash-permission-message')).toHaveText('连接器: E2E Local MCP 操作: e2e_echo 查看详情', { useInnerText: true });
+    const details = actionConfirmation.locator('.bash-permission-details');
+    await expect(details.locator('pre')).toBeHidden();
+    await actionConfirmation.screenshot({ path: testInfo.outputPath('connector-approval-collapsed.png') });
+    const viewport = page.viewportSize();
+    await page.setViewportSize({ width: 560, height: 760 });
+    expect(await actionConfirmation.evaluate((dialog) => {
+      const bounds = dialog.getBoundingClientRect();
+      return [...dialog.querySelectorAll('.bash-permission-actions button')].every((button) => {
+        const rect = button.getBoundingClientRect();
+        return rect.left >= bounds.left && rect.right <= bounds.right;
+      });
+    })).toBe(true);
+    await actionConfirmation.screenshot({ path: testInfo.outputPath('connector-approval-narrow.png') });
+    if (viewport) await page.setViewportSize(viewport);
+    await details.locator('summary').click();
+    await expect(details.locator('pre')).toBeVisible();
+    expect(JSON.parse(await details.locator('pre').innerText())).toEqual({ text: 'roundtrip' });
+    const expandedText = await details.locator('pre').textContent();
+    await details.locator('summary').click();
+    await expect(details.locator('pre')).toBeHidden();
+    await details.locator('summary').click();
+    await expect(details.locator('pre')).toBeVisible();
+    expect(await details.locator('pre').textContent()).toBe(expandedText);
+    await actionConfirmation.screenshot({ path: testInfo.outputPath('connector-approval-expanded.png') });
+    // Inspecting the details never approves or sends the operation.
     expect(JSON.parse(readFileSync(callStatePath, 'utf8'))).toEqual([]);
-    await expect(actionConfirmation.getByRole('button', { name: "Don't run", exact: true })).toBeVisible();
-    // Like other external mutations, this grant covers one exact operation.
-    await expect(actionConfirmation.locator('[data-id="allow_run"]')).toHaveCount(0);
-    await actionConfirmation.getByRole('button', { name: 'Allow once', exact: true }).click();
+    await expect(actionConfirmation.locator('[data-act="cancel"]')).toBeVisible();
+    await expect(actionConfirmation.locator('[data-id="allow_run"]')).toBeVisible();
+    await actionConfirmation.locator('[data-id="allow_run"]').click();
     await expect(actionConfirmation).toHaveCount(0);
+    await page.evaluate(() => (window as any).setLang('en'));
     await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
       hasText: 'E2E connector tool round trip completed.',
     })).toBeVisible({ timeout: 20_000 });
@@ -372,8 +400,8 @@ rl.on('line', (line) => {
       name: 'e2e_echo',
       arguments: { text: 'roundtrip' },
     }]);
-    // Allow once leaves the account in approval mode. A later action offers the
-    // same local permission menu and persists Trusted only on approval.
+    // Task approval leaves global permissions unchanged and expires at task
+    // completion. A new task must ask again before switching to Trusted.
     expect(await modelOrkas.invoke('permissions.getLocalExec')).toMatchObject({ mode: 'all_files_approval' });
     await startConnectorChat();
     modelOrkas.setConnectorToolScenario(instance.id);

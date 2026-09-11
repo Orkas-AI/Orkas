@@ -69,7 +69,7 @@ import {
   replaceAgentEntry,
 } from '../memory';
 import * as connectors from '../connectors';
-import { requestActionConfirm } from '../connectors/action_confirm';
+import { requestActionConfirm, connectorAccountKey } from '../connectors/action_confirm';
 import { connectorActionRisk, isConnectorActionBlocked } from '../connectors/action_policy';
 import {
   localCliCapabilities,
@@ -437,6 +437,7 @@ function _buildMethods(
             cid: opts.cid,
             connectorId,
             displayName: target.instance.display_name,
+            accountKey: connectorAccountKey(target.instance),
             accountLabel: target.instance.composio_grant?.account_label
               || target.instance.oauth_grant?.account_label,
             toolName,

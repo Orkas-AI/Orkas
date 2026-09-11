@@ -49,10 +49,64 @@ function makeElement(tag: string): any {
 }
 
 describe('connector setup assistance', () => {
+  it.each(['feishu', 'dingtalk', 'wecom'])('shows %s missing permissions alongside both Use and Reauthorize', id => {
+    const ctx = loadConnectorsRenderer();
+    ctx.t = (key: string, args: any = {}) => `${key} ${args.permissions || ''}`.trim();
+    const entry = { id, display_name: 'Lark', auth_mode: 'local_cli' };
+    const card = ctx._renderCatalogCard(entry, { id, status: { kind: 'connected' },
+      reauthorization_required: true, missing_permissions: id === 'wecom' ? [] : [id === 'feishu' ? 'im:message.send_as_user' : 'chat.message:send'] });
+    expect(card.innerHTML).toContain('data-act="use-connector"');
+    expect(card.innerHTML).toContain('connectors.action.authorize_permissions');
+    expect(card.querySelector('[data-role="permission-notice"]').textContent)
+      .toBe(id === 'wecom' ? 'connectors.permissions.limited' : 'connectors.permissions.missing connectors.permissions.send_as_user');
+    const ordinary = ctx._renderCatalogCard(entry, { id, status: { kind: 'connected' } });
+    expect(ordinary.innerHTML).not.toContain('permission-notice');
+  });
+
+  it('names DingTalk message permission and preserves unknown identifiers as text', () => {
+    const ctx = loadConnectorsRenderer();
+    ctx.t = (key: string, args: any = {}) => `${key} ${args.permissions || ''}`.trim();
+    const card = ctx._renderCatalogCard({ id: 'dingtalk', display_name: 'DingTalk', auth_mode: 'local_cli' },
+      { id: 'dingtalk', status: { kind: 'connected' }, reauthorization_required: true,
+        missing_permissions: ['chat.message:send', 'mail:send', 'calendar.event:get'] });
+    expect(card.querySelector('[data-role="permission-notice"]').textContent)
+      .toBe('connectors.permissions.missing connectors.permissions.send_as_user, connectors.permissions.send_mail, calendar.event:get');
+    expect(card.innerHTML).toContain('data-act="use-connector"');
+    expect(card.innerHTML).toContain('connectors.action.authorize_permissions');
+  });
+
   const complex = {
     id: 'seller-app', display_name: 'Seller', auth_mode: 'local_api',
     connection_setup: { requirement: 'provider_application', fields: [] },
   };
+
+  it.each(['feishu', 'dingtalk', 'wecom'].flatMap(id => [false, true].map(required => ({ id, required }))))(
+    'keeps $id usable and opens reauthorization only when required: $required', async ({ id, required }) => {
+    const ctx = loadConnectorsRenderer();
+    const entry = { id, display_name: id, auth_mode: 'local_cli' };
+    const instance = { id: entry.id, status: { kind: 'connected' }, reauthorization_required: required };
+    ctx.__setCatalog([entry]);
+    ctx.__setInstances([instance]);
+    ctx.loadConnectors = vi.fn(async () => {});
+    ctx._runConnect = vi.fn(async () => {});
+    ctx.window.focusConnectorById = vi.fn(async () => true);
+    const html = ctx._renderCatalogCard(entry, instance).innerHTML;
+    expect(html).toContain('data-act="use-connector"');
+    expect(html.includes('connectors.action.authorize_permissions')).toBe(required);
+    expect(await ctx.window.openConnectorSetupById(entry.id)).toBe(true);
+    expect(ctx._runConnect).toHaveBeenCalledTimes(required ? 1 : 0);
+    expect(ctx.window.focusConnectorById).toHaveBeenCalledTimes(required ? 0 : 1);
+  });
+
+  it.each(['error', 'degraded'])('offers reauthorization from a %s CLI connection', kind => {
+    const ctx = loadConnectorsRenderer();
+    const entry = { id: 'dingtalk', display_name: 'DingTalk', auth_mode: 'local_cli' };
+    const html = ctx._renderCatalogCard(entry, {
+      id: entry.id, status: { kind }, reauthorization_required: true,
+    }).innerHTML;
+    expect(html).toContain('data-act="connect"');
+    expect(html).toContain('connectors.action.authorize_permissions');
+  });
 
   it('offers assistance inside extra-setup panels while catalog cards and unavailable entries keep their normal actions', () => {
     const ctx = loadConnectorsRenderer();
@@ -674,11 +728,15 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
         }
       }
       for (const operation of ['external_or_financial_change', 'destructive', 'financial_record_change', 'external_or_workflow_change', 'future_unknown_operation']) {
-        const message = ctx._connectorActionMessage({ connector_id: 'feishu', display_name: '飞书', sensitive_operation: operation, tool_name: 'send_message', arguments_preview: '{"text":"用户内容"}' });
+        const info = { connector_id: 'feishu', display_name: '飞书', sensitive_operation: operation, tool_name: 'send_message', arguments_preview: '{"text":"用户内容"}' };
+        const message = ctx._connectorActionMessage(info);
+        const details = ctx._connectorActionDetails(info);
         expect(message).not.toContain('connectors.');
         expect(message).not.toContain('future_unknown_operation');
         expect(message).toContain(expected[lang][3]);
-        expect(message).toContain('{"text":"用户内容"}');
+        expect(details).not.toContain('connectors.');
+        expect(details).not.toContain('future_unknown_operation');
+        expect(details).toContain('{"text":"用户内容"}');
       }
       for (const [error, key] of [
         [{ code: 'seller_shop_mismatch', error: 'private upstream detail' }, 'connectors.seller.shop_mismatch'],
@@ -867,10 +925,10 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     });
   });
 
-  it('preserves destructive connector, account and final arguments in the shared permission message', () => {
+  it('keeps a destructive operation identifiable while details contain only its parameters', () => {
     const ctx = loadConnectorsRenderer();
 
-    const message = ctx._connectorActionMessage({
+    const info = {
       request_id: 'action-request',
       cid: 'c1',
       connector_id: 'shop',
@@ -880,13 +938,12 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
       risk: 'D',
       sensitive_operation: 'delete',
       arguments_preview: '{"order_id":"private-order-1"}',
-    });
+    };
+    const message = ctx._connectorActionMessage(info);
+    const details = ctx._connectorActionDetails(info);
 
-    expect(message).toContain('connectors.action_confirm.destructive_message');
-    expect(message).toContain('connectors.action_confirm.destructive_note');
-    for (const detail of ['Shop', 'Store A', 'SHOP_DELETE_ORDER', 'private-order-1']) {
-      expect(message).toContain(detail);
-    }
+    expect(message).toBe('connectors.action_confirm.connector: Shop\nconnectors.action_confirm.action: SHOP_DELETE_ORDER');
+    expect(details).toBe('{"order_id":"private-order-1"}');
   });
 
   it('closes a main-cancelled Agent install dialog without a stale response or funnel row', async () => {

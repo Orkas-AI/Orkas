@@ -13,6 +13,7 @@ const _bashPermLog = createLogger('bash-permission');
 const _bashPermQueue = [];
 let _bashPermDialogOpen = false;
 const _bashPermCancelled = new Set();
+const _bashPermTaskApproved = new Set();
 const _bashPermDialogClosers = new Map();
 
 const _BASH_PERMISSION_MODES = ['workspace_approval', 'all_files_approval', 'all_files_auto'];
@@ -59,17 +60,17 @@ function _bashPermissionReceivedAt(info, fallback = Date.now()) {
 }
 
 function _bashTrackCancelledPermission(info, currentMode, errorCode = 'request_cancelled') {
+  const approved = _bashPermTaskApproved.delete(info.request_id);
   _bashTrackPermissionResult(info, {
-    result: 'cancelled',
-    decision: 'none',
-    effective_decision: 'deny',
+    result: approved ? 'success' : 'cancelled',
+    decision: approved ? 'allow_run' : 'none',
+    effective_decision: approved ? 'allow_run' : 'deny',
     ...(currentMode ? { mode: currentMode } : {}),
     mode_changed: false,
     categories: _bashPermissionCategories(info),
     ...(_bashPermissionIrreversible(info) ? { irreversible: _bashPermissionIrreversible(info) } : {}),
     duration_ms: Math.max(0, Date.now() - _bashPermissionReceivedAt(info)),
-    error_type: 'state',
-    error_code: errorCode,
+    ...(approved ? {} : { error_type: 'state', error_code: errorCode }),
   });
 }
 
@@ -247,6 +248,8 @@ async function _setBashPermissionMode(mode) {
 function _showBashPermissionModeDialog({
   title,
   message,
+  details,
+  detailsLabel,
   currentMode,
   requestId,
   onPresented,
@@ -265,6 +268,9 @@ function _showBashPermissionModeDialog({
     overlay.className = 'modal-overlay ui-dialog-overlay open';
     const titleHtml = title ? `<div class="modal-title ui-dialog-title">${_bashEscapeHtml(title)}</div>` : '';
     const msgHtml = _bashEscapeHtml(message).replace(/\n/g, '<br />');
+    const detailsChevronHtml = details && typeof window.uiIconHtml === 'function'
+      ? window.uiIconHtml('chevron-down', 'sidebar-section-chevron') : '';
+    const detailsHtml = details ? `<details class="bash-permission-details"><summary>${detailsChevronHtml}${_bashEscapeHtml(detailsLabel)}</summary><pre>${_bashEscapeHtml(details)}</pre></details>` : '';
     let selectedModeValue = safeCurrentMode;
     const selectedItem = () => modes.find((item) => item.mode === selectedModeValue) || modes.find((item) => item.mode === safeCurrentMode) || modes[0];
     const modeHtml = modes.map((item) => `
@@ -294,7 +300,7 @@ function _showBashPermissionModeDialog({
     overlay.innerHTML = `
       <div class="modal modal-standard ui-dialog bash-permission-dialog" role="dialog" aria-modal="true" aria-label="${_bashEscapeHtml(title)}">
         ${titleHtml}
-        <div class="modal-body ui-dialog-message bash-permission-message">${msgHtml}</div>
+        <div class="modal-body ui-dialog-message bash-permission-message">${msgHtml}${detailsHtml}</div>
         <div class="bash-permission-footer">
           <div class="modal-actions bash-permission-actions">
             ${modeControlHtml}
@@ -468,10 +474,8 @@ async function _showBashPermissionDialog(info) {
   let presented = false;
   const isSensitiveApproval = isConnector || (Array.isArray(info.reasons)
     && info.reasons.some((reason) => _BASH_PERMISSION_RISK_CATEGORIES.includes(reason)));
-  // Connector approvals bind the exact account, operation and arguments, like
-  // other external mutations. A task grant must not widen that approval.
-  const canAllowRun = !isConnector && info.unresolved_paths !== true
-    && (!isSensitiveApproval || info.can_allow_run === true);
+  const canAllowRun = isConnector ? info.can_allow_run === true
+    : info.unresolved_paths !== true && (!isSensitiveApproval || info.can_allow_run === true);
   // An earlier queued permission can switch the account to Trusted while this
   // connector waits. Its host gate already checked availability/prohibitions.
   let result;
@@ -482,6 +486,10 @@ async function _showBashPermissionDialog(info) {
       : await _showBashPermissionModeDialog({
         title: t(isAction ? 'bash.permission.action_title' : 'bash.permission.title'),
         message,
+        ...(isConnector ? {
+          details: _connectorActionDetails(info),
+          detailsLabel: t('connectors.action_confirm.details'),
+        } : {}),
         currentMode,
         requestId,
         allowRun: canAllowRun,
@@ -553,7 +561,7 @@ async function _showBashPermissionDialog(info) {
     const response = await window.orkas.invoke(
       isConnector ? 'connectors.action_confirm_response' : 'bash.permission_response',
       isConnector
-        ? { request_id: info.request_id, approved: decision !== 'deny' }
+        ? { request_id: info.request_id, approved: decision !== 'deny', ...(decision === 'allow_run' ? { scope: 'task' } : {}) }
         : { request_id: info.request_id, decision },
     );
     const failed = !response || response.ok === false;
@@ -716,6 +724,7 @@ function _cancelBashPermissionRequests(payload, kind) {
     : [];
   const cancelled = new Set(ids);
   for (const id of ids) {
+    if (kind === 'connector' && payload.approved === true) _bashPermTaskApproved.add(id);
     _bashPermCancelled.add(id);
     const close = _bashPermDialogClosers.get(id);
     if (close) close();

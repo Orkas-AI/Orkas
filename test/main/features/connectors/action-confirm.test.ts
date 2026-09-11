@@ -15,6 +15,133 @@ afterEach(() => {
 
 
 describe('connectors/action_confirm', () => {
+  it.each([
+    ['feishu', 'execute_high_impact', { action: 'im.+messages-send' }, 'im.+messages-send'],
+    ['dingtalk', 'execute_high_impact', { action: 'chat send' }, 'chat send'],
+    ['xero', 'execute_destructive', { action: 'invoices.delete' }, 'invoices.delete'],
+    ['shopify-admin', 'execute_high_impact', { action: 'orders.cancel' }, 'orders.cancel'],
+    ['gmail', 'GMAIL_SEND_EMAIL', { action: 'unrelated parameter' }, 'GMAIL_SEND_EMAIL'],
+    ['custom-example', 'execute_high_impact', { action: 'unrelated parameter' }, 'execute_high_impact'],
+    ['unknown-provider', 'execute_high_impact', { action: 'unrelated parameter' }, 'execute_high_impact'],
+    ['feishu', 'describe_action', { action: 'im.+messages-send' }, 'describe_action'],
+    ['feishu', 'execute_high_impact', {}, 'execute_high_impact'],
+    ['feishu', 'execute_high_impact', { action: null }, 'execute_high_impact'],
+    ['feishu', 'execute_high_impact', { action: ['im.+messages-send'] }, 'execute_high_impact'],
+    ['feishu', 'execute_high_impact', { actions: ['im.+messages-send'] }, 'execute_high_impact'],
+    ['feishu', 'execute_high_impact', { action: { name: 'im.+messages-send' } }, 'execute_high_impact'],
+    ['feishu', 'execute_high_impact', { action: ' ' }, 'execute_high_impact'],
+  ])('shows the actual operation identifier for %s / %s without interpreting arbitrary parameters', async (connectorId, toolName, args, expected) => {
+    const confirm = await import('../../../../src/main/features/connectors/action_confirm');
+    let info: any;
+    confirm._setBroadcastForTest((_channel, payload) => { info = payload; });
+    const pending = confirm.requestActionConfirm({
+      connectorId, toolName, args, displayName: connectorId, risk: 'H',
+    });
+    expect(info.action_name).toBe(expected);
+    expect(info.tool_name).toBe(toolName);
+    confirm.respond(info.request_id, false);
+    await expect(pending).resolves.toBe(false);
+  });
+
+  it('preserves the operation when large parameters truncate the details, without mutating execution arguments', async () => {
+    const confirm = await import('../../../../src/main/features/connectors/action_confirm');
+    const args = {
+      parameters: { user_id: 'recipient-1', attachments: [{ api_key: 'private-key', name: 'report' }] },
+      ...Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`field_${i}`, 'x'.repeat(700)])),
+      action: 'im.+messages-send',
+    };
+    const original = JSON.stringify(args);
+    let info: any;
+    confirm._setBroadcastForTest((_channel, payload) => { info = payload; });
+    const pending = confirm.requestActionConfirm({
+      connectorId: 'feishu', displayName: 'Feishu', toolName: 'execute_high_impact', risk: 'H', args,
+    });
+    try {
+      expect(info.action_name).toBe('im.+messages-send');
+      expect(info.arguments_preview).not.toContain('im.+messages-send');
+      expect(info.arguments_preview).toContain('recipient-1');
+      expect(info.arguments_preview).toContain('[redacted]');
+      expect(info.arguments_preview).not.toContain('private-key');
+      expect(info.arguments_preview.length).toBeLessThanOrEqual(8_002);
+      expect(info.arguments_preview.endsWith('…')).toBe(true);
+      expect(JSON.stringify(args)).toBe(original);
+    } finally {
+      confirm.respond(info.request_id, false);
+      await expect(pending).resolves.toBe(false);
+    }
+  });
+
+  it('grants all actions for one connector account in one task, including concurrent requests', async () => {
+    const confirm = await import('../../../../src/main/features/connectors/action_confirm');
+    const pushes: Array<{ channel: string; payload: any }> = [];
+    confirm._setBroadcastForTest((channel, payload) => { pushes.push({ channel, payload }); });
+    const opts = {
+      cid: 'task-grant', connectorId: 'feishu', displayName: 'Feishu', accountLabel: 'Account A',
+      toolName: 'execute_high_impact', risk: 'H' as const, args: { action: 'send', recipient: 'A' },
+    };
+    const first = confirm.requestActionConfirm(opts);
+    const queued = confirm.requestActionConfirm({ ...opts, toolName: 'execute_destructive', risk: 'D' });
+    const [one, two] = pushes.map((push) => push.payload);
+    expect(one.can_allow_run).toBe(true);
+    expect(confirm.respond(one.request_id, true, 'task')).toBe(true);
+    await expect(first).resolves.toBe(true);
+    await expect(queued).resolves.toBe(true);
+    expect(pushes.at(-1)).toMatchObject({ channel: 'connectors:action-confirm-cancelled',
+      payload: { request_ids: [two.request_id], approved: true } });
+    expect(confirm.respond(two.request_id, false)).toBe(false);
+    const delivered = pushes.length;
+    await expect(confirm.requestActionConfirm({ ...opts, toolName: 'delete', risk: 'D', args: { id: 'other' } })).resolves.toBe(true);
+    expect(pushes).toHaveLength(delivered);
+    const permissions = await import('../../../../src/main/features/permissions');
+    expect(permissions.getLocalExecMode()).toBe('all_files_approval');
+
+    for (const change of [{ cid: 'other-task' }, { connectorId: 'gmail' }, { accountLabel: 'Account B' }, { accountKey: 'replacement-connection' }]) {
+      const isolated = confirm.requestActionConfirm({ ...opts, ...change });
+      expect(pushes.at(-1)?.channel).toBe('connectors:action-confirm');
+      confirm.respond(pushes.at(-1)!.payload.request_id, false);
+      await expect(isolated).resolves.toBe(false);
+    }
+    confirm.cancelForCid(opts.cid);
+    const nextTask = confirm.requestActionConfirm(opts);
+    expect(pushes.at(-1)?.channel).toBe('connectors:action-confirm');
+    confirm.respond(pushes.at(-1)!.payload.request_id, false);
+    await expect(nextTask).resolves.toBe(false);
+  });
+
+  it('does not cache one-time approval or denial and rejects task grants without a task', async () => {
+    const confirm = await import('../../../../src/main/features/connectors/action_confirm');
+    let info: any;
+    confirm._setBroadcastForTest((_channel, payload) => { info = payload; });
+    const opts = { connectorId: 'feishu', displayName: 'Feishu', toolName: 'send', risk: 'H' as const, args: {} };
+    const noTask = confirm.requestActionConfirm(opts);
+    expect(info.can_allow_run).toBe(false);
+    expect(confirm.respond(info.request_id, true, 'task')).toBe(false);
+    confirm.respond(info.request_id, false);
+    await expect(noTask).resolves.toBe(false);
+    for (const approved of [true, false, true]) {
+      const pending = confirm.requestActionConfirm({ ...opts, cid: 'repeat-once' });
+      expect(confirm.respond(info.request_id, approved)).toBe(true);
+      await expect(pending).resolves.toBe(approved);
+      expect(confirm.respond(info.request_id, true, 'task')).toBe(false);
+    }
+  });
+
+  it('revokes task grants after account switching even when returning to the original account', async () => {
+    const confirm = await import('../../../../src/main/features/connectors/action_confirm');
+    const users = await import('../../../../src/main/features/users');
+    let info: any;
+    confirm._setBroadcastForTest((_channel, payload) => { info = payload; });
+    const opts = { cid: 'switch-grant', connectorId: 'feishu', displayName: 'Feishu', toolName: 'send', risk: 'H' as const, args: {} };
+    const first = confirm.requestActionConfirm(opts);
+    confirm.respond(info.request_id, true, 'task');
+    await expect(first).resolves.toBe(true);
+    users.activateUser('other-account');
+    users.activateUser('action-confirm-user');
+    const next = confirm.requestActionConfirm(opts);
+    expect(confirm.respond(info.request_id, false)).toBe(true);
+    await expect(next).resolves.toBe(false);
+  });
+
   it.each(['H', 'D'] as const)('executes an allowed %s action without a dialog in trusted mode', async (risk) => {
     const confirm = await import('../../../../src/main/features/connectors/action_confirm');
     const permissions = await import('../../../../src/main/features/permissions');

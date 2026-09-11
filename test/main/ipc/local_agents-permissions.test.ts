@@ -110,6 +110,47 @@ describe('ipc/local_agents permission responses', () => {
     });
   });
 
+  it('routes cancellation through native confirmation and preserves failed requests for retry', async () => {
+    let requestId = '';
+    cliUserInput._setBroadcastForTest((channel, payload: any) => {
+      if (channel === 'local-agent:user-input') requestId = payload.request_id;
+    });
+    const cancel = vi.fn().mockResolvedValueOnce('failed').mockResolvedValueOnce('cancelled');
+    const pending = cliUserInput.requestUserInput({
+      uid: 'u1', cid: 'c1', runId: 'run-input', agentId: 'a1', agentName: 'Agent', cli: 'codex',
+      request: { questions: [{ id: 'scope', question: 'Choose scope' }], cancel },
+    });
+    const payload = { request_id: requestId, answers: {}, cancelled: true };
+    await expect(cliUserInputResponse(payload, { userId: 'u2' })).resolves.toEqual({ handled: false });
+    expect(cancel).not.toHaveBeenCalled();
+    await expect(cliUserInputResponse(payload, { userId: 'u1' })).resolves.toEqual({ handled: false, cancel_failed: true });
+    await expect(cliUserInputResponse(payload, { userId: 'u1' })).resolves.toEqual({ handled: true, cancelled: true });
+    await expect(pending).resolves.toMatchObject({ cancelled: true });
+    expect(cancel).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps an unknown native cancellation unknown across IPC replay and rejects a later answer', async () => {
+    let requestId = '';
+    cliUserInput._setBroadcastForTest((channel, payload: any) => {
+      if (channel === 'local-agent:user-input') requestId = payload.request_id;
+    });
+    const controller = new AbortController();
+    const cancel = vi.fn(async () => 'unknown' as const);
+    const pending = cliUserInput.requestUserInput({
+      uid: 'u1', cid: 'c1', runId: 'run-input', agentId: 'a1', agentName: 'Agent', cli: 'codex',
+      request: { questions: [{ id: 'scope', question: 'Choose scope' }], cancel, signal: controller.signal },
+    });
+    const payload = { request_id: requestId, answers: {}, cancelled: true };
+    await expect(cliUserInputResponse(payload, { userId: 'u1' })).resolves.toEqual({ handled: false, unknown: true });
+    await expect(cliUserInputResponse(payload, { userId: 'u1' })).resolves.toEqual({ handled: false, unknown: true });
+    await expect(cliUserInputResponse({ request_id: requestId, answers: { scope: ['Late'] } }, { userId: 'u1' }))
+      .resolves.toEqual({ handled: false });
+    expect(cancel).toHaveBeenCalledOnce();
+    controller.abort();
+    await expect(pending).resolves.toMatchObject({ cancelled: true });
+    await expect(cliUserInputResponse(payload, { userId: 'u1' })).resolves.toEqual({ handled: false, closed: true });
+  });
+
   it('delivers a validated external CLI decision to the pending request exactly once', async () => {
     let requestId = '';
     cliPermissions._setBroadcastForTest((channel, payload) => {

@@ -287,6 +287,7 @@ export const invokeHandlers = {
         && (!payload.answers || typeof payload.answers !== 'object' || Array.isArray(payload.answers))) {
       throw new Error('invalid answers');
     }
+    if (payload.cancelled === true) return cliUserInput.cancelRequest(payload.request_id, ctx.userId);
     return cliUserInput.respond(
       payload.request_id,
       ctx.userId,

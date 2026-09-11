@@ -58,7 +58,8 @@ vi.mock('../../../../src/main/features/connectors/install_confirm', () => ({
   requestInstallConfirm: async () => fixtures.installApproved,
 }));
 
-vi.mock('../../../../src/main/features/connectors/action_confirm', () => ({
+vi.mock('../../../../src/main/features/connectors/action_confirm', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../../../src/main/features/connectors/action_confirm')>(),
   requestActionConfirm: async (opts: Parameters<RequestActionConfirm>[0]) => {
     fixtures.actionConfirmCalls.push(opts);
     if (fixtures.actionConfirmImpl) return fixtures.actionConfirmImpl(opts);
@@ -939,6 +940,51 @@ describe('call_connector_tool', () => {
       }
     } finally {
       confirm.cancelForCid('real-operation-gate');
+      confirm._setBroadcastForTest(null);
+      fixtures.actionConfirmImpl = undefined;
+    }
+  });
+
+  it('reuses task approval across actions and metadata refresh but asks again for a replacement account', async () => {
+    const users = await import('../../../../src/main/features/users');
+    users.activateUser(UID);
+    const permissions = await import('../../../../src/main/features/permissions');
+    permissions.setLocalExecMode('all_files_approval');
+    const confirm = await vi.importActual<typeof import('../../../../src/main/features/connectors/action_confirm')>(
+      '../../../../src/main/features/connectors/action_confirm',
+    );
+    fixtures.actionConfirmImpl = confirm.requestActionConfirm;
+    let prompts = 0;
+    confirm._setBroadcastForTest((channel, payload: any) => {
+      if (channel !== 'connectors:action-confirm') return;
+      prompts += 1;
+      queueMicrotask(() => confirm.respond(payload.request_id, prompts === 1, 'task'));
+    });
+    fixtures.instances = [makeInstance({ id: 'gmail', tools: [
+      { name: 'GMAIL_SEND_EMAIL', description: 'Send mail.', input_schema: {} },
+      { name: 'trash_message', description: 'Trash mail.', input_schema: {} },
+      { name: 'GMAIL_BATCH_DELETE_MESSAGES', description: 'Batch delete.', input_schema: {} },
+    ], composio_grant: { connection_id: 'account-a', toolkit: 'gmail', auth_config_id: 'config', account_label: 'Same label' } })];
+    const execute = vi.fn(async () => 'completed');
+    fixtures.callTool = execute;
+    try {
+      const { createConnectorMetaTools } = await loadModule();
+      const [, call] = await createConnectorMetaTools({ userId: UID, cid: 'account-bound-grant' });
+      const invoke = (name: string) => runTool(call, { connector_id: 'gmail', tool_name: name, args: {} });
+      expect((await invoke('GMAIL_SEND_EMAIL')).isError).not.toBe(true);
+      // Metadata refresh does not change the authorized account.
+      fixtures.instances[0] = { ...fixtures.instances[0], updated_at: '2026-09-10T12:00:00Z' };
+      expect((await invoke('trash_message')).isError).not.toBe(true);
+      expect(prompts).toBe(1);
+      expect(execute).toHaveBeenCalledTimes(2);
+      expect((await invoke('GMAIL_BATCH_DELETE_MESSAGES')).isError).toBe(true);
+      expect(execute).toHaveBeenCalledTimes(2);
+      fixtures.instances[0].composio_grant!.connection_id = 'account-b';
+      expect((await invoke('GMAIL_SEND_EMAIL')).isError).toBe(true);
+      expect(prompts).toBe(2);
+      expect(execute).toHaveBeenCalledTimes(2);
+    } finally {
+      confirm.cancelForCid('account-bound-grant');
       confirm._setBroadcastForTest(null);
       fixtures.actionConfirmImpl = undefined;
     }

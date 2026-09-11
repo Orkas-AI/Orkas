@@ -20,7 +20,12 @@ class Element {
   constructor(public tagName = 'div') {}
   appendChild(el: Element) { el.remove(); this.children.push(el); el.parentElement = this; return el; }
   replaceChildren() { this.children = []; }
-  setAttribute() {}
+  attributes = new Map<string, string>();
+  placeholder = '';
+  rows = 0;
+  maxLength = 0;
+  type = '';
+  setAttribute(name?: string, value?: string) { if (name) this.attributes.set(name, String(value)); }
   addEventListener(type: string, listener: () => any) { this.listeners.set(type, listener); }
   async fire(type: string) { if (type !== 'click' || !this.disabled) await this.listeners.get(type)?.(); }
   all(tag: string): Element[] { return this.children.flatMap(el => [...(el.tagName === tag ? [el] : []), ...el.all(tag)]); }
@@ -41,6 +46,31 @@ function load(expiresAt?: number) {
   return { invoke, api, host, message, onAnswer, dock };
 }
 const send = (host: Element) => host.all('button').find(el => el.textContent === 'chat.cli_question.send')!;
+
+/** A blocking request card: same dock, same markup, caller-owned delivery. */
+function loadRequest(questions: any[], overrides: Record<string, any> = {}) {
+  const dock = new Element();
+  const context: any = {
+    Date, setTimeout, clearTimeout,
+    window: { orkas: { invoke: vi.fn() }, addEventListener() {} },
+    document: { getElementById: () => dock, createElement: (tag: string) => new Element(tag), addEventListener() {} },
+    t: (key: string) => key,
+  };
+  vm.runInNewContext(fs.readFileSync(path.resolve(__dirname, '../../src/renderer/modules/cli_async_input.js'), 'utf8'), context);
+  const api = context.window.CliAsyncInput;
+  const submit = vi.fn(async () => true);
+  const cancel = vi.fn(async () => 'closed');
+  const onClosed = vi.fn();
+  api.showConversation('chat-1');
+  const close = api.showCliInputRequest({
+    requestId: 'request-1', cid: 'chat-1', actorLabel: 'Orkas Codex',
+    questions, submit, cancel, onClosed, ...overrides,
+  });
+  const host = dock.children[0];
+  return { api, dock, host, close, submit, cancel, onClosed, context };
+}
+const cardButton = (host: Element, text: string) => host.all('button').find(el => el.textContent === text)!;
+const cardInputs = (host: Element) => host.all('textarea');
 
 describe('native asynchronous question drafts and delivery', () => {
   it('keeps a draft answerable after twenty minutes and ignores a previously stored host deadline', async () => {
@@ -143,6 +173,187 @@ describe('native asynchronous question drafts and delivery', () => {
   });
 });
 
+
+describe('blocking native request card', () => {
+  const questions = [{
+    id: 'target', header: '推送目标', question: '这次提交推到哪个远端分支?',
+    options: [
+      { label: '新建 origin/release_2.0.0', description: '远端会出现一条新的发布分支。' },
+      { label: '推进 origin/release_1.7.0' },
+    ],
+  }];
+
+  it('answers through the caller\'s delivery and leaves the dock when it settles', async () => {
+    const { dock, host, submit, onClosed } = loadRequest(questions);
+    expect(dock.children).toHaveLength(1);
+    expect(host.all('div').find(el => el.className === 'form-title')!.textContent)
+      .toBe('Orkas Codex · chat.cli_question.title');
+    // The question, its options and the free-text box are one field.
+    expect(host.all('label')[0].textContent).toBe('推送目标 · 这次提交推到哪个远端分支?');
+    // One row per described option, its name split out so a wrapped
+    // description cannot read as the next option's opening line.
+    const described = host.all('div').filter(el => el.className === 'form-field-desc-option');
+    expect(described).toHaveLength(1);
+    expect(described[0].all('span').map(el => el.textContent))
+      .toEqual(['新建 origin/release_2.0.0:', '远端会出现一条新的发布分支。']);
+    expect(cardInputs(host)).toHaveLength(1);
+    // Nothing is implicit: send stays closed until there is an answer.
+    expect(cardButton(host, 'chat.cli_question.send').disabled).toBe(true);
+
+    await cardButton(host, '新建 origin/release_2.0.0').fire('click');
+    expect(cardInputs(host)[0].value).toBe('新建 origin/release_2.0.0');
+    expect(cardButton(host, '新建 origin/release_2.0.0').className).toContain('is-selected');
+    expect(cardButton(host, 'chat.cli_question.send').disabled).toBe(false);
+
+    await cardButton(host, 'chat.cli_question.send').fire('click');
+    expect(submit).toHaveBeenCalledWith(['新建 origin/release_2.0.0'], [['新建 origin/release_2.0.0']]);
+    expect(onClosed).toHaveBeenCalledOnce();
+    expect(dock.children).toHaveLength(0);
+  });
+
+  it('keeps the card and reports a failed delivery so the answer can be retried', async () => {
+    const { dock, host, onClosed } = loadRequest(questions, { submit: vi.fn(async () => false) });
+    await cardButton(host, '推进 origin/release_1.7.0').fire('click');
+    await cardButton(host, 'chat.cli_question.send').fire('click');
+    expect(host.all('div').find(el => el.className === 'form-error')!.textContent)
+      .toBe('chat.cli_question.send_failed');
+    expect(onClosed).not.toHaveBeenCalled();
+    expect(dock.children).toHaveLength(1);
+    expect(cardButton(host, 'chat.cli_question.send').disabled).toBe(false);
+  });
+
+  it('sends a declined request through cancel and drops a typed-over option', async () => {
+    const declined = loadRequest(questions);
+    await cardButton(declined.host, 'common.cancel').fire('click');
+    expect(declined.cancel).toHaveBeenCalledOnce();
+    expect(declined.submit).not.toHaveBeenCalled();
+    expect(declined.dock.children).toHaveLength(0);
+
+    const edited = loadRequest(questions);
+    await cardButton(edited.host, '推进 origin/release_1.7.0').fire('click');
+    const input = cardInputs(edited.host)[0];
+    input.value = '推到 main';
+    await input.fire('input');
+    expect(cardButton(edited.host, '推进 origin/release_1.7.0').className).not.toContain('is-selected');
+    await cardButton(edited.host, 'chat.cli_question.send').fire('click');
+    // A label the user typed over must not travel back as a selected option.
+    expect(edited.submit).toHaveBeenCalledWith(['推到 main'], [[]]);
+  });
+
+  it('accumulates a multi-select answer and asks every question before sending', async () => {
+    const { host, submit } = loadRequest([
+      { id: 'scope', question: 'Which areas?', multiSelect: true, options: [{ label: 'Docs' }, { label: 'Tests' }] },
+      { id: 'note', question: 'Anything to add?' },
+    ]);
+    expect(cardInputs(host)).toHaveLength(2);
+    await cardButton(host, 'Docs').fire('click');
+    await cardButton(host, 'Tests').fire('click');
+    expect(cardInputs(host)[0].value).toBe('Docs, Tests');
+    // The second question is still unanswered, so nothing may be sent yet.
+    expect(cardButton(host, 'chat.cli_question.send').disabled).toBe(true);
+    cardInputs(host)[1].value = 'ship it';
+    await cardInputs(host)[1].fire('input');
+    await cardButton(host, 'chat.cli_question.send').fire('click');
+    expect(submit).toHaveBeenCalledWith(['Docs, Tests', 'ship it'], [['Docs', 'Tests'], []]);
+  });
+
+  it('shows the card only in its own conversation and refuses a duplicate request id', () => {
+    const first = loadRequest(questions);
+    expect(first.dock.children).toHaveLength(1);
+    first.api.showConversation('chat-2');
+    expect(first.dock.children).toHaveLength(0);
+    first.api.showConversation('chat-1');
+    expect(first.dock.children).toHaveLength(1);
+    expect(first.api.showCliInputRequest({
+      requestId: 'request-1', cid: 'chat-1', questions, submit: vi.fn(), cancel: vi.fn(),
+    })).toBeNull();
+  });
+
+  it('hides a cancelling card, retries once, and restores its answer without a message if both attempts fail', async () => {
+    const cancel = vi.fn(async () => 'failed');
+    const h = loadRequest(questions, { cancel });
+    await cardButton(h.host, '推进 origin/release_1.7.0').fire('click');
+    const pending = cardButton(h.host, 'common.cancel').fire('click');
+    expect(h.dock.children).toHaveLength(0);
+    await pending;
+    expect(cancel).toHaveBeenCalledTimes(2);
+    expect(h.dock.children).toEqual([h.host]);
+    expect(cardInputs(h.host)[0].value).toBe('推进 origin/release_1.7.0');
+    expect(cardButton(h.host, 'common.cancel').disabled).toBe(false);
+    expect(h.host.all('div').find(el => el.className === 'form-error')!.textContent).toBe('');
+    cancel.mockResolvedValueOnce('closed');
+    await cardButton(h.host, 'common.cancel').fire('click');
+    expect(h.dock.children).toHaveLength(0);
+    expect(h.onClosed).toHaveBeenCalledOnce();
+    expect(h.submit).not.toHaveBeenCalled();
+  });
+
+  it('restores a failed cancellation only in its original conversation and preserves multi-select answers', async () => {
+    let failRetry!: (value: string) => void;
+    const cancel = vi.fn(async () => 'failed').mockImplementationOnce(() =>
+      new Promise<string>(resolve => { failRetry = resolve; }));
+    const h = loadRequest([{
+      id: 'checks', question: 'Which checks?', multiSelect: true,
+      options: [{ label: 'Unit, fast' }, { label: 'Integration' }],
+    }], { cancel });
+    await cardButton(h.host, 'Unit, fast').fire('click');
+    await cardButton(h.host, 'Integration').fire('click');
+    const pending = cardButton(h.host, 'common.cancel').fire('click');
+    await cardButton(h.host, 'common.cancel').fire('click');
+    expect(cancel).toHaveBeenCalledOnce();
+    h.api.showConversation('chat-2');
+    failRetry('failed');
+    await pending;
+    expect(cancel).toHaveBeenCalledTimes(2);
+    expect(h.dock.children).toHaveLength(0);
+    h.api.showConversation('chat-1');
+    expect(h.dock.children).toEqual([h.host]);
+    expect(cardInputs(h.host)[0].value).toBe('Unit, fast, Integration');
+    expect(cardButton(h.host, 'Unit, fast').attributes.get('aria-pressed')).toBe('true');
+    expect(cardButton(h.host, 'Integration').attributes.get('aria-pressed')).toBe('true');
+    await cardButton(h.host, 'chat.cli_question.send').fire('click');
+    expect(h.submit).toHaveBeenCalledWith(['Unit, fast, Integration'], [['Unit, fast', 'Integration']]);
+    expect(h.dock.children).toHaveLength(0);
+  });
+
+  it.each(['unknown', 'ipc-error', 'failed-then-unknown', 'malformed'])('keeps an uncertain cancellation hidden without retry or message: %s', async outcome => {
+    const cancel = vi.fn(async () => 'unknown');
+    if (outcome === 'ipc-error') cancel.mockRejectedValueOnce(new Error('reply lost'));
+    if (outcome === 'failed-then-unknown') cancel.mockResolvedValueOnce('failed');
+    if (outcome === 'malformed') cancel.mockResolvedValueOnce(undefined as any);
+    const h = loadRequest(questions, { cancel });
+    await cardButton(h.host, 'common.cancel').fire('click');
+    expect(cancel).toHaveBeenCalledTimes(outcome === 'failed-then-unknown' ? 2 : 1);
+    expect(h.dock.children).toHaveLength(0);
+    expect(h.onClosed).toHaveBeenCalledOnce();
+    expect(h.host.all('div').find(el => el.className === 'form-error')!.textContent).toBe('');
+    h.api.showConversation('chat-2');
+    h.api.showConversation('chat-1');
+    h.close(); // A late CLI withdrawal must not resurrect or close it twice.
+    expect(h.dock.children).toHaveLength(0);
+    expect(h.onClosed).toHaveBeenCalledOnce();
+    expect(h.submit).not.toHaveBeenCalled();
+  });
+
+  it('keeps the card closed when cancellation succeeds on retry or the CLI withdraws during cancellation', async () => {
+    const cancel = vi.fn(async () => 'closed').mockResolvedValueOnce('failed');
+    const retried = loadRequest(questions, { cancel });
+    await cardButton(retried.host, 'common.cancel').fire('click');
+    expect(cancel).toHaveBeenCalledTimes(2);
+    expect(retried.dock.children).toHaveLength(0);
+
+    let finish!: (value: string) => void;
+    const slowCancel = vi.fn(() => new Promise<string>(resolve => { finish = resolve; }));
+    const withdrawn = loadRequest(questions, { cancel: slowCancel });
+    const pending = cardButton(withdrawn.host, 'common.cancel').fire('click');
+    withdrawn.close();
+    finish('failed');
+    await pending;
+    expect(slowCancel).toHaveBeenCalledOnce();
+    expect(withdrawn.dock.children).toHaveLength(0);
+    expect(withdrawn.onClosed).toHaveBeenCalledOnce();
+  });
+});
 
 describe('composer question dock', () => {
   it('shows questions only in their conversation, retains a draft without rebuilding focused controls, and retracts on answer', async () => {

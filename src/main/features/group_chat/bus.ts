@@ -55,6 +55,7 @@ import {
 } from '../../storage';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import { inspectCodingDirectory } from '../local_agents/project-directory';
 import type {
   LocalActiveRunIngress,
   LocalActiveRunInput,
@@ -146,6 +147,7 @@ import {
   type SkillSelectionRef,
 } from '../../model/core-agent/skill-registry';
 import { AGENT_DESCRIPTION_ROSTER_MAX_CHARS } from '../../util/skill-description-policy';
+import * as connectorActionConfirm from '../connectors/action_confirm';
 import * as bashPermissions from '../../model/core-agent/bash-permissions';
 import { toolExecutionFactKind } from '../../model/core-agent/tool-catalog';
 import {
@@ -1482,6 +1484,7 @@ function _emitTaskRunTerminal(state: CidState, status: TaskTerminalStatus): void
   // Abort also calls this directly so cancellation remains fail-closed before
   // the worker finishes unwinding.
   bashPermissions.cancelForCid(state.cid);
+  connectorActionConfirm.cancelForCid(state.cid);
   const recovered = status === 'completed' && run.internalFailureObserved === true;
   const event: TaskTerminalEvent = {
     run_id: run.runId,
@@ -5673,10 +5676,11 @@ async function runActorTurn(
     // still ask the user to switch through the standard directory form.
     // Non-coding CLIs always use the workspace. A frozen coding cwd that
     // disappears must never silently fall back to another workspace: that
-    // could make a later turn edit the wrong project while the required
-    // input gate still considers the stale path fulfilled. Clear it so the
-    // normal host form blocks the child until the user picks a real folder.
+    // could make a later turn edit the wrong project. Retain the selection
+    // and session binding, block this dispatch, and let restoration or an
+    // explicit directory-form submission recover the same conversation.
     let cliWorkingDir = wsRoot;
+    let projectDirectoryIssue: ReturnType<typeof inspectCodingDirectory> | undefined;
     if (agentsFeat.cliIsCodingAgent(cliAgent.runtime?.kind === 'cli' ? cliAgent.runtime.cli : '')) {
       const dirInfo = agentsFeat.getCliProjectDirInfoForAgent(uid, cliAgent, turnProjectId);
       cliWorkingDir = dirInfo.effective_path;
@@ -5685,25 +5689,14 @@ async function runActorTurn(
       const stateFile = await st.readState(uid, cid);
       const projDir = stateFile.coding_project_dir;
       if (projDir) {
-        try {
-          if (fs.statSync(projDir).isDirectory()) {
-            cliWorkingDir = projDir;
-          } else {
-            throw new Error('coding project path is not a directory');
-          }
-        } catch {
-          await setCodingProjectDir(uid, cid, '', { explicit: false });
-          try {
-            const cliSessions = await import('../local_agents/sessions');
-            await cliSessions.clearForConversation(uid, cid);
-          } catch (err) {
-            log.warn('stale coding project directory session cleanup failed', {
-              cid: maskId(cid),
-              error: logErrorSummary(err),
-            });
-          }
-          log.info('coding project directory disappeared; awaiting user selection', {
-            cid: maskId(cid),
+        projectDirectoryIssue = inspectCodingDirectory(projDir);
+        if (projectDirectoryIssue.kind === 'available') {
+          cliWorkingDir = projDir;
+        } else {
+          log.info('coding project directory check blocked dispatch', {
+            cid: maskId(cid), source: 'device',
+            directory: logPathRef(projDir),
+            reason: projectDirectoryIssue.kind, code: projectDirectoryIssue.code,
           });
         }
       }
@@ -5733,7 +5726,7 @@ async function runActorTurn(
       let persistedLiveCommentary = false;
       const cliOut = await _runCliAgentTurn({
         uid, cid, actor, agent: cliAgent,
-        item, canonicalRows, workingDir: cliWorkingDir,
+        item, canonicalRows, workingDir: cliWorkingDir, projectDirectoryIssue,
         language: turnLanguage,
         ...(turnConversationTitle ? { conversationTitle: turnConversationTitle } : {}),
         ...(turnProjectId ? { projectId: turnProjectId } : {}),
@@ -9514,20 +9507,14 @@ async function _initializeCodingProjectDir(
   uid: string, cid: string, info: agentsFeat.AgentCliProjectDirInfo,
 ): Promise<void> {
   const cur = await readState(uid, cid);
-  if (cur.coding_project_dir) return;
-  if (info.mode === 'custom' && !info.exists) {
-    log.info('coding project directory unavailable; awaiting user selection', {
-      cid: maskId(cid),
-    });
-    return;
-  }
-  const target = info.effective_path;
+  if (cur.coding_project_dir || cur.coding_project_dir_pending) return;
+  const target = info.mode === 'custom' ? info.path : info.effective_path;
   if (!target) return;
   // Set-once under the state lock: two coding agents' first turns can race
   // this initialisation, and both must converge on ONE winner (the read above
   // is only a fast path). The caller re-reads state and uses the recorded dir.
   const { applied } = await setCodingProjectDirOnce(uid, cid, target, {
-    explicit: info.mode === 'custom' && info.exists,
+    explicit: info.mode === 'custom',
   });
   if (applied) {
     log.info('coding project directory initialized', {
@@ -9546,7 +9533,7 @@ async function _initializeCodingProjectDir(
  *  re-asked on every dispatch (matches the "prompt every turn until
  *  collected" behaviour the in-process branch already has). */
 async function _maybeBuildCliInputForm(
-  uid: string, cid: string, agent: import('../agents').Agent,
+  uid: string, cid: string, agent: import('../agents').Agent, directoryMissing = false,
 ): Promise<string | null> {
   const inputs = Array.isArray(agent.inputs) ? agent.inputs : [];
   if (!inputs.length) return null;
@@ -9557,7 +9544,7 @@ async function _maybeBuildCliInputForm(
   const projectDir = state.coding_project_dir || '';
 
   const isFulfilled = (fieldId: string): boolean => {
-    if (fieldId === 'project_dir') return !!projectDir;
+    if (fieldId === 'project_dir') return !!projectDir && !directoryMissing;
     return false;
   };
 
@@ -9595,6 +9582,7 @@ async function _runCliAgentTurn(opts: {
   projectId?: string;
   conversationTitle?: string;
   workingDir: string;
+  projectDirectoryIssue?: ReturnType<typeof inspectCodingDirectory>;
   language: Lang;
   signal: AbortSignal;
   deadlineAt?: number;
@@ -9623,7 +9611,12 @@ async function _runCliAgentTurn(opts: {
   // through the standard pipeline. Only the `project_dir` input is
   // currently auto-injected, but the gate is generic so future required
   // inputs reuse the same path.
-  const formBlock = await _maybeBuildCliInputForm(opts.uid, opts.cid, opts.agent);
+  const issue = opts.projectDirectoryIssue;
+  if (issue?.kind === 'denied' || issue?.kind === 'unavailable') {
+    const message = t(issue.kind === 'denied' ? 'errors.cli_directory_denied' : 'errors.cli_directory_unavailable');
+    return { text: message, error: message, failureKind: 'dependency', failureCode: 'project_directory_unavailable' };
+  }
+  const formBlock = await _maybeBuildCliInputForm(opts.uid, opts.cid, opts.agent, issue?.kind === 'missing');
   if (formBlock) return { text: formBlock };
 
   // Look up any prior CLI session bound to this (cid, aid, cli). If

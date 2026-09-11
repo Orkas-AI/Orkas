@@ -67,6 +67,60 @@ function onnxRuntimePackage(nodeModules) {
   };
 }
 
+// Shared by preparation, early archive preflight, afterPack and final validation.
+// The first companion candidate is the current build requirement; remaining
+// candidates preserve validation of older release artifacts.
+function sharpNativeContract(platform, arch) {
+  if (!TARGETS.has(targetKey(platform, arch))) {
+    throw new Error(`[native-package-gate] unsupported Sharp target: ${platform}-${arch}`);
+  }
+  const mac = platform === 'darwin';
+  const specs = [
+    {
+      id: 'sharp-binding',
+      candidates: mac
+        ? [
+            `@img/sharp-darwin-${arch}/lib/sharp-darwin-${arch}-0.35.4.node`,
+            `@img/sharp-darwin-${arch}/lib/sharp-darwin-${arch}-0.35.3.node`,
+            `@img/sharp-darwin-${arch}/lib/sharp-darwin-${arch}.node`,
+          ]
+        : [
+            '@img/sharp-win32-x64/lib/sharp-win32-x64-0.35.4.node',
+            '@img/sharp-win32-x64/lib/sharp-win32-x64-0.35.3.node',
+            '@img/sharp-win32-x64/lib/sharp-win32-x64.node',
+          ],
+    },
+    {
+      id: 'sharp-libvips-cpp',
+      candidates: mac
+        ? [
+            `@img/sharp-libvips-darwin-${arch}/lib/libvips-cpp.8.18.6.dylib`,
+            `@img/sharp-libvips-darwin-${arch}/lib/libvips-cpp.8.18.3.dylib`,
+            `@img/sharp-libvips-darwin-${arch}/lib/libvips-cpp.8.17.3.dylib`,
+          ]
+        : [
+            '@img/sharp-win32-x64/lib/libvips-cpp-8.18.6.dll',
+            '@img/sharp-win32-x64/lib/libvips-cpp-8.18.3.dll',
+            '@img/sharp-win32-x64/lib/libvips-cpp-8.17.3.dll',
+          ],
+    },
+  ];
+  if (!mac) specs.push({ id: 'sharp-libvips', candidates: ['@img/sharp-win32-x64/lib/libvips-42.dll'] });
+  return specs;
+}
+
+function sharpPreparationFiles(platform, arch, version) {
+  const specs = sharpNativeContract(platform, arch);
+  if (!/^\d+\.\d+\.\d+$/.test(String(version || ''))) {
+    throw new Error('[native-package-gate] missing concrete locked Sharp version');
+  }
+  return {
+    binding: `@img/sharp-${platform}-${arch}/lib/sharp-${platform}-${arch}-${version}.node`,
+    cpp: specs.find(spec => spec.id === 'sharp-libvips-cpp').candidates[0],
+    ...(platform === 'win32' ? { libvips: specs.find(spec => spec.id === 'sharp-libvips').candidates[0] } : {}),
+  };
+}
+
 function nativePackageContract(nodeModules, platform, arch) {
   const key = targetKey(platform, arch);
   if (!TARGETS.has(key)) {
@@ -117,40 +171,11 @@ function nativePackageContract(nodeModules, platform, arch) {
       id: 'onnxruntime-core',
       candidates: [joinRelative(onnxBase, mac ? `libonnxruntime.${onnxVersion}.dylib` : 'onnxruntime.dll')],
     },
-    {
-      id: 'sharp-binding',
-      candidates: mac
-        ? [
-            `@img/sharp-darwin-${arch}/lib/sharp-darwin-${arch}-0.35.4.node`,
-            `@img/sharp-darwin-${arch}/lib/sharp-darwin-${arch}-0.35.3.node`,
-            `@img/sharp-darwin-${arch}/lib/sharp-darwin-${arch}.node`,
-          ]
-        : [
-            '@img/sharp-win32-x64/lib/sharp-win32-x64-0.35.4.node',
-            '@img/sharp-win32-x64/lib/sharp-win32-x64-0.35.3.node',
-            '@img/sharp-win32-x64/lib/sharp-win32-x64.node',
-          ],
-    },
-    {
-      id: 'sharp-libvips-cpp',
-      candidates: mac
-        ? [
-            `@img/sharp-libvips-darwin-${arch}/lib/libvips-cpp.8.18.6.dylib`,
-            `@img/sharp-libvips-darwin-${arch}/lib/libvips-cpp.8.18.3.dylib`,
-            `@img/sharp-libvips-darwin-${arch}/lib/libvips-cpp.8.17.3.dylib`,
-          ]
-        : [
-            '@img/sharp-win32-x64/lib/libvips-cpp-8.18.6.dll',
-            '@img/sharp-win32-x64/lib/libvips-cpp-8.18.3.dll',
-            '@img/sharp-win32-x64/lib/libvips-cpp-8.17.3.dll',
-          ],
-    },
+    ...sharpNativeContract(platform, arch),
   ];
 
   if (mac) {
     specs.push({ id: 'fsevents', candidates: ['fsevents/fsevents.node'] });
-  } else {
-    specs.push({ id: 'sharp-libvips', candidates: ['@img/sharp-win32-x64/lib/libvips-42.dll'] });
   }
   return specs;
 }
@@ -233,6 +258,9 @@ module.exports = {
   TARGETS,
   collectNativePayloadFiles,
   nativePackageContract,
+  sharpNativeContract,
+  sharpPreparationFiles,
+  isNativePayloadFile,
   requiredNativeVerificationEntries,
   targetKey,
   verifyNativePackagePayload,

@@ -168,6 +168,18 @@ function _taskBoardOnEvent(cid, evData) {
   const task = evData && evData.task;
   if (!cid || !task || !task.task_id) return;
   const m = _taskBoardMapFor(cid);
+  const cached = m.get(task.task_id);
+  // The primary send stream, observer stream and list resync can overlap.
+  // A delayed snapshot must not undo a settled lifecycle fact: terminal
+  // tasks never revive, initial admission settles once, and a started task
+  // never returns to queued/blocked (form resume goes straight to running).
+  // Otherwise a stale row can briefly invent concurrent or waiting work.
+  if (cached && (
+    (_TASK_BOARD_TERMINAL.has(cached.status) && !_TASK_BOARD_TERMINAL.has(task.status))
+    || (task.admission_pending === true && cached.admission_pending !== true)
+    || ((task.status === 'queued' || task.status === 'blocked')
+      && (cached.status === 'running' || cached.status === 'waiting_input'))
+  )) return;
   // A task id this board has never seen starts (or joins) the current batch;
   // if everything tracked is already terminal, the new task opens a FRESH
   // batch and the previous run's terminal rows leave the active board view.
@@ -336,6 +348,11 @@ function _taskBoardRender(cid) {
   // turn is suspended on the child — so the status text says that instead of
   // a second confusing "running".
   const orchestratingIds = new Set(rows.map((task) => task.parent_task_id).filter(Boolean));
+  // Runtime updates replace these buttons. Restore the focused agent rather
+  // than its index, which can change when another agent finishes.
+  const activeToggle = document.activeElement;
+  const focusedAssignee = activeToggle?.matches?.('.chat-queue-agent-toggle') && list.contains(activeToggle)
+    ? activeToggle.closest('.chat-queue-agent-group')?.dataset.assignee : null;
   list.innerHTML = groups.map((group, index) => {
     const expanded = !_taskBoardCollapsedAgents.get(cid)?.has(group.assignee);
     return `
@@ -416,6 +433,16 @@ function _taskBoardRender(cid) {
       button.setAttribute('aria-expanded', String(expanded));
       group.querySelector('.chat-queue-agent-items').hidden = !expanded;
     });
+    button.addEventListener('keydown', (event) => {
+      if (event.key !== ' ' || event.isComposing) return;
+      // Native Space clicks on keyup, but a task update can detach the pressed
+      // button first. Activate on keydown and suppress native/repeated clicks.
+      event.preventDefault();
+      if (!event.repeat) button.click();
+    });
+    if (focusedAssignee != null && button.closest('.chat-queue-agent-group')?.dataset.assignee === focusedAssignee) {
+      button.focus({ preventScroll: true });
+    }
   });
   list.querySelectorAll('.chat-queue-btn[data-act="task-send-now"]').forEach((btn) => {
     btn.addEventListener('click', (e) => {
@@ -541,7 +568,10 @@ async function _taskBoardResumeBlocked(cid, taskId) {
     if (data && data.ok) {
       const m = _taskBoardMapFor(cid);
       const task = m.get(taskId);
-      if (task) m.set(taskId, { ...task, status: 'queued', after: undefined });
+      // State events may beat the command acknowledgement. Only advance a
+      // still-blocked snapshot; never overwrite an already running or
+      // completed task with this acknowledgement's earlier queued state.
+      if (task && task.status === 'blocked') m.set(taskId, { ...task, status: 'queued', after: undefined });
       _taskBoardRender(cid);
       // Run-anyway STARTS an execution from a bare invoke — no send stream is
       // attached, so the released task's task_state/turn events would have no

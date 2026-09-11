@@ -257,6 +257,48 @@ describe('shared renderer dialogs', () => {
     confirm.click();
     expect(await result).toEqual(['integration']);
   });
+  it('groups a question dialog\'s choices above the action row and keeps confirm choices beside cancel', async () => {
+    // A CLI question sends prose options. On the action row (one non-wrapping
+    // line) more than a few of them collapse to their min-width and the labels
+    // wrap into columns, which is what the 2026-09-09 report showed. The
+    // grouped layout is the one the composer-dock question card already uses.
+    const ctx = loadDialogs();
+    const question = ctx.uiChoice({
+      title: 'Needs your input',
+      message: 'Which remote branch should this land on?',
+      choiceLayout: 'group',
+      choices: [
+        { id: 'option-0', label: 'Create origin/release_2.0.0' },
+        { id: 'option-1', label: 'Advance origin/release_1.7.0' },
+        { id: 'other', label: 'Other' },
+      ],
+    });
+    const grouped = overlays(ctx)[0];
+    const groupedHtml = grouped.innerHTML;
+    expect(groupedHtml).toContain('<div class="ui-dialog-choices"');
+    expect(groupedHtml.indexOf('data-act="choice"'))
+      .toBeGreaterThan(groupedHtml.indexOf('ui-dialog-choices'));
+    expect(groupedHtml.indexOf('data-act="choice"'))
+      .toBeLessThan(groupedHtml.indexOf('modal-actions'));
+    expect(groupedHtml.lastIndexOf('data-act="choice"'))
+      .toBeLessThan(groupedHtml.indexOf('modal-actions'));
+    // The group is still the same clickable contract.
+    grouped.querySelectorAll('[data-act="choice"]')[1].click();
+    expect(await question).toBe('option-1');
+
+    // A two-button confirm keeps its choices on the action row beside cancel.
+    const confirmChoice = ctx.uiChoice({
+      message: 'Disable cloud sync?',
+      choices: [{ id: 'keep', label: 'Keep the cloud copy', style: 'primary' }],
+    });
+    const rowed = overlays(ctx)[0];
+    expect(rowed.innerHTML).not.toContain('ui-dialog-choices');
+    expect(rowed.innerHTML.indexOf('data-act="choice"'))
+      .toBeGreaterThan(rowed.innerHTML.indexOf('modal-actions'));
+    rowed.querySelector('[data-act="choice"]')!.click();
+    expect(await confirmChoice).toBe('keep');
+  });
+
   it('keeps cancel keyboard intent, exposes an accessible name, escapes text, and restores focus', async () => {
     const ctx = loadDialogs();
     const background = ctx._document.createElement('button');

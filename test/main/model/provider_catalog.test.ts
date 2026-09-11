@@ -200,12 +200,78 @@ describe('provider_catalog › CURATED_MODELS', () => {
     ]);
   });
 
+  it('resolves the OpenRouter V4.1 Flash shortcut with vision before the SDK catalogs it', () => {
+    const modelId = 'deepseek/deepseek-v4.1-flash';
+    const catalog = {
+      getPiModel(provider: string, id: string) {
+        if (provider === 'openrouter' && id === modelId) return undefined;
+        return (getBuiltinModel as (p: string, m: string) => any)(provider, id);
+      },
+    };
+    expect(curatedModelsFor('openrouter')).toContainEqual(expect.objectContaining({
+      id: modelId,
+      name: 'DeepSeek V4.1 Flash',
+    }));
+    const resolved = resolveConfiguredPiModel(catalog, 'openrouter', modelId);
+    expect(resolved).toMatchObject({
+      requestedModelId: modelId,
+      isConfiguredFallback: true,
+      needsCustomModel: true,
+      model: {
+        id: modelId,
+        name: 'DeepSeek V4.1 Flash',
+        provider: 'openrouter',
+        api: 'openai-completions',
+        baseUrl: 'https://openrouter.ai/api/v1',
+        reasoning: true,
+        input: ['text', 'image'],
+        contextWindow: 1_048_576,
+        maxTokens: 384_000,
+        compat: { thinkingFormat: 'openrouter', requiresReasoningContentOnAssistantMessages: true },
+      },
+    });
+    expect(modelInputImageLimit('openrouter', modelId, resolved?.model)).toBe(20);
+  });
+
   it('curatedModelsFor returns a shallow copy safe to mutate', () => {
     const a = curatedModelsFor('anthropic');
     const b = curatedModelsFor('anthropic');
     expect(a).not.toBe(b);
     a.pop();
     expect(curatedModelsFor('anthropic').length).toBe(b.length);
+  });
+
+  it('resolves the OpenRouter V4.1 Flash shortcut with vision before the SDK catalogs it', () => {
+    const modelId = 'deepseek/deepseek-v4.1-flash';
+    const catalog = {
+      getPiModel(provider: string, id: string) {
+        if (provider === 'openrouter' && id === modelId) return undefined;
+        return (getBuiltinModel as (p: string, m: string) => any)(provider, id);
+      },
+    };
+    expect(curatedModelsFor('openrouter')).toContainEqual(expect.objectContaining({
+      id: modelId,
+      name: 'DeepSeek V4.1 Flash',
+    }));
+    const resolved = resolveConfiguredPiModel(catalog, 'openrouter', modelId);
+    expect(resolved).toMatchObject({
+      requestedModelId: modelId,
+      isConfiguredFallback: true,
+      needsCustomModel: true,
+      model: {
+        id: modelId,
+        name: 'DeepSeek V4.1 Flash',
+        provider: 'openrouter',
+        api: 'openai-completions',
+        baseUrl: 'https://openrouter.ai/api/v1',
+        reasoning: true,
+        input: ['text', 'image'],
+        contextWindow: 1_048_576,
+        maxTokens: 384_000,
+        compat: { thinkingFormat: 'openrouter', requiresReasoningContentOnAssistantMessages: true },
+      },
+    });
+    expect(modelInputImageLimit('openrouter', modelId, resolved?.model)).toBe(20);
   });
 
   it('curatedModelsFor returns [] for unknown providers (triggers pi-ai fallback)', () => {

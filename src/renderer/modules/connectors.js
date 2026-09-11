@@ -772,7 +772,7 @@ window.openConnectorSetupById = async function openConnectorSetupById(id) {
   let entry = _catalogEntryById(targetId);
   if (entry && entry.catalog_parent_id) entry = _catalogEntryById(entry.catalog_parent_id);
   const installed = entry ? _instanceForCatalogEntry(entry) : null;
-  if (!entry || (installed && !_isReconnectableError(entry, installed))) {
+  if (!entry || (installed && !installed.reauthorization_required && !_isReconnectableError(entry, installed))) {
     return window.focusConnectorById(entry ? entry.id : targetId);
   }
   // The protected form is owned by the catalog, not by a filtered DOM card.
@@ -1159,6 +1159,7 @@ function _renderCatalogCard(entry, instance) {
     : 0;
   const installPhase = _localCliInstallPhases.get(e.id) || '';
   const installError = _localCliInstallErrors.get(e.id) || null;
+  const permissionNotice = e.auth_mode === 'local_cli' && instance?.reauthorization_required;
 
   // The ⋯ menu lives on installed cards — it hosts the destructive disconnect action so it stays
   // one click away from accidental triggers. Un-connected / errored cards still surface the
@@ -1198,6 +1199,11 @@ function _renderCatalogCard(entry, instance) {
   } else if (connected) {
     const useTitle = escapeHtml(formatChatUseLabel({ kind: 'connector', id: e.id, name: displayName || e.id }));
     action = `<button class="agent-card-use connector-card-use" data-act="use-connector" title="${useTitle}" aria-label="${useTitle}" ${enabledFlag ? '' : 'disabled aria-disabled="true" tabindex="-1"'}>${escapeHtml(t('common.use'))}</button>`;
+    if (e.auth_mode === 'local_cli' && instance.reauthorization_required) {
+      action = `<button class="btn btn-sm btn-primary" data-act="connect">${escapeHtml(t('connectors.action.authorize_permissions'))}</button>${action}`;
+    }
+  } else if (e.auth_mode === 'local_cli' && instance && instance.reauthorization_required) {
+    action = `<button class="btn btn-sm btn-primary" data-act="connect">${escapeHtml(t('connectors.action.authorize_permissions'))}</button>`;
   } else if (degraded) {
     // Retry re-runs connect + token refresh (`connectors.refresh`) — NOT OAuth. The grant is fine;
     // what failed was reaching the backend. Offering "连接" here would send the user through a
@@ -1242,10 +1248,25 @@ function _renderCatalogCard(entry, instance) {
       ${menuHtml}
     </div>
     <div class="connector-card-desc muted"></div>
+    ${permissionNotice ? '<div class="connector-card-unverified" data-role="permission-notice"></div>' : ''}
     <div class="connector-card-foot">${cardBadgesHtml}${action}</div>
   `;
   card.querySelector('.connector-card-name').textContent = displayName;
   card.querySelector('.connector-card-desc').textContent = desc;
+  if (permissionNotice) {
+    const scopes = Array.isArray(instance.missing_permissions) ? instance.missing_permissions : [];
+    const permissionLabels = {
+      'im:message.send_as_user': 'send_as_user',
+      'chat.message:send': 'send_as_user',
+      'mail:send': 'send_mail',
+    };
+    const labels = [...new Set(scopes.map(scope => Object.hasOwn(permissionLabels, scope)
+      ? t('connectors.permissions.' + permissionLabels[scope]) : scope))];
+    const notice = card.querySelector('[data-role="permission-notice"]');
+    notice.textContent = labels.length
+      ? t('connectors.permissions.missing', { permissions: labels.join(', ') })
+      : t('connectors.permissions.limited');
+  }
   if (installError) {
     const el = card.querySelector('.connector-card-error');
     const text = _formatLocalCliInstallError(installError, e);
@@ -2246,27 +2267,14 @@ async function _drainConnectorInstallQueue() {
 }
 
 function _connectorActionMessage(info) {
-  const operationKey = `connectors.action_confirm.operation.${String(info.sensitive_operation || 'unclassified')}`;
-  const translatedOperation = t(operationKey);
-  const operation = translatedOperation === operationKey ? t('connectors.action_confirm.operation.unclassified') : translatedOperation;
   const catalogEntry = _catalogEntryById(info.connector_id);
   const displayName = catalogEntry ? _connectorDisplayName(catalogEntry) : (info.display_name || info.connector_id);
-  const account = info.account_label || t('connectors.action_confirm.account_unknown');
   return [
-    t(info.risk === 'D'
-      ? 'connectors.action_confirm.destructive_message'
-      : 'connectors.action_confirm.sensitive_message'),
-    '',
     `${t('connectors.action_confirm.connector')}: ${displayName}`,
-    `${t('connectors.action_confirm.account')}: ${account}`,
-    `${t('connectors.action_confirm.operation')}: ${operation}`,
-    `${t('connectors.action_confirm.action')}: ${info.tool_name}`,
-    '',
-    t('connectors.action_confirm.arguments'),
-    String(info.arguments_preview || '{}'),
-    '',
-    t(info.risk === 'D'
-      ? 'connectors.action_confirm.destructive_note'
-      : 'connectors.action_confirm.fresh_note'),
+    `${t('connectors.action_confirm.action')}: ${info.action_name || info.tool_name}`,
   ].join('\n');
+}
+
+function _connectorActionDetails(info) {
+  return String(info.arguments_preview || '{}');
 }

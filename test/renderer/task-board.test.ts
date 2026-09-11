@@ -50,9 +50,8 @@ function runVisibility(liveRows: unknown): { visible: boolean } {
   );
 }
 
-/** Paint one conversation's board through the real renderer against an inert
- *  panel/list pair and return the row markup the user would see. */
-function renderBoardRows(tasks: Array<Record<string, unknown>>): string {
+/** Run the real renderer against an inert panel/list pair. */
+function boardHarness() {
   const list: any = { dataset: {}, style: {}, innerHTML: '', querySelectorAll: () => [], addEventListener() {} };
   const panel: any = { style: {}, querySelector: () => null, addEventListener() {} };
   const context: any = {
@@ -61,13 +60,18 @@ function renderBoardRows(tasks: Array<Record<string, unknown>>): string {
       addEventListener() {},
       getElementById: (id: string) => (id === 'chat-task-board' ? panel : id === 'chat-task-board-list' ? list : null),
     },
-    window: {},
+    window: {}, currentCid: 'c1',
     t: (key: string, params?: Record<string, unknown>) => (params && 'name' in params ? `${key}:${params.name}` : key),
     escapeHtml: (value: unknown) => String(value ?? ''),
     uiIconHtml: () => '',
   };
   vm.createContext(context);
   vm.runInContext(source, context, { filename: 'task-board.js' });
+  return { context, panel, list, board: context.window.TaskBoard };
+}
+
+function renderBoardRows(tasks: Array<Record<string, unknown>>): string {
+  const { context, list } = boardHarness();
   context.__tasks = tasks;
   vm.runInContext("for (const task of __tasks) _taskBoardMapFor('c1').set(task.task_id, task);", context);
   context._taskBoardRender('c1');
@@ -375,6 +379,124 @@ describe('renderer task board › seed/resync merge (terminal-wins)', () => {
 });
 
 describe('renderer task board › visibility (multi-task only, adjudicated 2026-09-04)', () => {
+  it.each([
+    { terminal: 'done', settlement: 'event' },
+    { terminal: 'done', settlement: 'list' },
+    { terminal: 'failed', settlement: 'event' },
+    { terminal: 'stopped', settlement: 'list' },
+    { terminal: 'cancelled', settlement: 'event' },
+  ])(
+    'does not revive a $terminal task from delayed stream events after $settlement settlement', async ({ terminal, settlement }) => {
+      const { context, panel, board } = boardHarness();
+      const old = { task_id: 'old', assignee: 'commander', status: 'running' };
+      board.onEvent('c1', { task: old });
+      if (settlement === 'event') board.onEvent('c1', { task: { ...old, status: terminal } });
+      else {
+        context.apiFetch = async () => ({ json: async () => ({ ok: true, tasks: [{ ...old, status: terminal }] }) });
+        await board.sync('c1');
+      }
+      // A second observer can still be draining the previous turn. Its old
+      // running row must not count as concurrent work when a new send arrives.
+      for (const status of ['running', 'waiting_input', 'queued', 'blocked']) {
+        board.onEvent('c1', { task: { ...old, status } });
+        expect(panel.style.display).toBe('none');
+      }
+      const next = { task_id: 'next', assignee: 'commander', status: 'queued', admission_pending: true };
+      board.onEvent('c1', { task: next });
+      expect(panel.style.display).toBe('none');
+      board.onEvent('c1', { task: { ...next, status: 'running', admission_pending: undefined } });
+      expect(panel.style.display).toBe('none');
+      // Genuine concurrency still needs the execution panel.
+      board.onEvent('c1', { task: { task_id: 'parallel', assignee: 'other', status: 'running' } });
+      expect(panel.style.display).toBe('');
+    },
+  );
+
+  it('ignores old queue events after admission without hiding confirmed queue controls or form resumption', () => {
+    const { panel, list, board } = boardHarness();
+    const pending = { task_id: 'send', assignee: 'commander', status: 'queued', admission_pending: true };
+    const confirmed = { ...pending, admission_pending: undefined };
+    board.onEvent('c1', { task: pending });
+    expect(panel.style.display).toBe('none');
+    board.onEvent('c1', { task: confirmed });
+    expect(panel.style.display).toBe('');
+    board.onEvent('c1', { task: pending });
+    expect(panel.style.display).toBe('');
+    expect(list.innerHTML).toContain('data-act="task-cancel"');
+    board.onEvent('c1', { task: { ...confirmed, status: 'running' } });
+    for (const stale of [pending, confirmed]) {
+      board.onEvent('c1', { task: stale });
+      expect(panel.style.display).toBe('none');
+    }
+    board.onEvent('c1', { task: { ...confirmed, status: 'waiting_input' } });
+    board.onEvent('c1', { task: confirmed });
+    expect(panel.style.display).toBe('none');
+    board.onEvent('c1', { task: { ...confirmed, status: 'running' } });
+    board.onEvent('c1', { task: { task_id: 'parallel', assignee: 'other', status: 'running' } });
+    expect(list.innerHTML.match(/chat.task_status_running/g)).toHaveLength(2);
+  });
+
+  it('keeps a send absorbed into its active turn hidden when its old queue event arrives', () => {
+    const { panel, list, board } = boardHarness();
+    const queued = { task_id: 'update', assignee: 'commander', status: 'queued' };
+    board.onEvent('c1', { task: { task_id: 'active', assignee: 'commander', status: 'running' } });
+    board.onEvent('c1', { task: queued });
+    expect(panel.style.display).toBe('');
+    const absorbed = { ...queued, status: 'running', absorbed_into_turn_id: 'active-turn' };
+    board.onEvent('c1', { task: absorbed });
+    board.onEvent('c1', { task: queued });
+    expect(panel.style.display).toBe('none');
+    board.onEvent('c1', { task: { task_id: 'parallel', assignee: 'other', status: 'running' } });
+    expect(panel.style.display).toBe('');
+    expect(list.innerHTML).not.toContain('data-task-id="update"');
+  });
+
+  it.each(['ack-first', 'running-first', 'done-first'])(
+    'preserves blocked recovery when delivery is %s', async (order) => {
+      const { context, panel, list, board } = boardHarness();
+      const task = { task_id: 'blocked', assignee: 'commander', status: 'blocked', after: 'stopped-predecessor' };
+      board.onEvent('c1', { task });
+      expect(list.innerHTML).toContain('data-act="task-run-anyway"');
+      context.apiFetch = async () => {
+        if (order !== 'ack-first') {
+          board.onEvent('c1', { task: { ...task, after: undefined, status: 'running' } });
+          if (order === 'done-first') board.onEvent('c1', { task: { ...task, after: undefined, status: 'done' } });
+        }
+        return { json: async () => ({ ok: true }) };
+      };
+      await context._taskBoardResumeBlocked('c1', task.task_id);
+      if (order === 'ack-first') {
+        expect(panel.style.display).toBe('');
+        expect(list.innerHTML).toContain('chat.task_status_queued');
+        expect(list.innerHTML).not.toContain('data-act="task-run-anyway"');
+        board.onEvent('c1', { task: { ...task, after: undefined, status: 'running' } });
+      }
+      expect(panel.style.display).toBe('none');
+      board.onEvent('c1', { task }); // A delayed pre-recovery blocked snapshot.
+      expect(panel.style.display).toBe('none');
+      // The completed task must not remain as a phantom second execution.
+      if (order === 'done-first') {
+        board.onEvent('c1', { task: { task_id: 'new', assignee: 'commander', status: 'running' } });
+        expect(panel.style.display).toBe('none');
+      }
+    },
+  );
+
+  it('keeps blocked recovery controls available after a failed request, then accepts a successful retry', async () => {
+    const { context, panel, list, board } = boardHarness();
+    const task = { task_id: 'blocked', assignee: 'commander', status: 'blocked' };
+    board.onEvent('c1', { task });
+    context.apiFetch = async () => ({ json: async () => ({ ok: false }) });
+    await context._taskBoardResumeBlocked('c1', task.task_id);
+    expect(panel.style.display).toBe('');
+    expect(list.innerHTML).toContain('data-act="task-run-anyway"');
+    expect(list.innerHTML).toContain('data-act="task-cancel"');
+    context.apiFetch = async () => ({ json: async () => ({ ok: true }) });
+    await context._taskBoardResumeBlocked('c1', task.task_id);
+    board.onEvent('c1', { task: { ...task, status: 'running' } });
+    expect(panel.style.display).toBe('none');
+  });
+
   it('stays hidden for no work and ordinary single running or waiting-input turns', () => {
     expect(runVisibility([])).toEqual({ visible: false });
     expect(runVisibility([{ status: 'running' }])).toEqual({ visible: false });

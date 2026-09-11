@@ -36,7 +36,7 @@ import {
 } from '../../features/connectors/tools-adapter';
 import { validateCustomTransport, validateDisplayName, CustomTransportError } from '../../features/connectors/custom-transport';
 import { requestInstallConfirm } from '../../features/connectors/install_confirm';
-import { requestActionConfirm } from '../../features/connectors/action_confirm';
+import { requestActionConfirm, connectorAccountKey } from '../../features/connectors/action_confirm';
 import { connectorActionRisk, isConnectorActionBlocked } from '../../features/connectors/action_policy';
 import { findCatalogEntry } from '../../features/connectors/catalog';
 import { resolveLanguageForUser } from '../../features/config';
@@ -444,6 +444,7 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
               match.instance,
               _descriptionLangForUser(opts.userId),
             ),
+            accountKey: connectorAccountKey(match.instance),
             accountLabel: match.instance.composio_grant?.account_label
               || match.instance.oauth_grant?.account_label,
             toolName,

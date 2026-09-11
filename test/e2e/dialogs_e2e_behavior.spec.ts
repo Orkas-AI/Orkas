@@ -138,6 +138,131 @@ test.describe('shared dialog behavior', () => {
     expect(await appPage.evaluate(() => (window as any).__nativeQuestionAnswer)).toEqual(['unit', 'integration']);
   });
 
+  test('docks a blocking CLI question as the shared question card and answers it there', async ({ orkas: app }) => {
+    // A CLI that pauses its turn for an answer (Codex requestUserInput, Claude
+    // Code AskUserQuestion) uses the same card as an asynchronous question
+    // instead of a modal: same place, same controls, and the app stays usable.
+    const appPage = app.page!;
+    const created = await app.invoke<{ conversation: { conversation_id: string } }>('conversations.create', { title: 'Blocking question' });
+    const cid = created.conversation.conversation_id;
+    await appPage.evaluate((cid) => (window as any).setView('conversation', cid, { skipLoad: true }), cid);
+    await appPage.evaluate((cid) => {
+      const root = window as any;
+      root.__e2eBlockingAnswer = null;
+      root.CliAsyncInput.showConversation(cid);
+      root.__e2eBlockingClose = root.CliAsyncInput.showCliInputRequest({
+        requestId: 'blocking-1',
+        cid,
+        actorLabel: 'Orkas Codex',
+        questions: [{
+          id: 'target',
+          header: 'Push target',
+          question: 'Which remote branch should this commit go to?',
+          options: [
+            { label: 'Create origin/release_2.0.0', description: 'A new release branch appears on the remote.' },
+            { label: 'Advance origin/release_1.7.0' },
+            { label: 'Hold the commit on this machine' },
+          ],
+        }],
+        submit: async (values: string[]) => { root.__e2eBlockingAnswer = values; return true; },
+        cancel: async () => { root.__e2eBlockingAnswer = 'cancelled'; },
+      });
+    }, cid);
+
+    const card = appPage.locator('#chat-cli-questions .cli-question-panel');
+    await expect(card).toBeVisible();
+    await expect(card.locator('.form-title')).toHaveText('Orkas Codex · Question');
+    await expect(card.locator('.form-field-label'))
+      .toHaveText('Push target · Which remote branch should this commit go to?');
+    const answer = card.getByRole('textbox', { name: 'Which remote branch should this commit go to?' });
+    await expect(answer).toHaveValue('');
+    const send = card.getByRole('button', { name: 'Send answer', exact: true });
+    await expect(send).toBeDisabled();
+
+    const layout = await card.evaluate((node: Element) => {
+      const options = Array.from(node.querySelectorAll('.form-field-checkgroup .btn')) as HTMLElement[];
+      const box = (element: HTMLElement) => element.getBoundingClientRect();
+      return {
+        count: options.length,
+        clipped: options.filter((option) => option.scrollWidth > Math.ceil(box(option).width)).map((o) => o.textContent),
+        tallest: Math.max(...options.map((option) => Math.round(box(option).height))),
+        insideCard: options.every((option) => box(option).right <= Math.ceil(box(node as HTMLElement).right)),
+        widerThanTheirLabel: options.every((option) => box(option).width >= option.scrollWidth),
+      };
+    });
+    expect(layout.count).toBe(3);
+    // Every option reads in full inside the card, one line each.
+    expect(layout.clipped).toEqual([]);
+    expect(layout.widerThanTheirLabel).toBe(true);
+    expect(layout.insideCard).toBe(true);
+    expect(layout.tallest).toBeLessThan(56);
+
+    await card.getByRole('button', { name: 'Create origin/release_2.0.0', exact: true }).click();
+    await expect(answer).toHaveValue('Create origin/release_2.0.0');
+    await expect(send).toBeEnabled();
+    await send.click();
+
+    await expect.poll(() => appPage.evaluate(() => (window as any).__e2eBlockingAnswer))
+      .toEqual(['Create origin/release_2.0.0']);
+    await expect(card).toHaveCount(0);
+  });
+
+  test('lays a native question out as a wrapping option group instead of squeezing the action row', async ({
+    appPage,
+  }) => {
+    // Reported 2026-09-09: a Claude Code AskUserQuestion with prose options
+    // rendered as five narrow columns of wrapped text, with the branch names
+    // clipped. Real layout is the only oracle for that, so measure it.
+    await appPage.evaluate(() => {
+      (window as any).__e2eQuestion = (window as any).uiChoice({
+        title: 'Needs your input',
+        message: 'Push target\nWhich remote branch should this commit go to?',
+        choiceLayout: 'group',
+        choices: [
+          { id: 'option-0', label: 'Create origin/release_2.0.0' },
+          { id: 'option-1', label: 'Advance origin/release_1.7.0' },
+          { id: 'option-2', label: 'Hold the commit on this machine' },
+          { id: 'other', label: 'Other' },
+        ],
+      });
+    });
+    const dialog = appPage.getByRole('dialog', { name: 'Needs your input' });
+    await expect(dialog).toBeVisible();
+
+    const layout = await dialog.evaluate((node: Element) => {
+      const group = node.querySelector('.ui-dialog-choices');
+      const options = Array.from(node.querySelectorAll('[data-act="choice"]')) as HTMLElement[];
+      const box = (element: HTMLElement) => element.getBoundingClientRect();
+      return {
+        grouped: !!group && options.every((option) => group.contains(option)),
+        actionRow: Array.from(node.querySelectorAll('.modal-actions button'))
+          .map((button) => (button as HTMLElement).dataset.act),
+        clipped: options
+          .filter((option) => option.scrollWidth > Math.ceil(box(option).width))
+          .map((option) => option.textContent),
+        widerThanTheirLabel: options.every((option) => box(option).width >= option.scrollWidth),
+        tallest: Math.max(...options.map((option) => Math.round(box(option).height))),
+        rows: new Set(options.map((option) => Math.round(box(option).top))).size,
+        insideDialog: options.every((option) => box(option).right <= Math.ceil(box(node as HTMLElement).right)),
+      };
+    });
+
+    expect(layout.grouped).toBe(true);
+    expect(layout.actionRow).toEqual(['cancel']);
+    // Every label reads in full: nothing is cut off at the button edge.
+    expect(layout.clipped).toEqual([]);
+    expect(layout.widerThanTheirLabel).toBe(true);
+    expect(layout.insideDialog).toBe(true);
+    // Options keep one line each and wrap onto a second row instead of
+    // collapsing into columns (the reported failure was ~138px tall buttons).
+    expect(layout.tallest).toBeLessThan(56);
+    expect(layout.rows).toBeGreaterThan(1);
+
+    await dialog.locator('[data-act="cancel"]').click();
+    await expect(dialog).toHaveCount(0);
+    await expect.poll(() => appPage.evaluate(() => (window as any).__e2eQuestion)).toBeNull();
+  });
+
   test('preserves keyboard intent, accessible names, focus, and stacked decisions', async ({
     appPage,
   }) => {

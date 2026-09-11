@@ -6,6 +6,7 @@
  */
 const RISKS = new Set(['read', 'write', 'high-risk-write']);
 const OWNED_FLAGS = new Set(['help', 'profile', 'format', 'json', 'yes', 'dry-run']);
+const { isScopeName, readPermissionRequest, rememberPermissionRequest, clearPermissionRequest } = require('./local-cli-permissions.cjs');
 
 function contractError() {
   return Object.assign(new Error('official lark-cli command contract is unavailable or incompatible'), {
@@ -113,6 +114,11 @@ function shortcutParameters(parameters, schema, validateLocalFile) {
 function parameterArgs(parameters, schema) {
   const args = [];
   for (const [key, value] of Object.entries(parameters)) {
+    const carrier = schema?.inputSchema?.properties?.[key];
+    if (carrier?.carrier === '--file' && carrier.type === 'object') {
+      for (const [field, file] of Object.entries(value)) args.push('--file', `${field}=${file}`);
+      continue;
+    }
     const property = schema?._meta?.source === 'cli-help' ? schema.inputSchema.properties[key] : null;
     const flag = property?.flag || `--${key.replace(/_/g, '-')}`;
     if (typeof value === 'boolean') args.push(`${flag}=${value}`);
@@ -136,7 +142,7 @@ const ERROR_MESSAGES = Object.freeze({
   confirmation: ['local_cli_confirmation_required', 'official lark-cli requires confirmation for this action'],
 });
 const ERROR_SUBTYPES = new Set([
-  'invalid_argument', 'command_unavailable', 'missing_scope', 'app_scope_not_applied',
+  'invalid_argument', 'command_unavailable', 'missing_scope', 'token_scope_insufficient', 'app_scope_not_applied',
   'access_denied', 'token_missing', 'token_expired', 'token_invalid', 'not_configured',
   'timeout', 'dns', 'tls', 'transport', 'protocol', 'server_error', 'rate_limit',
   'not_found', 'failed_precondition', 'confirmation_required',
@@ -151,15 +157,28 @@ function structuredFailure(result) {
   }
   if (payload?.ok !== false || !Object.hasOwn(ERROR_MESSAGES, payload.error?.type || '')) return null;
   const { type, subtype, code } = payload.error;
-  const [errorCode, message] = ERROR_MESSAGES[type];
+  const identity = payload.identity || payload.error.identity;
+  const missingScopes = payload.missing_scopes || payload.error.missing_scopes;
+  // API visibility/scope denials may use the API envelope instead of the
+  // authorization envelope. Preserve their provider type and numeric code.
+  const permissionDenied = type === 'authorization' || (type === 'api' && [230013, 99991679].includes(code));
+  const [errorCode, message] = ERROR_MESSAGES[permissionDenied ? 'authorization' : type];
   return Object.assign(new Error(message), {
     code: errorCode,
     provider_error: {
       type,
       ...(ERROR_SUBTYPES.has(subtype) ? { subtype } : {}),
       ...(Number.isSafeInteger(code) ? { code } : {}),
+      ...(['user', 'bot'].includes(identity) ? { identity } : {}),
+      ...(Array.isArray(missingScopes) ? {
+        missing_scopes: missingScopes.filter(isScopeName).slice(0, 50),
+      } : {}),
     },
   });
 }
 
-module.exports = { shortcutSchema, capabilityCommands, apiSchema, shortcutParameters, parameterArgs, structuredFailure };
+
+module.exports = {
+  shortcutSchema, capabilityCommands, apiSchema, shortcutParameters, parameterArgs, structuredFailure,
+  isScopeName, readPermissionRequest, rememberPermissionRequest, clearPermissionRequest,
+};

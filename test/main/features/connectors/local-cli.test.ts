@@ -44,9 +44,11 @@ vi.mock('../../../../src/main/model/core-agent/interactive-cli-sessions', () => 
 import { findCatalogEntry } from '../../../../src/main/features/connectors/catalog';
 import {
   authorizeLocalCli,
+  checkLocalCliPermissions,
   installLocalCli,
   LOCAL_CLI_MANIFESTS,
   localCliInstallStatus,
+  localCliMissingPermissions,
   localCliProfileName,
   localCliRuntimeDir,
   localCliTransport,
@@ -84,6 +86,72 @@ function seedInstalled(uid: string, entry: NonNullable<ReturnType<typeof findCat
 }
 
 describe('official local CLI connector runtime', () => {
+  it('projects missing DingTalk OAuth and PAT scopes without exposing authorization data', () => {
+    const uid = 'dingtalk-permission-projection';
+    const runtime = localCliRuntimeDir(uid, 'dingtalk');
+    fs.mkdirSync(runtime, { recursive: true });
+    try {
+      fs.writeFileSync(path.join(runtime, '.orkas-user-permissions.json'), JSON.stringify({
+        profile: localCliProfileName(uid, 'dingtalk'), reauthorize: true,
+        scopes: ['mail:send'], pat_scopes: ['chat.message:send'], admin_required: false,
+      }));
+      expect(localCliMissingPermissions(uid, 'dingtalk')).toEqual(['chat.message:send', 'mail:send']);
+    } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
+  });
+
+  it('does not start an old-account permission check after switching accounts during proxy setup', async () => {
+    const entry = findCatalogEntry('feishu')!;
+    const uid = 'permission-switch-check';
+    const directory = seedInstalled(uid, entry);
+    const proxy = await import('../../../../src/main/util/proxy-dispatcher');
+    const { notifyUserSwitch } = await import('../../../../src/main/features/user-switch-hooks');
+    let finish!: (value: Record<string, string>) => void;
+    vi.mocked(proxy.buildChildProxyEnvironment).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const runner = vi.fn(async () => ({ exitCode: 0, stderr: '' }));
+    try {
+      const checking = checkLocalCliPermissions(uid, entry, true, runner);
+      notifyUserSwitch(uid, 'next-account');
+      finish({});
+      await checking;
+      expect(runner).not.toHaveBeenCalled();
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('checks installed Lark permissions on demand, coalesces repeated page opens and supports an explicit refresh', async () => {
+    const entry = findCatalogEntry('feishu')!;
+    const uid = 'permission-page-check';
+    const directory = seedInstalled(uid, entry);
+    let finish!: () => void;
+    const runner = vi.fn(async (options: any) => {
+      expect(options.env.ORKAS_LOCAL_CLI_CHECK_PERMISSIONS_ONLY).toBe('1');
+      expect(options.timeoutMs).toBe(60_000);
+      expect(options.args).toEqual([expect.stringContaining('local-cli-auth.cjs')]);
+      await new Promise<void>(resolve => { finish = resolve; });
+      return { exitCode: 0, stderr: '' };
+    });
+    try {
+      expect(runner).not.toHaveBeenCalled();
+      const first = checkLocalCliPermissions(uid, entry, false, runner);
+      const second = checkLocalCliPermissions(uid, entry, false, runner);
+      await vi.waitFor(() => expect(runner).toHaveBeenCalledOnce());
+      finish();
+      await Promise.all([first, second]);
+      await checkLocalCliPermissions(uid, entry, false, runner);
+      expect(runner).toHaveBeenCalledOnce();
+      const refreshed = checkLocalCliPermissions(uid, entry, true, runner);
+      await vi.waitFor(() => expect(runner).toHaveBeenCalledTimes(2));
+      const afterConsent = checkLocalCliPermissions(uid, entry, true, runner);
+      finish();
+      await refreshed;
+      await vi.waitFor(() => expect(runner).toHaveBeenCalledTimes(3));
+      finish();
+      await afterConsent;
+      await checkLocalCliPermissions('not-installed', entry, true, runner);
+      await checkLocalCliPermissions(uid, findCatalogEntry('wecom')!, true, runner);
+      expect(runner).toHaveBeenCalledTimes(3);
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it('derives deterministic account+connector-isolated profiles and device-local paths', () => {
     expect(localCliProfileName('account-a', 'feishu')).toMatch(/^orkas-[a-f0-9]{16}$/);
     expect(localCliProfileName('account-a', 'feishu')).toBe(localCliProfileName('account-a', 'feishu'));
@@ -93,6 +161,55 @@ describe('official local CLI connector runtime', () => {
       path.join(userLocalConfigDir('account-a'), 'connector-cli', 'wecom'),
     );
     expect(() => localCliRuntimeDir('account-a', '../escape')).toThrow('invalid local CLI catalog id');
+  });
+
+  it('expires the page-check cache without scheduling background checks or borrowing another account result', async () => {
+    const entry = findCatalogEntry('feishu')!;
+    const accounts = ['permission-ttl-a', 'permission-ttl-b'];
+    const directories = accounts.map(uid => seedInstalled(uid, entry));
+    let now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const runner = vi.fn(async () => ({ exitCode: 0, stderr: '' }));
+    const authCalls = interactiveMocks.start.mock.calls.length;
+    try {
+      await checkLocalCliPermissions(accounts[0], entry, false, runner);
+      now += 59_999;
+      await checkLocalCliPermissions(accounts[0], entry, false, runner);
+      expect(runner).toHaveBeenCalledOnce();
+      await checkLocalCliPermissions(accounts[1], entry, false, runner);
+      expect(runner).toHaveBeenCalledTimes(2);
+      now += 1;
+      expect(runner).toHaveBeenCalledTimes(2);
+      await checkLocalCliPermissions(accounts[0], entry, false, runner);
+      expect(runner).toHaveBeenCalledTimes(3);
+      expect(interactiveMocks.start).toHaveBeenCalledTimes(authCalls);
+    } finally {
+      clock.mockRestore();
+      directories.forEach(directory => fs.rmSync(directory, { recursive: true, force: true }));
+    }
+  });
+
+  it.each(['disconnect', 'account-switch'])('aborts a running permission check and queued refresh on %s', async mode => {
+    const entry = findCatalogEntry('feishu')!;
+    const uid = `permission-running-${mode}`;
+    const directory = seedInstalled(uid, entry);
+    let signal!: AbortSignal;
+    const runner = vi.fn(async (options: any) => {
+      signal = options.signal;
+      await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }));
+      return { exitCode: 1, stderr: '' };
+    });
+    try {
+      const checking = checkLocalCliPermissions(uid, entry, false, runner);
+      await vi.waitFor(() => expect(runner).toHaveBeenCalledOnce());
+      const queued = checkLocalCliPermissions(uid, entry, true, runner);
+      if (mode === 'disconnect') await removeLocalCliAuthorization(uid, entry);
+      else (await import('../../../../src/main/features/user-switch-hooks')).notifyUserSwitch(uid, 'next-account');
+      await Promise.all([checking, queued]);
+      expect(signal.aborted).toBe(true);
+      expect(runner).toHaveBeenCalledOnce();
+      if (mode === 'disconnect') expect(fs.existsSync(directory)).toBe(false);
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
   });
 
   it('materializes the governed adapter with pinned official package metadata and isolated auth env', () => {
@@ -299,7 +416,7 @@ describe('official local CLI connector runtime', () => {
     );
   });
 
-  it('uses DingTalk structured authentication state instead of the process exit code', () => {
+  it('requires DingTalk authenticated state as well as a successful status command', () => {
     const helper = require('../../../../bin/local-cli-auth.cjs') as {
       MANIFESTS: Record<string, { package: string; verify: string[] }>;
       dingtalkAuthorizationReady: (
@@ -317,7 +434,9 @@ describe('official local CLI connector runtime', () => {
         stdout: JSON.stringify({ success: true, authenticated: false }),
       })
       .mockReturnValueOnce({
-        status: 3,
+        // DWS 1.0.61 writeAuthStatusJSON returns the encoder result; a successful
+        // status command exits zero even when authenticated is false.
+        status: 0,
         stdout: JSON.stringify({ success: true, authenticated: true }),
       });
 
@@ -355,7 +474,9 @@ describe('official local CLI connector runtime', () => {
         stdout: JSON.stringify({ error: { code: 893999 } }),
       })
       .mockReturnValueOnce({
-        status: 3,
+        // WeCom's CLI reference defines exit zero as success; a payload alone
+        // cannot turn a failed identity command into verification.
+        status: 0,
         stdout: JSON.stringify({ extra_identity_context: 'verified identity context' }),
       });
 

@@ -32,6 +32,8 @@ import {
 import { createLogger } from '../../logger';
 import { logErrorSummary, maskId } from '../../util/log-redact';
 
+import { readCodingDirectory, readCodingDirectoryFromStateFile, writeCodingDirectory, cloudConversationState } from '../local_agents/project-directory';
+
 const log = createLogger('group_chat.state');
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -112,7 +114,7 @@ export interface StateFile {
    *  the directory or update this field. See `conv_workspace.ts` for the
    *  slug rules and the placeholder fallback. */
   workspace_dir?: string;
-  /** Project directory for coding-agent dispatches in
+  /** Device-local projection (never written to cloud state). Project directory for coding-agent dispatches in
    *  this conversation. Initialised on the first coding-agent turn from
    *  that agent's detail-page project-dir setting; missing setting =
    *  effective workspace path. Absolute path. Missing / empty → coding
@@ -126,6 +128,8 @@ export interface StateFile {
    *  picker (form-submit hook in `group_chat/index.ts`). Cleared
    *  whenever `coding_project_dir` is cleared. */
   coding_project_dir_explicit?: boolean;
+  /** Legacy selection without device provenance; never an execution root. */
+  coding_project_dir_pending?: string;
   /** Conversation-scoped absolute roots for file tools. Used by narrow
    *  system-created workflows such as sync-conflict resolution where the
    *  target file lives outside the active workspace. */
@@ -428,7 +432,14 @@ export async function renameAgentInMembers(
 
 // ── State IO ─────────────────────────────────────────────────────────────
 
-export async function readState(
+export async function readState(uid: string, cid: string, projectIdHint?: string | null): Promise<StateFile> {
+  const cloud = await readCloudState(uid, cid, projectIdHint);
+  return { ...cloudConversationState(cloud),
+    ...readCodingDirectoryFromStateFile(uid, cid, conversationLayout(uid, cid, projectIdHint).stateFile),
+  };
+}
+
+async function readCloudState(
   uid: string,
   cid: string,
   projectIdHint?: string | null,
@@ -508,7 +519,7 @@ export async function readState(
 
 async function writeStateRaw(uid: string, cid: string, s: StateFile): Promise<void> {
   ensureGroupDir(uid, cid);
-  await writeJson(conversationLayout(uid, cid).stateFile, s);
+  await writeJson(conversationLayout(uid, cid).stateFile, cloudConversationState(s));
 }
 
 // A compact local journal makes boot crash recovery proportional to the
@@ -1066,21 +1077,16 @@ export async function setWorkspaceDirOnce(uid: string, cid: string, dir: string)
  *  doesn't accidentally inherit a stale `true`. */
 export async function setCodingProjectDir(
   uid: string, cid: string, dir: string,
-  opts: { explicit: boolean },
+  opts: { explicit: boolean; needsConfirmation?: boolean },
 ): Promise<StateFile> {
   return _stateLock(uid, cid).runExclusive(async () => {
     const s = await readState(uid, cid);
     const trimmed = String(dir || '').trim();
-    if (trimmed) {
-      s.coding_project_dir = trimmed;
-      if (opts.explicit) s.coding_project_dir_explicit = true;
-      else delete s.coding_project_dir_explicit;
-    } else {
-      delete s.coding_project_dir;
-      delete s.coding_project_dir_explicit;
-    }
-    s.last_active_at = nowIso();
-    await writeStateRaw(uid, cid, s);
+    writeCodingDirectory(uid, cid, trimmed, opts.explicit, opts.needsConfirmation);
+    delete s.coding_project_dir;
+    delete s.coding_project_dir_explicit;
+    delete s.coding_project_dir_pending;
+    Object.assign(s, readCodingDirectory(uid, cid));
     return s;
   });
 }
@@ -1095,12 +1101,9 @@ export async function setCodingProjectDirOnce(
   return _stateLock(uid, cid).runExclusive(async () => {
     const s = await readState(uid, cid);
     const trimmed = String(dir || '').trim();
-    if (s.coding_project_dir || !trimmed) return { state: s, applied: false };
-    s.coding_project_dir = trimmed;
-    if (opts.explicit) s.coding_project_dir_explicit = true;
-    else delete s.coding_project_dir_explicit;
-    s.last_active_at = nowIso();
-    await writeStateRaw(uid, cid, s);
+    if (s.coding_project_dir || s.coding_project_dir_pending || !trimmed) return { state: s, applied: false };
+    writeCodingDirectory(uid, cid, trimmed, opts.explicit);
+    Object.assign(s, readCodingDirectory(uid, cid));
     return { state: s, applied: true };
   });
 }

@@ -117,6 +117,7 @@ const PACKAGED_BIN_HELPERS = Object.freeze([
   'gmail-mcp-server.cjs',
   // Lark CLI shortcut contract required by local-cli-mcp-server.cjs.
   'local-cli-lark.cjs',
+  'local-cli-permissions.cjs',
   'commerce-request-context.cjs',
   'ebay-signature.cjs',
   'shopify-setup-requirements.cjs',

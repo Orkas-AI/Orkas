@@ -4,6 +4,7 @@ const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { sharpPreparationFiles } = require('../bin/native-package-gate.cjs');
 const {
   ensureFile,
   isPeX64,
@@ -123,6 +124,7 @@ function expectedState(electronVersion) {
     scriptHashes: scriptHashes({
       prepareWinNativeDeps: __filename,
       nativePrepareCache: CACHE_HELPER,
+      nativePackageGate: require.resolve('../bin/native-package-gate.cjs'),
     }),
     packages: {
       '@esbuild/win32-x64': readLockPackage(LOCK_FILE, '@esbuild/win32-x64'),
@@ -154,6 +156,7 @@ function main() {
   const electronVersion = readElectronVersion(PC_DIR);
   const state = expectedState(electronVersion);
   const sharpVersion = state.packages['@img/sharp-win32-x64'];
+  const sharpFiles = sharpPreparationFiles('win32', 'x64', sharpVersion);
   const sqliteVecDir = path.join(PC_DIR, 'node_modules', 'sqlite-vec');
   const betterSqliteDir = path.join(PC_DIR, 'node_modules', 'better-sqlite3');
   const betterSqliteBinary = path.join(betterSqliteDir, 'build', 'Release', 'better_sqlite3.node');
@@ -163,9 +166,9 @@ function main() {
     betterSqlite: betterSqliteBinary,
     canvas: path.join(PC_DIR, 'node_modules', '@napi-rs', 'canvas-win32-x64-msvc', 'skia.win32-x64-msvc.node'),
     tokenizers: path.join(PC_DIR, 'node_modules', '@anush008', 'tokenizers-win32-x64-msvc', 'tokenizers.win32-x64-msvc.node'),
-    sharp: path.join(PC_DIR, 'node_modules', '@img', 'sharp-win32-x64', 'lib', `sharp-win32-x64-${sharpVersion}.node`),
-    sharpVipsCpp: path.join(PC_DIR, 'node_modules', '@img', 'sharp-win32-x64', 'lib', 'libvips-cpp-8.18.6.dll'),
-    sharpVips: path.join(PC_DIR, 'node_modules', '@img', 'sharp-win32-x64', 'lib', 'libvips-42.dll'),
+    sharp: path.join(PC_DIR, 'node_modules', sharpFiles.binding),
+    sharpVipsCpp: path.join(PC_DIR, 'node_modules', sharpFiles.cpp),
+    sharpVips: path.join(PC_DIR, 'node_modules', sharpFiles.libvips),
   };
 
   if (!fs.existsSync(sqliteVecDir) || !fs.statSync(sqliteVecDir).isDirectory()) {

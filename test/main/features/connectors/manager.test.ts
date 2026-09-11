@@ -2218,6 +2218,68 @@ describe('OAuth refresh ownership', () => {
     },
   );
 
+  it.each(['feishu', 'dingtalk', 'wecom'].flatMap(id =>
+    ['user_cancelled', 'local_cli_authorization_failed'].map(code => [id, code])))(
+    'keeps an existing CLI connection usable when additional authorization for %s ends with %s', async (id, code) => {
+      mocks.mcp.listTools = vi.fn(async () => [
+        { name: 'execute_read', description: 'Read an official action.', input_schema: {} },
+      ]);
+      const manager = await import('../../../../src/main/features/connectors/manager');
+      await manager.connectViaOAuth(TEST_UID, id);
+      mocks.localCli.authorize.mockRejectedValueOnce(Object.assign(new Error(code), { code }));
+      await expect(manager.connectViaOAuth(TEST_UID, id)).rejects.toMatchObject({ code });
+      expect(manager.getInstance(TEST_UID, id)?.status.kind).toBe('connected');
+      await manager.callTool(TEST_UID, id, 'execute_read', { action: 'docs.+fetch' });
+      expect(mocks.mcp.callTool).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each(['feishu', 'dingtalk', 'wecom'])(
+    'keeps %s connected and readable after one business operation is denied', async id => {
+      mocks.mcp.listTools = vi.fn(async () => [
+        { name: 'execute_high_impact', description: 'Send.', input_schema: {} },
+        { name: 'execute_read', description: 'Read.', input_schema: {} },
+      ]);
+      const manager = await import('../../../../src/main/features/connectors/manager');
+      await manager.connectViaOAuth(TEST_UID, id);
+      const denial = { isError: true, content: [{ type: 'text', text: JSON.stringify({
+        error_code: 'connector_permission_denied', provider_error: { type: 'authorization', recovery: 'reauthorize' },
+      }) }] };
+      mocks.mcp.callTool.mockResolvedValueOnce(denial);
+      expect(await manager.callTool(TEST_UID, id, 'execute_high_impact', { action: 'message.send' })).toEqual(denial);
+      expect(manager.getInstance(TEST_UID, id)?.status.kind).toBe('connected');
+      const readable = { content: [{ type: 'text', text: 'read fixture' }] };
+      mocks.mcp.callTool.mockResolvedValueOnce(readable);
+      expect(await manager.callTool(TEST_UID, id, 'execute_read', { action: 'doc.get' })).toEqual(readable);
+      expect(mocks.mcp.callTool).toHaveBeenCalledTimes(2);
+      expect(manager.getInstance(TEST_UID, id)?.status.kind).toBe('connected');
+    },
+  );
+
+  it('retains selected tools on CLI reauthorization and lets transfers finish within their own deadline', async () => {
+    mocks.mcp.listTools = vi.fn(async () => [
+      { name: 'execute_high_impact', description: 'Send a message.', input_schema: {} },
+      { name: 'execute_read', description: 'Read.', input_schema: {} },
+    ]);
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const initial = await manager.connectViaOAuth(TEST_UID, 'feishu');
+    await registry.upsert(TEST_UID, { ...initial, enabled_subtools: ['execute_high_impact'], created_at: '2026-01-01T00:00:00Z' });
+    const recovered = await manager.connectViaOAuth(TEST_UID, 'feishu');
+    expect(recovered.enabled_subtools).toEqual(['execute_high_impact']);
+    expect(recovered.created_at).toBe('2026-01-01T00:00:00Z');
+    const controller = new AbortController();
+    await manager.callTool(TEST_UID, 'feishu', 'execute_high_impact', {
+      action: 'im.+messages-send', parameters: { file: '/fixture/attachment.md' },
+    }, { signal: controller.signal });
+    expect(mocks.mcp.callTool).toHaveBeenCalledOnce();
+    const options = mocks.mcp.callTool.mock.calls[0][2];
+    expect(options.signal).toBe(controller.signal);
+    // A stalled transport fails promptly; only adapter progress extends the wait.
+    expect(options.timeoutMs).toBe(90_000);
+    expect(options.maxTotalTimeoutMs).toBe(13 * 60_000);
+  });
+
   it('keeps legacy standalone Lark installs mutually exclusive with the unified Feishu entry', async () => {
     mocks.mcp.listTools = vi.fn(async () => [
       { name: 'execute_read', description: 'Read an official action.', input_schema: {} },

@@ -109,6 +109,16 @@ describe('task board › a background conversation still settles', () => {
     expect(ctx._taskBoardTasks.get('visible-cid')?.get('v1')?.status).toBe('running');
     expect(ctx.renders).toEqual(['visible-cid']);
   });
+
+  it('rejects a delayed background event without suppressing real work with the same task id in another conversation', () => {
+    const ctx = applyEvents('visible-cid', [
+      ['bg-cid', RUNNING], ['bg-cid', DONE], ['bg-cid', RUNNING],
+      ['visible-cid', RUNNING],
+    ]);
+    expect(ctx._taskBoardTasks.get('bg-cid')?.get('t1')?.status).toBe('done');
+    expect(ctx._taskBoardTasks.get('visible-cid')?.get('t1')?.status).toBe('running');
+    expect(ctx.renders).toEqual(['visible-cid']);
+  });
 });
 
 describe('task board › events are settled above the cross-cid view guard', () => {

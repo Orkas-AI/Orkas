@@ -1518,6 +1518,30 @@ describe('chats › index repair', () => {
 });
 
 describe('chats › deleteConversation', () => {
+  it('removes only the deleted task directory binding and preserves project files and other bindings', async () => {
+    const chats = await loadChats();
+    const removed = await chats.createConversation(TEST_UID);
+    const retained = await chats.createConversation(TEST_UID);
+    const state = await import('../../../src/main/features/group_chat/state');
+    const paths = await import('../../../src/main/paths');
+    const project = path.join(tmpDir, 'user-project');
+    fs.mkdirSync(project);
+    const source = path.join(project, 'main.ts');
+    fs.writeFileSync(source, 'user project content');
+    await state.setCodingProjectDir(TEST_UID, removed.conversation_id, project, { explicit: true });
+    await state.setCodingProjectDir(TEST_UID, retained.conversation_id, project, { explicit: true });
+    await state.setCodingProjectDir('other-account', removed.conversation_id, project, { explicit: true });
+    expect(fs.existsSync(paths.localCliDirectoryFile(TEST_UID, removed.conversation_id))).toBe(true);
+
+    expect(await chats.deleteConversation(TEST_UID, removed.conversation_id)).toBe(true);
+    expect(fs.existsSync(paths.localCliDirectoryFile(TEST_UID, removed.conversation_id))).toBe(false);
+    expect((await state.readState(TEST_UID, retained.conversation_id)).coding_project_dir).toBe(project);
+    expect((await state.readState('other-account', removed.conversation_id)).coding_project_dir).toBe(project);
+    expect(fs.readFileSync(source, 'utf8')).toBe('user project content');
+    expect(await chats.deleteConversation(TEST_UID, removed.conversation_id)).toBe(true);
+    expect(fs.existsSync(paths.localCliDirectoryFile(TEST_UID, removed.conversation_id))).toBe(false);
+  });
+
   it('exposes compact active ids for maintenance without tombstoned rows', async () => {
     const chats = await loadChats();
     const live = await chats.createConversation(TEST_UID);
@@ -2149,11 +2173,15 @@ describe('chats › message display context memo', () => {
         fs.writeFileSync(path.join(root, 'report.txt'), root);
       }
       expect(workspace.setWorkspacePath(TEST_UID, oldRoot).ok).toBe(true);
-      const stateFile = path.join(tmpDir, TEST_UID, 'cloud', 'chats', cid, 'state.json');
+      const paths = await import('../../../src/main/paths');
+      const directory = await import('../../../src/main/features/local_agents/project-directory');
+      if (change !== 'workspace selection') directory.writeCodingDirectory(TEST_UID, cid, oldRoot, true);
+      const stateFile = change === 'workspace selection'
+        ? paths.groupChatStateFile(TEST_UID, cid) : paths.localCliDirectoryFile(TEST_UID, cid);
       fs.mkdirSync(path.dirname(stateFile), { recursive: true });
       const state = {
         version: 1, status: 'idle', in_flight: [],
-        ...(change === 'workspace selection' ? {} : { coding_project_dir: oldRoot }),
+        ...(change === 'workspace selection' ? {} : { directory: oldRoot, explicit: true }),
       };
       fs.writeFileSync(stateFile, JSON.stringify(state));
       const stamp = new Date('2026-07-10T09:00:00Z');
@@ -2172,7 +2200,7 @@ describe('chats › message display context memo', () => {
       } else {
         await new Promise((resolve) => setTimeout(resolve, 20));
         const target = change === 'state replacement' ? `${stateFile}.replacement` : stateFile;
-        fs.writeFileSync(target, JSON.stringify({ ...state, coding_project_dir: newRoot }));
+        fs.writeFileSync(target, JSON.stringify({ ...state, directory: newRoot }));
         fs.utimesSync(target, before.atime, before.mtime);
         if (target !== stateFile) fs.renameSync(target, stateFile);
         expect(fs.statSync(stateFile).size).toBe(before.size);
@@ -2206,6 +2234,8 @@ describe('chats › message display context memo', () => {
     fs.writeFileSync(stateFile, JSON.stringify({
       version: 1, status: 'idle', in_flight: [], coding_project_dir: tmpDir,
     }));
+    const directory = await import('../../../src/main/features/local_agents/project-directory');
+    directory.writeCodingDirectory(TEST_UID, cid, tmpDir, true);
     // storage.ts binds `node:fs/promises` as an ESM namespace, so the patched
     // property has to be re-synced into that namespace.
     const { syncBuiltinESMExports } = await import('node:module');

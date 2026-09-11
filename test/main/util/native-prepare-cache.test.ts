@@ -109,6 +109,7 @@ describe('native preparation cache', () => {
     cache.writeMarker(root, state);
 
     expect(cache.markerMatches(root, state, [required], () => true)).toBe(true);
+    expect(cache.markerMatches(root, { ...state, scriptHashes: { prepare: 'changed-shared-contract' } }, [required], () => true)).toBe(false);
     expect(cache.markerMatches(root, { ...state, arch: 'x64' }, [required], () => true)).toBe(false);
     expect(cache.markerMatches(root, state, [required], () => false)).toBe(false);
     fs.rmSync(required);

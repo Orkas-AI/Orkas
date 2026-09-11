@@ -4760,6 +4760,34 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
 });
 
 describe('group_chat bus integration › task terminal boundary', () => {
+  it('expires connector task grants on normal completion so the next request asks again', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const confirm = await import('../../../../src/main/features/connectors/action_confirm');
+    const permissions = await import('../../../../src/main/features/permissions');
+    permissions.setLocalExecMode('all_files_approval');
+    const prompts: any[] = [];
+    confirm._setBroadcastForTest((channel, payload) => { if (channel === 'connectors:action-confirm') prompts.push(payload); });
+    const opts = { userId: TEST_UID, cid, connectorId: 'feishu', displayName: 'Feishu', toolName: 'send', risk: 'H' as const, args: {} };
+    try {
+      const first = confirm.requestActionConfirm(opts);
+      confirm.respond(prompts[0].request_id, true, 'task');
+      await expect(first).resolves.toBe(true);
+      await expect(confirm.requestActionConfirm(opts)).resolves.toBe(true);
+      _setScript(state.buildGconvSessionId(cid), [{ type: 'final', text: 'Done.' }]);
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Finish this task.' });
+      await waitForQuiescent(TEST_UID, cid, 3000);
+      const next = confirm.requestActionConfirm(opts);
+      expect(prompts).toHaveLength(2);
+      confirm.respond(prompts[1].request_id, false);
+      await expect(next).resolves.toBe(false);
+    } finally {
+      confirm.cancelForCid(cid);
+      confirm._setBroadcastForTest(null);
+    }
+  });
+
   it('denies pending approvals when the active account changes', async () => {
     const users = await import('../../../../src/main/features/users');
     // Loading the bus mirrors the real runtime and exposes the synchronous

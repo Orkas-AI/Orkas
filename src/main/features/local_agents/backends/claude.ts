@@ -16,6 +16,7 @@
 import { createLogger } from '../../../logger.js';
 import { AGENT_EXECUTION_MAX_MS } from '../../../util/agent-execution-budget.js';
 import { logErrorSummary } from '../../../util/log-redact.js';
+import { CliInputCancellation, CliInputNotSentError } from '../cli_input_cancel.js';
 import {
   type LocalBackend,
   type LocalActiveRunIngress,
@@ -114,11 +115,11 @@ export const claudeBackend: LocalBackend = {
     // must never interleave records or let a steer overtake a pending approval
     // response.
     let stdinWrites: Promise<void> = Promise.resolve();
-    const writeInputRecord = (record: Record<string, unknown>): Promise<void> => {
+    const writeInputRecord = (record: Record<string, unknown>, cancellationSignal?: AbortSignal): Promise<void> => {
       const line = `${JSON.stringify(record)}\n`;
       const write = stdinWrites.then(() => new Promise<void>((resolve, reject) => {
-        if (exited || child.stdin.destroyed || !child.stdin.writable) {
-          reject(new Error('claude stdin is no longer writable'));
+        if (exited || cancellationSignal?.aborted || child.stdin.destroyed || !child.stdin.writable) {
+          reject(new CliInputNotSentError('claude stdin is no longer writable'));
           return;
         }
         child.stdin.write(line, (err?: Error | null) => {
@@ -392,15 +393,26 @@ export const claudeBackend: LocalBackend = {
      * overtake each other while the renderer is waiting for a decision. */
     let permissionResponseQueue = Promise.resolve();
     const userInputRequests = new Map<string, AbortController>();
+    const inputCancellations = new Map<string, { requestId: string; cancellation: CliInputCancellation }>();
     const cancelUserInputs = (): void => {
       for (const controller of userInputRequests.values()) controller.abort();
       userInputRequests.clear();
+      inputCancellations.clear();
     };
     const respondToControlRequest = async (msg: any, inputSignal?: AbortSignal): Promise<void> => {
       if (exited || inputSignal?.aborted) return;
       const req = msg?.request || {};
       const inputMap = (req.input && typeof req.input === 'object') ? req.input : {};
       if (req.subtype === 'can_use_tool' && req.tool_name === 'AskUserQuestion') {
+        const toolUseId = typeof req.tool_use_id === 'string' ? req.tool_use_id : '';
+        const cancellation = inputSignal && toolUseId ? new CliInputCancellation(inputSignal, () => writeInputRecord({
+          type: 'control_response',
+          response: {
+            subtype: 'success', request_id: msg.request_id,
+            response: { behavior: 'deny', message: 'The user did not answer this question.' },
+          },
+        }, inputSignal)) : undefined;
+        if (cancellation) inputCancellations.set(toolUseId, { requestId: msg.request_id, cancellation });
         const original = Array.isArray(inputMap.questions) ? inputMap.questions : [];
         const questions = original.slice(0, 4).map((question: any, index: number) => ({
           id: `question-${index}`,
@@ -416,12 +428,15 @@ export const claudeBackend: LocalBackend = {
         if (questions.length && questions.every((question: { question: string }) => question.question)
             && opts.requestUserInput) {
           try {
-            answer = await opts.requestUserInput({ id: String(msg.request_id || ''), questions, isBlocking: true, signal: inputSignal });
+            answer = await opts.requestUserInput({
+              id: String(msg.request_id || ''), questions, isBlocking: true, signal: inputSignal,
+              cancel: cancellation?.cancel,
+            });
           } catch (err) {
             log.warn('claude user-input request failed', { error: logErrorSummary(err) });
           }
         }
-        if (inputSignal?.aborted || exited) return;
+        if (inputSignal?.aborted || exited || cancellation?.mayHaveSent) return;
         const answered = !answer.cancelled && questions.length > 0
           && questions.every((question: { id: string }) => answer.answers[question.id]?.some(value => value.trim()));
         const answers = Object.fromEntries(questions.map((question: { id: string; question: string }) => [
@@ -526,6 +541,9 @@ export const claudeBackend: LocalBackend = {
               if (inputController && userInputRequests.get(obj.request_id) === inputController) {
                 userInputRequests.delete(obj.request_id);
               }
+              for (const [id, entry] of inputCancellations) {
+                if (entry.requestId === obj.request_id) inputCancellations.delete(id);
+              }
             });
           return;
         }
@@ -533,6 +551,18 @@ export const claudeBackend: LocalBackend = {
           userInputRequests.get(obj.request_id)?.abort();
           userInputRequests.delete(obj.request_id);
           return;
+        }
+        // Only the result for this exact tool invocation proves the CLI has
+        // finished the declined question. Text, unrelated tool results, and
+        // successful stdin writes cannot acknowledge a cancellation.
+        if (obj?.type === 'user' && Array.isArray(obj.message?.content)) {
+          for (const part of obj.message.content) {
+            if (part?.type !== 'tool_result') continue;
+            const entry = inputCancellations.get(part.tool_use_id);
+            if (!entry) continue;
+            entry.cancellation.confirm();
+            userInputRequests.get(entry.requestId)?.abort();
+          }
         }
         // Side-channel: each `assistant` block carries a `message.usage`
         // snapshot for that turn-piece. Multica accumulates these per

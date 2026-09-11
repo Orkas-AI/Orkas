@@ -28,6 +28,7 @@
 
 import { createLogger } from '../../../logger.js';
 import { logErrorSummary } from '../../../util/log-redact.js';
+import { CliInputCancellation, CliInputNotSentError } from '../cli_input_cancel.js';
 import {
   type LocalBackend,
   type LocalActiveRunIngress,
@@ -364,6 +365,7 @@ export const codexBackend: LocalBackend = {
     let nextRpcId = 1;
     const pending = new Map<number, { method: string; resolve: (r: any) => void; reject: (e: Error) => void }>();
     const userInputRequests = new Map<string | number, AbortController>();
+    const inputCancellations = new Map<string | number, CliInputCancellation>();
     let threadId: string | undefined;
     let activeTurnId: string | undefined;
     let turnStarted = false;
@@ -472,10 +474,20 @@ export const codexBackend: LocalBackend = {
           isSecret: question?.isSecret === true,
         }))
         .filter((question: { id: string; question: string }) => question.id && question.question);
+      const cancellation = new CliInputCancellation(signal, () => new Promise<void>((resolve, reject) => {
+        if (exited || signal.aborted || child.stdin.destroyed || !child.stdin.writable) {
+          reject(new CliInputNotSentError('codex input request is no longer writable'));
+          return;
+        }
+        child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: env.id, result: { answers: {} } }) + '\n',
+          (error?: Error | null) => error ? reject(error) : resolve());
+      }));
+      inputCancellations.set(env.id, cancellation);
       const response = opts.requestUserInput
         ? await opts.requestUserInput({
             id: typeof params.itemId === 'string' ? params.itemId : String(env.id),
             signal,
+            cancel: cancellation.cancel,
             questions,
             ...(typeof params.isBlocking === 'boolean' ? { isBlocking: params.isBlocking } : {}),
             ...(Number.isFinite(params.autoResolutionMs)
@@ -486,7 +498,7 @@ export const codexBackend: LocalBackend = {
             cancelled: true,
             answers: Object.fromEntries(questions.map((question: { id: string }) => [question.id, []])),
           };
-      if (signal.aborted) return;
+      if (signal.aborted || cancellation.mayHaveSent) return;
       const answers = Object.fromEntries(questions.map((question: { id: string }) => [
         question.id,
         {
@@ -560,6 +572,7 @@ export const codexBackend: LocalBackend = {
     const closePending = (err: Error) => {
       for (const controller of userInputRequests.values()) controller.abort();
       userInputRequests.clear();
+      inputCancellations.clear();
       for (const { reject } of pending.values()) reject(err);
       pending.clear();
     };
@@ -620,6 +633,7 @@ export const codexBackend: LocalBackend = {
               });
             }).finally(() => {
               if (userInputRequests.get(env.id) === controller) userInputRequests.delete(env.id);
+              inputCancellations.delete(env.id);
             });
           } else if (CODEX_OPTIONAL_SERVER_REQUEST_METHODS.has(env.method)) {
             // These callbacks require an explicit client capability or a
@@ -721,6 +735,8 @@ export const codexBackend: LocalBackend = {
       const eventThreadId = typeof params.threadId === 'string' ? params.threadId : '';
       if (threadId && eventThreadId && eventThreadId !== threadId) return;
       if (method === 'serverRequest/resolved') {
+        if (!threadId || eventThreadId !== threadId) return;
+        inputCancellations.get(params.requestId)?.confirm();
         userInputRequests.get(params.requestId)?.abort();
         userInputRequests.delete(params.requestId);
         return;

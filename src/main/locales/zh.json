@@ -1,4 +1,7 @@
 {
+  "errors.cli_directory_storage": "无法读取或保存项目目录设置，请检查磁盘访问权限后重试。",
+  "errors.cli_directory_denied": "没有项目目录的访问权限。请恢复文件夹访问权限后重试，原目录选择已保留。",
+  "errors.cli_directory_unavailable": "项目目录暂时无法访问。请检查文件夹或磁盘后重试，原目录选择已保留。",
   "agent.execution_idle_timeout_seconds": "智能体已连续 {seconds}s 没有实际进展，执行已停止。请重试，或让智能体继续。",
   "agent.execution_wall_timeout": "本次执行已达到 24 小时上限并停止。可让智能体继续未完成的工作。",
   "agent.execution_idle_timeout": "智能体已连续 30 分钟没有实际进展，执行已停止。请重试，或让智能体继续。",

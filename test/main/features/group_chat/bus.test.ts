@@ -4066,7 +4066,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
 
       expect(cliRunMock.calls).toHaveLength(0);
       const st = await state.readState(TEST_UID, cid);
-      expect(st.coding_project_dir).toBeUndefined();
+      expect(st.coding_project_dir).toBe(projectDir);
 
       const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
       const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
@@ -4075,7 +4075,8 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     },
   );
 
-  it('blocks a later OpenCode turn when its conversation cwd disappears instead of falling back', async () => {
+  it.each(['removed', 'replaced-with-file'])(
+    'blocks a later OpenCode turn when its cwd is %s and resumes in the restored directory', async (fault) => {
     const paths = await import('../../../../src/main/paths');
     const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
     const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
@@ -4104,6 +4105,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect((await state.readState(TEST_UID, cid)).coding_project_dir).toBe(projectDir);
     await sessions.setSessionId(TEST_UID, cid, AGENT_ID, 'opencode', 'stale-cwd-session');
     fs.rmSync(projectDir, { recursive: true, force: true });
+    if (fault === 'replaced-with-file') fs.writeFileSync(projectDir, 'not a directory');
 
     await bus.enqueue({
       uid: TEST_UID,
@@ -4114,14 +4116,89 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     await waitForQuiescent(TEST_UID, cid);
 
     expect(cliRunMock.calls).toHaveLength(1);
-    expect((await state.readState(TEST_UID, cid)).coding_project_dir).toBeUndefined();
-    expect(await sessions.getSessionId(TEST_UID, cid, AGENT_ID, 'opencode')).toBeNull();
+    expect((await state.readState(TEST_UID, cid)).coding_project_dir).toBe(projectDir);
+    expect(await sessions.getSessionId(TEST_UID, cid, AGENT_ID, 'opencode')).toBe('stale-cwd-session');
     const rows = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8')
       .trim().split('\n').map((line) => JSON.parse(line));
     const recoveryForm = rows.find((row: any) => row?.form?.agent_id === AGENT_ID
       && row.form.fields?.some((field: any) => field.id === 'project_dir'));
     expect(recoveryForm?.form?.submitted).toBe(false);
+    if (fault === 'replaced-with-file') fs.rmSync(projectDir);
+    fs.mkdirSync(projectDir);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: `@${AGENT_NAME} continue after restoring the drive` });
+    await waitForQuiescent(TEST_UID, cid);
+    expect(cliRunMock.calls).toHaveLength(2);
+    expect(cliRunMock.calls[1].cwd).toBe(projectDir);
   });
+
+  it('keeps an unverified legacy directory recoverable when form persistence fails', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+    const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+    spec.runtime = { kind: 'cli', cli: 'codex' };
+    fs.writeFileSync(agentFile, JSON.stringify(spec));
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const cid = 'cid-directory-migration-form';
+    const legacy = path.join(tmpDir, 'legacy-unverified');
+    await state.setCodingProjectDir(TEST_UID, cid, legacy, { explicit: true, needsConfirmation: true });
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: `@${AGENT_NAME} continue the task` });
+    await waitForQuiescent(TEST_UID, cid);
+    expect(cliRunMock.calls).toHaveLength(0);
+    const file = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const rows = fs.readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const form = rows.find((row: any) => row.form);
+    const storage = await import('../../../../src/main/storage');
+    const rewrite = vi.spyOn(storage, 'rewriteJsonlLine').mockResolvedValueOnce({ ok: false, error: 'injected transcript failure' });
+    const facade = await import('../../../../src/main/features/group_chat');
+    const input = { userId: TEST_UID, cid, msgId: form.id, formId: form.form.form_id, values: { project_dir: tmpDir } };
+    try {
+      expect((await facade.markFormSubmittedAndDispatch(input)).ok).toBe(false);
+      expect((await state.readState(TEST_UID, cid)).coding_project_dir_pending).toBe(legacy);
+      expect((await state.readState(TEST_UID, cid)).coding_project_dir).toBeUndefined();
+    } finally { rewrite.mockRestore(); }
+    expect((await facade.markFormSubmittedAndDispatch(input)).ok).toBe(true);
+    expect((await state.readState(TEST_UID, cid)).coding_project_dir).toBe(tmpDir);
+    expect((await state.readState(TEST_UID, cid)).coding_project_dir_pending).toBeUndefined();
+  });
+
+  it.each(['EACCES', 'EPERM', 'EIO'])(
+    'retains the project and resumes after a %s directory-check failure', async (code) => {
+      const paths = await import('../../../../src/main/paths');
+      const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+      const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+      spec.runtime = { kind: 'cli', cli: 'codex' };
+      fs.writeFileSync(agentFile, JSON.stringify(spec));
+      const selected = path.join(tmpDir, 'protected-project');
+      fs.mkdirSync(selected);
+      const state = await import('../../../../src/main/features/group_chat/state');
+      const cid = 'cid-directory-access';
+      await state.setCodingProjectDir(TEST_UID, cid, selected, { explicit: true });
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const { syncBuiltinESMExports } = await import('node:module');
+      const realStat = fs.statSync;
+      const nativeFs = (await import('node:fs')).default;
+      const stat = vi.spyOn(nativeFs, 'statSync').mockImplementation(((target: any, options: any) => {
+        if (String(target) === selected) throw Object.assign(new Error('injected directory access error'), { code });
+        return realStat(target, options);
+      }) as typeof fs.statSync);
+      syncBuiltinESMExports();
+      try {
+        await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: `@${AGENT_NAME} inspect this project` });
+        await waitForQuiescent(TEST_UID, cid);
+        expect(cliRunMock.calls).toHaveLength(0);
+        expect((await state.readState(TEST_UID, cid)).coding_project_dir).toBe(selected);
+        const rows = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8')
+          .trim().split('\n').map((line) => JSON.parse(line));
+        expect(rows.some((row: any) => row.form)).toBe(false);
+        expect(rows.some((row: any) => row.failure_code === 'project_directory_unavailable')).toBe(true);
+      } finally { stat.mockRestore(); syncBuiltinESMExports(); }
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: `@${AGENT_NAME} try again` });
+      await waitForQuiescent(TEST_UID, cid);
+      expect(cliRunMock.calls).toHaveLength(1);
+      expect(cliRunMock.calls[0].cwd).toBe(selected);
+    },
+  );
 
   it('ignores a legacy per-agent model override when dispatching a CLI turn', async () => {
     const paths = await import('../../../../src/main/paths');

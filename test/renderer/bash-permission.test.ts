@@ -178,6 +178,7 @@ class FakeDocument {
 interface DialogView {
   title: string;
   message: string;
+  summary: string;
   currentMode: string;
   modeLabel: string;
   modes: Array<{ mode: string; label: string; desc: string }>;
@@ -194,6 +195,9 @@ function dialogView(overlay: FakeElement): DialogView {
   return {
     title: text('.ui-dialog-title'),
     message: text('.bash-permission-message'),
+    summary: (overlay.querySelector('.bash-permission-message')?.children ?? [])
+      .filter((child) => typeof child === 'string' || child.tag !== 'details')
+      .map((child) => typeof child === 'string' ? child : child.tag === 'br' ? '\n' : child.textContent).join(''),
     currentMode: options.find((option) => option.attrs['aria-selected'] === 'true')?.dataset.mode ?? '',
     modeLabel: text('.bash-permission-mode-trigger-label'),
     modes: options.map((option) => ({
@@ -215,6 +219,7 @@ type Choice = 'allow_once' | 'allow_run' | 'deny';
 type UserAction = 'pending' | Choice | { choice: Choice; mode?: string };
 
 interface HarnessOptions {
+  locale?: 'zh' | 'en' | 'ja' | 'pt';
   visibility?: { state: 'visible' | 'hidden'; focused?: boolean };
   // Dialogs whose `document.createElement` throws before elements work again
   // (the broken-dialog negative control).
@@ -247,6 +252,9 @@ function loadHarness(
   invokeImpl?: (channel: string, payload: any) => Promise<any>,
   options: HarnessOptions = {},
 ) {
+  const localeStrings: Record<string, string> | undefined = options.locale
+    ? JSON.parse(fs.readFileSync(path.join(__dirname, '../../src/renderer/locales', `${options.locale}.json`), 'utf8'))
+    : undefined;
   let pushHandler: ((info: any) => void) | null = null;
   let cancelHandler: ((info: any) => void) | null = null;
   let localAgentPushHandler: ((info: any) => void) | null = null;
@@ -318,7 +326,7 @@ function loadHarness(
         'agents.cli_permission_full_access_desc': 'Automatically approve requests',
         'agents.cli_permission_mode_hint': 'Change this in AI Team > {agent} > Runtime settings > Permission level.',
       };
-      let text = dict[key] || key;
+      let text = (localeStrings ? localeStrings[key] : dict[key]) || key;
       for (const [k, v] of Object.entries(vars || {})) {
         text = text.replace(new RegExp('\\{' + k + '\\}', 'g'), String(v));
       }
@@ -382,11 +390,113 @@ async function flush() {
 
 describe('connector actions share local operation permissions', () => {
   const action = {
-    request_id: 'connector-request', cid: 'task-1', connector_id: 'feishu',
+    request_id: 'connector-request', cid: 'task-1', connector_id: 'feishu', can_allow_run: true,
     display_name: 'Feishu', account_label: 'Work account', tool_name: 'execute_high_impact',
+    action_name: 'im.+messages-send',
     risk: 'H', sensitive_operation: 'external_action',
     arguments_preview: '{"action":"im.+messages-send","text":"private-message"}',
   };
+
+  it.each([
+    { locale: 'zh', risk: 'H', connector: '连接器', operation: '操作', title: '允许这项敏感操作吗？' },
+    { locale: 'en', risk: 'D', connector: 'Connector', operation: 'Action', title: 'Allow this sensitive action?' },
+    { locale: 'ja', risk: 'H', connector: 'コネクター', operation: '操作', title: 'この機密操作を許可しますか？' },
+    { locale: 'pt', risk: 'D', connector: 'Conector', operation: 'Ação', title: 'Permitir esta ação sensível?' },
+  ] as const)('shows a localized two-line summary and collapsed details in $locale ($risk)', async ({ locale, risk, connector, operation, title }) => {
+    const h = loadHarness('pending', undefined, { locale });
+    h.emitPush('connectors:action-confirm', { ...action, risk, arguments_preview: '<img src=x onerror=alert(1)>' });
+    await flush();
+    expect(h.dialogs[0].title).toBe(title);
+    expect(h.dialogs[0].summary).toBe(`${connector}: Feishu\n${operation}: im.+messages-send`);
+    expect(h.document.body.textContent).not.toMatch(/connectors\.action_confirm\.|bash\.permission\./);
+    const details = h.document.body.querySelector('.bash-permission-details')!;
+    expect(details.tag).toBe('details');
+    expect(details.getAttribute('open')).toBeNull();
+    expect(details.children.filter((child) => typeof child !== 'string' && child.tag === 'pre')
+      .map((child) => (child as FakeElement).textContent)).toEqual(['<img src=x onerror=alert(1)>']);
+    expect(details.textContent).toContain('<img src=x onerror=alert(1)>');
+    expect([...details.descendants()].some((node) => node.tag === 'img')).toBe(false);
+    h.emitPush('connectors:action-confirm-cancelled', { request_ids: [action.request_id] });
+    await flush();
+  });
+
+  it('keeps a legacy request actionable without guessing from its parameter preview or offering task approval', async () => {
+    const h = loadHarness('pending', undefined, { locale: 'zh' });
+    h.emitPush('connectors:action-confirm', {
+      ...action, action_name: undefined, can_allow_run: undefined, account_label: '', sensitive_operation: 'unknown_type',
+    });
+    await flush();
+    expect(h.dialogs[0].summary).toBe('连接器: Feishu\n操作: execute_high_impact');
+    expect(h.dialogs[0].choices).toEqual(['allow_once']);
+    expect(h.dialogs[0].message).not.toContain('本次任务内允许');
+    expect(h.dialogs[0].message).not.toContain('当前已连接账号');
+    expect(h.dialogs[0].message).not.toContain('unknown_type');
+    h.document.body.querySelector('[data-id="allow_once"]')!.click();
+    await flush();
+    expect(h.invokeCalls).toContainEqual({
+      channel: 'connectors.action_confirm_response', payload: { request_id: action.request_id, approved: true },
+    });
+    expect(h.openDialogs()).toBe(0);
+  });
+
+  it('renders connector and operation markup as literal text and keeps it out of telemetry', async () => {
+    const h = loadHarness('pending');
+    const markup = '<img src=x onerror=alert(1)>';
+    h.emitPush('connectors:action-confirm', { ...action, connector_id: 'custom-markup', display_name: markup, action_name: markup });
+    await flush();
+    expect(h.dialogs[0].summary).toContain(markup);
+    expect([...h.document.body.descendants()].some((node) => node.tag === 'img')).toBe(false);
+    h.document.body.querySelector('[data-act="cancel"]')!.click();
+    await flush();
+    expect(JSON.stringify(h.monitorEvent.mock.calls)).not.toContain(markup);
+    expect(h.invokeCalls).toContainEqual({
+      channel: 'connectors.action_confirm_response', payload: { request_id: action.request_id, approved: false },
+    });
+  });
+
+  it('shows empty parameters without restoring removed metadata when the preview is missing', async () => {
+    const h = loadHarness('pending', undefined, { locale: 'zh' });
+    h.emitPush('connectors:action-confirm', { ...action, arguments_preview: undefined });
+    await flush();
+    expect(h.dialogs[0].message).toBe('连接器: Feishu\n操作: im.+messages-send查看详情{}');
+    h.document.body.querySelector('[data-act="cancel"]')!.click();
+    await flush();
+    expect(h.openDialogs()).toBe(0);
+  });
+
+  it('sends a task-scoped approval without changing the global permission mode', async () => {
+    const h = loadHarness('allow_run');
+    h.emitPush('connectors:action-confirm', action);
+    await flush();
+    expect(h.invokeCalls).toEqual([
+      { channel: 'permissions.getLocalExec', payload: undefined },
+      { channel: 'connectors.action_confirm_response', payload: { request_id: action.request_id, approved: true, scope: 'task' } },
+    ]);
+  });
+
+  it('omits task approval unless the host explicitly permits it', async () => {
+    const h = loadHarness('allow_once');
+    h.emitPush('connectors:action-confirm', { ...action, can_allow_run: false });
+    await flush();
+    expect(h.dialogs[0].allowRun).toBe(false);
+  });
+
+  it('dismisses active and queued approvals covered by a task grant without sending another decision', async () => {
+    const h = loadHarness('pending');
+    h.emitPush('connectors:action-confirm', action);
+    h.emitPush('connectors:action-confirm', { ...action, request_id: 'queued-grant' });
+    await flush();
+    h.emitPush('connectors:action-confirm-cancelled', {
+      request_ids: [action.request_id, 'queued-grant'], approved: true,
+    });
+    await flush();
+    expect(h.openDialogs()).toBe(0);
+    expect(h.dialogs).toHaveLength(1);
+    expect(h.invokeCalls.every((call) => call.channel === 'permissions.getLocalExec')).toBe(true);
+    const outcomes = h.monitorEvent.mock.calls.filter(([name]) => name === 'connector_action_confirmation_result');
+    expect(outcomes).toHaveLength(2);
+    for (const [, outcome] of outcomes) expect(outcome).toMatchObject({ decision: 'approved', result: 'success' });
+  });
 
   it.each(['built-in', 'codex', 'claude'])('shows the local mode menu for %s connector calls', async (caller) => {
     const h = loadHarness('allow_once');
@@ -400,15 +510,16 @@ describe('connector actions share local operation permissions', () => {
     expect(h.dialogs).toHaveLength(1);
     expect(h.dialogs[0]).toMatchObject({
       title: 'Allow this sensitive action?', currentMode: 'all_files_approval', modeLabel: 'Standard',
-      showModeControl: true, allowRun: false,
+      showModeControl: true, allowRun: true,
       modeHint: 'You can change this in Settings - General - Local operation permissions.',
     });
     expect(h.dialogs[0].modes.map((item: any) => item.mode)).toEqual([
       'workspace_approval', 'all_files_approval', 'all_files_auto',
     ]);
-    for (const detail of ['Feishu', 'Work account', 'execute_high_impact', 'im.+messages-send', 'private-message']) {
+    for (const detail of ['Feishu', 'im.+messages-send', 'private-message']) {
       expect(h.dialogs[0].message).toContain(detail);
     }
+    expect(h.dialogs[0].message).not.toMatch(/Work account|execute_high_impact/);
     expect(h.invokeCalls).toEqual([
       { channel: 'permissions.getLocalExec', payload: undefined },
       { channel: 'connectors.action_confirm_response', payload: { request_id: action.request_id, approved: true } },

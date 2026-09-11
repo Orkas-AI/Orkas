@@ -130,6 +130,7 @@ function resolveMcpConnectTimeoutMs(kind: Transport['kind']): number {
 export interface McpRequestOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
+  maxTotalTimeoutMs?: number;
 }
 
 export class McpConnection {
@@ -236,6 +237,11 @@ export class McpConnection {
       undefined,
       {
         timeout: opts.timeoutMs || DEFAULT_CALL_TOOL_TIMEOUT_MS,
+        ...(opts.maxTotalTimeoutMs ? {
+          maxTotalTimeout: opts.maxTotalTimeoutMs,
+          resetTimeoutOnProgress: true,
+          onprogress: () => {},
+        } : {}),
         ...(opts.signal ? { signal: opts.signal } : {}),
       },
     );

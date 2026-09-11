@@ -18,6 +18,7 @@ import { bundledNpxCli } from '../../util/bundled-runtime';
 import { buildChildProxyEnvironment } from '../../util/proxy-dispatcher';
 import { safeLocalCliAuthUrl } from '../../util/window-security';
 import { getLanguageForUser } from '../config';
+import { registerUserSwitchHook } from '../user-switch-hooks';
 import { buildSandboxEnv, killProcessTree } from '../../../core-agent/src/sandbox/executor';
 import {
   startInteractiveCliSession,
@@ -59,6 +60,7 @@ interface LocalCliInstallRunOptions {
   cwd: string;
   env: Record<string, string>;
   timeoutMs: number;
+  signal?: AbortSignal;
 }
 
 type LocalCliInstallRunner = (options: LocalCliInstallRunOptions) => Promise<LocalCliInstallRunResult>;
@@ -105,6 +107,69 @@ export function localCliProfileName(uid: string, catalogId: string): string {
     .digest('hex')
     .slice(0, 16);
   return `orkas-${digest}`;
+}
+
+/** Read-only recovery state; the renderer receives no scope list or profile data. */
+export function localCliReauthorizationRequired(uid: string, catalogId: string): boolean {
+  return localCliMissingPermissions(uid, catalogId) !== null;
+}
+
+/** Only missing scope identifiers may cross IPC; never return granted scopes or identities. */
+export function localCliMissingPermissions(uid: string, catalogId: string): string[] | null {
+  if (!uid || !['feishu', 'lark', 'dingtalk', 'wecom', 'xero'].includes(catalogId)) return null;
+  const contract = require(path.join(pcDirForChild(), 'bin/local-cli-permissions.cjs')) as {
+    readPermissionRequest: (env: Record<string, string>) => { scopes: string[]; pat_scopes?: string[] } | null;
+  };
+  const pending = contract.readPermissionRequest({
+    ORKAS_LOCAL_CLI_RUNTIME_DIR: localCliRuntimeDir(uid, catalogId),
+    ORKAS_LOCAL_CLI_PROFILE: localCliProfileName(uid, catalogId),
+  });
+  return pending ? [...new Set([...pending.scopes, ...(pending.pat_scopes || [])])].sort() : null;
+}
+
+const permissionChecks = new Map<string, { checkedAt: number; running?: Promise<void>; abort: AbortController }>();
+const PERMISSION_CHECK_TTL_MS = 60_000;
+registerUserSwitchHook('connector-permission-checks', () => {
+  for (const state of permissionChecks.values()) state.abort.abort();
+  permissionChecks.clear();
+});
+
+/** Called by the Connectors page and the completed authorization flow, never on a timer.
+ * Missing access is advisory and never rewrites the connector's usable status. */
+export async function checkLocalCliPermissions(
+  uid: string, entry: CatalogEntry, force = false, runner: LocalCliInstallRunner = runLocalCliProcess,
+): Promise<void> {
+  if (!uid || entry.local_cli?.provider !== 'lark' || !localCliInstallStatus(uid, entry).installed) return;
+  const key = JSON.stringify([uid, entry.id]);
+  const prior = permissionChecks.get(key);
+  if (prior?.running) {
+    await prior.running;
+    // A refresh after consent must observe the new grant, not reuse a check
+    // which started before the user granted it.
+    if (!force || prior.abort.signal.aborted) return;
+  }
+  if (!force && prior && Date.now() - prior.checkedAt < PERMISSION_CHECK_TTL_MS) return;
+  const state: { checkedAt: number; running?: Promise<void>; abort: AbortController } = {
+    checkedAt: Date.now(), abort: new AbortController(),
+  };
+  const run = (async () => {
+    try {
+      const proxyEnv = await buildChildProxyEnvironment();
+      // The user may disconnect while proxy setup is pending. Do not recreate its runtime.
+      if (state.abort.signal.aborted || !localCliInstallStatus(uid, entry).installed) return;
+      await runner({
+        command: resolveBackgroundNodeRuntime().executable,
+        args: [path.join(pcDirForChild(), 'bin/local-cli-auth.cjs')],
+        cwd: localCliRuntimeDir(uid, entry.id),
+        env: buildSandboxEnv({ ...localCliEnv(uid, entry), ...proxyEnv, ORKAS_LOCAL_CLI_CHECK_PERMISSIONS_ONLY: '1' }),
+        timeoutMs: 60_000,
+        signal: state.abort.signal,
+      });
+    } catch { /* Keep the last known permission state when verification is unavailable. */ }
+  })();
+  state.running = run;
+  permissionChecks.set(key, state);
+  try { await run; } finally { state.running = undefined; state.checkedAt = Date.now(); }
 }
 
 function localCliEnv(uid: string, entry: CatalogEntry): Record<string, string> {
@@ -219,6 +284,7 @@ export function localCliInstallStatus(uid: string, entry: CatalogEntry): LocalCl
 
 function runLocalCliProcess(options: LocalCliInstallRunOptions): Promise<LocalCliInstallRunResult> {
   return new Promise((resolve) => {
+    if (options.signal?.aborted) { resolve({ exitCode: null, stderr: '' }); return; }
     let stderr = '';
     let settled = false;
     let timedOut = false;
@@ -234,6 +300,7 @@ function runLocalCliProcess(options: LocalCliInstallRunOptions): Promise<LocalCl
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      options.signal?.removeEventListener('abort', abort);
       resolve({ exitCode, stderr, timedOut });
     };
     child.stderr?.on('data', (chunk) => {
@@ -244,13 +311,15 @@ function runLocalCliProcess(options: LocalCliInstallRunOptions): Promise<LocalCl
       finish(null);
     });
     child.once('close', (code) => finish(code));
-    timer = setTimeout(() => {
-      timedOut = true;
+    const abort = () => {
+      clearTimeout(timer);
       try { killProcessTree(child, 'SIGKILL'); } catch { /* child already exited */ }
       // Prefer close so Windows releases package/config file handles before cleanup.
       timer = setTimeout(() => finish(null), 3000);
       timer.unref?.();
-    }, options.timeoutMs);
+    };
+    options.signal?.addEventListener('abort', abort, { once: true });
+    timer = setTimeout(() => { timedOut = true; abort(); }, options.timeoutMs);
     timer.unref?.();
   });
 }
@@ -383,6 +452,8 @@ export async function authorizeLocalCli(uid: string, entry: CatalogEntry): Promi
 /** Provider logout is best-effort because some official CLIs only expose local config removal.
  *  The exact connector-owned directory is removed after logout; no parent/glob path is accepted. */
 export async function removeLocalCliAuthorization(uid: string, entry: CatalogEntry): Promise<void> {
+  permissionChecks.get(JSON.stringify([uid, entry.id]))?.abort.abort();
+  permissionChecks.delete(JSON.stringify([uid, entry.id]));
   const config = requireLocalCli(entry);
   const runtimeDir = localCliRuntimeDir(uid, entry.id);
   const npxCli = bundledNpxCli();
