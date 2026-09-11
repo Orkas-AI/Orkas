@@ -46,7 +46,7 @@ Orkas 是一个开源、本地优先的多智能体桌面应用。你描述目�
 ## 为什么选 Orkas
 
 - **超强指挥官** —— 理解上下文、拆解目标、选择合适的智能体、技能、连接器和工具；当没有更合适的专家时，也能直接处理分析、写作、调研、文件处理和自动化。
-- **驱动开源生态** —— 接入外部 CLI 编程智能体（Claude Code、Codex、OpenCode、Cline），并把 HyperFrames 等开源项目作为本地工具接入，全部由同一个指挥官协调。
+- **驱动开源生态** —— 以本地会话接入外部 CLI 智能体——编程智能体 Claude Code、Codex、OpenCode，以及个人智能体 OpenClaw、Hermes-Agent——并把 HyperFrames 等开源项目作为本地工具接入，全部由同一个指挥官协调。
 - **本地优先设计** —— 对话、文件、API key、知识库、自定义智能体全部留在你的硬盘上。模型调用从你的机器直连服务商，绝不经过 Orkas 服务器。
 - **无厂商锁定** —— 不同智能体可混用不同服务商：一个用 Claude，一个用 DeepSeek，一个接本地模型端点。
 - **会自我进化的智能体** —— 每个智能体拥有自己私有的技能与记忆，并在每次任务后通过复盘自我改进。
@@ -70,7 +70,7 @@ macOS 和 Windows 提供安装包。基于 glibc 的 Linux x64/arm64 目前需�
 - **自动化周期性报告与市场调研** —— 一个专业智能体负责收集、汇总并产出每周报告。
 - **把产品需求拆成开发任务** —— 指挥官把 PRD 拆成任务，分派给多个智能体。
 - **与你的文档对话、做本地数据分析** —— 拖入文件，数据全程留在本机。
-- **不止于代码 —— 视频、幻灯片等** —— 指挥官可驱动 HyperFrames 等开源工具，并把任务交接给 CLI 编程智能体（Claude Code、Codex、OpenCode、Cline）及其他本地智能体，于是一个对话就能产出代码、研究、视频与幻灯片。
+- **不止于代码 —— 视频、幻灯片等** —— 指挥官可驱动 HyperFrames 等开源工具，并把任务交接给 CLI 智能体——编程智能体 Claude Code、Codex、OpenCode，以及个人智能体 OpenClaw、Hermes-Agent——及其他本地智能体，于是一个对话就能产出代码、研究、视频与幻灯片。
 
 **查看使用场景 →** [研究工作流](https://orkas.ai/use/researchers?source=gh-orkas) · [数据分析](https://orkas.ai/use/data-analysis?source=gh-orkas) · [与文档对话](https://orkas.ai/use/chat-with-documents?source=gh-orkas) · [面向开发者](https://orkas.ai/use/developers?source=gh-orkas) · [自动化你的工作区](https://orkas.ai/use/automate-workspace?source=gh-orkas)
 
@@ -114,8 +114,8 @@ Orkas 是一个开源、本地优先的多智能体桌面应用。一个超强�
 **需要注册 Orkas 账号吗？**
 安装包版本在首次启动时会要求登录。本仓库的源码版本完全没有账号模块，启动后直接进入应用。两种方式下，模型 key 都是你自己的，并且留在本机。
 
-**Orkas 能驱动 Claude Code 等 CLI 编程智能体吗？**
-能。除了自己的指挥官与专业智能体，Orkas 还能把外部 CLI 编程智能体（Claude Code、Codex、OpenCode、Cline）作为本地子进程驱动，并接入 HyperFrames 等开源项目，全部在同一个对话里指挥。
+**Orkas 能驱动 Claude Code 等 CLI 智能体吗？**
+能。除了自己的指挥官与专业智能体，Orkas 还能把五个外部 CLI 智能体作为本地子进程驱动：编程智能体 Claude Code、Codex、OpenCode，以及个人智能体 OpenClaw、Hermes-Agent；并接入 HyperFrames 等开源项目，全部在同一个对话里指挥。
 
 **Orkas 和 Claude Desktop / CrewAI / LangChain 有什么不同？**
 Claude Desktop 是单个助理；CrewAI 和 LangChain 是代码优先的框架。Orkas 是一个本地优先的多智能体桌面应用：指挥官协调多个专业智能体，数据与 key 留在本地，每个智能体拥有私有技能与记忆。见[逐项对比](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas)。

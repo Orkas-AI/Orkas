@@ -46,7 +46,7 @@ Installed and ready the first time you launch Orkas — each with its own skills
 ## Why Orkas
 
 - **A super-powered Commander** — understands context, breaks down goals, chooses the right agents, skills, connectors, and tools, and directly handles analysis, writing, research, file work, and automation when no specialist is a better fit.
-- **Drives the open-source ecosystem** — plug in external CLI coding agents (Claude Code, Codex, OpenCode, Cline) and onboard open-source projects like HyperFrames as local tools, all coordinated by the same Commander.
+- **Drives the open-source ecosystem** — plug in external CLI agents as local sessions — the coding agents Claude Code, Codex and OpenCode, plus the personal agents OpenClaw and Hermes-Agent — and onboard open-source projects like HyperFrames as local tools, all coordinated by the same Commander.
 - **Local-first by design** — conversations, files, API keys, knowledge bases, and custom agents all stay on your disk. Model calls go straight from your machine to the provider — never through Orkas servers.
 - **No vendor lock-in** — mix providers across agents: one on Claude, another on DeepSeek, another on a local endpoint.
 - **Agents that get better** — each agent has its own private skills and memory, and improves through reflection after each task.
@@ -70,7 +70,7 @@ Packaged installers for macOS and Windows. glibc-based Linux x64/arm64 runs from
 - **Automate recurring reports & market research** — a specialist agent gathers, summarizes, and ships a weekly report.
 - **Turn a product spec into dev tasks** — the Commander breaks a PRD into tasks and dispatches them across agents.
 - **Chat with your documents & run local data analysis** — drop files in, keep the data on your machine.
-- **Go beyond code — video, slides, and more** — the Commander drives open-source tools like HyperFrames and hands off to CLI coding agents (Claude Code, Codex, OpenCode, Cline) and other local agents, so one chat produces code, research, video, and slide decks.
+- **Go beyond code — video, slides, and more** — the Commander drives open-source tools like HyperFrames and hands off to CLI agents — the coding agents Claude Code, Codex and OpenCode, plus the personal agents OpenClaw and Hermes-Agent — and other local agents, so one chat produces code, research, video, and slide decks.
 
 **Explore use cases →** [research workflows](https://orkas.ai/use/researchers?source=gh-orkas) · [data analysis](https://orkas.ai/use/data-analysis?source=gh-orkas) · [chat with documents](https://orkas.ai/use/chat-with-documents?source=gh-orkas) · [for developers](https://orkas.ai/use/developers?source=gh-orkas) · [automate your workspace](https://orkas.ai/use/automate-workspace?source=gh-orkas)
 
@@ -114,8 +114,8 @@ The app is fully offline-capable — only the model calls need network. Point ag
 **Do I need an Orkas account?**
 The packaged desktop app asks you to sign in when you first launch it. The source build in this repository has no account layer at all — it boots straight into the app. Either way your model keys are your own and stay on your machine.
 
-**Can Orkas drive Claude Code and other CLI coding agents?**
-Yes. Beyond its own Commander and specialist agents, Orkas can drive external CLI coding agents — Claude Code, Codex, OpenCode, Cline — as local subprocesses, and onboard open-source projects like HyperFrames, all directed from the same chat.
+**Can Orkas drive Claude Code and other CLI agents?**
+Yes. Beyond its own Commander and specialist agents, Orkas can drive five external CLI agents as local subprocesses — the coding agents Claude Code, Codex and OpenCode, plus the personal agents OpenClaw and Hermes-Agent — and onboard open-source projects like HyperFrames, all directed from the same chat.
 
 **How is Orkas different from Claude Desktop / CrewAI / LangChain?**
 Claude Desktop is a single assistant; CrewAI and LangChain are code-first frameworks. Orkas is a local-first multi-agent desktop app: the Commander coordinates specialist agents, keeps data and keys local, and gives each agent its own private skills and memory. See the [full comparisons](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas).
