@@ -35,7 +35,7 @@ const COUNTER_KEYS = [
   'successful_duration_ms',
 ] as const;
 
-export type AgentRunStatus = 'success' | 'error' | 'cancelled' | 'waiting_input';
+export type AgentRunStatus = 'success' | 'stopped' | 'error' | 'cancelled' | 'waiting_input';
 
 function coerceCounter(raw: unknown): number {
   const n = Number(raw);
@@ -108,7 +108,7 @@ function normalizeRunStatus(
   const rawStatus = typeof result.status === 'string' ? result.status.trim().toLowerCase() : '';
   if (result.aborted || rawStatus === 'cancelled') return 'cancelled';
   if (result.errored) return 'error';
-  if (rawStatus === 'success' || rawStatus === 'error'
+  if (rawStatus === 'success' || rawStatus === 'stopped' || rawStatus === 'error'
       || rawStatus === 'waiting_input') return rawStatus;
   // Legacy callers used `failure`/`success:false` for a definite failed run.
   // There is no longer a model-authored semantic-failure bucket; both map to

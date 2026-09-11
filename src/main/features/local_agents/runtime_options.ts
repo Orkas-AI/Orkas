@@ -1,5 +1,6 @@
 /**
- * Bounded discovery of model and thinking controls exposed by local CLIs.
+ * Bounded discovery of model, thinking, and permission controls exposed by
+ * local CLIs.
  *
  * The returned object is renderer-safe metadata only. Raw CLI output, config,
  * paths and provider errors never cross IPC. Missing overrides always mean
@@ -9,7 +10,12 @@
 import { createLogger } from '../../logger.js';
 import { logErrorSummary } from '../../util/log-redact.js';
 import { killProcessTree, LineSplitter, spawnCli, stripAnsi } from './backends/base.js';
-import type { LocalCliEntry, LocalCliType } from './registry.js';
+import {
+  localCliPermissionPolicies,
+  type LocalCliEntry,
+  type LocalCliPermissionPolicy,
+  type LocalCliType,
+} from './registry.js';
 
 const log = createLogger('local-agents:runtime-options');
 const DISCOVERY_TIMEOUT_MS = 20_000;
@@ -74,6 +80,10 @@ export interface LocalCliRuntimeOptions {
   can_select_thinking: boolean;
   allow_custom_model: boolean;
   allow_custom_thinking: boolean;
+  permission_policies: LocalCliPermissionPolicy[];
+  can_select_permission: boolean;
+  /** Sole non-inherited policy for adapters that cannot pause for approval. */
+  fixed_permission_policy: LocalCliPermissionPolicy | null;
 }
 
 type CaptureResult = { ok: boolean; stdout: string; stderr: string };
@@ -463,6 +473,11 @@ async function codexModelList(entry: LocalCliEntry, cwd: string): Promise<unknow
 }
 
 function baseOptions(cli: LocalCliType): LocalCliRuntimeOptions {
+  const permissionPolicies = [...localCliPermissionPolicies(cli)];
+  const fixedPermissionPolicy = permissionPolicies.length === 1
+    && permissionPolicies[0] !== 'inherit'
+    ? permissionPolicies[0]
+    : null;
   return {
     cli,
     status: 'unavailable',
@@ -476,6 +491,9 @@ function baseOptions(cli: LocalCliType): LocalCliRuntimeOptions {
     can_select_thinking: false,
     allow_custom_model: false,
     allow_custom_thinking: false,
+    permission_policies: permissionPolicies,
+    can_select_permission: permissionPolicies.length > 1,
+    fixed_permission_policy: fixedPermissionPolicy,
   };
 }
 

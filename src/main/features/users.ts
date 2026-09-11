@@ -464,12 +464,6 @@ function activateUserInternal(uid: string, switchCleanupComplete: boolean): void
     const store = require('../model/core-agent/session-store');
     if (typeof store?._evictAll === 'function') store._evictAll();
   } catch { /* not loaded yet */ }
-  try {
-    const runner = require.cache[require.resolve('../model/core-agent/runner')];
-    if (runner && typeof (runner.exports as any)?.invalidateConfig === 'function') {
-      (runner.exports as any).invalidateConfig();
-    }
-  } catch { /* not loaded yet */ }
 
   ACTIVE_UID = uid;
 

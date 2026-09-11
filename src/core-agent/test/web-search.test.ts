@@ -11,6 +11,7 @@ import {
   parseSogouHtml,
   parseYahooHtml,
   chooseProvider,
+  decodeEntities,
   runBuiltinWebSearch,
   webSearchTool,
   type SearchProvider,
@@ -267,6 +268,29 @@ describe("web-search structured fallbacks", () => {
       "https://www.sohu.com/404.html",
     );
     expect(parseSoHtml(html)).toEqual([]);
+  });
+});
+
+// ─── decodeEntities ───────────────────────────────────────────────────────
+
+describe("web-search › decodeEntities", () => {
+  it("decodes decimal astral entities via code points (emoji, not garbage)", () => {
+    // Old code used String.fromCharCode(128512), which truncates to U+F600.
+    expect(decodeEntities("&#128512;")).toBe("😀");
+  });
+
+  it("decodes hex astral entities via code points", () => {
+    expect(decodeEntities("&#x1F600;")).toBe("😀");
+  });
+
+  it("drops out-of-range numeric entities instead of emitting garbage", () => {
+    expect(decodeEntities("a&#1114112;b")).toBe("ab");
+    expect(decodeEntities("a&#x110000;b")).toBe("ab");
+  });
+
+  it("still decodes BMP numeric and named entities", () => {
+    expect(decodeEntities("&#65;&#x42;")).toBe("AB");
+    expect(decodeEntities("Fish &amp; Chips &#39;fresh&#39;")).toBe("Fish & Chips 'fresh'");
   });
 });
 

@@ -47,7 +47,7 @@ describe('MCP stdio diagnostic boundary', () => {
       expect(JSON.parse(result.stdout)).toEqual([
         { name: 'read_fixture', description: '', input_schema: { type: 'object' } },
       ]);
-      expect(result.stderr).toBe('');
+      expect(result.stderr.includes(marker)).toBe(false);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

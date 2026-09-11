@@ -12,11 +12,81 @@
  * spawning. Refresh is lazy — checked at boot / `connectors.refresh` / when the model's tool
  * call surfaces a 401.
  */
-import { GOOGLE_ENTRIES } from './catalog-google';
 import { getServerConnectorCatalogConfig } from '../client_config';
+import { COMPOSIO_COMMERCE_ENTRIES } from './catalog-commerce';
+import { COMPOSIO_MANAGED_ENTRIES } from './catalog-managed';
+import { DIRECT_COMMERCE_ENTRIES } from './catalog-direct-commerce';
+import { DOMESTIC_COLLABORATION_ENTRIES } from './catalog-domestic';
+import { GOOGLE_ENTRIES } from './catalog-google';
+import { LOCAL_COMMERCE_ENTRIES } from './catalog-local-commerce';
+import { REMOTE_COMMERCE_ENTRIES } from './catalog-remote-commerce';
 import type { CatalogEntry } from './types';
 
+const MICROSOFT_ICON_SVG = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#f25022" d="M1 1h10v10H1z"/><path fill="#7fba00" d="M13 1h10v10H13z"/><path fill="#00a4ef" d="M1 13h10v10H1z"/><path fill="#ffb900" d="M13 13h10v10H13z"/></svg>';
+const ONEDRIVE_ICON_SVG = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#0364b8" d="M9.5 8.2a6.1 6.1 0 0 1 11.4 2.6 4.8 4.8 0 0 1-1.7 9.3H8.1z"/><path fill="#0078d4" d="M9.5 8.2a7.1 7.1 0 0 0-7 6.1 3.7 3.7 0 0 0 1.2 7.2h4.4l11.1-11.4a6 6 0 0 0-9.7-1.9z"/><path fill="#1490df" d="M2.5 14.3A5.4 5.4 0 0 1 8 11.6l3.3 3.9-3.2 4.6H3.7a3.7 3.7 0 0 1-1.2-5.8z"/></svg>';
+
+const COMPOSIO_METERING = {
+  provider: 'composio' as const,
+  credits_milli_per_call: 420,
+};
+
+function composioCatalogEntry(entry: Omit<CatalogEntry, 'auth_mode' | 'transport_template' | 'usage_metering'>): CatalogEntry {
+  return {
+    ...entry,
+    requires_credits: true,
+    auth_mode: 'composio',
+    transport_template: null,
+    usage_metering: COMPOSIO_METERING,
+  };
+}
+
 export const CONNECTOR_CATALOG: CatalogEntry[] = [
+  composioCatalogEntry({
+    id: 'outlook',
+    display_name: 'Outlook',
+    icon_svg: MICROSOFT_ICON_SVG,
+    category: 'communication',
+    description_zh: '读取 Outlook 个人资料、联系人、邮箱设置和任务。',
+    description_en: 'Read Outlook profile, contacts, mailbox settings, and tasks.',
+    description_ja: "Outlook のプロフィール、連絡先、メールボックス設定、タスクを読み取ります。",
+    description_pt: "Leia perfil, contatos, configurações de caixa de correio e tarefas do Outlook.",
+  }),
+  composioCatalogEntry({
+    id: 'm365-mail',
+    display_name: 'Microsoft 365 Mail',
+    icon_svg: MICROSOFT_ICON_SVG,
+    category: 'communication',
+    description_zh: '搜索、读取、撰写和发送 Microsoft 365 邮件。',
+    description_en: 'Search, read, draft, and send Microsoft 365 mail.',
+    description_ja: "Microsoft 365 のメールを検索・読み取り・下書き・送信します。",
+    description_pt: "Pesquise, leia, redija e envie e-mails Microsoft 365.",
+  }),
+  composioCatalogEntry({
+    id: 'm365-calendar',
+    display_name: 'Microsoft 365 Calendar',
+    icon_svg: MICROSOFT_ICON_SVG,
+    category: 'productivity',
+    description_zh: '查看、创建和更新 Microsoft 365 日历事件。',
+    description_en: 'View, create, and update Microsoft 365 calendar events.',
+    description_ja: "Microsoft 365 のカレンダー予定を表示・作成・更新します。",
+    description_pt: "Consulte, crie e atualize eventos de calendário Microsoft 365.",
+  }),
+  composioCatalogEntry({
+    id: 'onedrive',
+    display_name: 'OneDrive',
+    icon_svg: ONEDRIVE_ICON_SVG,
+    category: 'productivity',
+    description_zh: '搜索、读取、上传和更新 OneDrive 文件。',
+    description_en: 'Search, read, upload, and update OneDrive files.',
+    description_ja: "OneDrive のファイルを検索・読み取り・アップロード・更新します。",
+    description_pt: "Pesquise, leia, envie e atualize arquivos OneDrive.",
+  }),
+  ...COMPOSIO_COMMERCE_ENTRIES,
+  ...COMPOSIO_MANAGED_ENTRIES,
+  ...DIRECT_COMMERCE_ENTRIES,
+  ...REMOTE_COMMERCE_ENTRIES,
+  ...LOCAL_COMMERCE_ENTRIES,
+  ...DOMESTIC_COLLABORATION_ENTRIES,
   {
     id: 'github',
     display_name: 'GitHub',
@@ -24,6 +94,8 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'developer',
     description_zh: '查找和管理代码仓库、Issue、PR、文件与代码。',
     description_en: 'Find and manage repositories, issues, PRs, files, and code.',
+    description_ja: "リポジトリ、Issue、PR、ファイル、コードを検索・管理します。",
+    description_pt: "Encontre e gerencie repositórios, issues, PRs, arquivos e código.",
     auth_mode: 'server_bridge',
     oauth: { provider_id: 'github' },
     // Remote MCP via GitHub's hosted Streamable HTTP endpoint. We pass the user-to-server OAuth
@@ -43,6 +115,8 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'productivity',
     description_zh: '查找、阅读和更新 Notion 页面、数据库与内容块。',
     description_en: 'Find, read, and update Notion pages, databases, and blocks.',
+    description_ja: "Notion のページ、データベース、ブロックを検索・読み取り・更新します。",
+    description_pt: "Encontre, leia e atualize páginas, bancos de dados e blocos Notion.",
     // DCR — Notion hosts an MCP-spec OAuth authorization server. No Orkas-side pre-registered
     // integration; PC self-registers at first connect via RFC 7591. See features/connectors/
     // oauth-dcr.ts. Server's only role is the HTTPS callback intermediate (no Notion-specific
@@ -61,6 +135,8 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'productivity',
     description_zh: '查找、创建和更新 Linear Issue、项目、周期与评论。',
     description_en: 'Find, create, and update Linear issues, projects, cycles, and comments.',
+    description_ja: "Linear の Issue、プロジェクト、サイクル、コメントを検索・作成・更新します。",
+    description_pt: "Encontre, crie e atualize issues, projetos, ciclos e comentários Linear.",
     auth_mode: 'mcp_dcr',
     transport_template: {
       kind: 'streamable-http',
@@ -75,6 +151,8 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'productivity',
     description_zh: '连接 Jira、Confluence 等 Atlassian 工作数据，搜索、读取并更新 issue、页面与项目上下文。',
     description_en: 'Connect Jira, Confluence, and other Atlassian work data to search, read, and update issues, pages, and project context.',
+    description_ja: "Jira、Confluence などの Atlassian 業務データに接続し、課題、ページ、プロジェクト情報を検索・読み取り・更新します。",
+    description_pt: "Conecte dados de trabalho Jira, Confluence e outros produtos Atlassian para pesquisar, ler e atualizar issues, páginas e contexto de projetos.",
     auth_mode: 'mcp_dcr',
     transport_template: {
       kind: 'streamable-http',
@@ -89,6 +167,8 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'data',
     description_zh: '查询和更新 Airtable bases、tables、records 与评论。',
     description_en: 'Query and update Airtable bases, tables, records, and comments.',
+    description_ja: "Airtable のベース、テーブル、レコード、コメントを検索・更新します。",
+    description_pt: "Consulte e atualize bases, tabelas, registros e comentários Airtable.",
     auth_mode: 'mcp_dcr',
     transport_template: {
       kind: 'streamable-http',
@@ -103,6 +183,8 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'developer',
     description_zh: '连接 GitLab.com 项目、Issue、Merge Request、Pipeline 与代码上下文。',
     description_en: 'Connect GitLab.com projects, issues, merge requests, pipelines, and code context.',
+    description_ja: "GitLab.com のプロジェクト、Issue、マージリクエスト、パイプライン、コード情報に接続します。",
+    description_pt: "Conecte projetos, issues, merge requests, pipelines e contexto de código do GitLab.com.",
     auth_mode: 'mcp_dcr',
     transport_template: {
       kind: 'streamable-http',
@@ -117,6 +199,8 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'developer',
     description_zh: '查询 Sentry 组织、项目、错误事件与调试上下文，并执行受控修复工作流。',
     description_en: 'Query Sentry organizations, projects, issues, and debugging context, with controlled remediation workflows.',
+    description_ja: "Sentry の組織、プロジェクト、Issue、デバッグ情報を検索し、制御された修復ワークフローを利用します。",
+    description_pt: "Consulte organizações, projetos, issues e contexto de depuração Sentry com fluxos controlados de correção.",
     auth_mode: 'mcp_dcr',
     transport_template: {
       kind: 'streamable-http',
@@ -131,6 +215,8 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'developer',
     description_zh: '连接 Cloudflare API MCP，管理 DNS、Workers、Zero Trust、WAF、账号资源与平台上下文。',
     description_en: 'Connect Cloudflare API MCP for DNS, Workers, Zero Trust, WAF, account resources, and platform context.',
+    description_ja: "Cloudflare API MCP に接続し、DNS、Workers、Zero Trust、WAF、アカウントリソース、プラットフォーム情報を扱います。",
+    description_pt: "Conecte o Cloudflare API MCP para DNS, Workers, Zero Trust, WAF, recursos da conta e contexto da plataforma.",
     auth_mode: 'mcp_dcr',
     transport_template: {
       kind: 'streamable-http',
@@ -145,6 +231,8 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'developer',
     description_zh: '查询和操作 Stripe 支付、客户、订阅、发票与开发者上下文。',
     description_en: 'Query and operate on Stripe payments, customers, subscriptions, invoices, and developer context.',
+    description_ja: "Stripe の支払、顧客、サブスクリプション、請求書、開発者情報を検索・操作します。",
+    description_pt: "Consulte e opere pagamentos, clientes, assinaturas, faturas e contexto de desenvolvimento Stripe.",
     auth_mode: 'mcp_dcr',
     // Stripe's MCP endpoint is the host root. Its PRM points at access.stripe.com, while
     // authorization-server metadata is also published on the MCP host; oauth-dcr.ts handles
@@ -162,6 +250,8 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'developer',
     description_zh: '连接 Supabase 项目、数据库、Edge Functions、Storage 与平台上下文。',
     description_en: 'Connect Supabase projects, databases, Edge Functions, Storage, and platform context.',
+    description_ja: "Supabase のプロジェクト、データベース、Edge Functions、Storage、プラットフォーム情報に接続します。",
+    description_pt: "Conecte projetos, bancos de dados, Edge Functions, Storage e contexto da plataforma Supabase.",
     auth_mode: 'mcp_dcr',
     transport_template: {
       kind: 'streamable-http',
@@ -176,6 +266,8 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'productivity',
     description_zh: '查询和更新 Close CRM leads、contacts、opportunities、tasks 与沟通记录。',
     description_en: 'Query and update Close CRM leads, contacts, opportunities, tasks, and communication records.',
+    description_ja: "Close CRM の見込み客、連絡先、商談、タスク、連絡記録を検索・更新します。",
+    description_pt: "Consulte e atualize leads, contatos, oportunidades, tarefas e registros de comunicação Close CRM.",
     auth_mode: 'mcp_dcr',
     transport_template: {
       kind: 'streamable-http',
@@ -190,6 +282,8 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'productivity',
     description_zh: '查看和更新 Webflow 站点、页面、CMS 内容、SEO 信息与资源文件。',
     description_en: 'View and update Webflow sites, pages, CMS content, SEO metadata, and assets.',
+    description_ja: "Webflow のサイト、ページ、CMS コンテンツ、SEO メタデータ、アセットを表示・更新します。",
+    description_pt: "Consulte e atualize sites, páginas, conteúdo CMS, metadados SEO e recursos Webflow.",
     auth_mode: 'mcp_dcr',
     transport_template: {
       kind: 'streamable-http',
@@ -204,6 +298,8 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'communication',
     description_zh: '发消息、读频道、自动化工作区任务。',
     description_en: 'Post messages, browse channels, automate workspace tasks.',
+    description_ja: "メッセージを投稿し、チャンネルを閲覧して、ワークスペースの作業を自動化します。",
+    description_pt: "Publique mensagens, navegue por canais e automatize tarefas do espaço de trabalho.",
     auth_mode: 'server_bridge',
     oauth: { provider_id: 'slack' },
     // Official Slack remote MCP (launched Feb 2026). Streamable HTTP — Slack does not support
@@ -223,6 +319,8 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'communication',
     description_zh: '读 / 发邮件、整理收件箱。',
     description_en: 'Read and send mail, organize the inbox.',
+    description_ja: 'メールを読み取り・送信し、受信トレイを整理します。',
+    description_pt: 'Leia e envie e-mails e organize a caixa de entrada.',
     requires_credits: true,
     auth_mode: 'composio',
     transport_template: null,
@@ -236,6 +334,8 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'data',
     description_zh: '查看 Bing 搜索流量：关键词、点击/曝光/排名、各页面表现（ChatGPT/Copilot 检索基于 Bing 索引）。',
     description_en: 'View Bing search traffic — queries, clicks/impressions/position and per-page stats (ChatGPT/Copilot retrieval runs on the Bing index).',
+    description_ja: "Bing の検索クエリ、クリック数、表示回数、順位、ページ別統計を確認します（ChatGPT/Copilot の検索は Bing インデックスを使用します）。",
+    description_pt: "Consulte tráfego de pesquisa Bing: consultas, cliques, impressões, posição e estatísticas por página (a busca do ChatGPT/Copilot usa o índice Bing).",
     auth_mode: 'server_bridge',
     oauth: { provider_id: 'bing' },
     // Read-only Webmaster scope. Standalone connector (own provider on Server, NOT Google). Its
@@ -256,8 +356,23 @@ export function connectorCatalog(): CatalogEntry[] {
   const byId = new Map(CONNECTOR_CATALOG.map((entry) => [entry.id, entry]));
   for (const entry of getServerConnectorCatalogConfig()) {
     const existing = byId.get(entry.id);
-    if (existing && existing.auth_mode !== 'composio') continue;
-    byId.set(entry.id, existing ? { ...existing, ...entry } : entry);
+    const serverEntry = entry as CatalogEntry;
+    // Released local/official connectors are authoritative. A stale Server-side Composio row
+    // with the same id must not roll a migrated connector back to third-party auth/metering.
+    if (existing && (existing.auth_mode !== 'composio' || serverEntry.auth_mode !== 'composio')) continue;
+    if (existing?.auth_mode === 'composio' && serverEntry.auth_mode === 'composio') {
+      byId.set(entry.id, {
+        ...existing,
+        composio: serverEntry.composio,
+        usage_metering: serverEntry.usage_metering || existing.usage_metering,
+        requires_credits: serverEntry.requires_credits ?? existing.requires_credits,
+        availability: serverEntry.availability || existing.availability,
+        disabled_reason: serverEntry.disabled_reason || existing.disabled_reason,
+        unavailable_reason: serverEntry.unavailable_reason || existing.unavailable_reason,
+      });
+      continue;
+    }
+    byId.set(entry.id, serverEntry);
   }
   return Array.from(byId.values());
 }

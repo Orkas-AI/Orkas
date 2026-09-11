@@ -109,6 +109,7 @@ describe('task completion notifications', () => {
 
   it.each([
     ['completed', 'notification.task.completed.title', 'notification.task.completed.body'],
+    ['stopped', 'notification.task.stopped.title', 'notification.task.stopped.body'],
     ['failed', 'notification.task.failed.title', 'notification.task.failed.body'],
     ['waiting_input', 'notification.task.waiting_input.title', 'notification.task.waiting_input.body'],
   ] as const)('shows generic localized copy for %s and routes clicks to the conversation', (status, title, body) => {

@@ -40,12 +40,12 @@ function writePackagedContent(): void {
   const builtin = path.join(tmpDir, 'builtin');
   const systemRoot = path.join(builtin, 'system', 'skills');
   writeJson(path.join(systemRoot, '_system.json'), {
-    skills: [{ id: 'project-tasks', update_at: 2026081401 }],
+    skills: [{ id: 'orkas-guide', update_at: 2026081401 }],
   });
-  fs.mkdirSync(path.join(systemRoot, 'project-tasks'), { recursive: true });
+  fs.mkdirSync(path.join(systemRoot, 'orkas-guide'), { recursive: true });
   fs.writeFileSync(
-    path.join(systemRoot, 'project-tasks', 'SKILL.md'),
-    '---\nname: project-tasks\ndescription: Manage project tasks\n---\n\n# Project tasks\n',
+    path.join(systemRoot, 'orkas-guide', 'SKILL.md'),
+    '---\nname: orkas-guide\ndescription: Manage project tasks\n---\n\n# Project tasks\n',
     'utf8',
   );
 
@@ -78,7 +78,7 @@ describe('bundled content startup boundary', () => {
 
     await expect(startup.syncBundledContentForUser(UID, { reason: 'first-window' }))
       .resolves.toMatchObject({
-        system_skills: [{ id: 'project-tasks', action: 'created' }],
+        system_skills: [{ id: 'orkas-guide', action: 'created' }],
         marketplace: {
           seeded_agents: 1,
           seeded_skills: 1,
@@ -87,7 +87,7 @@ describe('bundled content startup boundary', () => {
         },
         failed: [],
       });
-    expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'project-tasks'), 'SKILL.md')))
+    expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'orkas-guide'), 'SKILL.md')))
       .toBe(true);
     expect(fs.existsSync(path.join(paths.userMarketplaceAgentDir(UID, TEST_AGENT_ID), 'agent.json')))
       .toBe(true);
@@ -96,7 +96,7 @@ describe('bundled content startup boundary', () => {
 
     await expect(startup.syncBundledContentForUser(UID, { reason: 'warm-start' }))
       .resolves.toMatchObject({
-        system_skills: [{ id: 'project-tasks', action: 'skipped' }],
+        system_skills: [{ id: 'orkas-guide', action: 'skipped' }],
         marketplace: {
           seeded_agents: 0,
           seeded_skills: 0,
@@ -133,9 +133,9 @@ describe('bundled content startup boundary', () => {
 
     expect(result.failed).toContain('marketplace');
     expect(result.system_skills).toEqual([
-      expect.objectContaining({ id: 'project-tasks', action: 'created' }),
+      expect.objectContaining({ id: 'orkas-guide', action: 'created' }),
     ]);
-    expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'project-tasks'), 'SKILL.md')))
+    expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'orkas-guide'), 'SKILL.md')))
       .toBe(true);
   });
 
@@ -158,5 +158,97 @@ describe('bundled content startup boundary', () => {
     release();
     await expect(Promise.all([first, second])).resolves.toHaveLength(2);
     expect(reconcile).toHaveBeenCalledTimes(1);
+  });
+
+  it('makes repeated boot and login triggers free after one complete pass, without touching a different user', async () => {
+    // A logged-in boot fires first-window, account bootstrap, and the delayed
+    // login-capabilities pass for the same uid; only the first may walk the
+    // packaged directories. A non-startup reason still performs a real pass.
+    const paths = await activateTestUser();
+    const systemSkills = await import('../../../src/main/features/system_skills');
+    const marketplaceStartup = await import('../../../src/main/features/builtin_marketplace_startup');
+    const reconcile = vi.spyOn(systemSkills, 'reconcileAllForUserWithRetry');
+    const seed = vi.spyOn(marketplaceStartup, 'seedBuiltinMarketplaceForUser');
+    const startup = await import('../../../src/main/features/bundled_content_startup');
+
+    const first = await startup.syncBundledContentForUser(UID, { reason: 'first-window' });
+    expect(first.failed).toEqual([]);
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(seed).toHaveBeenCalledTimes(1);
+
+    for (const reason of ['startup', 'account-change', 'startup']) {
+      await expect(startup.syncBundledContentForUser(UID, { reason }))
+        .resolves.toEqual({ system_skills: [], marketplace: null, failed: [] });
+    }
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(seed).toHaveBeenCalledTimes(1);
+    expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'orkas-guide'), 'SKILL.md')))
+      .toBe(true);
+    expect(fs.existsSync(path.join(paths.userMarketplaceSkillDir(UID, TEST_SKILL_ID), 'SKILL.md')))
+      .toBe(true);
+
+    const other = 'bundled-content-other-user';
+    const users = await import('../../../src/main/features/users');
+    users.activateUser(other);
+    await expect(startup.syncBundledContentForUser(other, { reason: 'account-change' }))
+      .resolves.toMatchObject({ system_skills: [{ id: 'orkas-guide', action: 'created' }], failed: [] });
+    expect(reconcile).toHaveBeenCalledTimes(2);
+
+    await expect(startup.syncBundledContentForUser(UID, { reason: 'manual-refresh' }))
+      .resolves.toMatchObject({ system_skills: [{ id: 'orkas-guide', action: 'skipped' }], failed: [] });
+    expect(reconcile).toHaveBeenCalledTimes(3);
+  });
+
+  it('retries a failed or interrupted pass on the next startup trigger (negative control)', async () => {
+    const paths = await activateTestUser();
+    const systemSkills = await import('../../../src/main/features/system_skills');
+    const reconcile = vi.spyOn(systemSkills, 'reconcileAllForUserWithRetry');
+    const startup = await import('../../../src/main/features/bundled_content_startup');
+
+    const interrupted = await startup.syncBundledContentForUser(UID, {
+      reason: 'first-window',
+      shouldContinue: () => false,
+    });
+    expect(interrupted).toEqual({ system_skills: [], marketplace: null, failed: [] });
+    expect(reconcile).not.toHaveBeenCalled();
+
+    fs.rmSync(paths.userSystemSkillsDir(UID), { recursive: true, force: true });
+    fs.mkdirSync(path.dirname(paths.userSystemSkillsDir(UID)), { recursive: true });
+    fs.writeFileSync(paths.userSystemSkillsDir(UID), 'blocks directory creation', 'utf8');
+    const failed = await startup.syncBundledContentForUser(UID, { reason: 'startup' });
+    expect(failed.failed).toContain('system_skills');
+    expect(reconcile).toHaveBeenCalledTimes(1);
+
+    fs.rmSync(paths.userSystemSkillsDir(UID), { force: true });
+    const repaired = await startup.syncBundledContentForUser(UID, { reason: 'startup' });
+    expect(repaired.failed).toEqual([]);
+    expect(reconcile).toHaveBeenCalledTimes(2);
+    expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'orkas-guide'), 'SKILL.md')))
+      .toBe(true);
+
+    await startup.syncBundledContentForUser(UID, { reason: 'startup' });
+    expect(reconcile).toHaveBeenCalledTimes(2);
+  });
+
+  it('publishes again after an account switch resets the target workspace', async () => {
+    // Logout recreates the anonymous root, so the account-change trigger that
+    // follows a switch must not be treated as a repeat of the boot pass.
+    const paths = await activateTestUser();
+    const systemSkills = await import('../../../src/main/features/system_skills');
+    const reconcile = vi.spyOn(systemSkills, 'reconcileAllForUserWithRetry');
+    const hooks = await import('../../../src/main/features/user-switch-hooks');
+    const startup = await import('../../../src/main/features/bundled_content_startup');
+
+    await startup.syncBundledContentForUser(UID, { reason: 'first-window' });
+    await startup.syncBundledContentForUser(UID, { reason: 'account-change' });
+    expect(reconcile).toHaveBeenCalledTimes(1);
+
+    fs.rmSync(paths.userSystemSkillsDir(UID), { recursive: true, force: true });
+    hooks.notifyUserSwitch('previous-account', UID);
+    await expect(startup.syncBundledContentForUser(UID, { reason: 'account-change' }))
+      .resolves.toMatchObject({ system_skills: [{ id: 'orkas-guide', action: 'created' }], failed: [] });
+    expect(reconcile).toHaveBeenCalledTimes(2);
+    expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'orkas-guide'), 'SKILL.md')))
+      .toBe(true);
   });
 });

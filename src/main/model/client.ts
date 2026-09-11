@@ -27,6 +27,9 @@ import {
 export interface StreamEvent {
   type: 'progress' | 'event' | 'delta' | 'final' | 'error' | 'done';
   text?: string;
+  /** Assistant text presentation channel. Present on model text deltas after
+   * provider-native phase preservation or structured tool-round inference. */
+  phase?: 'commentary' | 'final_answer';
   event?: Record<string, unknown>;
   aborted?: boolean;
   /** Structured source for terminal failures. */
@@ -95,16 +98,27 @@ export interface ChatOptions {
   attachmentMetadata?: ChatAttachmentMetadata;
   /** Durable, host-verified resources that should survive history summaries. */
   historyResources?: HistoryResource[];
-  /** Hard idle window (seconds) for the tool-execution phase and cold start
-   *  (before the first stream event). Default 1800. core-agent's per-tool
-   *  watchdog stays authoritative for tool stalls; this is the outer backstop. */
+  /** Base idle bound (seconds), used to derive the runner-owned tool watchdog
+   *  and to cap the provider-wait and tool-input windows. Default 1800. */
   idleTimeout?: number;
+  /** Absolute execution deadline owned by the actor dispatch; retries retain it. */
+  executionDeadlineAt?: number;
+  /** Idle window (seconds) while streamed tool-call JSON is incomplete.
+   *  Starts with the first `tool_delta`; each later `tool_delta` renews it,
+   *  while unrelated events do not. Defaults to `idleTimeout`. */
+  toolInputIdleTimeout?: number;
   /** Short idle window (seconds) applied ONLY after ordinary assistant text
    *  has begun streaming with NO tool in flight. Catches a provider stream
    *  that started then went silent mid-generation, without false-killing
-   *  cold starts, post-tool model thinking, or long/silent tools (those run
-   *  under `idleTimeout` + the per-tool watchdog). Default 180. */
+   *  cold starts, post-tool model thinking, tool-input assembly, or
+   *  long/silent tools. Defaults to `idleTimeout`; shorter overrides are explicit. */
   streamIdleTimeout?: number;
+  /** Middle idle window (seconds) for the provider-wait phase — cold start,
+   *  silent reasoning, and post-tool model calls. Every raw event (thinking
+   *  deltas included) resets the watchdog, so this only fires on a stream
+   *  that produced ZERO events for the whole window: a dead stream, not slow
+   *  reasoning. Defaults to `idleTimeout`. */
+  providerWaitIdleTimeout?: number;
   /** Max tool-call rounds in a single turn before the run is force-ended with
    *  "(Tool loop limit reached)". Undefined → core-agent schema default (100).
    *  Group chat pins this for the commander (120) and named agent workers (100),
@@ -145,14 +159,6 @@ export interface ChatOptions {
   /** Mutable current-turn Agent tool groups granted by explicit user
    * selections. These activate before the Agent's lower-priority fallback. */
   runtimeGrantedToolGroups?: string[];
-  /** Project-scope skill allowlist applied ONLY to the System A render
-   *  block (`getSystemPromptBlock`). Resolved from the conversation's
-   *  project bindings at the top of `runTurn`. The runner intersects this
-   *  with `skillList` for prompt rendering but leaves SkillStore (System B,
-   *  agent's self-evolved skills) constrained by `skillList` alone — so
-   *  agents in projects retain access to their own evolved skills.
-   *  Undefined = orphan conversation, no project filter. */
-  projectAllowedSkillIds?: readonly string[];
   /** Extra tools merged into core-agent's builtin tool set for this call.
    * Currently used by group_chat commander to surface `plan_set` and
    * agent-management tools alongside the builtin set. */
@@ -216,12 +222,9 @@ export interface ChatOptions {
    * assistant message so the UI can offer a "reveal in Finder" chip. */
   onFileWritten?: (absPath: string) => void | Promise<void>;
   /** Accepts the model's complete final-deliverable declaration for this
-   * turn and returns the subset accepted by the conversation owner. Paths
-   * are absolute before this callback runs. */
+   * turn and returns the subset eligible for resource display. Paths are
+   * absolute before this callback runs. */
   onOutputsPublished?: (absPaths: string[]) => string[] | Promise<string[]>;
-  /** Existing current-turn paths eligible for publication. Used only to give
-   * the model a bounded recovery after a rejected declaration. */
-  getPublishableOutputPaths?: () => string[];
   /** Predicate: true when the given absolute path was already written by
    * this caller's session (typically: a `Set` populated by `onFileWritten`
    * earlier in the same turn). Used by the write-style tools' uniquify

@@ -69,6 +69,13 @@ def _key_text(row: dict) -> str:
     return ""
 
 
+def _looks_like_url(text: str) -> bool:
+    """URL-shaped key (page-dimension export rows are keyed by URL, not query).
+    A query that merely mentions a scheme ("what is https") stays a query."""
+    t = text.strip().lower()
+    return t.startswith(("http://", "https://", "//"))
+
+
 def _page_text(row: dict) -> str:
     keys = row.get("keys")
     if isinstance(keys, list):
@@ -200,7 +207,9 @@ def _console_opportunities(rows: list[dict], source: str, fallback_url: str) -> 
     by_query: dict[str, list[dict]] = {}
     for row in rows:
         q = _key_text(row).strip()
-        if not q:
+        # A page-dimension row's first key is the page URL, not a query; it can
+        # seed no query-typed opportunity (its Query column would be a URL).
+        if not q or _looks_like_url(q):
             continue
         by_query.setdefault(q.lower(), []).append(row)
         imps = _num(row, "impressions", "Impressions")

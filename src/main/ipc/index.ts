@@ -21,6 +21,8 @@ import * as chats from '../features/chats';
 import * as projects from '../features/projects';
 import * as projectFiles from '../features/project_files';
 import * as projectTasks from '../features/project_tasks';
+import * as projectDriver from '../features/project_driver';
+import * as projectDriverRunner from '../features/project_driver_runner';
 import * as projectLibraryIndexer from '../features/project_library_indexer';
 import * as groupChat from '../features/group_chat';
 import type { GroupEvent } from '../features/group_chat/bus';
@@ -39,7 +41,7 @@ import * as kbVector from '../features/kb_vector';
 import * as kbIndexer from '../features/kb_indexer';
 import * as chatAttachments from '../features/chat_attachments';
 import * as chatArtifacts from '../features/chat_artifacts';
-import * as conversationFiles from '../features/conversation_files';
+import * as conversationOutputs from '../features/conversation_outputs';
 import * as savedApps from '../features/saved_apps';
 import * as recycleBin from '../features/recycle_bin';
 import * as search from '../features/search';
@@ -59,9 +61,9 @@ import { getQuickStartConfigState } from '../features/client_config';
 import { getRendererTables, isLang, t } from '../i18n';
 import { isPathAllowed } from '../util/path-sandbox';
 import {
-  officeFileToPreviewHtml,
   officePreviewKindForExt as sharedOfficePreviewKindForExt,
 } from '../util/office-preview';
+import { officeFileToPreviewHtml } from '../features/office/office_preview_layout';
 import * as userWorkspace from '../features/user_workspace';
 import { invokeHandlers as localAgentsHandlers } from './local_agents';
 import { invokeHandlers as qualityHandlers } from './quality';
@@ -69,10 +71,13 @@ import {
   invokeHandlers as connectorsHandlers,
   removeApiKeyConnectorsForCredentialChange,
 } from './connectors';
+import { invokeHandlers as webAssistHandlers } from './web_assist';
+import { bindWebAssistConversation } from '../features/web_assist';
 import { invokeHandlers as memoryHandlers } from './memory';
 import { safeId } from '../storage';
 import { createLogger, logFromRenderer } from '../logger';
 import {
+  cancelConfirmation as cancelDeleteConfirmation,
   markConfirmationVisible as markDeleteConfirmationVisible,
   resolveConfirmation as resolveDeleteConfirmation,
 } from '../model/core-agent/delete-file-confirm';
@@ -86,8 +91,7 @@ import {
   findAutoTaskLocation,
   globalAutoTaskLocation,
 } from '../util/project-layout';
-import { readState as readGroupChatState } from '../features/group_chat/state';
-import { logErrorRef, logPathRef } from '../util/log-redact';
+import { logErrorRef, logPathRef, maskId } from '../util/log-redact';
 import { chatMediaLocalPathFromUrl } from '../util/chat-media-url';
 import { captureDeliveredTaskIntervention } from '../util/task-intervention-events';
 import { macosTccSensitivePath } from '../util/macos-tcc';
@@ -138,6 +142,14 @@ function conversationProjectHint(args: Record<string, any>): string | null | und
   if (raw === '') return null;
   if (!safeId(raw)) throw new Error('invalid project id');
   return raw;
+}
+
+// To-dos may be account-global. An omitted/null/empty project id selects that
+// scope; a non-empty value must still pass the normal project-id boundary.
+function todoProjectScope(projectId: unknown): string {
+  if (projectId === undefined || projectId === null || projectId === '') return '';
+  if (!safeId(projectId)) throw new Error('invalid projectId');
+  return projectId as string;
 }
 
 function requireMarketplaceId(id: unknown): string {
@@ -237,6 +249,10 @@ interface LocalFileImportEntry {
   path: string;
   name: string;
   size?: number;
+  /** Position in the renderer's File list. Echoed back for the conversation
+   * scope so the composer can match a result to the chip it painted without
+   * ever seeing the path. */
+  index?: number;
 }
 
 async function _importLocalFileEntries(payload: any, ctx: IpcContext): Promise<{ files: any[] }> {
@@ -254,6 +270,27 @@ async function _importLocalFileEntries(payload: any, ctx: IpcContext): Promise<{
   if (!entries.length) return { files: [] };
 
   const results = [];
+  if (scope === 'conversation') {
+    // Composer drop / paste of genuine OS files. Preload resolved the paths
+    // from user-selected File objects, so this mirrors the native picker:
+    // main copies from the path and enforces the same per-kind caps, UTF-8
+    // check, pending-count cap and hash dedupe as the byte upload.
+    const cid = payload?.cid;
+    if (!safeId(cid)) throw new Error('invalid cid');
+    for (const entry of entries) {
+      const name = path.basename(entry.name);
+      const index = Number.isInteger(entry.index) && (entry.index as number) >= 0
+        ? { index: entry.index }
+        : {};
+      try {
+        const result = await chatAttachments.importAttachmentFromPath(ctx.userId, cid, entry.path, name);
+        results.push({ ...index, name, ...result });
+      } catch (err) {
+        results.push({ ...index, name, ok: false, error: (err as Error)?.message || String(err) });
+      }
+    }
+    return { files: results };
+  }
   if (scope === 'contexts') {
     for (const entry of entries) {
       const name = path.basename(entry.name);
@@ -554,11 +591,8 @@ async function _isConversationRecordedFile(userId: string, cid: string, absPath:
     typeof value === 'string' && !!value && path.resolve(value) === target;
 
   try {
-    const messages = await chats.getMessages(userId, cid, 2000);
-    for (const msg of messages as any[]) {
-      const produced = Array.isArray(msg?.produced) ? msg.produced : [];
-      if (produced.some(matches)) return true;
-    }
+    const produced = await chats.listProducedPaths(userId, cid, 2000);
+    if (produced.some(matches)) return true;
   } catch { /* best-effort allow-list */ }
 
   return false;
@@ -817,6 +851,7 @@ function _recycleDataChangeForPaths(paths: string[]): { domains: string[]; cids:
     if (first === 'chats' || first === 'chat_attachments' || first === 'chat_artifacts' || first === 'sessions') {
       domains.add('chats');
     } else if (first === 'contexts') domains.add('contexts');
+    else if (first === 'tasks' || first === 'task_attachments') domains.add('projects');
     else if (first === 'projects') {
       const parts = rel.split('/');
       const projectChild = parts[3] || '';
@@ -919,14 +954,16 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return user;
   },
 
-  'conversations.list': async ({ mode, active_cid, expanded_projects, project_id, task_id, offset }, ctx) => {
+  'conversations.list': async ({ mode, active_cid, expanded_projects, active_since, project_id, task_id, offset }, ctx) => {
     if (mode === 'startup') {
       const expandedProjectIds = String(expanded_projects || '')
         .split(',')
         .filter((id) => safeId(id));
+      const activeSinceMs = Date.parse(String(active_since || ''));
       const result = await chats.listStartupConversations(ctx.userId, {
         activeConversationId: safeId(active_cid) ? active_cid : undefined,
         expandedProjectIds,
+        ...(Number.isFinite(activeSinceMs) ? { activeSinceMs } : {}),
       });
       return result;
     }
@@ -961,14 +998,13 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const { cid, limit = 10, before, around_index, around_message_id } = args;
     if (!safeId(cid)) throw new Error('invalid cid');
     const projectIdHint = conversationProjectHint(args);
-    const conv = await chats.getConversation(ctx.userId, cid, projectIdHint);
+    const conv = await chats.getConversationMetadata(ctx.userId, cid, projectIdHint);
     if (!conv) throw new Error('conversation not found');
     const resolvedProjectId = conv.project_id ?? null;
     // Stamp the conv-bound agent's current enabled state so the renderer can
     // grey out the input + show a banner without making a second IPC round trip.
     // True for unbound (no agent_id) — input always allowed there.
     const agent_enabled = conv.agent_id ? isAgentEnabled(ctx.userId, conv.agent_id) : true;
-    const runtime = await groupChat.runtimeStatus(ctx.userId, cid, resolvedProjectId);
     const requestedLimit = Math.max(1, Math.min(500, Math.floor(Number(limit) || 10)));
     const requestedBefore = Number(before);
     const requestedAroundIndex = Number(around_index);
@@ -976,16 +1012,21 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       ? around_message_id
       : '';
     const hasAroundIndex = Number.isSafeInteger(requestedAroundIndex) && requestedAroundIndex >= 0;
-    let page = hasAroundIndex
-      ? await chats.getMessagesPageAtIndex(
+    const pagePromise = hasAroundIndex
+      ? chats.getMessagesPageAtIndex(
         ctx.userId, cid, requestedAroundIndex, requestedLimit, resolvedProjectId)
-      : await chats.getMessagesPage(
+      : chats.getMessagesPage(
         ctx.userId,
         cid,
         requestedLimit,
         Number.isSafeInteger(requestedBefore) && requestedBefore >= 0 ? requestedBefore : undefined,
         resolvedProjectId,
       );
+    const [runtime, initialPage] = await Promise.all([
+      groupChat.runtimeStatus(ctx.userId, cid, resolvedProjectId),
+      pagePromise,
+    ]);
+    let page = initialPage;
     if (hasAroundIndex && requestedAroundMessageId
         && !page.history.some((message) => message.id === requestedAroundMessageId)) {
       const repairedIndex = await chats.findMessageIndexById(
@@ -1012,7 +1053,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const { cid, before } = args;
     if (!safeId(cid)) throw new Error('invalid cid');
     const projectIdHint = conversationProjectHint(args);
-    const conv = await chats.getConversation(ctx.userId, cid, projectIdHint);
+    const conv = await chats.getConversationMetadata(ctx.userId, cid, projectIdHint);
     if (!conv) throw new Error('conversation not found');
     const requestedBefore = Number(before);
     const page = await chats.getConversationTurnPage(
@@ -1040,16 +1081,12 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 
   'conversations.files.list': async ({ cid }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
-    const projectId = await userWorkspace.resolveProjectIdForCid(ctx.userId, cid);
-    const workspaceRoot = userWorkspace.getWorkspacePath(ctx.userId, projectId);
-    const state = await readGroupChatState(ctx.userId, cid);
-    const root = state.workspace_dir
-      ? path.join(workspaceRoot, state.workspace_dir)
-      : workspaceRoot;
-    return conversationFiles.listWorkspaceFiles(root);
+    return conversationOutputs.listConversationOutputs(ctx.userId, cid);
   },
 
-  'conversations.create': async ({ title = '', projectId = '' } = {}, ctx) => {
+  'conversations.create': async ({ title = '', projectId = '', assistance } = {}, ctx) => {
+    const setupAssistance = assistance === undefined ? undefined
+      : (await import('../features/connector_setup_context')).validateConnectorSetupAssistance(assistance);
     // Validate the projectId belongs to this user before persisting it on
     // the conv record. Unknown / invalid projectIds are dropped silently
     // (the conv lands without project membership) — the renderer should
@@ -1064,6 +1101,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       kind: 'normal',
       title,
       ...(validProjectId ? { projectId: validProjectId } : {}),
+      ...(setupAssistance ? { assistance: setupAssistance } : {}),
     });
     return { conversation: conv };
   },
@@ -1241,43 +1279,131 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 
   // ── Project tasks (structured work backlog — user + agent shared) ─────────
   'projects.tasks.list': async ({ projectId } = {}, ctx) => {
-    if (!safeId(projectId)) throw new Error('invalid projectId');
-    const tasks = await projectTasks.listTasks(ctx.userId, projectId);
-    return { tasks, progress: projectTasks.computeProgress(tasks) };
+    const scopeProjectId = todoProjectScope(projectId);
+    const tasks = await projectTasks.listTasks(ctx.userId, scopeProjectId);
+    const { backlogExecutionSnapshot } = await import('../features/group_chat/task_board');
+    const executions = backlogExecutionSnapshot(ctx.userId, scopeProjectId);
+    return {
+      tasks: tasks.map((task) => ({ ...task, is_running: executions.get(task.id)?.is_running ?? null })),
+      progress: projectTasks.computeProgress(tasks),
+    };
   },
 
-  'projects.tasks.create': async ({ projectId, title, detail, status, owner_agent, owner_agent_id, depends_on } = {}, ctx) => {
-    if (!safeId(projectId)) throw new Error('invalid projectId');
+  'projects.tasks.create': async ({ projectId, taskId, title, detail, status, owner_agent, owner_agent_id, depends_on } = {}, ctx) => {
+    const scopeProjectId = todoProjectScope(projectId);
     if (typeof title !== 'string') throw new Error('invalid title');
-    const r = await projectTasks.createTask(ctx.userId, projectId, {
+    const r = await projectTasks.createTask(ctx.userId, scopeProjectId, {
       title, detail, status, owner_agent, owner_agent_id, depends_on, created_by: 'user',
+      // Optional pre-allocated id so the editor can stage attachments before the
+      // task exists; create adopts whatever landed in that draft dir.
+      ...(typeof taskId === 'string' && taskId ? { id: taskId } : {}),
     });
     if (!r.ok) throw new Error((r as { error: string }).error);
     return { task: r.task, alreadyExists: r.alreadyExists };
   },
 
   'projects.tasks.update': async ({ projectId, taskId, title, detail, status, owner_agent, owner_agent_id, result_ref } = {}, ctx) => {
-    if (!safeId(projectId)) throw new Error('invalid projectId');
+    const scopeProjectId = todoProjectScope(projectId);
     if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
-    const r = await projectTasks.updateTask(ctx.userId, projectId, taskId, { title, detail, status, owner_agent, owner_agent_id, result_ref });
+    const r = await projectTasks.updateTask(ctx.userId, scopeProjectId, taskId, { title, detail, status, owner_agent, owner_agent_id, result_ref });
     if (!r.ok) throw new Error((r as { error: string }).error);
     return { task: r.task };
   },
 
   'projects.tasks.complete': async ({ projectId, taskId, resultRef } = {}, ctx) => {
-    if (!safeId(projectId)) throw new Error('invalid projectId');
+    const scopeProjectId = todoProjectScope(projectId);
     if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
-    const r = await projectTasks.completeTask(ctx.userId, projectId, taskId, resultRef);
+    const r = await projectTasks.completeTask(ctx.userId, scopeProjectId, taskId, resultRef);
     if (!r.ok) throw new Error((r as { error: string }).error);
     return { task: r.task };
   },
 
   'projects.tasks.delete': async ({ projectId, taskId } = {}, ctx) => {
-    if (!safeId(projectId)) throw new Error('invalid projectId');
+    const scopeProjectId = todoProjectScope(projectId);
     if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
-    const r = await projectTasks.deleteTask(ctx.userId, projectId, taskId);
+    const r = await projectTasks.deleteTask(ctx.userId, scopeProjectId, taskId);
     if (!r.ok) throw new Error((r as { error: string }).error);
     return { ok: true };
+  },
+
+  // Human review decision on an review task (user action; never a model tool).
+  'projects.tasks.decideReview': async ({ projectId, taskId, decision } = {}, ctx) => {
+    const scopeProjectId = todoProjectScope(projectId);
+    if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
+    if (decision !== 'approved' && decision !== 'changes_requested') throw new Error('invalid decision');
+    const r = await projectTasks.decideReview(ctx.userId, scopeProjectId, taskId, decision);
+    if (!r.ok) throw new Error((r as { error: string }).error);
+    return { task: r.task };
+  },
+
+  // User-triggered "run this task now": dispatch through the project Commander
+  // or global assistant in a fresh conversation. The runner owns admission;
+  // review and completion updates belong to the executor, not IPC delivery.
+  'projects.tasks.run': async ({ projectId, taskId } = {}, ctx) => {
+    const scopeProjectId = todoProjectScope(projectId);
+    if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
+    const r = await projectDriverRunner.runTaskNow(ctx.userId, scopeProjectId, taskId);
+    if (!r.ok) throw new Error(r.error || 'run_failed');
+    return { ok: true, cid: r.cid, conversation: r.conversation };
+  },
+
+  // Task attachments — files the task carries into the conversation it starts.
+  // The editor pre-allocates a taskId so it can stage files before create (draft).
+  'projects.tasks.attachments.list': async ({ projectId, taskId } = {}, ctx) => {
+    const scopeProjectId = todoProjectScope(projectId);
+    if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
+    return { items: await projectTasks.listTaskAttachments(ctx.userId, scopeProjectId, taskId) };
+  },
+
+  'projects.tasks.attachments.upload': async ({ projectId, taskId, name, dataBase64 } = {}, ctx) => {
+    const scopeProjectId = todoProjectScope(projectId);
+    if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
+    if (typeof name !== 'string' || !name) throw new Error('invalid name');
+    if (typeof dataBase64 !== 'string') throw new Error('invalid data');
+    // Decoding a 200 MB payload only to have the size gate reject it peaks
+    // at ~470 MB of main-process memory; the encoded length already bounds
+    // the decoded size (2026-08-28 review E1-11).
+    if (dataBase64.length > Math.ceil(projectTasks.TASK_ATTACHMENT_MAX_BYTES / 3) * 4) throw new Error('too_large');
+    const res = await projectTasks.uploadTaskAttachment(ctx.userId, scopeProjectId, taskId, name, Buffer.from(dataBase64, 'base64'));
+    if (!res.ok) throw new Error((res as { error: string }).error);
+    return { name: res.name };
+  },
+
+  'projects.tasks.attachments.delete': async ({ projectId, taskId, name } = {}, ctx) => {
+    const scopeProjectId = todoProjectScope(projectId);
+    if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
+    if (typeof name !== 'string' || !name) throw new Error('invalid name');
+    return projectTasks.deleteTaskAttachment(ctx.userId, scopeProjectId, taskId, name);
+  },
+
+  // Editor "cancel" for a task that was never saved: drop its staged draft files.
+  'projects.tasks.attachments.discardDraft': async ({ projectId, taskId } = {}, ctx) => {
+    const scopeProjectId = todoProjectScope(projectId);
+    if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
+    return projectTasks.discardTaskAttachmentDraft(ctx.userId, scopeProjectId, taskId);
+  },
+
+  // ── Project driver loop (goal-driven autonomous advancement; opt-in) ───────
+  'projects.driver.get': async ({ projectId } = {}, ctx) => {
+    const scopeProjectId = todoProjectScope(projectId);
+    if (scopeProjectId && !safeId(scopeProjectId)) throw new Error('invalid projectId');
+    return { config: await projectDriver.readConfig(ctx.userId, scopeProjectId) };
+  },
+
+  'projects.driver.set': async ({ projectId, enabled, maxAdvancesPerDay } = {}, ctx) => {
+    const scopeProjectId = todoProjectScope(projectId);
+    if (scopeProjectId && !safeId(scopeProjectId)) throw new Error('invalid projectId');
+    const patch: { enabled?: boolean; max_advances_per_day?: number } = {};
+    if (typeof enabled === 'boolean') patch.enabled = enabled;
+    if (maxAdvancesPerDay !== undefined) patch.max_advances_per_day = Number(maxAdvancesPerDay);
+    const config = await projectDriver.writeConfig(ctx.userId, scopeProjectId, patch);
+    // Turning it on: try one advance right away (the same guardrails still
+    // apply) so a task starts now instead of waiting for the next ~60s poll.
+    if (enabled === true && config.enabled) {
+      void projectDriverRunner.advanceProjectIfDue(ctx.userId, scopeProjectId)
+        .catch(() => { /* the periodic tick will retry */ });
+    }
+    return { config };
   },
 
   'projects.files.list': async ({ projectId }, ctx) => {
@@ -1438,8 +1564,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { ok: true, name };
   },
 
-  // ── Project bindings (the strict scope of agents/skills visible inside
-  // a project conversation; see CLAUDE.md §6 outer-intersection rule) ──
+  // ── Project bindings (the strict scope of agents visible inside a
+  // project conversation; see CLAUDE.md §6 outer-intersection rule) ──
   // `bindings.list` returns the bound ids JOINED with name/description so
   // the renderer can paint the detail page in one round-trip. Unknown ids
   // (referent deleted) are pruned here so stale bindings never become user
@@ -1447,15 +1573,10 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'projects.bindings.list': async ({ projectId }, ctx) => {
     if (!safeId(projectId)) throw new Error('invalid projectId');
     if (!await projects.projectExists(ctx.userId, projectId)) throw new Error('not_found');
-    const [agentList, skillList] = await Promise.all([
-      agents.listAgentSummaries(),
-      skills.listSkills(),
-    ]);
+    const agentList = await agents.listAgentSummaries();
     const agentById = new Map(agentList.map((a: any) => [a.agent_id, a]));
-    const skillById = new Map(skillList.map((s: any) => [s.id, s]));
     const pruned = await projects.pruneBindings(ctx.userId, projectId, {
       agents: new Set(agentList.map((a: any) => a.agent_id)),
-      skills: new Set(skillList.map((s: any) => s.id)),
     });
     if (!pruned.ok) throw new Error((pruned as { error: string }).error);
     const bindings = pruned.bindings;
@@ -1464,26 +1585,17 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       agentDetails: bindings.agents
         .map((id) => agentById.get(id))
         .filter(Boolean),
-      skillDetails: bindings.skills
-        .map((id) => skillById.get(id))
-        .filter(Boolean),
     };
   },
 
   'projects.bindings.add': async ({ projectId, kind, id }, ctx) => {
     if (!safeId(projectId)) throw new Error('invalid projectId');
     if (typeof id !== 'string' || !id) throw new Error('invalid id');
-    let result;
-    if (kind === 'agent') {
-      if (!agents.isValidAgentId(id)) throw new Error('invalid id');
-      const agent = await agents.getAgent(id);
-      if (!agent || agent.enabled === false) throw new Error('agent_disabled');
-      result = await projects.addAgentBinding(ctx.userId, projectId, id);
-    } else if (kind === 'skill') {
-      result = await projects.addSkillBinding(ctx.userId, projectId, id);
-    } else {
-      throw new Error('invalid kind');
-    }
+    if (kind !== 'agent') throw new Error('invalid kind');
+    if (!agents.isValidAgentId(id)) throw new Error('invalid id');
+    const agent = await agents.getAgent(id);
+    if (!agent || agent.enabled === false) throw new Error('agent_disabled');
+    const result = await projects.addAgentBinding(ctx.userId, projectId, id);
     if (!result.ok) throw new Error((result as { error: string }).error);
     return { bindings: result.bindings };
   },
@@ -1491,14 +1603,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'projects.bindings.remove': async ({ projectId, kind, id }, ctx) => {
     if (!safeId(projectId)) throw new Error('invalid projectId');
     if (typeof id !== 'string' || !id) throw new Error('invalid id');
-    let result;
-    if (kind === 'agent') {
-      result = await projects.removeAgentBinding(ctx.userId, projectId, id);
-    } else if (kind === 'skill') {
-      result = await projects.removeSkillBinding(ctx.userId, projectId, id);
-    } else {
-      throw new Error('invalid kind');
-    }
+    if (kind !== 'agent') throw new Error('invalid kind');
+    const result = await projects.removeAgentBinding(ctx.userId, projectId, id);
     if (!result.ok) throw new Error((result as { error: string }).error);
     return { bindings: result.bindings };
   },
@@ -1511,14 +1617,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!await projects.projectExists(ctx.userId, projectId)) throw new Error('not_found');
     const bindings = await projects.getBindings(ctx.userId, projectId);
     const boundAgents = new Set(bindings.agents);
-    const boundSkills = new Set(bindings.skills);
-    const [agentList, skillList] = await Promise.all([
-      agents.listAgentSearchListings(),
-      skills.listSkills(),
-    ]);
+    const agentList = await agents.listAgentSearchListings();
     return {
       agents: agentList.filter((a: any) => a.enabled !== false && !boundAgents.has(a.agent_id)),
-      skills: skillList.filter((s: any) => !boundSkills.has(s.id)),
     };
   },
 
@@ -1531,12 +1632,13 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { tasks };
   },
 
-  'autoTasks.create': async ({ id, content, message_parts, schedule, title, enabled, recipient, skill, connector, project_id, attachments }, ctx) => {
+  'autoTasks.create': async ({ id, content, message_parts, schedule, end_condition, title, enabled, recipient, skill, connector, project_id, attachments }, ctx) => {
     const result = await autoTasks.createTask(ctx.userId, {
       ...(typeof id === 'string' && id ? { id } : {}),
       content: typeof content === 'string' ? content : '',
       message_parts: Array.isArray(message_parts) ? message_parts : undefined,
       schedule,
+      end_condition: end_condition && typeof end_condition === 'object' ? end_condition : undefined,
       title: typeof title === 'string' ? title : undefined,
       enabled: enabled !== false,
       recipient: recipient && typeof recipient === 'object' ? recipient : undefined,
@@ -1727,13 +1829,17 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'groupChat.send': async ({
     cid,
     content,
+    commander_mention_display,
     title_text,
     attachments,
     use_selections,
     references,
     steer_active_turn,
+    multi_dispatch,
+    retry_message_id,
   }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
+    bindWebAssistConversation(ctx.userId, cid, ctx.sender);
     const text = (content || '').trim();
     if (!text) throw new Error('empty message');
     const hasTitleText = typeof title_text === 'string';
@@ -1741,9 +1847,23 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const atts = Array.isArray(attachments) ? attachments.filter((n: any) => typeof n === 'string') : [];
     const useSelections = Array.isArray(use_selections) ? use_selections : [];
     const refs = Array.isArray(references) ? references : [];
+    const retryMessageId = typeof retry_message_id === 'string' ? retry_message_id.trim() : '';
+    if (retryMessageId) {
+      return groupChat.retryFailedTurn({
+        userId: ctx.userId,
+        cid,
+        failedMessageId: retryMessageId,
+        visibleText: text,
+      });
+    }
     return groupChat.send({
       userId: ctx.userId, cid, text,
+      ...(commander_mention_display === 'preserve' || commander_mention_display === 'hide_generated_prefix'
+        ? { commander_mention_display } : {}),
       ...(steer_active_turn === true ? { steerActiveTurn: true } : {}),
+      ...(multi_dispatch === 'parallel' || multi_dispatch === 'serial'
+        ? { multi_dispatch }
+        : {}),
       ...(hasTitleText ? { title_text: titleText } : {}),
       ...(atts.length ? { attachments: atts } : {}),
       ...(useSelections.length ? { use_selections: useSelections } : {}),
@@ -1756,6 +1876,48 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return groupChat.abort(ctx.userId, cid);
   },
 
+  'groupChat.tasks.list': async ({ cid }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return groupChat.listTasks(ctx.userId, cid);
+  },
+
+  'groupChat.tasks.cancel': async ({ cid, task_id }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return groupChat.cancelTask(ctx.userId, cid, String(task_id || ''));
+  },
+
+  'groupChat.tasks.sendNow': async ({ cid, task_id }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return groupChat.sendTaskNow(ctx.userId, cid, String(task_id || ''));
+  },
+
+  'groupChat.tasks.setAfter': async ({ cid, task_id, after_task_id }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    const after = typeof after_task_id === 'string' && after_task_id ? after_task_id : null;
+    return groupChat.setTaskAfter(ctx.userId, cid, String(task_id || ''), after);
+  },
+
+  'groupChat.tasks.resumeBlocked': async ({ cid, task_id }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return groupChat.resumeBlockedTask(ctx.userId, cid, String(task_id || ''));
+  },
+
+  'groupChat.tasks.reorder': async ({ cid, task_id, before_task_id }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    const before = typeof before_task_id === 'string' && before_task_id ? before_task_id : null;
+    return groupChat.reorderTask(ctx.userId, cid, String(task_id || ''), before);
+  },
+
+  'groupChat.tasks.reassign': async ({ cid, task_id, assignee_id }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return groupChat.reassignTask(ctx.userId, cid, String(task_id || ''), String(assignee_id || ''));
+  },
+
+  'groupChat.setFloor': async ({ cid, actor_id, actor_ids }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return groupChat.setFloor(ctx.userId, cid, Array.isArray(actor_ids) ? actor_ids : String(actor_id || ''));
+  },
+
   'groupChat.deleteMessages': async ({ cid, message_ids }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
     const ids = Array.isArray(message_ids) ? message_ids.filter((id: unknown) => typeof id === 'string') : [];
@@ -1766,7 +1928,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const { cid } = args;
     if (!safeId(cid)) throw new Error('invalid cid');
     const projectIdHint = conversationProjectHint(args);
-    const conv = await chats.getConversation(ctx.userId, cid, projectIdHint);
+    const conv = await chats.getConversationMetadata(ctx.userId, cid, projectIdHint);
     if (!conv) {
       return { ok: false, error: 'conversation not found', actors: [] };
     }
@@ -1777,7 +1939,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const { cid } = args;
     if (!safeId(cid)) throw new Error('invalid cid');
     const projectIdHint = conversationProjectHint(args);
-    const conv = await chats.getConversation(ctx.userId, cid, projectIdHint);
+    const conv = await chats.getConversationMetadata(ctx.userId, cid, projectIdHint);
     return groupChat.runtimeStatus(ctx.userId, cid, conv?.project_id ?? projectIdHint);
   },
 
@@ -2921,8 +3083,19 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { ok };
   },
 
-  'delete_file.visible': async ({ confirm_id }: { confirm_id: string }) => {
-    const ok = markDeleteConfirmationVisible(String(confirm_id || ''));
+  // `visible` distinguishes "the card is on screen now" from "the card is
+  // mounted but the user is on another view". Omitted → true, so an older
+  // renderer keeps its previous meaning.
+  'delete_file.visible': async ({ confirm_id, visible }: { confirm_id: string; visible?: boolean }) => {
+    const ok = markDeleteConfirmationVisible(String(confirm_id || ''), visible !== false);
+    return { ok };
+  },
+
+  // The card was destroyed before the user answered (conversation switch /
+  // history reload). Retract the token so the LLM's next call is told to mint
+  // a fresh card instead of waiting on one nobody can see.
+  'delete_file.dismiss': async ({ confirm_id }: { confirm_id: string }) => {
+    const ok = cancelDeleteConfirmation(String(confirm_id || ''));
     return { ok };
   },
 
@@ -3277,6 +3450,10 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // agents. No Server dependency, so kept in the open-source build.
   ...connectorsHandlers,
 
+  // Shared in-app browser chrome. Remote pages stay in an isolated
+  // WebContentsView and never receive the renderer preload.
+  ...webAssistHandlers,
+
   // Cross-session memory UI — view/edit/import/export over features/memory.ts.
   ...memoryHandlers,
 };
@@ -3287,11 +3464,23 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 // unexpected throws.
 
 const streamHandlers: Record<string, StreamHandler> = {
-  'conversations.sendStream': async function* ({ cid, content, title_text, attachments, use_selections, references, retry_message_id, client_msg_id }, ctx, signal) {
+  'conversations.sendStream': async function* ({
+    cid,
+    content,
+    commander_mention_display,
+    title_text,
+    attachments,
+    use_selections,
+    references,
+    retry_message_id,
+    multi_dispatch,
+    client_msg_id,
+  }, ctx, signal) {
     if (!safeId(cid)) {
       yield { type: 'error', text: 'invalid cid' };
       return;
     }
+    bindWebAssistConversation(ctx.userId, cid, ctx.sender);
     const text = (content || '').trim();
     if (!text) {
       yield { type: 'error', text: 'empty message' };
@@ -3340,6 +3529,7 @@ const streamHandlers: Record<string, StreamHandler> = {
     let processCount = 0;
     let firstProcessLogged = false;
     let sendDone = false;
+    let acceptanceEmitted = false;
     let sendRes: Awaited<ReturnType<typeof groupChat.send>>
       | Awaited<ReturnType<typeof groupChat.retryFailedTurn>>
       | null = null;
@@ -3359,6 +3549,11 @@ const streamHandlers: Record<string, StreamHandler> = {
             })
           : await groupChat.send({
               userId: ctx.userId, cid, text,
+              ...(commander_mention_display === 'preserve' || commander_mention_display === 'hide_generated_prefix'
+                ? { commander_mention_display } : {}),
+              ...(multi_dispatch === 'parallel' || multi_dispatch === 'serial'
+                ? { multi_dispatch }
+                : {}),
               ...(typeof client_msg_id === 'string' && client_msg_id.trim()
                 ? { client_msg_id: client_msg_id.trim().slice(0, 64) }
                 : {}),
@@ -3398,6 +3593,10 @@ const streamHandlers: Record<string, StreamHandler> = {
           if (!sendRes?.ok) {
             yield { type: 'error', text: sendRes?.error || 'send failed' };
             return;
+          }
+          if (!acceptanceEmitted) {
+            acceptanceEmitted = true;
+            yield { type: 'send_accepted' };
           }
           if (groupChat.busIsQuiescent(ctx.userId, cid)) break drainLoop;
         }
@@ -3814,21 +4013,21 @@ export function register(): void {
         // Renderer cleanup may race the terminal `done` delivery by a few
         // milliseconds. Cancellation is idempotent: a request that this same
         // renderer already completed has nothing left to abort.
-        log.debug(`streamCancel: already settled requestId=${requestId}`);
+        log.debug('streamCancel: already settled', { request_id: maskId(requestId) });
         return;
       }
       if (settled) {
-        log.warn(`streamCancel: sender mismatch requestId=${requestId}`);
+        log.warn('streamCancel: sender mismatch', { request_id: maskId(requestId) });
         return;
       }
-      log.warn(`streamCancel: unknown requestId=${requestId}`);
+      log.warn('streamCancel: unknown request', { request_id: maskId(requestId) });
       return;
     }
     if (state.sender !== event.sender) {
-      log.warn(`streamCancel: sender mismatch requestId=${requestId}`);
+      log.warn('streamCancel: sender mismatch', { request_id: maskId(requestId) });
       return;
     }
-    log.info(`streamCancel requestId=${requestId}`);
+    log.info('streamCancel', { request_id: maskId(requestId) });
     state.cancelled = true;
     // Propagate the cancel into the generator's async work — in particular
     // the in-flight LLM HTTP call inside `streamChatWithModel`. Without this

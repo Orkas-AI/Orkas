@@ -256,3 +256,20 @@ class FileBackedAccount(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CjkPlan(unittest.TestCase):
+    """CJK bigram tokens: without them two pure-Chinese rephrasings produced
+    empty token sets and the near-dup Jaccard check was silently skipped."""
+
+    def test_chinese_near_duplicate_subquestions_collapse(self):
+        out = plan({"subquestions": ["中国新能源汽车的出口趋势分析",
+                                     "分析中国新能源汽车的出口趋势"]})
+        self.assertEqual(len(out["subquestions"]), 1)
+        self.assertEqual(len(out["dropped"]["duplicates"]), 1)
+
+    def test_distinct_chinese_subquestions_are_kept(self):
+        out = plan({"subquestions": ["中国新能源汽车的出口趋势",
+                                     "欧洲电池回收政策的合规成本"]})
+        self.assertEqual(len(out["subquestions"]), 2)
+        self.assertEqual(out["dropped"]["duplicates"], [])

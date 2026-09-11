@@ -564,14 +564,23 @@ describe('local_agents/backends/claude › mapClaudeEvent', () => {
   });
 });
 
-describe('local_agents/backends/claude › trusted local permissions', () => {
-  it('starts Claude Code in non-interactive full-permission mode', () => {
+describe('local_agents/backends/claude › Orkas permissions', () => {
+  it('inherits Claude Code permissions when the Agent has no override', () => {
     const args = buildClaudeArgs({});
-    expect(args).toContain('--permission-mode');
-    expect(args).toContain('bypassPermissions');
-    expect(args).toContain('--dangerously-skip-permissions');
+    expect(args).not.toContain('--permission-mode');
+    expect(args).not.toContain('--dangerously-skip-permissions');
     expect(args).toContain('--include-hook-events');
     expect(args).not.toContain('--model');
+  });
+
+  it('maps explicit approval and full-access policies to Claude flags', () => {
+    expect(buildClaudeArgs({ permissionPolicy: 'ask' })).toEqual(expect.arrayContaining([
+      '--permission-mode', 'default',
+      '--permission-prompt-tool', 'stdio',
+    ]));
+    expect(buildClaudeArgs({ permissionPolicy: 'full_access' })).toEqual(expect.arrayContaining([
+      '--permission-mode', 'bypassPermissions', '--dangerously-skip-permissions',
+    ]));
   });
 
   it('applies explicit per-Agent model and effort overrides', () => {

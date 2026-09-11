@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { createHash } from 'node:crypto';
 
 const mocks = vi.hoisted(() => ({
   execFile: vi.fn(),
@@ -30,6 +31,7 @@ import {
   _resetOcrRuntimeForTest,
   ocrFile,
   ocrImageText,
+  OCR_RUNTIME_KEY,
 } from '../../../src/main/features/ocr_runtime';
 
 function installSuccessfulExecMock(delayMs = 0): void {
@@ -49,6 +51,43 @@ function installSuccessfulExecMock(delayMs = 0): void {
   });
 }
 
+async function useRealPythonWithGbkParent(text: string, fail = false): Promise<void> {
+  const childProcess = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+  const localPython = path.resolve(__dirname, '../../../../venv',
+    process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
+  const candidates = [process.env.ORKAS_TEST_PYTHON, localPython, 'python3', 'python'];
+  const python = candidates.find((candidate) => candidate
+    && childProcess.spawnSync(candidate, ['--version'], { stdio: 'ignore' }).status === 0);
+  if (!python) throw new Error('OCR encoding regression requires Python; set ORKAS_TEST_PYTHON');
+
+  const venvPython = _ocrVenvPythonForTest();
+  fs.mkdirSync(path.dirname(venvPython), { recursive: true });
+  fs.writeFileSync(venvPython, 'python');
+  const modules = path.join(mocks.root, 'python-modules');
+  fs.mkdirSync(modules);
+  // Only the recognition engine is replaced. Execute the production Python
+  // script and its real stdout bytes through Node's normal UTF-8 decoder.
+  fs.writeFileSync(path.join(modules, 'rapidocr.py'), [
+    'class RapidOCR:',
+    '    def __init__(self, params=None): pass',
+    '    def __call__(self, image_path):',
+    fail ? `        raise ValueError(${JSON.stringify(text)})`
+      : `        return [[${JSON.stringify(text)}, 0.99]]`,
+    '',
+  ].join('\n'), 'utf8');
+  for (const name of ['onnxruntime', 'pypdfium2']) {
+    fs.writeFileSync(path.join(modules, `${name}.py`), '');
+  }
+  vi.stubEnv('PYTHONIOENCODING', 'gbk');
+  vi.stubEnv('PYTHONUTF8', '0');
+  mocks.execFile.mockImplementation((_file: string, args: string[], options: any, callback: Function) => (
+    childProcess.execFile(python, args, {
+      ...options,
+      env: { ...options.env, PYTHONPATH: modules },
+    }, (error, stdout, stderr) => callback(error, { stdout, stderr }))
+  ));
+}
+
 describe('OCR runtime provisioning', () => {
   beforeEach(() => {
     mocks.root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-ocr-runtime-'));
@@ -59,12 +98,68 @@ describe('OCR runtime provisioning', () => {
   afterEach(() => {
     _resetOcrRuntimeForTest();
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     fs.rmSync(mocks.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   });
 
   it('uses the platform-native virtualenv executable layout', () => {
     expect(_ocrVenvPythonForTest('D:\\venv', 'win32')).toBe(path.join('D:\\venv', 'Scripts', 'python.exe'));
     expect(_ocrVenvPythonForTest('/tmp/venv', 'darwin')).toBe(path.join('/tmp/venv', 'bin', 'python'));
+  });
+
+  it.each(['中文识别结果', '中文 • 🚀'])('preserves %s through Python stdout and the OCR cache with a GBK parent', async (text) => {
+    await useRealPythonWithGbkParent(text);
+    const image = path.join(mocks.root, 'page.jpg');
+    fs.writeFileSync(image, 'image');
+
+    await expect(ocrImageText({ absPath: image })).resolves.toMatchObject({
+      ok: true, text, items: [{ text, score: 0.99 }],
+    });
+    const first = await ocrFile({ userId: 'ocr-owner', absPath: image });
+    expect(first).toMatchObject({ ok: true, cached: false, content: expect.stringContaining(text) });
+    const runs = mocks.execFile.mock.calls.length;
+    await expect(ocrFile({ userId: 'ocr-owner', absPath: image })).resolves.toMatchObject({
+      ok: true, cached: true, content: expect.stringContaining(text),
+    });
+    expect(mocks.execFile).toHaveBeenCalledTimes(runs);
+  });
+
+  it('preserves a Unicode engine error instead of failing to encode the error response', async () => {
+    const message = '无法识别 • 🚀';
+    await useRealPythonWithGbkParent(message, true);
+    const image = path.join(mocks.root, 'page.jpg');
+    fs.writeFileSync(image, 'image');
+
+    await expect(ocrImageText({ absPath: image })).resolves.toMatchObject({
+      ok: false, errorCode: 'E_OCR_FAILED', message: expect.stringContaining(message),
+    });
+  });
+
+  it('rebuilds a legacy cache that may contain text decoded with the wrong encoding', async () => {
+    await useRealPythonWithGbkParent('中文');
+    const image = path.join(mocks.root, 'page.jpg');
+    fs.writeFileSync(image, 'image');
+    const stat = fs.statSync(image);
+    const shortHash = (value: string) => createHash('sha1').update(value).digest('hex').slice(0, 16);
+    // Freeze the persisted v2 format: changing the production cache key must
+    // leave this old, potentially corrupted entry ineligible for reuse.
+    const oldKey = shortHash(JSON.stringify({
+      cacheVersion: 2,
+      absPath: image,
+      size: stat.size,
+      mtime: stat.mtimeMs,
+      ctime: stat.ctimeMs,
+      contentSha256: createHash('sha256').update('image').digest('hex'),
+      pages: '',
+      runtime: OCR_RUNTIME_KEY,
+    }));
+    const cacheDir = path.join(mocks.root, 'cache', shortHash(image));
+    fs.mkdirSync(cacheDir, { recursive: true });
+    fs.writeFileSync(path.join(cacheDir, `ocr.${oldKey}.md`), '����');
+
+    await expect(ocrFile({ userId: 'ocr-owner', absPath: image })).resolves.toMatchObject({
+      ok: true, cached: false, content: expect.stringContaining('中文'),
+    });
   });
 
   it('coalesces concurrent first-use installs and caches the verified runtime', async () => {

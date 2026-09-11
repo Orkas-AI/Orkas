@@ -8,6 +8,7 @@ import {
   beginImageStudioGeneration,
   finishImageStudioGeneration,
   imageGenerationControlStatePath,
+  latestCompletedImageStudioGenerationOutput,
   readImageGenerationControlState,
   summarizeImageGenerationBudget,
 } from '../../features/image_production_control';
@@ -118,8 +119,55 @@ export function imageStudioStatePath(opts: ImageStudioToolOpts, projectDirAbs: s
   return path.join(userLocalRoot(opts.userId), 'image_studio', 'evidence', `${stateKey(opts, projectDirAbs)}.json`);
 }
 
+// Results are read by a model, not a person: compact JSON and no echo of
+// the manifest it wrote itself. Pretty-printing plus the full manifest cost
+// 3–8K characters per image iteration with no consumer.
 function jsonResult(value: Record<string, unknown>, renameNote = ''): ToolResult {
-  return { content: `${JSON.stringify(value, null, 2)}${renameNote}`, isError: value.ok === false };
+  return { content: `${JSON.stringify(value)}${renameNote}`, isError: value.ok === false };
+}
+
+type ProjectInspection = Awaited<ReturnType<typeof inspectImageStudioProject>>;
+
+/** The inspection minus the manifest body. Every derived fact the model acts
+ *  on (route, signature, blockers, budget, reference counts) is already a
+ *  sibling field; the manifest itself is the file the model authored. */
+function inspectionForModel(inspection: ProjectInspection): Omit<ProjectInspection, 'manifest'> {
+  const { manifest: _manifest, ...rest } = inspection;
+  return rest;
+}
+
+const IMAGE_STUDIO_FAILURE_CONTEXT_MAX_CODES = 64;
+
+function jsonValidationResult(
+  value: Record<string, unknown>,
+  validationScope: string,
+  renameNote = '',
+): ToolResult {
+  const result = jsonResult(value, renameNote);
+  const inspection = value.inspection;
+  if (
+    value.ok !== false
+    || !inspection
+    || typeof inspection !== 'object'
+    || Array.isArray(inspection)
+  ) return result;
+  const blockers = (inspection as Record<string, unknown>).blockers;
+  if (!Array.isArray(blockers) || blockers.length === 0) return result;
+  const issueCodes = [...new Set(blockers.flatMap((blocker) => {
+    if (!blocker || typeof blocker !== 'object' || Array.isArray(blocker)) return [];
+    const code = (blocker as Record<string, unknown>).code;
+    return typeof code === 'string' && code.trim() ? [code.trim()] : [];
+  }))].slice(0, IMAGE_STUDIO_FAILURE_CONTEXT_MAX_CODES);
+  return {
+    ...result,
+    failureContext: {
+      kind: 'deterministic_validation',
+      scope: validationScope,
+      complete: true,
+      issueCount: blockers.length,
+      issueCodes,
+    },
+  };
 }
 
 async function jsonResultWithVisualEvidence(
@@ -189,7 +237,7 @@ async function jsonResultWithVisualEvidence(
     },
   };
   return {
-    content: `${JSON.stringify(payload, null, 2)}${renameNote}`,
+    content: `${JSON.stringify(payload)}${renameNote}`,
     images: preparedEvidence.map((item) => ({
       data: item.prepared.buf.toString('base64'),
       mediaType: item.prepared.mediaType,
@@ -253,11 +301,13 @@ async function buildImageStudioRecoveryHandoff(input: {
   generation?: Awaited<ReturnType<typeof readImageGenerationControlState>>;
 }): Promise<Record<string, unknown>> {
   const state = await readImageStudioEvidenceState(input.stateAbsPath);
-  const inspection = input.inspection
-    || await inspectImageStudioProject(input.projectDirAbs, state?.source_path);
   const generation = input.generation === undefined
     ? await readImageGenerationControlState(input.generationStateAbsPath)
     : input.generation;
+  const resumeSource = latestCompletedImageStudioGenerationOutput(generation, input.turnId)
+    || state?.source_path;
+  const inspection = input.inspection
+    || await inspectImageStudioProject(input.projectDirAbs, resumeSource);
   const maxCalls = generation?.max_calls ?? inspection.manifest?.generation_budget.max_calls ?? null;
   const usage = summarizeImageGenerationBudget(generation, maxCalls ?? 0, input.turnId);
   const evidenceAvailable = await existingFile(state?.evidence_path);
@@ -308,7 +358,7 @@ async function buildImageStudioRecoveryHandoff(input: {
         budget_exhausted: maxCalls === null ? null : usage.calls_remaining === 0,
       },
       next_operation: nextImageStudioRecoveryOperation({
-        inspection,
+        inspection: inspectionForModel(inspection),
         evidenceCurrent,
         evidenceAvailable,
         reviewRequired,
@@ -350,7 +400,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
           description: 'Project QA/export or host-configured external workflow operation.',
         },
         project_dir: { type: 'string', description: 'Image project directory containing image-manifest.json and local assets.' },
-        input_path: { type: 'string', description: 'Generated or edited project-local raster for project.inspect.' },
+        input_path: { type: 'string', description: 'Optional generated or edited project-local raster for project.inspect. When omitted, the latest completed output from the current turn is adopted before manifest raster_source.' },
         output_path: { type: 'string', description: 'Snapshot, external workflow, or final export path.' },
         format: { type: 'string', enum: ['png', 'jpeg'], description: 'Final project.export format. Defaults from output_path, otherwise PNG.' },
         evidence_path: { type: 'string', description: 'Required for project.submit_design_review: exact current evidence path returned by project.inspect or project.snapshot.' },
@@ -415,6 +465,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
       if (dirError) return { content: dirError, isError: true } as ToolResult;
       const stateAbsPath = imageStudioStatePath(opts, projectDirAbs);
       const generationStateAbsPath = imageGenerationControlStatePath(opts.userId, projectDirAbs);
+      const validationScope = `image_studio.project:${stateKey(opts, projectDirAbs)}`;
 
       try {
         if (op === 'workflow.capabilities') {
@@ -545,9 +596,9 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
               stateAbsPath,
               generationStateAbsPath,
               turnId: currentTurnId,
-              inspection,
+              inspection: inspectionForModel(inspection),
             });
-            return jsonResult({ ok: false, op, inspection, ...handoff });
+            return jsonValidationResult({ ok: false, op, inspection, ...handoff }, validationScope);
           }
           const generation = await readImageGenerationControlState(
             generationStateAbsPath,
@@ -560,7 +611,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
               stateAbsPath,
               generationStateAbsPath,
               turnId: currentTurnId,
-              inspection,
+              inspection: inspectionForModel(inspection),
               generation,
             });
             return jsonResult({
@@ -609,7 +660,9 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             readImageStudioEvidenceState(stateAbsPath),
             readImageGenerationControlState(generationStateAbsPath),
           ]);
-          const inspection = await inspectImageStudioProject(projectDirAbs, state?.source_path);
+          const resumeSource = latestCompletedImageStudioGenerationOutput(generation, currentTurnId)
+            || state?.source_path;
+          const inspection = await inspectImageStudioProject(projectDirAbs, resumeSource);
           const maxCalls = generation?.max_calls ?? inspection.manifest?.generation_budget.max_calls ?? null;
           const usage = summarizeImageGenerationBudget(generation, maxCalls ?? 0, currentTurnId);
           let creditQuote: Record<string, unknown> | undefined;
@@ -636,10 +689,10 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             stateAbsPath,
             generationStateAbsPath,
             turnId: currentTurnId,
-            inspection,
+            inspection: inspectionForModel(inspection),
             generation,
           });
-          return jsonResult({
+          return jsonValidationResult({
             ok: inspection.ok,
             op,
             current_signature: inspection.signature || null,
@@ -658,16 +711,19 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
                 note: 'Call generation.quote with exact size/reference_count before dispatch; external provider billing is not estimated in-app.',
               },
             } : {}),
-            inspection,
+            inspection: inspectionForModel(inspection),
             ...handoff,
-          });
+          }, validationScope);
         }
 
         if (op === 'project.inspect') {
-          const inputAbs = input.input_path ? resolveAbs(ctx, opts, input.input_path) : undefined;
-          if (inputAbs && !isPathAllowed(inputAbs, roots)) {
-            return { content: `E_PATH_OUT_OF_SCOPE: input_path is outside scope: ${inputAbs}`, isError: true } as ToolResult;
+          const explicitInputAbs = input.input_path ? resolveAbs(ctx, opts, input.input_path) : undefined;
+          if (explicitInputAbs && !isPathAllowed(explicitInputAbs, roots)) {
+            return { content: `E_PATH_OUT_OF_SCOPE: input_path is outside scope: ${explicitInputAbs}`, isError: true } as ToolResult;
           }
+          const generation = await readImageGenerationControlState(generationStateAbsPath);
+          const inputAbs = explicitInputAbs
+            || latestCompletedImageStudioGenerationOutput(generation, currentTurnId);
           const preliminary = await inspectImageStudioProject(projectDirAbs, inputAbs);
           const inspection = preliminary.route === 'generate' || preliminary.route === 'edit'
             ? await recordRasterEvidence({ projectDirAbs, rasterAbsPath: inputAbs, stateAbsPath })
@@ -677,10 +733,11 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             stateAbsPath,
             generationStateAbsPath,
             turnId: currentTurnId,
-            inspection,
+            inspection: inspectionForModel(inspection),
+            generation,
           });
-          const result = { ok: inspection.ok, op, inspection, ...handoff };
-          return jsonResult(result);
+          const result = { ok: inspection.ok, op, inspection: inspectionForModel(inspection), ...handoff };
+          return jsonValidationResult(result, validationScope);
         }
 
         if (op === 'project.snapshot') {
@@ -698,12 +755,12 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             stateAbsPath,
             generationStateAbsPath,
             turnId: currentTurnId,
-            inspection,
+            inspection: inspectionForModel(inspection),
           });
           const result = {
             ok: inspection.ok,
             op,
-            inspection,
+            inspection: inspectionForModel(inspection),
             ...(inspection.ok ? { media: versionedChatMediaLocalUrl(unique.finalPath) } : {}),
             ...handoff,
           };
@@ -714,7 +771,11 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
               unique.renamed ? renderRenameSignal(requested, unique.finalPath) : '',
             );
           }
-          return jsonResult(result, unique.renamed ? renderRenameSignal(requested, unique.finalPath) : '');
+          return jsonValidationResult(
+            result,
+            validationScope,
+            unique.renamed ? renderRenameSignal(requested, unique.finalPath) : '',
+          );
         }
 
         if (op === 'project.submit_design_review') {

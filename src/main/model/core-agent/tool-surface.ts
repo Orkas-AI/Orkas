@@ -7,6 +7,7 @@ import {
   canonicalizeAgentToolGroups,
   canonicalizeToolGroups,
   expandToolGroups,
+  getToolCatalogEntry,
   hostManagedToolNames,
   isAgentFallbackToolGroup,
   isLoadableToolGroup,
@@ -45,6 +46,8 @@ export interface ToolSurfaceController {
    * tool-availability filtering. This is the single source for the prompt,
    * tool schema, and execute-time validation. */
   loadableGroups(): ToolGroupId[];
+  /** Recovery hints must respect this actor's actual model-loadable surface. */
+  loadableGroupsForTool(name: string): ToolGroupId[];
   runtimeStats(): {
     loadCalls: number;
     newlyLoadedGroups: ToolGroupId[];
@@ -111,6 +114,7 @@ export function createToolSurfaceController(input: {
       activeToolNames: () => [...available],
       loadedGroups: () => [...LOADABLE_TOOL_GROUP_IDS],
       loadableGroups: () => [],
+      loadableGroupsForTool: () => [],
       runtimeStats: () => ({
         loadCalls: 0,
         newlyLoadedGroups: [],
@@ -212,6 +216,10 @@ export function createToolSurfaceController(input: {
       return [...effectiveGroupRefs];
     },
     loadableGroups: () => dynamicLoading ? [...availableDynamicGroupRefs] : [],
+    loadableGroupsForTool: (name) => dynamicLoading && dynamicLoadable.has(name)
+      ? (getToolCatalogEntry(name)?.loadGroups ?? [])
+        .filter((group) => availableDynamicGroups.has(group))
+      : [],
     runtimeStats: () => ({
       loadCalls,
       newlyLoadedGroups: [...turnLoadedGroupRefs],
@@ -260,9 +268,16 @@ export function createToolSurfaceController(input: {
           isError: true,
         };
       }
-      if (!requested.length) {
+      // Validate the complete batch before changing activation state. A failed
+      // receipt must never conceal a successful subset that needs no retry.
+      if (!requested.length || unavailable.length) {
         return {
-          content: JSON.stringify({ ok: false, error: 'E_TOOL_GROUP_INVALID', unavailable }),
+          content: JSON.stringify({
+            ok: false,
+            error: 'E_TOOL_GROUP_INVALID',
+            unavailable,
+            available_groups: [...availableDynamicGroupRefs],
+          }),
           isError: true,
         };
       }
@@ -296,8 +311,8 @@ export function createToolSurfaceController(input: {
           already_loaded: alreadyLoaded,
           unavailable,
           activated_tools: active.size,
+          newly_activated_tools: [...active].filter((name) => !activeBeforeLoad.has(name)),
         }),
-        ...(unavailable.length && !eligibleRequested.length ? { isError: true } : {}),
       };
     },
   };
@@ -338,7 +353,7 @@ export function createToolLoadTool(
   const allowedGroups = controller.loadableGroups();
   const description = policy === 'agent-dependency'
     ? 'Fallback only for an in-domain request: activate missing Agent-dependency tool groups for this user turn. This does not expand the Agent domain or execution permissions. Include every clearly needed group in one call.'
-    : 'Fallback only: activate missing built-in tool groups for the current user turn when active tools cannot complete the request. Include every clearly needed group in one call. Loading never grants execution permissions.';
+    : 'Activate in one call the groups containing needed tools that are not currently exposed. Their full tool definitions become available on the next model round, for the current user turn only. Loading never grants execution permissions.';
   return {
     name: 'tool_load',
     description,

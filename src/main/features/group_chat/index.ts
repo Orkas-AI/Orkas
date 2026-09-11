@@ -14,7 +14,6 @@ import * as path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 
 import {
-  conversationLayout,
   conversationMessageFile,
   conversationMessageReadFile,
 } from '../../util/project-layout';
@@ -26,12 +25,20 @@ import { fileEditLock } from '../../util/locks';
 
 import {
   COMMANDER_ID, USER_ID, readMembers, readState, seedReservedActors, purgeGroupDir,
-  setCodingProjectDir, setStatus, actorSessionId, type Actor,
+  setCodingProjectDir, setStatus, actorSessionId, setActiveRecipients, type Actor,
 } from './state';
 import { isPlaceholderTitle } from './conv_title';
+import type { CommanderMentionDisplay } from './message-display';
 import {
   abort as busAbort, dropConv as busDropConv, enqueue, subscribe, isQuiescent, runtimeSnapshot,
   type GroupEvent,
+  cancelConversationTask as busCancelConversationTask,
+  sendConversationTaskNow as busSendConversationTaskNow,
+  listConversationTasks as busListConversationTasks,
+  setConversationTaskAfter as busSetConversationTaskAfter,
+  resumeBlockedTask as busResumeBlockedTask,
+  reorderConversationTask as busReorderConversationTask,
+  reassignConversationTask as busReassignConversationTask,
 } from './bus';
 
 /** Re-export so the IPC layer can poll the bus's true quiescent state on
@@ -44,7 +51,7 @@ export async function runtimeStatus(
   userId: string,
   cid: string,
   projectIdHint?: string | null,
-): Promise<{ processing: boolean; processing_since: string | null; in_flight: string[]; active_turns: Array<{ actor: string; turn_id: string; msg_id?: string; steerable: boolean; started_at_ms: number }>; active_recipient?: string }> {
+): Promise<{ processing: boolean; processing_since: string | null; in_flight: string[]; active_turns: Array<{ actor: string; turn_id: string; msg_id?: string; steerable: boolean; started_at_ms: number }>; active_recipient?: string; active_recipients?: string[]; active_recipient_revision?: number }> {
   if (!safeId(cid)) return { processing: false, processing_since: null, in_flight: [], active_turns: [] };
   try {
     const state = await readState(userId, cid, projectIdHint);
@@ -55,7 +62,8 @@ export async function runtimeStatus(
     // The conversation floor — included so a renderer reload / recovery poll
     // restores the composer target (the agent the commander handed off to)
     // instead of dropping back to the commander until the next state_changed.
-    const floor = state.active_recipient ? { active_recipient: state.active_recipient } : {};
+    const floor = { active_recipient_revision: state.active_recipient_revision || 0,
+      ...(state.active_recipient ? { active_recipient: state.active_recipient } : {}) };
     if ((state.status === 'running' || diskInFlight.length > 0) && !runtime.processing) {
       log.warn(`healing orphan running state user=${userId} cid=${cid} status=${state.status} in_flight=${diskInFlight.join(',')}`);
       await setStatus(userId, cid, 'idle');
@@ -103,7 +111,17 @@ export interface SendInput {
   userId: string;
   cid: string;
   text: string;
-  /** Renderer-generated identity for the optimistic user bubble. */
+  commander_mention_display?: CommanderMentionDisplay;
+  /** Host-owned delivery decision for the explicit queue "Send now" action.
+   * Analytics attribution must never imply this execution control. */
+  steerActiveTurn?: boolean;
+  /** Cross-group ordering for a multi-mention send (D9 serial default).
+   * Renderer composer toggle; absent = serial. See EnqueueParams. */
+  multi_dispatch?: 'serial' | 'parallel';
+  /** Renderer-generated id for the optimistic user bubble, echoed back on the
+   * persisted record so the renderer can claim that exact bubble instead of
+   * guessing by sender+timestamp+text. Two sends can legitimately share those
+   * three, which is why the guess needed defensive patches. */
   client_msg_id?: string;
   /** User-visible first-message text used only for automatic task titles.
    *  Callers that inject transport routing such as `@Agent` into `text`
@@ -115,8 +133,6 @@ export interface SendInput {
   attachments?: string[];
   use_selections?: ChatUseSelection[];
   references?: Array<{ source_cid: string; source_msg_id: string }>;
-  /** Host-owned delivery decision for the explicit queue “Send now” action. */
-  steerActiveTurn?: boolean;
 }
 
 async function _resolveMessageReferences(
@@ -245,7 +261,7 @@ export async function send(
 ): Promise<{ ok: boolean; msg?: GroupMessage; error?: string }> {
   const {
     userId, cid, text, title_text, model_text, attachments, use_selections, references,
-    steerActiveTurn,
+    steerActiveTurn, multi_dispatch, commander_mention_display,
     client_msg_id,
   } = input;
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
@@ -277,6 +293,12 @@ export async function send(
       uid: userId, cid,
       fromActorId: USER_ID,
       text,
+      ...(commander_mention_display === 'preserve' || commander_mention_display === 'hide_generated_prefix'
+        ? { commander_mention_display } : {}),
+      ...(steerActiveTurn === true ? { steerActiveTurn: true } : {}),
+      ...(multi_dispatch === 'parallel' || multi_dispatch === 'serial'
+        ? { multiDispatch: multi_dispatch }
+        : {}),
       ...(typeof client_msg_id === 'string' && client_msg_id.trim()
         ? { client_msg_id: client_msg_id.trim() }
         : {}),
@@ -656,17 +678,82 @@ export async function resolveFailedTurnRetry(
   };
 }
 
+export interface RetryFailedTurnResult {
+  ok: boolean;
+  mode?: FailedTurnRetryMode;
+  msg?: GroupMessage;
+  error?: string;
+  /** The same failed bubble already has a queued/running retry; nothing was
+   * enqueued or persisted. Not an error: the user's intent is already
+   * pending on the board. */
+  already_pending?: boolean;
+}
+
+/** Board statuses that still own a pending execution. The terminal set is
+ * `done | stopped | failed | cancelled` (task_board.ts); listing the pending
+ * side keeps an unknown future status fail-open (a duplicate retry rather
+ * than a bubble that can never be retried). */
+const PENDING_RETRY_TASK_STATUSES: ReadonlySet<string> = new Set([
+  'queued', 'running', 'waiting_input', 'blocked',
+]);
+/** failed-message key -> source message id of the retry task that was
+ * accepted for it. Memory-only on purpose: a process restart cancels every
+ * live board row, so there is never a pending retry to remember across it. */
+const _acceptedRetries = new Map<string, string>();
+/** Keys whose resolve + enqueue has not returned yet (a double-click lands
+ * before the first retry reaches the board). */
+const _retriesInFlight = new Set<string>();
+
+function retryDedupeKey(userId: string, cid: string, failedMessageId: string): string {
+  return [userId, cid, failedMessageId].join(' ');
+}
+
+async function _retryStillPending(userId: string, cid: string, retryMsgId: string): Promise<boolean> {
+  try {
+    const rows = await busListConversationTasks(userId, cid);
+    return rows.some((row) => row.source_msg_id === retryMsgId
+      && PENDING_RETRY_TASK_STATUSES.has(row.status));
+  } catch (err) {
+    log.warn('retry dedupe board lookup failed', { error: logErrorRef(err) });
+    return false;
+  }
+}
+
+/** Test-only: forget accepted/in-flight retry keys between isolated runs. */
+export function _resetFailedTurnRetryDedupeForTest(): void {
+  _acceptedRetries.clear();
+  _retriesInFlight.clear();
+}
+
 export async function retryFailedTurn(
   input: RetryFailedTurnInput,
-): Promise<{ ok: boolean; mode?: FailedTurnRetryMode; msg?: GroupMessage; error?: string }> {
+): Promise<RetryFailedTurnResult> {
+  // One failed bubble owns at most one pending retry. A second Retry while
+  // that retry is still queued/running (or still being resolved) is a no-op
+  // at this boundary so a double-click cannot enqueue two tasks, persist two
+  // "Retry" user messages, and run two model turns for one prompt.
+  const key = retryDedupeKey(input.userId, input.cid, input.failedMessageId);
+  if (_retriesInFlight.has(key)) return { ok: true, already_pending: true };
+  _retriesInFlight.add(key);
   try {
+    const accepted = _acceptedRetries.get(key);
+    if (accepted) {
+      if (await _retryStillPending(input.userId, input.cid, accepted)) {
+        log.info('failed-turn retry already pending', { cid: maskId(input.cid) });
+        return { ok: true, already_pending: true };
+      }
+      _acceptedRetries.delete(key);
+    }
     const resolved = await resolveFailedTurnRetry(input);
     if (!resolved.ok) return resolved;
     const msg = await enqueue(resolved.value.enqueue);
+    _acceptedRetries.set(key, msg.id);
     return { ok: true, mode: resolved.value.mode, msg };
   } catch (err) {
     log.error('failed-turn retry failed', { error: logErrorRef(err) });
     return { ok: false, error: (err as Error).message || String(err) };
+  } finally {
+    _retriesInFlight.delete(key);
   }
 }
 
@@ -679,7 +766,101 @@ export async function abort(userId: string, cid: string): Promise<{ ok: boolean 
 
 export async function dropConv(userId: string, cid: string): Promise<void> {
   await busDropConv(userId, cid);
+  // purgeGroupDir removes the whole group dir recursively — tasks.json
+  // (the conversation task board snapshot) goes with it.
   await purgeGroupDir(userId, cid);
+}
+
+// ── Conversation task board (list + queued/running cancel) ───────────────
+
+export async function listTasks(userId: string, cid: string) {
+  if (!safeId(cid)) return { ok: false as const, error: 'invalid cid', tasks: [] };
+  const tasks = await busListConversationTasks(userId, cid);
+  return { ok: true as const, tasks };
+}
+
+export async function cancelTask(userId: string, cid: string, taskId: string) {
+  if (!safeId(cid) || !taskId || typeof taskId !== 'string') {
+    return { ok: false as const, error: 'invalid arguments' };
+  }
+  return busCancelConversationTask(userId, cid, taskId);
+}
+
+export async function sendTaskNow(userId: string, cid: string, taskId: string) {
+  if (!safeId(cid) || !taskId || typeof taskId !== 'string') {
+    return { ok: false as const, error: 'invalid arguments' };
+  }
+  return busSendConversationTaskNow(userId, cid, taskId);
+}
+
+export async function setTaskAfter(
+  userId: string,
+  cid: string,
+  taskId: string,
+  afterTaskId: string | null,
+) {
+  if (!safeId(cid) || !taskId || typeof taskId !== 'string') {
+    return { ok: false as const, error: 'invalid arguments' };
+  }
+  return busSetConversationTaskAfter(userId, cid, taskId, afterTaskId);
+}
+
+export async function resumeBlockedTask(userId: string, cid: string, taskId: string) {
+  if (!safeId(cid) || !taskId || typeof taskId !== 'string') {
+    return { ok: false as const, error: 'invalid arguments' };
+  }
+  return busResumeBlockedTask(userId, cid, taskId);
+}
+
+export async function reorderTask(
+  userId: string,
+  cid: string,
+  taskId: string,
+  beforeTaskId: string | null,
+) {
+  if (!safeId(cid) || !taskId || typeof taskId !== 'string') {
+    return { ok: false as const, error: 'invalid arguments' };
+  }
+  return busReorderConversationTask(userId, cid, taskId, beforeTaskId);
+}
+
+export async function reassignTask(
+  userId: string,
+  cid: string,
+  taskId: string,
+  assigneeId: string,
+) {
+  if (!safeId(cid) || !taskId || typeof taskId !== 'string' || !assigneeId || typeof assigneeId !== 'string') {
+    return { ok: false as const, error: 'invalid arguments' };
+  }
+  return busReassignConversationTask(userId, cid, taskId, assigneeId);
+}
+
+/** D9 UI half: the composer chip's explicit selection sets the floor
+ * directly instead of synthesizing a hidden `@name` prefix into the next
+ * message. 'commander' resets the floor; an agent id must be a real,
+ * enabled agent (deterministic validation — no silent redirects). */
+export async function setFloor(userId: string, cid: string, actorId: string | string[]) {
+  if (!safeId(cid)) return { ok: false as const, error: 'invalid cid' };
+  const ids = [...new Set((Array.isArray(actorId) ? actorId : [actorId])
+    .map((id) => String(id || '').trim()))];
+  if (!ids.length) ids.push(COMMANDER_ID);
+  for (const id of ids) {
+    if (id !== COMMANDER_ID) {
+      if (!safeId(id)) return { ok: false as const, error: 'invalid actor' };
+      try {
+        const agentsFeat = await import('../agents');
+        const agent = await agentsFeat.getAgent(id);
+        if (!agent) return { ok: false as const, error: 'unknown agent' };
+      } catch {
+        return { ok: false as const, error: 'unknown agent' };
+      }
+    }
+  }
+  await seedReservedActors(userId, cid);
+  const state = await setActiveRecipients(userId, cid, ids, 'user_selection');
+  log.info(`floor set via chip user=${maskId(userId)} cid=${maskId(cid)} recipients=${ids.length}`);
+  return { ok: true as const, state };
 }
 
 // ── Members + plan ───────────────────────────────────────────────────────
@@ -836,8 +1017,8 @@ async function _prepareCodingProjectDirFormUpdate(
 }
 
 /**
- * Mutate the message that owns this form (main jsonl + the agent's
- * visibility slice) to mark it submitted. Does **not** enqueue a follow-up
+ * Mutate the canonical message that owns this form to mark it submitted.
+ * Does **not** enqueue a follow-up
  * user→agent message — the renderer is responsible for replaying the
  * encoded submission through the normal send-stream pipeline so the UI
  * gets a user bubble + subscribes to the agent's reply stream. Doing both
@@ -935,9 +1116,8 @@ export async function markFormSubmittedAndDispatch(
       return _buildFormSubmissionResult(target, storedValues);
     }
 
-    // Validate host-affecting form values and prepare the compatibility slice
-    // before touching state or either transcript. Invalid/stale paths and read
-    // failures therefore leave the whole operation retryable.
+    // Validate host-affecting form values before touching state or history.
+    // Invalid/stale paths therefore leave the operation retryable.
     const projectDirPreparation = await _prepareCodingProjectDirFormUpdate(
       userId,
       cid,
@@ -947,17 +1127,6 @@ export async function markFormSubmittedAndDispatch(
     if (!projectDirPreparation.ok) return projectDirPreparation;
 
     const agentId = target.form.agent_id;
-    const sliceFile = conversationLayout(userId, cid).visibilityFile(agentId);
-    let sliceIndex = -1;
-    if (fs.existsSync(sliceFile)) {
-      try {
-        const slice = await readJsonl<GroupMessage>(sliceFile, 100_000);
-        sliceIndex = slice.findIndex((message) => message.id === msgId);
-      } catch (err) {
-        log.warn('form-submit visibility slice read failed', { error: logErrorSummary(err) });
-        return { ok: false, error: 'form submit failed' };
-      }
-    }
 
     // Coding-agent contract: commit the validated cwd before consuming the
     // form. A state write failure therefore has zero transcript/session side
@@ -979,58 +1148,16 @@ export async function markFormSubmittedAndDispatch(
       values,
       submitted_at: nowIso(),
     };
-    let mainUpdated = false;
     try {
       const mainResult = await rewriteJsonlLine<GroupMessage>(file, idx, (rec) => {
         if (!rec || rec.id !== msgId || rec.form?.submitted) return null;
         return { ...rec, form: updated };
       });
       if (mainResult.ok === false) throw new Error(mainResult.error);
-      mainUpdated = true;
-
-      if (sliceIndex >= 0) {
-        const sliceResult = await rewriteJsonlLine<GroupMessage>(sliceFile, sliceIndex, (rec) => {
-          if (!rec || rec.id !== msgId) return null;
-          return { ...rec, form: updated };
-        });
-        if (sliceResult.ok === false) throw new Error(sliceResult.error);
-      }
     } catch (err) {
-      let mainRollbackFailed = false;
-      if (mainUpdated) {
-        try {
-          const rollbackResult = await rewriteJsonlLine<GroupMessage>(file, idx, (rec) => (
-            rec && rec.id === msgId ? target : null
-          ));
-          if (rollbackResult.ok === false) throw new Error(rollbackResult.error);
-        } catch (rollbackError) {
-          mainRollbackFailed = true;
-          log.error('form-submit transcript rollback failed; keeping authoritative commit', {
-            error: logErrorSummary(rollbackError),
-          });
-        }
-      }
-      if (!mainRollbackFailed) {
-        await _restoreProjectDirAfterFailedFormCommit(userId, cid, projectDirUpdate);
-        log.warn('form mark failed', { error: logErrorSummary(err) });
-        return { ok: false, error: 'form submit failed' };
-      }
-      // The main transcript is authoritative. If its rollback itself failed,
-      // report a committed submission instead of returning a false retryable
-      // error that would execute the same form twice. Repair the compatibility
-      // slice best-effort, then continue through ordinary post-commit hooks.
-      if (sliceIndex >= 0) {
-        try {
-          const sliceRepair = await rewriteJsonlLine<GroupMessage>(sliceFile, sliceIndex, (rec) => (
-            rec && rec.id === msgId ? { ...rec, form: updated } : null
-          ));
-          if (sliceRepair.ok === false) throw new Error(sliceRepair.error);
-        } catch (repairError) {
-          log.error('form-submit visibility slice repair failed', {
-            error: logErrorSummary(repairError),
-          });
-        }
-      }
+      await _restoreProjectDirAfterFailedFormCommit(userId, cid, projectDirUpdate);
+      log.warn('form mark failed', { error: logErrorSummary(err) });
+      return { ok: false, error: 'form submit failed' };
     }
 
     if (projectDirUpdate) {
@@ -1184,13 +1311,10 @@ async function _autoBindInstalledMarketplaceResource(
     const conv = await chats.getConversation(userId, cid);
     const projectId = (conv as any)?.project_id;
     if (typeof projectId !== 'string' || !projectId) return;
+    if (req.kind !== 'agent') return;
     const projectsFeat = await import('../projects');
-    if (req.kind === 'agent') {
-      await projectsFeat.addAgentBinding(userId, projectId, req.id);
-    } else {
-      await projectsFeat.addSkillBinding(userId, projectId, req.id);
-    }
-    log.info(`auto-bound marketplace ${req.kind} ${req.id} to project ${projectId} after install`);
+    await projectsFeat.addAgentBinding(userId, projectId, req.id);
+    log.info(`auto-bound marketplace agent ${req.id} to project ${projectId} after install`);
   } catch (err) {
     log.warn(`marketplace install auto-bind failed user=${userId} cid=${cid} id=${req.id}: ${(err as Error).message}`);
   }
@@ -1343,10 +1467,9 @@ async function _tombstoneMessagesInFile(file: string, ids: ReadonlySet<string>, 
   return changed;
 }
 
-/** Delete visible messages as versioned tombstones in the main log and all
- * actor slices. Persistent model sessions are purged so the next turn is
- * rebuilt from the filtered canonical log (Commander) or Agent slice rather
- * than retaining deleted context. */
+/** Delete visible messages as versioned tombstones in the canonical log.
+ * Persistent model sessions are purged so the next turn is rebuilt from the
+ * filtered canonical history rather than retaining deleted context. */
 export async function deleteMessages(
   userId: string,
   cid: string,
@@ -1368,18 +1491,6 @@ export async function deleteMessages(
 
   const deletedAt = nowIso();
   await _tombstoneMessagesInFile(mainFile, existing, deletedAt);
-  const layout = conversationLayout(userId, cid);
-  try {
-    const entries = await fsp.readdir(layout.visibilityDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
-      await _tombstoneMessagesInFile(path.join(layout.visibilityDir, entry.name), existing, deletedAt);
-    }
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log.warn('message delete slice rewrite failed', { userId, cid, error: logErrorRef(err) });
-    }
-  }
 
   try {
     const members = await readMembers(userId, cid);

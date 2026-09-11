@@ -18,6 +18,12 @@ import sys
 
 _WEIGHT = {"critical": 25, "high": 12, "medium": 6, "low": 2}
 
+# seo-tech-audit's audit.py flags word_count < 200 as `thin_content`; this
+# skill's `thin_for_topic` covers only the complementary 200-299 band so a page
+# is never thin-flagged by both skills in one merged report. Keep in sync with
+# audit.py's threshold.
+_AUDIT_THIN_WC = 200
+
 # AI-cliché / filler phrases (lowercased). Clean-room from common LLM-tells.
 _AI_PHRASES = [
     "delve into", "delve deeper", "leverage the power", "in today's fast-paced",
@@ -128,7 +134,7 @@ def audit_content(crawl_obj: dict) -> dict:
             "primary title term appears in H1/opening on recrawl",
             "recrawl still has no title-term overlap up top", dim="content")
 
-    if wc and wc < 300 and not any(f["id"] == "thin_content" for f in findings):
+    if _AUDIT_THIN_WC <= wc < 300:
         add("thin_for_topic", "low", "Short body for a content page",
             "{} words".format(wc),
             "If this is a content/landing page, expand with substantive, original information.",

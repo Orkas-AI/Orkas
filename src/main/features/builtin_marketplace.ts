@@ -149,23 +149,26 @@ function _builtinAgentReseedIfDeletedBefore(srcDir: string, agentJson: Record<st
     || _timestampMs(agentJson.reseed_if_deleted_before);
 }
 
-function _builtinSkillVersion(srcDir: string): string {
-  const meta = _readJsonObject(path.join(srcDir, '_meta.json'));
-  return normalizeInstallVersion(meta?.version);
+/** One parse of a packaged skill's `_meta.json`; the field readers below
+ *  take the parsed object so a seed pass reads the file once per skill. */
+function _builtinSkillMeta(srcDir: string): Record<string, unknown> {
+  return _readJsonObject(path.join(srcDir, '_meta.json')) || {};
 }
 
-function _builtinSkillUpdatedAt(srcDir: string): number {
-  const meta = _readJsonObject(path.join(srcDir, '_meta.json'));
-  return _timestampMs(meta?.updated_at);
+function _builtinSkillVersion(meta: Record<string, unknown>): string {
+  return normalizeInstallVersion(meta.version);
 }
 
-function _builtinSkillMinAppVersion(srcDir: string): string {
-  return minAppVersionFrom(_readJsonObject(path.join(srcDir, '_meta.json')) || {});
+function _builtinSkillUpdatedAt(meta: Record<string, unknown>): number {
+  return _timestampMs(meta.updated_at);
 }
 
-function _builtinSkillReseedIfDeletedBefore(srcDir: string): number {
-  const meta = _readJsonObject(path.join(srcDir, '_meta.json'));
-  return _timestampMs(meta?.reseed_if_deleted_before);
+function _builtinSkillMinAppVersion(meta: Record<string, unknown>): string {
+  return minAppVersionFrom(meta);
+}
+
+function _builtinSkillReseedIfDeletedBefore(meta: Record<string, unknown>): number {
+  return _timestampMs(meta.reseed_if_deleted_before);
 }
 
 function _emptyUrl(value: unknown): boolean {
@@ -274,7 +277,7 @@ function _clearDeletedAt(
 }
 
 function _shouldBypassBuiltinSkillTombstone(srcDir: string, deletedAt: number): boolean {
-  const cutoff = _builtinSkillReseedIfDeletedBefore(srcDir);
+  const cutoff = _builtinSkillReseedIfDeletedBefore(_builtinSkillMeta(srcDir));
   return cutoff > 0 && deletedAt > 0 && deletedAt < cutoff;
 }
 
@@ -313,7 +316,7 @@ function _shouldRefreshBuiltinSkill(
   const canRefresh = _isBuiltinSeedSkillRow(manifestRow) || (!manifestRow && _isLocalBuiltinSeedSkillMeta(meta));
   if (!canRefresh) return false;
 
-  const packagedVersion = _builtinSkillVersion(srcDir);
+  const packagedVersion = _builtinSkillVersion(_builtinSkillMeta(srcDir));
   return _shouldSyncBuiltinInstall(packagedVersion, meta, manifestRow);
 }
 
@@ -343,7 +346,7 @@ function _shouldOverlayMarketplaceSkillFromBuiltin(
   const meta = _readInstallMetaObject(target) || {};
   if (_isLocalResourceSeedMeta(meta)) return false;
 
-  const packagedVersion = _builtinSkillVersion(srcDir);
+  const packagedVersion = _builtinSkillVersion(_builtinSkillMeta(srcDir));
   return _shouldSyncBuiltinInstall(packagedVersion, meta, manifestRow);
 }
 
@@ -625,9 +628,10 @@ async function _writeSkillSeed(
     await _copyManagedFiles(srcDir, staged, files);
     const contentSha = sha256OfFile(path.join(staged, 'SKILL.md'));
     const contentTreeHash = marketplaceContentTreeHash(srcDir);
-    const version = _builtinSkillVersion(srcDir);
-    const updatedAt = _builtinSkillUpdatedAt(srcDir);
-    const minAppVersion = _builtinSkillMinAppVersion(srcDir);
+    const skillMeta = _builtinSkillMeta(srcDir);
+    const version = _builtinSkillVersion(skillMeta);
+    const updatedAt = _builtinSkillUpdatedAt(skillMeta);
+    const minAppVersion = _builtinSkillMinAppVersion(skillMeta);
     await fsp.writeFile(
       path.join(staged, '_install.json'),
       `${JSON.stringify({
@@ -669,9 +673,10 @@ async function _writeSkillMarketplaceOverlay(
     await _copyManagedFiles(srcDir, staged, files);
     const contentSha = sha256OfFile(path.join(staged, 'SKILL.md'));
     const contentTreeHash = marketplaceContentTreeHash(srcDir);
-    const version = _builtinSkillVersion(srcDir);
-    const updatedAt = _builtinSkillUpdatedAt(srcDir);
-    const minAppVersion = _builtinSkillMinAppVersion(srcDir);
+    const skillMeta = _builtinSkillMeta(srcDir);
+    const version = _builtinSkillVersion(skillMeta);
+    const updatedAt = _builtinSkillUpdatedAt(skillMeta);
+    const minAppVersion = _builtinSkillMinAppVersion(skillMeta);
     await fsp.writeFile(
       path.join(staged, '_install.json'),
       `${JSON.stringify({
@@ -800,9 +805,10 @@ export async function seedBuiltinMarketplaceForUser(
       if (_clearDeletedAt(manifest, 'skills', installId)) manifestChanged = true;
       log.info(`reseed builtin skill ${installId}: packaged content supersedes old uninstall tombstone`);
     }
-    const packagedVersion = _builtinSkillVersion(srcDir);
-    const packagedUpdatedAt = _builtinSkillUpdatedAt(srcDir);
-    const packagedMinAppVersion = _builtinSkillMinAppVersion(srcDir);
+    const packagedMeta = _builtinSkillMeta(srcDir);
+    const packagedVersion = _builtinSkillVersion(packagedMeta);
+    const packagedUpdatedAt = _builtinSkillUpdatedAt(packagedMeta);
+    const packagedMinAppVersion = _builtinSkillMinAppVersion(packagedMeta);
     const manifestSkillIndex = manifest.skills.findIndex((s) => s.id === installId);
     const manifestSkill = manifestSkillIndex >= 0 ? manifest.skills[manifestSkillIndex] : null;
     const targetSkillMd = path.join(userMarketplaceSkillDir(uid, installId), 'SKILL.md');

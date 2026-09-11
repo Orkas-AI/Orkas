@@ -8,10 +8,16 @@
  *   1. LLM calls `delete_file({ path })` (no token).
  *      Tool calls `requestConfirmation(absPath, ctx)` → gets a fresh
  *      `confirmation_token` synchronously. The renderer renders it in an
- *      inline card, then calls `delete_file.visible`. Only after that ack
- *      does the tool return the token to the LLM with
- *      `requires_user_confirmation: true`. Multiple pending tokens from the
- *      same turn may be grouped into one card.
+ *      inline card, then calls `delete_file.visible` with whether that card
+ *      is on screen right now. Only after that ack does the tool return the
+ *      token to the LLM with `requires_user_confirmation: true`. Multiple
+ *      pending tokens from the same turn may be grouped into one card.
+ *
+ *      The ack is tri-state, because "the user is looking at another view"
+ *      is NOT the same failure as "there is no card". A card mounted
+ *      off-screen becomes clickable the moment the user comes back, so its
+ *      token must survive; only a total absence of any renderer ack means
+ *      nobody can ever click, and only that case fails closed.
  *   2. LLM sees the token-bearing result; per skill-creator's SKILL.md
  *      rule, it MUST end the turn with a prose ask, NOT immediately
  *      re-call delete_file in the same turn. The token is in `pending`
@@ -56,30 +62,62 @@ const CONFIRM_TTL_MS = 30 * 60_000;
 const _GC_INTERVAL_MS = 5 * 60_000;
 
 type ConfirmState = 'pending' | 'granted' | 'denied';
+
+/** What the renderer has told us about this token's card.
+ *  - `absent`  — no ack at all. Either no chat surface exists or the push
+ *                never landed, so there is nothing the user can click.
+ *  - `mounted` — the card is in the DOM but off-screen (the user is on
+ *                another view / tab). It becomes clickable as soon as they
+ *                come back, so the token stays alive.
+ *  - `visible` — the card is on screen right now. */
+export type ConfirmVisibility = 'absent' | 'mounted' | 'visible';
+
+/** Why a token stopped existing. `consumed` is the normal end of life (the
+ *  user answered and the tool acted on it) and needs no renderer notice; the
+ *  other two strand a card that is still on screen. */
+export type ConfirmInvalidationReason = 'cancelled' | 'expired' | 'consumed';
+
 interface Entry {
   path: string;
   state: ConfirmState;
-  visible: boolean;
+  visibility: ConfirmVisibility;
   created_at_ms: number;
 }
 
 const _entries = new Map<string, Entry>();
-const _visibleWaiters = new Map<string, Array<{ resolve: (ok: boolean) => void; timer: NodeJS.Timeout }>>();
+const _visibleWaiters = new Map<string, Array<{ resolve: (v: ConfirmVisibility) => void; timer: NodeJS.Timeout }>>();
 const CONFIRM_VISIBLE_ACK_TIMEOUT_MS = 1200;
 
-function resolveVisibleWaiters(token: string, ok: boolean): void {
+function resolveVisibleWaiters(token: string, visibility: ConfirmVisibility): void {
   const waiters = _visibleWaiters.get(token);
   if (!waiters) return;
   _visibleWaiters.delete(token);
   for (const waiter of waiters) {
     clearTimeout(waiter.timer);
-    waiter.resolve(ok);
+    waiter.resolve(visibility);
   }
 }
 
-function deleteEntry(token: string): boolean {
+/** Tell the renderer a card it may still be showing is dead. Without this the
+ *  user clicks a stranded card, `resolveConfirmation` reports an unknown
+ *  token, and the only feedback is a bare "operation rejected" with nothing
+ *  on screen explaining why. */
+function notifyConfirmationInvalidated(token: string, reason: ConfirmInvalidationReason): void {
+  try {
+    broadcastToRenderer('delete_file.confirmation_invalidated', { confirm_id: token, reason });
+  } catch (err) {
+    log.warn('emit confirmation_invalidated failed', {
+      confirmation_id: maskId(token),
+      reason,
+      error: logErrorRef(err),
+    });
+  }
+}
+
+function deleteEntry(token: string, reason: ConfirmInvalidationReason): boolean {
   const existed = _entries.delete(token);
-  resolveVisibleWaiters(token, false);
+  resolveVisibleWaiters(token, 'absent');
+  if (existed && reason !== 'consumed') notifyConfirmationInvalidated(token, reason);
   return existed;
 }
 
@@ -89,7 +127,7 @@ function deleteEntry(token: string): boolean {
 setInterval(() => {
   const now = Date.now();
   for (const [token, e] of _entries) {
-    if (now - e.created_at_ms > CONFIRM_TTL_MS) deleteEntry(token);
+    if (now - e.created_at_ms > CONFIRM_TTL_MS) deleteEntry(token, 'expired');
   }
 }, _GC_INTERVAL_MS).unref?.();
 
@@ -111,7 +149,7 @@ export interface DeleteConfirmContext {
  *  has a card to click. */
 export function requestConfirmation(absPath: string, ctx: DeleteConfirmContext): string {
   const token = crypto.randomBytes(12).toString('hex');
-  _entries.set(token, { path: absPath, state: 'pending', visible: false, created_at_ms: Date.now() });
+  _entries.set(token, { path: absPath, state: 'pending', visibility: 'absent', created_at_ms: Date.now() });
   try {
     broadcastToRenderer('delete_file.confirmation_required', {
       confirm_id: token,
@@ -132,31 +170,39 @@ export function requestConfirmation(absPath: string, ctx: DeleteConfirmContext):
   return token;
 }
 
-/** Renderer ack: called only after the inline confirmation card is actually
- *  mounted into a visible chat surface. The tool waits briefly for this ack
- *  before telling the LLM to ask the user to click the card. */
-export function markConfirmationVisible(token: string): boolean {
+/** Renderer ack: the inline confirmation card exists in the DOM. `visible`
+ *  distinguishes "on screen now" from "mounted but the user is on another
+ *  view"; the renderer re-acks with `true` once the card comes into view.
+ *  Visibility only ever latches upward — a later `false` never demotes a card
+ *  the user has already seen. */
+export function markConfirmationVisible(token: string, visible = true): boolean {
   const entry = _entries.get(token);
   if (!entry) {
     log.warn('markConfirmationVisible unknown token', { confirmation_id: maskId(token), pending_count: _entries.size });
     return false;
   }
-  entry.visible = true;
-  resolveVisibleWaiters(token, true);
+  if (entry.visibility !== 'visible') entry.visibility = visible ? 'visible' : 'mounted';
+  // Any ack is a definitive answer for the caller's decision: `mounted` is
+  // enough to keep the token alive, so there is no reason to keep it waiting
+  // out the rest of the window for a maybe-later `visible`.
+  resolveVisibleWaiters(token, entry.visibility);
   return true;
 }
 
-export function waitForConfirmationVisible(token: string, timeoutMs = CONFIRM_VISIBLE_ACK_TIMEOUT_MS): Promise<boolean> {
+export function waitForConfirmationVisible(
+  token: string,
+  timeoutMs = CONFIRM_VISIBLE_ACK_TIMEOUT_MS,
+): Promise<ConfirmVisibility> {
   const entry = _entries.get(token);
-  if (!entry) return Promise.resolve(false);
-  if (entry.visible) return Promise.resolve(true);
+  if (!entry) return Promise.resolve('absent');
+  if (entry.visibility !== 'absent') return Promise.resolve(entry.visibility);
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       const waiters = _visibleWaiters.get(token) || [];
       const next = waiters.filter((w) => w.resolve !== resolve);
       if (next.length) _visibleWaiters.set(token, next);
       else _visibleWaiters.delete(token);
-      resolve(false);
+      resolve(_entries.get(token)?.visibility ?? 'absent');
     }, timeoutMs);
     timer.unref?.();
     const waiters = _visibleWaiters.get(token) || [];
@@ -166,7 +212,7 @@ export function waitForConfirmationVisible(token: string, timeoutMs = CONFIRM_VI
 }
 
 export function cancelConfirmation(token: string): boolean {
-  return deleteEntry(token);
+  return deleteEntry(token, 'cancelled');
 }
 
 /** IPC handler entry point — called by `delete_file.respond`. Returns
@@ -219,9 +265,9 @@ export function consumeGrantedConfirmation(token: string, absPath: string): Cons
   log.info('consumeGrantedConfirmation state', { confirmation_id: maskId(token), path: logPathRef(absPath), state: entry.state });
   if (entry.state === 'pending') return { outcome: 'pending' };
   if (entry.state === 'denied') {
-    deleteEntry(token);
+    deleteEntry(token, 'consumed');
     return { outcome: 'denied' };
   }
-  deleteEntry(token);
+  deleteEntry(token, 'consumed');
   return { outcome: 'granted', path: entry.path };
 }

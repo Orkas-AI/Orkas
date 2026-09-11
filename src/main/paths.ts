@@ -50,6 +50,7 @@ import * as os from 'node:os';
 export const SRC_ROOT      = path.resolve(__dirname, '..');            // PC/src
 export const PC_ROOT       = path.resolve(__dirname, '..', '..');      // PC
 export const APP_ROOT      = PC_ROOT;
+export const CONNECTOR_SETUP_GUIDES_DIR = path.join(PC_ROOT, 'resources', 'connectors', 'setup');
 export const PROJECT_ROOT  = path.resolve(PC_ROOT, '..');              // Orkas
 
 function packagedResourceDir(name: string): string {
@@ -111,7 +112,6 @@ export const NODE_NPM_GLOBAL_BIN_DIR = process.platform === 'win32'
 export const userRoot       = (uid: string) => path.join(WS_ROOT, uid);
 export const userCloudRoot  = (uid: string) => path.join(userRoot(uid), 'cloud');
 export const userLocalRoot  = (uid: string) => path.join(userRoot(uid), 'local');
-
 // ── Cloud-synced per-user ────────────────────────────────────────────────
 export const userChatsDir           = (uid: string) => path.join(userCloudRoot(uid), 'chats');
 export const userSkillChatDir       = (uid: string, sid: string) => path.join(userChatsDir(uid), 'skill', sid);
@@ -119,15 +119,11 @@ export const userAgentChatDir       = (uid: string, aid: string) => path.join(us
 
 // Group-chat per-conversation companion directory tree. `<cid>.jsonl` sits
 // at userChatsDir level alongside this directory; this directory holds
-// group-level metadata (members/state/plan) plus per-actor visibility slices.
-// See features/group_chat/ and CLAUDE.md §5.
+// group-level metadata (members/state/plan).
 export const groupChatDir            = (uid: string, cid: string) => path.join(userChatsDir(uid), cid);
 export const groupChatMembersFile    = (uid: string, cid: string) => path.join(groupChatDir(uid, cid), 'members.json');
 export const groupChatStateFile      = (uid: string, cid: string) => path.join(groupChatDir(uid, cid), 'state.json');
 export const groupChatPlanFile       = (uid: string, cid: string) => path.join(groupChatDir(uid, cid), 'plan.json');
-export const groupChatVisibilityDir  = (uid: string, cid: string) => path.join(groupChatDir(uid, cid), 'visibility');
-export const groupChatVisibilityFile = (uid: string, cid: string, actorId: string) =>
-  path.join(groupChatVisibilityDir(uid, cid), `${actorId}.jsonl`);
 
 export const userChatAttachmentsDir = (uid: string) => path.join(userCloudRoot(uid), 'chat_attachments');
 export const chatAttachmentDir      = (uid: string, cid: string) => path.join(userChatAttachmentsDir(uid), cid);
@@ -168,6 +164,13 @@ export const sessionCloudToolResultsDir = (uid: string, sessionId: string) =>
   path.join(userSessionsDir(uid), `${sessionId}.tool-results`);
 export const userLocalSessionsDir   = (uid: string) => path.join(userLocalRoot(uid), 'sessions');
 export const userLocalSessionFile   = (uid: string, sessionId: string) => path.join(userLocalSessionsDir(uid), `${sessionId}.jsonl`);
+
+// Persistent Chromium profile for the in-app Web Assist surface. Browser
+// cookies/storage are machine-private credentials-adjacent state: they stay
+// under the owning user's local tree, never enter cloud sync, and are isolated
+// from the app renderer/default Electron session.
+export const userWebAssistProfileDir = (uid: string) => path.join(userLocalRoot(uid), 'web-assist', 'profile');
+export const userWebAssistSessionCookiesFile = (uid: string) => path.join(userLocalRoot(uid), 'web-assist', 'session-cookies.enc');
 
 // Curated knowledge base (the "organized" region of the historical
 // two-region contexts design).
@@ -260,6 +263,11 @@ export const projectInstructionsFile = (uid: string, pid: string) => path.join(p
 // Project-scoped cross-session memory (`project` tier of cross_session_memory).
 // Inside the project dir so it lives/dies/syncs with the project.
 export const projectMemoryFile       = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'MEMORY.md');
+// Goal-driven driver-loop opt-in config (synced with the project). Absent = off.
+export const projectDriverFile       = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'driver.json');
+// Account-global backlog driver. Keep its synced config outside `cloud/tasks/`
+// because that directory is scanned as one-task-per-json-file.
+export const userTodoDriverFile      = (uid: string) => path.join(userCloudConfigDir(uid), 'todo-driver.json');
 export const projectChatsDir           = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'chats');
 export const projectChatIndexFile      = (uid: string, pid: string) => path.join(projectChatsDir(uid, pid), '_index.json');
 export const projectChatJsonlFile      = (uid: string, pid: string, cid: string) => path.join(projectChatsDir(uid, pid), `${cid}.jsonl`);
@@ -267,10 +275,6 @@ export const projectGroupChatDir       = (uid: string, pid: string, cid: string)
 export const projectGroupChatMembersFile = (uid: string, pid: string, cid: string) => path.join(projectGroupChatDir(uid, pid, cid), 'members.json');
 export const projectGroupChatStateFile = (uid: string, pid: string, cid: string) => path.join(projectGroupChatDir(uid, pid, cid), 'state.json');
 export const projectGroupChatPlanFile  = (uid: string, pid: string, cid: string) => path.join(projectGroupChatDir(uid, pid, cid), 'plan.json');
-export const projectGroupChatVisibilityDir = (uid: string, pid: string, cid: string) =>
-  path.join(projectGroupChatDir(uid, pid, cid), 'visibility');
-export const projectGroupChatVisibilityFile = (uid: string, pid: string, cid: string, actorId: string) =>
-  path.join(projectGroupChatVisibilityDir(uid, pid, cid), `${actorId}.jsonl`);
 
 export const projectSessionsDir        = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'sessions');
 export const projectSessionFile        = (uid: string, pid: string, sessionId: string) => path.join(projectSessionsDir(uid, pid), `${sessionId}.jsonl`);
@@ -279,7 +283,7 @@ export const projectSessionCloudToolResultsDir = (uid: string, pid: string, sess
 
 export const projectChatAttachmentsDir = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'chat_attachments');
 export const projectChatAttachmentDir  = (uid: string, pid: string, cid: string) => path.join(projectChatAttachmentsDir(uid, pid), cid);
-export const projectChatArtifactsDir   = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'chat_artifacts');
+const projectChatArtifactsDir   = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'chat_artifacts');
 export const projectChatArtifactCidDir = (uid: string, pid: string, cid: string) => path.join(projectChatArtifactsDir(uid, pid), cid);
 export const projectArtifactDir        = (uid: string, pid: string, cid: string, artifactId: string) =>
   path.join(projectChatArtifactCidDir(uid, pid, cid), artifactId);
@@ -296,8 +300,25 @@ export const projectLegacyFilesDir     = (uid: string, pid: string) => path.join
 // mirrors the project listing). See Common/docs/plans/project-work-state.md.
 export const projectTasksDir        = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'tasks');
 export const projectTaskFile        = (uid: string, pid: string, tid: string) => path.join(projectTasksDir(uid, pid), `${assertProjectSegment(tid)}.json`);
+// Account-level to-dos use the same per-task schema without belonging to a
+// project. Keep them at the cloud root (parallel to global auto_tasks) so they
+// remain visible even when the account has no projects.
+export const userTasksDir           = (uid: string) => path.join(userCloudRoot(uid), 'tasks');
+export const userTaskFile           = (uid: string, tid: string) => path.join(userTasksDir(uid), `${assertProjectSegment(tid)}.json`);
+// Files attached to a project to-do task, one dir per task (cloud-synced with
+// the project). Copied into a freshly-created conversation's chat_attachments/<cid>/
+// when the task runs (manual Run or the auto-advance driver) — mirrors the
+// auto_tasks attachment layout. Sibling of tasks/ so a task's JSON and its files
+// sync as independent per-task units.
+export const projectTaskAttachmentsDir = (uid: string, pid: string, tid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'task_attachments', assertProjectSegment(tid));
+export const userTaskAttachmentsDir = (uid: string, tid: string) => path.join(userCloudRoot(uid), 'task_attachments', assertProjectSegment(tid));
 export const projectLocalDir        = (uid: string, pid: string) => path.join(userLocalRoot(uid), 'projects', pid);
 export const projectLibraryVectorDbPath = (uid: string, pid: string) => path.join(projectLocalDir(uid, pid), 'contexts', '.kb', 'vector.db');
+// Driver-loop execution bookkeeping — per-device, machine-private, NEVER synced
+// (like auto_task_claims). Lives in local/ so a device's advance cadence, daily
+// count, and in-flight lease stay local to the machine that runs the advances.
+export const projectDriverStateFile = (uid: string, pid: string) => path.join(projectLocalDir(uid, assertProjectSegment(pid)), 'driver-state.json');
+export const userTodoDriverStateFile = (uid: string) => path.join(userLocalConfigDir(uid), 'todo-driver-state.json');
 export const agentDir            = (uid: string, agentId: string) => path.join(userAgentsDir(uid), agentId || '_default');
 export const agentDefinitionFile = (uid: string, agentId: string) => path.join(agentDir(uid, agentId), 'agent.json');
 export const userAgentMemoryDir  = (uid: string, agentId: string) => path.join(agentDir(uid, agentId), 'memory');
@@ -372,7 +393,8 @@ export const projectAutoTaskDir = (uid: string, pid: string, taskId: string) => 
 export const projectAutoTaskConfigFile = (uid: string, pid: string, taskId: string) => path.join(projectAutoTaskDir(uid, pid, taskId), 'config.json');
 export const projectAutoTaskAttachmentsDir = (uid: string, pid: string, taskId: string) =>
   path.join(projectAutoTaskDir(uid, pid, taskId), 'attachments');
-// Connector registry: installed MCP server instances + cached tool schemas + OAuth grants
+// Account-scoped connector registry (local_cli instances use userDeviceConnectorsConfigFile):
+// installed MCP server instances + cached tool schemas + OAuth grants
 // (local-secret encrypted with the active Orkas account's OAuth user_id as owner — see
 // `features/connectors/registry.ts`). Cloud-synced as of 2026-05-15 so a user authorizing on
 // one device sees the same connectors on another. **Secret owner:** OAuth user_id (not local uid)
@@ -387,6 +409,9 @@ export const userConnectorsConfigFile = (uid: string) => path.join(userCloudConf
 // activateUser(); both core-agent's auth store and the web-search provider
 // cache land in this same directory.
 export const userLocalConfigDir   = (uid: string) => path.join(userLocalRoot(uid), 'config');
+// Keep a distinct filename from the pre-cloud legacy connectors.json migration.
+export const userDeviceConnectorsConfigFile = (uid: string) => path.join(userLocalConfigDir(uid), 'device-connectors.json');
+export const userDeviceConnectorEnabledFile = (uid: string) => path.join(userLocalConfigDir(uid), 'device-connector-enabled.json');
 export const userAuthProfilesFile = (uid: string) => path.join(userLocalConfigDir(uid), 'auth-profiles.json');
 export const userWebSearchCache   = (uid: string) => path.join(userLocalConfigDir(uid), 'web-search-cache.json');
 export const userReflectionStateFile = (uid: string) => path.join(userLocalConfigDir(uid), 'reflection-state.json');
@@ -412,7 +437,7 @@ export const userAgentRuntimeConfigFile = (uid: string) => path.join(userLocalCo
 export const userSearchDir           = (uid: string) => path.join(userLocalRoot(uid), 'search');
 export const userContextsIndexPath   = (uid: string) => path.join(userSearchDir(uid), 'contexts.idx.json');
 export const userChatsIndexPath      = (uid: string) => path.join(userSearchDir(uid), 'chats.idx.json');
-export const userConversationTurnIndexesDir = (uid: string) => path.join(userSearchDir(uid), 'conversation-turns');
+const userConversationTurnIndexesDir = (uid: string) => path.join(userSearchDir(uid), 'conversation-turns');
 export const userConversationTurnIndexPath = (uid: string, cid: string) =>
   path.join(userConversationTurnIndexesDir(uid), `${cid}.idx.json`);
 
@@ -425,6 +450,11 @@ export const userTestDir = (uid: string) => path.join(userLocalRoot(uid), 'test'
 export const userToolResultsDir = (uid: string) => path.join(userLocalRoot(uid), 'tool-results');
 export const sessionToolResultsDir = (uid: string, sessionId: string) =>
   path.join(userToolResultsDir(uid), sessionId);
+// Machine-local working copies created when an Agent explicitly materializes
+// a persisted result for shell/code analysis. They never sync, are isolated by
+// session, and share the local Result Store sweep lifecycle.
+export const sessionAnalysisInputsDir = (uid: string, sessionId: string) =>
+  path.join(userToolResultsDir(uid), `${sessionId}.analysis-inputs`);
 
 // On-demand preprocessing cache for workspace / external path files
 // (features/file_indexer.ts). The subdirectory name is
@@ -443,6 +473,8 @@ export const userFileCacheDir = (uid: string) => path.join(userLocalRoot(uid), '
 export const userLocalCacheDir = (uid: string) => path.join(userLocalRoot(uid), 'cache');
 export const localCacheBucketDir = (uid: string, bucket: string) =>
   path.join(userLocalCacheDir(uid), bucket);
+export const userConversationHistoryCacheDir = (uid: string) =>
+  localCacheBucketDir(uid, 'conversation-history');
 export const userAgentCatalogCacheFile = (uid: string) =>
   path.join(localCacheBucketDir(uid, 'catalogs'), 'agents.json');
 export const userSkillCatalogCacheFile = (uid: string) =>

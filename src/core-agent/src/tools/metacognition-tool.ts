@@ -37,11 +37,12 @@ export function createMetacognitionTool(
     description: buildDescription(),
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         action: {
           type: 'string',
           enum: ['read', 'write'],
-          description: 'Read the target or replace it completely.',
+          description: 'read: target only; write: target/content. Omit unrelated fields.',
         },
         target: {
           type: 'string',
@@ -57,12 +58,23 @@ export function createMetacognitionTool(
         },
       },
       required: ['action', 'target'],
+      oneOf: [
+        { properties: { action: { const: 'read' } } },
+        { properties: { action: { const: 'write' } }, required: ['content'] },
+      ],
     },
 
     async execute(input: Record<string, unknown>, _ctx: ToolContext): Promise<ToolResult> {
       const action = input.action as string;
       const target = input.target as 'competence' | 'strategies';
       const content = (input.content as string) || '';
+
+      if (action === 'read' && Object.hasOwn(input, 'content')) {
+        return {
+          content: JSON.stringify({ ok: false, error: 'content is not allowed for read' }),
+          isError: true,
+        };
+      }
 
       if (target !== 'competence' && target !== 'strategies') {
         return {

@@ -115,6 +115,86 @@ function cacheSafeSessionId(s: string | undefined): string | undefined {
 
 // ─── Type conversion helpers ──────────────────────────────────────────────
 
+type RuntimePiContext = PiContext & { hostMessageIndexes: number[] };
+
+export const MIRRORED_PI_AI_SERIALIZER_VERSION = "0.85.1";
+
+export function restoreHostMessageRoles(payload: unknown, context: RuntimePiContext, model: Model<Api>): unknown {
+  if (!context.hostMessageIndexes.length) return payload;
+  const isChat = model.api === "openai-completions";
+  if (!isChat && !["openai-responses", "azure-openai-responses", "openai-codex-responses"].includes(model.api)) {
+    // APIs without a mid-history instruction role retain portable transport;
+    // do not move changing controls into their reusable system prefix.
+    return payload;
+  }
+  const compat = model.compat as { supportsDeveloperRole?: boolean } | undefined;
+  // Chat Completions rewrites only when the host declared developer support;
+  // compatible endpoints never receive mid-history `system` rows.
+  const hostRole = isChat
+    ? (compat?.supportsDeveloperRole === true ? "developer" : null)
+    : (compat?.supportsDeveloperRole !== false ? "developer" : "system");
+  if (!hostRole) return payload;
+  const field = isChat ? "messages" : "input";
+  const input = (payload as Record<string, Array<{ role?: string }>>)?.[field];
+  if (!Array.isArray(input)) {
+    log.warn(`host message transport skipped: native ${field} missing api=${model.api}`);
+    return payload;
+  }
+  const hostIndexes = new Set(context.hostMessageIndexes);
+  const expectedRoles: boolean[] = [];
+  let portableIndex = 0;
+  for (let index = 0; index < context.messages.length; index++) {
+    const message = context.messages[index];
+    if (message.role === "user") expectedRoles.push(hostIndexes.has(portableIndex++));
+    else if (isChat && message.role === "toolResult") {
+      // Chat Completions emits one image trailer per contiguous result batch.
+      // It is tool data, never an instruction, and must not shift host indexes.
+      let hasImages = false;
+      while (context.messages[index]?.role === "toolResult") {
+        const result = context.messages[index];
+        if (result.role === "toolResult") hasImages ||= result.content.some((part) => part.type === "image");
+        index++;
+      }
+      index--;
+      if (hasImages && model.input.includes("image")) expectedRoles.push(false);
+    }
+  }
+  const nativeUserCount = input.filter((item) => item.role === "user").length;
+  if (nativeUserCount !== expectedRoles.length) {
+    log.warn(
+      `host message transport skipped: native serializer drift api=${model.api} `
+      + `expected_user_items=${expectedRoles.length} actual=${nativeUserCount} `
+      + `mirrored_pi_ai=${MIRRORED_PI_AI_SERIALIZER_VERSION}`,
+    );
+    return payload;
+  }
+  let userIndex = 0;
+  const mapped = input.map((item) => (
+    item.role !== "user" ? item : (expectedRoles[userIndex++] ? { ...item, role: hostRole } : item)
+  ));
+  return { ...(payload as Record<string, unknown>), [field]: mapped };
+}
+
+function assistantTextPhaseFromSignature(
+  signature: unknown,
+): "commentary" | "final_answer" | undefined {
+  if (typeof signature !== "string" || !signature.startsWith("{")) return undefined;
+  try {
+    const parsed = JSON.parse(signature) as { v?: unknown; phase?: unknown };
+    if (
+      parsed.v === 1
+      && (parsed.phase === "commentary" || parsed.phase === "final_answer")
+    ) {
+      return parsed.phase;
+    }
+  } catch {
+    // A malformed/legacy signature has no trustworthy phase metadata.
+  }
+  return undefined;
+}
+
+export const assistantTextPhaseFromSignatureForTest = assistantTextPhaseFromSignature;
+
 /** Convert our internal Message[] to pi-ai Context. */
 function buildPiContext(
   messages: Message[],
@@ -144,14 +224,16 @@ function buildPiContext(
    * rejects. Per-message stamping is the proper long-term fix.
    */
   model?: { api: string; provider: string; id: string },
-): PiContext {
+): RuntimePiContext {
   const piMessages: PiContext["messages"] = [];
+  const hostMessageIndexes: number[] = [];
+  let userMessageIndex = 0;
   const toolNameByCallId = new Map<string, string>();
 
   for (const msg of messages) {
     if (msg.role === "system") continue;
 
-    if (msg.role === "user") {
+    if (msg.role === "user" || msg.role === "developer") {
       // Check for tool_result content
       const toolResults = msg.content.filter((c) => c.type === "tool_result");
       const others = msg.content.filter((c) => c.type !== "tool_result");
@@ -167,7 +249,13 @@ function buildPiContext(
           role: "toolResult",
           toolCallId: tr.toolUseId,
           toolName,
-          content: [{ type: "text", text: tr.content }],
+          content: [
+            { type: "text", text: tr.content },
+            ...(tr.images ?? []).flatMap((img) => [
+              ...(img.analysisMode ? [{ type: "text" as const, text: visualAnalysisMarker(img.analysisMode) }] : []),
+              { type: "image" as const, data: img.data, mimeType: img.mediaType },
+            ]),
+          ],
           ...(tr.addedToolNames?.length ? { addedToolNames: tr.addedToolNames } : {}),
           isError: tr.isError ?? false,
           timestamp: Date.now(),
@@ -188,6 +276,8 @@ function buildPiContext(
           }
         }
         if (piContent.length > 0) {
+          if (msg.role === "developer") hostMessageIndexes.push(userMessageIndex);
+          userMessageIndex++;
           piMessages.push({
             role: "user",
             content: piContent,
@@ -199,7 +289,11 @@ function buildPiContext(
       const piContent: PiAssistantMessage["content"] = [];
       for (const c of msg.content) {
         if (c.type === "text") {
-          piContent.push({ type: "text", text: c.text });
+          piContent.push({
+            type: "text",
+            text: c.text,
+            ...(c.textSignature ? { textSignature: c.textSignature } : {}),
+          });
         } else if (c.type === "tool_use") {
           const toolCallId = String(c.id || "").trim();
           const toolName = String(c.name || "").trim();
@@ -213,6 +307,7 @@ function buildPiContext(
             name: toolName,
             arguments: c.input,
             ...(c.thoughtSignature ? { thoughtSignature: c.thoughtSignature } : {}),
+            ...(c.namespace !== undefined ? { namespace: c.namespace } : {}),
           });
         } else if (c.type === "thinking") {
           // Re-inject reasoning into outgoing context — required by DeepSeek
@@ -285,6 +380,7 @@ function buildPiContext(
     systemPrompt,
     messages: piMessages,
     tools: piTools,
+    hostMessageIndexes,
   };
 }
 
@@ -293,7 +389,7 @@ export function buildPiContextForTest(
   systemPrompt?: string,
   tools?: ToolDefinition[],
   model?: { api: string; provider: string; id: string },
-): PiContext {
+): RuntimePiContext {
   return buildPiContext(messages, systemPrompt, tools, model);
 }
 
@@ -521,7 +617,11 @@ function mapContent(
     if (block.type === "text") {
       const text = atTextStart ? stripLeadingThinkText(block.text) : block.text;
       if (text) {
-        result.push({ type: "text", text });
+        result.push({
+          type: "text",
+          text,
+          ...(block.textSignature ? { textSignature: block.textSignature } : {}),
+        });
         atTextStart = false;
       }
     } else if (block.type === "toolCall") {
@@ -531,6 +631,7 @@ function mapContent(
         name: block.name,
         input: block.arguments,
         ...(block.thoughtSignature ? { thoughtSignature: block.thoughtSignature } : {}),
+        ...(block.namespace !== undefined ? { namespace: block.namespace } : {}),
       });
     } else if (block.type === "thinking") {
       // Preserve reasoning blocks for round-trip. DeepSeek-style reasoners
@@ -785,14 +886,16 @@ export function createPiProvider(config: {
       const useOfficialReasoningDefaults = model.reasoning === true
         && params.reasoning === undefined
         && config.defaultReasoning === undefined;
-      const onPayload = (useOfficialReasoningDefaults || config.onPayload)
+      const onPayload = (useOfficialReasoningDefaults || config.onPayload || context.hostMessageIndexes.length)
         ? ((payload: unknown, hookModel: Model<Api>) => {
+            payload = restoreHostMessageRoles(payload, context, hookModel);
             const normalized = useOfficialReasoningDefaults
               ? restoreOfficialReasoningDefaults(payload, hookModel)
               : payload;
-            return config.onPayload
+            const transformed = config.onPayload
               ? config.onPayload(normalized, hookModel, params.requestMetadata)
               : normalized;
+            return transformed === undefined ? normalized : transformed;
           })
         : undefined;
 
@@ -856,6 +959,7 @@ export function createPiProvider(config: {
         && config.defaultReasoning === undefined;
       let effectiveMaxTokens: number | undefined;
       const onPayload = async (payload: unknown, hookModel: Model<Api>): Promise<unknown> => {
+        payload = restoreHostMessageRoles(payload, context, hookModel);
         const normalized = useOfficialReasoningDefaults
           ? restoreOfficialReasoningDefaults(payload, hookModel)
           : payload;
@@ -868,7 +972,7 @@ export function createPiProvider(config: {
         effectiveMaxTokens = effectiveMaxTokensFromPayload(
           transformed === undefined ? payload : transformed,
         );
-        return transformed;
+        return transformed === undefined ? normalized : transformed;
       };
 
       log.debug(`stream ${providerId}/${model.id}`);
@@ -920,6 +1024,14 @@ export function createPiProvider(config: {
                 if (text) yield { type: "text_delta", text };
               }
               break;
+            case "text_end": {
+              const block = event.partial.content[event.contentIndex];
+              const phase = block?.type === "text"
+                ? assistantTextPhaseFromSignature(block.textSignature)
+                : undefined;
+              if (phase) yield { type: "text_phase", phase };
+              break;
+            }
             case "thinking_start":
               yield { type: "thinking_start" };
               break;

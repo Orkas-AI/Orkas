@@ -62,8 +62,6 @@ describe('OfficeWorker built-in agent evaluation', () => {
     expect(excelSkill).toContain('with one `targets` array to batch-check representative formulas');
     expect(excelSkill).toContain('`mode:"text"` exposes displayed values, not formula definitions');
     expect(excelSkill).toContain('For a new workbook, reuse the sheet order supplied to `create_xlsx`');
-    expect(excelSkill).toContain('Retry publication once with an exact `eligible_current_turn_paths` entry');
-    expect(excelSkill).toContain('do not edit, review, or regenerate the workbook');
   });
 
   it('owns both single Word and single Excel deliverables after specialist retirement', () => {

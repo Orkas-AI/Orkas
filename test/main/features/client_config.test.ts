@@ -47,7 +47,6 @@ describe('client_config', () => {
     electronMock.app.off.mockClear();
     electronMock.powerMonitor.on.mockClear();
     electronMock.powerMonitor.off.mockClear();
-    delete process.env.ORKAS_ACCOUNT_API_BASE;
     delete process.env.ORKAS_API_BASE_URL;
     delete process.env.ORKAS_PROFILE;
     delete process.env.ORKAS_CLIENT_CHANNEL;
@@ -58,7 +57,6 @@ describe('client_config', () => {
     stop();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
-    delete process.env.ORKAS_ACCOUNT_API_BASE;
     delete process.env.ORKAS_API_BASE_URL;
     delete process.env.ORKAS_PROFILE;
     delete process.env.ORKAS_CLIENT_CHANNEL;
@@ -86,11 +84,10 @@ describe('client_config', () => {
 
   it('ships the synchronized public model catalog with compatibility metadata', () => {
     expect(DEFAULT_PROVIDER_MODELS['openai-codex']).toEqual([
+      { id: 'gpt-6-astra', name: 'GPT-6 Astra', maxInputImages: 20 },
       { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', template: 'gpt-5.5', contextWindow: 372000, maxTokens: 128000, maxInputImages: 20 },
       { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', template: 'gpt-5.5', contextWindow: 372000, maxTokens: 128000, maxInputImages: 20 },
       { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', template: 'gpt-5.5', contextWindow: 272000, maxTokens: 128000, maxInputImages: 20 },
-      { id: 'gpt-5.5', name: 'GPT-5.5', maxInputImages: 20 },
-      { id: 'gpt-5.4', name: 'GPT-5.4', maxInputImages: 20 },
     ]);
   });
 

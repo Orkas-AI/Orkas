@@ -95,6 +95,22 @@ describe('ipc-shim invoke results', () => {
     });
   });
 
+  it('routes a task-board Send now action with the queued task identity', async () => {
+    const invoke = vi.fn(async () => ({ ok: true, turn_id: 'live-turn' }));
+    const { apiFetch } = loadShim(idleStream, invoke);
+
+    const response = await apiFetch('/api/conversations/c1/tasks/send-now', {
+      method: 'POST',
+      body: JSON.stringify({ task_id: 'queued-task' }),
+    });
+
+    expect(response.ok).toBe(true);
+    expect(invoke).toHaveBeenCalledWith('groupChat.tasks.sendNow', {
+      cid: 'c1',
+      task_id: 'queued-task',
+    });
+  });
+
   it('does not classify expected business failures as IPC transport errors', async () => {
     const invoke = vi.fn(async () => ({ ok: false, error: 'conversation not found', code: 'E_NOT_FOUND' }));
     const { apiFetch, monitorError } = loadShim(idleStream, invoke);

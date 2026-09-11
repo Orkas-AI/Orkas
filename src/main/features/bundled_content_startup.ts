@@ -2,10 +2,21 @@ import { createLogger } from '../logger';
 import { maskId } from '../util/log-redact';
 import * as systemSkills from './system_skills';
 import * as builtinMarketplaceStartup from './builtin_marketplace_startup';
+import { registerUserSwitchHook } from './user-switch-hooks';
 import type { BuiltinMarketplaceSeedResult } from './builtin_marketplace';
 import type { SystemSkillReconcileResult } from './system_skills';
 
 const log = createLogger('bundled-content');
+
+/** Boot and login triggers repeat for one uid (first window, account
+ *  bootstrap, the delayed login-capabilities pass). Packaged content cannot
+ *  change while the process runs, so after one complete pass these reasons
+ *  are no-ops; any other reason still performs a real pass. */
+const STARTUP_TRIGGER_REASONS: ReadonlySet<string> = new Set([
+  'first-window',
+  'startup',
+  'account-change',
+]);
 
 export interface SyncBundledContentOptions {
   reason: string;
@@ -20,6 +31,16 @@ export interface SyncBundledContentResult {
 }
 
 const inFlightByUid = new Map<string, Promise<SyncBundledContentResult>>();
+/** uid → completion time of the last pass that published everything without
+ *  a failure or a cooperative stop. A failed or interrupted pass clears the
+ *  entry so the next trigger retries. */
+const completedByUid = new Map<string, number>();
+
+// Switching accounts can reset the target workspace (the anonymous root is
+// recreated on logout), so the first trigger after a switch must publish.
+registerUserSwitchHook('bundled-content', (_previousUid, nextUid) => {
+  completedByUid.delete(nextUid);
+});
 
 function _hasMarketplaceChanges(result: BuiltinMarketplaceSeedResult | null): boolean {
   return !!result && !!(
@@ -95,9 +116,16 @@ async function _syncBundledContentForUser(
     });
   }
 
+  // `marketplace` stays null only when the pass stopped before that phase;
+  // the trailing continue check catches a stop during the last phase.
+  const complete = !result.failed.length && result.marketplace !== null && _canContinue(opts);
+  if (complete) completedByUid.set(uid, Date.now());
+  else completedByUid.delete(uid);
+
   log.info('bundled content sync completed', {
     reason: opts.reason,
     uid: maskId(uid),
+    complete,
     ms: Date.now() - startedAt,
     system_skill_changes: result.system_skills.filter((row) => (
       row.action === 'created' || row.action === 'updated' || row.action === 'deleted'
@@ -111,7 +139,9 @@ async function _syncBundledContentForUser(
 
 /**
  * Publish the packaged System Skills and bundled Marketplace Agents/Skills
- * for one local user. Calls for the same uid share one filesystem pass. The
+ * for one local user. Calls for the same uid share one filesystem pass, and
+ * a repeated boot/login trigger after one complete pass performs no
+ * filesystem work at all; only a failed or interrupted pass is retried. The
  * function always resolves so this local repair boundary cannot hold the app
  * or a later user task in a failed state.
  */
@@ -119,6 +149,13 @@ export async function syncBundledContentForUser(
   uid: string,
   opts: SyncBundledContentOptions,
 ): Promise<SyncBundledContentResult> {
+  if (completedByUid.has(uid) && STARTUP_TRIGGER_REASONS.has(opts.reason)) {
+    log.info('bundled content already published for this process', {
+      reason: opts.reason,
+      uid: maskId(uid),
+    });
+    return { system_skills: [], marketplace: null, failed: [] };
+  }
   const existing = inFlightByUid.get(uid);
   const inFlight = existing || _syncBundledContentForUser(uid, opts).finally(() => {
     if (inFlightByUid.get(uid) === inFlight) inFlightByUid.delete(uid);

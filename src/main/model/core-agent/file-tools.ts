@@ -26,10 +26,11 @@
  * write_file) live in local-tools.ts.
  */
 
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import type { AgentTool, ToolContext } from '#core-agent';
+import type { AgentTool, ProgramSourceLoader, ToolContext, ToolObservations } from '#core-agent';
 import { createLogger } from '../../logger';
 import {
   statFile,
@@ -109,6 +110,10 @@ export interface FileToolsOpts {
   /** The selected model can consume image blocks. Used only to provide a
    * controlled visual fallback after the local OCR runtime fails. */
   visionFallbackAvailable?: boolean;
+  /** Maximum exact UTF-8 body size returned by one raw_text call. The normal
+   * final-result boundary separately keeps direct calls out of model context
+   * when the returned JSON exceeds the inline budget. */
+  rawTextMaxBytes?: number;
   /** Current conversation id. Scopes file tools to this cid's attachment
    *  dir (in addition to the user's active workspace). Omitted = no
    *  attachment scope (workspace-only). */
@@ -314,6 +319,23 @@ function errText(code: string, msg: string): string {
   return `${code}: ${msg}`;
 }
 
+function fileReadBatchObservation(
+  items: readonly { ok: boolean; error?: string }[],
+): NonNullable<ToolObservations['fileReadBatch']> {
+  const failures = items.flatMap((item, index) => {
+    if (item.ok) return [];
+    const code = /^([A-Z][A-Z0-9_]{1,63}):/.exec(String(item.error || '').trim())?.[1]
+      || 'E_READ_FAILED';
+    return [{ index, code }];
+  });
+  return {
+    attempted: items.length,
+    succeeded: items.length - failures.length,
+    failed: failures.length,
+    failures,
+  };
+}
+
 function permissionWaitProgress(ctx: ToolContext | undefined, operation: string): (elapsedMs: number) => void {
   return (elapsedMs: number) => {
     ctx?.emitProgress?.({
@@ -404,6 +426,92 @@ function guardDisabledSkillAccess(opts: FileToolsOpts, abs: string): string | nu
     'E_SKILL_DISABLED',
     `skill "${skillId}" is disabled for this user; re-enable it before reading or running its workflow.`,
   );
+}
+
+/** Build the host-owned reader for run_program(path). It intentionally reuses
+ * the exact file-tool scope, sensitive-path, disabled-Skill, and persisted
+ * result guards instead of letting the isolated runtime read the filesystem. */
+export function createProgramSourceLoader(opts: FileToolsOpts): ProgramSourceLoader {
+  return async (requestedPath, ctx, maxSourceChars) => {
+    const resolved = resolveRequestedPath(opts, ctx, requestedPath);
+    if (resolved.error) {
+      return { status: 'denied', code: 'E_PROGRAM_SOURCE_PATH', reason: resolved.error };
+    }
+    const { abs, displayPath } = resolved;
+    const scopeError = await gatePathAccess(opts, abs, `execute JavaScript source ${displayPath}`, ctx);
+    if (scopeError) {
+      return { status: 'denied', code: 'E_PROGRAM_SOURCE_DENIED', reason: scopeError };
+    }
+    const disabledSkillError = guardDisabledSkillAccess(opts, abs);
+    if (disabledSkillError) {
+      return { status: 'denied', code: 'E_PROGRAM_SOURCE_DENIED', reason: disabledSkillError };
+    }
+    if (opts.toolResultsRoot && isInsideRoot(opts.toolResultsRoot, abs)) {
+      return {
+        status: 'denied',
+        code: 'E_PROGRAM_SOURCE_DENIED',
+        reason: errText(
+          'E_TOOL_RESULT_REF_REQUIRED',
+          'Persisted tool results cannot be executed by path.',
+        ),
+      };
+    }
+
+    try {
+      const stat = await fs.promises.stat(abs);
+      if (!stat.isFile()) {
+        return {
+          status: 'denied',
+          code: 'E_PROGRAM_SOURCE_NOT_FILE',
+          reason: `${displayPath} is not a regular file.`,
+        };
+      }
+      // UTF-8 can occupy at most four bytes per code point. Reject before a
+      // read when the file cannot possibly fit, then enforce the exact JS
+      // character limit after decoding.
+      if (stat.size > maxSourceChars * 4) {
+        return {
+          status: 'denied',
+          code: 'E_PROGRAM_SOURCE_LIMIT',
+          reason: `Program source exceeds the ${maxSourceChars}-character limit.`,
+        };
+      }
+      const bytes = await fs.promises.readFile(abs);
+      let source: string;
+      try {
+        // Keep a UTF-8 BOM as U+FEFF so re-encoding the evaluated source has
+        // the exact same bytes and the execution hash can match the artifact.
+        source = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+      } catch {
+        return {
+          status: 'denied',
+          code: 'E_PROGRAM_SOURCE_ENCODING',
+          reason: `${displayPath} must contain valid UTF-8 JavaScript source.`,
+        };
+      }
+      if (source.length > maxSourceChars) {
+        return {
+          status: 'denied',
+          code: 'E_PROGRAM_SOURCE_LIMIT',
+          reason: `Program source exceeds the ${maxSourceChars}-character limit.`,
+        };
+      }
+      const hash = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+      recordRead(ctx, abs, stat, hash);
+      return { status: 'completed', source, resolvedPath: abs };
+    } catch (error) {
+      const osCode = (error as NodeJS.ErrnoException)?.code;
+      return {
+        status: 'denied',
+        code: osCode === 'ENOENT' || osCode === 'ENOTDIR'
+          ? 'E_PROGRAM_SOURCE_NOT_FOUND'
+          : osCode === 'EACCES' || osCode === 'EPERM'
+            ? 'E_PROGRAM_SOURCE_PERMISSION'
+            : 'E_PROGRAM_SOURCE_READ',
+        reason: `${displayPath}: ${displayErrorMessage(error, abs, displayPath)}`,
+      };
+    }
+  };
 }
 
 function isExtractableRichKind(kind: string): boolean {
@@ -509,7 +617,7 @@ function createReadFileTool(
       type: 'object',
       additionalProperties: false,
       properties: {
-        path: { type: 'string', description: 'Visible absolute path, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
+        path: { type: 'string', description: 'Path relative to the working directory, a visible absolute path, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
         range: taggedReadRangeSchema(),
       },
       required: ['path'],
@@ -612,6 +720,61 @@ function createReadFileTool(
       const kind = kindOf(abs);
       const portableSkillDocument = isPortableSkillDocumentPath(abs);
       try {
+        if (input.rawText === true) {
+          if (kind !== 'text') {
+            return {
+              content: errText(
+                'E_RAW_TEXT_UNSUPPORTED',
+                `${displayPath}: raw_text supports UTF-8 text files only; use ordinary read_files for kind=${kind}.`,
+              ),
+              isError: true,
+            };
+          }
+          const maxBytes = Math.max(1, Math.trunc(
+            opts.rawTextMaxBytes ?? 8 * 1024 * 1024,
+          ));
+          if (sourceStat.size > maxBytes) {
+            return {
+              content: errText(
+                'E_RAW_TEXT_LIMIT',
+                `${displayPath}: ${sourceStat.size} bytes exceeds the ${maxBytes}-byte raw_text limit. Read bounded ranges instead.`,
+              ),
+              isError: true,
+            };
+          }
+          const bytes = await fs.promises.readFile(abs);
+          let content: string;
+          try {
+            content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+          } catch {
+            return {
+              content: errText(
+                'E_RAW_TEXT_ENCODING',
+                `${displayPath}: raw_text requires valid UTF-8.`,
+              ),
+              isError: true,
+            };
+          }
+          const sourceHash = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+          recordRead(ctx, abs, undefined, sourceHash);
+          return {
+            content: JSON.stringify({
+              path: displayPath,
+              content,
+              total_chars: content.length,
+              file_hash: sourceHash,
+            }),
+            observations: {
+              fileReads: [{
+                path: abs,
+                hash: sourceHash,
+                charRange: [0, content.length],
+                lineRange: [1, content.split('\n').length],
+              }],
+            },
+          };
+        }
+
         if (input.metadataOnly === true) {
           const meta = kind === 'image'
             ? null
@@ -876,7 +1039,7 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
     name: 'read_files',
     executionMode: 'parallel',
     description:
-      'Read one or more visible files in one call. Use one paths item for a single file; add an exact range for paging. PDF and Office files are prepared automatically. Set metadata_only to inspect several files without returning bodies.',
+      'Read one or more visible files in one call. Use one paths item for a single file; add an exact range for paging. PDF and Office files are prepared automatically. Set metadata_only to inspect several files without returning bodies. Set raw_text for exact UTF-8 text in machine-readable JSON.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -889,7 +1052,7 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
             type: 'object',
             additionalProperties: false,
             properties: {
-              path: { type: 'string', description: 'Visible absolute path, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
+              path: { type: 'string', description: 'Path relative to the working directory, a visible absolute path, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
               range: taggedReadRangeSchema(),
             },
             required: ['path'],
@@ -898,6 +1061,10 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
         metadata_only: {
           type: 'boolean',
           description: 'Prepare document extraction and return metadata for every path without file or image bodies.',
+        },
+        raw_text: {
+          type: 'boolean',
+          description: 'Return exact UTF-8 text as JSON {files:[{requested_path,ok,path,content,total_chars,file_hash}|{requested_path,ok:false,error}]}. Cannot combine with ranges/metadata_only. Large direct results may be persisted.',
         },
       },
       required: ['paths'],
@@ -917,6 +1084,16 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
           ? entry as Record<string, unknown>
           : {}
       ));
+      const rawText = input.raw_text === true;
+      if (rawText && (input.metadata_only === true || requests.some((entry) => entry.range !== undefined))) {
+        return {
+          content: errText(
+            'E_BAD_INPUT',
+            'read_files raw_text cannot be combined with metadata_only or ranges.',
+          ),
+          isError: true,
+        };
+      }
       if (requests.some((entry) => typeof entry.path !== 'string' || !entry.path)) {
         return {
           content: errText('E_BAD_INPUT', 'every read_files paths item requires a non-empty `path`'),
@@ -961,6 +1138,72 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
           charEnd: explicitEnd ?? start + READ_FILES_DEFAULT_SLICE_CHARS,
         };
       });
+      if (rawText) {
+        const results = [];
+        let resultBytes = 0;
+        const maxBytes = Math.max(1, Math.trunc(
+          opts.rawTextMaxBytes ?? 8 * 1024 * 1024,
+        ));
+        for (const request of normalized) {
+          const result = await readFile.execute({
+            ...request,
+            rawText: true,
+          }, ctx);
+          resultBytes += Buffer.byteLength(result.content, 'utf8');
+          if (resultBytes > maxBytes) {
+            return {
+              content: errText(
+                'E_RAW_TEXT_LIMIT',
+                `read_files raw_text result exceeds the ${maxBytes}-byte limit. Split the paths across calls.`,
+              ),
+              isError: true,
+            };
+          }
+          results.push(result);
+        }
+        const files = results.map((result, index) => {
+          const requestedPath = String(normalized[index].path);
+          if (result.isError) {
+            return { requested_path: requestedPath, ok: false, error: result.content };
+          }
+          try {
+            return {
+              requested_path: requestedPath,
+              ok: true,
+              ...JSON.parse(result.content) as Record<string, unknown>,
+            };
+          } catch {
+            return {
+              requested_path: requestedPath,
+              ok: false,
+              error: errText('E_READ_FAILED', 'raw_text produced an invalid internal response.'),
+            };
+          }
+        });
+        const errors = files.filter((file) => file.ok === false).length;
+        const content = JSON.stringify({ files });
+        if (Buffer.byteLength(content, 'utf8') > maxBytes) {
+          return {
+            content: errText(
+              'E_RAW_TEXT_LIMIT',
+              `read_files raw_text result exceeds the ${maxBytes}-byte limit. Split the paths across calls.`,
+            ),
+            isError: true,
+          };
+        }
+        return {
+          content,
+          ...(errors === files.length ? { isError: true } : {}),
+          observations: {
+            fileReads: results.flatMap((result) => result.observations?.fileReads ?? []),
+            fileReadBatch: fileReadBatchObservation(files.map((file) => (
+              file.ok === false
+                ? { ok: false, error: String(file.error || '') }
+                : { ok: true }
+            ))),
+          },
+        };
+      }
       const inlineBudget = readFilesInlineTokenBudget(ctx);
       const emptyEnvelope =
         `<read-files count="${normalized.length}" errors="0">\n`
@@ -999,6 +1242,10 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
         ...(includesVerbatimDocument ? { verbatimDocument: true } : {}),
         observations: {
           fileReads: results.flatMap((result) => result.observations?.fileReads ?? []),
+          fileReadBatch: fileReadBatchObservation(results.map((result) => ({
+            ok: !result.isError,
+            ...(result.isError ? { error: result.content } : {}),
+          }))),
         },
       };
     },
@@ -1016,7 +1263,7 @@ function createOcrFileTool(opts: FileToolsOpts): AgentTool {
     inputSchema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Visible absolute path, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
+        path: { type: 'string', description: 'Path relative to the working directory, a visible absolute path, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
         pages: { type: 'string', description: 'Optional PDF pages, e.g. "1-3,5". Omit to OCR all pages.' },
       },
       required: ['path'],
@@ -1218,7 +1465,7 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
       type: 'object',
       properties: {
         query: { type: 'string', description: 'Substring or glob. Omit to list everything.' },
-        root: { type: 'string', description: 'Optional visible directory or @skill/<read-ref>[/relative-path] to search instead of all visible roots.' },
+        root: { type: 'string', description: 'Optional file or directory relative to the working directory, visible absolute path, or @skill/<read-ref>[/relative-path]; searches all visible roots when omitted.' },
         include_glob: { type: 'array', items: { type: 'string' }, maxItems: 16, description: 'Optional include globs matched against root-relative paths or basenames.' },
         exclude_glob: { type: 'array', items: { type: 'string' }, maxItems: 16, description: 'Optional exclude globs.' },
         include_ignored: { type: 'boolean', description: 'Include ignored files when explicitly needed; dependency/build directories remain bounded.' },
@@ -1267,7 +1514,19 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
           };
         }
         if (!st.isDirectory()) {
-          return { content: errText('E_NOT_DIRECTORY', `${requestedRootDisplay}: not a directory`), isError: true };
+          // Widening to the parent would read siblings this call never gated,
+          // so the refusal stands — but it names the two things the caller
+          // actually meant, because retrying the same shape was the common
+          // next move.
+          return {
+            content: errText(
+              'E_NOT_DIRECTORY',
+              `${requestedRootDisplay}: not a directory. `
+              + `To find files near it, pass root="${path.dirname(requestedRootDisplay)}". `
+              + 'To search inside this one file, use grep_files with the same path as root, or read_file.',
+            ),
+            isError: true,
+          };
         }
         const source = rootKinds.find(({ root }) => isInsideRoot(root, requestedRoot))?.source ?? 'extra';
         rootKinds.splice(0, rootKinds.length, { root: requestedRoot, source });
@@ -1487,7 +1746,7 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
       type: 'object',
       properties: {
         pattern: { type: 'string', description: 'Pattern to search for.' },
-        root: { type: 'string', description: 'Optional visible directory or @skill/<read-ref>[/relative-path] to search instead of all visible roots.' },
+        root: { type: 'string', description: 'Optional directory relative to the working directory, visible absolute directory, or @skill/<read-ref>[/relative-path]; searches all visible roots when omitted.' },
         regex: { type: 'boolean', description: 'Default false — treat pattern as a case-insensitive substring.' },
         glob: { type: 'string', description: 'Optional file glob. No "/" matches basenames; with "/" matches relative paths, e.g. "src/**/*.ts".' },
         include_glob: { type: 'array', items: { type: 'string' }, maxItems: 16, description: 'Optional additional include globs. A file may match any include glob.' },
@@ -1553,6 +1812,8 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
       }
       const requestedRoot = requestedRootResolution?.abs || '';
       const requestedRootDisplay = requestedRootResolution?.displayPath || requestedRoot;
+      /** Set when `root` named a file: the scan is that file, not a walk. */
+      let singleFileTarget = '';
       if (requestedRoot) {
         const scopeErr = await gatePathAccess(opts, requestedRoot, 'grep_files', ctx);
         if (scopeErr) return { content: scopeErr, isError: true };
@@ -1567,11 +1828,21 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
             isError: true,
           };
         }
-        if (!st.isDirectory()) {
+        if (!st.isDirectory() && !st.isFile()) {
           return { content: errText('E_NOT_DIRECTORY', `${requestedRootDisplay}: not a directory`), isError: true };
         }
+        // "Search inside this one file" is the same request at a narrower
+        // scope, and the model asks for it often enough that refusing cost a
+        // round trip every time. The path was gated just above, so answering
+        // it reads nothing the caller could not already read; enumeration is
+        // skipped rather than widened to the parent directory.
         const source = rootKinds.find(({ root }) => isInsideRoot(root, requestedRoot))?.source ?? 'extra';
-        rootKinds.splice(0, rootKinds.length, { root: requestedRoot, source });
+        if (st.isFile()) {
+          singleFileTarget = requestedRoot;
+          rootKinds.splice(0, rootKinds.length, { root: path.dirname(requestedRoot), source });
+        } else {
+          rootKinds.splice(0, rootKinds.length, { root: requestedRoot, source });
+        }
       }
       if (!rootKinds.length) {
         return { content: errText('E_NO_SCOPE', 'no visible roots for this conversation'), isError: true };
@@ -1584,6 +1855,11 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
       let budget = MAX_SCAN_FILES;
       for (const { root, source } of rootKinds) {
         if (budget <= 0) break;
+        if (singleFileTarget) {
+          targets.push({ abs: singleFileTarget, source, root });
+          budget -= 1;
+          continue;
+        }
         const scan = await enumerateFiles(root, budget, { includeIgnored, signal: ctx.signal });
         if (scan.skippedReason) {
           skippedScans.push(`${source}:${scan.skippedReason}`);
@@ -1621,42 +1897,47 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
       let scanned = 0, skipped = 0, extracted = 0;
       const hits: GrepHit[] = [];
       const rgHandledRoots = new Set<string>();
-      for (const { root, source } of rootKinds) {
-        if (hits.length >= maxResults) break;
-        const repositoryResult = await grepRepository(root, {
-          pattern,
-          regex: useRegex,
-          caseSensitive,
-          contextLines,
-          maxResults: maxResults - hits.length,
-          includeGlobs: includeGlobs.map((glob) => glob.raw),
-          excludeGlobs: excludeGlobs.map((glob) => glob.raw),
-          includeIgnored,
-          signal: ctx.signal,
-        });
-        if (!repositoryResult.available) continue;
-        if (repositoryResult.error) {
-          return {
-            content: errText(
-              'E_GREP_FAILED',
-              requestedRootResolution?.skillRef
-                ? displayErrorMessage(repositoryResult.error, requestedRoot, requestedRootDisplay)
-                : repositoryResult.error,
-            ),
-            isError: true,
-          };
-        }
-        rgHandledRoots.add(path.resolve(root));
-        for (const hit of repositoryResult.hits) {
-          hits.push({
-            path: hit.path,
-            line: hit.line,
-            column: hit.column,
-            snippet: snippetFromLine(hit.text, matcher),
-            before: hit.before,
-            after: hit.after,
-            source,
+      // The fast path operates on directories. When the caller named one
+      // file, running it on the file's parent would widen the authorized and
+      // requested scope to siblings; let the direct-file path below own it.
+      if (!singleFileTarget) {
+        for (const { root, source } of rootKinds) {
+          if (hits.length >= maxResults) break;
+          const repositoryResult = await grepRepository(root, {
+            pattern,
+            regex: useRegex,
+            caseSensitive,
+            contextLines,
+            maxResults: maxResults - hits.length,
+            includeGlobs: includeGlobs.map((glob) => glob.raw),
+            excludeGlobs: excludeGlobs.map((glob) => glob.raw),
+            includeIgnored,
+            signal: ctx.signal,
           });
+          if (!repositoryResult.available) continue;
+          if (repositoryResult.error) {
+            return {
+              content: errText(
+                'E_GREP_FAILED',
+                requestedRootResolution?.skillRef
+                  ? displayErrorMessage(repositoryResult.error, requestedRoot, requestedRootDisplay)
+                  : repositoryResult.error,
+              ),
+              isError: true,
+            };
+          }
+          rgHandledRoots.add(path.resolve(root));
+          for (const hit of repositoryResult.hits) {
+            hits.push({
+              path: hit.path,
+              line: hit.line,
+              column: hit.column,
+              snippet: snippetFromLine(hit.text, matcher),
+              before: hit.before,
+              after: hit.after,
+              source,
+            });
+          }
         }
       }
 
@@ -1825,7 +2106,7 @@ function createListFilesTool(opts: FileToolsOpts): AgentTool {
     inputSchema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Visible absolute directory, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
+        path: { type: 'string', description: 'Directory relative to the working directory, a visible absolute directory, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
       },
       required: ['path'],
     },

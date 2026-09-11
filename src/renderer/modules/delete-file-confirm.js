@@ -20,11 +20,23 @@ const _deleteFileLog = (typeof createLogger === 'function')
 let _deleteFileSubscription = null;
 const _deleteFileBatches = new Map();
 const _DELETE_CONFIRM_FALLBACK_BATCH_MS = 1000;
+// A card that mounts into a hidden surface re-checks on this interval until
+// it comes into view. The ceiling matches the main-side token TTL (30 min);
+// past that main GCs the token and pushes an invalidation instead.
+const _DELETE_CONFIRM_ACK_POLL_MS = 400;
+const _DELETE_CONFIRM_ACK_MAX_MS = 30 * 60 * 1000;
 
 function startDeleteFileConfirmSubscription() {
   if (_deleteFileSubscription) return;  // idempotent
   if (!window.orkas || typeof window.orkas.onPushEvent !== 'function') return;
   try {
+    // Both channels or neither: a card we can raise but never retire is
+    // worse than no card, so the idempotency guard flips only once the
+    // invalidation channel is wired too.
+    window.orkas.onPushEvent(
+      'delete_file.confirmation_invalidated',
+      _handleDeleteFileConfirmInvalidated,
+    );
     _deleteFileSubscription = window.orkas.onPushEvent(
       'delete_file.confirmation_required',
       _handleDeleteFileConfirmRequest,
@@ -62,6 +74,22 @@ function _handleDeleteFileConfirmRequest(payload) {
   _mountDeleteConfirmCard(payload);
 }
 
+/** Main dropped a token whose card may still be on screen — it cancelled the
+ *  request, or the 30-minute TTL GC'd it. Retire the card: a live-looking
+ *  Delete button whose only possible outcome is a bare "operation rejected"
+ *  is worse than no card at all. */
+function _handleDeleteFileConfirmInvalidated(payload) {
+  const confirmId = String((payload && payload.confirm_id) || '');
+  if (!confirmId) return;
+  for (const batch of _deleteFileBatches.values()) {
+    if (!batch.ids.has(confirmId)) continue;
+    // One dead token makes the whole grouped card unhonorable — it is a
+    // single confirm action over every path it lists.
+    _retireDeleteConfirmBatch(batch);
+    return;
+  }
+}
+
 /** Find the chat-history container the user is currently looking at.
  *  Three surfaces can host a delete_file tool call:
  *    - main group chat (`#chat-history`)
@@ -78,10 +106,10 @@ function _findActiveChatContainer() {
     const el = document.getElementById(id);
     if (el && el.offsetParent !== null) return el;
   }
-  // Fallback: nothing visible — return chat-history anyway so the request
-  // has a DOM record for diagnostics. We deliberately do NOT ack visibility
-  // for hidden cards; main will fail closed and tell the model no card was
-  // shown, so the user is not asked to click something invisible.
+  // Fallback: nothing visible right now — mount into chat-history anyway.
+  // We still ack, with `visible:false`, so main keeps the token alive: the
+  // card becomes clickable the moment the user switches back to the chat.
+  // Only a total absence of any ack (no surface at all) fails closed.
   return document.getElementById('chat-history');
 }
 
@@ -158,6 +186,7 @@ function _createDeleteConfirmBatch(container, key, hasTurnId) {
     entries: [],
     ids: new Set(),
     settled: false,
+    watching: false,
     accepting: true,
     hasTurnId,
     createdAt: Date.now(),
@@ -183,6 +212,13 @@ function _createDeleteConfirmBatch(container, key, hasTurnId) {
     let failedCount = 0;
     for (const entry of entries) {
       if (!await _respondDeleteConfirm(entry.confirm_id, granted)) failedCount += 1;
+    }
+    if (failedCount > 0) {
+      // The token died before the click landed. Nothing was deleted — say
+      // that, instead of leaving a card that reads as if the choice stuck.
+      card.classList.remove('is-confirmed', 'is-cancelled');
+      card.classList.add('is-stale');
+      resultEl.textContent = _deleteConfirmStaleText();
     }
     try {
       const level = failedCount > 0 ? 'warn' : 'info';
@@ -220,7 +256,7 @@ function _createDeleteConfirmBatch(container, key, hasTurnId) {
     // message via the active surface's input + send button once per batch
     // so the LLM gets a new turn and retries with the tokens. Cancel doesn't need
     // this — the LLM treats `denied` as terminal.
-    if (granted) {
+    if (granted && failedCount === 0) {
       const trigger = _tDelete('local.delete_file.user_continue', '已确认删除，请继续。');
       const fired = _autoTriggerLLMContinue(trigger);
       if (!fired) {
@@ -241,27 +277,112 @@ function _addDeleteConfirmEntry(batch, payload) {
   _refreshDeleteConfirmFallbackWindow(batch);
   const displayPath = String(payload.path || payload.abs_path || '');
   batch.ids.add(confirmId);
-  batch.entries.push({ confirm_id: confirmId, path: displayPath });
+  const entry = { confirm_id: confirmId, path: displayPath, ackedVisible: false };
+  batch.entries.push(entry);
   batch.card.dataset.deleteConfirmId = batch.entries[0].confirm_id;
   batch.card.dataset.deleteConfirmCount = String(batch.entries.length);
   _renderDeleteConfirmBatch(batch);
   _scrollDeleteConfirmIntoView(batch.card);
-  _ackDeleteConfirmVisible(batch.card, confirmId);
+  _ackDeleteConfirmVisible(batch, entry);
 }
 
-function _ackDeleteConfirmVisible(card, confirmId) {
-  if (!confirmId || !card || card.offsetParent === null) return;
+/** Tell main the card exists, and whether it is on screen right now.
+ *  `offsetParent` is null when an ancestor is `display:none`, which is how
+ *  all three chat surfaces hide. A card that mounts while the user is on
+ *  another view used to ack nothing at all, so main timed out, killed the
+ *  token, and left a card that could only ever fail when clicked. */
+function _ackDeleteConfirmVisible(batch, entry) {
+  if (!entry || !entry.confirm_id || !batch || !batch.card) return;
   if (!window.orkas || typeof window.orkas.invoke !== 'function') return;
+  entry.ackedVisible = batch.card.offsetParent !== null;
+  _sendDeleteConfirmVisibleAck(entry.confirm_id, entry.ackedVisible);
+  _watchDeleteConfirmCard(batch);
+}
+
+function _sendDeleteConfirmVisibleAck(confirmId, visible) {
   try {
-    window.orkas.invoke('delete_file.visible', { confirm_id: confirmId })
-      .catch((err) => _deleteFileLog.warn('visible ack failed', {
+    const res = window.orkas.invoke('delete_file.visible', { confirm_id: confirmId, visible });
+    if (res && typeof res.catch === 'function') {
+      res.catch((err) => _deleteFileLog.warn('visible ack failed', {
         error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
       }));
+    }
   } catch (err) {
     _deleteFileLog.warn('visible ack failed', {
       error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
     });
   }
+}
+
+/** Watch a live card for the two things main cannot see: it coming into view
+ *  (re-ack every token it carries) and it being destroyed (retract them all).
+ *  One watch per card, not per token — a grouped card holds several tokens
+ *  and losing the card loses every one of them. Stops once the batch is
+ *  settled or retired, or the token TTL is up. */
+function _watchDeleteConfirmCard(batch) {
+  if (batch.watching) return;
+  batch.watching = true;
+  const deadline = Date.now() + _DELETE_CONFIRM_ACK_MAX_MS;
+  const tick = () => {
+    if (batch.settled) return;
+    if (!batch.card.parentNode) {
+      // The chat surface was rebuilt (conversation switch / history reload)
+      // and took the card with it. Retract every token rather than leave the
+      // model waiting on a click that can no longer happen — its next call
+      // gets an invalid-token result and mints a fresh, visible card.
+      const ids = batch.entries.map((item) => item.confirm_id);
+      _retireDeleteConfirmBatch(batch);
+      for (const id of ids) _dismissDeleteConfirm(id);
+      return;
+    }
+    if (batch.card.offsetParent !== null) {
+      for (const item of batch.entries) {
+        if (item.ackedVisible) continue;
+        item.ackedVisible = true;
+        _sendDeleteConfirmVisibleAck(item.confirm_id, true);
+      }
+    }
+    if (Date.now() >= deadline) return;
+    setTimeout(tick, _DELETE_CONFIRM_ACK_POLL_MS);
+  };
+  setTimeout(tick, _DELETE_CONFIRM_ACK_POLL_MS);
+}
+
+function _dismissDeleteConfirm(confirmId) {
+  try {
+    const res = window.orkas.invoke('delete_file.dismiss', { confirm_id: confirmId });
+    if (res && typeof res.catch === 'function') {
+      res.catch((err) => _deleteFileLog.warn('dismiss failed', {
+        error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+      }));
+    }
+  } catch (err) {
+    _deleteFileLog.warn('dismiss failed', {
+      error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+    });
+  }
+}
+
+function _retireDeleteConfirmBatch(batch) {
+  if (!batch || batch.settled) return;
+  batch.settled = true;
+  _deleteFileBatches.delete(batch.key);
+  if (batch.fallbackTimer) {
+    clearTimeout(batch.fallbackTimer);
+    batch.fallbackTimer = null;
+  }
+  batch.okBtn.disabled = true;
+  batch.cancelBtn.disabled = true;
+  batch.card.classList.add('is-stale');
+  batch.resultEl.textContent = _deleteConfirmStaleText();
+  batch.resultEl.hidden = false;
+}
+
+function _deleteConfirmStaleText() {
+  return _tDelete(
+    'local.delete_file.stale',
+    '此确认已失效，未删除任何文件。如仍需删除，请让智能体重新发起。',
+  );
 }
 
 function _refreshDeleteConfirmFallbackWindow(batch) {

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const oauthProgress = vi.fn();
 const logInfo = vi.fn();
+const logWarn = vi.fn();
 
 function mockElectron() {
   vi.doMock('electron', () => ({
@@ -37,7 +38,7 @@ beforeEach(() => {
   vi.doMock('../../../../src/main/logger', () => ({
     createLogger: () => ({
       error: vi.fn(),
-      warn: vi.fn(),
+      warn: logWarn,
       info: logInfo,
       debug: vi.fn(),
     }),
@@ -54,6 +55,33 @@ afterEach(() => {
 });
 
 describe('features/connectors/oauth', () => {
+  it('never logs callback URL components even when a stale deep link is malformed', async () => {
+    const oauth = await import('../../../../src/main/features/connectors/oauth');
+    await oauth.handleCallbackUrl('orkas://connectors/oauth/callback/private_callback_canary#private_fragment_canary');
+    const logs = JSON.stringify([logInfo.mock.calls, logWarn.mock.calls]);
+    expect(logs).not.toMatch(/private_callback_canary|private_fragment_canary/);
+    expect(logWarn).toHaveBeenCalledWith('connector callback arrived with no pending flow');
+  });
+
+  it('rejects an unsafe Composio redirect without opening it', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      code: 0, redirect_url: 'javascript:alert(document.domain)',
+    }))));
+
+    const oauth = await import('../../../../src/main/features/connectors/oauth');
+    const catalog = await import('../../../../src/main/features/connectors/catalog');
+    const { shell } = await import('electron');
+    const entry = catalog.findCatalogEntry('gmail');
+    expect(entry).toBeTruthy();
+
+    await expect(oauth.startComposioConnect(entry!)).rejects.toMatchObject({
+      message: 'invalid Composio redirect URL',
+      code: 'invalid_redirect_url',
+    });
+    expect(shell.openExternal).not.toHaveBeenCalled();
+  });
+
+
   it('uses Bearer auth for the existing Composio start and exchange routes', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({
@@ -257,6 +285,41 @@ describe('features/connectors/oauth', () => {
       access_token: 'access-1',
       scopes: expect.arrayContaining(['webmaster.read']),
     });
+    const successLog = logInfo.mock.calls.find(([message]) => message === 'connector OAuth grant resolved');
+    expect(successLog?.[1]).toMatchObject({ catalog_id: 'bing-webmaster', has_account_label: true });
+    expect(successLog?.[1]).not.toHaveProperty('account_label');
+    expect(JSON.stringify(successLog)).not.toContain('user@example.com');
+  });
+
+  it('announces the app return before starting callback exchange work', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        code: 0,
+        provider: 'bing',
+        access_token: 'access-1',
+        refresh_token: 'refresh-1',
+        expires_in: 3600,
+        token_type: 'Bearer',
+        scope: 'openid email webmaster.read',
+      }),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const oauth = await import('../../../../src/main/features/connectors/oauth');
+    const catalog = await import('../../../../src/main/features/connectors/catalog');
+    const entry = catalog.findCatalogEntry('bing-webmaster');
+    expect(entry).toBeTruthy();
+
+    const pending = oauth.startOAuth('u1', entry!, { attemptId: 'attempt-return' });
+    await oauth.handleCallbackUrl('orkas://connectors/oauth/callback?exchange_code=exchange-1');
+    await pending;
+
+    expect(oauthProgress).toHaveBeenCalledWith({
+      attempt_id: 'attempt-return',
+      catalog_id: 'bing-webmaster',
+    });
+    expect(oauthProgress.mock.invocationCallOrder[0]).toBeLessThan(fetchMock.mock.invocationCallOrder[0]);
   });
 
   it('rejects and preserves the server reason when the callback reports a non-scope OAuth error', async () => {

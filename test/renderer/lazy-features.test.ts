@@ -136,6 +136,7 @@ describe('renderer lazy feature loader', () => {
     for (const script of [
       'library-transfer.js',
       'project-detail.js',
+      'todos.js',
       'contexts.js',
       'kb-picker.js',
       'saved-apps.js',
@@ -160,6 +161,7 @@ describe('renderer lazy feature loader', () => {
     expect(appended.map((script) => script.src)).toEqual([
       './modules/library-transfer.js',
       './modules/project-detail.js',
+      './modules/todos.js',
     ]);
 
     await context.loadRendererFeature('auto');
@@ -167,6 +169,7 @@ describe('renderer lazy feature loader', () => {
     expect(appended.map((script) => script.src)).toEqual([
       './modules/library-transfer.js',
       './modules/project-detail.js',
+      './modules/todos.js',
       './modules/auto.js',
     ]);
   });
@@ -293,7 +296,7 @@ describe('renderer lazy feature loader', () => {
     expect(runtimeSelector).not.toContain("hint: t('agent.cli_missing')");
   });
 
-  it('loads Agent-scoped CLI model and thinking settings from main IPC', () => {
+  it('loads Agent-scoped CLI model, thinking, and permission settings from main IPC', () => {
     const source = fs.readFileSync(
       path.join(__dirname, '../../src/renderer/modules/agents.js'), 'utf8');
     const start = source.indexOf('function _loadAgentCliRuntimeOptions');
@@ -303,6 +306,7 @@ describe('renderer lazy feature loader', () => {
     expect(settings).toContain("window.orkas.invoke('localAgents.runtimeOptions'");
     expect(settings).toContain('model_override');
     expect(settings).toContain('thinking_level');
+    expect(settings).toContain('permission_policy');
     expect(settings).toContain('updates: { runtime: nextRuntime }');
   });
 

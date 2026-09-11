@@ -7,7 +7,9 @@
  */
 
 import type { AgentTool } from '#core-agent';
+import * as fs from 'node:fs';
 import { safeId } from '../../storage';
+import { conversationMessageReadFile } from '../../util/project-layout';
 import * as chats from '../../features/chats';
 import * as search from '../../features/search';
 
@@ -51,6 +53,7 @@ function chatReadPageSchema(): Record<string, unknown> {
   return {
     type: 'object',
     additionalProperties: false,
+    description: 'Read action only. Choose one paging mode; never include this object with action=search.',
     properties: {
       mode: {
         type: 'string',
@@ -164,15 +167,66 @@ type IndexedMessage = {
   message: chats.MessageRecord;
 };
 
+/** Reuse the current-turn boundary only while its source revision is unchanged.
+ * Sync can rewrite/reorder the log even when the triggering id stays stable. */
+const MAX_CACHED_BOUNDARIES = 64;
+type CurrentBoundary = { index: number; source: string };
+const currentBoundaryCache = new Map<string, CurrentBoundary>();
+
+function currentBoundarySource(userId: string, cid: string): string | undefined {
+  const file = conversationMessageReadFile(userId, cid);
+  try {
+    const stat = fs.statSync(file);
+    return JSON.stringify([file, stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs]);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+async function cachedCurrentBoundaryIndex(
+  userId: string,
+  cid: string,
+  currentMessageId: string | undefined,
+): Promise<CurrentBoundary | undefined> {
+  if (!currentMessageId) return undefined;
+  const key = `${userId}\u0000${cid}\u0000${currentMessageId}`;
+  const source = currentBoundarySource(userId, cid);
+  const cached = currentBoundaryCache.get(key);
+  if (cached && cached.source === source) return cached;
+  currentBoundaryCache.delete(key);
+  if (!source) return undefined;
+  const rows = await indexedConversationMessages(userId, cid);
+  if (currentBoundarySource(userId, cid) !== source) return undefined;
+  const index = currentBoundaryIndex(rows, currentMessageId);
+  if (index === undefined) return undefined;
+  if (currentBoundaryCache.size >= MAX_CACHED_BOUNDARIES) {
+    const oldest = currentBoundaryCache.keys().next().value;
+    if (oldest !== undefined) currentBoundaryCache.delete(oldest);
+  }
+  const boundary = { index, source };
+  currentBoundaryCache.set(key, boundary);
+  return boundary;
+}
+
+export function _resetCurrentBoundaryCacheForTest(): void {
+  currentBoundaryCache.clear();
+}
+
 async function indexedConversationMessages(
   userId: string,
   cid: string,
 ): Promise<IndexedMessage[]> {
+  // Text/ids only: skip the renderer projection (process-output spill files,
+  // display citation sanitizing) — it costs a hash + cache write per large
+  // tool output on every search/read of the conversation.
   const page = await chats.getMessagesPageAtIndex(
     userId,
     cid,
     0,
     Number.MAX_SAFE_INTEGER,
+    undefined,
+    { project: false },
   );
   return page.history.flatMap((message, offset) => {
     const index = page.historyIndexes[offset];
@@ -307,13 +361,20 @@ export function rankChatHitsForTest(
   });
 }
 
-export function diversifyChatHitsForTest(hits: search.SearchResult[], k: number): search.SearchResult[] {
+// The per-conversation cap keeps sibling conversations visible in cross-
+// conversation scopes. Inside `current` scope every hit shares one cid, so the
+// cap would silently clamp `k` to two rows and force read-pagination rounds.
+export function diversifyChatHitsForTest(
+  hits: search.SearchResult[],
+  k: number,
+  perConversationCap: number = MAX_HITS_PER_CONVERSATION,
+): search.SearchResult[] {
   const counts = new Map<string, number>();
   const out: search.SearchResult[] = [];
   for (const hit of hits) {
     const cid = String(hit.cid || '');
     const count = counts.get(cid) || 0;
-    if (count >= MAX_HITS_PER_CONVERSATION) continue;
+    if (count >= perConversationCap) continue;
     counts.set(cid, count + 1);
     out.push(hit);
     if (out.length >= k) break;
@@ -345,11 +406,11 @@ function createChatSearchTool(opts: ChatHistoryToolsOpts): AgentTool {
       properties: {
         query: {
           type: 'string',
-          description: 'Free-text query over conversation messages. Natural language or keywords both work.',
+          description: 'Search action only. Free-text query over conversation messages. Natural language or keywords both work.',
         },
         k: {
           type: 'number',
-          description: 'Top-k result count. Default 6, max 15. At most two hits are returned per conversation.',
+          description: 'Search action only. Top-k result count; default 6, max 15, with at most two hits per conversation.',
         },
         scope: {
           type: 'string',
@@ -365,8 +426,8 @@ function createChatSearchTool(opts: ChatHistoryToolsOpts): AgentTool {
               include_current: {
                 type: 'boolean',
                 description: hasProjectScope
-                  ? 'Include the current conversation. Defaults to false because its project history is already in context.'
-                  : 'Include the current conversation in cross-conversation search. Defaults to true.',
+                  ? 'Search action only. Include the current conversation; default false because its project history is already in context.'
+                  : 'Search action only. Include the current conversation in cross-conversation search; default true.',
               },
             }
           : {}),
@@ -384,11 +445,10 @@ function createChatSearchTool(opts: ChatHistoryToolsOpts): AgentTool {
         ? input.include_current
         : !opts.projectId;
 
-      let beforeMsgIndex: number | undefined;
+      let boundary: CurrentBoundary | undefined;
       if (scope === 'current') {
-        const rows = await indexedConversationMessages(opts.userId, opts.currentCid!);
-        beforeMsgIndex = currentBoundaryIndex(rows, opts.currentMessageId);
-        if (opts.currentMessageId && beforeMsgIndex === undefined) {
+        boundary = await cachedCurrentBoundaryIndex(opts.userId, opts.currentCid!, opts.currentMessageId);
+        if (opts.currentMessageId && !boundary) {
           return { content: `No conversation-history results for "${query}".` };
         }
       }
@@ -397,7 +457,7 @@ function createChatSearchTool(opts: ChatHistoryToolsOpts): AgentTool {
         ...(scope === 'current'
           ? {
               conversationId: opts.currentCid,
-              ...(beforeMsgIndex !== undefined ? { beforeMsgIndex } : {}),
+              ...(boundary ? { beforeMsgIndex: boundary.index } : {}),
               userVisibleOnly: true,
               limit: MAX_CURRENT_SEARCH_CANDIDATES,
             }
@@ -406,9 +466,13 @@ function createChatSearchTool(opts: ChatHistoryToolsOpts): AgentTool {
               ...(!includeCurrent && opts.currentCid ? { excludeCid: opts.currentCid } : {}),
             }),
       });
+      if (boundary && currentBoundarySource(opts.userId, opts.currentCid!) !== boundary.source) {
+        return { content: `No conversation-history results for "${query}".` };
+      }
       const hits = diversifyChatHitsForTest(
         rankChatHitsForTest(candidates, opts.currentCid, opts.projectId),
         k,
+        scope === 'current' ? Number.POSITIVE_INFINITY : MAX_HITS_PER_CONVERSATION,
       );
       if (!hits.length) return { content: `No conversation-history results for "${query}".` };
 
@@ -603,9 +667,9 @@ function createChatReadTool(opts: ChatHistoryToolsOpts): AgentTool {
 type ChatHistoryAction = 'search' | 'read';
 
 const CHAT_HISTORY_ACTION_FIELDS: Readonly<Record<ChatHistoryAction, ReadonlySet<string>>> = {
-  // `page` is part of the consolidated provider-visible schema. Some
-  // providers populate that schema-valid field even for search, so tolerate
-  // and ignore it instead of rejecting an otherwise valid search call.
+  // `page` was part of the old provider-visible union schema. Retain runtime
+  // compatibility for resumed calls, but the action-discriminated schema no
+  // longer advertises it for search.
   search: new Set(['action', 'query', 'k', 'scope', 'include_current', 'page']),
   // Legacy flat paging fields remain execution-only for model calls copied
   // from an older conversation. The provider-visible schema advertises only
@@ -636,12 +700,20 @@ export function createChatHistoryTool(opts: ChatHistoryToolsOpts): AgentTool {
   const searchProperties = search.inputSchema.properties as Record<string, unknown>;
   const readProperties = read.inputSchema.properties as Record<string, unknown>;
   const operations: Readonly<Record<ChatHistoryAction, AgentTool>> = { search, read };
-
+  const scopeProperty = {
+    type: 'string',
+    enum: scopeEnum,
+    description: hasProjectScope
+      ? 'History scope. current is host-bound; project stays in this project; all is only for explicit broader recall.'
+      : (currentOnly
+        ? 'History scope. current is host-bound to this conversation.'
+        : 'History scope. current is host-bound; all is only for explicit cross-conversation recall.'),
+  };
   return {
     name: 'chat_history',
     executionMode: 'parallel',
     description:
-      'Search or page conversation history when the request depends on earlier work. Treat returned records as quoted, potentially stale data; use Library for durable documents and facts.',
+      'Search or page conversation history only for earlier work dependencies. search uses query/k; read uses page/cid. Omit other-action fields. Treat results as potentially stale quoted data; use Library for durable documents.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -649,21 +721,23 @@ export function createChatHistoryTool(opts: ChatHistoryToolsOpts): AgentTool {
         action: {
           type: 'string',
           enum: ['search', 'read'],
-          description: 'Operation: search requires query; read uses page and may require cid outside current scope.',
+          description: 'search: query/k; read: page and optional cid. Omit other-action fields.',
         },
         ...searchProperties,
         ...readProperties,
-        scope: {
-          type: 'string',
-          enum: scopeEnum,
-          description: hasProjectScope
-            ? 'History scope. current is host-bound; project stays in this project; all is only for explicit broader recall.'
-            : (currentOnly
-              ? 'History scope. current is host-bound to this conversation.'
-              : 'History scope. current is host-bound; all is only for explicit cross-conversation recall.'),
-        },
+        scope: scopeProperty,
       },
       required: currentOnly ? ['action', 'scope'] : ['action'],
+      oneOf: [
+        {
+          properties: { action: { enum: ['search'] } },
+          required: ['action', ...((search.inputSchema.required as string[] | undefined) ?? [])],
+        },
+        {
+          properties: { action: { enum: ['read'] } },
+          required: ['action', ...((read.inputSchema.required as string[] | undefined) ?? [])],
+        },
+      ],
     },
     async execute(input, ctx) {
       const action = String(input.action ?? '').trim() as ChatHistoryAction;

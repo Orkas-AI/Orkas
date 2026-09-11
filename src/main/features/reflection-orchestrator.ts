@@ -34,7 +34,7 @@ import * as fs from 'node:fs';
 import { userReflectionStateFile, userLocalConfigDir } from '../paths';
 import { writeJsonSync } from '../storage';
 import { createLogger } from '../logger';
-import { logErrorRef } from '../util/log-redact';
+import { logErrorRef, logErrorSummary, maskId } from '../util/log-redact';
 import { listAgents } from './agents';
 import { listConversations, type Conversation } from './chats';
 import * as metacognition from './metacognition';
@@ -91,7 +91,9 @@ export function readReflectionState(uid: string): ReflectionState {
     const raw = fs.readFileSync(file, 'utf8');
     const data = JSON.parse(raw);
     if (!data || typeof data !== 'object' || !data.lastReflectedAt || typeof data.lastReflectedAt !== 'object') {
-      log.warn(`reflection-state.json malformed for uid ${uid}, treating as empty`);
+      log.warn('reflection-state.json malformed; treating as empty', {
+        user_id: maskId(uid),
+      });
       return { lastReflectedAt: {} };
     }
     const clean: Record<string, string> = {};
@@ -100,7 +102,10 @@ export function readReflectionState(uid: string): ReflectionState {
     }
     return { lastReflectedAt: clean };
   } catch (err) {
-    log.warn(`reflection-state.json parse failed for uid ${uid}: ${(err as Error).message}, treating as empty`);
+    log.warn('reflection-state.json parse failed; treating as empty', {
+      user_id: maskId(uid),
+      error: logErrorSummary(err),
+    });
     return { lastReflectedAt: {} };
   }
 }
@@ -303,6 +308,16 @@ async function realReflectForAgent(
     // Every failure inside `runReflection` collapses to '', including our own
     // deadline, so ask the signal before blaming the provider.
     if (signal?.aborted) throw reflectionError('cancelled', 'reflection cancelled');
+    // Loop exhaustion after the durable writes already landed: the lessons
+    // are saved, so failing here would re-run the same window next cycle
+    // and write them again (2026-08-28 review E1-6).
+    if (writes > 0) {
+      log.warn('reflection produced no final text after durable writes; counting as reflected', {
+        agent_id: maskId(agentId),
+        write_count: writes,
+      });
+      return 'reflected';
+    }
     throw reflectionError('empty_response', 'reflection returned empty (provider/LLM error or max loops; see core-agent log)');
   }
 

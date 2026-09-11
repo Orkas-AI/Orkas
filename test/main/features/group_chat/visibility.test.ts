@@ -1,99 +1,6 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import * as fs from 'node:fs';
-import * as os from 'node:os';
-import * as path from 'node:path';
+import { describe, it, expect } from 'vitest';
 
-let tmpDir: string;
-let prevWs: string | undefined;
-const TEST_UID = 'u1';
-const TEST_CID = 'cid42';
-
-beforeEach(async () => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-vis-'));
-  prevWs = process.env.ORKAS_WORKSPACE_ROOT;
-  process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
-  vi.resetModules();
-  const users = await import('../../../../src/main/features/users');
-  users.activateUser(TEST_UID);
-});
-
-afterEach(() => {
-  process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  fs.rmSync(tmpDir, { recursive: true, force: true });
-});
-
-describe('group_chat visibility › appendVisible filtering', () => {
-  it('does not write a commander slice because Commander reads the canonical log', async () => {
-    const v = await import('../../../../src/main/features/group_chat/visibility');
-    const paths = await import('../../../../src/main/paths');
-    const legacyCommanderSlice = paths.groupChatVisibilityFile(TEST_UID, TEST_CID, 'commander');
-    fs.mkdirSync(path.dirname(legacyCommanderSlice), { recursive: true });
-    fs.writeFileSync(legacyCommanderSlice, '{"id":"legacy"}\n');
-    // user → commander
-    await v.appendVisible(TEST_UID, TEST_CID, {
-      id: 'm1', ts: 't', from: 'user', to: ['commander'], text: 'hi',
-    }, ['commander', 'user', 'agent-a']);
-    // commander → @agent-a
-    await v.appendVisible(TEST_UID, TEST_CID, {
-      id: 'm2', ts: 't', from: 'commander', to: ['agent-a'], text: 'go',
-    }, ['commander', 'user', 'agent-a']);
-    // agent-a → commander (default)
-    await v.appendVisible(TEST_UID, TEST_CID, {
-      id: 'm3', ts: 't', from: 'agent-a', to: ['commander'], text: 'done',
-    }, ['commander', 'user', 'agent-a']);
-
-    const cmdSlice = await v.readSlice(TEST_UID, TEST_CID, 'commander');
-    expect(cmdSlice).toEqual([]);
-    expect(fs.existsSync(legacyCommanderSlice)).toBe(false);
-  });
-
-  it('agent slice only contains messages where it is from / to / @-mentioned', async () => {
-    const v = await import('../../../../src/main/features/group_chat/visibility');
-    // user → commander (NOT visible to agent-a)
-    await v.appendVisible(TEST_UID, TEST_CID, {
-      id: 'm1', ts: 't', from: 'user', to: ['commander'], text: 'hi',
-    }, ['commander', 'user', 'agent-a']);
-    // commander → @agent-a (visible to agent-a)
-    await v.appendVisible(TEST_UID, TEST_CID, {
-      id: 'm2', ts: 't', from: 'commander', to: ['agent-a'], text: 'go',
-    }, ['commander', 'user', 'agent-a']);
-    // agent-a → commander (visible to agent-a as own msg)
-    await v.appendVisible(TEST_UID, TEST_CID, {
-      id: 'm3', ts: 't', from: 'agent-a', to: ['commander'], text: 'done',
-    }, ['commander', 'user', 'agent-a']);
-    // user → @agent-b (NOT visible to agent-a)
-    await v.appendVisible(TEST_UID, TEST_CID, {
-      id: 'm4', ts: 't', from: 'user', to: ['agent-b'], text: 'unrelated',
-    }, ['commander', 'user', 'agent-a', 'agent-b']);
-
-    const aSlice = await v.readSlice(TEST_UID, TEST_CID, 'agent-a');
-    expect(aSlice.map((m) => m.id)).toEqual(['m2', 'm3']);
-  });
-
-  it('agent sees a message that mentions it even if not in to[]', async () => {
-    const v = await import('../../../../src/main/features/group_chat/visibility');
-    // user → commander, but mentions agent-x in text → router populates mentions[]
-    await v.appendVisible(TEST_UID, TEST_CID, {
-      id: 'm1', ts: 't', from: 'user', to: ['commander'],
-      mentions: ['agent-x'], text: '@agent-x heads up',
-    }, ['commander', 'user', 'agent-x']);
-    const slice = await v.readSlice(TEST_UID, TEST_CID, 'agent-x');
-    expect(slice).toHaveLength(1);
-    expect(slice[0].id).toBe('m1');
-  });
-
-  it('user is never written a slice (UI reads main jsonl directly)', async () => {
-    const v = await import('../../../../src/main/features/group_chat/visibility');
-    const paths = await import('../../../../src/main/paths');
-    await v.appendVisible(TEST_UID, TEST_CID, {
-      id: 'm1', ts: 't', from: 'commander', to: ['user'], text: 'hi',
-    }, ['commander', 'user']);
-    const userSliceFile = paths.groupChatVisibilityFile(TEST_UID, TEST_CID, 'user');
-    expect(fs.existsSync(userSliceFile)).toBe(false);
-  });
-});
-
-describe('group_chat visibility › Commander canonical conversation history', () => {
+describe('group_chat canonical conversation history', () => {
   it('includes exact Agent blockers and actor names from the full log before the current user turn', async () => {
     const v = await import('../../../../src/main/features/group_chat/visibility');
     const rows = [
@@ -132,19 +39,24 @@ describe('group_chat visibility › Commander canonical conversation history', (
     expect(serialized).toContain('把这段文案做成视频');
     expect(serialized).toContain('VideoStudio');
     expect(serialized).toContain('E_NARRATION_REPAIR_AUTHORIZATION_NOT_PERSISTED');
-    expect((history[1].content[0] as any).text).toContain(
-      'Commander delegated this step to VideoStudio (video-agent):',
-    );
-    expect((history[1].content[0] as any).text).toContain(
-      'VideoStudio (video-agent) replied to User:',
-    );
-    expect((history[1].content[0] as any).text).toContain(
-      'Recorded failure: operation/narration_authorization_missing.',
-    );
+    // Both source attribution and external bodies are historical data. No
+    // Commander reply was recorded, so no assistant speech is fabricated.
+    const [userText, routingNote] = history[0].content.map((block: any) => block.text);
+    expect(userText).toBe('把这段文案做成视频。');
+    expect(routingNote).toContain('[Conversation context note] Host routing record');
+    const records = JSON.parse(routingNote.split('\n').slice(1).join('\n'));
+    expect(records).toEqual([
+      { from: 'Commander', to: 'VideoStudio (video-agent)', dispatch: true, text: '制作视频' },
+      {
+        from: 'VideoStudio (video-agent)', to: 'User',
+        text: '当前不能继续：E_NARRATION_REPAIR_AUTHORIZATION_NOT_PERSISTED',
+        failure_kind: 'operation', failure_code: 'narration_authorization_missing',
+      },
+    ]);
+    expect(history[1].content).toEqual([]);
     expect(serialized).not.toContain(' -> ');
     expect(serialized).not.toContain('[Historical group conversation');
     expect(serialized).not.toContain('"actor_id"');
-    expect(serialized).not.toContain('"dispatch":true');
     expect(serialized).not.toContain('Fix that blocker.');
     expect(serialized).not.toContain('INTERNAL_PROCESS_MUST_NOT_REPLAY');
   });
@@ -160,10 +72,14 @@ describe('group_chat visibility › Commander canonical conversation history', (
     const history = v.buildCommanderConversationHistory(rows, 'u2');
 
     expect((history[0].content[0] as any).text).toBe('Start the export.');
+    // No routing note and no reply markers for plain dialogue: the common
+    // case keeps its exact pre-note shape so cached prefixes stay valid.
+    expect(history[0].content).toHaveLength(1);
     expect((history[1].content[0] as any).text).toBe('The export is ready.');
     expect(JSON.stringify(history)).not.toContain('[User -> Commander]');
     expect(JSON.stringify(history)).not.toContain('[Commander -> User]');
-    expect(v.groupConversationHistorySource('cid42')).toBe('group-main-v2:cid42');
+    expect(JSON.stringify(history)).not.toContain('[Conversation context note]');
+    expect(v.groupConversationHistorySource('cid42')).toBe('group-main-v5:cid42');
   });
 
   it('removes only authoritative leading legacy route headers during actor-history replay', async () => {
@@ -186,6 +102,57 @@ describe('group_chat visibility › Commander canonical conversation history', (
     expect(response).not.toContain('[Commander -> User]');
   });
 
+  it('drops host correction turns Commander addressed to itself from the replayed dialogue', async () => {
+    // Legacy persisted dispatch-claim corrections remain readable after the
+    // guard's rollback, but must not replay their internal instructions as
+    // dialogue. Preserve the visible status and actual Agent hand-back.
+    const v = await import('../../../../src/main/features/group_chat/visibility');
+    const rows = [
+      { id: 'u1', ts: 't1', from: 'user', to: ['commander'], text: '让 Writer 完成实现。' },
+      {
+        id: 'a1', ts: 't2', from: 'commander', to: ['user'],
+        text: '派发未执行，正在纠正。',
+        failure_kind: 'validation', failure_code: 'agent_dispatch_not_executed',
+      },
+      {
+        id: 'c1', ts: 't3', from: 'commander', to: ['commander'], dispatch: true,
+        text: 'Named Agent routing was not executed; correcting.',
+        model_text: '<routing-execution-feedback>\nDo not write or quote a “Commander delegated this step to …” line yourself.',
+      },
+      {
+        id: 'a2', ts: 't4', from: 'commander', to: ['writer-agent'], dispatch: true,
+        text: '请完成实现并返回结果。',
+      },
+      {
+        id: 'h1', ts: 't5', from: 'writer-agent', to: ['commander'], dispatch: true,
+        text: 'Agent returned the task to the commander.',
+        model_text: 'Writer 实际运行并完成了任务。',
+      },
+      { id: 'u2', ts: 't6', from: 'user', to: ['commander'], text: 'Continue.' },
+    ] as any;
+
+    const history = v.buildCommanderConversationHistory(
+      rows,
+      'u2',
+      new Map([['writer-agent', 'Writer']]),
+    );
+    const serialized = JSON.stringify(history);
+    const assistantText = (history[1].content[0] as any).text;
+    const routingNote = (history[0].content[1] as any).text;
+
+    expect(serialized).not.toContain('routing-execution-feedback');
+    expect(serialized).not.toContain('Named Agent routing was not executed');
+    expect(serialized).not.toContain('delegated this step to');
+    expect(assistantText).toContain('派发未执行，正在纠正。');
+    expect(assistantText).not.toContain('请完成实现并返回结果。');
+    expect(assistantText).not.toContain('Writer 实际运行并完成了任务。');
+    expect(JSON.parse(routingNote.split('\n').slice(1).join('\n'))).toEqual([
+      { from: 'Commander', to: 'User', failure_kind: 'validation', failure_code: 'agent_dispatch_not_executed', assistant_block: 1 },
+      { from: 'Commander', to: 'Writer (writer-agent)', dispatch: true, text: '请完成实现并返回结果。' },
+      { from: 'Writer (writer-agent)', to: 'Commander', dispatch: true, text: 'Writer 实际运行并完成了任务。' },
+    ]);
+  });
+
   it('collapses repeated current actor attribution before adding one authoritative history label', async () => {
     const v = await import('../../../../src/main/features/group_chat/visibility');
     const attribution = 'VideoStudio (video-agent) replied to User:';
@@ -203,10 +170,15 @@ describe('group_chat visibility › Commander canonical conversation history', (
       'u2',
       new Map([['video-agent', 'VideoStudio']]),
     );
-    const response = (history[1].content[0] as any).text;
+    const record = JSON.parse((history[0].content[1] as any).text.split('\n').slice(1).join('\n'))[0];
+    const response = record.text;
 
     expect(response).toContain('The render is ready.');
-    expect(response.match(/VideoStudio \(video-agent\) replied to User:/g)).toHaveLength(1);
+    // The legacy duplicated headers are stripped from the body and the single
+    // authoritative attribution lives in the user-role routing note.
+    expect(response).not.toContain('replied to User:');
+    expect(record).toMatchObject({ from: 'VideoStudio (video-agent)', to: 'User' });
+    expect(history[1].content).toEqual([]);
   });
 
   it('normalizes the model-facing body rather than replaying a clean visible fallback', async () => {

@@ -189,8 +189,8 @@ describe('ProductDeveloper builtin contract', () => {
     expect(prompt).toMatch(/explicit requirements as execution constraints/i);
     expect(prompt).toMatch(/Optional preferences do not block useful reversible work/i);
     expect(prompt).toMatch(/closed domain defined by a tool, schema, runtime capability, or protocol/i);
-    expect(prompt).toMatch(/unavailable verifier does not support a prediction/i);
-    expect(prompt).toMatch(/instead of using the user as the retry loop/i);
+    expect(prompt).toMatch(/unavailable verifier cannot support a prediction/i);
+    expect(prompt).toMatch(/stop speculative edits and obtain current documentation, runnable verification, or the exact missing evidence/i);
     expect(prompt).toMatch(/current request authorizes its exact action/i);
     expect(prompt).toMatch(/materially different action, target, or condition/i);
     expect(prompt).not.toContain(raw.knowhow[0]);

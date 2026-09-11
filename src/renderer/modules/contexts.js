@@ -87,6 +87,11 @@ function _applyKbStatusResult(data) {
   _kbUnavailableCode = code;
   if (_kbUnavailableReportedCode !== code) {
     _kbUnavailableReportedCode = code;
+    _contextsLog.warn('library status unavailable', {
+      error_code: code,
+      failure_kind: code === 'E_STORAGE_FULL' ? 'storage_full' : 'status_unavailable',
+    });
+
   }
   return false;
 }
@@ -217,34 +222,6 @@ function _applyKbEvent(ev) {
     renderCtxTree();
   }
   _scheduleKbStatusRefreshIfNeeded();
-}
-
-function _trackKbVectorizeEvent(relPath, ev) {
-  if (!window.Monitor || !ev || !ev.status) return;
-  if (ev.status === 'pending' || ev.status === 'processing') {
-    if (!_kbVectorizeStartedAtByPath.has(relPath)) _kbVectorizeStartedAtByPath.set(relPath, performance.now());
-    return;
-  }
-  if (ev.status !== 'ready' && ev.status !== 'failed') return;
-  const startedAt = _kbVectorizeStartedAtByPath.get(relPath);
-  _kbVectorizeStartedAtByPath.delete(relPath);
-  const payload = {
-    result: ev.status === 'ready' ? 'success' : 'failure',
-    file_ext: _ctxExtOf(relPath),
-    file_type: ev.kind || _kindOfPath(relPath),
-    chunk_count: Number(ev.chunks || 0),
-    duration_ms: startedAt ? Math.round(performance.now() - startedAt) : 0,
-  };
-  try { (() => {})('library_vectorize_result', payload); } catch (_) {}
-  if (ev.status === 'failed') {
-    try {
-      (() => {})('library_vectorize', {
-        file_ext: payload.file_ext,
-        file_type: payload.file_type,
-        error_message: ev.error || 'unknown',
-      });
-    } catch (_) {}
-  }
 }
 
 function _cssEscape(s) {
@@ -758,27 +735,7 @@ function _bindCtxTreeHandlers(container) {
 
 // ── Row-level actions ──
 
-function _ctxCreateEntryActionTracker(action) {
-  const startedAt = Date.now();
-  let done = false;
-  return (result, errorCode = '') => {
-    if (done) return;
-    done = true;
-    try {
-      if (!window.Monitor) return;
-      const payload = {
-        result,
-        action,
-        duration_ms: Math.max(0, Date.now() - startedAt),
-      };
-      if (result !== 'success') {
-        payload.error_code = errorCode || 'unknown';
-        payload.error_type = _ctxFailureType(payload.error_code);
-      }
-      Monitor.event('library_entry_action_result', payload);
-    } catch (_) {}
-  };
-}
+function _ctxCreateEntryActionTracker(action) { return () => {}; }
 
 async function reprocessCtxKbFile(rel) {
   const trackResult = _ctxCreateEntryActionTracker('reprocess');
@@ -1105,7 +1062,21 @@ async function _handleCtxMove(srcRel, targetDir) {
   if (dst === srcRel) return;
   const sourceWrap = Array.from(document.querySelectorAll('.contexts-tree .ctx-tree-wrap[data-path]'))
     .find((el) => el.dataset.path === srcRel);
-  const trackResult = () => {};
+  const entryType = sourceWrap?.dataset?.type || 'file';
+  const startedAt = performance.now();
+  const trackResult = (result, errorCode, reportError = true) => {
+    const payload = {
+      result,
+      entry_type: entryType,
+      has_target_dir: !!targetDir,
+      duration_ms: Math.round(performance.now() - startedAt),
+      ...(errorCode ? { error_code: errorCode } : {}),
+      ...(errorCode ? { error_type: _ctxFailureType(errorCode) } : {}),
+    };
+    if (result === 'failure' && reportError) {
+      _contextsLog.warn('library file move failed', payload);
+    }
+  };
   // Reject moves into self or own subtree (only meaningful for dirs but the
   // check is cheap and correct for files too).
   if (targetDir === srcRel || targetDir.startsWith(srcRel + '/')) {
@@ -1442,10 +1413,6 @@ function _ctxExtOf(name) {
   return i >= 0 ? name.slice(i).toLowerCase() : '';
 }
 
-function _ctxHasHiddenPathSegment(name) {
-  return String(name || '').split('/').some(part => part.startsWith('.'));
-}
-
 const _CTX_STABLE_FAILURE_CODES = new Set([
   'create_failed',
   'delete_failed',
@@ -1476,12 +1443,18 @@ function _ctxFailureType(code) {
 }
 
 function _ctxUploadErrorCode(reason) {
-  const text = String(reason || '').toLowerCase();
-  if (text === 'ext') return 'ext';
-  if (text === 'hidden') return 'hidden';
-  if (/picker/.test(text)) return 'picker_failed';
-  if (/network|fetch|timeout|econn|enotfound|socket/.test(text)) return 'network';
+  const code = String(reason || '').trim();
+  if (_CTX_STABLE_FAILURE_CODES.has(code)) return code;
+  if (/^E_[A-Z0-9_]{1,64}$/.test(code) && code !== 'E_UNKNOWN') return code;
   return 'upload_failed';
+}
+
+function _ctxLogUploadFailure(payload) {
+  _contextsLog.warn('library upload failed', payload || {});
+}
+
+function _ctxHasHiddenPathSegment(name) {
+  return String(name || '').split('/').some(part => part.startsWith('.'));
 }
 
 function _ctxLibraryDirectoryLabel(existingDir) {
@@ -1508,7 +1481,7 @@ async function _ctxAlertUploadFailures(rows) {
 
 async function handleCtxUpload(fileList, targetDir = '') {
   const files = Array.from(fileList || []);
-  _contextsLog.info(`upload: ${files.length} file(s), targetDir="${targetDir || '(root)'}"`);
+  _contextsLog.info('library upload started', { file_count: files.length, has_target_dir: !!targetDir });
   if (!files.length) return;
   if (targetDir) _ctxExpanded.add(targetDir);
 
@@ -1523,15 +1496,17 @@ async function handleCtxUpload(fileList, targetDir = '') {
     statusEl.style.display = '';
   }
 
-  // Parallel upload: each file runs its own apiFetch on the IPC layer —
-  // main-process handlers process invokes concurrently, and `kb_indexer`
-  // funnels them all into the same single-worker queue on the back end (so
-  // actual vectorization stays serial and predictable). Failures are
-  // collected and surfaced once at the end, not per-file.
+  // Bound filesystem imports to two at a time. The preload path uses
+  // webUtils.getPathForFile + async main-process copy, so large files never
+  // become ArrayBuffer/binary-string/base64 clones in renderer memory.
   const jobs = _ctxUploadMap(files, async (file) => {
-    if (_ctxHasHiddenPathSegment(file.name)) return { ok: false, name: file.name, reason: 'hidden' };
     const ext = _ctxExtOf(file.name);
-    if (!CTX_ALLOWED_EXTS.includes(ext)) return { ok: false, name: file.name, reason: 'ext' };
+    if (_ctxHasHiddenPathSegment(file.name)) {
+      return { ok: false, name: file.name, reason: 'hidden' };
+    }
+    if (!CTX_ALLOWED_EXTS.includes(ext)) {
+      return { ok: false, name: file.name, reason: 'ext' };
+    }
     try {
       const target = targetDir ? `${targetDir}/${file.name}` : file.name;
       _kbStatusByPath[target] = { status: 'pending' };
@@ -1586,9 +1561,22 @@ async function handleCtxUpload(fileList, targetDir = '') {
   }
 
   const rejected = results.filter((r) => !r.ok);
-  for (const r of rejected) {
-    const errorCode = _ctxUploadErrorCode(r.code || r.reason);
-    _contextsLog.warn(`upload failed: ${errorCode}`);
+  const errorCodes = Array.from(new Set(rejected.map((r) => _ctxUploadErrorCode(r.code || r.reason))));
+  const errorCode = errorCodes.length === 1 ? errorCodes[0] : errorCodes.length > 1 ? 'multiple' : '';
+  const result = rejected.length === 0 ? 'success' : rejected.length < results.length ? 'partial_failure' : 'failure';
+  if (rejected.length) {
+    _contextsLog.warn('upload batch completed with failures', {
+      file_count: results.length,
+      failed_count: rejected.length,
+      error_codes: errorCodes,
+    });
+    _ctxLogUploadFailure({
+      source_type: 'dom',
+      file_count: results.length,
+      failed_count: rejected.length,
+      error_code: errorCode,
+      error_type: _ctxFailureType(errorCode || 'upload_failed'),
+    });
   }
   if (results.some((row) => row && row.ok)) {
     try { await loadContexts(); }
@@ -1638,7 +1626,13 @@ async function handleCtxNativeUpload(targetDir = '') {
   try {
     data = await window.orkas.invoke('contexts.pickAndUpload', { targetDir });
   } catch (err) {
-    _contextsLog.warn('native upload failed', err);
+    _ctxLogUploadFailure({
+      source_type: 'native',
+      file_count: 0,
+      failed_count: 1,
+      error_code: 'picker_failed',
+      error_type: _ctxFailureType('picker_failed'),
+    });
     await uiAlert(t('contexts.upload_picker_failed'));
     return;
   } finally {
@@ -1646,7 +1640,10 @@ async function handleCtxNativeUpload(targetDir = '') {
   }
   if (!data?.ok) {
     const errorCode = _ctxUploadErrorCode(data && (data.code || data.error));
-    _contextsLog.warn('native upload rejected', {
+    _ctxLogUploadFailure({
+      source_type: 'native',
+      file_count: 0,
+      failed_count: 1,
       error_code: errorCode,
       error_type: _ctxFailureType(errorCode),
     });
@@ -1658,9 +1655,28 @@ async function handleCtxNativeUpload(targetDir = '') {
   }
   const files = Array.isArray(data && data.files) ? data.files : [];
   if (!files.length) {
-    _contextsLog.warn('native upload returned no files');
+    const errorCode = 'picker_failed';
+    _ctxLogUploadFailure({
+      source_type: 'native',
+      file_count: 0,
+      failed_count: 1,
+      error_code: errorCode,
+      error_type: _ctxFailureType(errorCode),
+    });
     await uiAlert(t('contexts.upload_picker_failed'));
     return;
+  }
+  const failedRows = files.filter((r) => !r || r.ok === false);
+  const nativeErrorCodes = Array.from(new Set(failedRows.map((r) => _ctxUploadErrorCode(r && (r.code || r.reason || r.error)))));
+  const nativeErrorCode = nativeErrorCodes.length === 1 ? nativeErrorCodes[0] : nativeErrorCodes.length > 1 ? 'multiple' : '';
+  if (failedRows.length) {
+    _ctxLogUploadFailure({
+      source_type: 'native',
+      file_count: files.length,
+      failed_count: failedRows.length,
+      error_code: nativeErrorCode,
+      error_type: _ctxFailureType(nativeErrorCode || 'upload_failed'),
+    });
   }
   if (files.some((row) => row && row.ok)) {
     try { await loadContexts(); }

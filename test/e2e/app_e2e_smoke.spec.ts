@@ -69,17 +69,17 @@ test.describe('desktop shell', () => {
     // user from the workspace registry while still proving that first-window
     // publication completed before the renderer became ready.
     const usersRegistry = JSON.parse(readFileSync(
-      path.join(orkas.workspaceRoot, 'users.json'),
+      path.join(orkas.workspaceRoot, 'open-users.json'),
       'utf8',
-    )) as { current_user_id?: string };
-    expect(usersRegistry.current_user_id).toEqual(expect.any(String));
+    )) as { open_current_user_id?: string };
+    expect(usersRegistry.open_current_user_id).toEqual(expect.any(String));
     expect(existsSync(path.join(
       orkas.workspaceRoot,
-      usersRegistry.current_user_id!,
+      usersRegistry.open_current_user_id!,
       'local',
       'system',
       'skills',
-      'project-tasks',
+      'agent-creator',
       'SKILL.md',
     ))).toBe(true);
     const model = await orkas.invoke<{ configured: boolean }>('auth.hasConfiguredModel');
@@ -132,16 +132,6 @@ test.describe('desktop shell', () => {
       maxDiffPixelRatio: 0.01,
     });
 
-    await appPage.locator('#auto-btn').click();
-    await appPage.locator('#auto-add-btn').click();
-    await expect(appPage.locator('.auto-task-dialog')).toHaveScreenshot('automation-create-dialog.png', {
-      animations: 'disabled',
-      caret: 'hide',
-      scale: 'css',
-      maxDiffPixelRatio: 0.01,
-    });
-    await appPage.locator('#auto-dialog-cancel-btn').click();
-
     await appPage.locator('#agents-btn').click();
     const agentCard = appPage.locator('.agent-card', { hasText: 'E2EVisualAgent' });
     await expect(agentCard).toBeVisible();
@@ -153,6 +143,38 @@ test.describe('desktop shell', () => {
       scale: 'css',
       maxDiffPixelRatio: 0.01,
     });
+  });
+
+  test('keeps the automation create dialog visually stable', async ({ appPage }) => {
+    await appPage.locator('#auto-btn').click();
+    await appPage.locator('#auto-add-btn').click();
+    await expect(appPage.locator('.auto-task-dialog')).toHaveScreenshot('automation-create-dialog.png', {
+      animations: 'disabled',
+      caret: 'hide',
+      scale: 'css',
+      maxDiffPixelRatio: 0.01,
+    });
+
+    await expect(appPage.locator('input[type="date"]')).toHaveCount(0);
+    await appPage.locator('#auto-freq-select .ai-select-trigger').click();
+    await appPage.locator('body > .ai-select-popover .ai-select-item[data-value="one_time"]').click();
+    await appPage.locator('#auto-date-input').fill('2099-08-29');
+    await appPage.locator('#auto-date-input').press('Escape');
+    await appPage.locator('#auto-date-picker .auto-date-picker-toggle').click();
+    const calendar = appPage.locator('body > #auto-date-picker-popover');
+    await expect(calendar).toBeVisible();
+    await expect(calendar.locator('.auto-date-picker-day')).toHaveCount(42);
+    await expect(calendar).toHaveScreenshot('automation-date-picker.png', {
+      animations: 'disabled',
+      caret: 'hide',
+      scale: 'css',
+      maxDiffPixelRatio: 0.01,
+    });
+
+    await appPage.keyboard.press('ArrowRight');
+    await appPage.keyboard.press('Enter');
+    await expect(calendar).toBeHidden();
+    await expect(appPage.locator('#auto-date-input')).toHaveValue('2099-08-30');
   });
 
   test('navigates every primary sidebar view and settings tab', async ({ appPage }) => {

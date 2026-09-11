@@ -126,8 +126,7 @@ test.describe('CLI Agent runtime settings', () => {
     if (!await processRail.evaluate((element: HTMLDetailsElement) => element.open)) {
       await processRail.locator('.stream-process-summary').click();
     }
-    await expect(processRail.locator('.stream-process-line', { hasText: 'Handle task' }))
-      .toHaveCount(1);
+    await processRail.locator('.stream-process-compact-summary').click();
     const commandRow = processRail.locator(
       '.stream-process-line[data-process-call-id="cli:e2e-result-command"]',
     );
@@ -165,13 +164,14 @@ test.describe('CLI Agent runtime settings', () => {
       .getAttribute('data-cid');
     expect(conversationId).toBeTruthy();
     const relaunchedPage = await cliOrkas.relaunch();
-    await relaunchedPage.locator(`.conv-item[data-cid="${conversationId}"]`).click();
+    await relaunchedPage.locator(`#conversation-list .conv-item[data-cid="${conversationId}"]`).click();
     const restoredReply = relaunchedPage.locator('#chat-history .chat-message.assistant', {
       hasText: 'E2E_CLI_DEFAULT_OK',
     });
     const restoredRail = restoredReply.locator('.stream-process');
     await expect(restoredRail).toBeVisible();
     await restoredRail.locator('.stream-process-summary').click();
+    await restoredRail.locator('.stream-process-compact-summary').click();
     const restoredCommand = restoredRail.locator(
       '.stream-process-line[data-process-call-id="cli:e2e-result-command"]',
     );
@@ -454,7 +454,7 @@ test.describe('CLI failed-turn recovery', () => {
     expect(persisted.sourceMessageId).toBeTruthy();
 
     const relaunchedPage = await cliOrkas.relaunch();
-    const conversation = relaunchedPage.locator(`.conv-item[data-cid="${conversationId}"]`);
+    const conversation = relaunchedPage.locator(`#conversation-list .conv-item[data-cid="${conversationId}"]`);
     await expect(conversation).toBeVisible();
     await conversation.click();
     const retry = relaunchedPage.locator('#chat-history .bubble-retry-btn').last();
@@ -650,20 +650,25 @@ test.describe('CLI failed-turn recovery', () => {
     expect(codexRuns[1].prompt).not.toContain('E2E_CODEX_DEFAULT_OK');
   });
 
-  test('sends a queued update into the active Codex App Server turn without starting another CLI run', async ({ cliOrkas }) => {
+  test('steers a composer update into the active Codex App Server turn without starting another CLI run', async ({ cliOrkas }) => {
+    // Queue absorption retired the local queue rows and their per-row "Send
+    // now": steering the live turn is the composer steer button, visible only
+    // while the composer's single target has a steerable running turn.
     const agentName = 'CodexSendNowE2E';
     const { page } = await createCliAgent(cliOrkas, agentName, 'codex');
     await sendNewChat(page, `@${agentName} E2E_CODEX_SEND_NOW_ACTIVE`);
     await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
 
-    await sendFollowUp(page, `@${agentName} E2E_CODEX_SEND_NOW_UPDATE`);
-    const queuedRow = page.locator('#chat-queue-list .chat-queue-item', {
+    const input = page.locator('#chat-input');
+    await input.fill('E2E_CODEX_SEND_NOW_UPDATE');
+    await input.press('Enter');
+    // The busy send parks as a queued board row; its Send now action folds
+    // it into the live Codex App Server turn (composer shortcut removed).
+    const queuedRow = page.locator('#chat-task-board-list .chat-queue-item', {
       hasText: 'E2E_CODEX_SEND_NOW_UPDATE',
     });
-    await expect(queuedRow).toBeVisible();
-    const sendNow = queuedRow.locator('[data-act="send"]');
-    await expect(sendNow).toBeVisible();
-    await sendNow.click();
+    await expect(queuedRow.locator('[data-act="task-send-now"]')).toBeVisible({ timeout: 10_000 });
+    await queuedRow.locator('[data-act="task-send-now"]').click();
 
     await expect(page.locator('#chat-history .chat-message.user', {
       hasText: 'E2E_CODEX_SEND_NOW_UPDATE',
@@ -671,7 +676,6 @@ test.describe('CLI failed-turn recovery', () => {
     await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
       hasText: 'E2E_CODEX_STEER_APPLIED',
     })).toBeVisible({ timeout: 30_000 });
-    await expect(page.locator('#chat-queue')).toBeHidden();
 
     const state = cliOrkas.readCliState();
     const codexRuns = state.invocations.filter((item) => item.cli === 'codex');
@@ -680,25 +684,30 @@ test.describe('CLI failed-turn recovery', () => {
     expect(codexRuns[0].steers?.[0].text).toContain('E2E_CODEX_SEND_NOW_UPDATE');
   });
 
-  test('hides active-turn Send for an unsupported one-shot CLI and executes the queue head as the next native turn', async ({ cliOrkas }) => {
+  test('offers no steer for an unsupported one-shot CLI and runs the busy send as the next native turn', async ({ cliOrkas }) => {
+    // OpenCode's one-shot adapter has no active-turn ingress: the steer
+    // button must never appear, and a message sent while the turn runs goes
+    // to the backend board, waiting for the same-agent serial rule to admit
+    // it as the next native turn.
     const agentName = 'OpenCodeSendNowE2E';
     const { page } = await createCliAgent(cliOrkas, agentName, 'opencode');
     await sendNewChat(page, `@${agentName} E2E_CLI_SEND_NOW_ACTIVE`);
     await expect.poll(() => cliOrkas.readCliState().invocations.length).toBe(1);
     await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
 
-    await sendFollowUp(page, `@${agentName} E2E_CLI_SEND_NOW_FOLLOWUP`);
-    const queuedRow = page.locator('#chat-queue-list .chat-queue-item', {
-      hasText: 'E2E_CLI_SEND_NOW_FOLLOWUP',
-    });
-    await expect(queuedRow).toBeVisible();
-    await expect(queuedRow.locator('[data-act="send"]')).toHaveCount(0);
-    await expect(queuedRow.locator('[data-act="edit"]')).toBeVisible();
-    await expect(page.locator('#chat-queue')).toBeVisible();
-    await expect(page.locator('#chat-history .chat-message.user')).toHaveCount(1);
+    const input = page.locator('#chat-input');
+    await input.fill('E2E_CLI_SEND_NOW_FOLLOWUP');
+    await input.press('Enter');
+
+    // The busy send parks as a queued board task behind the running one; its
+    // bubble waits for execution (queued-until-execution, 2026-08-27), and a
+    // one-shot CLI has no live-turn ingress so the row offers no Send now.
+    await expect(page.locator('#chat-task-board-list .chat-queue-item')).toHaveCount(2);
+    await expect(page.locator('#chat-task-board-list [data-act="task-send-now"]')).toHaveCount(0);
+    const users = page.locator('#chat-history .chat-message.user');
+    await expect(users).toHaveCount(1);
     await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
-    // OpenCode's current one-shot adapter has no active-turn ingress, so the
-    // queued message remains local and no second child starts before exit.
+    // Same-agent serial: no second CLI child starts while the first runs.
     expect(cliOrkas.readCliState().invocations).toHaveLength(1);
 
     await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
@@ -707,8 +716,7 @@ test.describe('CLI failed-turn recovery', () => {
     await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
       hasText: 'E2E_CLI_SEND_NOW_FOLLOWUP_OK',
     })).toBeVisible({ timeout: 30_000 });
-    await expect(page.locator('#chat-queue')).toBeHidden();
-    const users = page.locator('#chat-history .chat-message.user');
+
     await expect(users).toHaveCount(2);
     await expect(users.nth(1)).toContainText('E2E_CLI_SEND_NOW_FOLLOWUP');
 

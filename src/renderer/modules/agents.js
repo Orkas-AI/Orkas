@@ -93,6 +93,11 @@ function _isExternalCliAgent(agent) {
   return !!(agent && agent.runtime && agent.runtime.kind === 'cli');
 }
 
+function _agentSupportsMemory(agent) {
+  if (!_isExternalCliAgent(agent)) return true;
+  return agent.runtime.cli === 'claude' || agent.runtime.cli === 'codex';
+}
+
 function _agentCardMetaHtml(a, lang) {
   if (_isCommanderAgent(a)) {
     return '';
@@ -279,6 +284,7 @@ function _agentWorkflowSteps(agent) {
 }
 
 function _agentMemoryEntries(agent) {
+  if (!_agentSupportsMemory(agent)) return [];
   return _agentProfileEntries(_agentProfile(agent).memory);
 }
 
@@ -437,7 +443,7 @@ function _agentDetailStats(agent) {
       kind: 'duration',
     },
   ];
-  if (!_isExternalCliAgent(agent)) {
+  if (_agentSupportsMemory(agent)) {
     const memory = _agentMemoryEntries(agent);
     stats.push({
       key: _agentLabel('agents.stat_memory_label', '记忆', 'Memory', '記憶'),
@@ -564,7 +570,9 @@ async function loadAgents(forceRefresh, opts = {}) {
         });
         _agentsCache = sortedAgents;
         _agentsCacheIsSummary = summary;
-        if (typeof _syncComposerModelChipAvailability === 'function') {
+        if (typeof _renderRecipientChip === 'function') {
+          _renderRecipientChip();
+        } else if (typeof _syncComposerModelChipAvailability === 'function') {
           _syncComposerModelChipAvailability();
         }
         // Boot order is loadConversations → loadAgents; re-render the sidebar
@@ -757,7 +765,7 @@ function renderAgentsGrid(agents) {
     const isCommander = _isCommanderAgent(a);
     const desc = _agentSummary(a, lang);
     const metaHtml = _agentCardMetaHtml(a, lang);
-    const memoryEntries = _isExternalCliAgent(a) ? [] : _agentMemoryEntries(a);
+    const memoryEntries = _agentMemoryEntries(a);
     const memoryCount = memoryEntries.length;
     const skillCount = Array.isArray(a.skill_list) ? a.skill_list.length : 0;
     const deliveryCount = _agentDeliveryCount(a);
@@ -1437,7 +1445,7 @@ function _canEditAgentMemory(agent) {
   const source = _agentSource(agent && agent.source);
   return !!agent
     && !_isAgentProfileMock(agent)
-    && !_isExternalCliAgent(agent)
+    && _agentSupportsMemory(agent)
     && (_isCommanderAgent(agent) || source === 'custom' || _isAgentPlatformSource(source));
 }
 
@@ -1617,12 +1625,6 @@ function _renderAgentDetailMemory(agent, editing = false) {
   const section = document.getElementById('agents-detail-memory-section');
   const host = document.getElementById('agents-detail-memory');
   if (!section || !host) return;
-  if (_isExternalCliAgent(agent)) {
-    section.style.display = 'none';
-    host.innerHTML = '';
-    section.querySelector('[data-agent-memory-add]')?.remove();
-    return;
-  }
   const memoryTags = _agentMemoryEntries(agent)
     .map((entry) => entry.title || entry.description)
     .filter(Boolean)
@@ -2186,8 +2188,9 @@ function _loadAgentCliRuntimeOptions(agent, { force = false } = {}) {
   return request;
 }
 
-/** Model/thinking controls for the selected external CLI. Values are saved as
- * per-Agent runtime overrides; an empty value keeps the CLI/account default. */
+/** Model/thinking/permission controls for the selected external CLI. Values
+ * are saved as per-Agent runtime overrides; an empty value keeps the CLI's
+ * native default. */
 async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly = false } = {}) {
   const section = document.getElementById('agents-detail-cli-settings-section');
   const slot = document.getElementById('agents-detail-cli-settings');
@@ -2240,6 +2243,7 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
   const runtime = agent.runtime || { kind: 'cli', cli: '' };
   const currentModel = String(runtime.model_override || '');
   const currentThinking = String(runtime.thinking_level || '');
+  const currentPermission = String(runtime.permission_policy || '');
   const models = Array.isArray(info.models) ? info.models : [];
   const observedModel = info.last_resolved_model && typeof info.last_resolved_model === 'object'
     ? info.last_resolved_model
@@ -2361,7 +2365,24 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
   const selectedThinkingValue = !currentThinking || currentThinking === defaultThinking
     ? ''
     : currentThinking;
-
+  const advertisedPermissionPolicies = Array.isArray(info.permission_policies)
+    ? info.permission_policies.map(value => String(value || '')).filter(Boolean)
+    : ['inherit'];
+  const permissionOptions = advertisedPermissionPolicies.map((policy) => ({
+    value: policy === 'inherit' ? '' : policy,
+    label: t(`agents.cli_permission_${policy}`),
+  }));
+  if (!permissionOptions.some(option => option.value === '')) {
+    permissionOptions.unshift({ value: '', label: t('agents.cli_permission_inherit') });
+  }
+  if (currentPermission && !permissionOptions.some(option => option.value === currentPermission)) {
+    permissionOptions.push({ value: currentPermission, label: currentPermission });
+  }
+  if (info.can_select_permission === false && !currentPermission) {
+    permissionOptions.length = 0;
+    permissionOptions.push({ value: '', label: t('agents.cli_permission_managed') });
+  }
+  const hidePermissionControl = String(info.fixed_permission_policy || '') === 'full_access';
   const statusNote = info.status === 'ready'
     ? ''
     : `<div class="agents-detail-cli-note is-warning">${escapeHtml(
@@ -2389,6 +2410,10 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
         <div class="agents-detail-cli-field-label">${escapeHtml(t('agents.cli_thinking'))}</div>
         <div class="ai-select agents-detail-cli-select" data-role="thinking"></div>
       </div>
+      ${hidePermissionControl ? '' : `<div class="agents-detail-cli-field">
+        <div class="agents-detail-cli-field-label">${escapeHtml(t('agents.cli_permission'))}</div>
+        <div class="ai-select agents-detail-cli-select" data-role="permission"></div>
+      </div>`}
     </div>
     ${observedModelNote}
     ${statusNote}`;
@@ -2408,6 +2433,7 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
       const nextRuntime = { ...runtime, ...patch };
       if (!nextRuntime.model_override) delete nextRuntime.model_override;
       if (!nextRuntime.thinking_level) delete nextRuntime.thinking_level;
+      if (!nextRuntime.permission_policy) delete nextRuntime.permission_policy;
       const saved = await window.orkas.invoke('agents.update', {
         agent_id: agent.agent_id,
         updates: { runtime: nextRuntime },
@@ -2490,6 +2516,33 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
     thinkingMount,
     !canEdit || ((!info.can_select_thinking || thinkingUnsupported) && !currentThinking),
   );
+
+  if (!hidePermissionControl) {
+    const permissionMount = slot.querySelector('[data-role="permission"]');
+    let permissionApi;
+    permissionApi = _aiSelectMount(permissionMount, {
+      options: permissionOptions,
+      value: currentPermission,
+      onChange: async (value) => {
+        const next = String(value || '');
+        if (next === 'full_access') {
+          const confirmed = await uiConfirm(t('agents.cli_permission_full_access_warning'));
+          if (!confirmed) {
+            permissionApi.setValue(currentPermission);
+            return;
+          }
+        }
+        try {
+          await saveRuntime({ permission_policy: next });
+        } catch (err) {
+          permissionApi.setValue(currentPermission);
+          await uiAlert((err && err.message) || t('agents.update_failed'));
+        }
+      },
+    });
+    disableSelect(permissionMount, !canEdit || (info.can_select_permission === false && !currentPermission));
+  }
+
 }
 
 /** Project directory setting for external coding agents.
@@ -4074,6 +4127,7 @@ function _renderAgentPickerList(filterText) {
     _agentPickerTab = 'agents';
   }
   _updateAgentPickerChrome();
+  _refreshAgentPickerSelection();
   if (_agentPickerTab === 'skills') {
     if (typeof loadSkills !== 'function') {
       listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(t('common.loading'))}</div>`;
@@ -4421,7 +4475,8 @@ function _bindAgentPickerListItems(listEl, anchorId) {
     el.addEventListener('click', async () => {
       const sourceType = el.dataset.pickerSourceType === 'keyboard' ? 'keyboard' : 'mouse';
       delete el.dataset.pickerSourceType;
-      _closeAgentPicker({ preserveAtKey: true });
+      const multi = _isMultiRecipientPicker(anchorId) && (el.dataset.kind || 'agent') === 'agent' && !_atKeyMark;
+      if (!multi) _closeAgentPicker({ preserveAtKey: true });
       await _triggerPickerItem(
         el.dataset.kind || 'agent',
         el.dataset.id,
@@ -4430,6 +4485,9 @@ function _bindAgentPickerListItems(listEl, anchorId) {
         el.dataset,
         sourceType,
       );
+      if (multi) {
+        _refreshAgentPickerSelection();
+      }
     });
     el.addEventListener('mouseenter', () => {
       const all = listEl.querySelectorAll('.skill-picker-item[data-id]');
@@ -4438,6 +4496,112 @@ function _bindAgentPickerListItems(listEl, anchorId) {
     });
   }
   _setAgentPickerActive(0);
+  _refreshAgentPickerSelection();
+}
+
+function _isMultiRecipientPicker(anchorId) {
+  return ['chat-recipient-chip', 'new-chat-recipient-chip', 'project-chat-recipient-chip'].includes(anchorId);
+}
+
+function _renderAgentPickerSelectionHeader(picker, selected) {
+  const header = document.getElementById('agent-picker-selected');
+  if (!header) return;
+  const entries = selected.map((recipient) => ({
+    id: recipient.kind === 'commander' ? '__commander__' : recipient.id,
+    name: recipient.kind === 'commander' ? t('chat.recipient_commander') : recipient.name || recipient.id,
+  }));
+  const signature = JSON.stringify([picker.dataset.anchorId, t('common.remove'), entries]);
+  if (header.dataset.selection === signature) return;
+  const focusedIndex = Array.from(header.children).indexOf(document.activeElement);
+  header.dataset.selection = signature;
+  header.hidden = !entries.length;
+  header.replaceChildren();
+  entries.forEach(({ id, name }) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'chat-recipient-chip recipient-picker-selected-chip';
+    button.dataset.recipientId = id;
+    button.title = `${t('common.remove')}: ${name}`;
+    button.setAttribute('aria-label', button.title);
+    button.innerHTML = `<span class="chat-recipient-name">${escapeHtml(name)}</span>`
+      + (typeof window.uiIconHtml === 'function' ? window.uiIconHtml('x', 'recipient-picker-remove-icon') : '×');
+    button.addEventListener('click', async (event) => {
+      // Updating the draft can replace this button before the document's
+      // outside-click listener runs. Keep that removal inside the picker.
+      event.stopPropagation();
+      // A header removal cancels autocomplete before toggling the recipient;
+      // otherwise the pending @ would insert the name we are removing.
+      _consumeAtKeyChar();
+      await _triggerPickerItem('agent', id, name, picker.dataset.anchorId, {}, event.detail === 0 ? 'keyboard' : 'mouse');
+      _refreshAgentPickerSelection();
+    });
+    button.addEventListener('keydown', (event) => {
+      if (event.isComposing || event.keyCode === 229 || event.key !== 'Escape') return;
+      event.preventDefault();
+      _closeAgentPicker();
+      _focusInput(_composerRecipientInput(_targetFromPickerAnchor(picker.dataset.anchorId)));
+    });
+    header.appendChild(button);
+  });
+  if (focusedIndex >= 0) {
+    (header.children[Math.min(focusedIndex, header.children.length - 1)]
+      || document.getElementById('agent-picker-search'))?.focus();
+  }
+  const anchor = document.getElementById(picker.dataset.anchorId);
+  if (anchor && picker.style.display !== 'none') _positionPopoverAboveOrBelow(picker, anchor);
+}
+
+function _refreshAgentPickerSelection() {
+  const picker = document.getElementById('agent-picker');
+  const list = document.getElementById('agent-picker-list');
+  if (!picker || !list) return;
+  const multi = _agentPickerTab === 'agents' && _isMultiRecipientPicker(picker.dataset.anchorId);
+  const selected = multi && typeof _composerSelectedRecipients === 'function'
+    ? _composerSelectedRecipients(_targetFromPickerAnchor(picker.dataset.anchorId)) : [];
+  _renderAgentPickerSelectionHeader(picker, selected);
+  list.querySelectorAll('.skill-picker-item[data-id]').forEach((el) => {
+    if (!multi) return;
+    const checked = selected.some((r) => r.kind === 'commander'
+      ? el.dataset.id === '__commander__' : el.dataset.id === r.id);
+    el.setAttribute('role', 'checkbox');
+    el.setAttribute('aria-checked', String(checked));
+    el.setAttribute('tabindex', '0');
+    el.classList.add('recipient-picker-option');
+    const oldCheck = el.querySelector('.recipient-picker-check');
+    if (checked && !oldCheck) {
+      const check = document.createElement('span');
+      check.className = 'composer-model-menu-check recipient-picker-check';
+      check.setAttribute('aria-hidden', 'true');
+      check.innerHTML = typeof window.uiIconHtml === 'function' ? window.uiIconHtml('check', 'ui-icon') : '✓';
+      el.appendChild(check);
+    } else if (!checked && oldCheck) oldCheck.remove();
+    if (!el.dataset.recipientKeyboardWired) {
+      el.dataset.recipientKeyboardWired = '1';
+      el.addEventListener('keydown', (event) => {
+        if (event.isComposing || event.keyCode === 229) return;
+        if (event.key === ' ') {
+          event.preventDefault();
+          el.dataset.pickerSourceType = 'keyboard';
+          el.click();
+        }
+        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+          event.preventDefault();
+          _moveAgentPickerActive(event.key === 'ArrowDown' ? 1 : -1);
+          list.querySelector('.skill-picker-item.active')?.focus();
+        }
+        if (event.key === 'Enter' || event.key === 'Escape') {
+          event.preventDefault();
+          if (event.key === 'Enter' && _atKeyMark) {
+            el.dataset.pickerSourceType = 'keyboard';
+            el.click();
+            return;
+          }
+          _closeAgentPicker();
+          _focusInput(_composerRecipientInput(_targetFromPickerAnchor(picker.dataset.anchorId)));
+        }
+      });
+    }
+  });
 }
 
 // ── Agent picker keyboard navigation ─────────────────────────────────────
@@ -4613,23 +4777,15 @@ async function _triggerAgent(agentId, agentName, anchorId) {
     || anchorId === 'project-chat-recipient-chip';
   if (isRecipientAnchor) {
     const target = _targetFromPickerAnchor(anchorId);
-    const resourceAgentId = agentId === '__commander__' ? _COMMANDER_AGENT_ID : String(agentId || '');
-    _agentsTrackClick('chat_agent_select', {
-      target,
-      recipient_type: agentId === '__commander__' ? 'commander' : 'agent',
-      agent_id: agentId === '__commander__' ? '' : String(agentId || ''),
-    });
-    if (agentId === '__commander__') {
-      setChatRecipient(target, { kind: 'commander' });
-    } else {
-      setChatRecipient(target, { kind: 'agent', id: agentId, name: agentName || agentId });
+    // Autocomplete and panel selections insert at the caret and edit the same
+    // visible recipient markers. Dispatch segmentation stays text-owned.
+    if (_atKeyMark) {
+      _insertInlineMention(agentId === '__commander__' ? 'commander' : (agentName || agentId));
+      return;
     }
-    // If the picker was opened by the user typing `@` in the textarea, that
-    // `@` is now redundant (the chip carries the recipient) and would also
-    // leak into the sent text — strip it.
-    _consumeAtKeyChar();
-    const inputId = target === 'new-chat' ? 'new-chat-input' : (target === 'project' ? 'project-chat-input' : 'chat-input');
-    _focusInput(document.getElementById(inputId));
+    _toggleComposerRecipient(target, agentId === '__commander__'
+      ? { kind: 'commander', id: '', name: '' }
+      : { kind: 'agent', id: agentId, name: agentName || agentId });
     return;
   }
   // Sidebar / agent-detail "use" button → spin up a fresh conversation
@@ -4639,6 +4795,27 @@ async function _triggerAgent(agentId, agentName, anchorId) {
 // `@`-keystroke bookkeeping so a successful picker selection can remove the
 // `@` the user just typed. Cleared on every open; consumed on selection.
 let _atKeyMark = null; // { inputId, posAfter } | null
+
+// D9 inline mention: complete the `@` the user just typed with the picked
+// display name plus a trailing space, cursor after it. The `@` stays in the
+// text (it IS the dispatch marker); the rich composer turns it into the same
+// atomic chip used for Skills and Connectors through the normal input event.
+function _insertInlineMention(name) {
+  const m = _atKeyMark;
+  _atKeyMark = null;
+  if (!m || !name) return;
+  const ta = document.getElementById(m.inputId);
+  if (!ta) return;
+  const atIdx = m.posAfter - 1;
+  if (atIdx < 0 || ta.value.charAt(atIdx) !== '@') return;
+  const insert = `${name} `;
+  ta.value = ta.value.slice(0, m.posAfter) + insert + ta.value.slice(m.posAfter);
+  const caret = m.posAfter + insert.length;
+  try { ta.setSelectionRange(caret, caret); } catch (_) {}
+  if (typeof autoGrow === 'function') autoGrow(ta, 200);
+  ta.dispatchEvent(new Event('input', { bubbles: true }));
+  _focusInput(ta);
+}
 
 function _consumeAtKeyChar() {
   const m = _atKeyMark;
@@ -4676,13 +4853,6 @@ const _RECIPIENT_ANCHOR_PAIRS = [
   { chip: 'project-chat-recipient-chip', input: 'project-chat-input' },
 ];
 
-// Backspace right after a `@<name>` token (with or without the trailing
-// space the picker inserts) removes the whole mention as one unit —
-// character-by-character deletion of `@<CJK-name> ` is annoying when the
-// user picked the wrong agent. Matches the bus mention regex's charset so
-// CJK names work.
-const _MENTION_DELETE_RE = /@[A-Za-z0-9_一-鿿-]+ ?$/u;
-
 function _recipientTextareaFromEventTarget(target) {
   if (!target) return null;
   const inputId = target.dataset?.richInputId || target.id || '';
@@ -4691,25 +4861,6 @@ function _recipientTextareaFromEventTarget(target) {
     if (input) return input;
   }
   return target;
-}
-
-function _onMentionBackspace(e) {
-  if (e.key !== 'Backspace') return;
-  if (e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return;
-  const ta = _recipientTextareaFromEventTarget(e.currentTarget);
-  if (!ta || typeof ta.selectionStart !== 'number') return;
-  if (ta.selectionStart !== ta.selectionEnd) return; // user has a selection — let default handle
-  const caret = ta.selectionStart;
-  if (caret === 0) return;
-  const left = ta.value.slice(0, caret);
-  const m = _MENTION_DELETE_RE.exec(left);
-  if (!m) return;
-  const start = caret - m[0].length;
-  e.preventDefault();
-  ta.value = ta.value.slice(0, start) + ta.value.slice(caret);
-  try { ta.setSelectionRange(start, start); } catch (_) {}
-  if (typeof autoGrow === 'function') autoGrow(ta, 200);
-  ta.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
 function _atKeyOpener(chipId) {
@@ -4732,8 +4883,8 @@ function _atKeyOpener(chipId) {
   };
 }
 
-// Wire (chip → click opens picker) + (textarea → `@` opens picker,
-// Backspace deletes whole mention). Guarded with dataset flags so calling
+// Wire (chip → click opens picker) + (textarea → `@` opens picker).
+// Chip navigation/deletion is shared with Skills and Connectors. Guarded so calling
 // this twice for the same anchor is a no-op. Called at boot for the three
 // sticky composers AND on demand by `modules/auto.js` when its modal
 // mounts (registers the 4th `'auto-recipient-chip'` anchor).
@@ -4759,7 +4910,6 @@ function bindRecipientAnchor(chipId, inputId) {
     if (!el || el.dataset.atBound === '1') return;
     el.dataset.atBound = '1';
     el.addEventListener('keydown', _atKeyOpener(chipId));
-    el.addEventListener('keydown', _onMentionBackspace);
   };
   bindInput(ta);
   if (typeof getChatRichComposerEditor === 'function') {
@@ -4805,9 +4955,20 @@ function bindAgentPickers() {
     }
     if (e.key === 'ArrowRight') { _moveAgentPickerTab(1); e.preventDefault(); return; }
     if (e.key === 'ArrowLeft')  { _moveAgentPickerTab(-1); e.preventDefault(); return; }
-    if (e.key === 'ArrowDown') { _moveAgentPickerActive(1); e.preventDefault(); return; }
-    if (e.key === 'ArrowUp')   { _moveAgentPickerActive(-1); e.preventDefault(); return; }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      _moveAgentPickerActive(e.key === 'ArrowDown' ? 1 : -1);
+      if (!_atKeyMark) document.querySelector('#agent-picker-list .recipient-picker-option.active')?.focus();
+      e.preventDefault();
+      return;
+    }
     if (e.key === 'Enter') {
+      const picker = document.getElementById('agent-picker');
+      if (_agentPickerTab === 'agents' && _isMultiRecipientPicker(picker?.dataset.anchorId) && !_atKeyMark) {
+        e.preventDefault();
+        _closeAgentPicker();
+        _focusInput(_composerRecipientInput(_targetFromPickerAnchor(picker.dataset.anchorId)));
+        return;
+      }
       const listEl = document.getElementById('agent-picker-list');
       const active = listEl?.querySelector('.skill-picker-item.active[data-id]')
         || listEl?.querySelector('.skill-picker-item[data-id]');

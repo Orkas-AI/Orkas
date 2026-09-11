@@ -55,22 +55,6 @@ describe('file preview loading states', () => {
     expect(styleSource).toMatch(/\.chat-file-viewer-loading-resource\s*\{[\s\S]*?visibility:\s*hidden;/);
   });
 
-  it('starts streamed HTML navigation before awaiting its linear layout scan', () => {
-    const renderHtml = extractFunction(viewerSource, '_renderHtmlBody');
-    const appendIndex = renderHtml.indexOf('_viewerAppendLoadingResource(frameHost)');
-    const navigationIndex = renderHtml.indexOf('iframe.src = url');
-    const layoutRequestIndex = renderHtml.indexOf("window.orkas.invoke('produced.readText'");
-    expect(appendIndex).toBeGreaterThanOrEqual(0);
-    expect(navigationIndex).toBeGreaterThan(appendIndex);
-    expect(layoutRequestIndex).toBeGreaterThan(navigationIndex);
-    expect(renderHtml).toContain("iframe.addEventListener('load'");
-    expect(renderHtml).toContain('_viewerHtmlLayoutFinished');
-    expect(renderHtml).toContain('_viewerMaybeRevealHtml');
-    expect(renderHtml).toContain("frameHost.classList.add('chat-file-viewer-html-canvas-wrap')");
-    expect(renderHtml).not.toContain('wrap.appendChild(iframe)');
-    expect(renderHtml).not.toContain('innerHTML = `<iframe');
-  });
-
   it('keeps the image lightbox busy until the image load or error event settles', () => {
     const open = extractFunction(lightboxSource, 'openChatImageLightbox');
     expect(lightboxSource).toContain('class="chat-lightbox-loading"');

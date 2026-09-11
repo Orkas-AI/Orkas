@@ -67,6 +67,29 @@ export class TimeoutError extends CoreAgentError {
   }
 }
 
+/** Code carried by `RetryExhaustedError`; also honored structurally (see
+ * `classifyRetryableErrorWithPolicy`) so the classification survives module
+ * duplication across the main-process / #core-agent import boundary, where
+ * `instanceof` can fail. */
+export const RETRY_EXHAUSTED_CODE = "RETRY_EXHAUSTED";
+
+/**
+ * A failure whose inner retry budget is already spent. Thrown by layers that
+ * sit BELOW the agent runner and run their own transient-failure retries —
+ * e.g. the rotating provider, which retries each credential candidate on
+ * network-class errors before rotating to the next one. Classified
+ * non-retryable: the transient window was fully probed where the failure
+ * happened, so an outer runner retry would only replay the whole rotation
+ * (candidates × per-candidate retries) as pure amplification with no new
+ * chance of success.
+ */
+export class RetryExhaustedError extends CoreAgentError {
+  constructor(message: string, cause?: Error) {
+    super(message, RETRY_EXHAUSTED_CODE, cause);
+    this.name = "RetryExhaustedError";
+  }
+}
+
 export function formatError(err: unknown): string {
   if (err instanceof Error) {
     return err.message;
@@ -467,6 +490,15 @@ export function classifyRetryableErrorWithPolicy(
   const policy = config ? compileRetryErrorPolicy(config) : activeRetryErrorPolicy;
   if (err == null) return null;
   if (err instanceof AuthError || err instanceof ContextOverflowError || err instanceof OutputLimitError || err instanceof StorageFullError) return null;
+
+  // Retry budget already spent below us (for example after provider rotation).
+  // Check the structural code as well as instanceof so duplicated module loads
+  // cannot silently re-enable the outer retry loop.
+  if (
+    err instanceof RetryExhaustedError
+    || errorCodeOf(err) === RETRY_EXHAUSTED_CODE
+    || errorCodeOf(err) === "PROVIDER_NETWORK_EXHAUSTED"
+  ) return null;
 
   // Provider safety decisions are never retryable. This is a hard product
   // invariant rather than a server-configurable policy entry: retrying or

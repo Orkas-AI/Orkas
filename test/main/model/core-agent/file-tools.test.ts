@@ -101,7 +101,11 @@ function attachmentDir(): string {
   return path.join(tmpDir, UID, 'cloud', 'chat_attachments', CID);
 }
 
-async function buildTools(options: { includeOcrFile?: boolean; visionFallbackAvailable?: boolean } = {}) {
+async function buildTools(options: {
+  includeOcrFile?: boolean;
+  visionFallbackAvailable?: boolean;
+  rawTextMaxBytes?: number;
+} = {}) {
   const mod = await import('../../../../src/main/model/core-agent/file-tools');
   const ws = await import('../../../../src/main/features/user_workspace');
   const wsDir = path.join(tmpDir, 'ws');
@@ -166,6 +170,125 @@ function getTool(tools: any[], name: string) {
   }
   throw new Error(`tool ${name} not found`);
 }
+
+describe('file-tools › run_program source loader', () => {
+  it('loads exact UTF-8 source through the ordinary workspace scope', async () => {
+    const perm = await import('../../../../src/main/features/permissions');
+    perm.setLocalExecMode('workspace_approval');
+    const { wsDir } = await buildTools();
+    const sourcePath = path.join(wsDir, 'consolidate-corrections.js');
+    const source = "const rows = [1, 2, 3]; json({ count: rows.length });\n";
+    fs.writeFileSync(sourcePath, source, 'utf8');
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    const loader = mod.createProgramSourceLoader({ userId: UID, cid: CID });
+
+    await expect(loader('consolidate-corrections.js', {
+      workingDir: wsDir,
+      state: {},
+    }, 64_000)).resolves.toEqual({
+      status: 'completed',
+      source,
+      resolvedPath: sourcePath,
+    });
+  });
+
+  it('rejects out-of-scope and symlink-escaped program sources', async () => {
+    const perm = await import('../../../../src/main/features/permissions');
+    perm.setLocalExecMode('workspace_approval');
+    const { wsDir } = await buildTools();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-program-source-outside-'));
+    const outside = path.join(outsideDir, 'secret.js');
+    fs.writeFileSync(outside, "text('secret');\n", 'utf8');
+    const link = path.join(wsDir, 'escape.js');
+    let symlinkCreated = true;
+    try { fs.symlinkSync(outside, link); }
+    catch { symlinkCreated = false; }
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    const loader = mod.createProgramSourceLoader({ userId: UID, cid: CID });
+    try {
+      const outsideResult = await loader(outside, { workingDir: wsDir, state: {} }, 64_000);
+      expect(outsideResult).toMatchObject({ status: 'denied', code: 'E_PROGRAM_SOURCE_DENIED' });
+      if (symlinkCreated) {
+        const escaped = await loader(link, { workingDir: wsDir, state: {} }, 64_000);
+        expect(escaped).toMatchObject({ status: 'denied', code: 'E_PROGRAM_SOURCE_DENIED' });
+      }
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects non-UTF-8 and oversized saved sources before execution', async () => {
+    const { wsDir } = await buildTools();
+    const invalid = path.join(wsDir, 'invalid.js');
+    const oversized = path.join(wsDir, 'oversized.js');
+    fs.writeFileSync(invalid, Buffer.from([0xff, 0xfe, 0xfd]));
+    fs.writeFileSync(oversized, 'x'.repeat(33), 'utf8');
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    const loader = mod.createProgramSourceLoader({ userId: UID, cid: CID });
+
+    await expect(loader(invalid, { workingDir: wsDir, state: {} }, 64_000))
+      .resolves.toMatchObject({ status: 'denied', code: 'E_PROGRAM_SOURCE_ENCODING' });
+    await expect(loader(oversized, { workingDir: wsDir, state: {} }, 32))
+      .resolves.toMatchObject({ status: 'denied', code: 'E_PROGRAM_SOURCE_LIMIT' });
+  });
+});
+
+describe('file-tools › working-directory-relative paths', () => {
+  it('advertises and resolves relative locations consistently across workspace readers', async () => {
+    const mockOcr = vi.fn(async ({ absPath }: { absPath: string }) => ({
+      ok: true,
+      content: `<ocr-file path="${absPath}" kind="image">recognized</ocr-file>`,
+      pages: [1],
+      cached: false,
+      engine: 'test',
+    }));
+    vi.doMock('../../../../src/main/features/ocr_runtime', () => ({ ocrFile: mockOcr }));
+    const { tools, wsDir } = await buildTools({ includeOcrFile: true });
+    const recordsDir = path.join(wsDir, 'inputs', 'records');
+    const notePath = path.join(recordsDir, 'note.txt');
+    const scanPath = path.join(wsDir, 'inputs', 'scan.png');
+    fs.mkdirSync(recordsDir, { recursive: true });
+    fs.writeFileSync(notePath, 'relative-path-marker\n', 'utf8');
+    fs.writeFileSync(scanPath, 'image fixture', 'utf8');
+
+    const readFiles = getTool(tools, 'read_files');
+    const listFiles = getTool(tools, 'list_files');
+    const searchFiles = getTool(tools, 'search_files');
+    const grepFiles = getTool(tools, 'grep_files');
+    const ocrFile = getTool(tools, 'ocr_file');
+    const pathDescriptions = [
+      (readFiles.inputSchema as any).properties.paths.items.properties.path.description,
+      (listFiles.inputSchema as any).properties.path.description,
+      (searchFiles.inputSchema as any).properties.root.description,
+      (grepFiles.inputSchema as any).properties.root.description,
+      (ocrFile.inputSchema as any).properties.path.description,
+    ];
+    for (const description of pathDescriptions) {
+      expect(description.toLowerCase()).toContain('relative to the working directory');
+      expect(description.toLowerCase()).toContain('visible absolute');
+    }
+
+    const ctx = { workingDir: wsDir, signal: undefined } as any;
+    const read = await readFiles.execute({
+      paths: [{ path: 'inputs/records/note.txt' }],
+    }, ctx);
+    const list = await listFiles.execute({ path: 'inputs' }, ctx);
+    const search = await searchFiles.execute({ root: 'inputs', query: 'note.txt' }, ctx);
+    const grep = await grepFiles.execute({ root: 'inputs', pattern: 'relative-path-marker' }, ctx);
+    const ocr = await ocrFile.execute({ path: 'inputs/scan.png' }, ctx);
+
+    expect(read.isError).toBeFalsy();
+    expect(read.content).toContain('relative-path-marker');
+    expect(list.isError).toBeFalsy();
+    expect(list.content).toContain('d records');
+    expect(search.isError).toBeFalsy();
+    expect(search.content).toContain('note.txt');
+    expect(grep.isError).toBeFalsy();
+    expect(grep.content).toContain('relative-path-marker');
+    expect(ocr.isError).toBeFalsy();
+    expect(mockOcr).toHaveBeenCalledWith(expect.objectContaining({ absPath: scanPath }));
+  });
+});
 
 describe('file-tools › list_files', () => {
   it('treats a lazy, not-yet-created conversation cwd as an empty directory', async () => {
@@ -1258,6 +1381,11 @@ describe('file-tools › read_files', () => {
     const itemSchema = schema.properties.paths.items;
     expect(schema.required).toEqual(['paths']);
     expect(schema.properties.metadata_only.type).toBe('boolean');
+    expect(schema.properties.raw_text).toMatchObject({
+      type: 'boolean',
+      description: expect.stringContaining('exact UTF-8 text'),
+    });
+    expect(schema.properties.raw_text.description).not.toContain('run_program only');
     expect(itemSchema.properties).not.toHaveProperty('charStart');
     expect(itemSchema.properties).not.toHaveProperty('lineStart');
     expect(itemSchema.properties.range).toMatchObject({
@@ -1274,6 +1402,12 @@ describe('file-tools › read_files', () => {
     expect(result.isError).toBeFalsy();
     expect(result.content).toContain('2\ttwo');
     expect(result.content).not.toContain('1\tone');
+    expect(result.observations?.fileReadBatch).toEqual({
+      attempted: 1,
+      succeeded: 1,
+      failed: 0,
+      failures: [],
+    });
   });
 
   it('reads related slices together and keeps partial successes usable', async () => {
@@ -1297,6 +1431,12 @@ describe('file-tools › read_files', () => {
     expect(r.content).toContain('export const first = 1');
     expect(r.content).toContain('const second');
     expect(r.content).toContain('E_NOT_FOUND');
+    expect(r.observations?.fileReadBatch).toEqual({
+      attempted: 3,
+      succeeded: 2,
+      failed: 1,
+      failures: [{ index: 2, code: 'E_NOT_FOUND' }],
+    });
   });
 
   it.each(['EACCES', 'EPERM'] as const)(
@@ -1318,6 +1458,12 @@ describe('file-tools › read_files', () => {
         expect(result.content).not.toContain('E_NOT_FOUND');
         expect(result.content).not.toContain('<missing-file-recovery>');
         expect(result.content).not.toContain('<file-renamed-earlier>');
+        expect(result.observations?.fileReadBatch).toEqual({
+          attempted: 1,
+          succeeded: 0,
+          failed: 1,
+          failures: [{ index: 0, code: 'E_PERMISSION_DENIED' }],
+        });
         expect(fault.statAttempts).toEqual([denied]);
         expect(fault.parentReaddirAttempts).toEqual([]);
       } finally {
@@ -1334,6 +1480,121 @@ describe('file-tools › read_files', () => {
     expect(r.isError).toBeFalsy();
     expect(r.content).toContain('covered="0-24000"');
     expect(r.content.length).toBeLessThan(30_000);
+  });
+
+  it('returns the same exact machine-readable bulk text directly and inside run_program', async () => {
+    const { tools, wsDir } = await buildTools({
+      rawTextMaxBytes: 2 * 1024 * 1024,
+    });
+    const first = path.join(wsDir, 'day-01.jsonl');
+    const second = path.join(wsDir, 'day-02.jsonl');
+    const firstBody = `${Array.from({ length: 1200 }, (_, index) => JSON.stringify({ id: index, value: `第一批-${index}` })).join('\n')}\n`;
+    const secondBody = `${Array.from({ length: 1200 }, (_, index) => JSON.stringify({ id: index + 1200, value: `第二批-${index}` })).join('\n')}\n`;
+    expect(firstBody.length).toBeGreaterThan(24_000);
+    fs.writeFileSync(first, firstBody, 'utf8');
+    fs.writeFileSync(second, secondBody, 'utf8');
+    const readFiles = getTool(tools, 'read_files');
+
+    const direct = await readFiles.execute({
+      paths: [{ path: first }, { path: second }],
+      raw_text: true,
+    }, { workingDir: wsDir, state: {} } as any);
+    expect(direct.isError).toBeFalsy();
+
+    const programmatic = await readFiles.execute({
+      paths: [{ path: first }, { path: second }],
+      raw_text: true,
+    }, { workingDir: wsDir, state: { programmatic: true } } as any);
+    expect(programmatic.isError).toBeFalsy();
+    expect(programmatic.content).toBe(direct.content);
+    const payload = JSON.parse(programmatic.content);
+    expect(payload.files).toHaveLength(2);
+    expect(payload.files[0]).toMatchObject({
+      requested_path: first,
+      ok: true,
+      path: first,
+      content: firstBody,
+      total_chars: firstBody.length,
+      file_hash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+    });
+    expect(payload.files[1].content).toBe(secondBody);
+    expect(programmatic.content).not.toContain('<read-files');
+    expect(programmatic.content).not.toContain('1\\t');
+    expect(programmatic.observations?.fileReads).toHaveLength(2);
+    expect(programmatic.observations?.fileReadBatch).toEqual({
+      attempted: 2,
+      succeeded: 2,
+      failed: 0,
+      failures: [],
+    });
+
+    const cap = await import('../../../../src/main/util/tool-result-cap');
+    const toolResultsDir = path.join(tmpDir, 'tool-results');
+    const final = cap.capToolResult('read_files', direct, {
+      workingDir: wsDir,
+      state: {
+        [cap.TOOL_RESULT_INLINE_LEDGER_STATE_KEY]: {
+          initialTokens: 1_000,
+          remainingTokens: 1_000,
+          perResultTokens: 1_000,
+          verbatimDocumentTokens: 1_000,
+        },
+      },
+    } as any, {
+      maxInlineTokens: 1_000,
+      toolResultsDir,
+    });
+    expect(final.persistedOutput?.ref).toMatch(/^read_files\.[a-f0-9]{64}$/);
+    expect(final.content).toContain('chars omitted; full result is stored');
+    expect(final.content.length).toBeLessThan(direct.content.length);
+    expect(fs.readFileSync(final.persistedOutput!.path, 'utf8')).toBe(direct.content);
+  });
+
+  it('keeps raw_text input and result limits explicit and recoverable', async () => {
+    const { tools, wsDir } = await buildTools({
+      rawTextMaxBytes: 180,
+    });
+    const source = path.join(wsDir, 'source.txt');
+    fs.writeFileSync(source, 'private-value-'.repeat(20), 'utf8');
+    const readFiles = getTool(tools, 'read_files');
+
+    const incompatible = await readFiles.execute({
+      paths: [{ path: source, range: { unit: 'char', start: 0, end: 10 } }],
+      raw_text: true,
+    }, { workingDir: wsDir, state: {} } as any);
+    expect(incompatible.isError).toBe(true);
+    expect(incompatible.content).toContain('E_BAD_INPUT');
+
+    const oversized = await readFiles.execute({
+      paths: [{ path: source }],
+      raw_text: true,
+    }, { workingDir: wsDir, state: {} } as any);
+    expect(oversized.isError).toBe(true);
+    expect(oversized.content).toContain('E_RAW_TEXT_LIMIT');
+    expect(oversized.content).not.toContain('private-value');
+  });
+
+  it('returns partial raw_text errors without dropping valid files', async () => {
+    const { tools, wsDir } = await buildTools();
+    const present = path.join(wsDir, 'present.txt');
+    const missing = path.join(wsDir, 'missing.txt');
+    fs.writeFileSync(present, 'usable source\n', 'utf8');
+
+    const result = await getTool(tools, 'read_files').execute({
+      paths: [{ path: present }, { path: missing }],
+      raw_text: true,
+    }, { workingDir: wsDir, state: {} } as any);
+    expect(result.isError).toBeFalsy();
+    const payload = JSON.parse(result.content);
+    expect(payload.files[0]).toMatchObject({ ok: true, content: 'usable source\n' });
+    expect(payload.files[1]).toMatchObject({ ok: false });
+    expect(payload.files[1].error).toContain('E_NOT_FOUND');
+    expect(result.observations?.fileReadBatch).toEqual({
+      attempted: 2,
+      succeeded: 1,
+      failed: 1,
+      failures: [{ index: 1, code: 'E_NOT_FOUND' }],
+    });
   });
 
   it('pages and resumes a real >4 MiB UTF-8 file through the model-visible contract', async () => {
@@ -1425,6 +1686,53 @@ describe('file-tools › read_files', () => {
     }, nextCtx);
     expect(next.isError).toBeFalsy();
     expect(next.content).toContain(`covered="${continuationStart}-`);
+  });
+
+  it('pages dense numeric data within budget and reconstructs the original without gaps', async () => {
+    const { tools, wsDir } = await buildTools();
+    const file = path.join(wsDir, 'records.csv');
+    const body = 'record_id,quantity,price\n' + Array.from({ length: 300 }, (_, i) => (
+      `REC-${String(i).padStart(5, '0')},${i % 10},12.75\n`
+    )).join('');
+    fs.writeFileSync(file, body);
+    const cap = await import('../../../../src/main/util/tool-result-cap');
+    const readFiles = getTool(tools, 'read_files');
+    let offset = 0;
+    let reconstructed = '';
+    for (let page = 0; offset < body.length && page < 20; page++) {
+      const ctx = { workingDir: wsDir, state: {
+        [cap.TOOL_RESULT_INLINE_LEDGER_STATE_KEY]: {
+          initialTokens: 1600, remainingTokens: 1600, perResultTokens: 1600,
+        },
+      } } as any;
+      const raw = await readFiles.execute({ paths: [{
+        path: file,
+        ...(offset ? { range: { unit: 'char', start: offset, end: body.length } } : {}),
+      }] }, ctx);
+      expect(raw.isError).toBeFalsy();
+      const covered = /covered="(\d+)-(\d+)"/.exec(raw.content)!;
+      expect(Number(covered[1])).toBe(offset);
+      const end = Number(covered[2]);
+      expect(end).toBeGreaterThan(offset);
+      const numbered = /<file [^\n]*>\n([\s\S]*?)\n<\/file>/.exec(raw.content)![1];
+      const slice = numbered.replace(/^\d+\t/gm, '');
+      expect(slice).toBe(body.slice(offset, end));
+      // Independent o200k calibration: each complete data row costs 11 tokens
+      // before the reader adds line numbers and metadata. A 1600-token page
+      // must not contain hundreds of such rows under a chars/4 estimate.
+      expect(slice.split('\n').length - 1).toBeLessThanOrEqual(Math.floor(1600 / 11));
+      const bounded = cap.capToolResult('read_files', raw, ctx, {
+        maxInlineTokens: 1600, toolResultsDir: path.join(tmpDir, 'tool-results'),
+      });
+      expect(bounded.persistedOutput).toBeUndefined();
+      expect(bounded.content).toBe(raw.content);
+      reconstructed += slice;
+      offset = end;
+      if (end < body.length) expect(raw.content).toContain(`next_range="char:${end}-`);
+      else expect(raw.content).toContain('has_more="false"');
+    }
+    expect(reconstructed).toBe(body);
+    expect(fs.readFileSync(file, 'utf8')).toBe(body);
   });
 
   it('reads skill documents whole and preserves their semantics across batch aggregation', async () => {
@@ -1715,6 +2023,21 @@ describe('file-tools › search_files', () => {
   });
 });
 
+describe('file-tools › search_files root shape', () => {
+  it('names the two usable calls when root is a file', async () => {
+    // Widening to the parent would read siblings this call never gated, so the
+    // refusal stands; what changes is that the message says what to do next.
+    const { tools, wsDir } = await buildTools();
+    const file = path.join(wsDir, 'app.js');
+    fs.writeFileSync(file, 'console.log(1)');
+    const r = await run(getTool(tools, 'search_files'), { pattern: 'app', root: file });
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_NOT_DIRECTORY');
+    expect(r.content).toContain('grep_files');
+    expect(r.content).toContain(path.dirname(file));
+  });
+});
+
 describe('file-tools › grep_files', () => {
   it('matches text files directly on source', async () => {
     const { tools, wsDir } = await buildTools();
@@ -1744,6 +2067,34 @@ describe('file-tools › grep_files', () => {
     expect(r.content).toContain('scores.xlsx');
     expect(r.content).toContain('slides.pptx');
     expect(r.content).toContain('Banana');
+  });
+
+  // The model reaches for `root: <a file>` often enough that refusing it cost a
+  // round trip every time, and the two cases in production both retried the
+  // same shape before recovering.
+  it('searches inside a single file when root names one', async () => {
+    const { tools, wsDir } = await buildTools();
+    fs.writeFileSync(path.join(wsDir, 'a.md'), 'line with banana\nother line');
+    fs.writeFileSync(path.join(wsDir, 'b.md'), 'banana lives here too');
+    const r = await run(getTool(tools, 'grep_files'), {
+      pattern: 'banana',
+      root: path.join(wsDir, 'a.md'),
+    });
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('a.md:1');
+    // Naming a file must narrow the scan, never widen it to the directory.
+    expect(r.content).not.toContain('b.md');
+  });
+
+  it('reports no match inside a single file without claiming an error', async () => {
+    const { tools, wsDir } = await buildTools();
+    fs.writeFileSync(path.join(wsDir, 'a.md'), 'nothing relevant');
+    const r = await run(getTool(tools, 'grep_files'), {
+      pattern: 'banana',
+      root: path.join(wsDir, 'a.md'),
+    });
+    expect(r.isError).toBeFalsy();
+    expect(r.content).not.toContain('E_NOT_DIRECTORY');
   });
 
   it('rejects invalid regex under regex=true', async () => {

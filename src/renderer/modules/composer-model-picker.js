@@ -60,11 +60,18 @@ function _composerRecipientForTarget(target) {
 }
 
 function _composerRecipientUsesExternalAgent(target) {
-  const recipient = _composerRecipientForTarget(target);
-  if (!recipient || recipient.kind !== 'agent' || !recipient.id) return false;
   if (typeof _agentsCache === 'undefined' || !Array.isArray(_agentsCache)) return false;
-  const agent = _agentsCache.find((item) => item && item.agent_id === recipient.id);
-  return !!(agent && agent.runtime && agent.runtime.kind === 'cli');
+  const preview = target !== 'auto' && _COMPOSER_RECIPIENT_TARGETS.includes(target)
+    && typeof _mentionPreviewRecipients === 'function'
+    ? _mentionPreviewRecipients(target)
+    : [];
+  const selected = _composerRecipientForTarget(target);
+  const recipients = preview.length ? preview : selected?.kind === 'group' ? selected.recipients : [selected];
+  return recipients.every((recipient) => {
+    if (!recipient || recipient.kind !== 'agent' || !recipient.id) return false;
+    const agent = _agentsCache.find((item) => item && item.agent_id === recipient.id);
+    return !!(agent && agent.runtime && agent.runtime.kind === 'cli');
+  });
 }
 
 function _syncComposerModelChipAvailability(target) {
@@ -75,6 +82,7 @@ function _syncComposerModelChipAvailability(target) {
     const disabled = _composerRecipientUsesExternalAgent(item);
     if (disabled && _composerModelMenu?.anchor === chip) _closeComposerModelMenu();
     chip.disabled = disabled;
+    chip.hidden = false;
   });
 }
 

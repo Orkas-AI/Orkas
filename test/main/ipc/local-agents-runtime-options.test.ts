@@ -24,6 +24,9 @@ vi.mock('../../../src/main/features/local_agents/registry', () => ({
   detectOne: vi.fn(),
   findAllInstalled: vi.fn(),
   invalidateCache: vi.fn(),
+  localCliSupportsPermissionPolicy: (_cli: unknown, policy: unknown) => (
+    policy === 'inherit' || policy === 'ask' || policy === 'full_access'
+  ),
 }));
 
 vi.mock('../../../src/main/features/local_agents/runtime_options', () => ({

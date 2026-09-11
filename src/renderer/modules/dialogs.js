@@ -360,6 +360,11 @@ function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLab
 // null on cancel. Mirrors native `prompt()` semantics.
 function uiPrompt(message, defaultValue = '', options = {}) {
   return new Promise((resolve) => {
+    const signal = options && options.signal;
+    if (signal && signal.aborted) {
+      resolve(null);
+      return;
+    }
     const previousFocus = document.activeElement;
     const dialogId = _uiNextDialogId();
     const messageId = `${dialogId}-message`;
@@ -372,7 +377,7 @@ function uiPrompt(message, defaultValue = '', options = {}) {
       <div class="modal ui-dialog modal-standard" role="dialog" aria-modal="true" aria-labelledby="${messageId}">
         <div class="modal-body ui-dialog-message" id="${messageId}">${msgHtml}</div>
         <div class="form-row" style="margin-top:12px;margin-bottom:0">
-          <input type="text" class="ui-dialog-input" aria-labelledby="${messageId}" />
+          <input type="${options && options.secret ? 'password' : 'text'}" class="ui-dialog-input" aria-labelledby="${messageId}" />
         </div>
         <div class="modal-actions">
           <button class="btn" data-act="cancel">${cancelText}</button>
@@ -410,10 +415,13 @@ function uiPrompt(message, defaultValue = '', options = {}) {
       finished = true;
       document.removeEventListener('keydown', onKey, true);
       releaseFocusGuard();
+      if (signal) signal.removeEventListener('abort', onAbort);
       overlay.remove();
       _uiRestoreDialogFocus(previousFocus);
       resolve(val);
     };
+    const onAbort = () => finish(null);
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
     okBtn.addEventListener('click', () => finish(input.value));
     cancelBtn.addEventListener('click', () => finish(null));
     document.addEventListener('keydown', onKey, true);

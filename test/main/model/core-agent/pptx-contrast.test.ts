@@ -109,6 +109,41 @@ describe('PPTX deterministic contrast audit', () => {
     expect((result.issues as any).issues).toEqual(rawIssues.issues);
   });
 
+  it('only warns when the compared background is the theme default rather than a declared fill', () => {
+    // A full-bleed picture is a sibling shape the tree does not represent, so
+    // white text over it compares against the theme's white default. That is
+    // not proof of an unreadable slide; ppt-review treats a blocker as
+    // unpublishable, so the audit must not manufacture one from a guess.
+    const tree = presentationTree();
+    const slide = (tree.data.children[0] as any);
+    // No slide background declared at all: the audit falls back to lt1.
+    slide.format = {};
+    slide.children[0].children[0].format = { 'effective.size': '44pt', color: '#FFFFFF' };
+
+    const result = auditPptxContrast({ issues: [] }, tree);
+
+    expect(result.findingCount).toBe(1);
+    const issue = (result.issues as any).issues[0];
+    expect(issue).toMatchObject({
+      subtype: 'low_contrast',
+      severity: 'warning',
+      path: '/slide[1]/shape[1]',
+      background: '#FFFFFF',
+    });
+    expect(issue.message).toContain('theme default');
+  });
+
+  it('keeps a blocker when the unreadable text sits on a fill the deck declares', () => {
+    const tree = presentationTree('#FFFFFF');
+    const slide = (tree.data.children[0] as any);
+    slide.children[0].children[0].format = { 'effective.size': '44pt', color: '#FFFFFF' };
+
+    const issue = (auditPptxContrast({ issues: [] }, tree).issues as any).issues[0];
+
+    expect(issue).toMatchObject({ severity: 'blocker', path: '/slide[1]/shape[1]' });
+    expect(issue.message).not.toContain('theme default');
+  });
+
   it('uses WCAG relative luminance rather than simple palette brightness', () => {
     expect(contrastRatio('#000000', '#0F172A')).toBeCloseTo(1.18, 2);
     expect(contrastRatio('#38BDF8', '#1E293B')).toBeGreaterThan(6.8);

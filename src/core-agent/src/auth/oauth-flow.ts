@@ -8,7 +8,11 @@ import { createInterface } from "node:readline";
 import path from "node:path";
 import { createLogger } from "../shared/logger.js";
 import { writeOAuthCredentials, getOAuthCredential } from "./store.js";
-import type { OAuthCredentials, OAuthProviderInterface } from "./oauth-compat.js";
+import {
+  refreshOAuthProviderWithTimeout,
+  type OAuthCredentials,
+  type OAuthProviderInterface,
+} from "./oauth-compat.js";
 
 const log = createLogger("oauth-flow");
 
@@ -140,7 +144,7 @@ export async function refreshOAuthCredential(
 
   try {
     log.debug("refreshing OAuth token", { provider: provider.id });
-    const newCreds = await provider.refreshToken(stored);
+    const newCreds = await refreshOAuthProviderWithTimeout(provider, stored);
     writeOAuthCredentials(provider.id, newCreds);
     log.info("OAuth token refreshed", { provider: provider.id });
     return provider.getApiKey(newCreds);

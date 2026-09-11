@@ -68,13 +68,6 @@ export function compareVersions(a: unknown, b: unknown): VersionComparison | nul
   return 0;
 }
 
-/** Compatibility export for old callers. Prefer parseSemver/compareVersions. */
-export function versionTokens(value: unknown): Array<number | string> {
-  const parsed = parseSemver(value);
-  if (!parsed) return [];
-  return [parsed.major, parsed.minor, parsed.patch, ...parsed.prerelease];
-}
-
 export function normalizeMinAppVersion(value: unknown): string {
   const text = typeof value === 'string' ? value.trim() : '';
   return text || '';

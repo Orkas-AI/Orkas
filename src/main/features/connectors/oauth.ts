@@ -26,10 +26,13 @@
  * production HTTPS bridge and the connector-only `orkas://` receiver.
  */
 import { shell } from 'electron';
+import { cancelDcrOAuth } from './oauth-dcr';
+import { logErrorSummary } from '../../util/log-redact';
 
 import { accountApiBase, tokenStore } from './_server_bridge';
 import { withCommonHeaders } from '../api_common';
 import { getLanguage } from '../config';
+import { t } from '../../i18n';
 import { createLogger } from '../../logger';
 import { fetchWithTimeout } from '../../util/abort';
 import { safeExternalHttpUrl } from '../../util/window-security';
@@ -97,6 +100,19 @@ function _parseJsonObject(raw: string): Record<string, any> {
   } catch {
     return {};
   }
+}
+
+function _friendlyComposioStartError(body: Record<string, unknown>, fallback: string): Error {
+  const error = body.error && typeof body.error === 'object' && !Array.isArray(body.error)
+    ? body.error as Record<string, unknown>
+    : {};
+  const code = String(error.code || error.type || body.code || '').trim();
+  const rawMessage = String(error.message || body.msg || body.message || fallback || '').trim();
+  if (code === 'composio_not_configured' || /Composio API key is not configured/i.test(rawMessage)) {
+    const message = t('connectors.oauth.composio_not_configured', {}, getLanguage());
+    return _flowError(message, 'composio_not_configured');
+  }
+  return _flowError(rawMessage || fallback || 'Composio connector start failed', code || undefined);
 }
 
 function _cancelPending(reason: string, code?: string): void {
@@ -186,7 +202,7 @@ async function postConnectorBridgeJson(
       });
     } catch (err) {
       if (last) throw err;
-      log.warn('connector bridge fetch failed; retrying', { label, attempt, error: (err as Error).message });
+      log.warn('connector bridge fetch failed; retrying', { label, attempt, error: logErrorSummary(err) });
       await _bridgeRetryBackoff(attempt);
       continue;
     }
@@ -223,13 +239,7 @@ export async function startComposioConnect(
   const raw = await res.text();
   const body = _parseJsonObject(raw);
   if (!res.ok || Number(body.code || 0) !== 0 || typeof body.redirect_url !== 'string') {
-    const nested = body.error && typeof body.error === 'object' && !Array.isArray(body.error)
-      ? body.error as Record<string, unknown>
-      : {};
-    throw _flowError(
-      String(nested.message || body.msg || `Composio start HTTP ${res.status}`),
-      String(nested.code || 'composio_start_failed'),
-    );
+    throw _friendlyComposioStartError(body, `Composio start HTTP ${res.status}`);
   }
   const redirectUrl = safeExternalHttpUrl(body.redirect_url);
   if (!redirectUrl) throw _flowError('invalid Composio redirect URL', 'invalid_redirect_url');
@@ -254,7 +264,8 @@ export async function startComposioConnect(
 /** Externally callable cancel — wired to the renderer's "取消" link so a user who closed the
  *  browser without completing OAuth can unfreeze the card without waiting for the timeout. */
 export function cancelInFlightOAuth(): boolean {
-  if (!_pending) return false;
+  const cancelledDcr = cancelDcrOAuth();
+  if (!_pending) return cancelledDcr;
   _cancelPending('cancelled by user', 'user_cancelled');
   return true;
 }
@@ -340,9 +351,9 @@ export async function startGoogleSheetsPicker(fileIds?: string[]): Promise<Googl
 
 /** Called by the protocol handler when `orkas://connectors/oauth/callback?...` arrives. */
 export async function handleCallbackUrl(rawUrl: string): Promise<void> {
-  log.info('connector callback url received', { path: rawUrl.split('?')[0] });
+  log.info('connector callback received');
   if (!_pending) {
-    log.warn('connector callback arrived with no pending flow', { url: rawUrl.split('?')[0] });
+    log.warn('connector callback arrived with no pending flow');
     return;
   }
   const pending = _pending;
@@ -474,7 +485,7 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
       catalog_id: pending.catalogId,
       has_refresh: !!grant.refresh_token,
       expires_in: typeof body.expires_in === 'number' ? body.expires_in : null,
-      account_label: grant.account_label || null,
+      has_account_label: !!grant.account_label,
     });
     if (pending.kind === 'google_picker') {
       const pickedFileIds = String(body.picked_file_ids || '')
@@ -487,7 +498,7 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
     }
   } catch (err) {
     if (pending.kind === 'composio' && _pending !== pending) return;
-    log.warn('connector OAuth exchange failed', { error: (err as Error).message });
+    log.warn('connector OAuth exchange failed', { error: logErrorSummary(err) });
     const code = (err as { code?: unknown }).code;
     // A thrown network/timeout error carries no code of its own — still tag the stage so these do
     // not fall into the untyped bucket. The renderer's error_type derives network/timeout from the

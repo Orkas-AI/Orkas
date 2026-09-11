@@ -517,6 +517,27 @@ export const processStopTool: AgentTool = defineTool({
   },
 });
 
+type ProcessSessionAction = "start" | "read" | "write" | "stop";
+
+const PROCESS_SESSION_ACTION_FIELDS: Readonly<Record<ProcessSessionAction, ReadonlySet<string>>> = {
+  start: new Set(["action", "command", "max_lifetime_ms"]),
+  read: new Set(["action", "session_id", "cursor", "max_chars"]),
+  write: new Set(["action", "session_id", "chars", "add_newline"]),
+  stop: new Set(["action", "session_id"]),
+};
+
+function processSessionActionError(
+  action: ProcessSessionAction,
+  input: Record<string, unknown>,
+): string | null {
+  const unexpected = Object.keys(input)
+    .filter((key) => !PROCESS_SESSION_ACTION_FIELDS[action].has(key))
+    .sort();
+  return unexpected.length
+    ? `E_BAD_INPUT: process_session(${action}) does not accept: ${unexpected.join(", ")}`
+    : null;
+}
+
 /** Public lifecycle umbrella. The action discriminator removes three repeated
  * tool definitions while the operation implementations above keep their
  * focused validation and observations. The legacy exports remain available to
@@ -532,7 +553,7 @@ export const processSessionTool: AgentTool = defineTool({
       action: {
         type: "string",
         enum: ["start", "read", "write", "stop"],
-        description: "Lifecycle operation.",
+        description: "start: command; read: session_id/cursor; write: session_id/chars; stop: session_id. Use only its action-specific fields.",
       },
       command: { type: "string", description: "Required for start. Shell command to launch." },
       max_lifetime_ms: {
@@ -546,18 +567,29 @@ export const processSessionTool: AgentTool = defineTool({
       add_newline: { type: "boolean", description: "Write only. Append a newline; default false." },
     },
     required: ["action"],
+    oneOf: [
+      { properties: { action: { enum: ["start"] } }, required: ["action", "command"] },
+      { properties: { action: { enum: ["read"] } }, required: ["action", "session_id"] },
+      { properties: { action: { enum: ["write"] } }, required: ["action", "session_id", "chars"] },
+      { properties: { action: { enum: ["stop"] } }, required: ["action", "session_id"] },
+    ],
   },
   executionMode: "parallel",
   async execute(input, ctx) {
-    const action = String(input.action ?? "");
+    const action = String(input.action ?? "") as ProcessSessionAction;
+    if (!(["start", "read", "write", "stop"] as const).includes(action)) {
+      return {
+        content: "E_BAD_INPUT: `action` must be start, read, write, or stop",
+        isError: true,
+      };
+    }
+    const fieldError = processSessionActionError(action, input);
+    if (fieldError) return { content: fieldError, isError: true };
     if (action === "start") return processStartTool.execute(input, ctx);
     if (action === "read") return processReadTool.execute(input, ctx);
     if (action === "write") return processWriteTool.execute(input, ctx);
     if (action === "stop") return processStopTool.execute(input, ctx);
-    return {
-      content: "E_BAD_INPUT: `action` must be start, read, write, or stop",
-      isError: true,
-    };
+    return processStopTool.execute(input, ctx);
   },
 });
 

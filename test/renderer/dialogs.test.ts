@@ -356,6 +356,21 @@ describe('shared renderer dialogs', () => {
     await expect(result).resolves.toBe('最终名称');
   });
 
+  it('supports secret prompts and removes them when the native request is cancelled', async () => {
+    const ctx = loadDialogs();
+    const controller = new AbortController();
+    const result = ctx.uiPrompt('Enter token', '', {
+      signal: controller.signal,
+      secret: true,
+    });
+    const overlay = overlays(ctx)[0];
+
+    expect(overlay.innerHTML).toContain('type="password"');
+    controller.abort();
+    await expect(result).resolves.toBeNull();
+    expect(overlays(ctx)).toHaveLength(0);
+  });
+
   it('requires an explicit danger or choice button and returns its stable value', async () => {
     const ctx = loadDialogs();
     const dangerResult = ctx.uiConfirmDanger({

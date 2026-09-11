@@ -2444,7 +2444,6 @@ const _IMAGE_PROVIDER_OPTIONS = [
 ];
 
 function _imageProviderLabel(provider, model) {
-  if (provider === 'orkas-image') return 'Orkas · Image';
   const hit = _settingsImageProviderOptions().find((option) => (
     (option.provider || option.id) === provider
     && (!model || !option.model || option.model === model)

@@ -34,6 +34,27 @@ export interface ToolSchema {
   name: string;
   description: string;
   input_schema: Record<string, unknown>;
+  /** MCP ToolAnnotations are advisory server metadata. Orkas preserves only
+   * the standardized fields needed for Host-side risk decisions. Missing
+   * annotations never imply read-only. */
+  annotations?: {
+    title?: string;
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+    idempotentHint?: boolean;
+    openWorldHint?: boolean;
+  };
+  /** Trusted Orkas policy metadata emitted by the app-owned Composio adapter or applied from a
+   *  pinned built-in catalog entry. Provider/custom MCP metadata is never authoritative; the
+   *  Host applies operation permissions to sensitive actions locally. */
+  orkas_action_policy?: ConnectorActionPolicy;
+}
+
+export interface ConnectorActionPolicy {
+  risk: 'R' | 'W' | 'H' | 'D';
+  confirmation: 'none' | 'preview' | 'fresh' | 'destructive';
+  sensitive_operation?: string;
+  max_batch_size: number;
 }
 
 /** Connector status. Every value records an outcome that actually happened — no state here is
@@ -125,6 +146,10 @@ export interface ConnectorInstance {
   dcr_client?: DcrClientCredentials;
   /** Opaque Server connection handle. Provider credentials never leave Composio/Orkas Server. */
   composio_grant?: ComposioGrant;
+  /** Non-secret, user-selected values that bind a catalog connector to the intended tenant or
+   *  account-specific endpoint. Values are validated against the catalog's connection_setup
+   *  before OAuth and again whenever the transport is rebuilt. Unknown fields fail closed. */
+  connection_parameters?: Record<string, string>;
   created_at: string;
   updated_at: string;
 }
@@ -172,8 +197,112 @@ export type TransportTemplate =
       oauth_header_key?: string;
     };
 
+export interface CatalogConnectionField {
+  key: string;
+  input: 'text' | 'secret' | 'choice';
+  label_zh: string;
+  label_en: string;
+  label_ja?: string;
+  label_pt?: string;
+  help_zh?: string;
+  help_en?: string;
+  help_ja?: string;
+  help_pt?: string;
+  required: true;
+  /** Local-API fields marked credential are encrypted in the device-only connector store and
+   *  never copied into the synced connector registry. */
+  storage?: 'metadata' | 'credential';
+  options?: Array<{ value: string; label_zh: string; label_en: string; label_ja?: string; label_pt?: string }>;
+  /** Named validator/normalizer owned by the desktop. Catalog data never supplies executable
+   *  regexes or callbacks. */
+  format:
+    | 'netsuite_account_id'
+    | 'client_id'
+    | 'app_key'
+    | 'secret'
+    | 'shopify_shop_domain'
+    | 'lightspeed_store_domain'
+    | 'woocommerce_store_url'
+    | 'woocommerce_consumer_key'
+    | 'woocommerce_consumer_secret'
+    | 'commerce_layer_slug'
+    | 'bigcommerce_store_hash'
+    | 'shopline_store_domain'
+    | 'shoplazza_store_domain'
+    | 'magento_store_url'
+    | 'temu_region'
+    | 'lazada_country'
+    | 'walmart_market'
+    | 'ebay_marketplace'
+    | 'ebay_content_language'
+    | 'ebay_ru_name'
+    | 'ebay_redirect_uri'
+    | 'etsy_shop_id'
+    | 'etsy_keystring'
+    | 'etsy_redirect_uri'
+    | 'amazon_marketplace'
+    | 'amazon_seller_id'
+    | 'amazon_refresh_token'
+    | 'mercado_libre_user_id'
+    | 'mercado_libre_redirect_uri'
+    | 'alibaba_redirect_uri'
+    | 'jd_redirect_uri'
+    | 'pinduoduo_redirect_uri'
+    | 'douyin_shop_id'
+    | 'kuaishou_redirect_uri'
+    | 'youzan_kdt_id'
+    | 'weimob_wos_shop_id'
+    | 'reloadly_product'
+    | 'instacart_api_key'
+    | 'shopee_id'
+    | 'shopee_region'
+    | 'tiktok_shop_code'
+    | 'tiktok_service_id'
+    | 'tiktok_shop_region'
+    | 'sandbox_or_live';
+}
+
+export interface CatalogConnectionSetup {
+  fields: CatalogConnectionField[];
+  /** App-owned, read-only provider-console value; never submitted as user credentials. */
+  callback_url?: string;
+  callback_help_zh?: string;
+  callback_help_en?: string;
+  callback_help_ja?: string;
+  callback_help_pt?: string;
+  /** Material provider-side work that must be visible before the user starts entering fields. */
+  requirement?: 'provider_application' | 'business_qualification';
+  /** Localized, provider-authored prerequisites shown above the combined setup form. */
+  instructions_zh?: string;
+  instructions_en?: string;
+  instructions_ja?: string;
+  instructions_pt?: string;
+  /**
+   * Optional first-party setup guide. A direct user click opens the system
+   * browser; Commander-originated guidance opens the isolated Web Assist
+   * surface so the model can stay with the setup flow.
+   */
+  guide_url?: string;
+  guide_label_zh?: string;
+  guide_label_en?: string;
+  guide_label_ja?: string;
+  guide_label_pt?: string;
+}
+
+export interface CatalogConnectionVariant {
+  catalog_id: string;
+  label_zh: string;
+  label_en: string;
+  label_ja?: string;
+  label_pt?: string;
+  description_zh?: string;
+  description_en?: string;
+  description_ja?: string;
+  description_pt?: string;
+}
+
 // ── OAuth ───────────────────────────────────────────────────────────────
-// Two auth_modes for catalog entries:
+// Five auth_modes for catalog entries:
 //
 //  - 'server_bridge'  — Orkas company pre-registered an OAuth App at the provider. Server holds
 //    client_id/secret, runs the full OAuth handshake server-side, returns a token via deep-link.
@@ -187,6 +316,20 @@ export type TransportTemplate =
 //    as an HTTPS callback intermediate (Server stashes code+state in a 5-min KV, deep-links
 //    PC). The DCR client and rotating refresh grant remain encrypted on this device; Server is
 //    never a credential store for this mode. Used for Notion, Atlassian, Cloudflare suite, … .
+//
+//  - 'composio'       — Orkas Server creates a Composio Connect Link for a server-configured
+//    toolkit/auth_config, stores the resulting connected_account_id, and PC keeps only an opaque
+//    connection handle and one-time local credential. Tool execution goes back through Server for ownership checks and
+//    Orkas credit charging.
+//
+//  - 'local_cli'     — Provider ships an official, user-authorized CLI. Orkas starts the CLI's
+//    own QR/device authorization in the shared interactive terminal and stores its credentials
+//    in a per-Orkas-user, device-local profile. An app-owned MCP adapter exposes a reviewed
+//    read/write/high-impact/destructive surface; the model never receives a raw shell or CLI.
+//
+//  - 'local_api'     — The user supplies provider credentials through a catalog-defined form.
+//    Secrets are encrypted on this device and omitted from the public registry metadata. An app-owned
+//    adapter exposes only the catalog's reviewed action surface.
 
 export interface OAuthConfig {
   /** Server-bridge only: matches the Server's `biz/connectors/oauth/<provider>.py` module name
@@ -244,11 +387,79 @@ export interface ComposioGrant {
   account_label?: string;
 }
 
+export type CatalogCategory =
+  | 'developer'
+  | 'productivity'
+  | 'communication'
+  | 'search'
+  | 'data'
+  | 'commerce';
+
+export type AuthMode = 'server_bridge' | 'mcp_dcr' | 'composio' | 'local_cli' | 'local_api';
+
+export interface LocalCliConfig {
+  provider: 'wecom' | 'lark' | 'dingtalk' | 'xero';
+  /** Lark CLI serves both the China Feishu and international Lark brands. */
+  brand?: 'feishu' | 'lark';
+  package_name: string;
+  package_version: string;
+  package_integrity: string;
+  executable: string;
+  /** Reviewed top-level business domains. Raw API, auth/config/update and app-development
+   *  surfaces remain unavailable even when a future CLI release adds them. */
+  allowed_domains: string[];
+}
+
+export interface LocalApiConfig {
+  provider:
+    | 'bigcommerce'
+    | 'shopline'
+    | 'shoplazza'
+    | 'magento'
+    | 'temu'
+    | 'lazada'
+    | 'shein'
+    | 'alibaba_icbu'
+    | 'aliexpress'
+    | 'shopee'
+    | 'tiktok_shop'
+    | 'shopify'
+    | 'constant_contact'
+    | 'lightspeed'
+    | 'woocommerce'
+    | 'walmart'
+    | 'ebay'
+    | 'etsy'
+    | 'amazon_seller'
+    | 'mercado_libre'
+    | 'taobao_top'
+    | 'alibaba_1688'
+    | 'jd_jos'
+    | 'pinduoduo'
+    | 'douyin_shop'
+    | 'kuaishou_shop'
+    | 'youzan'
+    | 'weimob_wos'
+    | 'xiaohongshu_ark'
+    | 'reloadly'
+    | 'square'
+    | 'instacart'
+    | 'commerce_layer';
+}
+
 export interface ComposioToolConfig {
   slug: string;
   name?: string;
   description?: string;
   input_schema?: Record<string, unknown>;
+  policy?: {
+    risk: 'R' | 'W' | 'H' | 'D';
+    confirmation: 'none' | 'preview' | 'fresh' | 'destructive';
+    idempotency: 'required' | 'when_supported' | 'not_applicable';
+    max_batch_size: number;
+    sensitive_fields: string[];
+    sensitive_operation?: string;
+  };
 }
 
 export interface ComposioConfig {
@@ -262,21 +473,17 @@ export interface ConnectorUsageMetering {
   credits_milli_per_call: number;
 }
 
-export type CatalogCategory =
-  | 'developer'
-  | 'productivity'
-  | 'communication'
-  | 'search'
-  | 'data'
-  | 'commerce';
 
-export type AuthMode = 'server_bridge' | 'mcp_dcr' | 'composio';
 
 export interface CatalogEntry {
   /** Stable id; doubles as the installed instance id (one install per catalog entry in Phase 0).
    *  Lowercase, [a-z0-9_-]+; used as the `<inst>__<tool>` prefix. */
   id: string;
   display_name: string;
+  /** Optional localized product names. Chinese UI uses `display_name_zh`; every other UI locale
+   *  uses `display_name_en`. `display_name` remains the stable persisted/default fallback. */
+  display_name_zh?: string;
+  display_name_en?: string;
   /** Inline SVG markup for the brand logo. Required on every shipped catalog entry — the
    *  renderer draws this on a white rounded square. Keep the inner SVG `width` / `height`
    *  either absent or `100%` so CSS-set 40×40 card box governs the rendered size.
@@ -285,11 +492,16 @@ export interface CatalogEntry {
    *  was removed but the install still exists) can omit it; the orphan path renders the
    *  display_name initials on a neutral gray placeholder. */
   icon_svg?: string;
+  /** Public source asset used to derive `icon_svg`. */
+  icon_source_url?: string;
+  /** SHA-256 of the fetched source asset so artwork drift is explicit and reviewable. */
+  icon_source_sha256?: string;
   category: CatalogCategory;
   description_zh: string;
   description_en: string;
   description_ja?: string;
   description_pt?: string;
+  /** Sole display switch for the shared credit tag. Runtime metering fields do not affect it. */
   requires_credits?: boolean;
   /** Which OAuth pathway this provider needs — see the `// ── OAuth ──` section above. */
   auth_mode: AuthMode;
@@ -297,11 +509,37 @@ export interface CatalogEntry {
   oauth?: OAuthConfig;
   composio?: ComposioConfig;
   usage_metering?: ConnectorUsageMetering;
+  /** Required when `auth_mode === 'local_cli'`; credentials remain local to this device. */
+  local_cli?: LocalCliConfig;
+  /** Required when `auth_mode === 'local_api'`; encrypted credentials remain on this device. */
+  local_api?: LocalApiConfig;
   /** OAuth scopes that must be present in the provider's returned grant for the connector to
    *  function. Google lets users uncheck individual requested permissions on the consent screen;
    *  when that happens the token exchange still succeeds but downstream APIs fail with 403s.
    *  Entries that set this are rejected immediately after OAuth if any required scope is absent. */
   required_oauth_scopes?: string[];
+  /** Exact MCP tool names this catalog connector may expose and execute. The provider remains
+   *  authoritative for account/role permissions, but a newly added upstream tool is denied until
+   *  Orkas has reviewed and pinned it here. Omit only for legacy catalog entries whose tool
+   *  surface is already constrained by an Orkas-owned adapter or Server-side allowlist. */
+  allowed_tools?: string[];
+  /** Trusted host policy for each reviewed action in `allowed_tools`. Unlike provider `_meta`,
+   *  this catalog data may drive the local H/D confirmation gate. When present, the key set must
+   *  exactly match `allowed_tools`; discovery and stale-cache projection overwrite any policy
+   *  metadata supplied by the remote MCP server. */
+  tool_policies?: Record<string, ConnectorActionPolicy>;
+  /** Optional pre-OAuth tenant/account fields. Placeholders in a streamable-http URL use
+   *  `{{field_key}}` and are materialized only after main-process validation. */
+  connection_setup?: CatalogConnectionSetup;
+  /** Bundled, on-demand setup notes for this exact connection method; not a Skill. */
+  setup_guide_id?: string;
+  /** Multiple provider editions/environments shown under one product card. Each variant remains
+   *  a real, independently version-safe catalog id; older clients ignore unknown variants. */
+  connection_variants?: CatalogConnectionVariant[];
+  /** Controls selector copy. Region/edition choices must not inherit Sandbox warnings. */
+  connection_variant_kind?: 'environment' | 'region';
+  /** Hide this concrete variant as its own card; `catalog_parent_id` owns its UI surface. */
+  catalog_parent_id?: string;
   /** MCP server config + how the access_token maps into env / headers. Null when this entry is
    *  catalogued but not yet installable (we don't have an MCP server target for it yet).
    *  Renderer surfaces a disabled "敬请期待" state. */

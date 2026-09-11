@@ -90,6 +90,15 @@ try {
     $global:OrkasBootstrapDownloadShouldFail = $true
     & $bootstrap -PcRoot $fixturePc -Architecture X64
     Assert-True ($global:OrkasBootstrapDownloadCalls -eq 1) 'verified cache skips download'
+    # run.cmd uses -File without -PcRoot; exercise parameter binding in a fresh shell.
+    $fixtureScripts = Join-Path $fixturePc 'scripts'
+    New-Item -ItemType Directory -Force -Path $fixtureScripts | Out-Null
+    $fixtureBootstrap = Join-Path $fixtureScripts 'bootstrap-node.ps1'
+    Copy-Item -LiteralPath $bootstrap -Destination $fixtureBootstrap
+    $defaultRootOutput = & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        -File $fixtureBootstrap -Architecture X64 2>&1
+    Assert-True ($LASTEXITCODE -eq 0) 'fresh shell resolves default PC root'
+    Assert-True (($defaultRootOutput -join "`n") -like '*bundled Node*is ready*') 'default root reuses verified Node'
     $global:OrkasBootstrapDownloadShouldFail = $false
 
     $corruptMarker = Get-Content -Raw -LiteralPath $markerPath | ConvertFrom-Json

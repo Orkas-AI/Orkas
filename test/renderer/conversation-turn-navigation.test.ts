@@ -387,6 +387,10 @@ describe('conversation turn navigation', () => {
     rendered = markers.querySelectorAll('.chat-turn-nav-marker');
     expect(rendered).toHaveLength(16);
     expect(rendered[15].getAttribute('aria-current')).toBe('location');
+
+    turnNav.prepare('next-conversation');
+    expect(markers.querySelectorAll('.chat-turn-nav-marker')).toHaveLength(0);
+    expect(documentRef.getElementById('chat-turn-nav').hidden).toBe(true);
   });
 
   it('pages the compact rail independently without adding transcript prefetch', () => {

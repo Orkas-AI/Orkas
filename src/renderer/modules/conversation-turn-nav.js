@@ -675,6 +675,30 @@
     return state;
   }
 
+  function prepare(cidValue = '') {
+    init();
+    state.requestGeneration += 1;
+    state.cid = String(cidValue || '');
+    state.turns = [];
+    state.total = 0;
+    state.nextCursor = null;
+    state.indexReady = false;
+    state.activeKey = '';
+    state.loadPage = null;
+    state.onActivate = null;
+    state.loadingInitial = null;
+    state.loadingOlder = null;
+    state.userIntentUntil = 0;
+    hidePreview();
+    state.markers?.replaceChildren();
+    if (state.nav) {
+      state.nav.hidden = true;
+      updateOverflowIndicators();
+    }
+    if (state.intersectionObserver) state.intersectionObserver.disconnect();
+    return state;
+  }
+
   function open(options = {}) {
     init();
     const cid = String(options.cid || '');
@@ -685,24 +709,9 @@
       if (!state.loadingInitial && !state.indexReady) void loadInitialPage();
       return state.loadingInitial;
     }
-    state.requestGeneration += 1;
-    state.cid = cid;
-    state.turns = [];
-    state.total = 0;
-    state.nextCursor = null;
-    state.indexReady = false;
-    state.activeKey = '';
+    prepare(cid);
     state.loadPage = typeof options.loadPage === 'function' ? options.loadPage : null;
     state.onActivate = typeof options.onActivate === 'function' ? options.onActivate : null;
-    state.loadingInitial = null;
-    state.loadingOlder = null;
-    state.userIntentUntil = 0;
-    hidePreview();
-    state.markers?.replaceChildren();
-    if (state.nav) {
-      state.nav.hidden = true;
-      updateOverflowIndicators();
-    }
     void loadInitialPage();
     return state.loadingInitial;
   }
@@ -745,6 +754,7 @@
     PREVIEW_TITLE_CHARS,
     PREVIEW_BODY_CHARS,
     init,
+    prepare,
     open,
     appendLiveTurn,
     loadOlderPage,

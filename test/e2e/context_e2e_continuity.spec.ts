@@ -185,7 +185,7 @@ test.describe('long-task context continuity', () => {
     });
     await expect(page.locator('html')).toHaveAttribute('lang', 'pt-BR');
     page = await modelOrkas.relaunch();
-    await page.locator(`.conv-item[data-cid="${conversationId}"]`).click();
+    await page.locator(`#conversation-list .conv-item[data-cid="${conversationId}"]`).click();
     const restoredReply = page.locator(
       '#chat-history .chat-message.assistant[data-from-actor="commander"]',
       { hasText: finalReply },
@@ -239,7 +239,9 @@ test.describe('long-task context continuity', () => {
 
     const requestCountAtStop = modelOrkas.modelRequests.length;
     await page.locator('#chat-send-btn').click();
-    await expect(page.locator('#chat-history .stream-aborted-note')).toBeVisible({
+    await expect(page.locator(
+      '#chat-history .chat-message.assistant [data-role="final"]',
+    )).toHaveText('Interrupted', {
       timeout: 10_000,
     });
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
@@ -256,10 +258,12 @@ test.describe('long-task context continuity', () => {
       .getAttribute('data-cid');
     expect(conversationId).toBeTruthy();
     page = await modelOrkas.relaunch();
-    await page.locator(`.conv-item[data-cid="${conversationId}"]`).click();
+    await page.locator(`#conversation-list .conv-item[data-cid="${conversationId}"]`).click();
     await expect(page.locator('#chat-history .chat-message.user')).toHaveCount(1);
-    await expect(page.locator('#chat-history .chat-message.assistant')).toContainText('(stopped)');
-    await expect(page.locator('#chat-history .chat-message.assistant')).not.toContainText(
+    const interrupted = page.locator('#chat-history .chat-message.assistant');
+    await expect(interrupted).toHaveAttribute('data-interrupted', '1');
+    await expect(interrupted).toContainText('Run aborted');
+    await expect(interrupted).not.toContainText(
       forbiddenFinal,
     );
     expect(modelOrkas.modelRequests).toHaveLength(requestCountAtStop);

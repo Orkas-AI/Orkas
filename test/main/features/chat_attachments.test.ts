@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as crypto from 'node:crypto';
 
 import { makeMinimalPdf } from '../../fixtures/make-minimal-pdf';
 import { makeMinimalDocx } from '../../fixtures/make-minimal-docx';
@@ -28,6 +29,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.useRealTimers();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -54,6 +56,70 @@ async function makePng(color = 0xAACCEEFF): Promise<Buffer> {
   const img: any = new Jimp({ width: 200, height: 200, color });
   return await img.getBuffer('image/png');
 }
+
+describe('chat_attachments › diagnostic privacy', () => {
+  async function captureDiagnostics(): Promise<unknown[][]> {
+    const logger = await import('../../../src/main/logger');
+    const original = logger.createLogger;
+    const records: unknown[][] = [];
+    vi.spyOn(logger, 'createLogger').mockImplementation((scope) => {
+      if (scope !== 'chat_attachments') return original(scope);
+      const capture = (message: string, ...args: unknown[]) => {
+        records.push([message, ...args].map((value) => logger.redact(value)));
+      };
+      return { info: capture, warn: capture, error: capture, debug: capture };
+    });
+    return records;
+  }
+
+  it('keeps upload, import and duplicate filenames out of diagnostics while preserving files', async () => {
+    const records = await captureDiagnostics();
+    const m = await loadMod();
+    const uploadedName = 'Confidential merger notes.txt';
+    const importedName = 'Private diligence report.md';
+    const source = path.join(tmpDir, importedName);
+    fs.writeFileSync(source, 'imported source');
+    expect(await m.uploadAttachment(UID, CID, uploadedName, Buffer.from('uploaded source')))
+      .toMatchObject({ ok: true, info: { name: uploadedName } });
+    expect(await m.uploadAttachment(UID, CID, 'copy.txt', Buffer.from('uploaded source')))
+      .toMatchObject({ ok: true, reused: true, info: { name: uploadedName } });
+    expect(await m.importAttachmentFromPath(UID, CID, source))
+      .toMatchObject({ ok: true, info: { name: importedName } });
+    expect(await m.importAttachmentFromPath(UID, CID, source))
+      .toMatchObject({ ok: true, reused: true, info: { name: importedName } });
+    expect(fs.readFileSync(path.join(attDir(), uploadedName), 'utf8')).toBe('uploaded source');
+    expect(fs.readFileSync(path.join(attDir(), importedName), 'utf8')).toBe('imported source');
+    expect(fs.readFileSync(source, 'utf8')).toBe('imported source');
+    expect(records).toHaveLength(4);
+    for (const privateValue of [uploadedName, importedName, UID, CID, tmpDir]) {
+      expect(JSON.stringify(records)).not.toContain(privateValue);
+    }
+  });
+
+  it('keeps metadata and cache failure diagnostics private while leaving attachments usable', async () => {
+    const records = await captureDiagnostics();
+    const indexer = await import('../../../src/main/features/file_indexer');
+    const privateError = 'Confidential contract excerpt';
+    vi.spyOn(indexer, 'statFile').mockRejectedValue(new Error(privateError));
+    vi.spyOn(indexer, 'invalidateFileCache').mockImplementation(() => { throw new Error(privateError); });
+    const m = await loadMod();
+    const name = 'Private contract.txt';
+    expect((await m.uploadAttachment(UID, CID, name, Buffer.from('retained bytes'))).ok).toBe(true);
+    records.length = 0;
+    const manifest = await m.buildAttachmentManifest(UID, CID, [name]);
+    expect(manifest.skipped).toEqual([]);
+    expect(manifest.manifest).toContain(name);
+    expect(manifest.manifest).not.toContain('total_chars=');
+    expect(await m.buildConversationAttachmentIndex(UID, CID)).toContain(name);
+    expect(fs.readFileSync(path.join(attDir(), name), 'utf8')).toBe('retained bytes');
+    expect(m.deleteAttachment(UID, CID, name)).toEqual({ ok: true });
+    expect(m.listAttachments(UID, CID)).toEqual([]);
+    expect(records).toHaveLength(3);
+    for (const privateValue of [name, privateError, UID, CID, tmpDir]) {
+      expect(JSON.stringify(records)).not.toContain(privateValue);
+    }
+  });
+});
 
 describe('chat_attachments › uploadAttachment', () => {
   it('accepts and stores a text file without any sibling cache', async () => {
@@ -381,6 +447,42 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(fs.readFileSync(path.join(attDir(), 'workspace-note.md'), 'utf8')).toBe('# hello\n');
   });
 
+  it('returns the content hash for a path import so its composer chip dedupes like a byte upload', async () => {
+    const m = await loadMod();
+    const body = Buffer.from('hash me\n');
+    const source = path.join(tmpDir, 'hashed.txt');
+    fs.writeFileSync(source, body);
+    const expected = crypto.createHash('sha256').update(body).digest('hex');
+
+    const first = await m.importAttachmentFromPath(UID, CID, source);
+    const again = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(first).toMatchObject({ ok: true, sha256: expected });
+    expect(again).toMatchObject({ ok: true, reused: true, sha256: expected });
+    // A byte upload of the same content is the same pending attachment.
+    expect(await m.uploadAttachment(UID, CID, 'copy.txt', body)).toMatchObject({
+      ok: true, reused: true, info: expect.objectContaining({ name: 'hashed.txt' }),
+    });
+    expect(m.listAttachments(UID, CID).map((item) => item.name)).toEqual(['hashed.txt']);
+  });
+
+  it('applies the same per-kind cap and reason on the path route as on the byte route', async () => {
+    const m = await loadMod();
+    const oversized = Buffer.alloc(8 * 1024 * 1024 + 1, 0x61);
+    const source = path.join(tmpDir, 'oversized.zip');
+    fs.writeFileSync(source, oversized);
+
+    const viaBytes = await m.uploadAttachment(UID, CID, 'oversized.zip', oversized);
+    const viaPath = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(viaBytes.ok).toBe(false);
+    expect(viaPath.ok).toBe(false);
+    if (viaBytes.ok || viaPath.ok) return;
+    expect(viaPath.error).toBe(viaBytes.error);
+    expect(viaPath.error).toContain('8');
+    expect(fs.existsSync(path.join(attDir(), 'oversized.zip'))).toBe(false);
+  });
+
   it('imports text files above the legacy 5 MiB cap by path', async () => {
     const m = await loadMod();
     const source = path.join(tmpDir, 'large-events.csv');
@@ -472,6 +574,7 @@ describe('chat_attachments › uploadAttachment', () => {
     const canonicalName = results[0].info.name;
     expect(['source-a.md', 'source-b.md']).toContain(canonicalName);
     expect(fs.readdirSync(attDir()).filter((n) => !n.startsWith('.'))).toEqual([canonicalName]);
+    expect(fs.readFileSync(path.join(attDir(), canonicalName), 'utf8')).toBe('same imported body');
   });
 
   it('validates text encoding when importing by path', async () => {
@@ -1170,6 +1273,8 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     expect(r.manifest).toContain('name="notes.txt"');
     expect(r.manifest).toContain('kind="text"');
     expect(r.manifest).toContain(`total_chars="${body.length}"`);
+    expect(r.manifest).toContain('host-validated paths are authoritative and readable');
+    expect(r.manifest).toContain('call read_files with the exact path directly');
     // bytes attribute removed — model only sees chars.
     expect(r.manifest).not.toMatch(/bytes="/);
     // No body / chunks / preview leakage.

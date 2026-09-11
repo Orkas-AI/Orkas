@@ -279,7 +279,7 @@ describe('kb_vector › search', () => {
     const kb = await loadKb();
     const paths = await import('../../../src/main/paths');
 
-    expect(kb.searchExisting(TEST_UID, fakeVec(1), { k: 5 })).toEqual([]);
+    expect(kb.search(TEST_UID, fakeVec(1), { k: 5 })).toEqual([]);
     expect(fs.existsSync(paths.userKbVectorDbPath(TEST_UID))).toBe(false);
     expect(fs.existsSync(paths.userKbConfigPath(TEST_UID))).toBe(false);
   });
@@ -288,7 +288,7 @@ describe('kb_vector › search', () => {
     const kb = await loadKb();
     await seed(kb);
 
-    const hits = kb.searchExisting(TEST_UID, fakeVec(1, 0), { k: 1 });
+    const hits = kb.search(TEST_UID, fakeVec(1, 0), { k: 1 });
 
     expect(hits).toHaveLength(1);
     expect(hits[0]).toMatchObject({

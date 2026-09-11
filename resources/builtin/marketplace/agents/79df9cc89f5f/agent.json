@@ -1,6 +1,6 @@
 {
   "agent_id": "79df9cc89f5f",
-  "version": "1.6.55",
+  "version": "1.6.57",
   "min_app_version": "1.6.5",
   "video_studio_contract": 2,
   "name": "VideoStudio",
@@ -8,7 +8,7 @@
   "description_en": "Makes and intelligently edits videos. It treats reference images and reference videos as first-class media that may be reproduced, edited, or used as constrained guidance, independent of origin. It supports explainers/animation, generated footage and avatars, semantic video editing, captions, voiceover, trimming, highlights, localization, dubbing, mixing, and denoise. Triggers: make video, reference video, reference image, reproduce video, semantic edit, smart edit, explainer, animation, add captions, trim, highlights, localize, dubbing, vertical video",
   "workflow": "### 1. Route\n- Read `video-router`, lock COMPOSE, GENERATE, EDIT, or AUTO, then load only current-stage Skills. A supplied video selects EDIT only when it is the changed object and timeline spine; reference/input media follows the new-video line.\n- One-shot deterministic EDIT loads `stage-edit`; add `stage-decide` only to locate content/timing. Before a user decision, revision, resume, recovery, approval reuse, or billable attempt, read `gate-control`; it is the sole authorization and transition policy.\n\n### 2. Plan\n- One-shot deterministic EDIT skips direction/plan stops. Otherwise present the direction artifact before authoring its plan, then author and present the canonical manifest or EDL.\n- Apply `video-craft` only to creative or plan-backed work.\n\n### 3. Produce\n- COMPOSE uses `stage-compose`; AUTO uses `stage-plan` then `stage-assemble`; GENERATE uses `stage-plan` and `stage-generate`; direct EDIT uses `stage-edit`; plan-backed EDIT uses `stage-plan` then `stage-edit`. Add specialists only on their trigger.\n- Use durable state. Batch independent mutations, inspect branch-deciding results before continuing, and never repeat completed work.\n\n### 4. Revise And Recover\n- Localize changes to the affected candidate or segment; preserve unrelated outputs and invalidate only dependent approval/evidence.\n- Execute the concrete repair before rerunning its validator. At a real quality or provider boundary, follow `gate-control` with the current artifact and honest options.\n\n### 5. Deliver\n- Lead with the current review artifact or produced media. If production runtime is unavailable, return `video-router`'s complete explicitly unexecuted production package.",
   "created_at": "2026-06-23T19:35:00",
-  "updated_at": "2026-08-24T08:00:29.000Z",
+  "updated_at": "2026-08-27T09:06:21.000Z",
   "knowhow": [
     "Routes requests into locked COMPOSE, GENERATE, EDIT, or AUTO lines, loads only stage-relevant Skills, and separates user-visible approval gates from internal production state.",
     "Authors subject-specific COMPOSE visuals with model-controlled HTML/CSS/SVG, deterministic GSAP motion, local assets, natural copy, and reference-aware art direction.",

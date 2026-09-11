@@ -66,11 +66,11 @@ describe('ipc broadcastToRenderer delivery contract', () => {
       { isDestroyed: () => false, webContents: { send: liveSend } },
     );
 
-    expect(broadcastToRenderer('bridge:permission', { request_id: 'req-3' })).toBe(true);
+    expect(broadcastToRenderer('local-agent:permission', { request_id: 'req-3' })).toBe(true);
     expect(brokenSend).toHaveBeenCalledOnce();
-    expect(liveSend).toHaveBeenCalledWith('bridge:permission', { request_id: 'req-3' });
+    expect(liveSend).toHaveBeenCalledWith('local-agent:permission', { request_id: 'req-3' });
 
     electronMocks.windows.splice(1, 1);
-    expect(broadcastToRenderer('bridge:permission', { request_id: 'req-4' })).toBe(false);
+    expect(broadcastToRenderer('local-agent:permission', { request_id: 'req-4' })).toBe(false);
   });
 });

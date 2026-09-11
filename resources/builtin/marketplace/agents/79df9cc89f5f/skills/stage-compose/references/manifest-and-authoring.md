@@ -12,10 +12,14 @@ duplicate canvas, duration, scenes, or audio ownership in another contract.
 It owns canvas, immutable target duration, fps, video language, scene windows,
 complete approved `source_shots`, semantic roles, narration intent, audio
 ownership, and `art_direction`. Declare captions with
-`composition.caption_mode`; absent means none. Standalone narrated work stores
-complete candidate words in each `narration_text` and pre-production audio as
-`owner:"none"`, `tracks:[]`, plus selected `narration_intent`. Visual/SFX-only
-work keeps narration empty and says at plan review that no voiceover is made.
+`composition.caption_mode`; absent means none. When the user does not specify
+audio, standalone explainers, promos, and other compose-led work default to
+narration. Preserve existing spoken or lip-synced source audio without an
+overlay voice; keep narration empty only for an explicit silent, music-only,
+or visual/SFX-only request. Narrated work stores complete candidate words in
+each `narration_text` and pre-production audio as `owner:"none"`, `tracks:[]`,
+plus selected `narration_intent`; a no-narration plan states that choice at plan
+review.
 
 ```json
 {

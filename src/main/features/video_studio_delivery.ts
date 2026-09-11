@@ -17,13 +17,13 @@
  * Measurement (needs ffmpeg) is separated from assessment (pure) so the
  * judgement is unit-testable against real captured numbers.
  */
-import { spawn } from 'node:child_process';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
 import { createLogger } from '../logger';
 import { bundledFfmpegPaths } from '../util/bundled-runtime';
 import { isPathAllowed } from '../util/path-sandbox';
+import { runVideoProcessForTest } from './video_studio';
 
 const log = createLogger('video-studio-delivery');
 
@@ -227,16 +227,24 @@ export function parseIntegratedLufs(stderr: string): number | null {
   return Number.isFinite(value) ? value : null;
 }
 
-function run(cmd: string, args: string[], signal?: AbortSignal): Promise<{ code: number; stdout: string; stderr: string }> {
-  return new Promise((resolve) => {
-    const child = spawn(cmd, args, signal ? { signal } : {});
-    let stdout = '';
-    let stderr = '';
-    child.stdout?.on('data', (d) => { stdout += String(d); });
-    child.stderr?.on('data', (d) => { stderr += String(d); });
-    child.on('close', (code) => resolve({ code: code ?? -1, stdout, stderr }));
-    child.on('error', () => resolve({ code: -1, stdout, stderr }));
-  });
+// Probes read container metadata; decodes (loudness, silence detection) walk
+// the whole delivered file. Both run through the shared bounded runner so a
+// wedged ffmpeg cannot pin a `production.status` call until turn abort, and
+// tool output stays capped like every other spawn in this feature.
+const DELIVERY_PROBE_TIMEOUT_MS = 60_000;
+const DELIVERY_DECODE_TIMEOUT_MS = 10 * 60_000;
+
+async function run(
+  cmd: string,
+  args: string[],
+  signal?: AbortSignal,
+  timeoutMs: number = DELIVERY_PROBE_TIMEOUT_MS,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const result = await runVideoProcessForTest(cmd, args, { signal, timeoutMs });
+  if (result.timedOut) {
+    log.warn('delivery verification process timed out', { bin: path.basename(cmd), timeout_ms: timeoutMs });
+  }
+  return { code: result.timedOut || result.aborted ? -1 : result.code, stdout: result.stdout, stderr: result.stderr };
 }
 
 export async function probeDeliveredVideo(videoAbsPath: string, signal?: AbortSignal): Promise<DeliveryVideoSpec | null> {
@@ -274,7 +282,7 @@ export async function measureIntegratedLufs(videoAbsPath: string, signal?: Abort
   if (!ffmpeg) return null;
   const r = await run(ffmpeg, [
     '-hide_banner', '-nostats', '-i', videoAbsPath, '-af', 'ebur128=peak=true', '-f', 'null', '-',
-  ], signal);
+  ], signal, DELIVERY_DECODE_TIMEOUT_MS);
   return parseIntegratedLufs(r.stderr);
 }
 
@@ -291,7 +299,7 @@ export async function measureVoicedSpan(
   if (!(durationSec > 0)) return null;
   const detect = await run(ffmpeg, [
     '-hide_banner', '-nostats', '-i', audioAbsPath, '-af', 'silencedetect=noise=-45dB:d=0.15', '-f', 'null', '-',
-  ], signal);
+  ], signal, DELIVERY_DECODE_TIMEOUT_MS);
   const span = parseVoicedSpan(detect.stderr, durationSec);
   return { ...span, durationSec };
 }

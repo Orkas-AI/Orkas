@@ -345,7 +345,7 @@ describe('global search conversation navigation', () => {
     expect(ipcSource).toContain('chats.getMessagesPageAtIndex(');
     expect(ipcSource).toContain('history_indexes: page.historyIndexes');
     expect(chatsSource).toContain(
-      'readJsonlWindow<MessageRecord>(file, pageStart, Number.MAX_SAFE_INTEGER)',
+      'readJsonlWindow<MessageRecord>(sourceFile, pageStart, Number.MAX_SAFE_INTEGER)',
     );
     const loadStart = conversationSource.indexOf('async function loadConversationHistory');
     const loadBody = conversationSource.slice(loadStart, conversationSource.indexOf('\nfunction _messageRecordHasMountedSidecars', loadStart));

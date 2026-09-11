@@ -9,7 +9,7 @@ const BROWSER_RUNTIME_INSTALL_PATTERNS = [
   /\bpython3?\s+-m\s+playwright\s+install\b/i,
 ];
 
-const WAF_CHALLENGE_RE = /_waf_[a-z0-9]+|cf-browser-verification|__cf_chl|cf_chl_opt|Attention Required!\s*\|\s*Cloudflare|Cloudflare Ray ID|Checking your browser before access|Just a moment\.\.\.|Enable JavaScript and cookies to continue|Verify (?:you are|you're)(?: a)? human|complete the security check|you don'?t have permission to access|人机(?:身份)?验证|安全验证|访问验证|滑动验证|请完成验证|反爬/i;
+const WAF_CHALLENGE_RE = /_waf_[a-z0-9]+|cf-browser-verification|__cf_chl|cf_chl_opt|Attention Required!\s*\|\s*Cloudflare|Cloudflare Ray ID|Checking your browser before access|verif(?:y|ying)\s+(?:your\s+)?(?:browser|connection)|Just a moment\.\.\.|Enable JavaScript and cookies to continue|Verify (?:you are|you're)(?: a)? human|complete the security check|you don'?t have permission to access|人机(?:身份)?验证|安全验证|访问验证|滑动验证|请完成验证|反爬/i;
 
 export function isBrowserAutomationCommand(command: string): boolean {
   return BROWSER_AUTOMATION_RE.test(String(command || ''));

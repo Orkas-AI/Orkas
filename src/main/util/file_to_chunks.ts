@@ -45,7 +45,7 @@ export interface FileToChunksOptions {
 }
 
 export const DEFAULT_MAX_CHARS = 400;
-export const DEFAULT_OVERLAP = 50;
+const DEFAULT_OVERLAP = 50;
 
 /** Primary entrypoint. Returns ≥ 1 chunk for any successful input. */
 export async function fileToChunks(opts: FileToChunksOptions): Promise<ExtractedChunk[]> {
@@ -99,7 +99,7 @@ export async function fileToChunks(opts: FileToChunksOptions): Promise<Extracted
  *   4. A single sentence > budget (rare — pasted URL, no punctuation) is
  *      hard-sliced with overlap as a last resort.
  */
-export function chunkPlainText(
+function chunkPlainText(
   text: string,
   budget = DEFAULT_MAX_CHARS,
   overlap = DEFAULT_OVERLAP,

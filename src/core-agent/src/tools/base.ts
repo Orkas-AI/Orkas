@@ -91,9 +91,70 @@ export type CommandExecutionObservation = {
 };
 
 export type ToolObservations = {
+  /** Host-only outcomes from Result Store retrieval, including failures hidden
+   * by a partially successful outer call. Never serialized into model content. */
+  resultRetrievalBatch?: {
+    requested: number;
+    attempted: number;
+    succeeded: number;
+    failed: number;
+    skipped: number;
+    failures: Array<{ index: number; code: string }>;
+  };
   fileReads?: FileReadObservation[];
+  /** Host-only outcome of one bounded read_files batch. Partial item failure
+   * does not change the outer tool result: consumers use this only for
+   * diagnostics and keep successful reads usable. */
+  fileReadBatch?: {
+    attempted: number;
+    succeeded: number;
+    failed: number;
+    /** Zero-based indexes match the model-visible read-result envelope.
+     * Codes are bounded stable labels; paths and messages stay out of
+     * telemetry. */
+    failures: Array<{ index: number; code: string }>;
+  };
   fileChanges?: FileChangeObservation[];
   execution?: CommandExecutionObservation;
+  /** Exact identity of the JavaScript evaluated by run_program. The source
+   * body and local path stay private; diagnostics may retain this bounded
+   * identity to prove that a saved artifact, rather than regenerated inline
+   * code, was executed. */
+  programExecution?: {
+    sourceKind: "inline" | "file";
+    sourceSha256: string;
+    /** Host-only aggregate of child-tool outcomes. Ordinary child failures do
+     * not change run_program's own success state: the program may recover from
+     * them and still emit a useful batch result. */
+    childCalls: {
+      attempted: number;
+      succeeded: number;
+      failed: number;
+      failedTools: Array<{ name: string; count: number }>;
+    };
+  };
+  /** Host-only diagnostic for coordination tools. It records whether accepted
+   * state changed, but never controls task progress, termination, or exposure. */
+  coordination?: {
+    changed: boolean;
+  };
+};
+
+/** Host-only identity for a complete deterministic validation snapshot.
+ * Validators opt in only when one execution reports every blocker currently
+ * discoverable in `content`. The stable scope lets loop guards keep changing
+ * blocker codes in one convergence episode without conflating unrelated
+ * projects or ordinary/transient tool failures. */
+export type ToolFailureContext = {
+  kind: "deterministic_validation";
+  /** Stable non-sensitive identity for the validated artifact or project. */
+  scope: string;
+  /** Must be true only when content contains the complete current blocker set. */
+  complete: boolean;
+  /** Total current blocker count before this bounded host-only code summary. */
+  issueCount?: number;
+  /** Bounded diagnostic labels for logs/tests; raw messages stay in content. */
+  issueCodes?: string[];
 };
 
 /** Result returned from a tool execution. */
@@ -107,6 +168,9 @@ export type ToolResult = {
    * them with the real tool-call/turn identity; providers never receive this
    * object directly. */
   observations?: ToolObservations;
+  /** Host-only failure grouping used by run-scoped convergence guards. It is
+   * never serialized into provider tool_result content. */
+  failureContext?: ToolFailureContext;
   /** Host-only handoff for process output that was streamed to a session temp
    * file instead of being truncated at the in-memory capture threshold. The
    * final host result transformer must content-address/adopt this file before
@@ -137,6 +201,9 @@ export type ToolResult = {
    *  deliberate last act of a turn — e.g. handing the conversation off to
    *  another agent, where a commander "synthesis" turn would be wasted. */
   endTurn?: boolean;
+  /** Host-observed reason for an immediate terminal tool boundary. Only
+   * honored with endTurn; never inferred from model text or tool content. */
+  endTurnReason?: "waiting_input";
   /** Used with `endTurn` when a terminal bookkeeping tool expects the model to
    * write the user-facing reply in the same response. If that response has no
    * text, the runner permits exactly one tool-free synthesis instead of
@@ -162,6 +229,11 @@ export interface AgentTool {
   /** JSON Schema for the tool's input parameters. */
   readonly inputSchema: Record<string, unknown>;
 
+  /** Re-read the model-facing description whenever provider definitions are
+   * built. Use only when Host state changes the advertised capability during
+   * a run; ordinary tools stay cached. Engine-internal. */
+  readonly dynamicDescription?: boolean;
+
   /** Whether this tool may run concurrently with ADJACENT same-mode tool
    *  calls in one tool-use batch. Defaults to "sequential". Only
    *  side-effect-free, `ctx.state`-non-mutating tools (read / list / grep /
@@ -183,13 +255,19 @@ export interface AgentTool {
 export const TOOL_DESCRIPTION_SOFT_BUDGET_CHARS = 480;
 export const SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS = 220;
 
-const toolDefinitionCache = new WeakMap<AgentTool, ToolDefinition>();
+type CachedToolDefinition = {
+  definition: ToolDefinition;
+  description: string;
+};
+
+const toolDefinitionCache = new WeakMap<AgentTool, CachedToolDefinition>();
 
 /** Convert an AgentTool to the provider ToolDefinition format. */
 export function toToolDefinition(tool: AgentTool): ToolDefinition {
   const cached = toolDefinitionCache.get(tool);
-  if (cached) return cached;
+  if (cached && !tool.dynamicDescription) return cached.definition;
   const description = normalizeDescription(tool.description);
+  if (cached?.description === description) return cached.definition;
   warnLongDescriptionOnce(
     `tool:${tool.name}:description`,
     tool.name,
@@ -202,7 +280,7 @@ export function toToolDefinition(tool: AgentTool): ToolDefinition {
     description,
     inputSchema: compactSchema(tool.inputSchema, tool.name),
   };
-  toolDefinitionCache.set(tool, definition);
+  toolDefinitionCache.set(tool, { definition, description });
   return definition;
 }
 

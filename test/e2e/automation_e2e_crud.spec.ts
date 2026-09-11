@@ -1,5 +1,17 @@
 import type { Page } from '@playwright/test';
-import { expect, test } from './fixtures/orkas';
+import { expect, OrkasTestApp, test as base } from './fixtures/orkas';
+
+const test = base.extend<{ cliModelOrkas: OrkasTestApp }>({
+  cliModelOrkas: async ({}, use, testInfo) => {
+    const app = new OrkasTestApp(testInfo, { cliStub: true, modelStub: true });
+    try {
+      await app.launch();
+      await use(app);
+    } finally {
+      await app.dispose();
+    }
+  },
+});
 
 type AutoTask = {
   id: string;
@@ -9,12 +21,17 @@ type AutoTask = {
   project_id?: string;
   schedule?: {
     type: string;
+    interval_hours?: number;
     weekday?: number;
     day?: number;
     hour?: number;
     minute?: number;
     at?: string;
   };
+  end_condition?:
+    | { type: 'date'; date: string }
+    | { type: 'count'; max_runs: number };
+  scheduled_run_count?: number;
   last_run_at?: string;
 };
 
@@ -37,6 +54,99 @@ test.describe('automation', () => {
   // one-lifecycle budget even when each user-visible assertion is prompt.
   test.describe.configure({
     timeout: process.platform === 'win32' ? 120_000 : 60_000,
+  });
+
+  test('groups global automations first and follows sidebar project renames without losing expansion', async ({ orkas }, testInfo) => {
+    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+    const project10 = await orkas.invoke<{ project: { project_id: string } }>('projects.create', { name: 'Automation 10' });
+    const project2 = await orkas.invoke<{ project: { project_id: string } }>('projects.create', { name: 'Automation 2' });
+    const at = '2099-12-31T09:00:00.000Z';
+    const task10 = await orkas.invoke<{ task: AutoTask }>('autoTasks.create', {
+      title: 'Release checks', content: 'Check the release plan',
+      project_id: project10.project.project_id, schedule: { type: 'one_time', at },
+    });
+    const longContent = `Summarize project work. ${'Include the relevant details. '.repeat(10)}End of the complete instruction.`;
+    const task2 = await orkas.invoke<{ task: AutoTask }>('autoTasks.create', {
+      title: 'Project summary', content: longContent,
+      project_id: project2.project.project_id, schedule: { type: 'one_time', at },
+    });
+    await orkas.invoke('autoTasks.create', {
+      title: 'Global summary', content: 'Review work across projects', schedule: { type: 'one_time', at },
+      recipient: { kind: 'agent', id: 'e2e-release-reviewer', name: 'Release reviewer' },
+    });
+    const page = await orkas.relaunch();
+    await openAutomation(page);
+    const groupNames = page.locator('#auto-list .auto-group-name');
+    await expect(groupNames).toHaveText(['Global', 'Automation 2', 'Automation 10']);
+    await expect(page.locator('#projects-list .project-name')).toHaveText(['Automation 2', 'Automation 10']);
+    const globalGroup = page.locator('#auto-list .auto-group[data-project-id=""]');
+    const globalFolder = globalGroup.locator('.auto-group-folder-icon');
+    await expect(globalFolder).toHaveCount(1);
+    await expect(globalFolder).toHaveClass(/\bis-folder-open\b/);
+    await expect(globalGroup.locator('.auto-row-title')).toHaveText('Global summary');
+    await expect(globalGroup.locator('.auto-row-chip.is-agent')).toHaveText('Release reviewer');
+    await expect(globalGroup.locator('.auto-row-chip.is-device')).toHaveText('This device');
+    await globalGroup.locator('.auto-group-toggle').click();
+    await expect(globalGroup.locator('.auto-group-list')).toBeHidden();
+    await expect(globalGroup.locator('.auto-group-toggle')).toHaveAttribute('aria-expanded', 'false');
+    await expect(globalFolder).toHaveClass(/\bis-folder(?:\s|$)/);
+    await globalGroup.locator('.auto-group-toggle').click();
+    await expect(globalGroup.locator('.auto-row-title')).toBeVisible();
+    await expect(globalGroup.locator('.auto-group-toggle')).toHaveAttribute('aria-expanded', 'true');
+    await expect(globalFolder).toHaveClass(/\bis-folder-open\b/);
+    const group2 = page.locator(`#auto-list .auto-group[data-project-id="${project2.project.project_id}"]`);
+    const group10 = page.locator(`#auto-list .auto-group[data-project-id="${project10.project.project_id}"]`);
+    const row2 = group2.locator(`.auto-row[data-task-id="${task2.task.id}"]`);
+    await expect(row2.locator('.auto-row-chip.is-agent')).toHaveText('Commander');
+    await expect(row2.locator('.auto-row-expand, .auto-row-expand-icon')).toHaveCount(0);
+    await expect(page.locator('#auto-list .auto-group-chevron')).toHaveCount(0);
+    await row2.click();
+    await expect(row2.locator('.auto-row-content')).toHaveText(longContent);
+    await expect(row2.locator('.auto-row-convs')).toBeVisible();
+    await group10.locator('.auto-group-toggle').click();
+    await expect(group10.locator('.auto-group-list')).toBeHidden();
+
+    // Rename through the actual sidebar while Automation remains visible.
+    const sidebar10 = page.locator(`#projects-list .project-row[data-pid="${project10.project.project_id}"]`);
+    await sidebar10.hover();
+    await sidebar10.locator('[data-project-menu]').click();
+    await page.locator('#project-row-menu [data-action="rename"]').click();
+    const rename = page.locator('input.project-rename-input');
+    await rename.fill('Automation 1');
+    await rename.press('Enter');
+    await expect(groupNames).toHaveText(['Global', 'Automation 1', 'Automation 2']);
+    await expect(page.locator('#projects-list .project-name')).toHaveText(['Automation 1', 'Automation 2']);
+    await expect(group10.locator('.auto-group-list')).toBeHidden();
+    await expect(row2.locator('.auto-row-convs')).toBeVisible();
+
+    // The page-level create action assigns the selected project to its group.
+    await page.locator('#auto-add-btn').click();
+    await selectAiOption(page, '#auto-project-select', 'Automation 2');
+    await page.locator('#auto-task-input').fill('Prepare a project follow-up');
+    await page.locator('#auto-title-input').fill('Project follow-up');
+    await page.locator('#auto-enabled-input').uncheck();
+    await page.locator('#auto-submit-btn').click();
+    await expect(page.locator('#auto-task-dialog-overlay')).toBeHidden();
+    await expect(group2.locator('.auto-row-title')).toContainText(['Project follow-up', 'Project summary']);
+    const listed = await orkas.invoke<{ tasks: AutoTask[] }>('autoTasks.list', { projectId: project2.project.project_id });
+    expect(listed.tasks.find(task => task.title === 'Project follow-up')).toMatchObject({
+      project_id: project2.project.project_id, enabled: false,
+    });
+    await expect(group10.locator('.auto-group-list')).toBeHidden();
+    await expect(row2.locator('.auto-row-convs')).toBeVisible();
+    await page.evaluate(async () => (window as any).setLang('zh'));
+    await expect(groupNames).toHaveText(['全局', 'Automation 1', 'Automation 2']);
+    await expect(group10.locator('.auto-group-list')).toBeHidden();
+    await expect(row2.locator('.auto-row-convs')).toBeVisible();
+    await group10.locator('.auto-group-toggle').click();
+    await expect(group10.locator(`.auto-row[data-task-id="${task10.task.id}"]`)).toBeVisible();
+    await row2.click();
+    await page.screenshot({ path: testInfo.outputPath('automation-project-groups.png') });
+    await page.setViewportSize({ width: 800, height: 850 });
+    await expect(row2).toBeVisible();
+    const overflow = await page.locator('#auto-list').evaluate((el) => el.scrollWidth > el.clientWidth);
+    expect(overflow).toBe(false);
+    await page.screenshot({ path: testInfo.outputPath('automation-project-groups-narrow.png') });
   });
 
   test('creates a persistent automation from the Commander model protocol', async ({ modelOrkas }) => {
@@ -64,7 +174,8 @@ test.describe('automation', () => {
     await expect(final).not.toContainText('<auto-task>');
     expect(modelOrkas.modelRequests).toHaveLength(1);
     const requestText = JSON.stringify(modelOrkas.modelRequests[0]);
-    expect(requestText).toContain('autotask-creator');
+    expect(requestText).toContain('auto_tasks');
+    expect(requestText).not.toContain('**auto-tasks**');
 
     let listed = await modelOrkas.invoke<{ tasks: AutoTask[] }>('autoTasks.list');
     expect(listed.tasks).toHaveLength(1);
@@ -86,30 +197,34 @@ test.describe('automation', () => {
     expect(modelOrkas.modelRequests).toHaveLength(1);
   });
 
-  test('does not fire while locked and still fires while merely idle', async ({ modelOrkas }) => {
+  test('fires while the runnable app is locked or idle', async ({ modelOrkas }) => {
     if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
     const page = modelOrkas.page;
 
     await modelOrkas.setSystemIdleStateForTest('locked');
-    const sleeping = await modelOrkas.invoke<{ task: AutoTask }>('autoTasks.create', {
-      content: 'Do not run during system sleep',
-      title: 'E2E Sleeping Automation',
+    const locked = await modelOrkas.invoke<{ task: AutoTask }>('autoTasks.create', {
+      content: 'Run while the screen is locked but the app remains runnable',
+      title: 'E2E Locked Automation',
       schedule: { type: 'one_time', at: new Date(Date.now() + 1_500).toISOString() },
     });
-    await page.waitForTimeout(2_500);
 
     let conversations = await modelOrkas.invoke<{
       conversations: Array<{ conversation_id: string; origin_auto_task_id?: string }>;
     }>('conversations.list');
-    expect(conversations.conversations.filter(
-      (item) => item.origin_auto_task_id === sleeping.task.id,
-    )).toHaveLength(0);
+    await expect.poll(async () => {
+      conversations = await modelOrkas.invoke<{
+        conversations: Array<{ conversation_id: string; origin_auto_task_id?: string }>;
+      }>('conversations.list');
+      return conversations.conversations.filter(
+        (item) => item.origin_auto_task_id === locked.task.id,
+      ).length;
+    }).toBe(1);
 
     let listed = await modelOrkas.invoke<{ tasks: AutoTask[] }>('autoTasks.list');
-    const sleepingTask = listed.tasks.find((task) => task.id === sleeping.task.id);
-    expect(sleepingTask).toMatchObject({ enabled: true });
-    expect(sleepingTask?.last_run_at).toBeUndefined();
-    expect(sleepingTask).not.toHaveProperty('last_skipped_at');
+    expect(listed.tasks.find((task) => task.id === locked.task.id)).toMatchObject({
+      enabled: false,
+      last_run_at: expect.any(String),
+    });
 
     await modelOrkas.setSystemIdleStateForTest('idle');
     const idle = await modelOrkas.invoke<{ task: AutoTask }>('autoTasks.create', {
@@ -131,7 +246,7 @@ test.describe('automation', () => {
     )?.conversation_id;
     expect(idleConversationId).toBeTruthy();
     await expect(page.locator(
-      `.conv-item[data-cid="${idleConversationId}"]`,
+      `#conversation-list .conv-item[data-cid="${idleConversationId}"]`,
     )).toBeVisible();
 
     listed = await modelOrkas.invoke<{ tasks: AutoTask[] }>('autoTasks.list');
@@ -140,8 +255,8 @@ test.describe('automation', () => {
       last_run_at: expect.any(String),
     });
     expect(conversations.conversations.filter(
-      (item) => item.origin_auto_task_id === sleeping.task.id,
-    )).toHaveLength(0);
+      (item) => item.origin_auto_task_id === locked.task.id,
+    )).toHaveLength(1);
   });
 
   test('runs from the row menu, opens the conversation, and preserves the next scheduled run', async ({ modelOrkas }) => {
@@ -158,7 +273,28 @@ test.describe('automation', () => {
     await openAutomation(page);
     const row = page.locator('.auto-row', { hasText: 'Run this automation on demand' });
     await expect(row).toHaveClass(/\bis-disabled\b/);
-    await row.locator('.auto-row-more').click();
+    const more = row.locator('.auto-row-more');
+    await page.locator('#auto-add-btn').hover();
+    await expect(more).toHaveCSS('opacity', '0');
+    await row.hover();
+    await expect(more).toHaveCSS('opacity', '1');
+    const side = row.locator('.auto-row-side');
+    const [rowBox, moreBox, sideBox] = await Promise.all([
+      row.boundingBox(),
+      more.boundingBox(),
+      side.boundingBox(),
+    ]);
+    expect(rowBox).not.toBeNull();
+    expect(moreBox).not.toBeNull();
+    expect(sideBox).not.toBeNull();
+    expect(moreBox!.width).toBeLessThanOrEqual(22);
+    expect(moreBox!.y - rowBox!.y).toBeLessThan(12);
+    expect((rowBox!.x + rowBox!.width) - (moreBox!.x + moreBox!.width)).toBeLessThan(12);
+    // Schedule metadata uses only the card's normal inset. The hover-only menu
+    // overlays the corner instead of reserving a permanent blank column.
+    expect((rowBox!.x + rowBox!.width) - (sideBox!.x + sideBox!.width)).toBeLessThanOrEqual(18);
+    await expect(row.locator('.auto-row-head')).toHaveCSS('grid-template-columns', /^\S+\s+\S+$/);
+    await more.click();
     const runItem = page.locator('.auto-row-menu .auto-row-menu-item[data-action="run-now"]');
     await expect(runItem).toHaveText('Run now');
     await runItem.click();
@@ -184,7 +320,10 @@ test.describe('automation', () => {
     expect(listed.tasks[0].last_run_at).toBeUndefined();
   });
 
-  test('keeps the first-message @Agent target through follow-ups, relaunch, and an explicit Commander reset', async ({ cliOrkas }) => {
+  test('keeps the first-message @Agent target through follow-ups, relaunch, and an explicit Commander reset', async ({ cliModelOrkas: cliOrkas }) => {
+    // This case intentionally crosses two Electron lifecycles. Leave bounded
+    // headroom for the fixture to close both processes after the assertions.
+    test.setTimeout(120_000);
     if (!cliOrkas.page) throw new Error('Orkas renderer is unavailable');
     let page = cliOrkas.page;
     const agentName = 'AutomationStickyAgentE2E';
@@ -210,7 +349,7 @@ test.describe('automation', () => {
       taskId: created.task.id,
     });
     await page.evaluate(async () => (window as any).loadConversations());
-    await page.locator(`.conv-item[data-cid="${fired.cid}"]`).click();
+    await page.locator(`#conversation-list .conv-item[data-cid="${fired.cid}"]`).click();
 
     await expect(page.locator('#chat-history .chat-message.user').first()).toContainText(
       `@${agentName}`,
@@ -252,7 +391,7 @@ test.describe('automation', () => {
     expect(runtime.active_recipient).toBe(createdAgent.agent.agent_id);
 
     page = await cliOrkas.relaunch();
-    await page.locator(`.conv-item[data-cid="${fired.cid}"]`).click();
+    await page.locator(`#conversation-list .conv-item[data-cid="${fired.cid}"]`).click();
     await expect(page.locator('#chat-history .chat-message.assistant', {
       hasText: 'E2E_CLI_DEFAULT_OK',
     })).toHaveCount(2);
@@ -278,6 +417,10 @@ test.describe('automation', () => {
     await expect(picker).toBeVisible();
     await picker.locator('.skill-picker-item[data-id="__commander__"]').click();
     await expect(page.locator('#chat-recipient-name')).toHaveText('Commander');
+    await page.keyboard.press('Escape');
+    await expect(picker).toBeHidden();
+    const modelRequestsBeforeReset = cliOrkas.modelRequests.length;
+    cliOrkas.setModelTextReplies(['E2E Commander resumed this conversation.']);
     await page.locator('#chat-input').fill('E2E explicitly return this conversation to Commander');
     await page.locator('#chat-input').press('Enter');
     await expect.poll(async () => {
@@ -286,6 +429,14 @@ test.describe('automation', () => {
       });
       return afterReset.active_recipient || '';
     }).toBe('');
+    await expect(page.locator('#chat-history .chat-message.assistant', {
+      hasText: 'E2E Commander resumed this conversation.',
+    })).toBeVisible({ timeout: 20_000 });
+    await expect.poll(async () => {
+      const completed = await cliOrkas.invoke<{ processing: boolean }>('groupChat.runtimeStatus', { cid: fired.cid });
+      return completed.processing;
+    }).toBe(false);
+    expect(cliOrkas.modelRequests).toHaveLength(modelRequestsBeforeReset + 1);
     expect(cliOrkas.readCliState().invocations).toHaveLength(3);
   });
 
@@ -327,7 +478,7 @@ test.describe('automation', () => {
     }, { timeout: 30_000 }).not.toBe('');
 
     await page.evaluate(async () => (window as any).loadConversations());
-    await page.locator(`.conv-item[data-cid="${conversationId}"]`).click();
+    await page.locator(`#conversation-list .conv-item[data-cid="${conversationId}"]`).click();
     await expect(page.locator('#chat-history .chat-message.user').first()).toContainText(
       `@${newName}`,
     );
@@ -348,7 +499,7 @@ test.describe('automation', () => {
     expect(cliState.invocations[0].prompt).not.toContain('## Return control to commander');
   });
 
-  test('supports project-bound weekly, monthly, and one-time schedules', async ({ orkas }) => {
+  test('supports project-bound hourly, weekly, monthly, and one-time schedules with optional ends', async ({ orkas }) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     const createdProject = await orkas.invoke<{ project: { project_id: string; name: string } }>('projects.create', {
       name: 'E2E Scheduled Project',
@@ -367,12 +518,15 @@ test.describe('automation', () => {
 
     await page.locator('#auto-task-input').fill('Run the project release review');
     await page.locator('#auto-title-input').fill('E2E Project Schedule');
-    await selectAiOption(page, '#auto-freq-select', 'Weekly');
-    await expect(page.locator('#auto-row-weekday')).toBeVisible();
+    await selectAiOption(page, '#auto-freq-select', 'Every x hours');
+    await expect(page.locator('#auto-row-hourly-interval')).toBeVisible();
+    await expect(page.locator('#auto-row-time')).toBeHidden();
+    await page.locator('#auto-hourly-interval-input').fill('6');
+    await selectAiOption(page, '#auto-end-select', 'After a number of runs');
+    await expect(page.locator('#auto-row-end-count')).toBeVisible();
+    await page.locator('#auto-end-count-input').fill('3');
+    await expect(page.locator('#auto-row-weekday')).toBeHidden();
     await expect(page.locator('#auto-row-monthly-day')).toBeHidden();
-    await selectAiOption(page, '#auto-weekday-select', 'Wed');
-    await selectAiOption(page, '#auto-hour-select', '14');
-    await selectAiOption(page, '#auto-minute-select', '30');
     await page.locator('#auto-submit-btn').click();
     await expect(dialog).toBeHidden();
 
@@ -382,43 +536,75 @@ test.describe('automation', () => {
     let listed = await orkas.invoke<{ tasks: AutoTask[] }>('autoTasks.list', { projectId });
     expect(listed.tasks[0]).toMatchObject({
       project_id: projectId,
-      schedule: { type: 'weekly', weekday: 3, hour: 14, minute: 30 },
+      schedule: { type: 'hourly', interval_hours: 6 },
+      end_condition: { type: 'count', max_runs: 3 },
+      scheduled_run_count: 0,
     });
 
+    await row.hover();
+    await row.locator('.auto-row-more').click();
+    await page.locator('.auto-row-menu .auto-row-menu-item[data-action="edit"]').click();
+    await selectAiOption(page, '#auto-freq-select', 'Weekly');
+    await expect(page.locator('#auto-row-weekday')).toBeVisible();
+    await expect(page.locator('#auto-row-time')).toBeVisible();
+    await selectAiOption(page, '#auto-weekday-select', 'Wed');
+    await selectAiOption(page, '#auto-hour-select', '14');
+    await selectAiOption(page, '#auto-minute-select', '30');
+    await page.locator('#auto-submit-btn').click();
+    await expect(dialog).toBeHidden();
+    listed = await orkas.invoke<{ tasks: AutoTask[] }>('autoTasks.list', { projectId });
+    expect(listed.tasks[0]).toMatchObject({
+      schedule: { type: 'weekly', weekday: 3, hour: 14, minute: 30 },
+      end_condition: { type: 'count', max_runs: 3 },
+      scheduled_run_count: 0,
+    });
+
+    row = page.locator('#project-auto-list .auto-row', { hasText: 'Run the project release review' });
+    await row.hover();
     await row.locator('.auto-row-more').click();
     await page.locator('.auto-row-menu .auto-row-menu-item[data-action="edit"]').click();
     await selectAiOption(page, '#auto-freq-select', 'Monthly');
     await expect(page.locator('#auto-row-monthly-day')).toBeVisible();
     await expect(page.locator('#auto-row-weekday')).toBeHidden();
     await selectAiOption(page, '#auto-monthly-day-select', 'Last day');
+    await selectAiOption(page, '#auto-end-select', 'On a date');
+    await expect(page.locator('#auto-row-end-date')).toBeVisible();
+    await page.locator('#auto-end-date-input').fill('2099-12-31');
     await page.locator('#auto-submit-btn').click();
     await expect(dialog).toBeHidden();
     listed = await orkas.invoke<{ tasks: AutoTask[] }>('autoTasks.list', { projectId });
     expect(listed.tasks[0].schedule).toMatchObject({ type: 'monthly', day: 31, hour: 14, minute: 30 });
+    expect(listed.tasks[0].end_condition).toEqual({ type: 'date', date: '2099-12-31' });
+    expect(listed.tasks[0].scheduled_run_count).toBeUndefined();
 
     row = page.locator('#project-auto-list .auto-row', { hasText: 'Run the project release review' });
+    await row.hover();
     await row.locator('.auto-row-more').click();
     await page.locator('.auto-row-menu .auto-row-menu-item[data-action="edit"]').click();
     await selectAiOption(page, '#auto-freq-select', 'Once');
     await expect(page.locator('#auto-row-date')).toBeVisible();
     await expect(page.locator('#auto-row-time')).toBeVisible();
+    await expect(page.locator('#auto-row-end')).toBeHidden();
     await page.locator('#auto-date-input').fill('2099-12-31');
     await page.locator('#auto-submit-btn').click();
     await expect(dialog).toBeHidden();
     listed = await orkas.invoke<{ tasks: AutoTask[] }>('autoTasks.list', { projectId });
     expect(listed.tasks[0].schedule?.type).toBe('one_time');
     expect(listed.tasks[0].schedule?.at).toMatch(/^2099-12-31T/);
+    expect(listed.tasks[0].end_condition).toBeUndefined();
+    expect(listed.tasks[0].scheduled_run_count).toBeUndefined();
 
     page = await orkas.relaunch();
     await openAutomation(page);
     row = page.locator('.auto-row', { hasText: 'Run the project release review' });
     await expect(row).toBeVisible();
-    await expect(row).toContainText('E2E Scheduled Project');
+    await expect(page.locator('.auto-group', { has: row }).locator('.auto-group-name')).toHaveText('E2E Scheduled Project');
 
+    await row.hover();
     await row.locator('.auto-row-more').click();
     await page.locator('.auto-row-menu .auto-row-menu-item[data-action="edit"]').click();
     await expect(page.locator('#auto-row-project')).toBeVisible();
-    await selectAiOption(page, '#auto-project-select', 'None');
+    await selectAiOption(page, '#auto-project-select', 'Global');
     await page.locator('#auto-submit-btn').click();
     await expect(page.locator('#auto-task-dialog-overlay')).toBeHidden();
 
@@ -432,7 +618,7 @@ test.describe('automation', () => {
     await openAutomation(page);
     row = page.locator('.auto-row', { hasText: 'Run the project release review' });
     await expect(row).toBeVisible();
-    await expect(row).not.toContainText('E2E Scheduled Project');
+    await expect(page.locator('.auto-group', { has: row }).locator('.auto-group-name')).toHaveText('Global');
     const persistedGlobal = await orkas.invoke<{ tasks: AutoTask[] }>('autoTasks.list', {
       projectId: null,
     });
@@ -466,6 +652,7 @@ test.describe('automation', () => {
       enabled: true,
     });
 
+    await row.hover();
     await row.locator('.auto-row-more').click();
     await page.locator('.auto-row-menu .auto-row-menu-item[data-action="edit"]').click();
     await expect(dialog).toBeVisible();
@@ -475,6 +662,7 @@ test.describe('automation', () => {
     row = page.locator('.auto-row', { hasText: 'Review the E2E status every weekday' });
     await expect(row).toBeVisible();
 
+    await row.hover();
     await row.locator('.auto-row-more').click();
     await page.locator('.auto-row-menu .auto-row-menu-item[data-action="toggle-enabled"]').click();
     await expect(row).toHaveClass(/\bis-disabled\b/);
@@ -485,6 +673,7 @@ test.describe('automation', () => {
     await openAutomation(relaunchedPage);
     row = relaunchedPage.locator('.auto-row', { hasText: 'Review the E2E status every weekday' });
     await expect(row).toHaveClass(/\bis-disabled\b/);
+    await row.hover();
     await row.locator('.auto-row-more').click();
     await relaunchedPage.locator('.auto-row-menu .auto-row-menu-item[data-action="delete"]').click();
     await expect(relaunchedPage.locator('.ui-dialog-overlay:visible .ui-dialog')).toBeVisible();

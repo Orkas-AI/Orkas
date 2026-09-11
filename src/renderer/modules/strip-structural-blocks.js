@@ -556,7 +556,7 @@ function _stripSurvivingStructuralBlocks(text) {
   // `artifact-result` and `marketplace-install-result` are user→system result
   // tags (user-side render strips them); included here so they are also
   // removed if they ever leak into assistant text (LLM quoting / hallucination).
-  for (const tag of ['agent', 'agent-input-form', 'agent-input-submission', 'artifact-result', 'marketplace-install-result', 'skill', 'skill-meta', 'auto-task']) {
+  for (const tag of ['agent', 'agent-input-form', 'agent-input-submission', 'artifact-result', 'marketplace-install-result', 'skill', 'skill-meta', 'skill-as-package', 'auto-task']) {
     out = _stripOuterTagBlocks(out, tag);
   }
   // `<<<skill-file>>>` blocks: backend `extractSkillFileBlocks` strips them

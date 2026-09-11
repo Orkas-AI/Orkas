@@ -147,6 +147,9 @@ describe('local-tools › identity', () => {
     const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
     expect(bash.description.toLowerCase()).not.toContain('sandbox');
     expect(bash.description).toMatch(/local machine|host/i);
+    expect(bash.description).toMatch(/Built-in Python and Node\.js.*`python` and `node`/i);
+    expect(bash.description).toMatch(/deterministic transformations over many local files or records/i);
+    expect(bash.description).toMatch(/dedicated tool for a targeted operation/i);
   });
 
   it('resolves documented POSIX, PowerShell, and cmd environment path forms', async () => {
@@ -260,30 +263,18 @@ describe('local-tools › publish_outputs', () => {
     expect(JSON.parse(res.content)).toEqual({ published: 2, requested: 2 });
   });
 
-  it('rejects a guessed path and exposes the exact eligible path without auto-publishing it', async () => {
+  it('reports the filtered selection without turning a zero match into a task error', async () => {
     const { lt } = await loadModules();
-    const eligible = path.join(tmpDir, 'out', 'actual.xlsx');
-    const onOutputsPublished = vi.fn((paths: string[]) => (
-      paths.includes(eligible) ? [eligible] : []
-    ));
-    const getPublishableOutputPaths = vi.fn(() => [eligible]);
-    const publish = lt.createLocalTools({ onOutputsPublished, getPublishableOutputPaths })
+    const onOutputsPublished = vi.fn(() => []);
+    const publish = lt.createLocalTools({ onOutputsPublished })
       .find((t) => t.name === 'publish_outputs')!;
 
-    const rejected = await publish.execute({ paths: ['not-produced.xlsx'] }, makeCtx());
+    const res = await publish.execute({ paths: ['not-eligible.xlsx'] }, makeCtx());
 
-    expect(rejected.isError).toBe(true);
-    expect(rejected.content).toContain('E_OUTPUT_NOT_PRODUCED');
-    expect(rejected.content).toContain(`eligible_current_turn_paths=[${JSON.stringify(eligible)}]`);
-    expect(rejected.content).toContain('do not edit, review, or regenerate');
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(res.content)).toEqual({ published: 0, requested: 1 });
     expect(onOutputsPublished).toHaveBeenCalledTimes(1);
-    expect(onOutputsPublished).toHaveBeenLastCalledWith([path.join(tmpDir, 'not-produced.xlsx')]);
-    expect(getPublishableOutputPaths).toHaveBeenCalledTimes(1);
-
-    const recovered = await publish.execute({ paths: [eligible] }, makeCtx());
-    expect(recovered.isError).toBeFalsy();
-    expect(JSON.parse(recovered.content)).toEqual({ published: 1, requested: 1 });
-    expect(onOutputsPublished).toHaveBeenCalledTimes(2);
+    expect(onOutputsPublished).toHaveBeenCalledWith([path.join(tmpDir, 'not-eligible.xlsx')]);
   });
 });
 
@@ -329,6 +320,70 @@ describe('local-tools › bash access modes', () => {
     expect(res.isError).toBe(true);
     expect(res.content).toContain('E_INTERACTIVE_AUTH_CODE_UNSUPPORTED');
     expect(res.content).toContain('Do not ask the user to paste verification codes');
+  });
+
+  // all_files_auto exists so routine work stops asking. It cannot also waive
+  // the operations the user has no way to review afterwards — the reported
+  // case was an agent deleting a two-day-old browser profile and force-killing
+  // every Chrome process while this mode was on.
+  it('still asks before an irreversible command in all_files_auto', async () => {
+    const { lt, perm } = await loadModules();
+    const bp = await import('../../../src/main/model/core-agent/bash-permissions');
+    perm.setLocalExecMode('all_files_auto');
+    const asked: any[] = [];
+    bp._setBroadcastForTest((channel: string, payload: any) => {
+      if (channel === 'bash:permission') asked.push(payload);
+    });
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1' }).find((t) => t.name === 'bash')!;
+      const victim = path.join(tmpDir, 'warmed-profile');
+      fs.mkdirSync(victim, { recursive: true });
+      fs.writeFileSync(path.join(victim, 'fingerprint'), 'two days of warmup');
+      const run = bash.execute(
+        { command: `rm -rf ${victim}`, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS },
+        makeCtx(),
+      );
+      for (let i = 0; i < 200 && !asked.length; i++) await new Promise((r) => setTimeout(r, 10));
+      expect(asked).toHaveLength(1);
+      expect(asked[0].reasons).toContain('destructive');
+      // The dialog needs this to explain why a non-prompting mode is asking.
+      expect(asked[0].irreversible).toEqual(['recursive_delete']);
+
+      expect(bp.respond(asked[0].request_id, 'deny')).toBe(true);
+      const res = await run;
+      expect(res.isError).toBe(true);
+      // Denying has to actually stop it, not just annotate the transcript.
+      expect(fs.existsSync(path.join(victim, 'fingerprint'))).toBe(true);
+    } finally {
+      bp._setBroadcastForTest(null);
+      bp._resetForTest();
+    }
+  });
+
+  it('does not ask before a reviewable delete in all_files_auto', async () => {
+    const { lt, perm } = await loadModules();
+    const bp = await import('../../../src/main/model/core-agent/bash-permissions');
+    perm.setLocalExecMode('all_files_auto');
+    const asked: any[] = [];
+    bp._setBroadcastForTest((channel: string, payload: any) => {
+      if (channel === 'bash:permission') asked.push(payload);
+    });
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1' }).find((t) => t.name === 'bash')!;
+      const scratch = path.join(tmpDir, 'scratch.log');
+      fs.writeFileSync(scratch, 'noise');
+      const res = await bash.execute(
+        { command: `rm -f ${scratch}`, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS },
+        makeCtx(),
+      );
+      expect(res.isError).toBeFalsy();
+      // The mode still means what it says for everything else.
+      expect(asked).toEqual([]);
+      expect(fs.existsSync(scratch)).toBe(false);
+    } finally {
+      bp._setBroadcastForTest(null);
+      bp._resetForTest();
+    }
   });
 
   it('blocks synthesized Google OAuth URLs that reuse the Cloud SDK client for Workspace scopes', async () => {
@@ -459,6 +514,60 @@ describe('local-tools › bash filesystem mutation scope', () => {
     }
   });
 
+  it('admits only the configured session analysis root outside the workspace', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const analysisDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-analysis-input-'));
+    const siblingDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-analysis-sibling-'));
+    const analysisFile = path.join(analysisDir, 'result.txt');
+    const siblingFile = path.join(siblingDir, 'secret.txt');
+    fs.writeFileSync(analysisFile, 'ANALYSIS-INPUT');
+    fs.writeFileSync(siblingFile, 'OUTSIDE-SIBLING');
+    try {
+      const bash = lt.createLocalTools({
+        userId: 'u1',
+        cid: 'c1',
+        agentId: 'a1',
+        analysisInputRoots: [analysisDir],
+      }).find((t) => t.name === 'bash')!;
+      const readCommand = process.platform === 'win32'
+        ? `Get-Content -LiteralPath ${JSON.stringify(analysisFile)}`
+        : `cat ${JSON.stringify(analysisFile)}`;
+      const allowed = await bash.execute({
+        command: readCommand,
+        timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+      }, makeCtx());
+      expect(allowed.isError, `content=${allowed.content}`).toBeFalsy();
+      expect(allowed.content).toContain('ANALYSIS-INPUT');
+
+      const writeCommand = process.platform === 'win32'
+        ? `Set-Content -LiteralPath ${JSON.stringify(analysisFile)} -Value changed`
+        : `printf changed > ${JSON.stringify(analysisFile)}`;
+      const writeBlocked = await bash.execute({
+        command: writeCommand,
+        timeoutMs: 5_000,
+      }, makeCtx());
+      expect(writeBlocked.isError).toBe(true);
+      expect(writeBlocked.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+      expect(fs.readFileSync(analysisFile, 'utf8')).toBe('ANALYSIS-INPUT');
+
+      const siblingCommand = process.platform === 'win32'
+        ? `Get-Content -LiteralPath ${JSON.stringify(siblingFile)}`
+        : `cat ${JSON.stringify(siblingFile)}`;
+      const blocked = await bash.execute({
+        command: siblingCommand,
+        timeoutMs: 5_000,
+      }, makeCtx());
+      expect(blocked.isError).toBe(true);
+      expect(blocked.content).toContain('E_BASH_READ_PATH_OUT_OF_SCOPE');
+      expect(blocked.content).not.toContain('OUTSIDE-SIBLING');
+    } finally {
+      fs.rmSync(analysisDir, { recursive: true, force: true });
+      fs.rmSync(siblingDir, { recursive: true, force: true });
+    }
+  });
+
   it('allows explicit read targets outside the workspace in all_files_approval mode', async () => {
     const { lt, perm } = await loadModules();
     perm.setLocalExecMode('all_files_approval');
@@ -572,9 +681,9 @@ describe('local-tools › bash filesystem mutation scope', () => {
     }
   });
 
-  it('blocks unresolved dynamic bash write targets instead of guessing their scope', async () => {
+  it('blocks unresolved dynamic bash write targets in workspace-only mode', async () => {
     const { lt, perm } = await loadModules();
-    perm.setLocalExecMode('all_files_auto');
+    perm.setLocalExecMode('workspace_approval');
     await setTmpWorkspace();
     const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
     const res = await bash.execute({
@@ -587,7 +696,7 @@ describe('local-tools › bash filesystem mutation scope', () => {
 
   it('invalidates a prior literal when a later assignment becomes dynamic', async () => {
     const { lt, perm } = await loadModules();
-    perm.setLocalExecMode('all_files_auto');
+    perm.setLocalExecMode('workspace_approval');
     await setTmpWorkspace();
     const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
     const command = process.platform === 'win32'
@@ -603,6 +712,178 @@ describe('local-tools › bash filesystem mutation scope', () => {
       expect(loopRes.isError).toBe(true);
       expect(loopRes.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
     }
+  });
+
+  it.each(['all_files_approval', 'all_files_auto'] as const)(
+    'resolves sandbox-injected shell paths before execution in %s mode',
+    async (mode) => {
+      const { lt, perm } = await loadModules();
+      perm.setLocalExecMode(mode);
+      await setTmpWorkspace();
+      const report = path.join(tmpDir, 'injected-report.txt');
+      const output = path.join(tmpDir, 'injected-output.txt');
+      fs.writeFileSync(report, 'known environment path\n');
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+      const command = process.platform === 'win32'
+        ? 'Get-Content -LiteralPath "$env:REPORT_PATH"; Set-Content -LiteralPath "$env:REPORT_OUTPUT_PATH" -Value allowed'
+        : 'cat "$REPORT_PATH"; printf allowed > "$REPORT_OUTPUT_PATH"';
+
+      const res = await bash.execute({
+        command,
+        timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+      }, makeCtx({ REPORT_PATH: report, REPORT_OUTPUT_PATH: output }));
+
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(res.content).toContain('known environment path');
+      expect(fs.readFileSync(output, 'utf8').trim()).toBe('allowed');
+      expect(res.content).not.toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+    },
+  );
+
+  it.each(['all_files_approval', 'all_files_auto'] as const)(
+    'keeps a statically rooted shell glob verifiable in %s mode',
+    async (mode) => {
+      const { lt, perm } = await loadModules();
+      perm.setLocalExecMode(mode);
+      await setTmpWorkspace();
+      fs.writeFileSync(path.join(tmpDir, 'glob-1.txt'), 'one\n');
+      fs.writeFileSync(path.join(tmpDir, 'glob-2.txt'), 'two\n');
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+      const command = process.platform === 'win32'
+        ? 'Get-Content -Path "glob-*.txt"'
+        : 'cat glob-*.txt';
+
+      const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(res.content).toContain('one');
+      expect(res.content).toContain('two');
+      expect(res.content).not.toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+    },
+  );
+
+  it('rejects runtime-computed read, write, move, and removal paths in all_files_approval', async () => {
+    const { lt, perm } = await loadModules();
+    const bashPerms = await import('../../../src/main/model/core-agent/bash-permissions');
+    perm.setLocalExecMode('all_files_approval');
+    await setTmpWorkspace();
+    const readTarget = path.join(tmpDir, 'dynamic-read.txt');
+    const writeTarget = path.join(tmpDir, 'dynamic-write.txt');
+    const moveSource = path.join(tmpDir, 'dynamic-move-source.txt');
+    const moveTarget = path.join(tmpDir, 'dynamic-move-target.txt');
+    const removeTarget = path.join(tmpDir, 'dynamic-remove.txt');
+    fs.writeFileSync(readTarget, 'must not be read');
+    fs.writeFileSync(moveSource, 'must not move');
+    fs.writeFileSync(removeTarget, 'must not remove');
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    const commands = process.platform === 'win32'
+      ? [
+          '$target = Join-Path (Get-Location) "dynamic-read.txt"; Get-Content -LiteralPath "$target"',
+          '$target = Join-Path (Get-Location) "dynamic-write.txt"; Set-Content -LiteralPath "$target" -Value blocked',
+          '$target = Join-Path (Get-Location) "dynamic-move-target.txt"; Move-Item -LiteralPath "dynamic-move-source.txt" -Destination "$target"',
+          '$target = Join-Path (Get-Location) "dynamic-remove.txt"; Remove-Item -Force -LiteralPath "$target"',
+        ]
+      : [
+          'target="$(pwd)/dynamic-read.txt"; cat "$target"',
+          'target="$(pwd)/dynamic-write.txt"; printf blocked > "$target"',
+          'target="$(pwd)/dynamic-move-target.txt"; mv "dynamic-move-source.txt" "$target"',
+          'target="$(pwd)/dynamic-remove.txt"; rm -f "$target"',
+        ];
+    bashPerms._setBroadcastForTest((_channel: string, info: any) => {
+      bashPerms.respond(info.request_id, 'allow_once');
+    });
+    try {
+      for (const command of commands) {
+        const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+        expect(res.isError, `command=${command} content=${res.content}`).toBe(true);
+        expect(res.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+      }
+      expect(fs.readFileSync(readTarget, 'utf8')).toBe('must not be read');
+      expect(fs.existsSync(writeTarget)).toBe(false);
+      expect(fs.readFileSync(moveSource, 'utf8')).toBe('must not move');
+      expect(fs.existsSync(moveTarget)).toBe(false);
+      expect(fs.readFileSync(removeTarget, 'utf8')).toBe('must not remove');
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+    }
+  });
+
+  it('checks PowerShell transfer sources and destinations before starting shell sessions', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_approval');
+    await setTmpWorkspace();
+    fs.writeFileSync(path.join(tmpDir, 'source.txt'), 'keep source');
+    const tools = lt.createLocalTools({ userId: 'u1', cid: 'c1', hostPlatform: 'win32' });
+    const commands = [
+      'Move-Item -LiteralPath "$source" -Destination "target.txt"',
+      'Move-Item "source.txt" -Destination "$target"',
+      'Copy-Item -Destination "target.txt" -Path "$source"',
+      'Copy-Item "source.txt" "$target" -ErrorAction Stop',
+    ];
+    for (const name of ['bash', 'process_session']) {
+      const tool = tools.find((candidate) => candidate.name === name)!;
+      for (const command of commands) {
+        const result = await tool.execute({ action: 'start', command }, makeCtx());
+        expect(result.isError, `${name}: ${command}`).toBe(true);
+        expect(result.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+      }
+    }
+    const interactive = tools.find((tool) => tool.name === 'interactive_cli')!;
+    const result = await interactive.execute({ action: 'start', command: commands[0] }, makeCtx());
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+    expect(fs.readFileSync(path.join(tmpDir, 'source.txt'), 'utf8')).toBe('keep source');
+    expect(fs.existsSync(path.join(tmpDir, 'target.txt'))).toBe(false);
+  });
+
+  it.runIf(process.platform === 'win32').each([
+    ['Copy-Item -LiteralPath "source file.txt" -Destination "target file.txt" -ErrorAction Stop', true],
+    ['Copy-Item -Destination:"target file.txt" "source file.txt" -Force', true],
+    ['Move-Item -PATH "source file.txt" "target file.txt" -ERRORACTION Stop', false],
+    ['Move-Item "source file.txt" -Destination "target file.txt" -Force', false],
+  ] as const)('executes a literal PowerShell transfer without a removal prompt: %s', async (command, keepsSource) => {
+    const { lt, perm } = await loadModules();
+    const bp = await import('../../../src/main/model/core-agent/bash-permissions');
+    perm.setLocalExecMode('all_files_approval');
+    await setTmpWorkspace();
+    const asked: unknown[] = [];
+    bp._setBroadcastForTest((_channel: string, payload: any) => {
+      asked.push(payload);
+      bp.respond(payload.request_id, 'deny');
+    });
+    try {
+      const source = path.join(tmpDir, 'source file.txt');
+      fs.writeFileSync(source, 'transfer bytes');
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((tool) => tool.name === 'bash')!;
+      const result = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+      expect(result.isError, result.content).toBeFalsy();
+      expect(fs.readFileSync(path.join(tmpDir, 'target file.txt'), 'utf8')).toBe('transfer bytes');
+      expect(fs.existsSync(source)).toBe(keepsSource);
+      expect(asked).toEqual([]);
+    } finally {
+      bp._setBroadcastForTest(null);
+      bp._resetForTest();
+    }
+  });
+
+  it('allows runtime-computed shell paths in all_files_auto', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    fs.writeFileSync(path.join(tmpDir, 'dynamic-1.txt'), 'one\n');
+    fs.writeFileSync(path.join(tmpDir, 'dynamic-2.txt'), 'two\n');
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    const command = process.platform === 'win32'
+      ? '$files = Get-ChildItem -Name "dynamic-*.txt"; foreach ($f in $files) { Get-Content -LiteralPath "$f" }; $target = Join-Path (Get-Location) "dynamic-write.txt"; Set-Content -LiteralPath "$target" -Value allowed'
+      : 'for f in dynamic-*.txt; do cat "$f"; done; target="$(pwd)/dynamic-write.txt"; printf allowed > "$target"';
+
+    const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+
+    expect(res.isError, `content=${res.content}`).toBeFalsy();
+    expect(res.content).toContain('one');
+    expect(res.content).toContain('two');
+    expect(fs.readFileSync(path.join(tmpDir, 'dynamic-write.txt'), 'utf8').trim()).toBe('allowed');
+    expect(res.content).not.toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
   });
 
   it('reads workspace files through a finite literal shell loop', async () => {
@@ -652,7 +933,7 @@ describe('local-tools › bash filesystem mutation scope', () => {
     const rejected = await bash.execute({ command: rejectedCommand, timeoutMs: 5000 }, makeCtx());
     expect(rejected.isError).toBe(true);
     expect(rejected.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
-    expect(rejected.content).toContain('Resolve it to explicit readable paths before retrying.');
+    expect(rejected.content).toContain('resolve it to explicit readable paths before retrying.');
   });
 
   it('checks every finite loop expansion against the workspace boundary', async () => {
@@ -693,7 +974,7 @@ describe('local-tools › bash filesystem mutation scope', () => {
 
   it('still blocks loop paths whose values require runtime evaluation', async () => {
     const { lt, perm } = await loadModules();
-    perm.setLocalExecMode('all_files_auto');
+    perm.setLocalExecMode('workspace_approval');
     await setTmpWorkspace();
     const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
     const command = process.platform === 'win32'
@@ -704,7 +985,7 @@ describe('local-tools › bash filesystem mutation scope', () => {
 
     expect(res.isError).toBe(true);
     expect(res.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
-    expect(res.content).toContain('Resolve it to explicit readable paths before retrying.');
+    expect(res.content).toContain('resolve it to explicit readable paths before retrying.');
     expect(res.content).not.toContain('all-files access mode');
 
     const multiCommandLoop = process.platform === 'win32'
@@ -741,20 +1022,22 @@ describe('local-tools › bash filesystem mutation scope', () => {
     expect(res.content).not.toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
   });
 
-  it('resolves literal path assignments completed before a later command', async () => {
-    const { lt, perm } = await loadModules();
-    perm.setLocalExecMode('all_files_auto');
-    await setTmpWorkspace();
-    const file = path.join(tmpDir, 'assigned-path.txt');
-    fs.writeFileSync(file, 'literal assignment ok');
-    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
-    const command = process.platform === 'win32'
-      ? `$ROOT = ${JSON.stringify(tmpDir)}; Get-Content -LiteralPath "$ROOT\\assigned-path.txt"`
-      : `ROOT=${JSON.stringify(tmpDir)}; cat "$ROOT/assigned-path.txt"`;
-    const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
-    expect(res.isError, `content=${res.content}`).toBeFalsy();
-    expect(res.content).toContain('literal assignment ok');
-  });
+  it.each(['all_files_approval', 'all_files_auto'] as const)(
+    'resolves literal path assignments completed before a later command in %s mode', async (mode) => {
+      const { lt, perm } = await loadModules();
+      perm.setLocalExecMode(mode);
+      await setTmpWorkspace();
+      const file = path.join(tmpDir, 'assigned-path.txt');
+      fs.writeFileSync(file, 'literal assignment ok');
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+      const command = process.platform === 'win32'
+        ? `$ROOT = ${JSON.stringify(tmpDir)}; Get-Content -LiteralPath "$ROOT\\assigned-path.txt"`
+        : `ROOT=${JSON.stringify(tmpDir)}; cat "$ROOT/assigned-path.txt"`;
+      const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(res.content).toContain('literal assignment ok');
+    },
+  );
 
   it('still blocks a literal-assigned path when its resolved target is outside scope', async () => {
     const { lt, perm } = await loadModules();
@@ -922,6 +1205,11 @@ describe('local-tools › interactive_cli lifecycle', () => {
     expect(String(started.output)).toContain('verification code');
     expect(started.prompt_kind).toBe('auth_code');
     expect(startResult.endTurn).toBe(true);
+    expect(startResult.endTurnReason).toBe('waiting_input');
+
+    const waitingRead = await interactive.execute({ action: 'read', session_id: started.session_id }, makeCtx());
+    expect(waitingRead.endTurn).toBe(true);
+    expect(waitingRead.endTurnReason).toBe('waiting_input');
 
     const sent = parseToolJson(await interactive.execute({
       action: 'send',
@@ -965,6 +1253,7 @@ describe('local-tools › interactive_cli lifecycle', () => {
     expect(started.user_action_required).toBe(true);
     expect(started.agent_should_stop).toBe(true);
     expect(startResult.endTurn).toBe(true);
+    expect(startResult.endTurnReason).toBe('waiting_input');
 
     await interactive.execute({
       action: 'close',
@@ -980,6 +1269,39 @@ describe('local-tools › interactive_cli lifecycle', () => {
     const interactive = toolByName(lt.createLocalTools({ userId: 'u1' }), 'interactive_cli');
     const res = await interactive.execute({ action: 'start', command: 'echo ok' }, makeCtx());
     expect(res.isError).toBeFalsy();
+  });
+
+  it('still asks before an irreversible interactive command in all_files_auto', async () => {
+    const { lt, perm } = await loadModules();
+    const bashPerms = await import('../../../src/main/model/core-agent/bash-permissions');
+    perm.setLocalExecMode('all_files_auto');
+    const victim = path.join(tmpDir, 'interactive-profile');
+    fs.mkdirSync(victim, { recursive: true });
+    fs.writeFileSync(path.join(victim, 'fingerprint'), 'must survive denial');
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_channel: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const interactive = toolByName(
+        lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' }),
+        'interactive_cli',
+      );
+      const res = await interactive.execute({
+        action: 'start',
+        command: `rm -rf ${JSON.stringify(victim)}`,
+      }, makeCtx());
+
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompted?.reasons).toContain('destructive');
+      expect(prompted?.irreversible).toEqual(['recursive_delete']);
+      expect(fs.existsSync(path.join(victim, 'fingerprint'))).toBe(true);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      bashPerms._resetForTest();
+    }
   });
 
   it('rejects no-browser OAuth login in interactive sessions by default', async () => {
@@ -1052,6 +1374,7 @@ describe('local-tools › interactive_cli lifecycle', () => {
     expect(latest.agent_should_stop).toBe(true);
     expect(latest.user_action_reason).toBe('browser_auth');
     expect(startResult.endTurn).toBe(true);
+    expect(startResult.endTurnReason).toBe('waiting_input');
     expect(latest.next_step).toContain('Do not call open');
     expect(latest.next_step).toContain('do not restart or close');
     expect(latest.next_step).toContain('do not switch to another OAuth method');
@@ -1432,6 +1755,34 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
     } finally { bashPerms._setBroadcastForTest(null); }
   });
 
+  it.each([
+    ['all_files_approval', true],
+    ['all_files_auto', false],
+  ] as const)(
+    'applies the unresolved-path boundary before process_session starts in %s',
+    async (mode, shouldReject) => {
+      const { lt, perm } = await loadWithBashPerms();
+      perm.setLocalExecMode(mode);
+      await setTmpWorkspace();
+      const target = path.join(tmpDir, `process-runtime-${mode}.txt`);
+      const command = process.platform === 'win32'
+        ? `$target = Join-Path (Get-Location) ${JSON.stringify(path.basename(target))}; Set-Content -LiteralPath "$target" -Value allowed`
+        : `target="$(pwd)/${path.basename(target)}"; printf allowed > "$target"`;
+      const processTool = lt.createLocalTools(OPTS).find((item) => item.name === 'process_session')!;
+
+      const res = await processTool.execute({ action: 'start', command }, makeCtx());
+
+      if (shouldReject) {
+        expect(res.isError).toBe(true);
+        expect(res.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+        expect(fs.existsSync(target)).toBe(false);
+        return;
+      }
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      await vi.waitFor(() => expect(fs.readFileSync(target, 'utf8').trim()).toBe('allowed'));
+    },
+  );
+
   it('treats a Python heredoc as source code instead of shell commands', async () => {
     if (process.platform === 'win32') return;
     const { lt, perm, bashPerms } = await loadWithBashPerms();
@@ -1460,6 +1811,59 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
       }));
       expect(res.isError, `content=${res.content}`).toBeFalsy();
       expect(res.content).toContain('OK');
+      expect(prompted).toBe(false);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      bashPerms._resetForTest();
+    }
+  });
+
+  it('classifies a heredoc payload that is piped into a shell as shell commands', async () => {
+    if (process.platform === 'win32') return;
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    // The receiver (`cat`) only forwards stdin; the payload runs in `bash`.
+    // An in-workspace recursive delete must reach the destructive classifier
+    // (an out-of-scope target would already be rejected by the path guard).
+    const command = [
+      "cat <<'EOF' | bash",
+      'rm -rf ./orkas-e2e-heredoc-dir',
+      'EOF',
+    ].join('\n');
+    try {
+      const bash = lt.createLocalTools(OPTS).find((item) => item.name === 'bash')!;
+      const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompted?.reasons).toContain('destructive');
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      bashPerms._resetForTest();
+    }
+  });
+
+  it('keeps a heredoc that only feeds a non-shell pipeline masked', async () => {
+    if (process.platform === 'win32') return;
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    let prompted = false;
+    bashPerms._setBroadcastForTest(() => { prompted = true; });
+    const command = [
+      "cat <<'EOF' | wc -l",
+      'rm -rf ./orkas-e2e-heredoc-dir',
+      'EOF',
+    ].join('\n');
+    try {
+      const bash = lt.createLocalTools(OPTS).find((item) => item.name === 'bash')!;
+      const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
       expect(prompted).toBe(false);
     } finally {
       bashPerms._setBroadcastForTest(null);
@@ -1989,7 +2393,9 @@ describe('local-tools › bash produced files', () => {
 
     expect(res.isError).toBeFalsy();
     expect(fs.readFileSync(target, 'utf8')).toBe('v2');
-    expect(onFileWritten).toHaveBeenCalledWith(target);
+    // The command changed a file that was already there, so the caller may
+    // present it without treating it as something Orkas produced.
+    expect(onFileWritten).toHaveBeenCalledWith(target, { preExisting: true });
   });
 
   it('does not surface files written outside the conversation workspace as produced chips', async () => {
@@ -2093,7 +2499,7 @@ fs.writeFileSync(args[at + 1], 'downloaded');
     }, makeCtx());
 
     expect(res.isError, `content=${res.content}`).toBeFalsy();
-    expect(onFileWritten).toHaveBeenCalledWith(path.join(tmpDir, '.cache', 'final.pdf'));
+    expect(onFileWritten).toHaveBeenCalledWith(path.join(tmpDir, '.cache', 'final.pdf'), { preExisting: false });
     expect(fs.existsSync(path.join(tmpDir, '.orkas-output-manifest'))).toBe(false);
   });
 });
@@ -2125,7 +2531,7 @@ describe('local-tools › write_file', () => {
     expect(fs.existsSync(abs)).toBe(true);
     expect(fs.readFileSync(abs, 'utf8')).toBe('hello');
     expect(onFileWritten).toHaveBeenCalledTimes(1);
-    expect(onFileWritten).toHaveBeenCalledWith(abs);
+    expect(onFileWritten).toHaveBeenCalledWith(abs, { preExisting: false });
   });
 
   it('persists one complete large UTF-8 payload without applying the output-retry budget to storage', async () => {
@@ -2207,7 +2613,7 @@ describe('local-tools › write_file', () => {
     expect(res.isError).toBeFalsy();
     expect(fs.existsSync(target)).toBe(true);
     expect(res.content).not.toContain('<file-renamed>');
-    expect(onFileWritten).toHaveBeenCalledWith(target);
+    expect(onFileWritten).toHaveBeenCalledWith(target, { preExisting: false });
   });
 
   it('uniquifies basename and emits <file-renamed> when target exists and is not ours', async () => {
@@ -2228,7 +2634,8 @@ describe('local-tools › write_file', () => {
     expect(res.content).toContain('<file-renamed>');
     expect(res.content).toContain('You requested: note.md');
     expect(res.content).toContain('Saved as:      note-2.md');
-    expect(onFileWritten).toHaveBeenCalledWith(renamed);
+    // A uniquified path did not exist before this write.
+    expect(onFileWritten).toHaveBeenCalledWith(renamed, { preExisting: false });
   });
 
   it('overwrites in place (no rename) when hasProducedPath claims the target', async () => {
@@ -2249,7 +2656,9 @@ describe('local-tools › write_file', () => {
     expect(fs.readFileSync(target, 'utf8')).toBe('v2'); // overwritten, no -2
     expect(fs.existsSync(path.join(tmpDir, 'draft-2.md'))).toBe(false);
     expect(res.content).not.toContain('<file-renamed>');
-    expect(onFileWritten).toHaveBeenCalledWith(target);
+    // Overwriting our own earlier output is still production, not a write
+    // over a file the user brought.
+    expect(onFileWritten).toHaveBeenCalledWith(target, { preExisting: false });
   });
 });
 

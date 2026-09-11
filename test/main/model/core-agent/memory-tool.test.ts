@@ -22,7 +22,11 @@ describe('cross_session_memory tool › project tier exposure', () => {
     const target = (tool.inputSchema as any).properties.target;
     const action = (tool.inputSchema as any).properties.action;
     expect(enumOf(tool)).toEqual(['agent', 'shared', 'user']);
-    expect(tool.description).toContain('durable cross-session memory');
+    expect(tool.description).toContain('Manage durable agent, shared, or user memory');
+    expect(tool.description).toContain('before replying');
+    expect(tool.description).toContain('even without an explicit save request');
+    expect(tool.description).toContain('Decide from meaning, never trigger words');
+    expect(tool.description).toContain('Do not store current-task progress');
     expect(action.description).toContain('entries are already injected');
     expect(target.description).toContain('Defaults to agent');
     expect(target.description).toContain('user-wide profile/preferences');
@@ -33,7 +37,7 @@ describe('cross_session_memory tool › project tier exposure', () => {
     const tool = createCrossSessionMemoryTool(stubHandler(), { includeProjectTier: true });
     const target = (tool.inputSchema as any).properties.target;
     expect(enumOf(tool)).toEqual(['agent', 'project', 'shared', 'user']);
-    expect(tool.description).toContain('use project_tasks for task progress');
+    expect(tool.description).toContain('Use todo_tasks for task progress');
     expect(target.description).toContain('project-specific facts and decisions');
     expect(target.description).toContain('this agent\'s reusable lessons');
     expect((tool.inputSchema as any).properties.old_text.description).toContain('must match exactly one entry');

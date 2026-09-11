@@ -51,7 +51,7 @@ describe('project Library interactive search', () => {
     const paths = await import('../../../src/main/paths');
     const vector = new Array(512).fill(0);
 
-    expect(projectLibrary.searchExisting('user-a', 'project-a', vector, { k: 5 })).toEqual([]);
+    expect(projectLibrary.search('user-a', 'project-a', vector, { k: 5 })).toEqual([]);
     expect(fs.existsSync(paths.projectLibraryVectorDbPath('user-a', 'project-a'))).toBe(false);
   });
 
@@ -76,7 +76,7 @@ describe('project Library interactive search', () => {
       }],
     });
 
-    const hits = projectLibrary.searchExisting(
+    const hits = projectLibrary.search(
       'user-a',
       'project-a',
       vector,

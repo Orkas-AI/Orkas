@@ -6,11 +6,13 @@
  *                                      (`validate:false` does path-only discovery)
  *   - `localAgents.detect`           → single-CLI re-probe (bypasses cache;
  *                                      callers may run types concurrently)
- *   - `localAgents.runtimeOptions`   → Agent-scoped model/thinking metadata
+ *   - `localAgents.runtimeOptions`   → Agent-scoped model/thinking/permission metadata
  *   - `localAgents.readToolResult`   → read a spilled CLI tool_result file
  *                                       (renderer click-to-expand)
- *   - `bridge.permission_response`   → renderer answer to a `bridge:permission`
- *                                       push event (orkas-bridge connector-call gate)
+ *   - `localAgents.permissionResponse` → renderer answer to an external CLI's
+ *                                         native or connector permission request
+ *   - `localAgents.userInputResponse`  → renderer answer to a native CLI's
+ *                                         structured in-turn question
  *
  * No `run` channel here — the renderer doesn't spawn CLIs directly;
  * dispatch goes through the existing `groupChat` channel and `bus.ts`
@@ -19,10 +21,21 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { detectAll, detectOne, findAllInstalled, invalidateCache, LOCAL_CLI_TYPES, type LocalCliType, type LocalCliEntry } from '../features/local_agents/registry.js';
+import {
+  detectAll,
+  findAllInstalled,
+  localCliSupportsPermissionPolicy,
+  resolveCli,
+  LOCAL_CLI_TYPES,
+  type LocalCliPermissionPolicy,
+  type LocalCliType,
+  type LocalCliEntry,
+} from '../features/local_agents/registry.js';
 import { getLocalCliRuntimeOptions } from '../features/local_agents/runtime_options.js';
 import * as agents from '../features/agents.js';
-import * as bridgePermissions from '../features/local_agents/bridge_permissions.js';
+import * as cliPermissions from '../features/local_agents/cli_permissions.js';
+import * as cliUserInput from '../features/local_agents/cli_user_input.js';
+import type { LocalCliPermissionDecision } from '../features/local_agents/backends/base.js';
 import * as bashPermissions from '../model/core-agent/bash-permissions.js';
 import {
   closeInteractiveCliSession,
@@ -31,9 +44,9 @@ import {
   sendInteractiveCliInput,
 } from '../model/core-agent/interactive-cli-sessions.js';
 import { getActiveUserId } from '../features/users.js';
-import { userToolResultsDir } from '../paths.js';
+import { userConversationHistoryCacheDir, userToolResultsDir } from '../paths.js';
 import { createLogger } from '../logger.js';
-import { logPathRef, maskId } from '../util/log-redact.js';
+import { logErrorRef, logPathRef, maskId } from '../util/log-redact.js';
 
 const log = createLogger('ipc:local_agents');
 
@@ -62,6 +75,11 @@ function resolveToolResultRef(rootDir: string, ref: string): string | null {
 
 function isLocalCliType(v: unknown): v is LocalCliType {
   return typeof v === 'string' && (LOCAL_CLI_TYPES as readonly string[]).includes(v);
+}
+
+function isActivePermissionOwner(uid: string): boolean {
+  try { return getActiveUserId() === uid; }
+  catch { return false; }
 }
 
 // Set of CLI types we have a working dispatch backend for. Detection
@@ -103,15 +121,13 @@ export const invokeHandlers = {
   },
 
   /**
-   * Re-probe a single CLI without the cache. Used at execute-time by
-   * the runner to make sure a recently-uninstalled binary doesn't slip
-   * through, and by the create-modal to progressively render each CLI as its
-   * independent version probe completes.
+   * Refresh one CLI for the create modal. If startup warmup is already probing
+   * this type, the request joins that work; otherwise it invalidates only this
+   * type and starts its independent version probe.
    */
   'localAgents.detect': async ({ type }: { type?: unknown }) => {
     if (!isLocalCliType(type)) throw new Error('invalid CLI type');
-    invalidateCache();
-    const entry = await detectOne(type);
+    const entry = await resolveCli(type, { force: true });
     return { entry: maskUnsupported([entry])[0] };
   },
 
@@ -168,19 +184,102 @@ export const invokeHandlers = {
    * never throws across the IPC boundary so a UI bug can't crash the
    * renderer.
    */
-  /** Renderer answer to a `bridge:permission` push event. Unknown /
-   *  already-timed-out request ids return handled:false (the dialog was
-   *  stale); validation is shape-only — the verdict semantics live in
-   *  features/local_agents/bridge_permissions.ts. */
-  'bridge.permission_response': async (
-    payload: { request_id?: unknown; allow?: unknown; always?: unknown },
+  /** Renderer answer to an external CLI's native or connector approval request. */
+  'localAgents.permissionResponse': async (
+    payload: { request_id?: unknown; decision?: unknown; permission_policy?: unknown },
+    ctx: { userId: string },
   ) => {
     if (typeof payload?.request_id !== 'string' || !payload.request_id) throw new Error('invalid request_id');
-    if (typeof payload?.allow !== 'boolean') throw new Error('invalid allow flag');
-    return bridgePermissions.respondWithOutcome(
+    const decision = payload.decision;
+    if (decision !== 'allow_once' && decision !== 'allow_run' && decision !== 'deny') {
+      throw new Error('invalid decision');
+    }
+    const pending = cliPermissions.beginResponse(payload.request_id, ctx.userId);
+    if (!pending) return { handled: false };
+
+    const selectedPolicy = typeof payload.permission_policy === 'string'
+      ? payload.permission_policy
+      : pending.permissionPolicy;
+    let effectiveDecision: LocalCliPermissionDecision = decision;
+    let policySaved = true;
+    if (!isActivePermissionOwner(pending.uid)) {
+      effectiveDecision = 'deny';
+      policySaved = false;
+    } else if (!localCliSupportsPermissionPolicy(pending.cli, selectedPolicy)) {
+      effectiveDecision = 'deny';
+      policySaved = false;
+    } else if (decision !== 'deny' && selectedPolicy !== pending.permissionPolicy) {
+      try {
+        const agent = await agents.getAgent(pending.agentId);
+        if (!isActivePermissionOwner(pending.uid)
+          || agent?.runtime?.kind !== 'cli'
+          || agent.runtime.cli !== pending.cli) {
+          policySaved = false;
+        } else {
+          const nextRuntime = { ...agent.runtime };
+          if (selectedPolicy === 'inherit') delete nextRuntime.permission_policy;
+          else nextRuntime.permission_policy = selectedPolicy as Exclude<LocalCliPermissionPolicy, 'inherit'>;
+          const saved = await agents.updateAgentSpec(pending.agentId, { runtime: nextRuntime });
+          policySaved = isActivePermissionOwner(pending.uid)
+            && saved?.runtime?.kind === 'cli'
+            && saved.runtime.cli === pending.cli
+            && (saved.runtime.permission_policy || 'inherit') === selectedPolicy;
+        }
+      } catch (error) {
+        policySaved = false;
+        log.warn('external CLI permission policy update failed', {
+          agent_id: maskId(pending.agentId),
+          cli: pending.cli,
+          error: logErrorRef(error),
+        });
+      }
+      if (!policySaved) effectiveDecision = 'deny';
+    }
+    // A user switch cancels pending requests. Recheck after any disk write so
+    // a response from the old renderer can never grant authority in the new
+    // account, even if the switch landed while persistence was in flight.
+    if (!isActivePermissionOwner(pending.uid)) {
+      effectiveDecision = 'deny';
+      policySaved = false;
+    }
+    if (effectiveDecision !== 'deny' && policySaved) {
+      cliPermissions.updateActiveAgentPermissionPolicy({
+        uid: pending.uid,
+        agentId: pending.agentId,
+        cli: pending.cli,
+        permissionPolicy: selectedPolicy as LocalCliPermissionPolicy,
+      });
+    }
+    // The native process started under its previous policy. A newly selected
+    // full-access level therefore grants the remaining host task as well;
+    // native responses stay bounded to one operation.
+    if (effectiveDecision !== 'deny' && selectedPolicy === 'full_access') {
+      effectiveDecision = 'allow_run';
+    }
+    return {
+      ...cliPermissions.respond(payload.request_id, effectiveDecision),
+      policy_saved: policySaved,
+      permission_policy: selectedPolicy,
+    };
+  },
+
+  /** Renderer answer to a native CLI structured user-input request. */
+  'localAgents.userInputResponse': async (
+    payload: { request_id?: unknown; answers?: unknown; cancelled?: unknown },
+    ctx: { userId: string },
+  ) => {
+    if (typeof payload?.request_id !== 'string' || !payload.request_id) {
+      throw new Error('invalid request_id');
+    }
+    if (payload.answers !== undefined
+        && (!payload.answers || typeof payload.answers !== 'object' || Array.isArray(payload.answers))) {
+      throw new Error('invalid answers');
+    }
+    return cliUserInput.respond(
       payload.request_id,
-      payload.allow,
-      payload?.always === true,
+      ctx.userId,
+      payload.answers,
+      payload.cancelled === true,
     );
   },
 
@@ -240,6 +339,7 @@ export const invokeHandlers = {
     })();
     if (!uid) return { ok: false as const, error: 'no active user' };
     const rootDir = userToolResultsDir(uid);
+    const historyCacheRootDir = userConversationHistoryCacheDir(uid);
     let filePath = '';
     if (typeof ref === 'string' && ref) {
       if (!TOOL_RESULT_REF_RE.test(ref)) {
@@ -263,11 +363,27 @@ export const invokeHandlers = {
       if (code === 'ENOENT') return { ok: false as const, error: 'file no longer exists' };
       return { ok: false as const, error: `cannot resolve path: ${(err as Error).message}` };
     }
-    let rootResolved: string;
-    try { rootResolved = fs.realpathSync(rootDir); }
-    catch { return { ok: false as const, error: 'tool-results dir not found' }; }
-    const rel = path.relative(rootResolved, resolved);
-    if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    let insideAllowedRoot = false;
+    try {
+      const rootResolved = fs.realpathSync(rootDir);
+      const rel = path.relative(rootResolved, resolved);
+      insideAllowedRoot = rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+    } catch { /* local result store is optional */ }
+    if (!insideAllowedRoot) {
+      try {
+        const historyRootResolved = fs.realpathSync(historyCacheRootDir);
+        const rel = path.relative(historyRootResolved, resolved);
+        const segments = rel.split(path.sep);
+        // Only `<cache>/<entry>/tool-results/<file>` is readable. The sibling
+        // projected messages/meta files and every other clearable cache bucket
+        // remain outside this IPC capability.
+        insideAllowedRoot = !rel.startsWith('..')
+          && !path.isAbsolute(rel)
+          && segments.length === 3
+          && segments[1] === 'tool-results';
+      } catch { /* history cache is optional */ }
+    }
+    if (!insideAllowedRoot) {
       log.warn('readToolResult rejected out-of-scope path', {
         path: logPathRef(filePath),
         user_id: maskId(uid),

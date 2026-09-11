@@ -188,10 +188,10 @@ async function _libraryContentSearchProvider(): Promise<LibraryContentSearchProv
   ]);
   return {
     embedQuery: (query) => kbEmbed.embedQuery(query),
-    searchGlobal: (userId, queryVec, limit) => kbVector.searchExisting(userId, queryVec, { k: limit }),
+    searchGlobal: (userId, queryVec, limit) => kbVector.search(userId, queryVec, { k: limit }),
     listProjects: (userId) => projects.listProjectNameRows(userId),
     searchProject: (userId, projectId, queryVec, limit) => (
-      projectLibrary.searchExisting(userId, projectId, queryVec, { k: limit })
+      projectLibrary.search(userId, projectId, queryVec, { k: limit })
     ),
   };
 }

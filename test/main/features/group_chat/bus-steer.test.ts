@@ -193,12 +193,14 @@ describe('group_chat bus › drainSteerInto (interrupt-steer)', () => {
       durationMs: 0,
     });
     expect(JSON.stringify(requests[1])).toContain('Do not send it. Keep it as a draft instead.');
-    expect(requests[1].flatMap((message) => message.content)).toContainEqual({
+    // The provider must see the synthetic result for the committed tool_use
+    // before the steer text; extra carrier fields (images) are not the contract.
+    expect(requests[1].flatMap((message) => message.content)).toContainEqual(expect.objectContaining({
       type: 'tool_result',
       toolUseId: 'send-1',
       content: 'Tool call skipped because a newer user instruction arrived before execution.',
       isError: true,
-    });
+    }));
   });
 
   it('leaves an ordinary user message in FIFO unless Send now authorized steering', async () => {

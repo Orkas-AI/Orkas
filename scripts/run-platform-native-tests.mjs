@@ -30,6 +30,7 @@ const commonSuites = [
   'test/main/model/core-agent/local-tools.test.ts',
   'test/main/model/core-agent/html-preview-tool.test.ts',
   'test/main/features/html_preview.test.ts',
+  'test/main/features/connectors/local-cli.test.ts',
   'test/main/model/local-tools.test.ts',
   'test/main/model/core-agent/video-studio-state-tool.test.ts',
   'test/main/model/core-agent/image-studio-tool.test.ts',
@@ -49,11 +50,13 @@ const commonSuites = [
   'test/main/util/media_probe.test.ts',
   'test/main/features/video_studio_native_qa.test.ts',
   'test/main/features/video_studio_delivery.test.ts',
-  'test/main/install-data-root.test.ts',
+  'test/main/paths.test.ts',
 ];
 
 const platformSuites = process.platform === 'win32'
   ? [
+      'test/main/features/connectors/local-cli-lark-contract.test.ts',
+      'test/main/features/connectors/local-cli-stdio-adapter.test.ts',
       'test/main/util/prepare-win-native-deps.test.ts',
       'test/main/util/fetch-win-vc-runtime.test.ts',
     ]
@@ -86,4 +89,27 @@ const result = spawnSync(process.execPath, [
 });
 
 if (result.error) throw result.error;
-process.exit(result.status ?? 1);
+if (result.status !== 0) process.exit(result.status ?? 1);
+
+// The suites above run under `ELECTRON_RUN_AS_NODE`, where `BrowserWindow` does
+// not exist. Composition inspect measures frame 0 in a real window, so its
+// runtime probe — and every verdict that depends on measuring the page — is
+// unreachable from them and belongs in this lane, which already requires a
+// desktop host. Kept as its own step so a rendering regression reads as one
+// rather than being attributed to the Vitest run.
+console.log('[platform-native-tests] composition inspect canary (GUI Electron)');
+const canary = spawnSync(process.execPath, [resolve(pcRoot, 'test', 'gui', 'run-inspect-canary.mjs')], {
+  cwd: pcRoot,
+  env: { ...process.env, ORKAS_PLATFORM_NATIVE_TEST: '1' },
+  stdio: 'inherit',
+  windowsHide: true,
+});
+
+if (canary.error) throw canary.error;
+if (canary.status === 2) {
+  // Distinct from a failed case: this host gave the probe no window, so the
+  // lane proved nothing. Fail rather than skip — silence here is what let the
+  // gap live in the first place.
+  console.error('[platform-native-tests] inspect canary could not obtain a window; run it on a desktop session with a display');
+}
+process.exit(canary.status ?? 1);

@@ -19,6 +19,8 @@ class FakeElement {
   innerHTML = '';
   id = '';
   className = '';
+  children: FakeElement[] = [];
+  hidden = false;
   dataset: Record<string, string> = {};
   style: Record<string, string> = {};
   classList = new FakeClassList();
@@ -26,7 +28,9 @@ class FakeElement {
   querySelectorAll() { return []; }
   querySelector() { return null; }
   addEventListener() {}
-  appendChild() {}
+  appendChild(child: FakeElement) { this.children.push(child); }
+  replaceChildren(...children: FakeElement[]) { this.children = children; }
+  setAttribute(name: string, value: string) { (this as any)[name] = value; }
   focus() { this.focused = true; }
   getBoundingClientRect() { return { left: 0, right: 120, top: 0, bottom: 32, width: 120, height: 32 }; }
 }
@@ -108,7 +112,7 @@ function loadCategoryRenderers() {
     _mpShowReviewStatusUi: () => false,
   };
   vm.createContext(context);
-  for (const file of ['agents.js', 'skills.js']) {
+  for (const file of ['dropdown-placement.js', 'agents.js', 'skills.js']) {
     const code = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules', file), 'utf8');
     vm.runInContext(code, context, { filename: file });
   }
@@ -264,8 +268,8 @@ describe('agent and skill category tabs', () => {
     expect(el('skills-grid').innerHTML).not.toContain('reviewing');
   });
 
-  it('shows memory-only edit for marketplace agents outside dev mode', () => {
-    const { context } = loadCategoryRenderers();
+  it('shows memory-only edit for marketplace and Claude/Codex CLI agents outside dev mode', () => {
+    const { context, el } = loadCategoryRenderers();
     context.isDevMode = () => false;
     vm.runInContext(`
       _agentsCache = [{
@@ -286,7 +290,32 @@ describe('agent and skill category tabs', () => {
 
     expect(context._canEditAgentDefinition({ source: 'marketplace' })).toBe(false);
     expect(context._canEditAgentMemory({ source: 'marketplace' })).toBe(true);
-    expect(context._canEditAgentMemory({ source: 'marketplace', runtime: { kind: 'cli', cli: 'codex' } })).toBe(false);
+    expect(context._canEditAgentMemory({
+      source: 'marketplace',
+      runtime: { kind: 'cli', cli: 'codex' },
+    })).toBe(true);
+    const cliAgent = {
+      source: 'marketplace',
+      runtime: { kind: 'cli', cli: 'codex' },
+      profile: { memory: [{ title: 'CLI durable preference' }] },
+    };
+    expect(context._agentDetailStats(cliAgent).map((item: any) => item.kind)).toContain('memory');
+    context._renderAgentDetailMemory(cliAgent, false);
+    expect(el('agents-detail-memory-section').style.display).toBe('');
+    expect(el('agents-detail-memory').innerHTML).toContain('CLI durable preference');
+    for (const cli of ['openclaw', 'opencode', 'hermes']) {
+      const unsupported = {
+        source: 'marketplace',
+        runtime: { kind: 'cli', cli },
+        profile: { memory: [{ title: 'MUST_STAY_HIDDEN' }] },
+      };
+      expect(context._canEditAgentMemory(unsupported)).toBe(false);
+      expect(context._agentDetailStats(unsupported).map((item: any) => item.kind))
+        .not.toContain('memory');
+      context._renderAgentDetailMemory(unsupported, true);
+      expect(el('agents-detail-memory-section').style.display).toBe('none');
+      expect(el('agents-detail-memory').innerHTML).toBe('');
+    }
     expect(menu.innerHTML).toContain('data-action="edit"');
     expect(menu.innerHTML).not.toContain('data-action="delete"');
   });

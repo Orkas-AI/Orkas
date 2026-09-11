@@ -59,11 +59,11 @@ test.describe('agents and skills', () => {
     let page = await orkas.relaunch();
     await page.locator('#agents-btn').click();
     const card = page.locator('.agent-card[data-id="commander"]');
-    await expect(card.locator('.agent-card-name')).toHaveText('Comandante');
+    await expect(card.locator('.agent-card-name')).toHaveText('Commander');
     await expect(card.locator('.agent-card-desc')).toContainText('camada de orquestração');
 
     await card.click();
-    await expect(page.locator('#agents-detail-name')).toHaveText('Comandante');
+    await expect(page.locator('#agents-detail-name')).toHaveText('Commander');
     await expect(page.locator('#agents-detail-desc')).toContainText('camada de orquestração');
 
     await page.locator('#agents-detail-avatar .avatar-circle').click();
@@ -78,7 +78,7 @@ test.describe('agents and skills', () => {
     page = await orkas.relaunch();
     await page.locator('#agents-btn').click();
     const relaunchedCard = page.locator('.agent-card[data-id="commander"]');
-    await expect(relaunchedCard.locator('.agent-card-name')).toHaveText('Comandante');
+    await expect(relaunchedCard.locator('.agent-card-name')).toHaveText('Commander');
     await expect(relaunchedCard.locator('.avatar-circle'))
       .toHaveAttribute('style', /--avatar-bg:#7dd3fc/);
   });

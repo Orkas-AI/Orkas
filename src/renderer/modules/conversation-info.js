@@ -1,9 +1,13 @@
 // ─── Conversation info side panel ───────────────────────────────────────
-// Right-side companion panel for the active conversation. It summarizes the
-// workspace files and attachments. The file tab reads the live conversation
-// workspace first, then merges chip-tracked produced files from history so
-// the panel stays aligned with disk even when tools create files through
-// bash / CLI flows.
+// Right-side companion panel for the active conversation. It summarizes what
+// the conversation produced, plus its attachments.
+//
+// The Files tab renders one already-merged list from
+// `features/conversation_outputs.ts`: the workspace disk scan (the only thing
+// that can see files `bash` and external CLI agents write), the artifact
+// bundles that live outside the workspace entirely, and the history-recorded
+// paths written somewhere else. Each entry's `origin` decides its section and
+// how it opens — the panel does not re-derive membership from history.
 
 const ConversationInfo = (() => {
   const _infoLog = (typeof createLogger === 'function')
@@ -13,6 +17,8 @@ const ConversationInfo = (() => {
   let _cid = null;
   let _open = false;
   let _activeTab = 'files';
+  let _panelWidth = 400;
+  let _resizing = false;
   let _seq = 0;
   let _fileSeq = 0;
   let _attachmentSeq = 0;
@@ -28,8 +34,6 @@ const ConversationInfo = (() => {
     conversation: null,
     history: [],
     files: [],
-    fileRoot: '',
-    fileRootExists: false,
     filesTruncated: false,
     filesCount: 0,
     filesScanSkipped: false,
@@ -164,15 +168,6 @@ const ConversationInfo = (() => {
       if (_pathIsSameOrInside(deleted, target)) return true;
     }
     return false;
-  }
-
-  function _relPathUnder(root, target) {
-    const r = _normalizePath(root).replace(/\/+$/, '');
-    const t = _normalizePath(target);
-    if (!r || !t) return '';
-    if (t === r) return '';
-    const prefix = r + '/';
-    return t.startsWith(prefix) ? t.slice(prefix.length) : '';
   }
 
   function _samePrefix(a, b) {
@@ -331,8 +326,6 @@ const ConversationInfo = (() => {
       conversation: historyData.conversation || null,
       history: Array.isArray(historyData.history) ? historyData.history : [],
       files: Array.isArray(filesData.items) ? filesData.items : [],
-      fileRoot: typeof filesData.root === 'string' ? filesData.root : '',
-      fileRootExists: filesData.rootExists === true,
       filesTruncated: filesData.truncated === true,
       filesCount: Number(filesData.count) || 0,
       filesScanSkipped: filesData.scanSkipped === true,
@@ -353,8 +346,6 @@ const ConversationInfo = (() => {
     // Leave history/conversation/syncEnabled untouched in the caller's merge.
     return {
       files: Array.isArray(filesData.items) ? filesData.items : [],
-      fileRoot: typeof filesData.root === 'string' ? filesData.root : '',
-      fileRootExists: filesData.rootExists === true,
       filesTruncated: filesData.truncated === true,
       filesCount: Number(filesData.count) || 0,
       filesScanSkipped: filesData.scanSkipped === true,
@@ -385,68 +376,58 @@ const ConversationInfo = (() => {
     return c && c.title ? c.title : _label('chat.new_conv_title', 'New conversation');
   }
 
-  function _collectHistoryProducedFiles() {
-    const byPath = new Map();
-    for (const m of _snapshot.history || []) {
-      const ts = m && (m.ts || m.time || '');
-      const produced = Array.isArray(m && m.produced) ? m.produced : [];
-      for (const p of produced) {
-        if (!p) continue;
-        const abs = String(p);
-        if (_isLocallyDeletedPath(abs)) continue;
-        byPath.set(abs, { path: abs, time: ts });
-      }
-    }
-    return Array.from(byPath.values()).sort((a, b) => String(a.path).localeCompare(String(b.path)));
+  // The main process owns membership now (`features/conversation_outputs.ts`):
+  // the workspace scan, the artifact pool, and the history-recorded paths the
+  // scan structurally cannot reach, merged once with an `origin` on each entry.
+  // The panel used to re-derive that here from `_snapshot.history`, which is
+  // why an out-of-workspace file arrived with no relative path and got hung off
+  // the tree root as a bare basename.
+  function _outputEntries() {
+    return Array.isArray(_snapshot.files) ? _snapshot.files : [];
   }
 
+  /** Ordinary files — the workspace tree plus anything written outside it. */
   function _collectVisibleFiles() {
     const byPath = new Map();
-    const fileRoot = _snapshot.fileRoot || '';
-    const workspaceFiles = Array.isArray(_snapshot.files) ? _snapshot.files : [];
-    for (const item of workspaceFiles) {
-      const p = item && item.path ? String(item.path) : '';
-      if (!p) continue;
+    for (const item of _outputEntries()) {
+      if (!item || item.origin === 'artifact') continue;
+      const p = item.path ? String(item.path) : '';
+      if (!p || _isLocallyDeletedPath(p)) continue;
       const key = _normalizePath(p);
-      const relPath = item.relPath ? String(item.relPath) : _relPathUnder(fileRoot, p);
+      if (byPath.has(key)) continue;
       byPath.set(key, {
         path: p,
-        relPath,
+        relPath: item.relPath ? String(item.relPath) : '',
         name: item.name || _baseName(p),
         kind: item.kind || _kindForName(item.name || p),
         time: item.mtime ? new Date(Number(item.mtime)).toISOString() : '',
         bytes: Number(item.bytes) || 0,
-        source: 'workspace',
+        origin: item.origin === 'outside' ? 'outside' : 'workspace',
       });
     }
-
-    const hasAuthoritativeWorkspaceSnapshot = !!fileRoot && _snapshot.fileRootExists === true;
-    for (const produced of _collectHistoryProducedFiles()) {
-      const p = produced && produced.path ? String(produced.path) : '';
-      if (!p) continue;
-      const key = _normalizePath(p);
-      if (byPath.has(key)) continue;
-      const relPath = _relPathUnder(fileRoot, p);
-      if (relPath && hasAuthoritativeWorkspaceSnapshot && !_snapshot.filesTruncated) {
-        // The workspace snapshot is authoritative for files under its root.
-        // If a produced file was deleted or renamed, don't keep showing the
-        // stale history record.
-        continue;
-      }
-      byPath.set(key, {
-        ...produced,
-        relPath,
-        name: _baseName(p),
-        kind: _kindForName(_baseName(p)),
-        source: 'produced',
-      });
-    }
-
     return Array.from(byPath.values()).sort((a, b) => {
       const ar = a.relPath || a.path || '';
       const br = b.relPath || b.path || '';
       return String(ar).localeCompare(String(br));
     });
+  }
+
+  /** `create_artifact` bundles. One row each — an artifact is a directory of
+   *  web assets, so listing its internals would say nothing useful. */
+  function _collectVisibleArtifacts() {
+    const out = [];
+    for (const item of _outputEntries()) {
+      if (!item || item.origin !== 'artifact' || !item.artifactId) continue;
+      out.push({
+        artifactId: String(item.artifactId),
+        title: String(item.title || ''),
+        // Carried through so an interaction started from the panel routes back
+        // to the producing actor, exactly as it does from the bubble's frame.
+        agentId: String(item.agentId || ''),
+        mtime: Number(item.mtime) || 0,
+      });
+    }
+    return out;
   }
 
   function _buildFileTree(files) {
@@ -532,9 +513,55 @@ const ConversationInfo = (() => {
     return dirHtml + fileHtml;
   }
 
+  function _renderGroup(titleKey, fallback, rowsHtml) {
+    if (!rowsHtml) return '';
+    return `<div class="conversation-info-group">
+      <div class="conversation-info-group-title">${escapeHtml(_label(titleKey, fallback))}</div>
+      ${rowsHtml}
+    </div>`;
+  }
+
+  // Files the conversation produced outside its own workspace folder — an
+  // absolute path into the user's tree, the attachment pool, a sibling
+  // directory. They have no place in the workspace tree, and silently hanging
+  // them off its root made them read as workspace files. Full path stays in the
+  // tooltip because the basename alone cannot tell two of them apart.
+  function _renderOutsideFiles(files) {
+    const moreTitle = _label('common.more', 'More');
+    return files.map((file) => {
+      const kind = file.kind || _kindForName(file.name || file.path);
+      return `
+      <div class="conversation-info-file is-outside" role="button" tabindex="0" style="--depth:0"
+              data-file-path="${escapeHtml(file.path)}" draggable="true" title="${escapeHtml(file.path)}">
+        <span class="conversation-info-file-icon">${_iconForName(file.name)}</span>
+        <span class="conversation-info-file-name">${escapeHtml(file.name)}</span>
+        <button type="button" class="ctx-row-menu-btn conversation-info-file-menu-btn" data-file-menu
+                data-entry-kind="${escapeHtml(kind)}" data-entry-path="${escapeHtml(file.path)}" data-entry-name="${escapeHtml(file.name)}"
+                title="${escapeHtml(moreTitle)}" aria-label="${escapeHtml(moreTitle)}" aria-haspopup="menu" aria-expanded="false">${_uiIcon('more-horizontal', 'ctx-row-menu-icon')}</button>
+      </div>
+    `;
+    }).join('');
+  }
+
+  function _renderArtifactRows(artifacts) {
+    return artifacts.map((artifact) => {
+      const label = artifact.title || _label('artifact.title', 'Interactive app');
+      return `
+      <div class="conversation-info-file conversation-info-artifact" role="button" tabindex="0" style="--depth:0"
+              data-artifact-id="${escapeHtml(artifact.artifactId)}" title="${escapeHtml(label)}">
+        <span class="conversation-info-file-icon">${_uiIcon('layout-grid', 'ui-icon conversation-info-dir-svg-icon')}</span>
+        <span class="conversation-info-file-name">${escapeHtml(label)}</span>
+      </div>
+    `;
+    }).join('');
+  }
+
   function _renderFiles() {
-    const files = _collectVisibleFiles();
-    if (!files.length) {
+    const allFiles = _collectVisibleFiles();
+    const artifacts = _collectVisibleArtifacts();
+    const files = allFiles.filter((file) => file.origin !== 'outside');
+    const outside = allFiles.filter((file) => file.origin === 'outside');
+    if (!allFiles.length && !artifacts.length) {
       if (_snapshot.filesScanSkipped) {
         return `<div class="conversation-info-empty">${escapeHtml(_label(
           'conversation_info.files_scan_skipped',
@@ -554,9 +581,22 @@ const ConversationInfo = (() => {
         </div>`
       : '';
     const trunc = _snapshot.filesTruncated
-      ? `<div class="conversation-info-empty is-small">${escapeHtml(_label('conversation_info.files_truncated', 'Showing first {count} files', { count: _snapshot.filesCount || files.length }))}</div>`
+      ? `<div class="conversation-info-empty is-small">${escapeHtml(_label('conversation_info.files_truncated', 'Showing first {count} files', { count: _snapshot.filesCount || allFiles.length }))}</div>`
       : '';
-    return `<div class="ci-files">${syncNotice}${trunc}<div class="conversation-info-tree">${_renderTreeNode(tree, 0)}</div></div>`;
+    const treeHtml = files.length
+      ? `<div class="conversation-info-tree">${_renderTreeNode(tree, 0)}</div>`
+      : '';
+    const outsideHtml = _renderGroup(
+      'conversation_info.group_outside',
+      'Saved outside this conversation',
+      outside.length ? `<div class="conversation-info-tree">${_renderOutsideFiles(outside)}</div>` : '',
+    );
+    const artifactHtml = _renderGroup(
+      'conversation_info.group_artifacts',
+      'Interactive apps',
+      artifacts.length ? `<div class="conversation-info-tree">${_renderArtifactRows(artifacts)}</div>` : '',
+    );
+    return `<div class="ci-files">${syncNotice}${trunc}${treeHtml}${outsideHtml}${artifactHtml}</div>`;
   }
 
   function _collectConversationAttachments() {
@@ -632,7 +672,7 @@ const ConversationInfo = (() => {
   function _refreshTabCounts() {
     const filesEl = document.getElementById('conversation-info-tab-count-files');
     if (filesEl) {
-      const count = _collectVisibleFiles().length;
+      const count = _collectVisibleFiles().length + _collectVisibleArtifacts().length;
       filesEl.textContent = count > 0 ? String(count) : '';
     }
     const attachEl = document.getElementById('conversation-info-tab-count-attachments');
@@ -646,6 +686,11 @@ const ConversationInfo = (() => {
     _closeFileMenu();
     const body = document.getElementById('conversation-info-body');
     if (!body) return;
+    body.hidden = _activeTab === 'browser';
+    if (_activeTab === 'browser') {
+      _refreshTabCounts();
+      return;
+    }
     // File refreshes replace the tree markup. Capture the live <details>
     // state first so a background refresh does not collapse folders the user
     // is working in.
@@ -685,6 +730,9 @@ const ConversationInfo = (() => {
     document.querySelectorAll('.conversation-info-tab').forEach((tab) => {
       tab.classList.toggle('is-active', tab.dataset.infoTab === _activeTab);
     });
+    const body = document.getElementById('conversation-info-body');
+    if (body) body.hidden = _activeTab === 'browser';
+    window.WebAssist?.setPanelState(_open, _activeTab, _cid || '');
   }
 
   function _beginLoading(source, seq) {
@@ -714,7 +762,7 @@ const ConversationInfo = (() => {
   function _setOpen(next) {
     _open = !!next;
     _syncChrome();
-    if (_open) refresh(_cid);
+    if (_open && _activeTab !== 'browser') refresh(_cid);
   }
 
   async function refresh(cid, opts = {}) {
@@ -808,7 +856,7 @@ const ConversationInfo = (() => {
     _cid = cid || null;
     _open = false;
     _expandedDirectoryPaths.clear();
-    _snapshot = { conversation: null, history: [], files: [], fileRoot: '', fileRootExists: false, filesTruncated: false, filesCount: 0, filesScanSkipped: false, syncEnabled: false, attachments: [] };
+    _snapshot = { conversation: null, history: [], files: [], filesTruncated: false, filesCount: 0, filesScanSkipped: false, syncEnabled: false, attachments: [] };
     _error = '';
     _resetLoading();
     _seq++;
@@ -826,6 +874,21 @@ const ConversationInfo = (() => {
   function _openFile(absPath) {
     if (!absPath || typeof openChatFileViewer !== 'function') return;
     openChatFileViewer(absPath, _baseName(absPath), _cid ? { cid: _cid } : undefined);
+  }
+
+  /** Open a `create_artifact` bundle in the same full-screen frame the bubble's
+   *  own "open" action uses, so the panel adds a way in rather than a second
+   *  presentation of the app. */
+  function _openArtifact(artifactId) {
+    if (!artifactId || !_cid) return;
+    if (typeof window === 'undefined' || typeof window.openChatArtifactViewer !== 'function') return;
+    const entry = _collectVisibleArtifacts().find((item) => item.artifactId === artifactId);
+    window.openChatArtifactViewer({
+      cid: _cid,
+      artifactId,
+      title: (entry && entry.title) || '',
+      agentId: (entry && entry.agentId) || '',
+    });
   }
 
   function _attachmentEntriesForPath(absPath, kind) {
@@ -1215,10 +1278,80 @@ const ConversationInfo = (() => {
     }
   }
 
+  function _loadPanelWidth() {
+    try {
+      const value = Number(localStorage.getItem('orkas.conversationInfo.width'));
+      if (Number.isFinite(value) && value >= 320) _panelWidth = value;
+    } catch (_) { /* storage can be unavailable in isolated renderer tests */ }
+  }
+
+  function _applyPanelWidth() {
+    const panel = document.getElementById('conversation-info-panel');
+    const container = panel?.parentElement;
+    if (!panel || !container) return;
+    const available = container.getBoundingClientRect().width;
+    if (available <= 0) return;
+    const minimum = Math.min(320, available);
+    const maximum = Math.max(minimum, available - Math.min(420, available * 0.5));
+    _panelWidth = Math.round(Math.max(minimum, Math.min(_panelWidth, maximum)));
+    panel.style.width = `${_panelWidth}px`;
+    panel.style.flexBasis = `${_panelWidth}px`;
+    const handle = document.getElementById('conversation-info-resize');
+    if (handle) {
+      handle.setAttribute('aria-valuemin', String(Math.round(minimum)));
+      handle.setAttribute('aria-valuemax', String(Math.round(maximum)));
+      handle.setAttribute('aria-valuenow', String(_panelWidth));
+    }
+  }
+
+  function _finishPanelResize() {
+    if (!_resizing) return;
+    _resizing = false;
+    document.body.classList.remove('is-conversation-info-resizing');
+    window.WebAssist?.setResizing(false);
+    try { localStorage.setItem('orkas.conversationInfo.width', String(_panelWidth)); } catch (_) {}
+  }
+
+  function _bindPanelResize() {
+    const handle = document.getElementById('conversation-info-resize');
+    const panel = document.getElementById('conversation-info-panel');
+    if (!handle || !panel || handle.dataset.bound === '1') return;
+    handle.dataset.bound = '1';
+    _loadPanelWidth();
+    _applyPanelWidth();
+    handle.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      _resizing = true;
+      handle.setPointerCapture(event.pointerId);
+      document.body.classList.add('is-conversation-info-resizing');
+      window.WebAssist?.setResizing(true);
+    });
+    handle.addEventListener('pointermove', (event) => {
+      if (!_resizing) return;
+      const right = panel.parentElement.getBoundingClientRect().right;
+      _panelWidth = right - event.clientX;
+      _applyPanelWidth();
+    });
+    handle.addEventListener('pointerup', _finishPanelResize);
+    handle.addEventListener('pointercancel', _finishPanelResize);
+    handle.addEventListener('lostpointercapture', _finishPanelResize);
+    handle.addEventListener('keydown', (event) => {
+      if (event.isComposing || event.keyCode === 229) return;
+      if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+      event.preventDefault();
+      _panelWidth += event.key === 'ArrowLeft' ? 24 : -24;
+      _applyPanelWidth();
+      try { localStorage.setItem('orkas.conversationInfo.width', String(_panelWidth)); } catch (_) {}
+    });
+    window.addEventListener('resize', _applyPanelWidth);
+  }
+
   function _bindDom() {
     const toggle = document.getElementById('conversation-info-toggle');
     const close = document.getElementById('conversation-info-close');
     const body = document.getElementById('conversation-info-body');
+    _bindPanelResize();
     if (toggle && toggle.dataset.bound !== '1') {
       toggle.dataset.bound = '1';
       toggle.addEventListener('click', () => _setOpen(!_open));
@@ -1257,6 +1390,12 @@ const ConversationInfo = (() => {
           );
           return;
         }
+        const artifact = ev.target.closest('.conversation-info-artifact[data-artifact-id]');
+        if (artifact) {
+          ev.preventDefault();
+          _openArtifact(artifact.dataset.artifactId || '');
+          return;
+        }
         const file = ev.target.closest('.conversation-info-file[data-file-path]');
         if (file) {
           ev.preventDefault();
@@ -1270,9 +1409,15 @@ const ConversationInfo = (() => {
         }
       });
       body.addEventListener('keydown', (ev) => {
+        if (ev.key !== 'Enter' && ev.key !== ' ') return;
+        const artifact = ev.target.closest('.conversation-info-artifact[data-artifact-id]');
+        if (artifact) {
+          ev.preventDefault();
+          _openArtifact(artifact.dataset.artifactId || '');
+          return;
+        }
         const file = ev.target.closest('.conversation-info-file[data-file-path]');
         if (!file || ev.target.closest('.conversation-info-file-menu-btn')) return;
-        if (ev.key !== 'Enter' && ev.key !== ' ') return;
         ev.preventDefault();
         _openFile(file.dataset.filePath || '');
       });

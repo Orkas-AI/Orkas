@@ -37,8 +37,8 @@ class FakeElement {
   hidden = false;
   disabled = false;
   value = '';
-  offsetParent: unknown = {};
   private listeners = new Map<string, Function[]>();
+  private _offsetParent: unknown = undefined;
   private _className = '';
   private _innerHTML = '';
   private _textContent = '';
@@ -79,6 +79,23 @@ class FakeElement {
 
   get innerHTML() {
     return this._innerHTML;
+  }
+
+  set offsetParent(value: unknown) {
+    this._offsetParent = value;
+  }
+
+  /** `display:none` on an ancestor nulls `offsetParent` for everything under
+   *  it, and that is exactly how the module tells "card is off-screen" from
+   *  "card is on screen" — so the fake DOM has to inherit it too. */
+  get offsetParent(): unknown {
+    if (this._offsetParent !== undefined) return this._offsetParent;
+    let node: FakeElement | null = this.parentNode;
+    while (node) {
+      if (node._offsetParent === null) return null;
+      node = node.parentNode;
+    }
+    return {};
   }
 
   set textContent(value: string) {
@@ -156,8 +173,11 @@ function matches(el: FakeElement, selector: string) {
   return false;
 }
 
+const STALE_TEXT = 'This confirmation expired; nothing was deleted.';
+
 function loadHarness(
   invokeImpl: (channel: string, payload: any) => Promise<any> = async () => ({ ok: true }),
+  options: { manualTimers?: boolean } = {},
 ) {
   const elements = new Map<string, FakeElement>();
   const history = makeEl('div');
@@ -187,8 +207,15 @@ function loadHarness(
     'local.delete_file.confirmed': 'Deletion confirmed',
     'local.delete_file.batch_confirmed': 'Deletion confirmed for {count} files',
     'local.delete_file.cancelled': 'Cancelled',
+    'local.delete_file.stale': STALE_TEXT,
     'local.delete_file.batch_cancelled': 'Cancelled {count} files',
     'local.delete_file.user_continue': 'Confirmed, please continue.',
+  };
+
+  const pendingTimers: Array<{ id: number; fn: Function }> = [];
+  let timerSeq = 0;
+  const flushTimers = () => {
+    for (const timer of pendingTimers.splice(0)) timer.fn();
   };
 
   const context: any = {
@@ -198,8 +225,19 @@ function loadHarness(
     Object,
     String,
     RegExp,
-    setTimeout,
-    clearTimeout,
+    setTimeout: options.manualTimers
+      ? (fn: Function) => {
+        const id = ++timerSeq;
+        pendingTimers.push({ id, fn });
+        return id;
+      }
+      : setTimeout,
+    clearTimeout: options.manualTimers
+      ? (id: number) => {
+        const idx = pendingTimers.findIndex((timer) => timer.id === id);
+        if (idx >= 0) pendingTimers.splice(idx, 1);
+      }
+      : clearTimeout,
     createLogger: () => ({ info() {}, warn }),
     t: (key: string, vars?: Record<string, unknown>) => {
       let text = dict[key] || key;
@@ -252,6 +290,7 @@ function loadHarness(
     invokeCalls,
     monitor,
     warn,
+    flushTimers,
     get sendClicks() { return sendClicks; },
   };
 }
@@ -278,8 +317,8 @@ describe('delete-file-confirm batching', () => {
     await card.querySelector('[data-delete-act="ok"]')!.click();
 
     expect(h.invokeCalls).toEqual([
-      { channel: 'delete_file.visible', payload: { confirm_id: 'tok-a' } },
-      { channel: 'delete_file.visible', payload: { confirm_id: 'tok-b' } },
+      { channel: 'delete_file.visible', payload: { confirm_id: 'tok-a', visible: true } },
+      { channel: 'delete_file.visible', payload: { confirm_id: 'tok-b', visible: true } },
       { channel: 'delete_file.respond', payload: { confirm_id: 'tok-a', granted: true } },
       { channel: 'delete_file.respond', payload: { confirm_id: 'tok-b', granted: true } },
     ]);
@@ -311,8 +350,8 @@ describe('delete-file-confirm batching', () => {
     await card.querySelector('[data-delete-act="cancel"]')!.click();
 
     expect(h.invokeCalls).toEqual([
-      { channel: 'delete_file.visible', payload: { confirm_id: 'tok-a' } },
-      { channel: 'delete_file.visible', payload: { confirm_id: 'tok-b' } },
+      { channel: 'delete_file.visible', payload: { confirm_id: 'tok-a', visible: true } },
+      { channel: 'delete_file.visible', payload: { confirm_id: 'tok-b', visible: true } },
       { channel: 'delete_file.respond', payload: { confirm_id: 'tok-a', granted: false } },
       { channel: 'delete_file.respond', payload: { confirm_id: 'tok-b', granted: false } },
     ]);
@@ -370,5 +409,96 @@ describe('delete-file-confirm batching', () => {
     expect(diagnostics).not.toContain('/Users/alice');
     expect(diagnostics).not.toContain('private-token');
     expect(diagnostics).not.toContain('private-cid');
+  });
+});
+
+describe('delete-file-confirm off-screen cards', () => {
+  // 2026-08-26: mounting into a hidden surface acked nothing at all, so main
+  // timed out after 1200ms and destroyed the token. The card stayed on the
+  // page; the click 49s later could only ever fail.
+  it('acks an off-screen card as mounted, then re-acks once it comes into view', () => {
+    const h = loadHarness(undefined, { manualTimers: true });
+    h.history.offsetParent = null;
+
+    h.context._handleDeleteFileConfirmRequest({ confirm_id: 'tok-a', path: 'a.txt', cid: 'c1', turn_id: 'turn-1' });
+
+    expect(h.invokeCalls).toEqual([
+      { channel: 'delete_file.visible', payload: { confirm_id: 'tok-a', visible: false } },
+    ]);
+
+    h.flushTimers();
+    expect(h.invokeCalls).toHaveLength(1);
+
+    h.history.offsetParent = {};
+    h.flushTimers();
+
+    expect(h.invokeCalls[1]).toEqual({
+      channel: 'delete_file.visible',
+      payload: { confirm_id: 'tok-a', visible: true },
+    });
+  });
+
+  it('retracts the token when the chat surface is rebuilt out from under the card', () => {
+    const h = loadHarness(undefined, { manualTimers: true });
+    h.context._handleDeleteFileConfirmRequest({ confirm_id: 'tok-a', path: 'a.txt', cid: 'c1', turn_id: 'turn-1' });
+    const card = h.history.children[0];
+
+    h.history.removeChild(card);   // a conversation switch wipes chat history
+    h.flushTimers();
+
+    expect(h.invokeCalls).toEqual([
+      { channel: 'delete_file.visible', payload: { confirm_id: 'tok-a', visible: true } },
+      { channel: 'delete_file.dismiss', payload: { confirm_id: 'tok-a' } },
+    ]);
+  });
+
+  it('retracts every token a grouped card was holding, not just the first', () => {
+    const h = loadHarness(undefined, { manualTimers: true });
+    h.context._handleDeleteFileConfirmRequest({ confirm_id: 'tok-a', path: 'a.txt', cid: 'c1', turn_id: 'turn-1' });
+    h.context._handleDeleteFileConfirmRequest({ confirm_id: 'tok-b', path: 'b.txt', cid: 'c1', turn_id: 'turn-1' });
+    const card = h.history.children[0];
+    expect(card.dataset.deleteConfirmCount).toBe('2');
+
+    h.history.removeChild(card);
+    h.flushTimers();
+
+    expect(h.invokeCalls.filter((c) => c.channel === 'delete_file.dismiss')).toEqual([
+      { channel: 'delete_file.dismiss', payload: { confirm_id: 'tok-a' } },
+      { channel: 'delete_file.dismiss', payload: { confirm_id: 'tok-b' } },
+    ]);
+  });
+
+  it('retires a card whose token main has already dropped', async () => {
+    const h = loadHarness();
+    h.context._handleDeleteFileConfirmRequest({ confirm_id: 'tok-a', path: 'a.txt', cid: 'c1', turn_id: 'turn-1' });
+    const card = h.history.children[0];
+
+    h.context._handleDeleteFileConfirmInvalidated({ confirm_id: 'tok-a', reason: 'expired' });
+
+    expect(card.classList.contains('is-stale')).toBe(true);
+    expect(card.querySelector('[data-delete-act="ok"]')!.disabled).toBe(true);
+    expect(card.querySelector('.delete-confirm-result')?.textContent).toBe(STALE_TEXT);
+
+    await card.querySelector('[data-delete-act="ok"]')!.click();
+
+    expect(h.invokeCalls.some((c) => c.channel === 'delete_file.respond')).toBe(false);
+  });
+
+  it('says nothing was deleted when the token died before the click landed', async () => {
+    const h = loadHarness(async (channel) => (
+      channel === 'delete_file.respond' ? { ok: false } : { ok: true }
+    ));
+    h.context._handleDeleteFileConfirmRequest({ confirm_id: 'tok-a', path: 'a.txt', cid: 'c1', turn_id: 'turn-1' });
+    const card = h.history.children[0];
+
+    await card.querySelector('[data-delete-act="ok"]')!.click();
+
+    expect(card.classList.contains('is-stale')).toBe(true);
+    expect(card.classList.contains('is-confirmed')).toBe(false);
+    expect(card.querySelector('.delete-confirm-result')?.textContent).toBe(STALE_TEXT);
+    // Waking the model to retry a token main has already thrown away just
+    // burns a turn on a token that can never resolve.
+    expect(h.sendClicks).toBe(0);
+    expect(h.input.value).toBe('');
   });
 });

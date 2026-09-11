@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import * as path from 'node:path';
 import {
   LOCAL_AGENT_TYPES,
+  createLocalAgentLogCollector,
+  ingestLocalAgentLogEvent,
   classifyLiveFailure,
   ensureRequestedAgents,
   installerPlan,
@@ -162,4 +164,28 @@ describe('local-agent live test support', () => {
       'done count=2',
     ]);
   });
+});
+
+
+describe('local-agent process log evidence', () => {
+  it('surfaces native warnings without retaining their private message or dropping split lines', () => {
+    const collector = createLocalAgentLogCollector('cli-fixture');
+    ingestLocalAgentLogEvent(collector, { type: 'stderr-line', line: JSON.stringify({
+      level: 'warn', timestamp: '2030-01-01T00:00:00Z', target: 'cli::transport',
+      fields: { message: 'private-customer-marker' },
+    }) });
+    collector.ingest('stdout', '[00:00:00.000] [info] [(local-agent)] re');
+    collector.ingest('stdout', 'covered\n');
+    const result = collector.finish();
+    expect(result).toMatchObject({ passed: true, capturedLineCount: 2,
+      analyzedLineCount: 2, levelCounts: { warn: 1, info: 1 } });
+    expect(JSON.stringify(result)).not.toContain('private-customer-marker');
+  });
+
+  it.each(['plain private stderr', '[00:00:00.000] [error] [(cli)] private fault'])
+    ('rejects unclassified stderr and structured errors (%#)', (line) => {
+      const collector = createLocalAgentLogCollector('cli-fixture');
+      collector.ingest('stderr', line);
+      expect(collector.finish()).toMatchObject({ passed: false, capturedLineCount: 1, analyzedLineCount: 1 });
+    });
 });

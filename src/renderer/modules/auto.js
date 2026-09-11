@@ -5,16 +5,12 @@
 // features/auto_tasks.ts in main handles persistence + the in-process
 // scheduler that fires due tasks through groupChat.send.
 //
-// Layout (inline, no modal):
+// Layout:
 //   #panel-auto
 //     .auto-scroll
-//       .auto-create-section   create-or-edit form (always visible)
-//       .auto-list-section     existing task list
+//       .auto-list   global tasks first, then project groups in sidebar order
 //
-// Edit happens by pre-filling the same create form (submit button toggles
-// from "创建" to "保存", a "取消编辑" button shows). On submit or cancel
-// the form resets to create mode. Project-detail's auto card lists
-// tasks too; clicking its row's edit navigates here and enters edit mode.
+// Create and edit share a modal with the project-detail Automation tab.
 //
 // Reuses `.btn`, `.empty`, `.muted`, `.form-row`, `_aiSelectMount`, and the
 // `.new-chat-input-area` chrome (CLAUDE.md §7 component reuse). Recipient
@@ -47,6 +43,7 @@ const _AUTO_STABLE_FAILURE_CODES = new Set([
   'file_prepare_failed',
   'invalid_connector',
   'invalid_content',
+  'invalid_end_condition',
   'invalid_id',
   'invalid_message_parts',
   'invalid_name',
@@ -177,6 +174,8 @@ function _autoAttachDisplayName(item) {
 
 let _autoTasks = [];           // last fetched global list
 let _autoLoadedOnce = false;
+// Presentation state belongs to this list, independently of sidebar expansion.
+const _autoCollapsedGroups = new Set();
 let _autoFormMounted = false;  // _aiSelectMount only once
 let _autoEditingTaskId = null; // null = create mode, taskId = edit mode
 // Current persistent installation identity — fetched lazily on first row
@@ -237,12 +236,16 @@ const _autoTaskConversationPages = new Map();  // taskId -> page state
 
 // Cached `_aiSelectMount` handles for the inline form. Set on first mount.
 let _autoFreqSel = null;
+let _autoEndSel = null;
 let _autoWeekdaySel = null;
 let _autoMonthlyDaySel = null;
 let _autoHourSel = null;
 let _autoMinuteSel = null;
 let _autoProjectSel = null;
 let _autoRunDeviceSel = null;
+let _autoDatePicker = null;
+let _autoEndDatePicker = null;
+let _autoOpenDatePicker = null;
 // Set by `openAutoTaskDialog({projectId})` from the project-detail entry —
 // the task gets bound to this project on save. Global-tab opens omit it,
 // producing a project-less task. (No project picker inside the modal; the
@@ -271,6 +274,7 @@ function _autoPadHM(n) { return String(Math.max(0, Math.min(59, Number(n) | 0)))
 
 function _autoFormatSummary(task) {
   const s = task.schedule || {};
+  let summary = '';
   if (s.type === 'one_time') {
     let when = s.at;
     try {
@@ -281,14 +285,27 @@ function _autoFormatSummary(task) {
     } catch (_) { /* fall through with raw */ }
     return t('auto.summary_one_time', { when });
   }
+  if (s.type === 'hourly') summary = t('auto.summary_hourly', { hours: s.interval_hours });
   const time = _autoPadHM(s.hour) + ':' + _autoPadHM(s.minute);
-  if (s.type === 'daily') return t('auto.summary_daily', { time });
+  if (s.type === 'daily') summary = t('auto.summary_daily', { time });
   if (s.type === 'weekly') {
-    return t('auto.summary_weekly', { day: t('auto.weekday.' + s.weekday), time });
+    summary = t('auto.summary_weekly', { day: t('auto.weekday.' + s.weekday), time });
   }
   if (s.type === 'monthly') {
     const day = (s.day === 31) ? t('auto.day_last') : t('auto.day_value', { day: s.day });
-    return t('auto.summary_monthly', { day, time });
+    summary = t('auto.summary_monthly', { day, time });
+  }
+  const end = _autoFormatEndSummary(task);
+  return summary && end ? t('auto.summary_with_end', { schedule: summary, end }) : summary;
+}
+
+function _autoFormatEndSummary(task) {
+  const condition = task && task.end_condition;
+  if (!condition) return '';
+  if (condition.type === 'date') return t('auto.summary_end_date', { date: condition.date });
+  if (condition.type === 'count') {
+    const current = Number.isSafeInteger(task.scheduled_run_count) ? task.scheduled_run_count : 0;
+    return t('auto.summary_end_count', { current, max: condition.max_runs });
   }
   return '';
 }
@@ -331,16 +348,33 @@ function _autoRunDeviceOptions(task, device = _autoCurrentDevice, translate = t)
   ];
 }
 
-function _buildProjectNameLookup() {
-  return (pid) => {
-    try {
-      if (typeof _projectsCache !== 'undefined' && Array.isArray(_projectsCache)) {
-        const p = _projectsCache.find((x) => x && x.project_id === pid);
-        if (p && p.name) return p.name;
-      }
-    } catch (_) { /* ignore */ }
-    return pid;
-  };
+// Consume the exact projects.list order used by the sidebar. Keep unresolved
+// project references separate from global tasks while project metadata loads.
+function _autoGroupTasks(tasks, projects) {
+  const byProject = new Map();
+  for (const task of tasks) {
+    const projectId = task.project_id || '';
+    if (!byProject.has(projectId)) byProject.set(projectId, []);
+    byProject.get(projectId).push(task);
+  }
+  const groups = [{ projectId: '', name: '', tasks: byProject.get('') || [] }];
+  byProject.delete('');
+  for (const project of projects) {
+    const projectId = project.project_id;
+    if (!byProject.has(projectId)) continue;
+    groups.push({ projectId, name: project.name || '', tasks: byProject.get(projectId) });
+    byProject.delete(projectId);
+  }
+  for (const [projectId, items] of byProject) {
+    groups.push({ projectId, name: '', tasks: items });
+  }
+  return groups;
+}
+
+function _autoUiIcon(name, className) {
+  return typeof window !== 'undefined' && typeof window.uiIconHtml === 'function'
+    ? window.uiIconHtml(name, className)
+    : '';
 }
 
 function _autoStructuredMessagePreview(task, maxLength) {
@@ -399,37 +433,31 @@ function _autoTaskMessagePreviewHtml(task, maxLength = 160) {
 // ─── Row rendering (shared between global tab and project-detail card) ──
 
 function _autoRenderRow(task, opts) {
-  // opts: { showProjectBadge?: boolean, onEdit: (task) => void, afterChange: () => void }
+  // opts: { expanded?: boolean, onEdit: (task) => void, afterChange: () => void }
   const row = document.createElement('div');
   row.className = 'auto-row' + (task.enabled ? '' : ' is-disabled');
   row.dataset.taskId = task.id;
 
   // ── Main column (left) ────────────────────────────────────────────────
-  // Layout: message preview (with inline skill / connector chips) → metadata
-  // chips (recipient / attachment / project / device). Title is folded into
-  // the content area as a secondary line below the message preview, since the
-  // schedule summary moved to the right column.
+  // Name and message preview lead; enabled state sits with device metadata.
+  // Inline skill/connector resources retain the shared message rendering.
   const contentText = String(task.content || '');
   const contentHtml = contentText
     ? `<div class="auto-row-content">${_autoTaskMessagePreviewHtml(task)}</div>`
     : `<div class="auto-row-content auto-row-content-empty muted">${escapeHtml(t('auto.invalid_content'))}</div>`;
   const titleHtml = task.title
-    ? `<div class="auto-row-title muted">${escapeHtml(task.title)}</div>`
+    ? `<div class="auto-row-title">${escapeHtml(task.title)}</div>`
     : '';
+  if (!task.title) row.classList.add('is-untitled');
+  const statusHtml = `<span class="auto-row-status">${escapeHtml(t(task.enabled ? 'auto.status_enabled' : 'auto.status_disabled'))}</span>`;
 
   // Metadata chip row — skill and connector belong to the message preview
   // above, matching the current chat composer instead of forming a second row.
   const chips = [];
   if (task.recipient && task.recipient.kind === 'agent' && task.recipient.name) {
-    chips.push(`<span class="auto-row-chip is-agent">${escapeHtml('@' + task.recipient.name)}</span>`);
-  }
-  const attachCount = Array.isArray(task.attachments) ? task.attachments.length : 0;
-  if (attachCount > 0) {
-    chips.push(`<span class="auto-row-chip is-attach">📎 ${escapeHtml(t('auto.attachment_count', { n: attachCount }))}</span>`);
-  }
-  if (opts && opts.showProjectBadge && task.project_id) {
-    const pname = _buildProjectNameLookup()(task.project_id) || task.project_id;
-    chips.push(`<span class="auto-row-chip is-project">${escapeHtml(t('auto.project_scope', { name: pname }))}</span>`);
+    chips.push(`<span class="auto-row-chip is-agent" title="${escapeHtml(task.recipient.name)}">${_autoUiIcon('user', 'auto-row-meta-icon')}<span class="auto-row-chip-label">${escapeHtml(task.recipient.name)}</span></span>`);
+  } else if (!task.recipient || task.recipient.kind !== 'agent') {
+    chips.push(`<span class="auto-row-chip is-agent">${_autoUiIcon('user', 'auto-row-meta-icon')}<span class="auto-row-chip-label">${escapeHtml(t('chat.recipient_commander'))}</span></span>`);
   }
   // Device chip — always shown so the user can tell at a glance which
   // machine each task is bound to. "本机" when the task is assigned here
@@ -440,12 +468,17 @@ function _autoRenderRow(task, opts) {
   if (_autoCurrentDevice) {
     const isHere = _autoIsTaskOnCurrentDevice(task);
     if (isHere) {
-      chips.push(`<span class="auto-row-chip is-device is-device-here">${escapeHtml(t('auto.device_current'))}</span>`);
+      chips.push(`<span class="auto-row-chip is-device">${_autoUiIcon('monitor', 'auto-row-meta-icon')}<span class="auto-row-chip-label">${escapeHtml(t('auto.device_current'))}</span></span>`);
     } else {
       const hostname = _autoDisplayDeviceName(task.device_name || task.device_id);
       const hint = t('auto.device_remote_hint', { name: hostname });
-      chips.push(`<span class="auto-row-chip is-device is-device-remote" title="${escapeHtml(hint)}">${escapeHtml(hostname)}</span>`);
+      chips.push(`<span class="auto-row-chip is-device" title="${escapeHtml(hint)}">${_autoUiIcon('monitor', 'auto-row-meta-icon')}<span class="auto-row-chip-label">${escapeHtml(hostname)}</span></span>`);
     }
+  }
+  chips.push(statusHtml);
+  const attachCount = Array.isArray(task.attachments) ? task.attachments.length : 0;
+  if (attachCount > 0) {
+    chips.push(`<span class="auto-row-chip">${_autoUiIcon('paperclip', 'auto-row-meta-icon')}<span class="auto-row-chip-label">${escapeHtml(t('auto.attachment_count', { n: attachCount }))}</span></span>`);
   }
   const chipsHtml = chips.length ? `<div class="auto-row-chips">${chips.join('')}</div>` : '';
 
@@ -454,22 +487,17 @@ function _autoRenderRow(task, opts) {
   const lastRun = escapeHtml(_autoFormatLastRun(task.last_run_at));
   const moreTitle = escapeHtml(t('auto.more_menu'));
 
-  // Conversation count badge — number of convs in the global cache whose
-  // origin_auto_task_id matches this task. Used for the "Conversations (N)"
-  // expand header.
+  // Conversation count labels the row's optional execution-history disclosure.
+  // The row itself is the disclosure surface; the redundant per-row chevron is
+  // intentionally omitted so project grouping remains the only visible
+  // expand/collapse control in the list.
   const convCount = _autoCountConvsForTask(task.id);
-  const expandIcon = (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function')
-    ? window.uiIconHtml('chevron-down', 'auto-row-expand-icon')
-    : '▾';
 
   row.innerHTML = `
     <div class="auto-row-head">
-      <button type="button" class="auto-row-expand" data-act="expand" aria-expanded="false" aria-label="${escapeHtml(t('auto.task_convs', { n: convCount }))}">
-        ${expandIcon}
-      </button>
       <div class="auto-row-main">
-        ${contentHtml}
         ${titleHtml}
+        ${contentHtml}
         ${chipsHtml}
       </div>
       <div class="auto-row-side">
@@ -483,6 +511,9 @@ function _autoRenderRow(task, opts) {
       <div class="auto-row-convs-list"></div>
     </div>
   `;
+  row.tabIndex = 0;
+  row.setAttribute('aria-expanded', 'false');
+  row.setAttribute('aria-label', t('auto.task_convs', { n: convCount }));
 
   // ── ⋯ menu (enable/disable + edit + delete) ──────────────────────────
   const moreBtn = row.querySelector('[data-act="more"]');
@@ -490,23 +521,23 @@ function _autoRenderRow(task, opts) {
     e.stopPropagation();
     _openAutoRowMenu(moreBtn, task, opts);
   });
-  // ── Expand toggle ────────────────────────────────────────────────────
-  // Clicking anywhere on the row toggles expand/collapse — chevron is just
-  // a visual cue. Interactive controls inside the card (⋯ button, chips,
-  // nested conv items) stop propagation so they don't trigger the toggle.
-  const expandBtn = row.querySelector('[data-act="expand"]');
+  // ── Execution-history disclosure ────────────────────────────────────
+  // Clicking the row still reveals its runs, but project grouping owns the
+  // only visible chevron. Interactive controls keep their own click semantics.
   const convsWrap = row.querySelector('.auto-row-convs');
   const convsList = row.querySelector('.auto-row-convs-list');
   const toggleExpand = () => {
-    const expanded = expandBtn.getAttribute('aria-expanded') === 'true';
+    const expanded = row.getAttribute('aria-expanded') === 'true';
     if (expanded) {
-      expandBtn.setAttribute('aria-expanded', 'false');
+      row.setAttribute('aria-expanded', 'false');
       row.classList.remove('is-expanded');
       convsWrap.hidden = true;
+      if (contentText) row.querySelector('.auto-row-content').innerHTML = _autoTaskMessagePreviewHtml(task);
     } else {
-      expandBtn.setAttribute('aria-expanded', 'true');
+      row.setAttribute('aria-expanded', 'true');
       row.classList.add('is-expanded');
       convsWrap.hidden = false;
+      if (contentText) row.querySelector('.auto-row-content').innerHTML = _autoTaskMessagePreviewHtml(task, Number.MAX_SAFE_INTEGER);
       _autoRenderTaskConvs(task.id, convsList);
     }
   };
@@ -520,6 +551,12 @@ function _autoRenderRow(task, opts) {
     if (e.target.closest('.auto-row-more, .auto-row-menu, .conv-item, .conv-item-action')) return;
     toggleExpand();
   });
+  row.addEventListener('keydown', (e) => {
+    if (e.target !== row || (e.key !== 'Enter' && e.key !== ' ')) return;
+    e.preventDefault();
+    toggleExpand();
+  });
+  if (opts && opts.expanded) toggleExpand();
   return row;
 }
 
@@ -639,8 +676,7 @@ function _autoRefreshTaskConvsChrome(taskId, container) {
   const label = t('auto.task_convs', { n: count });
   const head = row.querySelector('.auto-row-convs-head');
   if (head) head.textContent = label;
-  const expandBtn = row.querySelector('[data-act="expand"]');
-  if (expandBtn) expandBtn.setAttribute('aria-label', label);
+  row.setAttribute('aria-label', label);
 }
 
 /** Render the list of conversations spawned by this task into the given
@@ -920,14 +956,18 @@ function _openAutoRowMenu(anchorBtn, task, opts) {
 // ─── Global auto tab — list rendering + form wiring ────────────────
 
 async function loadAutoList(force) {
-  const listEl = document.getElementById('auto-list');
-  const emptyEl = document.getElementById('auto-empty');
-  if (!listEl) return;
+  if (!document.getElementById('auto-list')) return;
   await _refreshAutoSyncNotice();
-  if (_autoLoadedOnce && !force) return;
-  // Fetch device identity in parallel with the task list so the device
-  // chip can paint on the first render.
-  await _ensureAutoCurrentDevice();
+  if (_autoLoadedOnce && !force) { _autoRenderList(); return; }
+  // Resolve the shared project metadata and device identity before grouping.
+  // The sidebar's project cache is the grouping authority; ask it to load only
+  // while nothing is cached yet, because even a warm `loadProjects()` repaints
+  // the sidebar section.
+  const projectsCached = typeof _projectsCache !== 'undefined' && Array.isArray(_projectsCache);
+  await Promise.all([
+    _ensureAutoCurrentDevice(),
+    typeof loadProjects === 'function' && !projectsCached ? loadProjects() : Promise.resolve(),
+  ]);
   try {
     const res = await window.orkas.invoke('autoTasks.list', {});
     _autoTasks = (res && Array.isArray(res.tasks)) ? res.tasks : [];
@@ -938,6 +978,19 @@ async function loadAutoList(force) {
     if (typeof uiAlert === 'function') uiAlert(t('auto.load_failed', { reason: (err && err.message) || err }));
   }
   _autoLoadedOnce = true;
+  _autoRenderList();
+}
+
+function _autoRenderList() {
+  const listEl = document.getElementById('auto-list');
+  const emptyEl = document.getElementById('auto-empty');
+  if (!listEl || !_autoLoadedOnce) return;
+  // The list lives only on the Auto tab. A projects reload or language change
+  // while another view is open waits for the next tab visit, which always
+  // reloads and repaints from the current caches.
+  if (typeof currentView !== 'undefined' && currentView !== 'auto') return;
+  const expandedIds = new Set(Array.from(listEl.querySelectorAll('.auto-row.is-expanded'), (row) => row.dataset.taskId));
+  _closeAutoRowMenu();
   listEl.innerHTML = '';
   const headerCount = document.getElementById('auto-header-count');
   const n = _autoTasks.length;
@@ -949,12 +1002,42 @@ async function loadAutoList(force) {
   if (emptyEl) emptyEl.style.display = 'none';
   const onEdit = (task) => openAutoTaskDialog({ task });
   const afterChange = () => loadAutoList(true);
-  for (const task of _autoTasks) {
-    listEl.appendChild(_autoRenderRow(task, {
-      showProjectBadge: true,
-      onEdit,
-      afterChange,
-    }));
+  const projects = typeof _projectsCache !== 'undefined' && Array.isArray(_projectsCache) ? _projectsCache : [];
+  for (const group of _autoGroupTasks(_autoTasks, projects)) {
+    const section = document.createElement('section');
+    section.className = 'auto-group';
+    section.dataset.projectId = group.projectId;
+    const name = group.projectId ? (group.name || t('auto.project_unavailable')) : t('auto.global');
+    const expanded = !_autoCollapsedGroups.has(group.projectId);
+    section.innerHTML = `
+      <div class="auto-group-head">
+        <button type="button" class="auto-group-toggle" aria-expanded="${expanded}">
+          <span class="auto-group-icon">${_autoUiIcon(expanded ? 'folder-open' : 'folder', 'auto-group-folder-icon')}</span>
+          <span class="auto-group-name">${escapeHtml(name)}</span>
+          <span class="auto-group-count">${group.tasks.length}</span>
+        </button>
+      </div>
+      <div class="auto-group-list"${expanded ? '' : ' hidden'}></div>`;
+    const groupList = section.querySelector('.auto-group-list');
+    groupList.id = `auto-group-list-${group.projectId || 'global'}`;
+    const toggle = section.querySelector('.auto-group-toggle');
+    toggle.setAttribute('aria-controls', groupList.id);
+    toggle.addEventListener('click', () => {
+      const next = toggle.getAttribute('aria-expanded') !== 'true';
+      toggle.setAttribute('aria-expanded', String(next));
+      groupList.hidden = !next;
+      if (next) _autoCollapsedGroups.delete(group.projectId);
+      else _autoCollapsedGroups.add(group.projectId);
+      section.querySelector('.auto-group-icon').innerHTML = _autoUiIcon(next ? 'folder-open' : 'folder', 'auto-group-folder-icon');
+      _closeAutoRowMenu();
+    });
+    if (!group.tasks.length) {
+      groupList.innerHTML = `<div class="auto-group-empty">${escapeHtml(t('auto.global_empty'))}</div>`;
+    }
+    for (const task of group.tasks) {
+      groupList.appendChild(_autoRenderRow(task, { onEdit, afterChange, expanded: expandedIds.has(task.id) }));
+    }
+    listEl.appendChild(section);
   }
 }
 
@@ -1001,7 +1084,6 @@ async function loadProjectAutoList(projectId) {
   };
   for (const task of tasks) {
     listEl.appendChild(_autoRenderRow(task, {
-      showProjectBadge: false,
       onEdit,
       afterChange,
     }));
@@ -1013,9 +1095,18 @@ async function loadProjectAutoList(projectId) {
 function _autoFreqOptions() {
   return [
     { value: 'one_time', label: t('auto.freq_one_time') },
+    { value: 'hourly',   label: t('auto.freq_hourly') },
     { value: 'daily',    label: t('auto.freq_daily') },
     { value: 'weekly',   label: t('auto.freq_weekly') },
     { value: 'monthly',  label: t('auto.freq_monthly') },
+  ];
+}
+
+function _autoEndOptions() {
+  return [
+    { value: 'none', label: t('auto.end_none') },
+    { value: 'date', label: t('auto.end_on_date') },
+    { value: 'count', label: t('auto.end_after_count') },
   ];
 }
 
@@ -1030,7 +1121,7 @@ function _autoMonthlyDayOptions() {
   return opts;
 }
 
-/** Project picker options: leading "无" + every project in the cache.
+/** Project picker options: Global followed by every project in sidebar order.
  *  Refreshed on every `openAutoTaskDialog` so newly-created projects appear
  *  without needing a renderer reload. */
 function _autoProjectOptions() {
@@ -1101,6 +1192,7 @@ function _autoRefreshProjectOptions(removedProjectId = '') {
     }
   }
   _autoRefreshProjectScopedPicker();
+  if (removedPid && _autoLoadedOnce) loadAutoList(true).catch(() => {});
 }
 
 async function _autoClearRecipientIfOutsideProject() {
@@ -1139,6 +1231,352 @@ function _autoLocalDateInputValue(iso) {
   if (Number.isNaN(d.getTime())) d = new Date();
   const pad = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function _autoLocalDateParts(raw) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(raw || '').trim());
+  if (!match) return null;
+  const year = parseInt(match[1], 10);
+  const month = parseInt(match[2], 10);
+  const day = parseInt(match[3], 10);
+  const parsed = new Date(year, month - 1, day);
+  if (parsed.getFullYear() !== year || parsed.getMonth() !== month - 1 || parsed.getDate() !== day) return null;
+  return { year, month, day, value: `${match[1]}-${match[2]}-${match[3]}` };
+}
+
+function _autoCalendarDateValue(date) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${String(date.getFullYear()).padStart(4, '0')}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function _autoCalendarCells(year, month) {
+  const first = new Date(year, month, 1, 12);
+  const cursor = new Date(year, month, 1 - first.getDay(), 12);
+  const cells = [];
+  for (let idx = 0; idx < 42; idx += 1) {
+    const date = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate() + idx, 12);
+    cells.push({
+      value: _autoCalendarDateValue(date),
+      day: date.getDate(),
+      inMonth: date.getFullYear() === year && date.getMonth() === month,
+    });
+  }
+  return cells;
+}
+
+function _autoCalendarDateFromValue(value) {
+  const parts = _autoLocalDateParts(value);
+  return parts ? new Date(parts.year, parts.month - 1, parts.day, 12) : null;
+}
+
+function _autoCalendarShiftDate(value, days) {
+  const date = _autoCalendarDateFromValue(value) || new Date();
+  date.setHours(12, 0, 0, 0);
+  date.setDate(date.getDate() + days);
+  return _autoCalendarDateValue(date);
+}
+
+function _autoCalendarShiftMonth(value, months) {
+  const date = _autoCalendarDateFromValue(value) || new Date();
+  const day = date.getDate();
+  const target = new Date(date.getFullYear(), date.getMonth() + months, 1, 12);
+  const lastDay = new Date(target.getFullYear(), target.getMonth() + 1, 0, 12).getDate();
+  target.setDate(Math.min(day, lastDay));
+  return _autoCalendarDateValue(target);
+}
+
+function _autoDatePickerMount(el, config = {}) {
+  if (!el) return null;
+  const input = el.querySelector('input');
+  const toggle = el.querySelector('.auto-date-picker-toggle');
+  const popover = el.querySelector('.auto-date-picker-popover');
+  if (!input || !toggle || !popover) return null;
+
+  const state = {
+    open: false,
+    viewYear: new Date().getFullYear(),
+    viewMonth: new Date().getMonth(),
+    activeValue: '',
+  };
+  const headingId = `${popover.id}-heading`;
+  let portalParent = null;
+  let portalNextSibling = null;
+
+  const locale = () => {
+    try {
+      return typeof getLocaleMeta === 'function'
+        ? getLocaleMeta(getLang()).intlLocale
+        : 'en-US';
+    } catch (_) {
+      return 'en-US';
+    }
+  };
+  const escape = (value) => (
+    typeof escapeHtml === 'function'
+      ? escapeHtml(String(value == null ? '' : value))
+      : String(value == null ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+  );
+  const icon = (name, className) => (
+    typeof window.uiIconHtml === 'function' ? window.uiIconHtml(name, className) : ''
+  );
+  const dateLabel = (date, options) => {
+    try { return new Intl.DateTimeFormat(locale(), options).format(date); }
+    catch (_) { return _autoCalendarDateValue(date); }
+  };
+  const todayValue = () => _autoCalendarDateValue(new Date());
+
+  const syncViewFromInput = () => {
+    const selected = _autoCalendarDateFromValue(input.value) || new Date();
+    state.viewYear = selected.getFullYear();
+    state.viewMonth = selected.getMonth();
+    state.activeValue = _autoCalendarDateValue(selected);
+  };
+
+  const render = ({ focusActive = false } = {}) => {
+    const selected = _autoLocalDateParts(input.value);
+    const selectedValue = selected ? selected.value : '';
+    const today = todayValue();
+    const monthDate = new Date(state.viewYear, state.viewMonth, 1, 12);
+    const monthTitle = dateLabel(monthDate, { year: 'numeric', month: 'long' });
+    const cells = _autoCalendarCells(state.viewYear, state.viewMonth);
+    const weekdays = [];
+    for (let day = 0; day < 7; day += 1) {
+      const date = new Date(2024, 0, 7 + day, 12);
+      weekdays.push({
+        short: dateLabel(date, { weekday: 'narrow' }),
+        full: dateLabel(date, { weekday: 'long' }),
+      });
+    }
+    if (!cells.some((cell) => cell.value === state.activeValue)) {
+      const firstInMonth = cells.find((cell) => cell.inMonth);
+      state.activeValue = firstInMonth ? firstInMonth.value : cells[0].value;
+    }
+    const weekdayHtml = weekdays.map((weekday) => (
+      `<span role="columnheader" aria-label="${escape(weekday.full)}">${escape(weekday.short)}</span>`
+    )).join('');
+    const cellHtml = cells.map((cell) => {
+      const date = _autoCalendarDateFromValue(cell.value);
+      const classNames = ['auto-date-picker-day'];
+      if (!cell.inMonth) classNames.push('is-outside');
+      if (cell.value === today) classNames.push('is-today');
+      if (cell.value === selectedValue) classNames.push('is-selected');
+      const ariaCurrent = cell.value === today ? ' aria-current="date"' : '';
+      return `<button type="button" class="${classNames.join(' ')}" data-date="${cell.value}" role="gridcell" aria-label="${escape(dateLabel(date, { year: 'numeric', month: 'long', day: 'numeric' }))}" aria-selected="${cell.value === selectedValue ? 'true' : 'false'}" tabindex="${cell.value === state.activeValue ? '0' : '-1'}"${ariaCurrent}>${cell.day}</button>`;
+    }).join('');
+    popover.setAttribute('aria-label', t(config.labelKey || 'auto.date_label'));
+    popover.innerHTML = `
+      <div class="auto-date-picker-header">
+        <button type="button" class="auto-date-picker-nav" data-action="previous" aria-label="${escape(t('auto.calendar_previous_month'))}" title="${escape(t('auto.calendar_previous_month'))}">${icon('chevron-left', 'ui-icon')}</button>
+        <div class="auto-date-picker-heading" id="${escape(headingId)}" aria-live="polite">${escape(monthTitle)}</div>
+        <button type="button" class="auto-date-picker-nav" data-action="next" aria-label="${escape(t('auto.calendar_next_month'))}" title="${escape(t('auto.calendar_next_month'))}">${icon('chevron-right', 'ui-icon')}</button>
+      </div>
+      <div class="auto-date-picker-weekdays" role="row">${weekdayHtml}</div>
+      <div class="auto-date-picker-grid" role="grid" aria-labelledby="${escape(headingId)}">${cellHtml}</div>
+      <div class="auto-date-picker-footer">
+        <button type="button" class="auto-date-picker-today" data-action="today">${escape(t('auto.calendar_today'))}</button>
+      </div>`;
+    if (focusActive) popover.querySelector('.auto-date-picker-day[tabindex="0"]')?.focus();
+  };
+
+  const reposition = () => {
+    if (!state.open) return;
+    const rect = el.getBoundingClientRect();
+    const edge = 8;
+    const width = Math.min(296, Math.max(240, window.innerWidth - edge * 2));
+    const left = Math.max(edge, Math.min(rect.left, window.innerWidth - width - edge));
+    popover.style.position = 'fixed';
+    popover.style.left = `${left}px`;
+    popover.style.width = `${width}px`;
+    const popoverHeight = popover.offsetHeight || 340;
+    const placement = typeof _dropdownVerticalPlacement === 'function'
+      ? _dropdownVerticalPlacement(rect, popoverHeight, window.innerHeight, { edge, gap: 6 })
+      : { top: Math.min(window.innerHeight - popoverHeight - edge, rect.bottom + 6), openAbove: false };
+    popover.style.top = `${Math.max(edge, placement.top)}px`;
+    popover.dataset.placement = placement.openAbove ? 'top' : 'bottom';
+    popover.style.zIndex = String(
+      typeof _aiSelectPopoverZIndexFor === 'function' ? _aiSelectPopoverZIndexFor(el) : 14000,
+    );
+  };
+
+  const close = () => {
+    if (!state.open) return;
+    state.open = false;
+    el.classList.remove('open');
+    input.setAttribute('aria-expanded', 'false');
+    toggle.setAttribute('aria-expanded', 'false');
+    popover.hidden = true;
+    popover.style.position = '';
+    popover.style.left = '';
+    popover.style.top = '';
+    popover.style.width = '';
+    popover.style.zIndex = '';
+    delete popover.dataset.placement;
+    if (portalParent) {
+      if (portalParent.isConnected) portalParent.insertBefore(popover, portalNextSibling);
+      else popover.remove();
+      portalParent = null;
+      portalNextSibling = null;
+    }
+    document.removeEventListener('mousedown', onDocumentDown, true);
+    window.removeEventListener('scroll', reposition, true);
+    window.removeEventListener('resize', reposition, true);
+    if (_autoOpenDatePicker === api) _autoOpenDatePicker = null;
+  };
+
+  const open = ({ focusGrid = false } = {}) => {
+    if (state.open) {
+      if (focusGrid) render({ focusActive: true });
+      return;
+    }
+    if (_autoOpenDatePicker && _autoOpenDatePicker !== api) _autoOpenDatePicker.close();
+    _autoOpenDatePicker = api;
+    syncViewFromInput();
+    state.open = true;
+    el.classList.add('open');
+    input.setAttribute('aria-expanded', 'true');
+    toggle.setAttribute('aria-expanded', 'true');
+    portalParent = popover.parentNode;
+    portalNextSibling = popover.nextSibling;
+    document.body.appendChild(popover);
+    popover.hidden = false;
+    render();
+    reposition();
+    document.addEventListener('mousedown', onDocumentDown, true);
+    window.addEventListener('scroll', reposition, true);
+    window.addEventListener('resize', reposition, true);
+    if (focusGrid) popover.querySelector('.auto-date-picker-day[tabindex="0"]')?.focus();
+  };
+
+  const commit = (value) => {
+    input.value = value;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    close();
+    input.focus();
+  };
+
+  function onDocumentDown(event) {
+    if (!el.contains(event.target) && !popover.contains(event.target)) close();
+  }
+
+  popover.addEventListener('click', (event) => {
+    const button = event.target.closest('button');
+    if (!button) return;
+    if (button.dataset.date) {
+      commit(button.dataset.date);
+      return;
+    }
+    if (button.dataset.action === 'today') {
+      commit(todayValue());
+      return;
+    }
+    if (button.dataset.action === 'previous' || button.dataset.action === 'next') {
+      const delta = button.dataset.action === 'previous' ? -1 : 1;
+      state.activeValue = _autoCalendarShiftMonth(state.activeValue, delta);
+      const active = _autoCalendarDateFromValue(state.activeValue);
+      state.viewYear = active.getFullYear();
+      state.viewMonth = active.getMonth();
+      render({ focusActive: true });
+      reposition();
+    }
+  });
+
+  popover.addEventListener('keydown', (event) => {
+    if (event.isComposing || event.keyCode === 229) return;
+    let nextValue = '';
+    if (event.key === 'Escape') {
+      close();
+      input.focus();
+      event.preventDefault();
+      return;
+    }
+    if (event.key === 'ArrowLeft') nextValue = _autoCalendarShiftDate(state.activeValue, -1);
+    else if (event.key === 'ArrowRight') nextValue = _autoCalendarShiftDate(state.activeValue, 1);
+    else if (event.key === 'ArrowUp') nextValue = _autoCalendarShiftDate(state.activeValue, -7);
+    else if (event.key === 'ArrowDown') nextValue = _autoCalendarShiftDate(state.activeValue, 7);
+    else if (event.key === 'Home') {
+      const active = _autoCalendarDateFromValue(state.activeValue);
+      nextValue = _autoCalendarShiftDate(state.activeValue, -active.getDay());
+    } else if (event.key === 'End') {
+      const active = _autoCalendarDateFromValue(state.activeValue);
+      nextValue = _autoCalendarShiftDate(state.activeValue, 6 - active.getDay());
+    } else if (event.key === 'PageUp') nextValue = _autoCalendarShiftMonth(state.activeValue, -1);
+    else if (event.key === 'PageDown') nextValue = _autoCalendarShiftMonth(state.activeValue, 1);
+    if (!nextValue) return;
+    const active = _autoCalendarDateFromValue(nextValue);
+    state.activeValue = nextValue;
+    state.viewYear = active.getFullYear();
+    state.viewMonth = active.getMonth();
+    render({ focusActive: true });
+    reposition();
+    event.preventDefault();
+  });
+
+  input.addEventListener('click', () => open());
+  input.addEventListener('input', () => {
+    if (!state.open) return;
+    const parsed = _autoCalendarDateFromValue(input.value);
+    if (parsed) {
+      state.viewYear = parsed.getFullYear();
+      state.viewMonth = parsed.getMonth();
+      state.activeValue = _autoCalendarDateValue(parsed);
+    }
+    render();
+    reposition();
+  });
+  input.addEventListener('keydown', (event) => {
+    if (event.isComposing || event.keyCode === 229) return;
+    if ((event.altKey && event.key === 'ArrowDown') || event.key === 'F4') {
+      open({ focusGrid: true });
+      event.preventDefault();
+    } else if (event.key === 'Escape' && state.open) {
+      close();
+      event.preventDefault();
+    }
+  });
+  toggle.addEventListener('click', () => {
+    if (state.open) close();
+    else open({ focusGrid: true });
+  });
+
+  const api = {
+    el,
+    state,
+    getValue() { return input.value; },
+    setValue(value) {
+      input.value = String(value || '');
+      if (state.open) {
+        syncViewFromInput();
+        render();
+        reposition();
+      }
+    },
+    repaint() {
+      const label = t(config.labelKey || 'auto.date_label');
+      input.setAttribute('aria-label', label);
+      toggle.setAttribute('aria-label', t('auto.calendar_open'));
+      toggle.setAttribute('title', t('auto.calendar_open'));
+      popover.setAttribute('aria-label', label);
+      if (state.open) {
+        render();
+        reposition();
+      }
+    },
+    open,
+    close,
+  };
+
+  input.setAttribute('aria-haspopup', 'dialog');
+  input.setAttribute('aria-controls', popover.id);
+  input.setAttribute('aria-expanded', 'false');
+  toggle.setAttribute('aria-expanded', 'false');
+  toggle.innerHTML = icon('calendar', 'ui-icon auto-date-picker-icon');
+  api.repaint();
+  return api;
 }
 
 function _autoUseToken(ref, kind) {
@@ -1232,6 +1670,7 @@ function _mountAutoForm() {
   // Mount the shared dropdown controls once. Frequency drives the
   // conditional schedule sub-rows below it.
   const freqMount = document.getElementById('auto-freq-select');
+  const endMount = document.getElementById('auto-end-select');
   const weekdayMount = document.getElementById('auto-weekday-select');
   const monthlyDayMount = document.getElementById('auto-monthly-day-select');
   const hourMount = document.getElementById('auto-hour-select');
@@ -1253,6 +1692,11 @@ function _mountAutoForm() {
     _autoMinuteSel = _aiSelectMount(minuteMount, {
       options: _autoMinuteOptions(),
       value: '0',
+    });
+    _autoEndSel = _aiSelectMount(endMount, {
+      options: _autoEndOptions(),
+      value: 'none',
+      onChange: (v) => _autoSyncEndRows(v),
     });
     _autoFreqSel = _aiSelectMount(freqMount, {
       options: _autoFreqOptions(),
@@ -1278,12 +1722,21 @@ function _mountAutoForm() {
     });
   }
 
-
-  // Initial default for the date input (one_time only).
-  const dateInput = document.getElementById('auto-date-input');
-  if (dateInput && !dateInput.value) {
-    dateInput.value = _autoLocalDateInputValue(new Date().toISOString());
+  if (!_autoDatePicker) {
+    _autoDatePicker = _autoDatePickerMount(document.getElementById('auto-date-picker'), {
+      labelKey: 'auto.date_label',
+    });
   }
+  if (!_autoEndDatePicker) {
+    _autoEndDatePicker = _autoDatePickerMount(document.getElementById('auto-end-date-picker'), {
+      labelKey: 'auto.end_date_label',
+    });
+  }
+
+  // Initial defaults for the one-time and optional end-date controls.
+  const initialDate = _autoLocalDateInputValue(new Date().toISOString());
+  if (_autoDatePicker && !_autoDatePicker.getValue()) _autoDatePicker.setValue(initialDate);
+  if (_autoEndDatePicker && !_autoEndDatePicker.getValue()) _autoEndDatePicker.setValue(initialDate);
 
   // Bind buttons.
   const ta = document.getElementById('auto-task-input');
@@ -1751,17 +2204,6 @@ async function _autoPickAndUploadFiles() {
   }
 }
 
-function _arrayBufferToBase64(buf) {
-  // Streamed conversion to avoid call-stack blow-up on big files.
-  const bytes = new Uint8Array(buf);
-  let binary = '';
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary);
-}
-
 function _renderAutoAttachmentChips() {
   const wrap = document.getElementById('auto-task-attachments');
   if (!wrap) return;
@@ -1813,15 +2255,31 @@ function _renderAutoAttachmentChips() {
 }
 
 function _autoSyncFreqRows(type) {
+  const hourlyIntervalRow = document.getElementById('auto-row-hourly-interval');
   const dateRow = document.getElementById('auto-row-date');
   const weekdayRow = document.getElementById('auto-row-weekday');
   const monthlyDayRow = document.getElementById('auto-row-monthly-day');
   const timeRow = document.getElementById('auto-row-time');
+  const endRow = document.getElementById('auto-row-end');
+  if (hourlyIntervalRow) hourlyIntervalRow.hidden = type !== 'hourly';
   if (dateRow) dateRow.hidden = type !== 'one_time';
+  if (type !== 'one_time' && _autoDatePicker) _autoDatePicker.close();
   if (weekdayRow) weekdayRow.hidden = type !== 'weekly';
   if (monthlyDayRow) monthlyDayRow.hidden = type !== 'monthly';
-  // Time row visible for all 4 frequencies (one_time pairs Date + HH:MM).
-  if (timeRow) timeRow.hidden = false;
+  // Hourly cadence is anchored to create / previous scheduled execution;
+  // calendar schedules use an explicit wall-clock time.
+  if (timeRow) timeRow.hidden = type === 'hourly';
+  if (endRow) endRow.hidden = type === 'one_time';
+  _autoSyncEndRows(_autoEndSel ? _autoEndSel.getValue() : 'none');
+}
+
+function _autoSyncEndRows(type) {
+  const oneTime = _autoFreqSel && _autoFreqSel.getValue() === 'one_time';
+  const dateRow = document.getElementById('auto-row-end-date');
+  const countRow = document.getElementById('auto-row-end-count');
+  if (dateRow) dateRow.hidden = oneTime || type !== 'date';
+  if (countRow) countRow.hidden = oneTime || type !== 'count';
+  if ((oneTime || type !== 'date') && _autoEndDatePicker) _autoEndDatePicker.close();
 }
 
 function _repaintAutoRecipientChip() {
@@ -1867,6 +2325,25 @@ function _autoRepaintLabels() {
   }
   const cancelBtn = document.getElementById('auto-dialog-cancel-btn');
   if (cancelBtn) cancelBtn.textContent = t('auto.cancel_btn');
+  if (_autoFreqSel) {
+    const value = _autoFreqSel.getValue();
+    _autoFreqSel.setOptions(_autoFreqOptions(), { value });
+  }
+  if (_autoEndSel) {
+    const value = _autoEndSel.getValue();
+    _autoEndSel.setOptions(_autoEndOptions(), { value });
+  }
+  if (_autoWeekdaySel) {
+    const value = _autoWeekdaySel.getValue();
+    _autoWeekdaySel.setOptions(_autoWeekdayOptions(), { value });
+  }
+  if (_autoMonthlyDaySel) {
+    const value = _autoMonthlyDaySel.getValue();
+    _autoMonthlyDaySel.setOptions(_autoMonthlyDayOptions(), { value });
+  }
+  if (_autoDatePicker) _autoDatePicker.repaint();
+  if (_autoEndDatePicker) _autoEndDatePicker.repaint();
+  _autoSyncFreqRows(_autoFreqSel ? _autoFreqSel.getValue() : 'daily');
   _autoRefreshRunDevicePicker();
   _paintAutoSyncNotice();
 }
@@ -1887,9 +2364,15 @@ function _autoResetForm() {
   const enabledInput = document.getElementById('auto-enabled-input');
   if (enabledInput) enabledInput.checked = true;
   _autoRefreshRunDevicePicker(true);
-  const dateInput = document.getElementById('auto-date-input');
-  if (dateInput) dateInput.value = _autoLocalDateInputValue(new Date().toISOString());
+  const defaultDate = _autoLocalDateInputValue(new Date().toISOString());
+  if (_autoDatePicker) _autoDatePicker.setValue(defaultDate);
+  const hourlyInput = document.getElementById('auto-hourly-interval-input');
+  if (hourlyInput) hourlyInput.value = '1';
+  if (_autoEndDatePicker) _autoEndDatePicker.setValue(defaultDate);
+  const endCountInput = document.getElementById('auto-end-count-input');
+  if (endCountInput) endCountInput.value = '10';
   if (_autoFreqSel) _autoFreqSel.setValue('daily');
+  if (_autoEndSel) _autoEndSel.setValue('none');
   if (_autoWeekdaySel) _autoWeekdaySel.setValue('1');
   if (_autoMonthlyDaySel) _autoMonthlyDaySel.setValue('1');
   if (_autoHourSel) _autoHourSel.setValue('9');
@@ -1943,10 +2426,24 @@ function _showAutoDialog() {
   overlay.style.display = 'flex';
   overlay.classList.add('open');
   const ta = document.getElementById('auto-task-input');
-  if (ta) setTimeout(() => ta.focus(), 50);
+  if (ta) {
+    const activeAtOpen = document.activeElement;
+    setTimeout(() => {
+      if (!overlay.classList.contains('open')) return;
+      const active = document.activeElement;
+      const composerStillOwnsFocus = typeof _chatComposerHasFocus === 'function'
+        && _chatComposerHasFocus(ta);
+      // The delayed convenience focus must not steal input after the user has
+      // already moved into another dialog control (for example, the title).
+      if (active !== activeAtOpen && !composerStillOwnsFocus) return;
+      ta.focus();
+    }, 50);
+  }
 }
 
 function _hideAutoDialog() {
+  if (_autoDatePicker) _autoDatePicker.close();
+  if (_autoEndDatePicker) _autoEndDatePicker.close();
   const overlay = document.getElementById('auto-task-dialog-overlay');
   if (overlay) {
     overlay.style.display = 'none';
@@ -1987,6 +2484,27 @@ function _autoFillForm(task) {
   if (_autoFreqSel) _autoFreqSel.setValue(sched.type || 'daily');
   _autoSyncFreqRows(sched.type || 'daily');
 
+  const hourlyInput = document.getElementById('auto-hourly-interval-input');
+  if (hourlyInput) hourlyInput.value = String(
+    sched.type === 'hourly' && Number.isSafeInteger(sched.interval_hours)
+      ? sched.interval_hours
+      : 1,
+  );
+  const endCondition = task.end_condition || null;
+  if (_autoEndSel) _autoEndSel.setValue(endCondition ? endCondition.type : 'none');
+  if (_autoEndDatePicker) {
+    _autoEndDatePicker.setValue(endCondition && endCondition.type === 'date'
+      ? endCondition.date
+      : _autoLocalDateInputValue(new Date().toISOString()));
+  }
+  const endCountInput = document.getElementById('auto-end-count-input');
+  if (endCountInput) {
+    endCountInput.value = String(
+      endCondition && endCondition.type === 'count' ? endCondition.max_runs : 10,
+    );
+  }
+  _autoSyncEndRows(endCondition ? endCondition.type : 'none');
+
   let hour = 9, minute = 0;
   if (sched.type === 'one_time') {
     let d;
@@ -1995,8 +2513,7 @@ function _autoFillForm(task) {
       hour = d.getHours();
       minute = d.getMinutes();
     }
-    const dateInput = document.getElementById('auto-date-input');
-    if (dateInput) dateInput.value = _autoLocalDateInputValue(sched.at);
+    if (_autoDatePicker) _autoDatePicker.setValue(_autoLocalDateInputValue(sched.at));
   } else if (Number.isInteger(sched.hour) && Number.isInteger(sched.minute)) {
     hour = sched.hour;
     minute = sched.minute;
@@ -2015,6 +2532,9 @@ async function _autoSubmitForm() {
   const titleInput = document.getElementById('auto-title-input');
   const enabledInput = document.getElementById('auto-enabled-input');
   const dateInput = document.getElementById('auto-date-input');
+  const hourlyInput = document.getElementById('auto-hourly-interval-input');
+  const endDateInput = document.getElementById('auto-end-date-input');
+  const endCountInput = document.getElementById('auto-end-count-input');
   if (!ta || !submitBtn || !_autoFreqSel || !_autoHourSel || !_autoMinuteSel) return;
 
   const rawContent = (ta.value || '').trim();
@@ -2065,7 +2585,7 @@ async function _autoSubmitForm() {
     return;
   }
 
-  // HH + MM dropdowns shared across all schedule types.
+  // HH + MM dropdowns are shared across calendar schedule types.
   const hour = parseInt(_autoHourSel.getValue() || '0', 10);
   const minute = parseInt(_autoMinuteSel.getValue() || '0', 10);
   if (!(hour >= 0 && hour <= 23) || !(minute >= 0 && minute <= 59)) {
@@ -2076,17 +2596,17 @@ async function _autoSubmitForm() {
   let schedule;
   if (type === 'one_time') {
     const raw = dateInput ? dateInput.value : '';
-    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(raw).trim());
-    if (!m) {
+    const parts = _autoLocalDateParts(raw);
+    if (!parts) {
       await blockSave('invalid_schedule', 'auto.invalid_schedule');
       return;
     }
     // Build the target in local time so the date/hour/minute the user picked
     // matches the wall-clock they expect, then store as ISO (UTC).
     const target = new Date(
-      parseInt(m[1], 10),
-      parseInt(m[2], 10) - 1,
-      parseInt(m[3], 10),
+      parts.year,
+      parts.month - 1,
+      parts.day,
       hour,
       minute,
       0,
@@ -2097,6 +2617,13 @@ async function _autoSubmitForm() {
       return;
     }
     schedule = { type: 'one_time', at: target.toISOString() };
+  } else if (type === 'hourly') {
+    const intervalHours = Number(hourlyInput ? hourlyInput.value : '');
+    if (!Number.isSafeInteger(intervalHours) || intervalHours < 1 || intervalHours > 876000) {
+      await blockSave('invalid_schedule', 'auto.invalid_schedule');
+      return;
+    }
+    schedule = { type: 'hourly', interval_hours: intervalHours };
   } else if (type === 'daily') {
     schedule = { type: 'daily', hour, minute };
   } else if (type === 'weekly') {
@@ -2108,6 +2635,24 @@ async function _autoSubmitForm() {
   } else {
     await blockSave('invalid_schedule', 'auto.invalid_schedule');
     return;
+  }
+
+  let endCondition = null;
+  const endType = _autoEndSel ? _autoEndSel.getValue() : 'none';
+  if (type !== 'one_time' && endType === 'date') {
+    const parts = _autoLocalDateParts(endDateInput ? endDateInput.value : '');
+    if (!parts) {
+      await blockSave('invalid_end_condition', 'auto.invalid_end_condition');
+      return;
+    }
+    endCondition = { type: 'date', date: parts.value };
+  } else if (type !== 'one_time' && endType === 'count') {
+    const maxRuns = Number(endCountInput ? endCountInput.value : '');
+    if (!Number.isSafeInteger(maxRuns) || maxRuns < 1) {
+      await blockSave('invalid_end_condition', 'auto.invalid_end_condition');
+      return;
+    }
+    endCondition = { type: 'count', max_runs: maxRuns };
   }
 
   if (_autoCurrentAttachments.some((a) => a && a.status === 'uploading')) {
@@ -2131,6 +2676,9 @@ async function _autoSubmitForm() {
         ? { message_parts: messageParts }
         : (_autoEditingTaskId ? { message_parts: null } : {})),
       schedule,
+      ...(endCondition
+        ? { end_condition: endCondition }
+        : (_autoEditingTaskId ? { end_condition: null } : {})),
       title: titleInput ? _autoNormaliseTitle(titleInput.value) : '',
       enabled: enabledInput ? !!enabledInput.checked : true,
       ...(isUpdate && _autoRunDeviceSel && _autoRunDeviceSel.getValue() === 'current'
@@ -2206,12 +2754,13 @@ async function _autoSubmitForm() {
 
 if (typeof window !== 'undefined') {
   window.loadAutoList = loadAutoList;
+  window.refreshAutoProjectGroups = _autoRenderList;
   window.loadProjectAutoList = loadProjectAutoList;
   window.openAutoTaskDialog = openAutoTaskDialog;
   window.openAutoTaskById = async function openAutoTaskById(taskId) {
     const id = String(taskId || '').trim();
     if (!id) return false;
-    await loadAutoTasks();
+    await loadAutoList(true);
     const task = _autoTasks.find((candidate) => candidate && candidate.id === id);
     if (!task) return false;
     openAutoTaskDialog({ task });
@@ -2229,15 +2778,26 @@ if (typeof window !== 'undefined') {
   };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bindAutoAddButton, { once: true });
   else bindAutoAddButton();
+  window.addEventListener('i18n-change', () => {
+    _autoRenderList();
+    if (typeof _projectDetailPid !== 'undefined' && _projectDetailPid) {
+      loadProjectAutoList(_projectDetailPid).catch(() => {});
+    }
+  });
 }
 
 if (typeof module !== 'undefined' && typeof module.exports === 'object') {
   module.exports = {
+    _autoGroupTasks,
     _autoDisplayDeviceName,
     _autoIsTaskOnCurrentDevice,
     _autoCanTransferTaskToCurrentDevice,
     _autoRunDeviceOptions,
     _autoTaskMessagePreviewHtml,
     _autoComposerValueForTask,
+    _autoLocalDateParts,
+    _autoCalendarCells,
+    _autoCalendarShiftDate,
+    _autoCalendarShiftMonth,
   };
 }

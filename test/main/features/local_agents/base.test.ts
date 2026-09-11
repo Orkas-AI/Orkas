@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
+import { spawn } from 'node:child_process';
 
 import {
   bindAbort,
@@ -13,7 +14,38 @@ import {
 
 const itPosix = process.platform === 'win32' ? it.skip : it;
 
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (processIsAlive(pid) && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  if (processIsAlive(pid)) throw new Error(`process ${pid} did not exit`);
+}
+
 describe('local_agents/backends/base', () => {
+  it('assembles one long line delivered in many chunks without rescanning', () => {
+    // A single stream-json line carrying a base64 image arrives in 64 KiB
+    // chunks; the splitter must yield it exactly once (2026-08-28 review D-6).
+    const splitter = new LineSplitter();
+    const payload = 'x'.repeat(1024 * 1024);
+    const lines: string[] = [];
+    for (let at = 0; at < payload.length; at += 65536) {
+      splitter.push(payload.slice(at, at + 65536), (line) => lines.push(line));
+    }
+    expect(lines).toEqual([]);
+    splitter.push('\r\nnext\n', (line) => lines.push(line));
+    expect(lines).toEqual([payload, 'next']);
+  });
+
   it('keeps only the bounded stderr tail', () => {
     const tail = new StderrTail(8);
 
@@ -119,7 +151,7 @@ describe('local_agents/backends/base', () => {
     expect(child.kill).toHaveBeenCalledWith('SIGKILL');
   });
 
-  itPosix('reaps a CLI asynchronously after an authoritative protocol terminal', () => {
+  itPosix('signals the CLI tree before a fast parent exit can cancel cleanup', () => {
     vi.useFakeTimers();
     const processKill = vi.spyOn(process, 'kill').mockImplementation(() => true);
     const child = Object.assign(new EventEmitter(), {
@@ -131,21 +163,77 @@ describe('local_agents/backends/base', () => {
     try {
       reapCliAfterProtocolTerminal(child as any, 50);
       expect(child.stdin.end).toHaveBeenCalledOnce();
-      expect(processKill).not.toHaveBeenCalled();
-
-      vi.advanceTimersByTime(50);
       expect(processKill).toHaveBeenCalledWith(-24680, 'SIGTERM');
-
-      vi.advanceTimersByTime(10_000);
-      expect(processKill).toHaveBeenCalledWith(-24680, 'SIGKILL');
 
       child.emit('close', 0);
       const callsAtClose = processKill.mock.calls.length;
-      vi.advanceTimersByTime(20_000);
+      vi.advanceTimersByTime(50);
       expect(processKill).toHaveBeenCalledTimes(callsAtClose);
     } finally {
       processKill.mockRestore();
       vi.useRealTimers();
+    }
+  });
+
+  itPosix('escalates terminal cleanup when the CLI process does not exit', () => {
+    vi.useFakeTimers();
+    const processKill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    const child = Object.assign(new EventEmitter(), {
+      pid: 24681,
+      stdin: { end: vi.fn() },
+      kill: vi.fn(),
+    });
+
+    try {
+      reapCliAfterProtocolTerminal(child as any, 50);
+      expect(processKill).toHaveBeenCalledWith(-24681, 'SIGTERM');
+
+      vi.advanceTimersByTime(50);
+      expect(processKill).toHaveBeenCalledWith(-24681, 'SIGKILL');
+    } finally {
+      processKill.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('reaps a spawned descendant when a completed CLI exits immediately', async () => {
+    const descendantSource = 'setInterval(() => {}, 1000);';
+    const parentSource = [
+      "const { spawn } = require('node:child_process');",
+      `const descendant = spawn(process.execPath, ['-e', ${JSON.stringify(descendantSource)}], { stdio: 'ignore' });`,
+      "process.stdout.write(String(descendant.pid) + '\\n', () => setTimeout(() => process.exit(0), 25));",
+    ].join('\n');
+    const child = spawn(process.execPath, ['-e', parentSource], {
+      detached: process.platform !== 'win32',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    let descendantPid = 0;
+
+    try {
+      descendantPid = await new Promise<number>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('CLI fixture did not report its descendant')), 5_000);
+        child.once('error', err => {
+          clearTimeout(timer);
+          reject(err);
+        });
+        child.stdout.once('data', chunk => {
+          clearTimeout(timer);
+          resolve(Number(String(chunk).trim()));
+        });
+      });
+      expect(Number.isSafeInteger(descendantPid) && descendantPid > 0).toBe(true);
+      expect(processIsAlive(descendantPid)).toBe(true);
+
+      reapCliAfterProtocolTerminal(child, 250);
+
+      await waitForProcessExit(descendantPid);
+      expect(processIsAlive(descendantPid)).toBe(false);
+    } finally {
+      killProcessTree(child, 'SIGKILL');
+      if (descendantPid && processIsAlive(descendantPid)) {
+        try { process.kill(descendantPid, 'SIGKILL'); } catch { /* already exited */ }
+      }
     }
   });
 });

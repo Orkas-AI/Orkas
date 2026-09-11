@@ -16,7 +16,7 @@ const REQUIRED_APP_EXEC_DENIALS = Object.freeze([
 const MAC_OFFICECLI_SANDBOX_PROFILE = Object.freeze([
   '(version 1)',
   '(allow default)',
-  ...REQUIRED_APP_EXEC_DENIALS.map((deniedRoot) => `(deny process-exec (subpath "${deniedRoot}"))`),
+  ...REQUIRED_APP_EXEC_DENIALS.map((deniedRoot) => `(deny process-exec (require-all (subpath "${deniedRoot}") (require-not (literal (param "OFFICECLI_BINARY")))))`),
 ].join(''));
 
 const POLICY_FILES = Object.freeze({
@@ -184,10 +184,15 @@ function verifyOfficeCliRuntimePolicy(pcRoot) {
     'runOfficeCli must spawn the guarded launch command, not the binary directly',
   );
   for (const deniedRoot of REQUIRED_APP_EXEC_DENIALS) {
-    if (!engine.includes(`(deny process-exec (subpath "${deniedRoot}"))`)) {
+    if (!engine.includes(`(deny process-exec (require-all (subpath "${deniedRoot}") (require-not (literal (param "OFFICECLI_BINARY")))))`)) {
       fail(`macOS process sandbox no longer denies installed app execution under ${deniedRoot}`);
     }
   }
+  requirePattern(
+    engine,
+    /\['-D', `OFFICECLI_BINARY=\$\{fs\.realpathSync\(bin\)\}`/,
+    'macOS process sandbox must bind its exact executable exception to the resolved bundled binary',
+  );
 
   requirePattern(
     renderer,

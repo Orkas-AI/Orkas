@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import * as os from 'node:os';
 
 import {
   TOOL_CATALOG,
@@ -15,6 +16,7 @@ import {
 } from '../../../src/core-agent/src/tools';
 import { BUILTIN_AGENT_TOOL_SURFACE_CASES } from '../model/core-agent/builtin-agent-tool-surface-fixture';
 import { enumerateAllInjectedTools } from '../model/core-agent/injected-tool-fixture';
+import { createToolResultTools } from '../../../src/main/model/core-agent/tool-result-tools';
 
 /**
  * The tool block is the largest fixed cost in every request, and nothing owned
@@ -48,7 +50,7 @@ function definitionChars(tool: AgentTool): number {
 
 /**
  * Ceiling for the assembled surface. Reset after the 2026-08-16 Office review
- * (64,871 chars over 39 tools on this enumeration path) plus ~8% headroom, so
+ * (64,871 chars over the pre-merge 39-tool enumeration path) plus ~8% headroom, so
  * ordinary wording edits pass and a new heavyweight schema does not land
  * unnoticed. Raising it is a deliberate act that belongs in review with the
  * reason, exactly like the skill budget.
@@ -59,6 +61,10 @@ const TOOL_SURFACE_BUDGET_CHARS = 70_000;
  *  7,161-char create_pptx definition. */
 const SINGLE_TOOL_BUDGET_CHARS = 8_000;
 const CONSOLIDATED_RETRIEVAL_BUDGET_CHARS = 4_000;
+/** `tool_result` is host-required in every non-reflection request. Measured 5,276
+ *  chars on 2026-09-08 after collapsing the four per-action copies of the request
+ *  schema into one `requests.items` union (was 7,181); ~4% headroom. */
+const TOOL_RESULT_BUDGET_CHARS = 5_500;
 /** Re-pinned on 2026-08-24 after the reviewed XLSX edit contract exposed A1
  * paths and the reusable cell value/style schema through `edit_office`.
  * The whole surface and every built-in Agent remain below their own caps. */
@@ -71,6 +77,15 @@ const OFFICE_HEAVY_TOOL_BUDGETS: Readonly<Record<string, number>> = Object.freez
 /** Named-Agent fallback discovery is part of every stable prompt, so it gets
  * a separate byte gate from the deferred tool schemas. */
 const AGENT_FALLBACK_DIRECTORY_BUDGET_CHARS = 1_900;
+/** Commander discovery includes deferred names and purposes, not full schemas.
+ * The maximal catalog fixture is separate from the common injection corpus. */
+// The retained public video description adds six characters ("short ")
+// to the shared directory. Keep the shared ceiling and account for this exact delta.
+const COMMANDER_DIRECTORY_BUDGET_CHARS = 4_500 + 6;
+const COMMANDER_COMMON_INITIAL_BUDGET_CHARS = 19_000;
+// The approved shared browser adds one initially active definition, including
+// task-turn retention. Keep its cost separate so the existing corpus cannot grow.
+const BROWSER_DEFINITION_BUDGET_CHARS = 3_000;
 
 /**
  * Per-Agent ceilings for the stable common injection corpus. Built-in Agents
@@ -92,13 +107,67 @@ const BUILTIN_AGENT_INITIAL_SURFACE_BUDGETS: Readonly<Record<
   PptMaker: { tools: 16, chars: 25_000 },
   ImageStudio: { tools: 20, chars: 31_000 },
   OfficeWorker: { tools: 21, chars: 36_000 },
-  ProductDeveloper: { tools: 24, chars: 27_000 },
-  UIDesigner: { tools: 24, chars: 27_000 },
+  ProductDeveloper: { tools: 25, chars: 27_000 },
+  UIDesigner: { tools: 25, chars: 27_000 },
   SeoGeoAgent: { tools: 24, chars: 25_000 },
 });
 
 describe('injected tool surface budget', () => {
   const tools = enumerateAllInjectedTools();
+
+  it('bounds Commander deferred discovery and its combined initial common-corpus surface', () => {
+    const previousMode = process.env.ORKAS_TOOL_LOADING_MODE;
+    process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
+    try {
+      const availableToolNames = TOOL_CATALOG
+        .filter((entry) => isToolVisibleToAgent(entry.name, ''))
+        .map((entry) => entry.name);
+      const surface = createToolSurfaceController({
+        availableToolNames,
+        hostPreloadGroups: ['workspace.read', 'workspace.execute.command', 'web'],
+        hostRequiredToolNames: ['open_app_view', 'publish_outputs'],
+        scopedEligible: true,
+      });
+      const directory = getLoadableToolGroupsSystemPromptBlock({
+        availableToolNames,
+        initialActiveToolNames: surface.activeToolNames(),
+        allowedGroupIds: surface.loadableGroups(),
+      });
+      expect(directory).toContain('`create_pptx` —');
+      expect(directory).toContain('`marketplace_search` —');
+      expect(directory).not.toContain('`image_studio`');
+      expect(directory).not.toContain('`bash`');
+      expect(directory.length).toBeLessThanOrEqual(COMMANDER_DIRECTORY_BUDGET_CHARS);
+
+      const commonTools = tools.filter((tool) => isToolVisibleToAgent(tool.name, ''));
+      const commonSurface = createToolSurfaceController({
+        availableToolNames: [...commonTools.map((tool) => tool.name), 'tool_load'],
+        hostPreloadGroups: ['workspace.read', 'workspace.execute.command', 'web'],
+        hostRequiredToolNames: ['publish_outputs'],
+        scopedEligible: true,
+      });
+      const commonDirectory = getLoadableToolGroupsSystemPromptBlock({
+        availableToolNames: commonTools.map((tool) => tool.name),
+        initialActiveToolNames: commonSurface.activeToolNames(),
+        allowedGroupIds: commonSurface.loadableGroups(),
+      });
+      const schemaChars = [
+        ...commonTools.filter((tool) => commonSurface.isActive(tool.name)),
+        createToolLoadTool(commonSurface),
+      ].reduce((sum, tool) => sum + definitionChars(tool), 0);
+      const browserChars = definitionChars(commonTools.find(tool => tool.name === 'browser')!);
+      expect(browserChars).toBeLessThanOrEqual(BROWSER_DEFINITION_BUDGET_CHARS);
+      expect(commonDirectory.length + schemaChars)
+        .toBeLessThanOrEqual(COMMANDER_COMMON_INITIAL_BUDGET_CHARS + BROWSER_DEFINITION_BUDGET_CHARS);
+      expect(commonDirectory.length + schemaChars - browserChars)
+        .toBeLessThanOrEqual(COMMANDER_COMMON_INITIAL_BUDGET_CHARS);
+      // eslint-disable-next-line no-console
+      console.log(`[tool-surface:commander] max_directory=${directory.length} common_directory=${commonDirectory.length} common_initial_schemas=${schemaChars}`);
+    } finally {
+      if (previousMode === undefined) delete process.env.ORKAS_TOOL_LOADING_MODE;
+      else process.env.ORKAS_TOOL_LOADING_MODE = previousMode;
+    }
+  });
 
   it('keeps the named-Agent fallback directory compact and leaf-scoped', () => {
     const block = getLoadableToolGroupsSystemPromptBlock({
@@ -119,9 +188,10 @@ describe('injected tool surface budget', () => {
     // A silent empty/short corpus would make every assertion below vacuous:
     // a factory signature change that returns [] must fail here, not pass
     // quietly with a 0-char surface.
-    // The open build includes its public API-key video generation tool;
-    // the 37-tool corpus must still be complete and non-vacuous.
-    expect(tools).toHaveLength(37);
+    // The merged surface includes the 1.7 additions and the 1.6.6 retirement
+    // of the duplicate read_file/stat_file tools.
+    expect(tools).toHaveLength(39);
+    expect(tools.some((tool) => tool.name === 'browser')).toBe(true);
     expect(tools.some((tool) => tool.name === 'create_xlsx')).toBe(true);
     expect(tools.some((tool) => tool.name === 'read_files')).toBe(true);
   });
@@ -141,6 +211,16 @@ describe('injected tool surface budget', () => {
       chars,
       `consolidated Library/history definitions total ${chars} chars; budget ${CONSOLIDATED_RETRIEVAL_BUDGET_CHARS}`,
     ).toBeLessThanOrEqual(CONSOLIDATED_RETRIEVAL_BUDGET_CHARS);
+  });
+
+  it('keeps the host-required tool_result definition compact', () => {
+    // Host-required, so it is not part of the enumerated allowlist surface.
+    const [toolResult] = createToolResultTools({ toolResultsDir: os.tmpdir() } as any);
+    const chars = definitionChars(toolResult);
+    expect(
+      chars,
+      `tool_result definition is ${chars} chars; budget ${TOOL_RESULT_BUDGET_CHARS} — it is sent on every model request`,
+    ).toBeLessThanOrEqual(TOOL_RESULT_BUDGET_CHARS);
   });
 
   it('keeps the whole injected tool surface under budget', () => {

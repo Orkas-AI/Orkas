@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-import { isPathAllowed } from '../../../src/main/util/path-sandbox';
+import { isPathAllowed, resolveSandboxRoot } from '../../../src/main/util/path-sandbox';
 
 let tmpRoot: string;
 let workspace: string;
@@ -103,6 +103,46 @@ describe('path-sandbox › isPathAllowed', () => {
     }
     try {
       expect(isPathAllowed(path.join(rootAlias, 'doc.md'), [rootAlias])).toBe(true);
+    } finally {
+      try { fs.unlinkSync(rootAlias); } catch { /* best-effort */ }
+    }
+  });
+
+  it('trusts a pre-resolved root only after resolveSandboxRoot, so a hot loop resolves it once', () => {
+    // A sync pass checks thousands of candidates against one root; the
+    // resolved form must reach the same verdicts as the per-call walk while
+    // candidates keep resolving (a planted symlink is still rejected).
+    const resolvedRoot = resolveSandboxRoot(workspace);
+    expect(isPathAllowed(workspaceFile, [resolvedRoot], { rootsResolved: true })).toBe(true);
+    expect(isPathAllowed(path.join(workspace, 'not-yet.md'), [resolvedRoot], { rootsResolved: true }))
+      .toBe(true);
+    expect(isPathAllowed(outsideFile, [resolvedRoot], { rootsResolved: true })).toBe(false);
+    const link = path.join(workspace, 'link-to-secret-resolved.md');
+    try { fs.symlinkSync(outsideFile, link); }
+    catch { return; /* platform without symlink perms — skip */ }
+    try {
+      expect(isPathAllowed(link, [resolvedRoot], { rootsResolved: true })).toBe(false);
+    } finally {
+      try { fs.unlinkSync(link); } catch { /* best-effort */ }
+    }
+  });
+
+  it('fails closed when a caller claims an unresolved symlinked root is resolved (negative control)', () => {
+    const rootAlias = path.join(tmpRoot, 'workspace-alias-unresolved');
+    if (process.platform === 'win32') {
+      fs.symlinkSync(workspace, rootAlias, 'junction');
+    } else {
+      try { fs.symlinkSync(workspace, rootAlias, 'dir'); }
+      catch { return; /* platform without symlink support — covered by Windows junction CI */ }
+    }
+    try {
+      // The per-call walk follows the alias; the resolved-root contract skips
+      // that walk, so the same call is rejected instead of silently trusted.
+      expect(isPathAllowed(path.join(rootAlias, 'doc.md'), [rootAlias])).toBe(true);
+      expect(isPathAllowed(path.join(rootAlias, 'doc.md'), [rootAlias], { rootsResolved: true }))
+        .toBe(false);
+      expect(isPathAllowed(path.join(rootAlias, 'doc.md'), [resolveSandboxRoot(rootAlias)], { rootsResolved: true }))
+        .toBe(true);
     } finally {
       try { fs.unlinkSync(rootAlias); } catch { /* best-effort */ }
     }

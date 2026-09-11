@@ -57,6 +57,24 @@ echo '{"brand":"Orkas","domain":"orkas.ai","competitors":["Cursor"],"context_ter
 ```
 → `{ ok, data: { share_of_voice, share_of_voice_basis, unbranded, branded_control, share_of_voice_all_answers, citation_rate, brand_mentions, domain_citations, ambiguous_mentions, competitor_share, context_terms, per_answer:[...], data_tier, note } }`
 
+4) Gate off-site references before naming them as the brand's:
+```
+echo '{"brand":"Floatboat","domain":"floatboat.ai","context_terms":["calendar","agent"],"references":[{"url":"https://www.g2.com/products/floatbot/reviews","title":"Floatbot Reviews 2026"}]}' | "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" geo-probe geo_probe -- --op disambiguate
+```
+→ `{ ok, data: { references_checked, citable, verdict_counts, references:[{url, verdict, data_tier, near_miss_tokens, context_hits}], data_tier, note } }`
+
+**Run this on every third-party page, directory, or review listing before the
+report calls it the brand's.** `score` gates model *answer* text; this gates the
+other channel — pages the agent found itself with `web_search`. Verdicts:
+`cited` (domain present) · `corroborated` (brand token + context term) ·
+`ambiguous` (brand token alone) · `near_miss` (a token 1–2 edits from the brand)
+· `absent`. Only `cited`/`corroborated` may be named as the brand's.
+
+`near_miss` is the trap this op exists for: a listing for a same-sounding
+company shares no exact token with the brand, so every equality test reports it
+merely `absent` and it reads as irrelevant rather than *wrong*. Report the near
+tie as a different entity — do not drop it silently.
+
 ## Honesty
 
 - **`share_of_voice` is measured over `unbranded` rows only.** Report it against
@@ -68,4 +86,5 @@ echo '{"brand":"Orkas","domain":"orkas.ai","competitors":["Cursor"],"context_ter
   presenting the branded average as a clean score.
 - `share_of_voice` counts only **corroborated product mentions**: the answer cites the domain, OR the brand token appears together with a page-context term. A brand-token hit with no context term and no domain is **`ambiguous`** (likely a homonym, e.g. "Orkas" → orcas/whales) and is excluded from share_of_voice (surfaced as `ambiguous_mentions`). Without `context_terms`, it falls back to counting any brand-token hit.
 - `citation_rate` counts sourced domain citations and is the most reliable signal.
+- `disambiguate` **cannot return `Measured`**, at any verdict. A page the target site does not control is someone else's statement about it, so an off-site reference is `Estimated` at best and `unverified` when uncorroborated.
 - `data_tier` is `Measured` only when every answer came from a retrieval-capable model, otherwise `Estimated`. Always report which it is — never present a parametric-memory mention as a real citation.

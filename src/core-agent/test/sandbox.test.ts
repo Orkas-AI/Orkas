@@ -483,6 +483,7 @@ describe("augmentPath", () => {
   describe("executeBackground", () => {
     it("returns a pid immediately and writes output to the log file", async () => {
       const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-bg-"));
+      const diagnostics = vi.spyOn(console, "info").mockImplementation(() => {});
       try {
         const logPath = path.join(dir, "run.log");
         const sandbox = new SandboxExecutor({ workingDir: dir });
@@ -492,6 +493,10 @@ describe("augmentPath", () => {
         );
         expect(error).toBeUndefined();
         expect(typeof pid).toBe("number");
+        const logged = JSON.stringify(diagnostics.mock.calls);
+        expect(logged).toContain(`pid=${pid}`);
+        expect(logged).not.toContain(dir);
+        expect(logged).not.toContain("run.log");
         // PowerShell cold-start plus native scanner latency can exceed two
         // seconds on loaded Windows hosts. Background launch is deliberately
         // asynchronous, so allow a bounded platform-specific startup window.
@@ -504,6 +509,7 @@ describe("augmentPath", () => {
         expect(body).toContain("done");
         await waitForProcessExit(pid!);
       } finally {
+        diagnostics.mockRestore();
         await removeTree(dir);
       }
     }, NATIVE_SHELL_TEST_TIMEOUT_MS);

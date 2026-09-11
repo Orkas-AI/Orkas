@@ -5,8 +5,6 @@ export const ProviderConfigSchema = z.object({
   apiKey: z.string().optional(),
   baseUrl: z.string().optional(),
   auth: z.enum(["api-key", "oauth", "token"]).optional(),
-  /** Max concurrent requests to this provider. */
-  maxConcurrency: z.number().int().positive().optional(),
 });
 
 /** Model configuration schema. */
@@ -15,12 +13,8 @@ export const ModelConfigSchema = z.object({
   model: z.string(),
   contextWindow: z.number().int().positive().optional(),
   maxOutputTokens: z.number().int().positive().optional(),
-  /** Whether this model supports tool use. */
-  supportsTools: z.boolean().optional(),
   /** Whether this model supports vision/images. */
   supportsVision: z.boolean().optional(),
-  /** Whether this model supports streaming. */
-  supportsStreaming: z.boolean().optional(),
 });
 
 /** Agent configuration schema. */
@@ -37,8 +31,6 @@ export const AgentConfigSchema = z.object({
   toolIdleTimeoutMs: z.number().int().positive().default(1_800_000),
   /** System prompt override or additions. */
   systemPrompt: z.string().optional(),
-  /** Explicit thinking/reasoning override. Omission preserves the model/provider default. */
-  thinkingLevel: z.enum(["off", "low", "high"]).optional(),
 });
 
 /** Metacognition (intrinsic self-improvement) configuration schema. */

@@ -219,3 +219,29 @@ describe("Auth Store", () => {
     expect(isOAuthExpired("nonexistent")).toBe(false);
   });
 });
+
+describe("Auth Store atomic save", () => {
+  let originalStore: string | undefined;
+  const storePath = resolveAuthStorePath();
+
+  beforeEach(() => {
+    try { originalStore = fs.readFileSync(storePath, "utf-8"); }
+    catch { originalStore = undefined; }
+  });
+  afterEach(() => {
+    if (originalStore !== undefined) fs.writeFileSync(storePath, originalStore, "utf-8");
+    else { try { fs.rmSync(storePath, { force: true }); } catch { /* ignore */ } }
+  });
+
+  it("saveAuthStore writes via tmp+rename and leaves no tmp file behind", () => {
+    // A torn direct write would make loadAuthStore fall back to an EMPTY store,
+    // silently wiping every provider credential — the save must be atomic.
+    saveAuthStore({ version: 1, profiles: { "p:default": { type: "api_key", provider: "p", key: "k" } as any } });
+    const dir = path.dirname(storePath);
+    const base = path.basename(storePath);
+    const leftovers = fs.readdirSync(dir).filter((n) => n.startsWith(`${base}.tmp`));
+    expect(leftovers).toEqual([]);
+    const loaded = loadAuthStore();
+    expect(Object.keys(loaded.profiles)).toContain("p:default");
+  });
+});

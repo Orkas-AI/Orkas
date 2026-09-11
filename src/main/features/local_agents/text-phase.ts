@@ -53,11 +53,25 @@ export function appendPhasedText(
 }
 
 /** Prefer the backend's terminal body when present. Otherwise a phased stream
- * resolves to final-answer text only; an unphased/commentary-only stream keeps
- * the legacy full-text fallback, which is also the abort-before-final result. */
+ * resolves to final-answer text only; an unphased or successfully completed
+ * commentary-only stream keeps the legacy full-text fallback. */
 export function resolvedPhasedText(state: PhasedTextState, terminalText = ''): string {
   if (terminalText) return terminalText;
   return state.sawFinalAnswer ? state.finalAnswerText : state.allText;
+}
+
+/** Resolve text for an unsuccessful run without promoting working commentary
+ * into a user-facing answer. A phase-aware CLI can fail or time out after
+ * streaming only commentary; that text already belongs to process history.
+ * Preserve a real final-answer phase when one began, and retain the legacy
+ * full-text fallback for CLIs that expose no phases at all. */
+export function resolvedUnsuccessfulPhasedText(
+  state: PhasedTextState,
+  terminalText = '',
+): string {
+  if (state.sawFinalAnswer) return terminalText || state.finalAnswerText;
+  if (state.commentaryText) return '';
+  return terminalText || state.allText;
 }
 
 /** Some CLIs (currently Claude Code) expose a canonical terminal result but no

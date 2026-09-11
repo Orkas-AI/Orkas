@@ -102,6 +102,11 @@ function loadSettingsClickHarness(
     'oauth-flow-body',
     'oauth-flow-close-btn',
     'settings-search-entries',
+    'settings-image-provider',
+    'settings-image-key-input',
+    'settings-image-key-row',
+    'settings-image-add-btn',
+    'settings-image-status',
     'settings-image-entries',
     'settings-video-entries',
     'settings-tts-entries',
@@ -174,6 +179,7 @@ function loadSettingsClickHarness(
     clearTimeout,
     setInterval,
     clearInterval,
+    requestAnimationFrame: (callback: () => void) => callback(),
     URL,
   };
   vm.createContext(context);

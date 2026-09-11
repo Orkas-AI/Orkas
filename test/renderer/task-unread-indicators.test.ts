@@ -61,13 +61,22 @@ function loadUnreadRenderer(
   const dots: Record<string, any> = {
     'tasks-unread-dot': { hidden: true },
     'projects-unread-dot': { hidden: true },
+    'today-unread-dot': { hidden: true },
   };
   const projectDots = new Map(['p1', 'p2'].map((projectId) => [projectId, {
     hidden: true,
     dataset: { projectUnreadDot: projectId },
   }]));
   const taskItems: any[] = [];
+  const todayTaskItems: any[] = [];
   const contentTaskItems: any[] = [];
+  const todayList = {
+    querySelector: (selector: string) => (
+      selector === '.conv-item.has-unread'
+        ? (todayTaskItems.find((item) => item.__hasUnreadClass()) || null)
+        : null
+    ),
+  };
   const context: any = {
     console,
     setTimeout,
@@ -91,11 +100,11 @@ function loadUnreadRenderer(
         setAttribute() {},
         remove() {},
       })),
-      getElementById: (id: string) => dots[id] || null,
+      getElementById: (id: string) => (id === 'today-list' ? todayList : dots[id] || null),
       querySelectorAll: (selector: string) => {
         if (selector === '[data-project-unread-dot]') return Array.from(projectDots.values());
-        if (selector === '.sidebar-conversation-nav .conv-item[data-cid]') return taskItems;
-        if (selector === '.conv-item[data-cid]') return [...taskItems, ...contentTaskItems];
+        if (selector === '.sidebar-conversation-nav .conv-item[data-cid]') return [...taskItems, ...todayTaskItems];
+        if (selector === '.conv-item[data-cid]') return [...taskItems, ...todayTaskItems, ...contentTaskItems];
         return [];
       },
     },
@@ -110,6 +119,11 @@ function loadUnreadRenderer(
   context.__addTaskItem = (cid: string) => {
     const item = makeTaskItem(cid);
     taskItems.push(item);
+    return item;
+  };
+  context.__addTodayTaskItem = (cid: string) => {
+    const item = makeTaskItem(cid);
+    todayTaskItems.push(item);
     return item;
   };
   context.__addContentTaskItem = (cid: string) => {
@@ -229,6 +243,37 @@ describe('unread task reply indicators', () => {
     context._markConversationRead('p2-a', { readAt: 450 });
     expect(context.__projectDots.get('p2').hidden).toBe(true);
     expect(context.__dots['projects-unread-dot'].hidden).toBe(true);
+  });
+
+  it('mirrors the Today copy: one read clears both rows and the Today header follows its rows', () => {
+    const context = loadUnreadRenderer();
+    context.conversations.push(
+      { conversation_id: 'p1-task', project_id: 'p1' },
+      { conversation_id: 'global-task', project_id: '' },
+    );
+    const projectCopy = context.__addTaskItem('p1-task');
+    const todayCopy = context.__addTodayTaskItem('p1-task');
+    // Finished yesterday: unread, but not in today's aggregate.
+    const globalCopy = context.__addTaskItem('global-task');
+
+    context._markConversationUnread('p1-task', { finishedAt: 100 });
+    context._markConversationUnread('global-task', { finishedAt: 200 });
+    expect(projectCopy.__hasUnreadDot()).toBe(true);
+    expect(todayCopy.__hasUnreadDot()).toBe(true);
+    expect(todayCopy.__dotIsAfterTitle()).toBe(true);
+    expect(context.__dots['today-unread-dot'].hidden).toBe(false);
+    expect(context.__projectDot.hidden).toBe(false);
+
+    // Entering the task from either copy is one read.
+    context._markConversationRead('p1-task', { readAt: 250 });
+    expect(projectCopy.__hasUnreadDot()).toBe(false);
+    expect(todayCopy.__hasUnreadDot()).toBe(false);
+    expect(context.__projectDot.hidden).toBe(true);
+    expect(context.__dots['projects-unread-dot'].hidden).toBe(true);
+    // An unread task outside today's list keeps Tasks lit, never Today.
+    expect(globalCopy.__hasUnreadDot()).toBe(true);
+    expect(context.__dots['tasks-unread-dot'].hidden).toBe(false);
+    expect(context.__dots['today-unread-dot'].hidden).toBe(true);
   });
 
   it('updates every sidebar copy but never adds dots to content task lists', () => {

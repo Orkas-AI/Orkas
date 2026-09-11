@@ -21,7 +21,10 @@ import { createHash } from 'crypto';
 import { StringDecoder } from 'string_decoder';
 import type { AgentTool, ToolResult, ToolContext } from '#core-agent';
 import { createLogger } from '../logger';
-import { CONSERVATIVE_CJK_WEIGHT, countTokenCharacters, estimateTokensWithWeight } from './token-estimate';
+import {
+  estimateBudgetTokenQuarters,
+  type TokenBudgetScanState,
+} from './token-estimate';
 import { logErrorRef, logPathRef, maskId } from './log-redact';
 import { describeToolResultData, type ToolResultDataDescriptor } from './tool-result-data';
 
@@ -61,11 +64,11 @@ export type ToolResultInlineLedger = {
   verbatimDocumentTokens?: number;
 };
 
-export const PERSISTED_PREVIEW_TOKENS = 600;
+const PERSISTED_PREVIEW_TOKENS = 600;
 /** Head-only preview kept alongside a section map. Smaller than the plain
  *  head/tail preview because the outline already covers the rest of the
  *  document, and the two together should stay near the same total. */
-export const OUTLINE_HEAD_PREVIEW_TOKENS = 250;
+const OUTLINE_HEAD_PREVIEW_TOKENS = 250;
 /** New refs retain the full SHA-256 digest. The reader still accepts legacy
  *  16-hex refs so existing persisted markers remain usable. */
 export const TOOL_RESULT_REF_HASH_HEX = 64;
@@ -156,6 +159,10 @@ export function capToolResult(
   const exceedsPerResultBudget = estimatedTokens > perResultBudget;
   const exceedsRoundBudget = !exceedsPerResultBudget && !claimRoundInlineBudget(ctx, estimatedTokens);
   if (!exceedsPerResultBudget && !exceedsRoundBudget) return result;
+  // A result the persisted marker would carry whole (≤ preview budget) only
+  // grows when wrapped: the marker repeats the content plus refs and hints and
+  // is itself not charged to the ledger. Keep it inline unchanged.
+  if (exceedsRoundBudget && estimatedTokens <= PERSISTED_PREVIEW_TOKENS) return result;
 
   const sid = path.basename(opts.toolResultsDir);
   try {
@@ -276,7 +283,7 @@ function claimRoundInlineBudget(ctx: ToolContext, estimatedTokens: number): bool
  * Conservative on purpose: an under-estimate here overflows a model window
  * and ends a run, while an over-estimate only spills a result sooner. */
 export function estimateToolResultTokens(text: string): number {
-  return estimateTokensWithWeight(text, CONSERVATIVE_CJK_WEIGHT);
+  return Math.ceil(estimateBudgetTokenQuarters(text) / 4);
 }
 
 export function persistToolResult(
@@ -329,13 +336,11 @@ export function persistStreamedToolResult(
   const buf = Buffer.allocUnsafe(64 * 1024);
   let bytes = 0;
   let chars = 0;
-  let cjk = 0;
-  let other = 0;
+  let tokenQuarters = 0;
+  const tokenState: TokenBudgetScanState = { digitRemainder: 0, inAsciiPunctuation: false };
   const countDecoded = (text: string) => {
     chars += text.length;
-    const counts = countTokenCharacters(text);
-    cjk += counts.cjk;
-    other += counts.other;
+    tokenQuarters += estimateBudgetTokenQuarters(text, tokenState);
   };
   try {
     while (true) {
@@ -382,7 +387,7 @@ export function persistStreamedToolResult(
     path: abs,
     bytes,
     chars,
-    estimatedTokens: Math.ceil(cjk * 1.5 + other / 4),
+    estimatedTokens: Math.ceil(tokenQuarters / 4),
   };
 }
 
@@ -404,33 +409,42 @@ export function toolResultRefForPath(absPath: string): string {
  *  phase:'result'` before forwarding to the renderer. Backends stay
  *  unaware of the spill mechanism — they always emit the full output.
  *
- *  Returns the rewritten `{output, outputPath}`. When below threshold,
- *  `outputPath` is undefined and `output` is the original content
- *  unchanged. */
+ *  Returns the rewritten `{output, outputPath}`. Structured CLI results are
+ *  measured and persisted as compact JSON, while below-threshold values keep
+ *  their original shape. */
 export function maybeSpillToolResult(opts: {
   toolResultsDir: string;
   toolName: string;
   callId: string;
-  output: string;
+  output: unknown;
   maxInlineTokens?: number;
-}): { output: string; outputPath?: string } {
+}): { output: unknown; outputPath?: string } {
   const { toolResultsDir, toolName, output } = opts;
   const maxInlineTokens = opts.maxInlineTokens ?? DEFAULT_INLINE_RESULT_TOKENS;
-  if (!output || estimateToolResultTokens(output) <= maxInlineTokens) {
+  let serialized: string | undefined;
+  try {
+    serialized = typeof output === 'string' ? output : JSON.stringify(output);
+  } catch {
+    return { output: '[Unserializable tool result omitted.]' };
+  }
+  if (typeof serialized !== 'string') {
+    return { output: '[Unsupported tool result omitted.]' };
+  }
+  if (!serialized || estimateToolResultTokens(serialized) <= maxInlineTokens) {
     return { output };
   }
   try {
-    const abs = persistToolResult(toolResultsDir, toolName, output);
+    const abs = persistToolResult(toolResultsDir, toolName, serialized);
     log.info('cli tool result spilled', {
       tool: toolName,
       session_id: maskId(path.basename(toolResultsDir)),
-      size: output.length,
+      size: serialized.length,
       path: logPathRef(abs),
     });
     // Same preview shape as the in-process path so the renderer's
     // click-to-expand logic works identically.
     return {
-      output: buildPersistedOutputMarker(abs, toolName, output),
+      output: buildPersistedOutputMarker(abs, toolName, serialized),
       outputPath: abs,
     };
   } catch (err) {
@@ -441,7 +455,7 @@ export function maybeSpillToolResult(opts: {
       error: logErrorRef(err),
     });
     return {
-      output: `${buildBoundedPreview(output, PERSISTED_PREVIEW_TOKENS)}\n\n[ERROR: oversized output spill failed; the full output was not preserved.]`,
+      output: `${buildBoundedPreview(serialized, PERSISTED_PREVIEW_TOKENS)}\n\n[ERROR: oversized output spill failed; the full output was not preserved.]`,
     };
   }
 }
@@ -479,8 +493,8 @@ export function buildPersistedOutputMarkerFromPreview(
   const outline = completePreview ? buildStructureOutline(preview) : null;
   const dataDescriptor = completePreview ? describeToolResultData(preview) : null;
   const actions = dataDescriptor && dataDescriptor.reason !== 'input_too_large'
-    ? 'query,search,read'
-    : 'search,read';
+    ? 'query,search,read,materialize'
+    : 'search,read,materialize';
   const dataSummary = dataDescriptor ? `${renderToolResultDataSummary(dataDescriptor)}\n` : '';
   const body = outline
     ? `${buildBoundedPreview(preview, OUTLINE_HEAD_PREVIEW_TOKENS)}\n\n`
@@ -491,11 +505,15 @@ export function buildPersistedOutputMarkerFromPreview(
     ? '[WARNING: The producer exceeded its hard safety limit. The stored file is an incomplete prefix; do not treat it as a lossless full result.]\n'
     : '';
   const queryHint = actions.startsWith('query')
-    ? ' Use tool_result action="query" for deterministic calculations supported by the Result data contract.'
+    ? ' Use tool_result action="query" for deterministic calculations supported by the Result data contract; structured queries must omit match and count_unit.'
     : '';
+  const batchingHint = ' Make at most one tool_result call in the next model step; batch same-action requests in one requests array.';
+  const calculationHint = dataDescriptor?.reason === 'input_too_large'
+    ? ''
+    : ' Use action="materialize" with an available local runtime for full-data calculations not supported by query.';
   const retrievalHint = outline
-    ? `[Full content is stored under result ref ${ref}.${queryHint} Seek a section with tool_result(action="read", requests=[{ref, cursor}]) using the @N offsets above; use action="search" with requests=[{ref, query}] when you do not know which section you need. Do not use read_files on the stored path.]`
-    : `[Full content is stored under result ref ${ref}.${queryHint} Use tool_result(action="search", requests=[{ref, query}]) to locate content, or tool_result(action="read", requests=[{ref, cursor, max_tokens}]) for an exact bounded slice. Do not use read_files on the stored path.]`;
+    ? `[Full content is stored under result ref ${ref}.${queryHint}${batchingHint} Seek a section with tool_result(action="read", requests=[{ref, cursor}]) using the @N offsets above; use action="search" with requests=[{ref, query}] when you do not know which section you need.${calculationHint} Do not use read_files on the stored path.]`
+    : `[Full content is stored under result ref ${ref}.${queryHint}${batchingHint} Use tool_result(action="search", requests=[{ref, query}]) to locate content or tool_result(action="read", requests=[{ref, cursor, max_tokens}]) for an exact bounded slice.${calculationHint} Do not use read_files on the stored path.]`;
   return (
     `<persisted-output ref="${escapeAttr(ref)}" tool="${escapeAttr(toolName)}" size="${meta.sizeChars}" estimated_tokens="${meta.estimatedTokens}" status="${meta.isError ? 'error' : 'success'}" source_truncated="${meta.sourceTruncated ? 'true' : 'false'}" data_type="${dataDescriptor?.reason === 'input_too_large' ? 'unknown' : dataDescriptor?.kind || 'unknown'}" actions="${actions}">\n` +
     sourceWarning +
@@ -508,12 +526,13 @@ export function buildPersistedOutputMarkerFromPreview(
 
 function renderToolResultDataSummary(descriptor: ToolResultDataDescriptor): string {
   if (descriptor.reason === 'input_too_large') {
-    return `[Result data — input exceeds the deterministic query limit; use search to locate content or read with a cursor.]`;
+    return `[Result data — input exceeds the deterministic query limit; use materialize for full-data calculations with an available local runtime, or search/read for source excerpts.]`;
   }
   if (!descriptor.queryable) {
     return `[Result data — type=text; lines=${descriptor.textLines ?? 0}; query supports exact count only with match + count_unit; search locates excerpts; read uses a cursor.]`;
   }
   let remainingFieldSlots = 16;
+  let remainingArrayFieldSlots = 8;
   const visibleDatasets = descriptor.datasets.slice(0, 8);
   const datasets = visibleDatasets.map((dataset, index) => {
     const remainingDatasets = visibleDatasets.length - index;
@@ -527,9 +546,30 @@ function renderToolResultDataSummary(descriptor: ToolResultDataDescriptor): stri
     const omitted = dataset.fields.length > shownFields
       ? `${fields ? ',' : ''}+${dataset.fields.length - shownFields} more`
       : '';
-    return `${dataset.name}{records=${dataset.records};fields=${fields || '(none)'}${omitted}}`;
+    const datasetArrays = dataset.arrays ?? [];
+    const arrays = datasetArrays.slice(0, 2).map((array) => {
+      const fieldSlots = Math.min(4, remainingArrayFieldSlots);
+      const usefulFields = array.fields
+        .filter((field) => field.name !== '$item' || field.type !== 'object');
+      const shownArrayFields = usefulFields.slice(0, fieldSlots);
+      const itemFields = shownArrayFields
+        .map((field) => `${field.name}:${field.type}`)
+        .join(',');
+      remainingArrayFieldSlots = Math.max(0, remainingArrayFieldSlots - shownArrayFields.length);
+      const arrayOmitted = usefulFields.length > shownArrayFields.length
+        ? `${itemFields ? ',' : ''}+${usefulFields.length - shownArrayFields.length} more`
+        : '';
+      return `${array.name}[]{items=${array.items};fields=${itemFields || '(none)'}${arrayOmitted}}`;
+    }).join(',');
+    const omittedArrays = datasetArrays.length > 2
+      ? `${arrays ? ',' : ''}+${datasetArrays.length - 2} more arrays`
+      : '';
+    return `${dataset.name}{records=${dataset.records};fields=${fields || '(none)'}${omitted}${arrays || omittedArrays ? `;arrays=${arrays}${omittedArrays}` : ''}}`;
   }).join(' ');
-  return `[Result data — type=${descriptor.kind}; query operations=count,sum,average,minimum,maximum; datasets: ${datasets}]`;
+  const arrayHint = descriptor.datasets.some((dataset) => dataset.arrays?.length)
+    ? '; array query uses explode with $item/$parent/$index'
+    : '';
+  return `[Result data — type=${descriptor.kind}; query operations=count,sum,average,minimum,maximum; omit match/count_unit for structured data${arrayHint}; datasets: ${datasets}]`;
 }
 
 /** Outline entries emitted at most; keeps the marker bounded on a document with
@@ -576,7 +616,7 @@ export function buildStructureOutline(content: string): string | null {
   return entries.join('\n');
 }
 
-export function buildBoundedPreview(content: string, maxTokens: number): string {
+function buildBoundedPreview(content: string, maxTokens: number): string {
   if (estimateToolResultTokens(content) <= maxTokens) return content;
   const headBudget = Math.max(1, Math.floor(maxTokens * 0.72));
   const tailBudget = Math.max(1, maxTokens - headBudget);
@@ -718,7 +758,7 @@ export const CLOUD_TOOL_RESULT_MAX_AGE_DAYS = 30;
  *  sync pass deleting 50+ files would trip the engine's mass-delete
  *  confirmation prompt, so a backlogged account amortizes cleanup across
  *  activations — oldest first, so the backlog converges. */
-export const CLOUD_TOOL_RESULT_SWEEP_MAX_DELETIONS = 40;
+const CLOUD_TOOL_RESULT_SWEEP_MAX_DELETIONS = 40;
 
 export type CloudToolResultSweepStats = {
   removedFiles: number;

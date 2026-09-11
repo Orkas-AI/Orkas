@@ -18,14 +18,77 @@ import {
   HISTORY_SUMMARY_MAX_TOKENS,
   IMAGE_BLOCK_ESTIMATE_TOKENS,
   DEFAULT_CONTEXT_BUDGET,
+  CONTEXT_COMPACTION_SUMMARY_HARD_TOKENS,
+  boundStructuredSummaryTokens,
   contextBudget,
+  ACTIVE_TURN_IMAGE_OMITTED_MARKER,
 } from "../src/agent/session.js";
 
 describe("Session", () => {
+  it("keeps a read/write turn append-only without manufacturing a new user boundary", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Update the file and check the result" }]);
+    session.addAssistantMessage([
+      { type: "thinking", thinking: "opaque", thinkingSignature: "signed-state" },
+      { type: "tool_use", id: "write-1", name: "write_file", input: {} },
+    ]);
+    session.recordToolObservations({
+      toolCallId: "write-1", tool: "write_file",
+      observations: { fileChanges: [{ operation: "create", sourcePath: "/workspace/report.txt",
+        beforeExists: false, afterExists: true, afterHash: "sha256:first", coverage: "exact" }] },
+    });
+    session.addToolResult("write-1", "Created report.txt sha256:first");
+    const first = session.getMessagesForModel();
+    session.addAssistantMessage([{ type: "tool_use", id: "read-2", name: "read_file", input: {} }]);
+    session.addToolResult("read-2", "Verified report.txt");
+    const second = session.getMessagesForModel();
+    expect(second.slice(0, first.length)).toEqual(first);
+    expect(second.filter((message) => message.role === "user"
+      && !message.content.some((part) => part.type === "tool_result"))).toHaveLength(1);
+    expect(JSON.stringify(second)).toContain("sha256:first");
+    // A real correction must still be a new user boundary.
+    session.addUserMessage("Use the corrected totals");
+    expect(session.getMessagesForModel().at(-1)).toMatchObject({ role: "user" });
+  });
+
   it("starts empty", () => {
     const session = new Session();
     expect(session.length).toBe(0);
     expect(session.getMessages()).toEqual([]);
+  });
+
+  it("keeps a real image-only steer through compaction instead of treating it as a tool trailer", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Inspect this report" }]);
+    session.addAssistantMessage([{ type: "tool_use", id: "read", name: "read_files", input: {} }]);
+    session.addToolResult("read", "report");
+    session.addMessage("user", [{ type: "image", data: "user-correction", mediaType: "image/png" }]);
+    session.applyActiveCheckpointSummary("Earlier report inspected.", session.length - 1);
+    expect(session.getMessagesForModel().at(-1)).toEqual({ role: "user",
+      content: [{ type: "image", data: "user-correction", mediaType: "image/png" }] });
+  });
+
+  it("freezes checkpoint recovery facts while later writes append newer evidence", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Revise a report" }]);
+    const write = (revision: number) => {
+      const id = `revision-${revision}`;
+      session.addAssistantMessage([{ type: "tool_use", id, name: "write_file", input: {} }]);
+      session.recordToolObservations({ toolCallId: id, tool: "write_file", observations: { fileChanges: [{
+        operation: "update", sourcePath: "/workspace/report.txt", beforeExists: true, afterExists: true,
+        beforeHash: `sha256:${revision - 1}`, afterHash: `sha256:${revision}`, coverage: "exact",
+      }] } });
+      session.addToolResult(id, `Saved sha256:${revision}`);
+    };
+    write(1);
+    session.applyActiveCheckpointSummary("The report was saved.", 2);
+    const checkpointView = session.getMessagesForModel();
+    write(2);
+    const view = session.getMessagesForModel();
+    expect(view.slice(0, checkpointView.length)).toEqual(checkpointView);
+    expect(JSON.stringify(checkpointView)).toContain("sha256:1");
+    expect(JSON.stringify(view.at(-1))).toContain("sha256:2");
+    expect(session.getWorkspaceObservations().entries.at(-1)?.fileChanges?.[0].afterHash).toBe("sha256:2");
   });
 
   it("adds user messages", () => {
@@ -58,20 +121,21 @@ describe("Session", () => {
       toolUseId: "tool-123",
       content: "result text",
       isError: false,
+      images: [],
     });
   });
 
-  it("appends image user message when addToolResult carries images", () => {
+  it("attaches returned images to their actual tool result", () => {
     const session = new Session();
     session.addToolResult("tool-img", "Image loaded.", [
       { data: "aGVsbG8=", mediaType: "image/jpeg", analysisMode: "quality_review" },
     ]);
 
     const msgs = session.getMessages();
-    expect(msgs).toHaveLength(2);
+    expect(msgs).toHaveLength(1);
     expect(msgs[0].content[0]).toMatchObject({ type: "tool_result", toolUseId: "tool-img" });
-    expect(msgs[1].role).toBe("user");
-    expect(msgs[1].content[0]).toEqual({
+    const receipt = msgs[0].content[0];
+    expect(receipt.type === "tool_result" ? receipt.images?.[0] : undefined).toEqual({
       type: "image",
       data: "aGVsbG8=",
       mediaType: "image/jpeg",
@@ -79,7 +143,7 @@ describe("Session", () => {
     });
   });
 
-  it("shows ordered desktop/mobile preview images for exactly the next model call", () => {
+  it("retains ordered tool images unchanged within the active turn until compaction", () => {
     const session = new Session();
     session.beginUserTurn([{
       type: "text",
@@ -112,11 +176,13 @@ describe("Session", () => {
       isError: true,
       content: expect.stringContaining("horizontal overflow"),
     });
-    expect(modelMessages[3].content).toEqual([
+    const receipt = modelMessages[2].content[0];
+    expect(receipt.type === "tool_result" ? receipt.images : undefined).toEqual([
       { type: "image", data: "desktop-preview", mediaType: "image/png" },
       { type: "image", data: "mobile-preview", mediaType: "image/png" },
     ]);
 
+    const firstView = modelMessages;
     session.addAssistantMessage([{
       type: "tool_use",
       id: "call-fix",
@@ -125,14 +191,87 @@ describe("Session", () => {
     }]);
     modelMessages = session.getMessagesForModel();
 
-    expect(modelMessages.flatMap((message) => message.content))
-      .not.toContainEqual(expect.objectContaining({ type: "image" }));
+    expect(modelMessages.slice(0, firstView.length)).toEqual(firstView);
     expect(modelMessages.flatMap((message) => message.content))
       .toContainEqual(expect.objectContaining({
         type: "tool_result",
         toolUseId: "call-preview",
         isError: true,
       }));
+    session.addToolResult("call-fix", "fixed");
+    session.applyActiveCheckpointSummary("Preview found mobile overflow; it was fixed.", 2);
+    expect(JSON.stringify(session.getMessagesForModel())).not.toContain("desktop-preview");
+  });
+
+  it("elides active-turn tool images after two assistant rounds with a stable marker", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Iterate on the poster until it renders cleanly" }]);
+    const capture = (round: number) => {
+      session.addAssistantMessage([{ type: "tool_use", id: `shot-${round}`, name: "html_preview", input: { round } }]);
+      session.addToolResult(`shot-${round}`, `capture ${round}`, [{ data: `img-${round}`, mediaType: "image/png" }]);
+    };
+    const imagesIn = (view: Message[]) => view.flatMap((m) => m.content).flatMap((c) => (
+      c.type === "tool_result" ? (c.images ?? []).map((img) => img.data) : c.type === "image" ? [c.data] : []
+    ));
+    capture(1);
+    capture(2);
+    const twoRounds = session.getMessagesForModel();
+    expect(imagesIn(twoRounds)).toEqual(["img-1", "img-2"]);
+    const requestTokens = session.estimateModelTokens();
+    const activeTokens = session.estimateActiveProcessTokens();
+
+    capture(3);
+    const threeRounds = session.getMessagesForModel();
+    expect(imagesIn(threeRounds)).toEqual(["img-2", "img-3"]);
+    // [user, A1, R1, A2, R2, A3, R3]: R1 has two assistant rounds after it.
+    expect(threeRounds[2].content[0]).toEqual({
+      type: "tool_result", toolUseId: "shot-1", images: [],
+      content: `capture 1\n\n${ACTIVE_TURN_IMAGE_OMITTED_MARKER}`,
+    });
+    // Everything else the previous request carried is byte-identical.
+    expect(threeRounds.slice(0, 2)).toEqual(twoRounds.slice(0, 2));
+    expect(threeRounds.slice(3, twoRounds.length)).toEqual(twoRounds.slice(3));
+    // One image entered, one left: the estimators do not grow by an image.
+    expect(session.estimateModelTokens()).toBeLessThan(requestTokens + IMAGE_BLOCK_ESTIMATE_TOKENS);
+    expect(session.estimateActiveProcessTokens()).toBeLessThan(activeTokens + IMAGE_BLOCK_ESTIMATE_TOKENS);
+
+    // The elided receipt never changes again; the next round elides the next one.
+    capture(4);
+    const fourRounds = session.getMessagesForModel();
+    expect(fourRounds[2]).toEqual(threeRounds[2]);
+    expect(imagesIn(fourRounds)).toEqual(["img-3", "img-4"]);
+    const changed = threeRounds.filter((message, index) => JSON.stringify(message) !== JSON.stringify(fourRounds[index]));
+    expect(changed).toHaveLength(1);
+    expect(changed[0].content[0]).toMatchObject({ type: "tool_result", toolUseId: "shot-2" });
+  });
+
+  it("marks elided JSON receipts structurally and keeps tagged user images as input", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Compare viewports" }]);
+    session.addAssistantMessage([
+      { type: "tool_use", id: "desk", name: "html_preview", input: {} },
+      { type: "tool_use", id: "mob", name: "html_preview", input: {} },
+    ]);
+    session.addToolResult("desk", JSON.stringify({ ok: true, viewport: "desktop" }), [{ data: "desk-1", mediaType: "image/png" }]);
+    session.addToolResult("mob", JSON.stringify({ ok: true, viewport: "mobile" }), [{ data: "mob-1", mediaType: "image/png" }]);
+    // A real mid-turn user image (tagged with the turn) is input, not a capture.
+    session.addMessage("user", [{ type: "image", data: "user-reference", mediaType: "image/png" }]);
+    for (const round of [2, 3]) {
+      session.addAssistantMessage([{ type: "tool_use", id: `fix-${round}`, name: "edit_file", input: {} }]);
+      session.addToolResult(`fix-${round}`, "edited");
+    }
+    const view = session.getMessagesForModel();
+    const receipts = view.flatMap((m) => m.content).filter((c) => c.type === "tool_result" && c.toolUseId !== "fix-2" && c.toolUseId !== "fix-3");
+    expect(receipts).toHaveLength(2);
+    for (const receipt of receipts) {
+      expect(receipt.type === "tool_result" ? receipt.images : undefined).toEqual([]);
+      const parsed = JSON.parse(receipt.type === "tool_result" ? receipt.content : "{}") as Record<string, unknown>;
+      expect(parsed.ok).toBe(true);
+      expect(parsed._images_omitted).toBe(ACTIVE_TURN_IMAGE_OMITTED_MARKER);
+    }
+    expect(view.flatMap((m) => m.content)).toContainEqual({ type: "image", data: "user-reference", mediaType: "image/png" });
+    // History is untouched: the raw receipts still own their images.
+    expect(JSON.stringify(session.getMessages())).toContain("desk-1");
   });
 
   it("keeps pending images in the model view until the assistant has seen them", () => {
@@ -155,7 +294,7 @@ describe("Session", () => {
     ]);
   });
 
-  it("drops old read_file image trailers from later model calls while keeping the file reference", () => {
+  it("keeps a legacy untracked tool image with its receipt", () => {
     const session = new Session();
     session.addAssistantMessage([{ type: "tool_use", id: "call-read", name: "read_file", input: { path: "/tmp/frame.png" } }]);
     session.addToolResult("call-read", '<file path="/tmp/frame.png" kind="image"/> Image loaded.', [
@@ -163,14 +302,16 @@ describe("Session", () => {
     ]);
 
     let modelMessages = session.getMessagesForModel();
-    expect(modelMessages).toHaveLength(3);
-    expect(modelMessages[2].content[0]).toEqual({ type: "image", data: "frame-bytes", mediaType: "image/jpeg" });
+    expect(modelMessages).toHaveLength(2);
+    expect(modelMessages[1].content[0]).toMatchObject({ images: [
+      { type: "image", data: "frame-bytes", mediaType: "image/jpeg" },
+    ] });
 
     session.addAssistantMessage([{ type: "tool_use", id: "call-next", name: "bash", input: { command: "echo ok" } }]);
     modelMessages = session.getMessagesForModel();
 
-    expect(session.getMessages()).toHaveLength(4);
-    expect(session.getMessages()[2].content[0]).toEqual({ type: "image", data: "frame-bytes", mediaType: "image/jpeg" });
+    expect(session.getMessages()).toHaveLength(3);
+    expect(JSON.stringify(modelMessages[1])).toContain("frame-bytes");
     expect(modelMessages).toHaveLength(3);
     expect(modelMessages.flatMap((m) => m.content).some((c) => c.type === "image")).toBe(false);
     expect(modelMessages[1].content[0]).toMatchObject({
@@ -626,6 +767,67 @@ describe("Session", () => {
     expect(modelView).toContain("FACT-1=amber");
     expect(modelView).toContain("FACT-2=birch");
     expect(modelView).not.toContain("FACT-3=cobalt");
+  });
+
+  it("keeps a completed structured summary unchanged below the Host ceiling", () => {
+    const summary = [
+      "Important observations and decisions:",
+      "- keep the chosen architecture",
+      "",
+      ACTIVE_CHECKPOINT_EXACT_FACTS_HEADING,
+      "- release_id=rel-7",
+      "",
+      "Open issues and next actions:",
+      "- run the focused tests",
+    ].join("\n");
+
+    expect(boundStructuredSummaryTokens(
+      summary,
+      CONTEXT_COMPACTION_SUMMARY_HARD_TOKENS,
+    )).toBe(summary);
+  });
+
+  it("bounds an oversized completed summary by whole entries and preserves critical sections", () => {
+    const summary = [
+      "Important observations and decisions:",
+      ...Array.from({ length: 80 }, (_, index) => `- observation-${index} ${"o".repeat(120)}`),
+      ACTIVE_CHECKPOINT_EXACT_FACTS_HEADING,
+      "- release_id=rel-critical",
+      "- checksum=sha256:critical",
+      "External source/result takeaways still needed:",
+      ...Array.from({ length: 60 }, (_, index) => `- source-${index} ${"s".repeat(120)}`),
+      "Open issues and next actions:",
+      "- deploy only after the approval gate",
+      "Exact data that must be re-read before editing/quoting:",
+      "- /workspace/report.log lines 20-40",
+    ].join("\n");
+
+    const bounded = boundStructuredSummaryTokens(
+      summary,
+      CONTEXT_COMPACTION_SUMMARY_HARD_TOKENS,
+    );
+
+    expect(estimateTextTokens(summary)).toBeGreaterThan(CONTEXT_COMPACTION_SUMMARY_HARD_TOKENS);
+    expect(estimateTextTokens(bounded)).toBeLessThanOrEqual(CONTEXT_COMPACTION_SUMMARY_HARD_TOKENS);
+    expect(bounded).toContain(ACTIVE_CHECKPOINT_EXACT_FACTS_HEADING);
+    expect(bounded).toContain("release_id=rel-critical");
+    expect(bounded).toContain("deploy only after the approval gate");
+    expect(bounded).toContain("/workspace/report.log lines 20-40");
+    expect(bounded).toContain("additional entries omitted by Host storage bound");
+    expect(bounded).not.toMatch(/observation-\d+\s+o{1,119}$/m);
+  });
+
+  it("never turns oversized unstructured provider text into an empty checkpoint", () => {
+    const summary = "unstructured evidence ".repeat(12_000);
+    const bounded = boundStructuredSummaryTokens(
+      summary,
+      CONTEXT_COMPACTION_SUMMARY_HARD_TOKENS,
+    );
+
+    expect(bounded).not.toBe("");
+    expect(estimateTextTokens(bounded)).toBeLessThanOrEqual(CONTEXT_COMPACTION_SUMMARY_HARD_TOKENS);
+    expect(bounded).toMatch(/^unstructured evidence/);
+    expect(bounded).toContain("Summary truncated by Host storage bound");
   });
 
   it("previews an active checkpoint without pruning or mutating metadata", () => {
@@ -1228,22 +1430,35 @@ describe("Session", () => {
       .toBe(2 * IMAGE_BLOCK_ESTIMATE_TOKENS);
   });
 
-  it("image-heavy tool steps reach the active checkpoint trigger", () => {
+  it("image-heavy tool steps reach the active checkpoint trigger while their images are resident", () => {
     const session = new Session();
     session.beginUserTurn([{ type: "text", text: "render the video frames" }]);
-    // 14 steps, each returning one screenshot: ~22K estimated tokens of
-    // images against the 18K default trigger. With images priced at zero
-    // this turn estimated as a few hundred tokens and never produced a
-    // checkpoint candidate while the real request kept growing.
+    // 14 captures in one round: ~22K estimated tokens of images against the
+    // 18K default trigger. With images priced at zero this turn estimated as a
+    // few hundred tokens and never produced a checkpoint candidate while the
+    // real request kept growing.
+    session.addAssistantMessage(Array.from({ length: 14 }, (_, i) => (
+      { type: "tool_use" as const, id: `frame-${i}`, name: "screenshot", input: { frame: i } }
+    )));
     for (let i = 0; i < 14; i++) {
-      session.addAssistantMessage([{ type: "tool_use", id: `frame-${i}`, name: "screenshot", input: { frame: i } }]);
-      session.addToolResult(`frame-${i}`, `frame ${i} captured`, [
-        { data: "aW1n", mediaType: "image/png" },
-      ]);
+      session.addToolResult(`frame-${i}`, `frame ${i} captured`, [{ data: "aW1n", mediaType: "image/png" }]);
     }
     const candidate = session.getPendingActiveCheckpoint();
     expect(candidate).not.toBeNull();
     expect(candidate!.tokensBefore).toBeGreaterThan(ACTIVE_PROCESS_TRIGGER_TOKENS);
+  });
+
+  it("does not let elided captures from earlier rounds inflate the checkpoint trigger", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "render the video frames" }]);
+    // The same 14 captures one round at a time: only the newest two rounds keep
+    // their image bytes, so the trigger tracks what the request actually carries.
+    for (let i = 0; i < 14; i++) {
+      session.addAssistantMessage([{ type: "tool_use", id: `frame-${i}`, name: "screenshot", input: { frame: i } }]);
+      session.addToolResult(`frame-${i}`, `frame ${i} captured`, [{ data: "aW1n", mediaType: "image/png" }]);
+    }
+    expect(session.estimateActiveProcessTokens()).toBeLessThan(3 * IMAGE_BLOCK_ESTIMATE_TOKENS);
+    expect(session.getPendingActiveCheckpoint()).toBeNull();
   });
 
   // Persistent-block shrink: the overflow-recovery lever for the one part of
@@ -1375,7 +1590,216 @@ describe("Session getMessagesForModel turnContext (P2 per-turn ephemeral)", () =
 });
 
 describe("Session execution plan anchor", () => {
-  it("keeps objective and steps outside raw history and injects them at the model tail", () => {
+  it("keeps an objective-only compatibility anchor out of model context", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Inspect the current value" }]);
+
+    const plan = session.ensureExecutionPlanAnchor();
+    const view = JSON.stringify(session.getMessagesForModel());
+
+    expect(plan).toMatchObject({ revision: 0, steps: [] });
+    expect(view).toContain("Inspect the current value");
+    expect(view).not.toContain("Execution plan anchor");
+    expect(view).not.toContain("no explicit milestones");
+  });
+
+  it("does not duplicate a successful current full snapshot that remains visible", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Complete the staged migration" }]);
+    const snapshot = [
+      { step: "Inspect inputs", status: "completed" as const },
+      { step: "Apply migration", status: "in_progress" as const },
+    ];
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "plan-1",
+      name: "manage_execution_plan",
+      input: { plan: snapshot },
+    }]);
+    const plan = session.updateExecutionPlan({ steps: snapshot });
+    session.addToolResult("plan-1", JSON.stringify({
+      ok: true,
+      action: "update",
+      revision: plan.revision,
+      step_count: plan.steps.length,
+      updated_step_ids: plan.steps.map((step) => step.id),
+    }));
+
+    const view = JSON.stringify(session.getMessagesForModel());
+    expect(view).toContain("Complete the staged migration");
+    expect(view).toContain("Apply migration");
+    expect(view).not.toContain("Execution plan anchor");
+  });
+
+  it("restores the durable anchor after checkpointing hides the full snapshot", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Complete the staged migration" }]);
+    const snapshot = [
+      { step: "Inspect inputs", status: "completed" as const },
+      { step: "Apply migration", status: "in_progress" as const },
+    ];
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "plan-1",
+      name: "manage_execution_plan",
+      input: { plan: snapshot },
+    }]);
+    const plan = session.updateExecutionPlan({ steps: snapshot });
+    session.addToolResult("plan-1", JSON.stringify({
+      ok: true,
+      action: "update",
+      revision: plan.revision,
+      step_count: plan.steps.length,
+      updated_step_ids: plan.steps.map((step) => step.id),
+    }));
+    session.applyActiveCheckpointSummary("The Plan was created and inspection completed.", 2);
+
+    const view = JSON.stringify(session.getMessagesForModel());
+    expect(view).toContain("Current turn checkpoint");
+    expect(view).toContain("Execution plan anchor");
+    expect(view).toContain("Complete the staged migration");
+    expect(view).toContain("step_2 [in_progress] Apply migration");
+  });
+
+  it("restores the last valid plan after checkpointing a rejected update", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Complete the staged migration" }]);
+    session.updateExecutionPlan({
+      steps: [{ step: "Apply migration", status: "in_progress" }],
+    });
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "plan-failed",
+      name: "manage_execution_plan",
+      input: { plan: [{ step: "Different milestone", status: "in_progress" }] },
+    }]);
+    session.addToolResult("plan-failed", JSON.stringify({
+      ok: false,
+      error_code: "PLAN_UPDATE_REJECTED",
+    }), undefined, true);
+    session.applyActiveCheckpointSummary("The attempted change was rejected.", 2);
+
+    const view = JSON.stringify(session.getMessagesForModel());
+    expect(view).toContain("Execution plan anchor");
+    expect(view).toContain("step_1 [in_progress] Apply migration");
+  });
+
+  it("restores a legacy incremental plan at a checkpoint", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Complete the staged migration" }]);
+    const snapshot = [{ step: "Apply migration", status: "in_progress" as const }];
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "plan-create",
+      name: "manage_execution_plan",
+      input: { plan: snapshot },
+    }]);
+    const created = session.updateExecutionPlan({ steps: snapshot });
+    session.addToolResult("plan-create", JSON.stringify({
+      ok: true,
+      action: "update",
+      revision: created.revision,
+      step_count: 1,
+      updated_step_ids: [1],
+    }));
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "plan-status",
+      name: "manage_execution_plan",
+      input: { action: "set_status", step_id: 1, status: "completed" },
+    }]);
+    const completed = session.updateExecutionPlan({
+      steps: [{ step: "Apply migration", status: "completed" }],
+    });
+    session.addToolResult("plan-status", JSON.stringify({
+      ok: true,
+      action: "set_status",
+      revision: completed.revision,
+      step_count: 1,
+      updated_step_ids: [1],
+    }));
+    session.applyActiveCheckpointSummary("Plan updated.", 4);
+
+    const view = JSON.stringify(session.getMessagesForModel());
+    expect(view).toContain("Execution plan anchor");
+    expect(view).toContain("step_1 [completed] Apply migration");
+  });
+
+  it("preserves real user correction without adding a second synthetic user turn", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Complete the staged migration" }]);
+    const snapshot = [{ step: "Apply migration", status: "in_progress" as const }];
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "plan-1",
+      name: "manage_execution_plan",
+      input: { plan: snapshot },
+    }]);
+    const plan = session.updateExecutionPlan({ steps: snapshot });
+    session.addToolResult("plan-1", JSON.stringify({
+      ok: true,
+      action: "update",
+      revision: plan.revision,
+      step_count: plan.steps.length,
+      updated_step_ids: [1],
+    }));
+    session.addMessage("user", [{ type: "text", text: "Pause migration and only report findings" }]);
+
+    // The correction stays the only new user boundary; the refreshed plan
+    // anchor rides inside it instead of a synthetic tail message.
+    const modelView = session.getMessagesForModel();
+    const tail = modelView.at(-1)!;
+    expect(tail.role).toBe("user");
+    expect(tail.content[0]).toEqual({ type: "text", text: "Pause migration and only report findings" });
+    expect(JSON.stringify(tail)).toContain("Reconciliation required");
+    expect(modelView.filter((message) => message.role === "user"
+      && !message.content.some((part) => part.type === "tool_result"))).toHaveLength(2);
+  });
+
+  it("freezes the plan anchor on a mid-turn correction and keeps later requests append-only", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Complete the staged migration" }]);
+    session.updateExecutionPlan({ steps: [{ step: "Apply migration", status: "in_progress" }] });
+    session.addAssistantMessage([{ type: "tool_use", id: "read-1", name: "read_file", input: {} }]);
+    session.addToolResult("read-1", "source bytes");
+    session.addMessage("user", [{ type: "text", text: "Pause migration and only report findings" }]);
+    const steerView = session.getMessagesForModel();
+    const steer = JSON.stringify(steerView.at(-1));
+    expect(steer).toContain("Reconciliation required");
+    expect(steer).toContain("step_1 [in_progress] Apply migration");
+    expect(steer.indexOf("Pause migration and only report findings")).toBeLessThan(steer.indexOf("Execution plan anchor"));
+
+    // Later plan and tool activity append after the frozen anchor.
+    session.updateExecutionPlan({ steps: [{ step: "Report findings", status: "in_progress" }] });
+    session.addAssistantMessage([{ type: "tool_use", id: "read-2", name: "read_file", input: {} }]);
+    session.addToolResult("read-2", "more bytes");
+    const later = session.getMessagesForModel();
+    expect(later.slice(0, steerView.length)).toEqual(steerView);
+    expect(JSON.stringify(later)).not.toContain("Report findings");
+
+    // A checkpoint covering the correction carries the refreshed anchor exactly once.
+    session.applyActiveCheckpointSummary("Migration paused; findings pending.", session.length - 1);
+    const afterCheckpoint = JSON.stringify(session.getMessagesForModel());
+    expect(afterCheckpoint.match(/Execution plan anchor/g)).toHaveLength(1);
+    expect(afterCheckpoint).toContain("Report findings");
+    expect(afterCheckpoint).toContain("Pause migration and only report findings");
+  });
+
+  it("attaches no anchor to tool results, host observations, or a correction without a plan", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Inspect the report" }]);
+    session.addMessage("user", [{ type: "text", text: "Also check the logs" }]);
+    expect(session.getMessagesForModel().at(-1)).toEqual({
+      role: "user", content: [{ type: "text", text: "Also check the logs" }],
+    });
+    session.updateExecutionPlan({ steps: [{ step: "Work", status: "in_progress" }] });
+    session.addAssistantMessage([{ type: "tool_use", id: "t1", name: "bash", input: {} }]);
+    session.addToolResult("t1", "ok");
+    session.addMessage("developer", [{ type: "text", text: "Runtime observation." }]);
+    expect(JSON.stringify(session.getMessagesForModel())).not.toContain("Execution plan anchor");
+  });
+
+  it("keeps objective and steps in durable recovery context, not a repeated model tail", () => {
     const session = new Session();
     session.beginUserTurn([{ type: "text", text: "Implement the long-running import safely" }]);
     const plan = session.updateExecutionPlan({
@@ -1388,6 +1812,8 @@ describe("Session execution plan anchor", () => {
     });
     session.addAssistantMessage([{ type: "tool_use", id: "call-1", name: "read_file", input: { path: "import.ts" } }]);
     session.addToolResult("call-1", "source bytes", undefined, false);
+    expect(JSON.stringify(session.getMessagesForModel())).not.toContain("Execution plan anchor");
+    session.applyActiveCheckpointSummary("Inspected the importer.", 2);
 
     const view = session.getMessagesForModel();
     const tail = JSON.stringify(view[view.length - 1]);
@@ -1470,6 +1896,7 @@ describe("Session execution plan anchor", () => {
       replaceObjective: true,
       steps: [{ step: "Replacement step", status: "in_progress" }],
     });
+    session.applyActiveCheckpointSummary("The objective was explicitly replaced.", session.length - 1);
     view = JSON.stringify(session.getMessagesForModel());
     expect(view).toContain("Reconciliation: current");
     expect(session.getExecutionPlan()?.objective).toBe("Actually switch to the replacement task");
@@ -1482,12 +1909,14 @@ describe("Session execution plan anchor", () => {
 
     session.addMessage("user", [{ type: "text", text: "Pause that and account for this new constraint" }]);
     const stalePlanTail = JSON.stringify(session.getMessagesForModel().at(-1));
-    expect(stalePlanTail).toContain("Reconciliation required");
+    expect(session.getMessagesForModel().at(-1)?.role).toBe("user");
     expect(stalePlanTail).toContain("Pause that and account for this new constraint");
+    expect(stalePlanTail).toContain("Reconciliation required");
     expect(stalePlanTail.indexOf("Pause that and account for this new constraint"))
-      .toBeLessThan(stalePlanTail.indexOf("Initial in-flight goal"));
+      .toBeLessThan(stalePlanTail.indexOf("Reconciliation required"));
 
     session.updateExecutionPlan({ steps: [{ step: "Account for constraint", status: "in_progress" }] });
+    session.applyActiveCheckpointSummary("The user corrected the task.", session.length - 1);
     const view = JSON.stringify(session.getMessagesForModel());
     expect(view).toContain("Reconciliation: current");
     expect(session.getExecutionPlan()?.objective).toContain("Initial in-flight goal");
@@ -1551,6 +1980,48 @@ describe("Session execution plan anchor", () => {
     expect(updated.nextStepId).toBe(4);
   });
 
+  it("does not create a revision or audit record for an unchanged complete snapshot", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Complete the migration" }]);
+    const steps = [
+      { step: "Inspect callers", status: "completed" as const },
+      { step: "Migrate storage", status: "in_progress" as const },
+      { step: "Verify restart recovery", status: "pending" as const },
+    ];
+    const initial = session.updateExecutionPlan({
+      explanation: "Initial transition",
+      steps,
+    });
+
+    const replay = session.updateExecutionPlan({
+      explanation: "Paraphrasing the reason is not execution progress",
+      steps,
+    });
+
+    expect(replay).toEqual(initial);
+    expect(replay.revision).toBe(1);
+    expect(replay.explanation).toBe("Initial transition");
+    expect(session.getExecutionPlanAudit()).toHaveLength(1);
+  });
+
+  it("still reconciles a newer user instruction when the milestone snapshot is unchanged", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Complete the migration" }]);
+    const steps = [
+      { step: "Inspect callers", status: "completed" as const },
+      { step: "Migrate storage", status: "in_progress" as const },
+    ];
+    session.updateExecutionPlan({ steps });
+    session.addMessage("user", [{ type: "text", text: "Also preserve rollback evidence" }]);
+
+    const reconciled = session.updateExecutionPlan({ steps });
+
+    expect(reconciled.revision).toBe(2);
+    expect(reconciled.objective).toContain("Also preserve rollback evidence");
+    expect(reconciled.objective).toContain("Complete the migration");
+    expect(session.getExecutionPlanAudit()).toHaveLength(2);
+  });
+
   // The anchor used to append "observed work #12,#13" to completed steps, from a
   // window-level scan that shared one id list across every step marked complete
   // in that window and counted read-only calls. Window data cannot answer a
@@ -1573,6 +2044,7 @@ describe("Session execution plan anchor", () => {
       ],
     });
 
+    session.applyActiveCheckpointSummary("Inspection completed.", session.length - 1);
     const anchor = JSON.stringify(session.getMessagesForModel());
     expect(anchor).toContain("Execution plan anchor");
     expect(anchor).toContain("[completed] Inspect callers");
@@ -1671,6 +2143,8 @@ describe("Session execution plan anchor", () => {
       checkpointEpoch: 1,
       resultSummary: "skill loaded again",
     })]);
+    expect(JSON.stringify(session.getMessagesForModel())).not.toContain("Completed work ledger");
+    session.applyActiveCheckpointSummary("Skill reads completed.", session.length - 1);
     const view = JSON.stringify(session.getMessagesForModel());
     expect(view).toContain("Completed work ledger");
     expect(view).toContain("Private runtime context for task continuation only.");
@@ -1812,260 +2286,77 @@ describe("Session execution plan anchor", () => {
 
     const modelView = JSON.stringify(session.getMessagesForModel());
     expect(modelView).toContain("LATEST_RAW_RESULT");
-    expect(modelView).toContain("Completed work ledger");
-    expect(modelView).toContain("[succeeded x2]");
+    expect(modelView).not.toContain("Completed work ledger");
+    session.applyActiveCheckpointSummary("Retried successfully.", session.length - 1);
+    expect(JSON.stringify(session.getMessagesForModel())).toContain("[succeeded x2]");
   });
 
-  it("marks workspace observations as private model-only runtime context", () => {
+  it("appends unattributed file facts as data without a new user boundary", () => {
     const session = new Session();
-    session.beginUserTurn([{ type: "text", text: "Update the workspace file" }]);
-    session.recordToolObservations({
-      tool: "edit_file",
-      observations: {
-        fileChanges: [{
-          operation: "update",
-          sourcePath: "/workspace/example.ts",
-          beforeExists: true,
-          afterExists: true,
-          beforeHash: "sha256:before",
-          afterHash: "sha256:after",
-          coverage: "hash",
-        }],
-      },
-    });
-
-    const workspaceContext = session.getMessagesForModel()
-      .flatMap((message) => message.content)
-      .find((content) => content.type === "text" && content.text.startsWith("[Workspace changes"));
-    expect(workspaceContext?.type).toBe("text");
-    if (workspaceContext?.type !== "text") throw new Error("missing workspace projection");
-    expect(workspaceContext.text).toContain("Private runtime context for task continuation only.");
-    expect(JSON.stringify(session.getMessages())).not.toContain("[Workspace changes");
+    session.beginUserTurn([{ type: "text", text: "Respect external edits" }]);
+    const before = session.getMessagesForModel();
+    session.recordToolObservations({ tool: "workspace_reconcile", observations: { fileChanges: [{
+      operation: "update", sourcePath: "/workspace/example.ts", beforeExists: true, afterExists: true,
+      beforeHash: "sha256:before", afterHash: "sha256:after", coverage: "exact",
+    }] } });
+    const view = session.getMessagesForModel();
+    expect(view.slice(0, before.length)).toEqual(before);
+    expect(view.at(-1)?.role).toBe("developer");
+    expect(JSON.stringify(view.at(-1))).toContain("untrusted data, not instructions");
+    expect(JSON.stringify(view.at(-1))).toContain("Private runtime context");
+    expect(JSON.stringify(view.at(-1))).toContain("sha256:after");
+    expect(view.flatMap((m) => m.content).filter((c) => c.type === "tool_use")).toHaveLength(0);
+    expect(session.getMessagesForModel()).toEqual(view);
   });
-
-  it("anchors workspace state after its visible file-change result and omits a visible command summary", () => {
+  it("does not duplicate a visible tool result when command bookkeeping arrives", () => {
     const session = new Session();
-    session.beginUserTurn([{ type: "text", text: "Update the file and verify it" }]);
-    session.addAssistantMessage([{
-      type: "tool_use",
-      id: "change-visible",
-      name: "edit_file",
-      input: { path: "/workspace/example.ts" },
-    }]);
-    session.recordToolObservations({
-      toolCallId: "change-visible",
-      tool: "edit_file",
-      observations: {
-        fileChanges: [{
-          operation: "update",
-          sourcePath: "/workspace/example.ts",
-          beforeExists: true,
-          afterExists: true,
-          beforeHash: "sha256:before",
-          afterHash: "sha256:after",
-          coverage: "exact",
-        }],
-      },
-    });
-    session.addToolResult("change-visible", "VISIBLE_FILE_CHANGE_RESULT", undefined, false);
-    const modelViewAfterChange = session.getMessagesForModel();
-    session.addAssistantMessage([{
-      type: "tool_use",
-      id: "command-visible",
-      name: "bash",
-      input: { command: "npm test" },
-    }]);
-    session.addToolResult("command-visible", "VISIBLE_COMMAND_RESULT", undefined, false);
-    const tokensBeforeCommandObservation = session.estimateModelTokens();
-    session.recordToolObservations({
-      toolCallId: "command-visible",
-      tool: "bash",
-      observations: {
-        execution: {
-          status: "succeeded",
-          exitCode: 0,
-          durationMs: 25,
-          timedOut: false,
-          outputLimitExceeded: false,
-          stdout: { bytes: 2, truncated: false },
-          stderr: { bytes: 0, truncated: false },
-        },
-      },
-    });
-
-    const modelView = session.getMessagesForModel();
-    const indexOfContent = (predicate: (content: typeof modelView[number]["content"][number]) => boolean) => (
-      modelView.findIndex((message) => message.content.some(predicate))
-    );
-    const changeResultIndex = indexOfContent((content) => (
-      content.type === "tool_result" && content.toolUseId === "change-visible"
-    ));
-    const workspaceIndex = indexOfContent((content) => (
-      content.type === "text" && content.text.startsWith("[Workspace changes")
-    ));
-    const commandUseIndex = indexOfContent((content) => (
-      content.type === "tool_use" && content.id === "command-visible"
-    ));
-    const workspaceText = modelView[workspaceIndex]?.content
-      .find((content) => content.type === "text")?.text ?? "";
-
-    expect(changeResultIndex).toBeGreaterThanOrEqual(0);
-    expect(workspaceIndex).toBe(changeResultIndex + 1);
-    expect(workspaceIndex).toBeLessThan(commandUseIndex);
-    expect(workspaceText).toContain("example.ts");
-    expect(workspaceText).not.toContain("Commands after latest observed change");
-    expect(JSON.stringify(modelView)).toContain("VISIBLE_COMMAND_RESULT");
-    expect(modelView.slice(0, modelViewAfterChange.length)).toEqual(modelViewAfterChange);
-    expect(session.estimateModelTokens()).toBe(tokensBeforeCommandObservation);
+    session.beginUserTurn([{ type: "text", text: "Verify the file" }]);
+    session.addAssistantMessage([{ type: "tool_use", id: "verify", name: "bash", input: {} }]);
+    session.addToolResult("verify", "Test passed: exit_code=0");
+    const before = session.getMessagesForModel();
+    session.recordToolObservations({ toolCallId: "verify", tool: "bash", observations: { execution: {
+      status: "succeeded", exitCode: 0, durationMs: 25, timedOut: false, outputLimitExceeded: false,
+      stdout: { bytes: 2, truncated: false }, stderr: { bytes: 0, truncated: false },
+    } } });
+    expect(session.getMessagesForModel()).toEqual(before);
+    expect(session.getWorkspaceObservations().entries.at(-1)?.execution?.exitCode).toBe(0);
   });
-
-  it("keeps workspace state outside a parallel tool-result cluster", () => {
+  it("keeps prior reads, reasoning and write receipts unchanged after a second write", () => {
     const session = new Session();
-    session.beginUserTurn([{ type: "text", text: "Write the manifest and render the image" }]);
-    session.addAssistantMessage([
-      {
-        type: "tool_use",
-        id: "write-manifest",
-        name: "write_file",
-        input: { path: "/workspace/manifest.json" },
-      },
-      {
-        type: "tool_use",
-        id: "render-image",
-        name: "image_studio",
-        input: { manifest: "/workspace/manifest.json" },
-      },
-    ]);
-    session.recordToolObservations({
-      toolCallId: "write-manifest",
-      tool: "write_file",
-      observations: {
-        fileChanges: [{
-          operation: "create",
-          sourcePath: "/workspace/manifest.json",
-          beforeExists: false,
-          afterExists: true,
-          afterHash: "sha256:manifest",
-          coverage: "exact",
-        }],
-      },
-    });
-    session.addToolResult("write-manifest", "MANIFEST_WRITTEN", undefined, false);
-    session.addToolResult("render-image", "E_MANIFEST_REFERENCE_ROLE", undefined, true);
-
-    const modelView = session.getMessagesForModel();
-    const indexOfContent = (predicate: (content: typeof modelView[number]["content"][number]) => boolean) => (
-      modelView.findIndex((message) => message.content.some(predicate))
-    );
-    const writeResultIndex = indexOfContent((content) => (
-      content.type === "tool_result" && content.toolUseId === "write-manifest"
-    ));
-    const renderResultIndex = indexOfContent((content) => (
-      content.type === "tool_result" && content.toolUseId === "render-image"
-    ));
-    const workspaceIndex = indexOfContent((content) => (
-      content.type === "text" && content.text.startsWith("[Workspace changes")
-    ));
-
-    expect(renderResultIndex).toBe(writeResultIndex + 1);
-    expect(workspaceIndex).toBe(renderResultIndex + 1);
+    session.beginUserTurn([{ type: "text", text: "Update two reports" }]);
+    for (const [id, result] of [["write-a", "A sha256:a1"], ["read-between", "A contents"]]) {
+      session.addAssistantMessage([{ type: "tool_use", id, name: "bash", input: {} }]);
+      session.addToolResult(id, result);
+    }
+    const before = session.getMessagesForModel();
+    session.addAssistantMessage([{ type: "tool_use", id: "write-b", name: "bash", input: {} }]);
+    session.recordToolObservations({ toolCallId: "write-b", tool: "bash", observations: { fileChanges: [{
+      operation: "update", sourcePath: "/workspace/b.txt", beforeExists: true, afterExists: true,
+      beforeHash: "sha256:b0", afterHash: "sha256:b1", coverage: "partial",
+    }] } });
+    session.addToolResult("write-b", "B sha256:b1");
+    expect(session.getMessagesForModel().slice(0, before.length)).toEqual(before);
+    expect(JSON.stringify(session.getMessagesForModel())).not.toContain("[Workspace changes");
   });
-
-  it("moves the workspace anchor only after the latest causal file change", () => {
+  it("restores only net workspace changes at a checkpoint without rewriting the audit receipts", () => {
     const session = new Session();
-    session.beginUserTurn([{ type: "text", text: "Update both files in order" }]);
-    session.addAssistantMessage([{
-      type: "tool_use",
-      id: "change-first",
-      name: "edit_file",
-      input: { path: "/workspace/first.ts" },
-    }]);
-    session.recordToolObservations({
-      toolCallId: "change-first",
-      tool: "edit_file",
-      observations: {
-        fileChanges: [{
-          operation: "update",
-          sourcePath: "/workspace/first.ts",
-          beforeExists: true,
-          afterExists: true,
-          beforeHash: "sha256:first-before",
-          afterHash: "sha256:first-after",
-          coverage: "exact",
-        }],
-      },
-    });
-    session.addToolResult("change-first", "FIRST_CHANGE_RESULT", undefined, false);
-    session.addAssistantMessage([{
-      type: "tool_use",
-      id: "change-second",
-      name: "edit_file",
-      input: { path: "/workspace/second.ts" },
-    }]);
-    session.recordToolObservations({
-      toolCallId: "change-second",
-      tool: "edit_file",
-      observations: {
-        fileChanges: [{
-          operation: "create",
-          sourcePath: "/workspace/second.ts",
-          beforeExists: false,
-          afterExists: true,
-          afterHash: "sha256:second-after",
-          coverage: "exact",
-        }],
-      },
-    });
-    session.addToolResult("change-second", "SECOND_CHANGE_RESULT", undefined, false);
-    session.addAssistantMessage([{
-      type: "tool_use",
-      id: "revert-second",
-      name: "delete_file",
-      input: { path: "/workspace/second.ts" },
-    }]);
-    session.recordToolObservations({
-      toolCallId: "revert-second",
-      tool: "delete_file",
-      observations: {
-        fileChanges: [{
-          operation: "delete",
-          sourcePath: "/workspace/second.ts",
-          beforeExists: true,
-          afterExists: false,
-          beforeHash: "sha256:second-after",
-          coverage: "exact",
-        }],
-      },
-    });
-    session.addToolResult("revert-second", "SECOND_CHANGE_REVERTED", undefined, false);
-    session.addAssistantMessage([{
-      type: "tool_use",
-      id: "read-after-second",
-      name: "read_file",
-      input: { path: "/workspace/first.ts" },
-    }]);
-    session.addToolResult("read-after-second", "READ_AFTER_SECOND_RESULT", undefined, false);
-
-    const modelView = session.getMessagesForModel();
-    const firstResultIndex = modelView.findIndex((message) => message.content.some((content) => (
-      content.type === "tool_result" && content.toolUseId === "change-first"
-    )));
-    const revertedResultIndex = modelView.findIndex((message) => message.content.some((content) => (
-      content.type === "tool_result" && content.toolUseId === "revert-second"
-    )));
-    const workspaceIndex = modelView.findIndex((message) => message.content.some((content) => (
-      content.type === "text" && content.text.startsWith("[Workspace changes")
-    )));
-    const workspaceText = modelView[workspaceIndex]?.content
-      .find((content) => content.type === "text")?.text ?? "";
-
-    expect(workspaceIndex).toBe(revertedResultIndex + 1);
-    expect(workspaceIndex).toBeGreaterThan(firstResultIndex);
-    expect(workspaceText).toContain("first.ts");
-    expect(workspaceText).not.toContain("second.ts");
+    session.beginUserTurn([{ type: "text", text: "Create a draft then discard it" }]);
+    for (const operation of ["create", "delete"] as const) {
+      session.addAssistantMessage([{ type: "tool_use", id: operation, name: "bash", input: {} }]);
+      session.recordToolObservations({ toolCallId: operation, tool: "bash", observations: { fileChanges: [{
+        operation, sourcePath: "/workspace/draft.txt", beforeExists: operation === "delete",
+        afterExists: operation === "create", beforeHash: operation === "delete" ? "sha256:draft" : undefined,
+        afterHash: operation === "create" ? "sha256:draft" : undefined, coverage: "exact",
+      }] } });
+      session.addToolResult(operation, operation + " draft.txt");
+    }
+    const raw = session.getMessages();
+    session.applyActiveCheckpointSummary("The temporary draft was discarded.", session.length - 1);
+    expect(JSON.stringify(session.getMessagesForModel())).not.toContain("[Workspace changes");
+    expect(session.getMessages()).toEqual(raw);
+    expect(session.renderWorkspaceDiff({ format: "summary" })).toContain('files_changed="0"');
   });
-
-  it("restores hidden command evidence beside the checkpointed workspace state", () => {
+  it("restores hidden command evidence in the workspace state after a checkpoint", () => {
     const session = new Session();
     session.beginUserTurn([{ type: "text", text: "Update and verify the checkpointed file" }]);
     session.addAssistantMessage([{
@@ -2118,12 +2409,13 @@ describe("Session execution plan anchor", () => {
       content.type === "text" && content.text.startsWith("[Current turn checkpoint]")
     )));
     const workspaceIndex = modelView.findIndex((message) => message.content.some((content) => (
-      content.type === "text" && content.text.startsWith("[Workspace changes")
+      content.type === "text" && content.text.includes("[Workspace changes")
     )));
     const workspaceText = modelView[workspaceIndex]?.content
       .find((content) => content.type === "text")?.text ?? "";
 
-    expect(workspaceIndex).toBe(checkpointIndex + 1);
+    expect(workspaceIndex).toBe(checkpointIndex);
+    expect(workspaceIndex).toBe(modelView.length - 1);
     expect(workspaceText).toContain("checkpointed.ts");
     expect(workspaceText).toContain("Commands after latest observed change");
     expect(workspaceText).toContain("bash: status=succeeded exit_code=0");
@@ -2131,7 +2423,7 @@ describe("Session execution plan anchor", () => {
     expect(JSON.stringify(modelView)).not.toContain("HIDDEN_COMMAND_RESULT");
   });
 
-  it("anchors after a partial checkpoint without duplicating a still-visible command", () => {
+  it("does not duplicate a still-visible command after a partial checkpoint", () => {
     const session = new Session();
     session.beginUserTurn([{ type: "text", text: "Continue after the earlier edit" }]);
     session.addAssistantMessage([{
@@ -2185,7 +2477,7 @@ describe("Session execution plan anchor", () => {
       content.type === "text" && content.text.startsWith("[Current turn checkpoint]")
     )));
     const workspaceIndex = modelView.findIndex((message) => message.content.some((content) => (
-      content.type === "text" && content.text.startsWith("[Workspace changes")
+      content.type === "text" && content.text.includes("[Workspace changes")
     )));
     const commandUseIndex = modelView.findIndex((message) => message.content.some((content) => (
       content.type === "tool_use" && content.id === "command-recent"
@@ -2193,13 +2485,56 @@ describe("Session execution plan anchor", () => {
     const workspaceText = modelView[workspaceIndex]?.content
       .find((content) => content.type === "text")?.text ?? "";
 
-    expect(workspaceIndex).toBe(checkpointIndex + 1);
+    expect(workspaceIndex).toBe(checkpointIndex);
     expect(workspaceIndex).toBeLessThan(commandUseIndex);
     expect(workspaceText).not.toContain("Commands after latest observed change");
     expect(JSON.stringify(modelView)).toContain("RECENT_COMMAND_RESULT");
   });
 
-  it("keeps an unanchored workspace reconciliation at the conservative tail", () => {
+  it("reports a volatile external file once per turn until the model reads it again", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Watch the build while editing" }]);
+    session.addAssistantMessage([{ type: "tool_use", id: "write-log", name: "bash", input: {} }]);
+    session.recordToolObservations({ toolCallId: "write-log", tool: "bash", observations: { fileChanges: [{
+      operation: "create", sourcePath: "/workspace/build.log", beforeExists: false, afterExists: true,
+      afterHash: "sha256:log-1", coverage: "exact",
+    }] } });
+    session.addToolResult("write-log", "started");
+    const reconcile = (afterHash: string, filePath = "/workspace/build.log") => session.recordToolObservations({
+      tool: "workspace_reconcile", observations: { fileChanges: [{
+        operation: "update", sourcePath: filePath, beforeExists: true, afterExists: true,
+        beforeHash: "sha256:previous", afterHash, coverage: "exact",
+      }] },
+    });
+    const observationRows = () => session.getMessages().filter((message) => message.role === "developer"
+      && message.content.some((part) => part.type === "text" && part.text.startsWith("Runtime observation."))).length;
+
+    reconcile("sha256:log-2");
+    expect(observationRows()).toBe(1);
+    session.addAssistantMessage([{ type: "tool_use", id: "edit-1", name: "edit_file", input: {} }]);
+    session.addToolResult("edit-1", "edited");
+    // The same volatile path changed again: no second row while unread.
+    reconcile("sha256:log-3");
+    expect(observationRows()).toBe(1);
+    expect(session.getWorkspaceObservations().entries.filter((entry) => entry.tool === "workspace_reconcile")).toHaveLength(2);
+    // Negative control: a different externally changed path is still reported.
+    reconcile("sha256:cfg-2", "/workspace/config.json");
+    expect(observationRows()).toBe(2);
+    expect(JSON.stringify(session.getMessages().at(-1))).toContain("config.json");
+    expect(JSON.stringify(session.getMessages().at(-1))).not.toContain("build.log");
+
+    // After the model reads the file again, the next change is news again.
+    session.addAssistantMessage([{ type: "tool_use", id: "read-log", name: "read_file", input: {} }]);
+    session.recordToolObservations({ toolCallId: "read-log", tool: "read_file", observations: { fileReads: [{
+      path: "/workspace/build.log", hash: "sha256:log-3",
+    }] } });
+    session.addToolResult("read-log", "log contents");
+    reconcile("sha256:log-4");
+    expect(observationRows()).toBe(3);
+    expect(JSON.stringify(session.getMessages().at(-1))).toContain("build.log");
+  });
+
+  it("appends a host reconciliation after the old receipt without moving prior context", () => {
     const session = new Session();
     session.beginUserTurn([{ type: "text", text: "Respect an externally changed file" }]);
     session.addAssistantMessage([{
@@ -2229,80 +2564,14 @@ describe("Session execution plan anchor", () => {
       content.type === "tool_result" && content.toolUseId === "read-before-reconcile"
     )));
     const workspaceIndex = modelView.findIndex((message) => message.content.some((content) => (
-      content.type === "text" && content.text.startsWith("[Workspace changes")
+      content.type === "text" && content.text.startsWith("Runtime observation.")
     )));
 
     expect(workspaceIndex).toBeGreaterThan(rawResultIndex);
     expect(workspaceIndex).toBe(modelView.length - 1);
+    expect(modelView[workspaceIndex].role).toBe("developer");
   });
 
-  it("keeps tool-result image evidence attached before the workspace cache anchor", () => {
-    const session = new Session();
-    session.beginUserTurn([{ type: "text", text: "Update the visual asset and inspect the result" }]);
-    session.addAssistantMessage([{
-      type: "tool_use",
-      id: "visual-change",
-      name: "edit_file",
-      input: { path: "/workspace/preview.png" },
-    }]);
-    session.recordToolObservations({
-      toolCallId: "visual-change",
-      tool: "edit_file",
-      observations: {
-        fileChanges: [{
-          operation: "update",
-          sourcePath: "/workspace/preview.png",
-          beforeExists: true,
-          afterExists: true,
-          beforeHash: "sha256:visual-before",
-          afterHash: "sha256:visual-after",
-          binary: true,
-          coverage: "exact",
-        }],
-      },
-    });
-    session.addToolResult("visual-change", "VISUAL_CHANGE_RESULT", [{
-      data: "aGVsbG8=",
-      mediaType: "image/png",
-      analysisMode: "quality_review",
-    }], false);
-
-    const firstModelView = session.getMessagesForModel();
-    const firstChangeResultIndex = firstModelView.findIndex((message) => message.content.some((content) => (
-      content.type === "tool_result" && content.toolUseId === "visual-change"
-    )));
-    const firstImageIndex = firstModelView.findIndex((message) => message.content.some((content) => (
-      content.type === "image" && content.data === "aGVsbG8="
-    )));
-    const firstWorkspaceIndex = firstModelView.findIndex((message) => message.content.some((content) => (
-      content.type === "text" && content.text.startsWith("[Workspace changes")
-    )));
-    expect(firstImageIndex).toBe(firstChangeResultIndex + 1);
-    expect(firstWorkspaceIndex).toBe(firstImageIndex + 1);
-
-    session.addAssistantMessage([{
-      type: "tool_use",
-      id: "inspect-after-visual",
-      name: "read_file",
-      input: { path: "/workspace/notes.txt" },
-    }]);
-    session.addToolResult("inspect-after-visual", "LATER_READ_RESULT", undefined, false);
-
-    const modelView = session.getMessagesForModel();
-    const changeResultIndex = modelView.findIndex((message) => message.content.some((content) => (
-      content.type === "tool_result" && content.toolUseId === "visual-change"
-    )));
-    const workspaceIndex = modelView.findIndex((message) => message.content.some((content) => (
-      content.type === "text" && content.text.startsWith("[Workspace changes")
-    )));
-    const laterUseIndex = modelView.findIndex((message) => message.content.some((content) => (
-      content.type === "tool_use" && content.id === "inspect-after-visual"
-    )));
-
-    expect(JSON.stringify(modelView)).not.toContain("aGVsbG8=");
-    expect(workspaceIndex).toBe(changeResultIndex + 1);
-    expect(workspaceIndex).toBeLessThan(laterUseIndex);
-  });
 
   it("retains an unattributed command summary that cannot be safely matched to a raw result", () => {
     const session = new Session();
@@ -2337,8 +2606,10 @@ describe("Session execution plan anchor", () => {
     });
 
     const modelView = JSON.stringify(session.getMessagesForModel());
-    expect(modelView).toContain("Commands after latest observed change");
-    expect(modelView).toContain("legacy_bash: status=failed exit_code=2");
+    expect(modelView).toContain("legacy_bash");
+    expect(modelView).toContain("failed");
+    expect(session.getWorkspaceObservations().entries.at(-1)?.execution?.exitCode).toBe(2);
+    expect(session.getMessagesForModel().at(-1)?.role).toBe("developer");
   });
 
   it("bounds the sidecar ledger and its model projection independently", () => {
@@ -2359,12 +2630,14 @@ describe("Session execution plan anchor", () => {
     expect(ledger[0].id).toBe(15);
     expect(ledger.at(-1)?.id).toBe(COMPLETED_WORK_MAX_ENTRIES + 14);
 
+    session.applyActiveCheckpointSummary("Investigation progressed.", session.length - 1);
     const ledgerText = session.getMessagesForModel()
       .flatMap((message) => message.content)
-      .find((content) => content.type === "text" && content.text.startsWith("[Completed work ledger"));
+      .find((content) => content.type === "text" && content.text.includes("[Completed work ledger"));
     expect(ledgerText?.type).toBe("text");
     if (ledgerText?.type !== "text") throw new Error("missing completed-work projection");
-    expect(ledgerText.text.length).toBeLessThanOrEqual(COMPLETED_WORK_MODEL_MAX_CHARS);
+    expect(ledgerText.text.slice(ledgerText.text.indexOf("[Completed work ledger")).length)
+      .toBeLessThanOrEqual(COMPLETED_WORK_MODEL_MAX_CHARS);
     expect(ledgerText.text.match(/^#\d+ /gm)?.length ?? 0)
       .toBeLessThanOrEqual(COMPLETED_WORK_MODEL_MAX_ENTRIES);
     expect(ledgerText.text).toContain(`#${COMPLETED_WORK_MAX_ENTRIES + 14}`);
@@ -2399,7 +2672,10 @@ describe("Session execution plan anchor", () => {
     for (let index = 0; index < EXECUTION_PLAN_AUDIT_MAX_ENTRIES + 4; index++) {
       session.updateExecutionPlan({
         explanation: `revision ${index}`,
-        steps: [{ step: "Complete the bounded audit", status: "in_progress" }],
+        steps: [{
+          step: "Complete the bounded audit",
+          status: index % 2 === 0 ? "in_progress" : "blocked",
+        }],
       });
     }
     const audit = session.getExecutionPlanAudit();

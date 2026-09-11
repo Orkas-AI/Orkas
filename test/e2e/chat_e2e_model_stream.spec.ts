@@ -29,9 +29,12 @@ async function sendNewChatToAgent(
   const picker = page.locator('#agent-picker');
   await expect(picker).toBeVisible();
   await picker.locator(`[data-kind="agent"][data-id="${agentId}"]`).click();
+  await page.keyboard.press('Escape');
   await expect(picker).toBeHidden();
   await expect(page.locator('#new-chat-recipient-name')).toHaveText(agentName);
-  await page.locator('#new-chat-input').fill(prompt);
+  // The pick inserted `@Agent ` into the composer; type after it rather than replacing it.
+  const input = page.locator('#new-chat-input');
+  await input.fill(`${await input.inputValue()}${prompt}`);
   await page.locator('#new-chat-send-btn').click();
   await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
   return page;
@@ -99,18 +102,18 @@ test.describe('real chat pipeline with a local model', () => {
     }>;
     const renderedSystemPrompt = requestMessages.find((message) => message.role === 'system')?.content ?? '';
     expect(renderedSystemPrompt).toContain('## Runtime injection');
-    expect(renderedSystemPrompt).toContain('Complete the full scope authorized for this turn');
+    expect(renderedSystemPrompt).toContain('Complete the authorized scope');
     expect(renderedSystemPrompt).not.toContain('## Sexual safety boundary');
     expect(renderedSystemPrompt).not.toMatch(
       /\$(?:agents_index|orchestration_state|working_dir|output_format_hint)\b/,
     );
     const conversationId = await page.locator('#conversation-list .conv-item').first().getAttribute('data-cid');
     expect(conversationId).toBeTruthy();
-    const liveConversation = page.locator(`.conv-item[data-cid="${conversationId}"]`);
+    const liveConversation = page.locator(`#conversation-list .conv-item[data-cid="${conversationId}"]`);
     await expect(liveConversation.locator('.conv-item-status-label.is-failed')).toHaveCount(0);
 
     page = await modelOrkas.relaunch();
-    const conversation = page.locator(`.conv-item[data-cid="${conversationId}"]`);
+    const conversation = page.locator(`#conversation-list .conv-item[data-cid="${conversationId}"]`);
     await expect(conversation).toBeVisible();
     await expect(conversation.locator('.conv-item-status-label.is-failed')).toHaveCount(0);
     await conversation.click();
@@ -137,7 +140,7 @@ test.describe('real chat pipeline with a local model', () => {
 
     const page = await sendNewChat(modelOrkas, 'E2E exercise delayed tool-call arguments.');
     const lifecycleRow = page.locator(
-      '#chat-history .stream-process-line[data-process-call-id="tool:call-e2e-write-conflict-file"]',
+      '#chat-history .stream-process-line[data-process-call-id^="tool:call-e2e-write-conflict-file"]',
     );
     await expect(lifecycleRow).toHaveText('Started · Edit file', { timeout: 20_000 });
     expect(existsSync(outputPath)).toBe(false);
@@ -146,6 +149,15 @@ test.describe('real chat pipeline with a local model', () => {
       'E2E delayed tool lifecycle completed.',
       { timeout: 20_000 },
     );
+    // Settlement rebuilds the canonical process rail lazily. Open the real
+    // disclosure before asserting its rows, just as on a cold history load.
+    const settledProcess = page.locator('#chat-history .chat-message.assistant', {
+      hasText: 'E2E delayed tool lifecycle completed.',
+    }).locator('.stream-process[data-process-state="complete"]');
+    await expect(settledProcess).toBeVisible();
+    if (!await settledProcess.evaluate((element: HTMLDetailsElement) => element.open)) {
+      await settledProcess.locator('.stream-process-summary').click();
+    }
     await expect(lifecycleRow).toHaveCount(1);
     await expect(lifecycleRow).toContainText('Edit file · delayed-process.html · Done');
     await expect(lifecycleRow).not.toContainText('Started');
@@ -156,9 +168,17 @@ test.describe('real chat pipeline with a local model', () => {
     const conversationId = await page.locator('#conversation-list .conv-item').first().getAttribute('data-cid');
     expect(conversationId).toBeTruthy();
     const relaunchedPage = await modelOrkas.relaunch();
-    await relaunchedPage.locator(`.conv-item[data-cid="${conversationId}"]`).click();
-    const restoredRow = relaunchedPage.locator(
-      '#chat-history .stream-process-line[data-process-call-id="tool:call-e2e-write-conflict-file"]',
+    await relaunchedPage.locator(`#conversation-list .conv-item[data-cid="${conversationId}"]`).click();
+    const restoredProcess = relaunchedPage.locator('#chat-history .chat-message.assistant', {
+      hasText: 'E2E delayed tool lifecycle completed.',
+    }).locator('.stream-process');
+    await expect(restoredProcess).toBeVisible();
+    if (!await restoredProcess.evaluate((element: HTMLDetailsElement) => element.open)) {
+      await restoredProcess.locator('.stream-process-summary').click();
+    }
+    await restoredProcess.locator('.stream-process-compact-summary').click();
+    const restoredRow = restoredProcess.locator(
+      '.stream-process-line[data-process-call-id^="tool:call-e2e-write-conflict-file"]',
     );
     await expect(restoredRow).toHaveCount(1);
     await expect(restoredRow).toContainText('Edit file · delayed-process.html · Done');
@@ -231,10 +251,10 @@ test.describe('real chat pipeline with a local model', () => {
 
     const conversationId = await page.locator('#conversation-list .conv-item').first().getAttribute('data-cid');
     expect(conversationId).toBeTruthy();
-    const completedConversation = page.locator(`.conv-item[data-cid="${conversationId}"]`);
+    const completedConversation = page.locator(`#conversation-list .conv-item[data-cid="${conversationId}"]`);
     await expect(completedConversation.locator('.conv-item-status-label.is-failed')).toHaveCount(0);
     const relaunchedPage = await modelOrkas.relaunch();
-    const persistedConversation = relaunchedPage.locator(`.conv-item[data-cid="${conversationId}"]`);
+    const persistedConversation = relaunchedPage.locator(`#conversation-list .conv-item[data-cid="${conversationId}"]`);
     await persistedConversation.click();
     await expect(
       relaunchedPage.locator('#chat-history .chat-message.assistant'),
@@ -253,7 +273,10 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
 
     await page.locator('#chat-send-btn').click();
-    await expect(page.locator('#chat-history .stream-aborted-note')).toBeVisible();
+    const liveInterrupted = page.locator(
+      '#chat-history .chat-message.assistant [data-role="final"]',
+    );
+    await expect(liveInterrupted).toHaveText('Interrupted');
     // Stopping hands the interrupted message back so it can be corrected and
     // sent again; the copy that was already sent stays in the transcript.
     await expect(page.locator('#chat-input')).toHaveValue('E2E stop this deliberately slow response.');
@@ -276,11 +299,12 @@ test.describe('real chat pipeline with a local model', () => {
     const conversationId = await page.locator('#conversation-list .conv-item').first().getAttribute('data-cid');
     expect(conversationId).toBeTruthy();
     const relaunchedPage = await modelOrkas.relaunch();
-    await relaunchedPage.locator(`.conv-item[data-cid="${conversationId}"]`).click();
+    await relaunchedPage.locator(`#conversation-list .conv-item[data-cid="${conversationId}"]`).click();
     await expect(relaunchedPage.locator('#chat-history .chat-message.user')).toHaveCount(1);
     const interrupted = relaunchedPage.locator('#chat-history .chat-message.assistant');
-    await expect(interrupted).toContainText('Hello from');
-    await expect(interrupted).toContainText('(stopped)');
+    await expect(interrupted).toHaveAttribute('data-interrupted', '1');
+    await expect(interrupted).toContainText('Run aborted');
+    await expect(interrupted).not.toContainText('Hello from');
     await expect(interrupted).not.toContainText('Hello from the local E2E model.');
     expect(modelOrkas.modelRequests).toHaveLength(1);
 
@@ -295,6 +319,48 @@ test.describe('real chat pipeline with a local model', () => {
       hasText: 'Hello from the local E2E model.',
     })).toBeVisible({ timeout: 20_000 });
     expect(modelOrkas.modelRequests).toHaveLength(2);
+  });
+
+  test('shows an empty-response notice and retry across restart without changing reply history', async ({ modelOrkas }) => {
+    // Real read-only tool work followed by a terminal response with no prose.
+    // Only the endpoint is scripted; settlement, rendering and retry are real.
+    modelOrkas.setBashSequenceScenario([process.platform === 'win32' ? 'Get-Location' : 'pwd'], '');
+    let page = await sendNewChat(modelOrkas, 'Inspect the current workspace and summarize what you found.');
+    const failed = page.locator('#chat-history .chat-message.assistant[data-failure-code="empty_response_normal"]');
+    await expect(failed).toBeVisible({ timeout: 30_000 });
+    await expect(failed.locator('.msg-error')).toHaveText('No reply was generated. You can retry.');
+    await failed.hover();
+    await expect(failed.locator('.bubble-retry-btn')).toBeVisible();
+    await expect(failed.locator('.stream-process')).toBeVisible();
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+    const requestsAfterFailure = modelOrkas.modelRequests.length;
+    const cid = await page.locator('#conversation-list .conv-item').first().getAttribute('data-cid');
+    expect(cid).toBeTruthy();
+    const { history } = await modelOrkas.invoke<{ history: Array<Record<string, any>> }>('conversations.history', { cid });
+    const record = history.find((message) => message.failure_code === 'empty_response_normal');
+    expect(record).toMatchObject({ text: '', failure_kind: 'model' });
+    expect(record?.process?.length).toBeGreaterThan(0);
+
+    page = await modelOrkas.relaunch();
+    const conversation = page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`);
+    await conversation.click();
+    const restored = page.locator('#chat-history .chat-message.assistant[data-failure-code="empty_response_normal"]');
+    await expect(restored.locator('.msg-error')).toHaveText('No reply was generated. You can retry.');
+    await expect(conversation.locator('.conv-item-status-label.is-failed')).toBeVisible();
+    await expect(restored.locator('.stream-process')).toBeVisible();
+    await restored.hover();
+    await expect(restored.locator('.bubble-retry-btn')).toBeVisible();
+    expect(modelOrkas.modelRequests).toHaveLength(requestsAfterFailure);
+
+    modelOrkas.clearModelToolScenario();
+    await restored.locator('.bubble-retry-btn').click();
+    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+      hasText: 'Hello from the local E2E model.',
+    })).toBeVisible({ timeout: 20_000 });
+    await expect(conversation.locator('.conv-item-status-label.is-failed')).toHaveCount(0);
+    expect(modelOrkas.modelRequests).toHaveLength(requestsAfterFailure + 1);
+    const recoveryRequest = JSON.stringify(modelOrkas.modelRequests.at(-1));
+    expect(recoveryRequest).not.toContain('No reply was generated. You can retry.');
   });
 
   test('shows a failed reply and succeeds when the user retries', async ({ modelOrkas }) => {
@@ -320,7 +386,7 @@ test.describe('real chat pipeline with a local model', () => {
     const conversationId = await page.locator('#conversation-list .conv-item').first().getAttribute('data-cid');
     expect(conversationId).toBeTruthy();
     const relaunchedPage = await modelOrkas.relaunch();
-    await relaunchedPage.locator(`.conv-item[data-cid="${conversationId}"]`).click();
+    await relaunchedPage.locator(`#conversation-list .conv-item[data-cid="${conversationId}"]`).click();
     await expect(relaunchedPage.locator('#chat-history .chat-message.user')).toHaveCount(2);
     await expect(relaunchedPage.locator('#chat-history .chat-message.assistant', {
       hasText: 'Hello from the local E2E model.',
@@ -351,17 +417,25 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(retry).toBeVisible({ timeout: 30_000 });
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
     const failedBubble = retry.locator('xpath=ancestor::*[contains(@class, "chat-message")]');
-    await expect(failedBubble).toContainText('Hello from');
+    // A failed unphased fragment belongs to the settled process disclosure,
+    // whose rows materialize on first open; it is never the final answer.
+    const failedProcess = failedBubble.locator('.stream-process');
+    await expect(failedProcess).toBeVisible();
+    if (!await failedProcess.evaluate((element: HTMLDetailsElement) => element.open)) {
+      await failedProcess.locator('.stream-process-summary').click();
+    }
+    await expect(failedProcess).toContainText('Hello from');
+    await expect(failedBubble.locator('[data-role="final"]')).not.toContainText('Hello from');
     await expect(failedBubble).not.toContainText('Hello from the local E2E model.');
     const requestsAfterFailure = modelOrkas.modelRequests.length;
     expect(requestsAfterFailure).toBeGreaterThan(0);
 
     const conversationId = await page.locator('#conversation-list .conv-item').first().getAttribute('data-cid');
     expect(conversationId).toBeTruthy();
-    const failedConversation = page.locator(`.conv-item[data-cid="${conversationId}"]`);
+    const failedConversation = page.locator(`#conversation-list .conv-item[data-cid="${conversationId}"]`);
     await expect(failedConversation.locator('.conv-item-status-label.is-failed')).toBeVisible();
     const relaunchedPage = await modelOrkas.relaunch();
-    const persistedFailedConversation = relaunchedPage.locator(`.conv-item[data-cid="${conversationId}"]`);
+    const persistedFailedConversation = relaunchedPage.locator(`#conversation-list .conv-item[data-cid="${conversationId}"]`);
     await persistedFailedConversation.click();
     const persistedRetry = relaunchedPage.locator('#chat-history .bubble-retry-btn').last();
     await expect(persistedRetry).toBeVisible();
@@ -376,12 +450,12 @@ test.describe('real chat pipeline with a local model', () => {
       hasText: 'Hello from the local E2E model.',
     })).toBeVisible({ timeout: 20_000 });
     await expect(
-      relaunchedPage.locator(`.conv-item[data-cid="${conversationId}"] .conv-item-status-label.is-failed`),
+      relaunchedPage.locator(`#conversation-list .conv-item[data-cid="${conversationId}"] .conv-item-status-label.is-failed`),
     ).toHaveCount(0);
     expect(modelOrkas.modelRequests).toHaveLength(requestsAfterFailure + 1);
   });
 
-  test('queues a second message while streaming and drains it in order', async ({ modelOrkas }) => {
+  test('board-queues a second message while streaming and runs it in order', async ({ modelOrkas }) => {
     modelOrkas.setModelMode('slow');
     const page = await sendNewChat(modelOrkas, 'E2E first slow queued turn.');
     await expect.poll(() => modelOrkas.modelRequests.length).toBeGreaterThan(0);
@@ -389,20 +463,24 @@ test.describe('real chat pipeline with a local model', () => {
 
     await page.locator('#chat-input').fill('E2E second queued turn.');
     await page.locator('#chat-input').press('Enter');
-    await expect(page.locator('#chat-queue')).toBeVisible();
-    await expect(page.locator('#chat-queue-count')).toHaveText('1');
-    await expect(page.locator('#chat-queue-list')).toContainText('E2E second queued turn.');
+    // The busy send goes straight to the backend scheduler, which parks it
+    // as a visible board row behind the running turn. Until that turn
+    // starts, the board row is the message's ONLY surface — no bubble
+    // (queued-until-execution, 2026-08-27).
+    await expect(page.locator('#chat-task-board')).toBeVisible();
+    await expect(page.locator('#chat-task-board-list .chat-queue-item')).toHaveCount(2);
+    await expect(page.locator('#chat-history .chat-message.user')).toHaveCount(1);
 
     modelOrkas.setModelMode('success');
     await expect.poll(() => modelOrkas.modelRequests.length, { timeout: 20_000 }).toBeGreaterThanOrEqual(2);
-    await expect(page.locator('#chat-queue')).toBeHidden();
     await expect(page.locator('#chat-history .chat-message.user')).toHaveCount(2);
     await expect(page.locator('#chat-history .chat-message.user').nth(0)).toContainText('E2E first slow queued turn.');
     await expect(page.locator('#chat-history .chat-message.user').nth(1)).toContainText('E2E second queued turn.');
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/, { timeout: 20_000 });
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+    await expect(page.locator('#chat-history .chat-message.assistant', {
       hasText: 'Hello from the local E2E model.',
     })).toHaveCount(2, { timeout: 20_000 });
+    await expect(page.locator('#chat-task-board')).toBeHidden();
     expect(modelOrkas.modelRequests).toHaveLength(2);
 
     const firstRequest = JSON.stringify(modelOrkas.modelRequests[0]);
@@ -415,19 +493,18 @@ test.describe('real chat pipeline with a local model', () => {
     const conversationId = await page.locator('#conversation-list .conv-item').first().getAttribute('data-cid');
     expect(conversationId).toBeTruthy();
     const relaunchedPage = await modelOrkas.relaunch();
-    await relaunchedPage.locator(`.conv-item[data-cid="${conversationId}"]`).click();
+    await relaunchedPage.locator(`#conversation-list .conv-item[data-cid="${conversationId}"]`).click();
     await expect(relaunchedPage.locator('#chat-history .chat-message.user')).toHaveCount(2);
     await expect(relaunchedPage.locator('#chat-history .chat-message.assistant')).toHaveCount(2);
     const persistedReplies = relaunchedPage.locator('#chat-history .chat-message.assistant');
     await expect(persistedReplies.nth(0)).toContainText('Hello from the local E2E model.');
     await expect(persistedReplies.nth(1)).toContainText('Hello from the local E2E model.');
-    await expect(relaunchedPage.locator('#chat-queue')).toBeHidden();
     await relaunchedPage.waitForTimeout(500);
     expect(modelOrkas.modelRequests).toHaveLength(2);
   });
 
-  test('steers a text-reference queue row and reorders the live reply on its next update', async ({ modelOrkas }) => {
-    modelOrkas.setModelMode('very-slow');
+  test('steers a text-reference composer update and reorders the live reply on its next update', async ({ modelOrkas }) => {
+    modelOrkas.setModelMode('controlled-slow');
     const page = await sendNewChat(modelOrkas, 'E2E active turn accepts a send-now update.');
     await expect.poll(
       () => modelOrkas.modelRequests.length,
@@ -442,19 +519,18 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(page.locator('#chat-quote-preview'))
       .toContainText('E2E active turn accepts a send-now update.');
 
-    await page.locator('#chat-input').fill('E2E send this queued constraint now.');
-    await page.locator('#chat-input').press('Enter');
-    const queuedRow = page.locator('#chat-queue-list .chat-queue-item', {
+    const input = page.locator('#chat-input');
+    await input.fill('E2E send this queued constraint now.');
+    await input.press('Enter');
+    // The busy send parks as a queued board row (no bubble yet — D21). Its
+    // explicit Send now action folds it into the live steerable turn; the
+    // fold is the moment the message persists and the bubble appears.
+    const queuedRow = page.locator('#chat-task-board-list .chat-queue-item', {
       hasText: 'E2E send this queued constraint now.',
     });
-    await expect(queuedRow).toBeVisible();
-    const actions = queuedRow.locator('.chat-queue-btn');
-    await expect(actions.nth(0)).toHaveAttribute('data-act', 'send');
-    await expect(actions.nth(1)).toHaveAttribute('data-act', 'edit');
-
-    await queuedRow.locator('[data-act="send"]').click();
-    await expect(page.locator('#chat-queue')).toBeHidden();
-    await expect(page.locator('#chat-history .chat-message.user')).toHaveCount(2);
+    await expect(queuedRow.locator('[data-act="task-send-now"]')).toBeVisible({ timeout: 10_000 });
+    await queuedRow.locator('[data-act="task-send-now"]').click();
+    await expect(page.locator('#chat-history .chat-message.user')).toHaveCount(2, { timeout: 10_000 });
     await expect(page.locator('#chat-history .chat-message.user').nth(1))
       .toContainText('E2E send this queued constraint now.');
     await expect(page.locator('#chat-history .chat-message.user').nth(1)
@@ -466,27 +542,32 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
     expect(modelOrkas.modelRequests).toHaveLength(1);
 
-    // The very-slow fixture emits the rest of its first response after the
-    // send-now user row has landed. The same live assistant node must cross
-    // that user boundary immediately; waiting for final persistence would
-    // leave the new user message stranded at the visual tail for several
-    // seconds.
+    // Release the next model fragment only after the send-now user row
+    // has landed. This stub deliberately withholds the phase/terminal boundary,
+    // so the unphased fragment must remain buffered instead of being painted as
+    // a final answer that may later turn out to precede a tool call.
+    modelOrkas.releaseControlledModelChunk();
+    await expect(page.locator('#chat-history .chat-message.assistant')).toHaveCount(1);
     await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]'))
-      .toContainText('the local E2E model.', { timeout: 20_000 });
-    const liveTimelineRoles = await page.locator('#chat-history > .chat-message').evaluateAll((nodes) => (
-      nodes.map(node => node.classList.contains('user') ? 'user' : 'assistant')
-    ));
-    expect(liveTimelineRoles).toEqual(['user', 'user', 'assistant']);
+      .toHaveText('');
     await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
 
-    modelOrkas.setModelMode('success');
+    // The terminal boundary makes the buffered reply visible. Keep the next
+    // steered round active so chronology is checked during the live turn,
+    // after a real UI update rather than an already-empty placeholder check.
+    modelOrkas.setModelMode('very-slow');
+    modelOrkas.finishControlledModelStream();
     await expect.poll(() => modelOrkas.modelRequests.length, { timeout: 20_000 })
       .toBeGreaterThanOrEqual(2);
+    await expect.poll(() => page.locator('#chat-history > .chat-message').evaluateAll((nodes) => (
+      nodes.map(node => node.classList.contains('user') ? 'user' : 'assistant')
+    ))).toEqual(['user', 'user', 'assistant']);
+    await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/, {
       timeout: 20_000,
     });
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]'))
-      .toContainText('Hello from the local E2E model.');
+    await expect(page.locator('#chat-history .chat-message.assistant'))
+      .toContainText('Hello from the local E2E model.', { timeout: 20_000 });
 
     const timelineRoles = await page.locator('#chat-history > .chat-message').evaluateAll((nodes) => (
       nodes.map(node => node.classList.contains('user') ? 'user' : 'assistant')
@@ -501,7 +582,7 @@ test.describe('real chat pipeline with a local model', () => {
     expect(steeredRequest).toContain('E2E active turn accepts a send-now update.');
   });
 
-  test('steers an attachment queue row into the active run with fresh file context', async ({ modelOrkas }) => {
+  test('steers an attachment composer update into the active run with fresh file context', async ({ modelOrkas }) => {
     modelOrkas.setModelMode('very-slow');
     const page = await sendNewChat(modelOrkas, 'E2E active turn before attachment send-now.');
     await expect.poll(
@@ -520,19 +601,14 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(page.locator('#chat-attachments .chat-attach-chip', {
       hasText: attachmentName,
     })).not.toHaveClass(/\bis-uploading\b/);
-    await page.locator('#chat-input').fill('E2E send this attachment immediately.');
-    await page.locator('#chat-input').press('Enter');
-
-    const queuedRow = page.locator('#chat-queue-list .chat-queue-item', {
+    const attachInput = page.locator('#chat-input');
+    await attachInput.fill('E2E send this attachment immediately.');
+    await attachInput.press('Enter');
+    const attachRow = page.locator('#chat-task-board-list .chat-queue-item', {
       hasText: 'E2E send this attachment immediately.',
     });
-    await expect(queuedRow).toContainText('1 attachment');
-    const actions = queuedRow.locator('.chat-queue-btn');
-    await expect(actions.nth(0)).toHaveAttribute('data-act', 'send');
-    await expect(actions.nth(1)).toHaveAttribute('data-act', 'edit');
-
-    await queuedRow.locator('[data-act="send"]').click();
-    await expect(page.locator('#chat-queue')).toBeHidden();
+    await expect(attachRow.locator('[data-act="task-send-now"]')).toBeVisible({ timeout: 10_000 });
+    await attachRow.locator('[data-act="task-send-now"]').click();
     const users = page.locator('#chat-history .chat-message.user');
     await expect(users).toHaveCount(2);
     await expect(users.nth(1)).toContainText('E2E send this attachment immediately.');
@@ -568,7 +644,7 @@ test.describe('real chat pipeline with a local model', () => {
     expect(firstRequest).not.toContain(attachmentName);
   });
 
-  test('drains a queued message after switching to another conversation', async ({ modelOrkas }) => {
+  test('runs a busy-conversation send after switching to another conversation', async ({ modelOrkas }) => {
     const page = await sendNewChat(modelOrkas, 'E2E foreground conversation stays isolated.');
     await expect.poll(() => modelOrkas.modelRequests.length).toBe(1);
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/, {
@@ -589,15 +665,21 @@ test.describe('real chat pipeline with a local model', () => {
 
     await page.locator('#chat-input').fill('E2E background queued continuation.');
     await page.locator('#chat-input').press('Enter');
-    await expect(page.locator('#chat-queue-count')).toHaveText('1');
+    // Direct busy send: the turn parks as a queued board row behind the
+    // running one; the bubble waits for its execution.
+    await expect(page.locator('#chat-task-board-list .chat-queue-item')).toHaveCount(2);
+    await expect(page.locator('#chat-history .chat-message.user')).toHaveCount(1);
 
-    await page.locator(`.conv-item[data-cid="${foregroundCid}"]`).click();
+    await page.locator(`#conversation-list .conv-item[data-cid="${foregroundCid}"]`).click();
     await expect(page.locator('#chat-history')).toContainText(
       'E2E foreground conversation stays isolated.',
     );
     await expect(page.locator('#chat-history')).not.toContainText(
       'E2E background queued continuation.',
     );
+    // The board follows the conversation: the idle foreground session has no
+    // tasks, so the background session's board must not linger on screen.
+    await expect(page.locator('#chat-task-board')).toBeHidden();
 
     modelOrkas.setModelMode('success');
     await expect.poll(() => modelOrkas.modelRequests.length, { timeout: 20_000 }).toBe(3);
@@ -609,8 +691,10 @@ test.describe('real chat pipeline with a local model', () => {
     );
     await expect(page.locator('#chat-history .chat-message.user')).toHaveCount(1);
 
-    await page.locator(`.conv-item[data-cid="${backgroundCid}"]`).click();
-    await expect(page.locator('#chat-queue')).toBeHidden({ timeout: 20_000 });
+    await page.locator(`#conversation-list .conv-item[data-cid="${backgroundCid}"]`).click();
+    // Switching back restores the conversation without reviving its finished
+    // task board: no multi-task control remains actionable.
+    await expect(page.locator('#chat-task-board')).toBeHidden();
     await expect(page.locator('#chat-history .chat-message.user')).toHaveCount(2);
     await expect(page.locator('#chat-history .chat-message.user').nth(0))
       .toContainText('E2E background first slow queued turn.');
@@ -626,90 +710,9 @@ test.describe('real chat pipeline with a local model', () => {
     expect(queuedRequest).toContain('E2E background queued continuation.');
   });
 
-  test('edits a queued message in the composer and blocks draining until commit', async ({ modelOrkas }) => {
-    // Attachment selection can exceed the 2.4s slow-stub window on a loaded
-    // Windows runner. Keep the first response alive long enough to establish
-    // all three queue rows before entering edit mode.
-    modelOrkas.setModelMode('very-slow');
-    const page = await sendNewChat(modelOrkas, 'E2E active turn while queue editing.');
-    await expect.poll(() => modelOrkas.modelRequests.length).toBe(1);
-    await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
-
-    await page.locator('#chat-input').fill('E2E queued first.');
-    await page.locator('#chat-input').press('Enter');
-
-    const attachmentName = 'E2E queued edit attachment.md';
-    const attachmentPath = modelOrkas.createFixtureFile(
-      attachmentName,
-      '# Queued edit attachment\n\nThis sidecar must survive composer editing.\n',
-    );
-    await modelOrkas.selectFilesOnNextDialog([attachmentPath]);
-    await page.locator('#chat-attach-btn').click();
-    const queuedAttachment = page.locator('#chat-attachments .chat-attach-chip', {
-      hasText: attachmentName,
-    });
-    await expect(queuedAttachment).toBeVisible();
-    await expect(queuedAttachment).not.toHaveClass(/\bis-uploading\b/);
-    await page.locator('#chat-input').fill('E2E queued middle original.');
-    await page.locator('#chat-input').press('Enter');
-    await expect(page.locator('#chat-attachments')).toBeHidden();
-
-    await page.locator('#chat-input').fill('E2E queued third.');
-    await page.locator('#chat-input').press('Enter');
-    await expect(page.locator('#chat-queue-count')).toHaveText('3');
-
-    const middleRow = page.locator('#chat-queue-list .chat-queue-item', {
-      hasText: 'E2E queued middle original.',
-    });
-    await middleRow.locator('[data-act="edit"]').click();
-
-    await expect(page.locator('#chat-input')).toHaveValue('E2E queued middle original.');
-    await expect(page.locator('#chat-attachments .chat-attach-chip', {
-      hasText: attachmentName,
-    })).toBeVisible();
-    await expect(page.locator('#chat-queue-count')).toHaveText('2');
-    await expect(page.locator('#chat-queue-list')).not.toContainText('E2E queued middle original.');
-    await expect(page.locator('#chat-queue-list')).toContainText('E2E queued first.');
-    await expect(page.locator('#chat-queue-list')).toContainText('E2E queued third.');
-    // Queue editing changes the button from Stop to the edit-commit action.
-    // Clicking it must not abort the active reply.
-    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
-
-    // The very-slow reply settles after 9.6 seconds. Observe beyond that
-    // boundary: no queued request may start while the middle item owns the
-    // composer, even though the active turn has become idle.
-    await page.waitForTimeout(10_000);
-    expect(modelOrkas.modelRequests).toHaveLength(1);
-    await expect(page.locator('#chat-input')).toHaveValue('E2E queued middle original.');
-    await expect(page.locator('#chat-queue-count')).toHaveText('2');
-
-    modelOrkas.setModelMode('success');
-    await page.locator('#chat-input').fill('E2E queued middle revised.');
-    await page.locator('#chat-send-btn').click();
-
-    await expect.poll(() => modelOrkas.modelRequests.length, { timeout: 20_000 }).toBe(4);
-    await expect(page.locator('#chat-queue')).toBeHidden({ timeout: 20_000 });
-    const users = page.locator('#chat-history .chat-message.user');
-    await expect(users).toHaveCount(4);
-    await expect(users.nth(0)).toContainText('E2E active turn while queue editing.');
-    await expect(users.nth(1)).toContainText('E2E queued first.');
-    await expect(users.nth(2)).toContainText('E2E queued middle revised.');
-    await expect(users.nth(3)).toContainText('E2E queued third.');
-
-    const requests = modelOrkas.modelRequests.map((request) => JSON.stringify(request));
-    expect(requests.join('\n')).not.toContain('E2E queued middle original.');
-    expect(requests[1]).toContain('E2E queued first.');
-    expect(requests[1]).not.toContain('E2E queued middle revised.');
-    expect(requests[2]).toContain('E2E queued middle revised.');
-    expect(requests[2]).toContain(attachmentName);
-    expect(requests[3]).toContain('E2E queued third.');
-  });
-
-  test('deletes a queued message from composer edit without ever sending it', async ({ modelOrkas }) => {
-    // Establish the edit lock before the local response ends, including on a
-    // loaded runner. The ordinary 2.4s fixture can drain the row during click.
-    modelOrkas.setModelMode('very-slow');
-    const page = await sendNewChat(modelOrkas, 'E2E active turn while deleting a queue edit.');
+  test('cancels a queued board task before it runs so its text never reaches the model', async ({ modelOrkas }) => {
+    modelOrkas.setModelMode('slow');
+    const page = await sendNewChat(modelOrkas, 'E2E active turn while cancelling a queued task.');
     await expect.poll(
       () => modelOrkas.modelRequests.length,
       { timeout: 30_000 },
@@ -718,37 +721,24 @@ test.describe('real chat pipeline with a local model', () => {
 
     await page.locator('#chat-input').fill('E2E queued message that must never send.');
     await page.locator('#chat-input').press('Enter');
-    await expect(page.locator('#chat-queue-count')).toHaveText('1');
+    const rows = page.locator('#chat-task-board-list .chat-queue-item');
+    await expect(rows).toHaveCount(2);
 
-    await page.locator('#chat-input').fill('E2E displaced draft survives queue deletion.');
-    const queuedRow = page.locator('#chat-queue-list .chat-queue-item', {
-      hasText: 'E2E queued message that must never send.',
+    // Queued-until-execution: the board row is the message's only surface.
+    await expect(page.locator('#chat-history .chat-message.user')).toHaveCount(1);
+    await rows.nth(1).locator('[data-act="task-cancel"]').click();
+
+    // Let the active slow turn settle. If the cancel silently failed, the
+    // queued text would reach the model right here as the next admission.
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/, {
+      timeout: 20_000,
     });
-    await queuedRow.locator('[data-act="edit"]').click();
-
-    await expect(page.locator('#chat-input'))
-      .toHaveValue('E2E queued message that must never send.');
-    await expect(page.locator('#chat-queue-edit-delete-btn')).toBeVisible();
-    await expect(page.locator('#chat-send-btn')).toHaveClass(/\bqueue-editing\b/);
-    await expect(page.locator('#chat-send-btn .queue-save-icon')).toBeVisible();
-    await expect(page.locator('#chat-send-btn .send-icon')).toBeHidden();
-
-    // Let the active slow turn settle while the edit lock is held. If the
-    // regression returns, the queued text would already reach the model here.
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]')).toBeVisible({ timeout: 30_000 });
-    expect(modelOrkas.modelRequests).toHaveLength(1);
-
-    await page.locator('#chat-queue-edit-delete-btn').click();
-
-    await expect(page.locator('#chat-input'))
-      .toHaveValue('E2E displaced draft survives queue deletion.');
-    await expect(page.locator('#chat-queue')).toBeHidden();
-    await expect(page.locator('#chat-queue-edit-delete-btn')).toBeHidden();
-    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bqueue-editing\b/);
     await page.waitForTimeout(500);
     expect(modelOrkas.modelRequests).toHaveLength(1);
     expect(JSON.stringify(modelOrkas.modelRequests))
       .not.toContain('E2E queued message that must never send.');
+    // The withdrawn message never entered the conversation.
+    await expect(page.locator('#chat-history .chat-message.user')).toHaveCount(1);
   });
 
   test('denies a dangerous local command without executing its side effect', async ({ modelOrkas }) => {
@@ -774,10 +764,21 @@ test.describe('real chat pipeline with a local model', () => {
       hasText: 'E2E dangerous command remained denied.',
     })).toBeVisible({ timeout: 20_000 });
     expect(existsSync(sentinelPath)).toBe(false);
-    // OSS loads the dangerous shell tool on demand before the tool call itself,
-    // so the denial is reported in the third model request.
-    expect(modelOrkas.modelRequests).toHaveLength(3);
-    expect(JSON.stringify(modelOrkas.modelRequests[2])).toMatch(/denied|permission/i);
+    await expect.poll(async () => modelOrkas.invoke<{ ok: boolean; mode: string }>(
+      'permissions.getLocalExec',
+    )).toMatchObject({ ok: true, mode: 'all_files_approval' });
+    // Commander preloads command execution; approval still gates the call.
+    expect(modelOrkas.modelRequests).toHaveLength(2);
+    expect(modelOrkas.modelRequests[0].tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({ function: expect.objectContaining({ name: 'bash' }) }),
+    ]));
+    const continuationMessages = modelOrkas.modelRequests[1].messages as Array<{
+      role?: string; content?: string;
+    }>;
+    expect(continuationMessages.filter((message) => message.role === 'tool'))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ content: expect.stringMatching(/denied|permission/i) }),
+      ]));
   });
 
   test('cleans up a file produced earlier in the same task without showing approval', async ({ modelOrkas }) => {
@@ -800,7 +801,7 @@ test.describe('real chat pipeline with a local model', () => {
     })).toBeVisible({ timeout: 20_000 });
     expect(existsSync(generatedPath)).toBe(false);
     await expect(page.locator('.bash-permission-dialog')).toHaveCount(0);
-    expect(modelOrkas.modelRequests).toHaveLength(5);
+    expect(modelOrkas.modelRequests).toHaveLength(4);
   });
 
   test('stopping a task closes its pending permission dialog without executing the command', async ({ modelOrkas }) => {
@@ -857,7 +858,7 @@ test.describe('real chat pipeline with a local model', () => {
       hasText: 'E2E allow-once sequence completed.',
     })).toBeVisible({ timeout: 20_000 });
     expect(existsSync(secondPath)).toBe(true);
-    expect(modelOrkas.modelRequests).toHaveLength(4);
+    expect(modelOrkas.modelRequests).toHaveLength(3);
   });
 
   test('allows the same dangerous category for the task without prompting twice', async ({ modelOrkas }) => {
@@ -880,7 +881,7 @@ test.describe('real chat pipeline with a local model', () => {
     expect(existsSync(firstPath)).toBe(false);
     expect(existsSync(secondPath)).toBe(false);
     await expect(dialog).toHaveCount(0);
-    expect(modelOrkas.modelRequests).toHaveLength(4);
+    expect(modelOrkas.modelRequests).toHaveLength(3);
   });
 
   test('offers allow-for-task to VideoStudio for a grantable category', async ({ modelOrkas }) => {
@@ -941,7 +942,7 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
       hasText: 'E2E category-scoped approval completed.',
     })).toBeVisible({ timeout: 20_000 });
-    expect(modelOrkas.modelRequests).toHaveLength(4);
+    expect(modelOrkas.modelRequests).toHaveLength(3);
   });
 
   test('expires allow-for-task after a completed turn in the same conversation', async ({ modelOrkas }) => {
@@ -977,6 +978,6 @@ test.describe('real chat pipeline with a local model', () => {
       hasText: 'E2E second task remained denied.',
     })).toBeVisible({ timeout: 20_000 });
     expect(existsSync(secondPath)).toBe(true);
-    expect(modelOrkas.modelRequests).toHaveLength(6);
+    expect(modelOrkas.modelRequests).toHaveLength(4);
   });
 });

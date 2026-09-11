@@ -4,7 +4,8 @@ import { accountApiBase } from './_server_bridge';
 import { connectorApiKeyHeaders } from './api-key';
 import type { CatalogEntry, ConnectorUsageMetering } from './types';
 
-export const COMPOSIO_CONNECTOR_CREDITS_MILLI_PER_CALL = 250;
+export const COMPOSIO_CONNECTOR_CREDITS_MILLI_PER_CALL = 420;
+
 export type ConnectorUsageStage = 'connect' | 'tool_call';
 
 export function usageMeteringForEntry(entry: CatalogEntry | null | undefined): ConnectorUsageMetering | null {

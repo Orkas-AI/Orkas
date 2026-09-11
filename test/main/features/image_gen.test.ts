@@ -87,7 +87,7 @@ describe('image_gen › pickImageGenProfile', () => {
     // load-bearing invariant that prevents "I logged in, why doesn't it work".
     writeProfilesFile(
       { 'google:default': oauthProfile('google') },
-      [entry('google', 'gemini-3-pro-preview', 'google:default', 'e1')],
+      [entry('google', 'gemini-3.8-flash', 'google:default', 'e1')],
     );
     const m = await import('../../../src/main/features/image_gen');
     expect(m.pickImageGenProfile()).toBeNull();
@@ -106,8 +106,8 @@ describe('image_gen › pickImageGenProfile', () => {
   it('picks first capable api-key entry, ignoring earlier non-capable entries', async () => {
     // Order matters: priority list says anthropic first, then openai. The
     // picker must skip anthropic (no image API) and land on openai (capable).
-    // The user's chat model on the openai entry (gpt-5.4) is irrelevant —
-    // the capability map fixes the model to gpt-image-1.
+    // The user's chat model on the openai entry (gpt-6-astra) is irrelevant —
+    // the capability map fixes the model to gpt-image-2.
     writeProfilesFile(
       {
         'anthropic:default': apiKeyProfile('anthropic', 'sk-ant-xxx'),
@@ -115,7 +115,7 @@ describe('image_gen › pickImageGenProfile', () => {
       },
       [
         entry('anthropic', 'claude-opus-4-7', 'anthropic:default', 'e1'),
-        entry('openai',    'gpt-5.4',         'openai:default',    'e2'),
+        entry('openai',    'gpt-6-astra',         'openai:default',    'e2'),
       ],
     );
     const m = await import('../../../src/main/features/image_gen');
@@ -137,8 +137,8 @@ describe('image_gen › pickImageGenProfile', () => {
         'google:studio': apiKeyProfile('google', 'AIza-xxx', 'studio'),
       },
       [
-        entry('google', 'gemini-3-pro-preview', 'google:cli',    'e1'),
-        entry('google', 'gemini-3-pro-preview', 'google:studio', 'e2'),
+        entry('google', 'gemini-3.8-flash', 'google:cli',    'e1'),
+        entry('google', 'gemini-3.8-flash', 'google:studio', 'e2'),
       ],
     );
     const m = await import('../../../src/main/features/image_gen');
@@ -404,7 +404,7 @@ describe('image generation transfer and artifact boundaries', () => {
   });
 
   it('does not submit or write an already cancelled image generation', async () => {
-    writeProfilesFile({ 'openai:default': apiKeyProfile('openai', 'fixture-key') }, [entry('openai', 'gpt-5.4', 'openai:default', 'e1')]);
+    writeProfilesFile({ 'openai:default': apiKeyProfile('openai', 'fixture-key') }, [entry('openai', 'gpt-6-astra', 'openai:default', 'e1')]);
     const m = await import('../../../src/main/features/image_gen');
     const fetchStub = vi.fn(async () => new Response('{}', { status: 200 }));
     vi.stubGlobal('fetch', fetchStub);

@@ -37,9 +37,6 @@ import {
   type SkillRuntimeBinding,
 } from './skill-registry';
 import { t } from '../../i18n';
-// tool-catalog.ts: TOOL_CATALOG kept as the source of truth for the drift
-// test (tool-catalog.test.ts asserts injected names ⊆ catalog) and for any
-// future targeted use; runtime no longer renders the prompt block from it.
 import {
   getSession,
   getSessionForUser,
@@ -63,11 +60,17 @@ import {
   writeProjectInstructionsIfUnchanged,
 } from '../../features/projects';
 import * as projectTasks from '../../features/project_tasks';
+import * as conversationTaskBoard from '../../features/group_chat/task_board';
 import * as metacognition from '../../features/metacognition';
 import { appendAgentSkill, listAgentSummaries } from '../../features/agents';
 const log = createLogger('model/runner');
 const REFLECTION_TOOL_NAMES = new Set(['metacognition', 'skill_manage']);
-import { createLocalTools, createFileTools } from './local-tools';
+// The durable Plan implementation remains in core-agent for persisted-session
+// compatibility and controlled evaluation, but Orkas does not currently expose
+// it as a model action. Internal model planning and the evidence-backed
+// workspace/completed-work state continue to operate without this tool.
+const EXPOSE_EXECUTION_PLAN_TOOL = false;
+import { createLocalTools, createFileTools, createProgramSourceLoader } from './local-tools';
 import { createOfficeTools } from './office-tools';
 import { createPdfTools } from './pdf-tools';
 import { officeCliAvailable } from '../../features/office/office_engine';
@@ -75,21 +78,24 @@ import { createLibraryTool } from './kb-tools';
 import { createChatHistoryTool } from './chat-history-tools';
 import { createImageGenTool } from './image-gen-tool';
 import { createVideoGenTool } from './video-gen-tool';
+import { createResearchVerifyTool } from './research-verify-tool';
 import { createGenerateSpeechTool } from './generate-speech-tool';
 import {
   AGENT_DEPENDENCY_TOOL_GROUP_IDS,
-  getActiveToolGroupsTurnBlock,
   getToolCatalogEntry,
   getLoadableToolGroupsSystemPromptBlock,
   isToolVisibleToAgent,
   toolNamesForGroups,
 } from './tool-catalog';
 import { createToolLoadTool, createToolSurfaceController } from './tool-surface';
+import { createProgrammaticToolPolicy } from './programmatic-tool-policy';
 import { shouldExposeOcrFileTool } from './ocr-tool-policy';
 import { createWebSearchOverrideTool } from './search-tools';
+import { renderWebFetchPage } from './web-fetch-render';
 import {
   agentEvolvedSkillsDir,
   agentPrivateSkillsDir,
+  sessionAnalysisInputsDir,
   userMarketplaceAgentSkillsDir,
 } from '../../paths';
 import { artifactDirForConversation, chatAttachmentDirForConversation } from '../../util/project-layout';
@@ -201,25 +207,28 @@ function applyRetryErrorPolicy(mod: CA): void {
   }
 }
 
+
+// core-agent has no browser runtime, so `web_fetch` falls back to the host's
+// offscreen Chromium when a direct response is a bot check or an app shell.
+let webFetchRendererRegistered = false;
+function applyWebFetchRenderer(mod: CA): void {
+  if (webFetchRendererRegistered) return;
+  try {
+    mod.configureWebFetchRenderer(renderWebFetchPage);
+    webFetchRendererRegistered = true;
+  } catch (err) {
+    runnerLog.warn('web fetch renderer registration failed', { error: logErrorSummary(err) });
+  }
+}
+
 async function ca(): Promise<CA> {
   if (!_caPromise) _caPromise = import('#core-agent') as Promise<CA>;
   const mod = await _caPromise;
   applyRetryErrorPolicy(mod);
+  applyWebFetchRenderer(mod);
   return mod;
 }
 
-/** No-op retained for backward compat; nothing is cached anymore. */
-export function invalidateConfig(): void {}
-
-function _intersectRenderAllowlist(
-  agentList: readonly string[] | undefined,
-  projectList: readonly string[] | undefined,
-): readonly string[] | undefined {
-  if (projectList === undefined) return agentList;
-  if (agentList === undefined) return projectList;
-  const agentSet = new Set(agentList);
-  return projectList.filter((id) => agentSet.has(id));
-}
 
 export interface BuildRunnerParams {
   sessionId: string;
@@ -268,8 +277,11 @@ export interface BuildRunnerParams {
   /** Max tool-call rounds per turn before force-end. Undefined → core-agent
    *  default (100). Group chat raises it for the commander's long builds. */
   maxToolLoops?: number;
-  /** Per-tool stall watchdog. The host derives this from the session idle
-   * timeout so the session-level tool-phase timer remains a later backstop. */
+  /** Per-tool stall watchdog. The caller derives it from the session idle
+   * timeout so the session-level tool-phase backstop always sits strictly
+   * behind it: a stalled tool fails as one recoverable tool error instead of
+   * the session watchdog killing the whole turn. Undefined → core-agent
+   * default (1_800_000ms). */
   toolIdleTimeoutMs?: number;
   /** Optional one-time soft convergence threshold. Undefined preserves the
    *  core-agent default; this does not change the hard tool-loop limit. */
@@ -290,14 +302,6 @@ export interface BuildRunnerParams {
   /** Expose the shared dependency-group directory for Agent Creator. This does
    * not expand the editor session's own fixed tool surface. */
   agentToolDependencyAuthoring?: boolean;
-  /** Project-scope skill allowlist applied ONLY to the System A render
-   *  block (`getSystemPromptBlock`). When present, the rendered allowlist
-   *  is `intersect(skillList, projectAllowedSkillIds)`; SkillStore (System
-   *  B, agent self-evolved skills) stays gated by `skillList` alone so
-   *  agents in projects retain access to their own evolved skills. See
-   *  `docs/architecture/skill-engineering-contract.md` and
-   *  `features/projects.ts::resolveProjectScope`. */
-  projectAllowedSkillIds?: readonly string[];
   /** User-explicit skill refs selected in the composer. These are rendered
    *  even when they live in open/global skill roots that are normally lazy. */
   forceOpenSkillRefs?: readonly SkillSelectionInput[];
@@ -340,11 +344,8 @@ export interface BuildRunnerParams {
    * `create_pdf` call or tracked bash output file. See `model/client.ts`
    * `ChatOptions.onFileWritten` for the caller-facing contract. */
   onFileWritten?: (absPath: string) => void | Promise<void>;
-  /** Turn owner validation hook for the `publish_outputs` tool. */
+  /** Turn owner resource-display filter for the `publish_outputs` tool. */
   onOutputsPublished?: (absPaths: string[]) => string[] | Promise<string[]>;
-  /** Existing current-turn paths eligible for publication after a rejected
-   * declaration. */
-  getPublishableOutputPaths?: () => string[];
   /** Caller-supplied predicate consumed by write-style tools' uniquify
    *  logic. See `model/client.ts` `ChatOptions.hasProducedPath`. */
   hasProducedPath?: (absPath: string) => boolean;
@@ -536,14 +537,10 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ? readDisabledSets(earlyUid).skills
     : new Set<string>();
 
-  // System A render allowlist = intersect(skillList, project bindings).
-  //   - no project scope (`projectAllowedSkillIds` undefined) → legacy
-  //     `skillList`-only behavior
-  //   - commander in a project (`skillList` undefined, project list set) →
-  //     project list governs the render block
-  //   - agent in a project (both set) → intersection
-  // SkillStore (System B) stays gated by `skillList` alone — see line ~429.
-  const renderAllowlist = _intersectRenderAllowlist(params.skillList, params.projectAllowedSkillIds);
+  // System A render allowlist. SkillStore (System B) is gated by `skillList`
+  // alone — see line ~429. Tier semantics live in
+  // `docs/architecture/skill-engineering-contract.md`; do not redefine them here.
+  const renderAllowlist = params.skillList;
   const skillDisplayNameById = new Map<string, string>();
   // Host-only logical paths for this runner. The registry fills this from the
   // exact filtered prompt render; every provider/tool round then reuses the
@@ -553,7 +550,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ? params.runtimeSkillBindings
     : new Map<string, SkillRuntimeBinding>();
   const systemSkillsVisible = systemSkillsExposureFromSessionId(params.sessionId);
-  const openSkillSourcesVisible = openSkillSourcesExposureFromSessionId(params.sessionId);
+  const skillSearchVisible = skillSearchExposureFromSessionId(params.sessionId);
   const skillBlocksPromise: Promise<[string, string]> = isReflectionSession
     ? Promise.resolve(['', ''])
     : (async (): Promise<[string, string]> => {
@@ -564,7 +561,6 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
             earlyUid || undefined,
             skillRuntimeBindings,
             params.systemSkillList,
-            params.projectId ? undefined : ['project-tasks'],
           )
         : '';
       const regularBlock = await getSystemPromptBlock({
@@ -577,7 +573,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         ...(params.onSkillAdvertised ? { onSkillAdvertised: params.onSkillAdvertised } : {}),
         displayNameById: skillDisplayNameById,
         runtimeBindings: skillRuntimeBindings,
-        ...(openSkillSourcesVisible ? { includeOpenSources: true } : {}),
+        ...(skillSearchVisible ? { includeSkillSearchHint: true } : {}),
         ...(params.forceOpenSkillRefs?.length ? { forceOpenSkillRefs: [...params.forceOpenSkillRefs] } : {}),
       });
       return [systemBlock, regularBlock];
@@ -615,18 +611,17 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     );
   }
 
-  // Build tools array: memory tool + metacognition tool. AgentRunner owns the
-  // final provider-definition snapshot after every source is assembled.
+  // Build the Host tools. Ordinary tasks may read persisted metacognition in
+  // their system prompt below, but only reflection receives its write tool.
+  // AgentRunner owns the final provider-definition snapshot after every
+  // source is assembled.
   const uid = params.userId || _safeActiveUserId();
   const agentId = params.agentId || '';
   // Cross-session memory eligibility + per-agent scope (null = not eligible →
   // no tool, no injection). See memoryScopeForSession for the per-kind rule.
   const memoryAgentScope = memoryScopeForSession(params.sessionId, agentId);
-  // The commander (the project's orchestrator conversation, `gconv`) owns the
-  // two project-wide stores: it may WRITE project instructions (ORKAS.md, via
-  // the `project_instructions` tool) and project memory. Dispatched sub-agents
-  // (gmember / gworker / cli) get read-only access to both. Derived from the
-  // immutable session id, so it can't drift mid-session.
+  // Commander and named Agents can mutate their current project's context.
+  // Anonymous workers retain their existing read-only project boundary.
   const isCommander = sessionKind === 'gconv';
   const isGroupAgent = sessionKind === 'gmember';
   const agentDisplayNameById = new Map<string, string>();
@@ -689,63 +684,78 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       list: (tier) => listEntries(uid, toScope(tier)),
     };
     const { createCrossSessionMemoryTool } = await import('../../../core-agent/src/tools/memory-tool');
-    // Project memory: commander read+write, sub-agents read-only (list only).
+    // Context writes do not widen the separate project-task permissions.
     injectedTools.push(createCrossSessionMemoryTool(memoryHandler, {
       includeProjectTier: !!projectScopeId,
-      projectTierReadOnly: !!projectScopeId && !isCommander,
+      projectTierReadOnly: !!projectScopeId && !isCommander && !isGroupAgent,
     }));
   }
 
-  // Project tasks: the project's shared, structured work backlog. Real work
-  // sessions in a project only (commander + agents) — gated like the memory
-  // project tier (`memoryAgentScope`), so edit / one-shot / reflection sessions
-  // never get it. Owner is a display NAME here (best-effort — the store
-  // validates a resolved id when the UI supplies one; the name is kept for
-  // display).
+  if (uid && (isCommander || (isGroupAgent && params.projectId))) {
+    const { createAutoTasksTool } = await import('../../features/auto_tasks_tool');
+    injectedTools.push(createAutoTasksTool({ userId: uid, cid: params.cid, projectId: params.projectId }));
+  }
+
+  // Project sessions keep their bound backlog. A non-project Commander may
+  // dynamically load the same tool with an account-scoped project selector;
+  // other actors never receive that selector. Owner is a display NAME; the store only
+  // VALIDATES an already-resolved id (project_tasks.ts: "name→id resolution
+  // lives with the caller"), so this handler resolves name → bound agent id
+  // before persisting — unknown owners fail closed with the valid set.
+  if (uid && memoryAgentScope && (params.projectId || isCommander)) {
+    const cid = params.cid || '';
+    const { createProjectTasksHandler: createBoundHandler } = await import('../../features/project_tasks_tool_handler');
+    const createProjectTasksHandler = (pid: string) => createBoundHandler(uid, pid, cid, agentDisplayNameById, { actorId: isCommander ? 'commander' : memoryAgentScope });
+    const { createProjectTasksTool } = await import('../../../core-agent/src/tools/project-tasks-tool');
+    if (params.projectId) {
+      injectedTools.push(createProjectTasksTool(createProjectTasksHandler(params.projectId), {
+        readOnly: !isCommander && !isGroupAgent,
+      }));
+    } else {
+      const { listProjectNameRows } = await import('../../features/projects');
+      // No project scan or schema data in the initial prompt. Resolve locally
+      // on demand, using this runner's uid even if the active account changes.
+      // `__global__` is a stable tool-only selector for account-global todos.
+      // Its backing store still uses the canonical empty project scope; the
+      // synthetic id merely lets an unbound Commander address it explicitly.
+      const globalTasks = { project_id: '__global__', name: 'Global' };
+      const listProjects = async () => [
+        globalTasks,
+        ...(await listProjectNameRows(uid))
+          .sort((a, b) => a.name.localeCompare(b.name) || a.project_id.localeCompare(b.project_id)),
+      ];
+      injectedTools.push(createProjectTasksTool({
+        listProjects,
+        async resolveProject(reference) {
+          const rows = await listProjects();
+          const exactId = rows.find((row) => row.project_id === reference);
+          const candidates = exactId ? [exactId] : rows.filter((row) => (
+            row.name.toLocaleLowerCase() === reference.toLocaleLowerCase()
+          ));
+          if (candidates.length !== 1) {
+            return {
+              ok: false,
+              error: candidates.length
+                ? 'project_ambiguous: ask the user to choose a project, then use its project_id'
+                : 'project_not_found: use list_projects to find an existing project in this account',
+              ...(candidates.length ? { candidates } : {}),
+            };
+          }
+          const project = candidates[0];
+          return {
+            ok: true,
+            project,
+            handler: createProjectTasksHandler(project.project_id === globalTasks.project_id ? '' : project.project_id),
+          };
+        },
+      }));
+    }
+  }
+
   if (uid && memoryAgentScope && params.projectId) {
     const pid = params.projectId;
-    const cid = params.cid || '';
-    const toView = (task: import('../../features/project_tasks').ProjectTask) => projectTasks.taskView(task);
-    const projectTasksHandler = {
-      list: async () => {
-        const tasks = await projectTasks.listTasks(uid, pid);
-        return { ok: true, tasks: tasks.map(toView), progress: projectTasks.computeProgress(tasks) };
-      },
-      create: async (input: { title: string; detail?: string; owner?: string; status?: projectTasks.TaskStatus }) => {
-        const r = await projectTasks.createTask(uid, pid, {
-          title: input.title,
-          ...(input.detail !== undefined ? { detail: input.detail } : {}),
-          ...(input.status !== undefined ? { status: input.status } : {}),
-          ...(input.owner ? { owner_agent: input.owner } : {}),
-          created_by: 'agent',
-          ...(cid ? { origin_cid: cid } : {}),
-        });
-        return r.ok
-          ? { ok: true, task: toView(r.task), alreadyExists: r.alreadyExists }
-          : { ok: false, error: (r as { error: string }).error };
-      },
-      update: async (taskId: string, patch: { title?: string; detail?: string; status?: projectTasks.TaskStatus; owner?: string; result_ref?: string }) => {
-        const r = await projectTasks.updateTask(uid, pid, taskId, {
-          ...(patch.title !== undefined ? { title: patch.title } : {}),
-          ...(patch.detail !== undefined ? { detail: patch.detail } : {}),
-          ...(patch.status !== undefined ? { status: patch.status } : {}),
-          ...(patch.owner !== undefined ? { owner_agent: patch.owner } : {}),
-          ...(patch.result_ref !== undefined ? { result_ref: patch.result_ref } : {}),
-        });
-        return r.ok ? { ok: true, task: toView(r.task) } : { ok: false, error: (r as { error: string }).error };
-      },
-      complete: async (taskId: string, resultRef?: string) => {
-        const r = await projectTasks.completeTask(uid, pid, taskId, resultRef);
-        return r.ok ? { ok: true, task: toView(r.task) } : { ok: false, error: (r as { error: string }).error };
-      },
-    };
-    const { createProjectTasksTool } = await import('../../../core-agent/src/tools/project-tasks-tool');
-    injectedTools.push(createProjectTasksTool(projectTasksHandler));
-
-    // Project instructions (ORKAS.md): the project's goal + rules. Commander
-    // writes; sub-agents read it from their system prompt but don't get this
-    // tool. Injected for the commander only, so there is no other write path.
-    if (isCommander) {
+    // Named project actors share the same conditional instructions writer.
+    if (isCommander || isGroupAgent) {
       const { createProjectInstructionsTool } = await import('../../../core-agent/src/tools/project-instructions-tool');
       const initialInstructions = await readProjectInstructions(uid, pid);
       let expectedInstructions = initialInstructions.ok ? initialInstructions.content : null;
@@ -772,9 +782,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     }
   }
 
-  // Metacognition tool (per-agent/account, only if enabled for the turn's
-  // owner). Never resolve this through the active-user singleton: a queued
-  // turn or background reflection may overlap an account switch.
+  // Reflection-only metacognition write tool. Never resolve this through the
+  // active-user singleton: a queued background reflection may overlap an
+  // account switch. Ordinary tasks still receive the read-only prompt block.
   if (
     uid
     && metacognitionAllowedForSession(params.sessionId, agentId)
@@ -812,6 +822,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...runtimeSkillReadRoots,
   ];
   const toolResultsDir = uid ? toolResultsDirForSession(uid, params.sessionId) : '';
+  const analysisInputsDir = uid ? sessionAnalysisInputsDir(uid, params.sessionId) : '';
   const deepResearchSnapshotFile = toolResultsDir
     ? deepResearchEvidenceFile(toolResultsDir)
     : '';
@@ -846,10 +857,10 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     // mutating platform/skill/agent specs that were exposed for inspection.
     ...(localReadOnlyDenyRoots.length ? { readOnlyExtraRoots: localReadOnlyDenyRoots } : {}),
     ...(params.runtimeReadOnlyRoots ? { runtimeReadOnlyRoots: params.runtimeReadOnlyRoots } : {}),
+    ...(analysisInputsDir ? { analysisInputRoots: [analysisInputsDir] } : {}),
     skillRuntimeBindings,
     ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
     ...(params.onOutputsPublished ? { onOutputsPublished: params.onOutputsPublished } : {}),
-    ...(params.getPublishableOutputPaths ? { getPublishableOutputPaths: params.getPublishableOutputPaths } : {}),
     ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
     ...(onArtifactCreatedForHistory ? { onArtifactCreated: onArtifactCreatedForHistory } : {}),
   });
@@ -859,9 +870,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // (e.g. ad-hoc test runs) since file-tools need it for cache scoping.
   // `readOnlyExtraRoots` is threaded here for the read scope (workspace +
   // attachment + extraRoots + readOnlyExtraRoots all visible). Local write
-  // and delete tools never receive those roots.
-  const fileTools = uid
-    ? createFileTools({
+  // and delete tools only receive those roots as deny-only guards above.
+  const fileToolOptions = uid
+    ? {
         userId: uid,
         includeOcrFile,
         visionFallbackAvailable,
@@ -881,13 +892,24 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         skillRuntimeBindings,
         ...(toolResultsDir ? { toolResultsRoot: toolResultsDir } : {}),
         ...(params.onSkillInvoked ? { onSkillInvoked: params.onSkillInvoked } : {}),
-      })
-    : [];
+        rawTextMaxBytes: mod.DEFAULT_RUN_PROGRAM_LIMITS.maxToolResultBytes,
+      }
+    : undefined;
+  const fileTools = fileToolOptions ? createFileTools(fileToolOptions) : [];
+  const programSourceLoader = fileToolOptions
+    ? createProgramSourceLoader(fileToolOptions)
+    : undefined;
 
   // Persisted oversized outputs have their own capability boundary. The model
-  // receives opaque refs and can only search or read bounded cursor chunks;
-  // generic read_file is explicitly denied for this root below.
-  const toolResultTools = toolResultsDir ? createToolResultTools({ toolResultsDir }) : [];
+  // receives opaque refs and can search/read bounded chunks or materialize a
+  // session-local working copy for bash/code analysis. The original store
+  // stays denied to generic file reads; only bash is granted the working-copy
+  // root in workspace-only mode.
+  const toolResultTools = toolResultsDir ? createToolResultTools({
+    toolResultsDir,
+    materializeDir: analysisInputsDir,
+    isProgrammaticToolCallContext: mod.isProgrammaticToolCallContext,
+  }) : [];
 
   // Library tool (list/search/read actions). Read-only, no localExec
   // required. Injected for every main conv + group_chat actor; agent-edit
@@ -995,6 +1017,11 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
       })]
     : [];
+
+  const deepResearchTools: AgentTool[] = [];
+  if (toolResultsDir && isToolVisibleToAgent('research_verify_citations', agentId)) {
+    deepResearchTools.push(createResearchVerifyTool({ toolResultsDir }));
+  }
 
   // Office document tools (bundled OfficeCLI engine). Permission-gated like
   // local-tools (writing a docx/xlsx/pptx is the same blast radius as
@@ -1112,6 +1139,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...speechGenTools,
     ...videoStudioTools,
     ...imageStudioTools,
+    ...deepResearchTools,
     ...officeTools,
     ...pdfTools,
     ...searchOverrideTools,
@@ -1133,6 +1161,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const isAgentToolAuthoringSession = isAgentEditSession
     && params.agentToolDependencyAuthoring === true;
   const isNamedAgentRuntime = sessionKind === 'gmember';
+  const programmaticToolPolicy = programmaticExecutionExposureFromSessionId(params.sessionId)
+    ? createProgrammaticToolPolicy({ ...(uid ? { userId: uid } : {}) })
+    : undefined;
   const dynamicToolLoading = isCommander || isNamedAgentRuntime;
   const dynamicLoadPolicy = isNamedAgentRuntime
     ? 'agent-dependency' as const
@@ -1140,9 +1171,10 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const availableToolNames = Array.from(new Set([
     ...builtinTools.map((tool) => tool.name),
     ...visibleTools.map((tool) => tool.name),
-    'manage_execution_plan',
+    ...(EXPOSE_EXECUTION_PLAN_TOOL ? ['manage_execution_plan'] : []),
     ...evolutionToolNames,
     ...(dynamicToolLoading ? ['tool_load'] : []),
+    ...(programmaticToolPolicy ? ['run_program'] : []),
   ]));
   // Reflection is a fixed utility surface. Its independent prompt never uses
   // ordinary Host Skills or general task tools: named Agents may update their
@@ -1196,7 +1228,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const hostPreloadGroups = sessionKind === 'gworker'
     ? ['workspace', 'web', 'library']
     : isCommander
-      ? ['workspace.read', 'web']
+      ? ['workspace.read', 'workspace.execute.command', 'web']
     : isAgentEditSession
       // Agent editor may inspect installed Connector action schemas while
       // authoring dependencies, but discover mode still withholds calls.
@@ -1217,11 +1249,21 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       : [
           'read_files',
           'tool_result',
+          ...(programmaticToolPolicy ? ['run_program'] : []),
+          // Skill discovery is a small read-only catalog surface for task
+          // runtimes. Package import and other management mutations remain
+          // dormant and Commander-only.
+          ...((isCommander || isNamedAgentRuntime) && availableToolNames.includes('skill_search')
+            ? ['skill_search']
+            : []),
           // App navigation is the one resident Commander support affordance:
           // it is broadly useful, closed-set, and remains side-effect-free
-          // until the user clicks the staged card. Skill discovery and app
-          // diagnosis stay behind their focused Management child groups.
+          // until the user clicks the staged card. App diagnosis stays behind
+          // its focused Management child group.
           ...(isCommander && availableToolNames.includes('open_app_view') ? ['open_app_view'] : []),
+          // Preserve the existing project-bound backlog surface. Only the
+          // non-project Commander selector is deferred under Management.
+          ...(params.projectId ? ['todo_tasks', ...((isCommander || isGroupAgent) ? ['auto_tasks'] : [])] : []),
           ...(params.onOutputsPublished ? ['publish_outputs'] : []),
         ],
     restoredState: session.getToolSurfaceState(),
@@ -1288,8 +1330,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
 
   // Source attribution for the final AgentRunner-owned definition snapshot.
   // Do not construct definitions here: AgentRunner still has to add late core
-  // tools (manage_execution_plan and, when evolution is enabled,
-  // skill_manage), and dormant schemas must stay unmaterialized.
+  // tools (currently skill_manage when evolution is enabled), and dormant
+  // schemas must stay unmaterialized. The retained Plan implementation is
+  // deliberately disabled at AgentRunner construction below.
   const extraToolNameSet = new Set((params.extraTools ?? []).map((t) => t.name));
   const toolSourceByName = new Map<string, ToolDefSnapshot['source']>();
   for (const t of builtinTools) {
@@ -1305,44 +1348,29 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   }
 
   // Finalize system prompt. Cache-friendly order:
-  //   [base prompt] → [connectors] → [system skills] → [skills]
+  //   [base prompt] → [tool groups] → [connectors] → [system skills] → [skills]
   //   → [agents] → [runtime injection] → [memory]
-  //   → [response language] → [orchestration state]
-  //   → [volatile datetime tail].
+  //   → [response language]. Conditional orchestration instructions/state and
+  //   the datetime tail ride the current turn instead.
   // Everything from [runtime injection] onward is the turn-volatile region;
   // the stable prefix above it is what the provider prompt-cache reuses.
-  // Tool list is no longer in the prompt (see toolsBlock removal note above)
-  // because the SDK tool-use protocol delivers it via a separate API field.
   const parts: string[] = [];
   const { stable: stableSystemPrompt, volatileTail } = splitVolatilePromptTail(params.systemPrompt);
   const { stable: stableWithoutAgents, agentsBlock } = splitCommanderAgentsBlock(stableSystemPrompt);
   const { stable: stableWithoutLanguage, languageDirectiveBlock } = splitLanguageDirectiveBlock(stableWithoutAgents);
   const { stable: stableWithoutRuntime, runtimeInjectionBlock } = splitRuntimeInjectionBlock(stableWithoutLanguage);
-  // Orchestration state carries the per-turn `orchestration_ledger` JSON; it
-  // must leave the cached prefix or it invalidates the whole prefix after it
-  // every commander turn a ledger is live. Peel it here and re-emit it in the
-  // volatile region below.
+  // Orchestration rules exist only with a live ledger. Peel that whole
+  // conditional block out with its per-turn JSON and re-emit it below.
   const { stable: stableWithoutOrchestration, orchestrationBlock } = splitCommanderOrchestrationBlock(stableWithoutRuntime);
   if (stableWithoutOrchestration) parts.push(stableWithoutOrchestration);
-  // Commander and named Agents receive a compact runtime directory. Named
-  // Agents treat it as a lower-priority, current-turn fallback after their
-  // authored baseline. Commander gets its exact Agent dependency directory on
-  // demand with agent-creator. Dedicated Agent editors receive that authoring
-  // directory directly without expanding their own fixed tool surface.
-  const toolGroupsPurpose = isAgentToolAuthoringSession
-    ? 'agent-authoring'
-    : toolSurface.mode === 'scoped' && toolSurface.dynamicLoading
-      ? (isNamedAgentRuntime ? 'agent-runtime' : 'runtime')
-      : null;
-  const toolGroupsBlock = toolGroupsPurpose
+  // Commander receives authoring dependencies on demand with agent-creator.
+  // A dedicated Agent editor sees them without widening its fixed surface.
+  const toolGroupsBlock = isAgentToolAuthoringSession || toolSurface.dynamicLoading
     ? getLoadableToolGroupsSystemPromptBlock({
-        availableToolNames: toolGroupsPurpose === 'agent-authoring'
-          ? availableToolNames
-          : dynamicLoadableToolNames,
-        purpose: toolGroupsPurpose,
-        ...(toolGroupsPurpose !== 'agent-authoring'
-          ? { allowedGroupIds: toolSurface.loadableGroups() }
-          : {}),
+        availableToolNames: isAgentToolAuthoringSession ? availableToolNames : dynamicLoadableToolNames,
+        initialActiveToolNames: toolSurface.activeToolNames(),
+        ...(isAgentToolAuthoringSession ? {} : { allowedGroupIds: toolSurface.loadableGroups() }),
+        purpose: isAgentToolAuthoringSession ? 'agent-authoring' : isCommander ? 'runtime' : 'agent-runtime',
       })
     : '';
   if (toolGroupsBlock) parts.push(toolGroupsBlock);
@@ -1390,29 +1418,31 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // English, but their source language must not become the reply language.
   if (languageDirectiveBlock) parts.push(languageDirectiveBlock);
   const resolvedSystemPrompt = parts.join('\n\n');
-  // P2: the truly per-turn-volatile blocks — the orchestration ledger (~7-9K
-  // JSON that changes every commander turn) and the datetime tail — do NOT go
-  // into the system prompt. Even peeled to the tail they bust the
+  // P2: the truly per-turn-volatile blocks — conditional orchestration rules,
+  // the ledger JSON, and the datetime tail — do NOT go into the system prompt.
+  // Even peeled to the tail they bust the
   // Anthropic single-block system cache (and therefore the whole history
   // prefix) every turn. Instead they ride on THIS turn's user message
   // (core-agent AgentRunParams.turnEphemeral → getMessagesForModel), the
   // uncached tail after all history, so the system + history cache prefix stays
   // byte-stable across turns. See Common/docs/plans/context-cost-optimization.md.
-  // Live project task board (project sessions only). Rides the turn — NOT the
-  // cached system prefix — because it changes as tasks update. The goal/rules
-  // stay in ORKAS.md (prefix) and decisions in the memory block; this is the
-  // task layer. See features/project_tasks.ts::formatProjectStatusForTurn.
-  const projectStatusBlock = (uid && memoryAgentScope && params.projectId)
-    ? await projectTasks.formatProjectStatusForTurn(uid, params.projectId)
+  // Conversation task board (plan D8/P3): commander turns only, and only
+  // while live rows exist — the block changes with every admission/terminal,
+  // so it rides the uncached turn tail, and the
+  // lightweight chat path (empty board) pays nothing.
+  const conversationBoardBlock = (uid && params.cid && sessionKind === 'gconv')
+    ? await conversationTaskBoard.formatConversationBoardForTurn(uid, params.cid).catch(() => '')
     : '';
-  const activeToolGroupsBlock = toolSurface.mode === 'scoped' && toolSurface.dynamicLoading
-    ? getActiveToolGroupsTurnBlock(toolSurface.loadedGroups())
+  // Feature-owned historical target and on-demand guidance; no tool grant,
+  // dialogue write, or configuration status is inferred from this association.
+  const connectorSetupBlock = (uid && params.cid && sessionKind === 'gconv')
+    ? await (await import('../../features/connector_setup_context')).formatConnectorSetupForTurn(uid, params.cid)
     : '';
   const turnEphemeral = [
     orchestrationBlock,
     volatileTail,
-    projectStatusBlock,
-    activeToolGroupsBlock,
+    conversationBoardBlock,
+    connectorSetupBlock,
   ]
     .filter((b) => b && b.trim())
     .join('\n\n');
@@ -1544,7 +1574,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
             ? {
                 // Makes the E_TOOL_NOT_LOADED refusal name the exact group(s)
                 // Commander can load instead of making it guess.
-                toolLoadGroups: (name: string) => getToolCatalogEntry(name)?.loadGroups,
+                toolLoadGroups: (name: string) => toolSurface.loadableGroupsForTool(name),
               }
             : {}),
         }
@@ -1555,6 +1585,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     // actors additionally drop dormant executors as before.
     disabledToolNames: [
       'read_file',
+      ...(!EXPOSE_EXECUTION_PLAN_TOOL ? ['manage_execution_plan'] : []),
       ...(toolSurface.mode === 'scoped' && !toolSurface.dynamicLoading
         ? availableToolNames.filter((name) => (
             !toolSurface.isActive(name) && !runtimeGrantableToolNames.has(name)
@@ -1562,6 +1593,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         : []),
     ],
     ...(transformToolResult ? { transformToolResult } : {}),
+    ...(programmaticToolPolicy ? { programmaticToolPolicy } : {}),
+    ...(programSourceLoader ? { programSourceLoader } : {}),
     ...(toolResultsDir ? {
       toolContextState: {
         toolResultSpoolDir: toolResultsDir,
@@ -1616,7 +1649,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       loadedUnusedGroupCount: stats.newlyLoadedGroups.filter((group) => (
         !toolNamesForGroups([group]).some((name) => used.has(name))
       )).length,
-      webToolUsed: used.has('web_search') || used.has('web_fetch'),
+      webToolUsed: used.has('web_search') || used.has('web_fetch') || used.has('browser'),
     };
   };
 
@@ -1675,6 +1708,13 @@ export function connectorExposureFromSessionId(sessionId: string): 'tools+block'
   return 'none';
 }
 
+/** Programmatic execution is a task-runtime capability, not an authoring or
+ * auxiliary-model capability. Its child calls remain constrained to the
+ * current actor's active tool surface. */
+export function programmaticExecutionExposureFromSessionId(sessionId: string): boolean {
+  return /^(gconv|gmember|gworker)-/.test(sessionId);
+}
+
 /** System skills are authoring/orchestration affordances, not worker context.
  *  Keep them visible to the group-chat commander, agent editor, and skill editor only; ordinary
  *  agent workers receive the normal user skill surface, not authoring protocols. */
@@ -1682,14 +1722,10 @@ export function systemSkillsExposureFromSessionId(sessionId: string): boolean {
   return /^gconv-/.test(sessionId) || /^agent-/.test(sessionId) || /^skill-/.test(sessionId);
 }
 
-/** OPEN-tier skills (external packages + global roots) render only for
- *  Commander task sessions. Agent editors author dependencies for runtime
- *  Agents, whose contract is trusted/private Skills only, so showing OPEN
- *  sources there would offer dependencies the finished Agent cannot load.
- *  User-explicit picker selections remain handled separately through
- *  `forceOpenSkillRefs`. */
-export function openSkillSourcesExposureFromSessionId(sessionId: string): boolean {
-  return /^gconv-/.test(sessionId);
+/** Task runtimes can discover shared non-System, non-private Skills lazily.
+ * Authoring sessions and anonymous workers retain their narrower surfaces. */
+export function skillSearchExposureFromSessionId(sessionId: string): boolean {
+  return /^(gconv|gmember)-/.test(sessionId);
 }
 
 /**
@@ -1765,6 +1801,7 @@ async function buildRotatingProvider(
       : resolvedModel?.model;
     const candidateMaxTokens = candidateModel?.maxTokens;
     const maxInputImages = modelInputImageLimit(candProviderId, candModelId, candidateModel);
+    let currentApiKey = choice.apiKey;
     return {
       profileId: choice.profileId,
       cooldownId: choice.profileId,
@@ -1791,7 +1828,7 @@ async function buildRotatingProvider(
         return mod.createPiProvider({
           provider: candProviderId,
           ...(resolvedModel?.needsCustomModel ? { customModel: resolvedModel.model } : { model: candModelId }),
-          apiKey: choice.apiKey,
+          apiKey: currentApiKey,
           onPayload: buildNativeSearchOnPayload(candProviderId, candModelId, onNativeSearchInjected),
         });
       },

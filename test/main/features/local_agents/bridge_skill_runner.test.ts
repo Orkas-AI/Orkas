@@ -223,16 +223,15 @@ describe('CLI bridge Skill runner', () => {
       const child = spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], {
         stdio: ['ignore', 'inherit', 'inherit'],
       });
-      const marker = path.join(process.env.ORKAS_RUN_SKILL_DIR, 'timeout-pids.json');
-      fs.writeFileSync(marker + '.tmp', JSON.stringify({ parent: process.pid, child: child.pid }));
-      fs.renameSync(marker + '.tmp', marker);
+      fs.writeFileSync(
+        path.join(process.env.ORKAS_RUN_SKILL_DIR, 'timeout-pids.json'),
+        JSON.stringify({ parent: process.pid, child: child.pid }),
+      );
       process.stdout.write('started');
       setInterval(() => {}, 1000);
     `;
     const runner = fixture(source, {
-      // Electron-as-Node plus the grandchild must finish starting before the
-      // timeout can exercise a TERM-resistant process tree on a loaded host.
-      timeoutMs: 2000,
+      timeoutMs: 500,
       previewBytes: 100,
       hardOutputBytes: 4096,
       killGraceMs: 60,
@@ -256,7 +255,7 @@ describe('CLI bridge Skill runner', () => {
       expect(result.status).toBe('timed_out');
       expect(result.timedOut).toBe(true);
       expect(result.stdout.text).toContain('started');
-      expect(Date.now() - startedAt).toBeLessThan(4000);
+      expect(Date.now() - startedAt).toBeLessThan(2500);
       await waitFor(() => processTree !== null
         && !processIsAlive(processTree.parent)
         && !processIsAlive(processTree.child));
@@ -271,6 +270,61 @@ describe('CLI bridge Skill runner', () => {
     }
   });
 
+  it.skipIf(process.platform === 'win32').each(['timeout', 'output_limit'] as const)(
+    'terminates quiet descendants after the parent exits during %s cleanup',
+    async (trigger) => {
+      const grandchild = "process.on('SIGTERM', () => {}); process.send('ready'); setInterval(() => {}, 1000);";
+      const source = `
+        const fs = require('node:fs');
+        const path = require('node:path');
+        const { spawn } = require('node:child_process');
+        const child = spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], {
+          stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+        });
+        child.once('message', () => {
+          fs.writeFileSync(
+            path.join(process.env.ORKAS_RUN_SKILL_DIR, 'quiet-pids.json'),
+            JSON.stringify({ parent: process.pid, child: child.pid }),
+          );
+          process.stdout.write(${JSON.stringify(trigger === 'output_limit' ? 'x'.repeat(2048) : 'ready')});
+        });
+        setInterval(() => {}, 1000);
+      `;
+      const runner = fixture(source, {
+        timeoutMs: trigger === 'timeout' ? 1000 : 5000,
+        previewBytes: 100,
+        hardOutputBytes: 1024,
+        killGraceMs: 60,
+        settleMs: 150,
+      });
+      const marker = path.join(tempDirs[0], 'quiet-pids.json');
+      let processTree: { parent: number; child: number } | undefined;
+
+      try {
+        const result = await runner.run({
+          skillRef: 'demo',
+          scriptBase: 'run',
+          skillDir: tempDirs[0],
+        });
+        processTree = JSON.parse(fs.readFileSync(marker, 'utf8'));
+        expect(result.status).toBe(trigger === 'timeout' ? 'timed_out' : 'output_limit');
+        await waitFor(() => processTree !== undefined
+          && !processIsAlive(processTree.parent)
+          && !processIsAlive(processTree.child), 500);
+      } finally {
+        await runner.shutdown();
+        if (!processTree && fs.existsSync(marker)) processTree = JSON.parse(fs.readFileSync(marker, 'utf8'));
+        if (processTree) {
+          for (const pid of [processTree.parent, processTree.child]) {
+            if (processIsAlive(pid)) {
+              try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }
+            }
+          }
+        }
+      }
+    },
+  );
+
   it('kills every active Skill process tree when shutdown is repeated', async () => {
     const grandchild = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
     const source = `
@@ -281,9 +335,10 @@ describe('CLI bridge Skill runner', () => {
       const child = spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], {
         stdio: 'ignore',
       });
-      const marker = path.join(process.env.ORKAS_RUN_SKILL_DIR, 'active-pids-' + label + '.json');
-      fs.writeFileSync(marker + '.tmp', JSON.stringify({ parent: process.pid, child: child.pid }));
-      fs.renameSync(marker + '.tmp', marker);
+      fs.writeFileSync(
+        path.join(process.env.ORKAS_RUN_SKILL_DIR, 'active-pids-' + label + '.json'),
+        JSON.stringify({ parent: process.pid, child: child.pid }),
+      );
       process.on('SIGTERM', () => {});
       setInterval(() => {}, 1000);
     `;

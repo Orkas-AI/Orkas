@@ -97,16 +97,12 @@ export function deleteFile(uid: string, relPath: string): Promise<boolean> {
 
 // ── Search / read ──────────────────────────────────────────────────────
 
-export function search(uid: string, queryVec: number[] | Float32Array, opts: KbSearchOpts = {}): KbSearchHit[] {
-  return hasStore(uid) ? storeForUid(uid).search(queryVec, opts) : [];
-}
-
 /** Query an already-built Library index without creating an empty vector
  * store. Interactive global search calls this on every settled query, so a
  * user with no Library must stay a read-only no-op. Index creation and source
  * reconciliation remain owned by the Library indexing lifecycle. */
-export function searchExisting(uid: string, queryVec: number[] | Float32Array, opts: KbSearchOpts = {}): KbSearchHit[] {
-  return search(uid, queryVec, opts);
+export function search(uid: string, queryVec: number[] | Float32Array, opts: KbSearchOpts = {}): KbSearchHit[] {
+  return hasStore(uid) ? storeForUid(uid).search(queryVec, opts) : [];
 }
 
 export function readFileChunks(uid: string, relPath: string): Array<{ chunk_idx: number; title: string | null; content: string }> {

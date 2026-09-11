@@ -193,6 +193,46 @@ class OpportunityTest(unittest.TestCase):
             build_opportunities({"data": {}})
 
 
+class PageDimensionRowTest(unittest.TestCase):
+    """Page-dimension console rows (keys = [page URL]) must not be misread as
+    queries: a URL can never seed a query-typed opportunity."""
+
+    def test_page_row_yields_no_query_opportunity(self):
+        gsc_pages = {"rows": [{"keys": ["https://orkas.ai/landing"],
+                               "clicks": 10, "impressions": 800, "position": 11.2}]}
+        got = build_opportunities(CRAWL, gsc_pages=gsc_pages)
+        self.assertFalse(any(o["source"] == "gsc" for o in got["opportunities"]))
+        self.assertFalse(any(o["query"].lower().startswith(("http://", "https://", "//"))
+                             for o in got["opportunities"]))
+
+    def test_uppercase_and_scheme_relative_page_keys_skipped(self):
+        gsc_pages = {"rows": [
+            {"keys": ["HTTPS://ORKAS.AI/X"], "clicks": 5, "impressions": 500, "position": 10},
+            {"keys": ["//orkas.ai/y"], "clicks": 5, "impressions": 500, "position": 10},
+        ]}
+        got = build_opportunities(CRAWL, gsc_pages=gsc_pages)
+        self.assertFalse(any(o["source"] == "gsc" for o in got["opportunities"]))
+
+    def test_genuine_query_row_next_to_page_row_still_generates(self):
+        gsc = {"rows": [{"keys": ["open source ai assistant"], "clicks": 10,
+                         "impressions": 800, "position": 11.2}]}
+        gsc_pages = {"rows": [{"keys": ["https://orkas.ai/landing"], "clicks": 10,
+                               "impressions": 800, "position": 11.2}]}
+        got = build_opportunities(CRAWL, gsc=gsc, gsc_pages=gsc_pages)
+        gsc_opps = [o for o in got["opportunities"] if o["source"] == "gsc"]
+        self.assertEqual(len(gsc_opps), 1)
+        self.assertEqual(gsc_opps[0]["query"], "open source ai assistant")
+        self.assertEqual(gsc_opps[0]["type"], "quick_win")
+
+    def test_query_containing_https_still_treated_as_query(self):
+        # Look-alike guard: mentioning a scheme is not being a URL.
+        gsc = {"rows": [{"keys": ["what is https"], "clicks": 10,
+                         "impressions": 800, "position": 11.2}]}
+        got = build_opportunities(CRAWL, gsc=gsc)
+        self.assertTrue(any(o["query"] == "what is https" and o["type"] == "quick_win"
+                            for o in got["opportunities"]))
+
+
 class ScoringHelperTest(unittest.TestCase):
     def test_scoring_helper_boundaries(self):
         traffic_inputs = (1000, 999, 300, 299, 100, 99, 30, 29, 0)

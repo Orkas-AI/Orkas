@@ -34,7 +34,7 @@ import {
   type Semver,
   type VersionProbeResult,
 } from './version.js';
-import * as fs from 'node:fs/promises';
+import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -50,6 +50,10 @@ export type LocalCliResumeStrategy = 'native' | 'session-id' | 'none';
 export type LocalCliInstructionChannel = 'native' | 'user-message';
 export type LocalCliDurableInstructionScope = 'invocation' | 'session';
 export type LocalCliActiveRunIngress = 'codex-app-server' | 'stream-json' | 'none';
+/** Per-Agent override of the external CLI's own permission posture. Missing
+ * runtime state maps to `inherit`, so a newly created Agent follows the CLI's
+ * native default instead of Orkas' separate local-operation setting. */
+export type LocalCliPermissionPolicy = 'inherit' | 'ask' | 'full_access';
 
 export interface LocalCliCapabilities {
   resume: LocalCliResumeStrategy;
@@ -65,10 +69,16 @@ export interface LocalCliCapabilities {
   codingProjectDirectory: boolean;
   /** Whether the runner can attach the per-run Orkas MCP bridge. */
   orkasBridge: boolean;
+  /** Whether this backend may read and update the calling Agent's durable
+   * memory. Keep this independent from the wider bridge capability: adding a
+   * bridge transport must not implicitly opt a backend into Agent memory. */
+  agentMemory: boolean;
   /** Transport contract for accepting another user message before the current
    * native CLI process/turn finishes. This is a framework capability, not a
    * model allowlist. */
   activeRunIngress: LocalCliActiveRunIngress;
+  /** Policies the adapter can apply without rewriting global CLI config. */
+  permissionPolicies: readonly LocalCliPermissionPolicy[];
 }
 
 /** Canonical CLI inventory and context/session contract. */
@@ -79,7 +89,9 @@ export const LOCAL_CLI_CAPABILITIES = {
     durableInstructionScope: 'invocation',
     codingProjectDirectory: true,
     orkasBridge: true,
+    agentMemory: true,
     activeRunIngress: 'stream-json',
+    permissionPolicies: ['inherit', 'ask', 'full_access'],
   },
   codex: {
     resume: 'native',
@@ -87,7 +99,9 @@ export const LOCAL_CLI_CAPABILITIES = {
     durableInstructionScope: 'session',
     codingProjectDirectory: true,
     orkasBridge: true,
+    agentMemory: true,
     activeRunIngress: 'codex-app-server',
+    permissionPolicies: ['inherit', 'ask', 'full_access'],
   },
   openclaw: {
     resume: 'session-id',
@@ -95,15 +109,22 @@ export const LOCAL_CLI_CAPABILITIES = {
     durableInstructionScope: 'session',
     codingProjectDirectory: false,
     orkasBridge: false,
+    agentMemory: false,
     activeRunIngress: 'none',
+    permissionPolicies: ['inherit'],
   },
   opencode: {
     resume: 'native',
     instructionChannel: 'user-message',
     durableInstructionScope: 'session',
     codingProjectDirectory: true,
-    orkasBridge: false,
+    orkasBridge: true,
+    agentMemory: false,
     activeRunIngress: 'none',
+    // OpenCode's one-shot run transport has no interactive approval return
+    // channel. Run it in its supported automatic mode and do not expose a
+    // selector that suggests Orkas can pause and answer a native prompt.
+    permissionPolicies: ['full_access'],
   },
   hermes: {
     resume: 'none',
@@ -111,7 +132,9 @@ export const LOCAL_CLI_CAPABILITIES = {
     durableInstructionScope: 'invocation',
     codingProjectDirectory: false,
     orkasBridge: false,
+    agentMemory: false,
     activeRunIngress: 'none',
+    permissionPolicies: ['inherit', 'ask', 'full_access'],
   },
 } as const satisfies Record<string, LocalCliCapabilities>;
 
@@ -128,7 +151,9 @@ const UNKNOWN_CLI_CAPABILITIES: Readonly<LocalCliCapabilities> = Object.freeze({
   durableInstructionScope: 'invocation',
   codingProjectDirectory: false,
   orkasBridge: false,
+  agentMemory: false,
   activeRunIngress: 'none',
+  permissionPolicies: ['inherit'] as const,
 });
 
 export function localCliCapabilities(cli: string | undefined): Readonly<LocalCliCapabilities> {
@@ -136,6 +161,34 @@ export function localCliCapabilities(cli: string | undefined): Readonly<LocalCli
     return LOCAL_CLI_CAPABILITIES[cli as LocalCliType];
   }
   return UNKNOWN_CLI_CAPABILITIES;
+}
+
+export function localCliSupportsAgentMemory(cli: string | undefined): boolean {
+  return localCliCapabilities(cli).agentMemory;
+}
+
+export function localCliPermissionPolicies(
+  cli: string | undefined,
+): readonly LocalCliPermissionPolicy[] {
+  return localCliCapabilities(cli).permissionPolicies;
+}
+
+/** Effective policy when an Agent has no persisted override. Most CLIs
+ * inherit their own defaults; a fixed-policy adapter publishes its sole
+ * supported policy instead. */
+export function localCliDefaultPermissionPolicy(
+  cli: string | undefined,
+): LocalCliPermissionPolicy {
+  const policies = localCliPermissionPolicies(cli);
+  return policies.includes('inherit') ? 'inherit' : policies[0] || 'inherit';
+}
+
+export function localCliSupportsPermissionPolicy(
+  cli: string | undefined,
+  policy: unknown,
+): policy is LocalCliPermissionPolicy {
+  return typeof policy === 'string'
+    && localCliPermissionPolicies(cli).includes(policy as LocalCliPermissionPolicy);
 }
 
 export function localCliResumeStrategy(cli: string | undefined): LocalCliResumeStrategy {
@@ -223,13 +276,13 @@ export function localCliSearchDirs(
 
 async function detectCodexPackageVersion(binPath: string): Promise<string | null> {
   let dir: string;
-  try { dir = path.dirname(await fs.realpath(binPath)); }
+  try { dir = path.dirname(await fs.promises.realpath(binPath)); }
   catch { dir = path.dirname(binPath); }
 
   for (let i = 0; i < 6; i += 1) {
     const pkgPath = path.join(dir, 'package.json');
     try {
-      const pkg = JSON.parse(await fs.readFile(pkgPath, 'utf8'));
+      const pkg = JSON.parse(await fs.promises.readFile(pkgPath, 'utf8'));
       if (pkg?.name === '@openai/codex' && typeof pkg.version === 'string') {
         const sv = parseSemver(pkg.version);
         if (sv) return `${sv.major}.${sv.minor}.${sv.patch}`;
@@ -251,6 +304,9 @@ export type LocalCliEntry = {
   path: string | null;
   /** Parsed `MAJOR.MINOR.PATCH` from the CLI's version probe, or null. */
   version: string | null;
+  /** Full reported semantic version when it carries a prerelease suffix. */
+  fullVersion?: string;
+  prerelease?: true;
   /** True when selectable. For normal results the version check passed;
    * path-only `validation:'pending'` results are provisionally selectable. */
   available: boolean;
@@ -277,9 +333,85 @@ export interface DetectLocalCliOptions {
   versionProbeTimeoutMs?: number;
 }
 
-let cache: LocalCliEntry[] | null = null;
-let detectionInFlight: Promise<LocalCliEntry[]> | null = null;
-let cacheGeneration = 0;
+type CachedCliEntry = {
+  entry: LocalCliEntry;
+  path: string | null;
+  mtimeMs?: number;
+  size?: number;
+};
+
+/** One cache and one in-flight probe per CLI. Startup warmup, UI discovery,
+ * runtime options and dispatch all converge here, so a foreground call can
+ * join an idle probe instead of launching a second `--version` child. */
+const entryCache = new Map<LocalCliType, CachedCliEntry>();
+const probeInFlight = new Map<LocalCliType, Promise<LocalCliEntry>>();
+const cacheGeneration = new Map<LocalCliType, number>();
+let detectAllInFlight: Promise<LocalCliEntry[]> | null = null;
+
+/** The most recent validated inventory for each CLI. Pools are source-neutral:
+ * PATH, standalone installs and bundled app binaries are ranked together.
+ * Runtime health is keyed by exact binary identity, so upgrades automatically
+ * get a fresh chance without clearing unrelated candidates. */
+const candidatePools = new Map<LocalCliType, LocalCliEntry[]>();
+const lastKnownGoodKeys = new Map<LocalCliType, string>();
+const unhealthyCandidateKeys = new Set<string>();
+
+function candidateKey(entry: Pick<LocalCliEntry, 'type' | 'path' | 'version' | 'fullVersion'>): string {
+  return `${entry.type}\u0000${entry.path || ''}\u0000${entry.fullVersion || entry.version || ''}`;
+}
+
+function orderCandidates(type: LocalCliType, entries: LocalCliEntry[]): LocalCliEntry[] {
+  const ranked = [...entries].sort((a, b) => {
+    // A validated stable build is preferred over a numerically newer alpha or
+    // beta. Installation source is deliberately not part of the ranking.
+    if (!!a.prerelease !== !!b.prerelease) return a.prerelease ? 1 : -1;
+    const aa = a.version ? parseSemver(a.version) : null;
+    const bb = b.version ? parseSemver(b.version) : null;
+    return aa && bb ? compareSemver(bb, aa) : 0;
+  });
+  const healthy = ranked.filter(entry => !unhealthyCandidateKeys.has(candidateKey(entry)));
+  const selectable = healthy.length ? healthy : ranked;
+  const lastGoodKey = lastKnownGoodKeys.get(type) || '';
+  const lastGoodIndex = selectable.findIndex(entry => candidateKey(entry) === lastGoodKey);
+  if (lastGoodIndex > 0) selectable.unshift(...selectable.splice(lastGoodIndex, 1));
+  return selectable;
+}
+
+/** Return a previously probed fallback without running another version scan. */
+export function cachedCliFallbackCandidate(current: LocalCliEntry): LocalCliEntry | null {
+  const currentKey = candidateKey(current);
+  return orderCandidates(current.type, candidatePools.get(current.type) || [])
+    .find(entry => candidateKey(entry) !== currentKey
+      && !unhealthyCandidateKeys.has(candidateKey(entry))) || null;
+}
+
+/** Runtime health only affects this exact binary version for this app process. */
+export function noteCliCandidateFailure(entry: LocalCliEntry): void {
+  const key = candidateKey(entry);
+  if (!entry.path || !entry.version) return;
+  unhealthyCandidateKeys.add(key);
+  if (lastKnownGoodKeys.get(entry.type) === key) lastKnownGoodKeys.delete(entry.type);
+  if (entryCache.get(entry.type)?.entry
+      && candidateKey(entryCache.get(entry.type)!.entry) === key) {
+    entryCache.delete(entry.type);
+  }
+}
+
+export function noteCliCandidateSuccess(entry: LocalCliEntry): void {
+  const key = candidateKey(entry);
+  if (!entry.path || !entry.version) return;
+  unhealthyCandidateKeys.delete(key);
+  lastKnownGoodKeys.set(entry.type, key);
+  try {
+    const stat = fs.statSync(entry.path);
+    entryCache.set(entry.type, {
+      entry,
+      path: entry.path,
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+    });
+  } catch { /* successful process already proves the candidate; next call re-probes if it vanished */ }
+}
 
 /**
  * Find installed CLI executables without running them. This is intentionally
@@ -299,9 +431,9 @@ async function findInstalled(type: LocalCliType): Promise<LocalCliEntry> {
   const envPath = process.env[ENV_KEYS[type]]?.trim();
   const candidate = envPath && envPath.length > 0 ? envPath : BIN_NAMES[type];
   const extraDirs = envPath ? [] : localCliSearchDirs(type);
-  const resolved = type === 'codex' && !envPath
-    ? (await whichBins(candidate, { extraDirs }))[0] ?? null
-    : await whichBin(candidate, { extraDirs });
+  const resolved = envPath
+    ? await whichBin(candidate, { extraDirs })
+    : (await whichBins(candidate, { extraDirs }))[0] ?? null;
 
   if (!resolved) {
     return {
@@ -330,35 +462,116 @@ async function findInstalled(type: LocalCliType): Promise<LocalCliEntry> {
  * unavailable ones — UI filters to `available === true` for the picker.
  */
 export async function detectAll(opts: { force?: boolean } = {}): Promise<LocalCliEntry[]> {
-  if (!opts.force && cache) return cache;
-  // The create modal and an Agent detail can request discovery at nearly the
-  // same time. Share the process-heavy pass even when one caller explicitly
-  // requested a refresh; a second identical set of version children cannot
-  // produce a fresher answer while the first set is still running.
-  if (detectionInFlight) return detectionInFlight;
-  const generation = cacheGeneration;
-  const detection = Promise.all(LOCAL_CLI_TYPES.map(t => detectOne(t)));
-  detectionInFlight = detection;
+  // Keep an aggregate promise for callers that need every result, while the
+  // actual ownership stays per CLI. A dispatch can therefore join only its
+  // selected CLI without waiting for the slowest member of this batch.
+  if (detectAllInFlight) return detectAllInFlight;
+  const detection = Promise.all(LOCAL_CLI_TYPES.map(type => resolveCli(type, {
+    force: opts.force === true,
+  })));
+  detectAllInFlight = detection;
   try {
     const entries = await detection;
-    // `localAgents.detect` can invalidate the aggregate cache while this pass
-    // is still running. Do not let the older pass repopulate it afterward.
-    if (generation === cacheGeneration) {
-      cache = entries;
-    }
     log.info('detected local CLIs', {
       available: entries.filter(e => e.available).map(e => e.type),
       missing: entries.filter(e => !e.available).map(e => e.type),
     });
     return entries;
   } finally {
-    if (detectionInFlight === detection) detectionInFlight = null;
+    if (detectAllInFlight === detection) detectAllInFlight = null;
   }
+}
+
+function generationFor(type: LocalCliType): number {
+  return cacheGeneration.get(type) || 0;
+}
+
+async function writeEntryCache(type: LocalCliType, entry: LocalCliEntry): Promise<void> {
+  if (!entry.path || !entry.available || entry.validation === 'pending') {
+    entryCache.set(type, { entry, path: entry.path });
+    return;
+  }
+  try {
+    const stat = await fs.promises.stat(entry.path);
+    entryCache.set(type, {
+      entry,
+      path: entry.path,
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+    });
+  } catch {
+    // A raced uninstall is handled by the dispatch identity check/spawn. Keep
+    // the probed result rather than manufacturing a different error here.
+    entryCache.set(type, { entry, path: entry.path });
+  }
+}
+
+/** Cached, de-duplicated single-CLI resolution used by UI and startup warmup. */
+export async function resolveCli(
+  type: LocalCliType,
+  opts: { force?: boolean } = {},
+): Promise<LocalCliEntry> {
+  const active = probeInFlight.get(type);
+  if (active) return active;
+  if (opts.force) invalidateCache(type);
+  const cached = entryCache.get(type);
+  if (cached) return cached.entry;
+
+  const generation = generationFor(type);
+  const probe = detectOne(type).then(async (entry) => {
+    if (generationFor(type) === generation) await writeEntryCache(type, entry);
+    return entry;
+  }).finally(() => {
+    if (probeInFlight.get(type) === probe) probeInFlight.delete(type);
+  });
+  probeInFlight.set(type, probe);
+  return probe;
+}
+
+/** Dispatch resolution reuses the shared probe only while the selected
+ * binary identity is unchanged. Unavailable entries are retried on explicit
+ * use so installing a CLI after startup does not require an app restart. */
+export async function resolveCliForDispatch(type: LocalCliType): Promise<LocalCliEntry> {
+  const active = probeInFlight.get(type);
+  if (active) return active;
+  const cached = entryCache.get(type);
+  if (cached?.entry.available && cached.path && cached.mtimeMs !== undefined && cached.size !== undefined) {
+    try {
+      const stat = await fs.promises.stat(cached.path);
+      if (stat.mtimeMs === cached.mtimeMs && stat.size === cached.size) return cached.entry;
+    } catch { /* binary moved or removed — re-probe below */ }
+  }
+  invalidateCache(type);
+  return resolveCli(type);
+}
+
+/** Startup-only idle warmup. Path discovery is process-free; installed CLIs
+ * are then probed one type at a time so the idle task does not create a burst
+ * of child processes. A foreground resolver can join the current type or
+ * start another type immediately without waiting for this loop. */
+export async function warmLocalClis(signal?: AbortSignal): Promise<LocalCliEntry[]> {
+  const installed = await findAllInstalled();
+  const results: LocalCliEntry[] = [];
+  for (const presence of installed) {
+    if (signal?.aborted) break;
+    if (!presence.available) {
+      if (!entryCache.has(presence.type)) await writeEntryCache(presence.type, presence);
+      results.push(entryCache.get(presence.type)?.entry || presence);
+      continue;
+    }
+    results.push(await resolveCli(presence.type));
+  }
+  log.info('local CLI idle warmup finished', {
+    checked: results.map(entry => entry.type),
+    available: results.filter(entry => entry.available).map(entry => entry.type),
+    aborted: signal?.aborted === true,
+  });
+  return results;
 }
 
 /**
  * Detect a single CLI. Skips the cache by design — callers that need
- * cache should go through detectAll.
+ * cache should go through resolveCli or detectAll.
  */
 export async function detectOne(
   type: LocalCliType,
@@ -373,18 +586,17 @@ export async function detectOne(
     && Number(opts.versionProbeTimeoutMs) > 0
     ? Number(opts.versionProbeTimeoutMs)
     : VERSION_PROBE_TIMEOUT_MS;
-  // Codex Desktop / ChatGPT and standalone Codex intentionally share
-  // ~/.codex state. A stale standalone binary can therefore see cache and
-  // model configuration written by a newer bundled binary, then fail before
-  // the turn starts. For automatic discovery, probe every Codex candidate and
-  // choose the newest valid version. Explicit ORKAS_CODEX_PATH remains an
-  // exact user override and is never replaced by another installation.
-  if (type === 'codex' && !envPath) {
-    return detectNewestCodex(
+  // Automatic discovery probes every installation for every CLI. This keeps
+  // source-neutral fallback available to all adapters, while an explicit
+  // ORKAS_<TYPE>_PATH remains authoritative and never silently switches.
+  if (!envPath) {
+    return detectPreferredCandidates(
+      type,
       await whichBins(candidate, { extraDirs }),
       versionProbeTimeoutMs,
     );
   }
+  candidatePools.set(type, []);
   const resolved = await whichBin(candidate, { extraDirs });
   if (!resolved) {
     return {
@@ -410,6 +622,9 @@ export async function detectOne(
     );
     version = versionResult.version;
   }
+  const versionMeta = versionResult?.status === 'success' && versionResult.prerelease
+    ? { fullVersion: versionResult.fullVersion, prerelease: true as const }
+    : {};
   if (!version) {
     const attempted = versionProbes
       .map(args => `\`${resolved} ${args.join(' ')}\``)
@@ -426,12 +641,12 @@ export async function detectOne(
   const minErr = checkMinVersion(type, version);
   if (minErr) {
     return {
-      type, path: resolved, version, available: false,
+      type, path: resolved, version, ...versionMeta, available: false,
       error: 'version_too_old',
       errorDetail: minErr,
     };
   }
-  return { type, path: resolved, version, available: true };
+  return { type, path: resolved, version, ...versionMeta, available: true };
 }
 
 type VersionDetector = (
@@ -543,61 +758,89 @@ export async function detectPreferredVersionResult(
   });
 }
 
-async function detectNewestCodex(
+async function detectPreferredCandidates(
+  type: LocalCliType,
   candidates: string[],
   timeoutMs = VERSION_PROBE_TIMEOUT_MS,
 ): Promise<LocalCliEntry> {
   if (!candidates.length) {
+    candidatePools.set(type, []);
     return {
-      type: 'codex', path: null, version: null, available: false,
+      type, path: null, version: null, available: false,
       error: 'not_found',
-      errorDetail: `${BIN_NAMES.codex} not found on PATH or standard CLI install locations`,
+      errorDetail: `${BIN_NAMES[type]} not found on PATH or standard CLI install locations`,
     };
   }
 
   const detected = await Promise.all(candidates.map(async (candidate) => ({
     path: candidate,
-    result: await detectVersionResult(
+    result: await detectPreferredVersionResult(
       candidate,
+      VERSION_PROBES[type],
+      detectVersionResult,
       timeoutMs,
-      VERSION_PROBES.codex[0],
     ),
   })));
-  const valid: Array<{ path: string; version: string; semver: Semver }> = [];
+  const valid: Array<{ entry: LocalCliEntry; semver: Semver }> = [];
   for (const entry of detected) {
     const semver = entry.result.version ? parseSemver(entry.result.version) : null;
     if (entry.result.version && semver) {
-      valid.push({ path: entry.path, version: entry.result.version, semver });
+      valid.push({
+        entry: {
+          type,
+          path: entry.path,
+          version: entry.result.version,
+          ...(entry.result.status === 'success' && entry.result.prerelease
+            ? { fullVersion: entry.result.fullVersion, prerelease: true as const }
+            : {}),
+          available: true,
+        },
+        semver,
+      });
     }
   }
 
   if (!valid.length) {
+    candidatePools.set(type, []);
     const timedOut = detected.every(entry => entry.result.status === 'timeout');
     return {
-      type: 'codex', path: candidates[0], version: null, available: false,
+      type, path: candidates[0], version: null, available: false,
       error: timedOut ? 'version_timeout' : 'version_unknown',
       errorDetail: timedOut
-        ? `Codex version probe timed out for ${candidates.length} installation(s)`
-        : `Codex version could not be identified from ${candidates.length} installation(s)`,
+        ? `${type} version probe timed out for ${candidates.length} installation(s)`
+        : `${type} version could not be identified from ${candidates.length} installation(s)`,
     };
   }
 
-  // Stable sort semantics keep PATH/search order as the tiebreaker when two
-  // installations report the same semantic version.
+  // Keep only versions that satisfy the protocol floor in the fallback pool.
+  // If none do, report the newest recognized candidate with the old error
+  // shape so callers still explain the actual installation problem.
+  const compatible = valid
+    .filter(candidate => !checkMinVersion(type, candidate.entry.version))
+    .map(candidate => candidate.entry);
+  const pool = orderCandidates(type, compatible);
+  candidatePools.set(type, pool);
+  if (pool.length) return pool[0];
+
   valid.sort((a, b) => compareSemver(b.semver, a.semver));
-  const selected = valid[0];
-  const minErr = checkMinVersion('codex', selected.version);
+  const selected = valid[0].entry;
+  const minErr = checkMinVersion(type, selected.version);
   if (minErr) {
     return {
-      type: 'codex', path: selected.path, version: selected.version, available: false,
+      type, path: selected.path, version: selected.version, available: false,
+      ...(selected.fullVersion ? { fullVersion: selected.fullVersion, prerelease: true as const } : {}),
       error: 'version_too_old', errorDetail: minErr,
     };
   }
-  return { type: 'codex', path: selected.path, version: selected.version, available: true };
+  return selected;
 }
 
 /** Clear the cache; mainly for tests and the single-CLI detection IPC path. */
-export function invalidateCache(): void {
-  cache = null;
-  cacheGeneration += 1;
+export function invalidateCache(type?: LocalCliType): void {
+  const targets = type ? [type] : LOCAL_CLI_TYPES;
+  for (const target of targets) {
+    entryCache.delete(target);
+    candidatePools.delete(target);
+    cacheGeneration.set(target, generationFor(target) + 1);
+  }
 }

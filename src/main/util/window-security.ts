@@ -32,6 +32,44 @@ export function safeExternalHttpUrl(raw: unknown): string | null {
 const SAFE_EXTERNAL_LINK_MAX_LENGTH = 2048;
 const SAFE_MAIL_QUERY_KEYS = new Set(['subject', 'body', 'cc', 'bcc']);
 
+const LOCAL_CLI_AUTH_ROUTES = new Map([
+  ['open.feishu.cn', new Map([['/page/cli', ['user_code']]])],
+  ['open.larksuite.com', new Map([['/page/cli', ['user_code']]])],
+  ['accounts.feishu.cn', new Map([['/oauth/v1/device/verify', ['flow_id', 'user_code']]])],
+  ['accounts.larksuite.com', new Map([['/oauth/v1/device/verify', ['flow_id', 'user_code']]])],
+  ['login.dingtalk.com', new Map([['/oauth2/device/verify.htm', ['user_code']]])],
+  ['work.weixin.qq.com', new Map([['/ai/qc/gen', ['source', 'scode']]])],
+  ['identity.constantcontact.com', new Map([['/activate', ['user_code']]])],
+  ['authz.constantcontact.com', new Map([['/activate', ['user_code']]])],
+]);
+
+/**
+ * Return an exact official local CLI authorization URL. This policy is deliberately
+ * structural: localized CLI prose never participates in deciding whether the OS browser opens.
+ */
+export function safeLocalCliAuthUrl(raw: unknown): string | null {
+  const value = typeof raw === 'string' ? raw.trim() : '';
+  if (!value || value.length > SAFE_EXTERNAL_LINK_MAX_LENGTH || /[\u0000-\u001f\u007f]/u.test(value)) return null;
+  const normalized = safeExternalHttpUrl(value);
+  if (!normalized) return null;
+  try {
+    const url = new URL(normalized);
+    if (url.protocol !== 'https:' || url.port || url.hash) return null;
+    const routes = LOCAL_CLI_AUTH_ROUTES.get(url.hostname.toLowerCase());
+    const requiredQueryKeys = routes?.get(url.pathname);
+    if (!requiredQueryKeys) return null;
+    if (url.hostname === 'work.weixin.qq.com' && url.searchParams.get('source') !== 'wecom_cli_external') return null;
+    for (const key of requiredQueryKeys) {
+      const values = url.searchParams.getAll(key);
+      if (values.length !== 1 || !values[0] || values[0].length > 512) return null;
+      if (/[\u0000-\u001f\u007f]/u.test(values[0])) return null;
+    }
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
 function decodeOpaquePath(value: string): string | null {
   try { return decodeURIComponent(value); }
   catch { return null; }

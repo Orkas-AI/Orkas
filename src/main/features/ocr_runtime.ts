@@ -31,7 +31,7 @@ export const OCR_RUNTIME_KEY = `ocr-rapidocr-3.9.0-onnxruntime-1.27.0-pypdfium2-
 const RAPIDOCR_VERSION = '3.9.0';
 const ONNXRUNTIME_VERSION = '1.27.0';
 const PYPDFIUM2_VERSION = '5.10.1';
-const CACHE_VERSION = 2;
+const CACHE_VERSION = 3;
 const OCR_TIMEOUT_MS = 5 * 60 * 1000;
 const INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
 const VERIFY_TIMEOUT_MS = 2 * 60 * 1000;
@@ -122,6 +122,9 @@ function runtimeEnv(): NodeJS.ProcessEnv {
     ...process.env,
     ...bundledRuntimeEnv(),
     PYTHONNOUSERSITE: '1',
+    // Python emits JSON with Unicode text; Node decodes the pipe as UTF-8.
+    // A Windows legacy code page otherwise corrupts text or raises on output.
+    PYTHONIOENCODING: 'utf-8',
     UV_CACHE_DIR: PYTHON_VENV_UV_CACHE_DIR,
     PIP_CACHE_DIR: PYTHON_VENV_PIP_CACHE_DIR,
   };

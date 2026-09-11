@@ -249,3 +249,111 @@ class CompressIntegration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── CJK (Chinese) fixtures — non-English behavior fixtures per the repo rule ──
+# Same three-way split as the English set above: topical vs off-topic (智能体 vs
+# real-estate 中介, mirroring the "agent" ambiguity) vs cooking noise. Each is a
+# single paragraph under MAX_CHUNK_CHARS.
+
+QUERY_ZH = "本地优先智能体的隐私保障"
+RELEVANT_ZH = (
+    "本地优先的智能体系统把用户数据完整保留在设备本地，模型推理全程不需要把私人对话上传到远程服务器。"
+    "由于所有处理都发生在用户自己的机器上，敏感文档不会暴露给任何第三方服务，隐私始终掌握在用户手中。"
+    "研究人员把这种端侧运行模式描述为可信助手最核心的隐私保障，也是本地优先架构的根本价值所在。"
+    "报告指出，本地优先架构显著缩小了自主智能体面临的隐私攻击面，减少了对运营方的信任依赖。"
+    "本地优先的智能体仍然可以同步加密后的状态，但明文内容永远不会离开用户的机器。"
+)
+OFFTOPIC_ZH = (
+    "房产中介周末带着几组买家看了市中心的房子，双方就成交价格进行了多轮谈判。"
+    "签约之前，银行审核了贷款材料并确认了首付比例，卖家急于接受一个合理的报价。"
+    "验房团队把最终的交割检查安排在周一上午进行，经纪人当天下午准备好了产权过户和资金托管文件。"
+    "同小区最近的成交记录显示，这套房源的挂牌价格略高于市场行情。"
+)
+NOISE_ZH = (
+    "厨师把番茄酱汁小火慢炖了两个小时，期间不断加入新鲜罗勒和牛至调味。"
+    "随后他把意面装盘，撒上厚厚一层擦碎的奶酪，再淋上少许橄榄油。"
+    "木炉里烤出的乡村酸面包外壳金黄酥脆，内里松软，甜点是一只黄油挞皮的柠檬挞。"
+    "厨房里弥漫着大蒜和迷迭香的香气，一盘盘菜被端进坐满客人的餐厅。"
+)
+
+
+class CjkCompression(unittest.TestCase):
+    """Before CJK bigram tokenization a pure-Chinese query produced zero query
+    terms (the whole corpus passed through uncompressed and unbudgeted) and CJK
+    chunks scored 0 under a mixed-language query (all dropped as noise)."""
+
+    def _zh_sources(self):
+        return [
+            {"id": "z1", "url": "https://zh-a", "title": "A",
+             "text": RELEVANT_ZH + "\n\n" + OFFTOPIC_ZH},
+            {"id": "z2", "url": "https://zh-b", "title": "B", "text": NOISE_ZH},
+        ]
+
+    def _run(self, payload):
+        # The CJK fixtures are dense, so lower the small-content gate the same
+        # way test_input_caps_are_applied_and_reported patches module caps.
+        old = compress.SMALL_CONTENT_CHARS
+        try:
+            compress.SMALL_CONTENT_CHARS = 200
+            return compress.compress(payload)
+        finally:
+            compress.SMALL_CONTENT_CHARS = old
+
+    def test_tokenize_emits_cjk_bigrams(self):
+        toks = tokenize("智能体")
+        self.assertIn("智能", toks)
+        self.assertIn("能体", toks)
+
+    def test_tokenize_mixed_keeps_latin_and_cjk(self):
+        toks = tokenize("AI 对就业的影响")
+        self.assertIn("ai", toks)
+        self.assertIn("就业", toks)
+        self.assertIn("影响", toks)
+
+    def test_pure_chinese_query_scores_instead_of_skipping(self):
+        out = self._run({"query": QUERY_ZH, "sources": self._zh_sources()})
+        self.assertFalse(out["stats"]["skipped_compression"])
+        kept = [k["chunk"] for k in out["kept"]]
+        self.assertIn(RELEVANT_ZH, kept)
+        self.assertNotIn(NOISE_ZH, kept)                  # no overlap -> dropped
+        self.assertEqual(out["kept"][0]["chunk"], RELEVANT_ZH)
+
+    def test_mixed_language_query_keeps_chinese_evidence(self):
+        out = self._run({"query": "AI 智能体的隐私保障", "sources": self._zh_sources()})
+        self.assertFalse(out["stats"]["skipped_compression"])
+        self.assertIn(RELEVANT_ZH, [k["chunk"] for k in out["kept"]])
+
+    def test_short_chinese_fragment_survives_min_gate(self):
+        zh = "本地优先的智能体系统把用户的全部数据保留在设备本地，天然保护用户隐私。"
+        en = "Short latin fragment of same size."
+        self.assertEqual(chunk_text(zh), [zh])    # CJK weighting keeps it
+        self.assertEqual(chunk_text(en), [])      # latin gate unchanged
+
+    def test_long_chinese_paragraph_splits_on_sentence_enders(self):
+        sent = "本地优先的智能体在设备上完成推理并保护用户的隐私数据不外泄。"
+        para = sent * 50    # ~1450 chars, no whitespace anywhere
+        chunks = chunk_text(para)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertLessEqual(len(c), MAX_CHUNK_CHARS)
+            self.assertTrue(c.endswith("。"))     # sentence boundary, not mid-cut
+
+
+class NoQueryPathBudget(unittest.TestCase):
+    def test_no_query_path_respects_budget(self):
+        # A no-content-term query still must not pass through unbounded.
+        words = ["alpha", "bravo", "charlie", "delta", "echo",
+                 "foxtrot", "golf", "hotel", "india", "juliet"]
+        sources = [{"id": "s%d" % i, "text": ("%s metrics " % w) * 75}
+                   for i, w in enumerate(words)]           # ~10 x 900+ chars
+        out = compress.compress({"query": "", "sources": sources, "max_chars": 2000})
+        self.assertFalse(out["stats"]["skipped_compression"])
+        self.assertTrue(out["stats"]["skipped_scoring"])
+        self.assertLessEqual(out["stats"]["chars_out"], 2000)
+        self.assertLess(out["stats"]["chunks_kept"], len(sources))
+
+    def test_skip_path_always_keeps_first_record(self):
+        out = compress.compress({"query": "", "sources": [
+            {"id": "s1", "text": "y" * 500}], "max_chars": 100})
+        self.assertEqual(out["stats"]["chunks_kept"], 1)   # never emit nothing

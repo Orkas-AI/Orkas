@@ -19,6 +19,64 @@
  */
 import * as path from 'node:path';
 import type { Transport, ToolSchema } from './types';
+
+type McpToolLike = {
+  name: string;
+  description?: unknown;
+  inputSchema?: unknown;
+  annotations?: unknown;
+  _meta?: unknown;
+};
+
+/** Preserve the standardized trust hints that the Host needs for
+ * programmatic child-call authorization; discard non-standard metadata. */
+export function normalizeMcpToolSchema(tool: McpToolLike): ToolSchema {
+  const annotations = tool.annotations && typeof tool.annotations === 'object'
+    ? tool.annotations as Record<string, unknown>
+    : null;
+  const metadata = tool._meta && typeof tool._meta === 'object'
+    ? tool._meta as Record<string, unknown>
+    : null;
+  const orkasMetadata = metadata?.orkas && typeof metadata.orkas === 'object'
+    ? metadata.orkas as Record<string, unknown>
+    : null;
+  const rawPolicy = orkasMetadata?.actionPolicy && typeof orkasMetadata.actionPolicy === 'object'
+    ? orkasMetadata.actionPolicy as Record<string, unknown>
+    : null;
+  const risk = String(rawPolicy?.risk || '') as 'R' | 'W' | 'H' | 'D';
+  const confirmation = String(rawPolicy?.confirmation || '') as 'none' | 'preview' | 'fresh' | 'destructive';
+  const validPolicy = !!rawPolicy
+    && ['R', 'W', 'H', 'D'].includes(risk)
+    && ['none', 'preview', 'fresh', 'destructive'].includes(confirmation)
+    && Number.isInteger(rawPolicy.maxBatchSize)
+    && Number(rawPolicy.maxBatchSize) > 0;
+  return {
+    name: tool.name,
+    description: typeof tool.description === 'string' ? tool.description : '',
+    input_schema: (tool.inputSchema && typeof tool.inputSchema === 'object')
+      ? tool.inputSchema as Record<string, unknown>
+      : { type: 'object', properties: {} },
+    ...(annotations ? {
+      annotations: {
+        ...(typeof annotations.title === 'string' ? { title: annotations.title } : {}),
+        ...(typeof annotations.readOnlyHint === 'boolean' ? { readOnlyHint: annotations.readOnlyHint } : {}),
+        ...(typeof annotations.destructiveHint === 'boolean' ? { destructiveHint: annotations.destructiveHint } : {}),
+        ...(typeof annotations.idempotentHint === 'boolean' ? { idempotentHint: annotations.idempotentHint } : {}),
+        ...(typeof annotations.openWorldHint === 'boolean' ? { openWorldHint: annotations.openWorldHint } : {}),
+      },
+    } : {}),
+    ...(validPolicy ? {
+      orkas_action_policy: {
+        risk,
+        confirmation,
+        ...(typeof rawPolicy?.sensitiveOperation === 'string' && rawPolicy.sensitiveOperation
+          ? { sensitive_operation: rawPolicy.sensitiveOperation }
+          : {}),
+        max_batch_size: Number(rawPolicy?.maxBatchSize),
+      },
+    } : {}),
+  };
+}
 import { createLogger } from '../../logger';
 import { buildChildProxyEnvironment } from '../../util/proxy-dispatcher';
 import { logErrorSummary } from '../../util/log-redact';
@@ -94,8 +152,8 @@ export class McpConnection {
       // `--api-key sk-…`); log only the command basename + arg count so a key
       // never lands in the persistent app log.
       log.info('spawning stdio MCP server', {
-        id: this.id,
-        command: path.basename(this.transport.command),
+        id: this.id.startsWith('custom-') ? 'custom' : this.id,
+        command: this.id.startsWith('custom-') ? 'custom' : path.basename(this.transport.command),
         argCount: this.transport.args.length,
         proxyMode: proxyEnv.ORKAS_PROXY_MODE || 'unmanaged',
       });
@@ -112,9 +170,9 @@ export class McpConnection {
       transport = stdioTransport;
     } else {
       const url = new URL(this.transport.url);
-      // A custom URL may carry credentials in the query string (`?key=…`); log
-      // only origin + pathname, never the query.
-      log.info('connecting streamable-http MCP server', { id: this.id, url: url.origin + url.pathname });
+      // Custom URLs may embed credentials in any URL component. The transport
+      // class is sufficient for diagnostics; never log the endpoint.
+      log.info('connecting streamable-http MCP server', { id: this.id.startsWith('custom-') ? 'custom' : this.id, transport: 'streamable-http' });
       const opts: { requestInit?: { headers?: Record<string, string> } } = {};
       if (this.transport.headers && Object.keys(this.transport.headers).length) {
         opts.requestInit = { headers: this.transport.headers };
@@ -140,19 +198,24 @@ export class McpConnection {
       this._client = client;
       this._connected = true;
       log.info('MCP connect ok', {
-        id: this.id,
+        id: this.id.startsWith('custom-') ? 'custom' : this.id,
         transport: this.transport.kind,
         duration_ms: Date.now() - startedAt,
         timeout_ms: connectTimeoutMs,
       });
     } catch (err) {
       log.warn('connect failed', {
-        id: this.id,
+        id: this.id.startsWith('custom-') ? 'custom' : this.id,
         transport: this.transport.kind,
         duration_ms: Date.now() - startedAt,
         error: logErrorSummary(err),
       });
-      try { await transport.close?.(); } catch { /* swallow */ }
+      try { await transport.close?.(); } catch (closeErr) {
+        log.warn('transport close after connect failure failed', {
+          id: this.id.startsWith('custom-') ? 'custom' : this.id,
+          error: logErrorSummary(closeErr),
+        });
+      }
       throw err;
     }
   }
@@ -163,13 +226,7 @@ export class McpConnection {
       timeout: opts.timeoutMs || DEFAULT_LIST_TOOLS_TIMEOUT_MS,
       ...(opts.signal ? { signal: opts.signal } : {}),
     });
-    return (res.tools || []).map((t) => ({
-      name: t.name,
-      description: typeof t.description === 'string' ? t.description : '',
-      input_schema: (t.inputSchema && typeof t.inputSchema === 'object')
-        ? t.inputSchema as Record<string, unknown>
-        : { type: 'object', properties: {} },
-    }));
+    return (res.tools || []).map(normalizeMcpToolSchema);
   }
 
   async callTool(name: string, args: Record<string, unknown>, opts: McpRequestOptions = {}): Promise<unknown> {
@@ -190,7 +247,7 @@ export class McpConnection {
     try {
       await this._client.close();
     } catch (err) {
-      log.warn('close failed', { id: this.id, error: (err as Error).message });
+      log.warn('close failed', { id: this.id.startsWith('custom-') ? 'custom' : this.id, error: logErrorSummary(err) });
     } finally {
       this._client = null;
       this._connected = false;

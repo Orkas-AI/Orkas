@@ -39,8 +39,9 @@ interface ClientConnectorInstance {
   id: string;
   display_name: string;
   origin?: 'catalog' | 'custom';
+  connection_environment?: 'sandbox' | 'live';
   transport?:
-    | { kind: 'stdio'; summary: string }
+    | { kind: 'stdio'; summary: string; command?: string; argument_count?: number }
     | { kind: 'streamable-http'; summary: string };
   enabled_subtools: string[] | null;
   tools_cache: ToolSchema[];
@@ -59,7 +60,7 @@ function _safeTransportSummary(inst: ConnectorInstance): ClientConnectorInstance
     const command = path.basename(transport.command || '');
     const argCount = transport.args?.length ?? 0;
     const suffix = argCount === 1 ? '1 arg' : `${argCount} args`;
-    return { kind: 'stdio', summary: argCount > 0 ? `${command} (${suffix})` : command };
+    return { kind: 'stdio', summary: argCount > 0 ? `${command} (${suffix})` : command, command, argument_count: argCount };
   }
   try {
     const url = new URL(transport.url);
@@ -88,6 +89,8 @@ function toClientInstance(inst: ConnectorInstance, enabled?: boolean): ClientCon
     created_at: inst.created_at,
     updated_at: inst.updated_at,
   };
+  const environment = inst.connection_parameters?.environment;
+  if (environment === 'sandbox' || environment === 'live') out.connection_environment = environment;
   if (inst.oauth_grant?.account_label) {
     out.oauth_grant = { account_label: inst.oauth_grant.account_label };
   } else if (inst.composio_grant?.account_label) {
@@ -137,7 +140,7 @@ export const invokeHandlers = {
     return { ok: true, enabled: payload.enabled };
   },
 
-  'connectors.start_oauth': async (payload: { catalog_id?: unknown }, ctx: { userId: string }) => {
+  'connectors.start_oauth': async (payload: { catalog_id?: unknown; connection_parameters?: unknown }, ctx: { userId: string }) => {
     if (typeof payload?.catalog_id !== 'string') throw new Error('invalid catalog_id');
     const entry = connectors.findCatalogEntry(payload.catalog_id);
     if (entry?.auth_mode === 'composio' || entry?.requires_credits) {
@@ -153,8 +156,39 @@ export const invokeHandlers = {
         };
       }
     }
-    const started = connectors.beginOAuthConnect(ctx.userId, payload.catalog_id);
+    const started = payload.connection_parameters === undefined
+      ? connectors.beginOAuthConnect(ctx.userId, payload.catalog_id)
+      : connectors.beginOAuthConnect(ctx.userId, payload.catalog_id, payload.connection_parameters);
     return { started: true, attempt_id: started.attempt_id };
+  },
+
+  'connectors.local_cli_status': async (
+    payload: { catalog_id?: unknown },
+    ctx: { userId: string },
+  ) => {
+    if (typeof payload?.catalog_id !== 'string') throw new Error('invalid catalog_id');
+    const entry = connectors.findCatalogEntry(payload.catalog_id);
+    if (!entry || entry.auth_mode !== 'local_cli' || !entry.local_cli) {
+      throw new Error('catalog entry is not a local CLI connector');
+    }
+    return { status: connectors.localCliInstallStatus(ctx.userId, entry) };
+  },
+
+  'connectors.install_local_cli': async (
+    payload: { catalog_id?: unknown },
+    ctx: { userId: string },
+  ) => {
+    if (typeof payload?.catalog_id !== 'string') throw new Error('invalid catalog_id');
+    const entry = connectors.findCatalogEntry(payload.catalog_id);
+    if (!entry || entry.auth_mode !== 'local_cli' || !entry.local_cli) {
+      throw new Error('catalog entry is not a local CLI connector');
+    }
+    return { status: await connectors.installLocalCli(ctx.userId, entry) };
+  },
+
+  'connectors.open_local_cli_auth_url': async (payload: { url?: unknown }) => {
+    await connectors.openLocalCliAuthorizationUrl(payload?.url);
+    return { opened: true };
   },
 
   'connectors.cancel_oauth': async () => {
@@ -171,6 +205,15 @@ export const invokeHandlers = {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const installConfirm = require('../features/connectors/install_confirm') as typeof import('../features/connectors/install_confirm');
     return { handled: installConfirm.respond(payload.request_id, payload.approved) };
+  },
+
+  /** Renderer answer to a per-action sensitive connector confirmation. */
+  'connectors.action_confirm_response': async (payload: { request_id?: unknown; approved?: unknown }) => {
+    if (typeof payload?.request_id !== 'string' || !payload.request_id) throw new Error('invalid request_id');
+    if (typeof payload?.approved !== 'boolean') throw new Error('invalid approved flag');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const actionConfirm = require('../features/connectors/action_confirm') as typeof import('../features/connectors/action_confirm');
+    return { handled: actionConfirm.respond(payload.request_id, payload.approved) };
   },
 
   'connectors.add_custom': async (

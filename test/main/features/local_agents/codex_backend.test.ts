@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import {
   CodexActivityHeartbeat,
@@ -21,29 +21,59 @@ describePosix('local_agents/backends/codex process lifecycle', () => {
     fs.writeFileSync(fakeCodexPath, `#!/usr/bin/env node
 const fs = require('node:fs');
 const specialScenarios = [
+  'bootstrap-hang',
   'protocol-failure',
   'fatal-lingers',
   'success-lingers',
   'interrupted-lingers',
   'idle-lingers',
   'system-error-lingers',
+  'system-error-then-failed',
   'thread-closed',
   'legacy-complete',
   'legacy-abort',
   'steer',
   'steer-rejected',
+  'approval-denied',
+  'permissions-full',
+  'approval',
+  'user-input-146',
+  'user-input-151',
+  'unknown-request',
   'hang',
 ];
 const scenario = specialScenarios.find((name) => process.argv.includes('--' + name))
   || 'resume-fallback';
 const traceFlag = process.argv.indexOf('--trace');
 const tracePath = traceFlag >= 0 ? process.argv[traceFlag + 1] : '';
+const envTraceFlag = process.argv.indexOf('--env-trace');
+if (envTraceFlag >= 0) {
+  fs.writeFileSync(process.argv[envTraceFlag + 1], JSON.stringify({
+    ORKAS_BRIDGE_ENV_FILE: process.env.ORKAS_BRIDGE_ENV_FILE ?? null,
+    ORKAS_PC_DIR: process.env.ORKAS_PC_DIR ?? null,
+  }));
+}
 const received = [];
 let buffer = '';
+let experimentalApiEnabled = false;
 const send = (message) => process.stdout.write(JSON.stringify(message) + '\\n');
 const record = (message) => {
   received.push(message);
   if (tracePath) fs.writeFileSync(tracePath, JSON.stringify(received));
+};
+const rejectUnnegotiatedPermissions = (message) => {
+  if (experimentalApiEnabled || !Object.prototype.hasOwnProperty.call(message.params || {}, 'permissions')) {
+    return false;
+  }
+  send({
+    jsonrpc: '2.0',
+    id: message.id,
+    error: {
+      code: -32600,
+      message: message.method + '.permissions requires experimentalApi capability',
+    },
+  });
+  return true;
 };
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => {
@@ -51,21 +81,26 @@ process.stdin.on('data', (chunk) => {
   let newline;
   while ((newline = buffer.indexOf('\\n')) >= 0) {
     const line = buffer.slice(0, newline);
+    if (scenario === 'bootstrap-hang') { buffer = buffer.slice(newline + 1); continue; }
     buffer = buffer.slice(newline + 1);
     if (!line.trim()) continue;
     const message = JSON.parse(line);
     record(message);
     if (message.method === 'initialize') {
+      experimentalApiEnabled = message.params?.capabilities?.experimentalApi === true;
       if (scenario === 'protocol-failure') {
         send({ jsonrpc: '2.0', id: message.id, error: { code: -32000, message: 'unsupported protocol' } });
       } else {
         send({ jsonrpc: '2.0', id: message.id, result: { userAgent: 'fake-codex' } });
       }
     } else if (message.method === 'thread/resume') {
+      if (rejectUnnegotiatedPermissions(message)) continue;
       send({ jsonrpc: '2.0', id: message.id, error: { code: -32001, message: 'thread expired' } });
     } else if (message.method === 'thread/start') {
+      if (rejectUnnegotiatedPermissions(message)) continue;
       send({ jsonrpc: '2.0', id: message.id, result: { threadId: 'fresh-thread' } });
     } else if (message.method === 'turn/start') {
+      if (rejectUnnegotiatedPermissions(message)) continue;
       send({ jsonrpc: '2.0', id: message.id, result: { turn: { id: 'turn-1' } } });
       if (scenario !== 'resume-fallback') {
         if (scenario === 'legacy-complete' || scenario === 'legacy-abort') {
@@ -142,10 +177,95 @@ process.stdin.on('data', (chunk) => {
           send({ jsonrpc: '2.0', method: 'thread/status/changed', params: {
             threadId: 'fresh-thread', status: { type: 'systemError' },
           } });
+        } else if (scenario === 'system-error-then-failed') {
+          send({ jsonrpc: '2.0', method: 'thread/status/changed', params: {
+            threadId: 'fresh-thread', status: { type: 'systemError' },
+          } });
+          send({ jsonrpc: '2.0', method: 'thread/status/changed', params: {
+            threadId: 'fresh-thread', status: { type: 'idle' },
+          } });
+          setTimeout(() => send({ jsonrpc: '2.0', method: 'turn/completed', params: {
+            threadId: 'fresh-thread',
+            turn: {
+              id: 'turn-1',
+              status: 'failed',
+              error: { message: 'Selected model is at capacity. Please try a different model.' },
+            },
+          } }), 10);
         } else if (scenario === 'thread-closed') {
           send({ jsonrpc: '2.0', method: 'thread/closed', params: {
             threadId: 'fresh-thread',
           } });
+        } else if (scenario === 'approval') {
+          send({
+            jsonrpc: '2.0',
+            id: 91,
+            method: 'item/commandExecution/requestApproval',
+            params: {
+              threadId: 'fresh-thread',
+              turnId: 'turn-1',
+              itemId: 'command-approval-1',
+              command: 'npm test',
+              reason: 'Run the focused test suite',
+            },
+          });
+        } else if (scenario === 'approval-denied') {
+          send({
+            jsonrpc: '2.0',
+            id: 92,
+            method: 'item/fileChange/requestApproval',
+            params: {
+              threadId: 'fresh-thread',
+              turnId: 'turn-1',
+              itemId: 'file-approval-1',
+              reason: 'Write outside the selected project',
+              grantRoot: '/protected/outside',
+            },
+          });
+        } else if (scenario === 'permissions-full') {
+          send({
+            jsonrpc: '2.0',
+            id: 93,
+            method: 'item/permissions/requestApproval',
+            params: {
+              threadId: 'fresh-thread',
+              turnId: 'turn-1',
+              approvalId: 'permissions-approval-1',
+              reason: 'Use the requested permission profile',
+              permissions: { fileSystem: { read: ['/workspace'] } },
+            },
+          });
+        } else if (scenario === 'user-input-146' || scenario === 'user-input-151') {
+          send({
+            jsonrpc: '2.0',
+            id: 94,
+            method: 'item/tool/requestUserInput',
+            params: {
+              threadId: 'fresh-thread',
+              turnId: 'turn-1',
+              itemId: 'user-input-1',
+              questions: [{
+                id: 'environment',
+                header: 'Environment',
+                question: 'Choose target',
+                options: [{ label: 'staging', description: 'Use staging' }],
+                isOther: true,
+                isSecret: false,
+              }],
+              ...(scenario === 'user-input-151' ? { isBlocking: true } : {}),
+            },
+          });
+        } else if (scenario === 'unknown-request') {
+          send({
+            jsonrpc: '2.0',
+            id: 95,
+            method: 'future/server/request',
+            params: {
+              threadId: 'fresh-thread',
+              turnId: 'turn-1',
+              value: 'additive request from a future protocol',
+            },
+          });
         }
         continue;
       }
@@ -408,6 +528,72 @@ process.stdin.on('data', (chunk) => {
           threadId: 'fresh-thread', turn: { id: 'turn-1', status: 'completed' },
         } });
       }, 20);
+    } else if (scenario === 'approval' && message.id === 91) {
+      if (message.result?.decision !== 'accept') {
+        process.stderr.write('unexpected approval response: ' + JSON.stringify(message) + '\\n');
+        process.exit(7);
+      }
+      send({ jsonrpc: '2.0', method: 'item/started', params: {
+        threadId: 'fresh-thread', turnId: 'turn-1',
+        item: { id: 'approval-answer', type: 'agentMessage', phase: 'final_answer' },
+      } });
+      send({ jsonrpc: '2.0', method: 'item/agentMessage/delta', params: {
+        threadId: 'fresh-thread', turnId: 'turn-1',
+        itemId: 'approval-answer', delta: 'approved',
+      } });
+      send({ jsonrpc: '2.0', method: 'turn/completed', params: {
+        threadId: 'fresh-thread', turn: { id: 'turn-1', status: 'completed' },
+      } });
+    } else if (scenario === 'approval-denied' && message.id === 92) {
+      if (message.result?.decision !== 'decline') {
+        process.stderr.write('file change was not denied: ' + JSON.stringify(message) + '\\n');
+        process.exit(7);
+      }
+      send({ jsonrpc: '2.0', method: 'item/started', params: {
+        threadId: 'fresh-thread', turnId: 'turn-1',
+        item: { id: 'denied-answer', type: 'agentMessage', phase: 'final_answer' },
+      } });
+      send({ jsonrpc: '2.0', method: 'item/agentMessage/delta', params: {
+        threadId: 'fresh-thread', turnId: 'turn-1',
+        itemId: 'denied-answer', delta: 'denied safely',
+      } });
+      send({ jsonrpc: '2.0', method: 'turn/completed', params: {
+        threadId: 'fresh-thread', turn: { id: 'turn-1', status: 'completed' },
+      } });
+    } else if (scenario === 'permissions-full' && message.id === 93) {
+      const expected = JSON.stringify({ fileSystem: { read: ['/workspace'] } });
+      if (message.result?.scope !== 'turn' || JSON.stringify(message.result?.permissions) !== expected) {
+        process.stderr.write('permission profile was not granted for the session: ' + JSON.stringify(message) + '\\n');
+        process.exit(7);
+      }
+      send({ jsonrpc: '2.0', method: 'item/started', params: {
+        threadId: 'fresh-thread', turnId: 'turn-1',
+        item: { id: 'full-answer', type: 'agentMessage', phase: 'final_answer' },
+      } });
+      send({ jsonrpc: '2.0', method: 'item/agentMessage/delta', params: {
+        threadId: 'fresh-thread', turnId: 'turn-1',
+        itemId: 'full-answer', delta: 'auto approved',
+      } });
+      send({ jsonrpc: '2.0', method: 'turn/completed', params: {
+        threadId: 'fresh-thread', turn: { id: 'turn-1', status: 'completed' },
+      } });
+    } else if ((scenario === 'user-input-146' || scenario === 'user-input-151') && message.id === 94) {
+      const answers = message.result?.answers?.environment?.answers;
+      if (JSON.stringify(answers) !== JSON.stringify(['staging'])) {
+        process.stderr.write('unexpected user input response: ' + JSON.stringify(message) + '\\n');
+        process.exit(7);
+      }
+      send({ jsonrpc: '2.0', method: 'item/started', params: {
+        threadId: 'fresh-thread', turnId: 'turn-1',
+        item: { id: 'input-answer', type: 'agentMessage', phase: 'final_answer' },
+      } });
+      send({ jsonrpc: '2.0', method: 'item/agentMessage/delta', params: {
+        threadId: 'fresh-thread', turnId: 'turn-1',
+        itemId: 'input-answer', delta: 'staging selected',
+      } });
+      send({ jsonrpc: '2.0', method: 'turn/completed', params: {
+        threadId: 'fresh-thread', turn: { id: 'turn-1', status: 'completed' },
+      } });
     } else if (message.method === 'turn/steer') {
       if (scenario === 'steer-rejected') {
         send({ jsonrpc: '2.0', id: message.id, error: {
@@ -440,7 +626,7 @@ if (scenario === 'protocol-failure') {
   process.on('SIGTERM', () => {});
   setInterval(() => {}, 1000);
 }
-if (scenario.endsWith('-lingers') || scenario === 'hang') setInterval(() => {}, 1000);
+if (scenario.endsWith('-lingers') || scenario === 'hang' || scenario === 'bootstrap-hang') setInterval(() => {}, 1000);
 `);
     fs.chmodSync(fakeCodexPath, 0o755);
   });
@@ -452,6 +638,7 @@ if (scenario.endsWith('-lingers') || scenario === 'hang') setInterval(() => {}, 
   it('falls back from an expired resume, restores recovery context, and completes the turn', async () => {
     const tracePath = path.join(tempDir, 'resume-trace.json');
     const events: any[] = [];
+    const protocolActivity = vi.fn();
 
     await codexBackend.run({
       binPath: fakeCodexPath,
@@ -461,22 +648,44 @@ if (scenario.endsWith('-lingers') || scenario === 'hang') setInterval(() => {}, 
       systemPrompt: 'durable Orkas instructions',
       reuseSessionInstructions: true,
       customArgs: ['--trace', tracePath],
+      permissionPolicy: 'ask',
       cwd: process.cwd(),
       signal: new AbortController().signal,
       timeoutMs: 2_000,
+      onActivity: protocolActivity,
       onEvent: event => events.push(event),
     });
 
     const requests = JSON.parse(fs.readFileSync(tracePath, 'utf8'));
+    // The fixture emits 25 command deltas even though the public rail coalesces
+    // them. Every real delta must reach the idle clock without leaking output.
+    expect(protocolActivity.mock.calls.length).toBeGreaterThanOrEqual(25);
+    const initialize = requests.find((entry: any) => entry.method === 'initialize');
     const resume = requests.find((entry: any) => entry.method === 'thread/resume');
     const start = requests.find((entry: any) => entry.method === 'thread/start');
     const turn = requests.find((entry: any) => entry.method === 'turn/start');
 
+    expect(initialize.params.capabilities).toEqual({ experimentalApi: true });
     expect(resume.params).not.toHaveProperty('model');
     expect(resume.params).not.toHaveProperty('developerInstructions');
+    expect(resume.params).toMatchObject({
+      approvalPolicy: 'on-request',
+      approvalsReviewer: 'user',
+      permissions: ':workspace',
+    });
     expect(start.params).not.toHaveProperty('model');
     expect(start.params.developerInstructions).toBe('durable Orkas instructions');
+    expect(start.params).toMatchObject({
+      approvalPolicy: 'on-request',
+      approvalsReviewer: 'user',
+      permissions: ':workspace',
+    });
     expect(turn.params.input).toEqual([{ type: 'text', text: 'bounded recovery\n\ncurrent turn' }]);
+    expect(turn.params).toMatchObject({
+      approvalPolicy: 'on-request',
+      approvalsReviewer: 'user',
+      permissions: ':workspace',
+    });
     expect(events).toContainEqual({
       type: 'text-delta',
       itemId: 'answer-1',
@@ -726,6 +935,126 @@ if (scenario.endsWith('-lingers') || scenario === 'hang') setInterval(() => {}, 
     });
   });
 
+  it('bridges app-server command approval without persisting a native session grant', async () => {
+    const events: any[] = [];
+    const requestPermission = vi.fn(async () => 'allow_run' as const);
+
+    await codexBackend.run({
+      binPath: fakeCodexPath,
+      prompt: 'run tests',
+      customArgs: ['--approval'],
+      permissionPolicy: 'ask',
+      requestPermission,
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+      timeoutMs: 2_000,
+      onEvent: event => events.push(event),
+    });
+
+    expect(requestPermission).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'command-approval-1',
+      tool: 'command',
+      description: 'Run the focused test suite',
+      command: 'npm test',
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'permission-request',
+      id: 'command-approval-1',
+      decision: 'allow',
+      reason: 'user',
+    }));
+    expect(events.at(-1)).toMatchObject({
+      type: 'done',
+      status: 'completed',
+      output: 'approved',
+    });
+  });
+
+  it('denies a file change when the host approval bridge fails', async () => {
+    const events: any[] = [];
+    const requestPermission = vi.fn(async () => {
+      throw new Error('renderer unavailable');
+    });
+
+    await codexBackend.run({
+      binPath: fakeCodexPath,
+      prompt: 'write outside the project',
+      customArgs: ['--approval-denied'],
+      permissionPolicy: 'ask',
+      requestPermission,
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+      timeoutMs: 2_000,
+      onEvent: event => events.push(event),
+    });
+
+    expect(requestPermission).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'file-approval-1',
+      tool: 'file_change',
+      description: 'Write outside the selected project',
+      subject: '/protected/outside',
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'permission-request',
+      id: 'file-approval-1',
+      decision: 'deny',
+      reason: 'user',
+    }));
+    expect(events.at(-1)).toMatchObject({
+      type: 'done',
+      status: 'completed',
+      output: 'denied safely',
+    });
+  });
+
+  it('auto-approves the requested Codex permission profile only in full-access mode', async () => {
+    const tracePath = path.join(tempDir, 'permissions-full-trace.json');
+    const events: any[] = [];
+    const requestPermission = vi.fn(async () => 'deny' as const);
+
+    await codexBackend.run({
+      binPath: fakeCodexPath,
+      prompt: 'use the profile',
+      customArgs: ['--permissions-full', '--trace', tracePath],
+      permissionPolicy: 'full_access',
+      requestPermission,
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+      timeoutMs: 2_000,
+      onEvent: event => events.push(event),
+    });
+
+    const requests = JSON.parse(fs.readFileSync(tracePath, 'utf8'));
+    const initializeIndex = requests.findIndex((entry: any) => entry.method === 'initialize');
+    const permissionRequestIndexes = requests
+      .map((entry: any, index: number) => ({ entry, index }))
+      .filter(({ entry }: any) => Object.prototype.hasOwnProperty.call(entry.params || {}, 'permissions'));
+    expect(initializeIndex).toBeGreaterThanOrEqual(0);
+    expect(requests[initializeIndex].params.capabilities).toEqual({ experimentalApi: true });
+    expect(permissionRequestIndexes).toHaveLength(2);
+    expect(permissionRequestIndexes.every(({ index }: any) => index > initializeIndex)).toBe(true);
+    expect(permissionRequestIndexes.map(({ entry }: any) => entry.method)).toEqual([
+      'thread/start',
+      'turn/start',
+    ]);
+    expect(permissionRequestIndexes.map(({ entry }: any) => entry.params.permissions)).toEqual([
+      ':danger-full-access',
+      ':danger-full-access',
+    ]);
+    expect(requestPermission).not.toHaveBeenCalled();
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'permission-request',
+      id: 'permissions-approval-1',
+      autoDecided: 'allow',
+      reason: 'full_access',
+    }));
+    expect(events.at(-1)).toMatchObject({
+      type: 'done',
+      status: 'completed',
+      output: 'auto approved',
+    });
+  });
+
   it('steers rich input into the exact active Codex turn and clears ingress at completion', async () => {
     const tracePath = path.join(tempDir, 'steer-trace.json');
     const ingressStates: any[] = [];
@@ -815,6 +1144,8 @@ if (scenario.endsWith('-lingers') || scenario === 'hang') setInterval(() => {}, 
         type: 'done',
         status: 'failed',
         error: expect.stringContaining('unsupported protocol'),
+        failureKind: 'cli_protocol',
+        retrySafe: true,
       });
       await expectProcessToExit(pid);
     } finally {
@@ -822,6 +1153,68 @@ if (scenario.endsWith('-lingers') || scenario === 'hang') setInterval(() => {}, 
         try { process.kill(-pid, 'SIGKILL'); } catch { /* already exited */ }
       }
     }
+  });
+
+  it.each([
+    ['0.146 request shape', 'user-input-146', undefined],
+    ['0.151 request shape', 'user-input-151', true],
+  ])('answers item/tool/requestUserInput for the Codex %s', async (_label, scenario, isBlocking) => {
+    const events: any[] = [];
+    const requestUserInput = vi.fn(async () => ({
+      cancelled: false,
+      answers: { environment: ['staging'] },
+    }));
+
+    await codexBackend.run({
+      binPath: fakeCodexPath,
+      prompt: 'choose an environment',
+      customArgs: [`--${scenario}`],
+      requestUserInput,
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+      timeoutMs: 2_000,
+      onEvent: event => events.push(event),
+    });
+
+    expect(requestUserInput).toHaveBeenCalledWith({
+      id: 'user-input-1',
+      questions: [{
+        id: 'environment',
+        header: 'Environment',
+        question: 'Choose target',
+        options: [{ label: 'staging', description: 'Use staging' }],
+        isOther: true,
+        isSecret: false,
+      }],
+      ...(isBlocking === undefined ? {} : { isBlocking }),
+    });
+    expect(events.at(-1)).toMatchObject({
+      type: 'done', status: 'completed', output: 'staging selected',
+    });
+  });
+
+  it('fails an unknown app-server request immediately instead of waiting for the watchdog', async () => {
+    const events: any[] = [];
+    const startedAt = Date.now();
+
+    await codexBackend.run({
+      binPath: fakeCodexPath,
+      prompt: 'request future input',
+      customArgs: ['--unknown-request'],
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+      timeoutMs: 2_000,
+      onEvent: event => events.push(event),
+    });
+
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(events.at(-1)).toMatchObject({
+      type: 'done',
+      status: 'failed',
+      error: expect.stringContaining('future/server/request'),
+      failureKind: 'cli_protocol',
+      retrySafe: false,
+    });
   });
 
   it('reports a spawn failure as one terminal event', async () => {
@@ -840,6 +1233,8 @@ if (scenario.endsWith('-lingers') || scenario === 'hang') setInterval(() => {}, 
       type: 'done',
       status: 'failed',
       error: expect.stringMatching(/ENOENT|not found/i),
+      failureKind: 'cli_spawn',
+      retrySafe: true,
     });
     expect(events.filter(event => event.type === 'done')).toHaveLength(1);
   });
@@ -892,7 +1287,14 @@ if (scenario.endsWith('-lingers') || scenario === 'hang') setInterval(() => {}, 
     },
     {
       scenario: 'system-error-lingers',
-      expected: { status: 'failed', error: 'codex thread entered a system error state' },
+      expected: { status: 'failed' },
+    },
+    {
+      scenario: 'system-error-then-failed',
+      expected: {
+        status: 'failed',
+        error: 'Selected model is at capacity. Please try a different model.',
+      },
     },
     {
       scenario: 'thread-closed',
@@ -919,6 +1321,9 @@ if (scenario.endsWith('-lingers') || scenario === 'hang') setInterval(() => {}, 
 
       expect(Date.now() - startedAt).toBeLessThan(750);
       expect(events.at(-1)).toMatchObject({ type: 'done', ...expected });
+      if (scenario === 'system-error-lingers') {
+        expect(events.at(-1).error).toBeUndefined();
+      }
       expect(events.filter(event => event.type === 'done')).toHaveLength(1);
       await expectProcessToExit(pid, 2_000);
     } finally {
@@ -1021,6 +1426,64 @@ if (scenario.endsWith('-lingers') || scenario === 'hang') setInterval(() => {}, 
         try { process.kill(-pid, 'SIGKILL'); } catch { /* already exited */ }
       }
     }
+  });
+
+  it('fails a hung bootstrap fast and retry-safe instead of waiting for the idle watchdog', async () => {
+    const events: any[] = [];
+    let pid = -1;
+    const previous = process.env.ORKAS_CODEX_BOOTSTRAP_TIMEOUT_MS;
+    process.env.ORKAS_CODEX_BOOTSTRAP_TIMEOUT_MS = '150';
+    try {
+      await codexBackend.run({
+        binPath: fakeCodexPath,
+        prompt: 'never answers initialize',
+        customArgs: ['--bootstrap-hang'],
+        cwd: process.cwd(),
+        signal: new AbortController().signal,
+        timeoutMs: 10_000,
+        onEvent: event => {
+          events.push(event);
+          if (event.type === 'process-info') pid = Number(event.pid);
+        },
+      });
+
+      const done = events.at(-1);
+      expect(done).toMatchObject({ type: 'done', status: 'failed', failureKind: 'cli_protocol', retrySafe: true });
+      expect(String(done.error)).toMatch(/bootstrap timed out/);
+      expect(events.filter(event => event.type === 'done')).toHaveLength(1);
+      await expectProcessToExit(pid);
+    } finally {
+      if (previous === undefined) delete process.env.ORKAS_CODEX_BOOTSTRAP_TIMEOUT_MS;
+      else process.env.ORKAS_CODEX_BOOTSTRAP_TIMEOUT_MS = previous;
+      if (pid > 0) {
+        try { process.kill(-pid, 'SIGKILL'); } catch { /* already exited */ }
+      }
+    }
+  });
+
+  it('does not hand the bridge env file to the Codex process itself', async () => {
+    const envTracePath = path.join(tempDir, `env-${Date.now()}.json`);
+    await codexBackend.run({
+      binPath: fakeCodexPath,
+      prompt: 'plain run',
+      customArgs: ['--env-trace', envTracePath],
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+      timeoutMs: 10_000,
+      bridge: {
+        mcpConfigPath: path.join(tempDir, 'mcp.json'),
+        server: {
+          command: 'node',
+          args: ['bridge.cjs'],
+          env: { ORKAS_BRIDGE_ENV_FILE: path.join(tempDir, 'bridge.env'), ORKAS_PC_DIR: tempDir },
+        },
+      },
+      onEvent: () => {},
+    });
+
+    const seen = JSON.parse(fs.readFileSync(envTracePath, 'utf8'));
+    expect(seen.ORKAS_BRIDGE_ENV_FILE).toBeNull();
+    expect(seen.ORKAS_PC_DIR).toBeNull();
   });
 
   it('reports timeout when Codex never emits a terminal event', async () => {

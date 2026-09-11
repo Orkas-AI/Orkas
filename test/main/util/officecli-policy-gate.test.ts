@@ -86,10 +86,18 @@ describe('OfficeCLI runtime policy gate', () => {
     fs.writeFileSync(
       engine,
       fs.readFileSync(engine, 'utf8').replace(
-        '(deny process-exec (subpath "/Applications"))',
-        '(allow process-exec (subpath "/Applications"))',
+        '(deny process-exec (require-all (subpath "/Applications")',
+        '(allow process-exec (require-all (subpath "/Applications")',
       ),
     );
+    expect(() => gate.verifyOfficeCliRuntimePolicy(fixtureRoot)).toThrow(/no longer denies installed app execution/);
+  });
+
+  it('rejects widening the bundled executable exception to its directory tree', () => {
+    const engine = path.join(fixtureRoot, gate.POLICY_FILES.engine);
+    fs.writeFileSync(engine, fs.readFileSync(engine, 'utf8').replaceAll(
+      '(literal (param "OFFICECLI_BINARY"))', '(subpath (param "OFFICECLI_BINARY"))',
+    ));
     expect(() => gate.verifyOfficeCliRuntimePolicy(fixtureRoot)).toThrow(/no longer denies installed app execution/);
   });
 

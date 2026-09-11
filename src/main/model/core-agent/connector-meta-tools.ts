@@ -36,6 +36,8 @@ import {
 } from '../../features/connectors/tools-adapter';
 import { validateCustomTransport, validateDisplayName, CustomTransportError } from '../../features/connectors/custom-transport';
 import { requestInstallConfirm } from '../../features/connectors/install_confirm';
+import { requestActionConfirm } from '../../features/connectors/action_confirm';
+import { connectorActionRisk, isConnectorActionBlocked } from '../../features/connectors/action_policy';
 import { findCatalogEntry } from '../../features/connectors/catalog';
 import { resolveLanguageForUser } from '../../features/config';
 import { descriptionLang } from '../../i18n';
@@ -44,6 +46,9 @@ import { logErrorRef, maskId } from '../../util/log-redact';
 import type { ConnectorInstance, ToolSchema } from '../../features/connectors/types';
 
 const log = createLogger('connector-meta-tools');
+const MAX_INLINE_CONNECTOR_TOOLS_CHARS = 30_000;
+const MAX_RECOVERY_ACTIONS = 24;
+const MAX_RECOVERY_ACTION_LIST_CHARS = 3_000;
 
 export interface ConnectorMetaToolsOpts {
   /** Active uid. Required — without it the meta-tools have no scope. */
@@ -73,50 +78,30 @@ function _recordVisibleConnectorDisplayNames(
   visible: VisibleConnectors,
 ): void {
   if (!opts.connectorDisplayNameById) return;
+  const lang = _descriptionLangForUser(opts.userId);
   for (const { instance } of visible) {
     const id = String(instance.id || '').trim();
-    const name = String(instance.display_name || '').trim();
+    const name = _localizedConnectorDisplayName(instance, lang);
     if (id && name) opts.connectorDisplayNameById.set(id, name);
   }
+}
+
+function _argumentsWithinBatchLimit(value: unknown, limit: number): boolean {
+  if (!Number.isInteger(limit) || limit < 1) return false;
+  if (Array.isArray(value)) {
+    return value.length <= limit && value.every((item) => _argumentsWithinBatchLimit(item, limit));
+  }
+  if (value && typeof value === 'object') {
+    return Object.values(value as Record<string, unknown>)
+      .every((item) => _argumentsWithinBatchLimit(item, limit));
+  }
+  return true;
 }
 
 function errResult(code: string, msg: string): ToolResult {
   return { content: `${code}: ${msg}`, isError: true };
 }
 
-function _descriptionLangForUser(uid: string): 'zh' | 'en' {
-  try {
-    return descriptionLang(resolveLanguageForUser(uid));
-  } catch {
-    return 'en';
-  }
-}
-
-function _renderConnectorLine(instance: ConnectorInstance, lang: 'zh' | 'en'): string {
-  // Catalog entry holds the bilingual description; instance.id doubles as the catalog id (per
-  // types.ts: instance.id is the catalog entry id, used both for routing and as the
-  // `<id>__<tool>` prefix). Falls back to display_name alone when the catalog has no
-  // description (shouldn't happen for shipped connectors).
-  //
-  // `resolveVisibleConnectors` routes `connected` AND `degraded` (the latter so a tool call can
-  // heal it), so a line is NOT implicitly healthy — a degraded one must say so. Keep the warning
-  // host-authored: status.message may contain arbitrary remote/provider text and this block is
-  // injected into the system prompt. The actual call can return its error as ordinary tool data.
-  // Disconnected / errored / connecting instances remain hidden entirely — see tools-adapter.ts
-  // for the filter + rationale.
-  const catalog = findCatalogEntry(instance.id);
-  const descKey = `description_${lang}` as 'description_zh' | 'description_en';
-  const desc = catalog ? (catalog[descKey] || '') : '';
-  const acct = instance.oauth_grant?.account_label ? ` (account: ${instance.oauth_grant.account_label})` : '';
-  const warn = instance.status.kind === 'degraded'
-    ? ' — ⚠️ UNVERIFIED: the last connection attempt failed. Calls may fail; if one does, report the connector error to the user rather than working around it.'
-    : '';
-  return desc
-    ? `- **${instance.id}** — ${instance.display_name}: ${desc}${acct}${warn}`
-    : `- **${instance.id}** — ${instance.display_name}${acct}${warn}`;
-}
-
-const MAX_INLINE_CONNECTOR_TOOLS_CHARS = 30_000;
 function _jsonStringify(value: unknown): string {
   try {
     return JSON.stringify(value ?? {}, null, 2);
@@ -168,9 +153,6 @@ function _renderCompactToolList(cid: string, tools: ToolSchema[]): string {
   return lines.join('\n').trimEnd();
 }
 
-const MAX_RECOVERY_ACTIONS = 24;
-const MAX_RECOVERY_ACTION_LIST_CHARS = 3_000;
-
 function _unavailableActionMessage(cid: string, requestedTool: string, tools: ToolSchema[]): string {
   const boundedRequestedTool = String(requestedTool || '').slice(0, 160);
   const names: string[] = [];
@@ -197,6 +179,45 @@ function _unavailableActionMessage(cid: string, requestedTool: string, tools: To
       'to obtain its input schema before invoking it.',
   );
   return lines.join('\n');
+}
+
+function _descriptionLangForUser(uid: string): 'zh' | 'en' {
+  try {
+    return descriptionLang(resolveLanguageForUser(uid));
+  } catch {
+    return 'en';
+  }
+}
+
+function _localizedConnectorDisplayName(instance: ConnectorInstance, lang: 'zh' | 'en'): string {
+  const catalog = findCatalogEntry(instance.id);
+  const localized = lang === 'zh' ? catalog?.display_name_zh : catalog?.display_name_en;
+  return String(localized || catalog?.display_name || instance.display_name || instance.id).trim();
+}
+
+function _renderConnectorLine(instance: ConnectorInstance, lang: 'zh' | 'en'): string {
+  // Catalog entry holds the bilingual description; instance.id doubles as the catalog id (per
+  // types.ts: instance.id is the catalog entry id, used both for routing and as the
+  // `<id>__<tool>` prefix). Falls back to display_name alone when the catalog has no
+  // description (shouldn't happen for shipped connectors).
+  //
+  // `resolveVisibleConnectors` routes `connected` AND `degraded` (the latter so a tool call can
+  // heal it), so a line is NOT implicitly healthy — a degraded one must say so. Keep the warning
+  // host-authored: status.message may contain arbitrary remote/provider text and this block is
+  // injected into the system prompt. The actual call can return its error as ordinary tool data.
+  // Disconnected / errored / connecting instances remain hidden entirely — see tools-adapter.ts
+  // for the filter + rationale.
+  const catalog = findCatalogEntry(instance.id);
+  const displayName = _localizedConnectorDisplayName(instance, lang);
+  const descKey = `description_${lang}` as 'description_zh' | 'description_en';
+  const desc = catalog ? (catalog[descKey] || '') : '';
+  const acct = instance.oauth_grant?.account_label ? ` (account: ${instance.oauth_grant.account_label})` : '';
+  const warn = instance.status.kind === 'degraded'
+    ? ' — ⚠️ UNVERIFIED: the last connection attempt failed. Calls may fail; if one does, report the connector error to the user rather than working around it.'
+    : '';
+  return desc
+    ? `- **${instance.id}** — ${displayName}: ${desc}${acct}${warn}`
+    : `- **${instance.id}** — ${displayName}${acct}${warn}`;
 }
 
 /** Render the `## Connectors` system-prompt block — pure enumeration (one line per connector).
@@ -385,7 +406,7 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
         );
       }
       const toolMatch = match.tools.find((t) => t.name === toolName);
-      if (!toolMatch) {
+      if (!toolMatch || isConnectorActionBlocked(cid, toolName)) {
         return errResult(
           'E_TOOL_NOT_AVAILABLE',
           _unavailableActionMessage(cid, toolName, match.tools),
@@ -393,7 +414,53 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
       }
 
       try {
-        const normalizedArgs = normalizeConnectorArgs(args, toolMatch.input_schema);
+        const normalizedArgs = applyConnectorArgDefaults(cid, toolName, args, toolMatch.input_schema);
+        const policy = toolMatch.orkas_action_policy;
+        const catalogEntry = findCatalogEntry(cid);
+        const isComposioCommerce = !!match.instance.composio_grant
+          && catalogEntry?.category === 'commerce';
+        const isCatalogGovernedRemoteCommerce = !match.instance.composio_grant
+          && catalogEntry?.category === 'commerce'
+          && !!catalogEntry.tool_policies;
+        if ((isComposioCommerce || isCatalogGovernedRemoteCommerce) && !policy) {
+          return errResult(
+            'E_CONNECTOR_POLICY_MISSING',
+            'This commerce action has no trusted action policy. Ask the user to refresh the connector before retrying.',
+          );
+        }
+        if (policy && !_argumentsWithinBatchLimit(normalizedArgs, policy.max_batch_size)) {
+          return errResult(
+            'E_CONNECTOR_BATCH_LIMIT',
+            `This connector action accepts at most ${policy.max_batch_size} items in any array argument. Split the request into smaller batches.`,
+          );
+        }
+        const actionRisk = connectorActionRisk(match.instance, toolMatch);
+        if (actionRisk.risk === 'H' || actionRisk.risk === 'D') {
+          const approved = await requestActionConfirm({
+            userId: opts.userId,
+            cid: opts.cid,
+            connectorId: cid,
+            displayName: _localizedConnectorDisplayName(
+              match.instance,
+              _descriptionLangForUser(opts.userId),
+            ),
+            accountLabel: match.instance.composio_grant?.account_label
+              || match.instance.oauth_grant?.account_label,
+            toolName,
+            risk: actionRisk.risk,
+            sensitiveOperation: actionRisk.sensitive_operation,
+            args: normalizedArgs,
+            signal: ctx.signal,
+          });
+          if (!approved) {
+            return errResult(
+              ctx.signal?.aborted ? 'E_TOOL_CALL_CANCELLED' : 'E_CONNECTOR_CONFIRMATION_DENIED',
+              ctx.signal?.aborted
+                ? 'The connector action was cancelled.'
+                : 'The sensitive connector action was not approved by the user.',
+            );
+          }
+        }
         const raw = await manager.callTool(opts.userId, cid, toolName, normalizedArgs, { signal: ctx.signal });
         const content = stringifyMcpResult(raw);
         const protocolError = !!raw && typeof raw === 'object' && (raw as { isError?: unknown }).isError === true;
@@ -410,7 +477,11 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
   };
 }
 
-function normalizeConnectorArgs(
+/** Shared by the in-process connector tools and the external-CLI bridge so
+ *  the same account, connector and action map to the same provider request. */
+export function applyConnectorArgDefaults(
+  connectorId: string,
+  toolName: string,
   args: Record<string, unknown>,
   schema: Record<string, unknown> | undefined,
 ): Record<string, unknown> {
@@ -473,7 +544,7 @@ function createAddCustomConnectorTool(opts: ConnectorMetaToolsOpts & { cid: stri
       try {
         const inst = await manager.addCustomInstance(opts.userId, { display_name: displayName, transport });
         try { opts.onCustomConnectorAdded?.(inst.id); }
-        catch { /* post-success navigation is best-effort */ }
+        catch { log.warn('custom connector post-success hook failed', { connector_id: 'custom', error_code: 'post_success_hook_failed' }); }
         if (inst.status.kind === 'connected') {
           return { content: `Connected "${inst.display_name}" (id: ${inst.id}). Its tools are now available via list_connector_tools({connector_id: "${inst.id}"}).` };
         }

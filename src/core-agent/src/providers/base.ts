@@ -47,8 +47,9 @@ export type CompletionParams = {
   reasoning?: "off" | "minimal" | "low" | "medium" | "high";
   /** Prompt-cache TTL policy forwarded to pi-ai. `"short"` (default in pi-ai)
    * = Anthropic 5m / OpenAI default window; `"long"` = Anthropic 1h / OpenAI
-   * 24h extended; `"none"` disables caching. Provider-specific translation
-   * happens inside pi-ai; providers without cache support ignore it. */
+   * extended retention (24h on legacy models or 30m on explicit-cache models);
+   * `"none"` disables caching. Provider-specific translation happens inside
+   * pi-ai; providers without cache support ignore it. */
   cacheRetention?: "none" | "short" | "long";
   /** Stable identifier used as `prompt_cache_key` (OpenAI / Codex / Azure /
    * OpenRouter) and as cache-affinity hint (Mistral, others). Should be the

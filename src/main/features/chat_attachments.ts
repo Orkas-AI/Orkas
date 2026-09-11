@@ -52,6 +52,7 @@ import {
   conversationMessageReadFile,
 } from '../util/project-layout';
 import { createLogger } from '../logger';
+import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { t } from '../i18n';
 import { toCompressedGrayJpeg } from '../util/image-transform';
 import {
@@ -235,7 +236,9 @@ function migrateLegacyDraftCloudDir(userId: string, cid: string): void {
       try { fs.rmdirSync(legacy); } catch { /* best-effort */ }
     }
   } catch (err) {
-    log.warn(`migrate legacy draft attachments user=${userId} cid=${cid}: ${(err as Error).message}`);
+    log.warn('legacy draft attachment migration failed', {
+      user_id: maskId(userId), cid: maskId(cid), error: logErrorSummary(err),
+    });
     return;
   }
 
@@ -489,8 +492,9 @@ function hashFile(absPath: string): Promise<string> {
 
 async function isUtf8File(absPath: string): Promise<boolean> {
   const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+  const stream = fs.createReadStream(absPath);
   try {
-    for await (const chunk of fs.createReadStream(absPath)) {
+    for await (const chunk of stream) {
       decoder.decode(chunk as Buffer, { stream: true });
     }
     decoder.decode();
@@ -500,6 +504,15 @@ async function isUtf8File(absPath: string): Promise<boolean> {
       return false;
     }
     throw err;
+  } finally {
+    // An invalid chunk ends iteration before the asynchronous handle close.
+    // Callers must be able to remove or replace the rejected source at once.
+    if (!stream.closed) {
+      await new Promise<void>((resolve) => {
+        stream.once('close', resolve);
+        stream.destroy();
+      });
+    }
   }
 }
 
@@ -570,7 +583,10 @@ export async function uploadAttachment(
     const pendingNames = new Set(pending.map((item) => item.name));
     const duplicate = await findDuplicateByHash(dir, buf.length, incomingHash, pendingNames);
     if (duplicate) {
-      log.info(`upload dedupe user=${userId} cid=${safeConvId} reuse=${duplicate.name} bytes=${duplicate.bytes}`);
+      log.info('attachment upload reused', {
+        user_id: maskId(userId), cid: maskId(safeConvId),
+        file: logPathRef(duplicate.name), bytes: duplicate.bytes,
+      });
       return { ok: true, info: duplicate, reused: true };
     }
     if (pending.length >= MAX_PENDING_ATTACHMENTS_PER_MESSAGE) {
@@ -600,7 +616,10 @@ export async function uploadAttachment(
 
     const st = fs.statSync(target);
     const kind = kindOf(ext);
-    log.info(`upload user=${userId} cid=${safeConvId} name=${finalName} kind=${kind} bytes=${st.size}`);
+    log.info('attachment uploaded', {
+      user_id: maskId(userId), cid: maskId(safeConvId),
+      file: logPathRef(finalName), kind, bytes: st.size,
+    });
     notifyAttachmentDirtyIfSyncable(userId, safeConvId, finalName);
     return {
       ok: true,
@@ -614,12 +633,15 @@ export async function uploadAttachment(
   });
 }
 
+/** Copy a local file into the attachment pool. `sha256` echoes the content
+ * hash so a composer chip created from a path import carries the same dedupe
+ * key as one created from a byte upload (renderer-side hash skip). */
 export async function importAttachmentFromPath(
   userId: string,
   cid: string,
   sourcePath: string,
   name?: string,
-): Promise<Result<{ info: AttachmentInfo; reused?: boolean }>> {
+): Promise<Result<{ info: AttachmentInfo; reused?: boolean; sha256: string }>> {
   let safeName: string;
   let safeConvId: string;
   try {
@@ -659,8 +681,11 @@ export async function importAttachmentFromPath(
     const pendingNames = new Set(pending.map((item) => item.name));
     const duplicate = await findDuplicateByHash(dir, sourceStat.size, incomingHash, pendingNames);
     if (duplicate) {
-      log.info(`import dedupe user=${userId} cid=${safeConvId} reuse=${duplicate.name} bytes=${duplicate.bytes}`);
-      return { ok: true, info: duplicate, reused: true };
+      log.info('attachment import reused', {
+        user_id: maskId(userId), cid: maskId(safeConvId),
+        file: logPathRef(duplicate.name), bytes: duplicate.bytes,
+      });
+      return { ok: true, info: duplicate, reused: true, sha256: incomingHash };
     }
     if (pending.length >= MAX_PENDING_ATTACHMENTS_PER_MESSAGE) {
       return {
@@ -681,7 +706,10 @@ export async function importAttachmentFromPath(
 
     const st = fs.statSync(target);
     const kind = kindOf(ext);
-    log.info(`import user=${userId} cid=${safeConvId} name=${finalName} kind=${kind} bytes=${st.size}`);
+    log.info('attachment imported', {
+      user_id: maskId(userId), cid: maskId(safeConvId),
+      file: logPathRef(finalName), kind, bytes: st.size,
+    });
     notifyAttachmentDirtyIfSyncable(userId, safeConvId, finalName);
     return {
       ok: true,
@@ -691,6 +719,7 @@ export async function importAttachmentFromPath(
         kind,
         mtime: Math.floor(st.mtimeMs / 1000),
       },
+      sha256: incomingHash,
     };
   });
 }
@@ -802,7 +831,7 @@ export function deleteAttachment(userId: string, cid: string, name: string): Res
   catch (err) { return { ok: false, error: (err as Error).message }; }
   // Drop the lazy file_cache entry for this source (if any was materialised).
   try { invalidateFileCache(userId, p); }
-  catch (err) { log.warn(`invalidate cache ${p}: ${(err as Error).message}`); }
+  catch (err) { log.warn('attachment cache invalidation failed', { file: logPathRef(p), error: logErrorSummary(err) }); }
   // Remove the per-cid directory if this was the last attachment — leaving
   // empty `chat_attachments/<cid>/` shells around violates the "no payload,
   // no directory" expectation, and the user has no UI to clean them up.
@@ -1126,9 +1155,10 @@ export function adoptDraftAttachments(
         fs.mkdirSync(path.dirname(item.from), { recursive: true });
         _moveFileBestEffort(item.target, item.from);
       } catch (rollbackErr) {
-        log.warn(
-          `adopt rollback failed user=${userId} ${dstSafe} → ${srcSafe}: ${(rollbackErr as Error).message}`,
-        );
+        log.warn('draft attachment adoption rollback failed', {
+          user_id: maskId(userId), from_cid: maskId(dstSafe), to_cid: maskId(srcSafe),
+          error: logErrorSummary(rollbackErr),
+        });
       }
     }
     return { ok: false, error: (err as Error).message };
@@ -1139,7 +1169,9 @@ export function adoptDraftAttachments(
     notifyAttachmentDirty(userId, dstSafe, name.target);
   }
   const count = movedNames.length;
-  log.info(`adopt user=${userId} ${srcSafe} → ${dstSafe} count=${count}`);
+  log.info('draft attachments adopted', {
+    user_id: maskId(userId), from_cid: maskId(srcSafe), to_cid: maskId(dstSafe), count,
+  });
   return {
     ok: true,
     count,
@@ -1169,9 +1201,9 @@ export async function purgeByCid(userId: string, cid: string): Promise<number> {
         }
         try { fs.rmdirSync(dir); } catch { /* best-effort */ }
       }
-    } catch (err) { log.warn(`purgeByCid(${cid}): ${(err as Error).message}`); }
+    } catch (err) { log.warn('attachment purge failed', { cid: maskId(cid), error: logErrorSummary(err) }); }
     try { await purgeFileCacheByCid(userId, safeConvId); }
-    catch (err) { log.warn(`purge file_cache cid=${safeConvId}: ${(err as Error).message}`); }
+    catch (err) { log.warn('attachment cache purge failed', { cid: maskId(safeConvId), error: logErrorSummary(err) }); }
     for (const name of names) notifyAttachmentDeletedIfSyncable(userId, safeConvId, name);
     return count;
   });
@@ -1319,7 +1351,7 @@ export async function buildAttachmentManifest(
         const meta = await statFile(userId, abs);
         totalChars = meta.totalChars;
       } catch (err) {
-        log.warn(`manifest statFile text failed name=${nm}: ${(err as Error).message}`);
+        log.warn('attachment manifest text metadata failed', { file: logPathRef(nm), error: logErrorSummary(err) });
       }
     } else {
       // Rich documents: peek only — no extract. total_chars appears only when
@@ -1351,8 +1383,11 @@ export async function buildAttachmentManifest(
   const imageNote = hasImages
     ? '\n<!-- image delivery is bounded by the active model. image_order maps prepared vision blocks in source order. If an image is deferred or is not actually visible in this request, call read_files({"paths":[{"path":"<exact-path>"}]}) for that image, one at a time; listing a path alone is not visual processing. -->'
     : '';
+  const accessNote = entries.length
+    ? '\n<!-- These host-validated paths are authoritative and readable. For file contents, call read_files with the exact path directly; do not search for an attached file first. -->'
+    : '';
   const manifest = entries.length
-    ? `<attachments>${mediaNote}${archiveNote}${imageNote}\n${entries.join('\n')}\n</attachments>`
+    ? `<attachments>${accessNote}${mediaNote}${archiveNote}${imageNote}\n${entries.join('\n')}\n</attachments>`
     : '';
   return { manifest, images, skipped, metadata: metadata() };
 }
@@ -1413,7 +1448,7 @@ export async function buildConversationAttachmentIndex(
         const meta = await statFile(userId, abs);
         attrs.push(`total_chars="${meta.totalChars}"`);
       } catch (err) {
-        log.warn(`attachment index statFile text failed name=${nm}: ${(err as Error).message}`);
+        log.warn('attachment index text metadata failed', { file: logPathRef(nm), error: logErrorSummary(err) });
       }
     } else {
       const cached = getCachedMeta(userId, abs);

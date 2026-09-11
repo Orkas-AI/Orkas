@@ -1,4 +1,4 @@
-import { createHash, randomInt, randomUUID } from 'node:crypto';
+import { randomInt, randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import {
   chmodSync,
@@ -13,7 +13,6 @@ import {
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
-import type { Duplex } from 'node:stream';
 import AdmZip from 'adm-zip';
 import {
   _electron as electron,
@@ -25,7 +24,9 @@ import {
 } from '@playwright/test';
 
 const PC_ROOT = path.resolve(__dirname, '../../..');
-const ACCOUNT_USER_ID = 'account-e2e';
+// Shared E2E scenarios address this local registry identity directly. The
+// value is a fixture UID; it does not create an official account or session.
+const LOCAL_USER_ID = 'account-e2e';
 const MAX_LOG_BYTES = 2 * 1024 * 1024;
 /** Evidence files read per model round in the context-compaction scenario.
  *  Four ~11.2K-token results stay well under the per-round inline allowance,
@@ -43,15 +44,14 @@ const E2E_MP4_BYTES = Buffer.from([
 ]);
 
 type OrkasOptions = {
-  authenticated?: boolean;
+  /** Keep storage-location probes isolated while allowing a non-temporary parent. */
+  rootParent?: string;
   configuredModel?: boolean;
   setDefaultViewport?: boolean;
   modelStub?: boolean;
   marketplaceStub?: boolean;
   cliStub?: boolean;
-  accountStub?: boolean;
   updateStub?: boolean;
-  voiceStub?: boolean;
   metacognitionEnabled?: boolean;
   enableSystemProxy?: boolean;
 };
@@ -79,9 +79,7 @@ export type CliStubState = {
   modelListResponses: number;
 };
 
-type ModelStubMode = 'success' | 'refusal' | 'http-error' | 'auth-error' | 'slow' | 'very-slow' | 'truncated';
-type ShareStubMode = 'success' | 'failure';
-type VoiceStubMode = 'success' | 'blocked-open';
+type ModelStubMode = 'success' | 'refusal' | 'http-error' | 'auth-error' | 'model-not-open' | 'slow' | 'very-slow' | 'controlled-slow' | 'truncated';
 type SystemIdleState = 'active' | 'idle' | 'locked' | 'unknown';
 type AgentFanoutTarget = {
   agentId: string;
@@ -678,65 +676,22 @@ input.on('line', line => {
 });
 `;
 }
-
-function seedUserWorkspace(
-  workspaceRoot: string,
-  userId: string,
-  authenticated: boolean,
-  profile: { nickname: string; email: string } = {
-    nickname: 'E2E User',
-    email: 'e2e@example.invalid',
-  },
-  subscription: Record<string, unknown> = {
-    plan: 'free',
-    status: 'active',
-  },
-): void {
-  const now = '2026-01-01T00:00:00.000Z';
-
-  writeJson(
-    path.join(workspaceRoot, userId, 'cloud', 'config', 'preferences.json'),
-    {
-      language: 'en',
-      task_notifications_enabled: true,
-      metacognition_enabled: false,
-      global_skill_roots_enabled: false,
-    },
-  );
-
-  if (!authenticated) return;
-
-  writeJson(
-    path.join(workspaceRoot, userId, 'local', 'config', 'account.json'),
-    {
-      version: 2,
-      device_id: `e2e-${randomUUID()}`,
-      user_id: userId,
-      session_id: `e2e-session-${randomUUID()}`,
-      user_info: {
-        id: userId,
-        nickname: profile.nickname,
-        email: profile.email,
-      },
-      subscription,
-    },
-  );
-}
-
-function seedWorkspace(
-  workspaceRoot: string,
-  authenticated: boolean,
-  subscription?: Record<string, unknown>,
-): void {
-  const userId = authenticated ? ACCOUNT_USER_ID : 'anonymous';
-  const now = '2026-01-01T00:00:00.000Z';
-  writeJson(path.join(workspaceRoot, 'users.json'), {
-    current_user_id: userId,
-    dev_current_user_id: userId,
-    users: [{ user_id: userId, created_at: now }],
+function seedUserWorkspace(workspaceRoot: string, userId: string): void {
+  writeJson(path.join(workspaceRoot, userId, 'cloud', 'config', 'preferences.json'), {
+    language: 'en', task_notifications_enabled: true,
+    metacognition_enabled: false, global_skill_roots_enabled: false,
   });
-  seedUserWorkspace(workspaceRoot, userId, authenticated, undefined, subscription);
 }
+
+function seedWorkspace(workspaceRoot: string): void {
+  const userId = LOCAL_USER_ID;
+  writeJson(path.join(workspaceRoot, 'open-users.json'), {
+    open_current_user_id: userId,
+    users: [{ user_id: userId, created_at: '2026-01-01T00:00:00.000Z' }],
+  });
+  seedUserWorkspace(workspaceRoot, userId);
+}
+
 
 function collectLogFiles(root: string): string {
   const chunks: string[] = [];
@@ -779,15 +734,12 @@ export class OrkasTestApp {
   readonly userWorkspaceRoot: string;
   readonly userDataRoot: string;
   readonly authRoot: string;
-  readonly authenticated: boolean;
   readonly configuredModel: boolean;
   readonly setDefaultViewport: boolean;
   readonly modelStub: boolean;
   readonly marketplaceStub: boolean;
   readonly cliStub: boolean;
-  readonly accountStub: boolean;
   readonly updateStub: boolean;
-  readonly voiceStub: boolean;
   readonly metacognitionEnabled: boolean;
   readonly enableSystemProxy: boolean;
   readonly cliStatePath: string;
@@ -807,9 +759,7 @@ export class OrkasTestApp {
     encryption: string;
     body: string;
   }> = [];
-  readonly shareCreateRequests: Array<Record<string, unknown>> = [];
   readonly marketplaceRequests: Array<{ path: string; body: Record<string, unknown> }> = [];
-  readonly creditTransactionRequests: string[] = [];
   readonly apiRequests: Array<{ method: string; path: string; channel: string }> = [];
   compactionRequestAborts = 0;
   imageTaskPolls = 0;
@@ -826,10 +776,13 @@ export class OrkasTestApp {
   private clientConfigImmediate: Record<string, unknown> = {
     'feature.e2e_published': 'generation-a',
   };
-  private shareStubMode: ShareStubMode = 'success';
-  private voiceStubMode: VoiceStubMode = 'success';
   private readonly modelTimers = new Set<ReturnType<typeof setTimeout>>();
-  private readonly voiceSockets = new Set<Duplex>();
+  private controlledModelStream: {
+    chunkReady: Promise<void>;
+    finishReady: Promise<void>;
+    releaseChunk: () => void;
+    releaseFinish: () => void;
+  } | null = null;
   private readonly testInfo: TestInfo;
   private readonly diagnostics: string[] = [];
   private readonly rendererPageErrors: string[] = [];
@@ -842,45 +795,23 @@ export class OrkasTestApp {
   private pendingAgentHandoffReply: (() => void) | null = null;
   private modelTextReplies: string[] = [];
   private libraryImageDescriptionReplies: string[] = [];
-  private readonly accountSubscription = {
-    billing_enabled: true,
-    tier: 'pro',
-    status: 'active',
-    current_period_end: 1_830_297_600,
-    benefits: {
-      credits: {
-        monthly_used: 250,
-        monthly_total: 1_000,
-        monthly_remaining: 750,
-        lifetime: 125,
-        available: 875,
-      },
-      cloud_storage: {
-        used_bytes: 1_048_576,
-        total_bytes: 10_485_760,
-      },
-    },
-  };
 
   constructor(testInfo: TestInfo, options: OrkasOptions = {}) {
     this.testInfo = testInfo;
-    this.authenticated = options.authenticated !== false;
     this.configuredModel = options.configuredModel !== false;
     this.setDefaultViewport = options.setDefaultViewport !== false;
     this.modelStub = options.modelStub === true;
     this.marketplaceStub = options.marketplaceStub === true;
     this.cliStub = options.cliStub === true;
-    this.accountStub = options.accountStub === true;
     this.updateStub = options.updateStub === true;
-    this.voiceStub = options.voiceStub === true;
     this.metacognitionEnabled = options.metacognitionEnabled === true;
     this.enableSystemProxy = options.enableSystemProxy === true;
-    this.root = mkdtempSync(path.join(tmpdir(), 'orkas-e2e-'));
+    this.root = mkdtempSync(path.join(options.rootParent ?? tmpdir(), 'orkas-e2e-'));
     this.workspaceRoot = path.join(this.root, 'workspace');
     this.userWorkspaceRoot = path.join(this.root, 'userWorkSpace');
     this.userDataRoot = path.join(this.root, 'electron-user-data');
     this.authRoot = path.join(this.root, 'core-agent-auth');
-    this.activeUserId = this.authenticated ? ACCOUNT_USER_ID : 'anonymous';
+    this.activeUserId = LOCAL_USER_ID;
     this.cliStatePath = path.join(this.root, 'cli-stub-state.json');
     // Match the layout of npm-installed Windows CLI shims. The production
     // launcher deliberately applies a second metacharacter-escaping pass for
@@ -908,12 +839,8 @@ export class OrkasTestApp {
         modelListResponses: 0,
       } satisfies CliStubState);
     }
-    seedWorkspace(
-      this.workspaceRoot,
-      this.authenticated,
-      this.accountStub ? this.accountSubscription : undefined,
-    );
-    if (this.updateStub && this.authenticated) {
+    seedWorkspace(this.workspaceRoot);
+    if (this.updateStub) {
       writeJson(
         path.join(this.workspaceRoot, this.activeUserId, 'local', 'config', 'remote-config.json'),
         {
@@ -937,15 +864,7 @@ export class OrkasTestApp {
   async launch(): Promise<void> {
     if (this.electronApp) throw new Error('Orkas Electron app is already running');
     this.lastLaunchReadyMs = null;
-    if (
-      this.modelStub
-      || this.marketplaceStub
-      || this.accountStub
-      || this.updateStub
-      || this.voiceStub
-    ) {
-      await this.ensureStubServer();
-    }
+    if (this.modelStub || this.marketplaceStub || this.updateStub) await this.ensureStubServer();
     const launchStartedAt = Date.now();
 
     const environment: NodeJS.ProcessEnv = {
@@ -955,7 +874,6 @@ export class OrkasTestApp {
       ORKAS_E2E_HIDE_WINDOW: process.env.PWDEBUG === '1' || process.env.ORKAS_E2E_SHOW_WINDOW === '1' ? '0' : '1',
       CORE_AGENT_AUTH_DIR: this.authRoot,
       ORKAS_API_BASE_URL: this.apiBaseUrl,
-      ORKAS_ACCOUNT_API_BASE: this.apiBaseUrl,
       ORKAS_E2E_MARKETPLACE_API_BASE: this.marketplaceStub ? this.apiBaseUrl : '',
       ORKAS_METACOGNITION: this.metacognitionEnabled ? '1' : '0',
       ORKAS_NO_AUTO_PROXY: this.enableSystemProxy ? '0' : '1',
@@ -1026,8 +944,6 @@ export class OrkasTestApp {
       await page.setViewportSize({ width: 1280, height: 800 });
     }
     await page.waitForLoadState('domcontentloaded');
-
-    if (this.authenticated) {
       // The app restores its last active view. Use persistent shell chrome as
       // the readiness signal instead of assuming every relaunch lands on the
       // new-chat composer.
@@ -1040,7 +956,7 @@ export class OrkasTestApp {
       );
       this.lastLaunchReadyMs = Date.now() - launchStartedAt;
       // The open build has no managed models. Seed one deterministic custom
-      // entry per local test account so every model-backed scenario exercises
+      // entry per local test user so every model-backed scenario exercises
       // the same BYO path that open-build users configure in Settings.
       if (this.configuredModel && !this.configuredModelSeededUsers.has(this.activeUserId)) {
         this.configuredModelSeededUsers.add(this.activeUserId);
@@ -1069,10 +985,7 @@ export class OrkasTestApp {
         }>('agents.list');
         return result.agents.some((agent) => agent.agent_id === '173d4235a431');
       }, { timeout: 20_000 }).toBe(true);
-    } else {
-      await expect(page.locator('#account-login-overlay')).toBeVisible({ timeout: 20_000 });
-      this.lastLaunchReadyMs = Date.now() - launchStartedAt;
-    }
+    
   }
 
   async relaunch(): Promise<Page> {
@@ -1082,29 +995,27 @@ export class OrkasTestApp {
     return this.page;
   }
 
-  async switchAccount(
+  async switchLocalUser(
     userId: string,
-    profile: { nickname: string; email: string },
+    _profile: { nickname: string; email: string },
   ): Promise<Page> {
-    if (!/^[A-Za-z0-9_-]+$/.test(userId)) throw new Error(`Invalid E2E account id: ${userId}`);
+    if (!/^[A-Za-z0-9_-]+$/.test(userId)) throw new Error(`Invalid E2E local user id: ${userId}`);
     await this.closeCurrentApp();
-    seedUserWorkspace(this.workspaceRoot, userId, true, profile);
+    seedUserWorkspace(this.workspaceRoot, userId);
 
-    const registryPath = path.join(this.workspaceRoot, 'users.json');
+    const registryPath = path.join(this.workspaceRoot, 'open-users.json');
     const registry = JSON.parse(readFileSync(registryPath, 'utf8')) as {
-      current_user_id: string;
-      dev_current_user_id: string;
+      open_current_user_id: string;
       users: Array<{ user_id: string; created_at: string }>;
     };
-    registry.current_user_id = userId;
-    registry.dev_current_user_id = userId;
+    registry.open_current_user_id = userId;
     if (!registry.users.some((item) => item.user_id === userId)) {
       registry.users.push({ user_id: userId, created_at: '2026-01-01T00:00:00.000Z' });
     }
     writeJson(registryPath, registry);
     this.activeUserId = userId;
     await this.launch();
-    if (!this.page) throw new Error('Orkas renderer did not open after switching accounts');
+    if (!this.page) throw new Error('Orkas renderer did not open after switching local users');
     return this.page;
   }
 
@@ -1113,8 +1024,8 @@ export class OrkasTestApp {
     profile: { nickname: string; email: string },
   ): Promise<void> {
     if (!this.electronApp) throw new Error('Orkas Electron app is unavailable');
-    if (!/^[A-Za-z0-9_-]+$/.test(userId)) throw new Error(`Invalid E2E account id: ${userId}`);
-    seedUserWorkspace(this.workspaceRoot, userId, true, profile);
+    if (!/^[A-Za-z0-9_-]+$/.test(userId)) throw new Error(`Invalid E2E local user id: ${userId}`);
+    seedUserWorkspace(this.workspaceRoot, userId);
     const usersModulePath = path.join(PC_ROOT, 'src', 'main', 'features', 'users.ts');
     await this.electronApp.evaluate(async (_electron, input) => {
       const mainModule = (process as NodeJS.Process & {
@@ -1129,7 +1040,7 @@ export class OrkasTestApp {
       };
       users.activateUser(input.userId);
       if (users.getActiveUserId() !== input.userId) {
-        throw new Error('in-process E2E account activation did not stick');
+        throw new Error('in-process E2E local user activation did not stick');
       }
     }, { usersModulePath, userId });
     this.activeUserId = userId;
@@ -1185,6 +1096,23 @@ export class OrkasTestApp {
   setModelMode(mode: ModelStubMode): void {
     if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
     this.modelStubMode = mode;
+    if (mode === 'controlled-slow') {
+      let releaseChunk = (): void => {};
+      let releaseFinish = (): void => {};
+      const chunkReady = new Promise<void>((resolve) => { releaseChunk = resolve; });
+      const finishReady = new Promise<void>((resolve) => { releaseFinish = resolve; });
+      this.controlledModelStream = { chunkReady, finishReady, releaseChunk, releaseFinish };
+    }
+  }
+
+  releaseControlledModelChunk(): void {
+    if (!this.controlledModelStream) throw new Error('No controlled model stream is active');
+    this.controlledModelStream.releaseChunk();
+  }
+
+  finishControlledModelStream(): void {
+    if (!this.controlledModelStream) throw new Error('No controlled model stream is active');
+    this.controlledModelStream.releaseFinish();
   }
 
   setClientConfigImmediate(immediate: Record<string, unknown>): string {
@@ -1195,71 +1123,6 @@ export class OrkasTestApp {
       ...immediate,
     };
     return `sha256:e2e-client-config-generation-${this.clientConfigGeneration}`;
-  }
-
-  setAccountTier(tier: 'free' | 'lite' | 'pro' | 'max'): void {
-    if (!this.accountStub) throw new Error('The local account stub is not enabled for this fixture');
-    this.accountSubscription.tier = tier;
-  }
-
-  setShareMode(mode: ShareStubMode): void {
-    if (!this.modelStub) throw new Error('The local API stub is not enabled for this fixture');
-    this.shareStubMode = mode;
-  }
-
-  setVoiceMode(mode: VoiceStubMode): void {
-    if (!this.voiceStub) throw new Error('The local voice stub is not enabled for this fixture');
-    this.voiceStubMode = mode;
-  }
-
-  async installVoiceCaptureStub(): Promise<void> {
-    if (!this.voiceStub || !this.electronApp || !this.page) {
-      throw new Error('The local voice fixture is unavailable');
-    }
-    await this.electronApp.evaluate(({ systemPreferences }) => {
-      const preferences = systemPreferences as any;
-      preferences.getMediaAccessStatus = () => 'granted';
-      preferences.askForMediaAccess = async () => true;
-    });
-    await this.page.evaluate(() => {
-      const noopNode = () => ({
-        connect() {},
-        disconnect() {},
-        onaudioprocess: null,
-      });
-      class FakeAudioContext {
-        state = 'running';
-        sampleRate = 16_000;
-        destination = {};
-        createMediaStreamSource() { return noopNode(); }
-        createScriptProcessor() { return noopNode(); }
-        createGain() {
-          return {
-            ...noopNode(),
-            gain: { value: 1 },
-          };
-        }
-        async resume() {}
-        async close() {}
-      }
-      Object.defineProperty(window, 'AudioContext', {
-        configurable: true,
-        value: FakeAudioContext,
-      });
-      Object.defineProperty(navigator, 'mediaDevices', {
-        configurable: true,
-        value: {
-          getUserMedia: async () => ({
-            getTracks: () => [{
-              stop() {
-                (window as any).__e2eVoiceTrackStops =
-                  Number((window as any).__e2eVoiceTrackStops || 0) + 1;
-              },
-            }],
-          }),
-        },
-      });
-    });
   }
 
   setModelTextReplies(replies: string[]): void {
@@ -1573,12 +1436,10 @@ export class OrkasTestApp {
     };
   }
 
-  /** Commander narrates BEFORE dispatching a visible agent, in one turn. The
-   * bus flushes that narration as its own `seg` bubble so the agent's reply
-   * lands under it, then the post-handback synthesis becomes the next segment.
-   * This is the shape that produced duplicate Commander bubbles: the narration
-   * streams into a live row and is persisted moments later, so the renderer has
-   * to recognise both as the same row. */
+  /** Commander emits working commentary before dispatching a visible agent,
+   * then returns a final synthesis after the handback. The mapper keeps the
+   * pre-tool block in process history and only the synthesis in the answer
+   * body, so the renderer must not leave a duplicate Commander row behind. */
   setCommanderSegmentScenario(input: {
     narration: string;
     agentId: string;
@@ -1732,7 +1593,7 @@ export class OrkasTestApp {
           contentType: 'application/json',
         }).catch(() => undefined);
       }
-      const appLogs = collectLogFiles(this.root);
+      const appLogs = collectLogFiles(path.join(this.workspaceRoot, 'logs'));
       const diagnosticText = [this.diagnostics.join('\n'), appLogs].filter(Boolean).join('\n');
       if (diagnosticText) {
         // Written to the failure's output directory, not only attached: line/list
@@ -1755,6 +1616,22 @@ export class OrkasTestApp {
         }
       }
     } else {
+      // Log analysis on PASSING runs (test-case-design §3.1): with
+      // ORKAS_E2E_KEEP_LOGS=1 preserves the same captured stdout/stderr,
+      // renderer diagnostics and app logs as a failed run. File logs alone
+      // omit direct console output, including renderer warnings.
+      if (process.env.ORKAS_E2E_KEEP_LOGS === '1') {
+        const appLogs = collectLogFiles(path.join(this.workspaceRoot, 'logs'));
+        const diagnosticText = [this.diagnostics.join('\n'), appLogs].filter(Boolean).join('\n');
+        if (diagnosticText) {
+          try {
+            mkdirSync(this.testInfo.outputDir, { recursive: true });
+            writeFileSync(path.join(this.testInfo.outputDir, 'electron-main.log'), diagnosticText, 'utf8');
+          } catch {
+            // Diagnostics only — never fail a passing test over log capture.
+          }
+        }
+      }
       for (const tracePath of this.tracePaths) {
         try {
           unlinkSync(tracePath);
@@ -1831,10 +1708,8 @@ export class OrkasTestApp {
         channel: String(request.headers['orkas-channel'] || ''),
       });
       const isChat = requestUrl.pathname === '/api/v1/chat/completions';
+      const isResponses = requestUrl.pathname === '/api/v1/responses';
       const isClientConfig = requestUrl.pathname === '/api/config/client';
-      const isShareCreate = requestUrl.pathname === '/api/share/create';
-      const isAccountMe = requestUrl.pathname === '/api/account/me';
-      const isCreditTransactions = requestUrl.pathname === '/api/account/credits/transactions';
       const isImageCreate = requestUrl.pathname === '/api/e2e-image/generations';
       const isImageTask = requestUrl.pathname === '/api/e2e-image/generations/e2e-image-task';
       const isImageOutput = requestUrl.pathname === '/generated/e2e-managed-image.png';
@@ -1848,7 +1723,7 @@ export class OrkasTestApp {
       const isModelStubRoute = this.modelStub
         && (
           isChat
-          || isShareCreate
+          || isResponses
           || isImageCreate
           || isGenerationReferenceAuth
           || isGenerationReferenceUpload
@@ -1902,56 +1777,6 @@ export class OrkasTestApp {
           'Content-Length': String(marketplaceUnsafeSkillBundle.length),
         });
         response.end(marketplaceUnsafeSkillBundle);
-        return;
-      }
-      if (request.method === 'GET' && isAccountMe && this.accountStub) {
-        response.writeHead(200, { 'Content-Type': 'application/json' });
-        response.end(JSON.stringify({
-          code: 0,
-          user_info: {
-            id: this.activeUserId,
-            nickname: 'E2E Member',
-            email: 'member@example.invalid',
-          },
-          subscription: this.accountSubscription,
-        }));
-        return;
-      }
-      if (request.method === 'GET' && isCreditTransactions && this.accountStub) {
-        const direction = requestUrl.searchParams.get('direction') === 'earn' ? 'earn' : 'consume';
-        this.creditTransactionRequests.push(requestUrl.search);
-        const records = direction === 'earn'
-          ? [{
-              id: 2,
-              direction: 'earn',
-              scene: 'initial_gift',
-              amount_milli: 10_000,
-              created_at: 1_767_225_600,
-            }]
-          : [{
-              id: 1,
-              direction: 'consume',
-              scene: 'llm',
-              amount_milli: 1_500,
-              created_at: 1_767_225_600,
-              quantity: 1,
-            }];
-        response.writeHead(200, { 'Content-Type': 'application/json' });
-        response.end(JSON.stringify({
-          code: 0,
-          direction,
-          records,
-          next_cursor: '',
-          retention_days: direction === 'consume' ? 30 : null,
-          summary: direction === 'consume' ? {
-            window_days: 30,
-            used_milli: 250_000,
-            total_milli: 1_000_000,
-            remaining_milli: 750_000,
-            lifetime_milli: 125_000,
-            top: records[0],
-          } : null,
-        }));
         return;
       }
       if (request.method === 'GET' && isImageTask && this.modelStub) {
@@ -2163,27 +1988,72 @@ export class OrkasTestApp {
           }));
           return;
         }
-        if (isShareCreate) {
-          this.shareCreateRequests.push(requestBody);
-          if (this.shareStubMode === 'failure') {
-            response.writeHead(503, { 'Content-Type': 'application/json' });
-            response.end(JSON.stringify({
-              code: 1,
-              msg: 'COS secret bucket upload failed at /private/e2e-account',
-              reason: 'internal_bucket_name',
-            }));
-            return;
+        if (isResponses) {
+          const input = Array.isArray(requestBody.input) ? requestBody.input : [];
+          const messages: Array<Record<string, unknown>> = [];
+          const responseTools = [
+            ...(Array.isArray(requestBody.tools) ? requestBody.tools : []),
+            ...input.flatMap((item) => (
+              item && typeof item === 'object'
+              && ['tool_search_output', 'additional_tools'].includes(String((item as { type?: unknown }).type || ''))
+              && Array.isArray((item as { tools?: unknown }).tools)
+                ? (item as { tools: unknown[] }).tools
+                : []
+            )),
+          ];
+          for (const rawItem of input) {
+            if (!rawItem || typeof rawItem !== 'object') continue;
+            const item = rawItem as Record<string, unknown>;
+            const role = String(item.role || '');
+            const type = String(item.type || '');
+            if (role) {
+              const content = Array.isArray(item.content)
+                ? item.content.map((block) => (
+                  block && typeof block === 'object'
+                    ? String((block as { text?: unknown; refusal?: unknown }).text
+                      || (block as { refusal?: unknown }).refusal
+                      || '')
+                    : String(block || '')
+                )).join('')
+                : item.content;
+              messages.push({ role: role === 'developer' ? 'system' : role, content });
+            } else if (type === 'function_call') {
+              messages.push({
+                role: 'assistant',
+                content: null,
+                tool_calls: [{
+                  id: item.call_id,
+                  type: 'function',
+                  function: { name: item.name, arguments: item.arguments },
+                }],
+              });
+            } else if (type === 'function_call_output') {
+              messages.push({ role: 'tool', tool_call_id: item.call_id, content: item.output });
+            }
           }
-          const createdAtMs = Date.now();
-          response.writeHead(200, { 'Content-Type': 'application/json' });
-          response.end(JSON.stringify({
-            code: 0,
-            url: `http://localhost:9000/share/${'A'.repeat(43)}`,
-            format: requestBody.format,
-            created_at_ms: createdAtMs,
-            expires_at_ms: createdAtMs + 30 * 24 * 60 * 60 * 1000,
-          }));
-          return;
+          const toolsByName = new Map<string, Record<string, unknown>>();
+          for (const rawTool of responseTools) {
+            if (!rawTool || typeof rawTool !== 'object') continue;
+            const tool = rawTool as Record<string, unknown>;
+            const nested = tool.function && typeof tool.function === 'object'
+              ? tool.function as Record<string, unknown>
+              : tool;
+            const name = String(nested.name || '');
+            if (!name) continue;
+            toolsByName.set(name, {
+              type: 'function',
+              function: {
+                name,
+                description: nested.description,
+                parameters: nested.parameters,
+              },
+            });
+          }
+          requestBody = {
+            ...requestBody,
+            messages,
+            tools: [...toolsByName.values()],
+          };
         }
         this.modelRequests.push(requestBody);
 
@@ -2251,13 +2121,208 @@ export class OrkasTestApp {
           'Content-Type': 'text/event-stream; charset=utf-8',
           Connection: 'keep-alive',
         });
+        let responsesStarted = false;
+        let responsesFinished = false;
+        let nextOutputIndex = 0;
+        let responseUsage: Record<string, unknown> = {};
+        let responseFinishReason = 'stop';
+        const responseId = `resp-e2e-${this.modelRequests.length}`;
+        const responseMessage = {
+          id: `msg-e2e-${this.modelRequests.length}`,
+          outputIndex: -1,
+          text: '',
+        };
+        const responseTools = new Map<number, {
+          id: string;
+          callId: string;
+          name: string;
+          arguments: string;
+          outputIndex: number;
+        }>();
+        const responseEvent = (type: string, fields: Record<string, unknown>): Record<string, unknown> => ({
+          type,
+          ...fields,
+        });
+        const convertChatEvent = (chatEvent: Record<string, unknown>): Array<Record<string, unknown>> => {
+          const converted: Array<Record<string, unknown>> = [];
+          if (!responsesStarted) {
+            responsesStarted = true;
+            converted.push(responseEvent('response.created', {
+              response: {
+                id: responseId,
+                object: 'response',
+                created_at: created,
+                status: 'in_progress',
+                model: 'e2e-chat-model',
+                output: [],
+              },
+            }));
+          }
+          if (chatEvent.usage && typeof chatEvent.usage === 'object') {
+            responseUsage = chatEvent.usage as Record<string, unknown>;
+          }
+          const choices = Array.isArray(chatEvent.choices)
+            ? chatEvent.choices as Array<Record<string, unknown>>
+            : [];
+          for (const choice of choices) {
+            if (typeof choice.finish_reason === 'string' && choice.finish_reason) {
+              responseFinishReason = choice.finish_reason;
+            }
+            const delta = choice.delta && typeof choice.delta === 'object'
+              ? choice.delta as Record<string, unknown>
+              : {};
+            if (typeof delta.content === 'string' && delta.content) {
+              if (responseMessage.outputIndex < 0) {
+                responseMessage.outputIndex = nextOutputIndex++;
+                converted.push(responseEvent('response.output_item.added', {
+                  output_index: responseMessage.outputIndex,
+                  item: {
+                    type: 'message',
+                    id: responseMessage.id,
+                    status: 'in_progress',
+                    role: 'assistant',
+                    content: [],
+                  },
+                }));
+              }
+              responseMessage.text += delta.content;
+              converted.push(responseEvent('response.output_text.delta', {
+                item_id: responseMessage.id,
+                output_index: responseMessage.outputIndex,
+                content_index: 0,
+                delta: delta.content,
+              }));
+            }
+            const toolCalls = Array.isArray(delta.tool_calls)
+              ? delta.tool_calls as Array<Record<string, unknown>>
+              : [];
+            for (const rawCall of toolCalls) {
+              const index = typeof rawCall.index === 'number' ? rawCall.index : responseTools.size;
+              let state = responseTools.get(index);
+              const isNewState = !state;
+              const fn = rawCall.function && typeof rawCall.function === 'object'
+                ? rawCall.function as Record<string, unknown>
+                : {};
+              if (!state) {
+                state = {
+                  id: `fc-e2e-${this.modelRequests.length}-${index}`,
+                  callId: String(rawCall.id || `call-e2e-${index}`),
+                  name: String(fn.name || ''),
+                  arguments: '',
+                  outputIndex: nextOutputIndex++,
+                };
+                responseTools.set(index, state);
+                converted.push(responseEvent('response.output_item.added', {
+                  output_index: state.outputIndex,
+                  item: {
+                    type: 'function_call',
+                    id: state.id,
+                    call_id: state.callId,
+                    name: state.name,
+                    arguments: '',
+                    status: 'in_progress',
+                  },
+                }));
+              }
+              if (rawCall.id) state.callId = String(rawCall.id);
+              if (!isNewState && fn.name) state.name += String(fn.name);
+              if (typeof fn.arguments === 'string' && fn.arguments) {
+                state.arguments += fn.arguments;
+                converted.push(responseEvent('response.function_call_arguments.delta', {
+                  item_id: state.id,
+                  output_index: state.outputIndex,
+                  delta: fn.arguments,
+                }));
+              }
+            }
+          }
+          return converted;
+        };
+        const finishResponses = (): Array<Record<string, unknown>> => {
+          if (responsesFinished) return [];
+          responsesFinished = true;
+          const terminal: Array<Record<string, unknown>> = [];
+          const output: Array<Record<string, unknown>> = [];
+          if (responseMessage.outputIndex >= 0) {
+            const item = {
+              type: 'message',
+              id: responseMessage.id,
+              status: 'completed',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: responseMessage.text, annotations: [] }],
+            };
+            output.push(item);
+            terminal.push(responseEvent('response.output_item.done', {
+              output_index: responseMessage.outputIndex,
+              item,
+            }));
+          }
+          for (const state of [...responseTools.values()].sort((a, b) => a.outputIndex - b.outputIndex)) {
+            const item = {
+              type: 'function_call',
+              id: state.id,
+              call_id: state.callId,
+              name: state.name,
+              arguments: state.arguments || '{}',
+              status: 'completed',
+            };
+            output.push(item);
+            terminal.push(responseEvent('response.output_item.done', {
+              output_index: state.outputIndex,
+              item,
+            }));
+          }
+          const promptTokens = Number(responseUsage.prompt_tokens || 0);
+          const completionTokens = Number(responseUsage.completion_tokens || 0);
+          const status = responseFinishReason === 'length' ? 'incomplete' : 'completed';
+          terminal.push(responseEvent(
+            status === 'incomplete' ? 'response.incomplete' : 'response.completed',
+            {
+              response: {
+                id: responseId,
+                object: 'response',
+                created_at: created,
+                status,
+                model: 'e2e-chat-model',
+                output,
+                ...(status === 'incomplete'
+                  ? { incomplete_details: { reason: 'max_output_tokens' } }
+                  : {}),
+                usage: {
+                  input_tokens: promptTokens,
+                  input_tokens_details: { cached_tokens: 0 },
+                  output_tokens: completionTokens,
+                  output_tokens_details: { reasoning_tokens: 0 },
+                  total_tokens: Number(responseUsage.total_tokens || promptTokens + completionTokens),
+                },
+              },
+            },
+          ));
+          return terminal;
+        };
+        const renderResponses = (streamEvents: Array<Record<string, unknown>>): string => (
+          streamEvents.map((event) => (
+            `event: ${String(event.type)}\ndata: ${JSON.stringify(event)}\n\n`
+          )).join('')
+        );
         const writeEvent = (event: Record<string, unknown>): void => {
-          if (!response.destroyed) response.write(`data: ${JSON.stringify(event)}\n\n`);
+          if (response.destroyed) return;
+          if (isResponses) response.write(renderResponses(convertChatEvent(event)));
+          else response.write(`data: ${JSON.stringify(event)}\n\n`);
         };
         const finishImmediately = (streamEvents: Array<Record<string, unknown>>): void => {
-          response.end(
-            `${streamEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('')}data: [DONE]\n\n`,
-          );
+          if (isResponses) {
+            const converted = streamEvents.flatMap(convertChatEvent);
+            response.end(renderResponses([...converted, ...finishResponses()]));
+          } else {
+            response.end(
+              `${streamEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('')}data: [DONE]\n\n`,
+            );
+          }
+        };
+        const finishWrittenStream = (): void => {
+          if (response.destroyed) return;
+          response.end(isResponses ? renderResponses(finishResponses()) : 'data: [DONE]\n\n');
         };
         const toolCallsEvents = (
           calls: Array<{
@@ -2359,6 +2424,41 @@ export class OrkasTestApp {
         );
         const requestToolGroup = (callId: string, group: string): void => {
           finishImmediately(toolCallEvents(callId, 'tool_load', { groups: [group] }));
+        };
+
+        // Scoped tool surface (production default): executors like `bash` and
+        // `write_file` stay dormant until the model loads their group. When a
+        // scenario's next step needs a tool the request did not offer, serve
+        // ONE `tool_load` call — exactly what the production contract asks a
+        // real model to do — and shift the scenario's request-start watermark
+        // so step numbering stays untouched by the extra round-trip.
+        const offeredToolNames = new Set<string>(
+          (Array.isArray((requestBody as { tools?: unknown }).tools)
+            ? (requestBody as { tools: Array<{ function?: { name?: unknown } }> }).tools
+            : [])
+            .map((tool) => tool?.function?.name)
+            .filter((name): name is string => typeof name === 'string'),
+        );
+        const toolLoadGroupByName: Record<string, string> = {
+          bash: 'workspace.execute.command',
+          write_file: 'workspace.write.output',
+        };
+        const serveToolLoadForMissing = (needed: readonly string[]): boolean => {
+          if (!offeredToolNames.has('tool_load')) return false;
+          const groups = [...new Set(
+            needed
+              .filter((name) => !offeredToolNames.has(name))
+              .map((name) => toolLoadGroupByName[name])
+              .filter(Boolean),
+          )];
+          if (!groups.length) return false;
+          this.modelToolScenarioRequestStart += 1;
+          finishImmediately(toolCallEvents(
+            `call-e2e-tool-load-${this.modelRequests.length}`,
+            'tool_load',
+            { groups },
+          ));
+          return true;
         };
 
         const requestText = JSON.stringify(requestBody);
@@ -2846,6 +2946,25 @@ export class OrkasTestApp {
           return;
         }
 
+        if (mode === 'controlled-slow') {
+          const controlled = this.controlledModelStream;
+          if (!controlled) {
+            response.destroy(new Error('Controlled model stream was not initialized'));
+            return;
+          }
+          writeEvent(events[0]);
+          writeEvent(events[1]);
+          void controlled.chunkReady.then(async () => {
+            if (response.destroyed || response.writableEnded) return;
+            writeEvent(events[2]);
+            await controlled.finishReady;
+            if (response.destroyed || response.writableEnded) return;
+            writeEvent(events[3]);
+            writeEvent(events[4]);
+            finishWrittenStream();
+          });
+          return;
+        }
         if (mode === 'slow' || mode === 'very-slow') {
           writeEvent(events[0]);
           writeEvent(events[1]);
@@ -2861,7 +2980,7 @@ export class OrkasTestApp {
           schedule(2_400 * delayScale, () => {
             writeEvent(events[3]);
             writeEvent(events[4]);
-            if (!response.destroyed) response.end('data: [DONE]\n\n');
+            finishWrittenStream();
           });
           return;
         }
@@ -2878,102 +2997,6 @@ export class OrkasTestApp {
         finishImmediately(events);
       });
     });
-    if (this.voiceStub) {
-      server.on('upgrade', (request, socket) => {
-        const requestUrl = new URL(request.url || '/', 'http://127.0.0.1');
-        if (requestUrl.pathname !== '/api/voice/asr_ws') {
-          socket.destroy();
-          return;
-        }
-        const key = String(request.headers['sec-websocket-key'] || '');
-        if (!key) {
-          socket.destroy();
-          return;
-        }
-        this.voiceSockets.add(socket);
-        socket.once('close', () => this.voiceSockets.delete(socket));
-
-        const accept = createHash('sha1')
-          .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
-          .digest('base64');
-        const openSocket = () => {
-          if (socket.destroyed) return;
-          socket.write([
-            'HTTP/1.1 101 Switching Protocols',
-            'Upgrade: websocket',
-            'Connection: Upgrade',
-            `Sec-WebSocket-Accept: ${accept}`,
-            '',
-            '',
-          ].join('\r\n'));
-        };
-        // Keep the HTTP upgrade pending until the client cancels. This makes
-        // the negotiation-cancellation contract deterministic under load;
-        // a fixed delay can expire before Playwright gets its second click in.
-        if (this.voiceStubMode !== 'blocked-open') {
-          openSocket();
-        }
-
-        let buffered = Buffer.alloc(0);
-        socket.on('data', (chunk) => {
-          buffered = Buffer.concat([buffered, Buffer.from(chunk)]);
-          while (buffered.length >= 2) {
-            const opcode = buffered[0] & 0x0f;
-            const masked = (buffered[1] & 0x80) !== 0;
-            let payloadLength = buffered[1] & 0x7f;
-            let offset = 2;
-            if (payloadLength === 126) {
-              if (buffered.length < 4) return;
-              payloadLength = buffered.readUInt16BE(2);
-              offset = 4;
-            } else if (payloadLength === 127) {
-              if (buffered.length < 10) return;
-              const longLength = buffered.readBigUInt64BE(2);
-              if (longLength > BigInt(Number.MAX_SAFE_INTEGER)) {
-                socket.destroy();
-                return;
-              }
-              payloadLength = Number(longLength);
-              offset = 10;
-            }
-            const maskBytes = masked ? 4 : 0;
-            if (buffered.length < offset + maskBytes + payloadLength) return;
-            const mask = masked ? buffered.subarray(offset, offset + 4) : null;
-            offset += maskBytes;
-            const payload = Buffer.from(buffered.subarray(offset, offset + payloadLength));
-            buffered = buffered.subarray(offset + payloadLength);
-            if (mask) {
-              for (let index = 0; index < payload.length; index += 1) {
-                payload[index] ^= mask[index % 4];
-              }
-            }
-            if (opcode === 0x8) {
-              socket.end(Buffer.from([0x88, 0x00]));
-              return;
-            }
-            if (opcode !== 0x1 || payload.toString('utf8') !== '__END__') continue;
-
-            const result = Buffer.from(JSON.stringify({
-              is_last_package: true,
-              payload_msg: {
-                result: {
-                  text: 'E2E dictated launch note',
-                  last: true,
-                },
-              },
-            }), 'utf8');
-            const header = result.length < 126
-              ? Buffer.from([0x81, result.length])
-              : Buffer.from([0x81, 126, (result.length >> 8) & 0xff, result.length & 0xff]);
-            const timer = setTimeout(() => {
-              this.modelTimers.delete(timer);
-              if (!socket.destroyed) socket.write(Buffer.concat([header, result]));
-            }, 20);
-            this.modelTimers.add(timer);
-          }
-        });
-      });
-    }
     // Chromium rejects several legacy ports before a request reaches the
     // local server. On Windows, listen(0) can still select from the legacy
     // ephemeral range, so choose from the modern high-port range explicitly.
@@ -3013,10 +3036,11 @@ export class OrkasTestApp {
     const server = this.apiServer;
     if (!server) return;
     this.apiServer = null;
+    this.controlledModelStream?.releaseChunk();
+    this.controlledModelStream?.releaseFinish();
+    this.controlledModelStream = null;
     for (const timer of this.modelTimers) clearTimeout(timer);
     this.modelTimers.clear();
-    for (const socket of this.voiceSockets) socket.destroy();
-    this.voiceSockets.clear();
     if ('closeAllConnections' in server && typeof server.closeAllConnections === 'function') {
       server.closeAllConnections();
     }
@@ -3027,13 +3051,11 @@ export class OrkasTestApp {
 type OrkasFixtures = {
   orkas: OrkasTestApp;
   appPage: Page;
-  loggedOutOrkas: OrkasTestApp;
   modelOrkas: OrkasTestApp;
   marketplaceOrkas: OrkasTestApp;
   cliOrkas: OrkasTestApp;
-  membershipOrkas: OrkasTestApp;
+  connectorOrkas: OrkasTestApp;
   updateOrkas: OrkasTestApp;
-  voiceOrkas: OrkasTestApp;
   metacognitionOrkas: OrkasTestApp;
 };
 
@@ -3050,15 +3072,6 @@ export const test = base.extend<OrkasFixtures>({
   appPage: async ({ orkas }, use) => {
     if (!orkas.page) throw new Error('Authenticated Orkas renderer is unavailable');
     await use(orkas.page);
-  },
-  loggedOutOrkas: async ({}, use, testInfo) => {
-    const app = new OrkasTestApp(testInfo, { authenticated: false });
-    try {
-      await app.launch();
-      await use(app);
-    } finally {
-      await app.dispose();
-    }
   },
   modelOrkas: async ({}, use, testInfo) => {
     const app = new OrkasTestApp(testInfo, { modelStub: true });
@@ -3086,9 +3099,8 @@ export const test = base.extend<OrkasFixtures>({
     } finally {
       await app.dispose();
     }
-  },
-  membershipOrkas: async ({}, use, testInfo) => {
-    const app = new OrkasTestApp(testInfo, { accountStub: true });
+  },connectorOrkas: async ({}, use, testInfo) => {
+    const app = new OrkasTestApp(testInfo, { modelStub: true });
     try {
       await app.launch();
       await use(app);
@@ -3098,15 +3110,6 @@ export const test = base.extend<OrkasFixtures>({
   },
   updateOrkas: async ({}, use, testInfo) => {
     const app = new OrkasTestApp(testInfo, { updateStub: true });
-    try {
-      await app.launch();
-      await use(app);
-    } finally {
-      await app.dispose();
-    }
-  },
-  voiceOrkas: async ({}, use, testInfo) => {
-    const app = new OrkasTestApp(testInfo, { voiceStub: true });
     try {
       await app.launch();
       await use(app);

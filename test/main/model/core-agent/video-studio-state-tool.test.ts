@@ -1773,6 +1773,37 @@ describe('VideoStudio production-state tool protocol', () => {
     expect(result.content).toContain('E_NARRATION_TEXT_MISSING');
   });
 
+  it('blocks an explicit narration track with no narration text instead of silently downgrading it', async () => {
+    const manifestPath = path.join(compositionDir, 'composition-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    manifest.schema_version = 2;
+    delete manifest.scenes[0].narration_text;
+    manifest.audio = {
+      owner: 'composition',
+      tracks: [{
+        id: 'narration',
+        kind: 'narration',
+        src: 'assets/narration.mp3',
+        start: 0,
+        duration: 5,
+        volume: 1,
+      }],
+    };
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+
+    const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const result = await toolMod.createVideoStudioTool({
+      userId: UID,
+      turnId: 'turn-track-no-text',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+    }).execute({
+      op: 'composition.check_narration_fit',
+      composition_dir: 'project/composition',
+    }, { workingDir: workspace, state: {} } as any);
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_NARRATION_TEXT_MISSING');
+  });
+
   it('recovers a legacy conversation-scoped ledger from a different resumed conversation', async () => {
     const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
     const paths = await import('../../../../src/main/paths');
@@ -3081,6 +3112,10 @@ describe('VideoStudio production-state tool protocol', () => {
         path: draftPath,
         cover_path: path.join(renderDir, 'draft-cover.png'),
         draft_ready: true,
+        // Exact top-level measurements returned by the native draft result
+        // and consumed by the Gate D pricing envelope.
+        render_profile: { render_fps: 30, total_render_seconds: 95.28 },
+        probe: { duration_seconds: 30 },
         report: { ...draftReport, report_path: options.reportAbsPath || '' },
       } as any;
     });
@@ -3108,6 +3143,20 @@ describe('VideoStudio production-state tool protocol', () => {
       design_review_required: false,
       gate_d_ready: true,
       next_action: 'open_gate_d',
+      delivery_options: [
+        expect.objectContaining({
+          id: 'final_high',
+          call: { op: 'composition.export', quality: 'high' },
+          estimated_minutes: 2,
+          default: true,
+        }),
+        expect.objectContaining({
+          id: 'final_fast_preview',
+          call: { op: 'composition.export', quality: 'draft' },
+          estimated_minutes: 1,
+          requires_explicit_user_choice: true,
+        }),
+      ],
       production_state: {
         stage: 'draft_ready',
         draft_design_review: {
@@ -4196,6 +4245,21 @@ describe('VideoStudio production-state tool protocol', () => {
     expect(qa.media_backed_segment_ids).toEqual(['cut']);
     expect(qa.unknown_segment_ids).toBeUndefined();
     expect(qa.message).toMatch(/produced media, not compositions/);
+
+    // A mixed QA batch must keep the reason for an unreadable media segment
+    // even when another composition is runnable. Otherwise the generic
+    // uncaptured id sends recovery down the composition-authoring path.
+    fs.rmSync(cutPath);
+    const mixedQa = parseResult((await statusTool.execute({
+      op: 'production.segment_qa',
+      plan_path: 'project/plan.json',
+      phase: 'lint',
+      segment_ids: ['cut', composeIds[0]],
+    }, ctx)).content);
+    expect(mixedQa.checked_segment_ids).toEqual([composeIds[0]]);
+    expect(mixedQa.production_review.uncaptured_segments).toEqual(expect.arrayContaining([
+      { segment_id: 'cut', reason: 'media_path_unresolved' },
+    ]));
   });
 
   it('carries a snapshot failure blockers, not just their count', async () => {
@@ -4288,8 +4352,10 @@ describe('VideoStudio production-state tool protocol', () => {
       'TEXT_BOX_OVERFLOW', 'LOW_CONTRAST', 'SAFE_AREA_VIOLATION',
     ]);
     for (const issue of segment!.blocking_issues) expect(issue.severity).toBe('error');
-    // The list is bounded, so a segment holding more blockers than it ships
-    // says how many are missing instead of reading as the complete set.
+    // This mock deliberately advertises more blockers than it supplies. The
+    // segment must preserve that incomplete-source fact; current QA producers
+    // no longer create this shape by item-capping known blockers.
+    expect(segment?.blocking_issues_complete).toBe(false);
     expect(segment?.blocking_issues_omitted).toBe(2);
   });
 
@@ -5281,6 +5347,7 @@ describe('VideoStudio production-state tool protocol', () => {
     expect(compact.preview_qa.issues.filter((issue: any) => issue.severity === 'error')
       .every((issue: any) => !!issue.fixHint)).toBe(true);
     expect(compact.preview_qa.issues_omitted).toBeUndefined();
+    expect(compact.preview_qa.blocking_issues_complete).toBe(true);
     expect(compact.preview_qa.samples).toBeUndefined();
     expect(compact.frame_evidence).toEqual({
       evidence_dir: '/ws/preview',
@@ -5292,6 +5359,21 @@ describe('VideoStudio production-state tool protocol', () => {
     // Locators the repair needs stay.
     expect(compact.contact_sheet).toBe('/ws/preview/contact-sheet.png');
     expect(compact.frame_paths).toHaveLength(9);
+
+    // A legacy producer that declares more blockers than it supplies remains
+    // explicitly partial; the projection must never upgrade it to complete.
+    const incompleteSource = mod.compactQaBlockedVideoStudioResult({
+      ...blocked,
+      preview_qa: {
+        ok: false,
+        error_count: 5,
+        issues: blocked.preview_qa.issues.slice(0, 1),
+      },
+    } as any) as any;
+    expect(incompleteSource.preview_qa).toMatchObject({
+      blocking_issues_complete: false,
+      blocking_issues_omitted: 4,
+    });
 
     // Small results and non-QA errors are returned untouched.
     const otherError = { ok: false, op: 'composition.snapshot', errorCode: 'E_SNAPSHOT_FAILED' } as any;
@@ -6068,15 +6150,15 @@ describe('VideoStudio production-state tool protocol', () => {
     // searches plus a chunk read hunting the one error inside its own result.
     const mod = await import('../../../../src/main/model/core-agent/video-studio-tool');
     const bulkIssues = [
-      {
-        code: 'TEXT_BOX_OVERFLOW',
+      ...Array.from({ length: 20 }, (_, i) => ({
+        code: i === 0 ? 'TEXT_BOX_OVERFLOW' : `BLOCKER_${i}`,
         severity: 'error',
-        sceneId: 's2_body',
-        selector: '.claim',
-        message: 'copy overflows its box',
-        fixHint: 'shorten the line or raise the box',
+        sceneId: `s${i}_body`,
+        selector: `.claim-${i}`,
+        message: i === 0 ? 'copy overflows its box' : `blocking defect ${i}`,
+        fixHint: i === 0 ? 'shorten the line or raise the box' : `repair defect ${i}`,
         evidence: { rect: 'x'.repeat(1500) },
-      },
+      })),
       ...Array.from({ length: 25 }, (_, i) => ({
         code: 'TEXT_DENSITY_HIGH',
         severity: 'warning',
@@ -6089,14 +6171,14 @@ describe('VideoStudio production-state tool protocol', () => {
       ok: true,
       op: 'composition.inspect',
       status: 'review_required',
-      blocking_error_count: 1,
+      blocking_error_count: 20,
       fatal_error_count: 0,
       preview_capture_allowed: true,
       findings: JSON.stringify({
         ok: false,
-        errorCount: 1,
+        errorCount: 20,
         warningCount: 25,
-        issueCount: 26,
+        issueCount: 45,
         issues: bulkIssues,
         samples: Array.from({ length: 9 }, (_, i) => ({ path: `/f/${i}.png`, blob: 'z'.repeat(1500) })),
         sample_plan: Array.from({ length: 9 }, (_, i) => ({ label: `p${i}`, detail: 'w'.repeat(800) })),
@@ -6113,22 +6195,25 @@ describe('VideoStudio production-state tool protocol', () => {
 
     const compact = mod.compactQaBlockedVideoStudioResult(reviewRequired) as any;
     expect(JSON.stringify(compact).length).toBeLessThan(JSON.stringify(reviewRequired).length / 4);
-    // The one blocker survives with its fix hint, and it comes FIRST — the
-    // advisory tail must never push a blocker past the cap.
+    // Every blocker survives with its fix hint and comes before the bounded
+    // advisory tail. The generic tool-result budget, not this projection,
+    // owns any lossless spill needed for a much larger set.
     expect(compact.findings.issues[0]).toEqual(
       expect.objectContaining({ code: 'TEXT_BOX_OVERFLOW', severity: 'error', fixHint: expect.any(String) }),
     );
+    expect(compact.findings.issues.filter((issue: any) => issue.severity === 'error')).toHaveLength(20);
+    expect(compact.findings.blocking_issues_complete).toBe(true);
     // 25 warnings, bounded to 8, so 17 are reported as dropped.
     expect(compact.findings.issues.filter((issue: any) => issue.severity === 'warning')).toHaveLength(8);
     expect(compact.findings.issues_omitted).toBe(17);
-    expect(compact.findings.errorCount).toBe(1);
+    expect(compact.findings.errorCount).toBe(20);
     // inspect's own bounded verdict is the repair material and stays.
     expect(compact.inspect_disposition.blocking_issues).toHaveLength(1);
     // Control-flow fields a caller acts on are untouched.
     expect(compact).toMatchObject({
       ok: true,
       status: 'review_required',
-      blocking_error_count: 1,
+      blocking_error_count: 20,
       preview_capture_allowed: true,
       next_allowed_ops: ['composition.snapshot'],
     });
@@ -6272,8 +6357,8 @@ describe('VideoStudio production-state tool protocol', () => {
     // own `issues` and the same array again under `report` — and the walker
     // that gathers blocking findings visited both. 2026-08-09: a run was told
     // it had six problems when it had three, every repair line printed twice,
-    // against a QA_COMPACT_MAX_ISSUES budget that then held half as much real
-    // material.
+    // against the former blocker item budget, which then held half as much
+    // real material.
     const mod = await import('../../../../src/main/model/core-agent/video-studio-tool');
     const finding = (code: string, selector: string, message: string) => ({
       code, selector, message, severity: 'error', fixHint: `fix ${code}`,
@@ -8159,6 +8244,77 @@ describe('VideoStudio production-state tool protocol', () => {
     expect(draft).toHaveBeenCalledTimes(5);
   });
 
+  it('a NEW user waiver lifts the deterministic-QA strike without an input edit; repeating it does not', async () => {
+    // gate-control promises "their current words authorize rerunning the
+    // same blocked operation with waive_qa_findings" — the one-strike QA
+    // breaker keyed on composition bytes alone refused that rerun and
+    // prescribed a placate-the-hash edit that would invalidate the user's
+    // approvals (2026-08-24 review finding VS-F1). Re-sending the SAME
+    // waiver stays blocked so an unchanged-retry loop remains impossible.
+    makePlanVisualOnly();
+    const videoStudio = await import('../../../../src/main/features/video_studio');
+    const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const opts = {
+      userId: UID,
+      cid: 'cid-waiver-rerun',
+      turnId: 'turn-waiver-rerun',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+      agentName: 'VideoStudio',
+      userMessage: '确认。可视检查跳过，就按现在的画面继续。',
+      onFileWritten: async () => {},
+      onOutputsPublished: async (paths: string[]) => paths,
+    };
+    const tool = toolMod.createVideoStudioTool(opts);
+    const ctx = { workingDir: workspace, state: {}, emitProgress: vi.fn() } as any;
+    expect((await tool.execute({
+      op: 'composition.approve_plan',
+      composition_dir: 'project/composition',
+      decision_evidence: decisionEvidence('plan', 'approve', '确认'),
+    }, ctx)).isError).toBe(false);
+    const contactSheet = path.join(workspace, 'project', 'render', 'draft-evidence', 'contact-sheet.svg');
+    const draft = vi.spyOn(videoStudio, 'draftComposition').mockImplementation(async (options: any) => {
+      fs.mkdirSync(path.dirname(contactSheet), { recursive: true });
+      fs.writeFileSync(options.outputAbsPath, 'failed draft bytes');
+      fs.writeFileSync(contactSheet, '<svg/>');
+      return {
+        ok: false,
+        op: 'composition.draft',
+        errorCode: 'E_VIDEO_QA_BLOCKED',
+        message: 'frozen frames',
+        path: options.outputAbsPath,
+        contact_sheet: contactSheet,
+        draft_ready: false,
+        report: { steps: { render: { status: 'passed' }, video_qa: { status: 'failed' } } },
+      } as any;
+    });
+    const input = {
+      op: 'composition.draft',
+      composition_dir: 'project/composition',
+      output_path: 'project/render/draft.mp4',
+    };
+    const waiverInput = {
+      ...input,
+      waive_qa_findings: ['COVER_CONTENT_SIGNALS_NOT_VISIBLE'],
+      decision_evidence: {
+        source: 'user_message',
+        gate: 'qa_waiver',
+        decision: 'approve',
+        quote: '可视检查跳过，就按现在的画面继续。',
+      },
+    };
+
+    expect(parseResult((await tool.execute(input, ctx)).content).errorCode).toBe('E_VIDEO_QA_BLOCKED');
+    expect(parseResult((await tool.execute(input, ctx)).content).errorCode).toBe('E_FULL_RENDER_RETRY_NO_CHANGE');
+    expect(draft).toHaveBeenCalledTimes(1);
+    // The waived rerun actually renders (breaker lifted): same bytes, new
+    // waiver, and the verdict is the draft's own QA result again.
+    expect(parseResult((await tool.execute(waiverInput, ctx)).content).errorCode).toBe('E_VIDEO_QA_BLOCKED');
+    expect(draft).toHaveBeenCalledTimes(2);
+    // The same waiver again is NOT new — the breaker holds.
+    expect(parseResult((await tool.execute(waiverInput, ctx)).content).errorCode).toBe('E_FULL_RENDER_RETRY_NO_CHANGE');
+    expect(draft).toHaveBeenCalledTimes(2);
+  });
+
   it('finalizes an approved export before registering or publishing its path', async () => {
     const videoStudio = await import('../../../../src/main/features/video_studio');
     const hooks = await import('../../../../src/main/features/produced_output_hooks');
@@ -8960,6 +9116,50 @@ describe('VideoStudio production-state tool protocol', () => {
     );
   });
 
+  it('drains sibling artifact reads before rejecting an unreadable preview identity', async () => {
+    const mod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const stateMod = await import('../../../../src/main/features/video_studio_state');
+    const statePath = mod.videoStudioProductionStatePath({ userId: UID, cid: 'cid-drain-preview' }, compositionDir);
+    const manifestPath = path.join(compositionDir, 'composition-manifest.json');
+    const htmlPath = path.join(compositionDir, 'index.html');
+    const readError = Object.assign(new Error('visual-manifest-unreadable'), { code: 'EACCES' });
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    let markReadStarted!: () => void;
+    const readStarted = new Promise<void>((resolve) => { markReadStarted = resolve; });
+    let markReadFailed!: () => void;
+    const readFailed = new Promise<void>((resolve) => { markReadFailed = resolve; });
+    fsPromiseMocks.readFile.mockImplementation(async (...args: unknown[]) => {
+      const [file, encoding] = args;
+      if (typeof file === 'string' && path.resolve(file) === manifestPath && encoding === 'utf8') {
+        markReadFailed();
+        throw readError;
+      }
+      if (typeof file === 'string' && path.resolve(file) === htmlPath && encoding === undefined) {
+        markReadStarted();
+        await readGate;
+        throw Object.assign(new Error('later-sibling-read-failure'), { code: 'EIO' });
+      }
+      return fsPromiseMocks.actualReadFile!(...args);
+    });
+    let settled = false;
+    const recording = mod.recordVideoStudioGate(statePath, 'preview', compositionDir, 'turn-drain', {
+      preview_ready: true,
+      preview_qa: { ok: true, error_count: 0 },
+      preflight: { status: 'passed', blocking_error_count: 0 },
+    });
+    void recording.then(() => { settled = true; }, () => { settled = true; });
+    try {
+      await Promise.all([readStarted, readFailed]);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
+    } finally {
+      releaseRead();
+      await expect(recording).rejects.toBe(readError);
+    }
+    expect((await stateMod.readVideoProductionState(statePath, compositionDir)).preview).toBeUndefined();
+  });
+
   it('does not approve a persisted empty-HTML visual identity when HTML is unreadable again', async () => {
     const mod = await import('../../../../src/main/model/core-agent/video-studio-tool');
     const contract = await import('../../../../src/main/features/video_studio_contract');
@@ -9034,29 +9234,59 @@ describe('VideoStudio production-state tool protocol', () => {
 
   it('ignores narration/audio identity but keeps visual timing and visible edits', async () => {
     const contract = await import('../../../../src/main/features/video_studio_contract');
+    // Indented like real authored composition HTML. The flat fixture this
+    // replaced could not fail: with nothing to the left of `<audio>`, the old
+    // rule's "collapse the element and all adjacent whitespace into one
+    // newline" happened to be equivalent to deleting the line. Indent it and
+    // the collapse eats the NEXT line's leading spaces, so a composition that
+    // dropped its audio track no longer matched one authored without it —
+    // two spaces re-hashed as a visual change and cost the user a second
+    // approval of byte-identical keyframes (2026-09-01).
     const baseHtml = [
       '<main data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="5">',
-      '<section class="clip" data-scene-id="cover" data-start="0" data-duration="5">',
-      '<h1>Approved</h1>',
-      '</section>',
-      '<script>tl.set("#scene-cover", { autoAlpha: 1 }, 0);</script>',
+      '  <section class="clip" data-scene-id="cover" data-start="0" data-duration="5">',
+      '    <h1>Approved</h1>',
+      '  </section>',
+      '  <script>tl.set("#scene-cover", { autoAlpha: 1 }, 0);</script>',
       '</main>',
     ].join('\n');
     const retimedHtml = baseHtml
-      .replace('data-start="0" data-duration="5">\n<section', 'data-start="0" data-duration="6.8">\n<section')
+      .replace('data-start="0" data-duration="5">\n  <section', 'data-start="0" data-duration="6.8">\n  <section')
       .replace('data-scene-id="cover" data-start="0" data-duration="5"', 'data-scene-id="cover" data-start="0" data-duration="6.8"')
       .replace('{ autoAlpha: 1 }, 0);', '{ autoAlpha: 1 }, 1.25);')
-      .replace('</main>', '<audio id="audio-narration" src="./assets/narration.mp3" data-start="0" data-duration="6.8"></audio>\n</main>');
+      .replace('</main>', '  <audio id="audio-narration" src="./assets/narration.mp3" data-start="0" data-duration="6.8"></audio>\n</main>');
     expect(contract.normalizeCompositionHtmlForVisualIdentity(retimedHtml))
       .not.toBe(contract.normalizeCompositionHtmlForVisualIdentity(baseHtml));
     const audioOnlyHtml = baseHtml.replace(
       '</main>',
-      '<audio id="audio-narration" src="./assets/narration.mp3" data-start="0" data-duration="5"></audio>\n</main>',
+      '  <audio id="audio-narration" src="./assets/narration.mp3" data-start="0" data-duration="5"></audio>\n</main>',
     );
     expect(contract.normalizeCompositionHtmlForVisualIdentity(audioOnlyHtml))
       .toBe(contract.normalizeCompositionHtmlForVisualIdentity(baseHtml));
+    // Both directions of the same identity: an sfx track added mid-document
+    // and then removed again leaves the visual projection where it started,
+    // whichever indentation the surrounding lines carry.
+    const sfxAddedHtml = baseHtml.replace(
+      '  <section',
+      '  <audio id="audio-sfx" src="./assets/sfx.wav" data-start="0" data-duration="5"></audio>\n  <section',
+    );
+    expect(contract.normalizeCompositionHtmlForVisualIdentity(sfxAddedHtml))
+      .toBe(contract.normalizeCompositionHtmlForVisualIdentity(baseHtml));
+    // An audio element written inline, not on its own line, is removed without
+    // disturbing the text around it.
+    const inlineAudioHtml = baseHtml.replace(
+      '<h1>Approved</h1>',
+      '<h1>Approved</h1><audio id="audio-sfx" src="./assets/sfx.wav" data-start="0" data-duration="5"></audio>',
+    );
+    expect(contract.normalizeCompositionHtmlForVisualIdentity(inlineAudioHtml))
+      .toBe(contract.normalizeCompositionHtmlForVisualIdentity(baseHtml));
     const visualEdit = baseHtml.replace('<h1>Approved</h1>', '<h1>Changed</h1>');
     expect(contract.normalizeCompositionHtmlForVisualIdentity(visualEdit))
+      .not.toBe(contract.normalizeCompositionHtmlForVisualIdentity(baseHtml));
+    // Negative control: indentation is not globally ignored. A reindent that
+    // has nothing to do with an audio element still reads as a change, so the
+    // rule cannot be hiding edits by flattening whitespace everywhere.
+    expect(contract.normalizeCompositionHtmlForVisualIdentity(baseHtml.replace('    <h1>', '      <h1>')))
       .not.toBe(contract.normalizeCompositionHtmlForVisualIdentity(baseHtml));
 
     const manifest = {

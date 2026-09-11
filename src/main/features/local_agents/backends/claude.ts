@@ -14,6 +14,7 @@
  */
 
 import { createLogger } from '../../../logger.js';
+import { AGENT_EXECUTION_MAX_MS } from '../../../util/agent-execution-budget.js';
 import { logErrorSummary } from '../../../util/log-redact.js';
 import {
   type LocalBackend,
@@ -21,6 +22,7 @@ import {
   type LocalActiveRunInput,
   type BackendRunOptions,
   type LocalEvent,
+  type LocalCliPermissionDecision,
   StderrTail,
   spawnCli,
   reapCliAfterProtocolTerminal,
@@ -33,10 +35,9 @@ import {
 
 const log = createLogger('local-agents:claude');
 
-/** Hard cap for one continuous background phase. Foreground model/tool work
- *  keeps the ordinary runner watchdog; only a protocol result with live tasks
- *  switches to this deliberately wide, non-sliding budget. */
-export const CLAUDE_BACKGROUND_TIMEOUT_MS = 24 * 60 * 60_000;
+/** Compatibility export for existing background probes; production uses the
+ *  shared dispatch watchdog in both foreground and background phases. */
+export const CLAUDE_BACKGROUND_TIMEOUT_MS = AGENT_EXECUTION_MAX_MS;
 /** Grace for the CLI to answer our `interrupt` before stdin closes. */
 const GRACEFUL_STOP_MS = 2_000;
 
@@ -59,6 +60,7 @@ export const claudeBackend: LocalBackend = {
     const child = spawnCli(opts.binPath, args, opts.cwd);
     const tail = new StderrTail();
     const startedAt = Date.now();
+    const deadlineAt = Math.min(opts.deadlineAt ?? Infinity, startedAt + opts.timeoutMs);
 
     let sessionId: string | undefined;
     let exited = false;
@@ -100,14 +102,12 @@ export const claudeBackend: LocalBackend = {
       args,
     });
 
-    const armForegroundWatchdog = (): ReturnType<typeof armKillWatchdog> => {
-      return armKillWatchdog(child, {
-        timeoutMs: opts.timeoutMs,
-        idleKillMs: opts.idleKillMs,
-        lastEventAt: opts.lastEventAt,
-      });
-    };
-    let watchdog = armForegroundWatchdog();
+    const watchdog = armKillWatchdog(child, {
+      timeoutMs: opts.timeoutMs,
+      deadlineAt,
+      idleKillMs: opts.idleKillMs,
+      lastEventAt: opts.lastEventAt,
+    });
 
     // Serialize user messages and control responses through one writer. Claude
     // Code's stream-json stdin is a multiplexed protocol; concurrent writes
@@ -308,10 +308,7 @@ export const claudeBackend: LocalBackend = {
       if (phase === 'foreground' || stopping || exited) return;
       phase = 'foreground';
       clearBackgroundTimer();
-      watchdog.disarm();
-      // This is a new foreground epoch. The old foreground wall-clock and idle
-      // ages are deliberately not inherited from the background wait.
-      watchdog = armForegroundWatchdog();
+      // Foreground and background share the dispatch watchdog and deadline.
       log.info('claude background run resumed foreground', {
         durationMs: Date.now() - startedAt,
         liveTasks: liveTasks.size,
@@ -321,13 +318,16 @@ export const claudeBackend: LocalBackend = {
     const enterBackground = (): void => {
       if (phase === 'background' || stopping || exited) return;
       phase = 'background';
-      watchdog.disarm();
-      const timeoutMs = backgroundTimeoutMs();
-      backgroundTimer = setTimeout(() => {
-        backgroundTimedOut = true;
-        gracefulStop('background timeout');
-      }, timeoutMs);
-      if (typeof backgroundTimer.unref === 'function') backgroundTimer.unref();
+      const timeoutMs = Math.max(0, Math.min(backgroundTimeoutMs(), deadlineAt - Date.now()));
+      // Retain the explicit shortened probe override, never a second default
+      // production budget. Re-entering this phase cannot move the run deadline.
+      if (backgroundTimeoutMs() < CLAUDE_BACKGROUND_TIMEOUT_MS) {
+        backgroundTimer = setTimeout(() => {
+          backgroundTimedOut = true;
+          gracefulStop('background timeout');
+        }, timeoutMs);
+        backgroundTimer.unref?.();
+      }
       log.info('claude run entered background phase', {
         timeoutMs,
         liveTasks: liveTasks.size,
@@ -353,9 +353,8 @@ export const claudeBackend: LocalBackend = {
       }
     };
 
-    /** Every stream event stays on the same host turn. A real model/tool event
-     *  after a background result is the phase boundary that restores the
-     *  ordinary foreground watchdog with fresh clocks. */
+    /** Every stream event stays on the same host turn. Real model/tool activity
+     *  resumes foreground presentation without resetting either run budget. */
     const emit = (event: LocalEvent): void => {
       trackTask(event);
       opts.onEvent(event);
@@ -366,9 +365,9 @@ export const claudeBackend: LocalBackend = {
     // claude code's stream-json protocol uses stdin for two channels:
     //   1. The user message that kicks off the turn (one and done).
     //   2. `control_response` records replying to claude's
-    //      `control_request` (tool-use permission, hook gates). Even
-    //      with `--permission-mode bypassPermissions`, MCP tools / user
-    //      hooks still gate via this channel and the process blocks
+    //      `control_request` (tool-use permission, hook gates). The CLI
+    //      can send these under its inherited policy or an explicit Orkas
+    //      policy, and the process blocks
     //      waiting for a stdin response we never send if we close
     //      stdin here. That's the "silent hang for 20 minutes" symptom
     //      users report — fix by writing the prompt without `.end()`
@@ -382,31 +381,60 @@ export const claudeBackend: LocalBackend = {
       },
     };
     void writeInputRecord(initialInput).catch((err) => {
-      log.warn('claude initial input write failed', { error: logErrorSummary(err) });
+      // A spawn failure closes stdin and reports its own terminal error. Do not
+      // turn the resulting asynchronous EPIPE into a second, misleading warning.
+      if (!exited) {
+        log.warn('claude initial input write failed', { error: logErrorSummary(err) });
+      }
     });
 
-    /** Auto-allow control_request — claude code asks for tool-use /
-     *  hook permission through this channel. We're a daemon-style
-     *  dispatcher (no interactive UI yet for approval), so the only
-     *  sane response is to allow and surface a permission-request
-     *  event to the rail for visibility. Schema mirrors multica's
-     *  daemon (`server/pkg/agent/claude.go::handleControlRequest`). */
-    const respondToControlRequest = (msg: any): void => {
+    /** Serialize native approval requests so two concurrent tool gates cannot
+     * overtake each other while the renderer is waiting for a decision. */
+    let permissionResponseQueue = Promise.resolve();
+    const respondToControlRequest = async (msg: any): Promise<void> => {
       const req = msg?.request || {};
       const inputMap = (req.input && typeof req.input === 'object') ? req.input : {};
+      const fullAccess = opts.permissionPolicy === 'full_access';
+      let decision: LocalCliPermissionDecision = fullAccess ? 'allow_once' : 'deny';
+      if (!fullAccess && opts.requestPermission) {
+        try {
+          decision = await opts.requestPermission({
+            id: String(msg.request_id || ''),
+            tool: String(req.tool_name || req.subtype || ''),
+            description: typeof req.description === 'string' ? req.description : undefined,
+            command: typeof inputMap.command === 'string' ? inputMap.command : undefined,
+            subject: typeof inputMap.file_path === 'string'
+              ? inputMap.file_path
+              : typeof inputMap.path === 'string'
+                ? inputMap.path
+                : typeof inputMap.url === 'string' ? inputMap.url : undefined,
+          });
+        } catch (err) {
+          log.warn('claude host permission request failed; denying', { error: logErrorSummary(err) });
+        }
+      }
+      const allowed = decision !== 'deny';
       const response = {
         type: 'control_response',
         response: {
           subtype: 'success',
           request_id: msg.request_id,
-          response: {
-            behavior: 'allow',
-            updatedInput: inputMap,
-          },
+          response: allowed
+            ? { behavior: 'allow', updatedInput: inputMap }
+            : { behavior: 'deny', message: 'The user denied this permission request.' },
         },
       };
-      void writeInputRecord(response).catch((err) => {
+      await writeInputRecord(response).catch((err) => {
         log.warn('claude control_response write failed', { error: logErrorSummary(err) });
+      });
+      emit({
+        type: 'permission-request',
+        id: String(msg.request_id || ''),
+        tool: String(req.tool_name || ''),
+        input: inputMap,
+        ...(fullAccess
+          ? { autoDecided: 'allow', reason: 'full_access' }
+          : { decision: allowed ? 'allow' : 'deny', reason: 'user' }),
       });
     };
 
@@ -442,15 +470,11 @@ export const claudeBackend: LocalBackend = {
         // rail event. Handled outside mapClaudeEvent so the mapper
         // stays a pure translator (no I/O, easier to unit-test).
         if (obj?.type === 'control_request') {
-          respondToControlRequest(obj);
-          emit({
-            type: 'permission-request',
-            id: String(obj.request_id || ''),
-            tool: String(obj?.request?.tool_name || ''),
-            input: obj?.request?.input ?? {},
-            autoDecided: 'allow',
-            reason: 'bypass',
-          });
+          permissionResponseQueue = permissionResponseQueue
+            .then(() => respondToControlRequest(obj))
+            .catch((err) => {
+              log.warn('claude permission response failed', { error: logErrorSummary(err) });
+            });
           return;
         }
         // Side-channel: each `assistant` block carries a `message.usage`
@@ -521,12 +545,14 @@ export const claudeBackend: LocalBackend = {
               finishRun('timeout', {
                 error: `claude timed out: exceeded ${backgroundTimeoutMs()}ms background cap`,
                 timeoutPhase: 'background',
+                timeoutKind: 'wall',
                 stderrTail: tail.toString(),
               });
             } else if (watchdog.fired()) {
               finishRun('timeout', {
                 error: `claude ${watchdog.reason()}`,
-                timeoutPhase: 'foreground',
+                timeoutKind: watchdog.fired(),
+                timeoutPhase: phase,
                 stderrTail: tail.toString(),
               });
             } else {
@@ -575,7 +601,12 @@ export const claudeBackend: LocalBackend = {
 
       child.on('error', err => {
         log.warn('claude spawn error', { error: logErrorSummary(err) });
-        finish('failed', { error: (err as Error).message, stderrTail: tail.toString() });
+        finish('failed', {
+          error: (err as Error).message,
+          stderrTail: tail.toString(),
+          failureKind: 'cli_spawn',
+          retrySafe: true,
+        });
       });
       child.on('close', code => {
         if (backgroundRegistered) {
@@ -588,13 +619,15 @@ export const claudeBackend: LocalBackend = {
           return finish('timeout', {
             error: `claude timed out: exceeded ${backgroundTimeoutMs()}ms background cap`,
             timeoutPhase: 'background',
+            timeoutKind: 'wall',
             stderrTail: tail.toString(),
           });
         }
         if (watchdog.fired()) {
           return finish('timeout', {
             error: `claude ${watchdog.reason()}`,
-            timeoutPhase: 'foreground',
+            timeoutKind: watchdog.fired(),
+            timeoutPhase: phase,
             stderrTail: tail.toString(),
           });
         }
@@ -612,11 +645,11 @@ export const claudeBackend: LocalBackend = {
 };
 
 /** Args mirroring the multica skeleton, distilled to what we actually
- *  use in v1: stream-json in/out, `--print` (non-interactive), and
- *  bypass permissions for daemon-style execution. Missing runtime overrides
- *  deliberately leave model and effort to Claude Code configuration. */
+ *  use in v1: stream-json in/out and `--print` (non-interactive). Missing
+ *  model/effort/permission overrides deliberately leave selection to Claude
+ *  Code when the Agent has no explicit value. */
 export function buildClaudeArgs(opts: Pick<BackendRunOptions,
-  'resumeSessionId' | 'customArgs' | 'bridge' | 'systemPrompt' | 'modelOverride' | 'thinkingLevel'
+  'resumeSessionId' | 'customArgs' | 'bridge' | 'systemPrompt' | 'modelOverride' | 'thinkingLevel' | 'permissionPolicy'
 >): string[] {
   // `--include-partial-messages` is the flag that turns claude code's
   // stream-json output from "one assistant message per completed turn"
@@ -631,8 +664,7 @@ export function buildClaudeArgs(opts: Pick<BackendRunOptions,
     '--include-partial-messages',
     '--include-hook-events',
     '--verbose',
-    '--permission-mode', 'bypassPermissions',
-    '--dangerously-skip-permissions',
+    ...buildClaudePermissionArgs(opts.permissionPolicy || 'inherit'),
   ];
   if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
   if (opts.modelOverride) args.push('--model', opts.modelOverride);
@@ -655,6 +687,24 @@ export function buildClaudeArgs(opts: Pick<BackendRunOptions,
   }
   if (opts.customArgs && opts.customArgs.length) args.push(...opts.customArgs);
   return args;
+}
+
+export function buildClaudePermissionArgs(
+  policy: NonNullable<BackendRunOptions['permissionPolicy']>,
+): string[] {
+  if (policy === 'ask') {
+    return [
+      '--permission-mode', 'default',
+      // Non-interactive stream-json runs need an explicit stdio reviewer;
+      // otherwise Claude may deny/hang locally without emitting the
+      // control_request that Orkas is waiting to present.
+      '--permission-prompt-tool', 'stdio',
+    ];
+  }
+  if (policy === 'full_access') {
+    return ['--permission-mode', 'bypassPermissions', '--dangerously-skip-permissions'];
+  }
+  return [];
 }
 
 /** Translate one parsed claude stream-json record into our event model.

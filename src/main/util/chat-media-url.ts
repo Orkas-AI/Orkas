@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 
 function _strictEncodePathSegment(segment: string): string {
   // encodeURIComponent deliberately leaves !'()* unescaped. They are legal in
@@ -119,11 +120,50 @@ function _isRenderableLocalMediaPath(absPath: string): boolean {
   return RENDERABLE_LOCAL_MEDIA_EXTS.has(basename.slice(dot).toLowerCase());
 }
 
-function _normalizeLocalMediaAliasesInMarkdown(text: string): string {
+/** A workspace-relative media destination resolved against the conversation's
+ * own working directory, or '' when it does not name a file there.
+ *
+ * An agent hands the user the path it was given, and for files it produced in
+ * its cwd that is a relative one — the same spelling it uses for every other
+ * deliverable. A non-media relative link renders as a link and is harmless, so
+ * the shape looks safe; a media one is upgraded to an `<img>`/`<video>` by the
+ * renderer, which has no base directory and so requested it against the app
+ * origin. On 2026-09-01 eight keyframes offered for approval all rendered as
+ * "image missing" while sitting on disk, and the contact sheet beside them —
+ * emitted by a tool as an absolute `chat-media://local/` URL — displayed fine.
+ * The main process is the layer that knows the cwd, so the destination is
+ * resolved here, before the renderer ever sees it.
+ *
+ * Deliberately narrow: the target must stay inside the conversation workspace
+ * and must exist. A relative destination that names nothing keeps its original
+ * text rather than becoming a broken embed, and `..` cannot walk the rewrite
+ * out of the workspace. */
+function _workspaceRelativeMediaPath(raw: string, baseDirAbs: string): string {
+  const candidate = String(raw || '').trim();
+  if (!candidate || !baseDirAbs) return '';
+  // Anything carrying a scheme, an authority, or a bare query/fragment is a
+  // URL the model meant as a URL, not a path in the workspace.
+  if (/^[a-z][a-z0-9+.-]*:/i.test(candidate) || candidate.startsWith('//')) return '';
+  if (/^[#?]/.test(candidate)) return '';
+  if (candidate.startsWith('/') || /^[A-Za-z]:[\\/]/.test(candidate)) return '';
+  let decoded = candidate;
+  try { decoded = decodeURIComponent(candidate); }
+  catch { /* a destination that is not valid percent-encoding is used verbatim */ }
+  const base = path.resolve(baseDirAbs);
+  const resolved = path.resolve(base, decoded);
+  const rel = path.relative(base, resolved);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return '';
+  try { if (!fs.statSync(resolved).isFile()) return ''; }
+  catch { return ''; }
+  return resolved;
+}
+
+function _normalizeLocalMediaAliasesInMarkdown(text: string, baseDirAbs: string): string {
   const normalizeSegment = (segment: string): string => segment.replace(
     MARKDOWN_LOCAL_MEDIA_DESTINATION,
     (full, prefix: string, destination: string, suffix: string) => {
-      const absPath = _localMediaAliasPath(destination);
+      const absPath = _localMediaAliasPath(destination)
+        || _workspaceRelativeMediaPath(destination, baseDirAbs);
       if (!absPath || !_isRenderableLocalMediaPath(absPath)) return full;
       // Use the canonical route even when the file is currently missing. An
       // existing file gains its byte-derived version below; a missing target
@@ -165,9 +205,12 @@ function _versionLocalUrlCandidate(candidate: string): string {
  * same path and drop (or retain an older) `?v=` query. Running this at the
  * message persistence boundary makes the stored and live-rendered text point
  * at the bytes that exist when the reply is committed.
+ *
+ * `baseDirAbs` is the author's working directory, when the caller knows it, so
+ * a media destination written relative to it resolves to the file it names.
  */
-export function versionChatMediaLocalUrlsInText(text: string): string {
-  const normalized = _normalizeLocalMediaAliasesInMarkdown(text);
+export function versionChatMediaLocalUrlsInText(text: string, baseDirAbs = ''): string {
+  const normalized = _normalizeLocalMediaAliasesInMarkdown(text, baseDirAbs);
   return normalized.replace(CHAT_MEDIA_LOCAL_URL_IN_TEXT, (raw) => {
     let candidate = raw;
     let suffix = '';

@@ -19,6 +19,11 @@ _TONE = {"positive", "negative", "neutral", "warning"}
 _GAP = {"sm", "md", "lg"}
 _LEVEL = {"info", "success", "warning", "error"}
 _CHART_KIND = {"line", "bar", "area", "pie"}
+# The only labels a finding may carry. Rendering defaults below resolve a
+# missing tier DOWN to "Estimated": an unlabelled item is one nobody proved,
+# and the safe failure is to under-claim. `validate_data_tiers` then rejects
+# the missing/invalid case outright so the default never silently ships.
+_DATA_TIERS = ("Measured", "Estimated", "unverified")
 
 _DIM_LABEL = {
     "security": "Security", "indexability": "Index", "content_meta": "Meta",
@@ -291,7 +296,7 @@ def build_action_plan(audit_obj: dict, crawl_obj: dict | None = None,
             lines.append("- Fix: {}".format(f["recommendation"]))
             lines.append("- Leading indicator: {}".format(f["leading_indicator"]))
             lines.append("- Failure criterion: {}".format(f["failure_criterion"]))
-            lines.append("- Data tier: {}".format(f.get("data_tier", "Measured")))
+            lines.append("- Data tier: {}".format(f.get("data_tier", "Estimated")))
             lines.append("")
     if not findings:
         lines.append("_No technical issues found in this pass._")
@@ -360,7 +365,7 @@ def build_action_plan(audit_obj: dict, crawl_obj: dict | None = None,
             lines.append("- Fix: {}".format(r["recommendation"]))
             lines.append("- Leading indicator: {}".format(r["leading_indicator"]))
             lines.append("- Failure criterion: {}".format(r["failure_criterion"]))
-            lines.append("- Data tier: {}".format(r.get("data_tier", "Measured")))
+            lines.append("- Data tier: {}".format(r.get("data_tier", "Estimated")))
             lines.append("")
     return "\n".join(lines)
 
@@ -406,6 +411,42 @@ def validate_dashboard(spec: dict) -> None:
             walk(ch, "{}>{}[{}]".format(path, t, i))
 
     walk(root)
+
+
+def validate_data_tiers(audit_obj: dict, opportunities_obj: dict | None = None,
+                        geo_probe_obj: dict | None = None) -> None:
+    """Raise ValueError if any emitted item lacks a valid `data_tier`.
+
+    Every first-party Skill sets this field deterministically from provenance
+    (CrUX field vs Lighthouse lab, connector-returned vs derived, retrieval vs
+    parametric answer), so a missing tier means the item did not come through
+    that path — it was composed downstream. Those are exactly the items whose
+    provenance nobody checked, and before this gate they inherited the renderer
+    default and printed as "Measured", i.e. an unproven claim wearing the label
+    reserved for observed fact. Failing here keeps the label honest: an
+    unlabelled finding is an authoring bug, not a formatting detail.
+    """
+    def _check(items, where):
+        for i, item in enumerate(items or []):
+            if not isinstance(item, dict):
+                continue
+            tier = item.get("data_tier")
+            if tier is None:
+                raise ValueError(
+                    "{}[{}] has no data_tier; label it one of {}".format(
+                        where, i, ", ".join(_DATA_TIERS)))
+            if tier not in _DATA_TIERS:
+                raise ValueError(
+                    "{}[{}] has data_tier {!r}; expected one of {}".format(
+                        where, i, tier, ", ".join(_DATA_TIERS)))
+
+    d = _data_of(audit_obj)
+    _check(d.get("findings"), "findings")
+    _check(d.get("geo_recommendations"), "geo_recommendations")
+    _check(_data_of_optional(opportunities_obj).get("opportunities"), "opportunities")
+    probe = _data_of_optional(geo_probe_obj)
+    if probe:
+        _check([probe], "geo_probe")
 
 
 def merge_audits(primary: dict, adds: list) -> dict:
@@ -480,14 +521,23 @@ def main(argv):
     ap.add_argument("--out", default=None, help="write the dashboard JSON here too")
     args = ap.parse_args(argv)
     primary = _load(args.audit)
-    # --add files load defensively: a missing/unreadable one (e.g. an optional
-    # seo-cwv that hit a rate limit and wrote nothing) is skipped, not fatal.
-    adds = []
-    for p in args.add:
+
+    # Optional inputs (--add / --opportunities / --geo-probe) load defensively:
+    # a missing/unreadable/invalid file (e.g. an optional seo-cwv that hit a
+    # rate limit and wrote nothing) is skipped and noted, never fatal to the
+    # final report. Only the primary --audit stays strict.
+    skipped_inputs: list[str] = []
+
+    def _load_or_skip(path, label):
+        if not path:
+            return None
         try:
-            adds.append(_load(p))
+            return _load(path)
         except (OSError, json.JSONDecodeError):
-            continue
+            skipped_inputs.append("{}: {}".format(label, path))
+            return None
+
+    adds = [a for a in (_load_or_skip(p, "add") for p in args.add) if a is not None]
     audit_obj = merge_audits(primary, adds) if adds else primary
     if args.geo:
         gd = _load(args.geo)
@@ -498,10 +548,11 @@ def main(argv):
         target["geo_recommendations"] = g.get("geo_recommendations")
         target["entity_status"] = g.get("entity_status")
     crawl_obj = _load(args.crawl) if args.crawl else None
-    opportunities_obj = _load(args.opportunities) if args.opportunities else None
-    geo_probe_obj = _load(args.geo_probe) if args.geo_probe else None
+    opportunities_obj = _load_or_skip(args.opportunities, "opportunities")
+    geo_probe_obj = _load_or_skip(args.geo_probe, "geo-probe")
     dashboard = build_dashboard(audit_obj, opportunities_obj=opportunities_obj, geo_probe_obj=geo_probe_obj)
     validate_dashboard(dashboard)
+    validate_data_tiers(audit_obj, opportunities_obj, geo_probe_obj)
     plan = build_action_plan(audit_obj, crawl_obj, opportunities_obj=opportunities_obj, geo_probe_obj=geo_probe_obj)
     if args.plan:
         with open(args.plan, "w", encoding="utf-8") as fh:
@@ -510,8 +561,11 @@ def main(argv):
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(dashboard, fh, ensure_ascii=False)
     d = _data_of(audit_obj)
-    return {"ok": True, "dashboard": dashboard, "action_plan_md": plan,
-            "health_score": d.get("health_score"), "summary": d.get("summary")}
+    result = {"ok": True, "dashboard": dashboard, "action_plan_md": plan,
+              "health_score": d.get("health_score"), "summary": d.get("summary")}
+    if skipped_inputs:
+        result["skipped_inputs"] = skipped_inputs
+    return result
 
 
 if __name__ == "__main__":

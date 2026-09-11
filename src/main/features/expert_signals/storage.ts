@@ -17,6 +17,7 @@ import * as path from 'node:path';
 
 import { signalsDailyFile, userSignalsDir } from '../../paths';
 import { createLogger } from '../../logger';
+import { logErrorSummary, logPathRef, maskId } from '../../util/log-redact';
 import { getActiveUserId } from '../users';
 
 import { Signal, SignalFilter, SignalInput } from './types';
@@ -45,7 +46,11 @@ export function appendSignal(uid: string, input: SignalInput): void {
   fsp.mkdir(path.dirname(file), { recursive: true })
     .then(() => fsp.appendFile(file, JSON.stringify(signal) + '\n'))
     .catch((err) => {
-      log.warn(`appendSignal failed uid=${uid} type=${input.type}: ${(err as Error).message}`);
+      log.warn('append signal failed', {
+        user_id: maskId(uid),
+        signal_type: input.type,
+        error: logErrorSummary(err),
+      });
     });
 }
 
@@ -74,7 +79,11 @@ export async function querySignalsForUser(
     let content: string;
     try { content = await fsp.readFile(file, 'utf8'); }
     catch (err) {
-      log.warn(`querySignals read failed file=${file}: ${(err as Error).message}`);
+      log.warn('query signals read failed', {
+        user_id: maskId(uid),
+        file: logPathRef(file),
+        error: logErrorSummary(err),
+      });
       continue;
     }
     for (const line of content.split('\n')) {
@@ -135,3 +144,32 @@ export const _internals = {
   buildSignal, appendSignal,
   ensureDir: (uid: string) => fs.mkdirSync(userSignalsDir(uid), { recursive: true }),
 };
+
+const SIGNAL_FILE_RE = /^(\d{4})-(\d{2})-(\d{2})\.jsonl$/;
+
+/** Boot maintenance: drop daily signal files older than `keepDays`. Every
+ *  consumer queries a bounded recent window (≤48h or since the last
+ *  reflection), so older files are disk growth only. Returns the number of
+ *  files removed. */
+export function pruneSignalFiles(uid: string, keepDays = 30, now = Date.now()): number {
+  const dir = userSignalsDir(uid);
+  let entries: string[];
+  try { entries = fs.readdirSync(dir); }
+  catch { return 0; }
+  const cutoff = now - keepDays * 24 * 60 * 60 * 1000;
+  let removed = 0;
+  for (const name of entries) {
+    const match = SIGNAL_FILE_RE.exec(name);
+    if (!match) continue;
+    const stamp = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+    if (!Number.isFinite(stamp) || stamp >= cutoff) continue;
+    try { fs.unlinkSync(path.join(dir, name)); removed += 1; }
+    catch (err) {
+      log.warn('prune signal file failed', {
+        user_id: maskId(uid),
+        error: logErrorSummary(err),
+      });
+    }
+  }
+  return removed;
+}

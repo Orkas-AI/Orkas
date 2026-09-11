@@ -14,8 +14,8 @@
  *   - Session = `PersistentSession` file under <WS_ROOT>/<user>/sessions/
  *
  * What stays the same:
- *   - Per-session Mutex + 5-slot global Semaphore (`util/locks`)
- *   - Idle watchdog: no event for `idleTimeout` seconds → abort
+ *   - Per-session Mutex + 10-slot global Semaphore (`util/locks`)
+ *   - Phase-aware idle watchdogs for provider wait, text, tool input, and tools
  *   - External AbortSignal honored
  *   - Returned event shapes + final reply accumulation
  */
@@ -31,7 +31,9 @@ import type {
   ServerModelFallbackReason,
 } from '#core-agent';
 import { createLogger } from '../../logger';
+import { AGENT_EXECUTION_IDLE_MS, agentExecutionDeadline } from '../../util/agent-execution-budget';
 import { logErrorRef, logErrorSummary, logPathRef, maskId } from '../../util/log-redact';
+import { recordUsageTokens } from '../../util/conversation-cost-meter';
 
 const log = createLogger('model');
 import { genConversationId } from '../../storage';
@@ -45,6 +47,7 @@ import {
 import type { SkillSelectionInput } from './skill-registry';
 import { mapCoreAgentEvents } from './event-mapper';
 import {
+  evictEphemeralSession,
   getSessionForUser as _getCachedSessionForUser,
   sessionKindOf,
 } from './session-store';
@@ -110,83 +113,6 @@ export async function* stopStreamOnAbort<T>(
     }
   } finally {
     if (abortListener) signal.removeEventListener('abort', abortListener);
-  }
-}
-
-/** First user-visible stall notice while the model/provider is silent, and
- * the repeat cadence afterwards. Deliberately far below the 180s/1800s idle
- * watchdog tiers: sampled conversations showed users staring at a silent
- * bubble for 18-42 minutes before the first failure surfaced, with nothing
- * telling them the run was retrying or that Stop was available. */
-const STALL_NOTICE_MODEL_FIRST_SEC = 60;
-const STALL_NOTICE_MODEL_REPEAT_SEC = 120;
-/** Tool executions are legitimately long/silent (downloads, renders), so the
- * first mid-tool notice waits longer and repeats slowly. */
-const STALL_NOTICE_TOOL_FIRST_SEC = 300;
-const STALL_NOTICE_TOOL_REPEAT_SEC = 300;
-
-function stallNoticeDurationLabel(seconds: number): string {
-  return seconds >= 120 ? `${Math.round(seconds / 60)}min` : `${Math.round(seconds)}s`;
-}
-
-/** Injects `{type:'progress'}` stall notices into a silent mapped-event
- * stream so a hang becomes user-visible long before the idle watchdog or a
- * provider error does. Synthetic events carry `event.stream='stall_notice'`
- * so the pump loop does NOT reset the idle watchdog for them (they would
- * otherwise keep a dead stream alive forever) and the task-turn sampler does
- * not count them as model activity. The wrapper never swallows or reorders
- * real events: a pending `next()` stays pending across notice emissions. */
-export async function* withStallNotices(
-  events: AsyncIterable<StreamEvent>,
-  opts: { inToolPhase: () => boolean },
-): AsyncGenerator<StreamEvent, void, unknown> {
-  const iterator = events[Symbol.asyncIterator]();
-  let pending: Promise<IteratorResult<StreamEvent, void>> | null = null;
-  let silentSinceMs = Date.now();
-  let noticesThisStretch = 0;
-  const timerToken = Symbol('stall');
-  try {
-    while (true) {
-      pending ||= iterator.next();
-      const inTool = opts.inToolPhase();
-      const firstSec = inTool ? STALL_NOTICE_TOOL_FIRST_SEC : STALL_NOTICE_MODEL_FIRST_SEC;
-      const repeatSec = inTool ? STALL_NOTICE_TOOL_REPEAT_SEC : STALL_NOTICE_MODEL_REPEAT_SEC;
-      const dueAtMs = silentSinceMs + (firstSec + noticesThisStretch * repeatSec) * 1000;
-      const waitMs = Math.max(250, dueAtMs - Date.now());
-      let timer: NodeJS.Timeout | null = null;
-      const timerPromise = new Promise<typeof timerToken>((resolve) => {
-        timer = setTimeout(() => resolve(timerToken), waitMs);
-      });
-      const winner = await Promise.race([pending, timerPromise])
-        .finally(() => { if (timer) clearTimeout(timer); });
-      if (winner === timerToken) {
-        noticesThisStretch += 1;
-        const elapsedSec = (Date.now() - silentSinceMs) / 1000;
-        yield {
-          type: 'progress',
-          text: inTool
-            ? t('model.stall_tool_running', { duration: stallNoticeDurationLabel(elapsedSec) })
-            : t('model.stall_waiting', { duration: stallNoticeDurationLabel(elapsedSec) }),
-          event: {
-            stream: 'stall_notice',
-            data: {
-              phase: inTool ? 'tool' : 'provider_wait',
-              elapsed_s: Math.round(elapsedSec),
-            },
-          },
-        };
-        continue;
-      }
-      pending = null;
-      silentSinceMs = Date.now();
-      noticesThisStretch = 0;
-      if (winner.done) return;
-      // `done` was checked above; TS cannot narrow IteratorResult<T, void>
-      // through the raced union here.
-      yield winner.value as StreamEvent;
-    }
-  } finally {
-    void iterator.return?.();
   }
 }
 
@@ -400,10 +326,33 @@ type SafeUsage = {
   totalTokens?: number;
 };
 
+/** Unbounded numeric aggregate for local evaluation. Detailed provider rounds
+ * stay capped, but their Token total must not disappear when a long or failed
+ * run exceeds that diagnostic cap. */
+export interface ProviderUsageAggregate {
+  observedCalls: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+}
+
 /** Privacy-bounded request evidence retained only by local Model Eval runs.
  * Prompt text, tool arguments, model output, paths, and provider identifiers
  * are deliberately absent. */
+export interface ProviderRoundPlanMutationEvidence {
+  action: 'update' | 'set_statuses' | 'append_step' | 'set_status' | 'clear' | 'replace';
+  /** Revision 1 is the first explicit milestone plan; revision 0 is the
+   * host-created objective-only anchor. */
+  initialExplicitPlan: boolean;
+  stepCount: number;
+  changedStepCount: number;
+  noOp: boolean;
+}
+
 export interface ProviderRoundEvidence {
+  planMutations?: ProviderRoundPlanMutationEvidence[];
   index: number;
   durationMs: number;
   outcome: 'completed' | 'failed';
@@ -472,6 +421,46 @@ export function snapshotLiveRunTimings(
   return snapshot;
 }
 
+export function modelRunTimingSummaryForLog(
+  totalMs: number,
+  timings: AgentRunTimings,
+): {
+  total_ms: number;
+  provider_ms: number;
+  tool_ms: number;
+  compaction_ms: number;
+  retry_wait_ms: number;
+  other_ms: number;
+} {
+  const boundedMs = (value: number): number => (
+    Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0
+  );
+  const providerMs = boundedMs(timings.providerMs);
+  const toolMs = boundedMs(timings.toolMs);
+  const compactionMs = boundedMs(timings.compactionMs);
+  const retryWaitMs = boundedMs(timings.retryWaitMs);
+  let otherMs = boundedMs(timings.otherMs);
+  const observedTotalMs = boundedMs(totalMs);
+  const attributedMs = providerMs + toolMs + compactionMs + retryWaitMs + otherMs;
+
+  // Successful runs prefer the runner's precise phase timings, whose clock
+  // starts after host-side setup. Attribute that pre-run residual to `other`
+  // so this single terminal record reconciles to the observed reply duration.
+  if (attributedMs < observedTotalMs) otherMs += observedTotalMs - attributedMs;
+
+  return {
+    total_ms: Math.max(
+      observedTotalMs,
+      providerMs + toolMs + compactionMs + retryWaitMs + otherMs,
+    ),
+    provider_ms: providerMs,
+    tool_ms: toolMs,
+    compaction_ms: compactionMs,
+    retry_wait_ms: retryWaitMs,
+    other_ms: otherMs,
+  };
+}
+
 function liveRunFailurePhase(phase: LiveRunTimingPhase): StreamEvent['failurePhase'] {
   if (phase === 'tool') return 'tool';
   if (phase === 'compaction') return 'compaction';
@@ -535,6 +524,9 @@ export interface ModelRunLogDiagnostics {
   providerCallCount: number;
   providerCallMaxMs: number;
   providerSlowCallCount: number;
+  structuredReasoningCallCount: number;
+  literalThinkContentCallCount: number;
+  providerUsage: ProviderUsageAggregate;
   providerRounds: ProviderRoundEvidence[];
   providerRoundsTruncated: number;
   toolDeltaCount: number;
@@ -546,7 +538,10 @@ export interface ModelRunLogDiagnostics {
   toolResultErrors: number;
   /** Tool-returned failures followed by a later successful call to the same
    * tool operation. This is deliberately sequence-based: a sibling call that
-   * was already running when the failure arrived cannot count as recovery. */
+   * was already running when the failure arrived cannot count as recovery.
+   * The inverse is only "no same-operation recovery was observed"; it does
+   * not prove that the task-level blocker remained unresolved because the
+   * model may have completed through a different operation or tool. */
   toolResultErrorsRecovered: number;
   toolEventSequence: number;
   toolStartSequenceById: Record<string, number>;
@@ -648,6 +643,32 @@ function safeUsageForLog(usage: unknown): SafeUsage | undefined {
   return Object.keys(out).length ? out : undefined;
 }
 
+const MAX_PROVIDER_ROUND_PLAN_MUTATIONS = 4;
+const SAFE_PLAN_MUTATION_ACTIONS = new Set<ProviderRoundPlanMutationEvidence['action']>(['update', 'set_statuses', 'append_step', 'set_status', 'clear', 'replace']);
+
+function safePlanMutationForLog(event: Record<string, unknown>): ProviderRoundPlanMutationEvidence | undefined {
+  if (event.isError || event.name !== 'manage_execution_plan' || typeof event.result !== 'string') return undefined;
+  try {
+    const parsed = JSON.parse(event.result) as Record<string, unknown>;
+    const action = String(parsed.action || '') as ProviderRoundPlanMutationEvidence['action'];
+    if (parsed.ok !== true || !SAFE_PLAN_MUTATION_ACTIONS.has(action)) return undefined;
+    const revision = Math.max(0, Math.round(finiteNumber(parsed.revision) || 0));
+    const updatedStepIds = Array.isArray(parsed.updated_step_ids)
+      ? parsed.updated_step_ids.slice(0, 12)
+      : [];
+    const noOp = parsed.unchanged === true || parsed.updated === false || parsed.appended === false;
+    return {
+      action,
+      initialExplicitPlan: action === 'update' && revision === 1 && !noOp,
+      stepCount: Math.max(0, Math.round(finiteNumber(parsed.step_count) || 0)),
+      changedStepCount: updatedStepIds.length,
+      noOp,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 export function createModelRunLogDiagnostics(nowMs = Date.now()): ModelRunLogDiagnostics {
   return {
     startedAtMs: nowMs,
@@ -674,6 +695,16 @@ export function createModelRunLogDiagnostics(nowMs = Date.now()): ModelRunLogDia
     providerCallCount: 0,
     providerCallMaxMs: 0,
     providerSlowCallCount: 0,
+    structuredReasoningCallCount: 0,
+    literalThinkContentCallCount: 0,
+    providerUsage: {
+      observedCalls: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      totalTokens: 0,
+    },
     providerRounds: [],
     providerRoundsTruncated: 0,
     toolDeltaCount: 0,
@@ -717,6 +748,23 @@ export function createModelRunLogDiagnostics(nowMs = Date.now()): ModelRunLogDia
 function noteElapsedOnce(target: ModelRunLogDiagnostics, key: keyof ModelRunLogDiagnostics, nowMs: number): void {
   if (target[key] !== undefined) return;
   (target as unknown as Record<string, unknown>)[key as string] = Math.max(0, nowMs - target.startedAtMs);
+}
+
+function addProviderUsage(target: ProviderUsageAggregate, usage: SafeUsage | undefined): void {
+  if (!usage) return;
+  target.observedCalls += 1;
+  target.inputTokens += Math.max(0, usage.inputTokens ?? 0);
+  target.outputTokens += Math.max(0, usage.outputTokens ?? 0);
+  target.cacheReadTokens += Math.max(0, usage.cacheReadTokens ?? 0);
+  target.cacheWriteTokens += Math.max(0, usage.cacheWriteTokens ?? 0);
+  target.totalTokens += Math.max(
+    0,
+    usage.totalTokens
+      ?? ((usage.inputTokens ?? 0)
+        + (usage.outputTokens ?? 0)
+        + (usage.cacheReadTokens ?? 0)
+        + (usage.cacheWriteTokens ?? 0)),
+  );
 }
 
 function toolCounter(stats: ModelRunLogDiagnostics, rawName: unknown): ToolRunLogCounter {
@@ -988,6 +1036,13 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
         nowMs,
         `tool=${safeToolNameForLog(e.name)} call=${maskId(e.id)} error=${e.isError ? 'true' : 'false'}${e.errorSeverity ? ` severity=${e.errorSeverity}` : ''}`,
       );
+      const runtimeException = ['tool_execution_exception', 'tool_execution_stalled', 'tool_result_processing_exception'].includes(String(e.errorCode || ''));
+      recordToolResultRecovery(stats, e, !!e.isError && e.errorSeverity !== 'recoverable' && !runtimeException);
+      const planMutation = safePlanMutationForLog(e);
+      const providerRound = stats.providerRounds.at(-1);
+      if (planMutation && providerRound) {
+        providerRound.planMutations = [...(providerRound.planMutations || []), planMutation].slice(0, MAX_PROVIDER_ROUND_PLAN_MUTATIONS);
+      }
       break;
     }
     case 'retry': {
@@ -1024,11 +1079,17 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
     }
     case 'provider_call': {
       const durationMs = Math.max(0, Math.round(finiteNumber(e.durationMs) || 0));
+      const usage = safeUsageForLog(e.usage);
       stats.providerCallCount += 1;
+      addProviderUsage(stats.providerUsage, usage);
+      const reasoningBoundary = e.reasoningBoundary && typeof e.reasoningBoundary === 'object'
+        ? e.reasoningBoundary as Record<string, unknown>
+        : {};
+      if (reasoningBoundary.structured === true) stats.structuredReasoningCallCount += 1;
+      if (reasoningBoundary.literalLeadingText === true) stats.literalThinkContentCallCount += 1;
       stats.providerCallMaxMs = Math.max(stats.providerCallMaxMs, durationMs);
       if (durationMs >= 60_000) stats.providerSlowCallCount += 1;
       if (stats.providerRounds.length < MAX_PROVIDER_ROUND_EVIDENCE) {
-        const usage = safeUsageForLog(e.usage);
         stats.providerRounds.push({
           index: stats.providerCallCount,
           durationMs,
@@ -1200,6 +1261,10 @@ export function recordModelStreamEventForLog(stats: ModelRunLogDiagnostics, ev: 
 
 export function summarizeModelRunForLog(stats: ModelRunLogDiagnostics, nowMs = Date.now()): Record<string, unknown> {
   const toolNames = Object.keys(stats.toolCounts).sort();
+  const toolResultErrorsWithoutObservedRecovery = Math.max(
+    0,
+    stats.toolResultErrors - stats.toolResultErrorsRecovered,
+  );
   return {
     durationMs: Math.max(0, nowMs - stats.startedAtMs),
     rawEventCount: stats.rawEventCount,
@@ -1225,6 +1290,9 @@ export function summarizeModelRunForLog(stats: ModelRunLogDiagnostics, nowMs = D
     providerCallCount: stats.providerCallCount,
     providerCallMaxMs: stats.providerCallMaxMs,
     providerSlowCallCount: stats.providerSlowCallCount,
+    structuredReasoningCallCount: stats.structuredReasoningCallCount,
+    literalThinkContentCallCount: stats.literalThinkContentCallCount,
+    providerUsage: { ...stats.providerUsage },
     toolDeltaCount: stats.toolDeltaCount,
     toolStarts: stats.toolStarts,
     toolProgress: stats.toolProgress,
@@ -1232,7 +1300,10 @@ export function summarizeModelRunForLog(stats: ModelRunLogDiagnostics, nowMs = D
     toolErrors: stats.toolErrors,
     toolResultErrors: stats.toolResultErrors,
     toolResultErrorsRecovered: stats.toolResultErrorsRecovered,
-    toolResultErrorsUnresolved: Math.max(0, stats.toolResultErrors - stats.toolResultErrorsRecovered),
+    toolResultErrorsWithoutObservedRecovery,
+    // Backward-compatible log alias. Consumers must not interpret this as a
+    // task-level unresolved blocker.
+    toolResultErrorsUnresolved: toolResultErrorsWithoutObservedRecovery,
     toolNames,
     toolCounts: stats.toolCounts,
     toolTimeline: stats.toolTimeline.map(formatToolTimelineEntryForLog),
@@ -1357,7 +1428,7 @@ function toolCountBucketForTelemetry(count: number): string {
 }
 
 function agentRunResultEventForTelemetry(input: {
-  status: 'completed' | 'aborted' | 'idle_timeout' | 'error' | 'empty';
+  status: 'completed' | 'stopped' | 'waiting_input' | 'aborted' | 'idle_timeout' | 'error' | 'empty';
   durationMs: number;
   providerId?: string;
   modelId?: string;
@@ -1371,10 +1442,10 @@ function agentRunResultEventForTelemetry(input: {
   failureRawCode?: string;
   failurePhase?: StreamEvent['failurePhase'];
 }): StreamEvent {
-  const result = input.status === 'completed'
+  const result = input.status === 'completed' || input.status === 'waiting_input'
     ? 'success'
-    : (input.status === 'aborted' ? 'aborted' : 'failure');
-  const errorCode = input.status === 'completed'
+    : (input.status === 'stopped' ? 'stopped' : (input.status === 'aborted' ? 'aborted' : 'failure'));
+  const errorCode = input.status === 'completed' || input.status === 'stopped' || input.status === 'waiting_input'
     ? ''
     : (input.failureCode || (input.status === 'empty' ? 'empty_response' : input.status));
   const data: Record<string, unknown> = {
@@ -1415,13 +1486,14 @@ export function modelTurnContextForLog(input: {
   attachmentMetadata?: { hasAttachments?: boolean; attachmentTypes?: readonly string[] };
   historyResources?: readonly unknown[];
   idleTimeout?: number;
+  toolInputIdleTimeout?: number;
   streamIdleTimeout?: number;
+  providerWaitIdleTimeout?: number;
   maxToolLoops?: number;
   skillList?: readonly string[];
   toolList?: readonly string[];
   toolSurfaceMode?: 'scoped' | 'legacy_all';
   forceOpenSkillRefs?: readonly SkillSelectionInput[];
-  projectAllowedSkillIds?: readonly string[];
   extraTools?: readonly AgentTool[];
   extraRoots?: readonly string[];
   readOnlyExtraRoots?: readonly string[];
@@ -1436,10 +1508,17 @@ export function modelTurnContextForLog(input: {
   profileId?: string;
   entryId?: string;
   resolvedSystemPrompt?: string;
+  turnEphemeral?: string;
   toolDefs?: readonly ToolDefSnapshot[];
   buildDurationMs?: number;
 }): Record<string, unknown> {
+  const sessionKind = sessionKindForLog(input.sessionId);
   const toolDefs = input.toolDefs || [];
+  const toolDefinitionChars = toolDefs.reduce((total, tool) => total + JSON.stringify({
+    name: tool.name,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+  }).length, 0);
   const toolSourceCounts = toolDefs.reduce<Record<string, number>>((acc, t) => {
     const source = t?.source || 'unknown';
     acc[source] = (acc[source] || 0) + 1;
@@ -1448,7 +1527,7 @@ export function modelTurnContextForLog(input: {
   return {
     user_id: maskId(input.userId),
     session_id: maskId(input.sessionId),
-    session_kind: sessionKindForLog(input.sessionId),
+    session_kind: sessionKind,
     cid: maskId(input.cid),
     turn_id: maskId(input.turnId),
     agent_id: maskId(input.agentId),
@@ -1460,6 +1539,7 @@ export function modelTurnContextForLog(input: {
     message_chars: String(input.message || '').length,
     system_prompt_chars: String(input.systemPrompt || '').length,
     resolved_system_prompt_chars: input.resolvedSystemPrompt ? input.resolvedSystemPrompt.length : undefined,
+    turn_ephemeral_chars: input.turnEphemeral ? input.turnEphemeral.length : undefined,
     image_count: Array.isArray(input.images) ? input.images.length : 0,
     has_attachments: input.attachmentMetadata?.hasAttachments,
     attachment_types: input.attachmentMetadata?.attachmentTypes ? [...input.attachmentMetadata.attachmentTypes].slice(0, 20) : undefined,
@@ -1467,15 +1547,21 @@ export function modelTurnContextForLog(input: {
     has_working_dir: !!input.workingDir,
     working_dir: input.workingDir ? logPathRef(input.workingDir) : undefined,
     idle_timeout_sec: input.idleTimeout,
+    tool_input_idle_timeout_sec: input.toolInputIdleTimeout,
     stream_idle_timeout_sec: input.streamIdleTimeout,
+    provider_wait_idle_timeout_sec: input.providerWaitIdleTimeout,
     max_tool_loops: input.maxToolLoops,
-    skill_list_mode: input.skillList === undefined ? 'all' : 'allowlist',
+    // A named Agent without authored skill_list metadata does not receive the
+    // Commander's full trusted roster. Its effective resident baseline is its
+    // own private Skills; other shared Skills remain lazy behind skill_search.
+    skill_list_mode: input.skillList === undefined
+      ? (sessionKind === 'gmember' ? 'agent_defaults' : 'all')
+      : 'allowlist',
     skill_list_count: input.skillList === undefined ? undefined : input.skillList.length,
     tool_list_mode: input.toolList === undefined ? 'legacy' : 'scoped',
     tool_list_count: input.toolList === undefined ? undefined : input.toolList.length,
     tool_surface_mode: input.toolSurfaceMode,
     force_open_skill_count: input.forceOpenSkillRefs?.length,
-    project_skill_allowlist_count: input.projectAllowedSkillIds?.length,
     extra_tool_count: input.extraTools?.length || 0,
     extra_root_count: input.extraRoots?.length || 0,
     read_only_extra_root_count: input.readOnlyExtraRoots?.length || 0,
@@ -1486,6 +1572,7 @@ export function modelTurnContextForLog(input: {
     has_abort_signal: !!input.hasAbortSignal,
     has_drain_steer: typeof input.drainSteer === 'function',
     tool_count: toolDefs.length,
+    tool_definition_chars: toolDefinitionChars,
     tool_source_counts: toolSourceCounts,
     tool_names: toolDefs.map((t) => t.name).filter(Boolean).sort().slice(0, 80),
     tool_names_truncated: toolDefs.length > 80,
@@ -1511,8 +1598,11 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     images,
     attachmentMetadata,
     historyResources,
-    idleTimeout = 1800,
-    streamIdleTimeout = 180,
+    idleTimeout = AGENT_EXECUTION_IDLE_MS / 1000,
+    toolInputIdleTimeout = idleTimeout,
+    streamIdleTimeout = idleTimeout,
+    providerWaitIdleTimeout = idleTimeout,
+    executionDeadlineAt = agentExecutionDeadline(),
     maxToolLoops,
     elapsedConvergenceMs,
     abortSignal = null,
@@ -1523,7 +1613,6 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     forceOpenSkillRefs,
     runtimeSkillBindings,
     runtimeGrantedToolGroups,
-    projectAllowedSkillIds,
     extraTools,
     extraRoots,
     readOnlyExtraRoots,
@@ -1539,7 +1628,6 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     projectId,
     onFileWritten,
     onOutputsPublished,
-    getPublishableOutputPaths,
     hasProducedPath,
     onArtifactCreated,
     onCustomConnectorAdded,
@@ -1567,12 +1655,13 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     attachmentMetadata,
     historyResources,
     idleTimeout,
+    toolInputIdleTimeout,
     streamIdleTimeout,
+    providerWaitIdleTimeout,
     maxToolLoops,
     skillList,
     toolList,
     forceOpenSkillRefs,
-    projectAllowedSkillIds,
     extraTools,
     extraRoots,
     readOnlyExtraRoots,
@@ -1640,9 +1729,8 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     global_slot_acquired: !nested,
   });
 
-  // Build an AbortController that fires when:
-  //   (a) no event has been produced for idleTimeout seconds, OR
-  //   (b) the caller's external abortSignal fires
+  // Build an AbortController that fires when the active phase's idle window
+  // expires or the caller's external abortSignal fires.
   // core-agent honors the signal via params.signal on every provider call.
   //
   // On either abort we release the session + global-slot locks **immediately**,
@@ -1656,25 +1744,23 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   const controller = new AbortController();
   let idleTimer: NodeJS.Timeout | null = null;
   let idleHit = false;
+  let wallHit = false;
+  const userWaitingTools = new Set<string>();
   let externalAbort = false;
   let directSessionAbort = false;
-  // Phase-aware idle watchdog. `toolDepth` > 0 means a tool is executing (a
-  // long/silent download is normal there — core-agent's per-tool watchdog or
-  // a delegated child executor handles that), so we use the long `idleTimeout`.
-  // `assemblingToolCallIds` covers the model-side gap after a streamed tool
-  // call begins but before core-agent has the complete JSON needed to emit
-  // `tool_start`; large `write_file` payloads can legitimately be silent there.
-  // Only when ordinary assistant text has begun streaming with no tool activity
-  // do we apply the short `streamIdleTimeout`, which catches a provider stream
-  // that started then went silent mid-generation. Cold starts, post-tool model
-  // calls, and compaction/retry handoffs keep the long `idleTimeout` until the
-  // next text delta arrives. `idleHitWindow` records which window actually fired
-  // for the surfaced error text.
+  // All phases default to the shared idle policy. Retain phase diagnostics and
+  // explicit caller overrides for bounded component requests. Runner-owned
+  // tools first get a recoverable per-tool timeout; the host backstop remains
+  // slightly later. Executor-owned delegation is bounded by its child runtime.
   let toolDepth = 0;
   const activeToolTimeoutOwners = new Map<string, "runner" | "executor">();
   const assemblingToolCallIds = new Set<string>();
+  let toolInputLastDeltaAt = 0;
   let modelTextStreamActive = false;
   let idleHitWindow = idleTimeout;
+  const idleTimeoutText = () => idleHitWindow === AGENT_EXECUTION_IDLE_MS / 1000
+    ? t('agent.execution_idle_timeout')
+    : t('agent.execution_idle_timeout_seconds', { seconds: String(idleHitWindow) });
   let idleHitPhase: NonNullable<StreamEvent['failurePhase']> = 'provider_wait';
   const activeAbortEntry: ActiveSessionAbort = {
     abort: () => {
@@ -1698,6 +1784,10 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   const resetIdle = () => {
     if (controller.signal.aborted) return;
     if (idleTimer) clearTimeout(idleTimer);
+    if (userWaitingTools.size > 0) {
+      idleTimer = null;
+      return;
+    }
     const assemblingToolCall = assemblingToolCallIds.size > 0;
     const toolExecuting = toolDepth > 0;
     const executorOwnedToolsOnly = toolExecuting
@@ -1710,16 +1800,26 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       idleTimer = null;
       return;
     }
-    // Only an executing tool has a core-agent watchdog to own the base window;
-    // the host may then wait longer as a session backstop. Argument assembly
-    // happens before tool_start, so the host keeps the base idle deadline there.
+    // Phase overrides cannot widen argument/provider waits beyond the base
+    // bound. Delegation has no stacked idle deadline; its child owns progress.
     const window = toolExecuting
       ? toolPhaseBackstopMs / 1000
-      : (!assemblingToolCall && modelTextStreamActive ? streamIdleTimeout : idleTimeout);
+      : assemblingToolCall
+        ? Math.min(idleTimeout, toolInputIdleTimeout)
+        : modelTextStreamActive
+          ? streamIdleTimeout
+          : Math.min(idleTimeout, providerWaitIdleTimeout);
     const phase: NonNullable<StreamEvent['failurePhase']> = toolDepth > 0
       ? 'tool'
       : (assemblingToolCall ? 'tool_input' : (modelTextStreamActive ? 'model_text' : 'provider_wait'));
+    // Mapped or unrelated raw events may call resetIdle while arguments are
+    // assembling. Preserve a true no-tool-delta deadline instead of extending
+    // it for those events; only the timestamp updated by `tool_delta` renews it.
+    const delayMs = assemblingToolCall && toolInputLastDeltaAt > 0
+      ? Math.max(0, (window * 1000) - (Date.now() - toolInputLastDeltaAt))
+      : window * 1000;
     idleTimer = setTimeout(() => {
+      if (controller.signal.aborted) return;
       idleHit = true;
       idleHitWindow = window;
       idleHitPhase = phase;
@@ -1731,9 +1831,17 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       controller.abort();
       releaseSlotOnce('idle-watchdog');
       releaseSessionOnce('idle-watchdog');
-    }, window * 1000);
+    }, delayMs);
   };
   resetIdle();
+  const wallTimer = setTimeout(() => {
+    if (controller.signal.aborted) return;
+    wallHit = true;
+    controller.abort();
+    releaseSlotOnce('wall-watchdog');
+    releaseSessionOnce('wall-watchdog');
+  }, Math.max(0, executionDeadlineAt - Date.now()));
+  wallTimer.unref?.();
 
   const onExternalAbort = () => {
     externalAbort = true;
@@ -1782,6 +1890,9 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(resumeActiveTurn ? { resumeActiveTurn: true } : {}),
       ...(agentName ? { agentName } : {}),
       ...(maxToolLoops ? { maxToolLoops } : {}),
+      // The per-tool stall watchdog derives from the same session idleTimeout
+      // so the tool-phase backstop above stays strictly behind it: a stalled
+      // tool fails as one recoverable tool error, never as a dead turn.
       toolIdleTimeoutMs,
       ...(elapsedConvergenceMs != null ? { elapsedConvergenceMs } : {}),
       providerFirstEventTimeoutMs: Math.max(1, streamIdleTimeout * 1000),
@@ -1800,7 +1911,6 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(forceOpenSkillRefs && forceOpenSkillRefs.length ? { forceOpenSkillRefs } : {}),
       ...(runtimeSkillBindings ? { runtimeSkillBindings } : {}),
       ...(runtimeGrantedToolGroups ? { runtimeGrantedToolGroups } : {}),
-      ...(projectAllowedSkillIds !== undefined ? { projectAllowedSkillIds } : {}),
       ...(extraTools && extraTools.length ? { extraTools } : {}),
       ...(extraRoots && extraRoots.length ? { extraRoots } : {}),
       ...(readOnlyExtraRoots && readOnlyExtraRoots.length ? { readOnlyExtraRoots } : {}),
@@ -1809,7 +1919,6 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(richSteerEnabled ? { richSteerEnabled: true } : {}),
       ...(onFileWritten ? { onFileWritten } : {}),
       ...(onOutputsPublished ? { onOutputsPublished } : {}),
-      ...(getPublishableOutputPaths ? { getPublishableOutputPaths } : {}),
       ...(hasProducedPath ? { hasProducedPath } : {}),
       ...(onArtifactCreated ? { onArtifactCreated } : {}),
       ...(onCustomConnectorAdded ? { onCustomConnectorAdded } : {}),
@@ -1878,13 +1987,14 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       attachmentMetadata,
       historyResources,
       idleTimeout,
+      toolInputIdleTimeout,
       streamIdleTimeout,
+      providerWaitIdleTimeout,
       maxToolLoops,
       skillList,
       toolList,
       toolSurfaceMode,
       forceOpenSkillRefs,
-      projectAllowedSkillIds,
       extraTools,
       extraRoots,
       readOnlyExtraRoots,
@@ -1899,6 +2009,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       profileId,
       entryId,
       resolvedSystemPrompt,
+      turnEphemeral,
       toolDefs,
       buildDurationMs: runnerBuildMs,
     });
@@ -1945,6 +2056,11 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     log.info('model turn run start', turnLogContext);
     const requestMetadata = attachmentMetadata ? { attachmentMetadata } : {};
 
+    if (Date.now() >= executionDeadlineAt) {
+      wallHit = true;
+      controller.abort();
+      throw new Error('Agent execution deadline reached before provider dispatch');
+    }
     modelRunStarted = true;
     transitionLiveRunTimings(liveRunTimings, 'provider');
     const rawEvents = runner.runStream({
@@ -1996,17 +2112,21 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
         } else if (ev.type === 'tool_delta') {
           modelTextStreamActive = false;
           assemblingToolCallIds.add(ev.id || 'stream_tool');
+          toolInputLastDeltaAt = Date.now();
         } else if (ev.type === 'tool_start') {
           modelTextStreamActive = false;
           assemblingToolCallIds.clear();
+          toolInputLastDeltaAt = 0;
           toolDepth += 1;
           activeToolTimeoutOwners.set(
             ev.id,
             ev.executionTimeoutOwner === 'executor' ? 'executor' : 'runner',
           );
         } else if (ev.type === 'tool_end') {
+          userWaitingTools.delete(ev.id);
           modelTextStreamActive = false;
           assemblingToolCallIds.delete(ev.id || 'stream_tool');
+          if (assemblingToolCallIds.size === 0) toolInputLastDeltaAt = 0;
           activeToolTimeoutOwners.delete(ev.id);
           toolDepth = Math.max(0, toolDepth - 1);
           if (toolDepth === 0 && liveRunTimings.phase === 'tool') {
@@ -2016,14 +2136,20 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
         // Some raw events intentionally do not map to visible UI events
         // (e.g. an empty tool-input delta before a large write_file argument).
         // They are still provider activity and must refresh the watchdog.
-        resetIdle();
+        let resumedUserWait = false;
+        if (ev.type === 'tool_progress') {
+          if (ev.data?.userAction === true) userWaitingTools.add(ev.id);
+          else resumedUserWait = userWaitingTools.delete(ev.id);
+        }
+        // UI-only heartbeats cannot extend a stalled execution. User-action
+        // progress pauses the idle timer until the tool resumes or completes.
+        if (resumedUserWait || ev.type !== 'tool_progress' || ev.data?.heartbeat !== true || ev.data?.userAction === true) resetIdle();
         yield ev;
       }
     }
 
     // The event mapper yields Orkas-shape events and handles the
-    // terminal final/error synthesis. We re-yield every event it produces,
-    // resetting the idle timer on each one.
+    // terminal final/error synthesis. Only raw protocol events own liveness.
     let eventCount = 0;
     let flushReasoningBeforeAbort: (() => StreamEvent | null) | null = null;
     const mappedEvents = mapCoreAgentEvents(captureResult(rawEvents), {
@@ -2043,16 +2169,10 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       turnTag,
       () => flushReasoningBeforeAbort?.() ?? null,
     );
-    for await (const ev of withStallNotices(abortableEvents, {
-      inToolPhase: () => toolDepth > 0 || assemblingToolCallIds.size > 0,
-    })) {
-      const isStallNotice = (ev as StreamEvent).event?.stream === 'stall_notice';
-      // The raw-event wrapper owns phase tracking. Reset here too because
-      // mapped UI events can be synthesized from accumulated raw state.
-      // Synthetic stall notices are host-generated and must NOT feed the
-      // watchdog — they would keep a dead stream alive past every idle tier.
-      if (!isStallNotice) resetIdle();
+    for await (const ev of abortableEvents) {
       eventCount += 1;
+      // The watchdog supplies the single classified terminal error below.
+      if (ev.type === 'error' && (wallHit || idleHit)) continue;
       let outgoing: StreamEvent = ev;
       if (ev.type === 'error' && !(ev as StreamEvent).aborted) {
         terminalFailureCode = (ev as StreamEvent).failureCode || 'model_stream_error';
@@ -2099,8 +2219,15 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       recordModelStreamEventForLog(diagnostics, abortEvent);
       recorder.record(abortEvent as any);
       yield abortEvent;
+    } else if (wallHit) {
+      errText = t('agent.execution_wall_timeout');
+      terminalFailureCode = 'execution_wall_timeout';
+      const wallEvent: StreamEvent = { type: 'error', text: errText, failureKind: 'model', failureCode: terminalFailureCode };
+      recordModelStreamEventForLog(diagnostics, wallEvent);
+      recorder.record(wallEvent as any);
+      yield wallEvent;
     } else if (idleHit) {
-      errText = errText || `Model exceeded ${idleHitWindow}s with no response (aborted)`;
+      errText = idleTimeoutText();
       terminalFailureCode = 'idle_timeout';
       terminalFailurePhase = idleHitPhase;
       const idleEvent: StreamEvent = {
@@ -2115,8 +2242,15 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       yield idleEvent;
     }
   } catch (err) {
-    if (idleHit) {
-      errText = `Model exceeded ${idleHitWindow}s with no response (aborted)`;
+    if (wallHit) {
+      errText = t('agent.execution_wall_timeout');
+      terminalFailureCode = 'execution_wall_timeout';
+      const wallEvent: StreamEvent = { type: 'error', text: errText, failureKind: 'model', failureCode: terminalFailureCode };
+      recordModelStreamEventForLog(diagnostics, wallEvent);
+      recorder.record(wallEvent as any);
+      yield wallEvent;
+    } else if (idleHit) {
+      errText = idleTimeoutText();
       terminalFailureCode = 'idle_timeout';
       terminalFailurePhase = idleHitPhase;
       log.warn('model turn idle timeout surfaced after stream error', { ...turnLogContext, error: logErrorSummary(err) });
@@ -2157,6 +2291,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   } finally {
     removeActiveSessionAbort(userId, sessionId, activeAbortEntry);
     if (idleTimer) clearTimeout(idleTimer);
+    clearTimeout(wallTimer);
     if (abortSignal) abortSignal.removeEventListener?.('abort', onExternalAbort);
     // Heal orphan tool_use in the cached session before releasing the
     // per-session lock. The PersistentSession instance is cached per
@@ -2187,13 +2322,28 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     } catch (err) {
       log.warn('post-turn heal failed', { ...turnLogContext, error: logErrorRef(err) });
     }
+    // One-shot sessions (anon / gworker / reflect / extract-img /
+    // memory-extract) are never resumed by anyone, and their ids are minted
+    // fresh per run — without eviction the session-store cache retains one
+    // full transcript per background run forever. Runs AFTER healAndPersist
+    // (which re-caches via getSession) and before the lock release, so no
+    // concurrent turn can be holding the evicted instance. Conversation-backed
+    // kinds are a no-op inside evictEphemeralSession.
+    try { evictEphemeralSession(userId, sessionId); }
+    catch (err) { log.warn('ephemeral session evict failed', { session_id: maskedSessionId, error: logErrorRef(err) }); }
     releaseSlotOnce('finally');
     releaseSessionOnce('finally');
     const doneEvent: StreamEvent = { type: 'done' };
     recordModelStreamEventForLog(diagnostics, doneEvent);
     const terminalStatus = abortedFlag
       ? 'aborted'
-      : (errText ? (idleHit ? 'idle_timeout' : 'error') : (finalText ? 'completed' : 'empty'));
+      : (errText
+          ? (idleHit ? 'idle_timeout' : 'error')
+          : (agentRunResult?.meta.termination?.status === 'waiting_input'
+              ? 'waiting_input'
+              : (agentRunResult?.meta.termination?.status === 'stopped'
+                  ? 'stopped'
+                  : (finalText ? 'completed' : 'empty'))));
     const telemetryIds = modelRunIdsForTelemetry(
       activeProviderId,
       activeModelId,
@@ -2216,6 +2366,10 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       failurePhase: terminalFailurePhase
         || (terminalStatus === 'aborted' ? liveRunFailurePhase(liveRunTimings.phase) : undefined),
     });
+    const timingSummary = modelRunTimingSummaryForLog(
+      Date.now() - runStartedAt,
+      agentRunResult?.meta.timings || snapshotLiveRunTimings(liveRunTimings),
+    );
     log.info('model turn finish', {
       ...turnLogContext,
       status: terminalStatus,
@@ -2225,8 +2379,10 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       final_chars: finalText.length,
       has_error: !!errText,
       error: errText ? logErrorRef(new Error(errText)) : undefined,
+      timings: timingSummary,
       diagnostics: summarizeModelRunForLog(diagnostics),
     });
+    recordUsageTokens(cid, { inputTokens: diagnostics.usage?.inputTokens ?? 0, outputTokens: diagnostics.usage?.outputTokens ?? 0 });
     try { recorder.finish({ text: finalText, aborted: abortedFlag, error: errText }); }
     catch (err) { log.warn('archive finish failed', { error: logErrorRef(err) }); }
     yield doneEvent;

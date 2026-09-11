@@ -1,7 +1,9 @@
 // ─── Generic right-click context menu ───
 // Small floating menu anchored at the cursor; items are { label, onClick,
 // disabled?, icon? }. There's exactly one menu instance at a time — opening a new
-// menu closes the previous one. Dismissers: outside click, Escape, scroll,
+// menu closes the previous one. A row may provide a leading `icon`, a
+// structured Agent `avatar`, and/or a `trailingIcon` for selection state.
+// Dismissers: outside click, Escape, scroll,
 // resize, and the i18n-change broadcast (label text may need refreshing).
 //
 // IME guard (CLAUDE.md §8): the up/down/Enter shortcuts early-return when a
@@ -46,7 +48,16 @@ function showContextMenu(event, items) {
     btn.setAttribute('role', 'menuitem');
     btn.setAttribute('tabindex', '-1');
     btn.disabled = !!it.disabled;
-    if (it.icon && typeof uiIconHtml === 'function') {
+    if (it.avatar && typeof renderAvatarHtml === 'function') {
+      const avatar = document.createElement('span');
+      avatar.className = 'context-menu-avatar';
+      avatar.innerHTML = renderAvatarHtml(it.avatar.icon, it.avatar.color, {
+        size: 18,
+        seed: it.avatar.seed,
+        extraClass: 'context-menu-agent-avatar',
+      });
+      btn.appendChild(avatar);
+    } else if (it.icon && typeof uiIconHtml === 'function') {
       const icon = document.createElement('span');
       icon.className = 'context-menu-icon';
       icon.innerHTML = uiIconHtml(it.icon);
@@ -56,6 +67,12 @@ function showContextMenu(event, items) {
     label.className = 'context-menu-label';
     label.textContent = it.label;
     btn.appendChild(label);
+    if (it.trailingIcon && typeof uiIconHtml === 'function') {
+      const trailingIcon = document.createElement('span');
+      trailingIcon.className = 'context-menu-trailing-icon';
+      trailingIcon.innerHTML = uiIconHtml(it.trailingIcon);
+      btn.appendChild(trailingIcon);
+    }
     menu.appendChild(btn);
   });
   _ctxMenuPreviousFocus = document.activeElement;

@@ -13,6 +13,10 @@ interface ContrastFinding {
   background: string;
   ratio: number;
   requiredRatio: number;
+  /** The compared background was declared by the text's owner, an ancestor
+   *  shape, or the slide itself. When it is only the theme default, a picture
+   *  or another shape may sit under the text, so the reading is advisory. */
+  backgroundDeclared: boolean;
 }
 
 function record(value: unknown): JsonRecord | null {
@@ -142,6 +146,7 @@ export function auditPptxContrast(rawIssues: unknown, rawTree: unknown): PptxCon
   const auditNode = (
     node: JsonRecord,
     inheritedBackground: string | null,
+    inheritedBackgroundDeclared: boolean,
     inheritedForeground: string,
     inheritedSize: number | null,
     inheritedBold: boolean,
@@ -153,6 +158,7 @@ export function auditPptxContrast(rawIssues: unknown, rawTree: unknown): PptxCon
     const isOwner = ['shape', 'placeholder', 'textbox', 'table-cell', 'cell'].includes(nodeType);
     const activeOwner = isOwner && nodePath ? nodePath : ownerPath;
     const background = resolvedBackground(format, inheritedBackground, theme);
+    const backgroundDeclared = background !== inheritedBackground ? background !== null : inheritedBackgroundDeclared;
     const foreground = normalizeHex(format.color ?? format['effective.color'], theme) ?? inheritedForeground;
     const size = parsePoints(format.size ?? format['font.size'] ?? format['effective.size']) ?? inheritedSize;
     const bold = format.bold !== undefined ? isBold(format.bold) : inheritedBold;
@@ -173,6 +179,7 @@ export function auditPptxContrast(rawIssues: unknown, rawTree: unknown): PptxCon
           background,
           ratio,
           requiredRatio,
+          backgroundDeclared,
         };
         const previous = findings.get(activeOwner);
         if (!previous || candidate.ratio < previous.ratio) findings.set(activeOwner, candidate);
@@ -180,7 +187,7 @@ export function auditPptxContrast(rawIssues: unknown, rawTree: unknown): PptxCon
     }
 
     for (const child of children) {
-      auditNode(child, background, foreground, size, bold, activeOwner);
+      auditNode(child, background, backgroundDeclared, foreground, size, bold, activeOwner);
     }
   };
 
@@ -192,7 +199,7 @@ export function auditPptxContrast(rawIssues: unknown, rawTree: unknown): PptxCon
     const slideBackground = slideFormat.background === undefined
       ? defaultBackground
       : normalizeHex(slideFormat.background, theme);
-    auditNode(slide, slideBackground, defaultText, null, false, '');
+    auditNode(slide, slideBackground, slideFormat.background !== undefined, defaultText, null, false, '');
   }
 
   const preserved = issueList(rawIssues).filter((issue) => !isOfficeLowContrastIssue(issue, auditedPaths));
@@ -200,11 +207,18 @@ export function auditPptxContrast(rawIssues: unknown, rawTree: unknown): PptxCon
     id: `ORKAS_CONTRAST_${index + 1}`,
     type: 'format',
     subtype: 'low_contrast',
-    severity: finding.ratio < 2 ? 'blocker' : 'warning',
+    // A blocker stops publication. Only a background the deck actually
+    // declares can justify that; against the theme default the text may sit
+    // on a picture the tree does not represent, so ppt-review gets a warning
+    // to verify visually instead of a false "unpublishable".
+    severity: finding.ratio < 2 && finding.backgroundDeclared ? 'blocker' : 'warning',
     path: finding.ownerPath,
     message:
       `Text "${finding.text}" has ${finding.ratio.toFixed(2)}:1 contrast ` +
-      `(${finding.foreground} on ${finding.background}); requires ${finding.requiredRatio.toFixed(1)}:1.`,
+      `(${finding.foreground} on ${finding.background}); requires ${finding.requiredRatio.toFixed(1)}:1.` +
+      (finding.backgroundDeclared
+        ? ''
+        : ' The background is the theme default, not a declared fill; confirm visually whether a picture or shape sits under this text.'),
     foreground: finding.foreground,
     background: finding.background,
     contrast_ratio: Number(finding.ratio.toFixed(2)),

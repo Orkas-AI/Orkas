@@ -31,8 +31,10 @@ const {
   _isHtmlSrc,
   _chatMediaLocalPathFromUrl,
   _normalizeLocalMediaSrc,
+  _mediaDedupKey,
   _parseOrkasMediaTitle,
   _chatVideoNativeControlsHit,
+  renderMarkdown,
 } = utils as {
   _BARE_URL_RE: RegExp;
   _linkifyBareUrls: (text: string) => string;
@@ -45,8 +47,10 @@ const {
   _isHtmlSrc: (src: string) => boolean;
   _chatMediaLocalPathFromUrl: (src: string) => string;
   _normalizeLocalMediaSrc: (src: string) => string;
+  _mediaDedupKey: (src: string) => string;
   _parseOrkasMediaTitle: (title: string) => { kind: 'image' | 'video'; remoteSrc: string } | null;
   _chatVideoNativeControlsHit: (clientY: number, rectTop: number, rectBottom: number) => boolean;
+  renderMarkdown: (md: string) => string;
 };
 
 const A = (url: string) =>
@@ -185,14 +189,15 @@ describe('markdown media links', () => {
     expect(_parseOrkasMediaTitle(marker)).toEqual({ kind: 'image', remoteSrc: remote });
   });
 
-  it('uses the persisted media kind to preview extensionless remote videos', () => {
+  it('uses the persisted media kind but keeps an unmaterialized remote video inert', () => {
     const remote = 'https://cdn.example/render?id=clip-1';
     const marker = `orkas-media-v1:video:${encodeURIComponent(remote)}`;
     const out = inlineFormat(`![generated video](${remote} "${marker}")`);
 
     expect(out).toContain('<video class="chat-md-video"');
-    expect(out).toContain(`src="${remote}"`);
-    expect(out).toContain(`data-orkas-remote-src="${remote}"`);
+    expect(out).toContain('src="data:,"');
+    expect(out).not.toContain(`src="${remote}"`);
+    expect(out).not.toContain('data-orkas-remote-src');
     expect(out).not.toContain('<img class="chat-md-img"');
   });
 
@@ -411,6 +416,78 @@ describe('markdown media links', () => {
 });
 
 // --- Boundary regex sanity ----------------------------------------------
+
+// One file, one copy. Upgrading media-looking links to inline players (the
+// block above) means an agent that writes BOTH a download link and the embed
+// for the same file gets that file rendered twice. Observed 2026-08-27:
+// ImageStudio delivered `[下载卡片图](…png?v=…)` and `![AI创业增量市场卡片图](…png?v=…)`
+// on consecutive lines and the bubble showed the same 2160×2880 card twice.
+// Suppression is deliberately narrow — it drops only the *link* upgrade, only
+// when an explicit `![](…)` for the same file exists in the same message.
+describe('duplicate media in one message', () => {
+  const CARD = 'chat-media://local/Users/test/deck/card.png';
+  const V1 = `${CARD}?v=111-111-360587`;
+  const imgCount = (html: string) => (html.match(/<img /g) || []).length;
+
+  it('renders one image when a download link and the embed name the same file', () => {
+    const out = renderMarkdown(`已完成。\n\n[下载卡片图](${V1})\n\n![AI创业增量市场卡片图](${V1})`);
+    expect(imgCount(out)).toBe(1);
+    // The embed wins: it is the presentation the prompt asks for, so its alt
+    // survives rather than the link label.
+    expect(out).toContain('alt="AI创业增量市场卡片图"');
+    expect(out).not.toContain('alt="下载卡片图"');
+    // The dropped link's line must not leave an empty paragraph behind.
+    expect(out).not.toContain('<p></p>');
+  });
+
+  it('collapses link and embed that carry different cache-busting tokens', () => {
+    const out = renderMarkdown(`[下载](${CARD}?v=1-1-1)\n\n![卡片](${CARD}?v=2-2-2)`);
+    expect(imgCount(out)).toBe(1);
+  });
+
+  it('collapses regardless of which form comes first', () => {
+    expect(imgCount(renderMarkdown(`![卡片](${V1})\n\n[下载卡片图](${V1})`))).toBe(1);
+  });
+
+  it('collapses a linked video that is also embedded', () => {
+    const clip = 'chat-media://local/Users/test/render/clip.mp4';
+    const out = renderMarkdown(`[视频成片](${clip})\n\n![成片](${clip})`);
+    expect((out.match(/<video /g) || []).length).toBe(1);
+  });
+
+  it('still upgrades a media link that has no matching embed', () => {
+    const out = renderMarkdown(`[下载生成的图片](${V1})`);
+    expect(imgCount(out)).toBe(1);
+    expect(out).toContain('alt="下载生成的图片"');
+  });
+
+  it('leaves links and embeds of different files alone', () => {
+    const out = renderMarkdown('[下载A](chat-media://local/Users/test/a.png)\n\n![B](chat-media://local/Users/test/b.png)');
+    expect(imgCount(out)).toBe(2);
+  });
+
+  it('does not treat a fenced `![](…)` sample as an embed of that file', () => {
+    const out = renderMarkdown('```\n![卡片](' + V1 + ')\n```\n\n[下载卡片图](' + V1 + ')');
+    expect(imgCount(out)).toBe(1);
+    expect(out).toContain('alt="下载卡片图"');
+  });
+
+  it('keeps two explicit embeds of one file — only link upgrades are suppressed', () => {
+    expect(imgCount(renderMarkdown(`![一](${V1})\n\n![二](${V1})`))).toBe(2);
+  });
+
+  it('leaves a bare inlineFormat call (no message context) unchanged', () => {
+    expect(imgCount(inlineFormat(`[下载卡片图](${V1})`))).toBe(1);
+  });
+
+  it('keys local media on the decoded path, ignoring the version token', () => {
+    expect(_mediaDedupKey(V1)).toBe('/Users/test/deck/card.png');
+    expect(_mediaDedupKey(`${CARD}?v=2-2-2`)).toBe(_mediaDedupKey(CARD));
+    expect(_mediaDedupKey('/Users/test/deck/card.png')).toBe('/Users/test/deck/card.png');
+    expect(_mediaDedupKey('https://cdn.test/a.png')).toBe('https://cdn.test/a.png');
+    expect(_mediaDedupKey('')).toBe('');
+  });
+});
 
 describe('_BARE_URL_RE termination set', () => {
   it('rejects fullwidth comma as URL char', () => {

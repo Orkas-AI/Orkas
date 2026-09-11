@@ -7,7 +7,7 @@
  * so stdio subprocesses exit instead of leaking. Tool calls route here from the AgentRunner's
  * meta-tools via `tools-adapter.ts`.
  *
- * Provider OAuth grants and API-key-backed Composio grants share `connectViaOAuth`. The manager
+ * Device-local CLI/API credentials, provider OAuth grants and API-key-backed Composio grants share `connectViaOAuth`. The manager
  * persists only opaque grants, applies the catalog transport, and brings the live MCP connection
  * up. Tokens are lazily refreshed at boot / refresh-tools / reconnect; mid-call expiry surfaces
  * as a tool error and the user re-clicks "刷新工具".
@@ -19,12 +19,14 @@ import { app } from 'electron';
 import * as registry from './registry';
 import * as paths from '../../paths';
 import { McpConnection } from './mcp-client';
-import { findCatalogEntry } from './catalog';
+import { connectorCatalog, findCatalogEntry } from './catalog';
 import { applyTemplate } from './apply-template';
+import { resolveCatalogConnection } from './connection-parameters';
 import { assertConnectorRuntimeEnabled, isConnectorRuntimeEnabled } from './availability';
 import { startComposioConnect, startOAuth, refreshIfStale, startGoogleSheetsPicker } from './oauth';
 import { startMcpDcrOAuth, refreshDcrIfStale } from './oauth-dcr';
 import { createLogger } from '../../logger';
+import { isConnectorActionBlocked } from './action_policy';
 import { logErrorSummary } from '../../util/log-redact';
 import { resolveBackgroundNodeRuntime, withBackgroundNodeEnv } from '../../util/background-node';
 import { fetchWithTimeout } from '../../util/abort';
@@ -33,8 +35,23 @@ import { accountApiBase } from './_server_bridge';
 import { connectorApiKeyHeaders } from './api-key';
 import { preflightConnectorCredits } from './usage-metering';
 import { registerUserSwitchHook } from '../user-switch-hooks';
-import { broadcastOAuthConnectOutcome } from './oauth-events';
+import { broadcastOAuthConnectOutcome, broadcastOAuthConnectProgress, type OAuthConnectOutcome } from './oauth-events';
+import { sanitizeAuthorizationDetail } from './local-cli-auth-error';
 import { deriveCustomId, validateCustomTransport, validateDisplayName, type CustomConnectorInput } from './custom-transport';
+import {
+  authorizeLocalCli,
+  localCliTransport,
+  removeLocalCliAuthorization,
+} from './local-cli';
+import {
+  authorizeLocalApi,
+  hasLocalApiAuthorization,
+  localApiStoredTransport,
+  localApiTransport,
+  normalizeLocalApiConnectionInput,
+  PRODUCTION_ONLY_LOCAL_API_PROVIDERS,
+  removeLocalApiAuthorization,
+} from './local-api';
 import { isConnectorUsable } from './types';
 import type { CatalogEntry, ComposioGrant, ConnectorInstance, OAuthGrant, ToolSchema, Transport } from './types';
 
@@ -46,7 +63,9 @@ function _runtimeKey(uid: string, id: string): string {
 
 const _conns = new Map<string, McpConnection>();
 const _verifyLocks = new Map<string, Promise<number>>();
-const _onDemandConnectLocks = new Map<string, Promise<McpConnection>>();
+const _toolsCacheRefreshLocks = new Map<string, Promise<number>>();
+const _connectLocks = new Map<string, Promise<ConnectorInstance>>();
+const _localCliConnectAttempts = new Map<string, string>();
 let _bootedFor: string | null = null;
 let _runtimeEpoch = 0;
 
@@ -78,16 +97,17 @@ function _isAccountChangedError(err: unknown): boolean {
   return (err as { code?: unknown } | null)?.code === 'E_CONNECTOR_ACCOUNT_CHANGED';
 }
 
+function _assertRuntimeEpoch(epoch: number): void {
+  if (epoch !== _runtimeEpoch) throw _accountChangedError();
+}
+
 async function _publishConnection(
   uid: string,
   id: string,
   conn: McpConnection,
   epoch: number,
 ): Promise<void> {
-  if (epoch !== _runtimeEpoch) {
-    try { await conn.close(); } catch { /* close already logs */ }
-    throw _accountChangedError();
-  }
+  _assertRuntimeEpoch(epoch);
   _conns.set(_runtimeKey(uid, id), conn);
 }
 
@@ -96,7 +116,9 @@ function _detachConnectorRuntime(): McpConnection[] {
   const all = Array.from(new Set(_conns.values()));
   _conns.clear();
   _verifyLocks.clear();
-  _onDemandConnectLocks.clear();
+  _toolsCacheRefreshLocks.clear();
+  _connectLocks.clear();
+  _localCliConnectAttempts.clear();
   _refreshLocks.clear();
   _bootedFor = null;
   return all;
@@ -155,6 +177,76 @@ function _sleep(ms: number): Promise<void> {
 function _tokPrefix(t: string | null | undefined): string {
   if (!t) return 'none';
   return crypto.createHash('sha256').update(t).digest('hex').slice(0, 12);
+}
+
+function _stableJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(_stableJson).join(',')}]`;
+  const obj = value as Record<string, unknown>;
+  return `{${Object.keys(obj).sort().map((key) => `${JSON.stringify(key)}:${_stableJson(obj[key])}`).join(',')}}`;
+}
+
+function _catalogToolsCacheKey(id: string): string {
+  const entry = findCatalogEntry(id);
+  if (!entry || (entry.auth_mode !== 'composio' && !entry.allowed_tools?.length)) return '';
+  return crypto.createHash('sha256').update(_stableJson({
+    auth_mode: entry.auth_mode,
+    toolkit: entry.composio?.toolkit || '',
+    auth_config_id: entry.composio?.auth_config_id || '',
+    tools: entry.composio?.tools || [],
+    allowed_tools: entry.allowed_tools || [],
+    tool_policies: entry.tool_policies || {},
+  })).digest('hex').slice(0, 16);
+}
+
+/** Runtime local-API transports contain a device credential key. Never project that transport
+ * back into the synced registry; retain the credential-free launch template already on the row. */
+function _transportForPersistence(
+  entry: CatalogEntry | null,
+  current: Transport,
+  resolved: Transport,
+): Transport {
+  return entry?.auth_mode === 'local_api' ? current : resolved;
+}
+
+/** Apply the catalog's reviewed MCP action boundary before schemas reach persistence or the LLM.
+ *  This is separate from the user's `enabled_subtools`: the catalog list is the hard product
+ *  policy, while the per-user list can only narrow it further. */
+function _applyCatalogToolPolicy(id: string, tools: ToolSchema[]): ToolSchema[] {
+  tools = tools.filter((tool) => !isConnectorActionBlocked(id, tool.name));
+  const entry = findCatalogEntry(id);
+  const configured = entry?.allowed_tools;
+  if (!configured?.length) return tools;
+  const allowed = new Set(configured);
+  const policies = entry?.tool_policies;
+  if (policies) {
+    const policyNames = Object.keys(policies);
+    if (policyNames.length !== configured.length
+      || configured.some((name) => !policies[name])
+      || policyNames.some((name) => !allowed.has(name))) {
+      throw new Error(`connector_tool_policy_invalid: ${id} policy keys must match allowed_tools`);
+    }
+  }
+  const filtered = tools.filter((tool) => allowed.has(tool.name));
+  if (!filtered.length) {
+    throw new Error(`connector_tool_policy_empty: ${id} returned no reviewed tools`);
+  }
+  if (filtered.length !== tools.length) {
+    log.info('connector tool policy filtered unreviewed provider actions', {
+      id,
+      reported_count: tools.length,
+      allowed_count: filtered.length,
+    });
+  }
+  return policies
+    ? filtered.map((tool) => ({ ...tool, orkas_action_policy: policies[tool.name] }))
+    : filtered;
+}
+
+function _isToolsCacheStale(inst: ConnectorInstance): boolean {
+  if (inst.origin === 'custom') return false;
+  const key = _catalogToolsCacheKey(inst.id);
+  return !!key && inst.tools_cache_key !== key;
 }
 
 function _pcDirForChild(): string {
@@ -288,7 +380,7 @@ async function _clearLegacyLocalSecretAuthPoison(
   });
   if (repaired) {
     log.warn('cleared legacy device-local secret failure misclassified as authorization error', {
-      id: inst.id,
+      id: inst.origin === 'custom' ? 'custom' : inst.id,
     });
   }
   return repaired || inst;
@@ -303,6 +395,10 @@ function _secretsUnavailableError(id: string): Error & { code: string; retryable
 
 function _isSecretsUnavailableError(err: unknown): boolean {
   return _connectorErrorCode(err) === registry.SECRETS_UNAVAILABLE_MESSAGE;
+}
+
+function _isLocalApiCredentialsMissingError(err: unknown): boolean {
+  return _connectorErrorCode(err) === 'local_api_credentials_missing';
 }
 
 function _hasStatusError(inst: ConnectorInstance, message: string): boolean {
@@ -459,10 +555,10 @@ async function _markDegradedOnTransientFailure(
 ): Promise<ConnectorInstance | null> {
   if (!_isTransientConnectorFailure(err) || !_hasEstablishedConnectorState(inst)) return null;
   const message = (err as Error).message;
-  log.warn('connector degraded after transient failure; keeping grant and cached tools for retry', {
-    id: inst.id,
+  log.warn('connector degraded after transient failure; keeping grant + cached tools for retry', {
+    id: inst.origin === 'custom' ? 'custom' : inst.id,
     reason,
-    error: message,
+    error: logErrorSummary(err),
   });
   const current = registry.load(uid).connections[inst.id] || inst;
   return _patchStatus(uid, current, (cur) => ({
@@ -508,7 +604,7 @@ async function _dropMissingScopeInstance(uid: string, inst: ConnectorInstance, r
   const missing = _missingRequiredScopes(entry, inst.oauth_grant);
   if (!missing.length) return false;
   log.warn('connector authorization missing required scopes; treating as uninstalled', {
-    id: inst.id,
+    id: inst.origin === 'custom' ? 'custom' : inst.id,
     missing_count: missing.length,
     reason,
   });
@@ -518,7 +614,7 @@ async function _dropMissingScopeInstance(uid: string, inst: ConnectorInstance, r
 
 function _dropMissingScopeInstanceSoon(uid: string, inst: ConnectorInstance, reason: string): void {
   void _dropMissingScopeInstance(uid, inst, reason).catch((err) => {
-    log.warn('failed to remove missing-scope connector instance', { id: inst.id, error: (err as Error).message });
+    log.warn('failed to remove missing-scope connector instance', { id: inst.origin === 'custom' ? 'custom' : inst.id, error: logErrorSummary(err) });
   });
 }
 
@@ -551,7 +647,7 @@ async function _markInstancesForCatalogError(uid: string, entry: CatalogEntry, m
 
 function _markAuthorizationErrorSoon(uid: string, id: string, message: string, reason: string): void {
   void _markAuthorizationError(uid, id, message, reason).catch((err) => {
-    log.warn('failed to mark connector authorization error', { id, error: (err as Error).message });
+    log.warn('failed to mark connector authorization error', { id, error: logErrorSummary(err) });
   });
 }
 
@@ -570,11 +666,13 @@ async function _refreshGrantIfStale(
   instId: string,
   opts: { force?: boolean } = {},
 ): Promise<OAuthGrant> {
+  const runtimeEpoch = _runtimeEpoch;
   const lockKey = _runtimeKey(uid, instId);
   const existing = _refreshLocks.get(lockKey);
   if (existing) {
     log.info('refresh dedupe hit', { id: instId, force: !!opts.force, existing_force: existing.force });
     const grant = await existing.promise;
+    _assertRuntimeEpoch(runtimeEpoch);
     if (opts.force && !existing.force && !existing.attemptedRemote) {
       return _refreshGrantIfStale(uid, entry, instId, opts);
     }
@@ -588,6 +686,7 @@ async function _refreshGrantIfStale(
   let p: Promise<OAuthGrant>;
   p = Promise.resolve().then(async () => {
     try {
+      _assertRuntimeEpoch(runtimeEpoch);
       const inst = registry.load(uid).connections[instId];
       if (!inst) throw new Error('instance not found');
       if (registry.hasUnavailableSecrets(inst)) throw _secretsUnavailableError(inst.id);
@@ -616,6 +715,7 @@ async function _refreshGrantIfStale(
       }
       lock.attemptedRemote = true;
       const oldRt = inst.oauth_grant.refresh_token;
+      _assertRuntimeEpoch(runtimeEpoch);
       log.info('refresh attempt', {
         id: instId,
         auth_mode: entry.auth_mode,
@@ -645,7 +745,7 @@ async function _refreshGrantIfStale(
         log.warn('refresh upstream failed', {
           id: instId,
           rt_sent: _tokPrefix(oldRt),
-          error: (err as Error).message,
+          error: logErrorSummary(err),
         });
         throw err;
       }
@@ -689,7 +789,7 @@ async function _refreshGrantIfStale(
           log.error('refresh grant persist FAILED — disk RT now diverged from server', {
             id: instId,
             new_rt_on_server: _tokPrefix(next.refresh_token),
-            error: (err as Error).message,
+            error: logErrorSummary(err),
           });
           throw err;
         }
@@ -712,7 +812,7 @@ async function _resolveTransport(uid: string, inst: ConnectorInstance): Promise<
   // API-key headers/env) lives inside secrets_enc like every other one.
   if (inst.origin === 'custom') {
     if (!inst.transport) {
-      log.warn('custom instance has no transport', { id: inst.id });
+      log.warn('custom instance has no transport', { id: inst.origin === 'custom' ? 'custom' : inst.id });
       return null;
     }
     return { transport: inst.transport, grant: null };
@@ -725,6 +825,12 @@ async function _resolveTransport(uid: string, inst: ConnectorInstance): Promise<
   if (entry.auth_mode === 'composio') {
     return { transport: _composioTransport(inst), grant: null };
   }
+  if (entry.auth_mode === 'local_cli') {
+    return { transport: localCliTransport(uid, entry), grant: null };
+  }
+  if (entry.auth_mode === 'local_api') {
+    return { transport: await localApiTransport(uid, entry, inst.connection_parameters), grant: null };
+  }
   if (!inst.oauth_grant) {
     log.warn('instance has no oauth_grant', { id: inst.id });
     return null;
@@ -733,10 +839,11 @@ async function _resolveTransport(uid: string, inst: ConnectorInstance): Promise<
   try {
     grant = await _refreshGrantIfStale(uid, entry, inst.id);
   } catch (err) {
-    log.warn('refresh failed', { id: inst.id, error: (err as Error).message });
+    log.warn('refresh failed', { id: inst.id, error: logErrorSummary(err) });
     throw err;
   }
-  const transport = applyTemplate(entry, grant);
+  const resolvedEntry = resolveCatalogConnection(entry, inst.connection_parameters).entry;
+  const transport = applyTemplate(resolvedEntry, grant);
   return { transport, grant };
 }
 
@@ -762,28 +869,66 @@ async function _patchStatus(
   return updated ?? inst;
 }
 
+/** Share discovery across bootstrap, panel verification, refresh and tool calls. */
 async function _connectAndCacheTools(
   uid: string,
   inst: ConnectorInstance,
-  statusPatches?: StatusPatchCollector,
+  statusPatches: StatusPatchCollector | undefined,
+  runtimeEpoch: number,
 ): Promise<ConnectorInstance> {
+  _assertRuntimeEpoch(runtimeEpoch);
+  const key = _runtimeKey(uid, inst.id);
+  const existing = _connectLocks.get(key);
+  if (existing) return existing;
+  const pending = _connectAndCacheToolsOnce(uid, inst, statusPatches, runtimeEpoch);
+  _connectLocks.set(key, pending);
+  try { return await pending; }
+  finally { if (_connectLocks.get(key) === pending) _connectLocks.delete(key); }
+}
+
+/** Explicit replacement/removal waits for discovery before closing its published connection. */
+async function _closeDiscoveredConnection(
+  uid: string, id: string, runtimeEpoch: number, signal?: AbortSignal,
+): Promise<void> {
+  const key = _runtimeKey(uid, id);
+  const pending = _connectLocks.get(key);
+  if (pending) {
+    try { await _waitForConnectorOrAbort(pending, signal); }
+    catch { /* a failed discovery also releases the slot */ }
+  }
+  _assertRuntimeEpoch(runtimeEpoch);
+  if (signal?.aborted) throw _connectorCancelledError(signal.reason);
+  const conn = _conns.get(key);
+  if (!conn) return;
+  _conns.delete(key);
+  try { await conn.close(); } catch { /* close already logs */ }
+  _assertRuntimeEpoch(runtimeEpoch);
+}
+
+async function _connectAndCacheToolsOnce(
+  uid: string,
+  inst: ConnectorInstance,
+  statusPatches: StatusPatchCollector | undefined,
+  runtimeEpoch: number,
+): Promise<ConnectorInstance> {
+  _assertRuntimeEpoch(runtimeEpoch);
   // A decrypt failure is local to this device. Never turn it into a metadata patch: doing so
   // syncs a false authorization failure to devices that can still open and use the same grant.
   if (registry.hasUnavailableSecrets(inst)) {
     log.warn('skipping connector connect because encrypted secrets are unavailable on this device', {
-      id: inst.id,
+      id: inst.origin === 'custom' ? 'custom' : inst.id,
     });
     return inst;
   }
-  const runtimeEpoch = _runtimeEpoch;
   const runtimeKey = _runtimeKey(uid, inst.id);
   const entry = findCatalogEntry(inst.id);
   let transport: Transport;
   try {
     const resolved = await _resolveTransport(uid, inst);
+    _assertRuntimeEpoch(runtimeEpoch);
     if (!resolved) {
       if (_isUnknownCatalogInstance(inst)) {
-        log.warn('skipping synced connector unsupported by this app version', { id: inst.id });
+        log.warn('skipping synced connector unsupported by this app version', { id: inst.origin === 'custom' ? 'custom' : inst.id });
         return inst;
       }
       return _patchStatus(uid, inst, (cur) => ({
@@ -794,7 +939,8 @@ async function _connectAndCacheTools(
     }
     transport = resolved.transport;
   } catch (err) {
-    if (_isSecretsUnavailableError(err)) {
+    _assertRuntimeEpoch(runtimeEpoch);
+    if (_isSecretsUnavailableError(err) || _isLocalApiCredentialsMissingError(err)) {
       return registry.load(uid).connections[inst.id] || inst;
     }
     const entry = findCatalogEntry(inst.id);
@@ -814,36 +960,44 @@ async function _connectAndCacheTools(
   const conn = new McpConnection(inst.id, transport);
   try {
     await conn.connect();
-    const tools = await conn.listTools();
+    _assertRuntimeEpoch(runtimeEpoch);
+    const tools = _applyCatalogToolPolicy(inst.id, await conn.listTools());
+    const toolsCacheKey = _catalogToolsCacheKey(inst.id);
     await _publishConnection(uid, inst.id, conn, runtimeEpoch);
     return _patchStatus(uid, inst, (cur) => ({
       ...cur,
-      transport,
+      transport: _transportForPersistence(entry, cur.transport, transport),
       tools_cache: tools,
       tools_cached_at: _now(),
+      tools_cache_key: toolsCacheKey,
       auth_error: undefined,
       status: { kind: 'connected', since: _now() },
       updated_at: _nowIso(),
     }), statusPatches);
   } catch (err) {
-    log.warn('connect+list failed', { id: inst.id, error: (err as Error).message });
-    if (_isAccountChangedError(err)) throw err;
+    log.warn('connect+list failed', { id: inst.origin === 'custom' ? 'custom' : inst.id, error: logErrorSummary(err) });
     try { await conn.close(); } catch { /* swallow */ }
+    _assertRuntimeEpoch(runtimeEpoch);
+    if (_isAccountChangedError(err)) throw err;
     let statusErr = err;
     if (_isTransientConnectorFailure(statusErr)) {
-      log.info('connect+list hit transient network failure; retrying once', { id: inst.id });
+      log.info('connect+list hit transient network failure; retrying once', { id: inst.origin === 'custom' ? 'custom' : inst.id });
       await _sleep(CONNECT_RETRY_DELAY_MS);
+      _assertRuntimeEpoch(runtimeEpoch);
       let retryConn: McpConnection | undefined;
       try {
         retryConn = new McpConnection(inst.id, transport);
         await retryConn.connect();
-        const tools = await retryConn.listTools();
+        _assertRuntimeEpoch(runtimeEpoch);
+        const tools = _applyCatalogToolPolicy(inst.id, await retryConn.listTools());
+        const toolsCacheKey = _catalogToolsCacheKey(inst.id);
         await _publishConnection(uid, inst.id, retryConn, runtimeEpoch);
         return _patchStatus(uid, inst, (cur) => ({
           ...cur,
-          transport,
+          transport: _transportForPersistence(entry, cur.transport, transport),
           tools_cache: tools,
           tools_cached_at: _now(),
+      tools_cache_key: toolsCacheKey,
           auth_error: undefined,
           status: { kind: 'connected', since: _now() },
           updated_at: _nowIso(),
@@ -853,25 +1007,31 @@ async function _connectAndCacheTools(
           try { await retryConn.close(); } catch { /* ignore */ }
         }
         statusErr = retryErr;
-        log.warn('connect+list transient retry failed', { id: inst.id, error: (retryErr as Error).message });
+        log.warn('connect+list transient retry failed', { id: inst.origin === 'custom' ? 'custom' : inst.id, error: logErrorSummary(retryErr) });
       }
     }
+    _assertRuntimeEpoch(runtimeEpoch);
     if (_isAccountChangedError(statusErr)) throw statusErr;
     if (_shouldForceRefreshAfterConnectFailure(entry, inst, statusErr)) {
-      log.info('MCP endpoint rejected OAuth token; forcing grant refresh and retrying', { id: inst.id });
+      log.info('MCP endpoint rejected OAuth token; forcing grant refresh and retrying', { id: inst.origin === 'custom' ? 'custom' : inst.id });
       let retryConn: McpConnection | undefined;
       try {
         const grant = await _refreshGrantIfStale(uid, entry!, inst.id, { force: true });
-        const retryTransport = applyTemplate(entry!, grant);
+        _assertRuntimeEpoch(runtimeEpoch);
+        const resolvedEntry = resolveCatalogConnection(entry!, inst.connection_parameters).entry;
+        const retryTransport = applyTemplate(resolvedEntry, grant);
         retryConn = new McpConnection(inst.id, retryTransport);
         await retryConn.connect();
-        const tools = await retryConn.listTools();
+        _assertRuntimeEpoch(runtimeEpoch);
+        const tools = _applyCatalogToolPolicy(inst.id, await retryConn.listTools());
+        const toolsCacheKey = _catalogToolsCacheKey(inst.id);
         await _publishConnection(uid, inst.id, retryConn, runtimeEpoch);
         return _patchStatus(uid, inst, (cur) => ({
           ...cur,
           transport: retryTransport,
           tools_cache: tools,
           tools_cached_at: _now(),
+      tools_cache_key: toolsCacheKey,
           auth_error: undefined,
           status: { kind: 'connected', since: _now() },
           updated_at: _nowIso(),
@@ -881,9 +1041,10 @@ async function _connectAndCacheTools(
           try { await retryConn.close(); } catch { /* ignore */ }
         }
         statusErr = retryErr;
-        log.warn('forced OAuth refresh retry failed', { id: inst.id, error: (retryErr as Error).message });
+        log.warn('forced OAuth refresh retry failed', { id: inst.origin === 'custom' ? 'custom' : inst.id, error: logErrorSummary(retryErr) });
       }
     }
+    _assertRuntimeEpoch(runtimeEpoch);
     if (_isAccountChangedError(statusErr)) throw statusErr;
     const degraded = await _markDegradedOnTransientFailure(
       uid, inst, statusErr, 'connect_list', statusPatches,
@@ -911,10 +1072,80 @@ function _shouldForceRefreshAfterConnectFailure(
   return /\b(401|403|unauthorized|AuthenticateToken|authentication failed|invalid_token|invalid access token|missing_token)\b/i.test(msg);
 }
 
+export async function refreshStaleToolCaches(uid: string, reason = 'manual'): Promise<number> {
+  if (!uid) return 0;
+  const existingLock = _toolsCacheRefreshLocks.get(uid);
+  if (existingLock) return existingLock;
+  const runtimeEpoch = _runtimeEpoch;
+
+  const run = (async () => {
+    const file = registry.load(uid);
+    const stale = Object.values(file.connections).filter((inst) => {
+      if (_isUnknownCatalogInstance(inst)) return false;
+      if (registry.hasUnavailableSecrets(inst)) return false;
+      if (!isConnectorRuntimeEnabled(inst.id)) return false;
+      // Respect the circuit breaker. This runs automatically (catalog signature change, and from
+      // `callTool` *before* its own cooldown check), and reconnects every stale row — so without
+      // this it is a way straight through the ceiling. A connector that cannot connect cannot
+      // refresh its schemas anyway; it re-caches on the attempt that succeeds.
+      if (_isInRetryCooldown(inst)) return false;
+      return _isToolsCacheStale(inst);
+    });
+    if (!stale.length) return 0;
+    let refreshed = 0;
+    for (const inst of stale) {
+      _assertRuntimeEpoch(runtimeEpoch);
+      await _closeDiscoveredConnection(uid, inst.id, runtimeEpoch);
+      _assertRuntimeEpoch(runtimeEpoch);
+      log.info('connector tool cache stale; refreshing', {
+        id: inst.origin === 'custom' ? 'custom' : inst.id,
+        reason,
+        old_key: inst.tools_cache_key || '',
+        new_key: _catalogToolsCacheKey(inst.id),
+      });
+      await _connectAndCacheTools(uid, inst, undefined, runtimeEpoch);
+      refreshed += 1;
+    }
+    return refreshed;
+  })();
+
+  _toolsCacheRefreshLocks.set(uid, run);
+  try {
+    return await run;
+  } finally {
+    if (_toolsCacheRefreshLocks.get(uid) === run) _toolsCacheRefreshLocks.delete(uid);
+  }
+}
+
+/** Re-verify installed connectors whose last successful connect is older than `VERIFY_TTL_MS`.
+ *
+ *  **Why this exists.** Bootstrap deliberately skips any row that is already `connected` with a
+ *  fresh tools cache (it would otherwise spend 10s+ warming every MCP process at startup). That
+ *  optimization is what let a connector sit on a green card for six days after its backend became
+ *  unreachable: nothing re-checked it, because nothing *used* it. Lazy verification on tool call is
+ *  right for the model's path, but the Connectors panel needs an answer before any tool call
+ *  happens — the user opening that panel is precisely the moment "does this actually work?" is
+ *  being asked.
+ *
+ *  **Cost model — why this is event-driven and not a timer.** One verification = one OAuth refresh
+ *  (an HTTP round-trip to Orkas Server) + one stdio spawn / socket + one `list_tools`, per
+ *  connector. It does NOT touch credits: `preflightConnectorCredits` is called only from
+ *  `connectViaOAuth` (first install) and `callTool`, never from `_connectAndCacheTools` — and even
+ *  there it is a `require_available` balance check, not a charge, and only for Composio-metered
+ *  entries. So the cost here is server load + local processes, not the user's money. That is still
+ *  worth bounding: a background poll would pay it for every connector forever, mostly to re-learn
+ *  what the next tool call would have told us for free, and would keep hammering a backend that is
+ *  already down. So there is no timer anywhere. We spend the cost only when all of these hold:
+ *    - the user opened the Connectors panel (the status is actually being read), and
+ *    - the row has no live connection already (a live conn IS the verification — free), and
+ *    - the last verified connect is older than `VERIFY_TTL_MS` (repeat opens are free).
+ *  A user who never opens the panel pays nothing; the model's path is unchanged and still lazy. */
 export async function verifyUsableConnectors(uid: string, reason = 'manual'): Promise<number> {
   if (!uid) return 0;
-  const existing = _verifyLocks.get(uid);
-  if (existing) return existing;
+  const existingLock = _verifyLocks.get(uid);
+  if (existingLock) return existingLock;
+  const runtimeEpoch = _runtimeEpoch;
+
   const run = (async () => {
     const now = Date.now();
     const due = listInstances(uid).filter((inst) => {
@@ -925,24 +1156,39 @@ export async function verifyUsableConnectors(uid: string, reason = 'manual'): Pr
     if (!due.length) return 0;
     log.info('verifying connectors with stale verification', { reason, due: due.length });
     let verified = 0;
-    await _runBounded(due, BOOTSTRAP_CONNECT_CONCURRENCY, async (inst) => {
-      const updated = await _connectAndCacheTools(uid, inst).catch((err) => {
-        log.warn('connector verification threw', { id: inst.id, error: (err as Error).message });
-        return null;
-      });
-      if (updated?.status?.kind === 'connected') verified += 1;
-    });
+    for (let i = 0; i < due.length; i += BOOTSTRAP_CONNECT_CONCURRENCY) {
+      _assertRuntimeEpoch(runtimeEpoch);
+      const batch = due.slice(i, i + BOOTSTRAP_CONNECT_CONCURRENCY);
+      await Promise.all(batch.map(async (inst) => {
+        // `_connectAndCacheTools` records the outcome itself — `connected` on success, `degraded`
+        // with the real reason on a transient failure, `error` on a hard one. We only count.
+        const updated = await _connectAndCacheTools(uid, inst, undefined, runtimeEpoch).catch((err) => {
+          if (_isAccountChangedError(err)) throw err;
+          log.warn('connector verification threw', { id: inst.origin === 'custom' ? 'custom' : inst.id, error: logErrorSummary(err) });
+          return null;
+        });
+        if (updated?.status?.kind === 'connected') verified += 1;
+      }));
+    }
+    log.info('connector verification done', { reason, due: due.length, verified });
     return verified;
   })();
   _verifyLocks.set(uid, run);
-  try { return await run; }
-  finally { _verifyLocks.delete(uid); }
+  try {
+    return await run;
+  } finally {
+    if (_verifyLocks.get(uid) === run) _verifyLocks.delete(uid);
+  }
 }
 
 export async function bootstrap(uid: string): Promise<void> {
   if (!uid || _bootedFor === uid) return;
+  let runtimeEpoch = _runtimeEpoch;
   if (_bootedFor && _bootedFor !== uid) {
-    await shutdownAll();
+    const closing = shutdownAll();
+    runtimeEpoch = _runtimeEpoch;
+    await closing;
+    _assertRuntimeEpoch(runtimeEpoch);
   }
   _bootedFor = uid;
   const file = registry.load(uid);
@@ -954,6 +1200,7 @@ export async function bootstrap(uid: string): Promise<void> {
   const connectCandidates: ConnectorInstance[] = [];
   let reusedCached = 0;
   for (const id of ids) {
+    _assertRuntimeEpoch(runtimeEpoch);
     let inst = file.connections[id];
     if (_isUnknownCatalogInstance(inst)) {
       log.warn('skipping synced connector unsupported by this app version', { id });
@@ -969,7 +1216,7 @@ export async function bootstrap(uid: string): Promise<void> {
       } catch (err) {
         log.warn('failed to clear legacy connector authorization misclassification', {
           id,
-          error: (err as Error).message,
+          error: logErrorSummary(err),
         });
         continue;
       }
@@ -977,7 +1224,7 @@ export async function bootstrap(uid: string): Promise<void> {
     try {
       if (await _dropMissingScopeInstance(uid, inst, 'missing_required_scopes_bootstrap')) continue;
     } catch (err) {
-      log.warn('failed to remove missing-scope connector during bootstrap', { id, error: (err as Error).message });
+      log.warn('failed to remove missing-scope connector during bootstrap', { id, error: logErrorSummary(err) });
       continue;
     }
     const problem = _storedAuthorizationProblem(inst);
@@ -986,7 +1233,7 @@ export async function bootstrap(uid: string): Promise<void> {
         try {
           await _markAuthorizationError(uid, inst.id, problem.message, `bootstrap_${problem.reason}`);
         } catch (err) {
-          log.warn('failed to mark authorization error during bootstrap', { id, error: (err as Error).message });
+          log.warn('failed to mark authorization error during bootstrap', { id, error: logErrorSummary(err) });
         }
       }
       continue;
@@ -1000,6 +1247,7 @@ export async function bootstrap(uid: string): Promise<void> {
     if (
       inst.status?.kind === 'connected'
       && inst.tools_cache.length > 0
+      && !_isToolsCacheStale(inst)
     ) {
       reusedCached += 1;
       continue;
@@ -1008,9 +1256,11 @@ export async function bootstrap(uid: string): Promise<void> {
     connectCandidates.push(inst);
   }
   const statusPatches: StatusPatchCollector = new Map();
+  _assertRuntimeEpoch(runtimeEpoch);
   await _runBounded(connectCandidates, BOOTSTRAP_CONNECT_CONCURRENCY, async (inst) => {
-    await _connectAndCacheTools(uid, inst, statusPatches).catch(() => {});
+    await _connectAndCacheTools(uid, inst, statusPatches, runtimeEpoch).catch(() => {});
   });
+  _assertRuntimeEpoch(runtimeEpoch);
   await registry.updateMany(uid, statusPatches);
   const runtimePrefix = `${uid}\u0000`;
   const connected = Array.from(_conns.entries())
@@ -1039,6 +1289,17 @@ export function listInstances(uid: string): ConnectorInstance[] {
     return true;
   }).map((inst) => {
     if (registry.hasUnavailableSecrets(inst)) return inst;
+    const entry = findCatalogEntry(inst.id);
+    if (entry?.auth_mode === 'local_api' && !hasLocalApiAuthorization(uid, entry)) {
+      return {
+        ...inst,
+        status: {
+          kind: 'error' as const,
+          message: `local_api_credentials_missing:${inst.id}`,
+          at: _now(),
+        },
+      };
+    }
     const problem = _storedAuthorizationProblem(inst);
     if (problem) {
       if (!inst.auth_error?.message || !_hasStatusError(inst, problem.message)) {
@@ -1084,19 +1345,78 @@ export function getInstance(uid: string, id: string): ConnectorInstance | null {
   return inst;
 }
 
-/** Drive the provider authorization flow for a catalog entry and bring its MCP connection up.
- *  Composio rows use the shared Orkas API Key for the Server hop; ordinary rows dispatch to the
- *  existing server-bridge or DCR provider flow. */
+/** Drive the catalog entry's interactive authorization flow and bring the resulting MCP connection up.
+ *  This is the only public install path: catalog-declared fields may include device-only API
+ *  credentials, but callers cannot supply a free-form transport. Dispatches according to the
+ *  catalog entry's server-bridge, DCR, Composio, local-CLI, or local-API auth mode. */
+function _assertNoInstalledSiblingVariant(uid: string, entry: CatalogEntry): void {
+  const parent = entry.catalog_parent_id ? findCatalogEntry(entry.catalog_parent_id) : entry;
+  const catalog = connectorCatalog();
+  const variantIds = [
+    ...(parent ? [parent.id] : []),
+    ...(parent?.connection_variants?.map((variant) => variant.catalog_id) || []),
+    ...catalog.filter((candidate) => candidate.catalog_parent_id === parent?.id).map((candidate) => candidate.id),
+  ].filter((id, index, values) => values.indexOf(id) === index);
+  if (variantIds.length <= 1) return;
+  const installed = registry.load(uid).connections;
+  const installedSibling = variantIds.find((id) => id !== entry.id && installed[id]);
+  if (installedSibling) {
+    throw new Error(`connector_variant_already_installed:${installedSibling}`);
+  }
+}
+
+function _assertProductionInstallBoundary(uid: string, entry: CatalogEntry): void {
+  const existing = registry.load(uid).connections[entry.id];
+  if (entry.id === 'paypal-sandbox' && !existing) {
+    throw Object.assign(new Error('New PayPal connections use production only.'), {
+      code: 'connector_production_only',
+    });
+  }
+  if (entry.auth_mode === 'local_api' && PRODUCTION_ONLY_LOCAL_API_PROVIDERS.has(entry.local_api!.provider)
+      && existing?.connection_parameters?.environment === 'sandbox') {
+    // Before authorization/cleanup: a reconnect must not overwrite or delete the sandbox grant.
+    throw Object.assign(new Error('Disconnect the existing test connection before connecting production.'), {
+      code: 'connector_sandbox_disconnect_required',
+    });
+  }
+}
+
 export async function connectViaOAuth(
   uid: string,
   catalogId: string,
-  opts: { attemptId?: string } = {},
+  opts: { attemptId?: string; connectionParameters?: unknown } = {},
 ): Promise<ConnectorInstance> {
   if (!uid) throw new Error('uid required');
-  const entry = findCatalogEntry(catalogId);
-  if (!entry) throw new Error('unknown catalog id');
+  const runtimeEpoch = _runtimeEpoch;
+  const catalogEntry = findCatalogEntry(catalogId);
+  if (!catalogEntry) throw new Error('unknown catalog id');
+  _assertProductionInstallBoundary(uid, catalogEntry);
+  if (catalogEntry.auth_mode === 'local_api') {
+    _assertNoInstalledSiblingVariant(uid, catalogEntry);
+    assertConnectorRuntimeEnabled(catalogId);
+    await preflightConnectorCredits(catalogEntry, 'connect');
+    _assertRuntimeEpoch(runtimeEpoch);
+    try {
+      const metadata = await authorizeLocalApi(uid, catalogEntry, opts.connectionParameters, { attemptId: opts.attemptId });
+      _assertRuntimeEpoch(runtimeEpoch);
+      const instance = await _provisionLocalApiInstance(uid, catalogEntry, metadata, runtimeEpoch);
+      if (instance.status.kind === 'error') {
+        throw new Error(instance.status.message || 'local API account verification failed');
+      }
+      return instance;
+    } catch (error) {
+      _assertRuntimeEpoch(runtimeEpoch);
+      removeLocalApiAuthorization(uid, catalogEntry);
+      await registry.remove(uid, catalogEntry.id);
+      throw error;
+    }
+  }
+  const resolved = resolveCatalogConnection(catalogEntry, opts.connectionParameters);
+  const entry = resolved.entry;
+  _assertNoInstalledSiblingVariant(uid, entry);
   assertConnectorRuntimeEnabled(catalogId);
   await preflightConnectorCredits(entry, 'connect');
+  _assertRuntimeEpoch(runtimeEpoch);
 
   log.info('connectViaOAuth: starting OAuth', { catalog_id: catalogId, auth_mode: entry.auth_mode });
   if (entry.auth_mode === 'composio') {
@@ -1104,7 +1424,18 @@ export async function connectViaOAuth(
       entry,
       opts.attemptId ? { attemptId: opts.attemptId } : {},
     );
-    return _provisionComposioInstance(uid, entry, composioGrant);
+    _assertRuntimeEpoch(runtimeEpoch);
+    return _provisionComposioInstance(uid, entry, composioGrant, runtimeEpoch);
+  }
+  if (entry.auth_mode === 'local_cli') {
+    await authorizeLocalCli(uid, entry);
+    _assertRuntimeEpoch(runtimeEpoch);
+    // Official CLIs complete authorization without the desktop OAuth deep-link callback.
+    // Keep the card busy while the authorized runtime connects and discovers its tools.
+    if (opts.attemptId) {
+      broadcastOAuthConnectProgress({ attempt_id: opts.attemptId, catalog_id: catalogId });
+    }
+    return _provisionLocalCliInstance(uid, entry, runtimeEpoch);
   }
   let grant: OAuthGrant;
   let dcrClient: ConnectorInstance['dcr_client'];
@@ -1118,6 +1449,7 @@ export async function connectViaOAuth(
       grant = result.grant;
       dcrClient = result.client;
     } catch (err) {
+      _assertRuntimeEpoch(runtimeEpoch);
       if (_isMissingRequiredScopesError(err)) {
         await _removeInstancesForCatalog(uid, entry, 'missing_required_scopes_oauth');
       } else if (_isGoogleAuthFailure(entry, err)) {
@@ -1139,6 +1471,7 @@ export async function connectViaOAuth(
         ...(opts.attemptId ? { attemptId: opts.attemptId } : {}),
       });
     } catch (err) {
+      _assertRuntimeEpoch(runtimeEpoch);
       if (_isMissingRequiredScopesError(err)) {
         await _removeInstancesForCatalog(uid, entry, 'missing_required_scopes_oauth');
       } else if (_isGoogleAuthFailure(entry, err)) {
@@ -1148,6 +1481,7 @@ export async function connectViaOAuth(
     }
   }
 
+  _assertRuntimeEpoch(runtimeEpoch);
   // Bundle entry: one OAuth flow (the Server returns a grant with union scopes) → provision N
   // member instances, each with its own transport and a deep-cloned grant. The bundle entry
   // itself has `transport_template: null` and never becomes an instance — see CatalogEntry's
@@ -1167,7 +1501,7 @@ export async function connectViaOAuth(
       // per user — acceptable); the alternative is a shared refresh lock keyed by `refresh_token`
       // which is a bigger lifecycle change.
       const memberGrant: OAuthGrant = JSON.parse(JSON.stringify(grant));
-      const member = await _provisionMemberInstance(uid, memberEntry, memberGrant, dcrClient);
+      const member = await _provisionMemberInstance(uid, memberEntry, memberGrant, dcrClient, runtimeEpoch);
       if (!firstMember) firstMember = member;
     }
     if (!firstMember) throw new Error('bundle produced no member instances');
@@ -1178,7 +1512,7 @@ export async function connectViaOAuth(
     throw new Error(`'${catalogId}' is not installable yet (${entry.unavailable_reason || 'unavailable'})`);
   }
   log.info('connectViaOAuth: OAuth done; spawning MCP server', { catalog_id: catalogId });
-  return _provisionMemberInstance(uid, entry, grant, dcrClient);
+  return _provisionMemberInstance(uid, entry, grant, dcrClient, runtimeEpoch, resolved.parameters);
 }
 
 function _oauthConnectErrorCode(err: unknown): string {
@@ -1190,23 +1524,62 @@ function _oauthConnectErrorCode(err: unknown): string {
   if (message.includes('flow timed out')) return 'flow_timeout';
   if (message.includes('failed to open browser')) return 'browser_open_failed';
   if (message.includes('exchange')) return 'exchange_failed';
+  if (message.includes('local_cli_authorization_failed')) return 'authorization_failed';
+  if (message.includes('local_api_authorization_failed')) return 'authorization_failed';
   return 'oauth_failed';
 }
 
-/** Start OAuth without holding renderer IPC open while the user is in the browser. */
-export function beginOAuthConnect(uid: string, catalogId: string): OAuthConnectStart {
+/** Accept a connector OAuth request without holding the renderer IPC open while the user is in
+ *  their browser. `connectViaOAuth` still owns the short-lived callback state and completes the
+ *  exchange/provisioning work when the custom-scheme callback arrives; this wrapper only detaches
+ *  that lifecycle from the click request and sends the real terminal result back as a push event.
+ *
+ *  A flow that receives no callback before its OAuth state expires is abandonment, not a product
+ *  failure, so `flow_timeout` deliberately produces no terminal failure event or user alert. */
+export function beginOAuthConnect(
+  uid: string,
+  catalogId: string,
+  connectionParameters?: unknown,
+): OAuthConnectStart {
   if (!uid) throw new Error('uid required');
   const entry = findCatalogEntry(catalogId);
   if (!entry) throw new Error('unknown catalog id');
+  _assertProductionInstallBoundary(uid, entry);
   assertConnectorRuntimeEnabled(catalogId);
+  _assertNoInstalledSiblingVariant(uid, entry);
+  // Validate before accepting the detached browser flow so malformed tenant data returns through
+  // the initiating IPC instead of becoming a delayed OAuth failure notification.
+  let normalized = connectionParameters;
+  if (entry.auth_mode === 'local_api') {
+    normalizeLocalApiConnectionInput(entry, connectionParameters);
+  } else {
+    normalized = resolveCatalogConnection(entry, connectionParameters).parameters;
+  }
+
+  const localCliAttemptKey = entry.auth_mode === 'local_cli'
+    ? _runtimeKey(uid, catalogId)
+    : '';
+  if (localCliAttemptKey) {
+    const activeAttemptId = _localCliConnectAttempts.get(localCliAttemptKey);
+    if (activeAttemptId) return { attempt_id: activeAttemptId };
+  }
 
   const attemptId = crypto.randomUUID();
   const startedAt = Date.now();
-  void connectViaOAuth(uid, catalogId, { attemptId }).then((instance) => {
-    const failureMessage = instance.status.kind === 'error'
+  const runtimeEpoch = _runtimeEpoch;
+  const reportOutcome = (outcome: OAuthConnectOutcome) => {
+    if (runtimeEpoch !== _runtimeEpoch) return;
+    broadcastOAuthConnectOutcome(outcome);
+  };
+  if (localCliAttemptKey) _localCliConnectAttempts.set(localCliAttemptKey, attemptId);
+  void connectViaOAuth(uid, catalogId, {
+    attemptId,
+    ...(normalized ? { connectionParameters: normalized } : {}),
+  }).then((instance) => {
+    const failureMessage = instance.status.kind === 'error' || instance.status.kind === 'degraded'
       ? (instance.status.message || 'connector transport error')
       : '';
-    broadcastOAuthConnectOutcome({
+      reportOutcome({
       attempt_id: attemptId,
       catalog_id: catalogId,
       result: failureMessage ? 'failure' : 'success',
@@ -1220,14 +1593,22 @@ export function beginOAuthConnect(uid: string, catalogId: string): OAuthConnectS
       return;
     }
     const cancelled = code === 'user_cancelled' || code === 'superseded';
-    broadcastOAuthConnectOutcome({
+    const authorizationDetail = entry.auth_mode === 'local_cli' && code === 'local_cli_authorization_failed'
+      ? sanitizeAuthorizationDetail((err as { authorization_detail?: unknown } | null)?.authorization_detail)
+      : '';
+    reportOutcome({
       attempt_id: attemptId,
       catalog_id: catalogId,
       result: cancelled ? 'cancelled' : 'failure',
       duration_ms: Math.max(0, Date.now() - startedAt),
       code,
       error: String((err as Error | null)?.message || err || 'connector authorization failed'),
+      ...(authorizationDetail ? { authorization_detail: authorizationDetail } : {}),
     });
+  }).finally(() => {
+    if (localCliAttemptKey && _localCliConnectAttempts.get(localCliAttemptKey) === attemptId) {
+      _localCliConnectAttempts.delete(localCliAttemptKey);
+    }
   });
   return { attempt_id: attemptId };
 }
@@ -1235,17 +1616,17 @@ export function beginOAuthConnect(uid: string, catalogId: string): OAuthConnectS
 async function _provisionComposioInstance(
   uid: string,
   entry: CatalogEntry,
-  grant: ComposioGrant,
+  composioGrant: ComposioGrant,
+  runtimeEpoch: number,
 ): Promise<ConnectorInstance> {
-  const runtimeKey = _runtimeKey(uid, entry.id);
-  const prior = _conns.get(runtimeKey);
-  if (prior) {
-    try { await prior.close(); } catch { /* swallow */ }
-    _conns.delete(runtimeKey);
-  }
-  const draft = _composioInstanceDraft(entry, grant);
+  _assertRuntimeEpoch(runtimeEpoch);
+  await _closeDiscoveredConnection(uid, entry.id, runtimeEpoch);
+  _assertRuntimeEpoch(runtimeEpoch);
+  const draft: ConnectorInstance = {
+    ..._composioInstanceDraft(entry, composioGrant),
+  };
   await registry.upsert(uid, draft);
-  return _connectAndCacheTools(uid, draft);
+  return _connectAndCacheTools(uid, draft, undefined, runtimeEpoch);
 }
 
 /** Provision (or replace) a single instance for a non-bundle catalog entry. Pulled out of
@@ -1256,16 +1637,15 @@ async function _provisionMemberInstance(
   entry: CatalogEntry,
   grant: OAuthGrant,
   dcrClient: ConnectorInstance['dcr_client'],
+  runtimeEpoch: number,
+  connectionParameters?: Record<string, string>,
 ): Promise<ConnectorInstance> {
+  _assertRuntimeEpoch(runtimeEpoch);
   const transport = applyTemplate(entry, grant);
 
   // Tear down any prior live connection for the same id before re-using the slot.
-  const runtimeKey = _runtimeKey(uid, entry.id);
-  const prior = _conns.get(runtimeKey);
-  if (prior) {
-    try { await prior.close(); } catch { /* swallow */ }
-    _conns.delete(runtimeKey);
-  }
+  await _closeDiscoveredConnection(uid, entry.id, runtimeEpoch);
+  _assertRuntimeEpoch(runtimeEpoch);
 
   const draft: ConnectorInstance = {
     id: entry.id,
@@ -1276,6 +1656,7 @@ async function _provisionMemberInstance(
     tools_cached_at: 0,
     status: { kind: 'connecting' },
     oauth_grant: grant,
+    ...(connectionParameters ? { connection_parameters: connectionParameters } : {}),
     ...(dcrClient ? { dcr_client: dcrClient } : {}),
     created_at: _nowIso(),
     updated_at: _nowIso(),
@@ -1293,10 +1674,59 @@ async function _provisionMemberInstance(
     has_dcr_client: !!dcrClient,
   });
   await registry.upsert(uid, draft);
+  _assertRuntimeEpoch(runtimeEpoch);
   if (_isGitHubEntry(entry)) {
     await registry.setReauthorizeHint(uid, entry.id, true);
   }
-  return _connectAndCacheTools(uid, draft);
+  return _connectAndCacheTools(uid, draft, undefined, runtimeEpoch);
+}
+
+async function _provisionLocalCliInstance(
+  uid: string,
+  entry: CatalogEntry,
+  runtimeEpoch: number,
+): Promise<ConnectorInstance> {
+  _assertRuntimeEpoch(runtimeEpoch);
+  await _closeDiscoveredConnection(uid, entry.id, runtimeEpoch);
+  _assertRuntimeEpoch(runtimeEpoch);
+  const draft: ConnectorInstance = {
+    id: entry.id,
+    display_name: entry.display_name,
+    transport: localCliTransport(uid, entry),
+    enabled_subtools: null,
+    tools_cache: [],
+    tools_cached_at: 0,
+    status: { kind: 'connecting' },
+    created_at: _nowIso(),
+    updated_at: _nowIso(),
+  };
+  await registry.upsert(uid, draft);
+  return _connectAndCacheTools(uid, draft, undefined, runtimeEpoch);
+}
+
+async function _provisionLocalApiInstance(
+  uid: string,
+  entry: CatalogEntry,
+  connectionParameters: Record<string, string>,
+  runtimeEpoch: number,
+): Promise<ConnectorInstance> {
+  _assertRuntimeEpoch(runtimeEpoch);
+  await _closeDiscoveredConnection(uid, entry.id, runtimeEpoch);
+  _assertRuntimeEpoch(runtimeEpoch);
+  const draft: ConnectorInstance = {
+    id: entry.id,
+    display_name: entry.display_name,
+    transport: localApiStoredTransport(uid, entry),
+    enabled_subtools: null,
+    tools_cache: [],
+    tools_cached_at: 0,
+    status: { kind: 'connecting' },
+    connection_parameters: connectionParameters,
+    created_at: _nowIso(),
+    updated_at: _nowIso(),
+  };
+  await registry.upsert(uid, draft);
+  return _connectAndCacheTools(uid, draft, undefined, runtimeEpoch);
 }
 
 /**
@@ -1312,6 +1742,7 @@ async function _provisionMemberInstance(
  */
 export async function addCustomInstance(uid: string, input: CustomConnectorInput): Promise<ConnectorInstance> {
   if (!uid) throw new Error('uid required');
+  const runtimeEpoch = _runtimeEpoch;
   const displayName = validateDisplayName(input?.display_name);
   const transport = validateCustomTransport(input?.transport);
 
@@ -1334,24 +1765,27 @@ export async function addCustomInstance(uid: string, input: CustomConnectorInput
     created_at: _nowIso(),
     updated_at: _nowIso(),
   };
-  log.info('custom connector add', { id, kind: transport.kind });
+  log.info('custom connector add', { id: 'custom', kind: transport.kind });
   await registry.upsert(uid, draft);
-  return _connectAndCacheTools(uid, draft);
+  return _connectAndCacheTools(uid, draft, undefined, runtimeEpoch);
 }
 
 export async function removeInstance(
   uid: string, id: string, options: { disconnectRemote?: boolean } = {},
 ): Promise<boolean> {
   if (!uid) return false;
-  const runtimeKey = _runtimeKey(uid, id);
-  const conn = _conns.get(runtimeKey);
-  if (conn) {
-    try { await conn.close(); } catch { /* swallow */ }
-    _conns.delete(runtimeKey);
-  }
+  const runtimeEpoch = _runtimeEpoch;
+  const entry = findCatalogEntry(id);
+  _assertRuntimeEpoch(runtimeEpoch);
+  await _closeDiscoveredConnection(uid, id, runtimeEpoch);
+  _assertRuntimeEpoch(runtimeEpoch);
+  if (entry?.auth_mode === 'local_cli') await removeLocalCliAuthorization(uid, entry);
+  _assertRuntimeEpoch(runtimeEpoch);
+  if (entry?.auth_mode === 'local_api') removeLocalApiAuthorization(uid, entry);
   if (options.disconnectRemote !== false) {
     await _deleteComposioConnectionOnServer(id, registry.load(uid).connections[id]?.composio_grant);
   }
+  _assertRuntimeEpoch(runtimeEpoch);
   return registry.remove(uid, id);
 }
 
@@ -1370,6 +1804,7 @@ export async function removeApiKeyConnectors(uid: string): Promise<number> {
 
 export async function refreshTools(uid: string, id: string): Promise<ToolSchema[]> {
   if (!uid) throw new Error('uid required');
+  const runtimeEpoch = _runtimeEpoch;
   assertConnectorRuntimeEnabled(id);
   const inst = getInstance(uid, id);
   if (!inst) throw new Error('instance not found');
@@ -1378,13 +1813,9 @@ export async function refreshTools(uid: string, id: string): Promise<ToolSchema[
   if (entry) await preflightConnectorCredits(entry, 'tool_call');
   // Force refresh-token check by tearing the live conn down and reconnecting through
   // _connectAndCacheTools (which re-resolves transport with a fresh access_token).
-  const runtimeKey = _runtimeKey(uid, id);
-  const prior = _conns.get(runtimeKey);
-  if (prior) {
-    try { await prior.close(); } catch { /* swallow */ }
-    _conns.delete(runtimeKey);
-  }
-  const updated = await _connectAndCacheTools(uid, inst);
+  await _closeDiscoveredConnection(uid, id, runtimeEpoch);
+  _assertRuntimeEpoch(runtimeEpoch);
+  const updated = await _connectAndCacheTools(uid, inst, undefined, runtimeEpoch);
   return updated.tools_cache;
 }
 
@@ -1436,21 +1867,45 @@ export async function callTool(
   opts: { signal?: AbortSignal } = {},
 ): Promise<unknown> {
   if (!uid) throw new Error('uid required');
+  if (isConnectorActionBlocked(id, name)) throw new Error('E_CONNECTOR_ACTION_UNAVAILABLE: this action is not available in Orkas');
+  const runtimeEpoch = _runtimeEpoch;
   if (opts.signal?.aborted) throw _connectorCancelledError(opts.signal.reason);
   assertConnectorRuntimeEnabled(id);
-  const inst = getInstance(uid, id);
+  let inst = getInstance(uid, id);
   if (!inst) throw new Error('instance not found');
   if (registry.hasUnavailableSecrets(inst)) throw _secretsUnavailableError(id);
-  const entry = findCatalogEntry(id);
-  if (entry) await preflightConnectorCredits(entry, 'tool_call');
+  const toolsCacheStale = _isToolsCacheStale(inst);
+  // Circuit breaker. Each connect attempt is bounded on its own (3 tries in
+  // `postConnectorBridgeJson`), but nothing bounded them *across* calls: a degraded connector is
+  // still routed to the model, so every tool call re-ran the full refresh — 3 requests each, with
+  // no ceiling — against a backend already known to be failing. An agent turn could fire dozens,
+  // and a restart reset the count. While the circuit is open we fail fast here: no credits
+  // preflight, no refresh, no spawn, zero network. It is also the better answer for the caller —
+  // an instant honest error beats ~1.6s of doomed retries.
+  //
+  // A live connection wins over the cooldown: the circuit governs *reconnecting*, not a socket
+  // that is already up and working.
   const runtimeKey = _runtimeKey(uid, id);
   const liveConn = _conns.get(runtimeKey);
   const grantForCooldown = inst.oauth_grant;
-  const grantStaleForCooldown = !!(grantForCooldown?.expires_at
+  const grantStale = !!(grantForCooldown?.expires_at
     && grantForCooldown.expires_at - Date.now() <= REFRESH_BUFFER_MS);
-  if ((!liveConn?.isConnected || grantStaleForCooldown) && _isInRetryCooldown(inst)) {
+  if ((toolsCacheStale || !liveConn?.isConnected || grantStale) && _isInRetryCooldown(inst)) {
+    log.info('connector in retry cooldown; failing fast without touching the network', {
+      id,
+      failures: _consecutiveFailures(inst),
+    });
     throw new Error(_cooldownMessage(id, inst));
   }
+  const entry = findCatalogEntry(id);
+  if (entry?.allowed_tools?.length && !entry.allowed_tools.includes(name)) {
+    throw new Error(`connector_tool_not_allowed: ${id}/${name}`);
+  }
+  if (entry?.tool_policies && !entry.tool_policies[name]) {
+    throw new Error(`connector_tool_policy_missing: ${id}/${name}`);
+  }
+  if (entry) await preflightConnectorCredits(entry, 'tool_call');
+  _assertRuntimeEpoch(runtimeEpoch);
   if (opts.signal?.aborted) throw _connectorCancelledError(opts.signal.reason);
   // Stale-token guard: the transport snapshots the bearer at connect time (for streamable-http)
   // or injects it into env at spawn time (for stdio). A long-lived connection past the
@@ -1462,41 +1917,24 @@ export async function callTool(
   const grant = inst.oauth_grant;
   const stale = !!(grant && grant.expires_at && grant.expires_at - Date.now() <= REFRESH_BUFFER_MS);
   let conn = _conns.get(runtimeKey);
-  if (stale && conn) {
+  if ((stale || toolsCacheStale) && conn) {
     log.info('connector state stale; tearing down only this instance before reconnect', {
       id,
       stale_grant: stale,
+      stale_tools: toolsCacheStale,
     });
-    try { await conn.close(); } catch { /* swallow */ }
-    _conns.delete(runtimeKey);
+    await _closeDiscoveredConnection(uid, id, runtimeEpoch, opts.signal);
+    _assertRuntimeEpoch(runtimeEpoch);
     conn = undefined;
   }
   if (!conn || !conn.isConnected) {
-    // Reuse the full connect/list/retry/auth-repair path that bootstrap used
-    // before healthy cached connectors became lazy. This keeps the optimization
-    // from weakening first-call recovery, refreshes the target's schemas, and
-    // persists a real failure for the Connectors UI. Coalesce concurrent model
-    // calls so only one stdio child/socket is created for this instance.
-    let pending = _onDemandConnectLocks.get(runtimeKey);
-    if (!pending) {
-      pending = (async () => {
-        const current = _conns.get(runtimeKey);
-        if (current?.isConnected) return current;
-        const updated = await _connectAndCacheTools(uid, inst!);
-        const connected = _conns.get(runtimeKey);
-        if (!connected?.isConnected) {
-          throw new Error(_connectFailureMessage(id, updated));
-        }
-        return connected;
-      })();
-      _onDemandConnectLocks.set(runtimeKey, pending);
-      void pending.finally(() => {
-        if (_onDemandConnectLocks.get(runtimeKey) === pending) _onDemandConnectLocks.delete(runtimeKey);
-      }).catch(() => {});
-    }
-    conn = await _waitForConnectorOrAbort(pending, opts.signal);
+    const updated = await _waitForConnectorOrAbort(
+      _connectAndCacheTools(uid, inst, undefined, runtimeEpoch), opts.signal,
+    );
+    conn = _conns.get(runtimeKey);
+    if (!conn?.isConnected) throw new Error(_connectFailureMessage(id, updated));
   }
-  const startedAt = Date.now();
+  _assertRuntimeEpoch(runtimeEpoch);
   try {
     const requestOpts = {
       ...(opts.signal ? { signal: opts.signal } : {}),
@@ -1505,18 +1943,16 @@ export async function callTool(
     const result = Object.keys(requestOpts).length
       ? await conn.callTool(name, args, requestOpts)
       : await conn.callTool(name, args);
-    log.info('connector tool call completed', {
-      id,
-      tool: name,
-      duration_ms: Date.now() - startedAt,
-    });
+    _assertRuntimeEpoch(runtimeEpoch);
     return result;
   } catch (err) {
+    _assertRuntimeEpoch(runtimeEpoch);
     const cancelled = opts.signal?.aborted || (err as Error)?.name === 'AbortError';
     const transient = !cancelled && _isTransientConnectorFailure(err);
     const hardAuth = !cancelled && !!entry
       && (_isGoogleAuthFailure(entry, err) || _isDcrAuthFailure(entry, err));
-    if (cancelled || transient || hardAuth) {
+    const invalidate = cancelled || transient || hardAuth;
+    if (invalidate) {
       const current = _conns.get(runtimeKey);
       if (current === conn) {
         _conns.delete(runtimeKey);
@@ -1530,22 +1966,13 @@ export async function callTool(
       } catch (statusErr) {
         log.warn('failed to persist connector tool-call degradation', {
           id,
-          error: (statusErr as Error).message,
+          error: logErrorSummary(statusErr),
         });
       }
     } else if (hardAuth) {
       try { await _markAuthorizationError(uid, id, (err as Error).message, 'tool_call_auth_failed'); }
       catch { /* primary tool error still wins */ }
     }
-    log.warn('connector tool call failed', {
-      id,
-      tool: name,
-      duration_ms: Date.now() - startedAt,
-      cancelled,
-      transient,
-      hard_auth: hardAuth,
-      error: logErrorSummary(err),
-    });
     if (cancelled) throw _connectorCancelledError(opts.signal?.reason || err);
     throw err;
   }

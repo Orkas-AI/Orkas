@@ -315,9 +315,27 @@ function normalizeEditOperations(
 ): { operations: EditOp[] } | { error: string } {
   if (!Array.isArray(raw)) return { error: '`operations` must be an array' };
   const operations: EditOp[] = [];
-  for (const item of raw) {
-    if (!item || typeof item !== 'object') continue;
+  const fieldsByAction: Readonly<Record<string, ReadonlySet<string>>> = {
+    set: new Set(['action', 'path', 'props']),
+    add: new Set(['action', 'parent', 'type', 'props']),
+    remove: new Set(['action', 'path']),
+  };
+  for (const [index, item] of raw.entries()) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      return { error: `operations[${index}] must be an object` };
+    }
     const operation = item as Record<string, unknown>;
+    const action = String(operation.action ?? '');
+    const allowed = fieldsByAction[action];
+    if (!allowed) {
+      return { error: `operations[${index}].action must be set, add, or remove` };
+    }
+    const unexpected = Object.keys(operation).filter((key) => !allowed.has(key)).sort();
+    if (unexpected.length) {
+      return {
+        error: `edit_office ${action} at operations[${index}] does not accept: ${unexpected.join(', ')}`,
+      };
+    }
     const normalizedProps = normalizeEditProps(opts, ctx, operation.props);
     if ('error' in normalizedProps) return normalizedProps;
     operations.push({
@@ -1100,26 +1118,54 @@ function createOfficeRenderTool(opts: OfficeToolsOpts): AgentTool {
       const pageErr = officeArgError(page, 'page');
       if (pageErr) return errResult('E_BAD_INPUT', pageErr);
       const cwd = path.dirname(abs);
+      const analysisMode = input.analysis_mode === 'quality_review' ? 'quality_review' : 'understand';
       try {
-        const img = await renderToImage(abs, cwd, page, ctx.signal);
-        if (!img) return errResult('E_OFFICE_RENDER_FAILED', `could not render ${abs} page ${page}`);
-        const artifactSha256 = sha256File(abs);
-        const imageSha256 = sha256Bytes(Buffer.from(img.data, 'base64'));
-        const analysisMode = input.analysis_mode === 'quality_review' ? 'quality_review' : 'understand';
-        return {
-          content:
-            `Rendered page=${page} mode=${analysisMode} ` +
-            `artifact_revision=${shortRevision(artifactSha256)} ` +
-            `image_revision=${shortRevision(imageSha256)} path=${abs} ` +
-            `artifact_sha256=${artifactSha256} image_sha256=${imageSha256}`,
-          images: [{ ...img, analysisMode }],
-          observations: { fileReads: [{ path: abs, hash: artifactSha256 }] },
-        };
+        return await renderOfficePage(abs, cwd, page, analysisMode, ctx.signal, {
+          artifactSha256: sha256File(abs),
+          echoArtifactSha256: true,
+        });
       } finally {
         await closeOfficeFile(abs, cwd);
       }
     },
   };
+}
+
+/** Render one page on whatever resident currently holds `abs`. The caller owns
+ *  the resident lifetime and the artifact hash, so a multi-page review can keep
+ *  one resident and hash the file once instead of once per page. */
+async function renderOfficePage(
+  abs: string,
+  cwd: string,
+  page: string,
+  analysisMode: 'understand' | 'quality_review',
+  signal: AbortSignal | undefined,
+  artifact: { artifactSha256: string; echoArtifactSha256: boolean },
+): Promise<ToolResult> {
+  const img = await renderToImage(abs, cwd, page, signal);
+  if (!img) return errResult('E_OFFICE_RENDER_FAILED', `could not render ${abs} page ${page}`);
+  const imageSha256 = sha256Bytes(Buffer.from(img.data, 'base64'));
+  return {
+    content:
+      `Rendered page=${page} mode=${analysisMode} ` +
+      `artifact_revision=${shortRevision(artifact.artifactSha256)} ` +
+      `image_revision=${shortRevision(imageSha256)} path=${abs}` +
+      (artifact.echoArtifactSha256 ? ` artifact_sha256=${artifact.artifactSha256}` : '') +
+      ` image_sha256=${imageSha256}`,
+    images: [{ ...img, analysisMode }],
+    observations: { fileReads: [{ path: abs, hash: artifact.artifactSha256 }] },
+  };
+}
+
+function officeFileSnapshot(abs: string): string | null {
+  try {
+    const st = fs.statSync(abs);
+    return st.isFile()
+      ? JSON.stringify([st.dev, st.ino, st.size, st.mtimeMs, st.ctimeMs])
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function createOfficeCheckTool(opts: OfficeToolsOpts): AgentTool {
@@ -1152,79 +1198,7 @@ function createOfficeCheckTool(opts: OfficeToolsOpts): AgentTool {
 
       const cwd = path.dirname(abs);
       try {
-        const validate = await runOfficeCli(['validate', abs, '--json'], {
-          cwd, ...(ctx.signal ? { signal: ctx.signal } : {}),
-        });
-        const issues = await runOfficeCli(['view', abs, 'issues', '--json'], {
-          cwd, ...(ctx.signal ? { signal: ctx.signal } : {}),
-        });
-        let normalizedIssues = parseOfficeCliOutput(issues.stdout, issues.stderr);
-        let contrastScanOk: boolean | undefined;
-        let contrastFindings: number | undefined;
-        let contrastTextRuns: number | undefined;
-        if (path.extname(abs).toLowerCase() === '.pptx') {
-          const tree = await runOfficeCli(['get', abs, '/', '--depth', '6', '--json'], {
-            cwd, ...(ctx.signal ? { signal: ctx.signal } : {}),
-          });
-          contrastScanOk = tree.code === 0;
-          if (contrastScanOk) {
-            const audit = auditPptxContrast(
-              normalizedIssues,
-              parseOfficeCliOutput(tree.stdout, tree.stderr),
-            );
-            normalizedIssues = audit.issues;
-            contrastFindings = audit.findingCount;
-            contrastTextRuns = audit.scannedTextCount;
-          }
-        }
-        const isXlsx = path.extname(abs).toLowerCase() === '.xlsx';
-        let xlsxStats: ReturnType<typeof compactXlsxStats> = null;
-        let xlsxStatsScanOk: boolean | undefined;
-        if (isXlsx) {
-          const stats = await runOfficeCli(['view', abs, 'stats', '--json'], {
-            cwd, ...(ctx.signal ? { signal: ctx.signal } : {}),
-          });
-          xlsxStats = compactXlsxStats(parseOfficeCliOutput(stats.stdout, stats.stderr));
-          xlsxStatsScanOk = stats.code === 0 && xlsxStats !== null;
-        }
-        const artifactSha256 = sha256File(abs);
-        const issueCount = officeIssueCount(normalizedIssues);
-        const issueSeverities = summarizeOfficeIssueSeverities(normalizedIssues, issueCount);
-        const reviewStatus = validate.code !== 0
-          ? 'invalid'
-          : issueSeverities.blocker > 0 || (xlsxStats?.error_cells ?? 0) > 0
-            ? 'blockers_found'
-            : issues.code !== 0 || issueCount === null || xlsxStatsScanOk === false || issueSeverities.unknown > 0
-              ? 'indeterminate'
-              : 'reviewed';
-        const payload = {
-          valid: validate.code === 0,
-          issue_count: issueCount,
-          issue_severity_counts: issueSeverities,
-          structural_review_status: reviewStatus,
-          artifact_revision: shortRevision(artifactSha256),
-          issue_scan_ok: issues.code === 0,
-          validation_exit_code: validate.code,
-          issue_scan_exit_code: issues.code,
-          ...(contrastScanOk === undefined ? {} : {
-            contrast_scan_ok: contrastScanOk,
-            contrast_findings: contrastFindings ?? 0,
-            contrast_text_runs: contrastTextRuns ?? 0,
-          }),
-          ...(xlsxStatsScanOk === undefined ? {} : {
-            xlsx_stats_scan_ok: xlsxStatsScanOk,
-            ...(xlsxStats ? { xlsx_stats: xlsxStats } : {}),
-          }),
-          path: abs,
-          artifact_sha256: artifactSha256,
-          validation: parseOfficeCliOutput(validate.stdout, validate.stderr),
-          issues: normalizedIssues,
-        };
-        return {
-          content: JSON.stringify(payload),
-          observations: { fileReads: [{ path: abs, hash: artifactSha256 }] },
-          ...(payload.valid ? {} : { isError: true }),
-        };
+        return (await checkOfficeFile(abs, cwd, ctx.signal)).result;
       } catch (err) {
         const code = err instanceof OfficeCliError ? err.code : 'E_OFFICE_CHECK_FAILED';
         return errResult(code, (err as Error).message);
@@ -1235,9 +1209,94 @@ function createOfficeCheckTool(opts: OfficeToolsOpts): AgentTool {
   };
 }
 
+/** Structural check on whatever resident currently holds `abs`. The caller
+ *  owns the resident lifetime; the artifact hash is returned so a review that
+ *  continues on the same resident does not hash the file again. */
+async function checkOfficeFile(
+  abs: string,
+  cwd: string,
+  signal: AbortSignal | undefined,
+): Promise<{ result: ToolResult; artifactSha256: string }> {
+  const validate = await runOfficeCli(['validate', abs, '--json'], {
+    cwd, ...(signal ? { signal } : {}),
+  });
+  const issues = await runOfficeCli(['view', abs, 'issues', '--json'], {
+    cwd, ...(signal ? { signal } : {}),
+  });
+  let normalizedIssues = parseOfficeCliOutput(issues.stdout, issues.stderr);
+  let contrastScanOk: boolean | undefined;
+  let contrastFindings: number | undefined;
+  let contrastTextRuns: number | undefined;
+  if (path.extname(abs).toLowerCase() === '.pptx') {
+    const tree = await runOfficeCli(['get', abs, '/', '--depth', '6', '--json'], {
+      cwd, ...(signal ? { signal } : {}),
+    });
+    contrastScanOk = tree.code === 0;
+    if (contrastScanOk) {
+      const audit = auditPptxContrast(
+        normalizedIssues,
+        parseOfficeCliOutput(tree.stdout, tree.stderr),
+      );
+      normalizedIssues = audit.issues;
+      contrastFindings = audit.findingCount;
+      contrastTextRuns = audit.scannedTextCount;
+    }
+  }
+  const isXlsx = path.extname(abs).toLowerCase() === '.xlsx';
+  let xlsxStats: ReturnType<typeof compactXlsxStats> = null;
+  let xlsxStatsScanOk: boolean | undefined;
+  if (isXlsx) {
+    const stats = await runOfficeCli(['view', abs, 'stats', '--json'], {
+      cwd, ...(signal ? { signal } : {}),
+    });
+    xlsxStats = compactXlsxStats(parseOfficeCliOutput(stats.stdout, stats.stderr));
+    xlsxStatsScanOk = stats.code === 0 && xlsxStats !== null;
+  }
+  const artifactSha256 = sha256File(abs);
+  const issueCount = officeIssueCount(normalizedIssues);
+  const issueSeverities = summarizeOfficeIssueSeverities(normalizedIssues, issueCount);
+  const reviewStatus = validate.code !== 0
+    ? 'invalid'
+    : issueSeverities.blocker > 0 || (xlsxStats?.error_cells ?? 0) > 0
+      ? 'blockers_found'
+      : issues.code !== 0 || issueCount === null || xlsxStatsScanOk === false || issueSeverities.unknown > 0
+        ? 'indeterminate'
+        : 'reviewed';
+  const payload = {
+    valid: validate.code === 0,
+    issue_count: issueCount,
+    issue_severity_counts: issueSeverities,
+    structural_review_status: reviewStatus,
+    artifact_revision: shortRevision(artifactSha256),
+    issue_scan_ok: issues.code === 0,
+    validation_exit_code: validate.code,
+    issue_scan_exit_code: issues.code,
+    ...(contrastScanOk === undefined ? {} : {
+      contrast_scan_ok: contrastScanOk,
+      contrast_findings: contrastFindings ?? 0,
+      contrast_text_runs: contrastTextRuns ?? 0,
+    }),
+    ...(xlsxStatsScanOk === undefined ? {} : {
+      xlsx_stats_scan_ok: xlsxStatsScanOk,
+      ...(xlsxStats ? { xlsx_stats: xlsxStats } : {}),
+    }),
+    path: abs,
+    artifact_sha256: artifactSha256,
+    validation: parseOfficeCliOutput(validate.stdout, validate.stderr),
+    issues: normalizedIssues,
+  };
+  return {
+    result: {
+      content: JSON.stringify(payload),
+      observations: { fileReads: [{ path: abs, hash: artifactSha256 }] },
+      ...(payload.valid ? {} : { isError: true }),
+    },
+    artifactSha256,
+  };
+}
+
 function createOfficeReviewTool(opts: OfficeToolsOpts): AgentTool {
   const check = createOfficeCheckTool(opts);
-  const render = createOfficeRenderTool(opts);
   return {
     name: 'office_review',
     description:
@@ -1249,7 +1308,7 @@ function createOfficeReviewTool(opts: OfficeToolsOpts): AgentTool {
         action: {
           type: 'string',
           enum: ['check', 'render', 'check_and_render'],
-          description: 'check scans OpenXML; render returns selected images; check_and_render stops before rendering when validation fails.',
+          description: 'check scans OpenXML with path only; render/check_and_render use pages/analysis_mode; omit unrelated fields. check_and_render stops on validation failure.',
         },
         path: { type: 'string', description: 'Existing .docx/.xlsx/.pptx path, absolute or workspace-relative.' },
         pages: {
@@ -1272,31 +1331,101 @@ function createOfficeReviewTool(opts: OfficeToolsOpts): AgentTool {
         return errResult('E_OFFICE_ENGINE_MISSING', 'the built-in Office engine is not available on this build.');
       }
       const action = String(input.action ?? '');
+      const allowedFields = action === 'check'
+        ? new Set(['action', 'path'])
+        : action === 'render' || action === 'check_and_render'
+          ? new Set(['action', 'path', 'pages', 'analysis_mode'])
+          : undefined;
+      if (allowedFields) {
+        const unrelated = Object.keys(input).filter((key) => !allowedFields.has(key));
+        if (unrelated.length) {
+          return errResult('E_BAD_INPUT', `fields not allowed for ${action}: ${unrelated.sort().join(', ')}`);
+        }
+      }
       if (action === 'check') return check.execute({ path: input.path }, ctx);
       if (action !== 'render' && action !== 'check_and_render') {
         return errResult('E_BAD_INPUT', '`action` must be check, render, or check_and_render');
       }
 
-      let checkResult: ToolResult | undefined;
-      if (action === 'check_and_render') {
-        checkResult = await check.execute({ path: input.path }, ctx);
-        if (checkResult.isError) return checkResult;
+      const rawPath = String(input.path ?? '');
+      if (!rawPath) return errResult('E_BAD_INPUT', '`path` is required');
+      const abs = path.resolve(ctx.workingDir ?? '.', rawPath);
+      if (!['.docx', '.xlsx', '.pptx'].includes(path.extname(abs).toLowerCase())) {
+        return errResult('E_BAD_INPUT', 'office_review supports .docx/.xlsx/.pptx only');
       }
-
+      const scopeErr = guardPath(opts, abs, 'readable');
+      if (scopeErr) return { content: scopeErr, isError: true };
+      if (!fs.existsSync(abs)) return errResult('E_NOT_FOUND', `${abs}: file not found`);
       const rawPages = Array.isArray(input.pages) && input.pages.length ? input.pages : ['1'];
       const pages = rawPages.map((page) => String(page));
+      const analysisMode = input.analysis_mode === 'quality_review' ? 'quality_review' : 'understand';
+      const cwd = path.dirname(abs);
+
+      // One OfficeCLI resident serves the check and every page: each command
+      // otherwise re-parses the document and pays a close spawn per page. The
+      // resident holds an in-memory copy, so if the file on disk changes while
+      // the review runs (an external editor or another conversation), reopen
+      // it and rehash before the next page rather than render the old bytes.
+      let checkResult: ToolResult | undefined;
+      let artifactSha256: string;
       const rendered: ToolResult[] = [];
-      for (const page of pages) {
-        rendered.push(await render.execute({
-          path: input.path,
-          page,
-          analysis_mode: input.analysis_mode,
-        }, ctx));
+      const changedBeforePage: string[] = [];
+      try {
+        if (action === 'check_and_render') {
+          let checked: Awaited<ReturnType<typeof checkOfficeFile>>;
+          try {
+            checked = await checkOfficeFile(abs, cwd, ctx.signal);
+          } catch (err) {
+            const code = err instanceof OfficeCliError ? err.code : 'E_OFFICE_CHECK_FAILED';
+            return errResult(code, (err as Error).message);
+          }
+          if (checked.result.isError) return checked.result;
+          checkResult = checked.result;
+          artifactSha256 = checked.artifactSha256;
+        } else {
+          artifactSha256 = sha256File(abs);
+        }
+        let snapshot = officeFileSnapshot(abs);
+        for (const page of pages) {
+          const pageErr = officeArgError(page, 'page');
+          if (pageErr) {
+            rendered.push(errResult('E_BAD_INPUT', pageErr));
+            continue;
+          }
+          const current = officeFileSnapshot(abs);
+          if (!current) {
+            rendered.push(errResult('E_OFFICE_RENDER_FAILED', `could not read ${abs} before rendering page ${page}`));
+            continue;
+          }
+          if (current !== snapshot) {
+            await closeOfficeFile(abs, cwd);
+            artifactSha256 = sha256File(abs);
+            snapshot = current;
+            changedBeforePage.push(page);
+          }
+          rendered.push(await renderOfficePage(abs, cwd, page, analysisMode, ctx.signal, {
+            artifactSha256,
+            echoArtifactSha256: false,
+          }));
+        }
+      } finally {
+        await closeOfficeFile(abs, cwd);
       }
       const blocks = [
-        ...(checkResult ? [`<office-check>\n${checkResult.content}\n</office-check>`] : []),
-        ...rendered.map((result, index) =>
-          `<office-render page="${pages[index]}">\n${result.content}\n</office-render>`),
+        ...(checkResult
+          ? [`<office-check>\n${checkResult.content}\n</office-check>`]
+          // Distinct from the create/edit `<office-artifact>{json}` receipt:
+          // this only names the file the page images below were rendered from.
+          : [`<office-render-source path="${abs}" artifact_revision="${shortRevision(artifactSha256)}" artifact_sha256="${artifactSha256}" />`]),
+        ...rendered.map((result, index) => {
+          const changed = changedBeforePage.includes(pages[index]) ? ' artifact_changed_during_review="true"' : '';
+          return `<office-render page="${pages[index]}"${changed}>\n${result.content}\n</office-render>`;
+        }),
+        ...(changedBeforePage.length
+          ? [`<office-review-note>The file changed on disk before page(s) ${changedBeforePage.join(', ')} rendered; `
+            + 'earlier blocks describe the previous revision. Rerun check_and_render to review the current file.'
+            + '</office-review-note>']
+          : []),
       ];
       const reads = [checkResult, ...rendered]
         .flatMap((result) => result?.observations?.fileReads ?? []);
@@ -1466,7 +1595,11 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
             type: 'object',
             additionalProperties: false,
             properties: {
-              action: { type: 'string', enum: ['set', 'add', 'remove'] },
+              action: {
+                type: 'string',
+                enum: ['set', 'add', 'remove'],
+                description: 'set: path/optional props; add: parent/type/optional props; remove: path; omit unrelated fields.',
+              },
               path: {
                 type: 'string',
                 description: 'Target element path (action set/remove). For XLSX cells use the exact A1 path returned by office_read, e.g. "/Sheet1/A2"; never use "/Sheet1/cell[A2]".',
@@ -1575,6 +1708,9 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
           );
         }
         await closeOfficeFile(workPath, workCwd);
+        // A prior inspection can leave the destination's resident holding the
+        // original file open. Release it before the atomic in-place replace.
+        if (fs.existsSync(finalPath)) await closeOfficeFile(finalPath, finalCwd);
         fs.renameSync(workPath, finalPath);
 
         const preview = input.preview === true ? await renderToImage(finalPath, finalCwd, '1', ctx.signal) : null;

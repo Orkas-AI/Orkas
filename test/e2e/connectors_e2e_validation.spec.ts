@@ -1,11 +1,231 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 
 import { expect, test } from './fixtures/orkas';
 
 test.describe('connectors', () => {
-  test('connects to a real local MCP server, calls a tool from chat, toggles it, and disconnects', async ({ modelOrkas }) => {
+  test('browses available connectors by category with localized chips and a narrow layout', async ({ connectorOrkas }, testInfo) => {
+    // A local catalog fixture keeps this browse journey independent of network recovery.
+    const appPage = connectorOrkas.page!;
+    await appPage.locator('#connectors-btn').click();
+    const categories = appPage.locator('#connectors-categories');
+    const available = appPage.locator('#connectors-grid-available');
+    await expect(categories.locator('[data-connectors-cat="rnd"]')).toBeVisible();
+    expect(await categories.locator('button').evaluateAll((buttons) => buttons.slice(0, 3).map((button) => button.getAttribute('data-connectors-cat'))))
+      .toEqual(['', 'ecommerce', 'office']);
+    await categories.locator('[data-connectors-cat="general"]').click();
+    for (const id of ['stripe', 'paypal', 'gmail', 'dropbox', 'typeform', 'exist']) {
+      await expect(available.locator(`[data-id="${id}"]`)).toHaveCount(1);
+    }
+    // Standalone Gmail is available through Composio; legacy Google remains disabled.
+    await expect(available.locator('[data-id="gdrive"]')).toHaveCount(0);
+    await expect(available.locator('[data-id="google-workspace"]')).toHaveCount(0);
+    await expect(available.locator('[data-id="shopify-admin"]')).toHaveCount(0);
+    await categories.locator('[data-connectors-cat="office"]').click();
+    for (const id of ['feishu', 'asana', 'fathom', 'miro', 'zoom']) {
+      await expect(available.locator(`[data-id="${id}"]`)).toHaveCount(1);
+    }
+    await expect(available.locator('[data-id="gsheets"]')).toHaveCount(0);
+    await expect(available.locator('[data-id="stripe"]')).toHaveCount(0);
+    await categories.locator('[data-connectors-cat="rnd"]').click();
+    await expect(available.locator('[data-id="github"]')).toBeVisible();
+    await expect(available.locator('[data-id="linear"]')).toBeVisible();
+    await expect(available.locator('[data-id="figma"]')).toHaveCount(1);
+    await expect(available.locator('[data-id="wakatime"]')).toHaveCount(1);
+    await expect(available.locator('[data-id="notion"]')).toHaveCount(0);
+    await categories.locator('[data-connectors-cat="data"]').click();
+    await expect(available.locator('[data-id="google-bigquery"]')).toHaveCount(1);
+    await expect(available.locator('[data-id="wakatime"]')).toHaveCount(0);
+    await expect(available.locator('[data-id="exist"]')).toHaveCount(0);
+    await categories.locator('[data-connectors-cat="education"]').click();
+    await expect(available.locator('.connector-card')).toHaveCount(1);
+    await expect(available.locator('[data-id="google-classroom"]')).toBeVisible();
+    await categories.locator('[data-connectors-cat="creation"]').click();
+    await expect(available.locator('[data-id="webflow"]')).toBeVisible();
+    await expect(available.locator('[data-id="canva"]')).toHaveCount(1);
+    await expect(available.locator('[data-id="youtube"]')).toHaveCount(1);
+    await expect(available.locator('[data-id="github"]')).toHaveCount(0);
+    for (const [lang, label] of [['zh', '创作'], ['en', 'Creation'], ['ja', '創作'], ['pt', 'Criação']]) {
+      await appPage.evaluate((next) => { (window as any).setLang(next); }, lang);
+      await expect(categories.locator('[aria-pressed="true"]')).toHaveText(label);
+    }
+    await appPage.evaluate(() => { (window as any).setLang('zh'); });
+    await categories.locator('[data-connectors-cat=""]').click();
+    await appPage.locator('#panel-connectors').screenshot({ path: testInfo.outputPath('connector-categories-desktop.png') });
+    await appPage.setViewportSize({ width: 760, height: 820 });
+    await expect(categories.locator('[data-connectors-cat="office"]')).toBeVisible();
+    expect(await categories.evaluate((host) => [...host.querySelectorAll('button')].every((button) => {
+      const rect = button.getBoundingClientRect();
+      const bounds = host.getBoundingClientRect();
+      return rect.left >= bounds.left && rect.right <= bounds.right;
+    }))).toBe(true);
+    await categories.screenshot({ path: testInfo.outputPath('connector-categories-narrow.png') });
+    await appPage.locator('#connectors-search-input').fill('webflow');
+    await expect(categories.locator('button')).toHaveText(['全部', '创作']);
+    await expect(available.locator('.connector-card')).toHaveCount(1);
+    await appPage.locator('#connectors-search-input').fill('');
+    await expect(categories.locator('[data-connectors-cat="office"]')).toBeVisible();
+  });
+
+  test('shows all remaining merchant forms in four languages with production-only setup and callback ownership', async ({ appPage, orkas }, testInfo) => {
+    const logs: string[] = [];
+    const child = orkas.electronApp?.process();
+    const stdout = (data: Buffer) => logs.push(`[main:stdout] ${String(data).trimEnd()}`);
+    const stderr = (data: Buffer) => logs.push(`[main:stderr] ${String(data).trimEnd()}`);
+    const renderer = (message: { type(): string; text(): string }) => logs.push(`[renderer:${message.type()}] ${message.text()}`);
+    child?.stdout?.on('data', stdout); child?.stderr?.on('data', stderr); appPage.on('console', renderer);
+    try {
+      await appPage.locator('#connectors-btn').click();
+      for (const [id, inputs, choices, callback] of [
+        ['magento', 5, 0, false], ['temu-seller', 3, 1, false], ['lazada-seller', 3, 1, true],
+        ['shein-seller', 3, 0, true], ['alibaba-com-seller', 3, 0, true], ['aliexpress-seller', 3, 0, true],
+      ] as const) {
+        await appPage.locator('#connectors-search-input').fill(id);
+        const card = appPage.locator(`.connector-card[data-id="${id}"]`);
+        await expect(card).toBeVisible();
+        await expect(card.locator('svg')).not.toHaveCount(0);
+        await card.screenshot({ path: testInfo.outputPath(`${id}-card.png`) });
+        await card.locator('[data-act="connect"]').click();
+        const setup = appPage.locator('#connectors-connect-modal');
+        await expect(setup).toBeVisible();
+        await expect(setup.locator('input')).toHaveCount(inputs);
+        await expect(setup.locator('select')).toHaveCount(choices);
+        await expect(setup.locator('[data-act="copy-setup-callback"]')).toHaveCount(callback ? 1 : 0);
+        await setup.locator('input[type="password"]').first().fill('merchant-ui-private-canary');
+        let englishInstructions = '';
+        for (const lang of ['en', 'zh', 'ja', 'pt']) {
+          await appPage.evaluate(async locale => { await (window as any).setLang(locale); }, lang);
+          const instructions = await setup.locator('.connectors-setup-instructions').innerText();
+          expect(instructions.trim()).not.toBe('');
+          if (lang === 'en') englishInstructions = instructions;
+          else expect(instructions).not.toBe(englishInstructions);
+          await expect(setup.locator('input[type="password"]').first()).toHaveValue('merchant-ui-private-canary');
+          await expect(setup).not.toContainText('connectors.setup.');
+          await expect(setup.locator('option[value="sandbox"]')).toHaveCount(0);
+          if (callback) await expect(setup.locator('input[readonly]')).toHaveValue('https://orkas.ai/api/connectors/oauth/dcr-callback');
+        }
+        await appPage.evaluate(async () => { await (window as any).setLang('zh'); });
+        await setup.screenshot({ path: testInfo.outputPath(`${id}-setup.png`) });
+        expect(await setup.evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
+        // Never submit dummy credentials to a live merchant API.
+        await setup.locator('[data-act="cancel"]').click();
+        await expect(setup).toHaveCount(0);
+      }
+    } finally {
+      child?.stdout?.off('data', stdout); child?.stderr?.off('data', stderr); appPage.off('console', renderer);
+      const logPath = testInfo.outputPath('merchant-runtime.log');
+      writeFileSync(logPath, logs.join('\n'), 'utf8');
+      await testInfo.attach('merchant-runtime.log', { path: logPath, contentType: 'text/plain' });
+    }
+    expect(logs.join('\n')).not.toContain('merchant-ui-private-canary');
+    expect(logs.filter(line => line.startsWith('[renderer:error]'))).toEqual([]);
+  });
+
+  test('shows storefront setup in one localized panel with real icons and no callback or environment selector', async ({ appPage, orkas }, testInfo) => {
+    const logs: string[] = [];
+    const child = orkas.electronApp?.process();
+    const stdout = (data: Buffer) => logs.push(`[main:stdout] ${String(data).trimEnd()}`);
+    const stderr = (data: Buffer) => logs.push(`[main:stderr] ${String(data).trimEnd()}`);
+    const renderer = (message: { type(): string; text(): string }) => logs.push(`[renderer:${message.type()}] ${message.text()}`);
+    child?.stdout?.on('data', stdout);
+    child?.stderr?.on('data', stderr);
+    appPage.on('console', renderer);
+    try {
+      await appPage.locator('#connectors-btn').click();
+      for (const id of ['bigcommerce', 'shopline', 'shoplazza']) {
+        await appPage.locator('#connectors-search-input').fill(id);
+        const card = appPage.locator(`.connector-card[data-id="${id}"]`);
+        await expect(card).toBeVisible();
+        await expect(card.locator('svg')).not.toHaveCount(0);
+        await card.locator('[data-act="connect"]').click();
+        const setup = appPage.locator('#connectors-connect-modal');
+        await expect(setup).toBeVisible();
+        await expect(setup.locator('input')).toHaveCount(2);
+        await expect(setup.locator('select, input[readonly], [data-act="copy-setup-callback"]')).toHaveCount(0);
+        await setup.locator('#connector-setup-field-0').fill(id === 'bigcommerce' ? 'abc123' : 'fixture');
+        await setup.locator('#connector-setup-field-1').fill('test-only-store-token');
+        for (const [lang, tokenLabel] of [['zh', 'Admin API 访问令牌'], ['ja', 'Admin API アクセストークン'], ['pt', 'Token de acesso da Admin API'], ['en', 'Admin API access token']]) {
+          await appPage.evaluate(async locale => { await (window as any).setLang(locale); }, lang);
+          await expect(setup.locator('label[for="connector-setup-field-1"]')).toContainText(tokenLabel);
+          await expect(setup.locator('#connector-setup-field-1')).toHaveAttribute('type', 'password');
+          await expect(setup.locator('#connector-setup-field-1')).toHaveValue('test-only-store-token');
+          await expect(setup.locator('.connectors-setup-instructions')).not.toBeEmpty();
+          await expect(setup).not.toContainText('connectors.setup.');
+        }
+        await setup.screenshot({ path: testInfo.outputPath(`${id}-setup.png`) });
+        const fits = await setup.evaluate(el => el.scrollWidth <= el.clientWidth + 1);
+        expect(fits).toBe(true);
+        // Do not submit fixture credentials to real merchant APIs.
+        await setup.locator('[data-act="cancel"]').click();
+        await expect(setup).toHaveCount(0);
+      }
+      await appPage.locator('#connectors-search-input').fill('');
+    } finally {
+      child?.stdout?.off('data', stdout);
+      child?.stderr?.off('data', stderr);
+      appPage.off('console', renderer);
+      const logPath = testInfo.outputPath('storefront-runtime.log');
+      writeFileSync(logPath, logs.join('\n'), 'utf8');
+      await testInfo.attach('storefront-runtime.log', { path: logPath, contentType: 'text/plain' });
+    }
+    expect(logs.join('\n')).not.toContain('test-only-store-token');
+    expect(logs.filter(line => line.startsWith('[renderer:error]'))).toEqual([]);
+  });
+
+  test('switches four locales in open connector forms without losing credentials or selected region', async ({ appPage }) => {
+    await appPage.locator('#connectors-btn').click();
+    const shopee = appPage.locator('.connector-card[data-id="shopee"]');
+    await shopee.locator('[data-act="connect"]').click();
+    const setup = appPage.locator('#connectors-connect-modal');
+    await expect(setup).toBeVisible();
+    await setup.locator('#connector-setup-field-0').selectOption('cn');
+    await setup.locator('#connector-setup-field-1').fill('12345');
+    await setup.locator('#connector-setup-field-2').fill('987654');
+    await setup.locator('#connector-setup-field-3').fill('test-only-secret');
+    // Isolate the clipboard boundary; never overwrite the developer's real clipboard.
+    await appPage.evaluate(() => Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+      writeText: async (value: string) => { (window as any).__copiedCallback = value; },
+    } }));
+    await setup.locator('[data-act="copy-setup-callback"]').click();
+    expect(await appPage.evaluate(() => (window as any).__copiedCallback)).toBe('https://orkas.ai/api/connectors/oauth/dcr-callback');
+    for (const [lang, label, copied] of [['ja', 'ショップ ID', 'コピーしました'], ['pt', 'ID da loja', 'Copiado'], ['zh', '店铺 ID', '已复制'], ['en', 'Shop ID', 'Copied']]) {
+      await appPage.evaluate(async locale => { await (window as any).setLang(locale); }, lang);
+      await expect(setup.locator('label[for="connector-setup-field-1"]')).toContainText(label);
+      await expect(setup.locator('[data-act="callback-copy-status"]')).toHaveText(copied);
+      await expect(setup.locator('#connector-setup-field-0')).toHaveValue('cn');
+      await expect(setup.locator('#connector-setup-field-1')).toHaveValue('12345');
+      await expect(setup.locator('#connector-setup-field-2')).toHaveValue('987654');
+      await expect(setup.locator('#connector-setup-field-3')).toHaveValue('test-only-secret');
+      await expect(setup.locator('#connector-setup-field-3')).toHaveAttribute('type', 'password');
+      await expect(setup.locator('input[readonly]')).toHaveValue('https://orkas.ai/api/connectors/oauth/dcr-callback');
+      await expect(setup).not.toContainText('connectors.setup.');
+    }
+    await setup.locator('[data-act="cancel"]').click();
+    await expect(setup).toHaveCount(0);
+    await appPage.locator('#connectors-add-custom-btn').click();
+    const custom = appPage.locator('.connector-custom-dialog');
+    await custom.locator('[data-f="name"]').fill('我的 MCP');
+    await custom.locator('[data-f="kind"]').selectOption('stdio');
+    await custom.locator('[data-f="command"]').fill('node');
+    await custom.locator('[data-f="env"]').fill('TEST_SECRET=test-only-secret');
+    for (const [lang, nameLabel] of [['ja', '名前'], ['pt', 'Nome'], ['zh', '名称'], ['en', 'Name']]) {
+      await appPage.evaluate(async locale => { await (window as any).setLang(locale); }, lang);
+      await expect(custom.locator('.form-row').first().locator('label')).toHaveText(nameLabel);
+      await expect(custom.locator('[data-f="name"]')).toHaveValue('我的 MCP');
+      await expect(custom.locator('[data-f="kind"]')).toHaveValue('stdio');
+      await expect(custom.locator('[data-f="command"]')).toHaveValue('node');
+      await expect(custom.locator('[data-f="env"]')).toHaveValue('TEST_SECRET=test-only-secret');
+      await expect(custom.locator('[data-sec="stdio"]')).toBeVisible();
+      await expect(custom).not.toContainText('connectors.custom.');
+    }
+    await custom.locator('[data-act="cancel"]').click();
+    await expect(custom).toHaveCount(0);
+  });
+
+  test('connects to a real local MCP server, approves once, changes operation trust, toggles it, and disconnects', async ({ modelOrkas }, testInfo) => {
     if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
     const page = modelOrkas.page;
+    expect(await modelOrkas.invoke('permissions.setLocalExecMode', { mode: 'all_files_approval' }))
+      .toMatchObject({ ok: true, mode: 'all_files_approval' });
     const callStatePath = modelOrkas.createFixtureFile('e2e-mcp-call-state.json', '[]\n');
     const serverPath = modelOrkas.createFixtureFile('e2e-mcp-server.cjs', String.raw`
 const fs = require('node:fs');
@@ -80,20 +300,35 @@ rl.on('line', (line) => {
     await expect(card).not.toHaveClass(/\bis-disabled\b/);
 
     if (!instance?.id) throw new Error('Connected E2E MCP instance was not returned');
-    await page.locator('#new-chat-btn').click();
-    await page.locator('#new-chat-recipient-chip').click();
-    const picker = page.locator('#agent-picker');
-    await picker.locator('[data-agent-picker-tab="connectors"]').click();
-    const connectorOption = picker.locator(
-      `.skill-picker-item[data-kind="connector"][data-id="${instance.id}"]`,
-    );
-    await expect(connectorOption).toContainText('E2E Local MCP');
-    await connectorOption.click();
-    await expect(page.locator('#new-chat-input')).toHaveValue(/Connector: E2E Local MCP/);
+    const startConnectorChat = async () => {
+      await page.locator('#new-chat-btn').click();
+      await page.locator('#new-chat-recipient-chip').click();
+      const picker = page.locator('#agent-picker');
+      await picker.locator('[data-agent-picker-tab="connectors"]').click();
+      const connectorOption = picker.locator(
+        `.skill-picker-item[data-kind="connector"][data-id="${instance.id}"]`,
+      );
+      await expect(connectorOption).toContainText('E2E Local MCP');
+      await connectorOption.click();
+      await expect(page.locator('#new-chat-input')).toHaveValue(/Connector: E2E Local MCP/);
+    };
+    await startConnectorChat();
 
     modelOrkas.setConnectorToolScenario(instance.id);
     await page.locator('#new-chat-input').type('Call the deterministic echo connector.');
     await page.locator('#new-chat-send-btn').click();
+    // Custom tool claims do not grant read-only trust. Complete the account's
+    // normal approval flow and prove that the local peer sees no early call.
+    const actionConfirmation = page.getByRole('dialog', { name: 'Allow this sensitive action?' });
+    await expect(actionConfirmation).toBeVisible();
+    await expect(actionConfirmation).toContainText('e2e_echo');
+    await expect(actionConfirmation).toContainText('roundtrip');
+    expect(JSON.parse(readFileSync(callStatePath, 'utf8'))).toEqual([]);
+    await expect(actionConfirmation.getByRole('button', { name: "Don't run", exact: true })).toBeVisible();
+    // Like other external mutations, this grant covers one exact operation.
+    await expect(actionConfirmation.locator('[data-id="allow_run"]')).toHaveCount(0);
+    await actionConfirmation.getByRole('button', { name: 'Allow once', exact: true }).click();
+    await expect(actionConfirmation).toHaveCount(0);
     await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
       hasText: 'E2E connector tool round trip completed.',
     })).toBeVisible({ timeout: 20_000 });
@@ -103,7 +338,43 @@ rl.on('line', (line) => {
       name: 'e2e_echo',
       arguments: { text: 'roundtrip' },
     }]);
+    // Allow once leaves the account in approval mode. A later action offers the
+    // same local permission menu and persists Trusted only on approval.
+    expect(await modelOrkas.invoke('permissions.getLocalExec')).toMatchObject({ mode: 'all_files_approval' });
+    await startConnectorChat();
+    modelOrkas.setConnectorToolScenario(instance.id);
+    await page.locator('#new-chat-input').type('Call the echo connector again.');
+    await page.locator('#new-chat-send-btn').click();
+    await expect(actionConfirmation).toBeVisible();
+    expect(JSON.parse(readFileSync(callStatePath, 'utf8'))).toHaveLength(1);
+    await actionConfirmation.locator('.bash-permission-mode-trigger').click();
+    const modeMenu = page.getByRole('listbox').filter({ has: page.locator('[data-mode="all_files_auto"]') });
+    await expect(modeMenu).toBeVisible();
+    await expect(modeMenu.getByRole('option')).toHaveCount(3);
+    await expect(modeMenu.locator('[data-mode="all_files_approval"]')).toHaveAttribute('aria-selected', 'true');
+    await page.locator('.ui-dialog-overlay').filter({ has: actionConfirmation }).screenshot({
+      path: testInfo.outputPath('connector-operation-permission.png'),
+    });
+    await modeMenu.locator('[data-mode="all_files_auto"]').click();
+    await actionConfirmation.getByRole('button', { name: 'Allow once', exact: true }).click();
+    await expect(actionConfirmation).toHaveCount(0);
+    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+      hasText: 'E2E connector tool round trip completed.',
+    })).toBeVisible({ timeout: 20_000 });
+    expect(await modelOrkas.invoke('permissions.getLocalExec')).toMatchObject({ mode: 'all_files_auto' });
+    expect(JSON.parse(readFileSync(callStatePath, 'utf8'))).toHaveLength(2);
 
+    await startConnectorChat();
+    modelOrkas.setConnectorToolScenario(instance.id);
+    await page.locator('#new-chat-input').type('Use the echo connector once more.');
+    await page.locator('#new-chat-send-btn').click();
+    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+      hasText: 'E2E connector tool round trip completed.',
+    })).toBeVisible({ timeout: 20_000 });
+    await expect(actionConfirmation).toHaveCount(0);
+    expect(JSON.parse(readFileSync(callStatePath, 'utf8'))).toEqual(Array.from({ length: 3 }, () => ({
+      name: 'e2e_echo', arguments: { text: 'roundtrip' },
+    })));
     await page.locator('#connectors-btn').click();
     await card.hover();
     await card.locator('.connector-card-menu-btn').click();

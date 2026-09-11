@@ -67,7 +67,7 @@ function _normalizeTaskNotificationNavigation(payload) {
     : '';
   if (!userId || !/^[A-Za-z0-9_-]+$/.test(userId)) return null;
   if (!conversationId || !/^[A-Za-z0-9_-]+$/.test(conversationId)) return null;
-  if (!['completed', 'failed', 'waiting_input'].includes(terminalStatus)) return null;
+  if (!['completed', 'stopped', 'failed', 'waiting_input'].includes(terminalStatus)) return null;
   return { userId, conversationId, terminalStatus };
 }
 
@@ -107,14 +107,14 @@ function _setViewFromSidebar(targetView) {
 // intentionally keeps the same hook as the commercial build.
 function _trackAgentCreateOpen() {}
 
-// Per-conversation queued messages (sent sequentially, one at a time).
-// key: cid, value: Array<{ id, content, skill }>
-const messageQueues = new Map();
-const _QUEUE_KEY = (cid) => `queue_${cid}`;
 const _DRAFT_KEY = (cid) => `draft_${cid}`;
 
 // Polling: detect assistant responses even after page refresh / reconnect
 const pollTimers = new Map();    // cid → setInterval id
+// A timer may fire again while its previous async request is still pending.
+// Keep this separate from pollTimers so stop/restart cannot create overlapping
+// work for the same conversation while an old IPC invoke drains.
+const pollInFlight = new Map();  // cid → unique request token
 const pollMsgCounts = new Map(); // cid → last known visible message identity
 
 // Per-conversation cached enabled state of the bound agent. Backend stamps
@@ -141,26 +141,53 @@ function _polledMessageKey(m) {
   return String(m.id || `${m.from || ''}\u0000${m.ts || ''}\u0000${m.text || ''}`);
 }
 
+function _pollRuntimeRequestUrl(cid) {
+  const projectId = typeof _projectIdForConversation === 'function'
+    ? _projectIdForConversation(cid)
+    : '';
+  return `/api/conversations/${encodeURIComponent(cid)}/runtime?project_id=${encodeURIComponent(projectId)}`;
+}
+
 function startPolling(cid) {
   if (pollTimers.has(cid)) return;
   const timer = setInterval(async () => {
     // Timer identity, rather than mere map membership, is the cancellation
     // token. `clearInterval` prevents future callbacks but cannot cancel a
-    // history request that an earlier tick already started; the cid may also
+    // polling request that an earlier tick already started; the cid may also
     // be stopped and re-started while that request is in flight.
-    if (pollTimers.get(cid) !== timer) return;
+    if (pollTimers.get(cid) !== timer || pollInFlight.has(cid)) return;
+    const requestToken = {};
+    pollInFlight.set(cid, requestToken);
     try {
-      const historyUrl = typeof _historyRequestUrl === 'function'
-        ? _historyRequestUrl(cid)
-        : `/api/conversations/${cid}/history?limit=10`;
-      const res = await apiFetch(historyUrl);
-      const data = await res.json();
+      // Polling is only a liveness fallback. While a turn is running, read the
+      // tiny runtime state instead of repeatedly parsing the last message page.
+      // A single history read is deferred until runtime becomes idle.
+      const runtimeRes = await apiFetch(_pollRuntimeRequestUrl(cid));
+      const runtimeData = await runtimeRes.json();
       // The live stream may have completed while either await above was in
       // flight. Never let that stale poll fall through to _onPolledResponse:
       // it would reload the whole transcript after the final bubble was
       // already painted, causing a visible "Loading…" flash on every reply.
       if (pollTimers.get(cid) !== timer) return;
-      if (!data.ok || !data.history) return;
+      if (!runtimeRes.ok || !runtimeData || runtimeData.ok === false) return;
+      const hasServerRuntime = Object.prototype.hasOwnProperty.call(runtimeData, 'processing');
+      const runtimeBusy = hasServerRuntime
+        ? runtimeData.processing === true
+        : isGroupConversationBusy(cid);
+      const since = runtimeData.processing_since;
+      const elapsedSec = since
+        ? (Date.now() - new Date(since).getTime()) / 1000
+        : 0;
+      const runtimeTimedOut = runtimeBusy && elapsedSec > 2100;
+      if (runtimeBusy && !runtimeTimedOut) return;
+
+      const historyUrl = typeof _historyRequestUrl === 'function'
+        ? _historyRequestUrl(cid)
+        : `/api/conversations/${encodeURIComponent(cid)}/history?limit=10`;
+      const historyRes = await apiFetch(historyUrl);
+      const data = await historyRes.json();
+      if (pollTimers.get(cid) !== timer) return;
+      if (!historyRes.ok || !data || data.ok === false || !data.history) return;
       // Same visibility filter as loadConversationHistory (drops `dispatch`
       // records AND redundant routing-only commander tails) so the polled
       // count matches what's actually rendered — a mismatch makes polling
@@ -173,11 +200,6 @@ function startPolling(cid) {
       const last = msgs[msgs.length - 1];
       const known = pollMsgCounts.get(cid) || '';
       const lastKey = _polledMessageKey(last);
-      const hasServerRuntime = !!data.conversation
-        && Object.prototype.hasOwnProperty.call(data.conversation, 'processing');
-      const runtimeBusy = hasServerRuntime
-        ? data.conversation.processing === true
-        : isGroupConversationBusy(cid);
 
       if (lastKey && lastKey !== known && _isPolledAssistantMsg(last)) {
         // New visible assistant message arrived. While runtime is still busy
@@ -203,7 +225,7 @@ function startPolling(cid) {
       }
 
       // If server is no longer processing but last message is still user → request was lost
-      if (_isPolledUserMsg(last) && data.conversation?.processing === false) {
+      if (_isPolledUserMsg(last) && !runtimeBusy) {
         stopPolling(cid);
         await _onPolledResponse(cid, t('chat.reply_interrupted'), true);
         return;
@@ -212,15 +234,20 @@ function startPolling(cid) {
       // Server crashed mid-request: processing=true but stuck longer than the
       // model idle watchdog (30 min) + a small buffer. Shorter thresholds would
       // trip on genuine long agent runs.
-      const since = data.conversation?.processing_since;
-      if (_isPolledUserMsg(last) && data.conversation?.processing === true && since) {
-        const elapsedSec = (Date.now() - new Date(since).getTime()) / 1000;
-        if (elapsedSec > 2100) {
-          stopPolling(cid);
-          await _onPolledResponse(cid, t('chat.reply_timeout'), true);
-        }
+      if (_isPolledUserMsg(last) && runtimeTimedOut) {
+        stopPolling(cid);
+        await _onPolledResponse(cid, t('chat.reply_timeout'), true);
+        return;
       }
-    } catch (_) {}
+
+      // Runtime is idle and the persisted tail has no actionable change.
+      // There is nothing left for this fallback timer to observe.
+      if (!runtimeBusy) stopPolling(cid);
+    } catch (_) {
+      // Keep the fallback timer alive across transient IPC failures.
+    } finally {
+      if (pollInFlight.get(cid) === requestToken) pollInFlight.delete(cid);
+    }
   }, 3000);
   pollTimers.set(cid, timer);
 }
@@ -242,7 +269,7 @@ async function _onPolledResponse(cid, contentOrMessage, isError = false) {
   setGroupConversationBusy(cid, false);
   _updateConvSidebarBadge(cid, false);
 
-  try {
+  {
     const el = state?.loadingEl;
     // Drop the standalone loading bubble (if any) and re-load history. Going
     // through `loadConversationHistory` instead of swapping innerHTML inline
@@ -306,13 +333,6 @@ async function _onPolledResponse(cid, contentOrMessage, isError = false) {
       await loadConversationHistory(cid, { preserveScroll: true });
       _updateConvSendUI(cid);
     }
-  } finally {
-    // A successful send stream can close just before its final idle
-    // state_changed reaches the renderer. Polling is the recovery owner for
-    // that race, so it must also release the durable queue. This cannot depend
-    // on the conversation being visible: background tasks have no history
-    // reload whose completion would otherwise kick the next item.
-    if (typeof _dispatchNextQueued === 'function') _dispatchNextQueued(cid);
   }
 }
 
@@ -334,6 +354,7 @@ function bindStaticHandlers() {
 
   // Sidebar nav
   document.getElementById('new-chat-btn').addEventListener('click', () => _setViewFromSidebar('new-chat'));
+  document.getElementById('todos-btn')?.addEventListener('click', () => _setViewFromSidebar('todos'));
   document.getElementById('auto-btn')?.addEventListener('click', () => _setViewFromSidebar('auto'));
   document.getElementById('agents-btn').addEventListener('click', () => _setViewFromSidebar('agents'));
   document.getElementById('skills-btn').addEventListener('click', () => _setViewFromSidebar('skills'));
@@ -367,25 +388,10 @@ function bindStaticHandlers() {
   // Conversation detail input
   const chatInput = document.getElementById('chat-input');
   const chatSendBtn = document.getElementById('chat-send-btn');
-  const queueEditDeleteBtn = document.getElementById('chat-queue-edit-delete-btn');
-  queueEditDeleteBtn?.addEventListener('click', () => {
-    if (!currentCid
-        || typeof _isQueueItemEditing !== 'function'
-        || !_isQueueItemEditing(currentCid)) return;
-    _deleteQueueItemEdit(currentCid);
-  });
   chatSendBtn.addEventListener('click', () => {
-    const editingQueueItem = currentCid
-      && typeof _isQueueItemEditing === 'function'
-      && _isQueueItemEditing(currentCid);
     // While a reply is streaming, the button is a stop icon — click aborts
-    // the in-flight reply. Queued messages (if any) stay put and will drain
-    // one-by-one after the abort completes. While a queued item owns the
-    // composer, the same button commits that edit instead of stopping or
-    // starting any send.
-    if (editingQueueItem) {
-      handleChatSubmit();
-    } else if (currentCid && isConvPending(currentCid)) {
+    // the in-flight reply. Queued board tasks stay put on the backend.
+    if (currentCid && isConvPending(currentCid)) {
       abortConvStream(currentCid, { userInitiated: true });
     } else {
       handleChatSubmit();
@@ -395,13 +401,6 @@ function bindStaticHandlers() {
     // Plain Enter sends; Shift/Cmd/Ctrl+Enter inserts a newline. Skip IME
     // (CLAUDE.md §8 — keyCode 229 belt-and-suspenders for older builds).
     if (e.isComposing || e.keyCode === 229) return;
-    if (e.key === 'Escape'
-        && typeof _isQueueItemEditing === 'function'
-        && _isQueueItemEditing(currentCid)) {
-      e.preventDefault();
-      _cancelQueueItemEdit(currentCid);
-      return;
-    }
     if (_handleModifiedComposerEnter(e)) return;
     if (_isPlainComposerEnter(e)) {
       e.preventDefault();
@@ -414,8 +413,8 @@ function bindStaticHandlers() {
   });
 
   // Quick-create-agent button (conversation toolbar). Pushes a canned
-  // request through handleChatSubmit so it honors queue / pending /
-  // attachments state — we don't bypass the send pipeline.
+  // request through handleChatSubmit so it honors pending / attachments
+  // state — we don't bypass the send pipeline.
   // The "Create agent" inline entry is dynamically created inside
   // conversation.js and binds its own click handler.
 

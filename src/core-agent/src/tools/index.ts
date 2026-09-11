@@ -5,6 +5,7 @@ export {
   type ToolResult,
   type ToolResultImage,
   type ToolObservations,
+  type ToolFailureContext,
   type FileReadObservation,
   type FileChangeObservation,
   type CommandExecutionObservation,
@@ -55,7 +56,8 @@ export {
   workspaceDiffTool,
 } from "./workspace-diff.js";
 export type { WorkspaceDiffProvider } from "./workspace-diff.js";
-export { webFetchTool } from "./web-fetch.js";
+export { configureWebFetchRenderer, webFetchTool } from "./web-fetch.js";
+export type { WebFetchRenderedPage, WebFetchRenderer } from "./web-fetch.js";
 export { createExecutionPlanTool, type ExecutionPlanController } from "./execution-plan.js";
 export {
   webSearchTool,
@@ -63,3 +65,19 @@ export {
   WEB_SEARCH_DEFAULT_COUNT,
   WEB_SEARCH_MAX_COUNT,
 } from "./web-search.js";
+export {
+  createRunProgramTool,
+  DEFAULT_RUN_PROGRAM_LIMITS,
+  isProgrammaticToolCallContext,
+  markProgrammaticToolCallState,
+  RUN_PROGRAM_TOOL_NAME,
+} from "./run-program.js";
+export type {
+  CreateRunProgramToolOptions,
+  ProgrammaticToolAuthorization,
+  ProgrammaticToolInvokeOutcome,
+  ProgrammaticToolPolicy,
+  ProgramSourceLoadOutcome,
+  ProgramSourceLoader,
+  RunProgramLimits,
+} from "./run-program.js";

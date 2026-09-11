@@ -838,7 +838,7 @@ export class SandboxExecutor {
       });
       child.unref();
       const pid = child.pid ?? null;
-      log.info(`background command started pid=${pid} log=${logPath}`);
+      log.info(`background command started pid=${pid}`);
       return { pid };
     } catch (err) {
       return { pid: null, error: (err as Error).message };

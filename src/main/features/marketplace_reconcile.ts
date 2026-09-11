@@ -42,7 +42,7 @@ import { agentPrivateSkillIdsFromBundle } from './marketplace_private_skills';
 import { downloadMarketplaceBundle, parseMarketplaceBundle } from './marketplace_bundle';
 import { createLogger } from '../logger';
 import { fetchWithRetry } from '../util/retry';
-import { replaceDirectoryAtomically } from '../util/atomic-directory-replace';
+import { replaceDirectoryAtomically, sweepStaleReplacementArtifacts } from '../util/atomic-directory-replace';
 import {
   compareVersions,
   minAppVersionFrom,
@@ -450,6 +450,17 @@ export async function reconcileInstalls(
 ): Promise<ReconcileResult> {
   try { _assertContinue(opts); } catch {
     return _emptyReconcileResult();
+  }
+  // Staging/backup directories of an install that died mid-flight start with
+  // a dot, so the listings below never saw them and nothing reclaimed them.
+  for (const root of [userMarketplaceAgentsDir(uid), userMarketplaceSkillsDir(uid)]) {
+    const removed = await sweepStaleReplacementArtifacts(root, (err, artifact) => {
+      log.warn('stale install artifact cleanup failed', {
+        artifact: path.basename(artifact),
+        error: (err as Error).message,
+      });
+    });
+    if (removed.length) log.info(`swept ${removed.length} stale install artifact(s) under ${path.basename(root)}`);
   }
   let manifest = await readInstalls(uid);
   let localConvergence: LocalConvergenceCounts;

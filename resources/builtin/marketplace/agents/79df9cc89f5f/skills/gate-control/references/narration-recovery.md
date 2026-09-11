@@ -31,7 +31,6 @@ says `redraft_same_turn_then_final_video_stop`), continue in the same turn to
 seconds — and present the new-voice draft at the final-video stop as the
 single audition and confirmation, with the narration audio attached. Do not
 stop for a standalone audio audition first: one listen, one decision.
-
 The native narration transaction ledger owns convergence. When it returns
 `E_TTS_RETRY_EPISODE_EXHAUSTED`, the unchanged request has reached its automatic
 uncertain-outcome boundary, not a permanent user-retry prohibition. The result

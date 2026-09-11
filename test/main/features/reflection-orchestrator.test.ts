@@ -3,11 +3,22 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+const loggerMocks = vi.hoisted(() => ({ warn: vi.fn() }));
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: () => ({
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: loggerMocks.warn,
+    error: vi.fn(),
+  }),
+}));
+
 let tmpDir: string;
 let prevWs: string | undefined;
 const TEST_UID = 'u1';
 
 beforeEach(async () => {
+  loggerMocks.warn.mockReset();
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-orchestrator-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
@@ -328,6 +339,19 @@ describe('reflection-orchestrator › runOneCycle', () => {
     expect(mod.readReflectionState(TEST_UID).lastReflectedAt).toEqual({});
   });
 
+  it('counts durable writes followed by an empty final text as reflected', async () => {
+    // Loop exhaustion after the lessons were saved must consume the window;
+    // failing it re-ran the same window next cycle and wrote the lessons
+    // again (2026-08-28 review E1-6).
+    const mod = await loadModuleWithRunner({ writes: 2, responseText: '' });
+    const completed = await mod.runOneCycle(TEST_UID, {
+      now: () => NOW,
+      isDirty: async () => true,
+    });
+    expect(completed).toBe(1);
+    expect(Object.keys(mod.readReflectionState(TEST_UID).lastReflectedAt)).toHaveLength(1);
+  });
+
   it('one agent exceeding its deadline does not take the rest of the cycle down', async () => {
     const mod = await loadModuleWithAgents(['agent-b']);
     const seen: string[] = [];
@@ -628,6 +652,24 @@ describe('reflection-orchestrator › state persistence', () => {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'reflection-state.json'), '{not json');
     expect(mod.readReflectionState(TEST_UID)).toEqual({ lastReflectedAt: {} });
+  });
+
+  it('does not disclose account ids or parser details for malformed state', async () => {
+    const privateUid = 'private-reflection-user-12345';
+    const mod = await loadModule();
+    const dir = path.join(tmpDir, privateUid, 'local', 'config');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'reflection-state.json'), '{private parser input');
+
+    expect(mod.readReflectionState(privateUid)).toEqual({ lastReflectedAt: {} });
+    expect(loggerMocks.warn).toHaveBeenCalledWith(
+      'reflection-state.json parse failed; treating as empty',
+      expect.objectContaining({ user_id: 'priv...2345' }),
+    );
+    const serialized = JSON.stringify(loggerMocks.warn.mock.calls);
+    expect(serialized).not.toContain(privateUid);
+    expect(serialized).not.toContain('private parser input');
+    expect(serialized).not.toContain(tmpDir);
   });
 
   it('filters out non-string values defensively', async () => {

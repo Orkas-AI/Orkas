@@ -290,13 +290,35 @@ function printStats(label, stats) {
  *  instead of silently mis-reporting "near cap" against a stale number here. */
 export const FACTS_TOKEN_CAP = 6_000;
 
-/** Mirror of session.ts estimateTextTokens (CJK 1.5/char, other 0.25/char,
- *  UTF-16 units) — pinned by the analyzer test's parity fixtures. */
-export function estimateTokensMirror(text) {
-  let cjk = 0;
-  let other = 0;
-  for (let i = 0; i < text.length; i++) {
-    const code = text.charCodeAt(i);
+/** Mirror of session.ts estimateTextTokens, including numeric and punctuation
+ * boundaries and CJK weights. The parity test owns compatibility. */
+export function estimateTokensMirror(s) {
+  let quarters = 0;
+  let digits = 0;
+  let punctuation = false;
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    if (code >= 0x30 && code <= 0x39) {
+      if (digits === 0) quarters += 4;
+      digits = (digits + 1) % 3;
+      punctuation = false;
+      continue;
+    }
+    digits = 0;
+    const isPunctuation = (code >= 0x21 && code <= 0x2F)
+      || (code >= 0x3A && code <= 0x40)
+      || (code >= 0x5B && code <= 0x60)
+      || (code >= 0x7B && code <= 0x7E);
+    if (isPunctuation) {
+      quarters += punctuation ? 1 : 4;
+      punctuation = true;
+      continue;
+    }
+    punctuation = false;
+    // CJK Unified Ideographs (U+4E00-U+9FFF), Extension A (U+3400-U+4DBF),
+    // CJK Symbols & Punctuation (U+3000-U+303F), Hiragana (U+3040-U+309F),
+    // Katakana (U+30A0-U+30FF), Halfwidth/Fullwidth Forms (U+FF00-U+FFEF),
+    // Hangul Syllables (U+AC00-U+D7AF).
     if (
       (code >= 0x4E00 && code <= 0x9FFF) ||
       (code >= 0x3400 && code <= 0x4DBF) ||
@@ -304,10 +326,10 @@ export function estimateTokensMirror(text) {
       (code >= 0x3040 && code <= 0x30FF) ||
       (code >= 0xFF00 && code <= 0xFFEF) ||
       (code >= 0xAC00 && code <= 0xD7AF)
-    ) cjk++;
-    else other++;
+    ) quarters += 6;
+    else quarters += 1;
   }
-  return Math.ceil(cjk * 1.5 + other / 4);
+  return Math.ceil(quarters / 4);
 }
 
 function runSidecarsMode(dataDir, asJson) {

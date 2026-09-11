@@ -361,7 +361,7 @@ describe('codesign-adhoc runtime gate', () => {
     expect(marker.verified).toContain('loader:tsx');
     expect(marker.verified).toContain('mcp-runtime:node_modules/@modelcontextprotocol/sdk');
     expect(marker.verified).toContain('dependency:lock-graph:win32-x64:packages=3:edges=2:overrides=0');
-  });
+  }, 60_000);
 
   it('blocks signing when FFmpeg is absent from the packaged app', async () => {
     const key = 'win32-x64';

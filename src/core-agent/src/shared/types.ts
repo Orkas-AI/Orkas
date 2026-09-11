@@ -2,6 +2,8 @@
 export type TextContent = {
   type: "text";
   text: string;
+  /** Opaque provider replay metadata (e.g. Responses message ID and phase). */
+  textSignature?: string;
 };
 
 export type ImageContent = {
@@ -20,6 +22,8 @@ export type ToolUseContent = {
   input: Record<string, unknown>;
   /** Opaque provider state for replaying tool calls, notably Gemini thought signatures. */
   thoughtSignature?: string;
+  /** Provider-returned tool namespace; preserve for replay, never infer from the name. */
+  namespace?: string;
 };
 
 export type ToolResultContent = {
@@ -34,6 +38,9 @@ export type ToolResultContent = {
    * receiving the ordinary current `tools` snapshot.
    */
   addedToolNames?: string[];
+  /** Images returned by this actual call, not a separate user turn. New
+   * receipts always include this array; absence identifies legacy trailers. */
+  images?: ImageContent[];
 };
 
 /** Reasoning / chain-of-thought block emitted by reasoning models.
@@ -58,7 +65,7 @@ export type MessageContent =
   | ToolResultContent
   | ThinkingContent;
 
-export type MessageRole = "user" | "assistant" | "system";
+export type MessageRole = "user" | "assistant" | "system" | "developer";
 
 export type Message = {
   role: MessageRole;
@@ -117,6 +124,10 @@ export type ServerModelFallbackReason =
 /** Streaming event types. */
 export type StreamEvent =
   | { type: "text_delta"; text: string }
+  /** Structured presentation phase for the immediately preceding text block.
+   * Responses-style providers may learn this only at `text_end`; consumers
+   * use it to classify buffered deltas without inspecting their prose. */
+  | { type: "text_phase"; phase: "commentary" | "final_answer" }
   /** Provider reasoning activity. `text` remains internal to the core-agent
    * pipeline and must be sanitized before it reaches UI or persistence. */
   | { type: "thinking_start" }
@@ -181,6 +192,12 @@ export type StreamEvent =
       serverFallbackReason?: ServerModelFallbackReason;
       /** Provider-native terminal classification for empty-response recovery. */
       providerTermination?: { category: ProviderTerminationCategory };
+      /** Privacy-safe provider-boundary provenance. No reasoning text or
+       * content is included in this diagnostic. */
+      reasoningBoundary?: {
+        structured: boolean;
+        literalLeadingText: boolean;
+      };
     }
   | {
       type: "error";

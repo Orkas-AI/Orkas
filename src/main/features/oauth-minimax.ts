@@ -374,11 +374,12 @@ export function buildMinimaxPortalProvider(region: MiniMaxRegion): OAuthProvider
       return loginMiniMaxPortal({ region, callbacks });
     },
 
-    async refreshToken(credentials) {
+    async refreshToken(credentials, signal) {
       const storedRegion = ((credentials as any).region as MiniMaxRegion) || region;
       const refreshed = await refreshTokenCall({
         region: storedRegion,
         refresh: credentials.refresh,
+        signal,
       });
       return {
         ...credentials,

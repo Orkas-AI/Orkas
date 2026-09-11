@@ -77,7 +77,7 @@ describe('retained Agent memory and Office preview IPC', () => {
   });
 
   it.each(['contexts.officeHtml', 'projects.files.officeHtml'])('%s reaches the owned Office renderer', async (channel) => {
-    const previews = await import('../../../src/main/util/office-preview');
+    const previews = await import('../../../src/main/features/office/office_preview_layout');
     const render = vi.spyOn(previews, 'officeFileToPreviewHtml').mockResolvedValue({
       html: '<html>quarterly results</html>', kind: 'spreadsheet', layoutRendered: true,
     });

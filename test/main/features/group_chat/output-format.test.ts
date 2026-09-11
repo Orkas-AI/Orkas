@@ -36,8 +36,8 @@ describe('group-chat response language', () => {
   });
 });
 
-describe('named Agent execution-plan ownership', () => {
-  it('keeps current-task planning with the Agent while group orchestration stays with Commander', async () => {
+describe('named Agent execution ownership', () => {
+  it('keeps current-task execution with the Agent without advertising the disabled Plan', async () => {
     const prompt = await _buildAgentInGroupSystemPromptForTest({
       agent_id: 'execution-owner-agent',
       name: 'ExecutionOwnerAgent',
@@ -45,14 +45,67 @@ describe('named Agent execution-plan ownership', () => {
     }, '/tmp/execution-owner-agent', 'en');
 
     const ownership = prompt.indexOf('The bus/commander owns cross-actor orchestration;');
-    const sharedAdmission = prompt.indexOf('- Use an execution plan when the user asks');
-
     expect(ownership).toBeGreaterThanOrEqual(0);
-    expect(prompt).toContain('your current-task execution Plan follows Shared rules.');
+    expect(prompt).toContain('you own execution of the current task.');
+    expect(prompt).toContain('one or two sentences when appropriate');
+    expect(prompt).toContain('These updates are not final replies');
+    expect(prompt).toContain('Complete the authorized scope');
+    expect(prompt).not.toContain('Once you output, your turn is done.');
+    expect(prompt).not.toContain('facts/conclusions only');
+    expect(prompt).not.toContain('before the first tool call');
+    expect(prompt.match(/These updates are not final replies/g)).toHaveLength(1);
+    expect(prompt.indexOf('These updates are not final replies')).toBeLessThan(prompt.indexOf('## Runtime injection'));
     expect(prompt).not.toContain('Plan/upstream/downstream state belongs to the bus/commander.');
-    expect(sharedAdmission).toBeGreaterThan(ownership);
-    expect(prompt).toContain('Skip simple work or work clear in live context; tool, file, and step counts never decide.');
-    expect(prompt.match(/- Use an execution plan when the user asks/g)).toHaveLength(1);
+    expect(prompt).not.toMatch(/current-task execution Plan|Use an execution Plan|manage_execution_plan/i);
+  });
+});
+
+describe('named Agent prompt stability', () => {
+  it('keeps the concrete working directory only in the runtime injection', async () => {
+    const agent = {
+      agent_id: 'stable-prefix-agent',
+      name: 'StablePrefixAgent',
+      workflow: 'Complete the assigned work.',
+    };
+    const first = await _buildAgentInGroupSystemPromptForTest(
+      agent,
+      '/tmp/orkas-agent-workspace-a',
+      'en',
+    );
+    const second = await _buildAgentInGroupSystemPromptForTest(
+      agent,
+      '/tmp/orkas-agent-workspace-b',
+      'en',
+    );
+    const marker = '## Runtime injection';
+    const firstMarker = first.indexOf(marker);
+    const secondMarker = second.indexOf(marker);
+
+    expect(firstMarker).toBeGreaterThanOrEqual(0);
+    expect(secondMarker).toBeGreaterThanOrEqual(0);
+    expect(first.slice(0, firstMarker)).toBe(second.slice(0, secondMarker));
+    expect(first.slice(0, firstMarker)).not.toContain('/tmp/orkas-agent-workspace-a');
+    expect(second.slice(0, secondMarker)).not.toContain('/tmp/orkas-agent-workspace-b');
+    expect(first.slice(firstMarker)).toContain('Tool cwd and default write location = `/tmp/orkas-agent-workspace-a`');
+    expect(second.slice(secondMarker)).toContain('Tool cwd and default write location = `/tmp/orkas-agent-workspace-b`');
+    expect(first.match(/\/tmp\/orkas-agent-workspace-a/g)).toHaveLength(1);
+    expect(second.match(/\/tmp\/orkas-agent-workspace-b/g)).toHaveLength(1);
+  });
+});
+
+describe('named Agent tool-surface ownership', () => {
+  it('leaves tool activation mechanics to the runtime tool contract', async () => {
+    const prompt = await _buildAgentInGroupSystemPromptForTest({
+      agent_id: 'tool-surface-agent',
+      name: 'ToolSurfaceAgent',
+      workflow: 'Complete the assigned work with the available capabilities.',
+    }, '/tmp/tool-surface-agent', 'en');
+
+    expect(prompt).not.toContain('Tools are auto-registered');
+    expect(prompt).not.toContain('`read_files` / `bash` / `library` / `web_search` / `create_pdf`');
+    expect(prompt).not.toContain('`tool_load`');
+    expect(prompt).toContain('its read-and-invoke contract is authoritative');
+    expect(prompt).toContain('use its `list_connector_tools` → `call_connector_tool` flow');
   });
 });
 
@@ -273,7 +326,7 @@ describe('group_chat plan interaction prompt hints', () => {
     }, '/tmp/prose-input-agent', 'en');
     expect(prompt).toContain('### Plan interaction');
     expect(prompt).toContain('<plan-interaction status="open" />');
-    expect(prompt).toMatch(/at most 2-3 focused questions/i);
+    expect(prompt).toMatch(/at most 2-3 focused fields or questions/i);
     expect(prompt).not.toMatch(/output exactly one `<agent-input-form>`/i);
   });
 });
@@ -283,10 +336,10 @@ describe('group_chat agent input-channel prompt blocks', () => {
     const protocol = _buildInputChannelProtocolForTest('form');
     expect(protocol).toContain('### Input channel: form');
     expect(protocol).toContain('Plain-text questions, numbered question lists, and "please confirm/tell me" prose are not input channels.');
-    expect(protocol).toContain('Ask for at most 2-3 focused missing fields.');
     expect(protocol).toContain('Prefer one plain question in a field label');
     expect(protocol).toContain('use multiple fields only for distinct typed values');
     expect(protocol).toContain('Do not replace the form with a "need these details" section.');
+    expect(protocol).not.toMatch(/at most 2-3|repeat the input decision|and stop/i);
     expect(protocol.match(/<agent-input-form>/g)).toHaveLength(2);
   });
 
@@ -296,8 +349,9 @@ describe('group_chat agent input-channel prompt blocks', () => {
     // platform. The prose channel removes the contradiction at its source.
     const protocol = _buildInputChannelProtocolForTest('prose');
     expect(protocol).toContain('### Input channel: plain prose');
-    expect(protocol).toMatch(/ask directly in plain language and stop/i);
+    expect(protocol).toMatch(/ask directly in plain language/i);
     expect(protocol).toMatch(/retired protocol, not an example/i);
+    expect(protocol).not.toMatch(/at most 2-3|repeat the input decision|and stop/i);
     // The tag may appear only inside "never emit" phrasing — every mention
     // must be a prohibition, and none of the form-mandate sentences survive.
     for (const line of protocol.split('\n')) {

@@ -1,7 +1,17 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+
+const loggerMocks = vi.hoisted(() => ({ warn: vi.fn() }));
+vi.mock('../../../../src/main/logger', () => ({
+  createLogger: () => ({
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: loggerMocks.warn,
+    error: vi.fn(),
+  }),
+}));
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'sig-storage-'));
 process.env.ORKAS_WORKSPACE_ROOT = TMP;
@@ -92,5 +102,59 @@ describe('expert_signals.storage', () => {
     } finally {
       activateUser('99999999');
     }
+  });
+});
+
+describe('pruneSignalFiles', () => {
+  it('removes daily files older than the retention window and keeps the rest', async () => {
+    // Signal files accumulated one per active day forever; every consumer
+    // reads a ≤48h window (2026-08-28 review E1-8).
+    const { pruneSignalFiles } = await import('../../../../src/main/features/expert_signals/storage');
+    const { userSignalsDir } = await import('../../../../src/main/paths');
+    const retentionUid = 'retention-test';
+    const dir = userSignalsDir(retentionUid);
+    fs.mkdirSync(dir, { recursive: true });
+    const now = Date.UTC(2026, 7, 28);
+    fs.writeFileSync(path.join(dir, '2026-06-01.jsonl'), '{}\n');
+    fs.writeFileSync(path.join(dir, '2026-08-20.jsonl'), '{}\n');
+    fs.writeFileSync(path.join(dir, '2026-08-28.jsonl'), '{}\n');
+    fs.writeFileSync(path.join(dir, 'notes.txt'), 'keep');
+    expect(pruneSignalFiles(retentionUid, 30, now)).toBe(1);
+    expect(fs.readdirSync(dir).sort()).toEqual(['2026-08-20.jsonl', '2026-08-28.jsonl', 'notes.txt']);
+  });
+
+  it('keeps account ids and local paths out of storage failure logs', async () => {
+    const storage = await import('../../../../src/main/features/expert_signals/storage');
+    const paths = await import('../../../../src/main/paths');
+    loggerMocks.warn.mockReset();
+
+    const appendUid = 'append-private-user-12345';
+    const appendDir = paths.userSignalsDir(appendUid);
+    fs.mkdirSync(path.dirname(appendDir), { recursive: true });
+    fs.writeFileSync(appendDir, 'blocks directory creation');
+    storage.appendSignal(appendUid, makeInput('accept'));
+    for (let attempt = 0; attempt < 20 && loggerMocks.warn.mock.calls.length === 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const queryUid = 'query-private-user-12345';
+    fs.mkdirSync(paths.signalsDailyFile(queryUid), { recursive: true });
+    await storage.querySignalsForUser(queryUid);
+
+    const pruneUid = 'prune-private-user-12345';
+    const pruneDir = paths.userSignalsDir(pruneUid);
+    fs.mkdirSync(path.join(pruneDir, '2026-01-01.jsonl'), { recursive: true });
+    storage.pruneSignalFiles(pruneUid, 30, Date.UTC(2026, 7, 28));
+
+    expect(loggerMocks.warn.mock.calls.map(([message]) => message)).toEqual([
+      'append signal failed',
+      'query signals read failed',
+      'prune signal file failed',
+    ]);
+    const serialized = JSON.stringify(loggerMocks.warn.mock.calls);
+    expect(serialized).not.toContain(appendUid);
+    expect(serialized).not.toContain(queryUid);
+    expect(serialized).not.toContain(pruneUid);
+    expect(serialized).not.toContain(TMP);
   });
 });

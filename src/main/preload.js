@@ -51,27 +51,43 @@ function invoke(channel, payload) {
  * Resolve genuine DOM File objects to OS paths inside preload and immediately
  * hand them to main. Raw paths are never exposed to renderer JavaScript, and
  * file bytes never cross contextBridge/base64 IPC.
+ *
+ * Scopes: `contexts` (Library), `project` (project files), `conversation`
+ * (composer attachments for `opts.cid`). `opts.onResolved(indexes)` — when
+ * given — is called synchronously, before main starts copying, with the
+ * positions of the Files that resolved to a path; the composer paints their
+ * chips immediately and byte-uploads only the path-less rest. Indexes carry
+ * no path data.
  */
 function importLocalFiles(scope, files, opts) {
   const list = Array.isArray(files) ? files : Array.from(files || []);
   const entries = [];
-  for (const file of list.slice(0, 200)) {
+  list.slice(0, 200).forEach((file, index) => {
     try {
       const localPath = webUtils && typeof webUtils.getPathForFile === 'function'
         ? webUtils.getPathForFile(file)
         : '';
-      if (!localPath) continue;
+      if (!localPath) return;
       entries.push({
+        index,
         path: localPath,
         name: String((file && file.name) || ''),
         size: Math.max(0, Number((file && file.size) || 0)),
       });
     } catch (_) { /* synthetic/non-local File; caller can use the small-file fallback */ }
+  });
+  if (opts && typeof opts.onResolved === 'function') {
+    try { opts.onResolved(entries.map((entry) => entry.index)); }
+    catch (_) { /* renderer callback must not block the import */ }
   }
+  const importScope = scope === 'project'
+    ? 'project'
+    : scope === 'conversation' ? 'conversation' : 'contexts';
   return ipcRenderer.invoke('orkas.importLocalFiles', {
-    scope: scope === 'project' ? 'project' : 'contexts',
+    scope: importScope,
     projectId: opts && opts.projectId ? String(opts.projectId) : '',
     targetDir: opts && opts.targetDir ? String(opts.targetDir) : '',
+    cid: opts && opts.cid ? String(opts.cid) : '',
     entries,
   });
 }
@@ -97,11 +113,14 @@ function logRecord(record) {
 // a known prefix list so the renderer can't tap into arbitrary internal IPC traffic.
 const PUSH_EVENT_CHANNELS = new Set([
   'conversation:media_materialized',
+  'conversation:task_terminal',
+  'local-agent:permission',
+  'local-agent:permission_cancelled',
+  'local-agent:user-input',
+  'local-agent:user-input_cancelled',
 ]);
-// Interactive CLI sessions are local-only and remain part of the open build;
-// their scoped lifecycle events must cross the same narrow push bridge as
-// bash and connector permission events.
-const PUSH_EVENT_PREFIXES = ['marketplace:', 'conversations:', 'connectors:', 'client-config:', 'delete_file.', 'bridge:', 'bash:', 'interactive-cli:'];
+// Local feature lifecycle events cross the same scoped push bridge.
+const PUSH_EVENT_PREFIXES = ['marketplace:', 'conversations:', 'connectors:', 'web-assist:', 'client-config:', 'delete_file.', 'bridge:', 'bash:', 'folder:', 'interactive-cli:', 'projects:'];
 function isAllowedPushChannel(channel) {
   if (typeof channel !== 'string') return false;
   return PUSH_EVENT_CHANNELS.has(channel) || PUSH_EVENT_PREFIXES.some((p) => channel.startsWith(p));

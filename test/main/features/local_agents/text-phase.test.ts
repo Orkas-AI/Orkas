@@ -4,6 +4,7 @@ import {
   commentaryForTerminalReplacement,
   createPhasedTextState,
   resolvedPhasedText,
+  resolvedUnsuccessfulPhasedText,
 } from '../../../../src/main/features/local_agents/text-phase';
 
 describe('local_agents/text-phase', () => {
@@ -23,6 +24,21 @@ describe('local_agents/text-phase', () => {
     const state = createPhasedTextState();
     appendPhasedText(state, 'Still working', 'commentary');
     expect(resolvedPhasedText(state)).toBe('Still working');
+  });
+
+  it('keeps commentary out of an unsuccessful final body', () => {
+    const commentaryOnly = createPhasedTextState();
+    appendPhasedText(commentaryOnly, 'Still working', 'commentary');
+    expect(resolvedUnsuccessfulPhasedText(commentaryOnly, 'Still working')).toBe('');
+
+    const withFinal = createPhasedTextState();
+    appendPhasedText(withFinal, 'Inspecting', 'commentary');
+    appendPhasedText(withFinal, 'Partial answer', 'final_answer');
+    expect(resolvedUnsuccessfulPhasedText(withFinal)).toBe('Partial answer');
+
+    const unphased = createPhasedTextState();
+    appendPhasedText(unphased, 'Legacy partial answer', undefined);
+    expect(resolvedUnsuccessfulPhasedText(unphased)).toBe('Legacy partial answer');
   });
 
   it('preserves the legacy concatenation for unphased CLIs', () => {

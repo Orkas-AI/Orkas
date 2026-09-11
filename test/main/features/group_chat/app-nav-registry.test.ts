@@ -27,6 +27,13 @@ const RENDERER_PROJECTS = path.join(
 const RENDERER_STYLE = path.join(
   __dirname, '..', '..', '..', '..', 'src', 'renderer', 'style.css',
 );
+// The real loader rejects eager scripts. A permissive loader mock previously
+// concealed the broken connector navigation path from these contract tests.
+const lazyFeatures = new Set<string>(vm.runInNewContext(
+  fs.readFileSync(path.join(path.dirname(RENDERER_CONVERSATION), 'lazy-features.js'), 'utf8')
+    + '\nObject.keys(_rendererFeatureManifest)',
+  { window: {} },
+));
 
 function extractAssignedAsyncFunction(source: string, marker: string): string {
   const markerAt = source.indexOf(marker);
@@ -84,9 +91,11 @@ function rendererNavHarness(failingFeature = '') {
   const calls: string[] = [];
   const context: any = {
     calls,
+    currentCid: 'conversation-1',
     setView: (view: string) => calls.push(`view:${view}`),
     loadRendererFeature: async (feature: string) => {
       calls.push(`load:${feature}`);
+      if (!lazyFeatures.has(feature)) throw new Error('unknown renderer feature');
       if (feature === failingFeature) throw new Error(`feature unavailable: ${feature}`);
       if (feature === 'settings') {
         context.window.activateSettingsTab = (tab: string) => calls.push(`settings:${tab}`);
@@ -98,11 +107,15 @@ function rendererNavHarness(failingFeature = '') {
       getElementById: (id: string) => ({ click: () => calls.push(`click:${id}`) }),
     },
     window: {
+      openCreditsUsage: (returnView: string, returnCid: string) => {
+        calls.push(`credits:${returnView}:${returnCid}`);
+      },
       openAgentModal: () => calls.push('agent:create'),
       openAgentDetail: async (id: string) => { calls.push(`agent:configure:${id}`); return id !== 'missing'; },
       openSkillModal: () => calls.push('skill:create'),
       openAutoTaskDialog: () => calls.push('auto:create'),
       openAutoTaskById: async (id: string) => { calls.push(`auto:configure:${id}`); return id !== 'missing'; },
+      openConnectorSetupById: async (id: string) => { calls.push(`connector:guided:${id}`); return id !== 'missing'; },
       focusConnectorById: async (id: string) => { calls.push(`connector:configure:${id}`); return id !== 'missing'; },
       openProjectsSurface: async (request: Record<string, string>) => {
         calls.push(`project:${request.action}:${request.target_id || ''}`);
@@ -174,6 +187,7 @@ function rendererMountHarness(failingFeature = '') {
       getElementById: (id: string) => ({ click: () => calls.push(`click:${id}`) }),
     },
     window: {
+      openConnectorSetupById: async (id: string) => { calls.push(`connector:guided:${id}`); return id !== 'missing'; },
       focusConnectorById: async (id: string) => { calls.push(`connector:configure:${id}`); return id !== 'missing'; },
       openAgentModal: () => calls.push('agent:create'),
       openAgentDetail: async (id: string) => { calls.push(`agent:configure:${id}`); return id !== 'missing'; },
@@ -188,6 +202,7 @@ function rendererMountHarness(failingFeature = '') {
     setView: (view: string) => calls.push(`view:${view}`),
     loadRendererFeature: async (feature: string) => {
       calls.push(`load:${feature}`);
+      if (!lazyFeatures.has(feature)) throw new Error('unknown renderer feature');
       if (feature === failingFeature) throw new Error(`feature unavailable: ${feature}`);
     },
     openMarketplace: (kind: string) => calls.push(`marketplace:${kind}`),
@@ -302,6 +317,12 @@ describe('group_chat app_nav registry', () => {
     });
     expect(validateAppNavRequest({ surface_id: 'settings.models', action: 'create' }))
       .toMatchObject({ ok: false, error: expect.stringContaining('not supported') });
+    expect(validateAppNavRequest({
+      surface_id: 'credits', action: 'open', target_id: 'account-settings',
+    })).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('unknown surface_id: credits'),
+    });
     expect(validateAppNavRequest({ surface_id: 'agents', action: 'configure' }))
       .toMatchObject({ ok: false, error: expect.stringContaining('target_id is required') });
     expect(validateAppNavRequest({
@@ -335,6 +356,7 @@ describe('group_chat app_nav registry', () => {
   it('loads cold-start feature modules before invoking action-specific handlers', () => {
     const source = fs.readFileSync(RENDERER_CONVERSATION, 'utf8');
     expect(source).toContain("_appNavLoadFeature('marketplace'");
+    expect(source).toContain('window.openConnectorSetupById');
     expect(source).toContain('window.focusConnectorById');
     expect(source).toContain('window.openAgentModal');
     expect(source).toContain('window.openAgentDetail');
@@ -353,12 +375,12 @@ describe('group_chat app_nav registry', () => {
 
     await surfaces.connectors.open({ action: 'add_custom' });
     expect(calls.splice(0)).toEqual([
-      'view:connectors', 'load:connectors', 'click:connectors-add-custom-btn',
+      'view:connectors', 'click:connectors-add-custom-btn',
     ]);
 
     await surfaces.connectors.open({ action: 'configure', target_id: 'connector-1' });
     expect(calls.splice(0)).toEqual([
-      'view:connectors', 'load:connectors', 'connector:configure:connector-1',
+      'view:connectors', 'connector:guided:connector-1',
     ]);
 
     await surfaces.agents.open({ action: 'create' });
@@ -386,9 +408,9 @@ describe('group_chat app_nav registry', () => {
       { surface: 'settings.models', request: { action: 'open' }, expected: ['view:settings', 'load:settings', 'settings:credentials', 'settings:credentials'] },
       { surface: 'settings.general', request: { action: 'open' }, expected: ['view:settings', 'load:settings', 'settings:general', 'settings:general'] },
       { surface: 'settings.data', request: { action: 'open' }, expected: ['view:settings', 'load:settings', 'settings:data', 'settings:data'] },
-      { surface: 'connectors', request: { action: 'open' }, expected: ['view:connectors', 'load:connectors'] },
-      { surface: 'connectors', request: { action: 'add_custom' }, expected: ['view:connectors', 'load:connectors', 'click:connectors-add-custom-btn'] },
-      { surface: 'connectors', request: { action: 'configure', target_id: 'connector-1' }, expected: ['view:connectors', 'load:connectors', 'connector:configure:connector-1'] },
+      { surface: 'connectors', request: { action: 'open' }, expected: ['view:connectors'] },
+      { surface: 'connectors', request: { action: 'add_custom' }, expected: ['view:connectors', 'click:connectors-add-custom-btn'] },
+      { surface: 'connectors', request: { action: 'configure', target_id: 'connector-1' }, expected: ['view:connectors', 'connector:guided:connector-1'] },
       { surface: 'library', request: { action: 'open' }, expected: ['view:contexts'] },
       { surface: 'projects', request: { action: 'open' }, expected: ['project:open:'] },
       { surface: 'projects', request: { action: 'create' }, expected: ['project:create:'] },
@@ -415,9 +437,9 @@ describe('group_chat app_nav registry', () => {
   });
 
   it('does not execute an action-specific side effect when its feature module is unavailable', async () => {
-    const { calls, surfaces } = rendererNavHarness('connectors');
-    await expect(surfaces.connectors.open({ action: 'add_custom' })).rejects.toThrow('feature unavailable');
-    expect(calls).toEqual(['view:connectors', 'load:connectors']);
+    const { calls, surfaces } = rendererNavHarness('agents');
+    await expect(surfaces.agents.open({ action: 'create' })).rejects.toThrow('feature unavailable');
+    expect(calls).toEqual(['view:agents', 'load:agents']);
   });
 
   it('rejects a stale configure target instead of presenting navigation as successful', async () => {
@@ -428,8 +450,8 @@ describe('group_chat app_nav registry', () => {
   });
 
   it('shows localized feedback when a clicked navigation card cannot open', async () => {
-    const { host, mount, toasts } = rendererMountHarness('connectors');
-    mount(host, { app_nav_requests: [{ surface_id: 'connectors', action: 'add_custom' }] });
+    const { host, mount, toasts } = rendererMountHarness();
+    mount(host, { app_nav_requests: [{ surface_id: 'connectors', action: 'configure', target_id: 'missing' }] });
     host.querySelector('.chat-app-nav-row')?.children[0]?.click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(toasts).toEqual([{ message: 'chat.app_nav_failed:', variant: 'error' }]);
@@ -466,7 +488,7 @@ describe('group_chat app_nav registry', () => {
     row?.children[1]?.click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(Array.from(calls)).toEqual([
-      'view:connectors', 'load:connectors', 'click:connectors-add-custom-btn',
+      'view:connectors', 'click:connectors-add-custom-btn',
     ]);
   });
 
@@ -488,7 +510,7 @@ describe('group_chat app_nav registry', () => {
     expect(mountBlock).not.toContain('chevron-right');
 
     const css = fs.readFileSync(RENDERER_STYLE, 'utf8');
-    const styleStart = css.indexOf('.chat-app-nav-row .chat-app-nav-btn {');
+    const styleStart = css.indexOf('.chat-app-nav-row .chat-app-nav-btn');
     const styleEnd = css.indexOf('.chat-marketplace-request {', styleStart);
     const styleBlock = css.slice(styleStart, styleEnd);
     expect(styleBlock).toContain('width: fit-content');
@@ -513,13 +535,18 @@ describe('group_chat app_nav registry', () => {
     }));
     const context = {
       loadConnectors: async () => { calls.push('load'); },
-      document: { querySelectorAll: () => cards },
+      _connectorsSearchQuery: 'previous search',
+      _renderConnectorsGrid: () => {},
+      document: { querySelectorAll: () => cards, getElementById: () => null },
+      // Cold grid: nothing painted yet, so the helper must load first.
+      _connectorsState: { catalog: [] as unknown[], loading: false },
     };
     const focusConnector = vm.runInNewContext(`(${fnSource})`, context) as (
       id: string,
     ) => Promise<boolean>;
 
     expect(await focusConnector(' connector-2 ')).toBe(true);
+    expect(context._connectorsSearchQuery).toBe('');
     expect(calls).toEqual([
       'load',
       'attr:connector-2:tabindex:-1',
@@ -528,6 +555,67 @@ describe('group_chat app_nav registry', () => {
     ]);
     expect(await focusConnector('missing')).toBe(false);
     expect(calls.at(-1)).toBe('load');
+
+    // Painted, idle grid: focus reuses the last completed load (S6-A5).
+    context._connectorsState = { catalog: [{ id: 'connector-1' }], loading: false };
+    calls.length = 0;
+    expect(await focusConnector('connector-1')).toBe(true);
+    expect(calls).toEqual(['attr:connector-1:tabindex:-1', 'scroll:connector-1', 'focus:connector-1']);
+    // A load still in flight would repaint the card, so the helper waits for it.
+    context._connectorsState = { catalog: [{ id: 'connector-1' }], loading: true };
+    calls.length = 0;
+    expect(await focusConnector('connector-1')).toBe(true);
+    expect(calls[0]).toBe('load');
+  });
+
+  it('starts Commander guidance only for an exact unconfigured catalog connector', async () => {
+    const source = fs.readFileSync(RENDERER_CONNECTORS, 'utf8');
+    const fnSource = extractAssignedAsyncFunction(source, 'window.openConnectorSetupById =');
+    const calls: string[] = [];
+    const entries = new Map([
+      ['xiaohongshu-seller', { id: 'xiaohongshu-seller' }],
+      ['xiaohongshu-orders', { id: 'xiaohongshu-orders', catalog_parent_id: 'xiaohongshu-seller' }],
+      ['connected-shop', { id: 'connected-shop' }],
+      ['errored-shop', { id: 'errored-shop' }],
+    ]);
+    const context = {
+      loadConnectors: async () => { calls.push('load'); },
+      _catalogEntryById: (id: string) => entries.get(id),
+      _instanceForCatalogEntry: (entry: { id: string }) => (
+        ['connected-shop', 'errored-shop'].includes(entry.id) ? { id: entry.id } : null
+      ),
+      _isReconnectableError: (entry: { id: string }) => entry.id === 'errored-shop',
+      _runConnect: async (entry: { id: string }) => {
+        calls.push(`form:${entry.id}`);
+      },
+      window: {
+        focusConnectorById: async (id: string) => {
+          calls.push(`focus:${id}`);
+          return id !== 'missing';
+        },
+      },
+    };
+    const openConnectorSetup = vm.runInNewContext(`(${fnSource})`, context) as (
+      id: string,
+    ) => Promise<boolean>;
+
+    expect(await openConnectorSetup(' xiaohongshu-orders ')).toBe(true);
+    expect(calls.splice(0)).toEqual([
+      'load',
+      'form:xiaohongshu-seller',
+    ]);
+
+    expect(await openConnectorSetup('connected-shop')).toBe(true);
+    expect(calls.splice(0)).toEqual(['load', 'focus:connected-shop']);
+
+    expect(await openConnectorSetup('errored-shop')).toBe(true);
+    expect(calls.splice(0)).toEqual([
+      'load',
+      'form:errored-shop',
+    ]);
+
+    expect(await openConnectorSetup('missing')).toBe(false);
+    expect(calls.splice(0)).toEqual(['load', 'focus:missing']);
   });
 
   it('opens Projects through the owning sidebar/create/detail workflows', async () => {
@@ -570,23 +658,51 @@ describe('group_chat app_nav registry', () => {
 
   it('opens the exact automation task through the production helper', async () => {
     const source = fs.readFileSync(RENDERER_AUTO, 'utf8');
-    const fnSource = extractAssignedAsyncFunction(source, 'window.openAutoTaskById =');
     const calls: string[] = [];
-    const tasks = [{ id: 'task-1' }, { id: 'task-2' }];
+    let tasks = [{ id: 'task-1' }, { id: 'task-2' }];
     const opened: Array<{ task: { id: string } }> = [];
-    const context = {
-      _autoTasks: tasks,
-      loadAutoTasks: async () => { calls.push('load'); },
-      openAutoTaskDialog: (input: { task: { id: string } }) => { opened.push(input); },
-    };
-    const openAutoTask = vm.runInNewContext(`(${fnSource})`, context) as (
+    const logs: unknown[][] = [];
+    const context = vm.createContext({
+      window: {
+        addEventListener() {},
+        orkas: { invoke: async (channel: string) => {
+          calls.push(channel);
+          if (channel === 'autoTasks.list') return { tasks: [...tasks] };
+          if (channel === 'autoTasks.currentDevice') return { device: { id: 'device-1' } };
+          if (channel === 'conversations.autoTaskCounts') return { counts: {} };
+          throw new Error(`Unexpected IPC: ${channel}`);
+        } },
+      },
+      document: {
+        readyState: 'loading',
+        addEventListener() {},
+        getElementById: (id: string) => id === 'auto-list' ? {} : null,
+      },
+      t: (key: string) => key,
+      createLogger: () => ({ warn: (...args: unknown[]) => logs.push(args) }),
+      recordOpened: (input: { task: { id: string } }) => { opened.push(input); },
+    });
+    // Load the real module and loader; only replace the presentation sinks.
+    // Inventing a loader in the fixture previously hid a missing function.
+    vm.runInContext(source, context);
+    vm.runInContext('_autoRenderList = () => {}; openAutoTaskDialog = recordOpened;', context);
+    const openAutoTask = vm.runInContext('window.openAutoTaskById', context) as (
       id: string,
     ) => Promise<boolean>;
 
     expect(await openAutoTask(' task-2 ')).toBe(true);
-    expect(calls).toEqual(['load']);
+    expect(calls).toContain('autoTasks.list');
     expect(opened).toEqual([{ task: tasks[1] }]);
+
+    // Commander can create a task after the sidebar list was already loaded.
+    tasks = [...tasks, { id: 'task-3' }];
+    expect(await openAutoTask('task-3')).toBe(true);
+    expect(opened[1]).toEqual({ task: tasks[2] });
+    tasks = tasks.filter((task) => task.id !== 'task-2');
+    expect(await openAutoTask('task-2')).toBe(false);
     expect(await openAutoTask('missing')).toBe(false);
-    expect(opened).toHaveLength(1);
+    expect(await openAutoTask(' ')).toBe(false);
+    expect(opened).toHaveLength(2);
+    expect(logs).toEqual([]);
   });
 });

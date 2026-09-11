@@ -57,7 +57,7 @@ describe("Tools", () => {
   });
 
   describe("manage_execution_plan tool", () => {
-    it("separates plan selection from operation and replacement semantics", () => {
+    it("exposes one complete-snapshot contract while keeping mutation mechanics host-owned", () => {
       const session = new Session();
       const tool = createExecutionPlanTool({
         get: () => session.getExecutionPlan(),
@@ -66,27 +66,34 @@ describe("Tools", () => {
       });
 
       const properties = tool.inputSchema.properties as Record<string, Record<string, unknown>>;
-      expect(tool.description).toContain("when a durable anchor is needed");
-      expect(tool.description).toContain("skip work clear in live context");
-      expect(tool.description).toContain("Co-emit necessary changes with a related business tool when available");
-      expect(tool.description).toContain("never ends the run");
-      expect(tool.description).toContain("set_statuses only when stale status could mislead execution or recovery");
-      expect(tool.description).toContain("project_tasks");
-      expect(properties.action.enum).toEqual(["update", "set_statuses"]);
-      expect(properties.action.description).toContain("Legacy operations remain accepted");
-      expect(properties.replace_objective.description).toContain("latest user text");
-      expect(properties.updates.description).toContain("keep the Plan accurate for execution or recovery");
-      expect(properties.updates.description).toContain("Apply them atomically and batch adjacent transitions");
-      expect(properties.plan.description).toContain("Preserve existing step text exactly");
-      expect(properties.plan.description).toContain("only for necessary status-only changes");
-      expect(tool.inputSchema.required).toEqual(["action"]);
+      expect(tool.description.length).toBeLessThanOrEqual(480);
+      expect(tool.description).toContain("optional current-task Plan");
+      expect(tool.description).toContain("complete ordered snapshot");
+      expect(tool.description).toContain("few durable outcome milestones");
+      expect(tool.description).toContain("complex work");
+      expect(tool.description).toContain("progress state across rounds");
+      expect(tool.description).toContain("at most one in_progress");
+      expect(tool.description).toContain("working memory, not task completion or termination");
+      expect(tool.description).toContain("todo_tasks");
+      expect(tool.description).not.toContain("when a key milestone");
+      expect(tool.description).not.toContain("otherwise update separately");
+      expect(tool.description).not.toContain("Co-emit");
+      expect(Object.keys(properties).sort()).toEqual(["explanation", "plan"]);
+      expect(properties.explanation.description).toContain("reason for this Plan update");
+      expect(properties.plan.description).toContain("preserves existing step text exactly");
+      expect(properties.plan.description).toContain("updates statuses in one batch");
+      expect(properties.plan.minItems).toBe(1);
+      expect(tool.inputSchema.required).toEqual(["plan"]);
+      expect(properties).not.toHaveProperty("action");
+      expect(properties).not.toHaveProperty("replace_objective");
+      expect(properties).not.toHaveProperty("updates");
       expect(properties).not.toHaveProperty("finish");
       expect(properties).not.toHaveProperty("step_id");
       expect(properties).not.toHaveProperty("step");
       expect(properties).not.toHaveProperty("status");
     });
 
-    it("repairs a missing update action when a complete plan is present", async () => {
+    it("creates a plan directly from the first complete snapshot", async () => {
       const session = new Session();
       session.beginUserTurn([{ type: "text", text: "Complete the task" }]);
       const tool = createExecutionPlanTool({
@@ -104,6 +111,8 @@ describe("Tools", () => {
       expect(JSON.parse(inferred.content)).toMatchObject({
         action: "update",
         action_inferred: true,
+        revision: 1,
+        updated_step_ids: [1],
       });
       expect(session.getExecutionPlan()?.steps[0].status).toBe("in_progress");
     });
@@ -248,7 +257,7 @@ describe("Tools", () => {
       expect(unsafeReplay.content).toContain("cannot remove or rename existing milestones");
     });
 
-    it("updates and appends by stable step id without replaying unchanged steps", async () => {
+    it("advances statuses, appends work, and ignores a replay through complete snapshots", async () => {
       const session = new Session();
       session.beginUserTurn([{ type: "text", text: "Complete the staged task" }]);
       const tool = createExecutionPlanTool({
@@ -259,38 +268,57 @@ describe("Tools", () => {
       const context: ToolContext = { state: {} };
 
       const initial = await tool.execute({
-        action: "update",
+        explanation: "Create the durable milestones",
         plan: [
           { step: "Inspect the inputs", status: "in_progress" },
           { step: "Verify the result", status: "pending" },
         ],
       }, context);
       expect(JSON.parse(initial.content)).toMatchObject({
+        revision: 1,
         step_ids: [1, 2],
         updated_step_ids: [1, 2],
       });
+      expect(initial.observations?.coordination).toEqual({ changed: true });
       expect(JSON.parse(initial.content)).not.toHaveProperty("steps");
 
-      const status = await tool.execute({ action: "set_status", step_id: 1, status: "completed" }, context);
-      expect(status.isError).toBeUndefined();
-      expect(JSON.parse(status.content)).toMatchObject({
-        step_ids: [1, 2],
-        updated_step_ids: [1],
-      });
-
-      const appended = await tool.execute({
-        action: "append_step",
-        step: "Publish the result",
-        status: "in_progress",
+      const nextSnapshot = [
+        { step: "Inspect the inputs", status: "completed" },
+        { step: "Verify the result", status: "in_progress" },
+        { step: "Publish the result", status: "pending" },
+      ] as const;
+      const advanced = await tool.execute({
+        explanation: "Inspection finished and publishing was discovered",
+        plan: nextSnapshot,
       }, context);
-      expect(appended.isError).toBeUndefined();
-      expect(JSON.parse(appended.content)).toMatchObject({ appended_step_id: 3, step_count: 3 });
+      expect(advanced.isError).toBeUndefined();
+      expect(JSON.parse(advanced.content)).toMatchObject({
+        action: "update",
+        action_inferred: true,
+        revision: 2,
+        step_count: 3,
+        step_ids: [1, 2, 3],
+        updated_step_ids: [1, 2, 3],
+      });
       expect(session.getExecutionPlan()?.steps.map((item) => item.id)).toEqual([1, 2, 3]);
-      expect(session.getExecutionPlan()?.steps.map((item) => item.step)).toEqual([
-        "Inspect the inputs",
-        "Verify the result",
-        "Publish the result",
-      ]);
+      expect(session.getExecutionPlan()?.steps.map((item) => item.status))
+        .toEqual(["completed", "in_progress", "pending"]);
+
+      const replay = await tool.execute({
+        explanation: "A different explanation cannot manufacture progress",
+        plan: nextSnapshot,
+      }, context);
+      expect(replay.isError).toBeUndefined();
+      const replayReceipt = JSON.parse(replay.content);
+      expect(replayReceipt).toMatchObject({
+        revision: 2,
+        updated_step_ids: [],
+        unchanged: true,
+      });
+      expect(replay.observations?.coordination).toEqual({ changed: false });
+      expect(replayReceipt).not.toHaveProperty("do_not_retry");
+      expect(replayReceipt).not.toHaveProperty("next_action");
+      expect(session.getExecutionPlanAudit()).toHaveLength(2);
     });
 
     it("atomically updates several known statuses while preserving stable step ids", async () => {
@@ -569,16 +597,17 @@ describe("Tools", () => {
       }, context);
 
       expect(appended.isError).toBeUndefined();
-      expect(JSON.parse(appended.content)).toMatchObject({
+      const appendReceipt = JSON.parse(appended.content);
+      expect(appendReceipt).toMatchObject({
         ok: true,
         action: "append_step",
         step_count: 12,
         appended: false,
         capacity_reached: true,
         max_steps: 12,
-        do_not_retry: true,
-        next_action: "continue_task_and_use_set_status_for_existing_steps",
       });
+      expect(appendReceipt).not.toHaveProperty("do_not_retry");
+      expect(appendReceipt).not.toHaveProperty("next_action");
       expect(session.getExecutionPlan()?.steps.map((item) => item.step))
         .toEqual(initialSteps.map((item) => item.step));
 
@@ -591,15 +620,17 @@ describe("Tools", () => {
       }, context);
 
       expect(replayedFullPlan.isError).toBeUndefined();
-      expect(JSON.parse(replayedFullPlan.content)).toMatchObject({
+      const replayedFullPlanReceipt = JSON.parse(replayedFullPlan.content);
+      expect(replayedFullPlanReceipt).toMatchObject({
         ok: true,
         action: "update",
         step_count: 12,
         updated: false,
         capacity_reached: true,
         requested_step_count: 13,
-        do_not_retry: true,
       });
+      expect(replayedFullPlanReceipt).not.toHaveProperty("do_not_retry");
+      expect(replayedFullPlanReceipt).not.toHaveProperty("next_action");
       expect(session.getExecutionPlan()?.steps.map((item) => item.step))
         .toEqual(initialSteps.map((item) => item.step));
 
@@ -713,6 +744,7 @@ describe("Tools", () => {
 
       expect(result.isError).toBeUndefined();
       expect(session.getExecutionPlan()?.steps[0].step).toBe(longStep);
+      session.applyActiveCheckpointSummary("Detailed milestone recorded.", session.length - 1);
       const modelView = JSON.stringify(session.getMessagesForModel());
       expect(modelView).toContain("chars omitted");
       expect(modelView.length).toBeLessThan(longStep.length + 2_000);

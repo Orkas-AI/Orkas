@@ -19,13 +19,20 @@ const XML_PROTOCOL = [
   '</agent-input-form>',
 ].join('\n');
 
+const INTENT_RULES = [
+  '## User intent and clarification',
+  'Treat explicit requirements as execution constraints.',
+  'Do not silently substitute another choice.',
+].join('\n');
+
 function plan() {
   return createCliContextPlan({
     durableInstructions: buildCliDurableInstructions({
       agentName: 'Orkas Codex',
+      intentRules: INTENT_RULES,
       workflow: 'Implement and verify changes in the current project.',
       codingProtocol: XML_PROTOCOL,
-      projectInstructions: '## Project instructions (user-authored)\n\nKeep public APIs stable.',
+      projectContext: '## Project instructions (user-authored)\n\nKeep public APIs stable.',
       language: 'zh',
     }),
     turnPrompt: buildCliTurnPrompt({ task: '修复登录失败' }),
@@ -57,6 +64,7 @@ describe('local_agents/context › semantic CLI context', () => {
 
       if (channel === 'native') {
         expect(fresh.systemPrompt).toContain('You are "Orkas Codex".');
+        expect(fresh.systemPrompt).toContain(INTENT_RULES);
         expect(fresh.systemPrompt).toContain('## Workflow');
         expect(fresh.systemPrompt).toContain(XML_PROTOCOL);
         expect(fresh.systemPrompt).toContain('## Project instructions (user-authored)');
@@ -66,12 +74,14 @@ describe('local_agents/context › semantic CLI context', () => {
       } else {
         expect(fresh.systemPrompt).toBeUndefined();
         expect(fresh.prompt).toContain('You are "Orkas Codex".');
+        expect(fresh.prompt).toContain(INTENT_RULES);
         expect(fresh.prompt).toContain(XML_PROTOCOL);
         expect(resumed.systemPrompt).toBeUndefined();
       }
 
       if (scope === 'session') {
         expect(resumed.prompt).toBe('修复登录失败');
+        expect(resumed.prompt).not.toContain(INTENT_RULES);
         expect(resumed.prompt).not.toContain('<agent-input-form>');
         expect(resumed.prompt).not.toContain('Conversation context recovered');
       } else if (cli === 'claude') {
@@ -79,13 +89,105 @@ describe('local_agents/context › semantic CLI context', () => {
         // native channel, so the user turn remains current-task-only.
         expect(resumed.prompt).toBe('修复登录失败');
         expect(resumed.systemPrompt).toContain(XML_PROTOCOL);
+        expect(resumed.systemPrompt).toContain(INTENT_RULES);
       } else {
         // Hermes declares resume=none. Even a stray resumed=true input must
         // fail closed to a fresh bootstrap with bounded visible recovery.
         expect(resumed.prompt).toContain('You are "Orkas Codex".');
+        expect(resumed.prompt).toContain(INTENT_RULES);
         expect(resumed.prompt).toContain('Conversation context recovered');
         expect(resumed.prompt).toContain('修复登录失败');
       }
+    },
+  );
+
+  it('places the shared intent core before workflow and static project context', () => {
+    const durable = buildCliDurableInstructions({
+      agentName: 'Orkas Codex',
+      intentRules: INTENT_RULES,
+      workflow: 'WORKFLOW_MARKER',
+      codingProtocol: 'CODING_PROTOCOL_MARKER',
+      projectContext: 'PROJECT_CONTEXT_MARKER',
+      language: 'zh',
+    });
+
+    const markers = [
+      'You are "Orkas Codex".',
+      INTENT_RULES,
+      '## Workflow',
+      'CODING_PROTOCOL_MARKER',
+      'PROJECT_CONTEXT_MARKER',
+      '## Response language',
+    ];
+    const positions = markers.map((marker) => durable.indexOf(marker));
+    expect(positions.every((position) => position >= 0)).toBe(true);
+    expect(positions).toEqual([...positions].sort((left, right) => left - right));
+    expect(durable).not.toContain('multiselect');
+    expect(durable).not.toContain(':::dashboard');
+  });
+
+  it.each(['claude', 'codex', 'opencode', 'openclaw', 'hermes'] as const)(
+    'keeps static %s instructions ahead of recovery, dynamic project state, runtime data, and the current task',
+    (cli) => {
+      const contextPlan = createCliContextPlan({
+        durableInstructions: buildCliDurableInstructions({
+          agentName: 'STATIC_IDENTITY',
+          intentRules: 'STATIC_INTENT',
+          workflow: 'STATIC_WORKFLOW',
+          codingProtocol: 'STATIC_CODING_PROTOCOL',
+          projectContext: 'STATIC_PROJECT_POLICY\n\nSTATIC_PROJECT_INSTRUCTIONS',
+          language: 'en',
+        }),
+        recoveryContext: 'DYNAMIC_RECOVERY',
+        incrementalContext: 'DYNAMIC_INCREMENTAL',
+        turnPrompt: buildCliTurnPrompt({
+          projectContext: 'DYNAMIC_PROJECT_MEMORY\n\nDYNAMIC_PROJECT_STATUS',
+          runtimeProtocol: 'DYNAMIC_RUNTIME_PROTOCOL',
+          attachmentPaths: ['/tmp/DYNAMIC_ATTACHMENT'],
+          task: 'CURRENT_TASK_LAST',
+        }),
+      });
+      const fresh = materializeCliContext(contextPlan, { cli, resumed: false });
+      const resumed = materializeCliContext(contextPlan, { cli, resumed: true });
+      const expectInOrder = (surface: string, markers: string[]) => {
+        const positions = markers.map((marker) => surface.indexOf(marker));
+        expect(positions.every((position) => position >= 0)).toBe(true);
+        expect(positions).toEqual([...positions].sort((left, right) => left - right));
+      };
+      const durableSurface = fresh.systemPrompt || fresh.prompt;
+      const staticMarkers = [
+        'STATIC_IDENTITY',
+        'STATIC_INTENT',
+        'STATIC_WORKFLOW',
+        'STATIC_CODING_PROTOCOL',
+        'STATIC_PROJECT_POLICY',
+        'STATIC_PROJECT_INSTRUCTIONS',
+        '## Response language',
+      ];
+      expectInOrder(durableSurface, staticMarkers);
+
+      const freshDynamicMarkers = [
+        'DYNAMIC_RECOVERY',
+        'DYNAMIC_PROJECT_MEMORY',
+        'DYNAMIC_PROJECT_STATUS',
+        'DYNAMIC_RUNTIME_PROTOCOL',
+        'DYNAMIC_ATTACHMENT',
+        'CURRENT_TASK_LAST',
+      ];
+      expectInOrder(fresh.prompt, freshDynamicMarkers);
+      expectInOrder(resumed.prompt, [
+        cli === 'hermes' ? 'DYNAMIC_RECOVERY' : 'DYNAMIC_INCREMENTAL',
+        'DYNAMIC_PROJECT_MEMORY',
+        'DYNAMIC_PROJECT_STATUS',
+        'DYNAMIC_RUNTIME_PROTOCOL',
+        'DYNAMIC_ATTACHMENT',
+        'CURRENT_TASK_LAST',
+      ]);
+      if (cli === 'opencode' || cli === 'openclaw') {
+        expect(resumed.prompt).not.toContain('STATIC_PROJECT_POLICY');
+      }
+      expect(contextPlan.durableInstructions).not.toContain('DYNAMIC_PROJECT_MEMORY');
+      expect(contextPlan.durableInstructions).not.toContain('DYNAMIC_PROJECT_STATUS');
     },
   );
 
@@ -166,6 +268,18 @@ describe('local_agents/context › semantic CLI context', () => {
       task: '检查附件',
       attachmentPaths: ['/tmp/a.txt', '/tmp/a.txt'],
     })).toBe('## Attachments\n- /tmp/a.txt\n\n## Your task\n\n检查附件');
+  });
+
+  it('carries an Agent-memory compatibility hash without changing prompt materialization', () => {
+    const contextPlan = createCliContextPlan({
+      durableInstructions: 'durable',
+      agentMemoryHash: 'memory-state-hash',
+      turnPrompt: 'CURRENT_TASK',
+    });
+
+    expect(contextPlan.agentMemoryHash).toBe('memory-state-hash');
+    expect(materializeCliContext(contextPlan, { cli: 'codex', resumed: false }).prompt)
+      .toBe('CURRENT_TASK');
   });
 
   it('does not add a wrapper around native slash commands', () => {

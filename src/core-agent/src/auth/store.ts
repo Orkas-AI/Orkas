@@ -89,7 +89,12 @@ export function loadAuthStore(): AuthStore {
   return { version: AUTH_STORE_VERSION, profiles: {} };
 }
 
-/** Save the auth store to disk. */
+/** Save the auth store to disk.
+ *
+ * Atomic tmp+rename: this file holds every configured provider credential, and
+ * loadAuthStore treats an unparsable file as an EMPTY store — so a torn write
+ * (crash/power loss mid-write) would silently wipe all provider auth instead of
+ * failing loudly. */
 export function saveAuthStore(store: AuthStore): void {
   ensureAuthDir();
   const storePath = resolveAuthStorePath();
@@ -101,7 +106,14 @@ export function saveAuthStore(store: AuthStore): void {
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
   }
-  fs.writeFileSync(storePath, JSON.stringify(store, null, 2), "utf-8");
+  const tmpPath = `${storePath}.tmp-${process.pid}`;
+  fs.writeFileSync(tmpPath, JSON.stringify(store, null, 2), "utf-8");
+  try {
+    fs.renameSync(tmpPath, storePath);
+  } catch (err) {
+    try { fs.rmSync(tmpPath, { force: true }); } catch { /* ignore */ }
+    throw err;
+  }
   log.debug("saved auth store");
 }
 

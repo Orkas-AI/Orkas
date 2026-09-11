@@ -22,19 +22,25 @@ function extractFunction(name: string): string {
 }
 
 function loadCommentaryHarness() {
-  const progress: Array<{ text: string; kind: string }> = [];
+  const commentary: string[] = [];
   const cancel = vi.fn();
+  const seal = vi.fn((msg) => {
+    msg._commentaryBuf = '';
+    msg._commentaryLine = null;
+  });
+  const complete = vi.fn();
   const paint = vi.fn((_msg, finalEl, text) => { finalEl.innerHTML = text; });
   const context = {
-    _streamingAppendProgress: (_msg: unknown, text: string, kind: string) => progress.push({ text, kind }),
+    _streamingAppendCommentaryDelta: (msg: any, text: string) => {
+      commentary.push(text);
+      msg.dataset.commentaryStreamed = '1';
+      msg._commentaryBuf = String(msg._commentaryBuf || '') + text;
+    },
+    _sealStreamingCommentary: seal,
+    _completeProcessDisclosure: complete,
     _isRepeatedPriorTurnCommentary: () => false,
     _cancelPendingStreamRaf: cancel,
-    _stripSkillCreateBlocksForStream: (value: string) => value,
-    _stripAgentCreateBlocksForStream: (value: string) => value,
-    _stripAutoTaskBlocksForStream: (value: string) => value,
-    _stripAgentFormBlockForStream: (value: string) => value,
-    _stripDashboardBlocksForStream: (value: string) => value,
-    _stripSkillFileBlocksForStream: (value: string) => value,
+    _streamingDisplayText: (value: string) => value,
     _paintStreamingFinalMarkdown: paint,
     requestAnimationFrame: (callback: () => void) => { callback(); return 1; },
     setTimeout,
@@ -44,45 +50,44 @@ function loadCommentaryHarness() {
     extractFunction('_streamingAppendFinalDelta'),
   ].join('\n');
   const api = vm.runInNewContext(`${funcs}\n({ finalize: _streamingFinalizeCommentary, append: _streamingAppendFinalDelta });`, context);
-  return { ...api, progress, cancel, paint };
+  return { ...api, commentary, cancel, seal, complete, paint };
 }
 
 describe('conversation commentary finalization', () => {
-  it('formats multilingual commentary as readable sentence paragraphs', () => {
+  it('normalizes newlines without collapsing markdown paragraph breaks', () => {
     const formatter = vm.runInNewContext(
       `${extractFunction('_formatStreamingCommentary')}\n_formatStreamingCommentary`,
     );
 
     expect(formatter('先检查实现。再补充测试！最后验证？')).toBe(
-      '先检查实现。\n\n再补充测试！\n\n最后验证？',
+      '先检查实现。再补充测试！最后验证？',
     );
-    expect(formatter('First inspect the implementation. Then add tests! Finally verify it.')).toBe(
-      'First inspect the implementation.\n\nThen add tests!\n\nFinally verify it.',
-    );
-    expect(formatter('実装を確認します。次にテストを追加します。')).toBe(
-      '実装を確認します。\n\n次にテストを追加します。',
-    );
+    expect(formatter('line one\r\nline two\rline three')).toBe('line one\nline two\nline three');
+    // Commentary renders as markdown: collapsing '\n\n' would merge authored
+    // paragraphs and turn a '---' thematic break into a setext underline that
+    // promotes the preceding line to a heading.
     expect(formatter('已有一段。\n\n已有二段。')).toBe('已有一段。\n\n已有二段。');
+    expect(formatter('核心判断\n\n---\n\n## 关键词矩阵')).toBe('核心判断\n\n---\n\n## 关键词矩阵');
   });
 
-  it('moves commentary into process and starts final text from an empty body', () => {
-    const { finalize, append, progress, cancel, paint } = loadCommentaryHarness();
-    const finalEl = { style: { display: '' }, innerHTML: 'live commentary' };
+  it('keeps commentary in the process stream and starts body text only at final_answer', () => {
+    const { finalize, append, commentary, cancel, complete, paint } = loadCommentaryHarness();
+    const finalEl = { style: { display: 'none' }, innerHTML: '' };
     const msg: any = {
-      dataset: {
-        streamBuf: 'live commentary',
-        finalText: 'live commentary',
-        streamDisplay: 'live commentary',
-        streamPaintedDisplay: 'live commentary',
-      },
+      dataset: {},
       querySelector: (selector: string) => selector === '[data-role="final"]' ? finalEl : null,
     };
 
-    finalize(msg, 'live commentary');
-    append(msg, 'Final answer');
+    append(msg, 'live commentary', 'commentary');
+    expect(commentary).toEqual(['live commentary']);
+    expect(finalEl.style.display).toBe('none');
 
-    expect(progress).toEqual([{ text: 'live commentary', kind: 'think' }]);
+    finalize(msg, 'live commentary');
+    append(msg, 'Final answer', 'final_answer');
+
+    expect(commentary).toEqual(['live commentary']);
     expect(cancel).toHaveBeenCalledOnce();
+    expect(complete).toHaveBeenCalledOnce();
     expect(msg.dataset.streamBuf).toBe('Final answer');
     expect(msg.dataset.finalText).toBe('Final answer');
     expect(finalEl.style.display).toBe('');
@@ -90,7 +95,7 @@ describe('conversation commentary finalization', () => {
   });
 
   it('is idempotent when a phase-transition event is replayed', () => {
-    const { finalize, progress } = loadCommentaryHarness();
+    const { finalize, commentary, seal } = loadCommentaryHarness();
     const finalEl = { style: { display: '' }, innerHTML: 'commentary' };
     const msg: any = {
       dataset: { streamBuf: 'commentary' },
@@ -100,7 +105,8 @@ describe('conversation commentary finalization', () => {
     finalize(msg, 'commentary');
     finalize(msg, 'commentary');
 
-    expect(progress).toHaveLength(1);
+    expect(commentary).toEqual(['commentary']);
+    expect(seal).toHaveBeenCalledOnce();
     expect(msg.dataset.commentaryFinalized).toBe('1');
   });
 });

@@ -470,13 +470,148 @@ class ParseEdgeCaseTest(unittest.TestCase):
                          [{"hreflang": "zh", "href": "https://x/zh/"}])
 
     def test_word_count_cjk_behavior(self):
-        # KNOWN LIMITATION: the \\b[\\w'-]+\\b word regex treats an unbroken run
-        # of CJK characters as a SINGLE token (no per-character segmentation),
-        # so this 8-character phrase counts as 1 word. Pin it so a future
-        # segmentation change is a deliberate, visible update.
+        # CJK runs have no \\b word boundaries, so word_count counts CJK
+        # characters at ~2 chars per word (rounded up): 10 han chars -> 5
+        # words, not the single token the plain word regex would report.
         f = extract_fields("<html><body><p>你好世界这是测试内容</p></body></html>",
                            "https://x/")
-        self.assertEqual(f["word_count"], 1)
+        self.assertEqual(f["word_count"], 5)
+
+
+class WordCountCjkTest(unittest.TestCase):
+    """CJK-aware word_count: latin words + ceil(cjk_chars / 2)."""
+
+    @staticmethod
+    def _wc(body_text):
+        return extract_fields(
+            "<html><body><p>{}</p></body></html>".format(body_text),
+            "https://x/")["word_count"]
+
+    def test_long_chinese_text_counts_half_the_chars(self):
+        # 600 han chars -> 300 words (was 1-10 under the token regex).
+        text = "这是一段说明中文分词" * 60
+        self.assertEqual(len(text), 600)
+        self.assertEqual(self._wc(text), 300)
+
+    def test_mixed_text_sums_latin_words_and_cjk_chars(self):
+        # latin: Orkas, local-first (2) + CJK: 桌面客户端设计 (7 chars -> 4).
+        self.assertEqual(self._wc("Orkas 桌面客户端 local-first 设计"), 6)
+
+    def test_kana_and_hangul_counted(self):
+        # 5 hiragana + 5 hangul = 10 CJK chars -> 5 words.
+        self.assertEqual(self._wc("こんにちは 안녕하세요"), 5)
+
+    def test_odd_cjk_char_count_rounds_up(self):
+        self.assertEqual(self._wc("你好世"), 2)
+
+    def test_pure_latin_behavior_unchanged(self):
+        self.assertEqual(self._wc("one two three four"), 4)
+        self.assertEqual(self._wc("it's a test-case, ok"), 4)
+
+    def test_cjk_punctuation_not_counted_as_chars(self):
+        # Full-width punctuation （，。) is not a CJK letter: 4 chars -> 2 words.
+        self.assertEqual(self._wc("你好，世界。"), 2)
+
+
+class DecompressionBombTest(unittest.TestCase):
+    """_decode_body/_finalize_body bound decompressed OUTPUT at MAX_BODY_BYTES;
+    the compressed-input cap alone must not admit a decompression bomb."""
+
+    def test_gzip_bomb_bounded_and_truncated(self):
+        # ~20 MB of zeros gzips to a few KB; output must stop at the cap
+        # (no MemoryError-scale inflation) and be flagged truncated like an
+        # oversized raw body.
+        bomb = gzip.compress(b"\x00" * (crawl.MAX_BODY_BYTES * 4))
+        self.assertLess(len(bomb), crawl.MAX_BODY_BYTES)  # small on the wire
+        body, truncated = crawl._finalize_body(bomb, "gzip")
+        self.assertTrue(truncated)
+        self.assertEqual(len(body), crawl.MAX_BODY_BYTES)
+
+    def test_deflate_bomb_output_capped(self):
+        bomb = zlib.compress(b"\x00" * (crawl.MAX_BODY_BYTES * 2))
+        out = _decode_body(bomb, "deflate")
+        self.assertLessEqual(len(out), crawl.MAX_BODY_BYTES + 1)
+
+    def test_small_gzip_still_decodes(self):
+        body, truncated = crawl._finalize_body(gzip.compress(b"<html>hi</html>"), "gzip")
+        self.assertEqual(body, b"<html>hi</html>")
+        self.assertFalse(truncated)
+
+    def test_identity_passthrough_unchanged(self):
+        body, truncated = crawl._finalize_body(b"plain", "")
+        self.assertEqual((body, truncated), (b"plain", False))
+
+    def test_oversized_raw_body_still_truncates(self):
+        big = b"x" * (crawl.MAX_BODY_BYTES + 10)
+        body, truncated = crawl._finalize_body(big, "")
+        self.assertTrue(truncated)
+        self.assertEqual(len(body), crawl.MAX_BODY_BYTES)
+
+
+GBK_HTML = ('<html><head><meta charset="gbk"><title>中文标题</title></head>'
+            '<body><p>正文内容</p></body></html>')
+
+
+class MetaCharsetDecodeTest(unittest.TestCase):
+    """When the Content-Type header names no charset, the <meta charset> in the
+    first 2 KiB decides the decode; the header still wins when present."""
+
+    def test_meta_charset_gbk_decoded(self):
+        text = crawl._decode_text(GBK_HTML.encode("gbk"), "text/html")
+        self.assertIn("中文标题", text)
+
+    def test_http_equiv_charset_decoded(self):
+        html = ('<html><head><meta http-equiv="Content-Type" '
+                'content="text/html; charset=gbk"><title>中文标题</title>'
+                '</head><body></body></html>')
+        text = crawl._decode_text(html.encode("gbk"), "text/html")
+        self.assertIn("中文标题", text)
+
+    def test_header_charset_still_wins_over_meta(self):
+        body = GBK_HTML.encode("gbk")
+        # Header gbk: decodes fine (unchanged path).
+        self.assertIn("中文标题", crawl._decode_text(body, "text/html; charset=gbk"))
+        # Header utf-8 beats the meta gbk declaration -> mojibake, by design.
+        self.assertNotIn("中文标题", crawl._decode_text(body, "text/html; charset=utf-8"))
+
+    def test_bogus_meta_codec_falls_back_to_utf8(self):
+        body = (b'<html><head><meta charset="bogus-codec-name">'
+                b'<title>ascii title</title></head><body></body></html>')
+        text = crawl._decode_text(body, "")  # must not raise
+        self.assertIn("ascii title", text)
+
+    def test_charset_mention_outside_meta_not_sniffed(self):
+        # Look-alike: charset= in body text / non-meta tags is not a declaration.
+        self.assertIsNone(crawl._sniff_meta_charset(
+            b"<html><body><p>use charset=gbk here</p></body></html>"))
+        self.assertIsNone(crawl._sniff_meta_charset(b'<p charset="gbk">x</p>'))
+
+    def test_meta_charset_beyond_2k_window_ignored(self):
+        body = b"<html><head>" + b" " * 2500 + b'<meta charset="gbk"></head>'
+        self.assertIsNone(crawl._sniff_meta_charset(body))
+
+
+class NoProxyMatchTest(unittest.TestCase):
+    """NO_PROXY entries match exact hosts and dot-suffixes only — never a bare
+    string suffix (orkas.ai must not swallow notorkas.ai)."""
+
+    def test_lookalike_suffix_domain_not_matched(self):
+        self.assertFalse(crawl._no_proxy_match("notorkas.ai", "orkas.ai"))
+
+    def test_exact_and_subdomain_matched(self):
+        self.assertTrue(crawl._no_proxy_match("orkas.ai", "orkas.ai"))
+        self.assertTrue(crawl._no_proxy_match("sub.orkas.ai", "orkas.ai"))
+
+    def test_star_and_dot_entry_forms(self):
+        for entry in ("*.orkas.ai", ".orkas.ai"):
+            self.assertTrue(crawl._no_proxy_match("sub.orkas.ai", entry), entry)
+            self.assertTrue(crawl._no_proxy_match("orkas.ai", entry), entry)
+            self.assertFalse(crawl._no_proxy_match("notorkas.ai", entry), entry)
+
+    def test_multiple_entries_and_empty(self):
+        self.assertTrue(crawl._no_proxy_match("sub.orkas.ai", "example.com, orkas.ai"))
+        self.assertFalse(crawl._no_proxy_match("notexample.com", "example.com, orkas.ai"))
+        self.assertFalse(crawl._no_proxy_match("orkas.ai", ""))
 
 
 class LocalFileEvidenceTest(unittest.TestCase):
@@ -530,3 +665,99 @@ class LocalFileEvidenceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AnswerFirstExtractTest(unittest.TestCase):
+    """first_paragraph now reflects the first real body-prose block (for the
+    GEO answer-first signal), not the first 320 chars of the whole page. Real
+    HTML in, per the repo's 'accepted real shapes' fixture rule."""
+
+    def _fp(self, html):
+        return extract_fields(html, "https://x.test/", status=200)["first_paragraph"]
+
+    def test_answer_first_page_yields_the_opening_sentence(self):
+        html = (
+            '<html><body><nav><a href="/">Home</a><a href="/p">Product</a></nav>'
+            '<main><h1>Orkas</h1>'
+            '<p>Orkas is a local-first AI agent platform that keeps data on device '
+            'and runs fully offline. It never uploads your files.</p>'
+            '<p>A second paragraph follows.</p></main></body></html>'
+        )
+        fp = self._fp(html)
+        # First sentence of the opening body paragraph, not the nav or the h1.
+        self.assertEqual(
+            fp,
+            "Orkas is a local-first AI agent platform that keeps data on device and runs fully offline.")
+        self.assertGreaterEqual(len(fp), 60)  # consumer treats >=60 as answer-first
+
+    def test_cta_or_nav_before_content_reads_as_no_answer_up_top(self):
+        html = (
+            '<html><body><header><h1>Widget</h1></header>'
+            '<div>Buy now</div>'
+            '<p>A much longer explanatory paragraph that only appears after the CTA '
+            'block above and is not front-loaded.</p></body></html>'
+        )
+        fp = self._fp(html)
+        self.assertEqual(fp, "Buy now")
+        self.assertLess(len(fp), 60)  # consumer flags no_answer_first
+
+    def test_heading_text_is_excluded_from_the_first_block(self):
+        html = ('<html><body><h1>Just A Page Title That Is Fairly Long Indeed</h1>'
+                '<p>The body answer sentence is right here.</p></body></html>')
+        self.assertEqual(self._fp(html), "The body answer sentence is right here.")
+
+    def test_nav_header_footer_aside_text_excluded(self):
+        html = (
+            '<html><body>'
+            '<header>Site masthead tagline that is quite long and would look like prose</header>'
+            '<nav>Home Products Pricing About Contact Documentation Blog Careers</nav>'
+            '<aside>Related links and a promotional blurb sitting in the sidebar column</aside>'
+            '<article><p>The real article opens with this direct answer sentence.</p></article>'
+            '<footer>Copyright and a long legal footer line that is not body prose at all</footer>'
+            '</body></html>'
+        )
+        self.assertEqual(self._fp(html), "The real article opens with this direct answer sentence.")
+
+    def test_chinese_first_sentence_split_on_cjk_terminator(self):
+        html = ('<html><body><p>Orkas 是一个本地优先的 AI 智能体平台，数据全部留在设备本地。'
+                '它可以完全离线运行。</p></body></html>')
+        # Splits at the first 。 not the latin period.
+        self.assertEqual(self._fp(html),
+                         "Orkas 是一个本地优先的 AI 智能体平台，数据全部留在设备本地。")
+
+    def test_empty_body_yields_empty_first_paragraph(self):
+        self.assertEqual(self._fp('<html><body></body></html>'), "")
+
+    def test_visible_text_and_word_count_unaffected_by_block_tracking(self):
+        html = ('<html><body><nav>Menu Link</nav><h1>Title</h1>'
+                '<p>Body words here counted normally.</p></body></html>')
+        f = extract_fields(html, "https://x.test/", status=200)
+        # nav + heading + body all still flow into the visible text / word count.
+        self.assertIn("Menu Link", f["text_sample"])
+        self.assertIn("Title", f["text_sample"])
+        self.assertIn("Body words here", f["text_sample"])
+
+    def test_long_first_block_without_terminator_capped_at_limit(self):
+        body = "word " * 200  # 1000 chars, no sentence terminator
+        html = "<html><body><p>{}</p></body></html>".format(body)
+        fp = self._fp(html)
+        self.assertLessEqual(len(fp), 320)
+        self.assertGreater(len(fp), 60)
+
+
+class FirstSentenceUnitTest(unittest.TestCase):
+    def test_splits_on_latin_terminator(self):
+        self.assertEqual(crawl._first_sentence("First one. Second two."), "First one.")
+
+    def test_splits_on_cjk_terminator(self):
+        self.assertEqual(crawl._first_sentence("第一句。第二句。"), "第一句。")
+
+    def test_no_terminator_returns_capped_prefix(self):
+        self.assertEqual(crawl._first_sentence("abc", limit=2), "ab")
+
+    def test_terminator_past_limit_falls_back_to_prefix(self):
+        # sentence end is beyond the cap → return the capped prefix, not the sentence
+        self.assertEqual(crawl._first_sentence("abcdef.", limit=3), "abc")
+
+    def test_empty_in_empty_out(self):
+        self.assertEqual(crawl._first_sentence("   "), "")

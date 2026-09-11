@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { describe, expect, it } from 'vitest';
@@ -7,8 +8,12 @@ import {
   DEFAULT_INLINE_RESULT_TOKENS,
   estimateToolResultTokens,
 } from '../../../src/main/util/tool-result-cap';
-import { SKILL_DESCRIPTION_AUTHORING_MAX_CHARS } from '../../../src/main/util/skill-description-policy';
 import {
+  SKILL_DESCRIPTION_AUTHORING_MAX_CHARS,
+  SKILL_ROSTER_MAX_CHARS,
+} from '../../../src/main/util/skill-description-policy';
+import {
+  _renderSkillLinesForTest,
   compactPromptDescription,
   resolveSkillAllowlistRefs,
 } from '../../../src/main/model/core-agent/skill-registry';
@@ -46,7 +51,6 @@ const SHARED_ROOT_MAX_CHARS = 20_000;
 const SHARED_ROUTE_MAX_CHARS = 40_000;
 const AGENT_PRIVATE_ROUTE_MAX_CHARS = 60_000;
 const VIDEO_MULTI_STAGE_ROUTE_MAX_CHARS = 80_000;
-const SHIPPED_ROSTER_BUDGET = { zh: 3_000, en: 5_000 } as const;
 
 interface BuiltinSkillGroup {
   label: string;
@@ -174,13 +178,6 @@ function topLevelReferenceNavigationFindings(skillDir: string): string[] {
     .map((entry) => entry.name);
 }
 
-function renderRoutingRoster(specs: SkillSpec[], lang: 'zh' | 'en'): string {
-  return specs.map((spec) => {
-    const description = compactPromptDescription(pickDescription(spec, lang));
-    return `- **${spec.name}** (Source: builtin; read ref: @skill/${spec.name}) — ${description}`;
-  }).join('\n');
-}
-
 function progressiveDisclosureFindings(skillDir: string, rootMaxChars: number): string[] {
   const rootFile = path.join(skillDir, 'SKILL.md');
   const body = fs.readFileSync(rootFile, 'utf8');
@@ -225,9 +222,8 @@ function effectiveAgentRoster(
   const byId = new Map(available.map((spec) => [spec.id, spec]));
   const roster = resolved.ids.map((id) => byId.get(id)).filter((spec): spec is SkillSpec => !!spec);
   const seen = new Set(roster.map((spec) => spec.id));
-  // Runtime appends every author-owned private Skill even if an older agent.json
-  // forgot to list one. Model that fail-safe so the budget covers what is
-  // actually injected, not only the metadata happy path.
+  // Runtime appends every author-owned private Skill even if an older
+  // agent.json omitted one. Undeclared shared Skills remain search-only.
   for (const spec of group.specs) {
     if (seen.has(spec.id)) continue;
     seen.add(spec.id);
@@ -389,6 +385,59 @@ describe('builtin skill inline budget', () => {
     const linked = Array.from(broken.matchAll(/\]\(references\/([^)]+\.md)\)/g), (match) => match[1]);
     expect(linked.some((relative) => !fs.existsSync(path.join(negativeDir, 'references', relative))))
       .toBe(true);
+  });
+
+  it('documents roster overflow the way the runtime renders it: name-only rows, not a marked tail', async () => {
+    // An author reading skill-creator's metadata reference decides how much
+    // routing signal to put in a description. The reference must describe the
+    // real overflow behavior: protected rows keep their description, a
+    // lower-priority row keeps only its name and stays reachable by search.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-skill-roster-doc-'));
+    try {
+      const roots = [
+        { label: 'builtin', root: path.join(tmp, 'builtin') },
+        { label: 'custom', root: path.join(tmp, 'custom') },
+      ];
+      const description = 'Describe, plan, and deliver the work for this routing entry in detail. '.repeat(3).trim();
+      for (const entry of roots) {
+        const dir = path.join(entry.root, `${entry.label}-skill`);
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(
+          path.join(dir, 'SKILL.md'),
+          `---\nname: ${entry.label}-skill\ndescription: ${description}\n---\n\n# ${entry.label}\n`,
+          'utf8',
+        );
+      }
+      const specs = roots.flatMap((entry) => new SkillLoader({ dirs: [entry.root] }).list());
+      expect(specs.map((spec) => spec.id).sort()).toEqual(['builtin-skill', 'custom-skill']);
+      const full = await _renderSkillLinesForTest(specs, roots, undefined, { maxChars: 10_000 });
+      expect(full).toContain(`**builtin-skill** (Source: builtin) — ${description}`);
+      expect(full).toContain(`**custom-skill** (Source: custom) — ${description}`);
+
+      const compacted = await _renderSkillLinesForTest(specs, roots, undefined, {
+        maxChars: full.length - 20,
+      });
+      expect(compacted).toContain(`**builtin-skill** (Source: builtin) — ${description}`);
+      expect(compacted).toMatch(/^- \*\*custom-skill\*\* \(Source: custom\)$/m);
+      expect(compacted).not.toContain(`**custom-skill** (Source: custom) — ${description}`);
+      expect(compacted).not.toContain('…');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+
+    const metadata = fs.readFileSync(
+      path.join(BUILTIN_ROOT, 'system', 'skills', 'skill-creator', 'references', 'metadata.md'),
+      'utf8',
+    );
+    const describesNameOnlyOverflow = (text: string): boolean => (
+      /roster exceeds its budget[^.]*name only[^.]*`skill_search`/.test(text)
+    );
+    expect(describesNameOnlyOverflow(metadata)).toBe(true);
+    // The pre-fix sentence promised every description survives up to the
+    // per-entry boundary and said nothing about roster overflow.
+    expect(describesNameOnlyOverflow(
+      'Runtime will preserve the complete description up to that boundary and mark an omitted tail with `…`; do not depend on truncation.',
+    )).toBe(false);
   });
 
   it('keeps each creator journey within one bounded progressive-disclosure load set', () => {
@@ -603,37 +652,48 @@ describe('builtin skill inline budget', () => {
     ).toEqual([]);
   });
 
-  it('keeps each shipped runtime roster within its context budget', () => {
+  it('keeps each shipped effective routing block within the production 8,000-character budget', async () => {
     const shared = groups.find((group) => group.kind === 'shared');
     const system = groups.find((group) => group.kind === 'system');
     expect(shared, 'shared marketplace Skill root must be scanned').toBeDefined();
     expect(system, 'system Skill root must be scanned').toBeDefined();
 
-    const rosters: Array<{ label: string; specs: SkillSpec[] }> = [
-      { label: system!.label, specs: system!.specs },
-      { label: shared!.label, specs: shared!.specs },
+    const rosters: Array<{ label: string; specs: SkillSpec[]; roots: Array<{ label: string; root: string }> }> = [
+      { label: system!.label, specs: system!.specs, roots: [{ label: 'system', root: system!.root }] },
+      { label: shared!.label, specs: shared!.specs, roots: [{ label: 'builtin', root: shared!.root }] },
     ];
     const unresolved: string[] = [];
     for (const group of groups.filter((candidate) => candidate.kind === 'agent')) {
       const roster = effectiveAgentRoster(group, shared!.specs);
-      rosters.push({ label: group.label, specs: roster.specs });
+      rosters.push({
+        label: group.label,
+        specs: roster.specs,
+        roots: [
+          { label: 'builtin', root: shared!.root },
+          { label: 'agent', root: group.root },
+        ],
+      });
       unresolved.push(...roster.unknown.map((ref) => `${group.label}:${ref}`));
     }
 
     expect(unresolved, 'every official Agent skill_list entry must resolve into its real runtime roster')
       .toEqual([]);
-    const overBudget = rosters.flatMap((roster) => (
-      ['zh', 'en'] as const
-    ).flatMap((lang) => {
-      const chars = renderRoutingRoster(roster.specs, lang).length;
-      return chars <= SHIPPED_ROSTER_BUDGET[lang]
-        ? []
-        : [`${roster.label}:${lang}:${chars}>${SHIPPED_ROSTER_BUDGET[lang]}`];
-    }));
+    const overBudget: string[] = [];
+    for (const roster of rosters) {
+      const rendered = await _renderSkillLinesForTest(roster.specs, roster.roots, new Map());
+      if (rendered.length > SKILL_ROSTER_MAX_CHARS) {
+        overBudget.push(`${roster.label}:${rendered.length}>${SKILL_ROSTER_MAX_CHARS}`);
+      }
+      // Mandatory shipped rows are never made name-only to hit the budget.
+      for (const spec of roster.specs) {
+        expect(rendered, `${roster.label}:${spec.id} description must remain complete`)
+          .toContain(compactPromptDescription(spec.description_en || spec.description_zh || ''));
+      }
+    }
 
     expect(
       overBudget,
-      'shipped routing indexes must leave prompt headroom for task context and user-installed Skills',
+      'shipped mandatory routing indexes must fit without compacting protected rows',
     ).toEqual([]);
   });
 

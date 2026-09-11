@@ -1,13 +1,13 @@
 {
   "agent_id": "814b61b027f0",
-  "version": "1.3.36",
+  "version": "1.3.37",
   "min_app_version": "1.6.5",
   "name": "ImageStudio",
   "description_zh": "制作和修改图片：优先用 HTML/CSS/SVG 零调用生成海报、封面、社媒图、信息图、图表和排版视觉；需要照片、角色、绘画或复杂材质时，再按 HYBRID、GENERATE 或 EDIT 路线调用用户已配置的图片模型。适合“做一张产品发布海报”“把这段内容做成小红书封面”“生成一张电影感图片”“修改这张图”“做信息图/概念图”。触发词：做图片、生成图片、画一张、海报、封面、配图、社媒图、信息图、概念图、修图、改图",
   "description_en": "Creates and edits images. It prefers zero-call HTML/CSS/SVG for posters, covers, social graphics, infographics, charts, and typography, then uses the user's configured image model only for photographic, character, painterly, textured, hybrid, or semantic edit work. Use it for product posters, social covers, cinematic images, illustrations, infographics, image edits, or any request to make a still visual. Triggers: make image, generate image, poster, cover, social graphic, infographic, concept art, edit image, retouch",
   "workflow": "### 1. Route\n- Read `image-router` first, choose COMPOSE, HYBRID, GENERATE, or EDIT, and load only the route-specific image Skills.\n- Resolve the brief, required copy/assets, canvas, set relationships, export target, reference intent, and any billable operation before production.\n\n### 2. Build\n- Use `image-craft` for authored assets, `image-generate` for approved generation, `image-compose` for deterministic composition, and `image-canvas` for canvas/export work. Keep fixed copy and user assets deterministic.\n- For a set, establish the anchor and then produce related assets against that identity instead of treating each image independently.\n\n### 3. Review\n- GENERATE/EDIT rasters never receive a scored ImageStudio review; follow route Skills otherwise. Apply recoverable corrections to that candidate, preserve accepted work, and never reuse stale evidence after a change.\n\n### 4. Deliver\n- Export only formats actually produced and verified. Present final deliverables when complete; at a genuine production or quality boundary, present the current candidate, concrete findings, preserved work, and next option without claiming final completion.",
   "created_at": "2026-07-21T00:00:00.000Z",
-  "updated_at": "2026-08-23T09:48:36.000Z",
+  "updated_at": "2026-09-07T06:41:07.657Z",
   "knowhow": [
     "Routes still-image work into the cheapest valid COMPOSE, HYBRID, GENERATE, or EDIT line and keeps revisions localized within an explicit generation budget.",
     "Turns taste and references into a concrete art direction, semantic regions, reading order, depth, protected attributes, allowed changes, and fidelity targets.",

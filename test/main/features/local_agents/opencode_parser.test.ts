@@ -2,9 +2,46 @@ import { describe, it, expect } from 'vitest';
 import * as path from 'node:path';
 import {
   buildOpencodeArgs,
+  buildOpencodeEnv,
   mapOpencodeEvent,
   extractOpencodeUsage,
 } from '../../../../src/main/features/local_agents/backends/opencode';
+
+describe('OpenCode run-scoped MCP configuration', () => {
+  const bridge = {
+    mcpConfigPath: '/private/run/mcp.json',
+    server: { command: '/runtime/node', args: ['/app/orkas-bridge.cjs'], env: { ORKAS_BRIDGE_ENV_FILE: '/private/run/env.json' } },
+  };
+
+  it('preserves inherited JSONC settings while replacing only the run-owned Orkas server', () => {
+    const inherited = { OPENCODE_CONFIG: '/custom/config.jsonc', OPENCODE_CONFIG_CONTENT: `{
+      // User-selected model and an unrelated server must survive.
+      "model": "provider/model", "label": "https://example.test/a//b/*c*/",
+      "mcp": {"other": {"type": "remote", "url": "https://example.test/mcp"}, "orkas": {"enabled": false},},
+    }` };
+    const env = buildOpencodeEnv(bridge, inherited);
+    expect(env.OPENCODE_CONFIG).toBe(inherited.OPENCODE_CONFIG);
+    expect(inherited.OPENCODE_CONFIG_CONTENT).toContain('// User-selected');
+    expect(JSON.parse(env.OPENCODE_CONFIG_CONTENT!)).toEqual({
+      model: 'provider/model', label: 'https://example.test/a//b/*c*/',
+      mcp: {
+        other: { type: 'remote', url: 'https://example.test/mcp' },
+        orkas: { type: 'local', command: ['/runtime/node', '/app/orkas-bridge.cjs'], environment: bridge.server.env, enabled: true },
+      },
+    });
+  });
+
+  it('leaves inline configuration untouched when no bridge is granted', () => {
+    const inherited = { OPENCODE_CONFIG_CONTENT: 'invalid native config remains native-owned' };
+    expect(buildOpencodeEnv(undefined, inherited).OPENCODE_CONFIG_CONTENT).toBe(inherited.OPENCODE_CONFIG_CONTENT);
+  });
+
+  it.each(['[]', 'null', '{"mcp":[]}', '{"mcp":null}', '{"private-key": "secret", broken}', '{ /* unfinished'])
+    ('rejects malformed config rather than discarding it or exposing it: %s', (raw) => {
+      expect(() => buildOpencodeEnv(bridge, { OPENCODE_CONFIG_CONTENT: raw }))
+        .toThrow('OpenCode inline configuration must be a JSON/JSONC object with an object-valued mcp section');
+    });
+});
 
 describe('local_agents/backends/opencode › mapOpencodeEvent', () => {
   it('captures sessionID at the top level', () => {
@@ -225,16 +262,16 @@ describe('local_agents/backends/opencode › extractOpencodeUsage', () => {
   });
 });
 
-describe('local_agents/backends/opencode › trusted local permissions', () => {
-  it('runs OpenCode in the selected absolute directory with non-interactive permission auto-approval', () => {
+describe('local_agents/backends/opencode › fixed full access', () => {
+  it('always enables OpenCode auto mode in the selected absolute directory', () => {
     const cwd = path.join('fixtures', 'selected project');
     const args = buildOpencodeArgs({ prompt: 'hi', cwd });
     expect(args).not.toContain('--model');
     expect(args).toEqual([
       'run',
+      '--auto',
       '--format',
       'json',
-      '--dangerously-skip-permissions',
       '--dir',
       path.resolve(cwd),
       'hi',
@@ -249,7 +286,7 @@ describe('local_agents/backends/opencode › trusted local permissions', () => {
       thinkingLevel: 'high',
     });
     expect(args).toEqual([
-      'run', '--format', 'json', '--dangerously-skip-permissions',
+      'run', '--auto', '--format', 'json',
       '--model', 'openai/gpt-5.4', '--variant', 'high',
       '--dir', path.resolve('/workspace/project'), 'hi',
     ]);
@@ -291,7 +328,7 @@ describe('local_agents/backends/opencode › trusted local permissions', () => {
     });
 
     expect(args).toEqual([
-      'run', '--format', 'json', '--dangerously-skip-permissions',
+      'run', '--auto', '--format', 'json',
       '--dir', selected, '--verbose', 'hi',
     ]);
   });
@@ -305,7 +342,7 @@ describe('local_agents/backends/opencode › trusted local permissions', () => {
     });
 
     expect(args).toEqual([
-      'run', '--format', 'json', '--dangerously-skip-permissions',
+      'run', '--auto', '--format', 'json',
       '--dir', selected, '--verbose', 'hi',
     ]);
   });
@@ -319,7 +356,7 @@ describe('local_agents/backends/opencode › trusted local permissions', () => {
     });
 
     expect(args).toEqual([
-      'run', '--format', 'json', '--dangerously-skip-permissions',
+      'run', '--auto', '--format', 'json',
       '--dir', selected, '--verbose', '--', 'hi',
     ]);
     expect(args.indexOf('--dir')).toBeLessThan(args.indexOf('--'));

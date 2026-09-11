@@ -19,14 +19,18 @@
  *     against listed skill dirs.
  *   - connectors.list / connectors.call — registered only when the ordinary
  *     group-chat Agent connector policy resolves at least one user-connected,
- *     enabled connector; every CLI call is additionally gated by bridge
- *     permissions.
+ *     enabled connector; actions use Orkas operation permissions independently
+ *     of native CLI approvals.
  *   - library — reuses the in-process Library tool's list/search/read actions,
  *     scoped to global + current project when the conversation belongs to a
  *     project.
  *   - chat_history — reuses the in-process conversation-history tool's
  *     search/read actions with a host-bound current-only scope and
  *     triggering-message bound.
+ *   - todo_tasks — paged backlog reads and task creation/updates for the host-bound project;
+ *     available only when the current conversation belongs to a project.
+ *   - memory.agent — reads and updates the calling Agent's durable memory;
+ *     uid and agentId are bound by the host and never accepted from the model.
  *   - commander.handoff — records one bounded, run-local request for the bus;
  *     it does not expose any Commander mutation or orchestration method.
  *
@@ -49,13 +53,44 @@ import { listSkillsForBridge, type BridgeSkillRow } from '../../model/core-agent
 import { readDisabledSets } from '../component_enabled';
 import { createLibraryTool } from '../../model/core-agent/kb-tools';
 import { createChatHistoryTool } from '../../model/core-agent/chat-history-tools';
+import * as projectTasks from '../project_tasks';
+import { projectExists, readProjectInstructions, writeProjectInstructionsIfUnchanged } from '../projects';
+import * as projectFiles from '../project_files';
+import * as memory from '../memory';
+import { getWorkspacePath } from '../user_workspace';
+import { isPathAllowed } from '../../util/path-sandbox';
+import { applyConnectorArgDefaults } from '../../model/core-agent/connector-meta-tools';
+import {
+  addAgentEntry,
+  listAgentEntries,
+  removeAgentEntry,
+  replaceAgentEntry,
+} from '../memory';
 import * as connectors from '../connectors';
-import * as bridgePermissions from './bridge_permissions';
+import { requestActionConfirm } from '../connectors/action_confirm';
+import { connectorActionRisk, isConnectorActionBlocked } from '../connectors/action_policy';
+import {
+  localCliSupportsAgentMemory,
+  type LocalCliPermissionPolicy,
+  type LocalCliType,
+} from './registry';
 
 const log = createLogger('local-agents:bridge');
 
 const MAX_LINE_BYTES = 1024 * 1024;
 const CONNECTOR_RESULT_CAP = 100_000;
+
+function _argumentsWithinBatchLimit(value: unknown, limit: number): boolean {
+  if (!Number.isInteger(limit) || limit < 1) return false;
+  if (Array.isArray(value)) {
+    return value.length <= limit && value.every((item) => _argumentsWithinBatchLimit(item, limit));
+  }
+  if (value && typeof value === 'object') {
+    return Object.values(value as Record<string, unknown>)
+      .every((item) => _argumentsWithinBatchLimit(item, limit));
+  }
+  return true;
+}
 
 function bridgeLogContext(opts: Pick<StartBridgeOpts, 'uid' | 'cid' | 'agentId' | 'projectId' | 'runId' | 'configDir'>, socketPath?: string): Record<string, unknown> {
   return {
@@ -96,6 +131,11 @@ export type BridgeCapability =
   | 'connectors'
   | 'kb.read'
   | 'chat.read'
+  | 'tasks.read'
+  | 'tasks.write'
+  | 'automation'
+  | 'memory.agent'
+  | 'project.context.write'
   | 'commander.handoff';
 
 export interface CommanderHandoffRequest {
@@ -108,11 +148,16 @@ export interface StartBridgeOpts {
   cid: string;
   agentId: string;
   agentName: string;
+  conversationTitle?: string;
+  cli: LocalCliType;
+  permissionPolicy: LocalCliPermissionPolicy;
   /** Inbound message that triggered this CLI run. Current history stops
    * strictly before it. */
   currentMessageId: string;
   /** Current conversation project, if any. Enables project + global Library tools. */
   projectId?: string;
+  /** Host-resolved CLI working directory; never supplied by an RPC caller. */
+  workingDir?: string;
   runId: string;
   /** Where to write the per-run mcp-config file (the persist run dir). */
   configDir: string;
@@ -121,6 +166,10 @@ export interface StartBridgeOpts {
    *  Electron-flavoured ORKAS_NODE with ORKAS_BUNDLED_NODE so headless helper
    *  launches never inherit the macOS GUI application identity. */
   sandboxEnv: Record<string, string>;
+  /** Keep the owning run visibly alive while a connector approval waits. */
+  onPermissionWaiting?: (elapsedMs: number) => void;
+  /** Suspend only the caller's idle clock while awaiting authorization. */
+  onPermissionWaitStart?: () => () => void;
   /** A resumed CLI may call a Skill id learned in an earlier turn before
    * invoking skills.list in this host. Prime display metadata only for that
    * path; fresh runs keep Skill discovery lazy. */
@@ -134,7 +183,12 @@ function _socketPath(runId: string): string {
   return path.join(os.tmpdir(), `orkas-bridge-${runId}.sock`);
 }
 
-type BridgeMethod = (params: Record<string, unknown>) => Promise<unknown>;
+/** `signal` aborts when the client withdrew this request (its own timeout or
+ *  an MCP cancellation) or asked `connectors.cancel` for it. */
+type BridgeMethod = (
+  params: Record<string, unknown>,
+  call: { signal: AbortSignal },
+) => Promise<unknown>;
 
 const BASE_CAPABILITIES: readonly BridgeCapability[] = [
   'skills.read',
@@ -144,11 +198,30 @@ const BASE_CAPABILITIES: readonly BridgeCapability[] = [
   'commander.handoff',
 ];
 
+type AgentMemoryAction = 'add' | 'replace' | 'remove' | 'list';
+
+const AGENT_MEMORY_ACTION_FIELDS: Readonly<Record<AgentMemoryAction, ReadonlySet<string>>> = {
+  add: new Set(['action', 'target', 'content']),
+  replace: new Set(['action', 'target', 'content', 'old_text']),
+  remove: new Set(['action', 'target', 'old_text']),
+  list: new Set(['action', 'target']),
+};
+
 async function _capabilitiesForRun(
   opts: StartBridgeOpts,
   recordConnectorDisplayName: (id: string, name: string) => void,
 ): Promise<BridgeCapability[]> {
+  // OpenCode only opts into current-project backlog reads and writes. Supporting
+  // MCP transport must not implicitly grant the broader Claude/Codex surface.
+  if (opts.cli === 'opencode') {
+    return opts.projectId && await projectExists(opts.uid, opts.projectId) ? ['tasks.read', 'tasks.write', 'automation'] : [];
+  }
   const capabilities = [...BASE_CAPABILITIES];
+  if (opts.projectId && await projectExists(opts.uid, opts.projectId)) {
+    capabilities.push('tasks.read', 'tasks.write', 'automation');
+    if (localCliSupportsAgentMemory(opts.cli)) capabilities.push('project.context.write');
+  }
+  if (localCliSupportsAgentMemory(opts.cli)) capabilities.push('memory.agent');
   try {
     // Match the ordinary gmember path in core-agent/runner: group-chat Agents
     // share the user's connected + enabled connector set.
@@ -285,35 +358,82 @@ function _buildMethods(
       };
     },
 
-    'connectors.call': async (params) => {
+    'connectors.call': async (params, call) => {
       const connectorId = String(params.connector_id || '');
       const toolName = String(params.tool_name || '');
-      const args = (params.args && typeof params.args === 'object') ? params.args as Record<string, unknown> : {};
+      const rawArgs = (params.args && typeof params.args === 'object') ? params.args as Record<string, unknown> : {};
       if (!connectorId || !toolName) throw new Error('connector_id and tool_name required');
+      // The client stops waiting on its own timeout or an MCP cancel. Once it
+      // has, no later user approval may run the side effect: the model has
+      // already been told the call failed and may have retried it.
+      const cancelled = () => new Error('E_BRIDGE_CALL_CANCELLED: the CLI stopped waiting for this connector call');
+      if (call.signal.aborted) throw cancelled();
       const visible = await connectors.resolveVisibleConnectors(opts.uid);
       for (const { instance } of visible) {
         recordConnectorDisplayName(instance.id, instance.display_name);
       }
       const target = visible.find((v) => v.instance.id === connectorId);
       if (!target) throw new Error(`connector not available: ${connectorId}`);
-      if (!target.tools.some((t) => t.name === toolName)) {
+      const tool = target.tools.find((item) => item.name === toolName);
+      if (!tool) {
         throw new Error(`tool not exposed by connector ${connectorId}: ${toolName}`);
       }
-
-      const allowed = await bridgePermissions.requestPermission({
-        uid: opts.uid,
-        cid: opts.cid,
-        agentId: opts.agentId,
-        agentName: opts.agentName,
+      if (isConnectorActionBlocked(connectorId, toolName)) {
+        throw new Error('E_CONNECTOR_ACTION_UNAVAILABLE: this action is not available in Orkas');
+      }
+      // Same normalisation as the in-process `call_connector_tool` (camelCase
+      // keys, Gmail defaults): an external CLI must not reach the provider with
+      // a different request shape than a built-in Agent for the same action.
+      const args = applyConnectorArgDefaults(
         connectorId,
-        connectorName: target.instance.display_name,
         toolName,
-      });
-      if (!allowed) {
-        throw new Error('E_BRIDGE_PERMISSION_DENIED: the user declined this connector call');
+        rawArgs,
+        (tool.input_schema && typeof tool.input_schema === 'object')
+          ? tool.input_schema as Record<string, unknown>
+          : undefined,
+      );
+      const policy = tool.orkas_action_policy;
+      const isComposioCommerce = !!target.instance.composio_grant
+        && connectors.findCatalogEntry(connectorId)?.category === 'commerce';
+      if (isComposioCommerce && !policy) {
+        throw new Error('E_CONNECTOR_POLICY_MISSING: this commerce action has no trusted policy');
+      }
+      if (policy && !_argumentsWithinBatchLimit(args, policy.max_batch_size)) {
+        throw new Error(`E_CONNECTOR_BATCH_LIMIT: at most ${policy.max_batch_size} items are allowed in any array argument`);
       }
 
-      const raw = await connectors.callTool(opts.uid, connectorId, toolName, args);
+      if (call.signal.aborted) throw cancelled();
+      const actionRisk = connectorActionRisk(target.instance, tool);
+      if (actionRisk.risk === 'H' || actionRisk.risk === 'D') {
+        const resumeIdle = opts.onPermissionWaitStart?.();
+        let approved: boolean;
+        try {
+          approved = await requestActionConfirm({
+            userId: opts.uid,
+            cid: opts.cid,
+            connectorId,
+            displayName: target.instance.display_name,
+            accountLabel: target.instance.composio_grant?.account_label
+              || target.instance.oauth_grant?.account_label,
+            toolName,
+            risk: actionRisk.risk,
+            sensitiveOperation: actionRisk.sensitive_operation,
+            args,
+            signal: call.signal,
+            onWaiting: opts.onPermissionWaiting,
+          });
+        } finally {
+          resumeIdle?.();
+        }
+        if (call.signal.aborted) throw cancelled();
+        if (!approved) {
+          throw new Error('E_CONNECTOR_CONFIRMATION_DENIED: the user declined this sensitive connector action');
+        }
+      }
+
+      const raw = await connectors.callTool(opts.uid, connectorId, toolName, args, {
+        signal: call.signal,
+      });
       const text = connectors.stringifyMcpResult(raw);
       const capped = text.length > CONNECTOR_RESULT_CAP
         ? `${text.slice(0, CONNECTOR_RESULT_CAP)}\n… [truncated by orkas-bridge at ${CONNECTOR_RESULT_CAP} chars]`
@@ -329,6 +449,154 @@ function _buildMethods(
   if (capabilities.has('chat.read')) Object.assign(methods, {
     chat_history: async (params) => runReadTool('chat_history', params),
   });
+
+  if (capabilities.has('automation') && opts.projectId) Object.assign(methods, {
+    auto_tasks: async (params) => {
+      const { createAutoTasksTool } = await import('../auto_tasks_tool');
+      const result = await createAutoTasksTool({ userId: opts.uid, cid: opts.cid, projectId: opts.projectId }).execute(params, { state: {} });
+      const receipt = JSON.parse(result.content);
+      if (result.isError) throw new Error(receipt.error || 'automation operation failed');
+      return receipt;
+    },
+  });
+
+  if (capabilities.has('tasks.read') && opts.projectId) Object.assign(methods, {
+    todo_tasks: async (params) => {
+      if (!(await projectExists(opts.uid, opts.projectId!))) throw new Error('project_not_found');
+      if (params.action !== 'list') {
+        if (!capabilities.has('tasks.write')) throw new Error('the backlog is read-only');
+        // Reuse the same validation, owner resolution, and conversation association as in-process Agents.
+        const { createProjectTasksTool } = await import('../../../core-agent/src/tools/project-tasks-tool');
+        const { createProjectTasksHandler } = await import('../project_tasks_tool_handler');
+        const names = new Map<string, string>();
+        if (typeof params.owner === 'string' && params.owner.trim()) {
+          const { getActiveUserId } = await import('../users');
+          if (getActiveUserId() !== opts.uid) throw new Error('account_changed');
+          const { listAgentSummaries } = await import('../agents');
+          const agents = await listAgentSummaries();
+          if (getActiveUserId() !== opts.uid) throw new Error('account_changed');
+          for (const agent of agents) names.set(agent.agent_id, agent.name || agent.agent_id);
+        }
+        const tool = createProjectTasksTool(createProjectTasksHandler(opts.uid, opts.projectId!, opts.cid, names, {
+          actorId: opts.agentId,
+        }));
+        const result = await tool.execute(params, { state: {} });
+        const receipt = JSON.parse(result.content);
+        if (result.isError) throw new Error(receipt.error || 'task update failed');
+        return receipt;
+      }
+      if (Object.keys(params).some((key) => !['action', 'offset', 'limit'].includes(key))) {
+        throw new Error('list accepts only action, offset, limit; the project is bound to this conversation');
+      }
+      const offset = params.offset ?? 0;
+      const limit = params.limit ?? 20;
+      if (!Number.isSafeInteger(offset) || (offset as number) < 0) throw new Error('offset must be a nonnegative integer');
+      if (!Number.isSafeInteger(limit) || (limit as number) < 1 || (limit as number) > 50) throw new Error('limit must be an integer from 1 to 50');
+      const tasks = await projectTasks.listTasks(opts.uid, opts.projectId!);
+      const { backlogExecutionSnapshot } = await import('../group_chat/task_board');
+      const executions = backlogExecutionSnapshot(opts.uid, opts.projectId!, opts.cid, {
+        actorId: opts.agentId,
+      });
+      const page: ReturnType<typeof projectTasks.taskView>[] = [];
+      let bytes = 0;
+      for (const task of tasks.slice(offset as number, (offset as number) + (limit as number))) {
+        const view = {
+          ...projectTasks.taskView(task),
+          ...(executions.get(task.id) || { is_running: null, is_current_run: false }),
+        };
+        const size = Buffer.byteLength(JSON.stringify(view), 'utf8');
+        if (bytes + size > 32_000) {
+          if (!page.length) throw new Error('task record exceeds the read limit');
+          break;
+        }
+        page.push(view);
+        bytes += size;
+      }
+      const next = (offset as number) + page.length;
+      return {
+        ok: true, tasks: page, progress: projectTasks.computeProgress(tasks),
+        next_offset: next < tasks.length ? next : null,
+      };
+    },
+  });
+
+  if (capabilities.has('memory.agent')) Object.assign(methods, {
+    'memory.agent': async (params) => {
+      const action = String(params.action || '') as AgentMemoryAction;
+      const allowedFields = AGENT_MEMORY_ACTION_FIELDS[action];
+      if (!allowedFields) throw new Error('action must be one of: add, replace, remove, list');
+      const unrelated = Object.keys(params).filter((key) => !allowedFields.has(key));
+      if (unrelated.length) {
+        throw new Error(`fields not allowed for ${action}: ${unrelated.sort().join(', ')}`);
+      }
+      const target = params.target === undefined ? 'agent' : String(params.target);
+      if (target === 'project' && capabilities.has('project.context.write') && opts.projectId) {
+        if (!(await projectExists(opts.uid, opts.projectId))) throw new Error('project_not_found');
+        const scope = { project: opts.projectId };
+        switch (action) {
+          case 'add': return memory.addEntry(opts.uid, scope, String(params.content || ''));
+          case 'replace': return memory.replaceEntry(opts.uid, scope, String(params.old_text || ''), String(params.content || ''));
+          case 'remove': return memory.removeEntry(opts.uid, scope, String(params.old_text || ''));
+          case 'list': return memory.listEntries(opts.uid, scope);
+        }
+      }
+      if (target !== 'agent') throw new Error('target must be "agent" for an external CLI Agent');
+
+      switch (action) {
+        case 'add':
+          return addAgentEntry(opts.uid, opts.agentId, String(params.content || ''));
+        case 'replace':
+          return replaceAgentEntry(
+            opts.uid,
+            opts.agentId,
+            String(params.old_text || ''),
+            String(params.content || ''),
+          );
+        case 'remove':
+          return removeAgentEntry(opts.uid, opts.agentId, String(params.old_text || ''));
+        case 'list':
+          return listAgentEntries(opts.uid, opts.agentId);
+      }
+    },
+  });
+
+  if (capabilities.has('project.context.write') && opts.projectId) {
+    const pid = opts.projectId;
+    let instructionsSnapshot = readProjectInstructions(opts.uid, pid);
+    const workspace = opts.workingDir || getWorkspacePath(opts.uid, pid);
+    Object.assign(methods, {
+      project_instructions: async (params: Record<string, unknown>) => {
+        if (Object.keys(params).some((key) => key !== 'instructions')
+            || typeof params.instructions !== 'string' || !params.instructions.trim()) throw new Error('instructions is required; no scope overrides are accepted');
+        const previous = await instructionsSnapshot;
+        if (!previous.ok) return previous;
+        const result = await writeProjectInstructionsIfUnchanged(opts.uid, pid, previous.content, params.instructions);
+        if (result.ok) instructionsSnapshot = Promise.resolve({ ...previous, content: params.instructions });
+        return result;
+      },
+      library_save: async (params: Record<string, unknown>) => {
+        if (Object.keys(params).some((key) => !['source_path', 'name', 'action', 'expected_revision'].includes(key))
+            || typeof params.source_path !== 'string' || !params.source_path.trim()
+            || (params.action !== undefined && params.action !== 'save' && params.action !== 'checkout')
+            || (params.expected_revision !== undefined && (typeof params.expected_revision !== 'string' || !params.expected_revision))) throw new Error('invalid library_save fields');
+        const source = path.resolve(workspace, params.source_path.trim());
+        if (!isPathAllowed(source, [workspace])) throw new Error('source_path must be inside the current workspace');
+        const name = typeof params.name === 'string' ? params.name.trim() : '';
+        const target = name || path.basename(source);
+        if (params.action === 'checkout') {
+          if (!name || params.expected_revision !== undefined) throw new Error('checkout requires name and does not accept expected_revision');
+          const result = await projectFiles.checkoutProjectFile(opts.uid, pid, name, source);
+          return result.ok ? { ...result, path: result.name } : result;
+        }
+        if (params.expected_revision !== undefined) {
+          const result = await projectFiles.replaceProjectFileFromPath(opts.uid, pid, source, target, params.expected_revision as string);
+          return result.ok ? { ...result, path: result.name } : result;
+        }
+        const result = await projectFiles.copyProjectEntryFromPath(opts.uid, pid, source, target);
+        return result.ok ? { ok: true, path: result.name, bytes: result.bytes } : result;
+      },
+    });
+  }
 
   if (capabilities.has('commander.handoff')) Object.assign(methods, {
     'commander.handoff': async (params) => {
@@ -389,7 +657,7 @@ export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> 
     },
     recordConnectorDisplayName,
   );
-  if (opts.preloadSkillDisplayNames) {
+  if (opts.preloadSkillDisplayNames && capabilitySet.has('skills.read')) {
     try {
       // Prime the same scoped registry before the resumed backend starts so
       // its first Skill event has a stable display name. A failed scan leaves
@@ -404,9 +672,26 @@ export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> 
   }
 
   const sockets = new Set<net.Socket>();
+  // Cancellation is scoped to the socket that made the call: request ids are
+  // only unique per client process.
+  const inflight = new WeakMap<net.Socket, Map<string | number, AbortController>>();
+  const inflightFor = (socket: net.Socket): Map<string | number, AbortController> => {
+    let calls = inflight.get(socket);
+    if (!calls) {
+      calls = new Map();
+      inflight.set(socket, calls);
+    }
+    return calls;
+  };
   const server = net.createServer((socket) => {
     sockets.add(socket);
-    socket.on('close', () => sockets.delete(socket));
+    socket.on('close', () => {
+      sockets.delete(socket);
+      // A client that died mid-wait can no longer receive the result, so a
+      // pending approval must not run its side effect either.
+      for (const controller of inflightFor(socket).values()) controller.abort();
+      inflight.delete(socket);
+    });
     socket.setEncoding('utf8');
     let buf = '';
     socket.on('data', (chunk: string) => {
@@ -440,16 +725,32 @@ export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> 
       return;
     }
     const method = typeof req.method === 'string' ? req.method : '';
-    const handler = methods[method];
+    const params = (req.params && typeof req.params === 'object') ? req.params as Record<string, unknown> : {};
     let payload: string;
+    if (method === 'connectors.cancel') {
+      // Not a registered capability method: it only withdraws this socket's
+      // own pending call, so it needs no visibility of its own.
+      const callId = typeof params.call_id === 'string' || typeof params.call_id === 'number' ? params.call_id : null;
+      const controller = callId === null ? undefined : inflightFor(socket).get(callId);
+      controller?.abort();
+      payload = JSON.stringify({ id, ok: true, result: { cancelled: !!controller } });
+      try { socket.write(payload + '\n'); } catch { /* gone */ }
+      return;
+    }
+    const handler = methods[method];
     if (!handler) {
       payload = JSON.stringify({ id, ok: false, error: `unknown method: ${method}` });
     } else {
+      const controller = new AbortController();
+      const calls = inflightFor(socket);
+      if (id !== null) calls.set(id, controller);
       try {
-        const result = await handler((req.params && typeof req.params === 'object') ? req.params as Record<string, unknown> : {});
+        const result = await handler(params, { signal: controller.signal });
         payload = JSON.stringify({ id, ok: true, result });
       } catch (err) {
         payload = JSON.stringify({ id, ok: false, error: (err as Error).message || String(err) });
+      } finally {
+        if (id !== null && calls.get(id) === controller) calls.delete(id);
       }
     }
     try { socket.write(payload + '\n'); } catch { /* gone */ }
@@ -528,7 +829,6 @@ export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> 
     getSkillDisplayName,
     getConnectorDisplayName: (id) => connectorDisplayNameById.get(String(id || '').trim()) || null,
     close: async () => {
-      bridgePermissions.cancelForCid(opts.cid);
       for (const s of sockets) { try { s.destroy(); } catch { /* gone */ } }
       await new Promise<void>((resolve) => server.close(() => resolve()));
       if (process.platform !== 'win32') {

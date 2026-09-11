@@ -6,7 +6,7 @@ import type {
   MessageContent,
 } from "../shared/types.js";
 import type { HistoryResource } from "./session.js";
-import type { CommandExecutionObservation } from "../tools/base.js";
+import type { CommandExecutionObservation, ToolObservations } from "../tools/base.js";
 
 /** A user-authored message admitted into an already-running AgentRunner.
  *
@@ -68,7 +68,7 @@ export type AgentRunParams = {
   /** Working directory for tool execution. */
   workingDir?: string;
   /** Thinking/reasoning level. */
-  thinkingLevel?: "off" | "low" | "high";
+  thinkingLevel?: "off" | "low" | "medium" | "high";
   /**
    * Env vars injected into the sandbox (bash tool) child process.
    * Surfaces as `ToolContext.state.sandboxEnv` and is consumed by
@@ -136,7 +136,8 @@ export type AgentRunTimings = {
 };
 
 /** Existing runner safeguards that had to intervene to make a run converge.
- * These are diagnostic signals only: they do not redefine task completion. */
+ * These remain diagnostics; `AgentRunMeta.termination` is the authoritative
+ * distinction between a completed run and a host-stopped run. */
 export type AgentRunConvergenceSignal =
   | "tool_loop_limit_nudge"
   | "elapsed_convergence_nudge"
@@ -145,10 +146,25 @@ export type AgentRunConvergenceSignal =
   | "discovery_stall_nudge"
   | "tool_loop_limit"
   | "repetitive_tool_calls"
+  | "repeated_tool_failure_nudge"
+  | "repeated_tool_failure_block"
   | "no_progress_stop"
   | "discovery_stall_stop"
   | "output_limit_continuation"
   | "output_limit_unrecovered";
+
+/** A host-owned boundary that paused or stopped execution without claiming completion. */
+export type AgentRunTermination = {
+  status: "stopped";
+  reason:
+    | "no_progress"
+    | "discovery_stall"
+    | "tool_loop_limit"
+    | "repetitive_tool_calls";
+} | {
+  status: "waiting_input";
+  reason: "user_action_required";
+};
 
 /** Metadata about an agent run. */
 export type AgentRunMeta = {
@@ -170,6 +186,8 @@ export type AgentRunMeta = {
   timings?: AgentRunTimings;
   /** Bounded, low-cardinality runner convergence interventions. */
   convergenceSignals?: AgentRunConvergenceSignal[];
+  /** Present only when the host stopped the run before normal completion. */
+  termination?: AgentRunTermination;
   /** Whether the run was aborted. */
   aborted?: boolean;
   /** Error info if the run failed. */
@@ -196,7 +214,15 @@ export type AgentRunMeta = {
 
 /** Events emitted during an agent run for streaming. */
 export type AgentRunEvent =
-  | { type: "text_delta"; text: string }
+  | {
+      type: "text_delta";
+      text: string;
+      /** User-visible assistant text channel. Providers with a native phase
+       * should preserve it; phase-less protocols are classified from the
+       * structured model-round/tool boundary by the host mapper. */
+      phase?: "commentary" | "final_answer";
+    }
+  | { type: "text_phase"; phase: "commentary" | "final_answer" }
   /** Reasoning-process signal. Progress `text` remains internal until the
    * main-process mapper sanitizes and bounds it for UI/persistence. */
   | { type: "thinking"; phase: "start" | "progress" | "end"; chars: number; text?: string }
@@ -223,6 +249,9 @@ export type AgentRunEvent =
       errorSeverity?: "recoverable" | "error";
       durationMs?: number;
       execution?: CommandExecutionObservation;
+      fileReadBatch?: ToolObservations["fileReadBatch"];
+      resultRetrievalBatch?: ToolObservations["resultRetrievalBatch"];
+      programExecution?: ToolObservations["programExecution"];
     }
   | { type: "compaction"; tokensBefore: number; tokensAfter: number; summary?: string; usage?: Usage; durationMs?: number }
   | {
@@ -237,6 +266,11 @@ export type AgentRunEvent =
        * Lets local eval distinguish a plan-only round from a final reply that
        * atomically closes the plan. */
       textChars?: number;
+      /** Privacy-safe reasoning transport evidence for this provider call. */
+      reasoningBoundary?: {
+        structured: boolean;
+        literalLeadingText: boolean;
+      };
       /** Request-local provider usage. The host may retain bounded per-round
        * evidence for Model Eval, but production telemetry remains aggregated. */
       usage?: Usage;

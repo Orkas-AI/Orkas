@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -217,6 +217,92 @@ describe("workspace_diff", () => {
       expect(diff).toContain("+export const value = 2;");
       expect(diff).toContain('stale="0"');
       expect(session.reconcileWorkspaceObservations()).toBeUndefined();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not re-read an unchanged tracked file on the next reconcile, but re-hashes once it changes", () => {
+    // Reconcile runs before every model call; re-reading and re-hashing every
+    // tracked file each time was the per-turn cost (H-6). Size+mtime decide
+    // whether the remembered hash is still current.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "orkas-workspace-memo-"));
+    try {
+      const filePath = path.join(dir, "tracked.ts");
+      const observed = "export const value = 1;\n";
+      const external = "export const value = 2;\n";
+      fs.writeFileSync(filePath, observed);
+      const hash = (body: string) =>
+        `sha256:${createHash("sha256").update(body).digest("hex")}`;
+      const session = new Session();
+      session.beginUserTurn([{ type: "text", text: "keep the file" }]);
+      session.recordToolObservations({
+        tool: "edit_file",
+        observations: {
+          fileChanges: [{
+            operation: "update", sourcePath: filePath, beforeExists: true, afterExists: true,
+            beforeHash: hash("x"), afterHash: hash(observed),
+            beforeBytes: 1, afterBytes: Buffer.byteLength(observed),
+            beforeContent: "x", afterContent: observed, coverage: "exact",
+          }],
+        },
+      });
+
+      expect(session.reconcileWorkspaceObservations()).toBeUndefined();
+      const readSpy = vi.spyOn(fs, "readFileSync");
+      try {
+        expect(session.reconcileWorkspaceObservations()).toBeUndefined();
+        expect(readSpy.mock.calls.filter(([target]) => String(target) === filePath)).toHaveLength(0);
+
+        // A content change with a new mtime/size is read and hashed again.
+        const later = new Date(Date.now() + 2_000);
+        fs.writeFileSync(filePath, external);
+        fs.utimesSync(filePath, later, later);
+        const reconciled = session.reconcileWorkspaceObservations();
+        expect(reconciled?.fileChanges?.[0]).toMatchObject({ afterHash: hash(external) });
+        expect(readSpy.mock.calls.filter(([target]) => String(target) === filePath)).toHaveLength(1);
+      } finally {
+        readSpy.mockRestore();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["overwrite", "replace"])("reconciles a same-size external %s that preserves mtime", async (operation) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "orkas-workspace-preserved-time-"));
+    try {
+      const filePath = path.join(dir, "tracked.txt");
+      const observed = "version one\n";
+      const external = "version two\n";
+      const fixedTime = new Date("2026-01-01T00:00:00Z");
+      const hash = (body: string) => `sha256:${createHash("sha256").update(body).digest("hex")}`;
+      fs.writeFileSync(filePath, observed);
+      fs.utimesSync(filePath, fixedTime, fixedTime);
+      const session = new Session();
+      session.beginUserTurn([{ type: "text", text: "inspect the file" }]);
+      session.recordToolObservations({
+        tool: "read_file", observations: { fileReads: [{ path: filePath, hash: hash(observed) }] },
+      });
+      expect(session.reconcileWorkspaceObservations()).toBeUndefined();
+      // Separate metadata changes even on filesystems with coarse timestamp precision.
+      await new Promise(resolve => setTimeout(resolve, 20));
+      const target = operation === "replace" ? path.join(dir, "replacement.txt") : filePath;
+      fs.writeFileSync(target, external);
+      fs.utimesSync(target, fixedTime, fixedTime);
+      if (operation === "replace") fs.renameSync(target, filePath);
+      expect(fs.statSync(filePath).size).toBe(Buffer.byteLength(observed));
+      expect(fs.statSync(filePath).mtimeMs).toBe(fixedTime.getTime());
+      expect(session.reconcileWorkspaceObservations()?.fileChanges?.[0]).toMatchObject({
+        beforeHash: hash(observed), afterHash: hash(external), afterContent: external, coverage: "exact",
+      });
+      const read = vi.spyOn(fs, "readFileSync");
+      try {
+        expect(session.reconcileWorkspaceObservations()).toBeUndefined();
+        expect(read.mock.calls.filter(([target]) => String(target) === filePath)).toHaveLength(0);
+      } finally {
+        read.mockRestore();
+      }
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

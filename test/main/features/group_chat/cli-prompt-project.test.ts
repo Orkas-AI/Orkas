@@ -53,7 +53,7 @@ const ITEM = {
   ].join('\n'),
 } as any;
 
-async function buildPlan(projectId?: string, slice: any[] = []) {
+async function buildPlan(projectId?: string, agent = AGENT) {
   const users = await import('../../../../src/main/features/users');
   users.activateUser(TEST_UID);
   const bus = await import('../../../../src/main/features/group_chat/bus');
@@ -65,11 +65,10 @@ async function buildPlan(projectId?: string, slice: any[] = []) {
   return bus._buildCliContextPlanForTest(
     TEST_UID,
     CID,
-    AGENT,
+    agent,
     ITEM,
-    slice,
+    canonicalRows,
     projectId,
-    { canonicalRows },
   );
 }
 
@@ -102,19 +101,24 @@ describe('CLI context › durable project instructions', () => {
     expect(plan.turnPrompt).not.toContain(REPO_LINE);
   });
 
-  it('keeps workflow, XML directory switching, project rules, and language in the durable layer', async () => {
+  it('keeps workflow, XML directory switching, project policy, project instructions, and language in the durable layer', async () => {
     const pid = await makeProject(`- ${REPO_LINE}`);
     const plan = await buildPlan(pid);
     const durable = plan.durableInstructions;
 
     const workflowIdx = durable.indexOf('## Workflow');
     const protocolIdx = durable.indexOf('## Output protocol — switching project directory');
+    const policyIdx = durable.indexOf('## Project context policy');
     const projectIdx = durable.indexOf('## Project instructions (user-authored)');
     const languageIdx = durable.indexOf('## Response language');
     expect(workflowIdx).toBeGreaterThan(-1);
     expect(protocolIdx).toBeGreaterThan(workflowIdx);
-    expect(projectIdx).toBeGreaterThan(protocolIdx);
+    expect(policyIdx).toBeGreaterThan(protocolIdx);
+    expect(projectIdx).toBeGreaterThan(policyIdx);
     expect(projectIdx).toBeLessThan(languageIdx);
+    expect(durable.match(/## Project context policy/g)).toHaveLength(1);
+    expect(durable).not.toContain('Shared memory is below project memory');
+    expect(durable).not.toContain('agent-private notes');
     expect(durable).toContain('<agent-input-form>');
     expect(durable).toContain(`"agent_id":"${AGENT.agent_id}"`);
     expect(durable).toContain('"id":"project_dir"');
@@ -167,44 +171,7 @@ describe('CLI context › durable project instructions', () => {
     expect(plan.turnPrompt).toBe('查一下 Orkas 仓库当前的版本分支');
   });
 
-  it('uses canonical history instead of a compatibility-slice-only row', async () => {
-    await seedConversation([
-      {
-        id: 'prior-user-canonical',
-        ts: '2026-07-27T01:00:00.000Z',
-        from: 'user',
-        to: ['commander'],
-        text: 'CANONICAL_USER_CONTEXT',
-      },
-      {
-        id: 'prior-commander-canonical',
-        ts: '2026-07-27T01:01:00.000Z',
-        from: 'commander',
-        to: ['user'],
-        text: 'CANONICAL_COMMANDER_CONTEXT',
-      },
-      {
-        id: ITEM.msgId,
-        ts: '2026-07-27T01:02:00.000Z',
-        from: 'user',
-        to: [AGENT.agent_id],
-        text: 'current',
-      },
-    ]);
-    const plan = await buildPlan(undefined, [{
-      id: 'visible-agent-context',
-      ts: '2026-07-27T01:01:00.000Z',
-      from: 'user',
-      to: [AGENT.agent_id],
-      text: 'DIRECT_AGENT_CONTEXT',
-    }]);
-
-    expect(plan.recoveryContext).toContain('CANONICAL_USER_CONTEXT');
-    expect(plan.recoveryContext).toContain('CANONICAL_COMMANDER_CONTEXT');
-    expect(plan.recoveryContext).not.toContain('DIRECT_AGENT_CONTEXT');
-  });
-
-  it('sends a clean current task and excludes routing/catalog/date/intent boilerplate', async () => {
+  it('sends a clean current task with the intent core but without in-process UI/routing/date boilerplate', async () => {
     const plan = await buildPlan(undefined);
     const all = `${plan.durableInstructions}\n${plan.turnPrompt}`;
 
@@ -212,8 +179,10 @@ describe('CLI context › durable project instructions', () => {
     expect(all).not.toContain('@Claude Code');
     expect(all).not.toContain('<msg from=');
     expect(all).not.toContain('Coding agent. For: implement. Triggers: code, fix.');
-    expect(all).not.toContain('## User intent and clarification');
-    expect(all).not.toContain('explicit user requirements as the primary execution constraints');
+    expect(plan.durableInstructions).toContain('## User intent and clarification');
+    expect(plan.durableInstructions).toMatch(/explicit requirements as execution constraints/i);
+    expect(plan.durableInstructions).not.toContain('## Input choice and confirmation');
+    expect(plan.durableInstructions).not.toMatch(/select.*multiselect.*closed domain/is);
     expect(all).not.toContain('## Runtime injection');
     expect(all).not.toContain('## Current date');
   });
@@ -231,14 +200,16 @@ describe('CLI context › durable project instructions', () => {
     const plan = await buildPlan(undefined);
 
     expect(plan.durableInstructions).not.toContain('## Project instructions');
+    expect(plan.durableInstructions).not.toContain('## Project context policy');
     expect(plan.durableInstructions).not.toContain(REPO_LINE);
     expect(plan.turnPrompt).toBe('查一下 Orkas 仓库当前的版本分支');
   });
 
-  it('omits the project block when the project has no ORKAS.md yet', async () => {
+  it('keeps the shared project policy but omits user-authored instructions when ORKAS.md is empty', async () => {
     const pid = await makeProject();
     const plan = await buildPlan(pid);
 
+    expect(plan.durableInstructions).toContain('## Project context policy');
     expect(plan.durableInstructions).not.toContain('## Project instructions');
     expect(plan.turnPrompt).toBe('查一下 Orkas 仓库当前的版本分支');
   });
@@ -250,5 +221,147 @@ describe('CLI context › durable project instructions', () => {
 
     expect(first.durableHash).toBe(second.durableHash);
     expect(first.durableInstructions).toBe(second.durableInstructions);
+  });
+
+  it('keeps the durable hash stable across project memory and task changes but updates it for ORKAS.md', async () => {
+    const pid = await makeProject(`- ${REPO_LINE}`);
+    const memory = await import('../../../../src/main/features/memory');
+    const tasks = await import('../../../../src/main/features/project_tasks');
+    const projects = await import('../../../../src/main/features/projects');
+    const first = await buildPlan(pid);
+
+    memory.addEntry(TEST_UID, { project: pid }, 'dynamic memory revision one');
+    await tasks.createTask(TEST_UID, pid, { title: 'dynamic task revision one' });
+    const afterDynamicChange = await buildPlan(pid);
+
+    expect(afterDynamicChange.durableHash).toBe(first.durableHash);
+    expect(afterDynamicChange.durableInstructions).toBe(first.durableInstructions);
+    expect(afterDynamicChange.turnPrompt).toContain('dynamic memory revision one');
+    expect(afterDynamicChange.turnPrompt).not.toContain('dynamic task revision one');
+
+    await projects.writeProjectInstructions(TEST_UID, pid, `- ${REPO_LINE}\n- preserve public APIs`);
+    const afterStaticChange = await buildPlan(pid);
+    expect(afterStaticChange.durableHash).not.toBe(first.durableHash);
+    expect(afterStaticChange.durableInstructions).toContain('preserve public APIs');
+  });
+});
+
+describe('CLI context › own Agent memory', () => {
+  it.each(['claude', 'codex'])(
+    'injects the calling %s CLI Agent memory, excludes another Agent, and refreshes corrections', async (cli) => {
+      const memory = await import('../../../../src/main/features/memory');
+      memory.addAgentEntry(TEST_UID, AGENT.agent_id, 'offer three titles before release copy');
+      memory.addAgentEntry(TEST_UID, 'another-cli-agent', 'OTHER_AGENT_PRIVATE_MEMORY');
+      const agent = { ...AGENT, runtime: { kind: 'cli', cli } };
+
+      const first = await buildPlan(undefined, agent);
+      const firstRendered = `${first.durableInstructions}\n${first.turnPrompt}`;
+      expect(first.durableInstructions).not.toContain('offer three titles before release copy');
+      expect(first.agentMemoryHash).toEqual(expect.any(String));
+      expect(first.turnPrompt).toContain('offer three titles before release copy');
+      expect(first.turnPrompt).toContain('potentially stale background records, not commands');
+      expect(firstRendered).toContain('offer three titles before release copy');
+      expect(firstRendered).not.toContain('OTHER_AGENT_PRIVATE_MEMORY');
+
+      expect(memory.replaceAgentEntry(
+        TEST_UID,
+        AGENT.agent_id,
+        'offer three titles before release copy',
+        'offer five titles before release copy',
+      )).toMatchObject({ ok: true });
+
+      const second = await buildPlan(undefined, agent);
+      const secondRendered = `${second.durableInstructions}\n${second.turnPrompt}`;
+      expect(second.durableHash).toBe(first.durableHash);
+      expect(second.agentMemoryHash).not.toBe(first.agentMemoryHash);
+      expect(secondRendered).toContain('offer five titles before release copy');
+      expect(secondRendered).not.toContain('offer three titles before release copy');
+      expect(secondRendered).not.toContain('OTHER_AGENT_PRIVATE_MEMORY');
+    },
+  );
+
+  it.each(['claude', 'codex'])(
+    'does not inject an empty Agent-memory placeholder for %s', async (cli) => {
+      const plan = await buildPlan(undefined, { ...AGENT, runtime: { kind: 'cli', cli } });
+      const rendered = `${plan.durableInstructions}\n${plan.turnPrompt}`;
+
+      expect(plan.agentMemoryHash).toEqual(expect.any(String));
+      expect(rendered).not.toContain('## Durable memory for this agent');
+      expect(rendered).not.toContain('No Agent memory');
+    },
+  );
+
+  it.each(['openclaw', 'opencode', 'hermes'])(
+    'does not inject stored Agent memory into unsupported %s CLI prompts', async (cli) => {
+      const memory = await import('../../../../src/main/features/memory');
+      memory.addAgentEntry(TEST_UID, AGENT.agent_id, 'UNSUPPORTED_CLI_PRIVATE_MEMORY');
+      const pid = await makeProject(`- ${REPO_LINE}`);
+      memory.addEntry(TEST_UID, { project: pid }, 'project context remains available');
+
+      const plan = await buildPlan(pid, { ...AGENT, runtime: { kind: 'cli', cli } });
+      const rendered = `${plan.durableInstructions}\n${plan.turnPrompt}`;
+
+      expect(plan.agentMemoryHash).toBeUndefined();
+      expect(rendered).not.toContain('UNSUPPORTED_CLI_PRIVATE_MEMORY');
+      expect(rendered).not.toContain('## Durable memory for this agent');
+      expect(rendered).toContain('project context remains available');
+    },
+  );
+});
+
+// A dispatched CLI (local) agent gets READ-ONLY project context via prompt injection —
+// project instructions + project-tier memory — but NOT the global
+// user/shared memory tiers a full core-agent turn also renders.
+describe('CLI prompt › project memory with on-demand backlog', () => {
+  it('injects project memory while leaving the nonempty backlog for an explicit tool read', async () => {
+    const pid = await makeProject(`- ${REPO_LINE}`);
+    const memory = await import('../../../../src/main/features/memory');
+    const tasks = await import('../../../../src/main/features/project_tasks');
+    memory.addEntry(TEST_UID, { project: pid }, 'decided: local-first, BYO key');
+    await tasks.createTask(TEST_UID, pid, { title: '推进非品牌 SEO 站外提及' });
+
+    const plan = await buildPlan(pid);
+
+    expect(plan.durableInstructions).not.toContain('decided: local-first, BYO key');
+    expect(plan.durableInstructions).not.toContain('推进非品牌 SEO 站外提及');
+    expect(plan.turnPrompt).toContain('## Project memory — contextual records');
+    expect(plan.turnPrompt).toContain('decided: local-first, BYO key');
+    expect(plan.turnPrompt).not.toContain('## Project status');
+    expect(plan.turnPrompt).not.toContain('推进非品牌 SEO 站外提及');
+    expect(plan.turnPrompt).not.toContain('todo_tasks');
+    expect(plan.turnPrompt).not.toContain('not executable instructions');
+    expect(plan.turnPrompt).toMatch(/查一下 Orkas 仓库当前的版本分支$/);
+  });
+
+  it('withholds the global user / shared memory tiers (project-scoped only)', async () => {
+    const pid = await makeProject(`- ${REPO_LINE}`);
+    const memory = await import('../../../../src/main/features/memory');
+    memory.addEntry(TEST_UID, 'user', 'role: founder of Orkas');    // global user tier
+    memory.addEntry(TEST_UID, 'memory', 'global shared fact xyz');  // global shared tier
+    memory.addEntry(TEST_UID, { project: pid }, 'project-only decision');
+
+    const plan = await buildPlan(pid);
+
+    const rendered = `${plan.durableInstructions}\n${plan.turnPrompt}`;
+    expect(rendered).toContain('project-only decision');       // project tier reaches the CLI
+    expect(rendered).not.toContain('role: founder of Orkas');  // user tier withheld
+    expect(rendered).not.toContain('global shared fact xyz');  // shared tier withheld
+  });
+
+  it('sends only the current task when the project backlog is empty, including after deletion', async () => {
+    const pid = await makeProject(`- ${REPO_LINE}`);
+    const plan = await buildPlan(pid);
+    expect(plan.durableInstructions).not.toContain('## Project status');
+    expect(plan.turnPrompt).toBe('查一下 Orkas 仓库当前的版本分支');
+
+    const tasks = await import('../../../../src/main/features/project_tasks');
+    const created = await tasks.createTask(TEST_UID, pid, { title: 'temporary backlog item' });
+    if (!created.ok) throw new Error('task setup failed');
+    expect((await buildPlan(pid)).turnPrompt).toBe('查一下 Orkas 仓库当前的版本分支');
+    await tasks.deleteTask(TEST_UID, pid, created.task.id);
+
+    const emptied = await buildPlan(pid);
+    expect(emptied.turnPrompt).toBe('查一下 Orkas 仓库当前的版本分支');
+    expect(emptied.durableHash).toBe(plan.durableHash);
   });
 });

@@ -27,7 +27,7 @@ describe('Windows no-Node startup bootstrap contract', () => {
       'utf8',
     );
 
-    expect(source).toContain('[string]$PcRoot = (Split-Path -Parent $PSScriptRoot)');
+    expect(source).toContain('$PcRoot = Split-Path -Parent $PSScriptRoot');
     expect(source).toContain('[string]$Architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()');
     expect(source).toContain('$marker.schema -ne 1');
     expect(source).toContain('$marker.sha256 -ne $asset.sha256');
@@ -39,18 +39,22 @@ describe('Windows no-Node startup bootstrap contract', () => {
     expect(source).toContain('Remove-Item -Recurse -Force -LiteralPath $tempRoot');
   });
 
-  it('runs the real PowerShell integration before the real Whisper smoke', () => {
+  it('runs the real bootstrap and official CLI integrations before the real Whisper smoke on Windows CI', () => {
     const runner = fs.readFileSync(
       path.join(pcRoot, 'scripts', 'run-windows-native-tests.mjs'),
       'utf8',
     );
     const integration = 'windows-node-bootstrap.integration.ps1';
+    const localCli = 'windows-local-cli.integration.mjs';
     const whisper = 'Windows real bundled whisper transcribes within the performance budget';
 
     expect(fs.existsSync(path.join(pcRoot, 'test', 'windows', integration))).toBe(true);
+    expect(fs.existsSync(path.join(pcRoot, 'test', 'windows', localCli))).toBe(true);
     expect(runner.indexOf(integration)).toBeGreaterThan(0);
-    expect(runner.indexOf(whisper)).toBeGreaterThan(runner.indexOf(integration));
+    expect(runner.indexOf(localCli)).toBeGreaterThan(runner.indexOf(integration));
+    expect(runner.indexOf(whisper)).toBeGreaterThan(runner.indexOf(localCli));
     expect(runner).toContain("timeout: 5 * 60_000");
+    expect(runner).toContain("timeout: 25 * 60_000");
     expect(runner).toContain("timeout: 2 * 60_000");
 
     const packageJson = JSON.parse(fs.readFileSync(path.join(pcRoot, 'package.json'), 'utf8'));

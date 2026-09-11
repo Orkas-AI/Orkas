@@ -532,6 +532,21 @@ export interface GoogleConnectorsConfig {
   gmail: ConnectorSwitchState;
 }
 
+export interface ServerComposioToolConfig {
+  slug: string;
+  name?: string;
+  description?: string;
+  input_schema?: Record<string, unknown>;
+  policy?: {
+    risk: 'R' | 'W' | 'H' | 'D';
+    confirmation: 'none' | 'preview' | 'fresh' | 'destructive';
+    idempotency: 'required' | 'when_supported' | 'not_applicable';
+    max_batch_size: number;
+    sensitive_fields: string[];
+    sensitive_operation?: string;
+  };
+}
+
 export interface ServerComposioConnectorConfig {
   id: string;
   display_name: string;
@@ -546,12 +561,7 @@ export interface ServerComposioConnectorConfig {
   composio: {
     toolkit: string;
     auth_config_id: string;
-    tools?: Array<{
-      slug: string;
-      name?: string;
-      description?: string;
-      input_schema?: Record<string, unknown>;
-    }>;
+    tools?: ServerComposioToolConfig[];
   };
   transport_template: null;
   usage_metering: { provider: 'composio'; credits_milli_per_call: number };
@@ -808,6 +818,53 @@ const CONNECTOR_CATEGORIES = new Set([
   'developer', 'productivity', 'communication', 'search', 'data', 'commerce',
 ]);
 
+function normalizeComposioToolConfig(raw: unknown): ServerComposioToolConfig | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const slug = typeof r.slug === 'string' ? r.slug.trim() : '';
+  if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(slug)) return null;
+  const name = typeof r.name === 'string' && r.name.trim() ? r.name.trim() : undefined;
+  const description = typeof r.description === 'string' && r.description.trim() ? r.description.trim() : undefined;
+  const inputSchema = r.input_schema && typeof r.input_schema === 'object' && !Array.isArray(r.input_schema)
+    ? r.input_schema as Record<string, unknown>
+    : undefined;
+  const rawPolicy = r.policy && typeof r.policy === 'object' && !Array.isArray(r.policy)
+    ? r.policy as Record<string, unknown>
+    : null;
+  const risk = String(rawPolicy?.risk || '') as 'R' | 'W' | 'H' | 'D';
+  const confirmation = String(rawPolicy?.confirmation || '') as 'none' | 'preview' | 'fresh' | 'destructive';
+  const idempotency = String(rawPolicy?.idempotency || '') as 'required' | 'when_supported' | 'not_applicable';
+  const sensitiveFields = Array.isArray(rawPolicy?.sensitive_fields)
+    ? rawPolicy.sensitive_fields.filter((field): field is string => typeof field === 'string' && !!field.trim())
+    : [];
+  const hasPolicy = !!rawPolicy
+    && ['R', 'W', 'H', 'D'].includes(risk)
+    && ['none', 'preview', 'fresh', 'destructive'].includes(confirmation)
+    && ['required', 'when_supported', 'not_applicable'].includes(idempotency)
+    && typeof rawPolicy.max_batch_size === 'number'
+    && Number.isInteger(rawPolicy.max_batch_size)
+    && rawPolicy.max_batch_size > 0
+    && sensitiveFields.length === (Array.isArray(rawPolicy.sensitive_fields) ? rawPolicy.sensitive_fields.length : -1);
+  return {
+    slug,
+    ...(name ? { name } : {}),
+    ...(description ? { description } : {}),
+    ...(inputSchema ? { input_schema: inputSchema } : {}),
+    ...(hasPolicy ? {
+      policy: {
+        risk,
+        confirmation,
+        idempotency,
+        max_batch_size: rawPolicy!.max_batch_size as number,
+        sensitive_fields: sensitiveFields.map((field) => field.trim()),
+        ...(typeof rawPolicy?.sensitive_operation === 'string' && rawPolicy.sensitive_operation.trim()
+          ? { sensitive_operation: rawPolicy.sensitive_operation.trim() }
+          : {}),
+      },
+    } : {}),
+  };
+}
+
 function normalizeServerComposioConnector(raw: unknown): ServerComposioConnectorConfig | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const value = raw as Record<string, unknown>;
@@ -820,27 +877,13 @@ function normalizeServerComposioConnector(raw: unknown): ServerComposioConnector
     : value;
   const toolkit = typeof composio.toolkit === 'string' ? composio.toolkit.trim().toLowerCase() : '';
   const authConfigId = typeof composio.auth_config_id === 'string' ? composio.auth_config_id.trim() : '';
-  if (!/^[a-z0-9][a-z0-9_-]{0,80}$/.test(toolkit) || !/^ac_[A-Za-z0-9_-]{6,}$/.test(authConfigId)) {
-    return null;
-  }
-  const tools = Array.isArray(composio.tools)
-    ? composio.tools.flatMap((item) => {
-        if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
-        const tool = item as Record<string, unknown>;
-        const slug = typeof tool.slug === 'string' ? tool.slug.trim() : '';
-        if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(slug)) return [];
-        return [{
-          slug,
-          ...(typeof tool.name === 'string' && tool.name.trim() ? { name: tool.name.trim() } : {}),
-          ...(typeof tool.description === 'string' && tool.description.trim()
-            ? { description: tool.description.trim() }
-            : {}),
-          ...(tool.input_schema && typeof tool.input_schema === 'object' && !Array.isArray(tool.input_schema)
-            ? { input_schema: tool.input_schema as Record<string, unknown> }
-            : {}),
-        }];
-      })
-    : [];
+  if (!/^[a-z0-9][a-z0-9_-]{0,80}$/.test(toolkit) || !/^ac_[A-Za-z0-9_-]{6,}$/.test(authConfigId)) return null;
+  const metering = value.usage_metering as Record<string, unknown> | null | undefined;
+  const tariff = metering?.provider === 'composio' ? metering.credits_milli_per_call : undefined;
+  const toolsRaw = Array.isArray(composio.tools) ? composio.tools : [];
+  const tools = toolsRaw
+    .map((tool) => normalizeComposioToolConfig(tool))
+    .filter((tool): tool is ServerComposioToolConfig => !!tool);
   return {
     id,
     display_name: typeof value.display_name === 'string' && value.display_name.trim()
@@ -856,7 +899,11 @@ function normalizeServerComposioConnector(raw: unknown): ServerComposioConnector
     auth_mode: 'composio',
     composio: { toolkit, auth_config_id: authConfigId, ...(tools.length ? { tools } : {}) },
     transport_template: null,
-    usage_metering: { provider: 'composio', credits_milli_per_call: 250 },
+    usage_metering: {
+      provider: 'composio',
+      credits_milli_per_call: typeof tariff === 'number' && Number.isSafeInteger(tariff) && tariff > 0
+        ? tariff : 420,
+    },
   };
 }
 

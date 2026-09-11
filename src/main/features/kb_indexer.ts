@@ -20,11 +20,8 @@ import {
   type CorpusReconcileResult,
   type CorpusStatusEvent,
   type LibraryCorpus,
-  EMBED_MAX_CHARS,
-  EMBED_OVERLAP,
 } from './library_corpus';
 
-export { EMBED_MAX_CHARS, EMBED_OVERLAP };
 
 export type KbEventType = 'pending' | 'processing' | 'ready' | 'failed' | 'deleted';
 
@@ -40,7 +37,6 @@ export interface KbStatusEvent {
   kind?: kb.KbKind;
   stage?: 'queue' | 'extract' | 'embed' | 'persist' | 'reconcile';
   errorCode?: string;
-  recovered?: boolean;
 }
 
 export type ReconcileResult = CorpusReconcileResult;

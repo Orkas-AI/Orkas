@@ -24,9 +24,9 @@ vi.mock('../../../src/main/logger', () => ({
   createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
 }));
 
+import { officeFileToPreviewHtml } from '../../../src/main/features/office/office_preview_layout';
 import {
   activePresentationSlideIndex,
-  officeFileToPreviewHtml,
   type OfficePreviewKind,
 } from '../../../src/main/util/office-preview';
 

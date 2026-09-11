@@ -1,19 +1,15 @@
 /**
  * Shared classifier for "transient network-class error" vs everything else.
  *
- * Two consumers as of 2026-05-20:
- *   - `features/group_chat/plan_executor.ts::maybeRetryTransient` — caps
- *     plan-step retries to network blips, NEVER retries permanent errors
- *     (would mask config / spec / sandbox issues + send the user-facing
- *     failure bubble into a silent retry loop).
+ * Consumer:
  *   - `features/expert_signals/turn_hooks.ts::SkillTurnBuffer.drainAndEmit`
  *     — `skill_ineffective` is only emitted when a turn's errText is
  *     non-transient, so we don't blame skills for network blips.
+ *   (The former `plan_executor.ts::maybeRetryTransient` consumer was removed
+ *   with the G8b plan-engine teardown.)
  *
  * IMPORTANT — never include `aborted` or `cancelled` in this pattern:
- * user-initiated abort must not be silently retried; the literal string
- * `'aborted by user'` is also explicitly excluded by the guard at the
- * caller site (see `plan_executor.ts::maybeRetryTransient`).
+ * user-initiated abort must not be silently retried.
  *
  * Pattern is intentionally scoped to provider transport / gateway failures:
  * undici / fetch / DNS / socket-layer signals, stream drops, request/header

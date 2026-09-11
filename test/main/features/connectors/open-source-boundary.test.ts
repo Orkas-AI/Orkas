@@ -9,7 +9,7 @@ const read = (rel: string) => fs.readFileSync(path.join(root, rel), 'utf8');
 describe('public connector boundary', () => {
   it('keeps public OAuth modes and confines credit metering to Composio', () => {
     for (const entry of CONNECTOR_CATALOG) {
-      expect(['server_bridge', 'mcp_dcr', 'composio']).toContain(entry.auth_mode);
+      expect(['server_bridge', 'mcp_dcr', 'composio', 'local_cli', 'local_api']).toContain(entry.auth_mode);
       expect(entry.icon_svg).toMatch(/^<svg\b/);
       if (entry.auth_mode === 'composio') {
         expect(entry).toMatchObject({

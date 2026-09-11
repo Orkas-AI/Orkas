@@ -50,14 +50,14 @@ export interface MemoryToolHandler {
 }
 
 const TOOL_DESCRIPTION =
-  'Read or update durable cross-session memory.';
+  'Manage durable agent, shared, or user memory. Call this tool before replying whenever the conversation establishes, corrects, or invalidates stable, reusable information that should affect future conversations—even without an explicit save request. Decide from meaning, never trigger words. Do not store current-task progress, temporary plans, one-off status, or TODO/dependency state.';
 
 const TOOL_DESCRIPTION_WITH_PROJECT =
-  'Read or update durable agent, project, shared, or user memory; use project_tasks for task progress.';
+  'Manage durable agent, project, shared, or user memory. Call this tool before replying whenever the conversation establishes, corrects, or invalidates stable, reusable information that should affect future conversations—even without an explicit save request. Decide from meaning, never trigger words. Use todo_tasks for task progress; do not store temporary plans, one-off status, or TODO/dependency state.';
 
 /** Appended for sub-agents: they may read project memory but not write it. */
 const PROJECT_READONLY_NOTE =
-  ' Project memory is read-only for this actor; only Commander may add, replace, or remove it.';
+  ' Project memory is read-only; only Commander may write it.';
 
 export interface CrossSessionMemoryToolOptions {
   /** Offer the `project` tier (project sessions only). The host binds it to
@@ -69,6 +69,15 @@ export interface CrossSessionMemoryToolOptions {
    *  Ignored unless `includeProjectTier`. */
   projectTierReadOnly?: boolean;
 }
+
+type MemoryAction = 'add' | 'replace' | 'remove' | 'list';
+
+const MEMORY_ACTION_FIELDS: Readonly<Record<MemoryAction, ReadonlySet<string>>> = {
+  add: new Set(['action', 'target', 'content']),
+  replace: new Set(['action', 'target', 'content', 'old_text']),
+  remove: new Set(['action', 'target', 'old_text']),
+  list: new Set(['action', 'target']),
+};
 
 export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: CrossSessionMemoryToolOptions = {}): AgentTool {
   const tiers: MemoryTier[] = opts.includeProjectTier
@@ -87,11 +96,12 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
     description,
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         action: {
           type: 'string',
           enum: ['add', 'replace', 'remove', 'list'],
-          description: 'Memory operation. Non-empty entries are already injected; use list only to inspect them or obtain exact text for replace/remove.',
+          description: 'add: content; replace: old_text/content; remove: old_text; list: no content fields. target is optional. Omit unrelated fields. Non-empty entries are already injected; use list only for exact text.',
         },
         target: {
           type: 'string',
@@ -108,6 +118,12 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
         },
       },
       required: ['action'],
+      oneOf: [
+        { properties: { action: { const: 'add' } }, required: ['content'] },
+        { properties: { action: { const: 'replace' } }, required: ['old_text', 'content'] },
+        { properties: { action: { const: 'remove' } }, required: ['old_text'] },
+        { properties: { action: { const: 'list' } } },
+      ],
     },
 
     async execute(input: Record<string, unknown>, _ctx: ToolContext): Promise<ToolResult> {
@@ -115,6 +131,17 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
       const target = (input.target as MemoryTier) || 'agent';
       const content = (input.content as string) || '';
       const oldText = (input.old_text as string) || '';
+
+      const allowedFields = MEMORY_ACTION_FIELDS[action as MemoryAction];
+      if (allowedFields) {
+        const unrelated = Object.keys(input).filter((key) => !allowedFields.has(key));
+        if (unrelated.length) {
+          return {
+            content: JSON.stringify({ ok: false, error: `fields not allowed for ${action}: ${unrelated.sort().join(', ')}` }),
+            isError: true,
+          };
+        }
+      }
 
       if (!tiers.includes(target)) {
         return { content: JSON.stringify({ ok: false, error: `target must be one of: ${tiers.map(t => `"${t}"`).join(', ')}` }), isError: true };

@@ -2,9 +2,8 @@
  * Blocking permission gate for sensitive local operations under approval
  * access modes (features/permissions.ts).
  *
- * Mirrors features/local_agents/bridge_permissions.ts (push `bash:permission`
- * → renderer dialog → `bash.permission_response` IPC → resolve), with two
- * differences:
+ * Uses the same push → renderer dialog → IPC response pattern as the
+ * external-CLI permission gate, with two differences:
  *
  *   1. THREE outcomes — `allow_once`, `allow_run`, `deny` — not a boolean.
  *   2. NO persistent store. A task-scoped grant is memory-only and bounded to
@@ -24,7 +23,7 @@ import * as crypto from 'node:crypto';
 import { createLogger } from '../../logger';
 import { maskId } from '../../util/log-redact';
 import { registerUserSwitchHook } from '../../features/user-switch-hooks';
-import type { RiskCategory } from './bash-risk';
+import type { IrreversibleAction, RiskCategory } from './bash-risk';
 import type { ExternalMutationFinding } from './external-mutation-risk';
 
 const log = createLogger('bash-permissions');
@@ -58,6 +57,10 @@ export interface BashPermissionInfo {
   /** Optional subject for non-shell operations, typically a path. */
   subject?: string;
   reasons: RiskCategory[];
+  /** Why this is being asked at all in a mode that otherwise skips prompts:
+   *  the step cannot be reviewed or undone once it runs. Empty/absent for an
+   *  ordinary sensitive operation. */
+  irreversible?: IrreversibleAction[];
   /** Main-process eligibility decision; stale renderers cannot widen it. */
   can_allow_run: boolean;
   /** Structured, bounded external actions detected inside the command/script. */
@@ -108,7 +111,7 @@ function isCoveredByRunGrant(uid: string, cid: string, agentId: string, reasons:
 }
 
 // Lazy ipc lookup — avoids a static model→ipc import cycle and degrades
-// cleanly in tests / headless builds (same pattern as bridge_permissions).
+// cleanly in tests / headless builds.
 type BroadcastOverride = (channel: string, payload: unknown) => void | boolean;
 let _broadcastOverride: BroadcastOverride | null = null;
 export function _setBroadcastForTest(fn: BroadcastOverride | null): void {
@@ -149,6 +152,7 @@ export async function requestBashDecision(opts: {
   operation?: string;
   subject?: string;
   reasons: RiskCategory[];
+  irreversible?: IrreversibleAction[];
   externalMutations?: ExternalMutationFinding[];
   onWaiting?: (elapsedMs: number) => void;
 }): Promise<BashDecision> {
@@ -176,6 +180,7 @@ export async function requestBashDecision(opts: {
     ...(opts.operation ? { operation: opts.operation } : {}),
     ...(opts.subject ? { subject: opts.subject } : {}),
     reasons,
+    ...(opts.irreversible?.length ? { irreversible: [...new Set(opts.irreversible)] } : {}),
     can_allow_run: taskGrantEligible,
     ...(opts.externalMutations?.length ? { external_mutations: opts.externalMutations.slice(0, 8) } : {}),
     cid: opts.cid,

@@ -109,11 +109,17 @@ function planSuccess(
   extra: Record<string, unknown>,
   finish?: ExecutionPlanFinish,
 ): ToolResult {
+  const changed = extra.unchanged !== true
+    && extra.updated !== false
+    && extra.appended !== false;
   return {
     content: planResult(plan, action, {
       ...extra,
       ...(finish ? { finish } : {}),
     }),
+    observations: {
+      coordination: { changed },
+    },
   };
 }
 
@@ -181,53 +187,20 @@ export function createExecutionPlanTool(controller: ExecutionPlanController): Ag
   return defineTool({
     name: "manage_execution_plan",
     description:
-      "Maintain current-task milestones only when a durable anchor is needed; skip work clear in live context and use project_tasks for a cross-conversation backlog. Use update to create or materially revise them, and set_statuses only when stale status could mislead execution or recovery. Co-emit necessary changes with a related business tool when available; the Plan records progress but never ends the run.",
+      "Store the optional current-task Plan as a complete ordered snapshot of a few durable outcome milestones. Use it for complex work that benefits from progress state across rounds; keep at most one in_progress. Use todo_tasks for backlogs. Plan state is working memory, not task completion or termination.",
     inputSchema: {
       type: "object",
       properties: {
-        action: {
-          type: "string",
-          enum: ["update", "set_statuses"],
-          description:
-            "update creates or materially revises the full plan; set_statuses atomically applies necessary status changes. Legacy operations remain accepted but are not advertised.",
-        },
         explanation: {
           type: "string",
-          description: "Optional concise reason for this revision.",
+          description: "Optional concise reason for this Plan update.",
           maxLength: EXECUTION_PLAN_MAX_EXPLANATION_CHARS,
-        },
-        replace_objective: {
-          type: "boolean",
-          description:
-            "Re-anchor to the latest user text after the user changes the objective; omit for status-only updates.",
-        },
-        updates: {
-          type: "array",
-          description:
-            "Necessary status changes that keep the Plan accurate for execution or recovery. Apply them atomically and batch adjacent transitions.",
-          minItems: 1,
-          maxItems: EXECUTION_PLAN_MAX_STEPS,
-          items: {
-            type: "object",
-            properties: {
-              step_id: {
-                type: "integer",
-                minimum: 1,
-                description: "Stable host-assigned ID.",
-              },
-              status: {
-                type: "string",
-                enum: ["pending", "in_progress", "completed", "blocked"],
-              },
-            },
-            required: ["step_id", "status"],
-            additionalProperties: false,
-          },
         },
         plan: {
           type: "array",
           description:
-            "Complete ordered milestone plan for creation or material revision. Preserve existing step text exactly; use set_statuses only for necessary status-only changes.",
+            "Complete ordered milestone snapshot. The first snapshot creates the Plan; every later snapshot preserves existing step text exactly, updates statuses in one batch, and may append newly discovered milestones.",
+          minItems: 1,
           maxItems: EXECUTION_PLAN_MAX_STEPS,
           items: {
             type: "object",
@@ -247,7 +220,7 @@ export function createExecutionPlanTool(controller: ExecutionPlanController): Ag
           },
         },
       },
-      required: ["action"],
+      required: ["plan"],
       additionalProperties: false,
     },
     async execute(input) {
@@ -308,8 +281,6 @@ export function createExecutionPlanTool(controller: ExecutionPlanController): Ag
               appended: false,
               capacity_reached: true,
               max_steps: EXECUTION_PLAN_MAX_STEPS,
-              do_not_retry: true,
-              next_action: "continue_task_and_use_set_status_for_existing_steps",
             });
           }
           const candidateSteps = normalizeCandidateStatuses([
@@ -516,8 +487,6 @@ export function createExecutionPlanTool(controller: ExecutionPlanController): Ag
             capacity_reached: true,
             max_steps: EXECUTION_PLAN_MAX_STEPS,
             requested_step_count: input.plan.length,
-            do_not_retry: true,
-            next_action: "continue_task_and_use_set_status_for_existing_steps",
           });
         }
         const requestedSteps = normalizePlanSteps(input.plan);
@@ -561,10 +530,14 @@ export function createExecutionPlanTool(controller: ExecutionPlanController): Ag
           replaceObjectiveApplied = false;
         }
         const statusNormalizations = normalizedStatuses(update.steps, plan);
+        const unchanged = current !== undefined && plan.revision === current.revision;
         return planSuccess(plan, "update", {
           action_inferred: !input.action || repairedFullPlanAction,
           replace_objective_applied: replaceObjectiveApplied,
           updated_step_ids: changedStepIds(current, plan),
+          ...(unchanged ? {
+            unchanged: true,
+          } : {}),
           ...(statusNormalizations.length ? { normalized_statuses: statusNormalizations } : {}),
         }, finish);
       } catch (err) {

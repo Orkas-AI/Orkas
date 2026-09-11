@@ -21,7 +21,7 @@ export interface BuiltinAgentToolSurfaceCase {
 }
 
 /**
- * Product-level fixed capability decisions for the nine built-in Agents.
+ * Product-level fixed capability decisions for the built-in Agents.
  * `configuredGroups` is a hard runtime boundary, not a preload hint.
  */
 export const BUILTIN_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurfaceCase[] = [
@@ -53,13 +53,13 @@ export const BUILTIN_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurfaceC
       { group: 'workspace.read', outcome: 'inspect supplied corpora and durable research state', witnessTools: ['list_files'] },
       { group: 'workspace.write.output', outcome: 'write and append durable ledgers and reports', witnessTools: ['write_file', 'append_file'] },
       { group: 'workspace.execute.command', outcome: 'run bounded research verifiers', witnessTools: ['bash'] },
-      { group: 'web', outcome: 'discover and fetch primary evidence', witnessTools: ['web_search', 'web_fetch'] },
+      { group: 'web', outcome: 'discover, fetch, and verify primary evidence', witnessTools: ['web_search', 'web_fetch', 'research_verify_citations'] },
     ],
     overbroadReplacements: [
       { narrowGroup: 'workspace.write.output', broadGroup: 'workspace.write', newlyExposedTool: 'apply_patch' },
       { narrowGroup: 'workspace.execute.command', broadGroup: 'workspace.execute', newlyExposedTool: 'interactive_cli' },
     ],
-    requiredTools: ['list_files', 'write_file', 'bash', 'web_search', 'web_fetch'],
+    requiredTools: ['list_files', 'write_file', 'bash', 'web_search', 'web_fetch', 'research_verify_citations'],
     forbiddenTools: [
       'apply_patch', 'edit_file', 'delete_file', 'process_session', 'interactive_cli',
       'library', 'create_pptx', 'create_artifact', 'generate_image',
@@ -193,6 +193,30 @@ export const BUILTIN_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurfaceC
  */
 export const RESOURCE_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurfaceCase[] = [
   {
+    agentId: '1040b336306f',
+    name: 'StockAnalyser',
+    configuredGroups: ['workspace.read', 'workspace.write.output', 'workspace.execute.command', 'web', 'connectors'],
+    groupRequirements: [
+      { group: 'workspace.read', outcome: 'inspect supplied market, strategy, and portfolio data', witnessTools: ['list_files'] },
+      { group: 'workspace.write.output', outcome: 'save explicitly requested analysis and experiment reports', witnessTools: ['write_file'] },
+      { group: 'workspace.execute.command', outcome: 'run the deterministic financial analysis core', witnessTools: ['bash'] },
+      { group: 'web', outcome: 'verify current filings, issuer facts, and market events', witnessTools: ['web_search', 'web_fetch'] },
+      { group: 'connectors', outcome: 'read connected Longbridge data and perform explicitly authorized broker actions', witnessTools: ['list_connector_tools', 'call_connector_tool'] },
+    ],
+    overbroadReplacements: [
+      { narrowGroup: 'workspace.write.output', broadGroup: 'workspace.write', newlyExposedTool: 'edit_file' },
+      { narrowGroup: 'workspace.execute.command', broadGroup: 'workspace.execute', newlyExposedTool: 'process_session' },
+    ],
+    requiredTools: [
+      'list_files', 'read_files', 'write_file', 'bash', 'web_search', 'web_fetch',
+      'list_connector_tools', 'call_connector_tool',
+    ],
+    forbiddenTools: [
+      'edit_file', 'delete_file', 'process_session', 'interactive_cli',
+      'library', 'create_pptx', 'create_artifact', 'generate_image',
+    ],
+  },
+  {
     agentId: '14ba06897645',
     name: 'StudyTutor',
     configuredGroups: ['workspace.read', 'workspace.write.output', 'workspace.execute.command'],
@@ -216,13 +240,13 @@ export const RESOURCE_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurface
       { group: 'workspace.read', outcome: 'inspect campaign exports and durable evidence state', witnessTools: ['list_files'] },
       { group: 'workspace.write.output', outcome: 'persist evidence ledgers and requested research reports', witnessTools: ['write_file'] },
       { group: 'workspace.execute.command', outcome: 'run social-data and research verification scripts', witnessTools: ['bash'] },
-      { group: 'web', outcome: 'verify public brand and broader source evidence', witnessTools: ['web_search', 'web_fetch'] },
+      { group: 'web', outcome: 'fetch and verify public brand and broader source evidence', witnessTools: ['web_search', 'web_fetch', 'research_verify_citations'] },
     ],
     overbroadReplacements: [
       { narrowGroup: 'workspace.write.output', broadGroup: 'workspace.write', newlyExposedTool: 'edit_file' },
       { narrowGroup: 'workspace.execute.command', broadGroup: 'workspace.execute', newlyExposedTool: 'process_session' },
     ],
-    requiredTools: ['read_files', 'write_file', 'bash', 'web_search', 'web_fetch'],
+    requiredTools: ['read_files', 'write_file', 'bash', 'web_search', 'web_fetch', 'research_verify_citations'],
     forbiddenTools: ['edit_file', 'process_session', 'create_xlsx', 'generate_image', 'list_connector_tools'],
   },
   {
@@ -310,13 +334,13 @@ export const RESOURCE_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurface
       { group: 'workspace.read', outcome: 'scan supplied folders and extract mixed source materials', witnessTools: ['list_files'] },
       { group: 'workspace.write', outcome: 'create and safely revise authorized local knowledge files', witnessTools: ['write_file', 'edit_file'] },
       { group: 'workspace.execute.command', outcome: 'run authorized Obsidian CLI operations', witnessTools: ['bash'] },
-      { group: 'web', outcome: 'read user-supplied source links without broadening the research scope', witnessTools: ['web_fetch'] },
+      { group: 'web', outcome: 'read and verify user-supplied source links without broadening the research scope', witnessTools: ['web_fetch', 'research_verify_citations'] },
       { group: 'connectors', outcome: 'search and update an authorized Notion workspace', witnessTools: ['list_connector_tools', 'call_connector_tool'] },
     ],
     overbroadReplacements: [
       { narrowGroup: 'workspace.execute.command', broadGroup: 'workspace.execute', newlyExposedTool: 'process_session' },
     ],
-    requiredTools: ['list_files', 'read_files', 'write_file', 'edit_file', 'bash', 'web_fetch', 'list_connector_tools', 'call_connector_tool'],
+    requiredTools: ['list_files', 'read_files', 'write_file', 'edit_file', 'bash', 'web_fetch', 'research_verify_citations', 'list_connector_tools', 'call_connector_tool'],
     forbiddenTools: ['process_session', 'create_artifact', 'create_docx', 'generate_image'],
   },
   {
@@ -327,13 +351,13 @@ export const RESOURCE_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurface
       { group: 'workspace.read', outcome: 'inspect durable evidence state and supplied brand materials', witnessTools: ['list_files'] },
       { group: 'workspace.write.output', outcome: 'persist evidence ledgers and requested Brand DNA files', witnessTools: ['write_file'] },
       { group: 'workspace.execute.command', outcome: 'run social-data and deep-research verification', witnessTools: ['bash'] },
-      { group: 'web', outcome: 'research first-party and public brand sources', witnessTools: ['web_search', 'web_fetch'] },
+      { group: 'web', outcome: 'research and verify first-party and public brand sources', witnessTools: ['web_search', 'web_fetch', 'research_verify_citations'] },
     ],
     overbroadReplacements: [
       { narrowGroup: 'workspace.write.output', broadGroup: 'workspace.write', newlyExposedTool: 'edit_file' },
       { narrowGroup: 'workspace.execute.command', broadGroup: 'workspace.execute', newlyExposedTool: 'process_session' },
     ],
-    requiredTools: ['list_files', 'write_file', 'bash', 'web_search', 'web_fetch'],
+    requiredTools: ['list_files', 'write_file', 'bash', 'web_search', 'web_fetch', 'research_verify_citations'],
     forbiddenTools: ['edit_file', 'process_session', 'create_pptx', 'generate_image', 'list_connector_tools'],
   },
   {

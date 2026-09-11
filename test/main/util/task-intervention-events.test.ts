@@ -25,7 +25,8 @@ describe('delivered task intervention signals', () => {
 
   it.each([
     ['bash:permission', { request_id: 'req-1', cid: 'c1' }, 'sensitive_operation'],
-    ['bridge:permission', { request_id: 'req-2', cid: 'c2' }, 'connector_permission'],
+    ['local-agent:permission', { request_id: 'req-cli', cid: 'c-cli' }, 'sensitive_operation'],
+    ['local-agent:permission', { request_id: 'req-2', cid: 'c2', permission_kind: 'connector' }, 'connector_permission'],
     ['connectors:install-confirm', { request_id: 'req-3', cid: 'c3' }, 'connector_install'],
     ['delete_file.confirmation_required', { confirm_id: 'req-4', cid: 'c4' }, 'delete_confirmation'],
   ] as const)('maps the delivered %s action surface without copying private prompt content', (channel, payload, kind) => {
@@ -60,8 +61,8 @@ describe('delivered task intervention signals', () => {
     expect(captureDeliveredTaskIntervention('bash:permission', {
       request_id: 'req-1',
     }, 'u1')).toBe(false);
-    expect(captureDeliveredTaskIntervention('bridge:permission', {
-      request_id: 'req-2', cid: 'c2',
+    expect(captureDeliveredTaskIntervention('local-agent:permission', {
+      request_id: 'req-2', cid: 'c2', permission_kind: 'connector',
     }, '')).toBe(false);
     expect(listener).not.toHaveBeenCalled();
   });

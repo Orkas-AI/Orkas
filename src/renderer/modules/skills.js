@@ -1638,8 +1638,16 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
       : (fallbackDesc ? [['description', fallbackDesc]] : []));
   });
 
+  // Staleness guard for the body, mirroring the skillMdPromise guard above but
+  // including the file: rapid skill OR same-skill file switching must not let a
+  // slower earlier response overwrite the newer selection's body (header/name
+  // already show the new selection — a stale body silently mismatches them).
+  const stale = () => _selectedSkill?.id !== id
+    || _selectedSkill?.source !== source
+    || _selectedSkill?.filepath !== filepath;
   try {
     const data = await mainPromise;
+    if (stale()) return;
     if (data.ok) {
       const editable = _skillEditMode && _skillEditSkillId === id && canEditThisSkill;
       if (editable) _renderSkillFileEditor(body, data.content || '', data.ext);
@@ -1648,6 +1656,7 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
       body.innerHTML = `<span style="color:var(--danger)">${escapeHtml(data.error)}</span>`;
     }
   } catch (e) {
+    if (stale()) return;
     body.innerHTML = `<span style="color:var(--danger)">${escapeHtml(t('skills.load_failed'))}</span>`;
   }
   // Release the loading-time minHeight pin so the body collapses to the
@@ -2474,14 +2483,13 @@ function _switchSkillTab(tab) {
   // Clear error msg when switching tabs
   const msgEl = document.getElementById('skill-form-msg');
   if (msgEl) { msgEl.textContent = ''; msgEl.className = 'form-msg'; }
-  // Focus primary input of the new tab
-  setTimeout(() => {
-    const focusId = tab === 'url' ? 'skill-url-input'
-                  : tab === 'dir' ? 'skill-dir-pick-btn'
-                  : 'skill-name';
-    const el = document.getElementById(focusId);
-    if (el) el.focus();
-  }, 30);
+  // The panel is visible now. A delayed focus can interrupt the user's next
+  // field selection and redirect their input into the wrong field.
+  const focusId = tab === 'url' ? 'skill-url-input'
+                : tab === 'dir' ? 'skill-dir-pick-btn'
+                : 'skill-name';
+  const el = document.getElementById(focusId);
+  if (el) el.focus();
 }
 window._switchSkillTab = _switchSkillTab;
 
@@ -2513,7 +2521,6 @@ async function openSkillModal(editId) {
     saveBtn.textContent = t('common.confirm');
     editIdInput.value = editId;
     if (tabBar) tabBar.style.display = 'none'; // edit mode: no tabs, manual only
-    _switchSkillTab('manual');
     const cached = _skillsCache?.find(s => s.id === editId && s.source === 'custom');
     if (cached) {
       document.getElementById('skill-name').value = cached.name || '';
@@ -2528,7 +2535,6 @@ async function openSkillModal(editId) {
     saveBtn.textContent = t('common.confirm');
     editIdInput.value = '';
     if (tabBar) tabBar.style.display = '';
-    _switchSkillTab('manual');
   }
 
   // Wire tab buttons (idempotent — checks a flag)
@@ -2540,6 +2546,7 @@ async function openSkillModal(editId) {
   }
 
   modal.classList.add('open');
+  _switchSkillTab('manual');
   if (typeof window.bindNameLimitControl === 'function') {
     window.bindNameLimitControl(document.getElementById('skill-name'));
   }

@@ -175,7 +175,7 @@ describe('auth › Orkas API quick setup', () => {
         }),
       ]),
     );
-    expect(entries[0]).toMatchObject({ provider: 'anthropic', model: 'claude-opus-4-8' });
+    expect(entries[0]).toMatchObject({ provider: 'anthropic', model: 'claude-opus-5' });
 
     expect(a.loadSearchProfiles().filter((profile) => profile.provider === 'orkas-api')).toHaveLength(1);
     expect(a.loadImageProfiles().filter((profile) => profile.provider === 'orkas-api')).toEqual([
@@ -751,8 +751,8 @@ describe('auth › entries (priority list)', () => {
 
     const { entries } = await a.listEntries();
     expect(entries.map((e) => `${e.provider}:${e.model}`)).toEqual([
-      'openai:gpt-5.5',
-      'anthropic:claude-opus-4-8',
+      'openai:gpt-5.6-sol',
+      'anthropic:claude-opus-5',
     ]);
   });
 
@@ -1038,14 +1038,13 @@ describe('auth › listModels', () => {
     expect(models).toEqual([]);
   });
 
-  it('returns the synchronized GPT-5.6 catalog for OpenAI Codex', async () => {
+  it('returns the synchronized GPT-6 and GPT-5.6 catalog for OpenAI Codex', async () => {
     const a = await import('../../../src/main/features/auth');
     expect((await a.listModels('openai-codex')).models.map((model) => model.id)).toEqual([
+      'gpt-6-astra',
       'gpt-5.6-sol',
       'gpt-5.6-terra',
       'gpt-5.6-luna',
-      'gpt-5.5',
-      'gpt-5.4',
     ]);
   });
 

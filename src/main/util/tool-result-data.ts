@@ -10,10 +10,14 @@
  */
 
 export const TOOL_RESULT_QUERY_MAX_INPUT_BYTES = 32 * 1024 * 1024;
-export const TOOL_RESULT_QUERY_MAX_RECORDS = 250_000;
-export const TOOL_RESULT_QUERY_MAX_GROUPS = 10_000;
-export const TOOL_RESULT_QUERY_MAX_FIELDS = 24;
-export const TOOL_RESULT_QUERY_MAX_RESULTS = 100;
+const TOOL_RESULT_QUERY_MAX_RECORDS = 250_000;
+const TOOL_RESULT_QUERY_MAX_GROUPS = 10_000;
+/** Descriptor preview bound, not a limit on which real fields can be queried. */
+const TOOL_RESULT_QUERY_MAX_FIELDS = 24;
+const TOOL_RESULT_QUERY_MAX_RESULTS = 100;
+export const TOOL_RESULT_QUERY_TOO_LARGE_MESSAGE =
+  `This result exceeds the ${TOOL_RESULT_QUERY_MAX_INPUT_BYTES}-byte deterministic query limit. `
+  + 'For full-data calculations, use materialize with the same ref and process the working copy with an available local runtime; use search or paged read for narrow excerpts.';
 
 export type ToolResultScalar = string | number | boolean | null;
 
@@ -22,10 +26,20 @@ export type ToolResultDataField = {
   type: 'string' | 'number' | 'boolean' | 'null' | 'object' | 'array' | 'mixed';
 };
 
+export type ToolResultDataArray = {
+  /** Dotted path from one source-dataset record to the array. */
+  name: string;
+  /** Total array elements observed across source records. */
+  items: number;
+  /** Bounded schema sample using the post-explode `$item` namespace. */
+  fields: ToolResultDataField[];
+};
+
 export type ToolResultDataSet = {
   name: string;
   records: number;
   fields: ToolResultDataField[];
+  arrays?: ToolResultDataArray[];
 };
 
 export type ToolResultDataDescriptor = {
@@ -46,6 +60,8 @@ export type ToolResultQueryFilter = {
 export type ToolResultAggregateRequest = {
   operation: 'count' | 'sum' | 'average' | 'minimum' | 'maximum';
   dataset?: string;
+  /** Expand one array field into `$item`, `$parent`, and `$index` records. */
+  explode?: string;
   field?: string;
   filters?: ToolResultQueryFilter[];
   groupBy?: string[];
@@ -101,7 +117,7 @@ export function aggregateToolResultData(
   if (descriptor.reason === 'input_too_large') {
     return failure(
       'E_RESULT_QUERY_TOO_LARGE',
-      `This result exceeds the ${TOOL_RESULT_QUERY_MAX_INPUT_BYTES}-byte deterministic query limit. Use search or paged read instead.`,
+      TOOL_RESULT_QUERY_TOO_LARGE_MESSAGE,
       descriptor,
     );
   }
@@ -180,9 +196,14 @@ export function aggregateToolResultData(
   }
   const datasetName = resolveDatasetName(descriptor, request.dataset);
   if (datasetName.ok === false) return failure(datasetName.code, datasetName.message, descriptor);
-  const records = materialized.datasets.get(datasetName.name) ?? [];
+  const sourceRecords = materialized.datasets.get(datasetName.name) ?? [];
   const dataset = descriptor.datasets.find((entry) => entry.name === datasetName.name)!;
-  const availableFields = new Set(dataset.fields.map((field) => field.name));
+  const expanded = expandRecords(sourceRecords, dataset, request.explode);
+  if (expanded.ok === false) return failure(expanded.code, expanded.message, descriptor);
+  const records = expanded.records;
+  const previewFields = request.explode
+    ? explodedQueryFields(dataset, request.explode)
+    : dataset.fields;
   const groupBy = Array.isArray(request.groupBy) ? request.groupBy : [];
   if (groupBy.length > 3 || groupBy.some((field) => !isSafeFieldName(field))) {
     return failure('E_RESULT_QUERY_SHAPE', 'group_by accepts at most three valid field paths.', descriptor);
@@ -196,11 +217,26 @@ export function aggregateToolResultData(
     ...filters.map((filter) => filter.field),
     ...(request.field ? [request.field] : []),
   ]);
+  // Preview width/depth bounds are presentation limits, not query permissions.
+  // Empty expanded sets retain their known parent/index schema for compatibility.
+  const inspection = inspectRequestedFields(records, referencedFields);
+  const queryFields = records.length ? inspection.fields : previewFields;
+  const availableFields = new Set(queryFields.map((field) => field.name));
   for (const field of referencedFields) {
+    const arrayPath = inspection.arrayCrossings.get(field)
+      ?? (!availableFields.has(field) ? arrayPrefixForField(queryFields, field) : undefined);
+    if (arrayPath) {
+      return failure(
+        'E_RESULT_QUERY_ARRAY_FIELD',
+        arrayFieldRecoveryMessage(field, arrayPath, request.explode, dataset),
+        descriptor,
+      );
+    }
     if (!isSafeFieldName(field) || !availableFields.has(field)) {
+      const suggestions = [...new Set([...previewFields.map((entry) => entry.name), ...availableFields])];
       return failure(
         'E_RESULT_QUERY_FIELD',
-        `Unknown field ${JSON.stringify(field)}. Available fields: ${[...availableFields].slice(0, TOOL_RESULT_QUERY_MAX_FIELDS).join(', ') || '(none)'}.`,
+        `Unknown field ${JSON.stringify(field)}. Available fields: ${suggestions.slice(0, TOOL_RESULT_QUERY_MAX_FIELDS).join(', ') || '(none)'}. Use run_program if the required deterministic transformation is outside this query contract.`,
         descriptor,
       );
     }
@@ -209,11 +245,20 @@ export function aggregateToolResultData(
     return failure('E_RESULT_QUERY_FIELD', `${operation} requires field.`, descriptor);
   }
   if (request.field && operation !== 'count') {
-    const field = dataset.fields.find((entry) => entry.name === request.field);
+    const field = queryFields.find((entry) => entry.name === request.field);
+    if (field?.type === 'array') {
+      return failure(
+        'E_RESULT_QUERY_ARRAY_FIELD',
+        arrayFieldRecoveryMessage(request.field, request.field, request.explode, dataset),
+        descriptor,
+      );
+    }
     if (!field || field.type !== 'number') {
       return failure(
         'E_RESULT_QUERY_FIELD',
-        `${operation} requires a numeric field; ${JSON.stringify(request.field)} is ${field?.type || 'unknown'}.`,
+        field?.type === 'mixed'
+          ? `${operation} requires every non-null ${JSON.stringify(request.field)} value to be a finite number.`
+          : `${operation} requires a numeric field; ${JSON.stringify(request.field)} is ${field?.type || 'unknown'}.`,
         descriptor,
       );
     }
@@ -381,6 +426,7 @@ function materialized(
       name,
       records: records.length,
       fields: inferFields(records),
+      ...arrayDescriptor(records),
     })),
   };
   return {
@@ -479,12 +525,110 @@ function parseDelimitedLine(
 function inferFields(records: RecordValue[]): ToolResultDataField[] {
   const types = new Map<string, Set<ToolResultDataField['type']>>();
   for (const record of records) collectFields(record, '', types, 0);
+  return fieldsFromTypes(types);
+}
+
+/** Inspect only the bounded set of query paths against every record. Keep array
+ * crossings separate from field types: heterogeneous rows must not turn an
+ * invalid traversal into a successful partial aggregate. */
+function inspectRequestedFields(
+  records: RecordValue[],
+  requested: ReadonlySet<string>,
+): { fields: ToolResultDataField[]; arrayCrossings: Map<string, string> } {
+  const types = new Map<string, Set<ToolResultDataField['type']>>();
+  const arrayCrossings = new Map<string, string>();
+  const add = (name: string, value: unknown) => {
+    const type = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+    const normalized = ['string', 'number', 'boolean', 'null', 'array'].includes(type)
+      ? type as ToolResultDataField['type'] : 'object';
+    const existing = types.get(name);
+    if (existing) existing.add(normalized);
+    else types.set(name, new Set([normalized]));
+  };
+  for (const field of requested) {
+    if (!isSafeFieldName(field)) continue;
+    const segments = field.split('.');
+    for (const record of records) {
+      let value: unknown = record;
+      for (let index = 0; index < segments.length; index++) {
+        if (Array.isArray(value)) {
+          arrayCrossings.set(field, segments.slice(0, index).join('.'));
+          break;
+        }
+        if (!value || typeof value !== 'object'
+          || !Object.prototype.hasOwnProperty.call(value, segments[index])) break;
+        value = (value as RecordValue)[segments[index]];
+        if (index === segments.length - 1) add(field, value);
+      }
+    }
+  }
+  return {
+    fields: [...types].map(([name, values]) => ({ name, type: inferredFieldType(values) })),
+    arrayCrossings,
+  };
+}
+
+function fieldsFromTypes(
+  types: Map<string, Set<ToolResultDataField['type']>>,
+): ToolResultDataField[] {
   return [...types]
     .slice(0, TOOL_RESULT_QUERY_MAX_FIELDS)
     .map(([name, values]) => ({
       name,
       type: inferredFieldType(values),
     }));
+}
+
+const TOOL_RESULT_QUERY_MAX_ARRAY_FIELDS = 8;
+const TOOL_RESULT_QUERY_MAX_ARRAY_SCHEMA_ITEMS = 10_000;
+
+type ArrayFieldAccumulator = {
+  items: number;
+  sampled: number;
+  types: Map<string, Set<ToolResultDataField['type']>>;
+};
+
+function arrayDescriptor(records: RecordValue[]): { arrays?: ToolResultDataArray[] } {
+  const arrays = new Map<string, ArrayFieldAccumulator>();
+  for (const record of records) collectArrayFields(record, '', arrays, 0);
+  if (!arrays.size) return {};
+  return {
+    arrays: [...arrays].map(([name, value]) => ({
+      name,
+      items: value.items,
+      fields: fieldsFromTypes(value.types),
+    })),
+  };
+}
+
+function collectArrayFields(
+  record: RecordValue,
+  prefix: string,
+  target: Map<string, ArrayFieldAccumulator>,
+  depth: number,
+): void {
+  for (const [key, value] of Object.entries(record)) {
+    const name = prefix ? `${prefix}.${key}` : key;
+    if (!isSafeFieldName(name)) continue;
+    if (Array.isArray(value)) {
+      let accumulator = target.get(name);
+      if (!accumulator) {
+        if (target.size >= TOOL_RESULT_QUERY_MAX_ARRAY_FIELDS) continue;
+        accumulator = { items: 0, sampled: 0, types: new Map() };
+        target.set(name, accumulator);
+      }
+      accumulator.items += value.length;
+      for (const item of value) {
+        if (accumulator.sampled >= TOOL_RESULT_QUERY_MAX_ARRAY_SCHEMA_ITEMS) break;
+        accumulator.sampled++;
+        collectFields({ $item: item }, '', accumulator.types, 0);
+      }
+      continue;
+    }
+    if (value && typeof value === 'object' && depth < 2) {
+      collectArrayFields(value as RecordValue, name, target, depth + 1);
+    }
+  }
 }
 
 function inferredFieldType(
@@ -536,6 +680,112 @@ function resolveDatasetName(
     code: 'E_RESULT_QUERY_DATASET',
     message: `dataset is required. Available datasets: ${descriptor.datasets.map((item) => item.name).join(', ')}.`,
   };
+}
+
+function expandRecords(
+  records: RecordValue[],
+  dataset: ToolResultDataSet,
+  requested: string | undefined,
+):
+  | { ok: true; records: RecordValue[] }
+  | { ok: false; code: string; message: string } {
+  const explode = String(requested ?? '').trim();
+  if (!explode) return { ok: true, records };
+  const availableArrays = (dataset.arrays ?? []).map((array) => array.name);
+  if (!isSafeFieldName(explode) || !availableArrays.includes(explode)) {
+    return {
+      ok: false,
+      code: 'E_RESULT_QUERY_EXPLODE',
+      message:
+        `Unknown explode array ${JSON.stringify(explode)}. Available array fields: ${availableArrays.join(', ') || '(none)'}. `
+        + 'Use run_program if the required deterministic transformation is outside this query contract.',
+    };
+  }
+
+  const expanded: RecordValue[] = [];
+  for (const parent of records) {
+    const value = readField(parent, explode);
+    if (value === undefined || value === null) continue;
+    if (!Array.isArray(value)) {
+      return {
+        ok: false,
+        code: 'E_RESULT_QUERY_EXPLODE',
+        message:
+          `explode field ${JSON.stringify(explode)} must be an array or null in every source record; no partial result was returned. `
+          + 'Use run_program if heterogeneous records require custom handling.',
+      };
+    }
+    for (let index = 0; index < value.length; index++) {
+      if (expanded.length >= TOOL_RESULT_QUERY_MAX_RECORDS) {
+        return {
+          ok: false,
+          code: 'E_RESULT_QUERY_RECORD_LIMIT',
+          message:
+            `explode would exceed the ${TOOL_RESULT_QUERY_MAX_RECORDS}-record deterministic query limit. `
+            + 'Use a narrower source result or run_program if available.',
+        };
+      }
+      expanded.push({
+        $item: value[index],
+        $parent: parent,
+        $index: index,
+      });
+    }
+  }
+  return { ok: true, records: expanded };
+}
+
+function explodedQueryFields(
+  dataset: ToolResultDataSet,
+  explode: string,
+): ToolResultDataField[] {
+  const itemFields = dataset.arrays?.find((array) => array.name === explode)?.fields ?? [];
+  return [
+    ...itemFields,
+    { name: '$index', type: 'number' },
+    { name: '$parent', type: 'object' },
+    ...dataset.fields.map((field) => ({
+      name: `$parent.${field.name}`,
+      type: field.type,
+    } as ToolResultDataField)),
+  ];
+}
+
+function arrayPrefixForField(
+  fields: ToolResultDataField[],
+  requested: string,
+): string | undefined {
+  return fields
+    .filter((field) => field.type === 'array')
+    .map((field) => field.name)
+    .filter((name) => requested === name || requested.startsWith(`${name}.`))
+    .sort((left, right) => right.length - left.length)[0];
+}
+
+function arrayFieldRecoveryMessage(
+  requested: string,
+  arrayPath: string,
+  explode: string | undefined,
+  dataset: ToolResultDataSet,
+): string {
+  if (explode) {
+    return (
+      `Field ${JSON.stringify(requested)} crosses nested array ${JSON.stringify(arrayPath)}. `
+      + 'tool_result query expands one array level per request; use run_program if available for another array level or a custom transformation.'
+    );
+  }
+  const suffix = requested === arrayPath ? '' : requested.slice(arrayPath.length + 1);
+  const field = suffix ? `$item.${suffix}` : '$item';
+  const itemFields = dataset.arrays
+    ?.find((array) => array.name === arrayPath)
+    ?.fields.map((item) => item.name)
+    .slice(0, 8)
+    .join(', ');
+  return (
+    `${JSON.stringify(arrayPath)} is an array, so ${JSON.stringify(requested)} is not a direct field. `
+    + `Retry with explode=${JSON.stringify(arrayPath)} and field=${JSON.stringify(field)}; parent fields use "$parent.<field>" and the array index is "$index". `
+    + `Available item fields: ${itemFields || '(none observed)'}.`
+  );
 }
 
 function isValidFilter(filter: ToolResultQueryFilter): boolean {

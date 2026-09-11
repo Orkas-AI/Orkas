@@ -47,11 +47,11 @@ function hostedBackend(): any | null {
   }
 }
 
-export function preferredLocalSecretKind(): 'hosted' | 'fallback' {
+function preferredLocalSecretKind(): 'hosted' | 'fallback' {
   return hostedBackend() ? 'hosted' : 'fallback';
 }
 
-export function isHostedEncryptedSecret(value: unknown): value is string {
+function isHostedEncryptedSecret(value: unknown): value is string {
   return typeof value === 'string' && value.startsWith(HOSTED_PREFIX);
 }
 

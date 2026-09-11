@@ -18,6 +18,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import * as path from 'node:path';
 import { buildCliSpawnEnv, resolveCliCommand } from '../spawn-command.js';
+import type { LocalCliPermissionPolicy } from '../registry.js';
 
 type KillableChild = Pick<ChildProcessWithoutNullStreams, 'kill' | 'pid'>;
 type SpawnFn = typeof spawn;
@@ -83,12 +84,56 @@ export interface LocalEvent {
    *    log:                { level: 'debug'|'info'|'warn'|'error', message, source? }
    *    raw-line:           { line }             // stdout line we couldn't parse as our protocol
    *    permission-request: { id, tool?, input?, autoDecided: 'allow'|'deny', reason }
-   *    idle:               { stalledMs }        // runner-emitted heartbeat on prolonged silence
+   *    idle:               { stalledMs, waitingOn?: [{ taskId, label }] }
+   *                        // runner-emitted heartbeat on prolonged silence. `waitingOn`
+   *                        // names the background tasks still open, so a run held by a
+   *                        // task that never ends reads as a stated wait instead of a
+   *                        // silent spinner.
    *    done:               { status: 'completed'|'failed'|'cancelled'|'timeout'|
    *                                  'missing_cli', error?, durationMs?, sessionId?, usage?,
-   *                                  timeoutPhase?: 'foreground'|'background' }
+   *                                  timeoutPhase?: 'foreground'|'background',
+   *                                  failureKind?: 'cli_spawn'|'cli_protocol', retrySafe?: boolean }
    */
   [key: string]: unknown;
+}
+
+/** Host decision scope. `allow_run` is owned by Orkas and must never be
+ * translated into a durable/native CLI-session grant. */
+export type LocalCliPermissionDecision = 'allow_once' | 'allow_run' | 'deny';
+
+export interface LocalCliPermissionRequest {
+  /** Opaque upstream request id used only for the persisted process rail. */
+  id?: string;
+  tool?: string;
+  description?: string;
+  command?: string;
+  subject?: string;
+}
+
+export interface LocalCliUserInputOption {
+  label: string;
+  description?: string;
+}
+
+export interface LocalCliUserInputQuestion {
+  id: string;
+  header?: string;
+  question: string;
+  options?: LocalCliUserInputOption[];
+  isOther?: boolean;
+  isSecret?: boolean;
+}
+
+export interface LocalCliUserInputRequest {
+  id?: string;
+  questions: LocalCliUserInputQuestion[];
+  isBlocking?: boolean;
+  autoResolutionMs?: number;
+}
+
+export interface LocalCliUserInputResponse {
+  cancelled: boolean;
+  answers: Record<string, string[]>;
 }
 
 export interface BackendRunOptions {
@@ -114,6 +159,16 @@ export interface BackendRunOptions {
    * CLI/account configuration. */
   modelOverride?: string;
   thinkingLevel?: string;
+  /** Per-Agent override. Missing/inherit leaves selection to the CLI's own
+   * configuration. */
+  permissionPolicy?: LocalCliPermissionPolicy;
+  /** Host-owned human approval bridge. Missing or broken callers must be
+   * treated as a denial by every backend. */
+  requestPermission?: (request: LocalCliPermissionRequest) => Promise<LocalCliPermissionDecision>;
+  /** Host-owned bridge for native CLI requests that pause for structured user
+   * input. Answers stay in memory and are returned only to the requesting
+   * process; they are never emitted as LocalEvents or persisted in run logs. */
+  requestUserInput?: (request: LocalCliUserInputRequest) => Promise<LocalCliUserInputResponse>;
   /** When set, ask the CLI to resume a prior session by id (claude:
    *  `--resume <id>`). The group-chat caller consults the registry's resume
    *  capability first, so backends without resume support receive no stale
@@ -144,22 +199,17 @@ export interface BackendRunOptions {
    *  (that's `idleKillMs`). Backends arm `armKillWatchdog` with both and
    *  emit `done({status:'timeout'})` when either fires before exit. */
   timeoutMs: number;
-  /** Kill the CLI when it emits no events for this long (ms). Unset /
-   *  0 disables idle-kill — the runner disables it for backends with no
-   *  mid-run event stream (openclaw), where silence is normal. */
+  /** Absolute dispatch deadline, shared by retries and background phases. */
+  deadlineAt?: number;
+  /** Kill the CLI when it emits no real progress for this long (ms).
+   *  Unset / 0 explicitly disables idle-kill for diagnostic callers. */
   idleKillMs?: number;
   /** Activity clock maintained by the runner (ms epoch of the last real
    *  backend event). Events explicitly marked `synthetic` do not slide it. Read by the
    *  idle-kill watchdog; unset means no tracking and idle-kill stays off. */
   lastEventAt?: () => number;
-  /** Per-backend visible-idle threshold override (ms). Read by `runner.ts`'s
-   *  idle-heartbeat to decide when to emit `{type:'idle'}` events. Synthetic
-   *  reasoning/tool heartbeats suppress this UI state while the item remains
-   *  active without advancing the separate idle-kill watchdog. When unset the
-   *  runner uses its own default (90 s; configurable via
-   *  ORKAS_LOCAL_AGENT_IDLE_MS). Backends with no streaming (today: openclaw)
-   *  may override the cadence for their product-specific behavior. */
-  idleMs?: number;
+  /** Real protocol progress omitted from the public event rail. */
+  onActivity?: () => void;
   /** orkas-bridge injection (plan §D — set by runner.ts when a bridge
    *  host is live for this run). Backends that support adding an MCP
    *  server pass the config through (claude: `--mcp-config`; codex:
@@ -334,27 +384,28 @@ export function killProcessTree(
 
 /**
  * A one-shot CLI's protocol terminal event is authoritative for the UI. Close
- * stdin immediately, then reap a process that fails to exit on its own without
- * holding the backend promise (and therefore the conversation loading state)
- * open. Descendants that inherited stdio are included via killProcessTree.
+ * stdin and signal the whole process tree immediately, while the direct CLI
+ * pid still identifies its descendants on Windows. Waiting for the CLI to exit
+ * before signaling lets a detached child escape `taskkill /t`; cancelling that
+ * delayed signal on `close` caused completed local-Agent runs to leave GUI and
+ * test processes behind. The hard-kill fallback remains bounded and does not
+ * hold the backend promise (and therefore the conversation loading state) open.
  */
 export function reapCliAfterProtocolTerminal(
   child: ChildProcessWithoutNullStreams,
-  graceMs = 1_000,
+  hardKillGraceMs = 10_000,
 ): void {
   try { child.stdin.end(); } catch { /* already closed */ }
 
-  let hardKill: NodeJS.Timeout | null = null;
-  const gracefulKill = setTimeout(() => {
-    killProcessTree(child, 'SIGTERM');
-    hardKill = setTimeout(() => killProcessTree(child, 'SIGKILL'), 10_000);
-    if (typeof hardKill.unref === 'function') hardKill.unref();
-  }, Math.max(0, graceMs));
-  if (typeof gracefulKill.unref === 'function') gracefulKill.unref();
+  killProcessTree(child, 'SIGTERM');
+  const hardKill = setTimeout(
+    () => killProcessTree(child, 'SIGKILL'),
+    Math.max(0, hardKillGraceMs),
+  );
+  if (typeof hardKill.unref === 'function') hardKill.unref();
 
   child.once('close', () => {
-    clearTimeout(gracefulKill);
-    if (hardKill) clearTimeout(hardKill);
+    clearTimeout(hardKill);
   });
 }
 
@@ -368,11 +419,17 @@ export class LineSplitter {
   private buf = '';
   /** Push a chunk; emit each complete line via `onLine`. */
   push(chunk: string, onLine: (line: string) => void): void {
+    // Only the new chunk can hold the next newline: rescanning the whole
+    // buffered partial line per chunk made one long record (a base64 image
+    // inside a single stream-json line) cost O(len²) on the main thread
+    // (2026-08-28 review D-6).
+    let scanFrom = this.buf.length;
     this.buf += chunk;
     let idx: number;
-    while ((idx = this.buf.indexOf('\n')) >= 0) {
+    while ((idx = this.buf.indexOf('\n', scanFrom)) >= 0) {
       let line = this.buf.slice(0, idx);
       this.buf = this.buf.slice(idx + 1);
+      scanFrom = 0;
       if (line.endsWith('\r')) line = line.slice(0, -1);
       onLine(line);
     }
@@ -420,9 +477,10 @@ export function levelOrInfo(raw: unknown): 'debug' | 'info' | 'warn' | 'error' {
  */
 export function armKillWatchdog(
   child: ChildProcessWithoutNullStreams,
-  opts: { timeoutMs: number; idleKillMs?: number; lastEventAt?: () => number },
+  opts: { timeoutMs: number; deadlineAt?: number; idleKillMs?: number; lastEventAt?: () => number },
 ): { fired: () => 'wall' | 'idle' | null; reason: () => string; disarm: () => void } {
   const startedAt = Date.now();
+  const deadlineAt = Math.min(opts.deadlineAt ?? Infinity, startedAt + opts.timeoutMs);
   const idleKillMs = opts.idleKillMs && opts.idleKillMs > 0 && opts.lastEventAt
     ? opts.idleKillMs
     : 0;
@@ -442,7 +500,7 @@ export function armKillWatchdog(
   const tickMs = Math.max(25, Math.min(5_000, Math.floor(minLimit / 4)));
   const ticker = setInterval(() => {
     const now = Date.now();
-    if (now - startedAt >= opts.timeoutMs) {
+    if (now >= deadlineAt) {
       firedKind = 'wall';
     } else if (idleKillMs) {
       const idleFor = now - opts.lastEventAt!();

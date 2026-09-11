@@ -269,23 +269,41 @@ describe('local_agents/backends/codex › extractCodexUsage', () => {
   });
 });
 
-describe('local_agents/backends/codex › trusted local permissions', () => {
-  it('starts threads without sandbox approval prompts', () => {
-    expect(buildCodexThreadPermissionOverrides()).toEqual({
-      approvalPolicy: 'never',
-      sandbox: 'danger-full-access',
+describe('local_agents/backends/codex › Orkas permissions', () => {
+  it('leaves Codex permission selection to its CLI defaults when the Agent has no override', () => {
+    expect(buildCodexThreadPermissionOverrides()).toEqual({});
+    expect(buildCodexTurnPermissionOverrides('/tmp/project')).toEqual({ cwd: '/tmp/project' });
+  });
+
+  it('maps approval mode to the Orkas-reviewed workspace profile', () => {
+    expect(buildCodexThreadPermissionOverrides('ask')).toEqual({
+      approvalPolicy: 'on-request',
+      approvalsReviewer: 'user',
+      permissions: ':workspace',
+    });
+    expect(buildCodexTurnPermissionOverrides('/tmp/project', 'ask')).toEqual({
+      cwd: '/tmp/project',
+      approvalPolicy: 'on-request',
+      approvalsReviewer: 'user',
+      permissions: ':workspace',
     });
   });
 
-  it('starts turns with full-access sandbox policy', () => {
-    expect(buildCodexTurnPermissionOverrides('/tmp/project')).toEqual({
+  it('maps Orkas trusted mode to the full-access profile', () => {
+    expect(buildCodexThreadPermissionOverrides('full_access')).toEqual({
+      approvalPolicy: 'never',
+      approvalsReviewer: 'user',
+      permissions: ':danger-full-access',
+    });
+    expect(buildCodexTurnPermissionOverrides('/tmp/project', 'full_access')).toEqual({
       cwd: '/tmp/project',
       approvalPolicy: 'never',
-      sandboxPolicy: { type: 'dangerFullAccess' },
+      approvalsReviewer: 'user',
+      permissions: ':danger-full-access',
     });
   });
 
-  it('omits CLI-owned defaults and sends only explicit per-Agent turn overrides', () => {
+  it('sends only explicit model and effort overrides', () => {
     expect(buildCodexTurnRuntimeOverrides({})).toEqual({});
     expect(buildCodexTurnRuntimeOverrides({
       modelOverride: 'gpt-5.4',

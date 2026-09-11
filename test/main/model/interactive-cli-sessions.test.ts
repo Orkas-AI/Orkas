@@ -14,6 +14,7 @@ import {
   readInteractiveCliSession,
   sendInteractiveCliInput,
   startInteractiveCliSession,
+  waitInteractiveCliSession,
 } from '../../../src/main/model/core-agent/interactive-cli-sessions';
 
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
@@ -49,6 +50,65 @@ async function eventually<T>(
 }
 
 describe('interactive CLI session privacy boundary', () => {
+  it.each(['browser_auth', 'agent_terminal', 'connector_input', undefined, 'unknown'] as const)('carries only the host-owned presentation %s across prompts and exit', async (presentation) => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-browser-auth-'));
+    tempRoots.push(cwd);
+    const events: Array<Record<string, unknown>> = [];
+    _setInteractiveCliBroadcastForTest((_channel, payload) => events.push(payload as Record<string, unknown>));
+    const started = startInteractiveCliSession({
+      uid: 'account-a',
+      cid: 'conversation-a',
+      command: TEST_NODE,
+      args: ['-e', [
+        "process.stderr.write('Please enter the authorization code in your browser:\\n');",
+        "setTimeout(() => process.stderr.write('https://login.dingtalk.com/oauth2/device/verify.htm?user_code=DING-42\\n'), 50);",
+      ].join('')],
+      cwd,
+      presentation: presentation as 'browser_auth',
+    });
+    const terminal = await waitInteractiveCliSession('account-a', started.session_id);
+    expect(terminal).toMatchObject({ status: 'exited', exit_code: 0 });
+    expect(events.map((event) => event.type)).toEqual(expect.arrayContaining(['started', 'output', 'waiting_input', 'exited']));
+    expect(events.every((event) => event.presentation === (presentation === 'unknown' ? undefined : presentation)
+      && event.user_id === 'account-a' && event.conversation_id === 'conversation-a')).toBe(true);
+    expect(terminal.urls).toContain('https://login.dingtalk.com/oauth2/device/verify.htm?user_code=DING-42');
+  });
+
+  it.each([undefined, '', '   '])('does not grant terminal presentation to a command without a task (%s)', async (cid) => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-unscoped-cli-'));
+    tempRoots.push(cwd);
+    const events: Array<Record<string, unknown>> = [];
+    _setInteractiveCliBroadcastForTest((_channel, payload) => events.push(payload as Record<string, unknown>));
+    const started = startInteractiveCliSession({
+      uid: 'account-a', cid, presentation: 'agent_terminal', agentId: 'claimed-agent',
+      command: TEST_NODE, args: ['-e', "process.stdout.write('Enter password: '); process.exit(2);"], cwd,
+    });
+    const terminal = await waitInteractiveCliSession('account-a', started.session_id);
+    expect(terminal).toMatchObject({ status: 'error', exit_code: 2 });
+    expect(events.map((event) => event.type)).toEqual(expect.arrayContaining(['started', 'waiting_input', 'error']));
+    expect(events.every((event) => event.presentation === undefined)).toBe(true);
+  });
+
+  it('spawns app-owned executable argv directly and exposes a non-polling completion waiter', async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-interactive-cli-argv-'));
+    tempRoots.push(cwd);
+    _setInteractiveCliBroadcastForTest(() => {});
+    const literal = 'literal;$(must-not-run)';
+    const started = startInteractiveCliSession({
+      uid: 'account-a',
+      command: TEST_NODE,
+      args: ['-e', 'process.stdout.write(process.argv[1])', literal],
+      cwd,
+      maxLifetimeMs: 30_000,
+    });
+
+    const terminal = await waitInteractiveCliSession('account-a', started.session_id);
+
+    expect(terminal).toMatchObject({ status: 'exited', exit_code: 0 });
+    expect(terminal.output).toBe(literal);
+    expect(terminal.command).toContain(JSON.stringify(literal));
+  });
+
   it.runIf(process.platform === 'win32')(
     'uses the configured Windows shell instead of passing PowerShell commands to cmd.exe',
     async () => {

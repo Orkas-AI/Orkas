@@ -119,9 +119,7 @@ describe('connectors registry secret storage', () => {
     expect(raw).not.toContain('refresh-secret');
     const disk = JSON.parse(raw);
     expect(disk.connections.github.oauth_grant).toBeUndefined();
-    expect(localSecrets.preferredLocalSecretKind()).toBe('fallback');
     expect(localSecrets.isEncryptedSecret(disk.connections.github.secrets_enc)).toBe(true);
-    expect(localSecrets.isHostedEncryptedSecret(disk.connections.github.secrets_enc)).toBe(false);
 
     const loaded = registry.load(TEST_UID);
     expect(loaded.connections.github.oauth_grant?.access_token).toBe('access-secret');

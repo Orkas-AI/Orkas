@@ -23,7 +23,10 @@ import { getActiveUserId } from '../../features/users';
 import { registerUserSwitchHook } from '../../features/user-switch-hooks';
 import { getLanguage, getGlobalSkillRootsEnabled } from '../../features/config';
 import { descriptionLang } from '../../i18n';
-import { SKILL_DESCRIPTION_ROSTER_MAX_CHARS } from '../../util/skill-description-policy';
+import {
+  SKILL_DESCRIPTION_ROSTER_MAX_CHARS,
+  SKILL_ROSTER_MAX_CHARS,
+} from '../../util/skill-description-policy';
 // `pickDescription` is loaded lazily — see CLAUDE.md §3: any static import
 // from `#core-agent` at module load would pull in pi-ai before
 // `sdk-timeout-patch` has had a chance to monkey-patch it. The cached fn is
@@ -53,11 +56,12 @@ export type SkillSelectionInput = string | SkillSelectionRef;
 // Open-tier roots (external packages / global dirs) are matched by the caller-supplied
 // label map in `renderSkillLines`; this fast path only distinguishes the trusted tier and
 // is what allowlist ranking + advertise signals rely on.
-function skillSourceLabel(source: string, uid = getActiveUserId()): 'platform' | 'custom' | 'unknown' {
+function skillSourceLabel(source: string, uid?: string): 'platform' | 'custom' | 'unknown' {
   try {
+    const resolvedUid = uid || getActiveUserId();
     const resolved = path.resolve(source);
-    if (resolved === path.resolve(userSkillsDir(uid))) return 'custom';
-    if (resolved === path.resolve(userMarketplaceSkillsDir(uid))) return 'platform';
+    if (resolved === path.resolve(userSkillsDir(resolvedUid))) return 'custom';
+    if (resolved === path.resolve(userMarketplaceSkillsDir(resolvedUid))) return 'platform';
     // Catch-all. custom is now matched EXPLICITLY above, so an unrecognized
     // root falls here as `unknown` (lowest dedupe priority) instead of being
     // silently treated as `custom` (highest). Open-tier roots are ranked via
@@ -95,9 +99,9 @@ function skillSourceRank(s: Pick<SkillAllowlistRef, 'source' | 'dir'>): number {
   return SOURCE_DEDUPE_RANK[skillSourceLabelForSpec(s)];
 }
 
-function capPromptDescription(text: string): string {
-  if (text.length <= SKILL_DESCRIPTION_ROSTER_MAX_CHARS) return text;
-  let end = SKILL_DESCRIPTION_ROSTER_MAX_CHARS - 1;
+function capPromptDescription(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  let end = maxChars - 1;
   const lastIncluded = text.charCodeAt(end - 1);
   const firstOmitted = text.charCodeAt(end);
   if (
@@ -110,14 +114,17 @@ function capPromptDescription(text: string): string {
   return `${visible}…`;
 }
 
-export function compactPromptDescription(description: string): string {
+export function compactPromptDescription(
+  description: string,
+  maxChars: number = SKILL_DESCRIPTION_ROSTER_MAX_CHARS,
+): string {
   const text = String(description || '').trim();
   if (!text) return '';
-  // A Skill description is the routing index: capability, typical intent,
-  // and any necessary boundary all affect whether the model reads SKILL.md.
+  // A routing description is the selection index: capability, typical intent,
+  // and any necessary boundary all affect whether the model reads the body.
   // Do not guess which clauses are expendable. Authors keep entries concise;
-  // runtime only enforces the shared visible safety ceiling.
-  return capPromptDescription(text);
+  // runtime only enforces the roster's visible safety ceiling.
+  return capPromptDescription(text, maxChars);
 }
 
 /** Prompt-internal routing descriptions use one stable language so a Chinese
@@ -314,10 +321,22 @@ function bindRuntimeSkillRefs(
   return refBySpec;
 }
 
+// Test-only export: the roster block exactly as the system prompt renders it.
+export { renderSkillLines as _renderSkillLinesForTest };
+
+interface RenderSkillLinesOptions {
+  /** User-selected Skills stay fully described even when the shared roster is
+   * compacted. Object identity is stable within one registry render. */
+  forceFullSpecs?: ReadonlySet<SkillSpec>;
+  maxChars?: number;
+  onRenderedSpecs?: (specs: readonly SkillSpec[]) => void;
+}
+
 async function renderSkillLines(
   specs: SkillSpec[],
   rootEntries: PromptRootEntry[],
   runtimeBindings?: Map<string, SkillRuntimeBinding>,
+  options: RenderSkillLinesOptions = {},
 ): Promise<string> {
   if (!specs.length) return '';
   const labelByRoot = new Map<string, string>();
@@ -325,59 +344,121 @@ async function renderSkillLines(
     const resolved = path.resolve(r.root);
     if (!labelByRoot.has(resolved)) labelByRoot.set(resolved, r.label);
   }
-  // Only print ROOT rows the entry list actually references — open-tier
-  // roots with zero surviving entries would be prompt noise.
+  // Only print ROOT rows the entry list actually references; roots with zero
+  // surviving entries would be prompt noise.
   const usedLabels = new Set<string>();
   const labelOf = (s: SkillSpec): string => {
     const trusted = skillSourceLabelForSpec(s);
     if (trusted !== 'unknown') return trusted;
     return labelByRoot.get(path.resolve(s.source)) || 'unknown';
   };
-  for (const s of specs) usedLabels.add(labelOf(s));
-
-  const runtimeRefBySpec = runtimeBindings
-    ? bindRuntimeSkillRefs(specs, labelOf, runtimeBindings)
-    : null;
-  const lines: string[] = ['## Available skills (skills)', ''];
-  if (runtimeRefBySpec) {
-    lines.push(
-      '`read_files({"paths":[{"path":"@skill/<read-ref>"}]})` loads that skill\'s SKILL.md for this run.',
-      '`read_files({"paths":[{"path":"@skill/<read-ref>/<relative-path>"}]})` loads a referenced file, template, asset, or script inside the same skill.',
-      'Use the exact read ref shown on the matching entry. Do not discover or reconstruct physical skill paths.',
-      'These entries are skills, not tool names: read SKILL.md and follow it; never call the display name or id as a tool. Never mention skill ids in plans, workflows, progress, or final replies.',
-      '',
-    );
-  } else {
-    lines.push('`read_files({"paths":[{"path":"<ROOT>/<id>/SKILL.md"}]})` — ROOT by Source:');
-    for (const r of rootEntries) {
-      // builtin + platform + custom rows always render (stable prompt prefix);
-      // other tiers render only when referenced. `custom:` keeps its historical
-      // two-space alignment.
-      if (r.label === 'builtin' || r.label === 'platform' || r.label === 'custom' || usedLabels.has(r.label)) {
-        lines.push(`- ${r.label}:${r.label === 'custom' ? '  ' : ' '}${r.root}`);
+  const build = (
+    selected: SkillSpec[],
+    detailed: ReadonlySet<SkillSpec>,
+  ): { text: string; bindings: Map<string, SkillRuntimeBinding> | null } => {
+    usedLabels.clear();
+    for (const s of selected) usedLabels.add(labelOf(s));
+    const nextBindings = runtimeBindings ? new Map(runtimeBindings) : null;
+    const runtimeRefBySpec = nextBindings
+      ? bindRuntimeSkillRefs(selected, labelOf, nextBindings)
+      : null;
+    const lines: string[] = ['## Available skills (skills)', ''];
+    if (runtimeRefBySpec) {
+      lines.push(
+        '`read_files({"paths":[{"path":"@skill/<read-ref>"}]})` loads that skill\'s SKILL.md for this run.',
+        '`read_files({"paths":[{"path":"@skill/<read-ref>/<relative-path>"}]})` loads a referenced file, template, asset, or script inside the same skill.',
+        'Use the exact read ref shown on the matching entry. Do not discover or reconstruct physical skill paths.',
+        'These entries are skills, not tool names: read SKILL.md and follow it; never call the display name or id as a tool. Never mention skill ids in plans, workflows, progress, or final replies.',
+        '',
+      );
+    } else {
+      lines.push('`read_files({"paths":[{"path":"<ROOT>/<id>/SKILL.md"}]})` — ROOT by Source:');
+      for (const r of rootEntries) {
+        if (r.label === 'builtin' || r.label === 'platform' || r.label === 'custom' || usedLabels.has(r.label)) {
+          lines.push(`- ${r.label}:${r.label === 'custom' ? '  ' : ' '}${r.root}`);
+        }
       }
+      lines.push(
+        'Use these ROOT values verbatim. `<id>` is the internal read id for read_files paths only, even when it differs from display name.',
+        'These entries are skills, not tool names: read SKILL.md and follow it; never call the display name or id as a tool. Never mention skill ids in plans, workflows, progress, or final replies.',
+        '',
+      );
     }
-    lines.push(
-      'Use these ROOT values verbatim. `<id>` is the internal read id for read_files paths only, even when it differs from display name.',
-      'These entries are skills, not tool names: read SKILL.md and follow it; never call the display name or id as a tool. Never mention skill ids in plans, workflows, progress, or final replies.',
-      '',
-    );
+    for (const s of selected) {
+      const source = labelOf(s);
+      const description = detailed.has(s)
+        ? compactPromptDescription(pickPromptDescription(s))
+        : '';
+      const desc = description ? ` — ${description}` : '';
+      const displayName = s.name || s.id;
+      const runtimeRef = runtimeRefBySpec?.get(s);
+      const internal = runtimeRef
+        ? `; read ref: @skill/${runtimeRef}`
+        : displayName !== s.id ? `; internal read id: ${s.id}` : '';
+      lines.push(`- **${displayName}** (Source: ${source}${internal})${desc}`);
+    }
+    return { text: lines.join('\n'), bindings: nextBindings };
+  };
+
+  const maxChars = Math.max(1, options.maxChars ?? SKILL_ROSTER_MAX_CHARS);
+  const allDetailed = new Set(specs);
+  let finalSpecs = specs;
+  let result = build(specs, allDetailed);
+  if (result.text.length > maxChars) {
+    // System Skills are rendered by a separate block. In the regular roster,
+    // platform builtins, the acting Agent's private Skills, and explicit user
+    // selections are non-searchable or user-mandated, so they remain complete.
+    const protectedSpecs = new Set(specs.filter((s) => {
+      const source = labelOf(s);
+      return source === 'builtin'
+        || source === 'agent'
+        || source.startsWith('agent')
+        || options.forceFullSpecs?.has(s);
+    }));
+    const searchable = specs.filter((s) => !protectedSpecs.has(s));
+    // Fit searchable name-only rows by stable source priority. There is no
+    // item-count limit: retain the longest priority prefix that fits the one
+    // character budget. Binary search keeps large registries O(n log n).
+    const orderedSearchable = searchable
+      .map((spec, index) => ({ spec, index, rank: SOURCE_DEDUPE_RANK[labelOf(spec) as SkillSourceLabel] ?? 99 }))
+      .sort((a, b) => (a.rank - b.rank) || (a.index - b.index));
+    let low = 0;
+    let high = orderedSearchable.length;
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      const candidate = new Set(protectedSpecs);
+      for (let i = 0; i < middle; i += 1) candidate.add(orderedSearchable[i].spec);
+      const next = build(specs.filter((s) => candidate.has(s)), protectedSpecs);
+      if (next.text.length <= maxChars) low = middle;
+      else high = middle - 1;
+    }
+    const retained = new Set(protectedSpecs);
+    for (let i = 0; i < low; i += 1) retained.add(orderedSearchable[i].spec);
+    finalSpecs = specs.filter((s) => retained.has(s));
+    // Gradual compaction: with the retained set fixed, give the top-ranked
+    // searchable rows their descriptions back for as long as the roster still
+    // fits, and degrade only the tail to name-only rows. Descriptions only add
+    // characters, so the longest describable prefix is a second binary search.
+    const retainedSearchable = orderedSearchable.slice(0, low).map((item) => item.spec);
+    let detailedLow = 0;
+    let detailedHigh = retainedSearchable.length;
+    while (detailedLow < detailedHigh) {
+      const middle = Math.ceil((detailedLow + detailedHigh) / 2);
+      const detailed = new Set(protectedSpecs);
+      for (let i = 0; i < middle; i += 1) detailed.add(retainedSearchable[i]);
+      if (build(finalSpecs, detailed).text.length <= maxChars) detailedLow = middle;
+      else detailedHigh = middle - 1;
+    }
+    const detailedSpecs = new Set(protectedSpecs);
+    for (let i = 0; i < detailedLow; i += 1) detailedSpecs.add(retainedSearchable[i]);
+    result = build(finalSpecs, detailedSpecs);
   }
-  for (const s of specs) {
-    const source = labelOf(s);
-    const description = compactPromptDescription(pickPromptDescription(s));
-    const desc = description ? ` — ${description}` : '';
-    // When name == id (custom skills authored locally), collapse the redundancy; when they
-    // differ (marketplace installs), keep the id explicitly internal so the model can read by
-    // path without being primed to repeat the id in user-facing prose.
-    const displayName = s.name || s.id;
-    const runtimeRef = runtimeRefBySpec?.get(s);
-    const internal = runtimeRef
-      ? `; read ref: @skill/${runtimeRef}`
-      : displayName !== s.id ? `; internal read id: ${s.id}` : '';
-    lines.push(`- **${displayName}** (Source: ${source}${internal})${desc}`);
+  if (runtimeBindings && result.bindings) {
+    runtimeBindings.clear();
+    for (const [ref, binding] of result.bindings) runtimeBindings.set(ref, binding);
   }
-  return lines.join('\n');
+  options.onRenderedSpecs?.(finalSpecs);
+  return result.text;
 }
 
 type CoreAgent = typeof import('#core-agent');
@@ -660,101 +741,160 @@ export function openSkillReadRoots(uid: string): string[] {
   return [...dirs.external, ...dirs.global];
 }
 
-/** Static commander hint appended to the skills block. External-package skills
- *  are now INLINED above (a quality, registry-bounded source). Only the GLOBAL
- *  skill folders stay behind `skill_search` — they are unbounded user content,
- *  and keeping them search-only with no count keeps the cache prefix stable. */
-const OPEN_TIER_SKILL_HINT =
-  'More skills may be available from your global skill folders — these are NOT listed '
-  + 'above. Load `management.skills`, call `skill_search` with a capability query, then '
-  + '`read_files` the returned run-scoped Skill ref before invoking.';
+/** Stable hint for task runtimes that own the read-only discovery tool. Keep
+ * it source-agnostic: lower tiers may be absent because they are lazy by
+ * policy or because the fixed roster budget omitted their name-only row. */
+const SKILL_SEARCH_HINT =
+  'Additional shared Skills are available through '
+  + '`skill_search`; read the returned run-scoped Skill ref before using one.';
 
-const OPEN_SEARCH_DEFAULT_LIMIT = 5;
-const OPEN_SEARCH_MAX_LIMIT = 10;
+const SKILL_SEARCH_DEFAULT_LIMIT = 5;
+const SKILL_SEARCH_MAX_LIMIT = 10;
 
-export interface OpenSkillSearchRow {
+export interface AvailableSkillSearchRow {
   name: string;
   id: string;
-  source: 'external' | 'global';
-  /** Absolute `<root>/<id>/SKILL.md` — commander reads this before invoking. */
+  source: 'builtin' | 'platform' | 'custom' | 'external' | 'global';
+  /** Absolute entry file. The caller replaces it with a run-scoped read ref. */
   read_path: string;
   description: string;
 }
 
-export interface OpenSkillSearchResult {
-  rows: OpenSkillSearchRow[];
+export interface AvailableSkillSearchResult {
+  rows: AvailableSkillSearchRow[];
   total_matched: number;
   returned: number;
 }
 
 /**
- * Search GLOBAL-folder skills by capability. External-package skills are
- * inlined into task/authoring prompts, so this backs the `skill_search` tool
- * only for the still-lazy global tier. Trusted-tier ids win id collisions
- * (dropped here) so a result never points at an ambiguous read path. Ranking
- * is lexical token overlap on name + description; an empty query returns a
- * bounded list ordered by name. Results are capped to `limit` (default 5,
- * max 10) after the zero-based `offset`; `total_matched` lets the host know
- * more exist. `disabledIds`
- * (the user's component-disable set, passed in by the feature caller so this
- * model-layer module stays free of `features/*`) is filtered out — a disabled
- * skill never surfaces in search.
+ * Search the shared Skill catalog. System Skills and every Agent-private
+ * Skill are intentionally outside it. Commander already has builtins resident;
+ * named Agents can discover builtins not declared in skill_list. Source
+ * precedence resolves collisions as builtin > platform-installed > user
+ * custom > external package > global folder.
  */
-export async function searchOpenTierSkills(
+export async function searchAvailableSkills(
   uid: string,
   query: string,
   limit?: number,
   disabledIds?: Iterable<string>,
   offset = 0,
-): Promise<OpenSkillSearchResult> {
+  excludedRefs?: Iterable<string>,
+): Promise<AvailableSkillSearchResult> {
   if (!Number.isSafeInteger(offset) || offset < 0) {
     throw new RangeError('skill search offset must be a non-negative safe integer');
   }
+  const normalize = (value: string): string => value.normalize('NFKC').toLocaleLowerCase().trim();
+  const disabled = disabledIds ? new Set(disabledIds) : null;
+  const excluded = excludedRefs ? new Set([...excludedRefs].map(normalize)) : null;
+  const isExcluded = (spec: SkillSpec): boolean => !!excluded && (
+    excluded.has(normalize(spec.id)) || excluded.has(normalize(spec.name || spec.id))
+  );
+  type Candidate = { spec: SkillSpec; source: AvailableSkillSearchRow['source'] };
+  const candidates: Candidate[] = [];
+
+  const trusted = (await getLoader(uid)).list();
+  for (const spec of trusted) {
+    if (spec.ownerAgent || (disabled && disabled.has(spec.id)) || isExcluded(spec)) continue;
+    const source = skillSourceLabelForSpec(spec, uid);
+    if (source === 'builtin' || source === 'platform' || source === 'custom') {
+      candidates.push({ spec, source });
+    }
+  }
+
   const dirs = _computeOpenTierDirs(uid);
   const loader = await getOpenLoader(dirs);
-  if (!loader) return { rows: [], total_matched: 0, returned: 0 };
+  if (loader) {
+    const externalSet = new Set(dirs.external.map((d) => path.resolve(d)));
+    const globalSet = new Set(dirs.global.map((d) => path.resolve(d)));
+    for (const spec of loader.list()) {
+      if (spec.ownerAgent || (disabled && disabled.has(spec.id)) || isExcluded(spec)) continue;
+      const root = path.resolve(spec.source);
+      if (externalSet.has(root)) {
+        const meta = packageMetaForSkillDir(uid, spec.dir);
+        if (!meta.package_name || meta.package_enabled === false) continue;
+        candidates.push({ spec, source: 'external' });
+      } else if (globalSet.has(root)) {
+        candidates.push({ spec, source: 'global' });
+      }
+    }
+  }
 
-  // External-package skills are now inlined into the commander prompt, so
-  // search returns ONLY global-folder skills (the still-lazy tier). The open
-  // loader still loads both (cache shared with the prompt/bridge); we filter
-  // external out of the results here.
-  const externalSet = new Set(dirs.external.map((d) => path.resolve(d)));
-  const trustedIds = new Set((await getLoader(uid)).list().map((s) => s.id));
-  const disabled = disabledIds ? new Set(disabledIds) : null;
-  const specs = loader.list().filter((s) =>
-    !trustedIds.has(s.id)
-    && !(disabled && disabled.has(s.id))
-    && !externalSet.has(path.resolve(s.source)));
+  const sourceRank: Record<AvailableSkillSearchRow['source'], number> = {
+    builtin: 0,
+    platform: 1,
+    custom: 2,
+    external: 3,
+    global: 4,
+  };
+  candidates.sort((a, b) => sourceRank[a.source] - sourceRank[b.source]);
+  const seenIds = new Set<string>();
+  const seenNames = new Set<string>();
+  const deduped = candidates.filter(({ spec }) => {
+    const name = (spec.name || spec.id).trim();
+    const nameKey = name.normalize('NFKC').toLocaleLowerCase();
+    if (seenIds.has(spec.id) || seenNames.has(nameKey)) return false;
+    seenIds.add(spec.id);
+    seenNames.add(nameKey);
+    return true;
+  });
 
   const lang = descriptionLang(getLanguage());
   const pick = await getPickDescription();
-  const q = String(query || '').toLowerCase().trim();
-  const tokens = q ? q.split(/[\s,，、;；]+/u).filter(Boolean) : [];
-
-  const scored = specs.map((s) => {
-    const name = s.name || s.id;
-    const fullDesc = pick(s, lang) || '';
-    const nameLc = name.toLowerCase();
-    const hay = `${nameLc}\n${fullDesc.toLowerCase()}`;
-    let score = 0;
-    for (const t of tokens) {
-      if (nameLc.includes(t)) score += t.length * 2; // name hits weigh more
-      else if (hay.includes(t)) score += t.length;
+  const tokenise = (value: string): string[] => {
+    const normalized = normalize(value);
+    const out = new Set<string>();
+    for (const token of normalized.match(/[a-z0-9][a-z0-9._+-]*|[\p{Script=Han}]+/gu) || []) {
+      if (/^[\p{Script=Han}]+$/u.test(token) && token.length > 2) {
+        for (let i = 0; i < token.length - 1; i++) out.add(token.slice(i, i + 2));
+      } else {
+        out.add(token);
+        // Keep the compound for exact/name scoring, but also match ordinary
+        // prose that spells a Skill id with spaces instead of separators
+        // (`risk-audit` vs `risk audit`). Ignore one-character fragments so
+        // package scopes and version suffixes do not turn into broad noise.
+        for (const part of token.split(/[._+-]+/g)) {
+          if (part.length >= 2) out.add(part);
+        }
+      }
     }
-    return { s, name, fullDesc, score };
+    return [...out];
+  };
+  const q = normalize(String(query || ''));
+  const tokens = tokenise(q);
+
+  const scored = deduped.map(({ spec, source }) => {
+    const name = spec.name || spec.id;
+    const fullDesc = pick(spec, lang) || pickPromptDescription(spec) || '';
+    const normalizedName = normalize(name);
+    const normalizedId = normalize(spec.id);
+    const hay = normalize(`${name}\n${spec.id}\n${spec.description_zh || ''}\n${spec.description_en || ''}`);
+    let score = 0;
+    if (q && (normalizedName === q || normalizedId === q)) score += 10_000;
+    else if (q && normalizedName.includes(q)) score += 2_000 + q.length;
+    else if (q && hay.includes(q)) score += 1_000 + q.length;
+    for (const token of tokens) {
+      if (normalizedName.includes(token) || normalizedId.includes(token)) score += 100 + token.length;
+      else if (hay.includes(token)) score += 10 + token.length;
+    }
+    return { spec, source, name, fullDesc, score };
   });
 
-  const matched = tokens.length ? scored.filter((x) => x.score > 0) : scored;
-  matched.sort((a, b) => (b.score - a.score) || a.name.localeCompare(b.name));
+  const matched = q ? scored.filter((x) => x.score > 0) : scored;
+  matched.sort((a, b) => (
+    (b.score - a.score)
+    || (sourceRank[a.source] - sourceRank[b.source])
+    || a.name.localeCompare(b.name)
+    || a.spec.id.localeCompare(b.spec.id)
+  ));
 
-  const cap = Math.max(1, Math.min(OPEN_SEARCH_MAX_LIMIT, Math.floor(limit || OPEN_SEARCH_DEFAULT_LIMIT)));
-  const rows: OpenSkillSearchRow[] = matched.slice(offset, offset + cap).map(({ s, name, fullDesc }) => {
-    const resolved = path.resolve(s.source);
+  const cap = Math.max(1, Math.min(SKILL_SEARCH_MAX_LIMIT, Math.floor(limit || SKILL_SEARCH_DEFAULT_LIMIT)));
+  const rows: AvailableSkillSearchRow[] = matched.slice(offset, offset + cap).map(({ spec, source, name, fullDesc }) => {
     return {
       name,
-      id: s.id,
-      source: externalSet.has(resolved) ? 'external' : 'global',
-      read_path: path.join(resolved, s.id, 'SKILL.md'),
+      id: spec.id,
+      source,
+      read_path: path.resolve(spec.skillFile),
       description: compactPromptDescription(fullDesc),
     };
   });
@@ -763,10 +903,10 @@ export async function searchOpenTierSkills(
 
 export interface SystemPromptBlockOptions {
   /**
-   * Restrict the skills listing to a subset. When undefined, every skill
-   * discovered by the loader is rendered (legacy behavior). When an empty
-   * array is passed, renders an empty block — legacy explicit-empty allowlist
-   * semantics.
+   * Commander/non-Agent callers render every trusted Skill when undefined and
+   * an exact subset when present. For a named Agent, missing and empty both
+   * mean no default shared dependency; a non-empty value is its resident
+   * `skill_list`. Agent-private Skills are appended independently.
    *
    * Unknown ids/names are silently dropped (skill may have been deleted
    * since the agent was configured). Display-name matching preserves legacy
@@ -801,17 +941,9 @@ export interface SystemPromptBlockOptions {
    * physical roots. Omit for standalone prompt fragments that do not share a
    * live Runner (they retain the legacy absolute-path contract). */
   runtimeBindings?: Map<string, SkillRuntimeBinding>;
-  /**
-   * Commander task sessions (`gconv`) only.
-   * Inlines enabled EXTERNAL-package skills into the block (registry-bounded,
-   * quality source — so the model sees
-   * what's installed and won't re-install it), and appends a static one-line hint
-   * pointing at `skill_search` (-> `searchOpenTierSkills`) for the still-lazy
-   * GLOBAL-folder tier (unbounded user content). Ignored under an allowlist
-   * (project pinning stays trusted-tier-only). Agent metadata excludes the
-   * entire OPEN tier because runtime Agents cannot load it.
-   */
-  includeOpenSources?: boolean;
+  /** The task runtime owns `skill_search`. External/global Skills stay lazy,
+   * and lower-tier rows omitted by the fixed roster budget remain discoverable. */
+  includeSkillSearchHint?: boolean;
   /**
    * The acting agent's `agent_id` for this render (empty/undefined for the
    * commander and non-agent sessions). Skills tagged `ownerAgent` render ONLY
@@ -834,9 +966,10 @@ export interface SystemPromptBlockOptions {
  * system prompt so the LLM knows what's available. Empty string when
  * no skills are found (core-agent treats `""` as "skip the section").
  *
- * When `opts.allowlist` is provided, trusted skills are restricted to that
- * list, then the acting agent's private skills and user-forced open skills
- * are appended. Rendering always goes through `renderSkillLines` so the
+ * For a named Agent, trusted skills are restricted to its dependency list;
+ * Commander retains the full trusted roster unless explicitly restricted.
+ * The acting Agent's private Skills and user-forced selections are appended.
+ * Rendering always goes through `renderSkillLines` so the
  * `Source` label is derived from the exact root path rather than basename.
  */
 export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}): Promise<string> {
@@ -857,10 +990,24 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
     { label: 'custom', root: path.resolve(userSkillsDir(uid)) },
   ];
 
+  const actorAgentId = (opts.agentId || '').trim();
   let rendered: typeof specs;
   let allowlisted = false;
   let rawAllow: string[] = [];
-  if (opts.allowlist === undefined) {
+  if (actorAgentId) {
+    // A named Agent receives only its declared shared defaults. skill_list is
+    // not a capability authorization wall: every other non-System, non-private
+    // Skill (including a platform builtin) remains available through search.
+    rawAllow = (opts.allowlist || []).filter((id) => typeof id === 'string' && id.length > 0);
+    allowlisted = opts.allowlist !== undefined;
+    if (!rawAllow.length) {
+      rendered = [];
+    } else {
+      const { ids } = resolveSkillAllowlistRefs(specs, rawAllow);
+      const allow = new Set([...ids, ...rawAllow]);
+      rendered = filterDisabled(specs.filter((s) => allow.has(s.id)));
+    }
+  } else if (opts.allowlist === undefined) {
     rendered = filterDisabled(specs);
   } else {
     allowlisted = true;
@@ -874,7 +1021,6 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
     }
   }
 
-  const actorAgentId = (opts.agentId || '').trim();
   if (actorAgentId) {
     const existingIds = new Set(rendered.map((s) => s.id));
     let privateIndex = 0;
@@ -890,13 +1036,8 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
     }
   }
 
-  // EXTERNAL-package skills are inlined for Commander task sessions
-  // (registry-bounded, quality source). GLOBAL-folder skills stay behind
-  // `skill_search` (unbounded user content; the hint below points there).
-  // Inlining external means a package install/enable busts the session cache
-  // prefix — an accepted trade for the model directly seeing installed
-  // packages (so it won't try to re-install something already present).
-  // Allowlisted render paths and Agent metadata stay trusted/private only.
+  // External-package and global-folder Skills stay lazy. Exact user selection
+  // below can still bind either tier without exposing its containing root.
   const openRootSet = new Set<string>();
   const openRankByRoot = new Map<string, number>();
   const addPromptRoot = (label: string, root: string) => {
@@ -904,32 +1045,6 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
     if (rootEntries.some((r) => r.label === label && path.resolve(r.root) === resolved)) return;
     rootEntries.push({ label, root: resolved });
   };
-  if (opts.includeOpenSources && !allowlisted) {
-    const openDirs = _computeOpenTierDirs(uid);
-    if (openDirs.external.length) {
-      const openLoader = await getOpenLoader(openDirs);
-      if (openLoader) {
-        openDirs.external.forEach((dir, i) => {
-          const resolved = path.resolve(dir);
-          openRootSet.add(resolved);
-          openRankByRoot.set(resolved, SOURCE_DEDUPE_RANK.external);
-          addPromptRoot(i === 0 ? 'external' : `external${i + 1}`, resolved);
-        });
-        const trustedIds = new Set(rendered.map((s) => s.id));
-        const externalSpecs = openLoader.list().filter((s) => {
-          if (!openRootSet.has(path.resolve(s.source))) return false;
-          if (trustedIds.has(s.id)) return false;
-          if (disabled && disabled.has(s.id)) return false;
-          // Registry-backed only: drops a companion whose package was removed
-          // but whose dir lingers (package_name absent), and disabled packages.
-          const meta = packageMetaForSkillDir(uid, s.dir);
-          return !!meta.package_name && meta.package_enabled !== false;
-        });
-        rendered = [...rendered, ...externalSpecs];
-      }
-    }
-  }
-
   const forcedSkillSelections: SkillSelectionRef[] = [];
   const forcedSelectionSeen = new Set<string>();
   for (const input of opts.forceOpenSkillRefs || []) {
@@ -1077,33 +1192,27 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
   // same-name shared one for a non-owner. (Mirrors agent-private tool gating.)
   rendered = rendered.filter((s) => !s.ownerAgent || s.ownerAgent === actorAgentId);
 
-  // Advertise signal stays trusted-only (`A.custom` / `A.platform`); external
-  // entries are rendered but not advertised — their invocation is still
-  // attributed downstream via `onSkillInvoked` (B tier).
-  if (opts.onSkillAdvertised && rendered.length) {
-    for (const s of rendered) {
-      if (openRootSet.has(path.resolve(s.source || ''))) continue;
-      const label = skillSourceLabelForSpec(s);
-      if (label === 'unknown') continue;
-      try {
-        opts.onSkillAdvertised(s.id, label === 'custom' ? 'A.custom' : 'A.platform');
-      } catch { /* callback throws are non-fatal; signal emission is best-effort */ }
-    }
+  const includeSearchHint = opts.includeSkillSearchHint === true;
+  const hintCost = includeSearchHint ? SKILL_SEARCH_HINT.length + 2 : 0;
+  let actuallyRendered: readonly SkillSpec[] = [];
+  const block = await renderSkillLines(rendered, rootEntries, opts.runtimeBindings, {
+    forceFullSpecs: new Set(forcedSpecs),
+    maxChars: Math.max(1, SKILL_ROSTER_MAX_CHARS - hintCost),
+    onRenderedSpecs: (next) => { actuallyRendered = next; },
+  });
+  // Signals and display metadata must describe the effective prompt, not rows
+  // omitted by roster compaction. Search-bound Skills are attributed when read.
+  for (const s of actuallyRendered) {
+    if (opts.displayNameById && s.id) opts.displayNameById.set(s.id, s.name || s.id);
+    if (!opts.onSkillAdvertised || openRootSet.has(path.resolve(s.source || ''))) continue;
+    const label = skillSourceLabelForSpec(s);
+    if (label === 'unknown') continue;
+    try {
+      opts.onSkillAdvertised(s.id, label === 'custom' ? 'A.custom' : 'A.platform');
+    } catch { /* callback throws are non-fatal; signal emission is best-effort */ }
   }
-
-  if (opts.displayNameById) {
-    for (const s of rendered) {
-      if (s.id) opts.displayNameById.set(s.id, s.name || s.id);
-    }
-  }
-
-  const block = await renderSkillLines(rendered, rootEntries, opts.runtimeBindings);
-  // Commander-task hint that GLOBAL-folder skills exist behind `skill_search`
-  // (external packages are inlined above). Constant (no count) so global-folder
-  // changes don't churn the cache prefix. Skipped under an allowlist — pinned
-  // render lists stay trusted-only, while authored metadata excludes global.
-  if (opts.includeOpenSources && !allowlisted) {
-    return block ? `${block}\n\n${OPEN_TIER_SKILL_HINT}` : OPEN_TIER_SKILL_HINT;
+  if (includeSearchHint) {
+    return block ? `${block}\n\n${SKILL_SEARCH_HINT}` : SKILL_SEARCH_HINT;
   }
   return block;
 }
@@ -1374,9 +1483,9 @@ export async function listSkillSpecs(opts: { forAgentId?: string } = {}): Promis
 /**
  * Skill refs an agent authoring session may persist in `<skills>` metadata.
  * Includes only trusted shared skills and the target Agent's private skills.
- * External-package and global-folder Skills are Commander-only: admitting
- * their ids here would persist a dependency that runtime Agent resolution
- * deliberately cannot load.
+ * External-package and global-folder Skills remain non-persistable: runtime
+ * Agents may discover them for one run, but admitting their ids here would
+ * turn a transient read binding into a durable dependency.
  * `opts.forAgentId` applies the same agent-private owner gate as
  * `listSkillSpecs`: another agent's `ownerAgent` skill cannot be persisted in
  * this agent's metadata.

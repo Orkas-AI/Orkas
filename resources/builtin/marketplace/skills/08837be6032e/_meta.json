@@ -1,0 +1,20 @@
+{
+  "version": "1.2.6",
+  "updated_at": "2026-09-05T17:05:00.000Z",
+  "category": "data",
+  "routing": {
+    "applicable_domain": [
+      "quantitative or structured evidence that must be transformed, compared, diagnosed, inferred from, forecast, or validated",
+      "analysis across files, databases, APIs, connectors, tool results, logs, or mixed data sources"
+    ],
+    "negative_examples": [
+      "format a spreadsheet without deriving analytical conclusions",
+      "repeat a conclusion already supplied by the user without examining its evidence",
+      "perform ordinary document or web research whose evidence is primarily narrative rather than quantitative or structured"
+    ],
+    "prerequisites": [
+      "the relevant data is supplied, discoverable in the authorized workspace, or accessible through an available source tool",
+      "the requested decision or analytical question is specific enough to identify a population, metric, comparison, or validation target"
+    ]
+  }
+}

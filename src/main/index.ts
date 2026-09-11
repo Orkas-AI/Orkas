@@ -46,6 +46,12 @@ import {
   installOfflineHtmlPreviewNavigationGuard,
   withOfflineHtmlPreviewPolicy,
 } from './util/window-security';
+import {
+  createRendererChannel,
+  type RendererChannel,
+  type RendererChannelDeps,
+  type RendererChannelOptions,
+} from './util/renderer-channel';
 import { resolveContainedProtocolFile } from './util/protocol-path';
 
 const APP_USER_MODEL_ID = 'com.orkas.desktop';
@@ -172,6 +178,7 @@ void installEnvProxyDispatcher();
 import { installFetchDiag } from './model/core-agent/fetch-diag';
 installFetchDiag();
 
+import { subscribeTaskTerminals, type TaskTerminalEvent } from './features/group_chat/bus';
 import { setFetchImplementation } from './util/retry';
 setFetchImplementation((input, init) => net.fetch(input as Parameters<typeof net.fetch>[0], init));
 
@@ -182,12 +189,16 @@ import * as skillsFeature from './features/skills';
 import * as agentsFeature from './features/agents';
 import * as contextsFeature from './features/contexts';
 import * as chatsFeature from './features/chats';
+import * as conversationTaskBoard from './features/group_chat/task_board';
 import * as searchFeature from './features/search';
 import * as projectFilesFeature from './features/project_files';
 import * as appConfig from './features/config';
 import { getRendererBootTables } from './i18n';
 import * as reflectionOrchestrator from './features/reflection-orchestrator';
 import * as autoTasks from './features/auto_tasks';
+import * as projectDriverRunner from './features/project_driver_runner';
+import * as projectTasks from './features/project_tasks';
+import * as systemSkills from './features/system_skills';
 import * as bundledContentStartup from './features/bundled_content_startup';
 import * as builtinMarketplaceStartup from './features/builtin_marketplace_startup';
 import type { BuiltinMarketplaceSeedResult } from './features/builtin_marketplace';
@@ -230,6 +241,30 @@ function setTaskNotificationBadgeCount(count: number): void {
   app.setBadgeCount(normalized);
 }
 
+let taskTurnRendererReady = false;
+
+// Renderer channels replay what the window could not take while loading; the
+// owner-scoped ones never hand one account's rows to the next (see
+// util/renderer-channel). Every channel created here is flushed on
+// `did-finish-load`.
+const rendererChannels: RendererChannel[] = [];
+const rendererChannelDeps: RendererChannelDeps = {
+  broadcast: (channel, payload) => ipc.broadcastToRenderer(channel, payload),
+  rendererReady: () => taskTurnRendererReady,
+  activeUserId: () => (users.hasActiveUser() ? users.getActiveUserId() : null),
+};
+function rendererChannel(channel: string, options: RendererChannelOptions): RendererChannel {
+  const created = createRendererChannel(channel, options, rendererChannelDeps);
+  rendererChannels.push(created);
+  return created;
+}
+const taskTerminalUi = rendererChannel('conversation:task_terminal', { maxPending: 100, ownerScoped: true });
+
+function emitTaskTerminalToRenderer(event: TaskTerminalEvent): void {
+  const { user_id: ownerUserId, ...terminal } = event;
+  taskTerminalUi.emit({ type: 'terminal', ...terminal }, ownerUserId);
+}
+
 function createWindow(): BrowserWindow {
   const dev = !app.isPackaged;
   const restored = windowState.restoreWindowState();
@@ -257,6 +292,19 @@ function createWindow(): BrowserWindow {
   if (restored.isMaximized) win.maximize();
 
   win.loadFile(path.join(paths.SRC_ROOT, 'renderer', 'index.html'));
+  win.webContents.on('did-start-loading', () => {
+    taskTurnRendererReady = false;
+  });
+  win.webContents.on('did-finish-load', () => {
+    taskTurnRendererReady = true;
+    for (const channel of rendererChannels) channel.flush();
+  });
+  win.webContents.on('render-process-gone', () => {
+    taskTurnRendererReady = false;
+  });
+  win.on('closed', () => {
+    taskTurnRendererReady = false;
+  });
 
   // Block HTML <title> from populating the native titlebar — we want a
   // frame-only look (drag works, but no label across the top).
@@ -328,6 +376,14 @@ function openConversationFromTaskNotification(
 
 function registerIpc(): void {
   ipc.register();
+  // Subscribe before opening the renderer. The deferred driver scheduler must
+  // not determine whether foreground or early background writes are visible.
+  projectTasks.onTasksChanged((e) => ipc.broadcastToRenderer('projects:tasks-changed', {
+    projectId: e.pid,
+  }));
+  conversationTaskBoard.onBacklogExecutionChanged((e) => ipc.broadcastToRenderer('projects:tasks-changed', {
+    projectId: e.pid,
+  }));
 
   ipcMain.handle('orkas.ping', () => {
     return { ok: true, pong: 'pong', ts: storage.nowIso() };
@@ -536,6 +592,8 @@ function registerIpc(): void {
 
 async function runBootSelfCheck(): Promise<void> {
   const diag = {
+    appVersion: app.getVersion(),
+    packaged: app.isPackaged,
     appRoot: paths.APP_ROOT,
     wsRoot: paths.WS_ROOT,
     promptChatNormal: prompts.exists('chat_commander'),
@@ -606,6 +664,16 @@ async function runBootMaintenanceSweeps(): Promise<void> {
       if (deleted) log.info('file_cache pruned', { deleted });
     }
   } catch (err) { log.warn('file_cache sweep failed', { error: (err as Error).message }); }
+
+  // Expert-signal daily files were never pruned; consumers read ≤48h windows.
+  try {
+    const uid = users.getActiveUserId();
+    if (uid) {
+      const signals = await import('./features/expert_signals/storage');
+      const removed = signals.pruneSignalFiles(uid);
+      if (removed) log.info('expert signal files pruned', { removed });
+    }
+  } catch (err) { log.warn('expert signal sweep failed', { error: logErrorSummary(err) }); }
 
   // Workspace empty-subdir sweep — clean up legacy per-conv slug dirs that
   // were materialised by bash's defensive mkdir on a turn that produced
@@ -1334,6 +1402,18 @@ if (!gotLock) {
       openConversation: openConversationFromTaskNotification,
     });
     app.once('before-quit', stopTaskNotifications);
+    // A CLI agent's process is our child but its own process-group leader, so
+    // quitting without ending it leaves it running with nothing to report to.
+    // Fire-and-forget: Electron does not await this hook, and the deadline
+    // inside only decides whether the CLI gets to write a clean session state
+    // before the app goes.
+    app.once('before-quit', () => {
+      void import('./features/local_agents/runner.js')
+        .then(runner => runner.stopBackgroundRuns('the app is quitting'))
+        .catch(() => { /* nothing was running, or the module never loaded */ });
+    });
+    const stopTaskTerminalUi = subscribeTaskTerminals(emitTaskTerminalToRenderer);
+    app.once('before-quit', stopTaskTerminalUi);
     clientConfigFeature.clientConfig.subscribeAll((keys) => {
       ipc.broadcastToRenderer('client-config:changed', { keys });
     });
@@ -1407,6 +1487,11 @@ if (!gotLock) {
       preferIdle: true,
       maxSliceMs: 15_000,
     };
+    const idleProcess = {
+      resourceClass: 'process' as const,
+      preferIdle: true,
+      maxSliceMs: 30_000,
+    };
     // Small schedulers/cache reads may share the first deferred cohort. Disk
     // walkers below are serial barriers so low-end devices do not receive a
     // simultaneous search + KB + marketplace I/O burst.
@@ -1415,6 +1500,27 @@ if (!gotLock) {
       // path in features/marketplace_biz.ts refreshes from Server when needed.
       const m = await import('./features/marketplace_biz');
       await m.primeCategoryCache({ localOnly: true });
+    }, 'serial', BOOT_HEAVY_DISK_DELAY_MS, idleDisk);
+    // Parallel: the probe only warms a cache. A serial barrier here would hold
+    // the automation and project-driver schedulers behind idle admission (no
+    // deadline while a conversation has active work) plus one `--version`
+    // spawn per installed CLI; the `process` resource class already serialises
+    // it against the connector bootstrap.
+    registerDeferred('local-agents:warm-cli-registry', async (signal) => {
+      const { warmLocalClis } = await import('./features/local_agents/registry');
+      await warmLocalClis(signal);
+    }, 'parallel', 0, idleProcess);
+    registerDeferred('auto-tasks:scheduler', () => autoTasks.startScheduler());
+    // To-do driver loop — opt-in per global/project backlog (default off); the
+    // poll early-exits on scopes that have not enabled it.
+    // Surface each driver-created conversation to the renderer so it appears in
+    // the project's task list live, like a human-started run.
+    registerDeferred('project-driver:scheduler', () => {
+      projectDriverRunner.onAdvance((e) => ipc.broadcastToRenderer('projects:advance', {
+        projectId: e.pid,
+        conversation: e.conversation,
+      }));
+      projectDriverRunner.startDriverScheduler();
     });
     registerDeferred('marketplace:reconcile', () => runMarketplaceInstallReconcile('startup'));
 
@@ -1426,6 +1532,21 @@ if (!gotLock) {
       // updates through the `kb.events` stream as files transition status.
       const { reconcile } = await import('./features/kb_indexer');
       await reconcile(users.getActiveUserId(), signal);
+    }, 'serial', BOOT_HEAVY_DISK_DELAY_MS, idleDisk);
+    registerDeferred('project-library:reconcile', async (signal) => {
+      // Project Libraries have the same out-of-band sources as the global one
+      // (Finder drops while the app was off, a just-synced project tree), and
+      // retrieval no longer reconciles, so boot is one of the three owners of
+      // index freshness. Reconcile is incremental and opens no store for a
+      // project without indexable sources.
+      const uid = users.getActiveUserId();
+      const { listProjectIds } = await import('./util/project-layout');
+      const { reconcile } = await import('./features/project_library_indexer');
+      for (const projectId of listProjectIds(uid)) {
+        if (signal?.aborted) return;
+        try { await reconcile(uid, projectId, signal); }
+        catch (err) { log.warn('project library boot reconcile failed', { error: logErrorSummary(err) }); }
+      }
     }, 'serial', BOOT_HEAVY_DISK_DELAY_MS, idleDisk);
     // Maintenance that can scan hundreds of sessions or invoke model-backed
     // reflection starts after the measured 30-second startup window. The two
@@ -1440,7 +1561,6 @@ if (!gotLock) {
     registerDeferred('reflection:loop', () => {
       reflectionOrchestrator.startReflectionLoop(users.getActiveUserId());
     }, 'serial', BOOT_POST_STARTUP_DELAY_MS);
-    registerDeferred('auto-tasks:scheduler', () => autoTasks.startScheduler());
 
     // Drive the immediate batch + schedule the deferred one.
     void runBootPhases(BOOT_BACKGROUND_DEFER_MS);
@@ -1469,6 +1589,12 @@ if (!gotLock) {
         const kb = await import('./features/kb_vector');
         kb.closeAllKb();
       } catch (err) { createLogger('kb_vector').warn('close failed', { error: (err as Error).message }); }
+      try {
+        const kbEmbed = await import('./features/kb_embed');
+        kbEmbed.closeEmbedder();
+      } catch (err) { createLogger('kb_embed').warn('close failed', { error: logErrorSummary(err) }); }
+      const webAssistSessions = await import('./features/web_assist_session');
+      await webAssistSessions.flushWebAssistSessions();
       await sweepOfficeResidents('quit');
       await lifecycleFlush;
     })();

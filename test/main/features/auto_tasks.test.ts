@@ -1,8 +1,9 @@
 /**
- * Automation tasks — `isDue` boundary semantics for the 4 schedule types.
+ * Automation tasks — `isDue` boundary semantics for the 5 schedule types.
  *
  * Locks the contract the in-process scheduler relies on:
  *   - one_time: fires once when `now >= at`, never again after `last_run_at`
+ *   - hourly: fires after the configured interval from create / last run
  *   - daily: fires when today's HH:MM boundary is crossed AND we haven't
  *     fired since that boundary
  *   - weekly: same as daily, gated on `now.getDay() === weekday`
@@ -10,13 +11,16 @@
  *     target = min(day, lastDayOfThisMonth) so day=31 falls back to the
  *     last day in shorter months
  *
- * Pure time math — no IO involved — keeping coverage tight on the seam the
- * scheduler tick uses every 30s.
+ * The schedule-math cases stay pure; scheduler-dispatch cases use isolated
+ * account storage and fake wall-clock time to verify persisted outcomes.
  */
 
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import * as fs from 'node:fs';
+import nativeFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
+import { setTimeout as realDelay } from 'node:timers/promises';
 
 const electronRuntime = vi.hoisted(() => ({
   idleState: 'active' as 'active' | 'idle' | 'locked' | 'unknown',
@@ -44,6 +48,7 @@ import {
 import {
   armedDueAtForTest,
   createTask,
+  deleteTask,
   deleteAttachment,
   applyAutoTaskContainerFromCommander,
   extractAutoTaskContainers,
@@ -54,6 +59,7 @@ import {
   listTasks,
   nextDueAfterRestoreForTest,
   nextDueAtForTest,
+  pruneFireBoundaryClaimsForTest,
   rescheduleAllAfterSyncForTest,
   rescheduleAllForTest,
   resumeSchedulerForTest,
@@ -72,6 +78,7 @@ import {
 } from '../../../src/main/features/auto_tasks';
 import { setCurrentLang } from '../../../src/main/i18n';
 import { _setDeviceFingerprintForTests } from '../../../src/main/util/device';
+import { activateUser } from '../../../src/main/features/users';
 
 const autoRuntime = vi.hoisted(() => ({
   createConversation: vi.fn(),
@@ -121,6 +128,18 @@ function writeProject(uid: string, projectId: string, agentIds: string[] = []) {
     agents: agentIds,
     skills: [],
   }));
+}
+
+async function waitForSchedulerOutcome(
+  condition: () => boolean,
+  description: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    await Promise.resolve();
+    if (condition()) return;
+    await realDelay(10);
+  }
+  throw new Error(`Timed out waiting for ${description}`);
 }
 
 beforeEach(() => {
@@ -191,6 +210,37 @@ describe('seed text composition', () => {
 });
 
 describe('task CRUD normalization', () => {
+  it('persists hourly schedules and optional date/count cutoffs', async () => {
+    const created = await createTask(TEST_UID, {
+      id: 'at_18181818',
+      content: 'poll the service',
+      schedule: { type: 'hourly', interval_hours: 6 },
+      end_condition: { type: 'count', max_runs: 3 },
+    });
+
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(created.task.schedule).toEqual({ type: 'hourly', interval_hours: 6 });
+    expect(created.task.end_condition).toEqual({ type: 'count', max_runs: 3 });
+    expect(created.task.scheduled_run_count).toBe(0);
+
+    const withDate = await updateTask(TEST_UID, created.task.id, {
+      end_condition: { type: 'date', date: '2026-12-31' },
+    });
+    expect(withDate.ok).toBe(true);
+    if (!withDate.ok) return;
+    expect(withDate.task.end_condition).toEqual({ type: 'date', date: '2026-12-31' });
+    expect(withDate.task.scheduled_run_count).toBeUndefined();
+
+    const oneTime = await updateTask(TEST_UID, created.task.id, {
+      schedule: { type: 'one_time', at: '2027-01-01T00:00:00.000Z' },
+    });
+    expect(oneTime.ok).toBe(true);
+    if (!oneTime.ok) return;
+    expect(oneTime.task.end_condition).toBeUndefined();
+    expect(oneTime.task.scheduled_run_count).toBeUndefined();
+  });
+
   it('normalizes drafts and clears optional fields on update', async () => {
     writeProject(TEST_UID, 'p_auto_project', ['agent_a']);
     const created = await createTask(TEST_UID, {
@@ -503,6 +553,23 @@ describe('task CRUD normalization', () => {
       message_parts: [{ type: 'text', text: 'hello' }],
       schedule: { type: 'daily', hour: 9, minute: 0 },
     })).toEqual({ ok: false, error: 'invalid_message_parts' });
+    expect(await createTask(TEST_UID, {
+      id: 'at_35353535',
+      content: 'hello',
+      schedule: { type: 'hourly', interval_hours: 0 },
+    })).toEqual({ ok: false, error: 'invalid_schedule' });
+    expect(await createTask(TEST_UID, {
+      id: 'at_36363636',
+      content: 'hello',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+      end_condition: { type: 'date', date: '2026-02-31' },
+    })).toEqual({ ok: false, error: 'invalid_end_condition' });
+    expect(await createTask(TEST_UID, {
+      id: 'at_37373737',
+      content: 'hello',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+      end_condition: { type: 'count', max_runs: 0 },
+    })).toEqual({ ok: false, error: 'invalid_end_condition' });
 
     fs.mkdirSync(path.dirname(autoTaskConfigFile(TEST_UID, 'at_44444444')), { recursive: true });
     fs.writeFileSync(autoTaskConfigFile(TEST_UID, 'at_44444444'), JSON.stringify({
@@ -544,14 +611,17 @@ describe('commander auto-task container', () => {
       '<auto-task>',
       '<action>update</action>',
       `<task_id>${taskId}</task_id>`,
-      '<schedule>{"type":"weekly","weekday":5,"hour":10,"minute":30}</schedule>',
+      '<schedule>{"type":"hourly","interval_hours":6}</schedule>',
+      '<end_condition>{"type":"count","max_runs":10}</end_condition>',
       '<skill>{"id":"research","name":"Research"}</skill>',
       '</auto-task>',
     ].join('\n'));
     const updated = await applyAutoTaskContainerFromCommander(TEST_UID, updateExtract.containers[0]);
     expect(updated.ok).toBe(true);
     expect(updated.kind).toBe('updated');
-    expect(updated.task?.schedule).toEqual({ type: 'weekly', weekday: 5, hour: 10, minute: 30 });
+    expect(updated.task?.schedule).toEqual({ type: 'hourly', interval_hours: 6 });
+    expect(updated.task?.end_condition).toEqual({ type: 'count', max_runs: 10 });
+    expect(updated.task?.scheduled_run_count).toBe(0);
     expect(updated.task?.skill).toEqual({ id: 'research', name: 'Research' });
 
     const disabled = await applyAutoTaskContainerFromCommander(TEST_UID, {
@@ -663,9 +733,41 @@ describe('attachments', () => {
 });
 
 describe('scheduler dispatch', () => {
-  it('skips a boundary crossed while the process is suspended and never back-fills it on resume', async () => {
+  it('stops after the configured scheduled-run count and ignores manual runs for that count', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 22, 8, 0, 0));
+    const taskId = 'at_54545454';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'run twice on schedule',
+      schedule: { type: 'hourly', interval_hours: 1 },
+      end_condition: { type: 'count', max_runs: 2 },
+    });
+    expect(created.ok).toBe(true);
+
+    expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_auto' });
+    expect((await getTask(TEST_UID, taskId))?.scheduled_run_count).toBe(0);
+
+    vi.setSystemTime(new Date(2026, 4, 22, 9, 0, 0));
+    await _onTimerFireForTest(TEST_UID, taskId);
+    expect((await getTask(TEST_UID, taskId))?.scheduled_run_count).toBe(1);
+
+    vi.setSystemTime(new Date(2026, 4, 22, 10, 0, 0));
+    await _onTimerFireForTest(TEST_UID, taskId);
+    expect((await getTask(TEST_UID, taskId))?.scheduled_run_count).toBe(2);
+    expect((await getTask(TEST_UID, taskId))?.enabled).toBe(true);
+    expect(armedDueAtForTest(taskId)).toBeNull();
+
+    vi.setSystemTime(new Date(2026, 4, 22, 11, 0, 0));
+    await _onTimerFireForTest(TEST_UID, taskId);
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(3);
+    expect(autoRuntime.send).toHaveBeenCalledTimes(3);
+  });
+
+  it('skips a boundary crossed while suspended, then runs the next occurrence after resume', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
+    activateUser(TEST_UID);
     const taskId = 'at_59595959';
     const created = await createTask(TEST_UID, {
       id: taskId,
@@ -683,6 +785,18 @@ describe('scheduler dispatch', () => {
     expect(autoRuntime.send).not.toHaveBeenCalled();
     expect(await getTask(TEST_UID, taskId)).toMatchObject({ enabled: true });
     expect((await getTask(TEST_UID, taskId))?.last_run_at).toBeUndefined();
+    const nextBoundary = new Date(2026, 4, 23, 9, 0, 0);
+    expect(armedDueAtForTest(taskId)).toBe(nextBoundary.getTime());
+
+    await vi.advanceTimersByTimeAsync(23 * 60 * 60 * 1000);
+    await waitForSchedulerOutcome(
+      () => autoRuntime.createConversation.mock.calls.length === 1,
+      'the first post-resume occurrence to dispatch',
+    );
+
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+    expect((await getTask(TEST_UID, taskId))?.last_run_at).toBe(nextBoundary.toISOString());
   });
 
   it('preserves an already-armed due boundary when live sync rebuilds timers before its callback', async () => {
@@ -698,15 +812,78 @@ describe('scheduler dispatch', () => {
 
     // setSystemTime moves the wall clock without first draining the 09:00
     // timer, reproducing sync winning the event-loop race after the boundary.
+    // Live sync must retain that exact boundary instead of shifting it to the
+    // rebuild time.
     vi.setSystemTime(new Date(2026, 4, 22, 9, 0, 1));
     await rescheduleAllAfterSyncForTest(TEST_UID);
-    expect(armedDueAtForTest(taskId)).toBe(new Date(2026, 4, 22, 9, 0, 1).getTime());
+    expect(armedDueAtForTest(taskId)).toBe(new Date(2026, 4, 22, 9, 0, 0).getTime());
     await _onTimerFireForTest(TEST_UID, taskId);
 
     expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
     expect(autoRuntime.send).toHaveBeenCalledTimes(1);
     expect((await getTask(TEST_UID, taskId))?.last_run_at)
       .toBe(new Date(2026, 4, 22, 9, 0, 1).toISOString());
+  });
+
+  it('keeps a restored hourly boundary across repeated live syncs and fires it automatically', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 22, 8, 0, 0));
+    const taskId = 'at_57585858';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'keep the recovered hourly cadence stable',
+      schedule: { type: 'hourly', interval_hours: 6 },
+    });
+    expect(created.ok).toBe(true);
+
+    // The 14:00 boundary was missed while Orkas was unavailable, so restore
+    // intentionally starts a fresh six-hour interval at 20:00.
+    vi.setSystemTime(new Date(2026, 4, 22, 20, 0, 0));
+    await rescheduleAllForTest(TEST_UID);
+    const recoveredDueAt = new Date(2026, 4, 23, 2, 0, 0).getTime();
+    expect(armedDueAtForTest(taskId)).toBe(recoveredDueAt);
+
+    // Sync updates the task's content without changing its schedule. The
+    // already recovered boundary must stay fixed, and dispatch must use the
+    // latest persisted content when that boundary arrives.
+    const firstSyncAt = new Date(2026, 4, 22, 21, 0, 0);
+    vi.setSystemTime(firstSyncAt);
+    const syncedTask = await getTask(TEST_UID, taskId);
+    expect(syncedTask).not.toBeNull();
+    fs.writeFileSync(autoTaskConfigFile(TEST_UID, taskId), `${JSON.stringify({
+      ...syncedTask,
+      content: 'use the latest synced instructions',
+      updated_at: firstSyncAt.toISOString(),
+    }, null, 2)}\n`);
+    await rescheduleAllAfterSyncForTest(TEST_UID);
+    expect(armedDueAtForTest(taskId)).toBe(recoveredDueAt);
+
+    // Repeated sync notifications used to restart the six-hour interval each
+    // time, so frequent sync traffic could postpone the task indefinitely.
+    for (const syncAt of [
+      new Date(2026, 4, 22, 22, 0, 0),
+      new Date(2026, 4, 22, 23, 0, 0),
+    ]) {
+      vi.setSystemTime(syncAt);
+      await rescheduleAllAfterSyncForTest(TEST_UID);
+      expect(armedDueAtForTest(taskId)).toBe(recoveredDueAt);
+    }
+
+    await vi.advanceTimersByTimeAsync(3 * 60 * 60 * 1000);
+    await waitForSchedulerOutcome(
+      () => autoRuntime.createConversation.mock.calls.length === 1,
+      'the sync-stable hourly occurrence to dispatch',
+    );
+
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.send).toHaveBeenCalledWith(expect.objectContaining({
+      text: 'use the latest synced instructions',
+    }));
+    expect((await getTask(TEST_UID, taskId))?.last_run_at)
+      .toBe(new Date(recoveredDueAt).toISOString());
+    expect(armedDueAtForTest(taskId))
+      .toBe(new Date(2026, 4, 23, 8, 0, 0).getTime());
   });
 
   it('starts a changed daily schedule at the next boundary instead of back-filling today', async () => {
@@ -748,6 +925,30 @@ describe('scheduler dispatch', () => {
     expect((await getTask(TEST_UID, taskId))?.last_run_at).toBe(firstRunAt);
     expect(armedDueAtForTest(taskId))
       .toBe(new Date(2026, 7, 5, 10, 0, 0).getTime());
+  });
+
+  it('starts a changed hourly schedule one full interval after the edit', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 7, 4, 8, 0, 0));
+    const taskId = 'at_53535353';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'switch to an elapsed cadence',
+      schedule: { type: 'daily', hour: 18, minute: 0 },
+    });
+    expect(created.ok).toBe(true);
+
+    const editedAt = new Date(2026, 7, 4, 12, 30, 0);
+    vi.setSystemTime(editedAt);
+    const updated = await updateTask(TEST_UID, taskId, {
+      schedule: { type: 'hourly', interval_hours: 6 },
+    });
+    expect(updated.ok).toBe(true);
+    expect(armedDueAtForTest(taskId)).toBe(editedAt.getTime() + 6 * 60 * 60 * 1000);
+    if (!updated.ok) return;
+    expect(updated.task.schedule_anchor_at).toBe(editedAt.toISOString());
+    expect(nextDueAtForTest(updated.task, new Date(2026, 7, 4, 13, 0, 0))?.getTime())
+      .toBe(editedAt.getTime() + 6 * 60 * 60 * 1000);
   });
 
   it('keeps a changed daily schedule on the same day when its boundary is still ahead', async () => {
@@ -805,29 +1006,28 @@ describe('scheduler dispatch', () => {
     expect((await getTask(TEST_UID, taskId))?.last_run_at).toBe(editAt.toISOString());
   });
 
-  it('ignores a due task when the computer is sleeping without mutating it', async () => {
+  it('fires a runnable due task while the screen is locked', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
     const taskId = 'at_60606060';
     const created = await createTask(TEST_UID, {
       id: taskId,
-      content: 'run after the computer wakes',
+      content: 'run while the screen is locked',
       schedule: { type: 'daily', hour: 9, minute: 0 },
     });
     expect(created.ok).toBe(true);
 
-    vi.setSystemTime(new Date(2026, 4, 22, 9, 0, 0));
     electronRuntime.idleState = 'locked';
-    const configBefore = fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId), 'utf8');
-    await _onTimerFireForTest(TEST_UID, taskId);
+    await vi.advanceTimersByTimeAsync(30 * 60 * 1000);
+    await waitForSchedulerOutcome(
+      () => autoRuntime.createConversation.mock.calls.length === 1,
+      'the locked-screen occurrence to dispatch',
+    );
 
-    expect(autoRuntime.createConversation).not.toHaveBeenCalled();
-    expect(autoRuntime.send).not.toHaveBeenCalled();
-    expect(await getTask(TEST_UID, taskId)).toMatchObject({
-      enabled: true,
-    });
-    expect((await getTask(TEST_UID, taskId))?.last_run_at).toBeUndefined();
-    expect(fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId), 'utf8')).toBe(configBefore);
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+    expect((await getTask(TEST_UID, taskId))?.last_run_at)
+      .toBe(new Date(2026, 4, 22, 9, 0, 0).toISOString());
   });
 
   it('fires normally when the computer is idle but not locked', async () => {
@@ -1298,6 +1498,37 @@ describe('isDue: daily', () => {
   });
 });
 
+describe('isDue: hourly and end conditions', () => {
+  it('uses create / last-run time as the hourly interval baseline', () => {
+    const createdAt = new Date(2026, 4, 22, 8, 0, 0);
+    const task = makeTask(
+      { type: 'hourly', interval_hours: 6 },
+      { created_at: createdAt.toISOString(), updated_at: createdAt.toISOString() },
+    );
+    expect(isDue(task, new Date(2026, 4, 22, 13, 59, 59), createdAt)).toBe(false);
+    expect(isDue(task, new Date(2026, 4, 22, 14, 0, 0), createdAt)).toBe(true);
+    expect(nextDueAtForTest(task, createdAt)?.getTime())
+      .toBe(new Date(2026, 4, 22, 14, 0, 0).getTime());
+  });
+
+  it('includes the local end date and blocks later dates or exhausted counts', () => {
+    const schedule: Schedule = { type: 'daily', hour: 9, minute: 0 };
+    const dateLimited = makeTask(schedule, {
+      end_condition: { type: 'date', date: '2026-05-22' },
+    });
+    expect(isDue(dateLimited, new Date(2026, 4, 22, 9, 0, 0), null)).toBe(true);
+    expect(isDue(dateLimited, new Date(2026, 4, 23, 9, 0, 0), null)).toBe(false);
+    expect(nextDueAtForTest(dateLimited, new Date(2026, 4, 23, 8, 0, 0))).toBeNull();
+
+    const countLimited = makeTask(schedule, {
+      end_condition: { type: 'count', max_runs: 2 },
+      scheduled_run_count: 2,
+    });
+    expect(isDue(countLimited, new Date(2026, 4, 22, 9, 0, 0), null)).toBe(false);
+    expect(nextDueAtForTest(countLimited, new Date(2026, 4, 22, 8, 0, 0))).toBeNull();
+  });
+});
+
 describe('scheduler next due: recurring creation baseline', () => {
   it('does not schedule disabled tasks or completed one-time tasks', () => {
     const now = new Date(2026, 4, 27, 8, 30, 0);
@@ -1384,6 +1615,22 @@ describe('scheduler next due: recurring creation baseline', () => {
 });
 
 describe('scheduler restore skips missed boundaries', () => {
+  it('starts a fresh hourly interval instead of back-filling missed intervals', () => {
+    const now = new Date(2026, 4, 27, 20, 0, 0);
+    const next = nextDueAfterRestoreForTest(
+      makeTask(
+        { type: 'hourly', interval_hours: 6 },
+        {
+          created_at: new Date(2026, 4, 27, 8, 0, 0).toISOString(),
+          updated_at: new Date(2026, 4, 27, 8, 0, 0).toISOString(),
+        },
+      ),
+      now,
+    );
+
+    expect(next?.getTime()).toBe(new Date(2026, 4, 28, 2, 0, 0).getTime());
+  });
+
   it('schedules the next day instead of back-filling a missed daily task', () => {
     const now = new Date(2026, 4, 27, 10, 30, 0);
     const next = nextDueAfterRestoreForTest(
@@ -1484,5 +1731,123 @@ describe('isDue: monthly', () => {
     const now = new Date(2026, 4, 15, 12, 30, 0);
     const lastRun = new Date(2026, 4, 15, 12, 0, 30);
     expect(isDue(task, now, lastRun)).toBe(false);
+  });
+});
+
+describe('fire-boundary claim retention', () => {
+  const claimsRoot = () => path.join(userLocalRoot(TEST_UID), 'auto_task_claims');
+
+  function writeClaim(taskId: string, boundaryMs: number) {
+    const dir = path.join(claimsRoot(), taskId);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${boundaryMs}.json`), '{}', 'utf8');
+  }
+
+  it('deleteTask removes the task\'s local claim directory with it', async () => {
+    const created = await createTask(TEST_UID, {
+      id: 'at_77777771',
+      content: 'x',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    expect(created.ok).toBe(true);
+    writeClaim('at_77777771', Date.now());
+    expect(fs.existsSync(path.join(claimsRoot(), 'at_77777771'))).toBe(true);
+
+    const res = await deleteTask(TEST_UID, 'at_77777771');
+    expect(res.ok).toBe(true);
+    // Without this, a deleted task orphaned its claim files forever.
+    expect(fs.existsSync(path.join(claimsRoot(), 'at_77777771'))).toBe(false);
+  });
+
+  it('prunes claims older than the retention window and keeps recent ones', () => {
+    const now = Date.now();
+    const old = now - 8 * 24 * 60 * 60 * 1000;   // > 7d: dead — boundary can never recur
+    const recent = now - 60 * 60 * 1000;         // same-day: still guards double-fire
+    writeClaim('at_88888881', old);
+    writeClaim('at_88888881', recent);
+    writeClaim('at_88888882', old);            // all-old dir → removed entirely
+
+    pruneFireBoundaryClaimsForTest(TEST_UID);
+
+    const dir1 = path.join(claimsRoot(), 'at_88888881');
+    expect(fs.readdirSync(dir1)).toEqual([`${recent}.json`]);
+    expect(fs.existsSync(path.join(claimsRoot(), 'at_88888882'))).toBe(false);
+  });
+});
+
+
+describe('automation › failed enable recovery', () => {
+  it('keeps a failed enable disabled and unarmed, then preserves concurrent edits on retry', async () => {
+    const created = await createTask(TEST_UID, {
+      title: 'Release reminder', content: 'Check release', enabled: false,
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    if (!created.ok) throw new Error('automation fixture failed');
+    const id = created.task.id;
+    const file = autoTaskConfigFile(TEST_UID, id);
+    const before = fs.readFileSync(file, 'utf8');
+    const rename = nativeFs.promises.rename.bind(nativeFs.promises);
+    const fault = Object.assign(new Error('injected disk full'), { code: 'ENOSPC' });
+    const spy = vi.spyOn(nativeFs.promises, 'rename').mockImplementation(async (from, to) => {
+      if (String(to) === file) throw fault;
+      await rename(from, to);
+    });
+    syncBuiltinESMExports();
+    try {
+      await expect(updateTask(TEST_UID, id, { enabled: true })).rejects.toThrow(fault);
+      expect(fs.readFileSync(file, 'utf8')).toBe(before);
+      expect((await getTask(TEST_UID, id))?.enabled).toBe(false);
+      expect(armedDueAtForTest(id)).toBeNull();
+      expect(autoRuntime.send).not.toHaveBeenCalled();
+      expect(fs.readdirSync(path.dirname(file))).toEqual(['config.json']);
+    } finally {
+      spy.mockRestore();
+      syncBuiltinESMExports();
+    }
+    const results = await Promise.all([
+      updateTask(TEST_UID, id, { content: 'Check release and owner' }),
+      updateTask(TEST_UID, id, { enabled: true }),
+    ]);
+    expect(results.every(result => result.ok)).toBe(true);
+    expect(await getTask(TEST_UID, id)).toMatchObject({ enabled: true, content: 'Check release and owner' });
+    expect(armedDueAtForTest(id)).not.toBeNull();
+    expect(autoRuntime.send).not.toHaveBeenCalled();
+    stopScheduler();
+    await rescheduleAllForTest(TEST_UID);
+    expect(armedDueAtForTest(id)).not.toBeNull();
+    expect(await listTasks(TEST_UID)).toHaveLength(1);
+  });
+});
+
+describe('automation › daylight-saving calendar boundaries', () => {
+  const priorTimezone = process.env.TZ;
+  beforeEach(() => { process.env.TZ = 'America/New_York'; });
+  afterEach(() => {
+    if (priorTimezone === undefined) delete process.env.TZ;
+    else process.env.TZ = priorTimezone;
+  });
+
+  it.each([
+    ['spring', '2026-03-07T14:00:00Z', '2026-03-08T13:00:00.000Z', 23],
+    ['fall', '2026-10-31T13:00:00Z', '2026-11-01T14:00:00.000Z', 25],
+  ])('keeps daily 09:00 local across the %s transition', (_season, previous, expected, hours) => {
+    const now = new Date(previous);
+    expect(now.getHours()).toBe(9);
+    const task = makeTask({ type: 'daily', hour: 9, minute: 0 }, { last_run_at: previous });
+    const next = nextDueAtForTest(task, now)!;
+    expect(next.toISOString()).toBe(expected);
+    expect(next.getHours()).toBe(9);
+    expect(next.getTime() - now.getTime()).toBe(Number(hours) * 60 * 60 * 1000);
+  });
+
+  it('does not execute the repeated 01:30 twice after a fall-back or restoration', () => {
+    const task = makeTask({ type: 'daily', hour: 1, minute: 30 }, {
+      last_run_at: '2026-11-01T05:30:00.000Z',
+    });
+    const repeated = new Date('2026-11-01T06:30:00Z');
+    expect(repeated.getHours()).toBe(1);
+    expect(isDue(task, repeated, new Date(task.last_run_at!))).toBe(false);
+    expect(nextDueAtForTest(task, repeated)?.toISOString()).toBe('2026-11-02T06:30:00.000Z');
+    expect(nextDueAfterRestoreForTest(task, repeated)?.toISOString()).toBe('2026-11-02T06:30:00.000Z');
   });
 });

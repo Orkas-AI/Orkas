@@ -79,7 +79,15 @@ def main(argv):
         'bilibili_sort': args.bilibili_sort,
     }
 
-    items, diag = FETCHERS[args.platform](config)
+    try:
+        items, diag = FETCHERS[args.platform](config)
+    except Exception as e:
+        # Documented failure envelope (stderr + exit 1) with the platform
+        # attached — e.g. a missing third-party dependency in a stdlib-only
+        # sandbox must surface as JSON, never as a raw traceback.
+        err = {'ok': False, 'error': f'{type(e).__name__}: {e}', 'platform': args.platform}
+        print(json.dumps(err, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
     out = {
         'ok': True,
         'platform': args.platform,

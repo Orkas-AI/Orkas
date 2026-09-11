@@ -1,21 +1,35 @@
 import { describe, it, expect } from 'vitest';
 import { Mutex, Semaphore, type SemaphoreInterface } from 'async-mutex';
 import {
-  sessionLock, globalSlots,
+  sessionLock, fileEditLock, globalSlots,
   acquireWithTimeout, acquireSemWithTimeout,
+  _keyedLockCountsForTest,
 } from '../../../src/main/util/locks';
 
 describe('locks › sessionLock', () => {
-  it('returns the same Mutex instance for the same session id', () => {
-    const a = sessionLock('sess-1');
-    const b = sessionLock('sess-1');
-    expect(a).toBe(b);
+  it('handles for the same session id share one exclusion', async () => {
+    const a = sessionLock('sess-shared');
+    const b = sessionLock('sess-shared');
+    const releaseA = await a.acquire();
+    expect(b.isLocked()).toBe(true);
+    let bHeld = false;
+    const bPending = b.acquire().then((release) => { bHeld = true; return release; });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(bHeld).toBe(false);
+    releaseA();
+    const releaseB = await bPending;
+    expect(bHeld).toBe(true);
+    releaseB();
+    expect(a.isLocked()).toBe(false);
   });
 
-  it('returns distinct Mutex instances for different session ids', () => {
+  it('distinct session ids never contend', async () => {
     const a = sessionLock('sess-1');
     const b = sessionLock('sess-2');
-    expect(a).not.toBe(b);
+    const releaseA = await a.acquire();
+    const releaseB = await b.acquire();
+    releaseA();
+    releaseB();
   });
 
   it('returned object is a Mutex (acquire/release contract)', async () => {
@@ -23,6 +37,37 @@ describe('locks › sessionLock', () => {
     const release = await m.acquire();
     expect(typeof release).toBe('function');
     release();
+  });
+
+  it('drops an entry once nobody holds or waits on it, but never while a waiter holds an old handle', async () => {
+    // The registries used to keep a Mutex for every session id and every path
+    // ever written. Entries must go away when idle — and only then: a waiter
+    // that already resolved the entry must keep excluding a newcomer.
+    const before = _keyedLockCountsForTest();
+    const key = `/tmp/orkas-lock-${Math.random()}`;
+    const first = fileEditLock(key);
+    const releaseFirst = await first.acquire();
+    expect(_keyedLockCountsForTest().files).toBe(before.files + 1);
+
+    const waiter = fileEditLock(key);
+    const order: string[] = [];
+    const waiting = waiter.runExclusive(async () => { order.push('waiter'); });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    releaseFirst();
+    // Released, but the waiter is queued: the entry stays and the newcomer
+    // still queues behind the waiter instead of getting a fresh mutex.
+    expect(_keyedLockCountsForTest().files).toBe(before.files + 1);
+    await fileEditLock(key).runExclusive(async () => { order.push('newcomer'); });
+    await waiting;
+    expect(order).toEqual(['waiter', 'newcomer']);
+    expect(_keyedLockCountsForTest().files).toBe(before.files);
+
+    // A session lock evicts the same way after its last release.
+    const session = sessionLock('sess-evict');
+    const release = await session.acquire();
+    expect(_keyedLockCountsForTest().sessions).toBe(before.sessions + 1);
+    release();
+    expect(_keyedLockCountsForTest().sessions).toBe(before.sessions);
   });
 });
 

@@ -38,10 +38,23 @@ const mocks = vi.hoisted(() => ({
     refreshDcrIfStale: undefined as any,
   },
   events: {
+    broadcastOAuthConnectProgress: undefined as any,
     broadcastOAuthConnectOutcome: undefined as any,
   },
   metering: {
     preflightConnectorCredits: undefined as any,
+  },
+  localCli: {
+    authorize: undefined as any,
+    transport: undefined as any,
+    remove: undefined as any,
+  },
+  localApi: {
+    authorize: undefined as any,
+    hasAuthorization: undefined as any,
+    storedTransport: undefined as any,
+    transport: undefined as any,
+    remove: undefined as any,
   },
 }));
 
@@ -72,8 +85,31 @@ vi.mock('../../../../src/main/features/connectors/oauth-dcr', () => ({
 }));
 
 vi.mock('../../../../src/main/features/connectors/oauth-events', () => ({
+  broadcastOAuthConnectProgress: (...args: any[]) => mocks.events.broadcastOAuthConnectProgress(...args),
   broadcastOAuthConnectOutcome: (...args: any[]) => mocks.events.broadcastOAuthConnectOutcome(...args),
 }));
+
+vi.mock('../../../../src/main/features/connectors/local-cli', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../../src/main/features/connectors/local-cli')>();
+  return {
+    ...actual,
+    authorizeLocalCli: (...args: any[]) => mocks.localCli.authorize(...args),
+    localCliTransport: (...args: any[]) => mocks.localCli.transport(...args),
+    removeLocalCliAuthorization: (...args: any[]) => mocks.localCli.remove(...args),
+  };
+});
+
+vi.mock('../../../../src/main/features/connectors/local-api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../../src/main/features/connectors/local-api')>();
+  return {
+    ...actual,
+    authorizeLocalApi: (...args: any[]) => mocks.localApi.authorize(...args),
+    hasLocalApiAuthorization: (...args: any[]) => mocks.localApi.hasAuthorization(...args),
+    localApiStoredTransport: (...args: any[]) => mocks.localApi.storedTransport(...args),
+    localApiTransport: (...args: any[]) => mocks.localApi.transport(...args),
+    removeLocalApiAuthorization: (...args: any[]) => mocks.localApi.remove(...args),
+  };
+});
 
 vi.mock('../../../../src/main/features/connectors/usage-metering', () => ({
   preflightConnectorCredits: (...args: any[]) => mocks.metering.preflightConnectorCredits(...args),
@@ -103,6 +139,35 @@ function resetMockBehaviors() {
   mocks.oauth.refreshIfStale = vi.fn(async (_uid: string, _entry: unknown, grant: unknown) => grant);
   mocks.dcr.startMcpDcrOAuth = vi.fn();
   mocks.dcr.refreshDcrIfStale = vi.fn(async (_client: unknown, grant: unknown) => grant);
+  mocks.events.broadcastOAuthConnectProgress = vi.fn();
+  mocks.events.broadcastOAuthConnectOutcome = vi.fn();
+  mocks.localCli.authorize = vi.fn(async () => {});
+  mocks.localCli.transport = vi.fn((_uid: string, entry: { id: string }) => ({
+    kind: 'stdio',
+    command: '/opt/orkas/runtime/node',
+    args: ['/app/bin/local-cli-mcp-server.cjs'],
+    env: { ORKAS_LOCAL_CLI_PROVIDER: entry.id === 'wecom' ? 'wecom' : entry.id },
+  }));
+  mocks.localCli.remove = vi.fn();
+  mocks.localApi.authorize = vi.fn(async () => ({ shop_domain: 'merchant.myshopify.com' }));
+  mocks.localApi.hasAuthorization = vi.fn(() => true);
+  mocks.localApi.storedTransport = vi.fn(() => ({
+    kind: 'stdio', command: '/opt/orkas/runtime/node',
+    args: ['/app/bin/direct-commerce-mcp-server.cjs'],
+    cwd: '/device-local/shopify-admin',
+  }));
+  mocks.localApi.transport = vi.fn((_uid: string, entry: { local_api: { provider: string } }, metadata: unknown) => ({
+    kind: 'stdio', command: '/opt/orkas/runtime/node',
+    args: ['/app/bin/direct-commerce-mcp-server.cjs'],
+    cwd: '/device-local/shopify-admin',
+    env: {
+      ORKAS_LOCAL_API_PROVIDER: entry.local_api.provider,
+      ORKAS_LOCAL_API_CREDENTIAL_FILE: '/device-local/shopify-admin/credentials.enc',
+      ORKAS_LOCAL_API_CREDENTIAL_KEY: 'device-only-key',
+      ORKAS_LOCAL_API_METADATA_JSON: JSON.stringify(metadata || {}),
+    },
+  }));
+  mocks.localApi.remove = vi.fn();
   mocks.metering.preflightConnectorCredits = vi.fn(async () => null);
 }
 
@@ -383,6 +448,85 @@ afterEach(() => {
 });
 
 describe('features/connectors/manager authorization recovery', () => {
+  it.each([
+    ['storefront_request_failed', 'failure', 'E_TOOL_CALL_UPSTREAM', 'upstream', 'warn'],
+    ['E_TOOL_CALL_CANCELLED', 'cancelled', 'E_TOOL_CALL_CANCELLED', 'cancelled', 'info'],
+  ])('preserves structured MCP reason %s without additional provider calls', async (code, result, error_code, error_type, level) => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const { default: electronLog } = await import('electron-log/main');
+    const records: Array<{ level: string; data: unknown[] }> = [];
+    const capture = (message: any, transport: unknown) => {
+      // electron-log runs hooks separately for file/console/IPC. Observe one
+      // actual output transport, not three copies of the same log invocation.
+      if (transport === electronLog.transports.console && message.data[0] === 'connector request completed') {
+        records.push({ level: message.level, data: message.data });
+      }
+      return message;
+    };
+    await registry.upsert(TEST_UID, githubInstance());
+    const wire = { isError: true, _meta: { orkas: { errorCode: code } }, content: [{ type: 'text', text: 'Check permissions; private-payload-canary' }] };
+    mocks.mcp.callTool = vi.fn(async () => wire);
+    electronLog.hooks.push(capture);
+    try {
+      await expect(manager.callTool(TEST_UID, 'github', 'github_search_repositories', { query: 'private-payload-canary' })).resolves.toBe(wire);
+      expect(mocks.mcp.callTool).toHaveBeenCalledOnce();
+    } finally { electronLog.hooks.splice(electronLog.hooks.indexOf(capture), 1); }
+  });
+
+  it('keeps a localized merchant setup failure actionable in its single authorization terminal', async () => {
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    mocks.localApi.authorize = vi.fn(async () => { throw Object.assign(new Error('请检查应用权限 private-payload-canary'), { code: 'storefront_network_failed' }); });
+    manager.beginOAuthConnect(TEST_UID, 'bigcommerce', { store_hash: 'fixture', access_token: 'private-token-canary' });
+    await vi.waitFor(() => expect(mocks.events.broadcastOAuthConnectOutcome).toHaveBeenCalledOnce());
+    expect(mocks.events.broadcastOAuthConnectOutcome).toHaveBeenCalledOnce();
+    expect(mocks.mcp.callTool).not.toHaveBeenCalled();
+  });
+
+  it('counts one real request after reconnect recovery and reports MCP business failure without private data', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    await registry.upsert(TEST_UID, githubInstance());
+    mocks.mcp.connect = vi.fn().mockRejectedValueOnce(new Error('fetch failed')).mockResolvedValue(undefined);
+    const wireResult = { isError: true, content: [{ type: 'text', text: 'HTTP 429 private_customer_canary' }] };
+    mocks.mcp.callTool = vi.fn(async () => wireResult);
+
+    await expect(manager.callTool(TEST_UID, 'github', 'github_search_repositories', {
+      query: 'private_customer_canary',
+    })).resolves.toBe(wireResult);
+
+    expect(mocks.mcp.connect).toHaveBeenCalledTimes(2);
+    expect(mocks.mcp.callTool).toHaveBeenCalledOnce();
+  });
+
+  it('excludes a pre-dispatch cancellation from attempted platform calls and never invokes MCP', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    await registry.upsert(TEST_UID, githubInstance());
+    const controller = new AbortController();
+    controller.abort('private cancellation reason');
+    await expect(manager.callTool(TEST_UID, 'github', 'github_search_repositories', {}, {
+      signal: controller.signal,
+    })).rejects.toMatchObject({ code: 'E_TOOL_CALL_CANCELLED' });
+    expect(mocks.mcp.callTool).not.toHaveBeenCalled();
+    expect(mocks.mcp.connect).not.toHaveBeenCalled();
+  });
+
+  it('records direct local-API success and legacy sandbox usage without exposing shop credentials', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    mocks.mcp.listTools = vi.fn(async () => [{ name: 'execute_read', description: '', input_schema: {} }]);
+    const now = new Date().toISOString();
+    await registry.upsert(TEST_UID, {
+      id: 'shopee', display_name: 'Shopee', transport: { kind: 'stdio', command: 'node', args: [] },
+      enabled_subtools: null, tools_cache: [{ name: 'execute_read', description: '', input_schema: {} }],
+      tools_cached_at: Date.now(), status: { kind: 'connected', since: Date.now() },
+      connection_parameters: { environment: 'sandbox', shop_id: 'private_shop_canary' },
+      created_at: now, updated_at: now,
+    });
+    await manager.callTool(TEST_UID, 'shopee', 'execute_read', {});
+  });
+
   it('requires reconnect for legacy Google Gmail and replaces it with an API-key Composio grant', async () => {
     await writeGoogleConnectorsConfig({ google: 'disabled', gmail: 'disabled' });
     const registry = await import('../../../../src/main/features/connectors/registry');
@@ -643,6 +787,221 @@ describe('features/connectors/manager authorization recovery', () => {
     await expect(manager.callTool(secondUid, 'custom-shared', 'read_owner', {}))
       .resolves.toEqual({ owner: 'account-b' });
     expect(mocks.mcp.callTool).toHaveBeenCalledTimes(1);
+  });
+
+  
+
+  it('does not disconnect the next account after waiting for the old local connection to close', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const users = await import('../../../../src/main/features/users');
+    await registry.upsert(TEST_UID, ({
+      id: 'gmail', origin: 'catalog', enabled: true, transport: { kind: 'streamable-http', url: 'https://orkas.ai/api/connectors/composio/mcp' },
+      composio_grant: { connection_id: 'gmail-connection', connection_token: 'a'.repeat(43), toolkit: 'gmail' },
+      tools_cache: [], status: { kind: 'connected', since: Date.now() }, created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+    } as any));
+    mocks.mcp.listTools = vi.fn(async () => [{ name: 'GMAIL_FETCH_EMAILS', description: '', input_schema: {} }]);
+    await manager.bootstrap(TEST_UID);
+    let releaseClose!: () => void;
+    mocks.mcp.close = vi.fn(() => new Promise<void>((resolve) => { releaseClose = resolve; }));
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{"code":0}', { status: 200 }));
+    try {
+      const removal = manager.removeInstance(TEST_UID, 'gmail');
+      await vi.waitFor(() => expect(mocks.mcp.close).toHaveBeenCalledOnce());
+      const finishRemovalClose = releaseClose;
+      users.activateUser('u-connectors-disconnect-second');
+      releaseClose();
+      finishRemovalClose();
+
+      await expect(removal).rejects.toMatchObject({ code: 'E_CONNECTOR_ACCOUNT_CHANGED' });
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(registry.load(TEST_UID).connections.gmail).toBeTruthy();
+    } finally {
+      releaseClose?.();
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it('does not dispatch old-account tools after a delayed credits preflight', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const users = await import('../../../../src/main/features/users');
+    await registry.upsert(TEST_UID, githubInstance());
+    let releasePreflight!: () => void;
+    mocks.metering.preflightConnectorCredits.mockImplementationOnce(
+      () => new Promise((resolve) => { releasePreflight = () => resolve(null); }),
+    );
+    const pending = manager.callTool(TEST_UID, 'github', 'github_search_repositories', {});
+    await vi.waitFor(() => expect(releasePreflight).toBeTypeOf('function'));
+    users.activateUser('u-connectors-preflight-second');
+    releasePreflight();
+
+    await expect(pending).rejects.toMatchObject({ code: 'E_CONNECTOR_ACCOUNT_CHANGED' });
+    expect(mocks.mcp.connect).not.toHaveBeenCalled();
+    expect(mocks.mcp.callTool).not.toHaveBeenCalled();
+  });
+
+  it.each(['feishu', 'shopify-admin'])(
+    'does not publish a late %s authorization after the account switch',
+    async (id) => {
+      const registry = await import('../../../../src/main/features/connectors/registry');
+      const manager = await import('../../../../src/main/features/connectors/manager');
+      const users = await import('../../../../src/main/features/users');
+      let releaseAuthorization!: () => void;
+      const authorization = new Promise<void>((resolve) => { releaseAuthorization = resolve; });
+      const authorize = vi.fn(async () => {
+        await authorization;
+        return { shop_domain: 'merchant.myshopify.com' };
+      });
+      if (id === 'feishu') mocks.localCli.authorize = authorize;
+      else mocks.localApi.authorize = authorize;
+      const pending = manager.connectViaOAuth(TEST_UID, id);
+      await vi.waitFor(() => expect(authorize).toHaveBeenCalledOnce());
+      users.activateUser('u-connectors-authorization-second');
+      releaseAuthorization();
+
+      await expect(pending).rejects.toMatchObject({ code: 'E_CONNECTOR_ACCOUNT_CHANGED' });
+      expect(registry.load(TEST_UID).connections[id]).toBeUndefined();
+      expect(mocks.mcp.connect).not.toHaveBeenCalled();
+      expect(mocks.localApi.remove).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['bootstrap', 'verifyUsableConnectors'] as const)(
+    'stops queued %s work when the account changes during the first batch',
+    async (operation) => {
+      const registry = await import('../../../../src/main/features/connectors/registry');
+      const manager = await import('../../../../src/main/features/connectors/manager');
+      const users = await import('../../../../src/main/features/users');
+      for (let i = 0; i < 4; i++) {
+        await registry.upsert(TEST_UID, {
+          ...customAccountInstance('account-a'),
+          id: `custom-batch-${i}`,
+          status: operation === 'bootstrap' ? { kind: 'connecting' } : { kind: 'connected', since: 1 },
+        });
+      }
+      let releaseConnections!: () => void;
+      const gate = new Promise<void>((resolve) => { releaseConnections = resolve; });
+      mocks.mcp.connect = vi.fn(() => gate);
+      const pending = manager[operation](TEST_UID);
+      await vi.waitFor(() => expect(mocks.mcp.connect).toHaveBeenCalledTimes(3));
+      users.activateUser('u-connectors-batch-second');
+      releaseConnections();
+
+      await expect(pending).rejects.toMatchObject({ code: 'E_CONNECTOR_ACCOUNT_CHANGED' });
+      expect(mocks.mcp.connect).toHaveBeenCalledTimes(3);
+      expect(mocks.mcp.listTools).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect(mocks.mcp.close).toHaveBeenCalledTimes(3));
+    },
+  );
+
+  it('persists an already-issued rotated grant to its original account without starting a stale transport', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const users = await import('../../../../src/main/features/users');
+    const original = githubInstance();
+    original.oauth_grant.expires_at = Date.now() - 1;
+    await registry.upsert(TEST_UID, original);
+    let releaseRefresh!: () => void;
+    const refresh = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+    mocks.oauth.refreshIfStale = vi.fn(async () => {
+      await refresh;
+      return { ...original.oauth_grant, access_token: 'rotated-access-fixture', refresh_token: 'rotated-refresh-fixture' };
+    });
+    const pending = manager.callTool(TEST_UID, 'github', 'github_search_repositories', {});
+    await vi.waitFor(() => expect(mocks.oauth.refreshIfStale).toHaveBeenCalledOnce());
+    users.activateUser('u-connectors-refresh-second');
+    releaseRefresh();
+
+    await expect(pending).rejects.toMatchObject({ code: 'E_CONNECTOR_ACCOUNT_CHANGED' });
+    expect(registry.load(TEST_UID).connections.github.oauth_grant?.refresh_token).toBe('rotated-refresh-fixture');
+    expect(registry.load('u-connectors-refresh-second').connections.github).toBeUndefined();
+    expect(mocks.mcp.connect).not.toHaveBeenCalled();
+    expect(mocks.mcp.callTool).not.toHaveBeenCalled();
+  });
+
+  it('closes every connection created by overlapping panel verification and a tool call', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    await registry.upsert(TEST_UID, {
+      ...customAccountInstance('account-a'),
+      status: { kind: 'connected', since: 1 },
+    });
+    let releaseConnect!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseConnect = resolve; });
+    mocks.mcp.connect = vi.fn(() => gate);
+    const verifying = manager.verifyUsableConnectors(TEST_UID);
+    await vi.waitFor(() => expect(mocks.mcp.connect).toHaveBeenCalledOnce());
+    const calling = manager.callTool(TEST_UID, 'custom-shared', 'read_owner', {});
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    releaseConnect();
+    await Promise.all([verifying, calling]);
+    await manager.shutdownAll();
+
+    const opened = new Set(mocks.mcp.connect.mock.contexts);
+    const closed = new Set(mocks.mcp.close.mock.contexts);
+    expect(closed).toEqual(opened);
+    expect(mocks.mcp.callTool).toHaveBeenCalledOnce();
+  });
+
+  it.each(['refreshTools', 'removeInstance'] as const)(
+    'settles pending discovery before %s replaces or removes its connection',
+    async (operation) => {
+      const registry = await import('../../../../src/main/features/connectors/registry');
+      const manager = await import('../../../../src/main/features/connectors/manager');
+      await registry.upsert(TEST_UID, {
+        ...customAccountInstance('account-a'), status: { kind: 'connected', since: 1 },
+      });
+      let releaseTools!: () => void;
+      const gate = new Promise<void>((resolve) => { releaseTools = resolve; });
+      mocks.mcp.listTools.mockImplementationOnce(async () => {
+        await gate;
+        return [{ name: 'read_owner', description: '', input_schema: {} }];
+      });
+      mocks.mcp.close = vi.fn(async function close(this: any) { this.__closed = true; });
+      mocks.mcp.callTool = vi.fn(async function call(this: any) {
+        if (this.__closed) throw new Error('fixture connection was closed');
+        return { ok: true };
+      });
+      const verifying = manager.verifyUsableConnectors(TEST_UID);
+      await vi.waitFor(() => expect(mocks.mcp.listTools).toHaveBeenCalledOnce());
+      const changing = manager[operation](TEST_UID, 'custom-shared');
+      releaseTools();
+      await Promise.all([verifying, changing]);
+      if (operation === 'refreshTools') {
+        await expect(manager.callTool(TEST_UID, 'custom-shared', 'read_owner', {})).resolves.toEqual({ ok: true });
+      } else {
+        expect(manager.getInstance(TEST_UID, 'custom-shared')).toBeNull();
+        expect(new Set(mocks.mcp.close.mock.contexts)).toEqual(new Set(mocks.mcp.connect.mock.contexts));
+      }
+      await manager.shutdownAll();
+      expect(new Set(mocks.mcp.close.mock.contexts)).toEqual(new Set(mocks.mcp.connect.mock.contexts));
+    },
+  );
+
+  it('cancels a tool waiter without waiting for or disrupting shared panel discovery', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    await registry.upsert(TEST_UID, {
+      ...customAccountInstance('account-a'), status: { kind: 'connected', since: 1 },
+    });
+    let releaseConnect!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseConnect = resolve; });
+    mocks.mcp.connect = vi.fn(() => gate);
+    const verifying = manager.verifyUsableConnectors(TEST_UID);
+    await vi.waitFor(() => expect(mocks.mcp.connect).toHaveBeenCalledOnce());
+    const controller = new AbortController();
+    const calling = manager.callTool(TEST_UID, 'custom-shared', 'read_owner', {}, { signal: controller.signal });
+    controller.abort();
+    try {
+      await expect(calling).rejects.toMatchObject({ code: 'E_TOOL_CALL_CANCELLED' });
+      expect(mocks.mcp.callTool).not.toHaveBeenCalled();
+      expect(mocks.mcp.connect).toHaveBeenCalledOnce();
+    } finally {
+      releaseConnect();
+      await verifying;
+      await manager.shutdownAll();
+    }
   });
 
   it('invalidates and degrades a live connection after a tool-call timeout', async () => {
@@ -1469,10 +1828,114 @@ describe('features/connectors/manager authorization recovery', () => {
     );
   });
 
+  it('returns from beginOAuthConnect before callback completion and pushes the eventual result', async () => {
+    let resolveGrant!: (grant: ReturnType<typeof githubGrant>) => void;
+    mocks.oauth.startOAuth = vi.fn(() => new Promise((resolve) => { resolveGrant = resolve; }));
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    const started = manager.beginOAuthConnect(TEST_UID, 'github');
+
+    expect(started.attempt_id).toBeTruthy();
+    await vi.waitFor(() => expect(mocks.oauth.startOAuth).toHaveBeenCalledTimes(1));
+    expect(mocks.oauth.startOAuth).toHaveBeenCalledWith(
+      TEST_UID,
+      expect.objectContaining({ id: 'github' }),
+      expect.objectContaining({ attemptId: started.attempt_id }),
+    );
+    expect(mocks.events.broadcastOAuthConnectOutcome).not.toHaveBeenCalled();
+
+    resolveGrant(githubGrant());
+    await vi.waitFor(() => {
+      expect(mocks.events.broadcastOAuthConnectOutcome).toHaveBeenCalledWith(
+        expect.objectContaining({
+          attempt_id: started.attempt_id,
+          catalog_id: 'github',
+          result: 'success',
+        }),
+      );
+    });
+  });
+
+  it('does not count an authorized but degraded MCP connection as a successful installation', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    await registry.upsert(TEST_UID, githubInstance());
+    mocks.oauth.startOAuth = vi.fn(async () => githubGrant());
+    mocks.mcp.connect = vi.fn(async () => { throw new Error('fetch failed'); });
+    manager.beginOAuthConnect(TEST_UID, 'github');
+    await vi.waitFor(() => expect(mocks.events.broadcastOAuthConnectOutcome).toHaveBeenCalledOnce(), { timeout: 2000 });
+  });
+
+  it('reuses one local-CLI attempt and reports connecting until authorized tool discovery finishes', async () => {
+    let finishAuthorization!: () => void;
+    let finishDiscovery!: () => void;
+    mocks.localCli.authorize = vi.fn(() => new Promise<void>((resolve) => {
+      finishAuthorization = resolve;
+    }));
+    const discovery = new Promise<void>((resolve) => { finishDiscovery = resolve; });
+    mocks.mcp.listTools = vi.fn(async () => {
+      await discovery;
+      return [{ name: 'execute_read', description: 'Read an official action.', input_schema: {} }];
+    });
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    const first = manager.beginOAuthConnect(TEST_UID, 'feishu');
+    const repeated = manager.beginOAuthConnect(TEST_UID, 'feishu');
+
+    expect(repeated.attempt_id).toBe(first.attempt_id);
+    await vi.waitFor(() => expect(mocks.localCli.authorize).toHaveBeenCalledTimes(1));
+    expect(mocks.events.broadcastOAuthConnectProgress).not.toHaveBeenCalled();
+    expect(mocks.events.broadcastOAuthConnectOutcome).not.toHaveBeenCalled();
+
+    finishAuthorization();
+    try {
+      await vi.waitFor(() => expect(mocks.mcp.listTools).toHaveBeenCalledOnce());
+      expect(mocks.events.broadcastOAuthConnectProgress).toHaveBeenCalledExactlyOnceWith({
+        attempt_id: first.attempt_id, catalog_id: 'feishu',
+      });
+      expect(manager.listInstances(TEST_UID).find((item) => item.id === 'feishu')?.status.kind).toBe('connecting');
+      expect(mocks.events.broadcastOAuthConnectOutcome).not.toHaveBeenCalled();
+      expect(manager.beginOAuthConnect(TEST_UID, 'feishu').attempt_id).toBe(first.attempt_id);
+    } finally {
+      finishDiscovery();
+    }
+    await vi.waitFor(() => {
+      expect(mocks.events.broadcastOAuthConnectOutcome).toHaveBeenCalledWith(
+        expect.objectContaining({
+          attempt_id: first.attempt_id,
+          catalog_id: 'feishu',
+          result: 'success',
+        }),
+      );
+    });
+    expect(mocks.events.broadcastOAuthConnectOutcome).toHaveBeenCalledTimes(1);
+    expect(manager.listInstances(TEST_UID).find((item) => item.id === 'feishu')?.status.kind).toBe('connected');
+  });
+
+  it('delivers a local CLI denial detail without provisioning or including it in analytics', async () => {
+    const reason = 'Organization CLI access is disabled. Contact your administrator.';
+    mocks.localCli.authorize = vi.fn(async () => {
+      throw Object.assign(new Error('local_cli_authorization_failed:dingtalk'), {
+        code: 'local_cli_authorization_failed', authorization_detail: reason,
+      });
+    });
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const started = manager.beginOAuthConnect(TEST_UID, 'dingtalk');
+    await vi.waitFor(() => expect(mocks.events.broadcastOAuthConnectOutcome).toHaveBeenCalledOnce());
+    expect(mocks.events.broadcastOAuthConnectOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      attempt_id: started.attempt_id, result: 'failure', code: 'local_cli_authorization_failed',
+      authorization_detail: reason,
+    }));
+    expect(registry.load(TEST_UID).connections.dingtalk).toBeUndefined();
+    expect(mocks.events.broadcastOAuthConnectProgress).not.toHaveBeenCalled();
+    expect(mocks.mcp.connect).not.toHaveBeenCalled();
+  });
+
 });
 
 describe('OAuth refresh ownership', () => {
-  it('shares one rotating grant between an ordinary refresh and a forced retry', async () => {
+  it('serializes overlapping discovery and refresh around one rotating grant', async () => {
     const registry = await import('../../../../src/main/features/connectors/registry');
     const manager = await import('../../../../src/main/features/connectors/manager');
     const instance = notionInstance();
@@ -1499,8 +1962,10 @@ describe('OAuth refresh ownership', () => {
     await firstConnect;
     await registry.update(TEST_UID, 'notion', (current) => ({ ...current, oauth_grant: { ...current.oauth_grant!, expires_at: 1 } }));
     const second = manager.refreshTools(TEST_UID, 'notion');
-    await refreshing;
+    // The second refresh waits for the in-flight discovery. Rejecting that
+    // discovery starts the forced grant refresh while the second caller is queued.
     rejectFirstConnect(new Error('401 Unauthorized'));
+    await refreshing;
     // Allow the rejected connect to enter its forced-refresh path while the
     // ordinary remote request remains held at the explicit fixture gate.
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -1524,4 +1989,355 @@ describe('OAuth refresh ownership', () => {
     expect(registry.load(TEST_UID).connections.gsheets.status.kind).toBe('error');
     expect(mocks.mcp.connect).not.toHaveBeenCalled();
   });
+
+  it('filters remote commerce tools at discovery and denies direct calls outside catalog policy', async () => {
+    mocks.dcr.startMcpDcrOAuth = vi.fn(async () => ({
+      grant: {
+        access_token: 'paypal-access-token',
+        refresh_token: null,
+        expires_at: Date.now() + 60 * 60 * 1000,
+        scopes: [],
+        token_type: 'Bearer',
+        server_grant_id: 'paypal-grant-1',
+        server_managed: true,
+      },
+      client: {
+        client_id: 'paypal-client-1',
+        authorization_endpoint: 'https://mcp.paypal.com/authorize',
+        token_endpoint: 'https://mcp.paypal.com/token',
+      },
+    }));
+    mocks.mcp.listTools = vi.fn(async () => [
+      { name: 'create_invoice', description: 'Create an invoice.', input_schema: {} },
+      { name: 'create_refund', description: 'Refund a payment.', input_schema: {} },
+      { name: 'unreviewed_future_admin_action', description: 'Must stay hidden.', input_schema: {} },
+    ]);
+
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    await manager.connectViaOAuth(TEST_UID, 'paypal');
+
+    expect(registry.load(TEST_UID).connections.paypal.tools_cache).toEqual([
+      expect.objectContaining({
+        name: 'create_invoice',
+        orkas_action_policy: expect.objectContaining({ risk: 'W', confirmation: 'preview' }),
+      }),
+      expect.objectContaining({
+        name: 'create_refund',
+        orkas_action_policy: expect.objectContaining({ risk: 'H', confirmation: 'fresh' }),
+      }),
+    ]);
+    await expect(
+      manager.callTool(TEST_UID, 'paypal', 'unreviewed_future_admin_action', {}),
+    ).rejects.toThrow('connector_tool_not_allowed');
+    expect(mocks.mcp.callTool).not.toHaveBeenCalled();
+
+    await expect(manager.callTool(TEST_UID, 'paypal', 'create_invoice', {})).resolves.toEqual({});
+    expect(mocks.mcp.callTool).toHaveBeenCalledWith('create_invoice', {});
+  });
+
+  it('removes prohibited actions from fresh discovery before caching or exposing them', async () => {
+    mocks.oauth.startOAuth = vi.fn(async () => githubGrant());
+    mocks.mcp.listTools = vi.fn(async () => [
+      { name: 'search_repositories', description: 'Search repositories.', input_schema: {} },
+      { name: 'delete_organization', description: 'Delete organization.', input_schema: {} },
+    ]);
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    await manager.connectViaOAuth(TEST_UID, 'github');
+    expect(registry.load(TEST_UID).connections.github.tools_cache.map((tool) => tool.name))
+      .toEqual(['search_repositories']);
+    expect(mocks.mcp.callTool).not.toHaveBeenCalled();
+  });
+
+  it('rejects forbidden account actions before connecting or sending to the provider even in trusted mode', async () => {
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const permissions = await import('../../../../src/main/features/permissions');
+    permissions.setLocalExecMode('all_files_auto');
+    await expect(manager.callTool(TEST_UID, 'gmail', 'GMAIL_BATCH_DELETE_MESSAGES', {}))
+      .rejects.toThrow('E_CONNECTOR_ACTION_UNAVAILABLE');
+    expect(mocks.mcp.connect).not.toHaveBeenCalled();
+    expect(mocks.mcp.callTool).not.toHaveBeenCalled();
+  });
+
+  it('binds NetSuite OAuth and reconnects to the validated account-specific standard SuiteApp', async () => {
+    mocks.dcr.startMcpDcrOAuth = vi.fn(async () => ({
+      grant: {
+        access_token: 'netsuite-access-token',
+        refresh_token: null,
+        expires_at: Date.now() + 60 * 60 * 1000,
+        scopes: [],
+        token_type: 'Bearer',
+        server_grant_id: 'netsuite-grant-1',
+        server_managed: true,
+      },
+      client: {
+        client_id: 'netsuite-client-1',
+        authorization_endpoint: 'https://123456-sb1.app.netsuite.com/app/login/oauth2/authorize.nl',
+        token_endpoint: 'https://123456-sb1.suitetalk.api.netsuite.com/services/rest/auth/oauth2/v1/token',
+      },
+    }));
+    mocks.mcp.listTools = vi.fn(async () => [
+      { name: 'ns_getRecord', description: 'Get a record.', input_schema: {} },
+      { name: 'ns_updateRecord', description: 'Update a record.', input_schema: {} },
+      { name: 'tenant_custom_tool', description: 'Must stay hidden.', input_schema: {} },
+    ]);
+    const transports: any[] = [];
+    mocks.mcp.connect = vi.fn(function (this: any) {
+      transports.push(this.__transport);
+      return Promise.resolve();
+    });
+
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    await manager.connectViaOAuth(TEST_UID, 'netsuite', {
+      connectionParameters: { account_id: '123456_SB1' },
+    });
+
+    expect(mocks.dcr.startMcpDcrOAuth).toHaveBeenCalledWith(
+      TEST_UID,
+      expect.objectContaining({
+        id: 'netsuite',
+        transport_template: expect.objectContaining({
+          url: 'https://123456-sb1.suitetalk.api.netsuite.com/services/mcp/v1/suiteapp/com.netsuite.mcpstandardtools',
+        }),
+      }),
+      {},
+    );
+    const stored = registry.load(TEST_UID).connections.netsuite;
+    expect(stored.connection_parameters).toEqual({ account_id: '123456_SB1' });
+    expect(stored.tools_cache.map((tool) => tool.name)).toEqual(['ns_getRecord', 'ns_updateRecord']);
+    expect(stored.tools_cache.find((tool) => tool.name === 'ns_updateRecord')?.orkas_action_policy)
+      .toMatchObject({ risk: 'H', confirmation: 'fresh', sensitive_operation: 'business_record' });
+    expect(transports.at(-1)?.url).toBe(
+      'https://123456-sb1.suitetalk.api.netsuite.com/services/mcp/v1/suiteapp/com.netsuite.mcpstandardtools',
+    );
+
+    await manager.refreshTools(TEST_UID, 'netsuite');
+    expect(transports.at(-1)?.url).toBe(
+      'https://123456-sb1.suitetalk.api.netsuite.com/services/mcp/v1/suiteapp/com.netsuite.mcpstandardtools',
+    );
+  });
+
+  it('rejects NetSuite endpoint injection synchronously before accepting an OAuth launch', async () => {
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    expect(() => manager.beginOAuthConnect(TEST_UID, 'netsuite', {
+      account_id: 'tenant.evil.example',
+    })).toThrow('invalid NetSuite account ID');
+    expect(mocks.dcr.startMcpDcrOAuth).not.toHaveBeenCalled();
+    expect(mocks.events.broadcastOAuthConnectOutcome).not.toHaveBeenCalled();
+  });
+
+  it('keeps an existing PayPal Sandbox grant on its endpoint but rejects new sandbox installs', async () => {
+    mocks.dcr.startMcpDcrOAuth = vi.fn(async () => ({
+      grant: {
+        access_token: 'paypal-sandbox-token',
+        refresh_token: null,
+        expires_at: Date.now() + 60 * 60 * 1000,
+        scopes: [],
+        token_type: 'Bearer',
+        server_grant_id: 'paypal-sandbox-grant',
+        server_managed: true,
+      },
+      client: {
+        client_id: 'paypal-sandbox-client',
+        authorization_endpoint: 'https://mcp.sandbox.paypal.com/authorize',
+        token_endpoint: 'https://mcp.sandbox.paypal.com/token',
+      },
+    }));
+    mocks.mcp.listTools = vi.fn(async () => [
+      { name: 'list_transactions', description: 'List transactions.', input_schema: {} },
+    ]);
+
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    expect(() => manager.beginOAuthConnect(TEST_UID, 'paypal-sandbox'))
+      .toThrow('New PayPal connections use production only');
+    await expect(manager.connectViaOAuth(TEST_UID, 'paypal-sandbox'))
+      .rejects.toThrow('New PayPal connections use production only');
+    expect(mocks.dcr.startMcpDcrOAuth).not.toHaveBeenCalled();
+    expect(registry.load(TEST_UID).connections['paypal-sandbox']).toBeUndefined();
+    await registry.upsert(TEST_UID, {
+      id: 'paypal-sandbox', display_name: 'PayPal Sandbox',
+      transport: { kind: 'streamable-http', url: 'https://mcp.sandbox.paypal.com/http' },
+      enabled_subtools: null, tools_cache: [], tools_cached_at: 0,
+      status: { kind: 'error', message: 'connector_reconnect_required', at: 1 },
+      created_at: '2026-09-01T00:00:00Z', updated_at: '2026-09-01T00:00:00Z',
+    });
+    await manager.connectViaOAuth(TEST_UID, 'paypal-sandbox');
+
+    expect(mocks.dcr.startMcpDcrOAuth).toHaveBeenCalledWith(
+      TEST_UID,
+      expect.objectContaining({
+        id: 'paypal-sandbox',
+        transport_template: expect.objectContaining({ url: 'https://mcp.sandbox.paypal.com/http' }),
+      }),
+      {},
+    );
+    await expect(manager.connectViaOAuth(TEST_UID, 'paypal')).rejects.toThrow(
+      'connector_variant_already_installed:paypal-sandbox',
+    );
+    await manager.refreshTools(TEST_UID, 'paypal-sandbox');
+    expect(registry.load(TEST_UID).connections['paypal-sandbox'].transport)
+      .toMatchObject({ url: 'https://mcp.sandbox.paypal.com/http' });
+  });
+
+  it.each(['square', 'instacart-shopping', 'reloadly', 'walmart-marketplace', 'ebay-seller', 'amazon-seller-central', 'shopee'])(
+    'preserves the installed %s sandbox during refresh and rejects a production overwrite before cleanup', async (id) => {
+      const manager = await import('../../../../src/main/features/connectors/manager');
+      const registry = await import('../../../../src/main/features/connectors/registry');
+      mocks.mcp.listTools = vi.fn(async () => [
+        { name: 'list_capabilities', description: 'Reviewed actions.', input_schema: {} },
+      ]);
+      await registry.upsert(TEST_UID, {
+        id, display_name: id,
+        transport: { kind: 'stdio', command: 'node', args: ['direct-commerce-mcp-server.cjs'] },
+        enabled_subtools: null, tools_cache: [], tools_cached_at: 0,
+        connection_parameters: { environment: 'sandbox', market: 'us' },
+        status: { kind: 'error', message: 'connector_reconnect_required', at: 1 },
+        created_at: '2026-09-01T00:00:00Z', updated_at: '2026-09-01T00:00:00Z',
+      });
+      await manager.refreshTools(TEST_UID, id);
+      expect(mocks.localApi.transport).toHaveBeenCalledWith(TEST_UID, expect.objectContaining({ id }),
+        expect.objectContaining({ environment: 'sandbox' }));
+      const before = registry.load(TEST_UID).connections[id];
+      expect(() => manager.beginOAuthConnect(TEST_UID, id, {}))
+        .toThrow('Disconnect the existing test connection');
+      await expect(manager.connectViaOAuth(TEST_UID, id, { connectionParameters: {} }))
+        .rejects.toThrow('Disconnect the existing test connection');
+      expect(registry.load(TEST_UID).connections[id]).toEqual(before);
+      expect(mocks.localApi.authorize).not.toHaveBeenCalled();
+      expect(mocks.localApi.remove).not.toHaveBeenCalled();
+      // Explicit disconnect is the recovery boundary; a later installation can use production.
+      await manager.removeInstance(TEST_UID, id);
+      mocks.localApi.authorize.mockResolvedValue({ environment: 'live' });
+      await manager.connectViaOAuth(TEST_UID, id, { connectionParameters: {} });
+      expect(registry.load(TEST_UID).connections[id].connection_parameters).toEqual({ environment: 'live' });
+    },
+  );
+
+  it('keeps legacy standalone Lark installs mutually exclusive with the unified Feishu entry', async () => {
+    mocks.mcp.listTools = vi.fn(async () => [
+      { name: 'execute_read', description: 'Read an official action.', input_schema: {} },
+    ]);
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    await manager.connectViaOAuth(TEST_UID, 'lark');
+
+    await expect(manager.connectViaOAuth(TEST_UID, 'feishu')).rejects.toThrow(
+      'connector_variant_already_installed:lark',
+    );
+    expect(mocks.localCli.authorize).toHaveBeenCalledTimes(1);
+  });
+
+  it('authorizes, provisions, reconnects and removes an official local-CLI connector without an OAuth grant', async () => {
+    mocks.mcp.listTools = vi.fn(async () => [
+      { name: 'execute_read', description: 'Read an official action.', input_schema: {} },
+      { name: 'execute_write', description: 'Write an official action.', input_schema: {} },
+      { name: 'raw_cli', description: 'Must stay hidden.', input_schema: {} },
+    ]);
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    await manager.connectViaOAuth(TEST_UID, 'wecom');
+
+    expect(mocks.localCli.authorize).toHaveBeenCalledWith(
+      TEST_UID,
+      expect.objectContaining({ id: 'wecom', auth_mode: 'local_cli' }),
+    );
+    const stored = registry.load(TEST_UID).connections.wecom;
+    expect(stored.oauth_grant).toBeUndefined();
+    expect(stored.tools_cache).toEqual([
+      expect.objectContaining({
+        name: 'execute_read',
+        orkas_action_policy: expect.objectContaining({ risk: 'R', confirmation: 'none' }),
+      }),
+      expect.objectContaining({
+        name: 'execute_write',
+        orkas_action_policy: expect.objectContaining({ risk: 'W', confirmation: 'preview' }),
+      }),
+    ]);
+
+    await manager.refreshTools(TEST_UID, 'wecom');
+    expect(mocks.localCli.transport).toHaveBeenCalledTimes(3);
+    let releaseLogout!: () => void;
+    mocks.localCli.remove = vi.fn(() => new Promise<void>((resolve) => { releaseLogout = resolve; }));
+    const removal = manager.removeInstance(TEST_UID, 'wecom');
+    try {
+      await vi.waitFor(() => expect(mocks.localCli.remove).toHaveBeenCalledOnce());
+      expect(registry.load(TEST_UID).connections.wecom).toBeDefined();
+    } finally {
+      releaseLogout();
+      await removal;
+    }
+    expect(registry.load(TEST_UID).connections.wecom).toBeUndefined();
+    expect(mocks.localCli.remove).toHaveBeenCalledWith(
+      TEST_UID,
+      expect.objectContaining({ id: 'wecom' }),
+    );
+  });
+
+  it('keeps direct-commerce credentials device-local across connect, refresh, list, and removal', async () => {
+    const liveTransports: any[] = [];
+    mocks.mcp.connect = vi.fn(function (this: any) {
+      liveTransports.push(this.__transport);
+      return Promise.resolve();
+    });
+    mocks.mcp.listTools = vi.fn(async () => [
+      { name: 'list_capabilities', description: 'Reviewed actions.', input_schema: {} },
+      { name: 'execute_read', description: 'Read.', input_schema: {} },
+      { name: 'execute_high_impact', description: 'Financial.', input_schema: {} },
+      { name: 'unreviewed_raw_request', description: 'Must stay hidden.', input_schema: {} },
+    ]);
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const raw = {
+      shop_domain: 'merchant.myshopify.com',
+      client_id: 'shopify-client',
+      client_secret: 'shopify-client-secret',
+    };
+
+    await manager.connectViaOAuth(TEST_UID, 'shopify-admin', { connectionParameters: raw, attemptId: 'direct-api-attempt' });
+
+    expect(mocks.localApi.authorize).toHaveBeenCalledWith(
+      TEST_UID,
+      expect.objectContaining({ id: 'shopify-admin', auth_mode: 'local_api' }),
+      raw,
+      { attemptId: 'direct-api-attempt' },
+    );
+    const stored = registry.load(TEST_UID).connections['shopify-admin'];
+    expect(stored.oauth_grant).toBeUndefined();
+    expect(stored.connection_parameters).toEqual({ shop_domain: 'merchant.myshopify.com' });
+    expect(JSON.stringify(stored)).not.toContain('shopify-client');
+    expect(JSON.stringify(stored)).not.toContain('shopify-client-secret');
+    expect(stored.transport.kind === 'stdio' ? stored.transport.env : undefined).toBeUndefined();
+    expect(stored.tools_cache.map((tool) => tool.name)).toEqual([
+      'list_capabilities', 'execute_read', 'execute_high_impact',
+    ]);
+    expect(stored.tools_cache.find((tool) => tool.name === 'execute_high_impact')?.orkas_action_policy)
+      .toMatchObject({ risk: 'H', confirmation: 'fresh' });
+    expect(liveTransports.at(-1)?.env).toMatchObject({
+      ORKAS_LOCAL_API_CREDENTIAL_KEY: 'device-only-key',
+      ORKAS_LOCAL_API_METADATA_JSON: JSON.stringify({ shop_domain: 'merchant.myshopify.com' }),
+    });
+
+    await manager.refreshTools(TEST_UID, 'shopify-admin');
+    const refreshed = registry.load(TEST_UID).connections['shopify-admin'];
+    expect(refreshed.transport.kind === 'stdio' ? refreshed.transport.env : undefined).toBeUndefined();
+    expect(JSON.stringify(refreshed)).not.toContain('device-only-key');
+
+    mocks.localApi.hasAuthorization.mockReturnValue(false);
+    expect(manager.listInstances(TEST_UID).find((item) => item.id === 'shopify-admin')?.status)
+      .toMatchObject({ kind: 'error', message: 'local_api_credentials_missing:shopify-admin' });
+    expect(registry.load(TEST_UID).connections['shopify-admin'].status.kind).toBe('connected');
+
+    await manager.removeInstance(TEST_UID, 'shopify-admin');
+    expect(mocks.localApi.remove).toHaveBeenCalledWith(
+      TEST_UID,
+      expect.objectContaining({ id: 'shopify-admin' }),
+    );
+  });
+
 });

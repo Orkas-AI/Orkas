@@ -49,7 +49,6 @@ export interface ProjectLibraryStatusEvent {
   kind?: ProjectLibraryKind;
   stage?: 'queue' | 'extract' | 'embed' | 'persist' | 'reconcile';
   errorCode?: string;
-  recovered?: boolean;
 }
 
 export type ProjectLibraryReconcileResult = CorpusReconcileResult;
@@ -133,32 +132,27 @@ export function enqueue(
   corpusFor(uid, pid).enqueue(name, op, opts);
 }
 
-export async function reconcile(uid: string, projectId: string): Promise<ProjectLibraryReconcileResult> {
+export async function reconcile(
+  uid: string,
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ProjectLibraryReconcileResult> {
   const pid = safeProjectId(projectId);
+  if (signal?.aborted) return { enqueuedUpsert: 0, enqueuedDelete: 0, unchanged: 0 };
   if (!await projectExists(uid, pid)) return { enqueuedUpsert: 0, enqueuedDelete: 0, unchanged: 0 };
   // A sync restore can legitimately bring back the same project id after a
   // local deletion. Reconcile is the authoritative resurrection boundary.
   _deletedProjects.delete(projectKey(uid, pid));
-  return corpusFor(uid, pid).reconcile();
+  return corpusFor(uid, pid).reconcile(signal);
 }
 
-/** Read-only retrieval. Index freshness belongs to source mutations, sync
- *  drop-in, and boot maintenance — never to a query: reconciling here made
- *  every model search stat and hash the whole project tree, serially and
- *  uncancellably, so latency grew with the project rather than the result
- *  set. Kept async because callers await it. */
-export async function search(
-  uid: string,
-  projectId: string,
-  queryVec: number[] | Float32Array,
-  opts: vs.VecSearchOpts = {},
-): Promise<vs.VecSearchHit[]> {
-  return searchExisting(uid, projectId, queryVec, opts);
-}
-
-/** Query only an existing project vector store. Global typeahead must not
+/** Read-only retrieval over an existing project vector store. Index
+ *  freshness belongs to source mutations, sync drop-in, and boot
+ *  maintenance — never to a query: reconciling here made every model search
+ *  stat and hash the whole project tree, serially and uncancellably.
+ *  Query only an existing project vector store. Global typeahead must not
  *  create derived state for every project on each keystroke. */
-export function searchExisting(
+export function search(
   uid: string,
   projectId: string,
   queryVec: number[] | Float32Array,

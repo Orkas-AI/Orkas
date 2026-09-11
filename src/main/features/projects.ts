@@ -1,12 +1,12 @@
 /**
- * Projects — logical groups of conversations + a strict scope of agents /
- * skills the conversations inside the project can use.
+ * Projects — logical groups of conversations + a strict scope of agents the
+ * conversations inside the project can use.
  *
  * Storage: each project is a self-contained directory under
  * `<uid>/cloud/projects/<pid>/` (cloud-synced):
  *   - `project.json`   {project_id, name, owner_uid, timestamps}
- *   - `bindings.json`  {agents: string[], skills: string[]} — id refs only,
- *                      no spec body copy. Missing file = empty bindings.
+ *   - `bindings.json`  {agents: string[]} — id refs only, no spec body
+ *                      copy. Missing file = empty bindings.
  *
  * **No aggregate `_index.json`**. Listing scans `projects/<pid>/project.json`.
  * **Why:** future server-mediated collaboration adds/removes a project from
@@ -23,7 +23,7 @@
  *
  * **Scope semantics** (CLAUDE.md §6, outer intersection BEFORE the 4
  * enable-filter sites):
- *   conversation in project P → only agents/skills in `bindings.json` are
+ *   conversation in project P → only agents in `bindings.json` are
  *   visible to the LLM. Orphan conversation (no project_id) → unchanged
  *   global visibility. `resolveProjectScope` is the single resolver
  *   threaded through the runTurn pipeline (alongside the workspace
@@ -49,7 +49,7 @@ import { nowIso, readJson, safeId, writeJson, writeTextAtomicSync } from '../sto
 import { createLogger } from '../logger';
 import { getCurrentLang, getLocaleMeta } from '../i18n';
 import { prompts } from '../prompts/loader';
-import { logErrorRef } from '../util/log-redact';
+import { logErrorRef, logErrorSummary, maskId } from '../util/log-redact';
 import * as chats from './chats';
 import * as autoTasks from './auto_tasks';
 import { readState } from './group_chat/state';
@@ -126,10 +126,9 @@ export interface ProjectWithStats extends Project {
 }
 
 /** Strict scope — only these ids are visible to the LLM inside the project.
- *  Empty arrays = "zero agents / zero skills" (intentional opt-out). */
+ *  Empty array = "zero agents" (intentional opt-out). */
 export interface ProjectBindings {
   agents: string[];
-  skills: string[];
 }
 
 // ── id helper ─────────────────────────────────────────────────────────────
@@ -153,19 +152,33 @@ function ensureProjectsDir(uid: string): string {
 async function _ensurePromoted(uid: string): Promise<void> {
   const legacy = path.join(ensureProjectsDir(uid), '_index.json');
   if (!fs.existsSync(legacy)) return;
-  let items: any[] = [];
+  let source: string;
+  let items: any[];
   try {
-    const data: any = await readJson(legacy);
+    source = await fsp.readFile(legacy, 'utf8');
+    const data: unknown = JSON.parse(source);
     if (Array.isArray(data)) items = data;
-    else if (data && Array.isArray(data.items)) items = data.items;
+    else if (data && typeof data === 'object' && Array.isArray((data as { items?: unknown }).items)) {
+      items = (data as { items: any[] }).items;
+    } else {
+      log.warn('legacy project index has an unrecognized format', { uid: maskId(uid) });
+      return;
+    }
   } catch (err) {
-    log.warn(`legacy _index.json read user=${uid}: ${(err as Error).message}`);
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn('legacy project index read failed', { uid: maskId(uid), error: logErrorSummary(err) });
+    }
+    return;
   }
   let promoted = 0;
+  let incomplete = 0;
   for (const raw of items) {
-    if (!raw || typeof raw !== 'object') continue;
-    const pid = typeof raw.project_id === 'string' ? raw.project_id : '';
-    if (!pid) continue;
+    const pid = raw && typeof raw === 'object' && !Array.isArray(raw)
+      && typeof raw.project_id === 'string' ? raw.project_id : '';
+    if (!safeId(pid)) {
+      incomplete += 1;
+      continue;
+    }
     const meta = projectMetaFile(uid, pid);
     if (fs.existsSync(meta)) continue;
     try {
@@ -173,14 +186,36 @@ async function _ensurePromoted(uid: string): Promise<void> {
       await writeJson(meta, _normaliseProject(raw, uid, pid));
       promoted += 1;
     } catch (err) {
-      log.warn(`legacy promote pid=${pid} user=${uid}: ${(err as Error).message}`);
+      incomplete += 1;
+      log.warn('legacy project promotion failed', { uid: maskId(uid), pid, error: logErrorSummary(err) });
     }
   }
-  try { await fsp.unlink(legacy); }
-  catch (err) {
-    log.warn(`legacy _index.json unlink user=${uid}: ${(err as Error).message}`);
+  if (incomplete) {
+    log.warn('legacy project index retained for recovery', { uid: maskId(uid), promoted, incomplete });
+    return;
   }
-  log.info(`legacy _index.json promoted user=${uid} count=${promoted}`);
+  try {
+    // Copying yields to other writers. Remove only the source we actually
+    // promoted, with no event-loop gap between the comparison and unlink.
+    if (fs.readFileSync(legacy, 'utf8') !== source) {
+      log.warn('legacy project index changed during promotion', { uid: maskId(uid), promoted });
+      return;
+    }
+    fs.unlinkSync(legacy);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn('legacy project index removal failed', { uid: maskId(uid), error: logErrorSummary(err) });
+    }
+    return;
+  }
+  log.info('legacy project index promoted', { uid: maskId(uid), promoted });
+}
+
+/** Readdir-only id list. Pollers that only need to know which projects
+ *  exist (the driver tick) must not pay `listProjects`' conversation-count
+ *  sweep every minute. */
+export async function listProjectIds(uid: string): Promise<string[]> {
+  return _listProjectIds(uid);
 }
 
 async function _listProjectIds(uid: string): Promise<string[]> {
@@ -238,7 +273,7 @@ async function _readProject(uid: string, pid: string): Promise<Project | null> {
     return _normaliseProject(raw, uid, pid);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log.warn('read project failed', { uid, pid, error: logErrorRef(err) });
+      log.warn('read project failed', { uid: maskId(uid), pid, error: logErrorSummary(err) });
     }
     return null;
   }
@@ -258,22 +293,24 @@ function _invalidateSearchDisplayCatalog(uid: string): void {
   } catch { /* search module may still be initializing */ }
 }
 
+// A `bindings.json` written before Skill bindings were removed still carries
+// a `skills` array. It is dropped here and on the next write; nothing reads it.
 function _normaliseBindings(raw: any): ProjectBindings {
-  if (!raw || typeof raw !== 'object') return { agents: [], skills: [] };
+  if (!raw || typeof raw !== 'object') return { agents: [] };
   const filt = (arr: unknown): string[] =>
     Array.isArray(arr) ? arr.filter((s) => typeof s === 'string' && !!s) as string[] : [];
-  return { agents: filt(raw.agents), skills: filt(raw.skills) };
+  return { agents: filt(raw.agents) };
 }
 
 async function _readBindings(uid: string, pid: string): Promise<ProjectBindings> {
   const f = projectBindingsFile(uid, pid);
-  if (!fs.existsSync(f)) return { agents: [], skills: [] };
+  if (!fs.existsSync(f)) return { agents: [] };
   try {
     const raw: any = await readJson(f);
     return _normaliseBindings(raw);
   } catch (err) {
     log.warn(`read bindings user=${uid} pid=${pid}: ${(err as Error).message}`);
-    return { agents: [], skills: [] };
+    return { agents: [] };
   }
 }
 
@@ -392,7 +429,7 @@ export async function createProject(
       updated_at: now,
     };
     await _writeProject(uid, project);
-    log.info(`created user=${uid} pid=${project.project_id} name="${name}"`);
+    log.info('created', { uid: maskId(uid), pid: project.project_id, name_chars: name.length });
     return { ok: true, project };
   });
 }
@@ -412,7 +449,7 @@ export async function renameProject(
     if (cur.name === name) return { ok: true, project: cur }; // no-op
     const next: Project = { ...cur, name, updated_at: nowIso() };
     await _writeProject(uid, next);
-    log.info(`renamed user=${uid} pid=${projectId} name="${name}"`);
+    log.info('renamed', { uid: maskId(uid), pid: projectId, name_chars: name.length });
     return { ok: true, project: next };
   });
 }
@@ -422,20 +459,28 @@ export async function renameProject(
 // A per-project markdown file: the project's standing goal + rules, injected
 // into the system prompt of every session that belongs to the project
 // (runner.ts). The USER edits it in the project settings UI; the COMMANDER may
-// also replace it via the `project_instructions` tool (runner injects that tool
-// for the commander session only — sub-agents read only). Same sync posture as the
+// and named project actors can replace it via `project_instructions` using
+// the conditional writer. Same sync posture as the
 // sibling project files (projects domain, no explicit markDirty — matches
 // `_writeProject`).
 
 export const PROJECT_INSTRUCTIONS_CHAR_LIMIT = 4000;
 
+/** Static conflict core shared by every project-aware model surface. */
+export function formatProjectContextCoreForPrompt(): string {
+  return prompts.load('chat_project_context_policy').trim();
+}
+
 /**
- * Static contract for the user-managed layers injected into project sessions.
- * Keep this separate from ORKAS.md so the conflict policy is present even when
- * the project has no user-authored instructions yet.
+ * Static contract for all user-managed layers available to in-process project
+ * sessions. The CLI surface receives only the shared core because global and
+ * Agent-private memory are intentionally withheld from external runtimes.
  */
 export function formatProjectContextPolicyForSystemPrompt(): string {
-  return prompts.load('chat_project_context_policy').trim();
+  return [
+    formatProjectContextCoreForPrompt(),
+    prompts.load('chat_project_context_inprocess').trim(),
+  ].filter(Boolean).join('\n\n');
 }
 
 export async function readProjectInstructions(
@@ -650,40 +695,37 @@ export async function projectExists(uid: string, projectId: string): Promise<boo
   return fs.existsSync(projectMetaFile(uid, projectId));
 }
 
-// ── Bindings: per-project agent / skill scope ────────────────────────────
+// ── Bindings: per-project agent scope ────────────────────────────────────
 
 /** Read the project's bindings. Missing file or unknown project → empty.
  *  Unknown ids in the file are NOT filtered here — that is the caller's
  *  job (loaders are async). Missing project → returns empty so the LLM
  *  sees nothing rather than leaking global scope. */
 export async function getBindings(uid: string, projectId: string): Promise<ProjectBindings> {
-  if (!projectId) return { agents: [], skills: [] };
+  if (!projectId) return { agents: [] };
   await _ensurePromoted(uid);
-  if (!fs.existsSync(projectMetaFile(uid, projectId))) return { agents: [], skills: [] };
+  if (!fs.existsSync(projectMetaFile(uid, projectId))) return { agents: [] };
   return _readBindings(uid, projectId);
 }
 
 export async function pruneBindings(
   uid: string,
   projectId: string,
-  valid: { agents?: ReadonlySet<string>; skills?: ReadonlySet<string> },
+  valid: { agents?: ReadonlySet<string> },
 ): Promise<{ ok: true; bindings: ProjectBindings; pruned: ProjectBindings } | { ok: false; error: ProjectError }> {
   await _ensurePromoted(uid);
   if (!fs.existsSync(projectMetaFile(uid, projectId))) return { ok: false, error: 'not_found' };
   const cur = await _readBindings(uid, projectId);
   const validAgents = valid.agents;
-  const validSkills = valid.skills;
   const next: ProjectBindings = {
     agents: validAgents ? cur.agents.filter((id) => validAgents.has(id)) : cur.agents,
-    skills: validSkills ? cur.skills.filter((id) => validSkills.has(id)) : cur.skills,
   };
   const pruned: ProjectBindings = {
     agents: validAgents ? cur.agents.filter((id) => !validAgents.has(id)) : [],
-    skills: validSkills ? cur.skills.filter((id) => !validSkills.has(id)) : [],
   };
-  if (pruned.agents.length || pruned.skills.length) {
+  if (pruned.agents.length) {
     await _writeBindings(uid, projectId, next);
-    log.info(`pruned stale bindings user=${uid} pid=${projectId} agents=${pruned.agents.length} skills=${pruned.skills.length}`);
+    log.info(`pruned stale bindings user=${uid} pid=${projectId} agents=${pruned.agents.length}`);
   }
   return { ok: true, bindings: next, pruned };
 }
@@ -734,22 +776,5 @@ export async function removeAgentBinding(
 ): Promise<{ ok: true; bindings: ProjectBindings } | { ok: false; error: ProjectError }> {
   return _mutateBindings(uid, projectId, (b) => (
     { ...b, agents: b.agents.filter((id) => id !== agentId) }
-  ));
-}
-
-export async function addSkillBinding(
-  uid: string, projectId: string, skillId: string,
-): Promise<{ ok: true; bindings: ProjectBindings } | { ok: false; error: ProjectError }> {
-  if (!skillId) return { ok: false, error: 'not_found' };
-  return _mutateBindings(uid, projectId, (b) => (
-    b.skills.includes(skillId) ? b : { ...b, skills: [...b.skills, skillId] }
-  ));
-}
-
-export async function removeSkillBinding(
-  uid: string, projectId: string, skillId: string,
-): Promise<{ ok: true; bindings: ProjectBindings } | { ok: false; error: ProjectError }> {
-  return _mutateBindings(uid, projectId, (b) => (
-    { ...b, skills: b.skills.filter((id) => id !== skillId) }
   ));
 }

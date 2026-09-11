@@ -236,6 +236,10 @@ interface Queue {
   running: boolean;
   scheduled: boolean;
   activePaths: Map<string, number>;
+  /** `${op}\0${relPath}` of every job in `jobs` — dedup and reconcile's
+   *  "owned by queue" test were linear scans, O(N²) over a first-time
+   *  reconcile of N files (2026-08-28 review E2-7). */
+  queuedKeys: Set<string>;
 }
 
 interface ExtractResult {
@@ -283,7 +287,7 @@ export function _resetLibraryCorporaForTests(): void {
 }
 
 function createCorpus(spec: CorpusSpec): LibraryCorpus {
-  const queue: Queue = { jobs: [], running: false, scheduled: false, activePaths: new Map() };
+  const queue: Queue = { jobs: [], running: false, scheduled: false, activePaths: new Map(), queuedKeys: new Set() };
   const epochOf = (): number => (spec.epoch ? spec.epoch() : 0);
   const discarded = (): boolean => spec.discarded?.() === true;
   const storeExists = (): boolean => fs.existsSync(path.join(spec.dbDir, 'vector.db'));
@@ -312,9 +316,12 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
     // stale searchable row forever.
     if (op === 'upsert' && spec.skipRelPath?.(safe)) return;
     if (op === 'upsert' && !libraryKindFor(safe)) return;
-    const existing = queue.jobs.find((job) => job.relPath === safe && job.op === op);
-    if (existing) {
-      if (opts.force) existing.force = true;
+    const queuedKey = `${op}\u0000${safe}`;
+    if (queue.queuedKeys.has(queuedKey)) {
+      if (opts.force) {
+        const existing = queue.jobs.find((job) => job.relPath === safe && job.op === op);
+        if (existing) existing.force = true;
+      }
       return;
     }
     queue.jobs.push({
@@ -326,6 +333,7 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
       reason: opts.reason || (opts.force ? 'manual' : 'mutation'),
       attempt: Math.max(1, Math.round(opts.attempt || 1)),
     });
+    queue.queuedKeys.add(queuedKey);
     if (op === 'upsert') {
       spec.emit({ relPath: safe, status: 'pending', ...(libraryKindFor(safe) ? { kind: libraryKindFor(safe)! } : {}) });
     }
@@ -357,6 +365,7 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
       while (true) {
         while (queue.jobs.length) {
           const job = queue.jobs.shift()!;
+          queue.queuedKeys.delete(`${job.op}\u0000${job.relPath}`);
           if (!jobIsCurrent(job)) continue;
           if (job.op === 'delete') {
             // Serialise deletes behind pending upserts to keep FS ↔ DB order.
@@ -694,7 +703,8 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
         ? store().getFile(relPath)
         : snapshotExisting;
       const ownedByQueue = queue.activePaths.has(relPath)
-        || queue.jobs.some((job) => job.relPath === relPath);
+        || queue.queuedKeys.has(`upsert\u0000${relPath}`)
+        || queue.queuedKeys.has(`delete\u0000${relPath}`);
       const orphanedProcessing = existing?.status === 'processing' && !ownedByQueue;
       const needsWork = !existing
         || existing.sha1 !== meta.sha1
@@ -861,6 +871,6 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
         ? store().statusSummary()
         : { total: 0, ready: 0, processing: 0, pending: 0, failed: 0 };
     },
-    cancelQueued() { queue.jobs = []; },
+    cancelQueued() { queue.jobs = []; queue.queuedKeys.clear(); },
   };
 }

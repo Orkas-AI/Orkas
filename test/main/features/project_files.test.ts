@@ -37,8 +37,134 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+describe('project_files › explicit versioned replacement', () => {
+  it('preserves create-only saves and protects a newer user edit from a stale save', async () => {
+    const files = await import('../../../src/main/features/project_files');
+    await files.uploadProjectFile('u1', 'p1', 'report.md', Buffer.from('Original'));
+    const working = path.join(tmpDir, 'working.md');
+    const checkout = await files.checkoutProjectFile('u1', 'p1', 'report.md', working);
+    expect(checkout.ok).toBe(true);
+    if (!checkout.ok) throw new Error('checkout failed');
+    expect(fs.readFileSync(working, 'utf8')).toBe('Original');
+    fs.writeFileSync(working, 'Agent revision');
+    expect(await files.copyProjectEntryFromPath('u1', 'p1', working, 'report.md'))
+      .toMatchObject({ ok: false, error: 'target_exists' });
+    expect(await files.checkoutProjectFile('u1', 'p1', 'report.md', working)).toMatchObject({ ok: false });
+    expect(fs.readFileSync(working, 'utf8')).toBe('Agent revision');
+    const saved = await files.replaceProjectFileFromPath('u1', 'p1', working, 'report.md', checkout.revision);
+    expect(saved.ok).toBe(true);
+    expect(await files.readProjectTextFile('u1', 'p1', 'report.md')).toMatchObject({ content: 'Agent revision' });
+    if (!saved.ok) throw new Error('save failed');
+    await files.updateProjectTextFile('u1', 'p1', 'report.md', 'Newer user edit');
+    expect(await files.replaceProjectFileFromPath('u1', 'p1', working, 'report.md', saved.revision))
+      .toMatchObject({ ok: false, error: expect.stringContaining('conflict') });
+    expect(await files.readProjectTextFile('u1', 'p1', 'report.md')).toMatchObject({ content: 'Newer user edit' });
+    expect(enqueueCalls.filter((call) => call.name === 'report.md')).toHaveLength(3);
+  });
+
+  it('binds revisions to the project and supports binary deliverables without text conversion', async () => {
+    const files = await import('../../../src/main/features/project_files');
+    const original = Buffer.from([0, 255, 12, 200]);
+    for (const pid of ['p1', 'p2']) await files.uploadProjectFile('u1', pid, 'report.pdf', original);
+    const working = path.join(tmpDir, 'working.pdf');
+    const checkout = await files.checkoutProjectFile('u1', 'p1', 'report.pdf', working);
+    if (!checkout.ok) throw new Error('checkout failed');
+    expect(fs.readFileSync(working)).toEqual(original);
+    fs.writeFileSync(working, Buffer.from([0, 254, 200]));
+    expect(await files.replaceProjectFileFromPath('u1', 'p2', working, 'report.pdf', checkout.revision))
+      .toMatchObject({ ok: false, error: expect.stringContaining('conflict') });
+    const [one, two] = await Promise.all([
+      files.replaceProjectFileFromPath('u1', 'p1', working, 'report.pdf', checkout.revision),
+      files.replaceProjectFileFromPath('u1', 'p1', working, 'report.pdf', checkout.revision),
+    ]);
+    expect([one.ok, two.ok].sort()).toEqual([false, true]);
+    const resolved = await files.resolveProjectFileAbsPath('u1', 'p1', 'report.pdf');
+    if (!resolved.ok) throw new Error('resolve failed');
+    expect(fs.readFileSync(resolved.absPath)).toEqual(Buffer.from([0, 254, 200]));
+    expect(await files.checkoutProjectFile('u1', 'p1', '../ORKAS.md', path.join(tmpDir, 'escape.md')))
+      .toMatchObject({ ok: false });
+  });
+});
+
+describe('project_files › diagnostic privacy', () => {
+  async function captureDiagnostics(): Promise<unknown[][]> {
+    const logger = await import('../../../src/main/logger');
+    const original = logger.createLogger;
+    const records: unknown[][] = [];
+    vi.spyOn(logger, 'createLogger').mockImplementation((scope) => {
+      const scoped = original(scope);
+      if (scope !== 'project_files') return scoped;
+      const capture = (message: string, ...args: unknown[]) => {
+        records.push([message, ...args].map((value) => logger.redact(value)));
+      };
+      return { info: capture, warn: capture, error: capture, debug: capture };
+    });
+    return records;
+  }
+
+  it('keeps Library names and cache error content private through edit, move, and delete', async () => {
+    const records = await captureDiagnostics();
+    const indexer = await import('../../../src/main/features/file_indexer');
+    vi.spyOn(indexer, 'invalidateFileCache').mockImplementation(() => {
+      throw new Error('Confidential acquisition excerpt');
+    });
+    const projectFiles = await import('../../../src/main/features/project_files');
+    const name = 'Private diligence notes.md';
+    const renamed = 'Private signed agreement.md';
+    const uploaded = await projectFiles.uploadProjectFile('u1', 'p1', name, Buffer.from('original'));
+    expect(uploaded.ok).toBe(true);
+    expect(await projectFiles.updateProjectTextFile('u1', 'p1', name, 'revised'))
+      .toMatchObject({ ok: true });
+    expect(await projectFiles.renameProjectFile('u1', 'p1', name, renamed))
+      .toMatchObject({ ok: true, name: renamed });
+    expect(await projectFiles.readProjectTextFile('u1', 'p1', renamed))
+      .toMatchObject({ ok: true, content: 'revised' });
+    expect(await projectFiles.deleteProjectFile('u1', 'p1', renamed)).toEqual({ ok: true });
+    expect(await projectFiles.listProjectFiles('u1', 'p1')).toEqual([]);
+    expect(records).toHaveLength(4);
+    const emitted = JSON.stringify(records);
+    for (const privateText of [name, renamed, 'Confidential acquisition excerpt', tmpDir]) {
+      expect(emitted).not.toContain(privateText);
+    }
+  });
+
+  it('keeps recursive Library deletion diagnostics private without preventing deletion', async () => {
+    const records = await captureDiagnostics();
+    const indexer = await import('../../../src/main/features/file_indexer');
+    vi.spyOn(indexer, 'invalidateFileCache').mockImplementation(() => {
+      throw new Error('Confidential source fragment');
+    });
+    const projectFiles = await import('../../../src/main/features/project_files');
+    const name = 'Private archive/Private source.md';
+    expect((await projectFiles.uploadProjectFile('u1', 'p1', name, Buffer.from('original'))).ok).toBe(true);
+    records.length = 0;
+    expect(await projectFiles.deleteProjectEntry('u1', 'p1', 'Private archive')).toEqual({ ok: true });
+    expect(await projectFiles.listProjectFiles('u1', 'p1')).toEqual([]);
+    expect(records).toHaveLength(1);
+    expect(JSON.stringify(records)).not.toMatch(/Private archive|Private source|Confidential source fragment/);
+  });
+
+  it.each(['docx', 'xlsx'] as const)('keeps malformed %s preview diagnostics private and preserves the source', async (ext) => {
+    const records = await captureDiagnostics();
+    const projectFiles = await import('../../../src/main/features/project_files');
+    const name = `Private acquisition.${ext}`;
+    const source = Buffer.from('invalid document');
+    const uploaded = await projectFiles.uploadProjectFile('u1', 'p1', name, source);
+    if (!uploaded.ok) throw new Error('upload failed');
+    records.length = 0;
+    const result = ext === 'docx'
+      ? await projectFiles.readProjectDocxHtml('u1', 'p1', name)
+      : await projectFiles.readProjectOfficeHtml('u1', 'p1', name);
+    expect(result).toMatchObject({ ok: false });
+    expect(fs.readFileSync(uploaded.info.path)).toEqual(source);
+    expect(records).toHaveLength(1);
+    expect(JSON.stringify(records)).not.toContain(name);
+  });
 });
 
 describe('project_files › modern Office support', () => {
@@ -257,6 +383,38 @@ describe('project_files › copyProjectEntryFromPath', () => {
 });
 
 describe('project_files › path safety', () => {
+  type ProjectFiles = typeof import('../../../src/main/features/project_files');
+  it.each([
+    { goal: 'read a file', run: (files: ProjectFiles) => files.readProjectTextFile('u1', 'p1', 'linked/note.md') },
+    { goal: 'edit a file', run: (files: ProjectFiles) => files.updateProjectTextFile('u1', 'p1', 'linked/note.md', 'replaced') },
+    { goal: 'upload a file', run: (files: ProjectFiles) => files.uploadProjectFile('u1', 'p1', 'linked/new.md', Buffer.from('new')) },
+    { goal: 'create a folder', run: (files: ProjectFiles) => files.createProjectDir('u1', 'p1', 'linked/new-folder') },
+    { goal: 'delete a file', run: (files: ProjectFiles) => files.deleteProjectFile('u1', 'p1', 'linked/note.md') },
+    { goal: 'delete a folder', run: (files: ProjectFiles) => files.deleteProjectEntry('u1', 'p1', 'linked/folder') },
+    { goal: 'move an outside file in', run: (files: ProjectFiles) => files.renameProjectFile('u1', 'p1', 'linked/note.md', 'moved.md') },
+    { goal: 'move a Library file out', run: (files: ProjectFiles) => files.renameProjectFile('u1', 'p1', 'local.md', 'linked/moved.md') },
+    { goal: 'copy a file out', run: (files: ProjectFiles) => files.copyProjectEntryFromPath('u1', 'p1', path.join(tmpDir, 'picked.md'), 'linked/copied.md') },
+    { goal: 'resolve a transfer source', run: (files: ProjectFiles) => files.resolveProjectEntryAbsPath('u1', 'p1', 'linked/folder') },
+  ])('refuses to $goal through an ancestor symlink', async ({ run }) => {
+    const files = await import('../../../src/main/features/project_files');
+    const root = path.join(tmpDir, 'u1', 'cloud', 'projects', 'p1', 'contexts');
+    const outside = path.join(tmpDir, 'outside');
+    fs.mkdirSync(root, { recursive: true });
+    fs.mkdirSync(path.join(outside, 'folder'), { recursive: true });
+    fs.writeFileSync(path.join(outside, 'note.md'), 'private outside content');
+    fs.writeFileSync(path.join(outside, 'folder', 'nested.md'), 'private nested content');
+    fs.writeFileSync(path.join(root, 'local.md'), 'local source');
+    fs.writeFileSync(path.join(tmpDir, 'picked.md'), 'picked source');
+    fs.symlinkSync(outside, path.join(root, 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
+
+    expect(await run(files)).toMatchObject({ ok: false });
+    expect(fs.readFileSync(path.join(outside, 'note.md'), 'utf8')).toBe('private outside content');
+    expect(fs.readFileSync(path.join(outside, 'folder', 'nested.md'), 'utf8')).toBe('private nested content');
+    expect(fs.readdirSync(outside).sort()).toEqual(['folder', 'note.md']);
+    expect(fs.readFileSync(path.join(root, 'local.md'), 'utf8')).toBe('local source');
+    expect(enqueueCalls).toEqual([]);
+  });
+
   it.skipIf(process.platform === 'win32')(
     'rejects a project Library symlink before it can read or overwrite an outside file',
     async () => {

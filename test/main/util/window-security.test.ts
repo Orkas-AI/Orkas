@@ -8,6 +8,7 @@ import {
   OFFLINE_HTML_PREVIEW_CSP,
   safeExternalHttpUrl,
   safeExternalUserActionUrl,
+  safeLocalCliAuthUrl,
   withOfflineHtmlPreviewPolicy,
 } from '../../../src/main/util/window-security';
 
@@ -73,6 +74,53 @@ describe('window security baseline', () => {
       'blob:https://example.test/id',
     ]) {
       expect(safeExternalUserActionUrl(value), value).toBeNull();
+    }
+  });
+
+  it('accepts only exact official local CLI authorization routes', () => {
+    for (const value of [
+      'https://open.feishu.cn/page/cli?user_code=FEISHU-42',
+      'https://open.larksuite.com/page/cli?user_code=LARK-42',
+      'https://accounts.feishu.cn/oauth/v1/device/verify?flow_id=flow-1&user_code=FEISHU-42',
+      'https://accounts.larksuite.com/oauth/v1/device/verify?flow_id=flow-2&user_code=LARK-42',
+      'https://login.dingtalk.com/oauth2/device/verify.htm?user_code=DING-42',
+      'https://work.weixin.qq.com/ai/qc/gen?source=wecom_cli_external&scode=WECOM-42',
+      'https://identity.constantcontact.com/activate?user_code=CODE-42',
+    ]) {
+      expect(safeLocalCliAuthUrl(value), value).toBe(value);
+    }
+
+    for (const value of [
+      'http://open.feishu.cn/page/cli?user_code=CODE',
+      'https://open.feishu.cn.evil.test/page/cli?user_code=CODE',
+      'https://user@open.feishu.cn/page/cli?user_code=CODE',
+      'https://open.feishu.cn:444/page/cli?user_code=CODE',
+      'https://open.feishu.cn/page/cli/extra?user_code=CODE',
+      'https://open.feishu.cn/page/cli',
+      'https://open.feishu.cn/page/cli?user_code=ONE&user_code=TWO',
+      'https://accounts.feishu.cn/oauth/v1/device/verify?user_code=CODE',
+      'https://accounts.feishu.cn/oauth/v1/device/verify?flow_id=flow&user_code=%0A',
+      'https://open.feishu.cn/page/cli?user_code=CODE#fragment',
+      'http://login.dingtalk.com/oauth2/device/verify.htm?user_code=CODE',
+      'https://login.dingtalk.com.evil.test/oauth2/device/verify.htm?user_code=CODE',
+      'https://user@login.dingtalk.com/oauth2/device/verify.htm?user_code=CODE',
+      'https://login.dingtalk.com:444/oauth2/device/verify.htm?user_code=CODE',
+      'https://login.dingtalk.com/oauth2/device/verify.htm/extra?user_code=CODE',
+      'https://login.dingtalk.com/oauth2/device/verify.htm',
+      'https://login.dingtalk.com/oauth2/device/verify.htm?user_code=ONE&user_code=TWO',
+      'https://login.dingtalk.com/oauth2/device/verify.htm?user_code=%0A',
+      'https://login.dingtalk.com/oauth2/device/verify.htm?user_code=CODE#fragment',
+      'javascript:alert(1)',
+      'https://work.weixin.qq.com.evil.test/ai/qc/gen?source=wecom_cli_external&scode=CODE',
+      'https://work.weixin.qq.com/ai/qc/generate?source=wecom_cli_external&scode=CODE',
+      'https://work.weixin.qq.com/ai/qc/gen?source=wecom_cli_external',
+      'https://work.weixin.qq.com/ai/qc/gen?source=other&scode=CODE',
+      'https://work.weixin.qq.com/ai/qc/gen?source=wecom_cli_external&scode=ONE&scode=TWO',
+      'https://work.weixin.qq.com/ai/qc/gen?source=wecom_cli_external&scode=%0A',
+      'https://identity.constantcontact.com/activate',
+      'https://identity.constantcontact.com.evil.test/activate?user_code=CODE',
+    ]) {
+      expect(safeLocalCliAuthUrl(value), value).toBeNull();
     }
   });
 

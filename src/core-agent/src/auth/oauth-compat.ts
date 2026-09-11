@@ -47,9 +47,73 @@ export interface OAuthProviderInterface {
   readonly name: string;
   login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials>;
   usesCallbackServer?: boolean;
-  refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials>;
+  refreshToken(credentials: OAuthCredentials, signal?: AbortSignal): Promise<OAuthCredentials>;
   getApiKey(credentials: OAuthCredentials): string;
   modifyModels?(models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[];
+}
+
+export const OAUTH_REFRESH_TIMEOUT_MS = 60_000;
+
+/**
+ * Bound every provider-owned refresh exchange at the compatibility boundary.
+ * Passing the composed signal lets cancellable providers stop their HTTP work;
+ * racing the abort gate also releases callers when a legacy provider ignores
+ * the optional signal.
+ */
+export async function refreshOAuthProviderWithTimeout(
+  provider: OAuthProviderInterface,
+  credentials: OAuthCredentials,
+  opts: { signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<OAuthCredentials> {
+  const timeoutMs = opts.timeoutMs ?? OAUTH_REFRESH_TIMEOUT_MS;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new RangeError('OAuth refresh timeout must be finite and positive');
+  }
+
+  const controller = new AbortController();
+  const timeoutError = Object.assign(
+    new Error(`OAuth token refresh timed out after ${Math.round(timeoutMs / 1000)}s`),
+    { code: 'OAUTH_REFRESH_TIMEOUT' },
+  );
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort(timeoutError);
+  }, timeoutMs);
+  timer.unref?.();
+
+  const parent = opts.signal;
+  const abortFromParent = () => {
+    const reason = parent?.reason;
+    controller.abort(reason instanceof Error ? reason : new Error('OAuth token refresh aborted'));
+  };
+  if (parent) {
+    if (parent.aborted) abortFromParent();
+    else parent.addEventListener('abort', abortFromParent, { once: true });
+  }
+
+  let rejectOnAbort: (reason: unknown) => void = () => {};
+  const abortGate = new Promise<never>((_resolve, reject) => {
+    rejectOnAbort = reject;
+  });
+  const onAbort = () => rejectOnAbort(controller.signal.reason);
+  controller.signal.addEventListener('abort', onAbort, { once: true });
+  if (controller.signal.aborted) onAbort();
+
+  try {
+    const operation = Promise.resolve().then(() => {
+      controller.signal.throwIfAborted();
+      return provider.refreshToken(credentials, controller.signal);
+    });
+    return await Promise.race([operation, abortGate]);
+  } catch (err) {
+    if (timedOut) throw timeoutError;
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    controller.signal.removeEventListener('abort', onAbort);
+    parent?.removeEventListener('abort', abortFromParent);
+  }
 }
 
 type LegacyOAuthModule = {
@@ -129,10 +193,10 @@ async function builtinProviders(): Promise<Map<string, OAuthProviderInterface>> 
           async login(callbacks) {
             return stripCredentialType(await oauth.login(interactionFromCallbacks(callbacks)));
           },
-          async refreshToken(credentials) {
+          async refreshToken(credentials, signal) {
             const refreshed = await oauth.refresh(
               { ...credentials, type: 'oauth' },
-              new AbortController().signal,
+              signal ?? new AbortController().signal,
             );
             return stripCredentialType(refreshed);
           },

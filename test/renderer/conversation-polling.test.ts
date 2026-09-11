@@ -51,7 +51,7 @@ describe('conversation polling cancellation', () => {
     expect(context.pollTimers.has('c0')).toBe(false);
   });
 
-  it('discards an in-flight history response after the live stream stops polling', async () => {
+  it('discards an in-flight runtime response after the live stream stops polling', async () => {
     const fetchResult = deferred<any>();
     const callbacks = new Map<number, () => Promise<void>>();
     const recovered: unknown[] = [];
@@ -61,6 +61,7 @@ describe('conversation polling cancellation', () => {
       Map,
       Date,
       pollTimers: new Map(),
+      pollInFlight: new Map(),
       pollMsgCounts: new Map([['c1', 1]]),
       setInterval(fn: () => Promise<void>) {
         nextTimer += 1;
@@ -82,6 +83,7 @@ describe('conversation polling cancellation', () => {
     vm.createContext(context);
     vm.runInContext([
       extractFunction('_polledMessageKey'),
+      extractFunction('_pollRuntimeRequestUrl'),
       extractFunction('startPolling'),
       extractFunction('stopPolling'),
     ].join('\n'), context);
@@ -92,17 +94,11 @@ describe('conversation polling cancellation', () => {
     const pendingTick = staleTick!();
 
     // This mirrors the normal stream-end cleanup while the polling fetch is
-    // still awaiting its history response.
+    // still awaiting its runtime response.
     context.stopPolling('c1');
     fetchResult.resolve({
-      json: async () => ({
-        ok: true,
-        history: [
-          { id: 'u1', from: 'user', text: 'question' },
-          { id: 'a1', from: 'commander', text: 'answer' },
-        ],
-        conversation: { processing: false },
-      }),
+      ok: true,
+      json: async () => ({ ok: true, processing: false, processing_since: null }),
     });
     await pendingTick;
 
@@ -121,6 +117,7 @@ describe('conversation polling cancellation', () => {
       Map,
       Date,
       pollTimers: new Map(),
+      pollInFlight: new Map(),
       pollMsgCounts: new Map([['c1', 1]]),
       setInterval(fn: () => Promise<void>) {
         nextTimer += 1;
@@ -145,6 +142,7 @@ describe('conversation polling cancellation', () => {
     vm.createContext(context);
     vm.runInContext([
       extractFunction('_polledMessageKey'),
+      extractFunction('_pollRuntimeRequestUrl'),
       extractFunction('startPolling'),
       extractFunction('stopPolling'),
     ].join('\n'), context);
@@ -154,21 +152,66 @@ describe('conversation polling cancellation', () => {
     context.stopPolling('c1');
     context.startPolling('c1');
     expect(context.pollTimers.get('c1')).toBe(2);
+    await callbacks.get(2)!();
+    expect(fetchCount, 'a restarted timer must wait for the old request to drain').toBe(1);
 
     firstFetch.resolve({
-      json: async () => ({
-        ok: true,
-        history: [
-          { id: 'u1', from: 'user', text: 'question' },
-          { id: 'a1', from: 'commander', text: 'answer' },
-        ],
-        conversation: { processing: false },
-      }),
+      ok: true,
+      json: async () => ({ ok: true, processing: false, processing_since: null }),
     });
     await oldTick;
 
     expect(recovered).toEqual([]);
     expect(context.pollTimers.get('c1')).toBe(2);
+  });
+
+  it('skips interval ticks while the previous runtime check is unresolved', async () => {
+    const runtimeResult = deferred<any>();
+    const callbacks = new Map<number, () => Promise<void>>();
+    let fetchCount = 0;
+
+    const context: any = {
+      Map,
+      Date,
+      pollTimers: new Map(),
+      pollInFlight: new Map(),
+      pollMsgCounts: new Map(),
+      setInterval(fn: () => Promise<void>) {
+        callbacks.set(1, fn);
+        return 1;
+      },
+      clearInterval: vi.fn(),
+      apiFetch: () => {
+        fetchCount += 1;
+        return runtimeResult.promise;
+      },
+      isGroupConversationBusy: () => true,
+      isConvPending: () => true,
+      _isPolledAssistantMsg: (m: any) => !!m && m.from !== 'user',
+      _isPolledUserMsg: (m: any) => !!m && m.from === 'user',
+      _onPolledResponse: vi.fn(),
+      t: (key: string) => key,
+    };
+    vm.createContext(context);
+    vm.runInContext([
+      extractFunction('_polledMessageKey'),
+      extractFunction('_pollRuntimeRequestUrl'),
+      extractFunction('startPolling'),
+      extractFunction('stopPolling'),
+    ].join('\n'), context);
+
+    context.startPolling('c1');
+    const tick = callbacks.get(1)!;
+    const firstTick = tick();
+    await Promise.all(Array.from({ length: 250 }, () => tick()));
+
+    expect(fetchCount).toBe(1);
+    runtimeResult.resolve({
+      ok: true,
+      json: async () => ({ ok: true, processing: true, processing_since: null }),
+    });
+    await firstTick;
+    expect(context.pollInFlight.has('c1')).toBe(false);
   });
 });
 
@@ -180,17 +223,19 @@ describe('conversation polling cancellation', () => {
 // conversation once runtime goes idle (otherwise a lost stream would hang the
 // UI forever).
 describe('conversation polling stays out of live rendering', () => {
-  function runPollContext(responses: Array<Record<string, unknown>>) {
+  function runPollContext(runtimeResponses: Array<Record<string, unknown>>) {
     const callbacks = new Map<number, () => Promise<void>>();
     const recovered: unknown[][] = [];
     const rendererCalls: string[] = [];
+    const requestUrls: string[] = [];
     let nextTimer = 0;
-    let fetchCount = 0;
+    let runtimeFetchCount = 0;
 
     const context: any = {
       Map,
       Date,
       pollTimers: new Map(),
+      pollInFlight: new Map(),
       pollMsgCounts: new Map(),
       setInterval(fn: () => Promise<void>) {
         nextTimer += 1;
@@ -198,10 +243,19 @@ describe('conversation polling stays out of live rendering', () => {
         return nextTimer;
       },
       clearInterval(id: number) { callbacks.delete(id); },
-      apiFetch: () => {
-        const body = responses[Math.min(fetchCount, responses.length - 1)];
-        fetchCount += 1;
-        return Promise.resolve({ json: async () => body });
+      apiFetch: (url: string) => {
+        requestUrls.push(url);
+        if (url.includes('/runtime?')) {
+          const body = runtimeResponses[
+            Math.min(runtimeFetchCount, runtimeResponses.length - 1)
+          ];
+          runtimeFetchCount += 1;
+          return Promise.resolve({ ok: true, json: async () => body });
+        }
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ ok: true, history: HISTORY }),
+        });
       },
       isGroupConversationBusy: () => false,
       isConvPending: () => true,
@@ -222,11 +276,12 @@ describe('conversation polling stays out of live rendering', () => {
     vm.createContext(context);
     vm.runInContext([
       extractFunction('_polledMessageKey'),
+      extractFunction('_pollRuntimeRequestUrl'),
       extractFunction('startPolling'),
       extractFunction('stopPolling'),
     ].join('\n'), context);
 
-    return { context, callbacks, recovered, rendererCalls };
+    return { context, callbacks, recovered, rendererCalls, requestUrls };
   }
 
   const HISTORY = [
@@ -235,9 +290,9 @@ describe('conversation polling stays out of live rendering', () => {
   ];
 
   it('renders nothing while runtime is busy and still rescues the turn once it goes idle', async () => {
-    const { context, callbacks, recovered, rendererCalls } = runPollContext([
-      { ok: true, history: HISTORY, conversation: { processing: true } },
-      { ok: true, history: HISTORY, conversation: { processing: false } },
+    const { context, callbacks, recovered, rendererCalls, requestUrls } = runPollContext([
+      { ok: true, processing: true, processing_since: null },
+      { ok: true, processing: false, processing_since: null },
     ]);
 
     context.startPolling('c1');
@@ -246,6 +301,9 @@ describe('conversation polling stays out of live rendering', () => {
     await tick();
     expect(rendererCalls, 'polling must not reach any renderer entry point').toEqual([]);
     expect(recovered, 'a busy turn is owned by the bus observer').toEqual([]);
+    expect(requestUrls).toEqual([
+      '/api/conversations/c1/runtime?project_id=',
+    ]);
     // Leaving the message unseen is what lets the idle pass below rescue it.
     // Marking it seen here would silently swallow the reply if the stream died.
     expect(context.pollMsgCounts.get('c1')).toBeUndefined();
@@ -255,6 +313,11 @@ describe('conversation polling stays out of live rendering', () => {
     expect((recovered[0] as any[])[1]).toMatchObject({ id: 'a1' });
     expect(context.pollMsgCounts.get('c1')).toBeTruthy();
     expect(rendererCalls).toEqual([]);
+    expect(requestUrls).toEqual([
+      '/api/conversations/c1/runtime?project_id=',
+      '/api/conversations/c1/runtime?project_id=',
+      '/api/conversations/c1/history?limit=10',
+    ]);
   });
 });
 
@@ -311,7 +374,11 @@ describe('conversation polling history reconcile', () => {
     expect(historyLoads).toEqual([['c1', { preserveScroll: true }]]);
   });
 
-  it('drains a background queue after polling repairs a missed terminal state', async () => {
+  it('settles a background terminal repair without touching the visible transcript', async () => {
+    // Queued work lives on the backend task board now, so polling has nothing
+    // local to drain — its only job for a background conversation is to
+    // settle the pending state without repainting whichever conversation the
+    // user is actually reading.
     const { context, historyLoads, queueDrains } = loadPolledResponse(undefined, 'c2');
 
     await context._onPolledResponse('c1', {
@@ -321,7 +388,7 @@ describe('conversation polling history reconcile', () => {
     });
 
     expect(historyLoads, 'background settlement must not replace the visible transcript').toEqual([]);
-    expect(queueDrains).toEqual(['c1']);
+    expect(queueDrains, 'the retired renderer-local queue must stay retired').toEqual([]);
   });
 
   it('re-captures scrolling that happens while the async history request is in flight', () => {

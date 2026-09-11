@@ -27,6 +27,31 @@ export {
 
 const log = createLogger("web-fetch");
 
+export type WebFetchRenderedPage = {
+  /** Full document HTML after the browser finished loading and running scripts. */
+  html: string;
+  /** Final URL after client-side redirects, when the renderer can report one. */
+  url?: string;
+};
+
+/**
+ * Browser-rendered retry for a URL whose direct HTTP response was a bot check
+ * or a client-rendered shell. core-agent ships no browser runtime, so the host
+ * registers one; unregistered, every fetch keeps the HTTP-only behavior.
+ * Returning null means "could not recover" and leaves the direct failure intact.
+ */
+export type WebFetchRenderer = (
+  url: string,
+  signal?: AbortSignal,
+) => Promise<WebFetchRenderedPage | null>;
+
+let activeWebFetchRenderer: WebFetchRenderer | null = null;
+
+/** Register the host's browser-rendered retry, or clear it with `null`. */
+export function configureWebFetchRenderer(renderer: WebFetchRenderer | null): void {
+  activeWebFetchRenderer = renderer;
+}
+
 type WebFetchCacheEntry = {
   epoch: number;
   result: Promise<ToolResult>;
@@ -225,9 +250,9 @@ function compactCacheReplay(result: ToolResult): ToolResult {
   const reusableHeader = result.content
     .split("\n")
     .filter((line) =>
-      /^(?:Title|URL|Accessed at|HTTP Last-Modified|Embedded document dates \(newest first\)):/i.test(line),
+      /^(?:Title|URL|Accessed at|Retrieved by|HTTP Last-Modified|Embedded document dates \(newest first\)):/i.test(line),
     )
-    .slice(0, 5)
+    .slice(0, 6)
     .join("\n");
   return {
     content: [
@@ -242,7 +267,12 @@ function compactCacheReplay(result: ToolResult): ToolResult {
  * Strip HTML tags and convert to readable plain text.
  * Handles common HTML entities and collapses whitespace.
  */
-function htmlToText(html: string): string {
+export function decodeNumericEntity(codePoint: number): string {
+  if (!Number.isFinite(codePoint) || codePoint < 0 || codePoint > 0x10ffff) return "";
+  return String.fromCodePoint(codePoint);
+}
+
+export function htmlToText(html: string): string {
   let text = html;
 
   // Remove <script>, <style>, <noscript> blocks entirely
@@ -251,6 +281,9 @@ function htmlToText(html: string): string {
   // Replace <br> and block-level closing tags with newlines
   text = text.replace(/<br\s*\/?>/gi, "\n");
   text = text.replace(/<\/(p|div|h[1-6]|li|tr|blockquote|section|article|header|footer)>/gi, "\n");
+  // Adjacent table cells must not concatenate ("<td>a</td><td>b</td>" → "a b"),
+  // so map cell-closing tags to a space before the generic tag strip.
+  text = text.replace(/<\/(td|th)>/gi, " ");
   text = text.replace(/<(hr)\s*\/?>/gi, "\n---\n");
 
   // Strip remaining HTML tags
@@ -276,11 +309,12 @@ function htmlToText(html: string): string {
     .replace(/&rsquo;/g, "'")
     .replace(/&ldquo;/g, "\u201C")
     .replace(/&rdquo;/g, "\u201D")
-    .replace(/&#(\d+);/g, (_, num) => String.fromCharCode(parseInt(num, 10)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+    .replace(/&#(\d+);/g, (_, num) => decodeNumericEntity(parseInt(num, 10)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => decodeNumericEntity(parseInt(hex, 16)));
 
   // Collapse excessive whitespace / blank lines
   text = text.replace(/[ \t]+/g, " ");
+  text = text.replace(/ +\n/g, "\n");
   text = text.replace(/\n{3,}/g, "\n\n");
   text = text.trim();
 
@@ -308,6 +342,11 @@ export function extractEmbeddedDocumentDates(html: string): string[] {
   return [...values].sort((a, b) => b.localeCompare(a)).slice(0, 5);
 }
 
+/** Bounds for the shell-by-emptiness rule in `classifyFetchContent`. */
+const SHELL_MAX_TEXT_CHARS = 600;
+const SHELL_MIN_HTML_BYTES = 4096;
+const SHELL_MAX_TEXT_TO_HTML_RATIO = 0.005;
+
 export type FetchContentIssue = {
   code: "WAF_OR_BOT_CHECK" | "PAGE_NOT_FOUND" | "JS_OR_NAV_SHELL";
   message: string;
@@ -322,8 +361,10 @@ export function classifyFetchContent(url: string, title: string | undefined, raw
   // that merely loads a Cloudflare CDN/Insights asset (cdnjs.cloudflare.com,
   // static.cloudflareinsights.com) or a reCAPTCHA widget, wrongly telling the
   // model "do not retry, this is a bot wall". These phrases only appear on the
-  // actual challenge/block page.
-  if (/_waf_[a-z0-9]+|cf-browser-verification|__cf_chl|cf_chl_opt|Attention Required!\s*\|\s*Cloudflare|Cloudflare Ray ID|Checking your browser before access|Just a moment\.\.\.|Enable JavaScript and cookies to continue|Verify (?:you are|you're)(?: a)? human|complete the security check|you don'?t have permission to access|人机(?:身份)?验证|安全验证|访问验证|滑动验证|请完成验证|反爬/i.test(head)) {
+  // actual challenge/block page. The `verify your browser|connection` clause
+  // covers AWS WAF interstitials ("Verifying your connection...", "Please wait
+  // while we verify your browser"), which share no wording with Cloudflare's.
+  if (/_waf_[a-z0-9]+|cf-browser-verification|__cf_chl|cf_chl_opt|Attention Required!\s*\|\s*Cloudflare|Cloudflare Ray ID|Checking your browser before access|verif(?:y|ying)\s+(?:your\s+)?(?:browser|connection)|Just a moment\.\.\.|Enable JavaScript and cookies to continue|Verify (?:you are|you're)(?: a)? human|complete the security check|you don'?t have permission to access|人机(?:身份)?验证|安全验证|访问验证|滑动验证|请完成验证|反爬/i.test(head)) {
     return {
       code: "WAF_OR_BOT_CHECK",
       message:
@@ -353,11 +394,65 @@ export function classifyFetchContent(url: string, title: string | undefined, raw
     };
   }
 
+  // A response carrying almost no readable text for its markup size is an app
+  // shell, bot-check interstitial, or login wall. Without this, such pages
+  // returned isError:false with an empty body, so the run cache recorded a
+  // successful fetch and the model could not tell "blocked" from "page is
+  // genuinely empty". Absolute and relative bounds must both hold so a
+  // genuinely short page (small markup, short text) is never flagged.
+  if (
+    compactText.length < SHELL_MAX_TEXT_CHARS
+    && raw.length >= SHELL_MIN_HTML_BYTES
+    && compactText.length < raw.length * SHELL_MAX_TEXT_TO_HTML_RATIO
+  ) {
+    return {
+      code: "JS_OR_NAV_SHELL",
+      message:
+        "The response carried almost no readable text for its markup size — a client-rendered " +
+        "app shell, bot-check interstitial, or login wall rather than the page body. " +
+        "Do not treat this as source content; use a browser-rendered source, search snippets, an alternate source, or ask the user for the text.",
+    };
+  }
+
   return null;
 }
 
-async function fetchGeneralUrl(url: string): Promise<ToolResult> {
+function pageHeader(fields: {
+  title?: string | undefined;
+  url: string;
+  lastModified?: string | null;
+  embeddedDates?: readonly string[];
+  retrievedBy?: string;
+}): string {
+  return [
+    ...(fields.title ? [`Title: ${fields.title}`] : []),
+    `URL: ${fields.url}`,
+    `Accessed at: ${new Date().toISOString()}`,
+    ...(fields.retrievedBy ? [`Retrieved by: ${fields.retrievedBy}`] : []),
+    ...(fields.lastModified ? [`HTTP Last-Modified: ${fields.lastModified}`] : []),
+    ...(fields.embeddedDates?.length
+      ? [`Embedded document dates (newest first): ${fields.embeddedDates.join(", ")}`]
+      : []),
+    "",
+    "",
+  ].join("\n");
+}
+
+type DirectFetchOutcome = {
+  result: ToolResult;
+  /** Set when running the same URL through a real browser could plausibly
+   * recover the body — a bot check or a client-rendered shell, not a missing
+   * page, an oversized body, or a transport failure. */
+  browserRecoverable: boolean;
+};
+
+async function httpFetchPage(url: string, signal?: AbortSignal): Promise<DirectFetchOutcome> {
   const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  }
   const timer = setTimeout(() => controller.abort(), DEFAULT_WEB_FETCH_TIMEOUT_MS);
   try {
     const response = await fetch(url, {
@@ -372,58 +467,115 @@ async function fetchGeneralUrl(url: string): Promise<ToolResult> {
     });
     const body = await readWebFetchResponse(response);
     if ("error" in body) {
+      const base = body.error.startsWith("HTTP") ? `${body.error} for ${url}` : body.error;
+      // A blocked response only identifies itself as an anti-bot challenge in
+      // its markup, so classify the body before reporting a bare status.
+      const challenge = body.errorBody
+        ? classifyFetchContent(url, extractTitle(body.errorBody), body.errorBody, htmlToText(body.errorBody))
+        : null;
+      if (!challenge) return { result: { content: base, isError: true }, browserRecoverable: false };
       return {
-        content: body.error.startsWith("HTTP") ? `${body.error} for ${url}` : body.error,
-        isError: true,
+        result: { content: `${base}\n${challenge.code}: ${challenge.message}`, isError: true },
+        browserRecoverable: challenge.code === "WAF_OR_BOT_CHECK",
       };
     }
 
     if (body.contentType.includes("json")) {
       try {
-        return { content: JSON.stringify(JSON.parse(body.raw), null, 2) };
+        return { result: { content: JSON.stringify(JSON.parse(body.raw), null, 2) }, browserRecoverable: false };
       } catch {
-        return { content: body.raw };
+        return { result: { content: body.raw }, browserRecoverable: false };
       }
     }
     if (body.contentType.includes("text/plain")) {
-      return { content: body.raw };
+      return { result: { content: body.raw }, browserRecoverable: false };
     }
 
     const title = extractTitle(body.raw);
     const text = htmlToText(body.raw);
     const issue = classifyFetchContent(url, title, body.raw, text);
-    const lastModified = response.headers.get("last-modified");
-    const embeddedDates = extractEmbeddedDocumentDates(body.raw);
-    const header = [
-      ...(title ? [`Title: ${title}`] : []),
-      `URL: ${response.url || url}`,
-      `Accessed at: ${new Date().toISOString()}`,
-      ...(lastModified ? [`HTTP Last-Modified: ${lastModified}`] : []),
-      ...(embeddedDates.length
-        ? [`Embedded document dates (newest first): ${embeddedDates.join(", ")}`]
-        : []),
-      "",
-      "",
-    ].join("\n");
+    const header = pageHeader({
+      title,
+      url: response.url || url,
+      lastModified: response.headers.get("last-modified"),
+      embeddedDates: extractEmbeddedDocumentDates(body.raw),
+    });
     if (issue) {
       return {
-        content: `${header}${issue.code}: ${issue.message}\n\nExtracted text preview:\n${text}`,
-        isError: true,
+        result: {
+          content: `${header}${issue.code}: ${issue.message}\n\nExtracted text preview:\n${text}`,
+          isError: true,
+        },
+        // A deleted page stays deleted in a browser; a challenge or a shell may not.
+        browserRecoverable: issue.code !== "PAGE_NOT_FOUND",
       };
     }
-    return { content: header + text };
+    return { result: { content: header + text }, browserRecoverable: false };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (signal?.aborted) {
+      return { result: { content: `Fetch of ${url} was cancelled`, isError: true }, browserRecoverable: false };
+    }
     if (message.includes("abort")) {
       return {
-        content: `Timeout fetching ${url} (${DEFAULT_WEB_FETCH_TIMEOUT_MS}ms)`,
-        isError: true,
+        result: {
+          content: `Timeout fetching ${url} (${DEFAULT_WEB_FETCH_TIMEOUT_MS}ms)`,
+          isError: true,
+        },
+        browserRecoverable: false,
       };
     }
-    return { content: `Error fetching ${url}: ${formatWebFetchNetworkFailure(error)}`, isError: true };
+    return {
+      result: { content: `Error fetching ${url}: ${formatWebFetchNetworkFailure(error)}`, isError: true },
+      browserRecoverable: false,
+    };
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
   }
+}
+
+/** Retry through the host browser. Returns null whenever the rendered document
+ * is missing, unusable, or still a challenge/shell, so the caller keeps the
+ * direct failure rather than presenting a second shell as evidence. */
+async function renderPage(url: string, signal?: AbortSignal): Promise<ToolResult | null> {
+  const renderer = activeWebFetchRenderer;
+  if (!renderer || signal?.aborted) return null;
+
+  let page: WebFetchRenderedPage | null = null;
+  try {
+    page = await renderer(url, signal);
+  } catch (error) {
+    log.warn("browser render retry failed", {
+      reason: error instanceof Error ? error.name : "unknown",
+    });
+    return null;
+  }
+
+  const html = page?.html ?? "";
+  if (!html) return null;
+  const title = extractTitle(html);
+  const text = htmlToText(html);
+  if (classifyFetchContent(url, title, html, text)) {
+    log.info("browser render retry still returned a challenge or shell");
+    return null;
+  }
+
+  log.info("browser render retry recovered the page body", { text_chars: text.length });
+  return {
+    content: pageHeader({
+      title,
+      url: page?.url || url,
+      embeddedDates: extractEmbeddedDocumentDates(html),
+      retrievedBy: "browser rendering (the direct HTTP response was a bot check or app shell)",
+    }) + text,
+  };
+}
+
+async function fetchGeneralUrl(url: string, signal?: AbortSignal): Promise<ToolResult> {
+  const direct = await httpFetchPage(url, signal);
+  if (!direct.browserRecoverable) return direct.result;
+  return (await renderPage(url, signal)) ?? direct.result;
 }
 
 export const webFetchTool: AgentTool = defineTool({
@@ -500,7 +652,7 @@ export const webFetchTool: AgentTool = defineTool({
 
     const request = githubResource?.kind === "repository"
       ? fetchGitHubRepositorySnapshot(githubResource)
-      : fetchGeneralUrl(url);
+      : fetchGeneralUrl(url, ctx.signal);
     const cacheEntry = { epoch, result: request };
     fetchCache.set(requestKey, cacheEntry);
     let result = await request;

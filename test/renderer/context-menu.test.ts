@@ -143,6 +143,9 @@ function createHarness() {
     createLogger: () => ({ warn }),
     escapeHtml: (value: unknown) => String(value),
     uiIconHtml: (name: string) => `<svg data-icon="${name}"></svg>`,
+    renderAvatarHtml: (icon: string, color: string, opts: { seed: string }) => (
+      `<span data-avatar="${icon}:${color}:${opts.seed}"></span>`
+    ),
     Promise,
     Number,
     Math,
@@ -193,6 +196,28 @@ describe('context menu', () => {
     expect(harness.document.activeElement).toBe(buttons[1]);
     expect(buttons[1].tabIndex).toBe(0);
     expect(buttons[1].children.at(-1)?.textContent).toBe('<Copy>');
+  });
+
+  it('renders a structured Agent avatar and keeps the selected check after the label', () => {
+    const harness = createHarness();
+    harness.window.showContextMenu(
+      { clientX: 20, clientY: 20 },
+      [{
+        label: 'Orkas Codex',
+        avatar: { icon: 'code', color: 'lime', seed: 'agent-1' },
+        trailingIcon: 'check',
+        onClick: vi.fn(),
+      }],
+    );
+
+    const button = harness.menu()!.querySelectorAll('.context-menu-item')[0];
+    expect(button.children).toHaveLength(3);
+    expect(button.children[0].className).toBe('context-menu-avatar');
+    expect(button.children[0].innerHTML).toContain('data-avatar="code:lime:agent-1"');
+    expect(button.children[1].className).toBe('context-menu-label');
+    expect(button.children[1].textContent).toBe('Orkas Codex');
+    expect(button.children[2].className).toBe('context-menu-trailing-icon');
+    expect(button.children[2].innerHTML).toContain('data-icon="check"');
   });
 
   it('wraps keyboard navigation, supports Home/End, and ignores IME keystrokes', () => {

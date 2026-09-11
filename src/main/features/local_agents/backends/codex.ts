@@ -34,6 +34,7 @@ import {
   type LocalActiveRunInput,
   type BackendRunOptions,
   type LocalEvent,
+  type LocalCliPermissionDecision,
   StderrTail,
   spawnCli,
   killProcessTree,
@@ -151,10 +152,6 @@ export class CodexActivityHeartbeat {
     ];
   }
 }
-
-const TRUSTED_LOCAL_APPROVAL_POLICY = 'never';
-const TRUSTED_LOCAL_SANDBOX_MODE = 'danger-full-access';
-const TRUSTED_LOCAL_SANDBOX_POLICY = { type: 'dangerFullAccess' } as const;
 
 /** Tracks the phase and streamed body of Codex `agentMessage` items. Delta
  * notifications carry only itemId + text, while the phase lives on the
@@ -301,16 +298,27 @@ export function mapCodexItemToolEvent(
   };
 }
 
+/** Control-call boundary for the app-server bootstrap (initialize, thread
+ *  start/resume, turn/start). Tests shorten it through the environment. */
+const CODEX_BOOTSTRAP_TIMEOUT_MS = 60_000;
+function codexBootstrapTimeoutMs(): number {
+  const override = Number(process.env.ORKAS_CODEX_BOOTSTRAP_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0 ? override : CODEX_BOOTSTRAP_TIMEOUT_MS;
+}
+
 export const codexBackend: LocalBackend = {
   async run(opts: BackendRunOptions): Promise<void> {
     const args = buildCodexArgs(opts);
-    const childEnv = opts.bridge?.server.env ? { ...process.env, ...opts.bridge.server.env } : process.env;
-    const child = spawnCli(opts.binPath, args, opts.cwd, childEnv);
+    // The bridge env (token/socket file path) reaches the MCP child through
+    // `-c mcp_servers.orkas.env.*` (buildCodexBridgeOverrides); Codex itself,
+    // and every shell it runs, must not inherit those handles.
+    const child = spawnCli(opts.binPath, args, opts.cwd);
     const detachAbort = bindAbort(child, opts.signal);
     const tail = new StderrTail();
     const startedAt = Date.now();
 
     let exited = false;
+    let bootstrapTimer: NodeJS.Timeout | null = null;
     let resolveOuter!: () => void;
     const outerPromise = new Promise<void>(resolve => { resolveOuter = resolve; });
 
@@ -324,6 +332,7 @@ export const codexBackend: LocalBackend = {
 
     const watchdog = armKillWatchdog(child, {
       timeoutMs: opts.timeoutMs,
+      deadlineAt: opts.deadlineAt,
       idleKillMs: opts.idleKillMs,
       lastEventAt: opts.lastEventAt,
     });
@@ -336,12 +345,15 @@ export const codexBackend: LocalBackend = {
     let turnStarted = false;
     let turnAborted = false;
     let turnCompleted = false;
+    let turnFailed = false;
     let retryAttempt = 0;
     const seenTurnIds = new Set<string>();
     const agentMessages = new CodexAgentMessageAccumulator();
     const activity = new CodexActivityHeartbeat();
     const reasoningByItem = new Map<string, CodexReasoningState>();
     let turnError: string | undefined;
+    let systemErrorTimer: ReturnType<typeof setTimeout> | null = null;
+    let systemErrorPending = false;
     // Latest usage snapshot from `thread/tokenUsage/updated` —
     // each notification is a cumulative state (not an increment),
     // so we just overwrite. Threaded into the done event below.
@@ -367,6 +379,97 @@ export const codexBackend: LocalBackend = {
 
     const notify = (method: string, params?: Record<string, unknown>) => {
       sendLine({ jsonrpc: '2.0', method, ...(params ? { params } : {}) });
+    };
+
+    const respondToServerRequest = async (env: any): Promise<void> => {
+      const method = String(env?.method || '');
+      if (!CODEX_PERMISSION_REQUEST_METHODS.has(method)) return;
+      const params = env?.params && typeof env.params === 'object' ? env.params : {};
+      const fullAccess = opts.permissionPolicy === 'full_access';
+      let permissionDecision: LocalCliPermissionDecision = fullAccess ? 'allow_once' : 'deny';
+      if (!fullAccess && opts.requestPermission) {
+        try {
+          permissionDecision = await opts.requestPermission({
+            id: String(params.approvalId || params.itemId || env.id || ''),
+            tool: method.includes('commandExecution')
+              ? 'command'
+              : method.includes('fileChange') ? 'file_change' : 'permissions',
+            description: typeof params.reason === 'string' ? params.reason : undefined,
+            command: typeof params.command === 'string' ? params.command : undefined,
+            subject: typeof params.grantRoot === 'string'
+              ? params.grantRoot
+              : typeof params.cwd === 'string' ? params.cwd : undefined,
+          });
+        } catch (err) {
+          log.warn('codex host permission request failed; denying', { error: logErrorSummary(err) });
+        }
+      }
+      let result: Record<string, unknown>;
+      if (method === 'item/permissions/requestApproval') {
+        result = permissionDecision === 'deny'
+          ? { permissions: {}, scope: 'turn' }
+          : {
+            permissions: params.permissions && typeof params.permissions === 'object'
+              ? params.permissions
+              : {},
+            scope: 'turn',
+          };
+      } else {
+        result = {
+          decision: permissionDecision === 'deny'
+            ? 'decline'
+            : 'accept',
+        };
+      }
+      sendLine({ jsonrpc: '2.0', id: env.id, result });
+      opts.onEvent({
+        type: 'permission-request',
+        id: String(params.approvalId || params.itemId || env.id || ''),
+        tool: method,
+        ...(fullAccess
+          ? { autoDecided: 'allow', reason: 'full_access' }
+          : { decision: permissionDecision === 'deny' ? 'deny' : 'allow', reason: 'user' }),
+      });
+    };
+
+    const respondToUserInputRequest = async (env: any): Promise<void> => {
+      const params = env?.params && typeof env.params === 'object' ? env.params : {};
+      const questions = (Array.isArray(params.questions) ? params.questions : [])
+        .map((question: any) => ({
+          id: typeof question?.id === 'string' ? question.id : '',
+          header: typeof question?.header === 'string' ? question.header : undefined,
+          question: typeof question?.question === 'string' ? question.question : '',
+          options: (Array.isArray(question?.options) ? question.options : [])
+            .map((option: any) => ({
+              label: typeof option?.label === 'string' ? option.label : '',
+              description: typeof option?.description === 'string' ? option.description : undefined,
+            })),
+          isOther: question?.isOther === true,
+          isSecret: question?.isSecret === true,
+        }))
+        .filter((question: { id: string; question: string }) => question.id && question.question);
+      const response = opts.requestUserInput
+        ? await opts.requestUserInput({
+            id: typeof params.itemId === 'string' ? params.itemId : String(env.id),
+            questions,
+            ...(typeof params.isBlocking === 'boolean' ? { isBlocking: params.isBlocking } : {}),
+            ...(Number.isFinite(params.autoResolutionMs)
+              ? { autoResolutionMs: Number(params.autoResolutionMs) }
+              : {}),
+          })
+        : {
+            cancelled: true,
+            answers: Object.fromEntries(questions.map((question: { id: string }) => [question.id, []])),
+          };
+      const answers = Object.fromEntries(questions.map((question: { id: string }) => [
+        question.id,
+        {
+          answers: Array.isArray(response.answers?.[question.id])
+            ? response.answers[question.id].map(String)
+            : [],
+        },
+      ]));
+      sendLine({ jsonrpc: '2.0', id: env.id, result: { answers } });
     };
 
     const publishActiveIngress = (turnId: string | null): void => {
@@ -458,6 +561,50 @@ export const codexBackend: LocalBackend = {
             p.reject(new Error(`${p.method}: ${env.error.message || 'rpc error'} (code=${env.error.code ?? 0})`));
           } else {
             p.resolve(env.result);
+          }
+          return;
+        }
+        // App-server callbacks (method + id) are requests, not notifications,
+        // and every one must receive a JSON-RPC response. Silently treating a
+        // request added by a newer CLI as a notification leaves that CLI
+        // waiting forever. Known permission methods use the host bridge;
+        // unknown methods fail fast and let the runner quarantine/fallback.
+        if (env && env.id !== undefined && typeof env.method === 'string') {
+          if (CODEX_PERMISSION_REQUEST_METHODS.has(env.method)) {
+            void respondToServerRequest(env).catch((err) => {
+              log.warn('codex permission response failed', { error: logErrorSummary(err) });
+              sendLine({
+                jsonrpc: '2.0',
+                id: env.id,
+                error: { code: -32603, message: 'Permission request could not be completed.' },
+              });
+            });
+          } else if (env.method === CODEX_USER_INPUT_REQUEST_METHOD) {
+            void respondToUserInputRequest(env).catch((err) => {
+              log.warn('codex user-input response failed', { error: logErrorSummary(err) });
+              sendLine({
+                jsonrpc: '2.0',
+                id: env.id,
+                error: { code: -32603, message: 'User input request could not be completed.' },
+              });
+            });
+          } else if (CODEX_OPTIONAL_SERVER_REQUEST_METHODS.has(env.method)) {
+            // These callbacks require an explicit client capability or a
+            // feature Orkas did not register (dynamic tools, MCP elicitation,
+            // auth/attestation). Reply immediately so Codex can degrade; an
+            // absent optional integration must not wedge or kill the turn.
+            sendLine({
+              jsonrpc: '2.0',
+              id: env.id,
+              error: { code: -32601, message: 'Optional Codex callback is not supported by Orkas.' },
+            });
+          } else {
+            sendLine({
+              jsonrpc: '2.0',
+              id: env.id,
+              error: { code: -32601, message: 'Unsupported Codex app-server request.' },
+            });
+            failProtocol(`unsupported Codex app-server request: ${env.method}`);
           }
           return;
         }
@@ -565,11 +712,13 @@ export const codexBackend: LocalBackend = {
         const itemId = String(params.itemId || 'reasoning');
         const state = reasoningState(itemId);
         if (typeof params.delta === 'string') state.rawChars += params.delta.length;
+        opts.onActivity?.();
         if (activity.startReasoning(itemId)) emitReasoningActivity(itemId, state);
         return;
       }
       if (method === 'item/commandExecution/outputDelta') {
         const itemId = String(params.itemId || 'command');
+        opts.onActivity?.();
         if (activity.startCommand(itemId)) {
           opts.onEvent({
             type: 'status',
@@ -607,7 +756,9 @@ export const codexBackend: LocalBackend = {
         if (turnId && seenTurnIds.has(turnId)) return;
         if (turnId) seenTurnIds.add(turnId);
         if (status === 'failed') {
-          turnError = (turn?.error?.message && String(turn.error.message)) || 'codex turn failed';
+          turnFailed = true;
+          const message = turn?.error?.message && String(turn.error.message).trim();
+          if (message) turnError = message;
         }
         const aborted = status === 'cancelled' || status === 'canceled'
                      || status === 'aborted' || status === 'interrupted';
@@ -689,9 +840,10 @@ export const codexBackend: LocalBackend = {
       // ── Top-level error ──────────────────────────────────────────
       if (method === 'error') {
         const willRetry = !!params.willRetry;
-        const errMsg = (params.error?.message && String(params.error.message))
-                    || (typeof params.message === 'string' ? params.message : '');
+        const errMsg = ((params.error?.message && String(params.error.message))
+                    || (typeof params.message === 'string' ? params.message : '')).trim();
         if (willRetry) {
+          clearSystemErrorFallback();
           retryAttempt += 1;
           opts.onEvent({
             type: 'status',
@@ -701,7 +853,8 @@ export const codexBackend: LocalBackend = {
           });
           return;
         }
-        turnError = errMsg || 'codex turn failed';
+        turnFailed = true;
+        if (errMsg) turnError = errMsg;
         finishTurn(false);
         return;
       }
@@ -709,12 +862,12 @@ export const codexBackend: LocalBackend = {
       // ── Idle fallback when turn/completed never arrives ─────────
       if (method === 'thread/status/changed') {
         const statusType = params?.status?.type;
-        if (statusType === 'idle' && turnStarted) {
+        if (statusType === 'idle' && turnStarted && !systemErrorPending) {
           finishTurn(false);
         } else if (statusType === 'systemError') {
-          turnError = 'codex thread entered a system error state';
-          finishTurn(false);
+          scheduleSystemErrorFallback();
         } else if (statusType === 'active') {
+          clearSystemErrorFallback();
           const flags = Array.isArray(params?.status?.activeFlags)
             ? params.status.activeFlags
             : [];
@@ -908,8 +1061,12 @@ export const codexBackend: LocalBackend = {
       const output = agentMessages.output();
       if (turnAborted) {
         finish('cancelled', { output });
-      } else if (turnError) {
-        finish('failed', { error: turnError, output, stderrTail: tail.toString() });
+      } else if (turnFailed) {
+        finish('failed', {
+          ...(turnError ? { error: turnError } : {}),
+          output,
+          stderrTail: tail.toString(),
+        });
       } else {
         finish('completed', { output });
       }
@@ -919,10 +1076,35 @@ export const codexBackend: LocalBackend = {
       reapCliAfterProtocolTerminal(child);
     }
 
+    function clearSystemErrorFallback() {
+      systemErrorPending = false;
+      if (systemErrorTimer) clearTimeout(systemErrorTimer);
+      systemErrorTimer = null;
+    }
+
+    function scheduleSystemErrorFallback() {
+      if (systemErrorPending || exited) return;
+      systemErrorPending = true;
+      // Codex may publish systemError immediately before the authoritative
+      // turn/completed payload that carries the real CLI error. Give that
+      // terminal event one short ordering window; if it never arrives, report
+      // failure without inventing a more specific explanation.
+      systemErrorTimer = setTimeout(() => {
+        systemErrorTimer = null;
+        if (exited || !systemErrorPending) return;
+        systemErrorPending = false;
+        finish('failed', { output: agentMessages.output(), stderrTail: tail.toString() });
+        reapCliAfterProtocolTerminal(child);
+      }, 250);
+      if (typeof systemErrorTimer.unref === 'function') systemErrorTimer.unref();
+    }
+
     function finish(status: 'completed' | 'failed' | 'cancelled' | 'timeout', extra: Record<string, unknown> = {}) {
       if (exited) return;
       publishActiveIngress(null);
       exited = true;
+      if (bootstrapTimer) clearTimeout(bootstrapTimer);
+      clearSystemErrorFallback();
       clearInterval(activityTimer);
       watchdog.disarm();
       detachAbort();
@@ -948,19 +1130,36 @@ export const codexBackend: LocalBackend = {
       child.once('close', () => clearTimeout(hardKill));
       try { child.stdin.end(); } catch { /* already closed */ }
       killProcessTree(child, 'SIGTERM');
-      finish('failed', { error, stderrTail: tail.toString() });
+      finish('failed', {
+        error,
+        stderrTail: tail.toString(),
+        failureKind: 'cli_protocol',
+        retrySafe: !turnStarted,
+      });
     }
 
     child.on('error', err => {
       log.warn('codex spawn error', { error: logErrorSummary(err) });
-      finish('failed', { error: (err as Error).message, stderrTail: tail.toString() });
+      finish('failed', {
+        error: (err as Error).message,
+        stderrTail: tail.toString(),
+        failureKind: 'cli_spawn',
+        retrySafe: !turnStarted,
+      });
     });
     child.on('close', code => {
       const output = agentMessages.output();
       if (opts.signal.aborted) return finish('cancelled', { output });
-      if (watchdog.fired()) return finish('timeout', { error: `cli ${watchdog.reason()}`, output, stderrTail: tail.toString() });
+if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`, output, stderrTail: tail.toString() });
       if (turnAborted) return finish('cancelled', { output });
-      if (turnError) return finish('failed', { error: turnError, output, stderrTail: tail.toString() });
+      if (turnFailed) {
+        return finish('failed', {
+          ...(turnError ? { error: turnError } : {}),
+          output,
+          stderrTail: tail.toString(),
+        });
+      }
+      if (systemErrorPending) return finish('failed', { output, stderrTail: tail.toString() });
       if (code === 0 && (turnCompleted || agentMessages.hasText())) {
         return finish('completed', { output });
       }
@@ -968,14 +1167,29 @@ export const codexBackend: LocalBackend = {
         error: `codex exited with code ${code}` + (turnCompleted ? '' : ' (turn never completed)'),
         output,
         stderrTail: tail.toString(),
+        ...(!turnStarted ? { failureKind: 'cli_spawn', retrySafe: true } : {}),
       });
     });
 
     // ─── Drive the protocol ──────────────────────────────────────────
+    // initialize → thread → turn/start is a control-plane exchange. A binary
+    // that never answers must fail fast and retry-safe (cli_protocol) instead
+    // of burning the 30-minute idle watchdog with a non-retryable timeout
+    // that the candidate-fallback loop never sees.
+    bootstrapTimer = setTimeout(() => {
+      if (exited || turnStarted) return;
+      failProtocol('codex bootstrap timed out before turn/start');
+    }, codexBootstrapTimeoutMs());
+    if (typeof bootstrapTimer.unref === 'function') bootstrapTimer.unref();
     (async () => {
       try {
         await rpc('initialize', {
           clientInfo: { name: 'orkas', title: 'Orkas', version: '0.1.0' },
+          // Named permission profiles (`thread/start.permissions` and the
+          // corresponding resume/turn fields) are capability-gated even
+          // though the surrounding v2 methods are stable. Orkas handles the
+          // callbacks those profiles need; optional callbacks are rejected
+          // explicitly and unknown requests fail fast below.
           capabilities: { experimentalApi: true },
         });
         notify('initialized');
@@ -994,16 +1208,21 @@ export const codexBackend: LocalBackend = {
             text: selectCodexTurnPrompt(opts, prepared.resumed),
           }],
           ...buildCodexTurnRuntimeOverrides(opts),
-          ...buildCodexTurnPermissionOverrides(opts.cwd),
+          ...buildCodexTurnPermissionOverrides(opts.cwd, opts.permissionPolicy || 'inherit'),
         });
+        if (bootstrapTimer) { clearTimeout(bootstrapTimer); bootstrapTimer = null; }
         // After turn/start succeeds we wait passively — turn end is
         // driven by `turn/completed` / `task_complete` notifications.
         // Their protocol terminal immediately resolves outerPromise;
         // process cleanup continues asynchronously.
       } catch (err) {
         const msg = (err as Error).message || String(err);
+        // A terminal process/spawn path closes pending RPCs as part of normal
+        // cleanup. Do not misreport that expected rejection as a second
+        // protocol failure after the authoritative done event was emitted.
+        if (exited) return;
         log.warn('codex protocol error', { error: logErrorSummary(err) });
-        if (!exited) failProtocol(msg);
+        failProtocol(msg);
       }
     })();
 
@@ -1015,7 +1234,7 @@ export const codexBackend: LocalBackend = {
           const r = await rpc('thread/resume', {
             threadId: o.resumeSessionId,
             cwd: o.cwd,
-            ...buildCodexThreadPermissionOverrides(),
+            ...buildCodexThreadPermissionOverrides(o.permissionPolicy || 'inherit'),
             ...codexThreadDeveloperInstructionParams(o, true),
           });
           const tid = extractThreadId(r);
@@ -1029,7 +1248,7 @@ export const codexBackend: LocalBackend = {
         modelProvider: null,
         profile: null,
         cwd: o.cwd,
-        ...buildCodexThreadPermissionOverrides(),
+        ...buildCodexThreadPermissionOverrides(o.permissionPolicy || 'inherit'),
         config: null,
         baseInstructions: null,
         ...codexThreadDeveloperInstructionParams(o, false),
@@ -1150,22 +1369,66 @@ export function buildCodexBridgeOverrides(server: { command: string; args: strin
   return overrides;
 }
 
-export function buildCodexThreadPermissionOverrides(): { approvalPolicy: string; sandbox: string } {
+const CODEX_PERMISSION_REQUEST_METHODS = new Set([
+  'item/commandExecution/requestApproval',
+  'item/fileChange/requestApproval',
+  'item/permissions/requestApproval',
+]);
+const CODEX_USER_INPUT_REQUEST_METHOD = 'item/tool/requestUserInput';
+const CODEX_OPTIONAL_SERVER_REQUEST_METHODS = new Set([
+  'account/chatgptAuthTokens/refresh',
+  'attestation/generate',
+  'currentTime/read',
+  'item/tool/call',
+  'mcpServer/elicitation/request',
+  'openai/form',
+]);
+
+export function buildCodexThreadPermissionOverrides(
+  policy: NonNullable<BackendRunOptions['permissionPolicy']> = 'inherit',
+): { approvalPolicy?: string; approvalsReviewer?: string; permissions?: string } {
+  if (policy === 'full_access') {
+    return {
+      approvalPolicy: 'never',
+      approvalsReviewer: 'user',
+      permissions: ':danger-full-access',
+    };
+  }
+  if (policy === 'inherit') return {};
+  // Always write the complete approval tuple. Codex persists thread settings;
+  // omitting one field on resume can otherwise retain `never` from an older
+  // trusted task while restoring a restricted sandbox, making escalation
+  // impossible instead of asking Orkas.
   return {
-    approvalPolicy: TRUSTED_LOCAL_APPROVAL_POLICY,
-    sandbox: TRUSTED_LOCAL_SANDBOX_MODE,
+    approvalPolicy: 'on-request',
+    approvalsReviewer: 'user',
+    permissions: ':workspace',
   };
 }
 
-export function buildCodexTurnPermissionOverrides(cwd: string): {
+export function buildCodexTurnPermissionOverrides(
+  cwd: string,
+  policy: NonNullable<BackendRunOptions['permissionPolicy']> = 'inherit',
+): {
   cwd: string;
-  approvalPolicy: string;
-  sandboxPolicy: { type: string };
+  approvalPolicy?: string;
+  approvalsReviewer?: string;
+  permissions?: string;
 } {
+  if (policy === 'full_access') {
+    return {
+      cwd,
+      approvalPolicy: 'never',
+      approvalsReviewer: 'user',
+      permissions: ':danger-full-access',
+    };
+  }
+  if (policy === 'inherit') return { cwd };
   return {
     cwd,
-    approvalPolicy: TRUSTED_LOCAL_APPROVAL_POLICY,
-    sandboxPolicy: { ...TRUSTED_LOCAL_SANDBOX_POLICY },
+    approvalPolicy: 'on-request',
+    approvalsReviewer: 'user',
+    permissions: ':workspace',
   };
 }
 

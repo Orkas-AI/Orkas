@@ -1,5 +1,5 @@
 /**
- * Commander-navigable app surfaces for the `open_app_view` tool.
+ * Commander-navigable app surfaces for `open_app_view` and setup tools.
  *
  * The tool stages a navigation card on the commander's reply; the renderer
  * executes the navigation only when the user clicks the card, so this
@@ -27,7 +27,7 @@ export const APP_NAV_SURFACES: readonly AppNavSurface[] = [
   { id: 'settings.data', summary: 'Settings → Data: local data and access permissions.', actions: ['open'] },
   {
     id: 'connectors',
-    summary: 'Connectors: open the catalog, add a custom MCP server, or focus one configured connector.',
+    summary: 'Connectors: open the catalog or add a custom MCP server. The configure action remains a navigation compatibility route; connector_setup owns guided built-in setup.',
     actions: ['open', 'add_custom', 'configure'],
     targetRequiredFor: ['configure'],
   },
@@ -73,7 +73,7 @@ export function appNavSurfaceDescription(): string {
   }
   return `Actions: ${[...idsByActionSet.entries()]
     .map(([actions, ids]) => `${ids.join(', ')}=${actions}`)
-    .join('; ')}.`;
+    .join(';')}.`;
 }
 
 export function validateAppNavRequest(input: {

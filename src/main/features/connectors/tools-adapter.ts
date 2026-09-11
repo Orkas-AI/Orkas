@@ -21,6 +21,8 @@ import {
   readEnabledMap,
 } from '../component_enabled';
 import { isConnectorRuntimeEnabled } from './availability';
+import { findCatalogEntry } from './catalog';
+import { isConnectorActionBlocked } from './action_policy';
 import { isConnectorUsable } from './types';
 import type { ConnectorInstance, ToolSchema } from './types';
 
@@ -83,10 +85,25 @@ export async function resolveVisibleConnectors(
   ));
   if (!userEnabled.length) return [];
   const resolved = userEnabled.map((instance) => {
-    const allowed = instance.enabled_subtools;
-    const tools = allowed === null
-      ? instance.tools_cache
-      : instance.tools_cache.filter((t) => allowed.includes(t.name));
+    const userAllowed = instance.enabled_subtools;
+    const catalogEntry = findCatalogEntry(instance.id);
+    const catalogAllowed = catalogEntry?.allowed_tools;
+    const filteredTools = catalogAllowed?.length
+      ? instance.tools_cache.filter((t) => catalogAllowed.includes(t.name))
+      : instance.tools_cache;
+    // Catalog policy is trusted Host data. Always reapply it while projecting cached tools so a
+    // legacy cache cannot omit the confirmation gate and provider-controlled MCP `_meta` cannot
+    // override the reviewed risk classification.
+    const productTools = catalogEntry?.tool_policies
+      ? filteredTools.flatMap((tool) => {
+        const policy = catalogEntry.tool_policies?.[tool.name];
+        return policy ? [{ ...tool, orkas_action_policy: policy }] : [];
+      })
+      : filteredTools;
+    const eligible = productTools.filter((tool) => !isConnectorActionBlocked(instance.id, tool.name));
+    const tools = userAllowed === null
+      ? eligible
+      : eligible.filter((t) => userAllowed.includes(t.name));
     return { instance, tools };
   });
   return _dedupeGoogleWorkspaceTools(resolved);

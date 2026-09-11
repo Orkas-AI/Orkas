@@ -27,6 +27,20 @@ function timeBucket(iso, now) {
   return 'older';
 }
 
+// Rows whose sidebar activity falls in today's local bucket, in input order.
+// Feeds the "Today's Tasks" section with the same `last_active_at` reading as
+// the bucketed lists, so a row is never under "Today" in one list and missing
+// from the aggregate.
+function selectTodayConversations(rows, now) {
+  const out = [];
+  for (const c of Array.isArray(rows) ? rows : []) {
+    if (!c || !c.conversation_id) continue;
+    const iso = c.last_active_at || c.updated_at || c.created_at || '';
+    if (timeBucket(iso, now) === 'today') out.push(c);
+  }
+  return out;
+}
+
 if (typeof module !== 'undefined' && typeof module.exports === 'object') {
-  module.exports = { timeBucket, _BUCKET_ORDER };
+  module.exports = { timeBucket, selectTodayConversations, _BUCKET_ORDER };
 }

@@ -22,7 +22,7 @@ const TOOL_RELATED_SECTIONS = [
 // The three global decision sections measure about 3.4K characters after PDF
 // failure handling moved to create_pdf. This margin rejects tool-local manuals
 // drifting back into the resident prompt.
-const RESIDENT_SURFACE_CEILING = 3_500;
+const RESIDENT_SURFACE_CEILING = 2_200;
 
 function section(body: string, heading: string): string {
   const start = body.indexOf(`## ${heading}`);

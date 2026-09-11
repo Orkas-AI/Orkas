@@ -59,6 +59,43 @@ describe('SeoGeoAgent built-in evaluation', () => {
     expect(surface).toMatch(/provisional strategy[\s\S]*missing\s+verification/i);
   });
 
+  it('routes backlink offers to the seo-backlink-value skill and keeps the calculator honest', () => {
+    const agent = JSON.parse(fs.readFileSync(path.join(agentDir, 'agent.json'), 'utf8')) as {
+      workflow: string; skill_list: string[]; description_zh: string; description_en: string; knowhow: string[];
+    };
+    const skillDir = path.join(agentDir, 'skills', 'seo-backlink-value');
+    const skill = fs.readFileSync(path.join(skillDir, 'SKILL.md'), 'utf8');
+
+    // Dependency metadata, workflow route, and Commander routing terms agree.
+    expect(agent.skill_list).toContain('seo-backlink-value');
+    expect(agent.workflow).toMatch(/BACKLINK[\s\S]*`seo-backlink-value`/);
+    // The agent acquires the numbers; the user is the last resort.
+    expect(agent.workflow).toMatch(/connected SEO data provider first[\s\S]*free public rank and RDAP endpoints[\s\S]*`web_fetch`[\s\S]*the user only for what remains/);
+    expect(agent.workflow).toMatch(/never scrape paid tools' web UIs/);
+    expect(skill).toMatch(/tranco-list\.eu\/api\/ranks\/domain/);
+    expect(skill).toMatch(/data\.iana\.org\/rdap\/dns\.json/);
+    expect(skill).toMatch(/proxies\.tranco_rank/);
+    expect(skill).toMatch(/Never scrape the web UI of Ahrefs, SimilarWeb, Semrush or Moz/);
+    expect(skill).toMatch(/public_proxy/);
+    expect(agent.workflow).not.toMatch(/backlink_value\.py|run-skill\.cjs/);
+    expect(agent.description_zh).toMatch(/外链/);
+    expect(agent.description_en).toMatch(/backlink/i);
+    expect(agent.knowhow.some((line) => /backlink offer/i.test(line))).toBe(true);
+    expect(fs.existsSync(path.join(skillDir, 'scripts', 'backlink_value.py'))).toBe(true);
+
+    // The skill fetches nothing and never lets a reference band pass as measured.
+    expect(skill).toMatch(/Fetches no paid metrics/i);
+    expect(skill).toMatch(/--op evaluate/);
+    expect(skill).toMatch(/--op rank/);
+    expect(skill).toMatch(/insufficient_evidence/);
+    expect(skill).toMatch(/reference-table or public-proxy band is Estimated/i);
+    expect(skill).toMatch(/Never call any of it Measured/i);
+    expect(skill).toMatch(/Nofollow passes no authority/i);
+    // Veto gate and the four link-type multipliers are the documented contract.
+    expect(skill).toMatch(/zero_traffic[\s\S]*inflated_traffic[\s\S]*link_farm[\s\S]*deindexed/);
+    expect(skill).toMatch(/homepage\/sitewide ×1\.3, niche edit ×0\.7, directory ×0\.5, nofollow ×0\.4/);
+  });
+
   it('keeps the only first crawl command runner-only and platform-neutral', () => {
     const agent = JSON.parse(
       fs.readFileSync(path.join(agentDir, 'agent.json'), 'utf8'),

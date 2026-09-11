@@ -106,6 +106,114 @@ describe('ipc/connectors renderer DTO', () => {
     expect(beginOAuthConnect).not.toHaveBeenCalled();
   });
 
+  it('forwards account-specific connection parameters to the main-process validator', async () => {
+    const beginOAuthConnect = vi.fn(() => ({ attempt_id: 'attempt-netsuite' }));
+    vi.doMock('../../../src/main/features/connectors', () => ({ beginOAuthConnect, findCatalogEntry: () => ({ id: 'netsuite', auth_mode: 'server_bridge' }) }));
+    vi.doMock('../../../src/main/features/component_enabled', () => ({
+      isConnectorEnabled: vi.fn(() => true),
+      setConnectorEnabled: vi.fn(),
+    }));
+    vi.doMock('../../../src/main/features/connectors/availability', () => ({
+      catalogWithAvailability: vi.fn((catalog) => catalog),
+      isConnectorRuntimeEnabled: vi.fn(() => true),
+    }));
+
+    const { invokeHandlers } = await import('../../../src/main/ipc/connectors');
+    const out = await invokeHandlers['connectors.start_oauth'](
+      { catalog_id: 'netsuite', connection_parameters: { account_id: '123456_SB1' } },
+      { userId: 'u-ipc' },
+    );
+
+    expect(beginOAuthConnect).toHaveBeenCalledWith(
+      'u-ipc',
+      'netsuite',
+      { account_id: '123456_SB1' },
+    );
+    expect(out).toEqual({ started: true, attempt_id: 'attempt-netsuite' });
+  });
+
+  it('checks and installs only a catalog-pinned local CLI for the active user', async () => {
+    const entry = {
+      id: 'dingtalk',
+      display_name: '钉钉',
+      auth_mode: 'local_cli',
+      local_cli: { executable: 'dws' },
+    };
+    const status = {
+      installed: false,
+      runtime_ready: true,
+      package_name: 'dingtalk-workspace-cli',
+      package_version: '1.0.61',
+      executable: 'dws',
+    };
+    const localCliInstallStatus = vi.fn(() => status);
+    const installLocalCli = vi.fn(async () => ({ ...status, installed: true }));
+    vi.doMock('../../../src/main/features/connectors', () => ({
+      findCatalogEntry: vi.fn((id) => id === 'dingtalk' ? entry : undefined),
+      localCliInstallStatus,
+      installLocalCli,
+    }));
+    vi.doMock('../../../src/main/features/component_enabled', () => ({
+      isConnectorEnabled: vi.fn(() => true),
+      setConnectorEnabled: vi.fn(),
+    }));
+    vi.doMock('../../../src/main/features/connectors/availability', () => ({
+      catalogWithAvailability: vi.fn((catalog) => catalog),
+      isConnectorRuntimeEnabled: vi.fn(() => true),
+    }));
+
+    const { invokeHandlers } = await import('../../../src/main/ipc/connectors');
+    await expect(invokeHandlers['connectors.local_cli_status'](
+      { catalog_id: 'dingtalk' }, { userId: 'u-cli' },
+    )).resolves.toEqual({ status });
+    await expect(invokeHandlers['connectors.install_local_cli'](
+      { catalog_id: 'dingtalk' }, { userId: 'u-cli' },
+    )).resolves.toEqual({ status: { ...status, installed: true } });
+    expect(localCliInstallStatus).toHaveBeenCalledWith('u-cli', entry);
+    expect(installLocalCli).toHaveBeenCalledWith('u-cli', entry);
+  });
+
+  it('rejects local CLI preparation for a non-CLI catalog entry', async () => {
+    vi.doMock('../../../src/main/features/connectors', () => ({
+      findCatalogEntry: vi.fn(() => ({ id: 'github', auth_mode: 'composio' })),
+      localCliInstallStatus: vi.fn(),
+      installLocalCli: vi.fn(),
+    }));
+    vi.doMock('../../../src/main/features/component_enabled', () => ({
+      isConnectorEnabled: vi.fn(() => true),
+      setConnectorEnabled: vi.fn(),
+    }));
+    vi.doMock('../../../src/main/features/connectors/availability', () => ({
+      catalogWithAvailability: vi.fn((catalog) => catalog),
+      isConnectorRuntimeEnabled: vi.fn(() => true),
+    }));
+
+    const { invokeHandlers } = await import('../../../src/main/ipc/connectors');
+    await expect(invokeHandlers['connectors.install_local_cli'](
+      { catalog_id: 'github' }, { userId: 'u-cli' },
+    )).rejects.toThrow('not a local CLI connector');
+  });
+
+  it('routes local CLI browser opening through the connector-specific main-process boundary', async () => {
+    const openLocalCliAuthorizationUrl = vi.fn(async () => undefined);
+    vi.doMock('../../../src/main/features/connectors', () => ({ openLocalCliAuthorizationUrl }));
+    vi.doMock('../../../src/main/features/component_enabled', () => ({
+      isConnectorEnabled: vi.fn(() => true),
+      setConnectorEnabled: vi.fn(),
+    }));
+    vi.doMock('../../../src/main/features/connectors/availability', () => ({
+      catalogWithAvailability: vi.fn((catalog) => catalog),
+      isConnectorRuntimeEnabled: vi.fn(() => true),
+    }));
+
+    const { invokeHandlers } = await import('../../../src/main/ipc/connectors');
+    const url = 'https://open.feishu.cn/page/cli?user_code=FEISHU-42';
+
+    await expect(invokeHandlers['connectors.open_local_cli_auth_url']({ url }))
+      .resolves.toEqual({ opened: true });
+    expect(openLocalCliAuthorizationUrl).toHaveBeenCalledWith(url);
+  });
+
   it('lists local connector state without triggering Composio restore', async () => {
     const restoreComposioConnectionsFromServer = vi.fn(async () => 0);
     vi.doMock('../../../src/main/features/connectors', () => ({
@@ -143,13 +251,25 @@ describe('ipc/connectors renderer DTO', () => {
     }), true);
 
     const json = JSON.stringify(dto);
-    expect(dto.transport).toEqual({ kind: 'stdio', summary: 'node (3 args)' });
+    expect(dto.transport).toEqual({ kind: 'stdio', summary: 'node (3 args)', command: 'node', argument_count: 3 });
     expect(json).not.toContain('sk-secret');
     expect(json).not.toContain('env-secret');
     expect(json).not.toContain('oauth-access-secret');
     expect(json).not.toContain('oauth-refresh-secret');
     expect(json).not.toContain('connection-private-secret');
     expect(dto).not.toHaveProperty('composio_grant');
+  });
+
+  it('exposes only the environment enum needed to keep legacy test connections isolated', async () => {
+    const { _toClientInstanceForTest } = await import('../../../src/main/ipc/connectors');
+    for (const environment of ['sandbox', 'live', 'private-unrecognized-value']) {
+      const dto = _toClientInstanceForTest({
+        ...baseInstance({ kind: 'stdio', command: 'node', args: [] }),
+        connection_parameters: { environment, app_secret: 'metadata-secret', shop_id: 'private-shop' },
+      });
+      expect(dto.connection_environment).toBe(environment === 'sandbox' || environment === 'live' ? environment : undefined);
+      expect(JSON.stringify(dto)).not.toMatch(/metadata-secret|private-shop|private-unrecognized-value|connection_parameters/);
+    }
   });
 
   it('strips credentials, query, and fragment from streamable-http URLs', async () => {

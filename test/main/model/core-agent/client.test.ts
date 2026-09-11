@@ -148,6 +148,8 @@ describe('core-agent client skill sandbox env', () => {
       projectId: 'project-private-abcdef',
       message: 'please analyze my private launch plan',
       systemPrompt: 'private system rules',
+      resolvedSystemPrompt: 'private system rules with private skill catalog',
+      turnEphemeral: 'private live task board',
       workingDir: '/Users/test/Secret Project',
       extraRoots: ['/Users/test/Extra Private Root'],
       readOnlyExtraRoots: ['/Users/test/Readonly Private Root'],
@@ -166,9 +168,16 @@ describe('core-agent client skill sandbox env', () => {
 
     expect(ctx.message_chars).toBe('please analyze my private launch plan'.length);
     expect(ctx.system_prompt_chars).toBe('private system rules'.length);
+    expect(ctx.resolved_system_prompt_chars)
+      .toBe('private system rules with private skill catalog'.length);
+    expect(ctx.turn_ephemeral_chars).toBe('private live task board'.length);
     expect(ctx.extra_root_count).toBe(1);
     expect(ctx.read_only_extra_root_count).toBe(1);
     expect(ctx.tool_count).toBe(2);
+    expect(ctx.tool_definition_chars).toBe(
+      JSON.stringify({ name: 'read_file', description: 'reads files', inputSchema: {} }).length
+      + JSON.stringify({ name: 'dispatch_to', description: 'dispatches', inputSchema: {} }).length,
+    );
     expect(ctx.tool_names).toEqual(['dispatch_to', 'read_file']);
     expect(ctx.tool_list_mode).toBe('scoped');
     expect(ctx.tool_list_count).toBe(2);
@@ -176,6 +185,8 @@ describe('core-agent client skill sandbox env', () => {
     const serialized = JSON.stringify(ctx);
     expect(serialized).not.toContain('private launch plan');
     expect(serialized).not.toContain('private system rules');
+    expect(serialized).not.toContain('private skill catalog');
+    expect(serialized).not.toContain('private live task board');
     expect(serialized).not.toContain('/Users/alice');
     expect(serialized).not.toContain('Secret Project');
     expect(serialized).not.toContain('secret-session-id');
@@ -193,6 +204,41 @@ describe('core-agent client skill sandbox env', () => {
 
     expect(ctx.tool_list_mode).toBe('legacy');
     expect(ctx.tool_surface_mode).toBe('scoped');
+  });
+
+  it('logs missing named-Agent skill_list metadata as lazy agent defaults instead of all skills', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+    const missing = client.modelTurnContextForLog({
+      sessionId: 'gmember-conversation-agent',
+    });
+    const explicitEmpty = client.modelTurnContextForLog({
+      sessionId: 'gmember-conversation-agent',
+      skillList: [],
+    });
+
+    expect(missing.skill_list_mode).toBe('agent_defaults');
+    expect(missing.skill_list_count).toBeUndefined();
+    expect(explicitEmpty.skill_list_mode).toBe('allowlist');
+    expect(explicitEmpty.skill_list_count).toBe(0);
+  });
+
+  it('reconciles one reply timing summary without requiring a full call timeline', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+
+    expect(client.modelRunTimingSummaryForLog(1_200, {
+      providerMs: 800,
+      toolMs: 100,
+      compactionMs: 50,
+      retryWaitMs: 25,
+      otherMs: 75,
+    })).toEqual({
+      total_ms: 1_200,
+      provider_ms: 800,
+      tool_ms: 100,
+      compaction_ms: 50,
+      retry_wait_ms: 25,
+      other_ms: 225,
+    });
   });
 
   it('preserves compound session kinds instead of truncating them at the first dash', async () => {
@@ -345,7 +391,152 @@ describe('core-agent client skill sandbox env', () => {
     expect(serialized).not.toContain('private-skill-id');
     expect(serialized).not.toContain('call-secret-123456');
     expect(serialized).not.toContain('private progress');
+  });
 
+  it('counts reasoning as model liveness without treating it as visible content', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+    const stats = client.createModelRunLogDiagnostics(1_000);
+
+    client.recordModelRawEventForLog(stats, {
+      type: 'thinking', phase: 'start', chars: 0,
+    }, 1_050);
+    client.recordModelRawEventForLog(stats, {
+      type: 'thinking', phase: 'progress', chars: 128,
+    }, 1_150);
+    client.recordModelRawEventForLog(stats, {
+      type: 'thinking', phase: 'end', chars: 128,
+    }, 1_250);
+
+    expect(stats.firstModelEventMs).toBe(50);
+    expect(stats.firstContentMs).toBeUndefined();
+    expect(client.summarizeModelRunForLog(stats, 1_300).runTimeline).toEqual([
+      '#1 +50ms thinking_start chars=0',
+      '#2 +150ms thinking_progress chars=128',
+      '#3 +250ms thinking_end chars=128',
+    ]);
+  });
+
+  it('tracks corrective same-operation tool calls separately from runtime exceptions and parallel siblings', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+    const stats = client.createModelRunLogDiagnostics(1000);
+
+    // These two calls were already running together. The successful sibling
+    // cannot be evidence that the later-arriving error was corrected.
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_start', id: 'read-failed', name: 'read_file', input: { path: 'missing.txt' },
+    }, 1010);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_start', id: 'read-sibling', name: 'read_file', input: { path: 'other.txt' },
+    }, 1011);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_end', id: 'read-failed', name: 'read_file', isError: true, result: 'not found',
+    }, 1020);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_end', id: 'read-sibling', name: 'read_file', isError: false, result: 'other file',
+    }, 1021);
+    expect(stats.toolResultErrorsRecovered).toBe(0);
+
+    // A newly started call to the same operation after observing the failure
+    // is a real recovery signal, even though its corrected path differs.
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_start', id: 'read-corrected', name: 'read_file', input: { path: 'correct.txt' },
+    }, 1030);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_end', id: 'read-corrected', name: 'read_file', isError: false, result: 'correct file',
+    }, 1040);
+
+    // A different operation exposed behind the same generic tool name is not
+    // a recovery for the failed operation.
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_start', id: 'state-read-failed', name: 'state_tool', input: { op: 'read' },
+    }, 1041);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_end', id: 'state-read-failed', name: 'state_tool', isError: true, result: 'bad locator',
+    }, 1042);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_start', id: 'state-write-ok', name: 'state_tool', input: { op: 'write' },
+    }, 1043);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_end', id: 'state-write-ok', name: 'state_tool', isError: false, result: 'saved',
+    }, 1044);
+
+    // A runner exception is a separate incident class and must not inflate the
+    // returned-error or recovery counters.
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_end', id: 'bash-crash', name: 'bash', isError: true,
+      errorCode: 'tool_execution_exception', errorSeverity: 'error', result: 'spawn failed',
+    }, 1050);
+
+    expect(stats.toolResultErrors).toBe(2);
+    expect(stats.toolResultErrorsRecovered).toBe(1);
+    expect(client.summarizeModelRunForLog(stats, 1060)).toMatchObject({
+      toolResultErrors: 2,
+      toolResultErrorsRecovered: 1,
+      toolResultErrorsWithoutObservedRecovery: 1,
+      toolResultErrorsUnresolved: 1,
+    });
+  });
+
+  it('recovers an invalid selector-less call only from a later retry with the same argument shape', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+    const stats = client.createModelRunLogDiagnostics(1000);
+
+    // The model omitted `action`, so the tool rejected the otherwise
+    // recognisable batch update. A corrected retry adds the selector.
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_start', id: 'plan-invalid', name: 'manage_execution_plan',
+      input: { updates: [{ step_id: 'step-1', status: 'completed' }] },
+    }, 1010);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_end', id: 'plan-invalid', name: 'manage_execution_plan',
+      isError: true, result: 'action is required',
+    }, 1020);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_start', id: 'plan-corrected', name: 'manage_execution_plan',
+      input: { action: 'set_statuses', updates: [{ step_id: 'step-1', status: 'completed' }] },
+    }, 1030);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_end', id: 'plan-corrected', name: 'manage_execution_plan',
+      isError: false, result: 'updated',
+    }, 1040);
+
+    expect(stats.toolResultErrors).toBe(1);
+    expect(stats.toolResultErrorsRecovered).toBe(1);
+    expect(client.summarizeModelRunForLog(stats, 1050)).toMatchObject({
+      toolResultErrors: 1,
+      toolResultErrorsRecovered: 1,
+      toolResultErrorsWithoutObservedRecovery: 0,
+      toolResultErrorsUnresolved: 0,
+    });
+  });
+
+  it('does not treat a different selector-less argument shape as recovery', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+    const stats = client.createModelRunLogDiagnostics(1000);
+
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_start', id: 'plan-invalid', name: 'manage_execution_plan',
+      input: { updates: [{ step_id: 'step-1', status: 'completed' }] },
+    }, 1010);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_end', id: 'plan-invalid', name: 'manage_execution_plan',
+      isError: true, result: 'action is required',
+    }, 1020);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_start', id: 'different-call', name: 'manage_execution_plan',
+      input: { action: 'set_status', step_id: 'step-1', status: 'completed' },
+    }, 1030);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_end', id: 'different-call', name: 'manage_execution_plan',
+      isError: false, result: 'updated',
+    }, 1040);
+
+    expect(stats.toolResultErrors).toBe(1);
+    expect(stats.toolResultErrorsRecovered).toBe(0);
+    expect(client.summarizeModelRunForLog(stats, 1050)).toMatchObject({
+      toolResultErrorsWithoutObservedRecovery: 1,
+      toolResultErrorsUnresolved: 1,
+    });
   });
 
   it('reports compaction attempts and failures separately from successful compactions', async () => {
@@ -448,6 +639,7 @@ describe('core-agent client skill sandbox env', () => {
       outcome: 'completed',
       model: 'private-model-id',
       durationMs: 70_000,
+      reasoningBoundary: { structured: true, literalLeadingText: false },
       usage: {
         inputTokens: 100,
         outputTokens: 4,
@@ -463,6 +655,7 @@ describe('core-agent client skill sandbox env', () => {
       durationMs: 500,
       stopReason: 'tool_use',
       textChars: 37,
+      reasoningBoundary: { structured: false, literalLeadingText: true },
       usage: {
         inputTokens: 120,
         outputTokens: 5,
@@ -495,6 +688,16 @@ describe('core-agent client skill sandbox env', () => {
       providerCallCount: 2,
       providerCallMaxMs: 70_000,
       providerSlowCallCount: 1,
+      structuredReasoningCallCount: 1,
+      literalThinkContentCallCount: 1,
+      providerUsage: {
+        observedCalls: 2,
+        inputTokens: 220,
+        outputTokens: 9,
+        cacheReadTokens: 2_000,
+        cacheWriteTokens: 11,
+        totalTokens: 2_240,
+      },
       providerCandidateCount: 3,
       providerEmptyCount: 1,
       providerEmptyNormalCount: 1,
@@ -505,6 +708,135 @@ describe('core-agent client skill sandbox env', () => {
     expect(JSON.stringify(summary)).not.toContain('private-provider-id');
     expect(JSON.stringify(summary)).not.toContain('another-private-provider');
     expect(JSON.stringify(summary)).not.toContain('private-call-id');
+    expect(JSON.stringify(summary)).not.toContain('/private/workspace');
 
+  });
+
+  it('keeps an unbounded Token aggregate when provider-round details are capped', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+    const stats = client.createModelRunLogDiagnostics(1_000);
+    for (let index = 0; index < 70; index++) {
+      client.recordModelRawEventForLog(stats, {
+        type: 'provider_call',
+        outcome: 'completed',
+        durationMs: 100,
+        usage: {
+          inputTokens: 5,
+          outputTokens: 1,
+          cacheReadTokens: 3,
+          cacheWriteTokens: 1,
+          totalTokens: 10,
+        },
+      }, 1_100 + index);
+    }
+
+    expect(stats.providerRounds).toHaveLength(64);
+    expect(stats.providerRoundsTruncated).toBe(6);
+    expect(stats.providerUsage).toEqual({
+      observedCalls: 70,
+      inputTokens: 350,
+      outputTokens: 70,
+      cacheReadTokens: 210,
+      cacheWriteTokens: 70,
+      totalTokens: 700,
+    });
+  });
+
+  it('records successful Plan mutation shape without retaining Plan content', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+    const stats = client.createModelRunLogDiagnostics(1_000);
+    client.recordModelRawEventForLog(stats, {
+      type: 'provider_call',
+      outcome: 'completed',
+      model: 'private-model-id',
+      durationMs: 500,
+      stopReason: 'tool_use',
+    }, 1_500);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_start',
+      id: 'private-plan-call',
+      name: 'manage_execution_plan',
+      input: {
+        action: 'update',
+        plan: [{ step: 'private milestone text', status: 'in_progress' }],
+      },
+    }, 1_510);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_end',
+      id: 'private-plan-call',
+      name: 'manage_execution_plan',
+      result: JSON.stringify({
+        ok: true,
+        action: 'update',
+        revision: 1,
+        step_count: 3,
+        step_ids: [1, 2, 3],
+        updated_step_ids: [1, 2, 3],
+      }),
+    }, 1_520);
+
+    client.recordModelRawEventForLog(stats, {
+      type: 'provider_call',
+      outcome: 'completed',
+      model: 'private-model-id',
+      durationMs: 400,
+      stopReason: 'tool_use',
+    }, 1_900);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_start',
+      id: 'failed-plan-call',
+      name: 'manage_execution_plan',
+      input: { action: 'set_statuses', updates: [{ step_id: 1, status: 'completed' }] },
+    }, 1_910);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_end',
+      id: 'failed-plan-call',
+      name: 'manage_execution_plan',
+      result: JSON.stringify({
+        ok: false,
+        current_steps: [{ id: 1, step: 'another private milestone', status: 'in_progress' }],
+      }),
+      isError: true,
+    }, 1_920);
+
+  });
+
+  it('does not misclassify a revision-one no-op replay as initial Plan creation', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+    const stats = client.createModelRunLogDiagnostics(1_000);
+    client.recordModelRawEventForLog(stats, {
+      type: 'provider_call',
+      outcome: 'completed',
+      model: 'private-model-id',
+      durationMs: 250,
+      stopReason: 'tool_use',
+    }, 1_250);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_start',
+      id: 'replayed-plan-call',
+      name: 'manage_execution_plan',
+      input: { plan: [{ step: 'private milestone text', status: 'in_progress' }] },
+    }, 1_260);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_end',
+      id: 'replayed-plan-call',
+      name: 'manage_execution_plan',
+      result: JSON.stringify({
+        ok: true,
+        action: 'update',
+        revision: 1,
+        step_count: 1,
+        updated_step_ids: [],
+        unchanged: true,
+      }),
+    }, 1_270);
+
+    expect(stats.providerRounds[0]?.planMutations).toEqual([{
+      action: 'update',
+      initialExplicitPlan: false,
+      stepCount: 1,
+      changedStepCount: 0,
+      noOp: true,
+    }]);
   });
 });

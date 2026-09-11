@@ -43,7 +43,7 @@ function guardedOfficeCliInvocation(binary, args) {
   if (process.platform !== 'darwin') return { command: binary, args };
   return {
     command: '/usr/bin/sandbox-exec',
-    args: ['-p', officeCliPolicy.MAC_OFFICECLI_SANDBOX_PROFILE, binary, ...args],
+    args: ['-D', `OFFICECLI_BINARY=${fs.realpathSync(binary)}`, '-p', officeCliPolicy.MAC_OFFICECLI_SANDBOX_PROFILE, binary, ...args],
   };
 }
 

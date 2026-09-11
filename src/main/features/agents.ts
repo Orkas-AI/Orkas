@@ -30,6 +30,7 @@ import { chatAttachmentDirForConversation } from '../util/project-layout';
 import { evictSession } from '../model/core-agent/session-store';
 import { getActiveUserId } from './users';
 import { createLogger } from '../logger';
+import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { t, buildLanguageDirective, descriptionLang } from '../i18n';
 import { getLanguage } from './config';
 import { getWorkspacePath } from './user_workspace';
@@ -41,8 +42,22 @@ import {
   type AgentRuntimeStatsBucket,
 } from './agent_runtime_stats';
 import { getCurrentDevice } from '../util/device';
-import { LOCAL_CLI_TYPES, localCliCapabilities, type LocalCliType } from './local_agents/registry';
-import { ensureEditChatRuntimeProcessItem, normalizeEditChatRuntimeEvent } from './edit_chat_runtime';
+import {
+  LOCAL_CLI_TYPES,
+  localCliCapabilities,
+  localCliDefaultPermissionPolicy,
+  localCliSupportsAgentMemory,
+  localCliSupportsPermissionPolicy,
+  type LocalCliPermissionPolicy,
+  type LocalCliType,
+} from './local_agents/registry';
+import {
+  appendEditChatCommentaryProcessItem,
+  ensureEditChatRuntimeProcessItem,
+  isEditChatWaitingForInputEvent,
+  normalizeEditChatRuntimeEvent,
+  sanitizeEditChatCommentaryProcessItems,
+} from './edit_chat_runtime';
 
 const log = createLogger('agents');
 
@@ -378,6 +393,9 @@ export type AgentRuntime =
       /** Per-Agent effort / thinking / variant override. Missing means use
        * the selected model's CLI default. */
       thinking_level?: string;
+      /** Per-Agent permission override. Missing means inherit the CLI's own
+       * configuration. */
+      permission_policy?: Exclude<LocalCliPermissionPolicy, 'inherit'>;
       /** Extra CLI flags appended after our own args. Strings only;
        *  not shell-parsed by us. */
       custom_args?: string[];
@@ -404,7 +422,7 @@ function _applyMarketplaceInstallMeta(agent: Agent, dir: string): void {
     else if (typeof meta.state === 'string') agent.status = meta.state;
     if (typeof meta.seed_source === 'string') agent.seed_source = meta.seed_source;
   } catch (err) {
-    log.warn(`marketplace agent install metadata unreadable dir=${dir}: ${(err as Error).message}`);
+    log.warn('marketplace agent install metadata unreadable', { directory: logPathRef(dir), error: logErrorSummary(err) });
   }
 }
 
@@ -575,15 +593,15 @@ export function validateAgentInputs(raw: unknown): AgentInput[] {
     if (!entry || typeof entry !== 'object') continue;
     const e = entry as Record<string, unknown>;
     const id = typeof e.id === 'string' ? e.id.trim() : '';
-    if (!INPUT_ID_RE.test(id) || seen.has(id)) { log.warn(`input dropped: bad id ${JSON.stringify(e.id)}`); continue; }
+    if (!INPUT_ID_RE.test(id) || seen.has(id)) { log.warn('agent input dropped: invalid or duplicate id'); continue; }
     const type = e.type as AgentInputType;
-    if (!ALLOWED_INPUT_TYPES.includes(type)) { log.warn(`input ${id} dropped: bad type ${JSON.stringify(e.type)}`); continue; }
+    if (!ALLOWED_INPUT_TYPES.includes(type)) { log.warn('agent input dropped: invalid type', { input_id: maskId(id) }); continue; }
     const label = typeof e.label === 'string' ? e.label : id;
 
     let options: AgentInputOption[] | undefined;
     if (type === 'select' || type === 'multiselect') {
       if (!Array.isArray(e.options) || e.options.length === 0) {
-        log.warn(`input ${id} dropped: ${type} needs non-empty options`); continue;
+        log.warn('agent input dropped: options required', { input_id: maskId(id), type }); continue;
       }
       const optValues = new Set<string>();
       options = [];
@@ -594,7 +612,7 @@ export function validateAgentInputs(raw: unknown): AgentInput[] {
         optValues.add(v);
         options.push({ value: v, label: typeof (o as any).label === 'string' ? (o as any).label : v });
       }
-      if (options.length === 0) { log.warn(`input ${id} dropped: options invalid`); continue; }
+      if (options.length === 0) { log.warn('agent input dropped: options invalid', { input_id: maskId(id) }); continue; }
     }
 
     let def: string | number | boolean | string[];
@@ -613,7 +631,7 @@ export function validateAgentInputs(raw: unknown): AgentInput[] {
         const parsed = Number(e.default);
         if (Number.isFinite(parsed)) n = parsed;
       }
-      if (n === null) { log.warn(`input ${id} dropped: default must be finite number`); continue; }
+      if (n === null) { log.warn('agent input dropped: default must be finite number', { input_id: maskId(id) }); continue; }
       def = n;
     } else if (type === 'boolean') {
       // Coerce common boolean reps the LLM emits (`"true"` / `"false"` /
@@ -625,7 +643,7 @@ export function validateAgentInputs(raw: unknown): AgentInput[] {
       else if (e.default === 'true' || e.default === 1) b = true;
       else if (e.default === 'false' || e.default === 0) b = false;
       else {
-        log.warn(`input ${id}: invalid boolean default ${JSON.stringify(e.default)}, falling back to false`);
+        log.warn('agent input default invalid: falling back to false', { input_id: maskId(id) });
         b = false;
       }
       def = b;
@@ -642,7 +660,7 @@ export function validateAgentInputs(raw: unknown): AgentInput[] {
       if (v && options!.some((o) => o.value === v)) {
         def = v;
       } else {
-        if (v) log.warn(`input ${id}: default ${JSON.stringify(v)} not in options, falling back to first`);
+        if (v) log.warn('agent input default not in options: falling back to first', { input_id: maskId(id) });
         def = options![0].value;
       }
     } else if (type === 'multiselect') {
@@ -685,8 +703,8 @@ export function validateAgentInputs(raw: unknown): AgentInput[] {
       if (typeof e.accept === 'string' && e.accept.trim()) input.accept = e.accept.trim();
     }
     if (type === 'number' && typeof def === 'number') {
-      if (typeof input.min === 'number' && def < input.min) { log.warn(`input ${id}: default below min`); }
-      if (typeof input.max === 'number' && def > input.max) { log.warn(`input ${id}: default above max`); }
+      if (typeof input.min === 'number' && def < input.min) { log.warn('agent input default below min', { input_id: maskId(id) }); }
+      if (typeof input.max === 'number' && def > input.max) { log.warn('agent input default above max', { input_id: maskId(id) }); }
     }
 
     seen.add(id);
@@ -1030,11 +1048,11 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
       // An explicitly malformed dependency contract must never broaden into
       // the historical missing-field compatibility surface.
       agent.tool_list = [];
-      log.warn(`agent ${raw.agent_id}: invalid tool_list normalized to host-only`);
+      log.warn('agent invalid tool_list normalized to host-only', { agent_id: maskId(raw.agent_id) });
     }
   } else if (hasToolList) {
     agent.tool_list = [];
-    log.warn(`agent ${raw.agent_id}: malformed tool_list normalized to host-only`);
+    log.warn('agent malformed tool_list normalized to host-only', { agent_id: maskId(raw.agent_id) });
   }
   // delivery_checks follows the same exact-array convention. Entries are
   // registry names (kebab tokens), bounded at 8; name resolution happens at
@@ -1104,6 +1122,12 @@ function _normalizeRuntime(raw: unknown): AgentRuntime | null {
   if (modelOverride) out.model_override = modelOverride;
   const thinkingLevel = _normalizeCliRuntimeOverride(r.thinking_level);
   if (thinkingLevel) out.thinking_level = thinkingLevel;
+  const permissionPolicy = r.permission_policy;
+  if ((permissionPolicy === 'ask' || permissionPolicy === 'full_access')
+      && localCliSupportsPermissionPolicy(cli, permissionPolicy)
+      && permissionPolicy !== localCliDefaultPermissionPolicy(cli)) {
+    out.permission_policy = permissionPolicy;
+  }
   if (Array.isArray(r.custom_args)) {
     const args = r.custom_args.filter((s): s is string => typeof s === 'string');
     if (args.length) out.custom_args = args;
@@ -1371,7 +1395,7 @@ function _writePersistedAgentCatalog(stamp: string, data: Agent[]): void {
       data,
     });
   } catch (err) {
-    log.warn(`agent catalog cache write failed: ${(err as Error).message}`);
+    log.warn('agent catalog cache write failed', { error: logErrorSummary(err) });
   }
 }
 
@@ -1507,7 +1531,7 @@ async function _listAgentSpecs(): Promise<Agent[]> {
           }
           if (seen.has(norm.agent_id)) {
             if (source === 'custom') {
-              log.warn(`id conflict: marketplace and custom both define "${norm.agent_id}" — marketplace wins, rename one`);
+              log.warn('agent id conflict: marketplace takes precedence over custom', { agent_id: maskId(norm.agent_id) });
             }
             continue;
           }
@@ -1674,7 +1698,7 @@ function resolveBilingualDescription(
 async function _skillSpecsForDisplay(userId = getActiveUserId()): Promise<SkillAllowlistRef[]> {
   try { return await listSkillSpecsForAgentMetadata(userId); }
   catch (err) {
-    log.warn(`skill display-name map unavailable: ${(err as Error).message}`);
+    log.warn('skill display-name map unavailable', { error: logErrorSummary(err) });
     return [];
   }
 }
@@ -1691,8 +1715,12 @@ function _withDisplaySkillRefs(agent: Agent, specs: SkillAllowlistRef[]): Agent 
 }
 
 function _withAgentMemoryEntries(userId: string, agent: Agent): Agent {
+  if (!_agentSupportsMemory(agent)) {
+    if (!agent.profile || agent.profile.memory === undefined) return agent;
+    const { memory: _memory, ...profile } = agent.profile;
+    return { ...agent, profile };
+  }
   if (!agent.agent_id) return agent;
-  if (isCliAgent(agent)) return agent;
   const res = listAgentEntries(userId, agent.agent_id);
   const fileEntries = res.entries || [];
   if (!fileEntries.length) return agent;
@@ -1714,18 +1742,15 @@ function _withAgentMemoryEntries(userId: string, agent: Agent): Agent {
   };
 }
 
-function _agentMemoryUnsupportedResult(error: string) {
-  return { ok: false, error, entries: [], usage: { current: 0, limit: 0, entries_current: 0, entries_limit: 0 } };
-}
-
-function _agentMemoryNotSupportedForExternalResult() {
-  return _agentMemoryUnsupportedResult('agent memory is not supported for external CLI agents');
+function _agentSupportsMemory(agent: Pick<Agent, 'runtime'>): boolean {
+  return agent.runtime?.kind !== 'cli' || localCliSupportsAgentMemory(agent.runtime.cli);
 }
 
 async function _resolveAgentMemoryTarget(agentId: string): Promise<{
   source: AgentSource;
   file: string;
   data: AgentRaw;
+  agent: Agent;
 } | null> {
   for (const source of ['marketplace', 'custom'] as AgentSource[]) {
     const file = isMarketplaceSource(source)
@@ -1735,7 +1760,7 @@ async function _resolveAgentMemoryTarget(agentId: string): Promise<{
     try {
       const data = await readJson<AgentRaw>(file);
       const norm = normalizeAgent(data, source);
-      if (norm?.agent_id === agentId) return { source, file, data };
+      if (norm?.agent_id === agentId) return { source, file, data, agent: norm };
     } catch {
       /* try the next source */
     }
@@ -1862,7 +1887,7 @@ export async function createCustomAgent(
 
   await writeJson(agentDefinitionFile(userId, agentId), data);
   _invalidateAgentListCache({ userId });
-  log.info(`created id=${agentId} name=${data.name}`);
+  log.info('custom agent created', { agent_id: maskId(agentId) });
   return normalizeAgent(data, 'custom');
 }
 
@@ -2126,7 +2151,7 @@ export async function updateCustomAgent(
 
   await writeJson(f, data);
   _invalidateAgentListCache({ userId });
-  log.info(`updated id=${agentId}`);
+  log.info('custom agent updated', { agent_id: maskId(agentId) });
   // Propagate a name change into every conversation roster that already
   // lists this agent. members.json snapshots the name at join time and the
   // @-router resolves on roster-first, so without this sweep `@<old-name>`
@@ -2134,7 +2159,7 @@ export async function updateCustomAgent(
   const newName = typeof (data as any).name === 'string' ? (data as any).name : '';
   if (newName && newName !== oldName) {
     try { await renameAgentInMembers(userId, agentId, newName); }
-    catch (err) { log.warn(`rename roster sweep failed id=${agentId}: ${(err as Error).message}`); }
+    catch (err) { log.warn('agent rename roster sweep failed', { agent_id: maskId(agentId), error: logErrorSummary(err) }); }
   }
   return normalizeAgent(data, 'custom');
 }
@@ -2280,7 +2305,7 @@ async function _applyAgentUpdates(
       const specs = await listSkillSpecsForAgentMetadata(userId, { forAgentId: agentId });
       const { ids, unknown } = resolveSkillAllowlistRefs(specs, raw);
       if (unknown.length) {
-        log.warn(`agent ${agentId}: unknown skills dropped: ${unknown.join(',')}`);
+        log.warn('agent unknown skills dropped', { agent_id: maskId(agentId), count: unknown.length });
       }
       data.skill_list = ids;
     }
@@ -2363,7 +2388,7 @@ async function _applyAgentUpdates(
       ? 'in_process'
       : (_normalizeRuntime(v)?.kind === 'cli' ? 'cli' : 'in_process');
     if (incomingKind !== null && incomingKind !== existingKind) {
-      log.warn(`agent ${agentId}: ignored runtime kind switch ${existingKind} → ${incomingKind}`);
+      log.warn('agent runtime kind switch ignored', { agent_id: maskId(agentId), from: existingKind, to: incomingKind });
     } else if (v === null) {
       delete data.runtime;
     } else {
@@ -2447,7 +2472,7 @@ export async function appendAgentSkill(agentId: string, skillId: string): Promis
   data.updated_at = nowIso();
   await writeJson(f, data);
   _invalidateAgentListCache();
-  log.info(`appended skill "${skillId}" to agent ${agentId}.skill_list`);
+  log.info('agent skill appended', { agent_id: maskId(agentId), skill_id: maskId(skillId) });
   return true;
 }
 
@@ -2455,7 +2480,7 @@ export async function addCustomAgentMemory(agentId: string, content: string) {
   if (!agentId || !safeId(agentId)) return { ok: false, error: 'invalid agent_id', entries: [], usage: { current: 0, limit: 0 } };
   const target = await _resolveAgentMemoryTarget(agentId);
   if (!target) return { ok: false, error: 'agent not found or read-only', entries: [], usage: { current: 0, limit: 0 } };
-  if (_normalizeRuntime(target.data.runtime)?.kind === 'cli') return _agentMemoryNotSupportedForExternalResult();
+  if (!_agentSupportsMemory(target.agent)) return _unsupportedCliAgentMemoryResult();
   const res = addAgentEntry(getActiveUserId(), agentId, content);
   if (res.ok) _invalidateAgentListCache();
   return res;
@@ -2465,8 +2490,7 @@ export async function removeCustomAgentMemory(agentId: string, oldText: string) 
   if (!agentId || !safeId(agentId)) return { ok: false, error: 'invalid agent_id', entries: [], usage: { current: 0, limit: 0 } };
   const target = await _resolveAgentMemoryTarget(agentId);
   if (!target) return { ok: false, error: 'agent not found or read-only', entries: [], usage: { current: 0, limit: 0 } };
-  if (_normalizeRuntime(target.data.runtime)?.kind === 'cli') return _agentMemoryNotSupportedForExternalResult();
-
+  if (!_agentSupportsMemory(target.agent)) return _unsupportedCliAgentMemoryResult();
   const fileRes = removeAgentEntry(getActiveUserId(), agentId, oldText);
   if (fileRes.ok) {
     _invalidateAgentListCache();
@@ -2478,10 +2502,19 @@ export async function updateCustomAgentMemory(agentId: string, oldText: string, 
   if (!agentId || !safeId(agentId)) return { ok: false, error: 'invalid agent_id', entries: [], usage: { current: 0, limit: 0 } };
   const target = await _resolveAgentMemoryTarget(agentId);
   if (!target) return { ok: false, error: 'agent not found or read-only', entries: [], usage: { current: 0, limit: 0 } };
-  if (_normalizeRuntime(target.data.runtime)?.kind === 'cli') return _agentMemoryNotSupportedForExternalResult();
+  if (!_agentSupportsMemory(target.agent)) return _unsupportedCliAgentMemoryResult();
   const res = replaceAgentEntry(getActiveUserId(), agentId, oldText, content);
   if (res.ok) _invalidateAgentListCache();
   return res;
+}
+
+function _unsupportedCliAgentMemoryResult() {
+  return {
+    ok: false,
+    error: 'agent memory is supported only for Claude and Codex CLI agents',
+    entries: [],
+    usage: { current: 0, limit: 0 },
+  };
 }
 
 export async function recordAgentRuntimeStats(
@@ -2510,7 +2543,7 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
   // meta/, and skills/ all live inside it, so we no longer need separate
   // cascades for metacognition.purgeAgent / SkillStore.delete.
   try { await fsp.rm(dir, { recursive: true, force: true }); }
-  catch (err) { log.warn(`rm failed ${dir}: ${(err as Error).message}`); return false; }
+  catch (err) { log.warn('agent directory removal failed', { directory: logPathRef(dir), error: logErrorSummary(err) }); return false; }
   _invalidateAgentListCache({ userId });
 
   // Drop this account's per-agent memory, edit chat, session, and local
@@ -2518,7 +2551,7 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
   // same id, so cleanup must never walk the whole workspace.
   const memoryDir = path.join(userMemoryDir(userId), 'agents', agentId);
   try { await fsp.rm(memoryDir, { recursive: true, force: true }); }
-  catch (err) { log.warn(`memory rm failed user=${userId} agent=${agentId}: ${(err as Error).message}`); }
+  catch (err) { log.warn('agent memory removal failed', { user_id: maskId(userId), agent_id: maskId(agentId), error: logErrorSummary(err) }); }
 
   // Drop this account's per-agent edit chat directory + the matching
   // core-agent session jsonl. Without the session purge, recreating an
@@ -2527,7 +2560,7 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
   const chatDir = userAgentChatDir(userId, agentId);
   if (fs.existsSync(chatDir)) {
     try { await fsp.rm(chatDir, { recursive: true, force: true }); }
-    catch (err) { log.warn(`rm failed user=${userId} agent=${agentId}: ${(err as Error).message}`); }
+    catch (err) { log.warn('agent chat removal failed', { user_id: maskId(userId), agent_id: maskId(agentId), error: logErrorSummary(err) }); }
     invalidateLineCount(path.join(chatDir, 'chat.jsonl'));
   }
   const sessionId = defaultAgentEditSessionId(agentId);
@@ -2536,17 +2569,17 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
   try { await fsp.unlink(sessionJsonl); }
   catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log.warn(`session unlink user=${userId} agent=${agentId}: ${(err as Error).message}`);
+      log.warn('agent session removal failed', { user_id: maskId(userId), agent_id: maskId(agentId), error: logErrorSummary(err) });
     }
   }
   try { _deleteAgentRuntimeConfigEntry(userId, agentId); }
-  catch (err) { log.warn(`runtime config cleanup user=${userId} agent=${agentId}: ${(err as Error).message}`); }
+  catch (err) { log.warn('agent runtime config cleanup failed', { user_id: maskId(userId), agent_id: maskId(agentId), error: logErrorSummary(err) }); }
 
   // Metacognition + evolved skills are already wiped by the
   // `rm -rf agents/<aid>/` above — meta / skills sub-directories live
   // inside that tree. No separate purge is needed.
 
-  log.info(`deleted id=${agentId}`);
+  log.info('custom agent deleted', { agent_id: maskId(agentId) });
   return true;
 }
 
@@ -2667,7 +2700,7 @@ function _parseAgentBlock(inner: string): ExtractedFields {
         if (profile?.knowhow) fields.knowhow = profile.knowhow;
         if (profile?.standards) fields.standards = profile.standards;
       } catch (err) {
-        log.warn(`<profile> JSON parse failed: ${(err as Error).message}`);
+        log.warn('agent field JSON parse failed', { field: 'profile', error: logErrorSummary(err) });
       }
     }
   }
@@ -2680,7 +2713,7 @@ function _parseAgentBlock(inner: string): ExtractedFields {
         // reject overflow instead of silently storing a truncated list.
         return _profileTextList(JSON.parse(trimmed), AGENT_GUIDANCE_ITEM_LIMIT + 1);
       } catch (err) {
-        log.warn(`<${tag}> JSON parse failed: ${(err as Error).message}`);
+        log.warn('agent field JSON parse failed', { field: tag, error: logErrorSummary(err) });
         return undefined;
       }
     }
@@ -2738,7 +2771,7 @@ function _parseAgentBlock(inner: string): ExtractedFields {
         const parsed = JSON.parse(trimmed);
         fields.inputs = validateAgentInputs(parsed);
       } catch (err) {
-        log.warn(`<inputs> JSON parse failed: ${(err as Error).message}`);
+        log.warn('agent field JSON parse failed', { field: 'inputs', error: logErrorSummary(err) });
         // Leave fields.inputs unset — malformed JSON shouldn't erase the
         // previous schema; let the next turn re-emit and fix it.
       }
@@ -2790,6 +2823,23 @@ export function extractAgentFieldBlocks(
   return { cleanText: cleaned, blocks };
 }
 
+function _visibleAgentEditText(text: string): string {
+  let visible = extractAgentFieldBlocks(text || '').cleanText;
+  const open = visible.lastIndexOf('<agent');
+  if (open >= 0 && visible.indexOf('</agent>', open + '<agent'.length) < 0) {
+    visible = visible.slice(0, open);
+  }
+  const scanStart = Math.max(0, visible.length - '<agent'.length);
+  for (let i = scanStart; i < visible.length; i += 1) {
+    const tail = visible.slice(i);
+    if (tail.length >= 2 && '<agent'.startsWith(tail)) {
+      visible = visible.slice(0, i);
+      break;
+    }
+  }
+  return visible.replace(/\n{3,}/g, '\n\n').trimEnd();
+}
+
 function agentChatDir(userId: string, agentId: string): string {
   const d = userAgentChatDir(userId, agentId);
   fs.mkdirSync(d, { recursive: true });
@@ -2839,7 +2889,7 @@ export async function clearAgentChat(userId: string, agentId: string): Promise<b
   for (const p of [agentChatMsgsPath(userId, agentId), agentChatMetaPath(userId, agentId)]) {
     if (fs.existsSync(p)) {
       try { await fsp.unlink(p); }
-      catch (err) { log.warn(`rm failed ${p}: ${(err as Error).message}`); }
+      catch (err) { log.warn('agent chat file removal failed', { file: logPathRef(p), error: logErrorSummary(err) }); }
     }
   }
   invalidateLineCount(agentChatMsgsPath(userId, agentId));
@@ -2852,10 +2902,10 @@ export async function clearAgentChat(userId: string, agentId: string): Promise<b
   try { await fsp.unlink(userSessionFile(userId, sessionId)); }
   catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log.warn(`session unlink user=${userId} agent=${agentId}: ${(err as Error).message}`);
+      log.warn('agent session removal failed', { user_id: maskId(userId), agent_id: maskId(agentId), error: logErrorSummary(err) });
     }
   }
-  log.info(`cleared user=${userId} agent=${agentId}`);
+  log.info('agent chat cleared', { user_id: maskId(userId), agent_id: maskId(agentId) });
   return true;
 }
 
@@ -3105,6 +3155,7 @@ export async function* streamSendToAgentEditChat(
   const { streamChatWithModel } = await import('../model/client');
   let finalText: string | null = null;
   let errMsg: string | null = null;
+  let waitingForInput = false;
   // Running assistant delta buffer. On user abort the IPC layer's `break`
   // triggers `return()` at the current yield, which skips the post-loop
   // append — finally salvages whatever was already rendered.
@@ -3126,9 +3177,20 @@ export async function* streamSendToAgentEditChat(
       ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
     }) as AsyncIterable<any>) {
       event = normalizeEditChatRuntimeEvent(event);
+      if (isEditChatWaitingForInputEvent(event)) waitingForInput = true;
       const etype = event.type;
       if (etype === 'delta' && typeof event.text === 'string') {
-        streamingText += event.text;
+        if (event.phase === 'commentary') {
+          appendEditChatCommentaryProcessItem(
+            processItems,
+            event.text,
+            MAX_AGENT_PROCESS_ITEMS,
+          );
+        } else {
+          // Legacy unphased deltas remain final-answer compatible. Current
+          // core-agent streams always carry an explicit phase.
+          streamingText += event.text;
+        }
       }
       // Domain events from field-block extraction are synthesized *before*
       // the transformed `final` yields, so they land in the process rail
@@ -3215,7 +3277,7 @@ export async function* streamSendToAgentEditChat(
     }
 
   } catch (err) {
-    log.error('stream failed:', err);
+    log.error('agent edit stream failed', { error: logErrorSummary(err) });
     const msg = (err as Error).message || String(err);
     errMsg = `Model response failed: ${msg}`;
     yield { type: 'error', text: msg };
@@ -3229,26 +3291,34 @@ export async function* streamSendToAgentEditChat(
       aborted: opts.abortSignal?.aborted,
       errored: !!errMsg,
     });
-    const saved = processItems;
+    const saved = sanitizeEditChatCommentaryProcessItems(
+      processItems,
+      _visibleAgentEditText,
+    );
     try {
       if (finalText !== null) {
         await _appendAgentChatMessage(userId, agentId,
           { time: nowIso(), role: 'assistant', content: finalText, ...(saved ? { process: saved } : {}) });
         await saveAgentChatMeta(userId, agentId, { session_id: sessionId });
       } else if (errMsg) {
-        const partial = streamingText.trim();
-        const content = partial ? `${streamingText}\n\n${errMsg}` : errMsg;
+        const partial = _visibleAgentEditText(streamingText).trim();
+        const content = partial ? `${partial}\n\n${errMsg}` : errMsg;
         await _appendAgentChatMessage(userId, agentId,
           { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
+      } else if (waitingForInput && !opts.abortSignal?.aborted) {
+        await _appendAgentChatMessage(userId, agentId,
+          { time: nowIso(), role: 'assistant', content: '', process: saved });
+        await saveAgentChatMeta(userId, agentId, { session_id: sessionId });
       } else if (streamingText.trim() || hadProcessItems) {
-        const content = streamingText.trim()
-          ? `${streamingText}\n\n(reply interrupted)`
+        const partial = _visibleAgentEditText(streamingText).trim();
+        const content = partial
+          ? `${partial}\n\n(reply interrupted)`
           : '(reply interrupted)';
         await _appendAgentChatMessage(userId, agentId,
           { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
       }
     } catch (e) {
-      log.warn(`persist agent chat assistant failed agent=${agentId}: ${(e as Error).message}`);
+      log.warn('agent chat assistant persistence failed', { agent_id: maskId(agentId), error: logErrorSummary(e) });
     }
   }
 }

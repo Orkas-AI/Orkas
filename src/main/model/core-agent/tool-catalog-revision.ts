@@ -5,4 +5,4 @@
  * it as their current-state oracle without pulling the Electron runtime or the
  * tool catalog's logger/path dependency chain into model-eval processes.
  */
-export const TOOL_CATALOG_REVISION = '12';
+export const TOOL_CATALOG_REVISION = '26';

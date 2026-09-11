@@ -5,10 +5,10 @@
  *   - Single spawn entry point for the whole project. `bus.ts` must
  *     route here; `features/*` must not call `child_process.spawn`
  *     directly for CLI agents.
- *   - Pre-flight `detectOne` re-probes the binary even if the cached
- *     entry says available — the user might have uninstalled it
- *     mid-conversation. A miss yields `done({status: 'missing_cli'})`
- *     before any persistence happens.
+ *   - Registry-owned pre-flight probing reuses the startup/UI probe only
+ *     while the binary's on-disk identity is unchanged. The user might have
+ *     upgraded or uninstalled it mid-conversation; a miss yields
+ *     `done({status: 'missing_cli'})` before any persistence happens.
  *   - Persistence wraps every backend event so `events.jsonl` is the
  *     authoritative replay log. Output text is also appended to
  *     output.txt as it streams; the final body lands in meta.json.
@@ -18,21 +18,25 @@
  */
 
 import * as fs from 'node:fs';
-import { createHash } from 'node:crypto';
-import { promises as dns } from 'node:dns';
 import { isIP } from 'node:net';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createLogger } from '../../logger.js';
+import { AGENT_EXECUTION_MAX_MS, AGENT_EXECUTION_IDLE_MS, AgentActivityClock, type AgentTimeoutKind } from '../../util/agent-execution-budget.js';
 import { chatMediaCidUrl } from '../../util/chat-media-url.js';
 import { logErrorRef, logErrorSummary, logPathRef, maskId } from '../../util/log-redact.js';
 import { sanitizeLogTextForUpload } from '../../util/log-sanitize.js';
 import { redactPaths } from '../../util/redact.js';
 import {
-  detectOne,
+  cachedCliFallbackCandidate,
   localCliCapabilities,
+  localCliDefaultPermissionPolicy,
+  noteCliCandidateFailure,
+  noteCliCandidateSuccess,
+  resolveCliForDispatch,
   type LocalCliEntry,
+  type LocalCliPermissionPolicy,
   type LocalCliType,
 } from './registry.js';
 import { claudeBackend } from './backends/claude.js';
@@ -46,13 +50,38 @@ import {
   type LocalEvent,
 } from './backends/base.js';
 import * as persist from './persist.js';
+import * as cliPermissions from './cli_permissions.js';
+import * as cliUserInput from './cli_user_input.js';
 import { sessionToolResultsDir } from '../../paths.js';
 import { maybeSpillToolResult, toolResultRefForPath } from '../../util/tool-result-cap.js';
 import { isPathAllowed } from '../../util/path-sandbox.js';
-import { composeAbortSignal } from '../../util/abort.js';
-import { downloadBinaryWithProxyPolicy } from '../../util/proxy-dispatcher.js';
 import { conversationMessageReadFile } from '../../util/project-layout.js';
 import { isCliResumeRejectedMessage } from './context.js';
+import {
+  LOCAL_AGENT_REMOTE_IMAGE_TIMEOUT_MS,
+  LOCAL_AGENT_REMOTE_VIDEO_TIMEOUT_MS,
+  LOCAL_AGENT_REMOTE_BATCH_TIMEOUT_MS,
+  LOCAL_AGENT_MEDIA_VIDEO_MAX_BYTES,
+  LOCAL_AGENT_REMOTE_TOTAL_MAX_BYTES,
+  LOCAL_AGENT_REMOTE_MAX_ITEMS,
+  LOCAL_AGENT_REMOTE_GLOBAL_MAX_ITEMS,
+  LOCAL_AGENT_REMOTE_GLOBAL_MAX_BYTES,
+  normalizedMediaMime,
+  mediaKindHint,
+  mediaExtensionHint,
+  stableRemoteMediaName,
+  inspectLocalAgentMedia,
+  decodeLocalAgentMediaData,
+  isPublicRemoteMediaIp,
+  downloadLocalAgentMedia,
+  decodeCodexGeneratedImageResult,
+  type LocalAgentMediaDecodeResult,
+  type SupportedMediaExtension,
+} from './media.js';
+export {
+  decodeCodexGeneratedImageResult,
+  type CodexGeneratedImageDecodeResult,
+} from './media.js';
 import type { BridgeCapability, BridgeHandle, CommanderHandoffRequest } from './bridge.js';
 import { registerUserSwitchHook } from '../user-switch-hooks.js';
 import {
@@ -100,463 +129,10 @@ function bridgeConnectorIdFromToolEvent(event: LocalEvent): string {
  *  (builds, model downloads, renders). The old 20-min value doubled as
  *  the hang detector and killed an actively-working 20-min claude turn
  *  (run 1dffe7c48d18). Override via ORKAS_LOCAL_AGENT_TIMEOUT_MS. */
-const DEFAULT_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const DEFAULT_TIMEOUT_MS = AGENT_EXECUTION_MAX_MS;
 
-/** Backends with no mid-run event stream can't be idle-killed (silence
- *  is normal for them), so they keep a long-but-bounded wall-clock cap
- *  as their only hang bound. */
-const BACKEND_TIMEOUT_MS: Partial<Record<LocalCliType, number>> = {
-  openclaw: 60 * 60 * 1000,
-};
-
-const PNG_SIGNATURE = Buffer.from('89504e470d0a1a0a', 'hex');
-const JPEG_SIGNATURE = Buffer.from('ffd8', 'hex');
-const WEBM_SIGNATURE = Buffer.from([0x1a, 0x45, 0xdf, 0xa3]);
-const MAX_GENERATED_IMAGE_DIMENSION = 16_384;
-const MAX_GENERATED_IMAGE_AREA = 100_000_000;
-const LOCAL_AGENT_REMOTE_IMAGE_TIMEOUT_MS = 15_000;
-const LOCAL_AGENT_REMOTE_VIDEO_TIMEOUT_MS = 45_000;
-const LOCAL_AGENT_REMOTE_BATCH_TIMEOUT_MS = 60_000;
-const LOCAL_AGENT_MEDIA_VIDEO_MAX_BYTES = 64 * 1024 * 1024;
-const LOCAL_AGENT_REMOTE_TOTAL_MAX_BYTES = 128 * 1024 * 1024;
-const LOCAL_AGENT_REMOTE_MAX_ITEMS = 4;
-const LOCAL_AGENT_REMOTE_GLOBAL_MAX_ITEMS = 8;
-const LOCAL_AGENT_REMOTE_GLOBAL_MAX_BYTES = 128 * 1024 * 1024;
-
-export type CodexGeneratedImageDecodeResult =
-  | { ok: true; buffer: Buffer; width: number; height: number; extension: '.png' }
-  | { ok: false; reason: 'not_image' | 'too_large' | 'malformed' | 'unsupported_format' | 'invalid_dimensions' };
-
-/** Decode the real Codex app-server `imageGeneration.result` shape: a bare
- * Base64 PNG string (the desktop UI receives image bytes, not a filesystem
- * path). Keep this synchronous so the normalized file event is ordered before
- * the backend's terminal marker. */
-export function decodeCodexGeneratedImageResult(
-  raw: unknown,
-  maxBytes = MAX_IMAGE_ATTACHMENT_BYTES,
-): CodexGeneratedImageDecodeResult {
-  if (typeof raw !== 'string') return { ok: false, reason: 'not_image' };
-  const source = raw.trim();
-  if (!source) return { ok: false, reason: 'not_image' };
-
-  let encoded = source;
-  const dataUrl = /^data:image\/([^;,]+);base64,([\s\S]*)$/i.exec(source);
-  if (dataUrl) {
-    if (dataUrl[1].toLowerCase() !== 'png') return { ok: false, reason: 'unsupported_format' };
-    encoded = dataUrl[2];
-  }
-  const compact = encoded.replace(/\s+/g, '');
-  // A bare PNG always starts with this Base64 representation of its magic.
-  // The early gate keeps ordinary status prose such as "completed" out of
-  // the decoder without treating it as a malformed image.
-  if (!dataUrl && !compact.startsWith('iVBORw0KGgo')) return { ok: false, reason: 'not_image' };
-  if (!compact || !/^[A-Za-z0-9+/]+={0,2}$/.test(compact) || compact.length % 4 === 1) {
-    return { ok: false, reason: 'malformed' };
-  }
-  const encodedLimit = Math.ceil(Math.max(1, maxBytes) / 3) * 4 + 4;
-  if (compact.length > encodedLimit) return { ok: false, reason: 'too_large' };
-
-  const buffer = Buffer.from(compact, 'base64');
-  const canonical = buffer.toString('base64').replace(/=+$/, '');
-  if (canonical !== compact.replace(/=+$/, '')) return { ok: false, reason: 'malformed' };
-  if (buffer.length > maxBytes) return { ok: false, reason: 'too_large' };
-  if (
-    buffer.length < 33
-    || !buffer.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)
-    || buffer.readUInt32BE(8) !== 13
-    || buffer.subarray(12, 16).toString('ascii') !== 'IHDR'
-  ) {
-    return { ok: false, reason: 'unsupported_format' };
-  }
-  const width = buffer.readUInt32BE(16);
-  const height = buffer.readUInt32BE(20);
-  if (
-    !width || !height
-    || width > MAX_GENERATED_IMAGE_DIMENSION
-    || height > MAX_GENERATED_IMAGE_DIMENSION
-    || width * height > MAX_GENERATED_IMAGE_AREA
-  ) {
-    return { ok: false, reason: 'invalid_dimensions' };
-  }
-  return { ok: true, buffer, width, height, extension: '.png' };
-}
-
-type LocalAgentImageDecodeResult =
-  | { ok: true; buffer: Buffer; width: number; height: number; mimeType: string; extension: '.png' | '.jpg' | '.webp' | '.gif' }
-  | { ok: false; reason: 'not_image' | 'too_large' | 'malformed' | 'unsupported_format' | 'invalid_dimensions' };
-
-function normalizedImageMime(raw: unknown): string {
-  const mime = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
-  return mime === 'image/jpg' ? 'image/jpeg' : mime;
-}
-
-function jpegDimensions(buffer: Buffer): { width: number; height: number } | null {
-  if (buffer.length < 4 || !buffer.subarray(0, 2).equals(JPEG_SIGNATURE)) return null;
-  const sof = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
-  let offset = 2;
-  while (offset + 4 <= buffer.length) {
-    if (buffer[offset] !== 0xff) { offset += 1; continue; }
-    while (offset < buffer.length && buffer[offset] === 0xff) offset += 1;
-    const marker = buffer[offset++];
-    if (marker === 0xd8 || marker === 0xd9 || (marker >= 0xd0 && marker <= 0xd7)) continue;
-    if (offset + 2 > buffer.length) return null;
-    const length = buffer.readUInt16BE(offset);
-    if (length < 2 || offset + length > buffer.length) return null;
-    if (sof.has(marker) && length >= 7) {
-      return { height: buffer.readUInt16BE(offset + 3), width: buffer.readUInt16BE(offset + 5) };
-    }
-    offset += length;
-  }
-  return null;
-}
-
-function webpDimensions(buffer: Buffer): { width: number; height: number } | null {
-  if (buffer.length < 30 || buffer.subarray(0, 4).toString('ascii') !== 'RIFF'
-      || buffer.subarray(8, 12).toString('ascii') !== 'WEBP') return null;
-  const kind = buffer.subarray(12, 16).toString('ascii');
-  if (kind === 'VP8X') {
-    return {
-      width: 1 + buffer.readUIntLE(24, 3),
-      height: 1 + buffer.readUIntLE(27, 3),
-    };
-  }
-  if (kind === 'VP8 ' && buffer.subarray(23, 26).equals(Buffer.from([0x9d, 0x01, 0x2a]))) {
-    return { width: buffer.readUInt16LE(26) & 0x3fff, height: buffer.readUInt16LE(28) & 0x3fff };
-  }
-  if (kind === 'VP8L' && buffer[20] === 0x2f && buffer.length >= 25) {
-    const bits = buffer.readUInt32LE(21);
-    return { width: (bits & 0x3fff) + 1, height: ((bits >>> 14) & 0x3fff) + 1 };
-  }
-  return null;
-}
-
-function inspectRasterImage(buffer: Buffer, declaredMime?: unknown): LocalAgentImageDecodeResult {
-  let mimeType = '';
-  let extension: '.png' | '.jpg' | '.webp' | '.gif' = '.png';
-  let dimensions: { width: number; height: number } | null = null;
-  if (
-    buffer.length >= 33
-    && buffer.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)
-    && buffer.readUInt32BE(8) === 13
-    && buffer.subarray(12, 16).toString('ascii') === 'IHDR'
-  ) {
-    mimeType = 'image/png';
-    extension = '.png';
-    dimensions = { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
-  } else if (buffer.subarray(0, 2).equals(JPEG_SIGNATURE)) {
-    mimeType = 'image/jpeg';
-    extension = '.jpg';
-    dimensions = jpegDimensions(buffer);
-  } else if (buffer.length >= 10 && /^GIF8[79]a$/.test(buffer.subarray(0, 6).toString('ascii'))) {
-    mimeType = 'image/gif';
-    extension = '.gif';
-    dimensions = { width: buffer.readUInt16LE(6), height: buffer.readUInt16LE(8) };
-  } else if (buffer.length >= 16 && buffer.subarray(0, 4).toString('ascii') === 'RIFF'
-      && buffer.subarray(8, 12).toString('ascii') === 'WEBP') {
-    mimeType = 'image/webp';
-    extension = '.webp';
-    dimensions = webpDimensions(buffer);
-  } else {
-    return { ok: false, reason: 'unsupported_format' };
-  }
-  const expectedMime = normalizedImageMime(declaredMime);
-  if (expectedMime && expectedMime !== mimeType) return { ok: false, reason: 'unsupported_format' };
-  if (!dimensions) return { ok: false, reason: 'malformed' };
-  const { width, height } = dimensions;
-  if (!width || !height || width > MAX_GENERATED_IMAGE_DIMENSION || height > MAX_GENERATED_IMAGE_DIMENSION
-      || width * height > MAX_GENERATED_IMAGE_AREA) {
-    return { ok: false, reason: 'invalid_dimensions' };
-  }
-  return { ok: true, buffer, width, height, mimeType, extension };
-}
-
-function decodeLocalAgentImageData(
-  raw: unknown,
-  declaredMime?: unknown,
-  maxBytes = MAX_IMAGE_ATTACHMENT_BYTES,
-): LocalAgentImageDecodeResult {
-  if (typeof raw !== 'string' || !raw.trim()) return { ok: false, reason: 'not_image' };
-  const source = raw.trim();
-  let encoded = source;
-  let mime = normalizedImageMime(declaredMime);
-  const dataUrl = /^data:([^;,]+);base64,([\s\S]*)$/i.exec(source);
-  if (dataUrl) {
-    const dataMime = normalizedImageMime(dataUrl[1]);
-    if (mime && dataMime !== mime) return { ok: false, reason: 'unsupported_format' };
-    mime = dataMime;
-    encoded = dataUrl[2];
-  }
-  const compact = encoded.replace(/\s+/g, '');
-  if (!compact || !/^[A-Za-z0-9+/]+={0,2}$/.test(compact) || compact.length % 4 === 1) {
-    return { ok: false, reason: 'malformed' };
-  }
-  if (compact.length > Math.ceil(Math.max(1, maxBytes) / 3) * 4 + 4) return { ok: false, reason: 'too_large' };
-  const buffer = Buffer.from(compact, 'base64');
-  if (buffer.toString('base64').replace(/=+$/, '') !== compact.replace(/=+$/, '')) {
-    return { ok: false, reason: 'malformed' };
-  }
-  if (buffer.length > maxBytes) return { ok: false, reason: 'too_large' };
-  return inspectRasterImage(buffer, mime);
-}
-
-type LocalAgentMediaDecodeResult =
-  | ({ ok: true; kind: 'image' } & Omit<Extract<LocalAgentImageDecodeResult, { ok: true }>, 'ok'>)
-  | {
-      ok: true;
-      kind: 'video';
-      buffer: Buffer;
-      mimeType: 'video/mp4' | 'video/quicktime' | 'video/x-m4v' | 'video/webm' | 'video/ogg';
-      extension: '.mp4' | '.mov' | '.m4v' | '.webm' | '.ogv';
-    }
-  | { ok: false; reason: 'not_media' | 'too_large' | 'malformed' | 'unsupported_format' | 'invalid_dimensions' };
-
-function normalizedMediaMime(raw: unknown): string {
-  const mime = typeof raw === 'string' ? raw.split(';', 1)[0].trim().toLowerCase() : '';
-  if (mime === 'image/jpg') return 'image/jpeg';
-  if (mime === 'video/mov') return 'video/quicktime';
-  if (mime === 'video/m4v') return 'video/x-m4v';
-  return mime;
-}
-
-function mediaKindHint(mime: unknown, name = ''): 'image' | 'video' | null {
-  const normalized = normalizedMediaMime(mime);
-  if (normalized.startsWith('image/')) return 'image';
-  if (normalized.startsWith('video/')) return 'video';
-  const ext = path.extname(String(name || '').split(/[?#]/, 1)[0]).toLowerCase();
-  if (['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext)) return 'image';
-  if (['.mp4', '.webm', '.mov', '.m4v', '.ogv'].includes(ext)) return 'video';
-  return null;
-}
-
-type SupportedMediaExtension =
-  '.png' | '.jpg' | '.webp' | '.gif' | '.mp4' | '.mov' | '.m4v' | '.webm' | '.ogv';
-
-function mediaExtensionHint(mime: unknown, name = ''): SupportedMediaExtension | null {
-  const normalized = normalizedMediaMime(mime);
-  const byMime: Partial<Record<string, SupportedMediaExtension>> = {
-    'image/png': '.png',
-    'image/jpeg': '.jpg',
-    'image/webp': '.webp',
-    'image/gif': '.gif',
-    'video/mp4': '.mp4',
-    'video/quicktime': '.mov',
-    'video/x-m4v': '.m4v',
-    'video/webm': '.webm',
-    'video/ogg': '.ogv',
-  };
-  if (byMime[normalized]) return byMime[normalized];
-  const ext = path.extname(String(name || '').split(/[?#]/, 1)[0]).toLowerCase();
-  if (ext === '.jpeg') return '.jpg';
-  if (['.png', '.jpg', '.webp', '.gif', '.mp4', '.mov', '.m4v', '.webm', '.ogv'].includes(ext)) {
-    return ext as SupportedMediaExtension;
-  }
-  return null;
-}
-
-function stableRemoteMediaName(uri: string, extension: SupportedMediaExtension): string {
-  const digest = createHash('sha256').update(uri).digest('hex').slice(0, 24);
-  return `cli-remote-${digest}${extension}`;
-}
-
-function hasIsoBmffFtyp(buffer: Buffer): boolean {
-  const scanLimit = Math.min(buffer.length, 4096);
-  let offset = 0;
-  while (offset + 8 <= scanLimit) {
-    let boxSize = buffer.readUInt32BE(offset);
-    const boxType = buffer.toString('ascii', offset + 4, offset + 8);
-    let headerSize = 8;
-    if (boxSize === 1) {
-      if (offset + 16 > scanLimit) break;
-      const extendedSize = buffer.readBigUInt64BE(offset + 8);
-      if (extendedSize > BigInt(Number.MAX_SAFE_INTEGER)) break;
-      boxSize = Number(extendedSize);
-      headerSize = 16;
-    }
-    if (boxType === 'ftyp') return boxSize >= headerSize + 8 && offset + boxSize <= buffer.length;
-    if (boxSize === 0 || boxSize < headerSize || offset + boxSize > scanLimit) break;
-    offset += boxSize;
-  }
-  return false;
-}
-
-function inspectLocalAgentMedia(
-  buffer: Buffer,
-  declaredMime?: unknown,
-  name = '',
-): LocalAgentMediaDecodeResult {
-  const declared = normalizedMediaMime(declaredMime);
-  if (declared && !declared.startsWith('image/') && !declared.startsWith('video/')) {
-    return { ok: false, reason: 'unsupported_format' };
-  }
-  if (!declared || declared.startsWith('image/')) {
-    const image = inspectRasterImage(buffer, declared);
-    if (image.ok) return { ...image, kind: 'image' };
-    if (declared.startsWith('image/') && 'reason' in image) {
-      return { ok: false, reason: image.reason === 'not_image' ? 'not_media' : image.reason };
-    }
-  }
-
-  if (buffer.length >= 4 && buffer.subarray(0, 4).equals(WEBM_SIGNATURE)) {
-    if (declared && declared !== 'video/webm') return { ok: false, reason: 'unsupported_format' };
-    return { ok: true, kind: 'video', buffer, mimeType: 'video/webm', extension: '.webm' };
-  }
-  if (buffer.length >= 4 && buffer.subarray(0, 4).toString('ascii') === 'OggS') {
-    if (declared && declared !== 'video/ogg') return { ok: false, reason: 'unsupported_format' };
-    if (!declared && path.extname(name.split(/[?#]/, 1)[0]).toLowerCase() !== '.ogv') {
-      return { ok: false, reason: 'unsupported_format' };
-    }
-    return { ok: true, kind: 'video', buffer, mimeType: 'video/ogg', extension: '.ogv' };
-  }
-  if (hasIsoBmffFtyp(buffer)) {
-    const declaredVideo = declared || '';
-    if (declaredVideo && !['video/mp4', 'video/quicktime', 'video/x-m4v'].includes(declaredVideo)) {
-      return { ok: false, reason: 'unsupported_format' };
-    }
-    const sourceExt = path.extname(name.split(/[?#]/, 1)[0]).toLowerCase();
-    if (declaredVideo === 'video/quicktime' || sourceExt === '.mov') {
-      return { ok: true, kind: 'video', buffer, mimeType: 'video/quicktime', extension: '.mov' };
-    }
-    if (declaredVideo === 'video/x-m4v' || sourceExt === '.m4v') {
-      return { ok: true, kind: 'video', buffer, mimeType: 'video/x-m4v', extension: '.m4v' };
-    }
-    return { ok: true, kind: 'video', buffer, mimeType: 'video/mp4', extension: '.mp4' };
-  }
-  return { ok: false, reason: 'unsupported_format' };
-}
-
-function decodeLocalAgentMediaData(raw: unknown, declaredMime?: unknown): LocalAgentMediaDecodeResult {
-  if (typeof raw !== 'string' || !raw.trim()) return { ok: false, reason: 'not_media' };
-  const source = raw.trim();
-  let encoded = source;
-  let mime = normalizedMediaMime(declaredMime);
-  const dataUrl = /^data:([^;,]+);base64,([\s\S]*)$/i.exec(source);
-  if (dataUrl) {
-    const dataMime = normalizedMediaMime(dataUrl[1]);
-    if (mime && dataMime !== mime) return { ok: false, reason: 'unsupported_format' };
-    mime = dataMime;
-    encoded = dataUrl[2];
-  }
-  const compact = encoded.replace(/\s+/g, '');
-  if (!compact || !/^[A-Za-z0-9+/]+={0,2}$/.test(compact) || compact.length % 4 === 1) {
-    return { ok: false, reason: 'malformed' };
-  }
-  const cap = mediaKindHint(mime) === 'image' ? MAX_IMAGE_ATTACHMENT_BYTES : LOCAL_AGENT_MEDIA_VIDEO_MAX_BYTES;
-  if (compact.length > Math.ceil(Math.max(1, cap) / 3) * 4 + 4) return { ok: false, reason: 'too_large' };
-  const buffer = Buffer.from(compact, 'base64');
-  if (buffer.toString('base64').replace(/=+$/, '') !== compact.replace(/=+$/, '')) {
-    return { ok: false, reason: 'malformed' };
-  }
-  if (buffer.length > cap) return { ok: false, reason: 'too_large' };
-  return inspectLocalAgentMedia(buffer, mime);
-}
-
-function isPublicRemoteMediaIpv4(address: string): boolean {
-  const parts = address.split('.').map(Number);
-  if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return false;
-  const [a, b, c] = parts;
-  return !(
-    a === 0 || a === 10 || a === 127 || a >= 224
-    || (a === 100 && b >= 64 && b <= 127)
-    || (a === 169 && b === 254)
-    || (a === 172 && b >= 16 && b <= 31)
-    || (a === 192 && b === 168)
-    || (a === 192 && b === 0 && (c === 0 || c === 2))
-    || (a === 198 && (b === 18 || b === 19))
-    || (a === 198 && b === 51 && c === 100)
-    || (a === 203 && b === 0 && c === 113)
-  );
-}
-
-function isPublicRemoteMediaIp(address: string): boolean {
-  const normalized = address.trim().toLowerCase().replace(/^\[|\]$/g, '').replace(/%[^%]+$/, '');
-  if (isIP(normalized) === 4) return isPublicRemoteMediaIpv4(normalized);
-  if (isIP(normalized) !== 6) return false;
-  return !(
-    normalized === '::' || normalized === '::1'
-    || normalized.startsWith('::ffff:')
-    || /^(?:fc|fd)/.test(normalized)
-    || /^fe[89ab]/.test(normalized)
-    || /^ff/.test(normalized)
-    || /^2001:db8(?:[:]|$)/.test(normalized)
-  );
-}
-
-async function validateRemoteMediaUrl(raw: string): Promise<URL> {
-  let url: URL;
-  try { url = new URL(raw); }
-  catch { throw new Error('malformed remote media URL'); }
-  // The remote URL remains available to the renderer as the compatibility
-  // fallback, but main-process background materialization is HTTPS-only.
-  if (url.protocol !== 'https:') throw new Error('background media download requires HTTPS');
-  if (url.username || url.password) throw new Error('remote media URL must not use URL credentials');
-  const hostname = url.hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
-  if (!hostname || hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local')) {
-    throw new Error('remote media URL resolves to a local host');
-  }
-  if (isIP(hostname)) {
-    if (!isPublicRemoteMediaIp(hostname)) throw new Error('remote media URL resolves to a non-public address');
-    return url;
-  }
-  const addresses = await dns.lookup(hostname, { all: true, verbatim: true });
-  if (!addresses.length || addresses.some(entry => !isPublicRemoteMediaIp(entry.address))) {
-    throw new Error('remote media URL resolves to a non-public address');
-  }
-  return url;
-}
-
-async function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) throw new Error('operation aborted');
-  return await new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(new Error('operation aborted'));
-    signal.addEventListener('abort', onAbort, { once: true });
-    void promise.then(
-      value => {
-        signal.removeEventListener('abort', onAbort);
-        resolve(value);
-      },
-      error => {
-        signal.removeEventListener('abort', onAbort);
-        reject(error);
-      },
-    );
-  });
-}
-
-async function downloadLocalAgentMedia(
-  uri: string,
-  declaredMime: unknown,
-  name: string,
-  signal: AbortSignal,
-  kind: 'image' | 'video',
-  timeoutMs: number,
-): Promise<LocalAgentMediaDecodeResult> {
-  const maxBytes = kind === 'image' ? MAX_IMAGE_ATTACHMENT_BYTES : LOCAL_AGENT_MEDIA_VIDEO_MAX_BYTES;
-  const composed = composeAbortSignal(signal, timeoutMs, 'remote media download timed out');
-  try {
-    const url = await awaitWithAbort(validateRemoteMediaUrl(uri), composed.signal);
-    const result = await downloadBinaryWithProxyPolicy(url.toString(), {
-      label: 'local agent remote media download',
-      signal: composed.signal,
-      maxBytes,
-      redirect: 'error',
-      retries: 0,
-      headers: { Accept: kind === 'video' ? 'video/*' : 'image/*' },
-      validate: body => {
-        const inspected = inspectLocalAgentMedia(body, declaredMime, name || url.pathname);
-        if ('reason' in inspected) throw new Error(`remote media rejected: ${inspected.reason}`);
-      },
-    });
-    return inspectLocalAgentMedia(result.body, declaredMime, name || url.pathname);
-  } catch (error) {
-    if (signal.aborted || composed.signal.aborted) return { ok: false, reason: 'malformed' };
-    throw error;
-  } finally {
-    composed.cleanup();
-  }
-}
-
-function resolveTimeoutMs(cli: LocalCliType): number {
-  const fallback = BACKEND_TIMEOUT_MS[cli] ?? DEFAULT_TIMEOUT_MS;
+function resolveTimeoutMs(): number {
+  const fallback = DEFAULT_TIMEOUT_MS;
   const raw = process.env.ORKAS_LOCAL_AGENT_TIMEOUT_MS;
   if (!raw) return fallback;
   const n = Number(raw);
@@ -569,17 +145,9 @@ function resolveTimeoutMs(cli: LocalCliType): number {
  *  are real — a single Bash tool call sat silent ~10 min downloading a
  *  whisper model — so the default stays comfortably above them.
  *  Override via ORKAS_LOCAL_AGENT_IDLE_KILL_MS; 0 disables. */
-const DEFAULT_IDLE_KILL_MS = 30 * 60 * 1000;
+const DEFAULT_IDLE_KILL_MS = AGENT_EXECUTION_IDLE_MS;
 
-/** Idle-kill is meaningless for backends that emit nothing mid-run
- *  (their silence carries no hang signal) — disable it there and rely
- *  on the per-backend wall cap instead. */
-const BACKEND_IDLE_KILL_DISABLED: Partial<Record<LocalCliType, boolean>> = {
-  openclaw: true,
-};
-
-function resolveIdleKillMs(cli: LocalCliType): number | undefined {
-  if (BACKEND_IDLE_KILL_DISABLED[cli]) return undefined;
+function resolveIdleKillMs(): number | undefined {
   const raw = process.env.ORKAS_LOCAL_AGENT_IDLE_KILL_MS;
   if (raw !== undefined) {
     const n = Number(raw);
@@ -633,14 +201,6 @@ function resolveIdleTickMs(idleMs: number): number {
   return Math.min(DEFAULT_IDLE_TICK_MS, Math.max(50, Math.floor(idleMs / 3)));
 }
 
-/** Default idle threshold per backend. Override only when the backend
- *  semantics deviate from "streams events through the turn"; openclaw
- *  emits no mid-run stream, so use the normal 90s/30s heartbeat cadence
- *  instead of the older 30s/10s cadence that was too noisy for long runs. */
-const BACKEND_IDLE_MS: Partial<Record<LocalCliType, number>> = {
-  openclaw: DEFAULT_IDLE_MS,
-};
-
 const BACKENDS: Partial<Record<LocalCliType, LocalBackend>> = {
   claude: claudeBackend,
   codex: codexBackend,
@@ -676,6 +236,13 @@ function sanitizePublicDiagnostic(value: unknown): string {
   return sanitized.length > MAX_PUBLIC_DIAGNOSTIC_CHARS
     ? `${sanitized.slice(0, MAX_PUBLIC_DIAGNOSTIC_CHARS)}…`
     : sanitized;
+}
+
+/** Safe user-visible form of an authoritative CLI terminal error. The caller
+ * may display this text verbatim; only secrets/paths and the size bound are
+ * changed, never its meaning. */
+export function sanitizePublicCliError(value: unknown): string {
+  return sanitizePublicDiagnostic(value).trim();
 }
 
 /** Reasoning summaries are model-authored progress descriptions, distinct from
@@ -963,11 +530,35 @@ export function redactPrivateLocalAgentEvent(event: LocalEvent, workingDir?: str
         : {}),
     };
   }
+  if (event.type === 'permission-request') {
+    // Native approval prompts carry the full tool input (file bodies, shell
+    // commands). Persisted history and the renderer need only the same
+    // display-safe view the tool-event path exposes.
+    const { input: _privateInput, ...rest } = event as LocalEvent & { input?: unknown };
+    const input = sanitizePublicToolInput(_privateInput, workingDir);
+    return { ...rest, ...(input !== undefined ? { input } : {}) } as LocalEvent;
+  }
   if (event.type === 'stderr-line' || event.type === 'raw-line') {
     return { ...event, line: sanitizePublicDiagnostic(event.line) };
   }
   if (event.type === 'log') {
     return { ...event, message: sanitizePublicDiagnostic(event.message) };
+  }
+  if (event.type === 'status') {
+    // Background-task descriptions and progress summaries are CLI-authored
+    // free text that may quote commands and absolute paths. They cross the
+    // same boundary as every other public diagnostic.
+    return typeof event.message === 'string'
+      ? { ...event, message: sanitizePublicDiagnostic(event.message) }
+      : event;
+  }
+  if (event.type === 'idle') {
+    if (!Array.isArray(event.waitingOn)) return event;
+    const waitingOn = event.waitingOn.map((task) => {
+      const entry = task && typeof task === 'object' ? task as Record<string, unknown> : {};
+      return { ...entry, label: sanitizePublicDiagnostic(entry.label) };
+    });
+    return { ...event, waitingOn };
   }
   if (event.type === 'done') {
     return {
@@ -1005,6 +596,11 @@ export function buildBridgeSystemPrompt(capabilities: readonly BridgeCapability[
       + `${granted.has('skills.run') ? ' and can run their packaged scripts (orkas_run_skill)' : ''}.`,
     );
   }
+  if (granted.has('memory.agent')) {
+    sentences.push(
+      'It can read and update only this Agent\'s durable Orkas memory with cross_session_memory; the Agent identity is fixed by the host.',
+    );
+  }
   if (granted.has('connectors')) {
     sentences.push(
       'It reaches the same connected services available to an ordinary Orkas group-chat Agent '
@@ -1024,9 +620,9 @@ export function buildBridgeSystemPrompt(capabilities: readonly BridgeCapability[
   }
   if (granted.has('commander.handoff')) {
     sentences.push(
-      'For Commander-only work—Orkas automation CRUD, Orkas Agent or Skill mutation, cross-Agent orchestration, or a user decision outside this CLI capability— '
+      'For Commander-only work—Orkas Agent or Skill mutation, cross-Agent orchestration, or a user decision outside this CLI capability— '
       + 'call orkas_handoff_to_commander with the concrete reason and continuation context, then end the turn. '
-      + 'Do not emit Commander-only <auto-task>, <agent>, or <skill> mutation containers from a CLI reply.',
+      + 'Do not emit Commander-only <agent> or <skill> mutation containers from a CLI reply.',
     );
   }
   sentences.push('Use only the registered bridge tools and prefer them when the task involves a granted Orkas capability or referenced context.');
@@ -1468,6 +1064,8 @@ export interface RunCliAgentOpts {
   agentId: string;
   /** Display name for permission dialogs; falls back to agentId. */
   agentName?: string;
+  /** User-visible task title shown in external CLI permission dialogs. */
+  conversationTitle?: string;
   /** Inbound conversation message that triggered this run. */
   currentMessageId: string;
   /** Conversation project scope, when the CLI turn belongs to a project. */
@@ -1476,6 +1074,8 @@ export interface RunCliAgentOpts {
   customArgs?: string[];
   modelOverride?: string;
   thinkingLevel?: string;
+  /** Per-Agent policy. Missing means follow the CLI's native default. */
+  permissionPolicy?: LocalCliPermissionPolicy;
   /** If set, the dispatch resumes a CLI-side session (claude
    *  `--resume <id>`) and the caller has already trimmed the prompt
    *  to "just the new turn" content — the CLI provides the prior
@@ -1488,6 +1088,7 @@ export interface RunCliAgentOpts {
   reuseSessionInstructions?: boolean;
   cwd: string;
   signal: AbortSignal;
+  deadlineAt?: number;
   /** Forwarded each backend event verbatim, after persistence. */
   onEvent: (e: LocalEvent) => void;
   /** Active native-turn ingress lifecycle. The runner forwards backend
@@ -1505,6 +1106,7 @@ export interface RunCliAgentResult {
   cliVersion?: string;
   commanderHandoff?: CommanderHandoffRequest;
   timeoutPhase?: 'foreground' | 'background';
+  timeoutKind?: AgentTimeoutKind;
 }
 
 /** Active background phases held so app shutdown cannot orphan their detached
@@ -1625,7 +1227,13 @@ export async function stopBackgroundRuns(reason: string, deadlineMs = 5_000): Pr
 
 
 export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
+  const executionStartedAt = Date.now();
   const backend = BACKENDS[opts.cli];
+  const defaultPermissionPolicy = localCliDefaultPermissionPolicy(opts.cli);
+  const requestedPermissionPolicy = opts.permissionPolicy || defaultPermissionPolicy;
+  const permissionPolicy = localCliCapabilities(opts.cli).permissionPolicies.includes(
+    requestedPermissionPolicy,
+  ) ? requestedPermissionPolicy : defaultPermissionPolicy;
   let runLogContext = localAgentRunContextForLog({
     uid: opts.uid,
     cid: opts.cid,
@@ -1648,16 +1256,18 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     return { runId: '', status: 'failed', error: err };
   }
 
-  // Pre-flight probe (cache-busting). A user might have uninstalled
-  // the CLI between create-time detection and now.
-  const entry = await detectOne(opts.cli);
+  // Pre-flight probe. A user might have uninstalled the CLI between
+  // create-time detection and now; probe reuse is gated on the binary's
+  // on-disk identity, so a removed or changed binary still re-probes.
+  let entry = await resolveCliForDispatch(opts.cli);
   if (!entry.available || !entry.path) {
     return _missing(opts, entry);
   }
 
-  const timeoutMs = resolveTimeoutMs(opts.cli);
-  const idleKillMs = resolveIdleKillMs(opts.cli);
-  const idleThresholdMs = resolveIdleMs(BACKEND_IDLE_MS[opts.cli]);
+  const timeoutMs = resolveTimeoutMs();
+  const deadlineAt = Math.min(opts.deadlineAt ?? Infinity, executionStartedAt + timeoutMs);
+  const idleKillMs = resolveIdleKillMs();
+  const idleThresholdMs = resolveIdleMs(undefined);
 
   const handle = await persist.start(opts.uid, {
     agentId: opts.agentId,
@@ -1665,6 +1275,13 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     cli: opts.cli,
     cliPath: entry.path,
     prompt: opts.prompt,
+  });
+  cliPermissions.registerRun({
+    uid: opts.uid,
+    runId: handle.runId,
+    agentId: opts.agentId,
+    cli: opts.cli,
+    permissionPolicy,
   });
   const startedAtMs = Date.now();
   const runDiagnostics = createLocalAgentRunLogDiagnostics(startedAtMs);
@@ -1701,8 +1318,11 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     error?: string;
     sessionId?: string;
     timeoutPhase?: 'foreground' | 'background';
+    timeoutKind?: AgentTimeoutKind;
     // Read to tell a turn the model never ran from one it chose to end quietly.
     usage?: unknown;
+    failureKind?: string;
+    retrySafe?: boolean;
   } | null = null;
   // CLI dispatch session id. The per-session spill dir is anchored on this
   // so sweep / read paths can find the file again.
@@ -1714,8 +1334,8 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   let remoteMediaScheduledCount = 0;
   let remoteMediaReservedBytes = 0;
   let remoteMediaDeadlineAt = 0;
-  let lastBackendEventAt = Date.now();
-  let lastVisibleActivityAt = lastBackendEventAt;
+  const activityClock = new AgentActivityClock();
+  let lastVisibleActivityAt = Date.now();
   const bridgeSkillRefByCallId = new Map<string, string>();
   let bridge: BridgeHandle | null = null;
   let inspectResumeAttempt = !!(opts.resumeSessionId && opts.resumeFallbackPrompt);
@@ -1724,9 +1344,15 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   // The recovery digest emits this while clearing the interrupted session's
   // live work; it is what separates a consumed turn from a quiet one.
   let sawBackgroundStopped = false;
+  // Background tasks the CLI has open right now, keyed by task id. A task that
+  // never finishes (a dev server, a watcher) keeps the CLI alive without a
+  // result frame, so the run has no terminal boundary and the UI spins with no
+  // stated reason. Naming the task turns that into a legible wait.
+  const liveBackgroundTasks = new Map<string, string>();
   // A resumed turn's terminal is held until we know whether the resume answered
   // it. Wider than the recovery check below, which also needs a fallback prompt.
   let holdTerminalForResumeCheck = !!opts.resumeSessionId;
+  const holdTerminalForCandidateFallback = true;
   let resendAttempted = false;
   let deferredDone: LocalEvent | null = null;
   const setTerminal = (e: LocalEvent) => {
@@ -1735,9 +1361,12 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
       output: typeof e.output === 'string' ? e.output : undefined,
       error: typeof e.error === 'string' ? e.error : undefined,
       sessionId: typeof e.sessionId === 'string' ? e.sessionId : undefined,
+      timeoutKind: e.timeoutKind === 'wall' || e.timeoutKind === 'idle' ? e.timeoutKind : undefined,
       timeoutPhase: e.timeoutPhase === 'background' ? 'background'
         : (e.timeoutPhase === 'foreground' ? 'foreground' : undefined),
       usage: e.usage,
+      failureKind: typeof e.failureKind === 'string' ? e.failureKind : undefined,
+      retrySafe: e.retrySafe === true,
     };
   };
   const materializeMediaItem = (
@@ -1785,7 +1414,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     // bytes, so only real protocol/process activity may slide the independent
     // hang deadline; otherwise a wedged Codex item could pulse forever.
     if (e.type !== 'idle') lastVisibleActivityAt = eventAtMs;
-    if (e.type !== 'idle' && e.synthetic !== true) lastBackendEventAt = eventAtMs;
+    if (e.type !== 'idle' && e.synthetic !== true) activityClock.progress();
     if (e.type === 'tool-event') {
       const callId = String(e.callId || '').trim();
       const phase = String(e.phase || '').toLowerCase();
@@ -1861,12 +1490,14 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     // the in-process tool-result spill format) and exposes an opaque
     // content ref for click-to-expand. Backends don't know
     // about this — they always emit the full output.
-    if (e.type === 'tool-event' && (e as any).phase === 'result' && typeof (e as any).output === 'string') {
+    if (e.type === 'tool-event'
+        && (e as any).phase === 'result'
+        && Object.prototype.hasOwnProperty.call(e, 'output')) {
       const { output, outputPath } = maybeSpillToolResult({
         toolResultsDir: spillDir,
         toolName: String((e as any).tool || 'tool'),
         callId: String((e as any).callId || ''),
-        output: (e as any).output as string,
+        output: (e as any).output,
       });
       // Rewrite in place so the persisted event and the forwarded
       // event match exactly — no divergence between disk replay and
@@ -2208,11 +1839,21 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
       }
     }
     if (e.type === 'status' && e.status === 'background-stopped') sawBackgroundStopped = true;
+    if (e.type === 'status' && typeof e.status === 'string' && e.status.startsWith('background-')) {
+      const taskId = String(e.taskId || '').trim();
+      if (taskId) {
+        if (e.status === 'background-started' || e.status === 'background-running') {
+          liveBackgroundTasks.set(taskId, String(e.message || e.taskType || '').trim());
+        } else {
+          liveBackgroundTasks.delete(taskId);
+        }
+      }
+    }
     // Hold only the terminal marker until we know whether this resume was a
     // pre-execution stale-session rejection, or answered the user at all.
     // Diagnostic stderr/process rows remain visible; users still get exactly
     // one terminal event.
-    if (holdTerminalForResumeCheck && e.type === 'done') {
+    if ((holdTerminalForResumeCheck || holdTerminalForCandidateFallback) && e.type === 'done') {
       deferredDone = e;
       setTerminal(e);
       return;
@@ -2231,7 +1872,10 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     if (terminal) return;  // run already finished, don't keep pulsing
     const stalledMs = Date.now() - lastVisibleActivityAt;
     if (stalledMs > idleThresholdMs) {
-      onEvent({ type: 'idle', stalledMs });
+      const waitingOn = [...liveBackgroundTasks].map(([taskId, label]) => ({ taskId, label }));
+      onEvent(waitingOn.length
+        ? { type: 'idle', stalledMs, waitingOn }
+        : { type: 'idle', stalledMs });
     }
   }, idleTickMs);
   if (typeof idleTimer.unref === 'function') idleTimer.unref();
@@ -2245,7 +1889,8 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   // stop registry.
   let backgroundRunEntered = false;
   let backgroundTaskCount = 0;
-  if (_bridgeSupported(opts.cli) && process.env.ORKAS_BRIDGE_DISABLED !== '1') {
+  if (_bridgeSupported(opts.cli) && process.env.ORKAS_BRIDGE_DISABLED !== '1'
+    && (opts.cli !== 'opencode' || opts.projectId)) {
     try {
       const [{ startBridge }, { buildSkillSandboxEnv }] = await Promise.all([
         import('./bridge.js'),
@@ -2256,11 +1901,25 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
         cid: opts.cid,
         agentId: opts.agentId,
         agentName: opts.agentName || opts.agentId,
+        conversationTitle: opts.conversationTitle,
+        cli: opts.cli,
+        permissionPolicy,
         currentMessageId: opts.currentMessageId,
         ...(opts.projectId ? { projectId: opts.projectId } : {}),
+        workingDir: opts.cwd,
         runId: handle.runId,
         configDir: handle.dir,
         sandboxEnv: buildSkillSandboxEnv(opts.uid, opts.agentId),
+        onPermissionWaitStart: () => activityClock.pause(),
+        onPermissionWaiting: elapsedMs => onEvent({
+          type: 'status',
+          status: 'waiting-approval',
+          elapsedMs,
+          heartbeat: true,
+          // Host-owned waiting marker, not backend activity: it must not slide
+          // the idle-kill clock (same contract as the native permission wait).
+          synthetic: true,
+        }),
         preloadSkillDisplayNames: !!opts.resumeSessionId,
       });
       log.info('local agent bridge ready', runLogContext);
@@ -2278,6 +1937,14 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     reuseSessionInstructions?: boolean;
   }) => {
     try {
+      if (Date.now() >= deadlineAt) {
+        onEvent({
+          type: 'done', status: 'timeout', timeoutKind: 'wall',
+          error: 'Agent execution deadline reached before CLI dispatch',
+          durationMs: Date.now() - executionStartedAt,
+        });
+        return;
+      }
       await backend.run({
         binPath: entry.path,
         prompt: attempt.prompt,
@@ -2288,6 +1955,45 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
         customArgs: opts.customArgs,
         modelOverride: opts.modelOverride,
         thinkingLevel: opts.thinkingLevel,
+        permissionPolicy,
+        requestPermission: request => activityClock.waitForUser(() => cliPermissions.requestPermission({
+          uid: opts.uid,
+          cid: opts.cid,
+          runId: handle.runId,
+          agentId: opts.agentId,
+          agentName: opts.agentName || opts.agentId,
+          conversationTitle: opts.conversationTitle,
+          cli: opts.cli,
+          permissionPolicy,
+          request,
+          onWaiting: elapsedMs => onEvent({
+            type: 'status',
+            status: 'waiting-approval',
+            elapsedMs,
+            heartbeat: true,
+            // Keeps the rail out of the "unresponsive" state but proves no
+            // CLI activity; the prompt's own host deadline bounds the wait,
+            // so the hang watchdog keeps its real-activity clock.
+            synthetic: true,
+          }),
+        })),
+        requestUserInput: request => activityClock.waitForUser(() => cliUserInput.requestUserInput({
+          uid: opts.uid,
+          cid: opts.cid,
+          runId: handle.runId,
+          agentId: opts.agentId,
+          agentName: opts.agentName || opts.agentId,
+          conversationTitle: opts.conversationTitle,
+          cli: opts.cli,
+          request,
+          onWaiting: elapsedMs => onEvent({
+            type: 'status',
+            status: 'waiting-input',
+            elapsedMs,
+            heartbeat: true,
+            synthetic: true,
+          }),
+        })),
         resumeSessionId: attempt.resumeSessionId,
         signal: opts.signal,
         onEvent,
@@ -2302,13 +2008,14 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
           });
         },
         timeoutMs,
+        deadlineAt,
         idleKillMs,
         // Real-activity clock for the backend's idle-kill watchdog. It excludes
         // self-emitted idle rows and synthetic backend heartbeats, so visible
         // progress can suppress false UI warnings without extending a wedged
         // process indefinitely.
-        lastEventAt: () => lastBackendEventAt,
-        idleMs: BACKEND_IDLE_MS[opts.cli],
+        lastEventAt: activityClock.lastEventAt,
+        onActivity: () => activityClock.progress(),
         ...(bridge ? {
           bridge: {
             mcpConfigPath: bridge.mcpConfigPath,
@@ -2393,7 +2100,54 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
         reuseSessionInstructions: opts.reuseSessionInstructions,
       });
     }
+
+    // Reuse the already-probed CLI inventory when protocol setup or process
+    // startup fails. The backend must explicitly prove replay is safe;
+    // a task that may already have changed files or called tools is never
+    // replayed silently under another binary.
+    while (
+      terminal?.status === 'failed'
+      && terminal.retrySafe === true
+      && (terminal.failureKind === 'cli_protocol' || terminal.failureKind === 'cli_spawn')
+      && !opts.signal.aborted
+      && streamedOutput.length === 0
+      && toolStartedAtByCallId.size === 0
+    ) {
+      const failedEntry = entry;
+      noteCliCandidateFailure(failedEntry);
+      const fallback = cachedCliFallbackCandidate(failedEntry);
+      if (!fallback?.path) break;
+
+      entry = fallback;
+      log.warn('CLI fallback selected', {
+        ...runLogContext,
+        from_version: failedEntry.fullVersion || failedEntry.version,
+        to_version: entry.fullVersion || entry.version,
+      });
+      commitEvent({
+        type: 'status',
+        status: 'retrying',
+        reason: 'cli-fallback',
+        fromVersion: failedEntry.fullVersion || failedEntry.version,
+        toVersion: entry.fullVersion || entry.version,
+      });
+      terminal = null;
+      deferredDone = null;
+      inspectResumeAttempt = false;
+      holdTerminalForResumeCheck = false;
+      resumeRejected = false;
+      resumeAttemptExecuted = false;
+      await runBackendAttempt({
+        prompt: opts.resumeSessionId ? (opts.resumeFallbackPrompt || opts.prompt) : opts.prompt,
+        reuseSessionInstructions: false,
+      });
+      if (!terminal) {
+        onEvent({ type: 'done', status: 'failed', error: 'backend exited without terminal event' });
+      }
+    }
   } finally {
+    cliPermissions.cancelForRun(handle.runId);
+    cliUserInput.cancelForRun(handle.runId);
     if (bridge) {
       commanderHandoff = bridge.getCommanderHandoff();
       try { await bridge.close(); }
@@ -2409,6 +2163,11 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     onEvent({ type: 'done', status: 'failed', error: 'backend exited without terminal event' });
     terminal = { status: 'failed', error: 'backend exited without terminal event' };
   }
+  if (terminal.status === 'completed') {
+    noteCliCandidateSuccess(entry);
+  } else if (terminal.failureKind === 'cli_protocol' || terminal.failureKind === 'cli_spawn') {
+    noteCliCandidateFailure(entry);
+  }
   if (deferredDone) {
     const done = deferredDone;
     deferredDone = null;
@@ -2419,6 +2178,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   const endedAtMs = Date.now();
   await persist.finalize(handle, {
     status: terminal.status,
+    ...(entry.path ? { cliPath: entry.path } : {}),
     output: finalOutput,
     error: terminal.error,
     sessionId: terminal.sessionId,
@@ -2440,7 +2200,10 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     status: terminal.status,
     output: finalOutput,
     error: terminal.error,
+    ...(entry.path ? { cliPath: entry.path } : {}),
+    ...(entry.version ? { cliVersion: entry.fullVersion || entry.version } : {}),
     ...(terminal.timeoutPhase ? { timeoutPhase: terminal.timeoutPhase } : {}),
+    ...(terminal.timeoutKind ? { timeoutKind: terminal.timeoutKind } : {}),
     ...(commanderHandoff ? { commanderHandoff } : {}),
   };
 }

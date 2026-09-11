@@ -19,7 +19,7 @@ import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import {
   userChatsDir, userLocalConfigDir, projectChatsDir, projectChatIndexFile,
@@ -58,6 +58,11 @@ import {
   persistedCodexOutputCitationPaths,
   sanitizePersistedCodexFileCitations,
 } from './local_agents/public-output';
+import {
+  projectConversationHistoryRecords,
+  purgeConversationHistoryCache,
+  readConversationHistoryPage,
+} from './conversation_history_cache';
 
 const log = createLogger('chats');
 // A boot-time stale-state sweep may run twice: once before the first window
@@ -78,7 +83,7 @@ import {
   untrackRunningConversation,
 } from './group_chat/state';
 import type { ActorKind } from './group_chat/state';
-import { appendVisible, type GroupMessage } from './group_chat/visibility';
+import type { GroupMessage } from './group_chat/visibility';
 
 function conversationIndexName(): string {
   return '_index.json';
@@ -100,8 +105,24 @@ function buildConversationSessionId(cid: string): string {
 
 export type ConversationKind = 'normal' | string;
 
+export interface ConnectorSetupAssistance {
+  kind: 'connector_setup';
+  connector_id: string;
+}
+
+/** Compatible reader: retain only the known association, never arbitrary context or secrets. */
+export function normalizeConnectorSetupAssistance(raw: unknown): ConnectorSetupAssistance | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  if (value.kind !== 'connector_setup' || typeof value.connector_id !== 'string'
+    || value.connector_id.length > 160 || !safeId(value.connector_id)) return undefined;
+  return { kind: 'connector_setup', connector_id: value.connector_id };
+}
+
 export interface Conversation {
   conversation_id: string;
+  /** Historical setup target only; does not imply active work, success, or permission. */
+  assistance?: ConnectorSetupAssistance;
   title: string;
   kind: ConversationKind;
   /** Optional starting agent — UI can suggest "@<this agent>" on the input
@@ -166,12 +187,35 @@ export interface Conversation {
 }
 
 /** Persisted record on `<cid>.jsonl`. Aliased for legacy callers; the new
- *  canonical type is `GroupMessage` from `group_chat/visibility`. */
+ *  canonical type is `GroupMessage` from the group-chat message module. */
 export type MessageRecord = GroupMessage;
 
 interface MessageDisplayContext {
   citationWorkingDir?: string;
+  /** Base for resolving a media destination the author wrote relative to its
+   *  own working directory, per `readConversationAuthoringDir`. */
+  mediaBaseDir?: string;
   allowedCitationRoots: string[];
+}
+
+/** Display context per (user, conversation, project). Reuse state and
+ *  conversation reads while the state file and effective workspace are
+ *  unchanged. Workspace selection and fallback can change independently of
+ *  state, and sync can replace state while preserving its size and mtime. */
+const MESSAGE_DISPLAY_CONTEXT_MEMO_MAX = 32;
+const _messageDisplayContextMemo = new Map<string, { stamp: string; context: MessageDisplayContext }>();
+
+function _fileStamp(file: string): string {
+  try {
+    const stat = fs.statSync(file);
+    return JSON.stringify([stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs]);
+  } catch {
+    return 'missing';
+  }
+}
+
+export function _resetMessageDisplayContextMemoForTest(): void {
+  _messageDisplayContextMemo.clear();
 }
 
 async function _messageDisplayContext(
@@ -180,6 +224,32 @@ async function _messageDisplayContext(
   projectIdHint?: string | null,
 ): Promise<MessageDisplayContext> {
   const layout = conversationLayout(userId, cid, projectIdHint);
+  const memoKey = `${userId}\u0000${cid}\u0000${layout.projectId || ''}`;
+  let workspaceRoot: string | undefined;
+  try {
+    const userWorkspace = await import('./user_workspace');
+    workspaceRoot = userWorkspace.getWorkspacePath(userId, layout.projectId || undefined);
+  } catch (err) {
+    log.warn(`resolve workspace for legacy Codex output cid=${maskId(cid)}: ${(err as Error).message}`);
+  }
+  const stamp = JSON.stringify([layout.stateFile, _fileStamp(layout.stateFile), workspaceRoot]);
+  const remembered = _messageDisplayContextMemo.get(memoKey);
+  if (remembered && remembered.stamp === stamp) return remembered.context;
+  const context = await _computeMessageDisplayContext(userId, cid, layout, workspaceRoot);
+  if (_messageDisplayContextMemo.size >= MESSAGE_DISPLAY_CONTEXT_MEMO_MAX) {
+    const oldest = _messageDisplayContextMemo.keys().next().value;
+    if (oldest !== undefined) _messageDisplayContextMemo.delete(oldest);
+  }
+  _messageDisplayContextMemo.set(memoKey, { stamp, context });
+  return context;
+}
+
+async function _computeMessageDisplayContext(
+  userId: string,
+  cid: string,
+  layout: ReturnType<typeof conversationLayout>,
+  workspaceRoot: string | undefined,
+): Promise<MessageDisplayContext> {
   const state = await readState(userId, cid, layout.projectId);
   const allowedCitationRoots = [
     state.coding_project_dir,
@@ -187,19 +257,26 @@ async function _messageDisplayContext(
     chatAttachmentDirForConversation(userId, cid, layout.projectId),
   ].filter((root): root is string => typeof root === 'string' && path.isAbsolute(root));
 
-  let workspaceRoot: string | undefined;
+  if (workspaceRoot && path.isAbsolute(workspaceRoot)) allowedCitationRoots.push(workspaceRoot);
+
+  // Same rule the bus applies when it persists the reply, so a stored message
+  // and its re-read display resolve a relative media destination identically.
+  let mediaBaseDir: string | undefined;
   try {
-    const userWorkspace = await import('./user_workspace');
-    workspaceRoot = userWorkspace.getWorkspacePath(userId, layout.projectId || undefined);
-    if (path.isAbsolute(workspaceRoot)) allowedCitationRoots.push(workspaceRoot);
+    const convWorkspace = await import('./group_chat/conv_workspace');
+    mediaBaseDir = await convWorkspace.readConversationAuthoringDir(userId, cid);
   } catch (err) {
-    log.warn(`resolve workspace for legacy Codex output cid=${maskId(cid)}: ${(err as Error).message}`);
+    log.warn('resolve media base dir failed', {
+      cid: maskId(cid),
+      error: logErrorSummary(err),
+    });
   }
 
   return {
     citationWorkingDir: state.coding_project_dir && path.isAbsolute(state.coding_project_dir)
       ? state.coding_project_dir
       : workspaceRoot,
+    ...(mediaBaseDir ? { mediaBaseDir } : {}),
     allowedCitationRoots,
   };
 }
@@ -210,11 +287,25 @@ function _isAuthorizedLegacyOutputFile(candidate: string, allowedRoots: readonly
   catch { return false; }
 }
 
-function _messageForDisplay(message: MessageRecord, context: MessageDisplayContext): MessageRecord {
-  if (message.from === 'user') return message;
-  const storedProduced = Array.isArray(message.produced)
+function _storedProducedPaths(message: Pick<MessageRecord, 'produced'>): string[] {
+  return Array.isArray(message.produced)
     ? message.produced.filter((item): item is string => typeof item === 'string' && !!item.trim())
     : [];
+}
+
+/** Resolve the produced-file paths a stored record presents. `backing` is the
+ *  stored list plus any authorized legacy Codex output citation; `display` is
+ *  what the renderer footer, the file panel, and file-action authorization
+ *  see. A native output citation is an exact publication declaration.
+ *  Historical rows predate a separate `published` field, so only the cited
+ *  files are displayed while the complete list remains sanitizer backing.
+ *  Without a trusted citation, the stored footer is preserved verbatim. */
+function _producedPathsForDisplay(
+  message: Pick<MessageRecord, 'from' | 'text' | 'produced'>,
+  context: MessageDisplayContext,
+): { backing: string[]; display: string[] } {
+  const storedProduced = _storedProducedPaths(message);
+  if (message.from === 'user') return { backing: storedProduced, display: storedProduced };
   const produced = [...storedProduced];
   const producedKeys = new Set(produced.map((item) => path.resolve(item)));
   const citedOutputs: string[] = [];
@@ -230,13 +321,16 @@ function _messageForDisplay(message: MessageRecord, context: MessageDisplayConte
     }
     citedOutputs.push(resolved);
   }
-  // A native output citation is an exact publication declaration. Historical
-  // rows predate a separate `published` field, so project only the cited files
-  // into the renderer footer while retaining the complete list as sanitizer
-  // backing. Without a trusted citation, preserve the stored footer verbatim.
-  const displayProduced = citedOutputs.length ? citedOutputs : storedProduced;
+  return { backing: produced, display: citedOutputs.length ? citedOutputs : storedProduced };
+}
+
+function _messageForDisplay(message: MessageRecord, context: MessageDisplayContext): MessageRecord {
+  if (message.from === 'user') return message;
+  const storedProduced = _storedProducedPaths(message);
+  const { backing: produced, display: displayProduced } = _producedPathsForDisplay(message, context);
   const text = versionChatMediaLocalUrlsInText(
     sanitizePersistedCodexFileCitations(message.text, produced, context.citationWorkingDir),
+    context.mediaBaseDir || '',
   );
   const producedUnchanged = displayProduced.length === storedProduced.length
     && displayProduced.every((item, index) => item === storedProduced[index]);
@@ -312,6 +406,9 @@ async function _runBounded<T>(
 
 function _cleanConversation(c: Conversation): Conversation {
   const { processing, processing_since, last_active_at, ...rest } = c;
+  const assistance = normalizeConnectorSetupAssistance(c.assistance);
+  if (assistance) rest.assistance = assistance;
+  else delete rest.assistance;
   return rest;
 }
 
@@ -344,6 +441,8 @@ function _normaliseConversation(raw: any, fallbackCid = ''): Conversation | null
   };
   if (typeof raw.project_id === 'string' && raw.project_id) out.project_id = raw.project_id;
   if (typeof raw.origin_auto_task_id === 'string' && raw.origin_auto_task_id) out.origin_auto_task_id = raw.origin_auto_task_id;
+  const assistance = normalizeConnectorSetupAssistance(raw.assistance);
+  if (assistance) out.assistance = assistance;
   if (typeof raw.pinned_at === 'string' && raw.pinned_at) out.pinned_at = raw.pinned_at;
   if (typeof raw.pin_state_updated_at === 'string' && raw.pin_state_updated_at) out.pin_state_updated_at = raw.pin_state_updated_at;
   if (raw.title_manually_set === true) out.title_manually_set = true;
@@ -1064,7 +1163,11 @@ const _conversationListInFlight = new Map<string, Promise<Conversation[]>>();
 const _conversationListGeneration = new Map<string, number>();
 
 function _cloneConversationList(items: Conversation[]): Conversation[] {
-  return items.map((c) => ({ ...c, ...(c.agent_ids ? { agent_ids: [...c.agent_ids] } : {}) }));
+  return items.map((c) => ({
+    ...c,
+    ...(c.agent_ids ? { agent_ids: [...c.agent_ids] } : {}),
+    ...(c.assistance ? { assistance: { ...c.assistance } } : {}),
+  }));
 }
 
 function _invalidateConversationListCache(userId: string): void {
@@ -1116,9 +1219,9 @@ async function _listConversationsUncached(
   // same module cache as the static-import chain. Node's dynamic `import()`
   // is always ESM, which would load bus.ts as a SECOND module instance with
   // its own _cids Map — splitting the bus state into two and silently
-  // losing every event that's emitted on the wrong half (see bus.ts comment
-  // at planExecutor.bindBusHooks for why ESM-vs-CJS duplication corrupts
-  // plan_executor's hooks).
+  // losing every event that's emitted on the wrong half (see the dual-loader
+  // note on bus.ts `_cids` for why ESM-vs-CJS duplication corrupts shared
+  // bus state).
   const bus = require('./group_chat/bus') as typeof import('./group_chat/bus');
   // 15-minute fast-path for the `processing` derivation only: any conv
   // whose last_active_at is older than the renderer's `processingFresh`
@@ -1293,6 +1396,10 @@ export interface ConversationPage extends ConversationPageInfo {
 }
 
 export const CONVERSATION_LIST_PAGE_SIZE = 10;
+// A renderer-provided local midnight can be 25 hours behind during a DST
+// fallback day. Keep one extra hour of tolerance without allowing an
+// untrusted renderer to turn the startup slice into an all-history load.
+const STARTUP_ACTIVE_SINCE_MAX_LOOKBACK_MS = 26 * 60 * 60 * 1000;
 
 function _conversationActivityMs(c: Conversation): number {
   return Math.max(tsMs(c.updated_at), tsMs(c.created_at));
@@ -1344,15 +1451,25 @@ async function _enrichConversationPage(
 /** Startup-only sidebar slice. Aggregate indexes are still the authority, but
  * per-conversation state/member/history enrichment is limited to rows that can
  * actually appear on first paint. Project and unprojected task lists each use
- * one chronological 10-row page; time buckets are only a renderer grouping. */
+ * one chronological 10-row page; time buckets are only a renderer grouping.
+ * Rows active at or after `activeSinceMs` (the renderer's local day start) are
+ * always included, whatever their project, so the sidebar's Today aggregate can
+ * show tasks under collapsed projects; page totals and cursors are unchanged. */
 export async function listStartupConversations(
   userId: string,
-  options: { activeConversationId?: string; expandedProjectIds?: string[] } = {},
+  options: { activeConversationId?: string; expandedProjectIds?: string[]; activeSinceMs?: number } = {},
 ): Promise<StartupConversationList> {
   const requestedProjects = new Set(
     (options.expandedProjectIds || []).filter((id) => typeof id === 'string' && safeId(id)),
   );
   const activeCid = safeId(options.activeConversationId || '') ? options.activeConversationId! : '';
+  const nowMs = Date.now();
+  const activeSinceMs = typeof options.activeSinceMs === 'number'
+    && Number.isFinite(options.activeSinceMs)
+    && options.activeSinceMs <= nowMs
+    && options.activeSinceMs >= nowMs - STARTUP_ACTIVE_SINCE_MAX_LOOKBACK_MS
+    ? options.activeSinceMs
+    : null;
   let loadedProjects: string[] = [];
   let unprojectedPagination: ConversationPageInfo = { total: 0, next_offset: null };
   const projectPagination: Record<string, ConversationPageInfo> = {};
@@ -1393,6 +1510,7 @@ export async function listStartupConversations(
     if (active?.project_id) selectedProjectCids.add(active.conversation_id);
     else if (active) selectedUnprojectedCids.add(active.conversation_id);
     return all.filter((c) => {
+      if (activeSinceMs !== null && _conversationActivityMs(c) >= activeSinceMs) return true;
       if (c.project_id) return selectedProjectCids.has(c.conversation_id);
       return selectedUnprojectedCids.has(c.conversation_id);
     });
@@ -1778,16 +1896,43 @@ export async function getConversation(
       || (projectIdHint === null ? !found?.project_id : found?.project_id === projectIdHint);
     if (!found || hintMatches) return found ? _cloneConversationList([found])[0] : null;
   }
+  const metadata = await getConversationMetadata(userId, cid, projectIdHint);
+  if (!metadata) return null;
   const target = await _listConversationsUncached(
     userId,
     () => false,
     undefined,
-    () => _readTargetRawConversation(userId, cid, projectIdHint),
+    () => Promise.resolve([metadata]),
   );
   return target.find((c) => c.conversation_id === cid) || null;
 }
 
+/** Targeted conversation metadata without performing sidebar runtime/
+ * participant enrichment. Detail IPC handlers combine this record with their
+ * own runtime snapshot, so enriching it first only repeats state/member reads. */
+export async function getConversationMetadata(
+  userId: string,
+  cid: string,
+  projectIdHint?: string | null,
+): Promise<Conversation | null> {
+  if (!safeId(cid)) return null;
+  const cached = _conversationListCache.get(userId);
+  if (cached && cached.expiresAt > Date.now()) {
+    const found = cached.items.find((c) => c.conversation_id === cid);
+    const hintMatches = projectIdHint === undefined
+      || (projectIdHint === null ? !found?.project_id : found?.project_id === projectIdHint);
+    if (!found || hintMatches) return found ? _cloneConversationList([found])[0] : null;
+  }
+  const target = await _readTargetRawConversation(userId, cid, projectIdHint);
+  const found = target.find((c) => (
+    c.conversation_id === cid && !isDeletedConversation(c)
+  ));
+  return found ? _cloneConversationList([found])[0] : null;
+}
+
 export interface CreateConversationOptions {
+  /** Catalog-validated by the setup entry boundary; persisted without private values. */
+  assistance?: ConnectorSetupAssistance;
   kind?: ConversationKind;
   agentId?: string;
   skillId?: string;
@@ -1813,8 +1958,9 @@ function normaliseConversationTitle(raw: unknown): string {
 }
 
 export async function createConversation(userId: string, {
-  kind = 'normal', agentId = '', skillId = '', title = '', projectId = '', conversationId = '', originAutoTaskId = '',
+  kind = 'normal', agentId = '', skillId = '', title = '', projectId = '', conversationId = '', originAutoTaskId = '', assistance: rawAssistance,
 }: CreateConversationOptions = {}): Promise<Conversation> {
+  const assistance = normalizeConnectorSetupAssistance(rawAssistance);
   const explicitCid = conversationId && safeId(conversationId) ? conversationId : '';
   const outcome = await _withConversationIndexStore(userId, async (store) => {
     if (explicitCid) {
@@ -1837,6 +1983,7 @@ export async function createConversation(userId: string, {
           session_id: current.session_id || buildConversationSessionId(explicitCid),
           ...(projectId ? { project_id: projectId } : {}),
           ...(originAutoTaskId ? { origin_auto_task_id: originAutoTaskId } : {}),
+          ...(assistance ? { assistance } : {}),
           updated_at: now,
         });
         delete revived.deleted_at;
@@ -1867,6 +2014,7 @@ export async function createConversation(userId: string, {
       session_id: buildConversationSessionId(cid),
       ...(projectId ? { project_id: projectId } : {}),
       ...(originAutoTaskId ? { origin_auto_task_id: originAutoTaskId } : {}),
+      ...(assistance ? { assistance } : {}),
       created_at: now,
       updated_at: now,
       agent_ids: _normaliseAgentIds(agentId ? [agentId] : []),
@@ -1910,6 +2058,9 @@ export async function updateConversation(
       updated_at: updatedAt,
       ...(summaryWasFresh ? { participant_summary_updated_at: updatedAt } : {}),
     });
+    const assistance = normalizeConnectorSetupAssistance(next.assistance);
+    if (assistance) next.assistance = assistance;
+    else delete next.assistance;
     delete next.deleted_at;
     await store.persistTarget(target, next);
     return next;
@@ -1979,7 +2130,7 @@ async function _purgeDeletedConversationFiles(userId: string, cid: string, remov
     log.warn(`background media cancel failed user=${userId} cid=${cid}: ${(err as Error).message}`);
   }
 
-  // Purge group dir (members.json / state.json / plan.md / visibility/) + bus state.
+  // Purge group companion dir (members/state/plan) + bus state.
   // CJS require (same reason as listConversations above) — dynamic `import()`
   // would load bus.ts as a second ESM module and dropConv would clear the
   // wrong _cids.
@@ -1992,6 +2143,7 @@ async function _purgeDeletedConversationFiles(userId: string, cid: string, remov
 
   // Purge main jsonl.
   const msgFile = conversationMessageFile(userId, cid, removed?.project_id ?? null);
+  await purgeConversationHistoryCache(userId, msgFile);
   try { await fsp.unlink(msgFile); } catch { /* ignore missing */ }
   invalidateLineCount(msgFile);
   await search.dropChatConversation(userId, cid);
@@ -2082,6 +2234,29 @@ export async function getMessages(userId: string, cid: string, limit = 200): Pro
   return (await getMessagesPage(userId, cid, limit)).history;
 }
 
+/** Produced-file paths from the newest `limit` visible messages, resolved the
+ *  way `getMessages` presents them but read raw. The file panel and
+ *  file-action authorization consume only these strings; `getMessages` would
+ *  first run the renderer projection, which spills every large process output
+ *  to a lazy cache file, hashes it, and rewrites each text for display. */
+export async function listProducedPaths(userId: string, cid: string, limit = 200): Promise<string[]> {
+  const sourceFile = conversationMessageReadFile(userId, cid);
+  const wanted = Math.max(1, Math.floor(Number(limit) || 1));
+  let records: MessageRecord[] = [];
+  let cursor: number | null | undefined;
+  while (records.length < wanted) {
+    const page = await readJsonlPage<MessageRecord>(sourceFile, wanted - records.length, cursor);
+    records = page.records.filter((message) => !message.deleted_at).concat(records);
+    if (page.nextCursor === null) break;
+    cursor = page.nextCursor;
+  }
+  if (!records.length) return [];
+  const context = await _messageDisplayContext(userId, cid);
+  const out: string[] = [];
+  for (const message of records) out.push(..._producedPathsForDisplay(message, context).display);
+  return out;
+}
+
 /** Bounded, cursor-paged message reads for the conversation detail view.
  *  The cursor is an opaque JSONL byte offset returned by the previous page. */
 export async function getMessagesPage(
@@ -2091,13 +2266,18 @@ export async function getMessagesPage(
   before?: number | null,
   projectIdHint?: string | null,
 ): Promise<{ history: MessageRecord[]; nextCursor: number | null }> {
-  const file = conversationMessageReadFile(userId, cid, projectIdHint);
+  const sourceFile = conversationMessageReadFile(userId, cid, projectIdHint);
   const wanted = Math.max(1, Math.floor(Number(limit) || 1));
   let cursor = before;
   let nextCursor: number | null = before ?? null;
   let history: MessageRecord[] = [];
   while (history.length < wanted) {
-    const page = await readJsonlPage<MessageRecord>(file, wanted - history.length, cursor);
+    const page = await readConversationHistoryPage(
+      userId,
+      sourceFile,
+      wanted - history.length,
+      cursor,
+    );
     const visible = page.records.filter((message) => !message.deleted_at);
     history = visible.concat(history);
     nextCursor = page.nextCursor;
@@ -2119,23 +2299,36 @@ export async function getMessagesPageAtIndex(
   messageIndex: number,
   limit = 10,
   projectIdHint?: string | null,
+  opts?: {
+    /** Renderer projection (process-output spill to lazy files + display
+     *  citation sanitizing). Model-facing readers that consume only text/ids
+     *  pass `false`: the spill writes cache files and hashes every large
+     *  output on the main thread for a view nothing reads. */
+    project?: boolean;
+  },
 ): Promise<{
   history: MessageRecord[];
   historyIndexes: number[];
   nextCursor: number | null;
   pageStart: number;
 }> {
-  const file = conversationMessageReadFile(userId, cid, projectIdHint);
+  const sourceFile = conversationMessageReadFile(userId, cid, projectIdHint);
   const wanted = Math.max(1, Math.floor(Number(limit) || 1));
   const index = Math.max(0, Math.floor(Number(messageIndex) || 0));
   const pageStart = Math.floor(index / wanted) * wanted;
-  const page = await readJsonlWindow<MessageRecord>(file, pageStart, Number.MAX_SAFE_INTEGER);
-  const visible = page.records
+  const page = await readJsonlWindow<MessageRecord>(sourceFile, pageStart, Number.MAX_SAFE_INTEGER);
+  const project = opts?.project !== false;
+  const projected = project
+    ? projectConversationHistoryRecords(userId, sourceFile, page.records)
+    : page.records;
+  const visible = projected
     .map((message, offset) => ({ message, index: pageStart + offset }))
     .filter(({ message }) => !message.deleted_at);
-  const displayContext = await _messageDisplayContext(userId, cid, projectIdHint);
+  const displayContext = project ? await _messageDisplayContext(userId, cid, projectIdHint) : null;
   return {
-    history: visible.map(({ message }) => _messageForDisplay(message, displayContext)),
+    history: visible.map(({ message }) => (
+      displayContext ? _messageForDisplay(message, displayContext) : message
+    )),
     // Keep the source JSONL indexes aligned with `history`. The renderer uses
     // this as the final navigation identity for old records that predate
     // stable message ids/timestamps; filtering a tombstone must not shift the
@@ -2156,13 +2349,13 @@ export async function findMessageIndexById(
   projectIdHint?: string | null,
 ): Promise<number | null> {
   if (!messageId) return null;
-  const file = conversationMessageReadFile(userId, cid, projectIdHint);
+  const sourceFile = conversationMessageReadFile(userId, cid, projectIdHint);
   let stream: fs.ReadStream | null = null;
   let lines: readline.Interface | null = null;
   let recordIndex = 0;
   let malformedRecordReported = false;
   try {
-    stream = fs.createReadStream(file, { encoding: 'utf8' });
+    stream = fs.createReadStream(sourceFile, { encoding: 'utf8' });
     lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
     for await (const line of lines) {
       const trimmed = line.trim();
@@ -2172,7 +2365,7 @@ export async function findMessageIndexById(
         if (!malformedRecordReported) {
           malformedRecordReported = true;
           log.warn('conversation message lookup skipped malformed records', {
-            file: logPathRef(file),
+            file: logPathRef(sourceFile),
             error: logErrorSummary(err),
           });
         }
@@ -2206,7 +2399,8 @@ export async function findMessageIndexById(
  * address for every user turn. This machine-local derived index is deliberately
  * compact and rebuildable: it never enters sync or the conversation metadata.
  */
-const CONVERSATION_TURN_INDEX_VERSION = 1;
+const CONVERSATION_TURN_INDEX_VERSION = 2;
+const CONVERSATION_TURN_FINGERPRINT_BYTES = 4 * 1024;
 export const CONVERSATION_TURN_PAGE_SIZE = 15;
 export const CONVERSATION_TURN_USER_PREVIEW_CHARS = 40;
 export const CONVERSATION_TURN_ASSISTANT_PREVIEW_CHARS = 80;
@@ -2230,6 +2424,8 @@ interface ConversationTurnIndexSource {
 interface ConversationTurnIndexFile {
   version: number;
   source: ConversationTurnIndexSource;
+  recordCount: number;
+  tailHash: string;
   turns: ConversationTurnIndexEntry[];
 }
 
@@ -2245,6 +2441,22 @@ export interface ConversationTurnPage {
 }
 
 const _conversationTurnIndexMemory = new Map<string, ConversationTurnIndexFile>();
+/** Whole turn indexes stay resident per visited conversation and were only
+ *  dropped on delete; keep the most recently used ones instead. */
+const CONVERSATION_TURN_INDEX_MEMORY_MAX = 64;
+
+function _rememberConversationTurnIndex(key: string, index: ConversationTurnIndexFile): void {
+  _conversationTurnIndexMemory.delete(key);
+  if (_conversationTurnIndexMemory.size >= CONVERSATION_TURN_INDEX_MEMORY_MAX) {
+    const oldest = _conversationTurnIndexMemory.keys().next().value;
+    if (oldest !== undefined) _conversationTurnIndexMemory.delete(oldest);
+  }
+  _conversationTurnIndexMemory.set(key, index);
+}
+
+export function _conversationTurnIndexMemorySizeForTest(): number {
+  return _conversationTurnIndexMemory.size;
+}
 const _conversationTurnIndexBuilds = new Map<string, Promise<ConversationTurnIndexFile>>();
 
 function _conversationTurnIndexKey(userId: string, cid: string): string {
@@ -2325,15 +2537,39 @@ function _isConversationTurnVisibleAssistantRecord(record: any): boolean {
   return role !== 'user';
 }
 
-async function _scanConversationTurnIndex(file: string): Promise<ConversationTurnIndexEntry[]> {
+interface ConversationTurnIndexScanOptions {
+  start?: number;
+  end?: number;
+  seed?: ConversationTurnIndexFile;
+}
+
+interface ConversationTurnIndexScanResult {
+  turns: ConversationTurnIndexEntry[];
+  recordCount: number;
+}
+
+async function _scanConversationTurnIndex(
+  file: string,
+  options: ConversationTurnIndexScanOptions = {},
+): Promise<ConversationTurnIndexScanResult> {
   let stream: fs.ReadStream | null = null;
   let lines: readline.Interface | null = null;
-  const turns: ConversationTurnIndexEntry[] = [];
-  let current: ConversationTurnIndexEntry | null = null;
-  let recordIndex = 0;
+  const turns = options.seed
+    ? options.seed.turns.map((turn) => ({ ...turn }))
+    : [];
+  let current: ConversationTurnIndexEntry | null = turns.pop() ?? null;
+  let recordIndex = options.seed?.recordCount ?? 0;
   let malformedRecordReported = false;
   try {
-    stream = fs.createReadStream(file, { encoding: 'utf8' });
+    const start = Math.max(0, Math.floor(Number(options.start) || 0));
+    const requestedEnd = Number(options.end);
+    stream = fs.createReadStream(file, {
+      encoding: 'utf8',
+      ...(start > 0 ? { start } : {}),
+      ...(Number.isSafeInteger(requestedEnd) && requestedEnd >= start
+        ? { end: requestedEnd }
+        : {}),
+    });
     lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
     for await (const line of lines) {
       const trimmed = line.trim();
@@ -2384,12 +2620,14 @@ async function _scanConversationTurnIndex(file: string): Promise<ConversationTur
     stream?.destroy();
   }
   if (current) turns.push(current);
-  return turns;
+  return { turns, recordCount: recordIndex };
 }
 
 function _isConversationTurnIndexFile(value: any): value is ConversationTurnIndexFile {
   return value?.version === CONVERSATION_TURN_INDEX_VERSION
     && value.source && typeof value.source === 'object'
+    && Number.isSafeInteger(value.recordCount) && value.recordCount >= 0
+    && typeof value.tailHash === 'string' && /^[a-f0-9]{64}$/.test(value.tailHash)
     && Array.isArray(value.turns)
     && value.turns.every((turn: any) => (
       turn && typeof turn === 'object'
@@ -2401,30 +2639,127 @@ function _isConversationTurnIndexFile(value: any): value is ConversationTurnInde
     ));
 }
 
+async function _conversationTurnTailFingerprint(
+  file: string,
+  endExclusive: number,
+): Promise<{ hash: string; endsWithNewline: boolean }> {
+  const end = Math.max(0, Math.floor(Number(endExclusive) || 0));
+  if (end === 0) {
+    return {
+      hash: createHash('sha256').update('').digest('hex'),
+      endsWithNewline: true,
+    };
+  }
+  const handle = await fsp.open(file, 'r');
+  try {
+    const start = Math.max(0, end - CONVERSATION_TURN_FINGERPRINT_BYTES);
+    const buffer = Buffer.allocUnsafe(end - start);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
+    const tail = buffer.subarray(0, bytesRead);
+    return {
+      hash: createHash('sha256').update(tail).digest('hex'),
+      endsWithNewline: tail.length > 0 && tail[tail.length - 1] === 0x0a,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+function _canExtendConversationTurnIndex(
+  index: ConversationTurnIndexFile,
+  source: ConversationTurnIndexSource,
+): boolean {
+  return index.source.owner === source.owner
+    && index.source.ino > 0
+    && index.source.ino === source.ino
+    && index.source.size >= 0
+    && source.size > index.source.size;
+}
+
+async function _extendConversationTurnIndex(
+  userId: string,
+  cid: string,
+  file: string,
+  base: ConversationTurnIndexFile,
+  source: ConversationTurnIndexSource,
+  projectIdHint?: string | null,
+): Promise<ConversationTurnIndexFile | null> {
+  const startedAt = Date.now();
+  const previousTail = await _conversationTurnTailFingerprint(file, base.source.size);
+  // Same inode + a larger size normally means append. Verify the old tail as
+  // well so ordinary in-place truncate/rewrite paths are not mistaken for one.
+  if (previousTail.hash !== base.tailHash || !previousTail.endsWithNewline) return null;
+
+  const scan = await _scanConversationTurnIndex(file, {
+    start: base.source.size,
+    end: source.size - 1,
+    seed: base,
+  });
+  const sourceAfter = await _conversationTurnSource(file, projectIdHint);
+  if (!_sameConversationTurnSource(source, sourceAfter)) return null;
+  const tail = await _conversationTurnTailFingerprint(file, sourceAfter.size);
+  const sourceVerified = await _conversationTurnSource(file, projectIdHint);
+  if (!_sameConversationTurnSource(sourceAfter, sourceVerified) || !tail.endsWithNewline) return null;
+
+  const index: ConversationTurnIndexFile = {
+    version: CONVERSATION_TURN_INDEX_VERSION,
+    source: sourceVerified,
+    recordCount: scan.recordCount,
+    tailHash: tail.hash,
+    turns: scan.turns,
+  };
+  await writeJson(userConversationTurnIndexPath(userId, cid), index);
+  _rememberConversationTurnIndex(_conversationTurnIndexKey(userId, cid), index);
+  log.info('conversation turn index extended', {
+    cid: maskId(cid),
+    ms: Date.now() - startedAt,
+    appended_bytes: sourceVerified.size - base.source.size,
+    records: index.recordCount - base.recordCount,
+    turns: index.turns.length,
+  });
+  return index;
+}
+
 async function _buildConversationTurnIndex(
   userId: string,
   cid: string,
   file: string,
   projectIdHint?: string | null,
 ): Promise<ConversationTurnIndexFile> {
+  const startedAt = Date.now();
   // A sync pull or live append can move the source while the lazy legacy scan
   // is running. Retry once so the atomically-published index describes one
   // coherent file revision rather than a mixed snapshot.
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const sourceBefore = await _conversationTurnSource(file, projectIdHint);
-    const turns = await _scanConversationTurnIndex(file);
+    const scan = await _scanConversationTurnIndex(file);
     const sourceAfter = await _conversationTurnSource(file, projectIdHint);
     if (!_sameConversationTurnSource(sourceBefore, sourceAfter)) {
       if (attempt === 0) continue;
       throw new Error('conversation turn index source did not stabilize');
     }
+    const tail = await _conversationTurnTailFingerprint(file, sourceAfter.size);
+    const sourceVerified = await _conversationTurnSource(file, projectIdHint);
+    if (!_sameConversationTurnSource(sourceAfter, sourceVerified)) {
+      if (attempt === 0) continue;
+      throw new Error('conversation turn index source did not stabilize');
+    }
     const index: ConversationTurnIndexFile = {
       version: CONVERSATION_TURN_INDEX_VERSION,
-      source: sourceAfter,
-      turns,
+      source: sourceVerified,
+      recordCount: scan.recordCount,
+      tailHash: tail.hash,
+      turns: scan.turns,
     };
     await writeJson(userConversationTurnIndexPath(userId, cid), index);
-    _conversationTurnIndexMemory.set(_conversationTurnIndexKey(userId, cid), index);
+    _rememberConversationTurnIndex(_conversationTurnIndexKey(userId, cid), index);
+    log.info('conversation turn index rebuilt', {
+      cid: maskId(cid),
+      ms: Date.now() - startedAt,
+      bytes: sourceVerified.size,
+      records: index.recordCount,
+      turns: index.turns.length,
+    });
     return index;
   }
   throw new Error('conversation turn index source did not stabilize');
@@ -2439,20 +2774,36 @@ async function _getConversationTurnIndex(
   const sourceFile = conversationMessageReadFile(userId, cid, projectIdHint);
   const source = await _conversationTurnSource(sourceFile, projectIdHint);
   const memory = _conversationTurnIndexMemory.get(key);
-  if (memory && _sameConversationTurnSource(memory.source, source)) return memory;
+  if (_isConversationTurnIndexFile(memory)
+      && _sameConversationTurnSource(memory.source, source)) {
+    _rememberConversationTurnIndex(key, memory);
+    return memory;
+  }
 
   const persisted = await readJson<ConversationTurnIndexFile>(
     userConversationTurnIndexPath(userId, cid),
   );
   if (_isConversationTurnIndexFile(persisted)
       && _sameConversationTurnSource(persisted.source, source)) {
-    _conversationTurnIndexMemory.set(key, persisted);
+    _rememberConversationTurnIndex(key, persisted);
     return persisted;
   }
 
   const existingBuild = _conversationTurnIndexBuilds.get(key);
   if (existingBuild) return existingBuild;
-  const build = _buildConversationTurnIndex(userId, cid, sourceFile, projectIdHint);
+  const appendBase = [memory, persisted]
+    .filter(_isConversationTurnIndexFile)
+    .filter((index) => _canExtendConversationTurnIndex(index, source))
+    .sort((left, right) => right.source.size - left.source.size)[0];
+  const build = (async () => {
+    if (appendBase) {
+      const extended = await _extendConversationTurnIndex(
+        userId, cid, sourceFile, appendBase, source, projectIdHint,
+      );
+      if (extended) return extended;
+    }
+    return _buildConversationTurnIndex(userId, cid, sourceFile, projectIdHint);
+  })();
   _conversationTurnIndexBuilds.set(key, build);
   try {
     return await build;
@@ -2777,7 +3128,6 @@ export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swe
       const layout = conversationLayout(uid, cid);
       const { msgIndex } = await appendJsonlAtomic<GroupMessage>(layout.messageFile, interruptedMessage);
       await search.indexChatMessage(uid, cid, msgIndex, interruptedMessage);
-      await appendVisible(uid, cid, interruptedMessage, [...new Set([...memberIds, senderId, 'commander'])]);
       const senderKind = members.actors.find((actor) => actor.id === senderId)?.kind
         || (senderId === 'commander' ? 'commander' : 'agent');
       await bumpConversationActivity(uid, cid, ts, {

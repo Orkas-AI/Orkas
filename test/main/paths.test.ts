@@ -106,8 +106,6 @@ describe('paths › cloud-synced per-user', () => {
     expect(p.userAgentChatDir(uid, 'a1')).toBe(path.join(p.WS_ROOT, uid, 'cloud', 'chats', 'agent', 'a1'));
     expect(p.groupChatDir(uid, 'c1'))
       .toBe(path.join(p.WS_ROOT, uid, 'cloud', 'chats', 'c1'));
-    expect(p.groupChatVisibilityFile(uid, 'c1', 'commander'))
-      .toBe(path.join(p.WS_ROOT, uid, 'cloud', 'chats', 'c1', 'visibility', 'commander.jsonl'));
     expect(p.chatAttachmentDir(uid, 'c1'))
       .toBe(path.join(p.WS_ROOT, uid, 'cloud', 'chat_attachments', 'c1'));
     expect(p.userSessionsDir(uid)).toBe(path.join(p.WS_ROOT, uid, 'cloud', 'sessions'));
@@ -156,8 +154,6 @@ describe('paths › cloud-synced per-user', () => {
     const root = path.join(p.WS_ROOT, uid, 'cloud', 'projects', pid);
     expect(p.projectChatIndexFile(uid, pid)).toBe(path.join(root, 'chats', '_index.json'));
     expect(p.projectChatJsonlFile(uid, pid, cid)).toBe(path.join(root, 'chats', 'c1.jsonl'));
-    expect(p.projectGroupChatVisibilityFile(uid, pid, cid, 'commander'))
-      .toBe(path.join(root, 'chats', cid, 'visibility', 'commander.jsonl'));
     expect(p.projectSessionFile(uid, pid, 'gconv-c1'))
       .toBe(path.join(root, 'sessions', 'gconv-c1.jsonl'));
     expect(p.projectChatAttachmentDir(uid, pid, cid))

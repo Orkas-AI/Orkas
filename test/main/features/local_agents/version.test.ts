@@ -63,7 +63,6 @@ describe('local_agents/version › compareSemver', () => {
 
 describe('local_agents/version › checkMinVersion', () => {
   it('returns null when CLI has no minimum', () => {
-    expect(checkMinVersion('opencode', '0.1.0')).toBeNull();
     expect(checkMinVersion('hermes', '0.0.0')).toBeNull();
   });
 
@@ -72,12 +71,14 @@ describe('local_agents/version › checkMinVersion', () => {
     expect(checkMinVersion('claude', '2.5.0')).toBeNull();
     expect(checkMinVersion('claude', '3.0.0')).toBeNull();
     expect(checkMinVersion('codex', '0.145.0-alpha.18')).toBeNull();
+    expect(checkMinVersion('opencode', MIN_VERSIONS.opencode)).toBeNull();
   });
 
   it('returns an explanatory string when detected is below minimum', () => {
     const msg = checkMinVersion('claude', '1.99.0');
     expect(msg).toMatch(/below required minimum/);
     expect(msg).toContain('claude');
+    expect(checkMinVersion('opencode', '1.17.9')).toMatch(/below required minimum/);
     expect(msg).toContain('1.99.0');
     expect(checkMinVersion('codex', '0.139.0')).toContain('0.145.0');
   });
@@ -102,6 +103,17 @@ describe('local_agents/version › detectVersion', () => {
   it('extracts the semver from --version stdout', async () => {
     const binPath = writeVersionCli(tmpDir, 'fake-cli', 'claude 2.1.100');
     expect(await detectVersion(binPath)).toBe('2.1.100');
+  });
+
+  it('preserves a prerelease suffix for CLI compatibility selection', async () => {
+    const binPath = writeVersionCli(tmpDir, 'prerelease-cli', 'codex-cli 0.151.0-alpha.7.2');
+    expect(await detectVersionResult(binPath)).toEqual({
+      status: 'success',
+      version: '0.151.0',
+      fullVersion: '0.151.0-alpha.7.2',
+      prerelease: true,
+    });
+    expect(await detectVersion(binPath)).toBe('0.151.0');
   });
 
   it('falls back to stderr when stdout is empty', async () => {

@@ -19,9 +19,9 @@ import { logErrorSummary } from '../../util/log-redact';
 
 const log = createLogger('sdk-timeout-patch');
 
-/** 1 hour. Paired with `idleTimeout` (1800s) in `client.ts` as the two real
- * guards on LLM calls; every other "timeout" in the app is either a short
- * external-IO failfast or a debounce. */
+/** 1 hour. The host's phase-aware idle watchdogs remain the authoritative
+ * liveness guards; every other timeout is either an external-IO failfast or
+ * a debounce. */
 const LLM_TIMEOUT_MS = 3_600_000;
 const LLM_SDK_MAX_RETRIES = 0;
 
