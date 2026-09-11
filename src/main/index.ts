@@ -831,6 +831,15 @@ async function runMarketplaceInstallReconcile(reason: string): Promise<void> {
         return;
       }
 
+      const builtinMarketplace = await import('./features/builtin_marketplace');
+      await builtinMarketplace.resolveBuiltinMarketplaceInstalls(uid, { shouldContinue }).catch((err) => {
+        marketplaceBootLog.warn('builtin marketplace resolve failed', { error: logErrorSummary(err) });
+      });
+      if (!shouldContinue()) {
+        clearDefaultSeedStatus();
+        return;
+      }
+
       const forceMarketplaceNetwork = reason === 'marketplace-defaults-retry';
       const seeded = await mp.ensureDefaultInstalls(uid, {
         shouldContinue,
