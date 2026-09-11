@@ -548,6 +548,59 @@ describe('search › searchContexts', () => {
 });
 
 describe('search › searchChats — group-chat shape end-to-end', () => {
+  it.each(['constructor', '__proto__'])(
+    'indexes and searches a new message containing %s after restarting with a saved index',
+    async (term) => {
+      const messages = [{ from: 'user', text: 'baseline message', ts: 't1' }];
+      writeChat(TEST_UID, 'restart-chat', messages);
+      const oldIndexer = await import('../../../../src/main/features/search/indexer');
+      await oldIndexer.reconcileChatsIndex(TEST_UID);
+      await oldIndexer.flushAll();
+      vi.resetModules();
+
+      const message = { from: 'user', text: `${term} freshmarker`, ts: 't2' };
+      writeChat(TEST_UID, 'restart-chat', [...messages, message]);
+      const ix = await import('../../../../src/main/features/search/indexer');
+      await ix.indexChatMessage(TEST_UID, 'restart-chat', 1, message);
+      const s = await loadSearch();
+      expect(await s.searchChats(TEST_UID, 'freshmarker')).toMatchObject([
+        { cid: 'restart-chat', msg_index: 1, snippet: message.text },
+      ]);
+      expect(await s.searchChats(TEST_UID, term)).toHaveLength(1);
+      expect(await s.searchChats(TEST_UID, term === 'constructor' ? '__proto__' : 'constructor')).toEqual([]);
+      await ix.dropChatConversation(TEST_UID, 'restart-chat');
+      // Remove the source too so reconciliation cannot re-add it.
+      fs.unlinkSync(path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'restart-chat.jsonl'));
+      expect(await s.searchChats(TEST_UID, term)).toEqual([]);
+    },
+  );
+
+  it('rebuilds a v4 index with incomplete postings even when source metadata is unchanged', async () => {
+    const message = { from: 'user', text: 'constructor recoveredmarker', ts: 't1' };
+    writeChat(TEST_UID, 'partial-chat', [message]);
+    const paths = await import('../../../../src/main/paths');
+    const idxPath = paths.userChatsIndexPath(TEST_UID);
+    const source = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'partial-chat.jsonl');
+    const stat = fs.statSync(source);
+    fs.mkdirSync(path.dirname(idxPath), { recursive: true });
+    // A failed append can leave the doc present without its posting rows;
+    // later successful appends can make the file metadata look up to date.
+    fs.writeFileSync(idxPath, JSON.stringify({
+      version: 4, kind: 'chat',
+      files: { 'partial-chat': { mtime: stat.mtimeMs, size: stat.size } },
+      docs: { 'chat:partial-chat:0': {
+        kind: 'chat', fileKey: 'partial-chat', cid: 'partial-chat', msg_index: 0,
+        len: message.text.length, _tokens: ['constructor', 'recoveredmarker'],
+      } },
+      postings: {},
+    }));
+    const s = await loadSearch();
+    expect(await s.searchChats(TEST_UID, 'recoveredmarker')).toMatchObject([
+      { cid: 'partial-chat', msg_index: 0, snippet: message.text },
+    ]);
+    expect(fs.readFileSync(source, 'utf8')).toBe(JSON.stringify(message) + '\n');
+  });
+
   it('finds a query token in current group-chat jsonl shape and returns a snippet', async () => {
     // Pin the bug-fix path: bus refactor changed `<cid>.jsonl` from
     // `{role, content, time}` to `{id, ts, from, to, mentions, text}`.

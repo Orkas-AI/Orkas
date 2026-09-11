@@ -86,6 +86,26 @@ describe('search/storage › loadIndex', () => {
 });
 
 describe('search/storage › saveIndex', () => {
+  it.each(['chat', 'context'] as const)('preserves dictionary keys and missing-key semantics after reloading %s', async (kind) => {
+    const p = path.join(tmpDir, 'dictionary.json');
+    const idx = emptyIndex(kind);
+    idx.files.__proto__ = { mtime: 42, size: 12 };
+    idx.docs.constructor = { kind, fileKey: '__proto__', len: 12 };
+    idx.postings.__proto__ = [['constructor', 1]];
+    await saveIndex(p, idx);
+    const loaded = await loadIndex(p, kind);
+    expect(loaded.files.__proto__).toEqual({ mtime: 42, size: 12 });
+    expect(loaded.docs.constructor).toMatchObject({ fileKey: '__proto__' });
+    expect(loaded.postings.__proto__).toEqual([['constructor', 1]]);
+    // Missing terms must not resolve to Object.prototype functions after JSON IO.
+    expect(loaded.postings.constructor).toBeUndefined();
+    expect(loaded.files.toString).toBeUndefined();
+    expect(loaded.docs.hasOwnProperty).toBeUndefined();
+    loaded.postings.constructor = [['constructor', 2]];
+    await saveIndex(p, loaded);
+    expect((await loadIndex(p, kind)).postings.constructor).toEqual([['constructor', 2]]);
+  });
+
   it('saveIndex + loadIndex roundtrip preserves shape', async () => {
     const p = path.join(tmpDir, 'rt.json');
     const idx: Index = {
@@ -111,7 +131,7 @@ describe('search/storage › saveIndex', () => {
 
   it('saveIndex mkdirs nested parent directories', async () => {
     const p = path.join(tmpDir, 'deep', 'nested', 'idx.json');
-    await saveIndex(p, emptyIndex('skill_chat'));
+    await saveIndex(p, emptyIndex('chat'));
     expect(fs.existsSync(p)).toBe(true);
   });
 });
