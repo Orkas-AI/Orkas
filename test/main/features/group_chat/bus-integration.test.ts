@@ -4768,6 +4768,10 @@ describe('group_chat bus integration › task terminal boundary', () => {
     const permissions = await import('../../../../src/main/features/permissions');
     permissions.setLocalExecMode('all_files_approval');
     const prompts: any[] = [];
+    const terminals: string[] = [];
+    const unsubscribe = bus.subscribeTaskTerminals(event => {
+      if (event.conversation_id === cid) terminals.push(event.status);
+    });
     confirm._setBroadcastForTest((channel, payload) => { if (channel === 'connectors:action-confirm') prompts.push(payload); });
     const opts = { userId: TEST_UID, cid, connectorId: 'feishu', displayName: 'Feishu', toolName: 'send', risk: 'H' as const, args: {} };
     try {
@@ -4778,11 +4782,14 @@ describe('group_chat bus integration › task terminal boundary', () => {
       _setScript(state.buildGconvSessionId(cid), [{ type: 'final', text: 'Done.' }]);
       await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Finish this task.' });
       await waitForQuiescent(TEST_UID, cid, 3000);
+      // Worker quiescence precedes the persisted status and terminal notification.
+      await expect.poll(() => terminals).toEqual(['completed']);
       const next = confirm.requestActionConfirm(opts);
       expect(prompts).toHaveLength(2);
       confirm.respond(prompts[1].request_id, false);
       await expect(next).resolves.toBe(false);
     } finally {
+      unsubscribe();
       confirm.cancelForCid(cid);
       confirm._setBroadcastForTest(null);
     }

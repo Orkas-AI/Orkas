@@ -2347,9 +2347,10 @@ describe('conversation stream lifecycle idempotency', () => {
 
   it('catches up persisted replies after subscribing to an already-running task', async () => {
     const context = loadConversationRenderer();
-    const { loadingEl } = setupRunningObserverTestContext(context);
-    context._findRenderedMessageForHistoryRecord = () => null;
-    context._consumePlaceholderForHistoryRecord = () => loadingEl;
+    const { historyEl, loadingEl } = setupRunningObserverTestContext(context);
+    loadingEl.dataset = { placeholder: '1', renderKey: 's:turn-1:0' };
+    historyEl.querySelector = (selector: string) => selector.includes('data-render-key="s:turn-1:0"') ? loadingEl : null;
+    historyEl.querySelectorAll = (selector: string) => selector.includes('data-render-key="s:turn-1:0"') ? [loadingEl] : [];
 
     const finalizedTexts: string[] = [];
     context._finalizeActorPlaceholder = (_el: any, message: any) => {
@@ -9823,10 +9824,14 @@ describe('polled history recovery identity', () => {
 
   it('settles a keyed live row once when its durable reply arrives through polling', async () => {
     const context = recoveryHarness();
-    const row = { dataset: { renderKey: 's:turn-a:0' }, parentElement: {} };
+    const row = { dataset: { renderKey: 's:turn-a:0', placeholder: '1', finalized: '0' }, parentElement: {} };
     const record = { id: 'reply-a', from: 'commander', turn_id: 'turn-a', seg: 0, text: 'Done' };
     context._findRenderedGroupMessage = () => row;
-    context._claimRenderNodeForMessage = () => row;
+    context._claimRenderNodeForMessage = () => {
+      if (row.dataset.finalized === '1') return null;
+      row.dataset.finalized = '1';
+      return row;
+    };
     context._finalizeActorPlaceholder = vi.fn((node: any, gm: any) => { node.dataset.msgId = gm.id; });
     context._messageRecordHasMountedSidecars = () => true;
     expect(await context._recoverPolledVisibleMessages('c1', [record])).toBe(true);

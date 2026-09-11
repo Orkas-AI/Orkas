@@ -8110,29 +8110,30 @@ async function _recoverPolledVisibleMessages(cid, rawMessages) {
   for (const gm of visible) {
     if (!gm.id) continue;
     const existing = _findRenderedGroupMessage(container, gm);
-    if (existing && String(existing.dataset.msgId || '') === String(gm.id)) {
+    if (existing) {
+      if (existing.dataset.placeholder === '1' && existing.dataset.finalized !== '1') {
+        const live = _claimRenderNodeForMessage(cid, gm);
+        if (live) {
+          _finalizeActorPlaceholder(live, gm, cid, true);
+          changed = true;
+          continue;
+        }
+      }
+      _syncRenderedGroupMessageIdentity(existing, gm);
       if (!_messageRecordHasMountedSidecars(gm, existing, { checkMutableState: false })) {
         loadConversationHistory(cid, { preserveScroll: true });
         return true;
       }
       continue;
     }
-    const ph = _claimRenderNodeForMessage(cid, gm)
-      || _adoptFallbackRowForMessage(cid, gm, pendingConvs.get(cid)?.loadingEl);
-    if (ph && ph.parentElement) {
-      _finalizeActorPlaceholder(ph, gm, cid, true);
-      changed = true;
-      continue;
-    }
-    // An uncorrelated interruption row can be stale while a newer exact turn
-    // for the same actor is live (or can itself be a false row from deferred
-    // boot maintenance). Do not append a second bubble mid-stream. Once the
-    // runtime settles, normal history reconciliation either removes the row as
-    // superseded by the final message or renders it when it was genuine.
+    // Recovery may precede mounting the newer live row. Keep its older
+    // interruption deferred using runtime identity until that turn settles.
     if (_isInterruptedAssistantMessage(gm) && (_latestActiveTurns.get(cid) || []).some((turn) => (
       String(turn.actor || '') === String(gm.from || '')
       && (!gm.turn_id || String(turn.turn_id || '') !== String(gm.turn_id))
     ))) continue;
+    // No row owns this record's identity. The shared interruption cleanup
+    // below removes any status superseded by a newer live row for its actor.
     const legacy = _groupMsgToLegacy(gm);
     const bubble = appendChatMessage(legacy, true, { cid, archive: true });
     if (bubble) bubble.dataset.fromActor = String(gm.from || '');
@@ -12336,8 +12337,8 @@ function _removeSupersededInterruptionBubbles(container) {
     if (el.dataset.systemKind === 'reply_interrupted') {
       // A boot-maintenance race used to append a false interruption below a
       // still-running placeholder. Never show that as a second bubble. The
-      // polling path defers the record too; this DOM guard repairs an already
-      // mounted row from an earlier poll without discarding the process rail.
+      // recovery path uses this same guard to repair a row mounted by an
+      // earlier poll without discarding the process rail.
       if (liveByActor.has(actor)) {
         el.remove();
         removed += 1;

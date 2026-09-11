@@ -215,6 +215,28 @@ function loadRenderer(cid: string) {
 const CID = 'c1';
 const TURN = 'turn-1';
 
+describe('keyed rendering › reconnect history', () => {
+  it('recovers missing replies once without merging same-text replies from different turns', async () => {
+    const { context, container, appended, finalized } = loadRenderer(CID);
+    const first = { id: 'saved-1', from: 'commander', to: ['user'], text: 'Saved answer',
+      ts: '2026-09-10T12:00:00Z', turn_id: 'first-turn', seg: 0 };
+    const second = { ...first, id: 'saved-2', turn_id: 'second-turn' };
+    const live = new FakeNode();
+    live.dataset.renderKey = 's:first-turn:0';
+    live.dataset.placeholder = '1';
+    container.appendChild(live);
+
+    await context._recoverPolledVisibleMessages(CID, [first]);
+    await context._recoverPolledVisibleMessages(CID, [first, second]);
+    await context._recoverPolledVisibleMessages(CID, [first, second]);
+
+    expect(container.rows.map(row => row.dataset.msgId)).toEqual(['saved-1', 'saved-2']);
+    expect(container.rows[0]).toBe(live);
+    expect(appended).toHaveLength(1);
+    expect(finalized.map(item => item.gm.text)).toEqual(['Saved answer']);
+  });
+});
+
 function delta(seg: number, text: string, actor = 'commander') {
   return { type: 'process', cid: CID, actor, turn_id: TURN, seg, data: { type: 'delta', text } };
 }

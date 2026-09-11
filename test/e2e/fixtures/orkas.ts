@@ -27,7 +27,7 @@ const PC_ROOT = path.resolve(__dirname, '../../..');
 // Shared E2E scenarios address this local registry identity directly. The
 // value is a fixture UID; it does not create an official account or session.
 const LOCAL_USER_ID = 'account-e2e';
-const MAX_LOG_BYTES = 2 * 1024 * 1024;
+const { collectLogFiles } = require('./electron-log-files.cjs') as { collectLogFiles: (root: string) => string };
 /** Evidence files read per model round in the context-compaction scenario.
  *  Four ~11.2K-token results stay well under the per-round inline allowance,
  *  so the batch builds context instead of spilling to disk. */
@@ -706,41 +706,6 @@ function seedWorkspace(workspaceRoot: string): void {
 }
 
 
-function collectLogFiles(root: string): string {
-  const chunks: string[] = [];
-  let totalBytes = 0;
-
-  const visit = (directory: string): void => {
-    let entries;
-    try {
-      entries = readdirSync(directory, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      if (totalBytes >= MAX_LOG_BYTES) return;
-      const fullPath = path.join(directory, entry.name);
-      if (entry.isDirectory()) {
-        visit(fullPath);
-        continue;
-      }
-      if (!entry.isFile() || !entry.name.endsWith('.log')) continue;
-      try {
-        const body = readFileSync(fullPath, 'utf8');
-        const available = MAX_LOG_BYTES - totalBytes;
-        const slice = body.slice(0, available);
-        chunks.push(`\n===== ${path.relative(root, fullPath)} =====\n${slice}`);
-        totalBytes += Buffer.byteLength(slice);
-      } catch {
-        // A log may be rotated while Electron is shutting down.
-      }
-    }
-  };
-
-  visit(root);
-  return chunks.join('');
-}
-
 export class OrkasTestApp {
   readonly root: string;
   readonly workspaceRoot: string;
@@ -900,6 +865,9 @@ export class OrkasTestApp {
     // Automation shells can use Electron as their Node runtime and leak this
     // switch into child processes. Playwright must launch Electron in app mode.
     delete environment.ELECTRON_RUN_AS_NODE;
+    // Preserve no-color output without leaking contradictory runner settings
+    // into Electron's stderr (which the app records as console errors).
+    if (environment.NO_COLOR !== undefined) delete environment.FORCE_COLOR;
     if (this.cliStub) {
       environment.ORKAS_E2E_CLI_STATE = this.cliStatePath;
       environment.ORKAS_OPENCODE_PATH = this.fakeOpenCodePath || '';
@@ -1633,7 +1601,7 @@ export class OrkasTestApp {
           contentType: 'application/json',
         }).catch(() => undefined);
       }
-      const appLogs = collectLogFiles(path.join(this.workspaceRoot, 'logs'));
+      const appLogs = collectLogFiles(this.root);
       const diagnosticText = [this.diagnostics.join('\n'), appLogs].filter(Boolean).join('\n');
       if (diagnosticText) {
         // Written to the failure's output directory, not only attached: line/list
@@ -1661,7 +1629,7 @@ export class OrkasTestApp {
       // renderer diagnostics and app logs as a failed run. File logs alone
       // omit direct console output, including renderer warnings.
       if (process.env.ORKAS_E2E_KEEP_LOGS === '1') {
-        const appLogs = collectLogFiles(path.join(this.workspaceRoot, 'logs'));
+        const appLogs = collectLogFiles(this.root);
         const diagnosticText = [this.diagnostics.join('\n'), appLogs].filter(Boolean).join('\n');
         if (diagnosticText) {
           try {

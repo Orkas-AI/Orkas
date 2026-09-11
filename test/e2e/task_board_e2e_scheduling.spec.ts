@@ -308,6 +308,12 @@ test.describe('task board scheduling (D18 serial chain)', () => {
     const board = page.locator('#chat-task-board');
     const rows = page.locator('#chat-task-board-list .chat-queue-item');
     const before = app.modelRequests.length;
+    const recoveryWarnings: string[] = [];
+    page.on('console', message => {
+      if (message.text().includes('plan recovery history reconcile failed')) {
+        recoveryWarnings.push(message.text());
+      }
+    });
 
     app.setModelMode('very-slow');
     await sendMultiMention(page, '@ContentWriter slow research task. @UIDesigner deck after research.');
@@ -326,6 +332,11 @@ test.describe('task board scheduling (D18 serial chain)', () => {
     // user clicked (the click itself must re-attach event delivery).
     app.setModelMode('success');
     app.setModelTextReplies(['ran anyway fine.']);
+    // Simulate a missed history render while the canonical seed reply remains
+    // on disk. Reattaching must recover it once as well as show the new reply.
+    const seedReply = page.locator('#chat-history .chat-message.assistant').filter({ hasText: 'ok task board' });
+    await expect(seedReply).toHaveCount(1);
+    await seedReply.evaluate(node => node.remove());
     await runAnyway.click();
     await expect.poll(() => app.modelRequests.length, { timeout: 15_000 }).toBe(before + 2);
     await expect(page.locator('#chat-history')).toContainText('ran anyway fine.', { timeout: 15_000 });
@@ -333,6 +344,8 @@ test.describe('task board scheduling (D18 serial chain)', () => {
     // is released into an ordinary single run, the board retracts and the
     // final result remains in chat history.
     await expect(board).toBeHidden({ timeout: 10_000 });
+    await expect(seedReply).toHaveCount(1);
+    expect(recoveryWarnings).toEqual([]);
   });
 
   test('groups by agent, drags queued messages only within that agent, and removes cancelled sends', async ({ modelOrkas, boardPage }, testInfo) => {

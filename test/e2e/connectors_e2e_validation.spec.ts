@@ -1,6 +1,100 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 
-import { expect, test } from './fixtures/orkas';
+import { expect, test, type OrkasTestApp } from './fixtures/orkas';
+
+async function connectLocalMcp(modelOrkas: OrkasTestApp) {
+  if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
+  const page = modelOrkas.page;
+  expect(await modelOrkas.invoke('permissions.setLocalExecMode', { mode: 'all_files_approval' }))
+    .toMatchObject({ ok: true, mode: 'all_files_approval' });
+  const callStatePath = modelOrkas.createFixtureFile('e2e-mcp-call-state.json', '[]\n');
+  const serverPath = modelOrkas.createFixtureFile('e2e-mcp-server.cjs', String.raw`
+const fs = require('node:fs');
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin, terminal: false });
+function reply(id, result) {
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n');
+}
+rl.on('line', (line) => {
+  let msg;
+  try { msg = JSON.parse(line); } catch { return; }
+  if (msg.method === 'initialize') {
+    reply(msg.id, {
+      protocolVersion: msg.params.protocolVersion,
+      capabilities: { tools: {} },
+      serverInfo: { name: 'orkas-e2e-mcp', version: '1.0.0' },
+    });
+  } else if (msg.method === 'tools/list') {
+    reply(msg.id, { tools: [{
+      name: 'e2e_echo',
+      description: 'Returns deterministic E2E text.',
+      inputSchema: { type: 'object', properties: { text: { type: 'string' } } },
+    }] });
+  } else if (msg.method === 'tools/call') {
+    let calls = [];
+    try { calls = JSON.parse(fs.readFileSync(process.env.E2E_MCP_STATE, 'utf8')); } catch {}
+    calls.push({ name: msg.params.name, arguments: msg.params.arguments });
+    fs.writeFileSync(process.env.E2E_MCP_STATE, JSON.stringify(calls, null, 2));
+    reply(msg.id, { content: [{ type: 'text', text: 'echo:' + String(msg.params.arguments.text || '') }] });
+  } else if (msg.method === 'ping') {
+    reply(msg.id, {});
+  }
+});
+`);
+
+  await page.locator('#connectors-btn').click();
+  await expect(page.locator('#panel-connectors')).toHaveClass(/\bactive\b/);
+  await page.locator('#connectors-add-custom-btn').click();
+  const dialog = page.locator('.connector-custom-dialog');
+  await dialog.locator('[data-f="name"]').fill('E2E Local MCP');
+  await dialog.locator('[data-f="kind"]').selectOption('stdio');
+  await dialog.locator('[data-f="command"]').fill(process.execPath);
+  await dialog.locator('[data-f="args"]').fill(serverPath);
+  await dialog.locator('[data-f="env"]').fill([
+    'E2E_SECRET=must-not-reach-renderer',
+    `E2E_MCP_STATE=${callStatePath}`,
+  ].join('\n'));
+  await dialog.locator('[data-act="ok"]').click();
+  await expect(dialog).toHaveCount(0, { timeout: 15_000 });
+
+  const listed = await modelOrkas.invoke<{
+    instances: Array<{
+      id: string;
+      display_name: string;
+      enabled?: boolean;
+      status: { kind: string };
+      transport?: { kind: string; summary: string };
+      tools_cache: Array<{ name: string }>;
+    }>;
+  }>('connectors.list');
+  const instance = listed.instances.find((item) => item.display_name === 'E2E Local MCP');
+  expect(instance).toMatchObject({
+    enabled: true,
+    status: { kind: 'connected' },
+    transport: { kind: 'stdio' },
+  });
+  expect(instance?.tools_cache.map((tool) => tool.name)).toContain('e2e_echo');
+  expect(JSON.stringify(instance)).not.toContain('must-not-reach-renderer');
+
+  const card = page.locator(`.connector-card[data-id="${instance?.id}"]`);
+  await expect(card).toContainText('E2E Local MCP');
+  await expect(card).not.toHaveClass(/\bis-disabled\b/);
+
+  if (!instance?.id) throw new Error('Connected E2E MCP instance was not returned');
+    const startConnectorChat = async () => {
+      await page.locator('#new-chat-btn').click();
+      await page.locator('#new-chat-recipient-chip').click();
+      const picker = page.locator('#agent-picker');
+      await picker.locator('[data-agent-picker-tab="connectors"]').click();
+      const connectorOption = picker.locator(
+        `.skill-picker-item[data-kind="connector"][data-id="${instance.id}"]`,
+      );
+      await expect(connectorOption).toContainText('E2E Local MCP');
+      await connectorOption.click();
+      await expect(page.locator('#new-chat-input')).toHaveValue(/Connector: E2E Local MCP/);
+    };
+  return { page, instance, card, callStatePath, startConnectorChat };
+}
 
 test.describe('connectors', () => {
   test('browses available connectors by category with localized chips and a narrow layout', async ({ connectorOrkas }, testInfo) => {
@@ -255,100 +349,8 @@ test.describe('connectors', () => {
     await expect(custom).toHaveCount(0);
   });
 
-  test('connects to a real local MCP server, approves a task, changes operation trust, toggles it, and disconnects', async ({ modelOrkas }, testInfo) => {
-    // This journey includes multiple model/tool rounds, permission changes and disconnect.
-    // Budget the whole journey separately; individual UI and operation deadlines stay unchanged.
-    test.setTimeout(120_000);
-    if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
-    const page = modelOrkas.page;
-    expect(await modelOrkas.invoke('permissions.setLocalExecMode', { mode: 'all_files_approval' }))
-      .toMatchObject({ ok: true, mode: 'all_files_approval' });
-    const callStatePath = modelOrkas.createFixtureFile('e2e-mcp-call-state.json', '[]\n');
-    const serverPath = modelOrkas.createFixtureFile('e2e-mcp-server.cjs', String.raw`
-const fs = require('node:fs');
-const readline = require('node:readline');
-const rl = readline.createInterface({ input: process.stdin, terminal: false });
-function reply(id, result) {
-  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n');
-}
-rl.on('line', (line) => {
-  let msg;
-  try { msg = JSON.parse(line); } catch { return; }
-  if (msg.method === 'initialize') {
-    reply(msg.id, {
-      protocolVersion: msg.params.protocolVersion,
-      capabilities: { tools: {} },
-      serverInfo: { name: 'orkas-e2e-mcp', version: '1.0.0' },
-    });
-  } else if (msg.method === 'tools/list') {
-    reply(msg.id, { tools: [{
-      name: 'e2e_echo',
-      description: 'Returns deterministic E2E text.',
-      inputSchema: { type: 'object', properties: { text: { type: 'string' } } },
-    }] });
-  } else if (msg.method === 'tools/call') {
-    let calls = [];
-    try { calls = JSON.parse(fs.readFileSync(process.env.E2E_MCP_STATE, 'utf8')); } catch {}
-    calls.push({ name: msg.params.name, arguments: msg.params.arguments });
-    fs.writeFileSync(process.env.E2E_MCP_STATE, JSON.stringify(calls, null, 2));
-    reply(msg.id, { content: [{ type: 'text', text: 'echo:' + String(msg.params.arguments.text || '') }] });
-  } else if (msg.method === 'ping') {
-    reply(msg.id, {});
-  }
-});
-`);
-
-    await page.locator('#connectors-btn').click();
-    await expect(page.locator('#panel-connectors')).toHaveClass(/\bactive\b/);
-    await page.locator('#connectors-add-custom-btn').click();
-    const dialog = page.locator('.connector-custom-dialog');
-    await dialog.locator('[data-f="name"]').fill('E2E Local MCP');
-    await dialog.locator('[data-f="kind"]').selectOption('stdio');
-    await dialog.locator('[data-f="command"]').fill(process.execPath);
-    await dialog.locator('[data-f="args"]').fill(serverPath);
-    await dialog.locator('[data-f="env"]').fill([
-      'E2E_SECRET=must-not-reach-renderer',
-      `E2E_MCP_STATE=${callStatePath}`,
-    ].join('\n'));
-    await dialog.locator('[data-act="ok"]').click();
-    await expect(dialog).toHaveCount(0, { timeout: 15_000 });
-
-    const listed = await modelOrkas.invoke<{
-      instances: Array<{
-        id: string;
-        display_name: string;
-        enabled?: boolean;
-        status: { kind: string };
-        transport?: { kind: string; summary: string };
-        tools_cache: Array<{ name: string }>;
-      }>;
-    }>('connectors.list');
-    const instance = listed.instances.find((item) => item.display_name === 'E2E Local MCP');
-    expect(instance).toMatchObject({
-      enabled: true,
-      status: { kind: 'connected' },
-      transport: { kind: 'stdio' },
-    });
-    expect(instance?.tools_cache.map((tool) => tool.name)).toContain('e2e_echo');
-    expect(JSON.stringify(instance)).not.toContain('must-not-reach-renderer');
-
-    const card = page.locator(`.connector-card[data-id="${instance?.id}"]`);
-    await expect(card).toContainText('E2E Local MCP');
-    await expect(card).not.toHaveClass(/\bis-disabled\b/);
-
-    if (!instance?.id) throw new Error('Connected E2E MCP instance was not returned');
-    const startConnectorChat = async () => {
-      await page.locator('#new-chat-btn').click();
-      await page.locator('#new-chat-recipient-chip').click();
-      const picker = page.locator('#agent-picker');
-      await picker.locator('[data-agent-picker-tab="connectors"]').click();
-      const connectorOption = picker.locator(
-        `.skill-picker-item[data-kind="connector"][data-id="${instance.id}"]`,
-      );
-      await expect(connectorOption).toContainText('E2E Local MCP');
-      await connectorOption.click();
-      await expect(page.locator('#new-chat-input')).toHaveValue(/Connector: E2E Local MCP/);
-    };
+  test('connects to a real local MCP server and expires task approval before the next task', async ({ modelOrkas }, testInfo) => {
+    const { page, instance, callStatePath, startConnectorChat } = await connectLocalMcp(modelOrkas);
     await startConnectorChat();
 
     modelOrkas.setConnectorToolScenario(instance.id);
@@ -401,7 +403,7 @@ rl.on('line', (line) => {
       arguments: { text: 'roundtrip' },
     }]);
     // Task approval leaves global permissions unchanged and expires at task
-    // completion. A new task must ask again before switching to Trusted.
+    // completion. A new task must ask again without changing global trust.
     expect(await modelOrkas.invoke('permissions.getLocalExec')).toMatchObject({ mode: 'all_files_approval' });
     await startConnectorChat();
     modelOrkas.setConnectorToolScenario(instance.id);
@@ -409,6 +411,24 @@ rl.on('line', (line) => {
     await page.locator('#new-chat-send-btn').click();
     await expect(actionConfirmation).toBeVisible();
     expect(JSON.parse(readFileSync(callStatePath, 'utf8'))).toHaveLength(1);
+    await actionConfirmation.locator('[data-id="allow_run"]').click();
+    await expect(actionConfirmation).toHaveCount(0);
+    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+      hasText: 'E2E connector tool round trip completed.',
+    })).toBeVisible({ timeout: 20_000 });
+    expect(JSON.parse(readFileSync(callStatePath, 'utf8'))).toHaveLength(2);
+    expect(await modelOrkas.invoke('permissions.getLocalExec')).toMatchObject({ mode: 'all_files_approval' });
+  });
+
+  test('connects to a real local MCP server and persists operation trust across tasks', async ({ modelOrkas }, testInfo) => {
+    const { page, instance, callStatePath, startConnectorChat } = await connectLocalMcp(modelOrkas);
+    await startConnectorChat();
+    modelOrkas.setConnectorToolScenario(instance.id);
+    await page.locator('#new-chat-input').type('Call the echo connector.');
+    await page.locator('#new-chat-send-btn').click();
+    const actionConfirmation = page.locator('.bash-permission-dialog');
+    await expect(actionConfirmation).toBeVisible();
+    expect(JSON.parse(readFileSync(callStatePath, 'utf8'))).toEqual([]);
     await actionConfirmation.locator('.bash-permission-mode-trigger').click();
     const modeMenu = page.getByRole('listbox').filter({ has: page.locator('[data-mode="all_files_auto"]') });
     await expect(modeMenu).toBeVisible();
@@ -424,7 +444,7 @@ rl.on('line', (line) => {
       hasText: 'E2E connector tool round trip completed.',
     })).toBeVisible({ timeout: 20_000 });
     expect(await modelOrkas.invoke('permissions.getLocalExec')).toMatchObject({ mode: 'all_files_auto' });
-    expect(JSON.parse(readFileSync(callStatePath, 'utf8'))).toHaveLength(2);
+    expect(JSON.parse(readFileSync(callStatePath, 'utf8'))).toHaveLength(1);
 
     await startConnectorChat();
     modelOrkas.setConnectorToolScenario(instance.id);
@@ -434,9 +454,28 @@ rl.on('line', (line) => {
       hasText: 'E2E connector tool round trip completed.',
     })).toBeVisible({ timeout: 20_000 });
     await expect(actionConfirmation).toHaveCount(0);
-    expect(JSON.parse(readFileSync(callStatePath, 'utf8'))).toEqual(Array.from({ length: 3 }, () => ({
+    expect(JSON.parse(readFileSync(callStatePath, 'utf8'))).toEqual(Array.from({ length: 2 }, () => ({
       name: 'e2e_echo', arguments: { text: 'roundtrip' },
     })));
+  });
+
+  // Availability has its own journey and deadline; approval/trust coverage above
+  // remains complete instead of sharing a cumulative multi-journey timeout.
+  test('connects to a real local MCP server, toggles availability, and disconnects', async ({ modelOrkas }) => {
+    const { page, instance, card, callStatePath, startConnectorChat } = await connectLocalMcp(modelOrkas);
+    // Warm the real connector through an agent call before disabling it, so
+    // stale tool visibility cannot hide behind a never-used instance.
+    await modelOrkas.invoke('permissions.setLocalExecMode', { mode: 'all_files_auto' });
+    await startConnectorChat();
+    modelOrkas.setConnectorToolScenario(instance.id);
+    await page.locator('#new-chat-input').type('Call the echo connector before disabling it.');
+    await page.locator('#new-chat-send-btn').click();
+    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+      hasText: 'E2E connector tool round trip completed.',
+    })).toBeVisible({ timeout: 20_000 });
+    expect(JSON.parse(readFileSync(callStatePath, 'utf8'))).toEqual([
+      { name: 'e2e_echo', arguments: { text: 'roundtrip' } },
+    ]);
     await page.locator('#connectors-btn').click();
     await card.hover();
     await card.locator('.connector-card-menu-btn').click();
