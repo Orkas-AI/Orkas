@@ -6,6 +6,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
+import content  # noqa: E402
 from content import audit_content, _count_claims, _avg_sentence_words  # noqa: E402
 
 
@@ -110,9 +111,33 @@ class ThinBoundaryTest(unittest.TestCase):
         self.assertIn("thin_for_topic", ids299)
         ids300 = {f["id"] for f in audit_content(crawl(dict(CLEAN, word_count=300)))["findings"]}
         self.assertNotIn("thin_for_topic", ids300)
-        # word_count 0 is falsy → the `wc and` guard suppresses thin_for_topic.
+        # word_count 0 sits in audit.py's thin_content band, not this skill's.
         ids0 = {f["id"] for f in audit_content(crawl(dict(CLEAN, word_count=0)))["findings"]}
         self.assertNotIn("thin_for_topic", ids0)
+
+
+class ThinComplementTest(unittest.TestCase):
+    """thin_for_topic covers exactly the 200-299 band: the complement of
+    audit.py's thin_content (word_count < 200), so a page is never thin-flagged
+    twice in one merged report."""
+
+    @staticmethod
+    def _ids(wc):
+        return {f["id"] for f in audit_content(crawl(dict(CLEAN, word_count=wc)))["findings"]}
+
+    def test_threshold_matches_audit_thin_content(self):
+        self.assertEqual(content._AUDIT_THIN_WC, 200)  # audit.py flags wc < 200
+
+    def test_audit_thin_band_not_double_flagged(self):
+        # wc=150 already gets audit.py's thin_content; no thin_for_topic on top.
+        self.assertNotIn("thin_for_topic", self._ids(150))
+
+    def test_midband_page_still_flagged(self):
+        self.assertIn("thin_for_topic", self._ids(250))
+
+    def test_exact_complement_boundary(self):
+        self.assertNotIn("thin_for_topic", self._ids(199))  # audit.py's band
+        self.assertIn("thin_for_topic", self._ids(200))     # this skill's band
 
 
 class CountClaimsBoundaryTest(unittest.TestCase):

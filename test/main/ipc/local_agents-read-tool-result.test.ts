@@ -3,6 +3,7 @@
  *
  * Security invariants the handler MUST hold (CLAUDE.md §5 boundary):
  *   - active uid only, opaque refs resolve under <uid>/local/tool-results/
+ *   - projected-history paths resolve only under cache entries' tool-results/
  *   - reject ENOENT, symlink-escape, traversal (`../`), non-file targets
  *   - byte-cap reads at 256 KB; signal truncation via `{truncated:true}`
  *
@@ -84,6 +85,26 @@ describe('ipc/local_agents.readToolResult', () => {
     expect(r.ok).toBe(true);
     expect(r.content).toBe('hello world');
     expect(r.truncated).toBe(false);
+  });
+
+  it('reads a lazy history-cache result while keeping other cache buckets out of scope', async () => {
+    const historyResultDir = path.join(
+      tmpDir, TEST_UID, 'local', 'cache', 'conversation-history', 'entry', 'tool-results',
+    );
+    fs.mkdirSync(historyResultDir, { recursive: true });
+    const filePath = path.join(historyResultDir, 'bash.history.txt');
+    fs.writeFileSync(filePath, 'cached history result');
+
+    expect(await callHandler({ path: filePath })).toMatchObject({
+      ok: true,
+      content: 'cached history result',
+      truncated: false,
+    });
+
+    const unrelatedCache = path.join(tmpDir, TEST_UID, 'local', 'cache', 'catalogs', 'private.txt');
+    fs.mkdirSync(path.dirname(unrelatedCache), { recursive: true });
+    fs.writeFileSync(unrelatedCache, 'not a tool result');
+    expect(await callHandler({ path: unrelatedCache })).toMatchObject({ ok: false });
   });
 
   it('rejects an absolute path outside the active uid tool-results dir', async () => {

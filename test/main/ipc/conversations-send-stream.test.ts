@@ -126,8 +126,68 @@ async function callGroupChatSend(payload: Record<string, unknown>): Promise<Reco
   );
 }
 
+describe('connector assistance creation boundary', () => {
+  it('persists only a validated target and rejects forged setup metadata before creating a conversation', async () => {
+    const invokeCreate = (assistance: unknown) => invokeHandler!(
+      { sender: trustedIpcSender() }, { channel: 'conversations.create', payload: { title: 'Set up seller', assistance } },
+    );
+    const created = await invokeCreate({
+      kind: 'connector_setup', connector_id: 'xiaohongshu-seller', prompt: 'untrusted instructions', secret: 'private-value',
+    });
+    expect(created).toMatchObject({ ok: true, conversation: {
+      assistance: { kind: 'connector_setup', connector_id: 'xiaohongshu-seller' },
+    } });
+    expect(JSON.stringify(created)).not.toContain('private-value');
+    const chats = await import('../../../src/main/features/chats');
+    const before = await chats.listConversations(TEST_UID);
+    const rejected = await invokeCreate({ kind: 'connector_setup', connector_id: 'not-a-catalog-entry' });
+    expect(rejected.ok).toBe(false);
+    expect((await chats.listConversations(TEST_UID)).length).toBe(before.length);
+    const ordinary = await invokeCreate(undefined);
+    expect(ordinary.ok).toBe(true);
+    expect((ordinary.conversation as any).assistance).toBeUndefined();
+  });
+});
+
 describe('ipc › groupChat.send active-turn control', () => {
-  it('forwards explicit active-turn authorization', async () => {
+  it('preserves smart-retry identity when a repeated click enters the busy-conversation queue', async () => {
+    const run = callGroupChatSend({
+      cid: 'c123abc',
+      content: 'Continue',
+      retry_message_id: 'failed-message-1',
+    });
+
+    await groupChatMock.sendStarted;
+    expect(groupChatMock.retryCalls).toEqual([{
+      userId: TEST_UID,
+      cid: 'c123abc',
+      failedMessageId: 'failed-message-1',
+      visibleText: 'Continue',
+    }]);
+    expect(groupChatMock.sendCalls).toEqual([]);
+    groupChatMock.releaseSend?.();
+    await expect(run).resolves.toMatchObject({ ok: true, mode: 'resume' });
+  });
+
+  it('forwards explicit Send now authorization ', async () => {
+    const run = callGroupChatSend({
+      cid: 'c123abc',
+      content: 'Apply this constraint now',
+      steer_active_turn: true,
+    });
+
+    await groupChatMock.sendStarted;
+    expect(groupChatMock.sendCalls).toEqual([{
+      userId: TEST_UID,
+      cid: 'c123abc',
+      text: 'Apply this constraint now',
+      steerActiveTurn: true,
+    }]);
+    groupChatMock.releaseSend?.();
+    await expect(run).resolves.toMatchObject({ ok: true });
+  });
+
+  it('forwards explicit active-turn authorization ', async () => {
     const run = callGroupChatSend({
       cid: 'c123abc',
       content: 'Apply this constraint now',
@@ -168,6 +228,31 @@ describe('ipc › groupChat.send active-turn control', () => {
 });
 
 describe('ipc › conversations.sendStream', () => {
+  it.each(['preserve', 'hide_generated_prefix', 'invalid'])('forwards validated Commander display provenance %s on both send paths', async (mode) => {
+    const content = '@commander first @指挥官 second';
+    const payload = { cid: 'c123abc', content, commander_mention_display: mode };
+    const expected = mode === 'invalid' ? undefined : mode;
+    const invokeRun = callGroupChatSend(payload);
+    await groupChatMock.sendStarted;
+    expect(groupChatMock.sendCalls[0].commander_mention_display).toBe(expected);
+    expect(groupChatMock.sendCalls[0].text).toBe(content);
+    groupChatMock.releaseSend?.();
+    await invokeRun;
+
+    if (!streamStartHandler) throw new Error('stream handler not registered');
+    groupChatMock.sendStarted = new Promise<void>((resolve) => { groupChatMock.resolveSendStarted = resolve; });
+    const sender = trustedIpcSender({ isDestroyed: () => false, send: vi.fn() });
+    const streamRun = streamStartHandler({ sender }, {
+      requestId: 'commander-display', channel: 'conversations.sendStream', payload,
+    });
+    await groupChatMock.sendStarted;
+    expect(groupChatMock.sendCalls[1].commander_mention_display).toBe(expected);
+    expect(groupChatMock.sendCalls[1].text).toBe(content);
+    groupChatMock.quiescent = true;
+    groupChatMock.releaseSend?.();
+    await streamRun;
+  });
+
   it('passes the pre-routing title text separately from the routed message', async () => {
     if (!streamStartHandler) throw new Error('stream handler not registered');
     const sender = trustedIpcSender({ isDestroyed: () => false, send: vi.fn() });
@@ -322,7 +407,8 @@ describe('ipc › conversations.sendStream', () => {
 
     expect(loggerMocks.warn).not.toHaveBeenCalled();
     expect(loggerMocks.debug).toHaveBeenCalledWith(
-      'streamCancel: already settled requestId=already-settled',
+      'streamCancel: already settled',
+      { request_id: 'alre...tled' },
     );
   });
 
@@ -403,11 +489,13 @@ describe('ipc › conversations.sendStream', () => {
     // Still open: a turn that ended here would clear the composer's busy state
     // while the agent is mid-run.
     expect(sent.some((item) => item.payload?.type === 'done')).toBe(false);
+    expect(sent.some((item) => item.payload?.type === 'send_accepted')).toBe(false);
 
     groupChatMock.quiescent = true;
     groupChatMock.releaseSend?.();
     await run;
 
+    expect(sent.filter((item) => item.payload?.type === 'send_accepted')).toHaveLength(1);
     expect(sent.at(-1)).toEqual({ channel: 'stream:req1', payload: { type: 'done' } });
   });
 

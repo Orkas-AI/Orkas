@@ -15,6 +15,8 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   classifyCurrentHistoryReadMode,
+  ingestLocalAgentLogEvent,
+  createLocalAgentLogCollector,
   LOCAL_AGENT_ENV_KEYS,
   localAgentBenchmarkScenariosFor,
   classifyLiveFailure,
@@ -44,6 +46,7 @@ function usage(): string {
     '  --no-install               Fail instead of installing a missing CLI',
     '  --install-only             Install and version-check, skip model calls',
     '  --benchmark                Run the objective model-quality suite',
+    '  --scenario id[,id...]     Select a focused benchmark cohort',
     '  --k N                      Benchmark rollouts per scenario; default: 2',
     '  --no-save                  Print benchmark scorecard without saving it',
     '  -h, --help                 Show this help',
@@ -185,6 +188,7 @@ type QualityRun = {
   wallMs: number;
   checks: Array<{ name: string; pass: boolean; detail: string }>;
   outputSha256: string;
+  cliLogAnalysis?: unknown;
   failureKind: string | null;
 };
 
@@ -214,7 +218,7 @@ async function runQualityBenchmark(
   run: (options: any) => Promise<any>,
   uid: string,
   testDataRoot: string,
-  options: { k: number; noSave: boolean },
+  options: { k: number; noSave: boolean; scenarios?: string[] },
 ): Promise<void> {
   const inventoryErrors = validateLocalAgentBenchmarkInventory();
   if (inventoryErrors.length) {
@@ -231,7 +235,7 @@ async function runQualityBenchmark(
   ]);
 
   for (const entry of entries) {
-    for (const scenario of localAgentBenchmarkScenariosFor(entry.type)) {
+    for (const scenario of localAgentBenchmarkScenariosFor(entry.type).filter(item => !options.scenarios || options.scenarios.includes(item.id))) {
       for (let rollout = 1; rollout <= options.k; rollout += 1) {
         const cwd = path.join(testDataRoot, 'benchmark', entry.type, scenario.id, `rollout-${rollout}`);
         fs.mkdirSync(cwd, { recursive: true });
@@ -251,11 +255,25 @@ async function runQualityBenchmark(
         const cid = `c-bench-${entry.type}-${scenario.id}-${rollout}`;
         const agentId = `a-bench-${entry.type}`;
         const currentMessageId = `trigger-${scenario.id}-${rollout}`;
+        let projectId: string | undefined;
+        let taskId: string | undefined;
+        if ((scenario as any).projectTask) {
+          const projects = await import('../src/main/features/projects.js');
+          const tasks = await import('../src/main/features/project_tasks.js');
+          const project = await projects.createProject(uid, `${entry.type} ${rollout} ${scenario.id}`);
+          if (!project.ok) throw new Error('project fixture setup failed');
+          projectId = project.project.project_id;
+          await projects.addAgentBinding(uid, projectId, agentId);
+          const task = await tasks.createTask(uid, projectId, { title: 'Release review', status: (scenario as any).projectTask.initialStatus, origin_cid: cid });
+          if (!task.ok) throw new Error('task fixture setup failed');
+          taskId = task.task.id;
+        }
         await chats.createConversation(uid, {
           conversationId: cid,
+          ...(projectId ? { projectId } : {}),
           title: `Local Agent benchmark: ${scenario.id}`,
         });
-        const messageFile = layout.conversationMessageFile(uid, cid);
+        const messageFile = layout.conversationMessageFile(uid, cid, projectId);
         const historyRows = Array.isArray((scenario as any).chatHistory?.messages)
           ? (scenario as any).chatHistory.messages
           : [];
@@ -277,6 +295,7 @@ async function runQualityBenchmark(
           text: scenario.prompt,
         });
 
+        const cliLogs = createLocalAgentLogCollector(`${entry.type}/${scenario.id}/${rollout}`);
         let terminalEvent: any = null;
         const toolNames: string[] = [];
         const historyReadModes: string[] = [];
@@ -288,10 +307,13 @@ async function runQualityBenchmark(
           agentName: `Benchmark ${entry.type}`,
           currentMessageId,
           cli: entry.type,
+          ...(projectId ? { projectId, permissionPolicy: 'full_access' } : {}),
+          ...(entry.type === 'codex' ? { modelOverride: process.env.EVAL_MODEL || 'gpt-5.5', customArgs: ['-c', 'model_provider="openai"'] } : {}),
           prompt: scenario.prompt,
           cwd,
           signal: new AbortController().signal,
           onEvent: (event: any) => {
+            ingestLocalAgentLogEvent(cliLogs, event);
             if (event?.type === 'done') terminalEvent = event;
             if (event?.type === 'tool-event' && event?.phase === 'use' && event?.tool) {
               toolNames.push(String(event.tool));
@@ -305,9 +327,15 @@ async function runQualityBenchmark(
           try { files[relPath] = fs.readFileSync(path.join(cwd, relPath), 'utf8'); }
           catch { files[relPath] = null; }
         }
+        let projectTaskState: Record<string, unknown> | undefined;
+        if (projectId && taskId) {
+          const tasks = await import('../src/main/features/project_tasks.js');
+          projectTaskState = { task: await tasks.getTask(uid, projectId, taskId), taskCount: (await tasks.listTasks(uid, projectId)).length, originCid: cid };
+        }
         const output = String(result.output || '');
         const checks = scoreLocalAgentBenchmarkScenario(scenario, {
           status: result.status,
+          projectTaskState,
           output,
           files,
           workspaceFiles: listWorkspaceFiles(cwd),
@@ -315,6 +343,8 @@ async function runQualityBenchmark(
           historyReadModes,
           commanderHandoff: result.commanderHandoff || null,
         });
+        const cliLogAnalysis = cliLogs.finish();
+        checks.push({ name: 'cli-log-health', pass: cliLogAnalysis.passed, detail: `coverage=${cliLogAnalysis.analyzedLineCount}/${cliLogAnalysis.capturedLineCount}; warnings=${cliLogAnalysis.levelCounts.warn}; errors=${cliLogAnalysis.levelCounts.error}` });
         const passed = checks.every(check => check.pass);
         const failureKind = passed
           ? null
@@ -331,6 +361,7 @@ async function runQualityBenchmark(
           wallMs: Date.now() - t0,
           checks,
           outputSha256: outputFingerprint(output),
+          cliLogAnalysis,
           failureKind,
         });
         const failedChecks = checks.filter(check => !check.pass).map(check => check.name);
@@ -426,7 +457,7 @@ async function main(): Promise<void> {
     activateUser(uid);
     if (args.benchmark) {
       process.stdout.write(`\n[local-agent-benchmark] running pass@${args.k}...\n`);
-      await runQualityBenchmark(entries, run, uid, testDataRoot, { k: args.k, noSave: args.noSave });
+      await runQualityBenchmark(entries, run, uid, testDataRoot, { k: args.k, noSave: args.noSave, scenarios: args.scenarios });
       return;
     }
     const failures: string[] = [];

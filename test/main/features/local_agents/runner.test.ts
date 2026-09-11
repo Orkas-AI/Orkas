@@ -5,14 +5,20 @@ import * as os from 'node:os';
 import * as net from 'node:net';
 
 // Mocks must be declared at top-level for vi to hoist them. The
-// registry mock keeps real exports but swaps `detectOne`; the claude
+// registry mock keeps real exports but swaps dispatch resolution; the claude
 // backend is fully replaced by a controllable stub.
 const mockDetect = vi.fn<[string], Promise<any>>();
+const mockCliFallback = vi.fn<[any], any>();
+const mockCliFailure = vi.fn();
+const mockCliSuccess = vi.fn();
 vi.mock('../../../../src/main/features/local_agents/registry', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../../../src/main/features/local_agents/registry')>();
   return {
     ...actual,
-    detectOne: (type: string) => mockDetect(type),
+    resolveCliForDispatch: (type: string) => mockDetect(type),
+    cachedCliFallbackCandidate: (entry: any) => mockCliFallback(entry),
+    noteCliCandidateFailure: (entry: any) => mockCliFailure(entry),
+    noteCliCandidateSuccess: (entry: any) => mockCliSuccess(entry),
   };
 });
 
@@ -59,6 +65,20 @@ vi.mock('../../../../src/main/features/local_agents/backends/codex', () => ({
   },
 }));
 
+let mockOpencodeBackendImpl: ((opts: any) => Promise<void>) | null = null;
+vi.mock('../../../../src/main/features/local_agents/backends/opencode', () => ({
+  opencodeBackend: {
+    run: (opts: any) => (mockOpencodeBackendImpl ? mockOpencodeBackendImpl(opts) : Promise.resolve()),
+  },
+}));
+
+let mockHermesBackendImpl: ((opts: any) => Promise<void>) | null = null;
+vi.mock('../../../../src/main/features/local_agents/backends/hermes', () => ({
+  hermesBackend: {
+    run: (opts: any) => (mockHermesBackendImpl ? mockHermesBackendImpl(opts) : Promise.resolve()),
+  },
+}));
+
 let tmpDir: string;
 let prevWs: string | undefined;
 const TEST_UID = 'u1';
@@ -73,6 +93,10 @@ beforeEach(async () => {
   const users = await import('../../../../src/main/features/users');
   users.activateUser(TEST_UID);
   mockDetect.mockReset();
+  mockCliFallback.mockReset();
+  mockCliFallback.mockReturnValue(null);
+  mockCliFailure.mockReset();
+  mockCliSuccess.mockReset();
   runnerConnectorMock.resolveVisibleConnectors.mockReset();
   runnerConnectorMock.resolveVisibleConnectors.mockResolvedValue([]);
   remoteMediaDownloadMock.download.mockReset();
@@ -80,6 +104,8 @@ beforeEach(async () => {
   mockBackendImpl = null;
   mockOpenclawBackendImpl = null;
   mockCodexBackendImpl = null;
+  mockOpencodeBackendImpl = null;
+  mockHermesBackendImpl = null;
 });
 
 afterEach(() => {
@@ -131,10 +157,16 @@ describe('local_agents/runner', () => {
   it('advertises only granted bridge categories and directs Commander-only work to handoff', async () => {
     const runner = await loadRunner();
     const restricted = runner.buildBridgeSystemPrompt([
-      'skills.read', 'skills.run', 'kb.read', 'chat.read', 'commander.handoff',
+      'skills.read', 'skills.run', 'kb.read', 'chat.read', 'memory.agent', 'commander.handoff',
     ]);
+    expect(restricted).toContain('cross_session_memory');
+    expect(restricted).toContain('Agent identity is fixed by the host');
+    // The MCP tool description owns the write rule; the prompt keeps the pointer only.
+    expect(restricted).not.toContain('Decide from meaning');
+    expect(restricted).not.toContain('stable, reusable information');
     expect(restricted).toContain('orkas_handoff_to_commander');
-    expect(restricted).toContain('Do not emit Commander-only <auto-task>');
+    expect(restricted).toContain('Do not emit Commander-only <agent>');
+    expect(restricted).not.toContain('Orkas automation CRUD');
     expect(restricted).not.toContain('orkas_list_connector_tools');
 
     const connectorGranted = runner.buildBridgeSystemPrompt(['connectors', 'commander.handoff']);
@@ -143,6 +175,7 @@ describe('local_agents/runner', () => {
 
     const openOnly = runner.buildBridgeSystemPrompt(['skills.read', 'skills.run']);
     expect(openOnly).toContain('orkas_run_skill');
+    expect(openOnly).not.toContain('cross_session_memory');
     expect(openOnly).not.toContain('orkas_handoff_to_commander');
     expect(openOnly).not.toContain('<auto-task>');
   });
@@ -406,6 +439,121 @@ describe('local_agents/runner', () => {
     expect(meta.endedAt).toBeTruthy();
   });
 
+  it('retries a pre-turn CLI protocol failure with the cached fallback only once', async () => {
+    const firstBin = path.join(tmpDir, 'codex-alpha');
+    const fallbackBin = path.join(tmpDir, 'codex-stable');
+    fs.writeFileSync(firstBin, 'first');
+    fs.writeFileSync(fallbackBin, 'fallback');
+    const firstEntry = {
+      type: 'codex', available: true, path: firstBin, version: '0.151.0',
+      fullVersion: '0.151.0-alpha.7.2', prerelease: true,
+    };
+    const fallbackEntry = {
+      type: 'codex', available: true, path: fallbackBin, version: '0.146.0',
+    };
+    mockDetect.mockResolvedValue(firstEntry);
+    mockCliFallback.mockReturnValue(fallbackEntry);
+    const attemptedPaths: string[] = [];
+    const deadlines: number[] = [];
+    const originalDeadline = Date.now() + 60_000;
+    mockCodexBackendImpl = async ({ binPath, onEvent, deadlineAt }) => {
+      attemptedPaths.push(binPath);
+      deadlines.push(deadlineAt);
+      if (binPath === firstBin) {
+        onEvent({
+          type: 'done', status: 'failed', error: 'unsupported initialize',
+          failureKind: 'cli_protocol', retrySafe: true,
+        });
+        return;
+      }
+      onEvent({ type: 'text-delta', text: 'fallback worked' });
+      onEvent({ type: 'done', status: 'completed', output: 'fallback worked' });
+    };
+    const previousBridgeDisabled = process.env.ORKAS_BRIDGE_DISABLED;
+    process.env.ORKAS_BRIDGE_DISABLED = '1';
+    try {
+      const runner = await loadRunner();
+      const events: any[] = [];
+      const result = await runner.run({
+        uid: TEST_UID, cid: 'c-fallback', agentId: 'agent-x',
+        deadlineAt: originalDeadline,
+        cli: 'codex', prompt: 'do work', cwd: tmpDir,
+        signal: new AbortController().signal,
+        onEvent: event => events.push(event),
+      });
+
+      expect(attemptedPaths).toEqual([firstBin, fallbackBin]);
+      expect(deadlines).toEqual([originalDeadline, originalDeadline]);
+      expect(result).toMatchObject({
+        status: 'completed',
+        output: 'fallback worked',
+        cliPath: fallbackBin,
+        cliVersion: '0.146.0',
+      });
+      expect(events.filter(event => event.type === 'done')).toEqual([
+        expect.objectContaining({ type: 'done', status: 'completed' }),
+      ]);
+      expect(events).toContainEqual(expect.objectContaining({
+        type: 'status', status: 'retrying', reason: 'cli-fallback',
+      }));
+      expect(mockCliFailure).toHaveBeenCalledWith(firstEntry);
+      expect(mockCliSuccess).toHaveBeenCalledWith(fallbackEntry);
+
+      const meta = JSON.parse(fs.readFileSync(path.join(
+        tmpDir, TEST_UID, 'local', 'file_cache', 'local-agent-runs', result.runId, 'meta.json',
+      ), 'utf8'));
+      expect(meta.cliPath).toBe(fallbackBin);
+    } finally {
+      if (previousBridgeDisabled === undefined) delete process.env.ORKAS_BRIDGE_DISABLED;
+      else process.env.ORKAS_BRIDGE_DISABLED = previousBridgeDisabled;
+    }
+  });
+
+  it('applies the same retry-safe fallback to a non-Codex CLI', async () => {
+    const firstBin = path.join(tmpDir, 'claude-new');
+    const fallbackBin = path.join(tmpDir, 'claude-known-good');
+    fs.writeFileSync(firstBin, 'first');
+    fs.writeFileSync(fallbackBin, 'fallback');
+    const firstEntry = { type: 'claude', available: true, path: firstBin, version: '2.2.0' };
+    const fallbackEntry = { type: 'claude', available: true, path: fallbackBin, version: '2.1.0' };
+    mockDetect.mockResolvedValue(firstEntry);
+    mockCliFallback.mockReturnValue(fallbackEntry);
+    const attemptedPaths: string[] = [];
+    mockBackendImpl = async ({ binPath, onEvent }) => {
+      attemptedPaths.push(binPath);
+      if (binPath === firstBin) {
+        onEvent({
+          type: 'done', status: 'failed', error: 'spawn contract rejected',
+          failureKind: 'cli_spawn', retrySafe: true,
+        });
+        return;
+      }
+      onEvent({ type: 'done', status: 'completed', output: 'known good' });
+    };
+
+    const previousBridgeDisabled = process.env.ORKAS_BRIDGE_DISABLED;
+    process.env.ORKAS_BRIDGE_DISABLED = '1';
+    try {
+      const runner = await loadRunner();
+      const result = await runner.run({
+        uid: TEST_UID, cid: 'c-claude-fallback', agentId: 'agent-x',
+        cli: 'claude', prompt: 'do work', cwd: tmpDir,
+        signal: new AbortController().signal,
+        onEvent: () => {},
+      });
+
+      expect(attemptedPaths).toEqual([firstBin, fallbackBin]);
+      expect(result).toMatchObject({
+        status: 'completed', output: 'known good', cliPath: fallbackBin, cliVersion: '2.1.0',
+      });
+      expect(mockCliFailure).toHaveBeenCalledWith(firstEntry);
+      expect(mockCliSuccess).toHaveBeenCalledWith(fallbackEntry);
+    } finally {
+      if (previousBridgeDisabled === undefined) delete process.env.ORKAS_BRIDGE_DISABLED;
+      else process.env.ORKAS_BRIDGE_DISABLED = previousBridgeDisabled;
+    }
+  });
+
   it('adds and persists a duration for each correlated CLI tool result', async () => {
     mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
     mockBackendImpl = async ({ onEvent }) => {
@@ -578,6 +726,268 @@ describe('local_agents/runner', () => {
       .toMatchObject({ connector_name: 'Notion Workspace' });
   });
 
+  it('keeps OpenClaw permission handling self-managed', async () => {
+    mockDetect.mockResolvedValue({
+      type: 'openclaw', available: true, path: '/fake/openclaw', version: '1.0.0',
+    });
+    let backendOptions: any;
+    mockOpenclawBackendImpl = async (opts) => {
+      backendOptions = opts;
+      opts.onEvent({ type: 'done', status: 'completed', output: 'ok', durationMs: 1 });
+    };
+
+    const runner = await loadRunner();
+    const result = await runner.run({
+      uid: TEST_UID,
+      cid: 'c-openclaw-permission',
+      agentId: 'agent-x',
+      cli: 'openclaw',
+      prompt: 'do work',
+      cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+    });
+
+    expect(result.status).toBe('completed');
+    expect(backendOptions.permissionPolicy).toBe('inherit');
+    expect(backendOptions.requestPermission).toEqual(expect.any(Function));
+  });
+
+  it('clamps a stale unsupported per-Agent policy to the CLI-native default', async () => {
+    mockDetect.mockResolvedValue({
+      type: 'openclaw', available: true, path: '/fake/openclaw', version: '1.0.0',
+    });
+    let backendOptions: any;
+    mockOpenclawBackendImpl = async (opts) => {
+      backendOptions = opts;
+      opts.onEvent({ type: 'done', status: 'completed', output: 'ok', durationMs: 1 });
+    };
+
+    const runner = await loadRunner();
+    const result = await runner.run({
+      uid: TEST_UID,
+      cid: 'c-openclaw-stale-permission',
+      agentId: 'agent-x',
+      cli: 'openclaw',
+      permissionPolicy: 'full_access',
+      prompt: 'do work',
+      cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+    });
+
+    expect(result.status).toBe('completed');
+    expect(backendOptions.permissionPolicy).toBe('inherit');
+  });
+
+  it.each([
+    'workspace_approval',
+    'all_files_approval',
+    'all_files_auto',
+  ] as const)('keeps Claude on its CLI default independently of local-operation mode $mode', async (mode) => {
+    const permissions = await import('../../../../src/main/features/permissions');
+    permissions.setLocalExecMode(mode);
+    mockDetect.mockResolvedValue({
+      type: 'claude', available: true, path: '/fake/claude', version: '2.0.0',
+    });
+    let backendOptions: any;
+    mockBackendImpl = async (opts) => {
+      backendOptions = opts;
+      opts.onEvent({ type: 'done', status: 'completed', output: 'ok', durationMs: 1 });
+    };
+
+    const runner = await loadRunner();
+    const result = await runner.run({
+      uid: TEST_UID,
+      cid: `c-unified-permission-${mode}`,
+      agentId: 'agent-x',
+      cli: 'claude',
+      prompt: 'do work',
+      cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+    });
+
+    expect(result.status).toBe('completed');
+    expect(backendOptions.permissionPolicy).toBe('inherit');
+  });
+
+  it.each([
+    { requested: 'ask', expected: 'ask' },
+    { requested: 'full_access', expected: 'full_access' },
+  ] as const)('forwards an explicit Claude permission policy $requested', async ({ requested, expected }) => {
+    mockDetect.mockResolvedValue({
+      type: 'claude', available: true, path: '/fake/claude', version: '2.0.0',
+    });
+    let backendOptions: any;
+    mockBackendImpl = async (opts) => {
+      backendOptions = opts;
+      opts.onEvent({ type: 'done', status: 'completed', output: 'ok', durationMs: 1 });
+    };
+    const runner = await loadRunner();
+    await runner.run({
+      uid: TEST_UID,
+      cid: `c-explicit-permission-${requested}`,
+      agentId: 'agent-x',
+      cli: 'claude',
+      permissionPolicy: requested,
+      prompt: 'do work',
+      cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+    });
+    expect(backendOptions.permissionPolicy).toBe(expected);
+  });
+
+  it.each([undefined, 'ask'] as const)(
+    'runs OpenCode with fixed full access when the Agent permission is %s',
+    async (requestedPermission) => {
+      mockDetect.mockResolvedValue({
+        type: 'opencode', available: true, path: '/fake/opencode', version: '1.2.0',
+      });
+      let backendOptions: any;
+      mockOpencodeBackendImpl = async (opts) => {
+        backendOptions = opts;
+        opts.onEvent({ type: 'done', status: 'completed', output: 'ok', durationMs: 1 });
+      };
+
+      const runner = await loadRunner();
+      const result = await runner.run({
+        uid: TEST_UID,
+        cid: 'c-opencode-fixed-full-access',
+        agentId: 'agent-x',
+        cli: 'opencode',
+        permissionPolicy: requestedPermission,
+        prompt: 'do work',
+        cwd: tmpDir,
+        signal: new AbortController().signal,
+        onEvent: () => {},
+      });
+
+      expect(result.status).toBe('completed');
+      expect(backendOptions.permissionPolicy).toBe('full_access');
+    },
+  );
+
+  it.each(['claude', 'codex', 'hermes'] as const)(
+    'round-trips a %s native approval through the Orkas permission bridge',
+    async (cli) => {
+      mockDetect.mockResolvedValue({
+        type: cli, available: true, path: `/fake/${cli}`, version: '2.0.0',
+      });
+      const nativeDecisions: string[] = [];
+      const backendImpl = async (opts: any) => {
+        nativeDecisions.push(await opts.requestPermission({
+          id: `${cli}-native-approval`,
+          tool: 'command',
+          description: 'Run the focused test suite',
+          command: 'npm test',
+          subject: path.join(tmpDir, 'selected-project'),
+        }));
+        opts.onEvent({ type: 'done', status: 'completed', output: 'approved', durationMs: 1 });
+      };
+      if (cli === 'claude') mockBackendImpl = backendImpl;
+      if (cli === 'codex') mockCodexBackendImpl = backendImpl;
+      if (cli === 'hermes') mockHermesBackendImpl = backendImpl;
+
+      const permissions = await import('../../../../src/main/features/local_agents/cli_permissions');
+      let delivered: any;
+      permissions._setBroadcastForTest((channel, payload) => {
+        if (channel !== 'local-agent:permission') return;
+        delivered = payload;
+        queueMicrotask(() => permissions.respond((payload as any).request_id, 'allow_once'));
+      });
+      const events: any[] = [];
+      try {
+        const runner = await loadRunner();
+        const result = await runner.run({
+          uid: TEST_UID,
+          cid: `c-${cli}-orkas-approval-roundtrip`,
+          agentId: 'agent-x',
+          agentName: 'Reviewer',
+          conversationTitle: 'Review the release',
+          cli,
+          permissionPolicy: 'ask',
+          prompt: 'run tests',
+          cwd: tmpDir,
+          signal: new AbortController().signal,
+          onEvent: event => events.push(event),
+        });
+
+        expect(result.status).toBe('completed');
+        expect(nativeDecisions).toEqual(['allow_once']);
+        expect(delivered).toMatchObject({
+          agent_name: 'Reviewer',
+          conversation_title: 'Review the release',
+          cli,
+          tool: 'command',
+          description: 'Run the focused test suite',
+          command: 'npm test',
+          subject: path.join(tmpDir, 'selected-project'),
+          permission_policy: 'ask',
+          permission_policies: ['inherit', 'ask', 'full_access'],
+        });
+        // The approval-wait pulse keeps the rail alive but is not CLI
+        // activity: the prompt's host deadline bounds the wait, so the hang
+        // watchdog must keep its real-activity clock (synthetic).
+        expect(events).toContainEqual(expect.objectContaining({
+          type: 'status',
+          status: 'waiting-approval',
+          heartbeat: true,
+          synthetic: true,
+        }));
+      } finally {
+        permissions._resetForTest();
+      }
+    },
+  );
+
+  it('uses a saved full-access upgrade for a later request in an already-running task', async () => {
+    mockDetect.mockResolvedValue({
+      type: 'codex', available: true, path: '/fake/codex', version: '2.0.0',
+    });
+    const permissions = await import('../../../../src/main/features/local_agents/cli_permissions');
+    const broadcast = vi.fn();
+    permissions._setBroadcastForTest(broadcast);
+    const nativeDecisions: string[] = [];
+    mockCodexBackendImpl = async (opts) => {
+      permissions.updateActiveAgentPermissionPolicy({
+        uid: TEST_UID,
+        agentId: 'agent-x',
+        cli: 'codex',
+        permissionPolicy: 'full_access',
+      });
+      nativeDecisions.push(await opts.requestPermission({
+        tool: 'command',
+        command: 'git fetch --all --prune',
+      }));
+      opts.onEvent({ type: 'done', status: 'completed', output: 'approved', durationMs: 1 });
+    };
+
+    try {
+      const runner = await loadRunner();
+      const result = await runner.run({
+        uid: TEST_UID,
+        cid: 'c-live-policy-upgrade',
+        agentId: 'agent-x',
+        agentName: 'Reviewer',
+        currentMessageId: 'message-x',
+        cli: 'codex',
+        permissionPolicy: 'ask',
+        prompt: 'sync branches',
+        cwd: tmpDir,
+        signal: new AbortController().signal,
+        onEvent: () => {},
+      });
+
+      expect(result.status).toBe('completed');
+      expect(nativeDecisions).toEqual(['allow_once']);
+      expect(broadcast).not.toHaveBeenCalled();
+    } finally {
+      permissions._resetForTest();
+    }
+  });
+
   it('forwards the backend active-run ingress and always clears it after the attempt', async () => {
     mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
     const ingress = {
@@ -607,6 +1017,85 @@ describe('local_agents/runner', () => {
 
     expect(result.status).toBe('completed');
     expect(states).toEqual([ingress, null]);
+  });
+
+  it('gives project OpenCode runs live backlog status updates without expanding other Orkas permissions', async () => {
+    const projects = await import('../../../../src/main/features/projects');
+    const tasks = await import('../../../../src/main/features/project_tasks');
+    const project = await projects.createProject(TEST_UID, 'On-demand OpenCode');
+    if (!project.ok) throw new Error('project fixture failed');
+    const projectId = project.project.project_id;
+    mockDetect.mockResolvedValue({ type: 'opencode', available: true, path: '/fake/opencode', version: '1.0.0' });
+    let envFile: string | undefined;
+    mockOpencodeBackendImpl = async ({ bridge, onEvent }) => {
+      expect(bridge).toBeDefined();
+      envFile = bridge.server.env.ORKAS_BRIDGE_ENV_FILE;
+      expect((await callRunnerBridge(bridge, 'todo_tasks', { action: 'list' })).result.tasks).toEqual([]);
+      const created = await tasks.createTask(TEST_UID, projectId, { title: 'Latest backlog state' });
+      if (!created.ok) throw new Error('task fixture failed');
+      expect((await callRunnerBridge(bridge, 'todo_tasks', { action: 'list' })).result.tasks)
+        .toContainEqual(expect.objectContaining({ id: created.task.id, title: 'Latest backlog state' }));
+      expect((await callRunnerBridge(bridge, 'todo_tasks', { action: 'update', task_id: created.task.id, status: 'review' })).ok).toBe(true);
+      expect((await tasks.getTask(TEST_UID, projectId, created.task.id))?.status).toBe('review');
+      expect((await callRunnerBridge(bridge, 'todo_tasks', { action: 'complete', task_id: created.task.id })).ok).toBe(true);
+      for (const [method, params] of [
+        ['todo_tasks', { action: 'list', project: 'another-project' }],
+        ['memory.agent', { action: 'list' }], ['skills.list', {}], ['connectors.list', {}],
+        ['commander.handoff', { reason: 'Not granted' }],
+      ] as const) expect((await callRunnerBridge(bridge, method, params)).ok).toBe(false);
+      expect(await tasks.getTask(TEST_UID, projectId, created.task.id)).toMatchObject({ status: 'done', origin_cid: 'c-opencode-backlog' });
+      onEvent({ type: 'done', status: 'completed', output: 'Read on demand.' });
+    };
+    const runner = await loadRunner();
+    const opts = {
+      uid: TEST_UID, cid: 'c-opencode-backlog', agentId: 'agent-x', currentMessageId: 'message-x',
+      cli: 'opencode' as const, prompt: 'Inspect the backlog', cwd: tmpDir,
+      signal: new AbortController().signal, onEvent: () => {},
+    };
+    expect((await runner.run({ ...opts, projectId })).status).toBe('completed');
+    expect(envFile).toBeDefined();
+    expect(fs.existsSync(envFile!)).toBe(false);
+    mockOpencodeBackendImpl = async ({ bridge, onEvent }) => {
+      expect(bridge).toBeUndefined();
+      onEvent({ type: 'done', status: 'completed', output: 'No project scope.' });
+    };
+    expect((await runner.run(opts)).status).toBe('completed');
+  });
+
+  it.each(['claude', 'codex', 'opencode'] as const)('gives a projectless %s task browser access that expires with its conversation turn', async (cli) => {
+    const life = await import('../../../../src/main/features/web_assist_lifecycle');
+    const cid = 'c-projectless-browser';
+    life.beginBrowserTaskRun(TEST_UID, cid, 'browser-turn');
+    mockDetect.mockResolvedValue({ type: cli, available: true, path: `/fake/${cli}`, version: '1.0.0' });
+    let envFile: string | undefined;
+    const backend = async ({ bridge, onEvent }: any) => {
+      expect(bridge).toBeDefined();
+      envFile = bridge.server.env.ORKAS_BRIDGE_ENV_FILE;
+      life.finishBrowserTaskRun(TEST_UID, cid, 'browser-turn');
+      const reply = await callRunnerBridge(bridge, 'browser', { operation: 'tabs' });
+      expect(reply).toMatchObject({ ok: true, result: { isError: true } });
+      expect(JSON.parse(reply.result.content)).toMatchObject({ ok: false, code: 'task_run_ended' });
+      expect((await callRunnerBridge(bridge, 'todo_tasks', { action: 'list' })).ok).toBe(false);
+      if (cli === 'opencode') {
+        expect((await callRunnerBridge(bridge, 'skills.list', {})).ok).toBe(false);
+        expect((await callRunnerBridge(bridge, 'connectors.list', {})).ok).toBe(false);
+      }
+      onEvent({ type: 'done', status: 'completed', output: 'Browser authority expired.' });
+    };
+    mockBackendImpl = mockCodexBackendImpl = mockOpencodeBackendImpl = backend;
+    try {
+      const runner = await loadRunner();
+      const result = await runner.run({
+        uid: TEST_UID, cid, agentId: 'agent-x', currentMessageId: 'message-x',
+        cli, prompt: 'Use this conversation browser', cwd: tmpDir,
+        signal: new AbortController().signal, onEvent: () => {},
+      });
+      expect(result.status).toBe('completed');
+      expect(envFile).toBeDefined();
+      expect(fs.existsSync(envFile!)).toBe(false);
+    } finally {
+      life.finishBrowserTaskRun(TEST_UID, cid, 'browser-turn');
+    }
   });
 
   it('returns a structured Commander handoff recorded through the live run bridge', async () => {
@@ -922,6 +1411,68 @@ describe('local_agents/runner', () => {
     expect((event as any).input).toEqual({ displayPath: 'secret.ts' });
   });
 
+  it('strips private tool bodies and paths from native permission-request events', async () => {
+    const runner = await loadRunner();
+    const event = runner.redactPrivateLocalAgentEvent({
+      type: 'permission-request',
+      id: 'req-1',
+      tool: 'Write',
+      input: { file_path: '/Users/test/project/notes.md', content: 'PRIVATE_WRITE_BODY' },
+      autoDecided: 'allow',
+      reason: 'full_access',
+    } as any, '/Users/test/project');
+
+    const serialized = JSON.stringify(event);
+    expect(serialized).not.toContain('PRIVATE_WRITE_BODY');
+    expect(serialized).not.toContain('/Users/alice');
+    expect(event).toMatchObject({
+      type: 'permission-request', id: 'req-1', tool: 'Write', autoDecided: 'allow', reason: 'full_access',
+    });
+  });
+
+  it('redacts paths from background-task status messages and the idle labels built from them', async () => {
+    const runner = await loadRunner();
+
+    const status = runner.redactPrivateLocalAgentEvent({
+      type: 'status',
+      status: 'background-started',
+      taskId: 'bz0apow42',
+      taskType: 'local_bash',
+      message: 'Run npm test in /Users/test/project/web',
+    });
+    expect(status).toMatchObject({ type: 'status', status: 'background-started', taskId: 'bz0apow42' });
+    expect((status as any).message).toContain('Run npm test');
+    expect((status as any).message).not.toContain('/Users/alice');
+
+    const idle = runner.redactPrivateLocalAgentEvent({
+      type: 'idle',
+      stalledMs: 95_000,
+      waitingOn: [{ taskId: 'bz0apow42', label: 'Run npm test in /Users/test/project/web' }],
+    });
+    expect((idle as any).stalledMs).toBe(95_000);
+    expect((idle as any).waitingOn[0].taskId).toBe('bz0apow42');
+    expect((idle as any).waitingOn[0].label).toContain('Run npm test');
+    expect((idle as any).waitingOn[0].label).not.toContain('/Users/alice');
+
+    // Negative controls: events without free text keep their exact shape.
+    const anonymousIdle = { type: 'idle', stalledMs: 95_000 };
+    expect(runner.redactPrivateLocalAgentEvent(anonymousIdle)).toEqual(anonymousIdle);
+    const usage = { type: 'status', status: 'usage', usage: { input_tokens: 3 } };
+    expect(runner.redactPrivateLocalAgentEvent(usage)).toEqual(usage);
+  });
+
+  it('keeps the CLI terminal error wording while removing private details', async () => {
+    const runner = await loadRunner();
+    const error = runner.sanitizePublicCliError(
+      'Selected model is at capacity; token=secret-value; cwd=/Users/test/private/project',
+    );
+
+    expect(error).toContain('Selected model is at capacity');
+    expect(error).not.toContain('secret-value');
+    expect(error).not.toContain('/Users/alice');
+    expect(runner.sanitizePublicCliError('   ')).toBe('');
+  });
+
   it('reports backend exception as a failed done event', async () => {
     mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
     mockBackendImpl = async () => { throw new Error('spawn went sideways'); };
@@ -993,12 +1544,15 @@ describe('local_agents/runner', () => {
     });
   });
 
-  it('does not fresh-retry after a resumed session has begun executing', async () => {
+  it.each([
+    { type: 'status', status: 'running' },
+    { type: 'async-message', itemId: 'ask-1', text: 'Choose a scope.', questions: [{ title: 'Which scope?' }] },
+  ])('does not fresh-retry after a resumed session has emitted $type', async activity => {
     mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
     let attempts = 0;
     mockBackendImpl = async (opts) => {
       attempts += 1;
-      opts.onEvent({ type: 'status', status: 'running' });
+      opts.onEvent(activity as any);
       opts.onEvent({ type: 'stderr-line', line: 'session expired after execution began' });
       opts.onEvent({ type: 'done', status: 'failed', error: 'failed after execution' });
     };
@@ -1119,26 +1673,63 @@ describe('local_agents/runner', () => {
     await expect(runner.stopBackgroundRuns('already drained', 10)).resolves.toBe(0);
   });
 
-  it('uses a long wall cap and no idle kill for OpenClaw no-stream runs', async () => {
-    mockDetect.mockResolvedValue({ type: 'openclaw', available: true, path: '/fake/openclaw', version: '2026.4.11' });
+  it.each(['claude', 'codex', 'openclaw', 'opencode', 'hermes'] as const)('applies the shared 24-hour total and 30-minute idle limits to %s', async (cli) => {
+    mockDetect.mockResolvedValue({ type: cli, available: true, path: `/fake/${cli}`, version: '2026.4.11' });
     let captured: any = null;
-    mockOpenclawBackendImpl = async (opts) => {
+    const backendImpl = async (opts: any) => {
       captured = opts;
       opts.onEvent({ type: 'done', status: 'completed', output: '', durationMs: 0 });
     };
+    mockBackendImpl = mockCodexBackendImpl = mockOpenclawBackendImpl = mockOpencodeBackendImpl = mockHermesBackendImpl = backendImpl;
 
     const events: any[] = [];
     const result = await (await import('../../../../src/main/features/local_agents/runner')).run({
       uid: TEST_UID, cid: 'c', agentId: 'a',
-      cli: 'openclaw', prompt: 'p', cwd: tmpDir,
+      cli, prompt: 'p', cwd: tmpDir,
       signal: new AbortController().signal,
       onEvent: e => events.push(e),
     });
 
     expect(result.status).toBe('completed');
-    expect(captured?.timeoutMs).toBe(60 * 60 * 1000);
-    expect(captured?.idleKillMs).toBeUndefined();
-    expect(captured?.idleMs).toBe(90 * 1000);
+    expect(captured?.timeoutMs).toBe(24 * 60 * 60 * 1000);
+    expect(captured?.idleKillMs).toBe(30 * 60 * 1000);
+  });
+
+  it('counts throttled protocol activity but not synthetic UI pulses as real progress', async () => {
+    mockDetect.mockResolvedValue({ type: 'codex', available: true, path: '/fake/codex', version: '2026.4.11' });
+    mockCodexBackendImpl = async (opts) => {
+      const now = vi.spyOn(Date, 'now');
+      try {
+        now.mockReturnValue(1_000);
+        opts.onEvent({ type: 'text-delta', text: 'partial' });
+        now.mockReturnValue(2_000);
+        opts.onEvent({ type: 'thinking', chars: 0, heartbeat: true, synthetic: true });
+        expect(opts.lastEventAt()).toBe(1_000);
+        opts.onActivity();
+        expect(opts.lastEventAt()).toBe(2_000);
+      } finally { now.mockRestore(); }
+      opts.onEvent({ type: 'done', status: 'completed', output: 'done' });
+    };
+    const result = await (await loadRunner()).run({
+      uid: TEST_UID, cid: 'c-activity', agentId: 'a', cli: 'codex', prompt: 'work', cwd: tmpDir,
+      signal: new AbortController().signal, onEvent: () => {},
+    });
+    expect(result.status).toBe('completed');
+  });
+
+  it('does not start a CLI or repeat its side effects after the inherited deadline expires', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2026.4.11' });
+    const backend = vi.fn(async () => {});
+    mockBackendImpl = backend;
+    const events: any[] = [];
+    const result = await (await loadRunner()).run({
+      uid: TEST_UID, cid: 'c-expired', agentId: 'a', cli: 'claude', prompt: 'work', cwd: tmpDir,
+      deadlineAt: Date.now() - 1,
+      signal: new AbortController().signal, onEvent: event => events.push(event),
+    });
+    expect(result).toMatchObject({ status: 'timeout', timeoutKind: 'wall' });
+    expect(events.filter(event => event.type === 'done')).toHaveLength(1);
+    expect(backend).not.toHaveBeenCalled();
   });
 
   it('emits idle events when the backend goes quiet beyond the threshold', async () => {
@@ -1234,6 +1825,90 @@ describe('local_agents/runner', () => {
     }
   });
 
+  it('names the open background task on idle so a held run is not a bare spinner', async () => {
+    // A background task that never exits (a dev server, a watcher) keeps the
+    // CLI alive without a result frame: the run has no terminal boundary and
+    // the only thing the user sees is an unexplained wait until the 30-minute
+    // idle-kill. Observed on run e79c7d5a1a72, cancelled by hand after 11
+    // minutes with the reply text already complete.
+    const prevIdleMs = process.env.ORKAS_LOCAL_AGENT_IDLE_MS;
+    const prevIdleMin = process.env.ORKAS_LOCAL_AGENT_IDLE_MIN_MS;
+    process.env.ORKAS_LOCAL_AGENT_IDLE_MIN_MS = '50';
+    process.env.ORKAS_LOCAL_AGENT_IDLE_MS = '120';
+    vi.useFakeTimers();
+    try {
+      mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+      let onEventCb: ((e: any) => void) | null = null;
+      let resolveBackend!: () => void;
+      let markBackendReady!: () => void;
+      const backendReady = new Promise<void>((resolve) => { markBackendReady = resolve; });
+      mockBackendImpl = async ({ onEvent }) => {
+        onEventCb = onEvent;
+        onEvent({ type: 'process-info', pid: 7, cwd: '/x', cmd: 'claude', args: [] });
+        markBackendReady();
+        await new Promise<void>(resolve => { resolveBackend = resolve; });
+        onEvent({ type: 'done', status: 'completed', output: '', durationMs: 0 });
+      };
+
+      const runner = await loadRunner();
+      const events: any[] = [];
+      const promise = runner.run({
+        uid: TEST_UID, cid: 'c', agentId: 'a',
+        cli: 'claude', prompt: 'p', cwd: tmpDir,
+        signal: new AbortController().signal,
+        onEvent: e => events.push(e),
+      });
+      await backendReady;
+
+      // Quiet with nothing outstanding — the heartbeat stays anonymous.
+      await vi.advanceTimersByTimeAsync(250);
+      const anonymous = events.filter(e => e.type === 'idle');
+      expect(anonymous.length).toBeGreaterThanOrEqual(1);
+      expect(anonymous.every(e => e.waitingOn === undefined)).toBe(true);
+
+      // The task description is CLI-authored free text; it may quote the
+      // absolute project path, which must not reach persisted history through
+      // the wait label any more than through the status row itself.
+      onEventCb!({
+        type: 'status', status: 'background-running',
+        taskId: 'bz0apow42', taskType: 'local_bash',
+        message: 'Start Web dev server on :9000 in /Users/test/project/web',
+      });
+      const afterStart = events.filter(e => e.type === 'idle').length;
+      await vi.advanceTimersByTimeAsync(250);
+      const named = events.filter(e => e.type === 'idle').slice(afterStart);
+      expect(named.length).toBeGreaterThanOrEqual(1);
+      for (const e of named) {
+        expect(e.waitingOn).toHaveLength(1);
+        expect(e.waitingOn[0].taskId).toBe('bz0apow42');
+        expect(e.waitingOn[0].label).toContain('Start Web dev server on :9000');
+        expect(e.waitingOn[0].label).not.toContain('/Users/alice');
+      }
+      const statusRow = events.find(e => e.type === 'status' && e.status === 'background-running');
+      expect(statusRow?.message).toContain('Start Web dev server on :9000');
+      expect(statusRow?.message).not.toContain('/Users/alice');
+
+      // Once the task closes, the wait goes back to being anonymous rather
+      // than naming a task that is no longer holding anything.
+      onEventCb!({ type: 'status', status: 'background-stopped', taskId: 'bz0apow42' });
+      const afterStop = events.filter(e => e.type === 'idle').length;
+      await vi.advanceTimersByTimeAsync(250);
+      const cleared = events.filter(e => e.type === 'idle').slice(afterStop);
+      expect(cleared.length).toBeGreaterThanOrEqual(1);
+      expect(cleared.every(e => e.waitingOn === undefined)).toBe(true);
+
+      resolveBackend();
+      await vi.advanceTimersByTimeAsync(0);
+      await promise;
+    } finally {
+      vi.useRealTimers();
+      if (prevIdleMs === undefined) delete process.env.ORKAS_LOCAL_AGENT_IDLE_MS;
+      else process.env.ORKAS_LOCAL_AGENT_IDLE_MS = prevIdleMs;
+      if (prevIdleMin === undefined) delete process.env.ORKAS_LOCAL_AGENT_IDLE_MIN_MS;
+      else process.env.ORKAS_LOCAL_AGENT_IDLE_MIN_MS = prevIdleMin;
+    }
+  });
+
   it('spills oversized tool-event results and exposes only an opaque output ref', async () => {
     const { DEFAULT_INLINE_RESULT_TOKENS } = await import('../../../../src/main/util/tool-result-cap');
     // ASCII length past the token-aware spill budget (~4 chars per token).
@@ -1284,6 +1959,55 @@ describe('local_agents/runner', () => {
     // dropped uid prefix; user scoping comes from path root, not the filename)
     expect(JSON.stringify(toolEvent)).not.toContain(`cli-claude-${result.runId}`);
     expect(JSON.stringify(toolEvent)).not.toContain(tmpDir);
+  });
+
+  it('spills oversized structured Codex tool results before persisting the run log', async () => {
+    const { DEFAULT_INLINE_RESULT_TOKENS } = await import('../../../../src/main/util/tool-result-cap');
+    const structured = {
+      rows: [
+        { section: 'head', value: 'H'.repeat(DEFAULT_INLINE_RESULT_TOKENS * 4) },
+        { section: 'middle', value: 'STRUCTURED_RESULT_MIDDLE_SENTINEL' },
+        { section: 'tail', value: 'T'.repeat(DEFAULT_INLINE_RESULT_TOKENS * 4) },
+      ],
+    };
+    const serialized = JSON.stringify(structured);
+    mockDetect.mockResolvedValue({ type: 'codex', available: true, path: '/fake/codex', version: '1.0.0' });
+    mockCodexBackendImpl = async ({ onEvent }) => {
+      onEvent({
+        type: 'tool-event', tool: 'mcp_read', callId: 'structured-1', phase: 'result', output: structured,
+      });
+      onEvent({ type: 'done', status: 'completed', output: '', durationMs: 0 });
+    };
+
+    const runner = await loadRunner();
+    const events: any[] = [];
+    const result = await runner.run({
+      uid: TEST_UID, cid: 'c-structured-codex', agentId: 'a',
+      cli: 'codex', prompt: 'p', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: e => events.push(e),
+    });
+
+    const toolEvent = events.find(e => e.type === 'tool-event' && e.phase === 'result');
+    expect(typeof toolEvent.output).toBe('string');
+    expect(toolEvent.output).toContain('<persisted-output');
+    expect(toolEvent.outputRef).toMatch(/^mcp_read\.[0-9a-f]+$/);
+    const spillPath = path.join(
+      tmpDir,
+      TEST_UID,
+      'local',
+      'tool-results',
+      `cli-codex-${result.runId}`,
+      `${toolEvent.outputRef}.txt`,
+    );
+    expect(fs.readFileSync(spillPath, 'utf8')).toBe(serialized);
+
+    const eventPath = path.join(
+      tmpDir, TEST_UID, 'local', 'file_cache', 'local-agent-runs', result.runId, 'events.jsonl',
+    );
+    const persistedText = fs.readFileSync(eventPath, 'utf8');
+    expect(persistedText.length).toBeLessThan(serialized.length / 2);
+    expect(persistedText).not.toContain('STRUCTURED_RESULT_MIDDLE_SENTINEL');
   });
 
   it('does not spill small tool-event outputs', async () => {
@@ -1471,6 +2195,9 @@ describe('local_agents/runner', () => {
     expect(result.status).toBe('completed');
     expect(events.at(-1)).toMatchObject({ type: 'done', status: 'completed' });
     await vi.waitFor(() => expect(remoteMediaDownloadMock.download).toHaveBeenCalledTimes(1));
+    const firstDownloadOptions = remoteMediaDownloadMock.download.mock.calls[0][1];
+    expect(firstDownloadOptions.isAllowedDirectAddress('8.8.8.8')).toBe(true);
+    expect(firstDownloadOptions.isAllowedDirectAddress('127.0.0.1')).toBe(false);
     const mediaEvent = events.find(event => event.type === 'media-output');
     expect(mediaEvent).toMatchObject({
       source: 'claude',

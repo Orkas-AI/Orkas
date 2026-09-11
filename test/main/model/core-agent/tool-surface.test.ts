@@ -4,11 +4,43 @@ import {
   createToolSurfaceController,
 } from '../../../../src/main/model/core-agent/tool-surface';
 import {
-  getActiveToolGroupsTurnBlock,
   getLoadableToolGroupsSystemPromptBlock,
+  LOADABLE_TOOL_GROUP_IDS,
+  TOOL_CATALOG,
+  TOOL_GROUPS,
 } from '../../../../src/main/model/core-agent/tool-catalog';
+import { TOOL_CATALOG_REVISION } from '../../../../src/main/model/core-agent/tool-catalog-revision';
 
 describe('tool-surface', () => {
+  it.each(LOADABLE_TOOL_GROUP_IDS)('activates exactly the available descendants of %s, then resets next turn', (groupId) => {
+    const available = TOOL_CATALOG.filter((entry) => !entry.ownerAgent).map((entry) => entry.name);
+    const surface = createToolSurfaceController({ availableToolNames: available, scopedEligible: true });
+    const baseline = surface.activeToolNames();
+    const directory = getLoadableToolGroupsSystemPromptBlock({
+      availableToolNames: available,
+      initialActiveToolNames: baseline,
+      allowedGroupIds: surface.loadableGroups(),
+    });
+    // Independent graph walk: do not derive expected membership with the
+    // production expandToolGroups/toolNamesForGroups implementation under test.
+    const descendants = new Set<string>([groupId]);
+    for (let depth = 0; depth < TOOL_GROUPS.length; depth++) {
+      for (const group of TOOL_GROUPS) if (group.parent && descendants.has(group.parent)) descendants.add(group.id);
+    }
+    const expected = TOOL_CATALOG.filter((entry) => available.includes(entry.name)
+      && entry.loadGroups?.some((group) => descendants.has(group))).map((entry) => entry.name);
+    expect(expected.length).toBeGreaterThan(0);
+    expect(directory).toContain(`\`${groupId}\``);
+    for (const name of expected.filter((name) => !baseline.includes(name))) expect(directory).toContain(`\`${name}\``);
+    const loaded = JSON.parse(surface.load([groupId]).content);
+    expect(loaded.ok).toBe(true);
+    expect(new Set(surface.activeToolNames())).toEqual(new Set([...baseline, ...expected]));
+    expect(new Set(loaded.newly_activated_tools)).toEqual(new Set(expected.filter((name) => !baseline.includes(name))));
+    expect(JSON.parse(surface.load([groupId]).content).newly_activated_tools).toEqual([]);
+    const next = createToolSurfaceController({ availableToolNames: available, scopedEligible: true });
+    expect(next.activeToolNames()).toEqual(baseline);
+  });
+
   let previousMode: string | undefined;
 
   beforeEach(() => {
@@ -109,7 +141,7 @@ describe('tool-surface', () => {
     const surface = createToolSurfaceController({
       availableToolNames: [
         'read_files', 'write_file', 'web_search', 'open_app_view', 'app_health',
-        'skill_search', 'marketplace_search', 'auto_tasks_list', 'tool_load',
+        'skill_search', 'marketplace_search', 'auto_tasks', 'tool_load',
       ],
       configuredGroups: ['workspace.read'],
       scopedEligible: true,
@@ -220,22 +252,35 @@ describe('tool-surface', () => {
     expect(surface.isActive('call_connector_tool')).toBe(true);
   });
 
-  it('keeps Commander Connector installation loadable without exposing dormant action tools', () => {
+  it('keeps Commander Connector setup tools non-resident and loadable without configured actions', () => {
     const surface = createToolSurfaceController({
       availableToolNames: [
-        'list_connector_tools', 'call_connector_tool', 'add_custom_connector', 'tool_load',
+        'list_connector_tools', 'call_connector_tool', 'add_custom_connector', 'connector_setup', 'tool_load',
       ],
-      dynamicLoadableToolNames: ['add_custom_connector', 'tool_load'],
+      dynamicLoadableToolNames: ['add_custom_connector', 'connector_setup', 'tool_load'],
       scopedEligible: true,
       dynamicLoading: true,
       dynamicLoadPolicy: 'loadable',
     });
 
     expect(surface.loadableGroups()).toContain('connectors');
+    expect(surface.isActive('connector_setup')).toBe(false);
+    expect(surface.isActive('add_custom_connector')).toBe(false);
     expect(surface.load(['connectors'])).not.toMatchObject({ isError: true });
     expect(surface.isActive('add_custom_connector')).toBe(true);
+    expect(surface.isActive('connector_setup')).toBe(true);
     expect(surface.isActive('list_connector_tools')).toBe(false);
     expect(surface.isActive('call_connector_tool')).toBe(false);
+
+    const directory = getLoadableToolGroupsSystemPromptBlock({
+      availableToolNames: ['add_custom_connector', 'connector_setup', 'tool_load'],
+      allowedGroupIds: surface.loadableGroups(),
+    });
+    expect(directory).toContain('`add_custom_connector` — Commander-only custom MCP installation request.');
+    expect(directory).toMatch(/`connector_setup`[^\n]*Setup\/reconnect any built-in/);
+    expect(directory).not.toContain('`list_connector_tools`');
+    expect(directory).not.toContain('`call_connector_tool`');
+    expect(directory).toContain('`connectors` — Connectors.');
   });
 
   it('activates configured leaves plus host-managed and required tools', () => {
@@ -319,7 +364,7 @@ describe('tool-surface', () => {
       version: 3,
       mode: 'scoped',
       loadedGroups: [],
-      catalogRevision: '12',
+      catalogRevision: TOOL_CATALOG_REVISION,
     })]);
     expect(surface.runtimeStats()).toEqual({
       loadCalls: 2,
@@ -377,7 +422,7 @@ describe('tool-surface', () => {
     const surface = createToolSurfaceController({
       availableToolNames: [
         'open_app_view', 'app_health', 'skill_search', 'marketplace_search',
-        'auto_tasks_list', 'skill_manage', 'tool_load',
+        'auto_tasks', 'skill_manage', 'tool_load',
       ],
       // A stale or bypassed Agent config must not preload a runtime-only group.
       configuredGroups: ['management'],
@@ -391,7 +436,7 @@ describe('tool-surface', () => {
     expect(surface.isActive('app_health')).toBe(false);
     expect(surface.isActive('skill_search')).toBe(false);
     expect(surface.isActive('marketplace_search')).toBe(false);
-    expect(surface.isActive('auto_tasks_list')).toBe(false);
+    expect(surface.isActive('auto_tasks')).toBe(false);
     expect(states.at(-1)?.loadedGroups).toEqual([]);
 
     expect(JSON.parse(surface.load(['management.skills']).content)).toMatchObject({
@@ -402,7 +447,7 @@ describe('tool-surface', () => {
     expect(surface.isActive('skill_search')).toBe(true);
     expect(surface.isActive('app_health')).toBe(false);
     expect(surface.isActive('marketplace_search')).toBe(false);
-    expect(surface.isActive('auto_tasks_list')).toBe(false);
+    expect(surface.isActive('auto_tasks')).toBe(false);
     expect(states.at(-1)?.loadedGroups).toEqual([]);
 
     expect(JSON.parse(surface.load(['management.app']).content)).toMatchObject({
@@ -414,20 +459,20 @@ describe('tool-surface', () => {
     expect(surface.isActive('app_health')).toBe(true);
     expect(surface.isActive('skill_search')).toBe(true);
     expect(surface.isActive('marketplace_search')).toBe(false);
-    expect(surface.isActive('auto_tasks_list')).toBe(false);
+    expect(surface.isActive('auto_tasks')).toBe(false);
 
     expect(JSON.parse(surface.load(['management.automation']).content)).toMatchObject({
       ok: true,
       newly_loaded: ['management.automation'],
       unavailable: [],
     });
-    expect(surface.isActive('auto_tasks_list')).toBe(true);
+    expect(surface.isActive('auto_tasks')).toBe(true);
     expect(surface.isActive('marketplace_search')).toBe(false);
     expect(surface.runtimeStats()).toEqual({
       loadCalls: 3,
       newlyLoadedGroups: ['management.app', 'management.skills', 'management.automation'],
       newlyActivatedToolNames: [
-        'skill_search', 'open_app_view', 'app_health', 'auto_tasks_list',
+        'skill_search', 'open_app_view', 'app_health', 'auto_tasks',
       ],
     });
   });
@@ -445,6 +490,7 @@ describe('tool-surface', () => {
       ok: false,
       error: 'E_TOOL_GROUP_INVALID',
       unavailable: ['context', 'not-real', 'office'],
+      available_groups: ['workspace', 'workspace.read'],
     });
     expect(surface.isActive('read_files')).toBe(false);
   });
@@ -515,10 +561,10 @@ describe('tool-surface', () => {
     expect(states).toEqual([expect.objectContaining({
       version: 3,
       loadedGroups: [],
-      catalogRevision: '12',
+      catalogRevision: TOOL_CATALOG_REVISION,
     })]);
 
-    const unchangedWrites: unknown[] = [];
+    const priorRevisionWrites: unknown[] = [];
     createToolSurfaceController({
       availableToolNames: ['library', 'tool_load'],
       restoredState: {
@@ -528,16 +574,95 @@ describe('tool-surface', () => {
         catalogRevision: '12',
       },
       scopedEligible: true,
+      persist: (state) => priorRevisionWrites.push(state),
+    });
+    expect(priorRevisionWrites).toEqual([expect.objectContaining({
+      version: 3,
+      loadedGroups: [],
+      catalogRevision: TOOL_CATALOG_REVISION,
+    })]);
+
+    const unchangedWrites: unknown[] = [];
+    createToolSurfaceController({
+      availableToolNames: ['library', 'tool_load'],
+      restoredState: {
+        version: 3,
+        mode: 'scoped',
+        loadedGroups: [],
+        catalogRevision: TOOL_CATALOG_REVISION,
+      },
+      scopedEligible: true,
       persist: (state) => unchangedWrites.push(state),
     });
     expect(unchangedWrites).toEqual([]);
   });
 
-  it('keeps runtime group selection compact without the Agent dependency inventory', () => {
-    const block = getLoadableToolGroupsSystemPromptBlock({
+  it('does not revive a revision-10 library load after citation verification moves to web', () => {
+    process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
+    const states: Array<{
+      version: number;
+      loadedGroups: string[];
+      catalogRevision?: string;
+    }> = [];
+    const surface = createToolSurfaceController({
       availableToolNames: [
-        'read_files', 'write_file', 'create_pdf', 'web_search', 'marketplace_search',
+        'library',
+        'web_fetch',
+        'research_verify_citations',
+        'tool_load',
       ],
+      restoredState: {
+        version: 3,
+        mode: 'scoped',
+        // v3 normally persists no dynamic groups. Keep this adversarial value
+        // to prove stale/corrupt sidecars fail closed across the group move.
+        loadedGroups: ['library'],
+        catalogRevision: '10',
+      },
+      scopedEligible: true,
+      persist: (state) => states.push(state),
+    });
+
+    expect(surface.isActive('library')).toBe(false);
+    expect(surface.isActive('web_fetch')).toBe(false);
+    expect(surface.isActive('research_verify_citations')).toBe(false);
+    expect(states).toEqual([expect.objectContaining({
+      version: 3,
+      loadedGroups: [],
+      catalogRevision: TOOL_CATALOG_REVISION,
+    })]);
+
+    expect(JSON.parse(surface.load(['library']).content)).toMatchObject({
+      ok: true,
+      newly_loaded: ['library'],
+    });
+    expect(surface.isActive('library')).toBe(true);
+    expect(surface.isActive('research_verify_citations')).toBe(false);
+
+    expect(JSON.parse(surface.load(['web']).content)).toMatchObject({
+      ok: true,
+      newly_loaded: ['web'],
+    });
+    expect(surface.isActive('web_fetch')).toBe(true);
+    expect(surface.isActive('research_verify_citations')).toBe(true);
+    expect(states).toHaveLength(1);
+  });
+
+  it('maps deferred names and purposes to loadable groups without repeating active tool descriptions', () => {
+    const options = {
+      availableToolNames: [
+        'read_files', 'write_file', 'publish_outputs', 'create_pdf', 'web_search', 'marketplace_search',
+      ],
+      hostPreloadGroups: ['workspace.read', 'web'],
+      hostRequiredToolNames: ['publish_outputs'],
+      scopedEligible: true,
+      allowLegacyAll: false,
+    };
+    const surface = createToolSurfaceController(options);
+    const block = getLoadableToolGroupsSystemPromptBlock({
+      availableToolNames: options.availableToolNames,
+      initialActiveToolNames: surface.activeToolNames(),
+      allowedGroupIds: surface.loadableGroups(),
     });
 
     expect(block).toContain('`workspace.read`');
@@ -545,21 +670,72 @@ describe('tool-surface', () => {
     expect(block).toContain('`office`');
     expect(block).toContain('`web`');
     expect(block).toContain('`management` (runtime only; not an Agent dependency)');
-    expect(block).toContain('all clearly needed groups in one call');
+    expect(block).toContain('smallest sufficient groups');
     expect(block).toContain('current user turn only');
-    expect(block).not.toContain('Tools:');
+    expect(block).not.toContain('Fallback only');
+    expect(block).toContain('`workspace.write.output` — Workspace output.\n      - `write_file` — Write a text file.');
+    expect(block).toContain('`office.pdf` — PDF.\n    - `create_pdf` — Create a PDF from Markdown or HTML.');
+    expect(block).toContain('`management.marketplace` (runtime only; not an Agent dependency) — Marketplace management.\n    - `marketplace_search` — Search the marketplace.');
     expect(block).not.toContain('`read_files`');
-    expect(block).not.toContain('`create_pdf`');
+    expect(block).not.toContain('`publish_outputs`');
     expect(block).not.toContain('`web_search`');
-    expect(block).not.toContain('`marketplace_search`');
+    expect(block).not.toContain('`edit_pdf`');
     expect(block).not.toContain('`media`');
     expect(block).not.toContain('(loaded)');
+  });
 
-    expect(getActiveToolGroupsTurnBlock(['workspace.read', 'library'])).toBe([
-      '## Active tool groups',
-      '',
-      'Already active; do not call `tool_load` for these groups: `workspace.read`, `library`.',
-    ].join('\n'));
+  it('rejects a mixed-validity batch atomically, then permits a corrected retry', () => {
+    const surface = createToolSurfaceController({
+      availableToolNames: ['library', 'web_search', 'tool_load'],
+      scopedEligible: true,
+      allowLegacyAll: false,
+    });
+    const before = surface.activeToolNames();
+    const rejected = surface.load(['library', 'missing']);
+    expect(rejected.isError).toBe(true);
+    expect(JSON.parse(rejected.content)).toMatchObject({
+      error: 'E_TOOL_GROUP_INVALID', unavailable: ['missing'], available_groups: ['library', 'web'],
+    });
+    expect(surface.activeToolNames()).toEqual(before);
+    expect(surface.runtimeStats().newlyActivatedToolNames).toEqual([]);
+    expect(JSON.parse(surface.load(['library']).content)).toMatchObject({
+      ok: true, newly_activated_tools: ['library'],
+    });
+    expect(surface.isActive('library')).toBe(true);
+    expect(surface.isActive('web_search')).toBe(false);
+  });
+
+  it('reports exact activation deltas without treating repeat loads or host grants as additions', () => {
+    const grants: string[] = [];
+    const surface = createToolSurfaceController({
+      availableToolNames: ['read_files', 'write_file', 'library', 'web_search', 'tool_load'],
+      hostPreloadGroups: ['workspace.read'],
+      runtimeGrantedGroups: grants,
+      scopedEligible: true,
+      allowLegacyAll: false,
+    });
+    const first = JSON.parse(surface.load(['workspace', 'library']).content);
+    expect(first.newly_activated_tools).toEqual(['write_file', 'library']);
+    expect(first.activated_tools).toBe(surface.activeToolNames().length);
+    grants.push('web');
+    const repeated = JSON.parse(surface.load(['workspace.read', 'library']).content);
+    expect(repeated.newly_activated_tools).toEqual([]);
+    expect(repeated.already_loaded).toEqual(['workspace.read', 'library']);
+    expect(surface.runtimeStats().newlyActivatedToolNames).not.toContain('web_search');
+  });
+
+  it('returns recovery groups only for tools this actor can actually load', () => {
+    const surface = createToolSurfaceController({
+      availableToolNames: ['write_file', 'call_connector_tool', 'add_custom_connector', 'todo_tasks', 'tool_load'],
+      dynamicLoadableToolNames: ['write_file', 'add_custom_connector', 'todo_tasks', 'tool_load'],
+      scopedEligible: true,
+      dynamicLoadPolicy: 'agent-dependency',
+      allowLegacyAll: false,
+    });
+    expect(surface.loadableGroupsForTool('write_file')).toEqual(['workspace.write.output']);
+    expect(surface.loadableGroupsForTool('call_connector_tool')).toEqual([]);
+    expect(surface.loadableGroupsForTool('todo_tasks')).toEqual([]);
+    expect(surface.loadableGroupsForTool('missing')).toEqual([]);
   });
 
   it('keeps every ancestor visible when only a grandchild group has an available tool', () => {

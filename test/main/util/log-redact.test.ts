@@ -1,6 +1,10 @@
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { redactPaths } from '../../../src/main/util/redact';
 import {
+  fileToolBuildRef,
   logErrorRef,
   logErrorSummary,
   maskId,
@@ -9,6 +13,32 @@ import {
 } from '../../../src/main/util/log-redact';
 
 describe('log-redact', () => {
+  it('identifies different file-tool builds without logging source bytes or inventing a partial build id', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'file-tool-build-'));
+    const sources = [
+      'src/main/model/core-agent/file-tools.ts', 'src/main/model/core-agent/local-tools.ts',
+      'src/main/model/core-agent/read-tracker.ts', 'src/core-agent/src/tools/apply-patch.ts',
+      'src/core-agent/src/tools/file-diagnostics.ts', 'src/core-agent/src/tools/base.ts',
+      'src/core-agent/src/agent/runner.ts',
+    ];
+    try {
+      for (const file of sources) {
+        fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+        fs.writeFileSync(path.join(root, file), 'synthetic private source');
+      }
+      const first = fileToolBuildRef(root);
+      expect(first).toMatchObject({ status: 'complete', source_hash: expect.stringMatching(/^[a-f0-9]{64}$/) });
+      expect(fileToolBuildRef(root)).toEqual(first);
+      fs.appendFileSync(path.join(root, sources[0]), ' changed');
+      expect(fileToolBuildRef(root).source_hash).not.toBe(first.source_hash);
+      fs.unlinkSync(path.join(root, sources[1]));
+      const incomplete = fileToolBuildRef(root);
+      expect(incomplete).toEqual({ status: 'incomplete', unavailable_sources: 1 });
+      expect(JSON.stringify([first, incomplete])).not.toContain(root);
+      expect(JSON.stringify([first, incomplete])).not.toContain('private');
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('masks opaque account and local ids while preserving anonymous', () => {
     expect(maskId('anonymous')).toBe('anonymous');
     expect(maskId('7242')).toBe('72***42');

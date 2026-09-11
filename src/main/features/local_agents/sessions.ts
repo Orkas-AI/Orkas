@@ -25,8 +25,10 @@ import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 
 import { localCliSessionsFile, userLocalCliSessionsDir } from '../../paths.js';
+import { writeJson } from '../../storage.js';
 import { createLogger } from '../../logger.js';
 import { logErrorRef, maskId } from '../../util/log-redact.js';
+import type { LocalCliPermissionPolicy } from './registry.js';
 
 const log = createLogger('local-agents:sessions');
 
@@ -38,10 +40,23 @@ export interface CliSessionRecord {
    * Missing on v1 records; native-instruction adapters can safely refresh it,
    * while user-message-only adapters treat the record as a fresh boundary. */
   durableContextHash?: string;
+  /** Hash of the canonical private Agent-memory block represented in this
+   * native session. Missing legacy markers are intentionally incompatible
+   * for Claude/Codex so stale deleted memory cannot survive a resume. */
+  agentMemoryHash?: string;
+  /** Sorted fingerprints of the Agent-memory entries this native session has
+   * seen. Present on bindings written after 2026-09-08; a binding that has it
+   * resumes across appends and resets only when one of these entries was
+   * removed or edited. Older bindings fall back to the block hash. */
+  agentMemoryEntryHashes?: string[];
   /** Hash of the effective cwd. Session stores for some CLIs are cwd-scoped,
    * so a mismatch must never suppress the one-time recovery context. */
   cwdFingerprint?: string;
   contextProtocolVersion?: number;
+  /** Effective per-Agent policy used to create/resume this native session.
+   * A mismatch starts a fresh session so sticky CLI-side settings cannot
+   * retain a previous Orkas override. */
+  permissionPolicy?: LocalCliPermissionPolicy;
   /** User/group message that launched the most recently persisted CLI run.
    * Failed-turn retry uses this to avoid attaching an older bubble to a newer
    * native CLI session. Missing on legacy records, which remain resumable for
@@ -77,8 +92,10 @@ async function read(uid: string, cid: string): Promise<CliSessionsFile> {
 
 async function write(uid: string, cid: string, data: CliSessionsFile): Promise<void> {
   const file = localCliSessionsFile(uid, cid);
-  await fsp.mkdir(path.dirname(file), { recursive: true });
-  await fsp.writeFile(file, JSON.stringify(data, null, 2), 'utf8');
+  // Atomic tmp+rename: a torn write parses as garbage and read() falls back to
+  // {}, silently dropping the CLI --resume binding (next dispatch loses the
+  // CLI-side conversation continuity).
+  await writeJson(file, data);
 }
 
 /**
@@ -98,6 +115,22 @@ export async function getBinding(uid: string, cid: string, aid: string, cli: str
   return r.sessionId ? { ...r } : null;
 }
 
+// One file holds every agent's binding for the conversation, and parallel
+// CLI actors finish independently: two unserialized read-modify-writes let
+// the later writer overwrite the earlier one's fresh session id / history
+// cursor (2026-08-28 review D-5). Chain writers per (uid, cid).
+const _writeChains = new Map<string, Promise<unknown>>();
+function _serialized<T>(uid: string, cid: string, fn: () => Promise<T>): Promise<T> {
+  const key = `${uid}\u0000${cid}`;
+  const previous = _writeChains.get(key) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(fn);
+  _writeChains.set(key, next);
+  void next.catch(() => undefined).finally(() => {
+    if (_writeChains.get(key) === next) _writeChains.delete(key);
+  });
+  return next;
+}
+
 /** Persist the session id reported by the CLI after any terminal run. */
 export async function setSessionId(
   uid: string,
@@ -111,11 +144,15 @@ export async function setSessionId(
     | 'runId'
     | 'terminalStatus'
     | 'durableContextHash'
+    | 'agentMemoryHash'
+    | 'agentMemoryEntryHashes'
     | 'cwdFingerprint'
     | 'contextProtocolVersion'
+    | 'permissionPolicy'
   >> = {},
 ): Promise<void> {
   if (!sessionId) return;
+  return _serialized(uid, cid, async () => {
   const file = await read(uid, cid);
   const previous = file[aid];
   const preservedHistoryCursor = previous?.cli === cli
@@ -131,10 +168,13 @@ export async function setSessionId(
     ...(provenance.runId ? { runId: provenance.runId } : {}),
     ...(provenance.terminalStatus ? { terminalStatus: provenance.terminalStatus } : {}),
     ...(provenance.durableContextHash ? { durableContextHash: provenance.durableContextHash } : {}),
+    ...(provenance.agentMemoryHash ? { agentMemoryHash: provenance.agentMemoryHash } : {}),
+    ...(provenance.agentMemoryEntryHashes ? { agentMemoryEntryHashes: [...provenance.agentMemoryEntryHashes] } : {}),
     ...(provenance.cwdFingerprint ? { cwdFingerprint: provenance.cwdFingerprint } : {}),
     ...(provenance.contextProtocolVersion
       ? { contextProtocolVersion: provenance.contextProtocolVersion }
       : {}),
+    ...(provenance.permissionPolicy ? { permissionPolicy: provenance.permissionPolicy } : {}),
     ...(preservedHistoryCursor
       ? { historySyncedThroughMessageId: preservedHistoryCursor }
       : {}),
@@ -143,6 +183,7 @@ export async function setSessionId(
   catch (err) {
     log.warn('setSessionId failed', { user_id: maskId(uid), cid: maskId(cid), agent_id: maskId(aid), error: logErrorRef(err) });
   }
+  });
 }
 
 /** Advance canonical-history delivery only after a successful visible CLI
@@ -156,6 +197,7 @@ export async function markHistorySyncedThrough(
   messageId: string,
 ): Promise<void> {
   if (!messageId) return;
+  return _serialized(uid, cid, async () => {
   const file = await read(uid, cid);
   const current = file[aid];
   if (!current || current.cli !== cli || !current.sessionId) return;
@@ -168,11 +210,13 @@ export async function markHistorySyncedThrough(
   catch (err) {
     log.warn('markHistorySyncedThrough failed', { user_id: maskId(uid), cid: maskId(cid), agent_id: maskId(aid), error: logErrorRef(err) });
   }
+  });
 }
 
 /** Drop the binding for a single (cid, aid). Used when the agent is
  *  removed from the conversation or the user explicitly resets it. */
 export async function clearForAgent(uid: string, cid: string, aid: string): Promise<void> {
+  return _serialized(uid, cid, async () => {
   const file = await read(uid, cid);
   if (!(aid in file)) return;
   delete file[aid];
@@ -185,6 +229,7 @@ export async function clearForAgent(uid: string, cid: string, aid: string): Prom
   } catch (err) {
     log.warn('clearForAgent failed', { user_id: maskId(uid), cid: maskId(cid), agent_id: maskId(aid), error: logErrorRef(err) });
   }
+  });
 }
 
 /** Drop ALL bindings for a conversation. Called from

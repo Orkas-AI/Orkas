@@ -76,13 +76,32 @@ const META_FILENAME = '__orkas-meta.json';
 // it so an artifact can't shadow the real bridge.
 export const RESERVED_PREFIX = '__orkas/';
 export const BRIDGE_RELPATH = '__orkas/bridge.js';
+export const BRIDGE_SCRIPT_TAG = `<script src="${BRIDGE_RELPATH}"></script>`;
 
-const COMPACTED_HISTORY_MARKERS = [
-  '[old tool input string compacted:',
-  '[old nested tool input ',
-  '__orkas_context_note',
-  '__orkas_compacted_tool_use',
-];
+/**
+ * The chat embed frame the renderer gives an artifact.
+ *
+ * Canonical here rather than in the renderer because `create_artifact`'s
+ * pre-exposure smoke has to validate against the same box the user actually
+ * gets. `renderer/modules/chat-artifact.js` mirrors these numbers and
+ * `test/main/features/chat-artifact-frame-contract.test.ts` pins the two
+ * together, so the gate can never drift away from the surface it guards.
+ */
+export const ARTIFACT_FRAME = Object.freeze({
+  /** Height the iframe starts at, before the artifact reports its own. */
+  defaultHeight: 420,
+  /** Ceiling. Taller content scrolls inside the frame rather than growing it. */
+  maxHeight: 640,
+  minHeight: 80,
+  /**
+   * Representative embed width for the smoke. `.chat-artifact-card` is
+   * `width: 40cqw` against the chat column, so a maximised window lands near
+   * 480px — close to a third of the 1280px the smoke used to validate at,
+   * which is why artifacts kept shipping desktop layouts that collapsed to
+   * their own mobile breakpoint once embedded.
+   */
+  smokeWidth: 480,
+});
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -105,7 +124,7 @@ interface ResolveErr { ok: false; code: 'bad_input' | 'forbidden' | 'not_found';
 export type ResolveResult = ResolveOk | ResolveErr;
 export type ArtifactInspection =
   | { ok: true; status: 'ok' }
-  | { ok: true; status: 'unavailable'; reason: string; marker?: string }
+  | { ok: true; status: 'unavailable'; reason: string }
   | { ok: false; error: string };
 
 // ── Safe-name helpers ────────────────────────────────────────────────────
@@ -239,6 +258,37 @@ export const BRIDGE_JS = `(function(){
 })();
 `;
 
+/** An artifact that already drives its own height. Loading the bridge on top
+ *  of a hand-rolled reporter would put two writers on the same frame height. */
+function reportsOwnHeight(html: string): boolean {
+  return html.includes('__orkasArtifact') && /['"]resize['"]/.test(html);
+}
+
+/**
+ * Give every artifact the auto-sizing bridge instead of hoping it opts in.
+ *
+ * The frame is cross-origin by design, so the host cannot measure the content
+ * and an artifact that never posts `resize` is stuck at
+ * `ARTIFACT_FRAME.defaultHeight` for its whole life. That was documented only
+ * as "apps may load `__orkas/bridge.js`" in a parameter description, and in
+ * practice nobody opted in: on 2026-08-26 three consecutive artifacts in one
+ * conversation shipped `100vh` layouts with zero height reporting and rendered
+ * roughly 39% clipped, with the clipped part being the controls the user had
+ * asked for over the preceding three revisions.
+ *
+ * Injecting the tag makes correct sizing the default. An artifact that already
+ * references the bridge, or already reports its own height, is left untouched.
+ */
+export function ensureBridgeScript(html: string): string {
+  if (html.includes(BRIDGE_RELPATH) || reportsOwnHeight(html)) return html;
+  const tag = `${BRIDGE_SCRIPT_TAG}\n`;
+  const headClose = html.search(/<\/head\s*>/i);
+  if (headClose >= 0) return `${html.slice(0, headClose)}${tag}${html.slice(headClose)}`;
+  const bodyClose = html.search(/<\/body\s*>/i);
+  if (bodyClose >= 0) return `${html.slice(0, bodyClose)}${tag}${html.slice(bodyClose)}`;
+  return `${html}\n${tag}`;
+}
+
 // ── Public API ───────────────────────────────────────────────────────────
 
 /**
@@ -303,17 +353,11 @@ export function createArtifact(
       }
       buf = Buffer.from(f.content, 'base64'); // tolerant of url-safe alphabet + whitespace
     } else {
-      const compactedMarker = findCompactedHistoryMarker(f.content);
-      if (compactedMarker) {
-        return {
-          ok: false,
-          error:
-            `file "${rel}": contains compacted conversation-history marker ${compactedMarker}. ` +
-            'This is not an artifact or preview limitation; regenerate the complete artifact content before creating it.',
-        };
-      }
       buf = Buffer.from(f.content, 'utf8');
       if (buf.toString('utf8') !== f.content) return { ok: false, error: `file "${rel}": content is not valid UTF-8` };
+      // Before the size accounting below, so the caps still describe what
+      // actually lands on disk.
+      if (rel === 'index.html') buf = Buffer.from(ensureBridgeScript(f.content), 'utf8');
     }
     if (buf.length > MAX_BYTES_PER_FILE) {
       return { ok: false, error: `file "${rel}": exceeds ${Math.round(MAX_BYTES_PER_FILE / 1024)}KB per-file cap` };
@@ -366,32 +410,13 @@ export function createArtifact(
   return { ok: true, artifactId, title };
 }
 
-function findCompactedHistoryMarker(content: string): string | null {
-  for (const marker of COMPACTED_HISTORY_MARKERS) {
-    if (content.includes(marker)) return marker;
-  }
-  if (/Old .+ tool input compacted for repeated context;/.test(content)) {
-    return 'old tool input context note';
-  }
-  return null;
-}
-
 export function inspectArtifactIndex(userId: string, cid: string, artifactId: string): ArtifactInspection {
   const resolved = resolveArtifactFilePath(userId, cid, artifactId, 'index.html');
   if (!resolved.ok) {
     return { ok: true, status: 'unavailable', reason: (resolved as { error?: string }).error || 'artifact index is unavailable' };
   }
   try {
-    const content = fs.readFileSync((resolved as { absPath: string }).absPath, 'utf8');
-    const marker = findCompactedHistoryMarker(content);
-    if (marker) {
-      return {
-        ok: true,
-        status: 'unavailable',
-        reason: 'artifact index contains compacted conversation-history content',
-        marker,
-      };
-    }
+    fs.accessSync((resolved as { absPath: string }).absPath, fs.constants.R_OK);
     return { ok: true, status: 'ok' };
   } catch (err) {
     return { ok: false, error: (err as Error).message || 'failed to inspect artifact index' };
@@ -490,6 +515,75 @@ export function readArtifactMeta(userId: string, cid: string, artifactId: string
     }
   } catch { /* missing / malformed */ }
   return undefined;
+}
+
+export interface ArtifactSummary {
+  artifactId: string;
+  title: string;
+  agentId: string;
+  createdAt: string;
+  /** Total bytes on disk and newest mtime, so the conversation output list can
+   *  present an artifact next to ordinary files without special-casing them. */
+  bytes: number;
+  mtime: number;
+}
+
+/**
+ * Every artifact this conversation holds, newest first.
+ *
+ * An artifact is a directory bundle rather than a file, so it is summarized as
+ * one row: the pool is the only place it exists, and until this listing it was
+ * reachable only from the bubble that created it — scroll past that bubble and
+ * a `create_artifact` app could not be found again.
+ *
+ * Best-effort: an unreadable or malformed entry is skipped rather than failing
+ * the whole listing, and the caps here are the same ones `createArtifact`
+ * enforces on write.
+ */
+export function listArtifacts(userId: string, cid: string): ArtifactSummary[] {
+  let safeConvId: string;
+  try { safeConvId = safeCid(cid); }
+  catch { return []; }
+
+  const root = chatArtifactCidDirForConversation(userId, safeConvId);
+  let entries: fs.Dirent[];
+  try { entries = fs.readdirSync(root, { withFileTypes: true }); }
+  catch { return []; }
+
+  const out: ArtifactSummary[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    let artifactId: string;
+    try { artifactId = safeArtifactId(entry.name); }
+    catch { continue; }
+    const dir = artifactDirForConversation(userId, safeConvId, artifactId);
+    let bytes = 0;
+    let mtime = 0;
+    let files: fs.Dirent[];
+    try { files = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch { continue; }
+    // An artifact with no entry point is a half-written or discarded bundle;
+    // the `chat-app://` handler could not serve it either.
+    if (!files.some((file) => file.isFile() && file.name === 'index.html')) continue;
+    for (const file of files) {
+      if (!file.isFile()) continue;
+      try {
+        const st = fs.statSync(path.join(dir, file.name));
+        bytes += st.size;
+        mtime = Math.max(mtime, Math.floor(st.mtimeMs));
+      } catch { /* skip an unreadable sibling, keep the bundle */ }
+    }
+    const meta = readArtifactMeta(userId, safeConvId, artifactId);
+    out.push({
+      artifactId,
+      title: meta?.title || '',
+      agentId: meta?.agentId || '',
+      createdAt: meta?.createdAt || '',
+      bytes,
+      mtime,
+    });
+  }
+  return out.sort((a, b) => b.mtime - a.mtime || a.artifactId.localeCompare(b.artifactId));
 }
 
 /**

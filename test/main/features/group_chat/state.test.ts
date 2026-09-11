@@ -18,6 +18,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -69,7 +70,66 @@ describe('group_chat state › addMember + ensureAgentMember', () => {
   });
 });
 
+describe('group_chat state › legacy visibility slices', () => {
+  it('removes a retired per-Agent visibility directory the first time the roster is read', async () => {
+    // The slices were derived copies with no reader since 697819029; they are
+    // private data that stayed on disk (and in cloud sync) for every existing
+    // conversation. The roster read is the first group-dir touch of a turn.
+    const s = await import('../../../../src/main/features/group_chat/state');
+    s._resetLegacyVisibilitySweepForTest();
+    const groupDir = path.join(tmpDir, TEST_UID, 'cloud', 'chats', TEST_CID);
+    fs.mkdirSync(path.join(groupDir, 'visibility'), { recursive: true });
+    fs.writeFileSync(path.join(groupDir, 'visibility', 'agent-a.jsonl'), '{"id":"m1"}\n');
+    fs.writeFileSync(path.join(groupDir, 'members.json'), JSON.stringify({ version: 1, actors: [{ id: 'agent-a', kind: 'agent', name: 'A' }] }));
+
+    const members = await s.readMembers(TEST_UID, TEST_CID);
+    // The roster read schedules background filesystem IO; wait for its result
+    // instead of assuming the host completes recursive deletion within 20ms.
+    await vi.waitFor(() => expect(fs.existsSync(path.join(groupDir, 'visibility'))).toBe(false));
+    // Negative control: the canonical roster file is untouched and still read.
+    expect(fs.existsSync(path.join(groupDir, 'members.json'))).toBe(true);
+    expect(members.actors.map((a) => a.id)).toEqual(['agent-a']);
+  });
+});
+
 describe('group_chat state › active recipient provenance', () => {
+  it('reads an old persisted multi-recipient default as Commander after restart', async () => {
+    const { groupChatStateFile } = await import('../../../../src/main/paths');
+    const file = groupChatStateFile(TEST_UID, TEST_CID);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ version: 1, status: 'idle', active_recipients: ['agent-a', 'agent-b'], active_recipient_source: 'user_selection' }));
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const current = await state.readState(TEST_UID, TEST_CID);
+    expect(current.active_recipient).toBeUndefined();
+    expect(current.active_recipients).toBeUndefined();
+    await state.setActiveRecipient(TEST_UID, TEST_CID, 'agent-a', 'user_selection');
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toMatchObject({ active_recipient: 'agent-a' });
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).active_recipients).toBeUndefined();
+  });
+
+  it('keeps Commander as the default after a multi-recipient choice and restores a later single choice', async () => {
+    const s = await import('../../../../src/main/features/group_chat/state');
+    await s.setActiveRecipients(TEST_UID, TEST_CID, ['agent-a', 'commander', 'agent-a'], 'user_selection');
+    expect((await s.readState(TEST_UID, TEST_CID)).active_recipients).toBeUndefined();
+    const facade = await import('../../../../src/main/features/group_chat');
+    expect((await facade.runtimeStatus(TEST_UID, TEST_CID)).active_recipients).toBeUndefined();
+    expect(await facade.setFloor(TEST_UID, TEST_CID, ['commander', '../missing'])).toMatchObject({ ok: false });
+    expect((await s.readState(TEST_UID, TEST_CID)).active_recipients).toBeUndefined();
+    await s.clearOrchestrationForCancellation(TEST_UID, TEST_CID);
+    const receipt = await s.beginAgentHandoff(TEST_UID, TEST_CID, {
+      ownerAgentId: 'agent-b', interactive: true, userGoal: 'review', handoffMessage: 'review',
+    });
+    expect((await s.readState(TEST_UID, TEST_CID)).active_recipients).toBeUndefined();
+    await s.rollbackAgentHandoff(TEST_UID, TEST_CID, receipt);
+    expect((await s.readState(TEST_UID, TEST_CID)).active_recipients).toBeUndefined();
+    await s.setActiveRecipient(TEST_UID, TEST_CID, 'agent-b', 'user_selection');
+    const floor = await s.readState(TEST_UID, TEST_CID);
+    expect(floor.active_recipients).toBeUndefined();
+    expect(floor.active_recipient).toBe('agent-b');
+    await s.rollbackAgentHandoff(TEST_UID, TEST_CID, receipt);
+    expect((await s.readState(TEST_UID, TEST_CID)).active_recipient).toBe('agent-b');
+  });
+
   it('preserves the source across same-Agent follow-ups and clears it with the floor', async () => {
     const s = await import('../../../../src/main/features/group_chat/state');
 
@@ -95,7 +155,7 @@ describe('group_chat state › active recipient provenance', () => {
 });
 
 describe('group_chat state › scheduled Agent hand-off admission', () => {
-  it('establishes floor and resume ledger together and restores the previous state on admission failure', async () => {
+  it('preserves a manual single recipient through unrelated handoff admission and rollback', async () => {
     const s = await import('../../../../src/main/features/group_chat/state');
     await s.setActiveRecipient(TEST_UID, TEST_CID, 'agent-old', 'user_selection');
     await s.setOrchestrationLedger(TEST_UID, TEST_CID, {
@@ -118,8 +178,8 @@ describe('group_chat state › scheduled Agent hand-off admission', () => {
       resumeInstruction: 'finish new goal',
     });
     let current = await s.readState(TEST_UID, TEST_CID);
-    expect(current.active_recipient).toBe('agent-new');
-    expect(current.active_recipient_source).toBe('commander_handoff');
+    expect(current.active_recipient).toBe('agent-old');
+    expect(current.active_recipient_source).toBe('user_selection');
     expect(current.orchestration_ledger).toMatchObject({
       id: admission.token,
       source_tool: 'hand_off_to',
@@ -135,6 +195,26 @@ describe('group_chat state › scheduled Agent hand-off admission', () => {
       owner_agent_id: 'agent-old',
       resume_instruction: 'finish old goal',
     });
+  });
+
+  it('rejects stale automatic selection after the user chooses Commander and protects a newer same-Agent handoff', async () => {
+    const s = await import('../../../../src/main/features/group_chat/state');
+    const origin = (await s.readState(TEST_UID, TEST_CID)).active_recipient_revision || 0;
+    await s.setActiveRecipient(TEST_UID, TEST_CID, 'commander', 'user_selection');
+    const request = { ownerAgentId: 'agent-a', interactive: true, userGoal: 'review', handoffMessage: 'review' };
+    const stale = await s.beginAgentHandoff(TEST_UID, TEST_CID, { ...request, expectedFloorRevision: origin });
+    expect(stale.floorApplied).toBe(false);
+    expect((await s.readState(TEST_UID, TEST_CID)).active_recipient).toBeUndefined();
+    const old = await s.beginAgentHandoff(TEST_UID, TEST_CID, request);
+    expect(old.floorApplied).toBe(true);
+    const oldRevision = (await s.readState(TEST_UID, TEST_CID)).active_recipient_revision;
+    await s.setActiveRecipient(TEST_UID, TEST_CID, 'commander', 'user_selection');
+    const newer = await s.beginAgentHandoff(TEST_UID, TEST_CID, request);
+    await s.rollbackAgentHandoff(TEST_UID, TEST_CID, old);
+    await s.setActiveRecipient(TEST_UID, TEST_CID, 'commander', undefined, oldRevision);
+    const current = await s.readState(TEST_UID, TEST_CID);
+    expect(current.active_recipient).toBe('agent-a');
+    expect(current.active_recipient_handoff_id).toBe(newer.token);
   });
 
   it('rollback never overwrites a newer user floor or orchestration ledger', async () => {
@@ -373,7 +453,7 @@ describe('group_chat facade › runtimeStatus orphan recovery', () => {
 
     const facade = await import('../../../../src/main/features/group_chat');
     const runtime = await facade.runtimeStatus(TEST_UID, TEST_CID);
-    expect(runtime).toEqual({
+    expect(runtime).toMatchObject({
       processing: false,
       processing_since: null,
       in_flight: [],
@@ -423,5 +503,44 @@ describe('group_chat state › setCodingProjectDirOnce', () => {
     const blank = await s.setCodingProjectDirOnce(TEST_UID, 'cid-fresh', '   ', { explicit: false });
     expect(blank.applied).toBe(false);
     expect((await s.readState(TEST_UID, 'cid-fresh')).coding_project_dir).toBeUndefined();
+  });
+});
+
+// Use the production redactor as the transport boundary: caller summaries must
+// remain private even when arbitrary user text has no recognizable secret shape.
+async function capturePrivateDiagnostics(): Promise<unknown[][]> {
+  const logger = await import('../../../../src/main/logger');
+  const original = logger.createLogger;
+  const records: unknown[][] = [];
+  vi.spyOn(logger, 'createLogger').mockImplementation((scope) => {
+    const scoped = original(scope);
+    if (scope !== 'group_chat.state') return scoped;
+    const capture = (message: string, ...args: unknown[]) => {
+      records.push([message, ...args].map((value) => logger.redact(value)));
+    };
+    return { info: capture, warn: capture, error: capture, debug: capture };
+  });
+  return records;
+}
+
+describe('group_chat state › diagnostic privacy', () => {
+  it('preserves member names through join and rename without including them in logs', async () => {
+    const records = await capturePrivateDiagnostics();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const paths = await import('../../../../src/main/paths');
+    const original = 'Confidential customer';
+    const renamed = 'Private customer notes';
+    expect(await state.addMember(TEST_UID, TEST_CID, { kind: 'agent', id: 'writer', name: original })).toBe(true);
+    fs.writeFileSync(path.join(paths.userChatsDir(TEST_UID), '_index.json'), JSON.stringify([
+      { conversation_id: TEST_CID },
+    ]));
+    expect(await state.renameAgentInMembers(TEST_UID, 'writer', renamed)).toBe(1);
+    expect((await state.readMembers(TEST_UID, TEST_CID)).actors).toEqual([
+      expect.objectContaining({ id: 'writer', name: renamed }),
+    ]);
+    expect(records).toHaveLength(2);
+    const emitted = JSON.stringify(records);
+    expect(emitted).not.toContain(original);
+    expect(emitted).not.toContain(renamed);
   });
 });

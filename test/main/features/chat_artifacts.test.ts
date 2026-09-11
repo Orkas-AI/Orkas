@@ -34,6 +34,97 @@ function cidDir(): string {
 
 const MIN_FILES = [{ path: 'index.html', content: '<!doctype html><h1>hi</h1>' }];
 
+/**
+ * 2026-08-26: the host cannot measure a cross-origin iframe, so an artifact
+ * that never posts `resize` stays at the 420px default for its whole life.
+ * That was opt-in via `__orkas/bridge.js` and nobody opted in — three
+ * consecutive artifacts in one conversation shipped `100vh` layouts with zero
+ * height reporting and rendered about 39% clipped. Auto-sizing is now the
+ * default; these tests are the reason it has to stay that way.
+ */
+describe('chat_artifacts › bridge injection', () => {
+  function readEntry(dir: string): string {
+    return fs.readFileSync(path.join(dir, 'index.html'), 'utf8');
+  }
+
+  it('gives an ordinary artifact the auto-sizing bridge without being asked', async () => {
+    const m = await loadMod();
+    const r = m.createArtifact(UID, CID, AGENT, {
+      title: 'Sized',
+      files: [{ path: 'index.html', content: '<!doctype html><html><head><title>a</title></head><body><button>go</button></body></html>' }],
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const html = readEntry(path.join(cidDir(), r.artifactId));
+    expect(html).toContain(m.BRIDGE_SCRIPT_TAG);
+    // In <head>, so the reporter is live before first paint rather than after
+    // the layout the user already saw.
+    expect(html.indexOf(m.BRIDGE_RELPATH)).toBeLessThan(html.indexOf('</head>'));
+    expect(html).toContain('<button>go</button>');
+  });
+
+  it('does not inject twice when the artifact already loads the bridge', async () => {
+    const m = await loadMod();
+    const authored = `<!doctype html><html><head>${m.BRIDGE_SCRIPT_TAG}</head><body><button>go</button></body></html>`;
+    const r = m.createArtifact(UID, CID, AGENT, { title: 'Own bridge', files: [{ path: 'index.html', content: authored }] });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const html = readEntry(path.join(cidDir(), r.artifactId));
+    expect(html.split(m.BRIDGE_RELPATH).length - 1).toBe(1);
+  });
+
+  it('leaves an artifact that already reports its own height alone', async () => {
+    // Two writers on one frame height would fight; the artifact wins.
+    const m = await loadMod();
+    const authored = '<!doctype html><html><head><script>'
+      + 'parent.postMessage({ __orkasArtifact: true, type: "resize", height: 300 }, "*");'
+      + '</script></head><body><button>go</button></body></html>';
+    const r = m.createArtifact(UID, CID, AGENT, { title: 'Self sizing', files: [{ path: 'index.html', content: authored }] });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(readEntry(path.join(cidDir(), r.artifactId))).not.toContain(m.BRIDGE_RELPATH);
+  });
+
+  it('places the tag in a fragment that has no head or body', async () => {
+    const m = await loadMod();
+    const r = m.createArtifact(UID, CID, AGENT, {
+      title: 'Fragment',
+      files: [{ path: 'index.html', content: '<h1>hi</h1><button>go</button>' }],
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const html = readEntry(path.join(cidDir(), r.artifactId));
+    expect(html).toContain('<h1>hi</h1>');
+    expect(html).toContain(m.BRIDGE_SCRIPT_TAG);
+  });
+
+  it('only touches the entry file', async () => {
+    const m = await loadMod();
+    const helper = 'export const value = 1;\n';
+    const r = m.createArtifact(UID, CID, AGENT, {
+      title: 'Multi',
+      files: [
+        { path: 'index.html', content: '<!doctype html><html><body><button>go</button></body></html>' },
+        { path: 'app.js', content: helper },
+      ],
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const dir = path.join(cidDir(), r.artifactId);
+    expect(fs.readFileSync(path.join(dir, 'app.js'), 'utf8')).toBe(helper);
+    expect(readEntry(dir)).toContain(m.BRIDGE_SCRIPT_TAG);
+  });
+
+  it('reports the real content height, which is the whole point of injecting it', async () => {
+    const m = await loadMod();
+    // The bridge is what turns a 420px frame into a fitted one. Pin the
+    // behaviour, not just the tag: a bridge that stopped posting `resize`
+    // would leave the tag in place and the artifact clipped again.
+    expect(m.BRIDGE_JS).toContain('scrollHeight');
+    expect(m.BRIDGE_JS).toContain("post('resize'");
+  });
+});
+
 describe('chat_artifacts › createArtifact', () => {
   it('accepts a minimal one-file app, stamps meta, returns the id', async () => {
     const m = await loadMod();
@@ -104,45 +195,6 @@ describe('chat_artifacts › createArtifact', () => {
     if (!r.ok) return;
     const buf = fs.readFileSync(path.join(cidDir(), r.artifactId, 'logo.png'));
     expect([...buf.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
-  });
-
-  it('rejects compacted history markers in artifact text files', async () => {
-    const m = await loadMod();
-    const r = m.createArtifact(UID, CID, AGENT, {
-      files: [
-        {
-          path: 'index.html',
-          content:
-            '[old tool input string compacted: original_size=13653 chars]\n' +
-            'preview_head:\n<!doctype html><h1>stale preview</h1>',
-        },
-      ],
-    });
-
-    expect(r.ok).toBe(false);
-    if (r.ok) return;
-    expect(r.error).toContain('compacted conversation-history marker');
-    expect(r.error).toContain('not an artifact or preview limitation');
-    expect(fs.existsSync(cidDir())).toBe(false);
-  });
-
-  it('reports compacted history artifacts as unavailable without rewriting them', async () => {
-    const m = await loadMod();
-    const r = m.createArtifact(UID, CID, AGENT, { title: 'Ok app', files: MIN_FILES });
-    expect(r.ok).toBe(true);
-    if (!r.ok) return;
-
-    expect(m.inspectArtifactIndex(UID, CID, r.artifactId)).toEqual({ ok: true, status: 'ok' });
-
-    const indexPath = path.join(cidDir(), r.artifactId, 'index.html');
-    fs.writeFileSync(indexPath, '__orkas_compacted_tool_use', 'utf8');
-    const inspected = m.inspectArtifactIndex(UID, CID, r.artifactId);
-    expect(inspected).toMatchObject({
-      ok: true,
-      status: 'unavailable',
-      marker: '__orkas_compacted_tool_use',
-    });
-    expect(fs.readFileSync(indexPath, 'utf8')).toBe('__orkas_compacted_tool_use');
   });
 
   it('rejects: no index.html', async () => {

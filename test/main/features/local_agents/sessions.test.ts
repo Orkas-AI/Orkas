@@ -35,6 +35,26 @@ describe('local_agents/sessions', () => {
     expect(await s.getSessionId(TEST_UID, TEST_CID, 'agent-x', 'claude')).toBe('sess-1');
   });
 
+  it('keeps both bindings when two agents of one conversation persist concurrently', async () => {
+    // One file holds every agent's binding; unserialized read-modify-writes
+    // let the later writer drop the earlier agent's fresh session
+    // (2026-08-28 review D-5).
+    const sessions = await import('../../../../src/main/features/local_agents/sessions');
+    await Promise.all([
+      sessions.setSessionId(TEST_UID, 'c1', 'agent-a', 'codex', 'thread-a'),
+      sessions.setSessionId(TEST_UID, 'c1', 'agent-b', 'codex', 'thread-b'),
+    ]);
+    expect(await sessions.getSessionId(TEST_UID, 'c1', 'agent-a', 'codex')).toBe('thread-a');
+    expect(await sessions.getSessionId(TEST_UID, 'c1', 'agent-b', 'codex')).toBe('thread-b');
+
+    await Promise.all([
+      sessions.markHistorySyncedThrough(TEST_UID, 'c1', 'agent-a', 'codex', 'm-a'),
+      sessions.setSessionId(TEST_UID, 'c1', 'agent-b', 'codex', 'thread-b2'),
+    ]);
+    expect((await sessions.getBinding(TEST_UID, 'c1', 'agent-a', 'codex'))?.historySyncedThroughMessageId).toBe('m-a');
+    expect(await sessions.getSessionId(TEST_UID, 'c1', 'agent-b', 'codex')).toBe('thread-b2');
+  });
+
   it('round-trips failed-turn provenance and context compatibility metadata', async () => {
     const s = await loadSessions();
     await s.setSessionId(TEST_UID, TEST_CID, 'agent-x', 'codex', 'sess-1', {
@@ -43,8 +63,10 @@ describe('local_agents/sessions', () => {
       runId: 'run-1',
       terminalStatus: 'failed',
       durableContextHash: 'durable-hash',
+      agentMemoryHash: 'agent-memory-hash',
       cwdFingerprint: 'cwd-hash',
       contextProtocolVersion: 3,
+      permissionPolicy: 'ask',
     });
     expect(await s.getBinding(TEST_UID, TEST_CID, 'agent-x', 'codex')).toMatchObject({
       sessionId: 'sess-1',
@@ -53,8 +75,10 @@ describe('local_agents/sessions', () => {
       runId: 'run-1',
       terminalStatus: 'failed',
       durableContextHash: 'durable-hash',
+      agentMemoryHash: 'agent-memory-hash',
       cwdFingerprint: 'cwd-hash',
       contextProtocolVersion: 3,
+      permissionPolicy: 'ask',
     });
   });
 

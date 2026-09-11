@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { Compile } from 'typebox/compile';
 import { drainMainRuntimeForTest } from '../../../helpers/drain-main-runtime';
 
 vi.mock('../../../../src/main/logger', () => ({
@@ -105,6 +106,30 @@ describe('chat-history-tools › chat_history(search)', () => {
     expect(result.content).toMatch(/msg=0/);
     expect(result.content).toMatch(/Planning chat/);
     expect(result.content).toMatch(/nebula migration/);
+  });
+
+  it('reads the conversation without running the renderer projection or spilling tool output', async () => {
+    // The tool only consumes text/ids. Before 2026-08-28 (review E2-3) every
+    // search/read of the current conversation hashed each large process
+    // output and wrote lazy spill files under the history cache on the main
+    // thread for a view nothing reads.
+    const bigOutput = 'x'.repeat(4096);
+    writeConversation('cproc', 'Tool heavy chat', [
+      { id: 'm0', ts: '2026-01-01T00:00:00Z', from: 'user', to: ['commander'], mentions: [], text: 'run the quasar build' },
+      {
+        id: 'm1', ts: '2026-01-01T00:00:01Z', from: 'commander', to: ['user'], mentions: [], text: 'quasar build finished',
+        process: [{ type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 'tool-m1', name: 'bash', output: bigOutput } } }],
+      },
+      { id: 'm2', ts: '2026-01-01T00:00:02Z', from: 'user', to: ['commander'], mentions: [], text: 'what did the build say?' },
+    ]);
+    const paths = await import('../../../../src/main/paths');
+    const [, chatRead] = await createChatHistoryActions({
+      userId: TEST_UID, currentCid: 'cproc', currentMessageId: 'm2',
+    });
+    const result = await chatRead.execute({ scope: 'current' }, ctxFor());
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toMatch(/quasar build finished/);
+    expect(fs.existsSync(paths.userConversationHistoryCacheDir(TEST_UID))).toBe(false);
   });
 
   it('rejects empty query', async () => {
@@ -222,6 +247,8 @@ describe('chat-history-tools › chat_history(search)', () => {
   it('searches only visible earlier rows in the host-bound current conversation', async () => {
     writeConversation('current-bound', 'Current bounded task', [
       { id: 'prior', ts: '2026-07-30T00:00:00Z', from: 'user', to: ['commander'], text: 'BOUNDARYWORD public earlier result' },
+      { id: 'prior-2', ts: '2026-07-30T00:00:20Z', from: 'commander', to: ['user'], text: 'BOUNDARYWORD second earlier result' },
+      { id: 'prior-3', ts: '2026-07-30T00:00:40Z', from: 'user', to: ['commander'], text: 'BOUNDARYWORD third earlier result' },
       { id: 'dispatch', ts: '2026-07-30T00:01:00Z', from: 'commander', to: ['agent-a'], text: 'BOUNDARYWORD hidden dispatch', dispatch: true },
       { id: 'trigger', ts: '2026-07-30T00:02:00Z', from: 'user', to: ['agent-a'], text: 'BOUNDARYWORD current trigger' },
       { id: 'later', ts: '2026-07-30T00:03:00Z', from: 'commander', to: ['user'], text: 'BOUNDARYWORD concurrent later result' },
@@ -245,10 +272,105 @@ describe('chat-history-tools › chat_history(search)', () => {
     expect(result.isError).toBeFalsy();
     expect(result.content).toContain('cid=current-bound msg=0');
     expect(result.content).toContain('public earlier result');
+    // One conversation is the whole scope: `k` must not be clamped by the
+    // cross-conversation diversity cap (2 per cid).
+    expect(result.content).toContain('second earlier result');
+    expect(result.content).toContain('third earlier result');
     expect(result.content).not.toContain('hidden dispatch');
     expect(result.content).not.toContain('current trigger');
     expect(result.content).not.toContain('concurrent later result');
     expect(result.content).not.toContain('other-chat');
+  });
+
+  it('rechecks the current-turn boundary after sync reorders the conversation', async () => {
+    const earlier = { id: 'earlier', from: 'commander', to: ['user'], text: 'SYNCBOUNDARY earlier result' };
+    const trigger = { id: 'trigger', from: 'user', to: ['commander'], text: 'SYNCBOUNDARY current trigger' };
+    const later = { id: 'later', from: 'commander', to: ['user'], text: 'SYNCBOUNDARY future result' };
+    writeConversation('boundary-sync', 'Boundary', [earlier, later, trigger]);
+    const [chatSearch] = await createChatHistoryActions({
+      userId: TEST_UID, currentCid: 'boundary-sync', currentMessageId: 'trigger',
+    });
+    const search = () => chatSearch.execute({ query: 'SYNCBOUNDARY', scope: 'current', k: 10 }, ctxFor());
+    expect((await search()).content).toContain('earlier result');
+
+    // Sync can move an existing stable id to a different source index.
+    writeConversation('boundary-sync', 'Boundary', [trigger, earlier, later]);
+    const indexer = await import('../../../../src/main/features/search/indexer');
+    await indexer.reconcileChatsIndex(TEST_UID);
+    const afterSync = await search();
+    expect(afterSync.isError).toBeFalsy();
+    expect(afterSync.content).toContain('No conversation-history results');
+    expect(afterSync.content).not.toContain('current trigger');
+    expect(afterSync.content).not.toContain('earlier result');
+    expect(afterSync.content).not.toContain('future result');
+  });
+
+  it('reuses the current-turn boundary instead of re-parsing the conversation on every search', async () => {
+    // A current-scope search needs one number from the conversation log: the
+    // index of the triggering message. Parsing the whole JSONL for it on
+    // every call was the per-turn cost (K-5). While the source revision stays
+    // unchanged, the first lookup serves later searches of the turn.
+    // Oracle: opens of the log (the page reader goes through
+    // fs.promises.open; the search snippet reader does not).
+    const { _resetCurrentBoundaryCacheForTest } = await import('../../../../src/main/model/core-agent/chat-history-tools');
+    _resetCurrentBoundaryCacheForTest();
+    writeConversation('boundary-cache', 'Boundary', [
+      { id: 'earlier', ts: '2026-07-01T00:00:00Z', from: 'commander', to: ['user'], text: 'CACHEDBOUNDARY earlier result' },
+      { id: 'trigger', ts: '2026-07-01T00:01:00Z', from: 'user', to: ['commander'], text: 'current trigger' },
+    ]);
+    const [chatSearch] = await createChatHistoryActions({
+      userId: TEST_UID, currentCid: 'boundary-cache', currentMessageId: 'trigger',
+    });
+    const logPath = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'boundary-cache.jsonl');
+    // storage.ts binds `node:fs/promises` as an ESM namespace, so the patched
+    // property has to be re-synced into that namespace.
+    const { syncBuiltinESMExports } = await import('node:module');
+    const openSpy = vi.spyOn(fs.promises, 'open');
+    syncBuiltinESMExports();
+    const logOpens = () => openSpy.mock.calls.filter((call) => String(call[0]) === logPath).length;
+    const search = () => chatSearch.execute({ query: 'CACHEDBOUNDARY', scope: 'current', k: 10 }, ctxFor());
+    try {
+      const first = await search();
+      expect(first.content).toContain('CACHEDBOUNDARY earlier result');
+      const opensForFirst = logOpens();
+      expect(opensForFirst).toBeGreaterThan(0);
+
+      const second = await search();
+      expect(second.content).toContain('CACHEDBOUNDARY earlier result');
+      expect(logOpens()).toBe(opensForFirst);
+
+      // Negative control: forgetting the boundary brings the parse back.
+      _resetCurrentBoundaryCacheForTest();
+      await search();
+      expect(logOpens()).toBeGreaterThan(opensForFirst);
+    } finally {
+      openSpy.mockRestore();
+      syncBuiltinESMExports();
+    }
+  });
+
+  it('discards current-history hits if sync changes the source while search is running', async () => {
+    const earlier = { id: 'earlier', from: 'commander', to: ['user'], text: 'MIDSEARCH earlier result' };
+    const trigger = { id: 'trigger', from: 'user', to: ['commander'], text: 'MIDSEARCH current trigger' };
+    writeConversation('boundary-mid-search', 'Boundary', [earlier, trigger]);
+    const [chatSearch] = await createChatHistoryActions({
+      userId: TEST_UID, currentCid: 'boundary-mid-search', currentMessageId: 'trigger',
+    });
+    const searchModule = await import('../../../../src/main/features/search');
+    const searchChats = searchModule.searchChats;
+    const searchSpy = vi.spyOn(searchModule, 'searchChats').mockImplementationOnce(async (...args) => {
+      const hits = await searchChats(...args);
+      expect(hits).toHaveLength(1);
+      writeConversation('boundary-mid-search', 'Boundary', [trigger, earlier]);
+      return hits;
+    });
+    try {
+      const result = await chatSearch.execute({ query: 'MIDSEARCH', scope: 'current' }, ctxFor());
+      expect(result.content).toContain('No conversation-history results');
+      expect(result.content).not.toContain('earlier result');
+    } finally {
+      searchSpy.mockRestore();
+    }
   });
 
   it('denies project and all scopes to a current-only Agent', async () => {
@@ -546,22 +668,77 @@ describe('chat-history-tools › chat_history(read)', () => {
 describe('chat-history-tools › shape', () => {
   it('exposes one chat_history tool with search and read actions', async () => {
     const [, , chatHistory] = await createChatHistoryActions({ userId: TEST_UID });
+    const schema = chatHistory.inputSchema as any;
     expect(chatHistory.name).toBe('chat_history');
-    expect((chatHistory.inputSchema.properties as any).action.enum).toEqual(['search', 'read']);
-    expect((chatHistory.inputSchema.properties as any).scope.enum).toEqual(['current', 'all']);
+    expect(schema.properties.action.enum).toEqual(['search', 'read']);
+    expect(schema.properties.scope.enum).toEqual(['current', 'all']);
     expect(chatHistory.inputSchema.required).toEqual(['action']);
-    expect(chatHistory.inputSchema.additionalProperties).toBe(false);
     expect(JSON.stringify(chatHistory.inputSchema)).not.toMatch(/project/i);
+    expect(schema.oneOf).toHaveLength(2);
   });
 
-  it('keeps conditional selection at tool level and paging semantics on their fields', async () => {
+  it.each([false, true])('keeps action-specific schema validation aligned with execution (currentOnly=%s)', async (currentOnly) => {
+    writeConversation('current', 'Current task', [
+      { id: 'prior', from: 'user', text: 'contractword previous decision' },
+      { id: 'trigger', from: 'user', text: 'Find the earlier decision' },
+    ]);
+    writeConversation('sibling', 'Earlier task', [
+      { id: 'earlier', from: 'commander', text: 'contractword sibling decision' },
+    ]);
+    const [, , tool] = await createChatHistoryActions({
+      userId: TEST_UID,
+      currentCid: 'current',
+      currentMessageId: 'trigger',
+      allowedScopes: currentOnly ? ['current'] : ['current', 'all'],
+    });
+    const { buildPiContextForTest } = await import('../../../../src/core-agent/src/providers/pi-provider');
+    const { toToolDefinition } = await import('../../../../src/core-agent/src/tools');
+    const providerContext = buildPiContextForTest([], undefined, [toToolDefinition(tool)]);
+    const schema = Compile(JSON.parse(JSON.stringify(providerContext.tools![0].parameters)));
+    const scope = currentOnly ? 'current' : 'all';
+    const search = { action: 'search', scope, query: 'contractword', k: 2 };
+    const read = {
+      action: 'read', scope,
+      ...(currentOnly ? {} : { cid: 'sibling' }),
+      page: { mode: 'latest', count: 1 },
+    };
+    for (const valid of [search, read]) {
+      expect(schema.Check(valid), JSON.stringify(valid)).toBe(true);
+      const result = await tool.execute(valid, ctxFor());
+      expect(result.isError).toBeFalsy();
+      expect(result.content).toContain('contractword');
+    }
+    // These are valid field types but belong to a different action. The
+    // sampled search+cid failure must be excluded by the advertised schema.
+    for (const invalid of [
+      { ...search, cid: 'sibling' },
+      { ...read, query: 'contractword' },
+      { ...read, k: 2 },
+      { ...read, include_current: true },
+      { ...search, unknown_field: true },
+    ]) {
+      expect(schema.Check(invalid), JSON.stringify(invalid)).toBe(false);
+      const result = await tool.execute(invalid, ctxFor());
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain('unsupported field(s)');
+    }
+    expect(schema.Check({ action: 'search', scope })).toBe(false);
+    expect(schema.Check({ ...search, action: 'invalid' })).toBe(false);
+    // Legacy search+page is still tolerated at execution, but must not be
+    // advertised to models generating new calls.
+    expect(schema.Check({ ...search, page: read.page })).toBe(false);
+  });
+
+  it('keeps action guidance on the tool and paging semantics on their fields', async () => {
     const [, , chatHistory] = await createChatHistoryActions({ userId: TEST_UID, projectId: 'project-a' });
     const description = chatHistory.description.replace(/\s+/g, ' ');
     const properties = chatHistory.inputSchema.properties as any;
-    expect(description).toContain('when the request depends on earlier work');
-    expect(description).toContain('quoted, potentially stale data');
+    expect(description).toContain('earlier work dependencies');
+    expect(description).toContain('potentially stale quoted data');
     expect(properties.query.description).toContain('Natural language or keywords');
-    expect(properties.action.description).toContain('search requires query');
+    expect(properties.query.description).toContain('Search action only');
+    expect(properties.action.description).toContain('Omit other-action fields');
+    expect(properties.page.description).toContain('Read action only');
     expect(properties.page.properties.mode.description).toContain('latest reads the tail');
     expect(properties.page.properties.mode.description).toContain('around centers on index');
     expect(properties.page.properties.mode.description).toContain('before pages backward');
@@ -598,11 +775,15 @@ describe('chat-history-tools › shape', () => {
     expect(crossActionField.content).toContain('unsupported field(s): query');
   });
 
-  it('accepts schema-valid read paging metadata on search and ignores it', async () => {
+  it('retains runtime compatibility for legacy search calls that carried read paging metadata', async () => {
     writeConversation('search-page-compat', 'Search paging compatibility', [
       { id: 'm0', ts: '2026-01-01T00:00:00Z', from: 'user', text: 'find schemaunionword here' },
     ]);
     const [, , chatHistory] = await createChatHistoryActions({ userId: TEST_UID });
+    const searchBranch = (chatHistory.inputSchema as any).oneOf.find(
+      (branch: any) => branch.properties.action.enum[0] === 'search',
+    );
+    expect(searchBranch.properties).not.toHaveProperty('page');
 
     const result = await chatHistory.execute({
       action: 'search',

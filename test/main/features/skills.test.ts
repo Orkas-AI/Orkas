@@ -2105,16 +2105,16 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
       .toContain('◯ 拒绝写入 ../evil.md');
   });
 
-  it('normalizes and persists terminal runtime for live and restored edit chat', async () => {
+  it.each(['completed', 'waiting_input'])('persists a %s runtime for live and restored edit chat', async (terminalStatus) => {
     streamImpl.current = async function* () {
-      yield { type: 'final', text: 'done' };
+      if (terminalStatus === 'completed') yield { type: 'final', text: 'done' };
       yield {
         type: 'event',
         event: {
           stream: 'agent_run_result',
           data: {
             result: 'success',
-            terminal_status: 'completed',
+            terminal_status: terminalStatus,
             duration_ms: 37_000,
             provider_ms: 35_000,
             tool_ms: 2_000,
@@ -2137,18 +2137,21 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
       type: 'event',
       event: expect.objectContaining({
         stream: 'runtime',
-        data: expect.objectContaining({ phase: 'end', duration_ms: 37_000, status: 'success' }),
+        data: expect.objectContaining({ phase: 'end', duration_ms: 37_000, status: terminalStatus === 'waiting_input' ? 'waiting_input' : 'success' }),
       }),
     }));
 
     const chatPath = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'skill', 'alpha', 'chat.jsonl');
     const rows = fs.readFileSync(chatPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(rows.at(-1)?.content).toBe(terminalStatus === 'waiting_input' ? '' : 'done');
     const runtime = rows.at(-1)?.process?.find((item: any) => item.event?.stream === 'runtime');
-    expect(runtime?.event?.data).toMatchObject({ phase: 'end', duration_ms: 37_000, status: 'success' });
+    expect(runtime?.event?.data).toMatchObject({ phase: 'end', duration_ms: 37_000, status: terminalStatus === 'waiting_input' ? 'waiting_input' : 'success' });
   });
 
   it('persists an errored fallback runtime when no terminal receipt arrives', async () => {
     streamImpl.current = async function* () {
+      yield { type: 'delta', text: 'Checking the existing skill.', phase: 'commentary' };
+      yield { type: 'delta', text: 'Visible partial.', phase: 'final_answer' };
       yield { type: 'error', text: 'provider failed' };
     };
     writeCustomSkill('alpha');
@@ -2162,7 +2165,13 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
     const rows = fs.readFileSync(chatPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     const assistant = rows.at(-1);
     const runtime = assistant?.process?.find((item: any) => item.event?.stream === 'runtime');
+    expect(assistant?.content).toContain('Visible partial.');
+    expect(assistant?.content).not.toContain('Checking the existing skill.');
     expect(assistant?.content).toContain('Model response failed: provider failed');
+    expect(assistant?.process).toContainEqual(expect.objectContaining({
+      text: 'Checking the existing skill.',
+      event: { stream: 'assistant', data: { phase: 'commentary' } },
+    }));
     expect(runtime?.event?.data).toMatchObject({
       phase: 'end',
       status: 'error',
@@ -2314,8 +2323,9 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
     ].join('\n');
     const raw = `Now emitting the completed skill:\n<<<skill-file path=SKILL.md\n${skillMd}\n>>>`;
     streamImpl.current = async function* () {
-      yield { type: 'delta', text: '已根据资料整理技能。\n<<<skill-file path=SKILL.md\n---\nname: "alpha"\n' };
-      yield { type: 'delta', text: 'description: "整理增长研究材料"\n---\n\n## 何时使用\n用于增长研究。\n>>>' };
+      yield { type: 'delta', text: '先检查现有技能。', phase: 'commentary' };
+      yield { type: 'delta', text: '已根据资料整理技能。\n<<<skill-file path=SKILL.md\n---\nname: "alpha"\n', phase: 'final_answer' };
+      yield { type: 'delta', text: 'description: "整理增长研究材料"\n---\n\n## 何时使用\n用于增长研究。\n>>>', phase: 'final_answer' };
       yield { type: 'final', text: raw };
     };
     writeCustomSkill('alpha');
@@ -2326,8 +2336,11 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
       events.push(ev);
     }
 
-    const liveText = events.filter((e) => e.type === 'delta').map((e) => e.text || '').join('');
-    expect(liveText).toBe('');
+    const liveDeltas = events.filter((e) => e.type === 'delta');
+    const liveText = liveDeltas.map((e) => e.text || '').join('');
+    expect(liveDeltas).toEqual([
+      { type: 'delta', text: '先检查现有技能。', phase: 'commentary' },
+    ]);
     expect(liveText).not.toContain('SKILL.md');
     expect(liveText).not.toContain('整理增长研究材料');
     const finalText = events.find((e) => e.type === 'final')?.text || '';
@@ -2335,6 +2348,12 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
     expect(finalText).not.toContain('Now emitting');
     expect(events.filter((e) => e.type === 'progress').map((e) => e.text))
       .toContain('▶ 写入 SKILL.md');
+    const chatPath = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'skill', 'alpha', 'chat.jsonl');
+    const rows = fs.readFileSync(chatPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(rows.at(-1)?.process).toContainEqual(expect.objectContaining({
+      text: '先检查现有技能。',
+      event: { stream: 'assistant', data: { phase: 'commentary' } },
+    }));
   });
 
   it('creates multiple skills from outer skill containers in an import draft', async () => {

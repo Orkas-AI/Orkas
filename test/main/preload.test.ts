@@ -76,7 +76,10 @@ function productionRendererPushSubscriptions(): PushSubscriptionInspection {
 
 type Listener = (event: unknown, payload?: unknown) => void;
 
-function loadPreload(bootResponse: unknown = null) {
+function loadPreload(
+  bootResponse: unknown = null,
+  electronExtras: { webUtils?: { getPathForFile?: (file: unknown) => string } } = {},
+) {
   const exposed: Record<string, unknown> = {};
   const listeners = new Map<string, Set<Listener>>();
   const ipcRenderer = {
@@ -100,7 +103,7 @@ function loadPreload(bootResponse: unknown = null) {
   const sandbox = {
     require: (id: string) => {
       if (id !== 'electron') throw new Error(`unexpected require: ${id}`);
-      return { contextBridge, ipcRenderer };
+      return { contextBridge, ipcRenderer, ...electronExtras };
     },
     process: { argv: [] as string[] },
     window: { addEventListener: vi.fn() },
@@ -116,6 +119,7 @@ function loadPreload(bootResponse: unknown = null) {
   vm.runInNewContext(source, sandbox, { filename: 'preload.js' });
   const api = exposed.orkas as {
     invoke: (channel: string, payload?: unknown) => Promise<unknown>;
+    importLocalFiles: (scope: string, files: unknown[], opts?: Record<string, unknown>) => Promise<unknown>;
     stream: (channel: string, payload: unknown, onEvent?: (event: unknown) => void) => {
       promise: Promise<void>;
       cancel: () => void;
@@ -181,20 +185,57 @@ describe('preload bridge', () => {
     const bashCancelledHandler = vi.fn();
     const bridgeHandler = vi.fn();
     const interactiveCliHandler = vi.fn();
+    const localAgentHandler = vi.fn();
+    const localAgentCancelledHandler = vi.fn();
+    const localAgentUserInputHandler = vi.fn();
+    const localAgentUserInputCancelledHandler = vi.fn();
 
     api.onPushEvent('bash:permission', bashHandler);
     api.onPushEvent('bash:permission_cancelled', bashCancelledHandler);
     api.onPushEvent('bridge:permission', bridgeHandler);
     api.onPushEvent('interactive-cli:event', interactiveCliHandler);
+    api.onPushEvent('local-agent:permission', localAgentHandler);
+    api.onPushEvent('local-agent:permission_cancelled', localAgentCancelledHandler);
+    api.onPushEvent('local-agent:user-input', localAgentUserInputHandler);
+    api.onPushEvent('local-agent:user-input_cancelled', localAgentUserInputCancelledHandler);
+    expect(() => api.onPushEvent('local-agent:permission:private', vi.fn())).toThrow(/not allowed/);
+    expect(() => api.onPushEvent('local-agent:user-input:private', vi.fn())).toThrow(/not allowed/);
 
     expect(() => emit('bash:permission', { request_id: 'bash-1' })).not.toThrow();
     emit('bash:permission_cancelled', { request_ids: ['bash-1'] });
     emit('bridge:permission', { request_id: 'bridge-1' });
     emit('interactive-cli:event', { session_id: 'session-1', kind: 'prompt' });
+    emit('local-agent:permission', { request_id: 'cli-1', cli: 'codex' });
+    emit('local-agent:permission_cancelled', { request_ids: ['cli-1'] });
+    emit('local-agent:user-input', { request_id: 'input-1', cli: 'codex' });
+    emit('local-agent:user-input_cancelled', { request_ids: ['input-1'] });
     expect(bashHandler).toHaveBeenCalledOnce();
     expect(bashCancelledHandler).toHaveBeenCalledWith({ request_ids: ['bash-1'] });
     expect(bridgeHandler).toHaveBeenCalledWith({ request_id: 'bridge-1' });
     expect(interactiveCliHandler).toHaveBeenCalledWith({ session_id: 'session-1', kind: 'prompt' });
+    expect(localAgentHandler).toHaveBeenCalledWith({ request_id: 'cli-1', cli: 'codex' });
+    expect(localAgentCancelledHandler).toHaveBeenCalledWith({ request_ids: ['cli-1'] });
+    expect(localAgentUserInputHandler).toHaveBeenCalledWith({ request_id: 'input-1', cli: 'codex' });
+    expect(localAgentUserInputCancelledHandler).toHaveBeenCalledWith({ request_ids: ['input-1'] });
+  });
+
+  it('delivers task terminals through the exact presentation channel and rejects near misses', () => {
+    const { api, emit } = loadPreload();
+    const handler = vi.fn();
+
+    api.onPushEvent('conversation:task_terminal', handler);
+    expect(() => api.onPushEvent('conversation:task_terminal:private', vi.fn())).toThrow(/not allowed/);
+
+    const terminal = {
+      type: 'terminal',
+      conversation_id: 'task-1',
+      status: 'completed',
+      finished_at_ms: 123,
+    };
+    emit('conversation:task_terminal', terminal);
+
+    expect(handler).toHaveBeenCalledOnce();
+    expect(handler).toHaveBeenCalledWith(terminal);
   });
 
   it('delivers materialized media through the exact preview channel and rejects near misses', () => {
@@ -303,5 +344,84 @@ describe('preload bridge', () => {
 
     ipcRenderer.invoke.mockImplementationOnce(() => { throw new Error('bridge unavailable'); });
     expect(() => api.log({ level: 'info' })).not.toThrow();
+  });
+
+  // Composer drop / paste (S9-2): preload resolves genuine OS Files to paths
+  // and tells the renderer WHICH files resolved (by index, before main copies
+  // anything) so chips can be painted immediately and the path-less rest can
+  // fall back to the byte upload. The path itself never reaches the renderer.
+  it('routes conversation attachments by path, reports resolved indexes first, and keeps paths out of the renderer', async () => {
+    const osFile = { name: 'report.csv', size: 3000 };
+    const clipboardBlob = { name: 'screenshot.png', size: 512 };
+    const { api, ipcRenderer } = loadPreload(null, {
+      webUtils: {
+        getPathForFile: (file: unknown) => (file === osFile ? '/Users/test/Desktop/report.csv' : ''),
+      },
+    });
+    const order: string[] = [];
+    let resolvedIndexes: unknown = null;
+    ipcRenderer.invoke.mockImplementationOnce(async (_channel: string, payload?: unknown) => {
+      order.push('invoke');
+      return { ok: true, payload };
+    });
+
+    const promise = api.importLocalFiles('conversation', [clipboardBlob, osFile], {
+      cid: 'conv-1',
+      onResolved: (indexes: unknown) => {
+        order.push('resolved');
+        resolvedIndexes = indexes;
+      },
+    });
+
+    // The callback is synchronous and precedes the copy request.
+    expect(resolvedIndexes).toEqual([1]);
+    expect(order).toEqual(['resolved', 'invoke']);
+    expect(JSON.stringify(resolvedIndexes)).not.toContain('/Users/');
+    await promise;
+    expect(ipcRenderer.invoke).toHaveBeenCalledWith('orkas.importLocalFiles', {
+      scope: 'conversation',
+      projectId: '',
+      targetDir: '',
+      cid: 'conv-1',
+      entries: [{ index: 1, path: '/Users/test/Desktop/report.csv', name: 'report.csv', size: 3000 }],
+    });
+  });
+
+  it('keeps the existing scopes unchanged and still imports when no callback is given', async () => {
+    const osFile = { name: 'note.md', size: 10 };
+    const { api, ipcRenderer } = loadPreload(null, {
+      webUtils: { getPathForFile: () => '/tmp/note.md' },
+    });
+
+    await api.importLocalFiles('project', [osFile], { projectId: 'p1', targetDir: 'docs' });
+    await api.importLocalFiles('attachments', [osFile]);
+    await api.importLocalFiles('conversation', [osFile], { cid: 'conv-2', onResolved: 'not a function' });
+
+    expect(ipcRenderer.invoke).toHaveBeenNthCalledWith(1, 'orkas.importLocalFiles', expect.objectContaining({
+      scope: 'project', projectId: 'p1', targetDir: 'docs', cid: '',
+      entries: [{ index: 0, path: '/tmp/note.md', name: 'note.md', size: 10 }],
+    }));
+    // An unknown scope still degrades to the Library import, never to the
+    // conversation pool.
+    expect(ipcRenderer.invoke).toHaveBeenNthCalledWith(2, 'orkas.importLocalFiles', expect.objectContaining({
+      scope: 'contexts', cid: '',
+    }));
+    expect(ipcRenderer.invoke).toHaveBeenNthCalledWith(3, 'orkas.importLocalFiles', expect.objectContaining({
+      scope: 'conversation', cid: 'conv-2',
+    }));
+  });
+
+  it('reports no resolved index for a File without an OS path so the caller keeps its byte upload', async () => {
+    const { api, ipcRenderer } = loadPreload(null, {
+      webUtils: { getPathForFile: () => { throw new Error('not a local file'); } },
+    });
+    const onResolved = vi.fn();
+
+    await api.importLocalFiles('conversation', [{ name: 'blob.png', size: 3 }], { cid: 'conv-3', onResolved });
+
+    expect(onResolved).toHaveBeenCalledWith([]);
+    expect(ipcRenderer.invoke).toHaveBeenCalledWith('orkas.importLocalFiles', expect.objectContaining({
+      scope: 'conversation', cid: 'conv-3', entries: [],
+    }));
   });
 });

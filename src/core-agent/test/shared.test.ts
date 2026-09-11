@@ -7,6 +7,8 @@ import {
   ProviderError,
   StorageFullError,
   TimeoutError,
+  RetryExhaustedError,
+  RETRY_EXHAUSTED_CODE,
   configureRetryErrorPolicy,
   classifyRetryableError,
   classifyRetryableErrorWithPolicy,
@@ -310,6 +312,40 @@ describe("Errors", () => {
         permanent_message_patterns: ["["],
       })).not.toThrow();
       expect(isRetryableError(new Error("plain"))).toBe(true);
+    });
+
+    it("returns null for RetryExhaustedError even with a transient cause/message", () => {
+      // The rotating provider already retried each candidate on network-class
+      // failures; re-retrying its exhausted summary at the runner would replay
+      // the whole rotation (~candidates × retries extra full-prompt calls).
+      const err = new RetryExhaustedError(
+        "All configured model candidates failed after network retries: connection failed",
+        new TypeError("fetch failed"),
+      );
+      expect(err.code).toBe(RETRY_EXHAUSTED_CODE);
+      expect(classifyRetryableError(err)).toBeNull();
+      expect(isRetryableError(err)).toBe(false);
+    });
+
+    it("honors the RETRY_EXHAUSTED code structurally (no instanceof needed)", () => {
+      // A duplicated errors-module load (main vs #core-agent) breaks
+      // instanceof; the code check must still classify it non-retryable.
+      const foreign = Object.assign(
+        new Error("All configured model candidates failed after network retries: connection failed"),
+        { code: RETRY_EXHAUSTED_CODE },
+      );
+      expect(classifyRetryableError(foreign)).toBeNull();
+    });
+
+    it("look-alike guard: plain network errors and un-coded summary text stay retryable", () => {
+      // A raw undici failure must keep its transient classification.
+      expect(classifyRetryableError(new TypeError("fetch failed"))).toBe("connection_dropped");
+      // The same summary WORDING without the RETRY_EXHAUSTED marker still
+      // falls back to the retry-by-default policy — only the typed/coded
+      // error is exempt from outer retries.
+      expect(classifyRetryableError(
+        new Error("All configured model candidates failed after network retries: connection failed"),
+      )).toBe("network");
     });
   });
 

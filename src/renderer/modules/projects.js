@@ -135,6 +135,7 @@ async function loadProjects(forceRefresh) {
     _projectsCache = previousProjects;
   }
   renderProjectsSection();
+  if (typeof window.refreshAutoProjectGroups === 'function') window.refreshAutoProjectGroups();
   return _projectsCache;
 }
 
@@ -328,7 +329,7 @@ function _renderProjectRow(p, convs) {
     if (!convs.length) {
       html += `<div class="project-conv-empty">${escapeHtml(t('sidebar.project_conv_empty'))}</div>`;
     } else if (typeof _renderConversationTimeBucketList === 'function') {
-      html += _renderConversationTimeBucketList(convs, { nested: true });
+      html += _renderConversationTimeBucketList(convs, { nested: true, listId: 'projects-list' });
     } else {
       for (const c of convs) {
         html += (typeof _renderConversationSidebarItem === 'function')

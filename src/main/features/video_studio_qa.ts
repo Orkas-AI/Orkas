@@ -9,6 +9,7 @@ import {
   approvedShotReferenceIndex,
   resolveApprovedShotReference,
 } from './video_studio_source_alignment';
+import { projectModelVisibleIssues } from '../util/tool-issue-policy';
 
 export type Issue = {
   code: string;
@@ -412,6 +413,12 @@ const NON_WAIVABLE_QA_CODES = new Set([
   'COVER_SEMANTIC_EVIDENCE_MISSING',
   'SCENE_MAP_REQUIRED_FOR_AUDIO_TIMING',
   'SCENE_MAP_REQUIRED_FOR_SOURCE_ALIGNMENT',
+  // The inspect probe never measured the page, so there is no look for the
+  // user to have seen and accepted. These read as ordinary inspect blockers,
+  // and inspect now honors waivers, so they have to be named here or "skip
+  // this check" would skip the measurement instead of a judgment.
+  'INSPECT_RENDERER_FAILED',
+  'INSPECT_RENDERER_TIMEOUT',
 ]);
 
 export function qaFindingIsWaivable(code: string): boolean {
@@ -627,18 +634,23 @@ export function parseFindingsPayload(findings: string): { errorCount: number; wa
 export function summarizeDraftInspectDisposition(findings: string): Record<string, unknown> {
   const parsed = parseFindingsPayload(findings);
   const normalizedIssues = dedupeInspectIssues(normalizeDraftInspectIssueSeverities(parsed.issues));
-  const advisoryIssues: Issue[] = [];
-  const blockingIssues: Issue[] = [];
-  for (const issue of normalizedIssues) {
-    if (issue.severity === 'error') blockingIssues.push(issue);
-    else advisoryIssues.push(issue);
-  }
+  const projected = projectModelVisibleIssues(
+    normalizedIssues,
+    (issue) => issue.severity === 'error',
+    12,
+  );
+  const blockingIssues = projected.blockers;
+  const advisoryIssues = projected.advisories;
   return {
     blocking_error_count: blockingIssues.length,
     fatal_error_count: blockingIssues.filter((issue) => issue.disposition === 'fatal').length,
-    advisory_count: advisoryIssues.length,
-    blocking_issues: blockingIssues.slice(0, 12),
-    advisory_issues: advisoryIssues.slice(0, 12),
+    advisory_count: projected.advisoryCount,
+    blocking_issues: blockingIssues,
+    blocking_issues_complete: true,
+    advisory_issues: advisoryIssues,
+    ...(projected.advisoryIssuesOmitted > 0
+      ? { advisory_issues_omitted: projected.advisoryIssuesOmitted }
+      : {}),
   };
 }
 
@@ -1608,11 +1620,28 @@ function sceneMapAudio(value: unknown): Record<string, unknown> | null {
   return isRecord(value) && isRecord(value.audio) ? value.audio : null;
 }
 
+/** Whether this audio block declares narration the composition must render.
+ *
+ * `audio.owner` says who renders the audio; the track `kind` says what the
+ * audio IS. Reading `owner === 'composition'` as narration conflated the two,
+ * so a deliberately narration-free composition that owned its own sfx/music
+ * was told it "declares composition-owned narration" with none to play. On
+ * 2026-09-01 that fired on a manifest whose only track was `kind: "sfx"` and
+ * whose every narration field was null, for a video the user had asked to be
+ * silent from the first turn; the delivery blocker cost two user round trips
+ * and was escaped only by setting `owner: "none"` — which the manifest
+ * contract then answers with "Audio tracks are not allowed", so the sfx track
+ * had to be deleted and mixed back in outside the composition, past all of
+ * this QA. Narration ownership is therefore an explicit narration source: the
+ * projected `narration` path of a `kind: "narration"` track
+ * (`manifestAsSceneMap`), or a legacy narration path field. A narrated
+ * composition that is missing that source is still blocked, by
+ * NARRATION_REQUIRED_BUT_NOT_MATERIALIZED below. */
 function audioOwnsNarration(audio: Record<string, unknown> | null): boolean {
   if (!audio) return false;
   const owner = String(audio.owner || audio.mode || '').toLowerCase();
   if (audio.render_silent === true || owner === 'assemble' || owner === 'assembler' || owner === 'external') return false;
-  return owner === 'composition' || !!(audio.narration || audio.narration_path || audio.path || audio.src);
+  return !!(audio.narration || audio.narration_path || audio.path || audio.src);
 }
 
 function compositionOwnsNarration(contract: unknown, sceneMap: unknown): boolean {

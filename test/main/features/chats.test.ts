@@ -5,11 +5,12 @@ import * as path from 'node:path';
 import { drainMainRuntimeForTest } from '../../helpers/drain-main-runtime';
 
 const loggerMocks = vi.hoisted(() => ({
+  info: vi.fn(),
   warn: vi.fn(),
 }));
 
 vi.mock('../../../src/main/logger', () => ({
-  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: loggerMocks.warn, error: vi.fn() }),
+  createLogger: () => ({ debug: vi.fn(), info: loggerMocks.info, warn: loggerMocks.warn, error: vi.fn() }),
 }));
 
 // Mock the model client so the autoTitle integration test below can
@@ -38,6 +39,7 @@ beforeEach(async () => {
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
+  loggerMocks.info.mockReset();
   loggerMocks.warn.mockReset();
   const users = await import('../../../src/main/features/users');
   users.activateUser(TEST_UID);
@@ -228,6 +230,70 @@ describe('chats › message history tombstones', () => {
     expect(persisted[3].produced).toBeUndefined();
   });
 
+  it('lists produced paths raw with the same resolution the display path applies', async () => {
+    // The file panel and file-action authorization only need the produced
+    // path strings. The oracle is the display path itself: the raw reader must
+    // present exactly the paths getMessages presents — stored lists, the cited
+    // subset, an authorized legacy Codex citation, user rows — while skipping
+    // deleted rows and never building the history page cache that spills and
+    // hashes large process outputs.
+    const chats = await loadChats();
+    const paths = await import('../../../src/main/paths');
+    const conv = await chats.createConversation(TEST_UID, { title: 'produced paths' });
+    const cid = conv.conversation_id;
+    const historyFile = path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${cid}.jsonl`);
+    const deckPath = path.join(tmpDir, 'workspace', 'deck.pptx');
+    const notesPath = path.join(tmpDir, 'workspace', 'notes.md');
+    const legacyPath = path.join(tmpDir, 'workspace', 'legacy.pdf');
+    const userPath = path.join(tmpDir, 'workspace', 'from-user.txt');
+    const deletedPath = path.join(tmpDir, 'workspace', 'deleted.txt');
+    fs.mkdirSync(path.dirname(deckPath), { recursive: true });
+    for (const file of [deckPath, notesPath, legacyPath, userPath, deletedPath]) fs.writeFileSync(file, 'x');
+    const groupState = await import('../../../src/main/features/group_chat/state');
+    await groupState.setCodingProjectDir(TEST_UID, cid, path.dirname(deckPath), { explicit: true });
+    const rows = [
+      {
+        id: 'm1', ts: '2026-07-10T10:00:00Z', from: 'codex-agent', to: ['user'],
+        text: `Done.\n\n:codex-file-citation{path="${deckPath}" purpose="output"}`,
+        produced: [notesPath, deckPath],
+      },
+      {
+        id: 'm2', ts: '2026-07-10T10:01:00Z', from: 'codex-agent', to: ['user'],
+        text: `Recovered.\n\n:codex-file-citation{path="${legacyPath}" purpose="output"}`,
+        process: [{
+          type: 'event',
+          event: { stream: 'tool', data: { phase: 'end', name: 'bash', output: 'o'.repeat(4096) } },
+        }],
+      },
+      {
+        id: 'm3', ts: '2026-07-10T10:02:00Z', from: 'user', to: ['codex-agent'],
+        text: 'attached', produced: [userPath],
+      },
+      {
+        id: 'm4', ts: '2026-07-10T10:03:00Z', from: 'codex-agent', to: ['user'],
+        text: 'gone', produced: [deletedPath], deleted_at: '2026-07-10T10:04:00Z',
+      },
+      {
+        id: 'm5', ts: '2026-07-10T10:05:00Z', from: 'codex-agent', to: ['user'],
+        text: 'plain', produced: [notesPath, '', 42],
+      },
+    ];
+    fs.writeFileSync(historyFile, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+    const cacheDir = paths.userConversationHistoryCacheDir(TEST_UID);
+
+    const raw = await chats.listProducedPaths(TEST_UID, cid, 500);
+    expect(fs.existsSync(cacheDir)).toBe(false);
+
+    const displayed = (await chats.getMessages(TEST_UID, cid, 500))
+      .flatMap((message) => (Array.isArray(message.produced) ? message.produced : []))
+      .filter((value): value is string => typeof value === 'string' && !!value);
+    expect(fs.existsSync(cacheDir)).toBe(true);
+
+    expect(raw).toEqual(displayed);
+    expect(raw).toEqual([deckPath, legacyPath, userPath, notesPath]);
+    expect(raw).not.toContain(deletedPath);
+  });
+
   it('fills each page with visible messages while skipping deleted rows', async () => {
     const chats = await loadChats();
     const conv = await chats.createConversation(TEST_UID, { title: 'history' });
@@ -368,7 +434,7 @@ describe('chats › conversation turn navigation index', () => {
     expect(oldest.nextCursor).toBeNull();
   });
 
-  it('lazily builds a compact legacy index and rebuilds it after the source changes', async () => {
+  it('lazily builds a compact legacy index and extends only the appended tail', async () => {
     const chats = await loadChats();
     const conv = await chats.createConversation(TEST_UID, { title: 'legacy turn index' });
     const file = path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`);
@@ -407,6 +473,11 @@ describe('chats › conversation turn navigation index', () => {
     );
     expect(fs.existsSync(indexFile)).toBe(true);
     const persisted = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
+    expect(persisted).toMatchObject({
+      version: 2,
+      recordCount: 3,
+      tailHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
     expect(persisted.turns).toEqual([{
       messageId: '',
       clientMessageId: '',
@@ -415,20 +486,64 @@ describe('chats › conversation turn navigation index', () => {
       assistantPreview: first.turns[0].assistantPreview,
     }]);
 
+    loggerMocks.info.mockClear();
     fs.appendFileSync(file, `${JSON.stringify({ id: 'u2', from: 'user', text: 'second' })}\n`);
     fs.appendFileSync(file, `${JSON.stringify({ id: 'a2', from: 'commander', text: 'second reply' })}\n`);
-    const rebuilt = await chats.getConversationTurnPage(TEST_UID, conv.conversation_id);
-    expect(rebuilt.total).toBe(2);
-    expect(rebuilt.turns.at(-1)).toMatchObject({
+    fs.appendFileSync(file, `${JSON.stringify({ id: 'a2-extra', from: 'commander', text: 'extra detail' })}\n`);
+    const extended = await chats.getConversationTurnPage(TEST_UID, conv.conversation_id);
+    expect(extended.total).toBe(2);
+    expect(extended.turns.at(-1)).toMatchObject({
       turnNo: 2,
       messageId: 'u2',
       messageIndex: 3,
       userPreview: 'second',
-      assistantPreview: 'second reply',
+      assistantPreview: 'second reply · extra detail',
     });
+    expect(loggerMocks.info).toHaveBeenCalledWith(
+      'conversation turn index extended',
+      expect.objectContaining({
+        appended_bytes: expect.any(Number),
+        records: 3,
+        turns: 2,
+      }),
+    );
+    expect(loggerMocks.info).not.toHaveBeenCalledWith(
+      'conversation turn index rebuilt', expect.anything(),
+    );
     await expect(chats.findMessageIndexById(
       TEST_UID, conv.conversation_id, 'u2',
     )).resolves.toBe(3);
+  });
+
+  it('falls back to a full rebuild when a same-inode source prefix is rewritten', async () => {
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID, { title: 'rewritten turn index' });
+    const file = path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`);
+    fs.writeFileSync(file, [
+      JSON.stringify({ id: 'old-u1', from: 'user', text: 'old request' }),
+      JSON.stringify({ id: 'old-a1', from: 'commander', text: 'old reply' }),
+    ].join('\n') + '\n');
+    await chats.getConversationTurnPage(TEST_UID, conv.conversation_id);
+    const originalInode = fs.statSync(file).ino;
+
+    loggerMocks.info.mockClear();
+    fs.writeFileSync(file, [
+      JSON.stringify({ id: 'new-u1', from: 'user', text: 'replacement request with a longer prefix' }),
+      JSON.stringify({ id: 'new-a1', from: 'commander', text: 'replacement reply' }),
+      JSON.stringify({ id: 'new-u2', from: 'user', text: 'second replacement request' }),
+    ].join('\n') + '\n');
+    expect(fs.statSync(file).ino).toBe(originalInode);
+
+    const rebuilt = await chats.getConversationTurnPage(TEST_UID, conv.conversation_id);
+    expect(rebuilt.total).toBe(2);
+    expect(rebuilt.turns.map((turn) => turn.messageId)).toEqual(['new-u1', 'new-u2']);
+    expect(loggerMocks.info).toHaveBeenCalledWith(
+      'conversation turn index rebuilt',
+      expect.objectContaining({ records: 3, turns: 2 }),
+    );
+    expect(loggerMocks.info).not.toHaveBeenCalledWith(
+      'conversation turn index extended', expect.anything(),
+    );
   });
 
   it('purges the local derived turn index with its conversation', async () => {
@@ -559,11 +674,18 @@ describe('chats › targeted conversation lookup', () => {
 
     const projectFound = await chats.getConversation(
       TEST_UID, target.conversation_id, first.project.project_id);
+    const projectMetadata = await chats.getConversationMetadata(
+      TEST_UID, target.conversation_id, first.project.project_id);
     const globalFound = await chats.getConversation(TEST_UID, global.conversation_id, null);
+    const globalMetadata = await chats.getConversationMetadata(
+      TEST_UID, global.conversation_id, null);
 
     expect(projectFound?.title).toBe('target');
     expect(projectFound?.project_id).toBe(first.project.project_id);
+    expect(projectMetadata?.title).toBe('target');
+    expect(projectMetadata?.project_id).toBe(first.project.project_id);
     expect(globalFound?.project_id).toBeUndefined();
+    expect(globalMetadata?.project_id).toBeUndefined();
     expect(unrelated.conversation_id).not.toBe(target.conversation_id);
 
     // The shared startup snapshot contains both duplicate rows. A hinted
@@ -588,9 +710,13 @@ describe('chats › targeted conversation lookup', () => {
     chats.invalidateConversationCaches(TEST_UID);
 
     const found = await chats.getConversation(TEST_UID, target.conversation_id, stale.project.project_id);
+    const metadata = await chats.getConversationMetadata(
+      TEST_UID, target.conversation_id, stale.project.project_id);
 
     expect(found?.conversation_id).toBe(target.conversation_id);
     expect(found?.project_id).toBe(owner.project.project_id);
+    expect(metadata?.conversation_id).toBe(target.conversation_id);
+    expect(metadata?.project_id).toBe(owner.project.project_id);
   });
 });
 
@@ -792,6 +918,77 @@ describe('chats › index repair', () => {
       .map((c) => c.conversation_id)).toEqual([recent.conversation_id, old.conversation_id]);
     expect((await chats.listProjectConversations(TEST_UID, collapsed.project.project_id))
       .map((c) => c.conversation_id)).toEqual([collapsedConv.conversation_id]);
+  });
+
+  it('always includes tasks active since the renderer day start, even under collapsed projects', async () => {
+    const chats = await loadChats();
+    const projects = await import('../../../src/main/features/projects');
+    const collapsed = await projects.createProject(TEST_UID, 'Collapsed');
+    if (!collapsed.ok) throw new Error('project setup failed');
+    const pid = collapsed.project.project_id;
+
+    const globalRecent = await chats.createConversation(TEST_UID, { title: 'global recent' });
+    const globalOld = await chats.createConversation(TEST_UID, { title: 'global old' });
+    const collapsedToday = await chats.createConversation(TEST_UID, { title: 'collapsed today', projectId: pid });
+    const collapsedOld = await chats.createConversation(TEST_UID, { title: 'collapsed old', projectId: pid });
+    const backdate = (indexFile: string, cid: string) => {
+      const rows = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
+      const row = rows.find((r: any) => r.conversation_id === cid);
+      row.created_at = '2020-01-01T00:00:00.000Z';
+      row.updated_at = '2020-01-01T00:00:00.000Z';
+      row.participant_summary_updated_at = row.updated_at;
+      fs.writeFileSync(indexFile, JSON.stringify(rows, null, 2));
+    };
+    backdate(path.join(tmpDir, TEST_UID, 'cloud', 'chats', '_index.json'), globalOld.conversation_id);
+    backdate(
+      path.join(tmpDir, TEST_UID, 'cloud', 'projects', pid, 'chats', '_index.json'),
+      collapsedOld.conversation_id,
+    );
+    chats.invalidateConversationCaches(TEST_UID);
+    const activeSinceMs = Date.now() - 60 * 60 * 1000;
+
+    // Negative control: without the day-start filter the collapsed project
+    // contributes nothing, so the Today aggregate would miss a live task.
+    const withoutFilter = await chats.listStartupConversations(TEST_UID, { expandedProjectIds: [] });
+    expect(withoutFilter.conversations.map((c) => c.conversation_id))
+      .not.toContain(collapsedToday.conversation_id);
+
+    const startup = await chats.listStartupConversations(TEST_UID, {
+      expandedProjectIds: [],
+      activeSinceMs,
+    });
+    const ids = startup.conversations.map((c) => c.conversation_id);
+    expect(ids).toContain(collapsedToday.conversation_id);
+    expect(ids).not.toContain(collapsedOld.conversation_id);
+    expect(ids).toContain(globalRecent.conversation_id);
+    expect(ids).toContain(globalOld.conversation_id);
+    expect(startup.conversations.find((c) => c.conversation_id === collapsedToday.conversation_id)?.project_id)
+      .toBe(pid);
+    // Page contracts are untouched: the project stays unloaded and the
+    // unprojected first page is the same two rows.
+    expect(startup.loaded_project_ids).toEqual([]);
+    expect(startup.project_pagination).toEqual({});
+    expect(startup.unprojected_pagination).toEqual({ total: 2, next_offset: null });
+  });
+
+  it('rejects renderer active-since values outside a plausible local day', async () => {
+    const chats = await loadChats();
+    const projects = await import('../../../src/main/features/projects');
+    const collapsed = await projects.createProject(TEST_UID, 'Collapsed');
+    if (!collapsed.ok) throw new Error('project setup failed');
+    const hidden = await chats.createConversation(TEST_UID, {
+      title: 'hidden project task',
+      projectId: collapsed.project.project_id,
+    });
+
+    for (const activeSinceMs of [0, Date.now() + 60 * 60 * 1000]) {
+      const startup = await chats.listStartupConversations(TEST_UID, {
+        expandedProjectIds: [],
+        activeSinceMs,
+      });
+      expect(startup.conversations.map((c) => c.conversation_id))
+        .not.toContain(hidden.conversation_id);
+    }
   });
 
   it('pages project and unprojected tasks in chronological 10-row slices', async () => {
@@ -1321,6 +1518,30 @@ describe('chats › index repair', () => {
 });
 
 describe('chats › deleteConversation', () => {
+  it('removes only the deleted task directory binding and preserves project files and other bindings', async () => {
+    const chats = await loadChats();
+    const removed = await chats.createConversation(TEST_UID);
+    const retained = await chats.createConversation(TEST_UID);
+    const state = await import('../../../src/main/features/group_chat/state');
+    const paths = await import('../../../src/main/paths');
+    const project = path.join(tmpDir, 'user-project');
+    fs.mkdirSync(project);
+    const source = path.join(project, 'main.ts');
+    fs.writeFileSync(source, 'user project content');
+    await state.setCodingProjectDir(TEST_UID, removed.conversation_id, project, { explicit: true });
+    await state.setCodingProjectDir(TEST_UID, retained.conversation_id, project, { explicit: true });
+    await state.setCodingProjectDir('other-account', removed.conversation_id, project, { explicit: true });
+    expect(fs.existsSync(paths.localCliDirectoryFile(TEST_UID, removed.conversation_id))).toBe(true);
+
+    expect(await chats.deleteConversation(TEST_UID, removed.conversation_id)).toBe(true);
+    expect(fs.existsSync(paths.localCliDirectoryFile(TEST_UID, removed.conversation_id))).toBe(false);
+    expect((await state.readState(TEST_UID, retained.conversation_id)).coding_project_dir).toBe(project);
+    expect((await state.readState('other-account', removed.conversation_id)).coding_project_dir).toBe(project);
+    expect(fs.readFileSync(source, 'utf8')).toBe('user project content');
+    expect(await chats.deleteConversation(TEST_UID, removed.conversation_id)).toBe(true);
+    expect(fs.existsSync(paths.localCliDirectoryFile(TEST_UID, removed.conversation_id))).toBe(false);
+  });
+
   it('exposes compact active ids for maintenance without tombstoned rows', async () => {
     const chats = await loadChats();
     const live = await chats.createConversation(TEST_UID);
@@ -1934,5 +2155,136 @@ describe('chats › sweepStaleProcessing', () => {
       path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`),
       'utf8',
     ).trim().split('\n')).toHaveLength(1);
+  });
+});
+
+describe('chats › message display context memo', () => {
+  it.each(['workspace selection', 'state overwrite', 'state replacement'])(
+    'refreshes displayed output paths after %s changes the authoring root',
+    async (change) => {
+      const chats = await loadChats();
+      const workspace = await import('../../../src/main/features/user_workspace');
+      const conv = await chats.createConversation(TEST_UID, { title: 'display roots' });
+      const cid = conv.conversation_id;
+      const oldRoot = path.join(tmpDir, 'root-a');
+      const newRoot = path.join(tmpDir, 'root-b');
+      for (const root of [oldRoot, newRoot]) {
+        fs.mkdirSync(root, { recursive: true });
+        fs.writeFileSync(path.join(root, 'report.txt'), root);
+      }
+      expect(workspace.setWorkspacePath(TEST_UID, oldRoot).ok).toBe(true);
+      const paths = await import('../../../src/main/paths');
+      const directory = await import('../../../src/main/features/local_agents/project-directory');
+      if (change !== 'workspace selection') directory.writeCodingDirectory(TEST_UID, cid, oldRoot, true);
+      const stateFile = change === 'workspace selection'
+        ? paths.groupChatStateFile(TEST_UID, cid) : paths.localCliDirectoryFile(TEST_UID, cid);
+      fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+      const state = {
+        version: 1, status: 'idle', in_flight: [],
+        ...(change === 'workspace selection' ? {} : { directory: oldRoot, explicit: true }),
+      };
+      fs.writeFileSync(stateFile, JSON.stringify(state));
+      const stamp = new Date('2026-07-10T09:00:00Z');
+      fs.utimesSync(stateFile, stamp, stamp);
+      fs.writeFileSync(path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${cid}.jsonl`),
+        `${JSON.stringify({
+          id: 'output', ts: '2026-07-10T10:00:00Z', from: 'codex-agent', to: ['user'],
+          text: ':codex-file-citation{path="report.txt" purpose="output"}',
+        })}\n`);
+      expect((await chats.getMessagesPage(TEST_UID, cid, 10)).history[0].produced)
+        .toEqual([path.join(oldRoot, 'report.txt')]);
+      const before = fs.statSync(stateFile);
+      if (change === 'workspace selection') {
+        expect(workspace.setWorkspacePath(TEST_UID, newRoot).ok).toBe(true);
+        expect(fs.statSync(stateFile).mtimeMs).toBe(before.mtimeMs);
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const target = change === 'state replacement' ? `${stateFile}.replacement` : stateFile;
+        fs.writeFileSync(target, JSON.stringify({ ...state, directory: newRoot }));
+        fs.utimesSync(target, before.atime, before.mtime);
+        if (target !== stateFile) fs.renameSync(target, stateFile);
+        expect(fs.statSync(stateFile).size).toBe(before.size);
+        expect(fs.statSync(stateFile).mtimeMs).toBe(before.mtimeMs);
+      }
+      expect((await chats.getMessagesPage(TEST_UID, cid, 10)).history[0].produced)
+        .toEqual([path.join(newRoot, 'report.txt')]);
+      expect(await chats.listProducedPaths(TEST_UID, cid)).toEqual([path.join(newRoot, 'report.txt')]);
+    },
+  );
+
+  it('reads the conversation state once per unchanged state file across page reads', async () => {
+    // Every history page (ten messages) used to re-read the same state file,
+    // conversation index and workspace root to rebuild an identical display
+    // context (D-6). The memo follows state identity and the effective
+    // workspace, so unchanged state is not read again.
+    const chats = await loadChats();
+    chats._resetMessageDisplayContextMemoForTest();
+    const conv = await chats.createConversation(TEST_UID, { title: 'display memo' });
+    const cid = conv.conversation_id;
+    const file = path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${cid}.jsonl`);
+    fs.writeFileSync(file, `${Array.from({ length: 12 }, (_, i) => JSON.stringify({
+      id: `m${i}`,
+      ts: `2026-07-10T10:${String(i).padStart(2, '0')}:00Z`,
+      from: i % 2 ? 'commander' : 'user',
+      to: [i % 2 ? 'user' : 'commander'],
+      text: `row ${i}`,
+    })).join('\n')}\n`);
+    const stateFile = path.join(tmpDir, TEST_UID, 'cloud', 'chats', cid, 'state.json');
+    fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+    fs.writeFileSync(stateFile, JSON.stringify({
+      version: 1, status: 'idle', in_flight: [], coding_project_dir: tmpDir,
+    }));
+    const directory = await import('../../../src/main/features/local_agents/project-directory');
+    directory.writeCodingDirectory(TEST_UID, cid, tmpDir, true);
+    // storage.ts binds `node:fs/promises` as an ESM namespace, so the patched
+    // property has to be re-synced into that namespace.
+    const { syncBuiltinESMExports } = await import('node:module');
+    const readSpy = vi.spyOn(fs.promises, 'readFile');
+    syncBuiltinESMExports();
+    const stateReads = () => readSpy.mock.calls.filter((call) => String(call[0]) === stateFile).length;
+    try {
+      await chats.getMessagesPage(TEST_UID, cid, 10);
+      const readsForFirstPage = stateReads();
+      expect(readsForFirstPage).toBeGreaterThan(0);
+
+      const latest = await chats.getMessagesPage(TEST_UID, cid, 10);
+      await chats.getMessagesPage(TEST_UID, cid, 10, latest.nextCursor);
+      await chats.listProducedPaths(TEST_UID, cid);
+      expect(stateReads()).toBe(readsForFirstPage);
+
+      // Negative control: the memo follows the file, not time.
+      fs.writeFileSync(stateFile, JSON.stringify({
+        version: 1, status: 'idle', in_flight: [], coding_project_dir: tmpDir, tool_extra_roots: [tmpDir],
+      }));
+      await chats.getMessagesPage(TEST_UID, cid, 10);
+      expect(stateReads()).toBeGreaterThan(readsForFirstPage);
+    } finally {
+      readSpy.mockRestore();
+      syncBuiltinESMExports();
+    }
+  });
+});
+
+
+describe('chats › conversation turn index memory', () => {
+  it('keeps only the most recently used turn indexes resident', async () => {
+    // A whole turn index per visited conversation stayed in memory until the
+    // conversation was deleted (D-10); the memory is now an LRU of 64.
+    const chats = await loadChats();
+    const cids: string[] = [];
+    for (let i = 0; i < 66; i += 1) {
+      const conv = await chats.createConversation(TEST_UID, { title: `turn memory ${i}` });
+      const file = path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`);
+      fs.writeFileSync(file, `${JSON.stringify({
+        id: `u${i}`, ts: '2026-07-10T10:00:00Z', from: 'user', to: ['commander'], text: `turn ${i}`,
+      })}\n`);
+      cids.push(conv.conversation_id);
+    }
+    for (const cid of cids) await chats.getConversationTurnPage(TEST_UID, cid);
+    expect(chats._conversationTurnIndexMemorySizeForTest()).toBe(64);
+    // The most recent visit is the one still served from memory; the first
+    // two visits were evicted.
+    const page = await chats.getConversationTurnPage(TEST_UID, cids[65]);
+    expect(page.total).toBe(1);
   });
 });

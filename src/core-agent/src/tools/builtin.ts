@@ -233,7 +233,7 @@ export function normalizeBashTimeoutMs(
 
 export const bashTool: AgentTool = defineTool({
   name: "bash",
-  description: "Execute a shell command in a sandboxed environment and return its output. Use for system operations, builds, etc. For GUI apps, browsers, servers, watchers, or any command you would normally background with `&`, set run_in_background=true instead of shell-backgrounding it; inherited stdout/stderr can otherwise keep the tool waiting.",
+  description: "Execute a shell command in a sandboxed environment and return its output. Node.js is available as `node`; use scripts and files for general or potentially large data processing. For GUI apps, browsers, servers, watchers, or any command you would normally background with `&`, set run_in_background=true instead of shell-backgrounding it; inherited stdout/stderr can otherwise keep the tool waiting.",
   inputSchema: {
     type: "object",
     properties: {

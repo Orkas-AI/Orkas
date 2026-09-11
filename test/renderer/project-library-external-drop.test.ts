@@ -34,6 +34,9 @@ function loadProjectDetailScript() {
     setTimeout,
     Uint8Array,
     btoa: (value: string) => Buffer.from(value, 'binary').toString('base64'),
+    // Uploads encode through the shared renderer helper (utils.js).
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    _arrayBufferToBase64: require('../../src/renderer/modules/utils.js')._arrayBufferToBase64,
     createLogger: () => ({ error: vi.fn(), info: vi.fn(), warn: vi.fn() }),
     escapeHtml: (value: unknown) => String(value ?? ''),
     t: (key: string, vars?: Record<string, unknown>) => `${key}:${JSON.stringify(vars || {})}`,

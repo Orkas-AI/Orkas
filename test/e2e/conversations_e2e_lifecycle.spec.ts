@@ -19,11 +19,14 @@ test.describe('conversations and resource picker', () => {
       `.skill-picker-item[data-kind="agent"][data-id="${created.agent.agent_id}"]`,
     ).click();
     await expect(page.locator('#new-chat-recipient-name')).toHaveText(agentName);
-    await page.locator('#new-chat-input').fill(taskText);
+    // The pick inserted `@Agent ` into the composer; the task text follows it.
+    const input = page.locator('#new-chat-input');
+    await input.fill(`${await input.inputValue()}${taskText}`);
     await page.locator('#new-chat-send-btn').click();
 
     await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
     await expect(page.locator('#chat-header-title')).toHaveText(taskText);
+    // The bubble keeps the routing mention; only the title strips it.
     await expect(page.locator('#chat-history .chat-message.user')).toContainText(
       `@${agentName} ${taskText}`,
     );
@@ -44,7 +47,7 @@ test.describe('conversations and resource picker', () => {
       app.setView('conversation', cid);
     }, conversation?.conversation_id);
     await expect(page.locator('#chat-header-title')).toHaveText(taskText);
-    await expect(page.locator(`.conv-item[data-cid="${conversation?.conversation_id}"] .conv-item-title`))
+    await expect(page.locator(`#conversation-list .conv-item[data-cid="${conversation?.conversation_id}"] .conv-item-title`))
       .toHaveText(taskText);
   });
 
@@ -57,7 +60,7 @@ test.describe('conversations and resource picker', () => {
     const cid = created.conversation.conversation_id;
     await page.evaluate(async () => (window as any).loadConversations());
 
-    let row = page.locator(`.conv-item[data-cid="${cid}"]`);
+    let row = page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`);
     await expect(row).toContainText('E2E Conversation Before Rename');
     await row.hover();
     await row.locator('.conv-item-menu').click();
@@ -67,10 +70,10 @@ test.describe('conversations and resource picker', () => {
     await row.hover();
     await row.locator('.conv-item-menu').click();
     await page.locator('#conversation-action-menu [data-action="rename"]').click();
-    const renameInput = page.locator(`input[data-conv-rename-cid="${cid}"]`);
+    const renameInput = page.locator(`#conversation-list input[data-conv-rename-cid="${cid}"]`);
     await renameInput.fill('E2E Conversation After Rename');
     await renameInput.press('Enter');
-    row = page.locator(`.conv-item[data-cid="${cid}"]`);
+    row = page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`);
     await expect(row).toContainText('E2E Conversation After Rename');
 
     await row.click();
@@ -78,7 +81,7 @@ test.describe('conversations and resource picker', () => {
     await expect(page.locator('#chat-header-title')).toContainText('E2E Conversation After Rename');
 
     const relaunchedPage = await orkas.relaunch();
-    row = relaunchedPage.locator(`.conv-item[data-cid="${cid}"]`);
+    row = relaunchedPage.locator(`#conversation-list .conv-item[data-cid="${cid}"]`);
     await expect(row).toContainText('E2E Conversation After Rename');
     await expect(row).toHaveClass(/\bis-pinned\b/);
     await row.hover();
@@ -101,11 +104,11 @@ test.describe('conversations and resource picker', () => {
     const cid = created.conversation.conversation_id;
     await page.evaluate(async () => (window as any).loadConversations());
 
-    const row = page.locator(`.conv-item[data-cid="${cid}"]`);
+    const row = page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`);
     await row.hover();
     await row.locator('.conv-item-menu').click();
     await page.locator('#conversation-action-menu [data-action="rename"]').click();
-    let renameInput = page.locator(`input[data-conv-rename-cid="${cid}"]`);
+    let renameInput = page.locator(`#conversation-list input[data-conv-rename-cid="${cid}"]`);
     await renameInput.fill(draftTitle);
     await expect(renameInput).toBeFocused();
     await renameInput.evaluate((element: any) => { element.__e2eRenameInputIdentity = true; });
@@ -114,7 +117,7 @@ test.describe('conversations and resource picker', () => {
       await (window as any).loadConversations();
     });
 
-    renameInput = page.locator(`input[data-conv-rename-cid="${cid}"]`);
+    renameInput = page.locator(`#conversation-list input[data-conv-rename-cid="${cid}"]`);
     await expect(renameInput).toHaveValue(draftTitle);
     await expect(renameInput).toBeFocused();
     expect(await renameInput.evaluate((element: any) => element.__e2eRenameInputIdentity)).toBe(true);
@@ -189,7 +192,7 @@ test.describe('conversations and resource picker', () => {
     const cid = created.conversation.conversation_id;
     await page.evaluate(async () => (window as any).loadConversations());
 
-    let row = page.locator(`.conv-item[data-cid="${cid}"]`);
+    let row = page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`);
     await expect(row).toBeVisible();
     await page.evaluate(() => {
       const w = window as any;
@@ -228,7 +231,7 @@ test.describe('conversations and resource picker', () => {
       w.apiFetch = w.__e2eOriginalApiFetch;
       delete w.__e2eOriginalApiFetch;
     });
-    row = page.locator(`.conv-item[data-cid="${cid}"]`);
+    row = page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`);
     await row.hover();
     await row.locator('.conv-item-menu').click();
     await page.locator('#conversation-action-menu [data-action="delete"]').click();
@@ -326,6 +329,7 @@ test.describe('conversations and resource picker', () => {
     await picker.locator('[data-agent-picker-tab="agents"]').click();
     await picker.locator('.skill-picker-item[data-kind="agent"][data-id="173d4235a431"]').click();
     await expect(page.locator('#new-chat-recipient-name')).toHaveText('ContentWriter');
+    await page.keyboard.press('Escape');
     await expect(picker).toBeHidden();
   });
 });

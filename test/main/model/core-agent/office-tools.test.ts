@@ -435,7 +435,6 @@ describe('Office built-in tools', () => {
       stdout: '',
       stderr: 'Resident is running but the batch could not be delivered (main pipe busy or unresponsive).',
     });
-    h.runOfficeCli.mockResolvedValueOnce({ code: 0, stdout: 'ok', stderr: '' });
 
     const result = await getTool('create_pptx').execute({
       path: 'retry-resident.pptx',
@@ -446,11 +445,58 @@ describe('Office built-in tools', () => {
     expect(result.isError).toBeUndefined();
     const batchCalls = h.runOfficeCli.mock.calls.filter(([args]) => args[0] === 'batch');
     expect(batchCalls).toHaveLength(2);
-    expect(batchCalls[1][0][1]).toBe(batchCalls[0][0][1]);
+    expect(batchCalls[1][0][1]).not.toBe(batchCalls[0][0][1]);
     expect(h.closeOfficeFile).toHaveBeenCalledWith(
       batchCalls[0][0][1],
       path.dirname(batchCalls[0][0][1]),
     );
+  });
+
+  it.each([false, true])('restarts private creation after ambiguous delivery without duplicating writes (failure=%s)', async (retryFails) => {
+    const target = path.join(h.workspace, 'ambiguous.xlsx');
+    fs.writeFileSync(target, 'prior-owned-file');
+    produced.add(target);
+    let batches = 0;
+    const inputStates: string[] = [];
+    h.runOfficeCli.mockImplementation(async (args: string[]) => {
+      if (args[0] === 'create') fs.writeFileSync(args[1], 'pristine');
+      if (args[0] === 'batch') {
+        batches += 1;
+        // A committed non-idempotent edit can lose its reply. Never replay it
+        // against the mutated staging file or overwrite the prior final file.
+        inputStates.push(fs.readFileSync(args[1], 'utf8'));
+        fs.appendFileSync(args[1], ':one-sheet');
+        if (batches === 1 || retryFails) return {
+          code: 3, stdout: '', stderr: 'batch could not be delivered (main pipe busy)',
+        };
+      }
+      return { code: 0, stdout: 'ok', stderr: '' };
+    });
+    const result = await getTool('create_xlsx').execute({
+      path: target, rows: [['value']], preview: false,
+    }, ctx());
+    expect(batches).toBe(2);
+    expect(inputStates).toEqual(['pristine', 'pristine']);
+    expect(fs.readFileSync(target, 'utf8')).toBe(retryFails ? 'prior-owned-file' : 'pristine:one-sheet');
+    expect(Boolean(result.isError)).toBe(retryFails);
+    expect(onFileWritten).toHaveBeenCalledTimes(retryFails ? 0 : 1);
+    expect(fs.readdirSync(h.workspace)).toEqual(['ambiguous.xlsx']);
+  });
+
+  it('does not restart or publish creation when cancelled after ambiguous delivery', async () => {
+    const abort = new AbortController();
+    h.runOfficeCli.mockImplementationOnce(async (args: string[]) => {
+      fs.writeFileSync(args[1], 'pristine');
+      return { code: 0, stdout: '', stderr: '' };
+    }).mockResolvedValueOnce({ code: 3, stdout: '', stderr: 'batch could not be delivered' });
+    h.closeOfficeFile.mockImplementationOnce(async () => { abort.abort(); });
+    const result = await getTool('create_xlsx').execute({
+      path: 'cancelled.xlsx', rows: [['value']], preview: false,
+    }, ctx({ signal: abort.signal }));
+    expect(result.isError).toBe(true);
+    expect(h.runOfficeCli).toHaveBeenCalledTimes(2);
+    expect(onFileWritten).not.toHaveBeenCalled();
+    expect(fs.readdirSync(h.workspace)).toEqual([]);
   });
 
   it('keeps a prior conversation-produced workbook intact when a recreate batch fails', async () => {
@@ -748,6 +794,27 @@ describe('Office built-in tools', () => {
     expect(typeDescription).toContain('PPTX shape/textbox/picture/chart/table/slide');
   });
 
+  it('advertises nested edit requirements and rejects fields from another operation action', async () => {
+    const file = path.join(h.workspace, 'action-contract.docx');
+    fs.writeFileSync(file, 'source-document');
+    const edit = getTool('edit_office');
+    const operationSchema = (edit.inputSchema as any).properties.operations.items;
+    expect(operationSchema.properties.action.description)
+      .toContain('set: path/optional props');
+    expect(operationSchema.properties.action.description)
+      .toContain('add: parent/type/optional props');
+    expect(operationSchema.properties.action.description)
+      .toContain('remove: path');
+
+    const rejected = await edit.execute({
+      path: file,
+      operations: [{ action: 'set', path: '/body/p[1]', parent: '/body', props: { text: 'x' } }],
+    }, ctx());
+    expect(rejected).toMatchObject({ isError: true });
+    expect(rejected.content).toContain('edit_office set at operations[0] does not accept: parent');
+    expect(h.runOfficeCli).not.toHaveBeenCalled();
+  });
+
   it('shares the XLSX cell property contract between create_xlsx and XLSX edit operations', () => {
     const create = getTool('create_xlsx').inputSchema as any;
     const edit = getTool('edit_office').inputSchema as any;
@@ -903,6 +970,42 @@ describe('Office built-in tools', () => {
       artifact_revision: createHash('sha256').update('generated-v2').digest('hex').slice(0, 16),
     });
     expect(fs.readFileSync(file, 'utf8')).toBe('generated-v2');
+    expect(onFileWritten).toHaveBeenCalledWith(file);
+  });
+
+  it('keeps an in-place edit uncommitted until the destination resident has closed', async () => {
+    const file = path.join(h.workspace, 'inspected.xlsx');
+    fs.writeFileSync(file, 'original-workbook');
+    produced.add(file);
+    h.runOfficeCli.mockImplementation(async (args: string[]) => {
+      if (args[0] === 'batch') fs.writeFileSync(args[1], 'validated-edit');
+      return { code: 0, stdout: 'ok', stderr: '' };
+    });
+    let closingDestination = false;
+    let releaseResident!: () => void;
+    const residentClosed = new Promise<void>((resolve) => { releaseResident = resolve; });
+    h.closeOfficeFile.mockImplementation(async (target: string) => {
+      if (target === file) {
+        closingDestination = true;
+        await residentClosed;
+      }
+    });
+
+    const edit = getTool('edit_office').execute({
+      path: file,
+      operations: [{ action: 'set', path: '/Sheet1/A1', props: { value: 'updated' } }],
+      preview: false,
+    }, ctx());
+    try {
+      await vi.waitFor(() => expect(closingDestination).toBe(true));
+      expect(fs.readFileSync(file, 'utf8')).toBe('original-workbook');
+      expect(onFileWritten).not.toHaveBeenCalled();
+    } finally {
+      releaseResident();
+      await edit;
+    }
+    expect((await edit).isError).toBeUndefined();
+    expect(fs.readFileSync(file, 'utf8')).toBe('validated-edit');
     expect(onFileWritten).toHaveBeenCalledWith(file);
   });
 
@@ -1228,8 +1331,11 @@ describe('Office built-in tools', () => {
     }, ctx());
     expect(blocked.isError).toBe(true);
     expect(h.renderOfficePageToPng).not.toHaveBeenCalled();
+    expect(h.closeOfficeFile).toHaveBeenCalledTimes(1);
 
     h.runOfficeCli.mockReset();
+    h.closeOfficeFile.mockReset();
+    h.closeOfficeFile.mockResolvedValue(undefined);
     h.runOfficeCli
       .mockResolvedValueOnce({ code: 0, stdout: '{"valid":true}', stderr: '' })
       .mockResolvedValueOnce({ code: 0, stdout: '{"issues":[]}', stderr: '' })
@@ -1257,6 +1363,125 @@ describe('Office built-in tools', () => {
     expect(reviewed.content).toContain('<office-render page="2">');
     expect(h.renderOfficePageToPng).toHaveBeenCalledTimes(2);
     expect(maxActiveRenders).toBe(1);
+    // One resident serves the check and both pages: a single close at the end,
+    // and the full artifact hash is stated once in the check block rather than
+    // repeated in every page block.
+    expect(h.closeOfficeFile).toHaveBeenCalledTimes(1);
+    expect(reviewed.content).toContain('"artifact_sha256"');
+    const pageBlocks = reviewed.content.split('<office-render').slice(1);
+    expect(pageBlocks).toHaveLength(2);
+    for (const block of pageBlocks) {
+      expect(block).toContain('artifact_revision=');
+      expect(block).not.toContain('artifact_sha256=');
+    }
+    expect(reviewed.content).not.toContain('artifact_changed_during_review');
+  });
+
+  it('reopens the resident and rehashes when the file changes on disk mid-review', async () => {
+    // The resident holds an in-memory copy. If an external editor or another
+    // conversation rewrites the file between pages, the later page must show
+    // the current bytes and say so, instead of silently rendering the old
+    // revision behind a check that no longer describes the file.
+    const file = path.join(h.workspace, 'review-changed.pptx');
+    fs.writeFileSync(file, 'fixture-v1');
+    h.runOfficeCli
+      .mockResolvedValueOnce({ code: 0, stdout: '{"valid":true}', stderr: '' })
+      .mockResolvedValueOnce({ code: 0, stdout: '{"issues":[]}', stderr: '' })
+      .mockResolvedValueOnce({ code: 0, stdout: '{"success":true,"data":{"count":0,"issues":[]}}', stderr: '' });
+    h.renderOfficePageToPng.mockImplementation(async (_file: string, _cwd: string, page: string) => {
+      if (page === '1') fs.writeFileSync(file, 'fixture-v2-longer-than-before');
+      return Buffer.from(`png-page-${page}`);
+    });
+
+    const reviewed = await getTool('office_review').execute({
+      action: 'check_and_render',
+      path: file,
+      pages: ['1', '2', '3'],
+    }, ctx());
+
+    expect(reviewed.isError).toBeUndefined();
+    expect(reviewed.images).toHaveLength(3);
+    // guard reopen before page 2 + final close; page 3 sees no further change
+    expect(h.closeOfficeFile).toHaveBeenCalledTimes(2);
+    expect(reviewed.content).toContain('<office-render page="1">');
+    expect(reviewed.content).toContain('<office-render page="2" artifact_changed_during_review="true">');
+    expect(reviewed.content).toContain('<office-render page="3">');
+    expect(reviewed.content).toContain('<office-review-note>');
+    expect(reviewed.content).toContain('page(s) 2 rendered');
+    const revisions = [...reviewed.content.matchAll(/Rendered page=(\d) .*?artifact_revision=([0-9a-f]+)/g)]
+      .map((m) => [m[1], m[2]]);
+    expect(revisions.map(([page]) => page)).toEqual(['1', '2', '3']);
+    expect(revisions[0][1]).not.toBe(revisions[1][1]);
+    expect(revisions[1][1]).toBe(revisions[2][1]);
+    const hashes = new Set((reviewed.observations?.fileReads ?? []).map((read) => read.hash));
+    expect(hashes.size).toBe(2);
+  });
+
+  it('closes the resident once even when a later page fails during check_and_render', async () => {
+    const file = path.join(h.workspace, 'review-partial.pptx');
+    fs.writeFileSync(file, 'fixture');
+    h.runOfficeCli
+      .mockResolvedValueOnce({ code: 0, stdout: '{"valid":true}', stderr: '' })
+      .mockResolvedValueOnce({ code: 0, stdout: '{"issues":[]}', stderr: '' })
+      .mockResolvedValueOnce({ code: 0, stdout: '{"success":true,"data":{"count":0,"issues":[]}}', stderr: '' });
+    h.renderOfficePageToPng.mockImplementation(async (_file: string, _cwd: string, page: string) => {
+      if (page === '2') throw new Error('page 2 render failed');
+      return Buffer.from(`png-page-${page}`);
+    });
+
+    const reviewed = await getTool('office_review').execute({
+      action: 'check_and_render',
+      path: file,
+      pages: ['1', '2'],
+    }, ctx());
+
+    expect(reviewed.isError).toBe(true);
+    expect(reviewed.images).toHaveLength(1);
+    expect(reviewed.content).toContain('<office-check>');
+    expect(reviewed.content).toContain('E_OFFICE_RENDER_FAILED');
+    expect(h.closeOfficeFile).toHaveBeenCalledTimes(1);
+    expect(h.closeOfficeFile).toHaveBeenCalledWith(file, path.dirname(file));
+  });
+
+  it.each(['overwrite', 'replace', 'delete'])('does not reuse stale resident pages after a timestamp-preserving %s', async (operation) => {
+    const file = path.join(h.workspace, 'resident-source.pptx');
+    const fixedTime = new Date('2026-01-01T00:00:00Z');
+    fs.writeFileSync(file, 'version-one');
+    fs.utimesSync(file, fixedTime, fixedTime);
+    let resident: string | undefined;
+    h.closeOfficeFile.mockImplementation(async () => { resident = undefined; });
+    h.renderOfficePageToPng.mockImplementation(async () => {
+      resident ??= fs.readFileSync(file, 'utf8');
+      const rendered = Buffer.from(`image:${resident}`);
+      if (h.renderOfficePageToPng.mock.calls.length === 1) {
+        await new Promise(resolve => setTimeout(resolve, 20));
+        if (operation === 'delete') {
+          fs.unlinkSync(file);
+        } else {
+          const target = operation === 'replace' ? `${file}.replacement` : file;
+          fs.writeFileSync(target, 'version-two');
+          fs.utimesSync(target, fixedTime, fixedTime);
+          if (operation === 'replace') fs.renameSync(target, file);
+          expect(fs.statSync(file).size).toBe(Buffer.byteLength('version-one'));
+          expect(fs.statSync(file).mtimeMs).toBe(fixedTime.getTime());
+        }
+      }
+      return rendered;
+    });
+    const result = await getTool('office_review').execute({ action: 'render', path: file, pages: ['1', '2', '3'] }, ctx());
+    const images = result.images?.map(image => Buffer.from(image.data, 'base64').toString());
+    if (operation === 'delete') {
+      expect(result.isError).toBe(true);
+      expect(images).toEqual(['image:version-one']);
+      expect(h.renderOfficePageToPng).toHaveBeenCalledTimes(1);
+    } else {
+      expect(result.isError).toBeUndefined();
+      expect(images).toEqual(['image:version-one', 'image:version-two', 'image:version-two']);
+      expect(result.content).toContain('artifact_changed_during_review="true"');
+      const hashes = new Set(result.observations?.fileReads?.map(read => read.hash));
+      expect(hashes).toEqual(new Set(['version-one', 'version-two'].map(value => `sha256:${createHash('sha256').update(value).digest('hex')}`)));
+    }
+    expect(h.closeOfficeFile).toHaveBeenCalled();
   });
 
   it('rejects an unknown review action before validation or rendering', async () => {
@@ -1302,6 +1527,12 @@ describe('Office built-in tools', () => {
     expect(result.content).toContain('E_OFFICE_RENDER_FAILED');
     expect(h.renderOfficePageToPng).toHaveBeenCalledTimes(2);
     expect(h.runOfficeCli).not.toHaveBeenCalled();
+    // Render-only reviews name the source file once instead of echoing the
+    // full artifact hash in every page block.
+    expect(result.content.match(/<office-render-source /g)).toHaveLength(1);
+    expect(result.content).toContain(`path="${file}"`);
+    expect(result.content.split('<office-render page').slice(1).join('')).not.toContain('artifact_sha256=');
+    expect(h.closeOfficeFile).toHaveBeenCalledTimes(1);
   });
 
   it('renders a page to an inline PNG and validates the page before execution', async () => {
@@ -1348,5 +1579,23 @@ describe('Office built-in tools', () => {
     expect(h.renderOfficePageToPng).toHaveBeenCalledTimes(1);
     expect(h.runOfficeCli).not.toHaveBeenCalled();
     expect(h.closeOfficeFile).toHaveBeenCalledWith(file, path.dirname(file));
+  });
+
+  it('rejects render-only fields on the check action', async () => {
+    const file = path.join(h.workspace, 'existing.pptx');
+    fs.writeFileSync(file, 'fixture');
+    const review = getTool('office_review');
+    const actionDescription = (review.inputSchema as any).properties.action.description;
+    expect(actionDescription).toContain('path only');
+    expect(actionDescription).toContain('omit unrelated fields');
+
+    const result = await review.execute({
+      action: 'check',
+      path: file,
+      pages: ['1'],
+    }, ctx());
+    expect(result).toMatchObject({ isError: true });
+    expect(result.content).toContain('fields not allowed for check');
+    expect(h.runOfficeCli).not.toHaveBeenCalled();
   });
 });

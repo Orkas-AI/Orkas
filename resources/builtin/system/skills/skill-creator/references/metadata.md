@@ -22,7 +22,7 @@ The current-language description is the routing index that decides whether the m
 
 Do not include execution steps, tool names, implementation details, marketing claims, or exhaustive format lists unless they materially affect selection. Put essential routing signal first.
 
-When authoring or repairing a description, use the same compact routing index as SKILL.md frontmatter; aim for 100–300 characters without padding and keep it at or below 512 characters. A shorter complete description is better than filler. Runtime will preserve the complete description up to that boundary and mark an omitted tail with `…`; do not depend on truncation. Preserve faithful imported descriptions unless the user asks for a rewrite.
+When authoring or repairing a description, use the same compact routing index as SKILL.md frontmatter; aim for 100–500 characters without padding and keep it at or below 512 characters. A shorter complete description is better than filler. Runtime will preserve the complete description up to that boundary and mark an omitted tail with `…`; when the roster exceeds its budget, lower-priority non-builtin entries are listed by name only and stay discoverable through `skill_search`. Do not depend on truncation. Preserve faithful imported descriptions unless the user asks for a rewrite.
 
 Use `<description>` for the current UI language. Emit `<description_zh>` and `<description_en>` only when the user explicitly asks for multilingual/bilingual descriptions; write each independently with equivalent routing signal.
 

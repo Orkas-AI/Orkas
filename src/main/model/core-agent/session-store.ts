@@ -38,6 +38,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 
 import {
+  sessionAnalysisInputsDir,
   sessionToolResultsDir,
   userLocalSessionFile,
 } from '../../paths';
@@ -100,22 +101,13 @@ export function memoryScopeForSession(sessionId: string, agentId: string): strin
   return null;
 }
 
-/** Whether a session may hold the `metacognition` tool.
+/** Whether a session may hold the write-capable `metacognition` tool.
  *
- *  Memory-eligible sessions qualify because they also receive the
- *  metacognition system-prompt block: the agent can read what it previously
- *  concluded before revising it. Reflection is the one deliberate asymmetry —
- *  writing its assessment is the whole point of the session, and the current
- *  content reaches it through the review prompt rather than the system block.
- *
- *  Everything else (agent/skill authoring, image extraction, one-shots) must
- *  not hold the tool. Those sessions never see the block, so a write there is
- *  blind; worse, they carry no agent id, which normalizes to `_default` — the
- *  commander's own file, injected into every commander turn. An observation
- *  made while editing one agent would land in the commander's self-assessment
- *  and stay there. */
-export function metacognitionAllowedForSession(sessionId: string, agentId: string): boolean {
-  if (memoryScopeForSession(sessionId, agentId)) return true;
+ *  Ordinary task sessions still receive the persisted metacognition block as
+ *  read-only background context. Durable self-assessment writes belong to the
+ *  independent reflection workflow so optional learning never extends the
+ *  user-facing task's critical path. */
+export function metacognitionAllowedForSession(sessionId: string, _agentId: string): boolean {
   return sessionKindOf(sessionId) === 'reflect';
 }
 
@@ -236,6 +228,25 @@ export function evictSession(sessionId: string): void {
   pending.delete(key);
 }
 
+/**
+ * Drop a COMPLETED one-shot session from the in-memory cache. Ephemeral kinds
+ * (see EPHEMERAL_KINDS) mint a fresh session id per run — client.ts's `anon-*`
+ * fallback, group-chat `gworker-*` sub-runs, reflection/extraction one-shots —
+ * so without post-run eviction the module-level cache grows by one full
+ * transcript per background run for the life of the process. Non-ephemeral
+ * kinds (gconv / gmember / skill / agent / cli) are conversation-backed and
+ * deliberately stay cached: their instance is the cross-turn in-memory source
+ * of truth. Call only after the run's terminal cleanup (post `healAndPersist`);
+ * even if an ephemeral id were ever resumed, the next `getSession` reloads
+ * state from the persisted jsonl.
+ */
+export function evictEphemeralSession(userId: string, sessionId: string): void {
+  if (!isEphemeralSessionId(sessionId)) return;
+  const key = cacheKey(userId, sessionId);
+  cache.delete(key);
+  pending.delete(key);
+}
+
 /** Delete the on-disk jsonl. Caller is responsible for also evicting. */
 export function deleteSessionFile(sessionId: string): void {
   const userId = getActiveUserId();
@@ -262,6 +273,8 @@ export function deleteSessionFile(sessionId: string): void {
   }
   try { fs.rmSync(toolResultsDirForSession(userId, sessionId), { recursive: true, force: true }); }
   catch (err) { log.warn('session tool-results delete failed', { session_id: maskId(sessionId), error: logErrorRef(err) }); }
+  try { fs.rmSync(sessionAnalysisInputsDir(userId, sessionId), { recursive: true, force: true }); }
+  catch (err) { log.warn('session analysis-inputs delete failed', { session_id: maskId(sessionId), error: logErrorRef(err) }); }
 }
 
 /** Same as deleteSessionFile but takes an explicit userId (caller has the
@@ -299,6 +312,14 @@ export function deleteSessionFileForUser(userId: string, sessionId: string): voi
       error: logErrorRef(err),
     });
   }
+  try { fs.rmSync(sessionAnalysisInputsDir(userId, sessionId), { recursive: true, force: true }); }
+  catch (err) {
+    log.warn('session analysis-inputs delete failed', {
+      user_id: maskId(userId),
+      session_id: maskId(sessionId),
+      error: logErrorRef(err),
+    });
+  }
 }
 
 /** Flush all cached sessions — called by `features/users.activateUser()` on uid switch. */
@@ -311,4 +332,9 @@ export function _evictAll(): void {
 /** For diagnostics / tests. */
 export function _cacheSize(): number {
   return cache.size;
+}
+
+/** For diagnostics / tests. */
+export function _cacheHas(sessionId: string): boolean {
+  return cache.has(cacheKey(getActiveUserId(), sessionId));
 }

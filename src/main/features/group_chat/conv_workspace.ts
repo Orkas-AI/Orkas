@@ -39,6 +39,7 @@ import { getConversation } from '../chats';
 import { readState, setWorkspaceDirOnce } from './state';
 import { PLACEHOLDER_TITLES } from './conv_title';
 import { createLogger } from '../../logger';
+import { logErrorSummary, maskId } from '../../util/log-redact';
 
 const log = createLogger('group_chat.conv_workspace');
 
@@ -54,6 +55,24 @@ const WINDOWS_RESERVED: ReadonlySet<string> = new Set([
 ]);
 
 const ILLEGAL_CHARS_RE = /[\\/:*?"<>|]/g;
+
+/** Resolve the persisted workspace basename under its owning root. Synced
+ * state is untrusted at this boundary: only one portable path component is
+ * accepted, and the resolved path must remain a direct child of the root. */
+export function resolveConversationWorkspaceChild(workspaceRoot: string, rawDir: unknown): string {
+  if (typeof rawDir !== 'string' || !rawDir || rawDir !== rawDir.trim()) return '';
+  if (Buffer.byteLength(rawDir, 'utf8') > 256) return '';
+  if (rawDir === '.' || rawDir === '..') return '';
+  if (path.posix.isAbsolute(rawDir) || path.win32.isAbsolute(rawDir)) return '';
+  if (/[\\/\u0000-\u001f<>:"|?*]/.test(rawDir) || /[. ]$/.test(rawDir)) return '';
+
+  const root = path.resolve(workspaceRoot);
+  const resolved = path.resolve(root, rawDir);
+  const relative = path.relative(root, resolved);
+  if (!relative || path.isAbsolute(relative) || relative === '..'
+      || relative.startsWith(`..${path.sep}`) || path.dirname(relative) !== '.') return '';
+  return resolved;
+}
 
 /** Pure slug derivation. Returns empty string on placeholder / unusable input;
  *  callers fall back to the date-based name. Exported for unit testing. */
@@ -159,11 +178,16 @@ export async function getConversationWorkspacePath(uid: string, cid: string): Pr
       // if the conv index has nothing for cid, the bus is operating on a phantom
       // and we don't want to spawn a directory off it. In practice every active
       // bus path runs after `chats.createConversation`, so this branch is rare.
-      log.warn(`no conv record for cid=${cid} — falling back to root workspace`);
+      log.warn('conversation workspace fallback: conversation record missing', {
+        cid: maskId(cid),
+      });
       return getWorkspacePath(uid);
     }
   } catch (err) {
-    log.warn(`getConversation failed cid=${cid}: ${(err as Error).message} — falling back to root`);
+    log.warn('conversation workspace fallback: conversation lookup failed', {
+      cid: maskId(cid),
+      error: logErrorSummary(err),
+    });
     return getWorkspacePath(uid);
   }
 
@@ -172,7 +196,12 @@ export async function getConversationWorkspacePath(uid: string, cid: string): Pr
   // Fast path: state already has a workspace_dir baked in.
   const cur = await readState(uid, cid);
   if (cur.workspace_dir) {
-    return path.join(root, cur.workspace_dir);
+    const persistedPath = resolveConversationWorkspaceChild(root, cur.workspace_dir);
+    if (persistedPath) return persistedPath;
+    log.warn('conversation workspace fallback: invalid persisted directory', {
+      cid: maskId(cid),
+    });
+    return root;
   }
 
   let slug = slugifyConvTitle(title);
@@ -184,9 +213,49 @@ export async function getConversationWorkspacePath(uid: string, cid: string): Pr
   // directory is NOT created here — see the function-level comment above.
   const persisted = await setWorkspaceDirOnce(uid, cid, slug);
   const finalSlug = persisted.workspace_dir || slug;
-  // Don't log the raw title — it's user-authored content (can include
-  // chat topic / names). The slug (after slugifyConvTitle) is the
-  // diagnostic signal we need.
-  log.info(`cid=${cid} workspace_dir=${finalSlug} title_len=${title.length} (lazy-mkdir)`);
-  return path.join(root, finalSlug);
+  // The slug is derived from the user-authored title and is itself a local
+  // filename, so retain only bounded diagnostics at the logging boundary.
+  log.info('conversation workspace selected', {
+    cid: maskId(cid),
+    title_len: title.length,
+    lazy_mkdir: true,
+  });
+  const selectedPath = resolveConversationWorkspaceChild(root, finalSlug);
+  if (selectedPath) return selectedPath;
+  log.warn('conversation workspace fallback: invalid selected directory', {
+    cid: maskId(cid),
+  });
+  return root;
+}
+
+/** The directory this conversation's agents actually ran in, or '' when it
+ * cannot be named yet. A coding agent's frozen `coding_project_dir` wins,
+ * matching how `bus.ts` picks a CLI cwd; everything else uses the frozen
+ * per-conversation workspace subdir.
+ *
+ * Read-only counterpart of `getConversationWorkspacePath`: it never derives,
+ * uniquifies, or persists a slug, so a caller that merely wants to interpret a
+ * path an agent already wrote cannot give a chat a workspace it never had. */
+export async function readConversationAuthoringDir(uid: string, cid: string): Promise<string> {
+  const state = await readState(uid, cid).catch(() => null);
+  if (!state) return '';
+  const codingDir = String(state.coding_project_dir || '');
+  if (codingDir && path.isAbsolute(codingDir)) return codingDir;
+  if (!state.workspace_dir) return '';
+  let projectId: string | undefined;
+  try {
+    const conv = await getConversation(uid, cid);
+    const pid = (conv as { project_id?: unknown } | null)?.project_id;
+    if (typeof pid === 'string' && pid) projectId = pid;
+  } catch (err) {
+    log.warn('read authoring dir: getConversation failed', {
+      cid: maskId(cid),
+      error: logErrorSummary(err),
+    });
+    return '';
+  }
+  return resolveConversationWorkspaceChild(
+    getWorkspacePath(uid, projectId),
+    state.workspace_dir,
+  );
 }

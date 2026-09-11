@@ -7,8 +7,8 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 from geo_probe import (  # noqa: E402
-    context_terms, derive_brand_domain, filter_candidates, gen_queries, score_answers,
-    _mentions,
+    context_terms, derive_brand_domain, disambiguate_references, filter_candidates,
+    gen_queries, score_answers, _mentions, _near_miss_tokens,
 )
 
 
@@ -179,6 +179,105 @@ class DomainCitationBoundaryTest(unittest.TestCase):
         self.assertEqual(r["per_answer"][0]["result"], "cited")
         self.assertTrue(r["per_answer"][0]["domain_cited"])
         self.assertEqual(r["citation_rate"], 1.0)
+
+
+
+class DisambiguateTest(unittest.TestCase):
+    """The off-site channel: pages the agent found itself, not model answers.
+
+    Regression source: a 2026-08-30 report listed a G2 page for "Floatbot" as
+    third-party authority for "Floatboat". Nothing caught it, because the two
+    names share no token — every equality test called the page merely `absent`,
+    which reads as irrelevant rather than as somebody else's company.
+    """
+
+    BRAND = {"brand": "Floatboat", "domain": "floatboat.ai",
+             "context_terms": ["calendar", "agent", "proactive"]}
+
+    def _run(self, refs):
+        return disambiguate_references({**self.BRAND, "references": refs})
+
+    def test_same_sounding_company_is_near_miss_not_absent(self):
+        d = self._run([{"url": "https://www.g2.com/products/floatbot/reviews",
+                        "title": "Floatbot Reviews 2026"}])
+        row = d["references"][0]
+        self.assertEqual(row["verdict"], "near_miss")
+        self.assertIn("floatbot", row["near_miss_tokens"])
+        self.assertEqual(row["data_tier"], "unverified")
+        self.assertEqual(d["citable"], 0)
+
+    def test_multi_word_brand_still_catches_the_same_sounding_company(self):
+        # A page token is a single word, so the joined brand string could never
+        # be within two edits of it: "Float Boat" vs "Floatbot" used to fall
+        # through to `absent` and the homonym trap went unreported.
+        d = disambiguate_references({
+            **self.BRAND, "brand": "Float Boat",
+            "references": [{"url": "https://www.g2.com/products/floatbot/reviews",
+                            "title": "Floatbot Reviews 2026"}],
+        })
+        row = d["references"][0]
+        self.assertEqual(row["verdict"], "near_miss")
+        self.assertIn("floatbot", row["near_miss_tokens"])
+        # The brand's own words are not near misses of themselves.
+        self.assertEqual(_near_miss_tokens("Float Boat calendar agent", "Float Boat"), [])
+
+    def test_domain_citation_is_the_strongest_verdict(self):
+        d = self._run([{"url": "https://floatboat.ai/blog/x", "title": "Post"}])
+        self.assertEqual(d["references"][0]["verdict"], "cited")
+
+    def test_brand_plus_context_term_corroborates(self):
+        d = self._run([{"url": "https://sourceforge.net/software/product/Floatboat/",
+                        "title": "Floatboat Reviews in 2026",
+                        "snippet": "a proactive calendar agent workspace"}])
+        row = d["references"][0]
+        self.assertEqual(row["verdict"], "corroborated")
+        self.assertIn("calendar", row["context_hits"])
+
+    def test_bare_brand_token_without_context_is_ambiguous(self):
+        d = self._run([{"url": "https://example.com/x", "title": "Floatboat"}])
+        self.assertEqual(d["references"][0]["verdict"], "ambiguous")
+        self.assertEqual(d["references"][0]["data_tier"], "unverified")
+
+    def test_unrelated_page_is_absent(self):
+        d = self._run([{"url": "https://example.com/y", "title": "Something else"}])
+        self.assertEqual(d["references"][0]["verdict"], "absent")
+
+    def test_no_verdict_can_reach_measured(self):
+        """An off-site page is someone else's statement about the target."""
+        d = self._run([
+            {"url": "https://floatboat.ai/blog/x", "title": "Post"},
+            {"url": "https://sourceforge.net/x", "title": "Floatboat",
+             "snippet": "calendar agent"},
+            {"url": "https://www.g2.com/products/floatbot/reviews", "title": "Floatbot"},
+        ])
+        self.assertNotEqual(d["data_tier"], "Measured")
+        for row in d["references"]:
+            self.assertNotEqual(row["data_tier"], "Measured")
+
+    def test_top_tier_is_estimated_only_when_every_reference_is_citable(self):
+        ok = self._run([{"url": "https://floatboat.ai/a", "title": "A"}])
+        self.assertEqual(ok["data_tier"], "Estimated")
+        mixed = self._run([{"url": "https://floatboat.ai/a", "title": "A"},
+                           {"url": "https://example.com/b", "title": "Unrelated"}])
+        self.assertEqual(mixed["data_tier"], "unverified")
+
+    def test_empty_reference_set_is_unverified_not_estimated(self):
+        self.assertEqual(self._run([])["data_tier"], "unverified")
+
+    def test_bare_url_string_is_accepted(self):
+        d = self._run(["https://floatboat.ai/pricing"])
+        self.assertEqual(d["references"][0]["verdict"], "cited")
+
+    def test_near_miss_ignores_the_brand_itself_and_short_tokens(self):
+        self.assertEqual(_near_miss_tokens("Floatboat", "Floatboat"), [])
+        self.assertEqual(_near_miss_tokens("the cat sat", "Floatboat"), [])
+
+    def test_without_context_terms_a_brand_token_still_corroborates(self):
+        """Falls back to the score-op rule: no context list, no homonym test."""
+        d = disambiguate_references(
+            {"brand": "Floatboat", "domain": "floatboat.ai",
+             "references": [{"url": "https://example.com/x", "title": "Floatboat"}]})
+        self.assertEqual(d["references"][0]["verdict"], "corroborated")
 
 
 if __name__ == "__main__":

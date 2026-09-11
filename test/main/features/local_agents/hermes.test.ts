@@ -12,7 +12,7 @@ vi.mock('../../../../src/main/features/local_agents/backends/_acp', () => ({
 }));
 
 describe('local_agents/backends/hermes', () => {
-  it('configures Hermes as an ACP backend with headless permissions enabled', async () => {
+  it('inherits permissions by default and enables YOLO only for full access', async () => {
     const { hermesBackend } = await import('../../../../src/main/features/local_agents/backends/hermes');
 
     expect(typeof hermesBackend.run).toBe('function');
@@ -21,7 +21,9 @@ describe('local_agents/backends/hermes', () => {
       logName: 'local-agents:hermes',
       argv: ['acp'],
       clientName: 'orkas',
-      extraEnv: { HERMES_YOLO_MODE: '1' },
     });
+    expect(acpMock.defs[0].extraEnv({ permissionPolicy: 'inherit' })).toEqual({});
+    expect(acpMock.defs[0].extraEnv({ permissionPolicy: 'ask' })).toEqual({ HERMES_YOLO_MODE: '0' });
+    expect(acpMock.defs[0].extraEnv({ permissionPolicy: 'full_access' })).toEqual({ HERMES_YOLO_MODE: '1' });
   });
 });

@@ -202,7 +202,19 @@ function catalogSourceLabel(source, kind = 'agents') {
 }
 
 // Full markdown renderer (used for skill detail view and chat)
+// Save/restore around the whole pass: `:::dashboard` bodies recurse back into
+// here, and a throw inside phase 2 must not leak one message's embed set into
+// the next render.
 function renderMarkdownFull(md) {
+  const prevEmbeddedMediaKeys = _mdEmbeddedMediaKeys;
+  try {
+    return _renderMarkdownFullInner(md);
+  } finally {
+    _mdEmbeddedMediaKeys = prevEmbeddedMediaKeys;
+  }
+}
+
+function _renderMarkdownFullInner(md) {
   if (!md) return '';
 
   // Strip YAML frontmatter
@@ -219,10 +231,26 @@ function renderMarkdownFull(md) {
   // Code blocks. Some models wrap a dashboard spec in ```json instead of the
   // `:::dashboard` directive; render only high-confidence dashboard-shaped JSON
   // and keep all other fenced code verbatim.
-  md = md.replace(/```([^\n`]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+  //
+  // The fence is length-aware and must open a line, both per CommonMark. A
+  // hardcoded three-backtick opener that could also start mid-sentence split
+  // ```` into "``` + a stray backtick", so one prose mention of a fence
+  // re-paired every later fence in the message: the table, headings and list
+  // items after it were swallowed into a `<pre>`, and the HTML sample inside
+  // the *next* real fence escaped its box and rendered as live DOM
+  // (2026-08-27, a reply that documented this renderer).
+  //
+  // Two deliberate divergences from CommonMark, both load-bearing for the
+  // dashboard recovery path in `utils-dashboard.test.ts`: the newline after the
+  // info string stays optional, and the closer may sit on the opening line.
+  // `>` counts as line-opening whitespace because fences are protected before
+  // blockquotes are parsed, and quoted history arrives as `> ```text` — 78 of
+  // the 100 non-line-start fences in this account's chat store are that shape,
+  // and all 22 of the rest are prose *about* fences, wrapped in inline code.
+  md = md.replace(/(^|\n)([ \t>]*)(`{3,})([^\n`]*)\n?([\s\S]*?)\3`*/g, (_, lead, indent, _fence, lang, code) => {
     const dashboard = _renderDashboardFromJsonBlock(lang, code);
-    if (dashboard) return protect(dashboard);
-    return protect(`<pre><code>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`);
+    if (dashboard) return `${lead}${indent}${protect(dashboard)}`;
+    return `${lead}${indent}${protect(`<pre><code>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`)}`;
   });
 
   // :::chart-bar directives
@@ -269,10 +297,24 @@ function renderMarkdownFull(md) {
     (_, pre, expr) => pre + protect(`$${sanitizeMathExpressionForMathJax(expr)}$`));
 
   // Inline code — protect from phase 2 transforms so autolinking / emphasis
-  // don't touch its contents.
-  md = md.replace(/`([^`]+)`/g, (_, c) => protect(`<code>${escapeHtml(c)}</code>`));
+  // don't touch its contents. Delimiters pair on equal-length backtick runs
+  // (CommonMark), so a span can carry backticks of its own: `` ` `` and
+  // ```` ``` ```` are the only way to show a literal backtick or fence in
+  // prose, and a single-backtick-only rule rendered both as garbage.
+  md = md.replace(/(?<!`)(`+)(?!`)([\s\S]*?)(?<!`)\1(?!`)/g, (_, _ticks, raw) => {
+    // CommonMark strips one leading and one trailing space when both are
+    // present and the content is not all spaces — that padding is what keeps
+    // the delimiters apart from the backticks being shown.
+    const content = (raw.length >= 2 && raw.startsWith(' ') && raw.endsWith(' ') && raw.trim())
+      ? raw.slice(1, -1)
+      : raw;
+    return protect(`<code>${escapeHtml(content)}</code>`);
+  });
 
   // ── Phase 2: line-by-line parsing ──
+  // Collected after phase 1 so a fenced or inline-code `![](…)` sample — now a
+  // placeholder — is not mistaken for an embed this message actually shows.
+  _mdEmbeddedMediaKeys = _collectEmbeddedMediaKeys(md);
   const lines = md.split('\n');
   const out = [];
   // Stack of open lists: { type:'ul'|'ol', indent:number,
@@ -402,7 +444,12 @@ function renderMarkdownFull(md) {
 
     flushList();
     if (!line.trim()) { out.push(''); continue; }
-    out.push(`<p>${inlineFormat(line)}</p>`);
+    const inline = inlineFormat(line);
+    // A line that held nothing but a dropped duplicate media link renders to
+    // nothing; emitting `<p></p>` would leave its vertical margin as a gap
+    // where the second copy of the image used to be.
+    if (!inline.trim()) continue;
+    out.push(`<p>${inline}</p>`);
   }
   flushList(); flushBQ(); flushTable();
 
@@ -492,6 +539,18 @@ function renderChartBar(data) {
   }
   html += '</div>';
   return html;
+}
+
+// Base64 for IPC file uploads (to-do and automation attachments). Chunked so
+// `String.fromCharCode.apply` never sees a large file in one call.
+function _arrayBufferToBase64(buf) {
+  const bytes = new Uint8Array(buf || new ArrayBuffer(0));
+  let binary = '';
+  const step = 0x8000;
+  for (let i = 0; i < bytes.length; i += step) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + step, bytes.length)));
+  }
+  return btoa(binary);
 }
 
 // ─── Dashboard renderer (`:::dashboard` directive) ────────────────────────
@@ -1249,14 +1308,19 @@ function _markdownVideoHtml(src, label, title) {
   const t = visibleTitle ? ` title="${escapeHtml(visibleTitle)}"` : '';
   const localPath = _chatMediaLocalPathFromUrl(src);
   const managedLocalSrc = localPath || /^chat-media:\/\/cid\//i.test(src) ? src : '';
-  const fallbackAttrs = mediaMeta
-    ? ` data-orkas-remote-src="${escapeHtml(mediaMeta.remoteSrc)}"${managedLocalSrc ? ` data-orkas-local-src="${escapeHtml(managedLocalSrc)}"` : ''}`
+  // Historical messages may contain an internal remote-media marker whose
+  // primary URL was the provider URL. Keep its media kind for rendering, but
+  // make that source inert: remote media may enter the renderer only after the
+  // main process has validated and materialized it into chat-media://.
+  const renderedSrc = mediaMeta && !managedLocalSrc ? 'data:,' : src;
+  const materializationAttrs = mediaMeta && managedLocalSrc
+    ? ` data-orkas-remote-src="${escapeHtml(mediaMeta.remoteSrc)}" data-orkas-local-src="${escapeHtml(managedLocalSrc)}"`
     : '';
   const openLabel = _markdownVideoOpenFloatingLabel();
   const openButton = localPath
     ? `<button type="button" class="chat-md-video-float" data-chat-md-video-open="1" data-video-src="${escapeHtml(src)}" aria-label="${escapeHtml(openLabel)}" title="${escapeHtml(openLabel)}">${_markdownVideoOpenIconHtml()}</button>`
     : '';
-  return `<span class="chat-md-video-shell" data-chat-video-playback-surface="markdown_bubble"><video class="chat-md-video" width="640" height="360" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(src)}"${t}${fallbackAttrs} aria-label="${escapeHtml(label || 'video')}" data-monitor-resource="chat-markdown-video"></video>${openButton}</span>`;
+  return `<span class="chat-md-video-shell" data-chat-video-playback-surface="markdown_bubble"><video class="chat-md-video" width="640" height="360" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(renderedSrc)}"${t}${materializationAttrs} aria-label="${escapeHtml(label || 'video')}" data-monitor-resource="chat-markdown-video"></video>${openButton}</span>`;
 }
 
 function _markdownMediaLabel(src, label, fallback) {
@@ -1423,10 +1487,11 @@ function _markdownImageHtml(src, alt, title) {
   const t = visibleTitle ? ` title="${escapeHtml(visibleTitle)}"` : '';
   const localPath = _chatMediaLocalPathFromUrl(src);
   const managedLocalSrc = localPath || /^chat-media:\/\/cid\//i.test(src) ? src : '';
-  const fallbackAttrs = mediaMeta
-    ? ` data-orkas-remote-src="${escapeHtml(mediaMeta.remoteSrc)}"${managedLocalSrc ? ` data-orkas-local-src="${escapeHtml(managedLocalSrc)}"` : ''}`
+  const renderedSrc = mediaMeta && !managedLocalSrc ? 'data:,' : src;
+  const materializationAttrs = mediaMeta && managedLocalSrc
+    ? ` data-orkas-remote-src="${escapeHtml(mediaMeta.remoteSrc)}" data-orkas-local-src="${escapeHtml(managedLocalSrc)}"`
     : '';
-  return `<span class="chat-image-shell chat-md-img-shell is-loading"><img class="chat-md-img" src="${escapeHtml(src)}" alt="${escapeHtml(alt)}"${t}${fallbackAttrs} data-monitor-resource="chat-markdown-image"></span>`;
+  return `<span class="chat-image-shell chat-md-img-shell is-loading"><img class="chat-md-img" src="${escapeHtml(renderedSrc)}" alt="${escapeHtml(alt)}"${t}${materializationAttrs} data-monitor-resource="chat-markdown-image"></span>`;
 }
 
 function _notifyChatImageSettled(node) {
@@ -1592,21 +1657,6 @@ function _clearMarkdownVideoLoadFailure(video) {
   }
 }
 
-function _tryMarkdownRemoteFallback(media) {
-  if (!media || media.dataset?.orkasRemoteFallbackAttempted === '1') return false;
-  const remoteSrc = String(media.getAttribute?.('data-orkas-remote-src') || '');
-  const currentSrc = String(media.getAttribute?.('src') || '');
-  if (!remoteSrc || remoteSrc === currentSrc) return false;
-  if (media.dataset) media.dataset.orkasRemoteFallbackAttempted = '1';
-  media.setAttribute('src', remoteSrc);
-  if (media.tagName === 'VIDEO') {
-    const button = media.closest?.('.chat-md-video-shell')?.querySelector?.('[data-chat-md-video-open="1"]');
-    if (button) button.hidden = true;
-    try { media.load(); } catch (_) { /* the normal error path remains available */ }
-  }
-  return true;
-}
-
 function _applyMaterializedMarkdownMedia(payload, root) {
   const remoteSrc = String(payload?.remote_url || '');
   const localSrc = String(payload?.local_url || '');
@@ -1718,16 +1768,40 @@ if (typeof document !== 'undefined') document.addEventListener('loadedmetadata',
   }
 }, true);
 
+/**
+ * Host-rendered produced-media previews (`.chat-msg-produced-media`, built by
+ * conversation.js) are a convenience layer sitting directly above the
+ * deliverable chip row. The chip is the durable record and already reports a
+ * deleted file when clicked, so a preview whose bytes are gone is removed
+ * rather than replaced with a "missing" placeholder — otherwise reopening an
+ * old conversation whose workspace was since cleaned would grow one tombstone
+ * per generated file where previously there was none.
+ *
+ * Media the model wrote into its own prose keeps the placeholder: the
+ * surrounding text refers to it, so its absence has to be visible.
+ */
+function _dropFailedProducedPreview(el) {
+  const host = el?.closest?.('.chat-msg-produced-media');
+  if (!host) return false;
+  const blockSelector = '.chat-image-shell, .chat-md-video-shell, .chat-md-audio-card';
+  (el.closest(blockSelector) || el).remove();
+  if (!host.querySelector(blockSelector)) host.remove();
+  return true;
+}
+
 if (typeof document !== 'undefined') document.addEventListener('error', (e) => {
   const target = e.target;
   if (!target || target.nodeType !== 1) return;
-  if (target.tagName === 'IMG' && target.classList?.contains('chat-md-img')) {
-    if (_tryMarkdownRemoteFallback(target)) return;
+  const isChatMedia = (target.tagName === 'IMG' && target.classList?.contains('chat-md-img'))
+    || (target.tagName === 'VIDEO' && target.classList?.contains('chat-md-video'))
+    || (target.tagName === 'AUDIO' && target.classList?.contains('chat-md-audio'));
+  if (!isChatMedia) return;
+  if (_dropFailedProducedPreview(target)) return;
+  if (target.tagName === 'IMG') {
     _replaceMissingMarkdownImage(target);
     return;
   }
-  if (target.tagName === 'VIDEO' && target.classList?.contains('chat-md-video')) {
-    if (_tryMarkdownRemoteFallback(target)) return;
+  if (target.tagName === 'VIDEO') {
     _diagnoseMarkdownVideoError(target);
   }
 }, true);
@@ -1870,6 +1944,37 @@ function _linkifyBareEmails(text) {
   return text.replace(_BARE_EMAIL_RE, (_, email) => `<a href="mailto:${email}">${email}</a>`);
 }
 
+// One comparable identity per media reference, so two spellings of the same
+// file collapse. Local media keys on the decoded absolute path, which drops the
+// `?v=<mtime>-<ctime>-<size>` cache token `versionedChatMediaLocalUrl`
+// (main/util/chat-media-url.ts) appends and the percent-encoding differences
+// between a main-generated URL and `_normalizeLocalMediaSrc`. Anything else
+// keys on the normalized src itself — exact string equality, no false pairs.
+function _mediaDedupKey(src) {
+  const normalized = _normalizeLocalMediaSrc(String(src === null || src === undefined ? '' : src).trim());
+  if (!normalized) return '';
+  const local = _chatMediaLocalPathFromUrl(normalized);
+  return local ? local.replace(/\\/g, '/') : normalized;
+}
+
+// Media this message already presents through an explicit `![](…)` embed.
+// Populated per `renderMarkdownFull` pass because the duplicate pair sits on
+// two different lines and `inlineFormat` only ever sees one of them.
+let _mdEmbeddedMediaKeys = null;
+
+function _collectEmbeddedMediaKeys(md) {
+  const keys = new Set();
+  String(md || '').replace(/!\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_, rawSrc) => {
+    const src = _normalizeLocalMediaSrc(rawSrc);
+    if (_isImageSrc(src) || _isVideoSrc(src) || _isAudioSrc(src)) {
+      const key = _mediaDedupKey(src);
+      if (key) keys.add(key);
+    }
+    return '';
+  });
+  return keys;
+}
+
 function inlineFormat(text) {
   // Phase 1: media + markdown links + `<url>` / `<email>` autolinks + emphasis.
   const phase1 = text
@@ -1896,6 +2001,18 @@ function inlineFormat(text) {
         const url = _isImageSrc(rawUrl) || _isVideoSrc(rawUrl) || _isAudioSrc(rawUrl)
           ? _normalizeLocalMediaSrc(rawUrl)
           : rawUrl;
+        // …but an agent also writes both: a download link *and* the embed for
+        // one file, which rendered that file twice in the same bubble
+        // (2026-08-27, ImageStudio: `[下载卡片图](…png?v=…)` on one line and
+        // `![AI创业增量市场卡片图](…png?v=…)` on the next). The embed is the
+        // presentation the model was asked for (main/prompts/chat_shared_rules.md
+        // "File output + chat-media usage"), so it wins and the redundant link
+        // is dropped. Scoped to link-upgraded media only: two explicit embeds of
+        // one path still render twice, and a link with no matching embed still
+        // upgrades — that case is why the upgrade exists.
+        if (_mdEmbeddedMediaKeys
+          && (_isImageSrc(url) || _isVideoSrc(url) || _isAudioSrc(url))
+          && _mdEmbeddedMediaKeys.has(_mediaDedupKey(url))) return '';
         if (_isImageSrc(url)) return _markdownImageHtml(url, txt, title);
         if (_isVideoSrc(url)) return _markdownVideoHtml(url, txt, title);
         if (_isAudioSrc(url)) return _markdownAudioHtml(url, txt, title);
@@ -2075,7 +2192,7 @@ function _aiSelectPopoverZIndexFor(el) {
 function _aiSelectMount(el, config) {
   if (!el) return null;
   const state = {
-    options: [],        // [{value, label, hint?, iconName?, disabled?}]
+    options: [],        // [{value, label, hint?, iconName?, avatar?, disabled?}]
     value: '',
     placeholder: (t('ai_select.placeholder')),
     onChange: () => {},
@@ -2117,7 +2234,15 @@ function _aiSelectMount(el, config) {
 
   const renderOptionLabel = (target, opt) => {
     target.innerHTML = '';
-    if (opt && opt.iconName && typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+    if (opt && opt.avatar && typeof renderAvatarHtml === 'function') {
+      const avatar = document.createElement('span');
+      avatar.className = 'ai-select-option-icon';
+      avatar.setAttribute('aria-hidden', 'true');
+      avatar.innerHTML = renderAvatarHtml(opt.avatar.icon, opt.avatar.color, {
+        size: 18, seed: opt.avatar.seed,
+      });
+      target.appendChild(avatar);
+    } else if (opt && opt.iconName && typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
       const iconWrap = document.createElement('span');
       iconWrap.className = 'ai-select-option-icon';
       iconWrap.innerHTML = window.uiIconHtml(opt.iconName, 'ui-icon ai-select-svg-icon');
@@ -2363,17 +2488,7 @@ function _aiSelectPick(api, value) {
   if (prev !== api.state.value) {
     try { api.state.onChange(api.state.value); } catch (_) {}
   }
-  const labelEl = api.el.querySelector('.ai-select-label');
-  const opt = api.state.options.find(o => o.value === api.state.value);
-  if (labelEl) {
-    if (opt) {
-      labelEl.textContent = opt.label;
-      labelEl.classList.remove('placeholder');
-    } else {
-      labelEl.textContent = api.state.placeholder;
-      labelEl.classList.add('placeholder');
-    }
-  }
+  api.setValue(api.state.value);
 }
 
 // Test bridge — guarded CommonJS export of pure helpers. No-op in the
@@ -2400,6 +2515,8 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     _chatImageIntrinsicStyle,
     _chatMediaLocalPathFromUrl,
     _normalizeLocalMediaSrc,
+    _mediaDedupKey,
+    _dropFailedProducedPreview,
     _parseOrkasMediaTitle,
     _chatVideoNativeControlsHit,
     escapeHtml,
@@ -2415,5 +2532,6 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     sanitizeMathExpressionForMathJax,
     _aiSelectNextZIndex,
     _aiSelectNormalizeOptions,
+    _arrayBufferToBase64,
   };
 }

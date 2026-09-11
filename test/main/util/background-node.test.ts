@@ -91,4 +91,31 @@ describe('background Node runtime', () => {
     });
     expect(violations).toEqual([]);
   });
+
+  it('keeps sandboxed test helpers on the explicit outer Node runtime', () => {
+    const testRoots = [
+      path.join(process.cwd(), 'test'),
+      path.join(process.cwd(), 'src', 'core-agent', 'test'),
+    ];
+    const pending = [...testRoots];
+    const violations: string[] = [];
+
+    while (pending.length) {
+      const directory = pending.pop()!;
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const absolute = path.join(directory, entry.name);
+        if (entry.isDirectory()) {
+          pending.push(absolute);
+          continue;
+        }
+        if (!entry.isFile() || !entry.name.endsWith('.test.ts')) continue;
+        const source = fs.readFileSync(absolute, 'utf8');
+        if (/ORKAS_NODE:\s*process\.execPath/.test(source)) {
+          violations.push(path.relative(process.cwd(), absolute));
+        }
+      }
+    }
+
+    expect(violations).toEqual([]);
+  });
 });

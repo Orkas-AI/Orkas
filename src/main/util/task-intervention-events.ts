@@ -72,11 +72,15 @@ export function captureDeliveredTaskIntervention(
 
   const requestKinds: Record<string, TaskInterventionKind> = {
     'bash:permission': 'sensitive_operation',
-    'bridge:permission': 'connector_permission',
     'connectors:install-confirm': 'connector_install',
     'delete_file.confirmation_required': 'delete_confirmation',
+    'local-agent:user-input': 'interactive_cli_input',
   };
-  const requestKind = requestKinds[channel];
+  const requestKind = channel === 'local-agent:permission'
+    ? (stringField(record, 'permission_kind') === 'connector'
+      ? 'connector_permission'
+      : 'sensitive_operation')
+    : requestKinds[channel];
   if (requestKind) {
     const requestId = stringField(record, channel === 'delete_file.confirmation_required'
       ? 'confirm_id'

@@ -126,6 +126,7 @@ import { decodeSubmission } from '../../features/group_chat/router';
 import { chatAttachmentDirForConversation } from '../../util/project-layout';
 import { resolveLocalMediaPath } from '../../features/chat_attachments';
 import { createLogger } from '../../logger';
+import { projectModelVisibleIssues } from '../../util/tool-issue-policy';
 import { logErrorSummary } from '../../util/log-redact';
 import { userLocalRoot } from '../../paths';
 import { recordRead } from './read-tracker';
@@ -1314,12 +1315,17 @@ async function sha256File(absPath: string): Promise<string | undefined> {
 }
 
 async function videoProductionArtifacts(compositionDirAbs: string): Promise<VideoProductionArtifactState> {
-  const [manifestSha, htmlSha, compositionSignature, visualSignature] = await Promise.all([
+  const scans = [
     sha256File(path.join(compositionDirAbs, 'composition-manifest.json')),
     sha256File(path.join(compositionDirAbs, 'index.html')),
     videoStudioCompositionSignature(compositionDirAbs),
     videoStudioVisualCompositionSignature(compositionDirAbs),
-  ]);
+  ] as const;
+  // Drain sibling reads before returning an error: callers may immediately
+  // clean up the composition, and Windows cannot remove an open source file.
+  const [combined] = await Promise.allSettled([Promise.all(scans), ...scans] as const);
+  if (combined.status === 'rejected') throw combined.reason;
+  const [manifestSha, htmlSha, compositionSignature, visualSignature] = combined.value;
   return {
     composition_signature: compositionSignature,
     visual_signature: visualSignature,
@@ -3170,7 +3176,7 @@ function emptyPlanEvidence(): VideoProductionPlanEvidence {
   };
 }
 
-function boundedPlanValidationDetails(error: unknown): Array<{ path: string; message: string }> {
+function planValidationDetails(error: unknown): Array<{ path: string; message: string }> {
   const issues = error && typeof error === 'object' && Array.isArray(
     (error as { issues?: unknown }).issues,
   )
@@ -3179,7 +3185,7 @@ function boundedPlanValidationDetails(error: unknown): Array<{ path: string; mes
     }).issues
     : [];
   if (issues.length > 0) {
-    return issues.slice(0, 12).map((issue) => ({
+    return issues.map((issue) => ({
       path: Array.isArray(issue.path) && issue.path.length > 0
         ? issue.path.map(String).join('.')
         : '$',
@@ -3250,7 +3256,7 @@ async function buildVideoProductionPlanIdentity(
       code: 'invalid_manifest',
       path: manifestPath,
       message: 'composition-manifest.json does not match the required video-plan structure.',
-      details: boundedPlanValidationDetails(error),
+      details: planValidationDetails(error),
     });
   }
   const semanticHash = crypto.createHash('sha256').update(planPayload);
@@ -3668,13 +3674,12 @@ async function runProductionSegmentQa(input: {
         ? findingsRecord.issues as Record<string, unknown>[]
         : []).filter((issue) => issue.severity === 'error');
     // The snapshot phase does not produce `findings` at all. Its blockers ride
-    // on `inspect_disposition` (already bounded to 12 by the QA layer), so
-    // reading only `findings` left every snapshot failure with a count and
-    // nothing else: the 2026-08-10 AUTO run got `error_count: 14` with zero
-    // issues, then spent a round of partial reads and a grep across five
-    // 35–55KB findings files to recover what this row was holding. lint and
-    // inspect keep using `findings`; whichever the phase wrote, the blockers
-    // travel with the failure.
+    // on `inspect_disposition`, so reading only `findings` left every snapshot
+    // failure with a count and nothing else: the 2026-08-10 AUTO run got
+    // `error_count: 14` with zero issues, then spent a round of partial reads
+    // and a grep across five 35–55KB findings files to recover what this row
+    // was holding. lint and inspect keep using `findings`; whichever the phase
+    // wrote, every known blocker travels with the failure.
     const dispositionIssues = findingsIssues.length ? [] : (() => {
       const disposition = result.inspect_disposition;
       const issues = disposition && typeof disposition === 'object' && !Array.isArray(disposition)
@@ -3686,6 +3691,7 @@ async function runProductionSegmentQa(input: {
     const errorCount = Number(result.blocking_error_count ?? 0)
       || Number(findingsRecord?.errorCount ?? 0)
       || blockingIssues.length;
+    const blockingIssuesComplete = errorCount <= blockingIssues.length;
     return {
       segment_id: segmentId,
       ok,
@@ -3709,11 +3715,11 @@ async function runProductionSegmentQa(input: {
         // model reads these rows, not the underlying phase result.
         ...(result.same_input_retry_allowed === false ? { same_input_retry_allowed: false } : {}),
         ...(blockingIssues.length ? { blocking_issues: blockingIssues } : {}),
-        // Count only the blockers that did not fit; `issues_omitted` also
-        // covers the advisory tail, which would overstate what is missing.
-        // `errorCount` is the segment's own blocker total whichever carrier
-        // supplied the list, so a truncated snapshot list says so too rather
-        // than reading as complete.
+        blocking_issues_complete: blockingIssuesComplete,
+        // A legacy or mocked producer can still supply fewer blocker objects
+        // than its count. Preserve that fact explicitly rather than pretending
+        // the partial source was complete. Current QA producers no longer
+        // item-cap known blockers.
         ...(Math.max(0, errorCount - blockingIssues.length) > 0
           ? { blocking_issues_omitted: errorCount - blockingIssues.length }
           : {}),
@@ -3747,6 +3753,9 @@ async function runProductionSegmentQa(input: {
     production_review: {
       renderable: afterReview.renderable,
       uncaptured_segment_ids: afterReview.uncaptured_segment_ids,
+      uncaptured_segments: afterReview.segments
+        .filter((segment) => !segment.captured)
+        .map(({ segment_id, reason }) => ({ segment_id, ...(reason ? { reason } : {}) })),
     },
     ...productionSegmentQaOutcome({
       phase: input.phase,
@@ -3824,7 +3833,6 @@ const QA_BLOCKED_COMPACT_CODES = new Set([
   'E_MEDIA_QA_BLOCKED',
 ]);
 
-const QA_COMPACT_MAX_ISSUES = 12;
 /** Advisory findings are repair material, not noise. Compaction used to keep
  *  only `severity:'error'`, so a passing inspect reported `issueCount: 13,
  *  issues: []` — a count and nothing else. On 2026-08-07 the model then
@@ -3838,13 +3846,12 @@ function compactQaIssueEntries(issues: unknown): Record<string, unknown>[] {
   const entries = issues.filter((issue): issue is Record<string, unknown> => (
     !!issue && typeof issue === 'object' && !Array.isArray(issue)
   ));
-  // Errors first: they are what blocks, and a truncated tail must never cost
-  // the model a blocker in exchange for an advisory note.
-  const kept = [
-    ...entries.filter((issue) => issue.severity === 'error').slice(0, QA_COMPACT_MAX_ISSUES),
-    ...entries.filter((issue) => issue.severity === 'warning').slice(0, QA_COMPACT_MAX_ADVISORY),
-  ];
-  return kept.map((issue) => ({
+  const projected = projectModelVisibleIssues(
+    entries,
+    (issue) => issue.severity === 'error',
+    QA_COMPACT_MAX_ADVISORY,
+  );
+  return projected.issues.map((issue) => ({
     code: issue.code,
     severity: issue.severity,
     ...(issue.sceneId ? { sceneId: issue.sceneId } : {}),
@@ -3860,6 +3867,17 @@ function compactQaSection(section: unknown): Record<string, unknown> | undefined
   const record = section as Record<string, unknown>;
   const issues = Array.isArray(record.issues) ? record.issues : [];
   const errors = compactQaIssueEntries(issues);
+  const advisoryCount = issues.filter((issue) => (
+    !!issue && typeof issue === 'object' && !Array.isArray(issue)
+      && (issue as Record<string, unknown>).severity !== 'error'
+  )).length;
+  const shownAdvisoryCount = errors.filter((issue) => issue.severity !== 'error').length;
+  const advisoryIssuesOmitted = Math.max(0, advisoryCount - shownAdvisoryCount);
+  const knownBlockerCount = errors.filter((issue) => issue.severity === 'error').length;
+  const declaredBlockerCount = Number.isFinite(Number(record.error_count))
+    ? Math.max(0, Math.floor(Number(record.error_count)))
+    : knownBlockerCount;
+  const blockingIssuesOmitted = Math.max(0, declaredBlockerCount - knownBlockerCount);
   return {
     ...(record.ok !== undefined ? { ok: record.ok } : {}),
     ...(record.status !== undefined ? { status: record.status } : {}),
@@ -3867,12 +3885,18 @@ function compactQaSection(section: unknown): Record<string, unknown> | undefined
     ...(record.warning_count !== undefined ? { warning_count: record.warning_count } : {}),
     ...(record.issue_count !== undefined ? { issue_count: record.issue_count } : {}),
     issues: errors,
-    ...(issues.length > errors.length ? { issues_omitted: issues.length - errors.length } : {}),
+    blocking_issues_complete: blockingIssuesOmitted === 0,
+    ...(blockingIssuesOmitted > 0 ? { blocking_issues_omitted: blockingIssuesOmitted } : {}),
+    ...(advisoryIssuesOmitted > 0 ? {
+      issues_omitted: advisoryIssuesOmitted,
+      advisory_issues_omitted: advisoryIssuesOmitted,
+    } : {}),
   };
 }
 
 /** Deep-collect error-severity issue entries from an arbitrary report shape
- * (preflight reports nest per-section issue arrays). Bounded. */
+ * (preflight reports nest per-section issue arrays). Recursion is bounded;
+ * known blocker count is not. */
 /** Walks a preflight payload for blocking findings.
  *
  * Deduplicated, because a preflight carries its findings in more than one
@@ -3887,7 +3911,7 @@ function collectErrorIssues(
   depth = 0,
   seen: Set<string> = new Set(),
 ): void {
-  if (out.length >= QA_COMPACT_MAX_ISSUES || depth > 6) return;
+  if (depth > 6) return;
   if (Array.isArray(value)) {
     for (const entry of value) collectErrorIssues(entry, out, depth + 1, seen);
     return;
@@ -3942,13 +3966,29 @@ function compactFindingsPayload(value: unknown): unknown {
   const record = parsed as Record<string, unknown>;
   const issues = Array.isArray(record.issues) ? record.issues : [];
   const errors = compactQaIssueEntries(issues);
+  const advisoryCount = issues.filter((issue) => (
+    !!issue && typeof issue === 'object' && !Array.isArray(issue)
+      && (issue as Record<string, unknown>).severity !== 'error'
+  )).length;
+  const shownAdvisoryCount = errors.filter((issue) => issue.severity !== 'error').length;
+  const advisoryIssuesOmitted = Math.max(0, advisoryCount - shownAdvisoryCount);
+  const knownBlockerCount = errors.filter((issue) => issue.severity === 'error').length;
+  const declaredBlockerCount = Number.isFinite(Number(record.errorCount))
+    ? Math.max(0, Math.floor(Number(record.errorCount)))
+    : knownBlockerCount;
+  const blockingIssuesOmitted = Math.max(0, declaredBlockerCount - knownBlockerCount);
   return {
     ...(record.ok !== undefined ? { ok: record.ok } : {}),
     ...(record.errorCount !== undefined ? { errorCount: record.errorCount } : {}),
     ...(record.warningCount !== undefined ? { warningCount: record.warningCount } : {}),
     ...(record.issueCount !== undefined ? { issueCount: record.issueCount } : {}),
     issues: errors,
-    ...(issues.length > errors.length ? { issues_omitted: issues.length - errors.length } : {}),
+    blocking_issues_complete: blockingIssuesOmitted === 0,
+    ...(blockingIssuesOmitted > 0 ? { blocking_issues_omitted: blockingIssuesOmitted } : {}),
+    ...(advisoryIssuesOmitted > 0 ? {
+      issues_omitted: advisoryIssuesOmitted,
+      advisory_issues_omitted: advisoryIssuesOmitted,
+    } : {}),
   };
 }
 
@@ -5924,20 +5964,9 @@ export async function recordVideoStudioGate(
       && isPassingPreflight(result.preflight)
     : result.draft_ready === true;
   if (!isReady) return false;
-  // A rejected Promise.all returns while its sibling filesystem scans keep
-  // running. On Windows that lets callers begin temp-tree cleanup while those
-  // scans still hold files open. Settle every scan before propagating an error.
-  const [signatureResult, visualSignatureResult, artifactsResult] = await Promise.allSettled([
-    videoStudioCompositionSignature(compositionDirAbs),
-    videoStudioVisualCompositionSignature(compositionDirAbs),
-    videoProductionArtifacts(compositionDirAbs),
-  ]);
-  if (signatureResult.status === 'rejected') throw signatureResult.reason;
-  if (visualSignatureResult.status === 'rejected') throw visualSignatureResult.reason;
-  if (artifactsResult.status === 'rejected') throw artifactsResult.reason;
-  const signature = signatureResult.value;
-  const visualSignature = visualSignatureResult.value;
-  const artifacts = artifactsResult.value;
+  const artifacts = await videoProductionArtifacts(compositionDirAbs);
+  const signature = artifacts.composition_signature;
+  const visualSignature = artifacts.visual_signature;
   const framePaths = Array.isArray(result.frame_paths)
     ? result.frame_paths
       .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
@@ -8978,6 +9007,38 @@ async function materializeCompositionNarration(input: {
       billable_request_sent: billableRequestSent,
     };
   }
+  // Decide the index.html to write BEFORE touching any file, so a failure
+  // leaves manifest / narration-map / html all untouched. A first-time
+  // materialize runs on the pristine generated scaffold and (re)builds it. On
+  // the narration retry / recovery path, `transactionMatches` bypassed the
+  // pristine-scaffold guard above, so the model may already have authored
+  // visuals — rebuilding the bare scaffold would silently destroy them. Retime
+  // the authored html via reconcile (attribute surgery, visuals preserved) and
+  // fail closed if the timing can't be applied — losing the retime is
+  // recoverable, discarding authored work is not.
+  const liveHtml = await fs.readFile(htmlPath, 'utf8').catch(() => '');
+  let nextHtml: string;
+  if (
+    !authoredVisualsPresent
+    || !liveHtml.trim()
+    || liveHtml.includes('ORKAS-GENERATED-SCAFFOLD')
+  ) {
+    nextHtml = buildCompositionScaffold(retimedValidation.data);
+  } else {
+    const reconciled = reconcileCompositionHtml(liveHtml, retimedValidation.data);
+    if (!reconciled.ok) {
+      return {
+        ok: false,
+        op: 'composition.materialize_narration',
+        errorCode: 'E_NARRATION_RETIME_RECONCILE_FAILED',
+        message: 'Narration timing was measured, but it could not be applied to your authored index.html without rebuilding the bare scaffold (which would discard your visuals). Fix the flagged scene/root hooks, then run composition.reconcile or materialize_narration again.',
+        issues: reconciled.issues,
+        path: outputAbsPath,
+        billable_request_sent: billableRequestSent,
+      };
+    }
+    nextHtml = reconciled.html;
+  }
   const sceneRetiming = retimedValidation.data.scenes.map((scene, index) => ({
     id: scene.id,
     previous_start: manifest.scenes[index]?.start ?? null,
@@ -8996,31 +9057,9 @@ async function materializeCompositionNarration(input: {
     method: 'scene_estimate_scaled',
     audioDurationSec: measuredDurationSec,
     requestSignature,
-  }));
-  const authoredVisualsRecovered = narrationInvariantRecovery
-    && artifactsShowAuthoredVisuals(state.artifacts, currentArtifacts, html);
-  if (authoredVisualsRecovered) {
-    const reconciledHtml = reconcileCompositionHtml(html, retimedValidation.data);
-    if (!reconciledHtml.ok) {
-      return {
-        ok: false,
-        op: 'composition.materialize_narration',
-        errorCode: 'E_NARRATION_VISUAL_RECOVERY_BLOCKED',
-        message: reconciledHtml.issues[0]?.message || 'Narration was generated, but protected timing/audio markup could not be reconciled without replacing authored visuals.',
-        issues: reconciledHtml.issues,
-        path: outputAbsPath,
-        billable_request_sent: billableRequestSent,
-        blocked_operation: 'composition.materialize_narration',
-        requires_user_decision: false,
-        preserved_artifacts: ['narration_audio', 'narration_transaction', 'composition_manifest', 'authored_visuals'],
-        allowed_recovery_ops: ['composition.status', 'composition.reconcile', 'composition.lint'],
-        next_action: 'repair_protected_binding_then_composition.reconcile',
-      };
-    }
-    await writeTextAtomic(htmlPath, reconciledHtml.html, input.ctx);
-  } else {
-    await writeTextAtomic(htmlPath, buildCompositionScaffold(retimedValidation.data), input.ctx);
-  }
+  }), input.ctx);
+  const authoredVisualsRecovered = authoredVisualsPresent;
+  await writeTextAtomic(htmlPath, nextHtml, input.ctx);
   // Files are in their final post-narration form now: the visual signature
   // decides whether the recorded preview (with its approval and design
   // review) survives. Narration-only changes leave it unchanged; a scaffold
@@ -9960,11 +9999,22 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         // to ask them to skip the same check twice. Invalid requests fail
         // closed here without writing state.
         const requestedQaWaivers = normalizedQaWaiverCodes(input.waive_qa_findings);
+        // Waiver codes granted for the FIRST time on this call. The
+        // unchanged-render breaker below exempts prior deterministic QA
+        // verdicts when this is non-empty: the user's waiver changes the QA
+        // outcome without changing the composition bytes, so the same input
+        // signature no longer predicts the same verdict (gate-control
+        // SKILL.md promises exactly this rerun). Re-sending an
+        // already-recorded code stays empty here, so the breaker still stops
+        // an unchanged-retry loop.
+        let newlyWaivedQaCodes: string[] = [];
         if (requestedQaWaivers.length) {
           const verdict = verifyQaWaiverRequest(op, opts.userMessage, requestedQaWaivers, input.decision_evidence);
           if (verdict.error) {
             return { content: resultContent(verdict.error), isError: true } as ToolResult;
           }
+          const priorWaived = new Set((stateBefore.qa_waivers || []).map((waiver) => waiver.code));
+          newlyWaivedQaCodes = requestedQaWaivers.filter((code) => !priorWaived.has(code));
           stateBefore = await recordQaWaivers({
             statePath: gateStatePath,
             compositionDirAbs,
@@ -10342,10 +10392,11 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             // narration_text", which rewrote user intent and left no-narration
             // productions with no passing path to Gate B. Narration still
             // counts as planned-but-missing when the caller passed a legacy
-            // voice or the manifest signs a narration_intent on an audible
-            // owner.
+            // voice, the manifest signs a narration_intent on an audible
+            // owner, or an explicit narration track is already present.
             const narrationPlanned = (typeof input.voice === 'string' && !!input.voice.trim())
-              || (manifest.audio.owner !== 'none' && !!manifest.audio.narration_intent);
+              || (manifest.audio.owner !== 'none' && !!manifest.audio.narration_intent)
+              || manifest.audio.tracks.some((track) => track.kind === 'narration');
             if (!narrationPlanned) {
               const planApprovalCurrent = planApprovalMatchesIdentity(stateBefore.plan_approval, identity);
               const gateBRequired = !planApprovalCurrent;
@@ -11758,7 +11809,16 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             // prove the current render request is actually identical.
             && entry.render_quality === renderQualityIdentity
             && entry.status === 'failed'
-            && entry.consumes_same_input_attempt === true,
+            && entry.consumes_same_input_attempt === true
+            // A rerun that just gained at least one NEW user waiver is not
+            // the doomed identical attempt this breaker exists for: waived
+            // findings downgrade to informational, so a recorded QA verdict
+            // no longer predicts this run even though the composition bytes
+            // (and hence the input signature) are unchanged BY DESIGN.
+            // Non-QA failures keep their strikes — a waiver cannot fix a
+            // crashed render (2026-08-24 review finding VS-F1).
+            && !(newlyWaivedQaCodes.length > 0
+              && (entry.error_code === 'E_VIDEO_QA_BLOCKED' || entry.error_code === 'E_MEDIA_QA_BLOCKED')),
         );
         const identicalRenderAttempts = identicalRenderFailures.length;
         // A deterministic frame/media QA verdict re-runs into the identical

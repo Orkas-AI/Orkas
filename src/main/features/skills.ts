@@ -36,7 +36,13 @@ import { t, buildLanguageDirective, descriptionLang } from '../i18n';
 import { buildAttachmentManifest } from './chat_attachments';
 import { getLanguage } from './config';
 import { logErrorSummary } from '../util/log-redact';
-import { ensureEditChatRuntimeProcessItem, normalizeEditChatRuntimeEvent } from './edit_chat_runtime';
+import {
+  appendEditChatCommentaryProcessItem,
+  ensureEditChatRuntimeProcessItem,
+  isEditChatWaitingForInputEvent,
+  normalizeEditChatRuntimeEvent,
+  sanitizeEditChatCommentaryProcessItems,
+} from './edit_chat_runtime';
 
 // Custom skills live per-user at `<uid>/cloud/skills/`. Resolved lazily
 // from the active uid.
@@ -3449,6 +3455,7 @@ export async function* streamSendToSkillChat(
   const { streamChatWithModel } = await import('../model/client');
   let finalText: string | null = null;
   let errMsg: string | null = null;
+  let waitingForInput = false;
   // Running assistant delta buffer. When the user aborts mid-stream the IPC
   // layer's `break` triggers `return()` on this generator, which skips the
   // post-loop append — finally has to salvage what's been rendered.
@@ -3477,13 +3484,27 @@ export async function* streamSendToSkillChat(
       ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
     }) as AsyncIterable<any>) {
       event = normalizeEditChatRuntimeEvent(event);
+      if (isEditChatWaitingForInputEvent(event)) waitingForInput = true;
       const etype = event.type;
       if (etype === 'delta' && typeof event.text === 'string') {
+        if (event.phase === 'commentary') {
+          appendEditChatCommentaryProcessItem(
+            processItems,
+            event.text,
+            MAX_SKILL_PROCESS_ITEMS,
+          );
+          // Commentary is safe to route through the renderer's phase-aware
+          // process rail. Its cumulative streaming scrub still hides any
+          // authoring protocol that a provider misclassifies as commentary.
+          yield event;
+          continue;
+        }
+        // Skill final-answer deltas can contain write protocol before final
+        // parsing knows which parts are user prose. Keep them out of the
+        // bubble while the turn streams; the final event below repaints the
+        // canonical user-visible message. Legacy unphased deltas follow this
+        // conservative path too.
         streamingText += event.text;
-        // Skill edit replies are a mixed channel: raw model deltas can contain
-        // write protocol before final parsing knows which parts are user prose.
-        // Keep mutation output out of the bubble while the turn streams; the
-        // final event below repaints a canonical user-visible message.
         continue;
       }
       // Domain events: each `<<<skill-file path=...>>>` block the LLM wrote
@@ -3736,7 +3757,10 @@ export async function* streamSendToSkillChat(
       aborted: opts.abortSignal?.aborted,
       errored: !!errMsg,
     });
-    const saved = processItems;
+    const saved = sanitizeEditChatCommentaryProcessItems(
+      processItems,
+      (text) => _visibleInlineSkillEditText(text, skillId),
+    );
     try {
       if (installedAsPkg) {
         // Placeholder skill (and its chat dir) was deleted after resolving the
@@ -3752,6 +3776,10 @@ export async function* streamSendToSkillChat(
         const content = partial ? `${partial}\n\n${errMsg}` : errMsg;
         await _appendSkillChatMessage(userId, skillId,
           { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
+      } else if (waitingForInput && !opts.abortSignal?.aborted) {
+        await _appendSkillChatMessage(userId, skillId,
+          { time: nowIso(), role: 'assistant', content: '', process: saved });
+        await saveSkillChatMeta(userId, skillId, { session_id: sessionId });
       } else if (streamingText.trim() || hadProcessItems) {
         const partial = _visibleInlineSkillEditText(streamingText, skillId).trim();
         const content = partial

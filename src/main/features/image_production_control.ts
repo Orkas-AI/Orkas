@@ -78,6 +78,24 @@ export function summarizeImageGenerationBudget(
   };
 }
 
+/** Return the newest completed raster for the requested host turn. A named
+ * turn never falls back to another turn, and pending/failed transactions are
+ * deliberately ignored so recovery cannot adopt an uncertain candidate. */
+export function latestCompletedImageStudioGenerationOutput(
+  state: ImageGenerationControlState | null,
+  turnId?: string,
+): string | undefined {
+  const normalizedTurnId = String(turnId || '').trim();
+  for (let index = (state?.transactions.length || 0) - 1; index >= 0; index -= 1) {
+    const transaction = state!.transactions[index];
+    if (normalizedTurnId && transaction.turn_id !== normalizedTurnId) continue;
+    if (transaction.status === 'completed' && transaction.output_path) {
+      return path.resolve(transaction.output_path);
+    }
+  }
+  return undefined;
+}
+
 export function imageGenerationControlStatePath(userId: string, projectDirAbs: string): string {
   const key = crypto.createHash('sha256')
     .update(`${userId}\0${path.resolve(projectDirAbs)}`)

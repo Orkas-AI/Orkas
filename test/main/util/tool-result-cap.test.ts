@@ -151,7 +151,8 @@ describe('wrapToolWithCap', () => {
     // The wider ceiling is a per-item policy, not an exemption: the ledger is
     // what protects the context window, and it falls to zero as the request
     // fills. A skill read that no longer fits the round spills like anything
-    // else.
+    // else once it is larger than the marker's own preview; below that size
+    // the marker would repeat the whole document, so it stays inline.
     const ledger = {
       initialTokens: 50_000,
       remainingTokens: 100,
@@ -164,11 +165,19 @@ describe('wrapToolWithCap', () => {
     } as unknown as typeof ctx;
     const result = capToolResult(
       'read_file',
-      { content: 'x'.repeat(2_400), verbatimDocument: true },
+      { content: 'x'.repeat(4_000), verbatimDocument: true },
       tightCtx,
       { maxInlineTokens: 12_500, toolResultsDir: dir },
     );
     expect(result.content).toMatch(/^<persisted-output/);
+    const small = capToolResult(
+      'read_file',
+      { content: 'y'.repeat(2_000), verbatimDocument: true },
+      tightCtx,
+      { maxInlineTokens: 12_500, toolResultsDir: dir },
+    );
+    expect(small.content).toBe('y'.repeat(2_000));
+    expect(small.persistedOutput).toBeUndefined();
   });
 
   it('keeps the caller default when no budget was resolved', () => {
@@ -216,12 +225,27 @@ describe('wrapToolWithCap', () => {
 
   it('persists oversized error output and preserves the error flag', async () => {
     const original = 'error\n'.repeat(2_000);
-    const tool = wrapToolWithCap(stubTool('bash', { content: original, isError: true }), {
+    const failureContext = {
+      kind: 'deterministic_validation' as const,
+      scope: 'project:stable-id',
+      complete: true,
+      issueCount: 80,
+      issueCodes: ['E_FIRST', 'E_SECOND'],
+    };
+    const tool = wrapToolWithCap(stubTool('bash', {
+      content: original,
+      isError: true,
+      failureContext,
+      observations: { fileFailure: { code: "E_NO_MATCH", reason: "no_match", match_count: 0 } },
+    }), {
       maxInlineTokens: 200,
       toolResultsDir: dir,
     });
     const result = await tool.execute({}, ctx);
     expect(result.isError).toBe(true);
+    expect(result.failureContext).toEqual(failureContext);
+    expect(result.observations?.fileFailure).toEqual({ code: "E_NO_MATCH", reason: "no_match", match_count: 0 });
+    expect(result.content).not.toContain("fileFailure");
     expect(result.content).toContain('status="error"');
     expect(fs.readdirSync(dir)).toHaveLength(1);
   });
@@ -318,6 +342,29 @@ describe('wrapToolWithCap', () => {
         .remainingTokens,
     ).toBe(4_000);
     expect(fs.readFileSync(third.persistedOutput!.path, 'utf8')).toBe('c'.repeat(20_000));
+  });
+
+  it('keeps a small result inline when the round ledger is exhausted instead of wrapping it', () => {
+    const ledgerCtx: ToolContext = {
+      state: {
+        [TOOL_RESULT_INLINE_LEDGER_STATE_KEY]: {
+          initialTokens: 16_000,
+          remainingTokens: 0,
+        },
+      },
+    };
+    const opts = { maxInlineTokens: 8_000, toolResultsDir: dir };
+    const small = capToolResult('write_file', { content: 'wrote 12 bytes to notes.md' }, ledgerCtx, opts);
+    const large = capToolResult('read_files', { content: 'z'.repeat(24_000) }, ledgerCtx, opts);
+
+    // The marker for a ≤600-token result would repeat the whole content plus
+    // ~200 tokens of refs/hints; inline unchanged is strictly cheaper.
+    expect(small.content).toBe('wrote 12 bytes to notes.md');
+    expect(small.persistedOutput).toBeUndefined();
+    expect(fs.readdirSync(dir).some((name) => name.startsWith('write_file.'))).toBe(false);
+    // Results above the preview budget still spill to disk on round exhaustion.
+    expect(large.persistedOutput?.ref).toMatch(/^read_files\.[0-9a-f]{64}$/);
+    expect(large.content).toContain('<persisted-output');
   });
 
   it('does not spend the round ledger on a result already above the 8K limit', () => {
@@ -424,11 +471,40 @@ describe('persisted result helpers', () => {
     );
 
     expect(marker).toContain('data_type="json"');
-    expect(marker).toContain('actions="query,search,read"');
+    expect(marker).toContain('actions="query,search,read,materialize"');
     expect(marker).toContain('query operations=count,sum,average,minimum,maximum');
+    expect(marker).toContain('omit match/count_unit for structured data');
+    expect(marker).toContain('Make at most one tool_result call in the next model step');
+    expect(marker).toContain('batch same-action requests in one requests array');
     expect(marker).toContain('data{records=2;fields=');
     expect(marker).toContain('amount:number');
     expect(marker).toContain('nested.region:string');
+  });
+
+  it('advertises queryable array item fields and the explode namespaces', () => {
+    const marker = buildPersistedOutputMarker(
+      '/tmp/connector.0123456789abcdef.txt',
+      'connector',
+      JSON.stringify([{ campaign_id: 9, metrics_list: [{ date: '2026-08-01', expense: 12 }] }]),
+    );
+
+    expect(marker).toContain('array query uses explode with $item/$parent/$index');
+    expect(marker).toContain('metrics_list[]{items=1;fields=');
+    expect(marker).toContain('$item.date:string');
+    expect(marker).toContain('$item.expense:number');
+    expect(marker).not.toContain('/tmp/connector');
+  });
+
+  it('states when the bounded result marker omits additional arrays', () => {
+    const marker = buildPersistedOutputMarker(
+      '/tmp/connector.0123456789abcdef.txt',
+      'connector',
+      JSON.stringify([{ first: [1], second: [2], third: [3] }]),
+    );
+
+    expect(marker).toContain('first[]{items=1');
+    expect(marker).toContain('second[]{items=1');
+    expect(marker).toContain('+1 more arrays');
   });
 
   it('labels the only safe query for unstructured text instead of inventing record semantics', () => {
@@ -439,8 +515,10 @@ describe('persisted result helpers', () => {
     );
 
     expect(marker).toContain('data_type="text"');
-    expect(marker).toContain('actions="query,search,read"');
+    expect(marker).toContain('actions="query,search,read,materialize"');
     expect(marker).toContain('query supports exact count only with match + count_unit');
+    expect(marker).toContain('Make at most one tool_result call in the next model step');
+    expect(marker).toContain('batch same-action requests in one requests array');
     expect(marker).toContain('lines=3');
   });
 
@@ -478,8 +556,22 @@ describe('persisted result helpers', () => {
     );
     expect(marker).not.toContain('Section map');
     expect(marker).toContain('data_type="unknown"');
-    expect(marker).toContain('actions="search,read"');
+    expect(marker).toContain('actions="search,read,materialize"');
     expect(marker).not.toContain('query operations=');
+  });
+
+  it('explains full-data calculation recovery when built-in querying is unavailable', () => {
+    const marker = buildPersistedOutputMarker(
+      '/tmp/connector.0123456789abcdef.txt',
+      'connector',
+      JSON.stringify({ rows: [{ amount: 7 }], diagnostic_blob: 'x'.repeat(32 * 1024 * 1024) }),
+    );
+    const summary = marker.split('\n').find((line) => line.startsWith('[Result data'));
+    expect(marker).toContain('actions="search,read,materialize"');
+    expect(summary).toMatch(/query.*limit/);
+    expect(summary).toMatch(/materialize.*full-data calculations/);
+    expect(summary).toMatch(/search\/read.*excerpts/);
+    expect(marker).not.toContain('/tmp/connector');
   });
 
   it('leaves unstructured output on the plain head/tail preview', () => {
@@ -508,6 +600,20 @@ describe('maybeSpillToolResult', () => {
     expect(result).toEqual({ output: 'small' });
   });
 
+  it('preserves the original shape of a small structured result', () => {
+    const output = { rows: [{ id: 1, value: 'small' }], hasMore: false };
+    const result = maybeSpillToolResult({
+      toolResultsDir: dir,
+      toolName: 'mcp_read',
+      callId: 'c-structured-small',
+      output,
+    });
+
+    expect(result).toEqual({ output });
+    expect(result.output).toBe(output);
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
+
   it('spills output above the budget and returns its durable path', () => {
     // ASCII length past the token-aware spill budget (~4 chars per token).
     const original = 'X'.repeat(DEFAULT_INLINE_RESULT_TOKENS * 4 + 100);
@@ -520,6 +626,38 @@ describe('maybeSpillToolResult', () => {
     expect(result.outputPath).toBeTruthy();
     expect(fs.readFileSync(result.outputPath!, 'utf8')).toBe(original);
     expect(result.output).toContain('<persisted-output');
+  });
+
+  it('serializes and spills an oversized structured array as exact JSON', () => {
+    const original = [
+      { id: 'row-1', value: 'A'.repeat(DEFAULT_INLINE_RESULT_TOKENS * 4) },
+      { id: 'row-2', value: 'B'.repeat(DEFAULT_INLINE_RESULT_TOKENS * 4) },
+    ];
+    const result = maybeSpillToolResult({
+      toolResultsDir: dir,
+      toolName: 'mcp_query',
+      callId: 'c-structured-large',
+      output: original,
+    });
+
+    expect(result.outputPath).toBeTruthy();
+    expect(fs.readFileSync(result.outputPath!, 'utf8')).toBe(JSON.stringify(original));
+    expect(result.output).toEqual(expect.stringContaining('<persisted-output'));
+  });
+
+  it('replaces an unserializable result with a bounded safe marker', () => {
+    const original: Record<string, unknown> = {};
+    original.self = original;
+
+    const result = maybeSpillToolResult({
+      toolResultsDir: dir,
+      toolName: 'mcp_query',
+      callId: 'c-circular',
+      output: original,
+    });
+
+    expect(result).toEqual({ output: '[Unserializable tool result omitted.]' });
+    expect(fs.readdirSync(dir)).toEqual([]);
   });
 });
 

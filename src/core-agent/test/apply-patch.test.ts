@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { fileFailureForLog } from "../src/tools/file-diagnostics.js";
 import { createApplyPatchTool } from "../src/tools/apply-patch.js";
 import type { ToolContext } from "../src/tools/base.js";
 
@@ -24,6 +25,28 @@ function context(workingDir: string): ToolContext {
 }
 
 describe("apply_patch", () => {
+  it('drops unknown diagnostic labels instead of leaking arbitrary text into logs', () => {
+    expect(fileFailureForLog({ code: 'private error text', reason: 'no_match' })).toBeUndefined();
+    expect(fileFailureForLog({ code: 'E_NO_MATCH', reason: '/Users/test/private.txt' })).toBeUndefined();
+    expect(fileFailureForLog(null)).toBeUndefined();
+  });
+
+  it.each([
+    { body: '*** Update File: target.txt\n@@\n-old\n+new', reason: 'patch_envelope', facts: { begin_marker: false, end_marker: false } },
+    { body: '*** Begin Patch\n*** Update File: target.txt\n@@\n private content\n*** End Patch', reason: 'hunk_without_changes', facts: { line: 3, hunk_index: 1, added_lines: 0, removed_lines: 0, context_lines: 1 } },
+    { body: '*** Begin Patch\n*** Update File: target.txt\n@@\n-invalid\nwrong prefix\n*** End Patch', reason: 'hunk_line_prefix', facts: { line: 5, hunk_index: 1 } },
+    { body: '*** Begin Patch\n*** Update File: target.txt\n@@\n-absent private text\n+replacement\n*** End Patch', reason: 'no_match', facts: { match_count: 0 } },
+  ])('diagnoses $reason without changing files or exposing their content in metadata', async ({ body, reason, facts }) => {
+    const dir = await tempDir();
+    await fs.writeFile(path.join(dir, 'target.txt'), 'private content\n');
+    const result = await createApplyPatchTool().execute({ patch: body }, context(dir));
+    expect(result.isError).toBe(true);
+    expect(result.observations?.fileFailure).toMatchObject({ reason, ...facts });
+    const metadata = JSON.stringify(result.observations);
+    for (const secret of ['private content', 'absent private text', 'target.txt', dir]) expect(metadata).not.toContain(secret);
+    expect(await fs.readFile(path.join(dir, 'target.txt'), 'utf8')).toBe('private content\n');
+  });
+
   it("commits add, update, move, and delete as one transaction", async () => {
     const dir = await tempDir();
     await fs.writeFile(path.join(dir, "update.txt"), "alpha\r\nbeta\r\n", "utf8");

@@ -7,6 +7,71 @@
 
 import * as path from 'node:path';
 
+/** Collect the established local-agent log protocol without retaining private messages. */
+export function createLocalAgentLogCollector(phase) {
+  const buffers = { stdout: '', stderr: '' };
+  const result = { phase, passed: true, capturedLineCount: 0, analyzedLineCount: 0,
+    levelCounts: { debug: 0, info: 0, warn: 0, error: 0 }, unclassifiedStderr: 0 };
+  const analyze = (stream, line) => {
+    result.capturedLineCount += 1;
+    result.analyzedLineCount += 1;
+    if (!line.trim()) return;
+    const record = line.match(/^\[\d{2}:\d{2}:\d{2}\.\d{3}\] \[(debug|info|warn|error)\] \[\([^)]*\)\] /);
+    if (record) result.levelCounts[record[1]] += 1;
+    else if (stream === 'stderr') result.unclassifiedStderr += 1;
+  };
+  return {
+    ingest(stream, chunk) {
+      if (!(stream in buffers)) throw new Error('Unknown local-agent log stream');
+      buffers[stream] += String(chunk);
+      const lines = buffers[stream].split(/\r?\n/);
+      buffers[stream] = lines.pop();
+      for (const line of lines) analyze(stream, line);
+    },
+    finish() {
+      for (const stream of ['stdout', 'stderr']) {
+        if (buffers[stream]) analyze(stream, buffers[stream]);
+        buffers[stream] = '';
+      }
+      result.passed = result.levelCounts.error === 0 && result.unclassifiedStderr === 0
+        && result.capturedLineCount === result.analyzedLineCount;
+      return { ...result, levelCounts: { ...result.levelCounts } };
+    },
+  };
+}
+
+/** Adapt native CLI diagnostics to the shared evaluator log protocol without
+ * suppressing warnings or treating unknown stderr as successful output. */
+export function ingestLocalAgentLogEvent(collector, event) {
+  const emit = (stream, level, source, message, timestamp = '00:00:00.000') => {
+    for (const line of message.split(/\r?\n/)) {
+      collector.ingest(stream, `[${timestamp}] [${level}] [(${source})] ${line}\n`);
+    }
+  };
+  if (event?.type === 'stderr-line') {
+    const line = String(event.line ?? '');
+    try {
+      const record = JSON.parse(line);
+      const level = String(record.level ?? '').toLowerCase();
+      if (/^(debug|info|warn|error)$/.test(level)
+        && typeof record.timestamp === 'string' && Number.isFinite(Date.parse(record.timestamp))
+        && typeof record.target === 'string' && /^[\w:./-]+$/.test(record.target)
+        && typeof record.fields?.message === 'string') {
+        emit('stderr', level, record.target, record.fields.message, new Date(record.timestamp).toISOString().slice(11, 23));
+        return;
+      }
+    } catch { /* Unknown native stderr remains fail-closed below. */ }
+    collector.ingest('stderr', `${line}\n`);
+  } else if (event?.type === 'log') {
+    const level = String(event.level ?? 'info').toLowerCase();
+    if (/^(debug|info|warn|error)$/.test(level)) {
+      emit('stdout', level, 'local-agent', String(event.message ?? ''));
+    } else {
+      collector.ingest('stderr', `Unknown local-agent log level: ${level}\n`);
+    }
+  }
+}
+
 export const LOCAL_AGENT_TYPES = Object.freeze([
   'claude',
   'codex',
@@ -56,6 +121,8 @@ const BRIDGE_SKILL = [
   '',
 ].join('\n');
 const MUTATION_PROTECTED_FILE = 'This workspace is reference-only. Do not modify it.\n';
+
+const TASK_REVIEW_PROMPT = '处理当前项目的“Release review”待办。检查 delivery.md 是否包含 Bluejay 发布代号、2031-04-17 发布日期和负责人 Mira Chen。只有这些交付证据齐全才推进状态：处理中的事项进入待确认，待确认的事项进入已完成。证据不足时保留原状态并说明缺失内容，不补造证据，不修改工作区文件。';
 
 export const LOCAL_AGENT_BENCHMARK_SCENARIOS = Object.freeze([
   Object.freeze({
@@ -162,6 +229,22 @@ export const LOCAL_AGENT_BENCHMARK_SCENARIOS = Object.freeze([
     }),
     observedFiles: Object.freeze(['protected.txt']),
   }),
+  ...[
+    { suffix: 'delivery', initialStatus: 'progress', expectedStatus: 'review', evidence: RELEASE_BRIEF },
+    { suffix: 'approval', initialStatus: 'review', expectedStatus: 'done', evidence: RELEASE_BRIEF },
+    { suffix: 'missing-evidence', initialStatus: 'review', expectedStatus: 'review', evidence: 'Release codename: Bluejay\nLaunch date: 2031-04-17\nOwner: not yet supplied\n' },
+    { suffix: 'blocked-delivery', initialStatus: 'progress', expectedStatus: 'progress', evidence: 'Release codename: Bluejay\nLaunch date: 2031-04-17\nOwner: not yet supplied\n' },
+    { suffix: 'conflicting-review', initialStatus: 'review', expectedStatus: 'review', evidence: 'Release codename: Bluejay\nLaunch date: 2031-04-18\nOwner: Mira Chen\n' },
+  ].map(({ suffix, initialStatus, expectedStatus, evidence }) => Object.freeze({
+    id: `local-agent-project-task-${suffix}`,
+    agents: Object.freeze(['claude', 'codex']),
+    category: 'project-task-status',
+    prompt: TASK_REVIEW_PROMPT,
+    projectTask: Object.freeze({ initialStatus, expectedStatus }),
+    seedFiles: Object.freeze({ 'delivery.md': evidence }),
+    observedFiles: Object.freeze(['delivery.md']),
+  })),
+
 ]);
 
 const BIN_NAMES = Object.freeze({
@@ -227,6 +310,12 @@ export function parseLiveArgs(argv) {
       result.help = true;
       continue;
     }
+    if (arg === '--scenario') {
+      const value = argv[++i];
+      if (!value || value.startsWith('--')) throw new Error('--scenario requires ids');
+      result.scenarios = [...new Set(value.split(',').filter(Boolean))];
+      continue;
+    }
     if (arg === '--agents') {
       const value = argv[i + 1];
       if (!value || value.startsWith('--')) throw new Error('--agents requires a comma-separated value');
@@ -256,6 +345,10 @@ export function parseLiveArgs(argv) {
   }
   if (result.installOnly && result.benchmark) {
     throw new Error('--install-only and --benchmark cannot be used together');
+  }
+  if (result.scenarios) {
+    const eligible = new Set(result.agents.flatMap(localAgentBenchmarkScenariosFor).map(scenario => scenario.id));
+    if (!result.benchmark || result.scenarios.some(id => !eligible.has(id))) throw new Error('selected scenario is unavailable for this benchmark cohort');
   }
   return result;
 }
@@ -305,7 +398,17 @@ export function scoreLocalAgentBenchmarkScenario(scenario, observation) {
       'workspace contains exactly the scenario files',
     ),
   ];
-  if (scenario?.id === 'local-agent-grounded-release-brief') {
+  if (scenario?.projectTask) {
+    const state = observation?.projectTaskState;
+    checks.push(
+      check('persisted-task-status', state?.task?.status === scenario.projectTask.expectedStatus, 'the persisted state follows verified evidence and the initial stage'),
+      check('original-conversation-preserved', !!state?.originCid && state?.task?.origin_cid === state.originCid, 'status updates retain the source conversation'),
+      check('no-extra-tasks', state?.taskCount === 1, 'processing updates the original task without creating duplicates'),
+      check('delivery-evidence-unchanged', files['delivery.md'] === scenario.seedFiles['delivery.md'], 'verification cannot manufacture missing evidence'),
+      check('uses-task-tool', (observation?.toolNames || []).some(name => /(?:^|__|\.)todo_tasks$/.test(name)), 'the real task tool is used'),
+      check('no-commander-transfer', !observation?.commanderHandoff, 'a bound CLI completes its own supported task operation'),
+    );
+  } else if (scenario?.id === 'local-agent-grounded-release-brief') {
     checks.push(
       check('keeps-codename', /\bBluejay\b/i.test(output), 'output contains exact codename'),
       check('keeps-launch-date', output.includes('2031-04-17'), 'output contains exact launch date'),

@@ -4,14 +4,35 @@ import * as path from 'node:path';
 import * as vm from 'node:vm';
 
 const skillsSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/chat-use.js'), 'utf8');
+const conversationSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation.js'), 'utf8');
+const composerHelpers = [
+  ['const _MENTION_FALLBACK_CLASS', 'function _highlightMentionsIn'],
+  ['function _quotedLineRanges', 'function _composerDispatchShape'],
+  ['function _resolvedMentionSpans', 'function _explicitMentionRecipients'],
+  ['function _findChatComposerTokens', 'function _chatRichChipsMatchValue'],
+].map(([start, end]) => {
+  const from = conversationSource.indexOf(start);
+  const to = conversationSource.indexOf(end, from);
+  if (from < 0 || to <= from) throw new Error('missing composer helper block');
+  return conversationSource.slice(from, to);
+}).join('\n');
 
-function loadChatUseHelpers() {
+function loadChatUseHelpers(projectId = '', boundIds: string[] = []) {
   const start = skillsSource.indexOf('// ─── Chat-input inline use chips');
   const end = skillsSource.indexOf('// Chat composers are part of the startup shell', start);
   if (start < 0 || end < 0) throw new Error('missing chat use helper block');
   const block = skillsSource.slice(start, end);
   return vm.runInNewContext(`
-    const currentCid = '';
+    const currentCid = 'current';
+    const conversations = [{ conversation_id: 'current', project_id: ${JSON.stringify(projectId)} }];
+    const _projectDetailPid = ${JSON.stringify(projectId)};
+    const _composerAgentScopes = new Map(['conversation', 'project'].map((target) => [target, { pid: ${JSON.stringify(projectId)}, ids: new Set(${JSON.stringify(boundIds)}) }]));
+    const _COMMANDER = { kind: 'commander', id: '', name: '' };
+    const _agentsCache = [
+      { agent_id: 'cli', name: 'Orkas Codex' },
+      { agent_id: 'writer', name: '写作助手' },
+      { agent_id: 'disabled', name: 'Disabled', enabled: false },
+    ];
     function _saveDraft() {}
     function escapeHtml(value) {
       return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
@@ -30,18 +51,22 @@ function loadChatUseHelpers() {
         'skills.use_label': 'Skill: {skill}',
         'skills.use_prefix': 'Use {skill} skill: {content}',
         'skills.inline_text': '{skill} skill',
+        'chat.recipient_commander': 'Commander',
       };
       let text = table[key] || key;
       for (const [k, v] of Object.entries(vars)) text = text.replaceAll('{' + k + '}', String(v));
       return text;
     }
     const document = { getElementById: () => null, querySelectorAll: () => [] };
+    ${fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/strip-structural-blocks.js'), 'utf8')}
     ${block}
+    ${composerHelpers}
     ({
       normalize: _normalizeChatUseSelection,
       normalizeMany: _normalizeChatUseSelections,
       tokenFor: _chatUseTokenFor,
       tokens: _findChatUseTokens,
+      composerTokens: _findChatComposerTokens,
       partsFromText: chatUseMessagePartsFromText,
       textFromParts: chatUseTextFromMessageParts,
       transform: transformWithChatUse,
@@ -49,11 +74,26 @@ function loadChatUseHelpers() {
       mirror: _renderChatUseMirrorHtml,
       deleteRange: _chatUseTokenDeleteRange,
       moveTarget: _chatUseTokenMoveTarget,
+      titleSeed: _titleSeedWithoutRoutingMentions,
     });
   `, {});
 }
 
 describe('chat use inline chips', () => {
+  it.each(['chat-input', 'project-chat-input'])('only chips project-bound names in typed or pasted text: %s', (inputId) => {
+    const h = loadChatUseHelpers('project-a', ['writer']);
+    const text = '@写作助手 draft A; @Orkas Codex inspect B; @Disabled do C';
+    expect(h.composerTokens(text, inputId).map((token: any) => token.selection.id)).toEqual(['writer']);
+    expect(h.composerTokens(text, 'new-chat-input').map((token: any) => token.selection.id)).toEqual(['writer', 'cli']);
+    expect(h.transform(text)).toBe(text);
+  });
+
+  it('keeps all non-reserved @names as text in a project with no Agent bindings', () => {
+    const h = loadChatUseHelpers('empty-project');
+    expect(h.composerTokens('@Orkas Codex inspect; @Commander help', 'chat-input')
+      .map((token: any) => token.selection.kind)).toEqual(['commander']);
+  });
+
   it('serializes multiple skill and connector tokens into localized plain text', () => {
     const h = loadChatUseHelpers();
     const text = [
@@ -176,5 +216,54 @@ describe('chat use inline chips', () => {
     expect(h.moveTarget(text, end, 'backward')).toBe(start);
     expect(h.moveTarget(text, end + 1, 'backward')).toBe(start);
     expect(h.moveTarget(text, 1, 'forward')).toBeNull();
+  });
+
+  it('shares chip boundaries for full Agent names and resources without changing sent text', () => {
+    const h = loadChatUseHelpers();
+    const skill = h.tokenFor({ kind: 'skill', name: 'Docs @Orkas Codex' });
+    const text = `@Orkas Codex ${skill} 然后@写作助手 审核 @commander`;
+    const tokens = h.composerTokens(text);
+    expect(tokens.map((token: any) => token.selection.kind)).toEqual(['agent', 'skill', 'agent', 'commander']);
+    expect(tokens.map((token: any) => text.slice(token.start, token.end)))
+      .toEqual(['@Orkas Codex', skill, '@写作助手', '@commander']);
+    expect(h.transform(text)).toBe('@Orkas Codex Docs @Orkas Codex skill 然后@写作助手 审核 @commander');
+    expect(h.partsFromText(text).filter((part: any) => part.type === 'use')).toHaveLength(1);
+  });
+
+  it('moves and deletes Agent chips atomically, including a selection crossing a resource chip', () => {
+    const h = loadChatUseHelpers();
+    const skill = h.tokenFor({ kind: 'skill', name: 'Docs' });
+    const text = `@Orkas Codex ${skill} @写作助手 审核`;
+    const [agent, resource, writer] = h.composerTokens(text);
+    expect(h.moveTarget(text, agent.start, 'forward')).toBe(agent.end);
+    expect(h.moveTarget(text, agent.end + 1, 'backward')).toBe(agent.start);
+    for (const [position, direction] of [[agent.end, 'backward'], [agent.start, 'forward'], [agent.start + 4, 'backward']] as const) {
+      expect(h.deleteRange({ value: text, selectionStart: position, selectionEnd: position }, direction))
+        .toEqual({ start: agent.start, end: agent.end });
+    }
+    expect(h.deleteRange({ value: text, selectionStart: resource.start + 2, selectionEnd: writer.start + 2 }, 'forward'))
+      .toEqual({ start: resource.start, end: writer.end });
+  });
+
+  it('leaves unknown, disabled, email and quoted lookalikes as ordinary editable text', () => {
+    const h = loadChatUseHelpers();
+    for (const text of ['@Unknown', '@Disabled', 'mail@Orkas Codex', '> @Orkas Codex', '  > @写作助手']) {
+      expect(h.composerTokens(text)).toEqual([]);
+      expect(h.moveTarget(text, text.length, 'backward')).toBeNull();
+      expect(h.deleteRange({ value: text, selectionStart: text.length, selectionEnd: text.length }, 'backward')).toBeFalsy();
+    }
+    expect(h.composerTokens('@Orkas Codex', 'auto-task-input')).toEqual([]);
+  });
+
+  it('keeps routing mentions out of the task title seed but leaves lookalikes alone', () => {
+    const h = loadChatUseHelpers();
+    expect(h.titleSeed('@Orkas Codex Draft the launch summary')).toBe('Draft the launch summary');
+    expect(h.titleSeed('@写作助手 @Orkas Codex 写一份周报')).toBe('写一份周报');
+    expect(h.titleSeed('Summarize this @Orkas Codex by noon')).toBe('Summarize this by noon');
+    expect(h.titleSeed('@commander plan the sprint')).toBe('plan the sprint');
+    for (const text of ['@Unknown fix it', '@Disabled fix it', 'mail@Orkas Codex bounced', '> @Orkas Codex quoted\nreply']) {
+      expect(h.titleSeed(text)).toBe(text);
+    }
+    expect(h.titleSeed('@Orkas Codex')).toBe('@Orkas Codex');
   });
 });

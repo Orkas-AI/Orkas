@@ -34,6 +34,73 @@ describe("PersistentSession", () => {
     expect(fs.existsSync(file)).toBe(false);
   });
 
+  it("reloads host observations and native tool images without creating a user turn", () => {
+    const session = new PersistentSession({ sessionFile: file });
+    session.beginUserTurn([{ type: "text", text: "Inspect the preview" }]);
+    session.addAssistantMessage([{ type: "tool_use", id: "image", name: "read_files", input: {} }]);
+    session.addToolResult("image", "preview", [{ data: "pixels", mediaType: "image/png" }]);
+    session.addMessage("developer", [{ type: "text", text: "Runtime observation: externally changed." }]);
+    const before = session.getMessagesForModel();
+    const restored = new PersistentSession({ sessionFile: file });
+    expect(restored.getMessagesForModel()).toEqual(before);
+    expect(restored.activeTurnHasUserMessage([{ type: "text", text: "Inspect the preview" }])).toBe(true);
+    expect(restored.activeTurnHasUserMessage([{ type: "text", text: "Runtime observation: externally changed." }])).toBe(false);
+    restored.addUserMessage("A genuine correction");
+    const again = new PersistentSession({ sessionFile: file });
+    expect(again.getMessagesForModel().at(-1)).toMatchObject({ role: "user",
+      content: [{ type: "text", text: "A genuine correction" }] });
+  });
+
+  it("migrates legacy tool image trailers but not a later user's image-only message", () => {
+    const rows: Message[] = [
+      { role: "user", turnId: 1, content: [{ type: "text", text: "Inspect" }] },
+      { role: "assistant", turnId: 1, content: [{ type: "tool_use", id: "image", name: "read_files", input: {} }] },
+      { role: "user", turnId: 1, content: [{ type: "tool_result", toolUseId: "image", content: "preview" }] },
+      { role: "user", turnId: 1, content: [{ type: "image", data: "old-tool-image", mediaType: "image/png" }] },
+      { role: "user", turnId: 2, content: [{ type: "image", data: "real-user-image", mediaType: "image/png" }] },
+    ];
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+    const restored = new PersistentSession({ sessionFile: file });
+    const messages = restored.getMessages();
+    expect(messages[2].content[0]).toMatchObject({ type: "tool_result", images: [{ data: "old-tool-image" }] });
+    expect(messages[3]).toMatchObject({ role: "user", turnId: 2, content: [{ type: "image", data: "real-user-image" }] });
+    expect(new PersistentSession({ sessionFile: file }).getMessages()).toEqual(messages);
+  });
+
+  it.each([false, true])("preserves a same-turn user image after a new receipt (tool image: %s)", (hasToolImage) => {
+    const session = new PersistentSession({ sessionFile: file });
+    session.beginUserTurn([{ type: "text", text: "Inspect" }]);
+    session.addAssistantMessage([{ type: "tool_use", id: "read", name: "read_files", input: {} }]);
+    session.addToolResult("read", "result", hasToolImage ? [{ data: "tool-pixels", mediaType: "image/png" }] : undefined);
+    session.addMessage("user", [{ type: "image", data: "real-user-correction", mediaType: "image/png" }]);
+    const before = session.getMessagesForModel();
+    expect(session.healAndPersist()).toBe(false);
+    const restored = new PersistentSession({ sessionFile: file });
+    expect(restored.getMessagesForModel()).toEqual(before);
+    expect(restored.getMessagesForModel().at(-1)).toMatchObject({ role: "user",
+      content: [{ type: "image", data: "real-user-correction" }] });
+    restored.applyActiveCheckpointSummary("Inspected the earlier report.", restored.length - 1);
+    expect(restored.getMessagesForModel().at(-1)).toMatchObject({ role: "user",
+      content: [{ type: "image", data: "real-user-correction" }] });
+  });
+
+  it("keeps a mid-turn correction's frozen plan anchor across restart", () => {
+    const s1 = new PersistentSession({ sessionFile: file });
+    s1.beginUserTurn([{ type: "text", text: "Finish the migration" }]);
+    s1.updateExecutionPlan({ steps: [{ step: "Apply migration", status: "in_progress" }] });
+    s1.addAssistantMessage([{ type: "tool_use", id: "read", name: "read_file", input: {} }]);
+    s1.addToolResult("read", "bytes");
+    s1.addMessage("user", [{ type: "text", text: "Pause and report" }]);
+    const before = s1.getMessagesForModel();
+    expect(JSON.stringify(before.at(-1))).toContain("Reconciliation required");
+
+    const s2 = new PersistentSession({ sessionFile: file });
+    expect(s2.getMessagesForModel()).toEqual(before);
+    // A later plan change after restart appends; the restored anchor stays put.
+    s2.updateExecutionPlan({ steps: [{ step: "Report", status: "in_progress" }] });
+    expect(s2.getMessagesForModel()).toEqual(before);
+  });
+
   it("persists messages to disk on add", () => {
     const s = new PersistentSession({ sessionFile: file });
     s.addUserMessage("hello");
@@ -314,7 +381,7 @@ describe("PersistentSession", () => {
     expect(restored.getWorkspaceObservations().entries).toHaveLength(1);
   });
 
-  it("restores the workspace cache anchor from persisted tool-call identity", () => {
+  it("preserves the exact active tool history and workspace ledger across restart", () => {
     const s1 = new PersistentSession({ sessionFile: file });
     s1.beginUserTurn([{ type: "text", text: "Update the persistent file and inspect it" }]);
     s1.addAssistantMessage([{
@@ -346,21 +413,11 @@ describe("PersistentSession", () => {
       input: { path: "/workspace/persistent.ts" },
     }]);
     s1.addToolResult("persistent-read", "PERSISTENT_READ_RESULT", undefined, false);
+    const beforeRestart = s1.getMessagesForModel();
 
     const s2 = new PersistentSession({ sessionFile: file });
     const modelView = s2.getMessagesForModel();
-    const changeResultIndex = modelView.findIndex((message) => message.content.some((content) => (
-      content.type === "tool_result" && content.toolUseId === "persistent-change"
-    )));
-    const workspaceIndex = modelView.findIndex((message) => message.content.some((content) => (
-      content.type === "text" && content.text.startsWith("[Workspace changes")
-    )));
-    const readUseIndex = modelView.findIndex((message) => message.content.some((content) => (
-      content.type === "tool_use" && content.id === "persistent-read"
-    )));
-
-    expect(workspaceIndex).toBe(changeResultIndex + 1);
-    expect(workspaceIndex).toBeLessThan(readUseIndex);
+    expect(modelView).toEqual(beforeRestart);
     expect(JSON.stringify(modelView)).toContain("PERSISTENT_READ_RESULT");
     expect(s2.getWorkspaceObservations().entries).toHaveLength(1);
   });
@@ -411,6 +468,55 @@ describe("PersistentSession", () => {
       const serialized = fs.readFileSync(`${file}.context.json`, "utf8");
       expect(serialized).not.toContain("\n  ");
       expect(JSON.parse(serialized).completedWork).toHaveLength(1);
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
+
+  it("flushes a context mutation batch before propagating a synchronous interruption", () => {
+    const session = new PersistentSession({ sessionFile: file });
+    session.beginUserTurn([{ type: "text", text: "persist before interruption" }]);
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "call-interrupted-commit",
+      name: "read_file",
+      input: { path: "/workspace/input.txt" },
+    }]);
+    const writeSpy = vi.spyOn(fs, "writeFileSync");
+    try {
+      expect(() => session.withContextMutationBatch(() => {
+        session.recordToolObservations({
+          toolCallId: "call-interrupted-commit",
+          tool: "read_file",
+          observations: {
+            fileReads: [{ path: "/workspace/input.txt", hash: "sha256:stable" }],
+          },
+        });
+        session.addToolResult("call-interrupted-commit", "read ok", undefined, false);
+        session.recordCompletedWork({
+          toolCallId: "call-interrupted-commit",
+          tool: "read_file",
+          inputDigest: "8:input-txt",
+          inputSummary: '{"path":"/workspace/input.txt"}',
+          status: "succeeded",
+          resultSummary: "read ok",
+          checkpointEpoch: 0,
+        });
+        throw new Error("injected synchronous interruption");
+      })).toThrow("injected synchronous interruption");
+
+      const contextWrites = writeSpy.mock.calls.filter(
+        ([target]) => target === `${file}.context.json.tmp`,
+      );
+      expect(contextWrites).toHaveLength(1);
+
+      const restored = new PersistentSession({ sessionFile: file });
+      expect(restored.getSerializedContextState()?.completedWork)
+        .toHaveLength(1);
+      expect(restored.getWorkspaceObservations().entries)
+        .toHaveLength(1);
+      expect(JSON.stringify(restored.getMessages()))
+        .toContain("call-interrupted-commit");
     } finally {
       writeSpy.mockRestore();
     }
@@ -510,7 +616,7 @@ describe("PersistentSession", () => {
     ))).toBe(true);
   });
 
-  it("persists the execution plan in the sidecar and restores its tail anchor", () => {
+  it("persists the execution plan and its frozen checkpoint context across restart", () => {
     const s1 = new PersistentSession({ sessionFile: file });
     s1.beginUserTurn([{ type: "text", text: "Finish the multi-hour migration" }]);
     s1.updateExecutionPlan({
@@ -522,6 +628,7 @@ describe("PersistentSession", () => {
     });
     s1.addAssistantMessage([{ type: "tool_use", id: "call-plan", name: "bash", input: { command: "inspect" } }]);
     s1.addToolResult("call-plan", "inspection complete", undefined, false);
+    s1.applyActiveCheckpointSummary("Inspection complete.", 2);
 
     const rawHistory = fs.readFileSync(file, "utf-8");
     const sidecar = fs.readFileSync(`${file}.context.json`, "utf-8");
@@ -537,6 +644,26 @@ describe("PersistentSession", () => {
     expect(s2.getExecutionPlan()?.revision).toBe(1);
     expect(s2.getExecutionPlan()?.steps.map((step) => step.id)).toEqual([1, 2, 3]);
     expect(s2.getExecutionPlan()?.nextStepId).toBe(4);
+  });
+
+  it("does not rewrite the sidecar for an unchanged complete Plan snapshot", () => {
+    const session = new PersistentSession({ sessionFile: file });
+    session.beginUserTurn([{ type: "text", text: "Finish the durable migration" }]);
+    const steps = [
+      { step: "Inventory callers", status: "completed" as const },
+      { step: "Migrate storage", status: "in_progress" as const },
+    ];
+    session.updateExecutionPlan({ explanation: "Initial transition", steps });
+    const writeSpy = vi.spyOn(fs, "writeFileSync");
+
+    const replay = session.updateExecutionPlan({
+      explanation: "A paraphrased explanation is not new progress",
+      steps,
+    });
+
+    expect(replay.revision).toBe(1);
+    expect(writeSpy).not.toHaveBeenCalled();
+    writeSpy.mockRestore();
   });
 
   it("migrates persisted plans without step ids and keeps assigned ids stable", () => {
@@ -585,6 +712,7 @@ describe("PersistentSession", () => {
     s1.updateExecutionPlan({
       steps: [{ step: "Run migration verification", status: "completed" }],
     });
+    s1.applyActiveCheckpointSummary("Verification complete.", s1.length - 1);
 
     const s2 = new PersistentSession({ sessionFile: file });
     expect(s2.getCompletedWorkLedger()).toEqual([expect.objectContaining({
@@ -637,6 +765,26 @@ describe("PersistentSession", () => {
     expect(modelView).not.toContain("DURABLE_RAW_RESULT");
     expect(modelView).toContain("DURABLE_LEDGER_RESULT");
     expect(s3.getCompletedWorkLedger()).toHaveLength(1);
+  });
+
+  it("applies the checkpoint summary hard bound at storage, not only in the preview", () => {
+    // The runner passes CONTEXT_COMPACTION_SUMMARY_HARD_TOKENS to the
+    // production session class. An override that drops the bound stores the
+    // model's unbounded summary and the savings gate is fooled by the bounded
+    // preview (2026-08-28 review B1-1).
+    const s1 = new PersistentSession({ sessionFile: file });
+    s1.beginUserTurn([{ type: "text", text: "Long task with an oversized checkpoint" }]);
+    s1.addAssistantMessage([{ type: "tool_use", id: "call-1", name: "bash", input: { command: "ls" } }]);
+    s1.addToolResult("call-1", "listing", undefined, false);
+    const oversized = Array.from({ length: 400 }, (_, i) => `- fact ${i}: ${"x".repeat(40)}`).join("\n");
+    const bound = 200;
+    const preview = s1.previewActiveCheckpointTokens(oversized, 2, bound);
+    const stored = s1.applyActiveCheckpointSummary(oversized, 2, bound);
+    expect(stored.length).toBeLessThan(oversized.length);
+    const reloaded = new PersistentSession({ sessionFile: file });
+    const modelView = JSON.stringify(reloaded.getMessagesForModel());
+    expect(modelView).not.toContain("fact 399");
+    expect(reloaded.estimateModelTokens()).toBeLessThanOrEqual(preview + 50);
   });
 
   it("repairs restored turn context when indexes point at tool process rows", () => {
@@ -745,18 +893,24 @@ describe("PersistentSession", () => {
     expect(fs.statSync(file).size).toBe(0);
   });
 
-  it("paired tool_use + tool_result round-trip through reload", () => {
-    // 验证 valid pair 完整保留:assistant.tool_use 后接 user.tool_result。
-    // 这是 healOrphanToolUses 不会动的 happy path。
+  it.each([undefined, "documents"])("paired tool calls preserve optional namespace %s through reload and active-turn projection", (namespace) => {
+    // A resumed turn must replay the original call identity and result,
+    // including legacy calls that predate namespace persistence.
     const s1 = new PersistentSession({ sessionFile: file });
-    s1.addAssistantMessage([
-      { type: "tool_use", id: "call-123", name: "test_tool", input: {} } as MessageContent,
-    ]);
+    s1.beginUserTurn([{ type: "text", text: "Read the selected document" }]);
+    const call = {
+      type: "tool_use" as const, id: "call-123", name: "test_tool", input: {},
+      ...(namespace !== undefined ? { namespace } : {}),
+    };
+    s1.addAssistantMessage([call]);
     s1.addToolResult("call-123", "tool output", undefined, false);
 
     const s2 = new PersistentSession({ sessionFile: file });
-    expect(s2.length).toBe(2);
-    const toolResultMsg = s2.getMessages()[1];
+    expect(s2.length).toBe(3);
+    expect(s2.getMessages()[1].content).toEqual([call]);
+    expect(s2.getMessagesForModel()).toEqual(s1.getMessagesForModel());
+    expect(s2.getMessagesForModel()[1].content).toEqual([call]);
+    const toolResultMsg = s2.getMessages()[2];
     expect(toolResultMsg.role).toBe("user");
     const c = toolResultMsg.content[0];
     expect(c.type).toBe("tool_result");

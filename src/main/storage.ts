@@ -95,12 +95,14 @@ function sleepSync(ms: number): void {
 async function renameWithRetryUsing(
   tmp: string,
   filePath: string,
-  renameFn: (oldPath: string, newPath: string) => Promise<void>,
-): Promise<void> {
+  renameFn: (oldPath: string, newPath: string) => Promise<void> | void,
+  shouldCommit?: () => boolean,
+): Promise<boolean> {
   for (let attempt = 0; ; attempt++) {
+    if (shouldCommit && !shouldCommit()) return false;
     try {
       await renameFn(tmp, filePath);
-      return;
+      return true;
     } catch (err) {
       if (!isRetryableRenameError(err) || attempt >= RENAME_RETRY_DELAYS_MS.length) throw err;
       await sleep(RENAME_RETRY_DELAYS_MS[attempt]);
@@ -108,8 +110,10 @@ async function renameWithRetryUsing(
   }
 }
 
-function renameWithRetry(tmp: string, filePath: string): Promise<void> {
-  return renameWithRetryUsing(tmp, filePath, fsp.rename);
+function renameWithRetry(tmp: string, filePath: string, shouldCommit?: () => boolean): Promise<boolean> {
+  // A guarded publication must not yield between the ownership check and
+  // rename. Retry delays stay asynchronous so file locks do not block main.
+  return renameWithRetryUsing(tmp, filePath, shouldCommit ? fs.renameSync : fsp.rename, shouldCommit);
 }
 
 function renameWithRetrySyncUsing(
@@ -128,7 +132,8 @@ function renameWithRetrySyncUsing(
   }
 }
 
-function renameWithRetrySync(tmp: string, filePath: string): void {
+/** Rename with retry on Windows AV/backup-tool lock errors. */
+export function renameWithRetrySync(tmp: string, filePath: string): void {
   return renameWithRetrySyncUsing(tmp, filePath, fs.renameSync);
 }
 
@@ -140,14 +145,21 @@ export const __storageTestHooks = {
 /**
  * Atomically write JSON with UTF-8 and 2-space indent.
  * Writes to a same-directory temp file then renames over the target to
- * prevent torn reads.
+ * prevent torn reads. An optional synchronous ownership guard can discard
+ * a superseded snapshot before publication, including after rename retries.
  */
-export async function writeJson(filePath: string, data: unknown): Promise<void> {
+export async function writeJson(
+  filePath: string,
+  data: unknown,
+  opts?: { shouldCommit?: () => boolean },
+): Promise<void> {
   await fsp.mkdir(path.dirname(filePath), { recursive: true });
   const tmp = atomicTmpPath(filePath);
   await fsp.writeFile(tmp, JSON.stringify(data, null, 2), 'utf8');
   try {
-    await renameWithRetry(tmp, filePath);
+    if (!await renameWithRetry(tmp, filePath, opts?.shouldCommit)) {
+      await fsp.rm(tmp, { force: true });
+    }
   } catch (err) {
     await fsp.rm(tmp, { force: true }).catch(() => {});
     throw err;
@@ -172,10 +184,17 @@ export function writeJsonSync(filePath: string, data: unknown): void {
  * (e.g. SKILL.md, custom skill files) where a torn write would lose the
  * definition entirely.
  */
-export function writeTextAtomicSync(filePath: string, text: string, encoding: BufferEncoding = 'utf8'): void {
+export function writeTextAtomicSync(
+  filePath: string,
+  text: string,
+  encoding: BufferEncoding = 'utf8',
+  opts?: { mode?: number },
+): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const tmp = atomicTmpPath(filePath);
-  fs.writeFileSync(tmp, text, { encoding });
+  // Mode is applied to the tmp file; rename carries it onto the target — used
+  // by secret-bearing writers (connectors.json, auth profiles) that need 0600.
+  fs.writeFileSync(tmp, text, { encoding, ...(opts && opts.mode !== undefined ? { mode: opts.mode } : {}) });
   try {
     renameWithRetrySync(tmp, filePath);
   } catch (err) {
@@ -310,6 +329,12 @@ export async function rewriteJsonlLine<T extends object>(
 
 const JSONL_TAIL_CHUNK_BYTES = 64 * 1024;
 
+function _concatJsonlSegments(segments: Buffer[]): Buffer {
+  if (segments.length === 0) return Buffer.alloc(0);
+  if (segments.length === 1) return segments[0];
+  return Buffer.concat(segments);
+}
+
 function _parseJsonlRecord<T>(line: string): T | undefined {
   const trimmed = line.trim();
   if (!trimmed) return undefined;
@@ -323,6 +348,18 @@ function _appendJsonlRecord<T>(out: T[], line: string): void {
 
 export interface JsonlPage<T> {
   records: T[];
+  /** Byte offset at which an older page ends; null means the file start. */
+  nextCursor: number | null;
+}
+
+export interface JsonlRecordWithOffset<T> {
+  record: T;
+  /** Byte offset of the record's first byte in the source JSONL. */
+  start: number;
+}
+
+export interface JsonlPageWithOffsets<T> {
+  entries: JsonlRecordWithOffset<T>[];
   /** Byte offset at which an older page ends; null means the file start. */
   nextCursor: number | null;
 }
@@ -345,12 +382,25 @@ export async function readJsonlPage<T = Record<string, any>>(
   limit = 200,
   before?: number | null,
 ): Promise<JsonlPage<T>> {
+  const page = await readJsonlPageWithOffsets<T>(filePath, limit, before);
+  return {
+    records: page.entries.map(({ record }) => record),
+    nextCursor: page.nextCursor,
+  };
+}
+
+/** Offset-preserving variant used by sparse derived page caches. */
+export async function readJsonlPageWithOffsets<T = Record<string, any>>(
+  filePath: string,
+  limit = 200,
+  before?: number | null,
+): Promise<JsonlPageWithOffsets<T>> {
   const wanted = Math.max(1, Math.floor(Number(limit) || 1));
   let handle: fs.promises.FileHandle;
   try {
     handle = await fsp.open(filePath, 'r');
   } catch {
-    return { records: [], nextCursor: null };
+    return { entries: [], nextCursor: null };
   }
 
   try {
@@ -359,8 +409,11 @@ export async function readJsonlPage<T = Record<string, any>>(
     let position = Number.isSafeInteger(requestedEnd)
       ? Math.max(0, Math.min(requestedEnd, size))
       : size;
-    let carry = Buffer.alloc(0);
-    const newestFirst: T[] = [];
+    // Keep chunk slices until a newline completes the record. Re-concatenating
+    // an ever-growing carry buffer on every 64 KiB read makes a multi-megabyte
+    // JSONL row quadratic (and made a 24 MiB tail take seconds to open).
+    let suffixSegments: Buffer[] = [];
+    const newestFirst: JsonlRecordWithOffset<T>[] = [];
     let oldestRecordStart = -1;
 
     while (position > 0 && newestFirst.length < wanted) {
@@ -368,33 +421,43 @@ export async function readJsonlPage<T = Record<string, any>>(
       position -= bytes;
       const block = Buffer.allocUnsafe(bytes);
       const { bytesRead } = await handle.read(block, 0, bytes, position);
-      const joined = carry.length
-        ? Buffer.concat([block.subarray(0, bytesRead), carry])
-        : block.subarray(0, bytesRead);
+      if (bytesRead <= 0) break;
 
-      let end = joined.length;
-      for (let i = joined.length - 1; i >= 0 && newestFirst.length < wanted; i -= 1) {
-        if (joined[i] !== 0x0a) continue; // '\n'
-        const record = _parseJsonlRecord<T>(joined.subarray(i + 1, end).toString('utf8'));
+      let end = bytesRead;
+      for (let i = bytesRead - 1; i >= 0 && newestFirst.length < wanted; i -= 1) {
+        if (block[i] !== 0x0a) continue; // '\n'
+        const current = block.subarray(i + 1, end);
+        const line = suffixSegments.length
+          ? _concatJsonlSegments([current, ...suffixSegments.reverse()])
+          : current;
+        const record = _parseJsonlRecord<T>(line.toString('utf8'));
         if (record !== undefined) {
-          newestFirst.push(record);
-          oldestRecordStart = position + i + 1;
+          const start = position + i + 1;
+          newestFirst.push({ record, start });
+          oldestRecordStart = start;
         }
         end = i;
+        suffixSegments = [];
       }
-      carry = joined.subarray(0, end);
+      if (newestFirst.length < wanted && end > 0) {
+        // Reverse traversal discovers later segments first. Keep that order
+        // with O(1) pushes, then reverse once when the record is complete.
+        suffixSegments.push(block.subarray(0, end));
+      }
     }
 
-    if (newestFirst.length < wanted && carry.length) {
-      const record = _parseJsonlRecord<T>(carry.toString('utf8'));
+    if (newestFirst.length < wanted && suffixSegments.length) {
+      const record = _parseJsonlRecord<T>(
+        _concatJsonlSegments(suffixSegments.reverse()).toString('utf8'),
+      );
       if (record !== undefined) {
-        newestFirst.push(record);
+        newestFirst.push({ record, start: 0 });
         oldestRecordStart = 0;
       }
     }
 
     return {
-      records: newestFirst.reverse(),
+      entries: newestFirst.reverse(),
       nextCursor: oldestRecordStart > 0 ? oldestRecordStart : null,
     };
   } finally {
@@ -429,7 +492,8 @@ export async function readJsonlWindow<T = Record<string, any>>(
     const records: T[] = [];
     let recordIndex = 0;
     let position = 0;
-    let carry = Buffer.alloc(0);
+    let lineSegments: Buffer[] = [];
+    let currentRecordStart = 0;
     let firstRecordStart = -1;
     let done = false;
 
@@ -449,21 +513,25 @@ export async function readJsonlWindow<T = Record<string, any>>(
       const block = Buffer.allocUnsafe(bytes);
       const { bytesRead } = await handle.read(block, 0, bytes, position);
       if (bytesRead <= 0) break;
-      const joined = carry.length
-        ? Buffer.concat([carry, block.subarray(0, bytesRead)])
-        : block.subarray(0, bytesRead);
-      const joinedStart = position - carry.length;
       let lineStart = 0;
-      for (let i = 0; i < joined.length; i += 1) {
-        if (joined[i] !== 0x0a) continue;
-        done = consumeLine(joined.subarray(lineStart, i), joinedStart + lineStart);
+      for (let i = 0; i < bytesRead; i += 1) {
+        if (block[i] !== 0x0a) continue;
+        const current = block.subarray(lineStart, i);
+        const line = lineSegments.length
+          ? _concatJsonlSegments([...lineSegments, current])
+          : current;
+        done = consumeLine(line, currentRecordStart);
+        lineSegments = [];
         lineStart = i + 1;
+        currentRecordStart = position + lineStart;
         if (done) break;
       }
       position += bytesRead;
-      if (!done) carry = joined.subarray(lineStart);
+      if (!done && lineStart < bytesRead) lineSegments.push(block.subarray(lineStart, bytesRead));
     }
-    if (!done && carry.length) consumeLine(carry, position - carry.length);
+    if (!done && lineSegments.length) {
+      consumeLine(_concatJsonlSegments(lineSegments), currentRecordStart);
+    }
 
     return {
       records,

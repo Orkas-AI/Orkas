@@ -15,20 +15,37 @@ const CONNECTOR_CATALOG_ENTRYPOINTS = Object.freeze([
   'bing-webmaster-mcp-server.cjs',
   'gcal-mcp-server.cjs',
   'gdocs-mcp-server.cjs',
-  'gmail-mcp-server.cjs',
   'google-workspace-mcp-server.cjs',
   'gsearch-console-mcp-server.cjs',
   'gsheets-mcp-server.cjs',
   'gtasks-mcp-server.cjs',
+  'direct-commerce-mcp-server.cjs',
+  'local-cli-mcp-server.cjs',
 ]);
 
 const CONNECTOR_CATALOG_SOURCE_FILES = Object.freeze([
   'src/main/features/connectors/catalog.ts',
   'src/main/features/connectors/catalog-google.ts',
+  'src/main/features/connectors/catalog-direct-commerce.ts',
+  'src/main/features/connectors/catalog-domestic.ts',
 ]);
+const CONNECTOR_AUTH_ENTRYPOINTS = Object.freeze({
+  'local-api-auth.cjs': Object.freeze([
+    'src/main/features/connectors/local-api.ts',
+  ]),
+  'local-cli-auth.cjs': Object.freeze([
+    'src/main/features/connectors/local-cli.ts',
+  ]),
+});
 const GOOGLE_CONNECTOR_CATALOG_SOURCE = 'src/main/features/connectors/catalog-google.ts';
 
 const INTERNAL_ENTRYPOINT_CONSUMERS = Object.freeze({
+  'composio-mcp-server.cjs': Object.freeze([
+    'src/main/features/connectors/manager.ts',
+  ]),
+  'kb-embed-worker.cjs': Object.freeze([
+    'src/main/features/kb_embed.ts',
+  ]),
   'orkas-bridge.cjs': Object.freeze([
     'src/main/features/local_agents/bridge.ts',
     'src/main/features/local_agents/runner.ts',
@@ -83,6 +100,7 @@ const CONNECTOR_RUNTIME_SMOKE_REQUEST = `${JSON.stringify({
 
 const PACKAGED_BIN_ENTRYPOINTS = Object.freeze([
   ...CONNECTOR_CATALOG_ENTRYPOINTS,
+  ...Object.keys(CONNECTOR_AUTH_ENTRYPOINTS),
   ...Object.keys(INTERNAL_ENTRYPOINT_CONSUMERS),
 ].sort());
 
@@ -90,7 +108,29 @@ const PACKAGED_BIN_ENTRYPOINTS = Object.freeze([
 // surfaces themselves. App-owned connector entrypoints load this proxy
 // bootstrap so their fetch can follow the route selected by Electron main.
 const PACKAGED_BIN_HELPERS = Object.freeze([
+  // Shared automation schema loaded by both the packaged Orkas bridge and
+  // the in-process auto_tasks tool.
+  'auto-tasks-contract.cjs',
+  'browser-tool-contract.cjs',
   'bridge-skill-runner.cjs',
+  // Loaded by the retained Google Workspace bundle, never a standalone catalog transport.
+  'gmail-mcp-server.cjs',
+  // Lark CLI shortcut contract required by local-cli-mcp-server.cjs.
+  'local-cli-lark.cjs',
+  'local-cli-permissions.cjs',
+  'commerce-request-context.cjs',
+  'ebay-signature.cjs',
+  'shopify-setup-requirements.cjs',
+  'local-api-credential-codec.cjs',
+  'marketplace-seller-api.cjs',
+  'storefront-admin-api.cjs',
+  'merchant-platform-api.cjs',
+  'magento-admin-api.cjs',
+  'temu-seller-api.cjs',
+  'lazada-seller-api.cjs',
+  'shein-seller-api.cjs',
+  'alibaba-icbu-api.cjs',
+  'aliexpress-seller-api.cjs',
   'proxy-bootstrap.cjs',
 ]);
 
@@ -316,6 +356,17 @@ function verifyRuntimeConsumerReferences(projectRoot) {
       }
     }
   }
+  for (const [entrypoint, consumers] of Object.entries(CONNECTOR_AUTH_ENTRYPOINTS)) {
+    for (const relativeFile of consumers) {
+      const file = path.join(projectRoot, ...relativeFile.split('/'));
+      requiredFile(`${entrypoint} consumer`, file);
+      if (!fs.readFileSync(file, 'utf8').includes(entrypoint)) {
+        throw new Error(
+          `[packaged-entrypoint-gate] ${relativeFile} no longer references auth entrypoint ${entrypoint}`,
+        );
+      }
+    }
+  }
 }
 
 function verifySourceEntrypointContract(projectRoot) {
@@ -526,6 +577,7 @@ function verifyPackagedEntrypointPayload(pcRoot, options = {}) {
 module.exports = {
   BUILD_ONLY_BIN_FILES,
   CONNECTOR_CATALOG_ENTRYPOINTS,
+  CONNECTOR_AUTH_ENTRYPOINTS,
   CONNECTOR_RUNTIME_ENTRYPOINTS,
   CONNECTOR_RUNTIME_SMOKE_PROFILES,
   PACKAGED_BIN_HELPERS,

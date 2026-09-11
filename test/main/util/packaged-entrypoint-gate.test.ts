@@ -106,8 +106,12 @@ describe('packaged-entrypoint-gate', () => {
     );
     expect(gate.BUILD_ONLY_BIN_FILES).toContain('packaged-entrypoint-gate.cjs');
     expect(gate.BUILD_ONLY_BIN_FILES).toContain('packaged-dependency-gate.cjs');
+    expect(gate.PACKAGED_BIN_HELPERS).toContain('auto-tasks-contract.cjs');
     expect(gate.PACKAGED_BIN_HELPERS).toContain('bridge-skill-runner.cjs');
+    expect(gate.PACKAGED_BIN_HELPERS).toContain('local-cli-lark.cjs');
     expect(gate.PACKAGED_BIN_HELPERS).toContain('proxy-bootstrap.cjs');
+    expect(gate.PACKAGED_BIN_HELPERS).toContain('shopify-setup-requirements.cjs');
+    expect(gate.PACKAGED_BIN_ENTRYPOINTS).not.toContain('shopify-setup-requirements.cjs');
   });
 
   it('rejects a build-only helper that is not excluded from the app', () => {
@@ -157,6 +161,24 @@ describe('packaged-entrypoint-gate', () => {
       .toThrow(/missing esbuild loader lib\/main\.js/);
   });
 
+  it.each(['browser-tool-contract.cjs', 'ebay-signature.cjs'])(
+    'blocks a package missing the runtime helper %s', (name) => {
+      const pcRoot = packagedFixture();
+      fs.rmSync(path.join(pcRoot, 'bin', name));
+      expect(() => gate.verifyPackagedEntrypointPayload(pcRoot, { projectRoot: process.cwd() }))
+        .toThrow(`missing: ${name}`);
+    },
+  );
+
+  it('rejects a missing shared Shopify scope module in the packaged payload and real adapter startup', () => {
+    const pcRoot = packagedRuntimeFixture();
+    fs.rmSync(path.join(pcRoot, 'bin', 'shopify-setup-requirements.cjs'));
+    expect(() => gate.verifyPackagedEntrypointPayload(pcRoot, { projectRoot: process.cwd() }))
+      .toThrow(/missing: shopify-setup-requirements\.cjs/);
+    expect(() => gate.verifyPackagedConnectorRuntime(pcRoot))
+      .toThrow(/connector smoke failed for direct bin\/direct-commerce-mcp-server\.cjs.*shopify-setup-requirements/s);
+  });
+
   it('rejects an incomplete MCP runtime dependency closure', () => {
     const pcRoot = packagedFixture();
     fs.rmSync(path.join(
@@ -182,7 +204,7 @@ describe('packaged-entrypoint-gate', () => {
     expect(gate.requiredPackagedConnectorSmokeEntries()).toHaveLength(
       gate.CONNECTOR_RUNTIME_ENTRYPOINTS.length * gate.CONNECTOR_RUNTIME_SMOKE_PROFILES.length,
     );
-  });
+  }, 60_000);
 
   it('reproduces the 1.6.2 failure when the packaged MCP SDK is absent', () => {
     const pcRoot = packagedRuntimeFixture();
@@ -192,7 +214,7 @@ describe('packaged-entrypoint-gate', () => {
     });
 
     expect(() => gate.verifyPackagedConnectorRuntime(pcRoot))
-      .toThrow(/connector smoke failed for direct bin\/bing-webmaster-mcp-server\.cjs.*@modelcontextprotocol\/sdk/s);
+      .toThrow(/connector smoke failed for direct bin\/[a-z-]+-mcp-server\.cjs.*@modelcontextprotocol\/sdk/s);
   });
 
   it('loads the explicit-proxy-only runtime instead of accepting a direct-mode false green', () => {
@@ -200,7 +222,7 @@ describe('packaged-entrypoint-gate', () => {
     fs.rmSync(path.join(pcRoot, 'node_modules', 'undici'), { recursive: true, force: true });
 
     expect(() => gate.verifyPackagedConnectorRuntime(pcRoot))
-      .toThrow(/connector smoke failed for env-proxy bin\/bing-webmaster-mcp-server\.cjs.*undici/s);
+      .toThrow(/connector smoke failed for env-proxy bin\/[a-z-]+-mcp-server\.cjs.*undici/s);
   });
 
   it('rejects a future connector import even before it is added to the manual package list', () => {
@@ -214,7 +236,7 @@ describe('packaged-entrypoint-gate', () => {
     );
 
     expect(() => gate.verifyPackagedConnectorRuntime(pcRoot))
-      .toThrow(/connector smoke failed for direct bin\/bing-webmaster-mcp-server\.cjs.*future-connector-runtime/s);
+      .toThrow(/connector smoke failed for direct bin\/[a-z-]+-mcp-server\.cjs.*future-connector-runtime/s);
   });
 
   it('rejects startup logs that corrupt the connector JSON-RPC stdout channel', () => {

@@ -26,6 +26,7 @@ import {
 } from '../util/project-layout';
 import { isAtomicWriteTempPath, safeId, writeJson } from '../storage';
 import { t } from '../i18n';
+import { assertLocalImportTarget } from '../util/file-import';
 import {
   EN_FILLER_RE, TITLE_MAX, ZH_FILLER_RE,
 } from '../util/auto-title';
@@ -190,7 +191,7 @@ export function assertSafeCloudRelPath(relPath: string): string {
   return relPath;
 }
 
-export function resolveCloudRelPath(root: string, relPath: string): string {
+export async function resolveCloudRelPath(root: string, relPath: string): Promise<string> {
   assertSafeCloudRelPath(relPath);
   const base = path.resolve(root);
   const child = relPath.slice('cloud/'.length).split('/').join(path.sep);
@@ -199,6 +200,7 @@ export function resolveCloudRelPath(root: string, relPath: string): string {
   if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
     throw new Error('unsafe recycle path');
   }
+  await assertLocalImportTarget(base, abs);
   return abs;
 }
 
@@ -211,8 +213,10 @@ function batchMetaFile(uid: string, batchId: string): string {
   return path.join(batchDir(uid, batchId), META_FILE);
 }
 
-function recycleFileAbs(uid: string, batchId: string, relPath: string): string {
-  return resolveCloudRelPath(path.join(batchDir(uid, batchId), FILES_DIR), relPath);
+async function recycleFileAbs(uid: string, batchId: string, relPath: string): Promise<string> {
+  const abs = await resolveCloudRelPath(path.join(batchDir(uid, batchId), FILES_DIR), relPath);
+  await assertLocalImportTarget(userRecycleDir(uid), abs);
+  return abs;
 }
 
 async function migrateLegacySyncRecycle(uid: string): Promise<void> {
@@ -247,6 +251,7 @@ async function migrateLegacySyncRecycle(uid: string): Promise<void> {
       await fsp.rename(src, dest);
       const metaFile = path.join(dest, META_FILE);
       try {
+        await assertLocalImportTarget(userRecycleDir(uid), metaFile);
         const raw = JSON.parse(await fsp.readFile(metaFile, 'utf-8'));
         if (raw && typeof raw === 'object') {
           raw.source = 'cloud_sync';
@@ -369,7 +374,7 @@ async function collectCloudFilesUnder(uid: string, relDir: string): Promise<stri
     }));
   }
   try {
-    const abs = resolveCloudRelPath(root, relDir);
+    const abs = await resolveCloudRelPath(root, relDir);
     const st = await fsp.stat(abs);
     if (!st.isDirectory()) return [];
     await walk(abs, safeRelDir);
@@ -385,7 +390,7 @@ async function collectCloudFilesMatching(uid: string, relDir: string, predicate:
   if (!isSafeCloudRelPath(`${safeRelDir}/__probe__`)) return [];
   let entries: fs.Dirent[] = [];
   try {
-    const abs = resolveCloudRelPath(userCloudRoot(uid), safeRelDir);
+    const abs = await resolveCloudRelPath(userCloudRoot(uid), safeRelDir);
     entries = await fsp.readdir(abs, { withFileTypes: true });
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
@@ -402,7 +407,7 @@ async function collectCloudFilesUnderMatchingDirs(uid: string, relDir: string, p
   if (!isSafeCloudRelPath(`${safeRelDir}/__probe__`)) return [];
   let entries: fs.Dirent[] = [];
   try {
-    const abs = resolveCloudRelPath(userCloudRoot(uid), safeRelDir);
+    const abs = await resolveCloudRelPath(userCloudRoot(uid), safeRelDir);
     entries = await fsp.readdir(abs, { withFileTypes: true });
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
@@ -417,7 +422,7 @@ async function collectCloudFilesUnderMatchingDirs(uid: string, relDir: string, p
 export async function collectCloudEntryFiles(uid: string, relPath: string): Promise<string[]> {
   if (!isSafeCloudRelPath(relPath)) return [];
   try {
-    const abs = resolveCloudRelPath(userCloudRoot(uid), relPath);
+    const abs = await resolveCloudRelPath(userCloudRoot(uid), relPath);
     const st = await fsp.stat(abs);
     if (st.isFile()) return [relPath];
     if (st.isDirectory()) return collectCloudFilesUnder(uid, relPath);
@@ -582,7 +587,7 @@ function parseJsonText(text: string | null): Record<string, any> | null {
 async function readRecycleText(uid: string, batchId: string | undefined, relPath: string): Promise<string | null> {
   if (!batchId || !isSafeCloudRelPath(relPath)) return null;
   try {
-    return await readTextIfSmall(recycleFileAbs(uid, batchId, relPath));
+    return await readTextIfSmall(await recycleFileAbs(uid, batchId, relPath));
   } catch {
     return null;
   }
@@ -591,7 +596,7 @@ async function readRecycleText(uid: string, batchId: string | undefined, relPath
 async function readCloudText(uid: string, relPath: string): Promise<string | null> {
   if (!isSafeCloudRelPath(relPath)) return null;
   try {
-    return await readTextIfSmall(resolveCloudRelPath(userCloudRoot(uid), relPath));
+    return await readTextIfSmall(await resolveCloudRelPath(userCloudRoot(uid), relPath));
   } catch {
     return null;
   }
@@ -1223,7 +1228,7 @@ export async function snapshotRecycleMetadata(uid: string, relPaths: string[]): 
   const chatRowsByCid = new Map<string, Record<string, any>>();
   if (cids.size > 0) {
     try {
-      const indexFile = resolveCloudRelPath(userCloudRoot(uid), 'cloud/chats/_index.json');
+      const indexFile = await resolveCloudRelPath(userCloudRoot(uid), 'cloud/chats/_index.json');
       const rows = JSON.parse(await fsp.readFile(indexFile, 'utf-8'));
       if (Array.isArray(rows)) {
         for (const row of rows) {
@@ -1240,7 +1245,7 @@ export async function snapshotRecycleMetadata(uid: string, relPaths: string[]): 
     }
     for (const pid of Array.from(projectIds)) {
       try {
-        const indexFile = resolveCloudRelPath(userCloudRoot(uid), `cloud/projects/${pid}/chats/_index.json`);
+        const indexFile = await resolveCloudRelPath(userCloudRoot(uid), `cloud/projects/${pid}/chats/_index.json`);
         const rows = JSON.parse(await fsp.readFile(indexFile, 'utf-8'));
         if (Array.isArray(rows)) {
           for (const row of rows) {
@@ -1255,7 +1260,7 @@ export async function snapshotRecycleMetadata(uid: string, relPaths: string[]): 
       }
     }
     for (const cid of cids) {
-      const metaFile = resolveCloudRelPath(userCloudRoot(uid), `cloud/chats/${cid}/meta.json`);
+      const metaFile = await resolveCloudRelPath(userCloudRoot(uid), `cloud/chats/${cid}/meta.json`);
       const row = await readJsonObject(metaFile);
       if (row) {
         chatRowsByCid.set(cid, { ...chatRowsByCid.get(cid), ...row, conversation_id: cid });
@@ -1263,7 +1268,7 @@ export async function snapshotRecycleMetadata(uid: string, relPaths: string[]): 
         if (safeId(pid)) projectIds.add(pid);
       }
       for (const pid of Array.from(projectIds)) {
-        const projectMetaFile = resolveCloudRelPath(userCloudRoot(uid), `cloud/projects/${pid}/chats/${cid}/meta.json`);
+        const projectMetaFile = await resolveCloudRelPath(userCloudRoot(uid), `cloud/projects/${pid}/chats/${cid}/meta.json`);
         const projectRow = await readJsonObject(projectMetaFile);
         if (!projectRow) continue;
         chatRowsByCid.set(cid, { ...chatRowsByCid.get(cid), ...projectRow, conversation_id: cid, project_id: projectRow.project_id || pid });
@@ -1273,7 +1278,7 @@ export async function snapshotRecycleMetadata(uid: string, relPaths: string[]): 
   chatIndexRows.push(...chatRowsByCid.values());
 
   for (const taskId of autoTaskIds) {
-    const cfg = await readJsonObject(resolveCloudRelPath(userCloudRoot(uid), `cloud/auto_tasks/${taskId}/config.json`));
+    const cfg = await readJsonObject(await resolveCloudRelPath(userCloudRoot(uid), `cloud/auto_tasks/${taskId}/config.json`));
     const pid = typeof cfg?.project_id === 'string' ? cfg.project_id : '';
     if (safeId(pid)) projectIds.add(pid);
     const projectTask = projectAutoTaskConfigInfo(relPaths.find((rel) => autoTaskIdFromRelPath(rel) === taskId) || '');
@@ -1282,8 +1287,13 @@ export async function snapshotRecycleMetadata(uid: string, relPaths: string[]): 
 
   const projectRows: Record<string, any>[] = [];
   for (const pid of projectIds) {
-    const row = await readJsonObject(projectMetaFile(uid, pid));
-    if (row && safeId(row.project_id)) projectRows.push({ ...row });
+    try {
+      const file = await resolveCloudRelPath(userCloudRoot(uid), `cloud/projects/${pid}/project.json`);
+      const row = await readJsonObject(file);
+      if (row && safeId(row.project_id)) projectRows.push({ ...row });
+    } catch {
+      // Optional relationship metadata must not read outside the cloud root.
+    }
   }
 
   return normalizeMetadata({
@@ -1341,7 +1351,7 @@ async function deriveChatIndexRowFromArchive(
   let createdMs = 0;
   let updatedMs = 0;
   try {
-    const file = recycleFileAbs(uid, batchId, relPath);
+    const file = await recycleFileAbs(uid, batchId, relPath);
     const text = await fsp.readFile(file, 'utf-8');
     for (const line of text.split(/\r?\n/)) {
       const trimmed = line.trim();
@@ -1407,8 +1417,8 @@ async function reactivateChatIndexRows(
   const bucketFor = async (relPath: string) => {
     const projectChat = projectChatJsonlInfo(relPath);
     const indexFile = projectChat
-      ? resolveCloudRelPath(userCloudRoot(uid), `cloud/projects/${projectChat.pid}/chats/_index.json`)
-      : resolveCloudRelPath(userCloudRoot(uid), 'cloud/chats/_index.json');
+      ? await resolveCloudRelPath(userCloudRoot(uid), `cloud/projects/${projectChat.pid}/chats/_index.json`)
+      : await resolveCloudRelPath(userCloudRoot(uid), 'cloud/chats/_index.json');
     const existing = buckets.get(indexFile);
     if (existing) return existing;
     let rows: any[] = [];
@@ -1488,9 +1498,9 @@ async function restoreProjectMetadata(uid: string, metadata: SyncRecycleMetadata
   for (const row of metadata?.project_rows || []) {
     const pid = typeof row.project_id === 'string' ? row.project_id : '';
     if (!safeId(pid)) continue;
-    const file = projectMetaFile(uid, pid);
-    if (fs.existsSync(file)) continue;
     try {
+      const file = await resolveCloudRelPath(userCloudRoot(uid), `cloud/projects/${pid}/project.json`);
+      if (fs.existsSync(file)) continue;
       await writeJson(file, row);
       restored.push(`cloud/projects/${pid}/project.json`);
     } catch (err: any) {
@@ -1543,7 +1553,9 @@ function normalizeBatch(raw: any): SyncRecycleBatch | null {
 
 async function readBatch(uid: string, batchId: string): Promise<SyncRecycleBatch | null> {
   try {
-    const raw = JSON.parse(await fsp.readFile(batchMetaFile(uid, batchId), 'utf-8'));
+    const file = batchMetaFile(uid, batchId);
+    await assertLocalImportTarget(userRecycleDir(uid), file);
+    const raw = JSON.parse(await fsp.readFile(file, 'utf-8'));
     const batch = normalizeBatch(raw);
     if (!batch) {
       log.warn('read recycle batch rejected', {
@@ -1620,10 +1632,10 @@ export async function createRecycleBatch(
 
   for (const relPath of uniquePaths) {
     try {
-      const src = resolveCloudRelPath(userCloudRoot(uid), relPath);
+      const src = await resolveCloudRelPath(userCloudRoot(uid), relPath);
       const st = await fsp.stat(src);
       if (!st.isFile()) continue;
-      const dest = recycleFileAbs(uid, id, relPath);
+      const dest = await recycleFileAbs(uid, id, relPath);
       await fsp.mkdir(path.dirname(dest), { recursive: true });
       await fsp.copyFile(src, dest);
       items.push({ path: relPath, size: st.size });
@@ -1643,7 +1655,13 @@ export async function createRecycleBatch(
   }
 
   if (opts.strict && failedArchivePaths.length > 0) {
-    await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+    await fsp.rm(dir, { recursive: true, force: true }).catch((err) => {
+      log.warn('recycle strict batch cleanup failed', {
+        user_id: maskId(uid),
+        batch_id: logBatchId(id),
+        error: logRecycleErrorRef(err),
+      });
+    });
     log.warn('recycle batch archive aborted: strict snapshot incomplete', {
       user_id: maskId(uid),
       batch_id: logBatchId(id),
@@ -1659,7 +1677,13 @@ export async function createRecycleBatch(
   }
 
   if (items.length === 0) {
-    await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+    await fsp.rm(dir, { recursive: true, force: true }).catch((err) => {
+      log.warn('recycle empty batch cleanup failed', {
+        user_id: maskId(uid),
+        batch_id: logBatchId(id),
+        error: logRecycleErrorRef(err),
+      });
+    });
     log.info('recycle batch create skipped: archive empty', {
       user_id: maskId(uid),
       batch_id: logBatchId(id),
@@ -1766,7 +1790,7 @@ export async function createAppRecycleBatchForAutoTask(
 
 async function conversationIdsForProject(uid: string, projectId: string): Promise<string[]> {
   try {
-    const indexFile = resolveCloudRelPath(userCloudRoot(uid), `cloud/projects/${projectId}/chats/_index.json`);
+    const indexFile = await resolveCloudRelPath(userCloudRoot(uid), `cloud/projects/${projectId}/chats/_index.json`);
     const rows = JSON.parse(await fsp.readFile(indexFile, 'utf-8'));
     if (!Array.isArray(rows)) return [];
     return rows
@@ -1775,7 +1799,7 @@ async function conversationIdsForProject(uid: string, projectId: string): Promis
   } catch {
     // Fallback for legacy layouts that still kept project rows in the global index.
     try {
-      const indexFile = resolveCloudRelPath(userCloudRoot(uid), 'cloud/chats/_index.json');
+      const indexFile = await resolveCloudRelPath(userCloudRoot(uid), 'cloud/chats/_index.json');
       const rows = JSON.parse(await fsp.readFile(indexFile, 'utf-8'));
       if (!Array.isArray(rows)) return [];
       return rows
@@ -1850,7 +1874,7 @@ export async function createAppRecycleBatchForAgent(
   ];
   for (const relPath of optional) {
     try {
-      await fsp.stat(resolveCloudRelPath(userCloudRoot(uid), relPath));
+      await fsp.stat(await resolveCloudRelPath(userCloudRoot(uid), relPath));
       rels.push(relPath);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') rels.push(relPath);
@@ -1873,7 +1897,7 @@ export async function createAppRecycleBatchForSkill(
   ];
   for (const relPath of optional) {
     try {
-      await fsp.stat(resolveCloudRelPath(userCloudRoot(uid), relPath));
+      await fsp.stat(await resolveCloudRelPath(userCloudRoot(uid), relPath));
       rels.push(relPath);
     } catch (err) {
       // Missing edit history is normal. Any other stat failure is retained
@@ -1981,8 +2005,8 @@ export async function restoreRecycleBatch(
   const now = new Date();
   for (const item of batch.items) {
     try {
-      const src = recycleFileAbs(uid, batchId, item.path);
-      const dest = resolveCloudRelPath(userCloudRoot(uid), item.path);
+      const src = await recycleFileAbs(uid, batchId, item.path);
+      const dest = await resolveCloudRelPath(userCloudRoot(uid), item.path);
       try {
         await fsp.stat(dest);
         skipped.push(item.path);

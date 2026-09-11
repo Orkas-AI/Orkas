@@ -145,19 +145,17 @@ it('restores unread state after the real user initialization boundary', async ()
   expect(context.currentUserId).toBe('local-owner');
 });
 
-it('does not drain restored queues before conversation history resolves', () => {
+it('binds the requested task board while conversation history is still loading', () => {
   const { context } = loadRendererNavigation();
   const history = Promise.withResolvers<void>();
   context.loadConversationHistory = vi.fn(() => history.promise);
   context._restoreDraft = vi.fn();
-  context.renderMessageQueue = vi.fn();
   context.isConvPending = () => false;
-  context._dispatchNextQueued = vi.fn();
   context._updateConvSendUI = vi.fn();
   context.focusChatComposerIfIdle = vi.fn();
-  vm.runInContext("messageQueues.set('queued-task', [{ id: 'q1', content: 'follow up' }]);", context);
-  context.setView('conversation', 'queued-task');
-  expect(context.loadConversationHistory).toHaveBeenCalledWith('queued-task', undefined);
-  expect(context._dispatchNextQueued).not.toHaveBeenCalled();
+  context.window.TaskBoard = { sync: vi.fn() };
+  context.setView('conversation', 'task-board-session');
+  expect(context.loadConversationHistory).toHaveBeenCalledWith('task-board-session', undefined);
+  expect(context.window.TaskBoard.sync).toHaveBeenCalledExactlyOnceWith('task-board-session');
   history.resolve();
 });

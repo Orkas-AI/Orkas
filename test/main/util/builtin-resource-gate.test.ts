@@ -68,6 +68,8 @@ describe('builtin-resource-gate', () => {
     expect(manifest.inventory.marketplace_skills.map((row) => row.id).sort())
       .toEqual([...gate.REQUIRED_BUILTIN_INVENTORY.marketplace_skills].sort());
     expect(manifest.inventory.marketplace_agents)
+      .not.toContainEqual(expect.objectContaining({ id: '1040b336306f' }));
+    expect(manifest.inventory.marketplace_agents)
       .toContainEqual(expect.objectContaining({
         id: '173d4235a431',
         name: 'ContentWriter',

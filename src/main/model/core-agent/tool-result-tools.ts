@@ -3,21 +3,26 @@
  *
  * Persisted outputs are addressed by an opaque ref, never by a model-chosen
  * path. Search locates text, query computes deterministic aggregates over
- * recognized records, and read returns an exact cursor range. Every operation
- * accepts a bounded batch; a runner-provided per-round ledger enforces a 4K
- * aggregate budget and suppresses duplicate retrievals within one compaction
- * epoch.
+ * recognized records, read returns an exact cursor range, and materialize
+ * creates an isolated working copy for bash/Node processing. Every operation
+ * accepts a bounded batch. Model-facing reads use a runner-provided 4K round
+ * ledger with duplicate suppression; reads retained inside run_program use
+ * that runtime's stricter call/result/wall-clock limits instead.
  */
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { createHash } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { Worker } from 'node:worker_threads';
-import type { AgentTool, ToolContext } from '#core-agent';
+import type { AgentTool, ToolContext, ToolResult } from '#core-agent';
 import { createLogger } from '../../logger';
+import { fileEditLock } from '../../util/locks';
+import { sha256OfFileStream } from '../../util/sha256';
 import { CLOUD_TOOL_RESULT_MAX_AGE_DAYS, estimateToolResultTokens } from '../../util/tool-result-cap';
 import {
   TOOL_RESULT_QUERY_MAX_INPUT_BYTES,
+  TOOL_RESULT_QUERY_TOO_LARGE_MESSAGE,
   aggregateToolResultData,
   type ToolResultAggregateRequest,
   type ToolResultAggregateResult,
@@ -62,7 +67,9 @@ export type ToolResultReadLedger = {
 
 type ToolResultToolsOpts = {
   toolResultsDir: string;
+  materializeDir: string;
   queryExecutor?: PersistedToolResultQueryExecutor;
+  isProgrammaticToolCallContext: (ctx: ToolContext) => boolean;
 };
 
 type PersistedToolResultQueryExecutor = (
@@ -211,90 +218,210 @@ export function createToolResultTools(opts: ToolResultToolsOpts): AgentTool[] {
   return [createToolResultTool(opts)];
 }
 
+type ToolResultAction = 'search' | 'query' | 'read' | 'materialize';
+
+const TOOL_RESULT_ACTION_REQUEST_FIELDS: Readonly<Record<ToolResultAction, ReadonlySet<string>>> = {
+  search: new Set(['ref', 'query']),
+  query: new Set([
+    'ref', 'operation', 'dataset', 'explode', 'field', 'filters', 'group_by',
+    'order', 'limit', 'match', 'count_unit',
+  ]),
+  read: new Set(['ref', 'cursor', 'max_tokens']),
+  materialize: new Set(['ref']),
+};
+
+function toolResultActionRequestError(
+  action: ToolResultAction,
+  requests: unknown,
+): RetrievalItemResult | null {
+  if (!Array.isArray(requests)) return null;
+  const allowed = TOOL_RESULT_ACTION_REQUEST_FIELDS[action];
+  for (let index = 0; index < requests.length; index++) {
+    const item = requests[index];
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const unexpected = Object.keys(item).filter((key) => !allowed.has(key)).sort();
+    if (!unexpected.length) continue;
+    return error(
+      'E_BAD_INPUT',
+      `tool_result(${action}) request ${index + 1}: unsupported field(s): ${unexpected.join(', ')}. `
+      + 'Use only the fields advertised for the selected action.',
+    );
+  }
+  return null;
+}
+
 function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
   const search = createSearchTool(opts);
   const read = createReadChunkTool(opts);
   const query = createQueryTool(opts);
+  const refProperty = () => ({
+    type: 'string',
+    pattern: TOOL_RESULT_REF_SCHEMA_PATTERN,
+    description: TOOL_RESULT_REF_DESCRIPTION,
+  });
+  const searchRequest = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      ref: refProperty(),
+      query: {
+        type: 'string',
+        description: 'Narrow text expression under 256 estimated tokens. Do not use for structured aggregation.',
+      },
+    },
+    required: ['ref', 'query'],
+  };
+  const structuredQueryProperties = () => ({
+    ref: refProperty(),
+    dataset: {
+      type: 'string',
+      description: 'Dataset advertised by the marker. Required only when multiple datasets are advertised.',
+    },
+    explode: {
+      type: 'string',
+      description: 'Expand one advertised array by its record-relative path; no dataset prefix or [].',
+    },
+    field: {
+      type: 'string',
+      description: 'Dotted numeric field. Required for sum, average, minimum, and maximum; optional for count.',
+    },
+    filters: {
+      type: 'array',
+      maxItems: 8,
+      description: 'Up to eight structured predicates combined with AND.',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          field: { type: 'string' },
+          op: { type: 'string', enum: ['eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'contains', 'exists'] },
+          value: { type: ['string', 'number', 'boolean', 'null'] },
+        },
+        required: ['field', 'op'],
+      },
+    },
+    group_by: {
+      type: 'array',
+      maxItems: 3,
+      items: { type: 'string' },
+      description: 'Up to three dotted fields used to group a structured aggregate.',
+    },
+    order: { type: 'string', enum: ['asc', 'desc'], description: 'Structured aggregate sort order; default desc.' },
+    limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Maximum structured result groups; default 20.' },
+  });
+  // One structured request covers count and numeric aggregates; the runtime
+  // (`toolResultActionRequestError` + the query tool) enforces which fields
+  // each operation needs, so the schema does not repeat the property set per
+  // operation.
+  const structuredRequest = {
+    type: 'object',
+    description: 'With explode, field, filters.field and group_by use $item.<field>, $parent.<field>, or $index; scalar items use $item.',
+    additionalProperties: false,
+    properties: {
+      ...structuredQueryProperties(),
+      operation: {
+        type: 'string',
+        enum: ['count', 'sum', 'average', 'minimum', 'maximum'],
+        description: 'Structured aggregate. count needs no field; sum/average/minimum/maximum require field. Never include match or count_unit.',
+      },
+    },
+    required: ['ref', 'operation'],
+  };
+  const textCountRequest = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      ref: refProperty(),
+      operation: {
+        type: 'string',
+        enum: ['count'],
+        description: 'Exact count over a marker advertised as unstructured text.',
+      },
+      match: {
+        type: 'string',
+        description: 'Required exact case-insensitive text. Use only for unstructured-text count.',
+      },
+      count_unit: {
+        type: 'string',
+        enum: ['matching_lines', 'occurrences'],
+        description: 'Required count unit. Use only for unstructured-text count.',
+      },
+    },
+    required: ['ref', 'operation', 'match', 'count_unit'],
+  };
+  const readRequest = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      ref: refProperty(),
+      cursor: { type: 'integer', minimum: 0, description: 'Exact non-negative character cursor.' },
+      max_tokens: {
+        type: 'integer',
+        minimum: 256,
+        maximum: TOOL_RESULT_CHUNK_MAX_TOKENS,
+        description: 'Requested slice size; default 1000, maximum 2000.',
+      },
+    },
+    required: ['ref', 'cursor'],
+  };
+  const materializeRequest = {
+    type: 'object',
+    additionalProperties: false,
+    properties: { ref: refProperty() },
+    required: ['ref'],
+  };
+  const actionProperty = {
+    type: 'string',
+    enum: ['search', 'query', 'read', 'materialize'],
+    description: 'Choose exactly one operation and use only that action\'s request fields.',
+  };
+  // The request shapes are advertised once, as the union of `requests.items`;
+  // the action branches below only bind `action` to its purpose. Pairing each
+  // action with its request shape is enforced at runtime
+  // (`toolResultActionRequestError`), so repeating the full item schema per
+  // branch bought no enforcement and cost ~1,100 tokens on every model request.
+  const actionBranch = (action: ToolResultAction, description: string) => ({
+    properties: {
+      action: { type: 'string', enum: [action], description },
+    },
+  });
   return {
     name: 'tool_result',
     description:
-      'Search, aggregate, or read an oversized result referenced by a prior <persisted-output ref="..."> marker. Use only actions advertised by that marker; never use a tool-call ID such as call_... as a result ref.',
+      'Inspect one oversized result referenced by a prior <persisted-output ref="..."> marker. Make at most one tool_result call per model step and batch up to eight currently needed same-action requests. Use only the selected action branch; never use a tool-call ID such as call_....',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        action: {
-          type: 'string',
-          enum: ['search', 'query', 'read'],
-          description: 'search locates text; query computes aggregates over advertised structured data or exact text matches; read uses exact cursors.',
-        },
+        action: actionProperty,
         requests: {
           type: 'array',
           minItems: 1,
           maxItems: TOOL_RESULT_BATCH_MAX_ITEMS,
-          description: 'One to eight requests sharing a 4K-token round budget. Each item uses the fields for the selected action.',
-          items: {
-            type: 'object',
-            additionalProperties: false,
-            properties: {
-              ref: {
-                type: 'string',
-                pattern: TOOL_RESULT_REF_SCHEMA_PATTERN,
-                description: TOOL_RESULT_REF_DESCRIPTION,
-              },
-              query: { type: 'string', description: 'Search only. Narrow expression under 256 estimated tokens.' },
-              operation: {
-                type: 'string',
-                enum: ['count', 'sum', 'average', 'minimum', 'maximum'],
-                description: 'Query only. count may omit field; other operations require a numeric field.',
-              },
-              dataset: { type: 'string', description: 'Query only. Required when the marker advertises multiple datasets.' },
-              field: { type: 'string', description: 'Query only. Dotted field path to aggregate.' },
-              filters: {
-                type: 'array',
-                maxItems: 8,
-                description: 'Query only. All predicates are combined with AND.',
-                items: {
-                  type: 'object',
-                  additionalProperties: false,
-                  properties: {
-                    field: { type: 'string' },
-                    op: { type: 'string', enum: ['eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'contains', 'exists'] },
-                    value: { type: ['string', 'number', 'boolean', 'null'] },
-                  },
-                  required: ['field', 'op'],
-                },
-              },
-              group_by: {
-                type: 'array',
-                maxItems: 3,
-                items: { type: 'string' },
-                description: 'Query only. Dotted field paths used to group the aggregate.',
-              },
-              order: { type: 'string', enum: ['asc', 'desc'], description: 'Query only. Sort aggregate values; default desc.' },
-              limit: { type: 'number', minimum: 1, maximum: 100, description: 'Query only. Maximum result groups; default 20.' },
-              match: { type: 'string', description: 'Unstructured-text count only. Exact case-insensitive text to count.' },
-              count_unit: {
-                type: 'string',
-                enum: ['matching_lines', 'occurrences'],
-                description: 'Unstructured-text count only. The exact unit returned.',
-              },
-              cursor: { type: 'number', description: 'Read only. Non-negative character cursor.' },
-              max_tokens: { type: 'number', description: 'Read only. Default 1000; maximum 2000.' },
-            },
-            required: ['ref'],
-          },
+          description: 'One to eight same-action requests using only that action\'s fields (search: ref+query; query: ref+operation…; read: ref+cursor; materialize: ref). Retrieval actions share one 4K-token model-step budget.',
+          items: { oneOf: [searchRequest, structuredRequest, textCountRequest, readRequest, materializeRequest] },
         },
       },
       required: ['action', 'requests'],
+      oneOf: [
+        actionBranch('search', 'Search 1-8 narrow text expressions; do not include cursor or aggregate fields.'),
+        actionBranch('query', 'Run 1-8 deterministic aggregates matching the marker data type.'),
+        actionBranch('read', 'Read 1-8 exact source excerpts by cursor for inspection; do not prefetch sequential chunks.'),
+        actionBranch('materialize', 'Create 1-8 session-scoped UTF-8 working copies for full-data calculations that query cannot express; process them with an available local runtime.'),
+      ],
     },
     async execute(input, ctx) {
-      const action = String(input.action ?? '');
+      const action = String(input.action ?? '') as ToolResultAction;
       const requests = Array.isArray(input.requests)
         ? input.requests.map((item) => item && typeof item === 'object' && !Array.isArray(item)
           ? item as Record<string, unknown>
           : {})
         : input.requests;
+      if (!['search', 'query', 'read', 'materialize'].includes(action)) {
+        return error('E_BAD_INPUT', '`action` must be search, query, read, or materialize.');
+      }
+      const shapeError = toolResultActionRequestError(action, requests);
+      if (shapeError) return shapeError;
       if (action === 'search') return search.execute({ queries: requests }, ctx);
       if (action === 'query') return query.execute({ queries: requests }, ctx);
       if (action === 'read') {
@@ -303,9 +430,91 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
           : requests;
         return read.execute({ chunks }, ctx);
       }
-      return error('E_BAD_INPUT', '`action` must be search, query, or read.');
+      if (action === 'materialize') return materializeToolResults(opts, requests);
+      return error('E_BAD_INPUT', '`action` must be search, query, read, or materialize.');
     },
   };
+}
+
+async function materializeToolResults(
+  opts: ToolResultToolsOpts,
+  requests: unknown,
+): Promise<RetrievalItemResult> {
+  const batch = batchItems({ requests }, 'requests', ['ref']);
+  if (batch.error) return batch.error;
+
+  const sources: Array<{ ref: string; path: string; bytes: number }> = [];
+  for (const item of batch.items) {
+    const ref = String(item.ref || '').trim();
+    if (!ref) return error('E_BAD_INPUT', '`ref` is required.');
+    const resolved = resolveToolResultRef(opts.toolResultsDir, ref);
+    if (resolved.ok === false) return error(resolved.code, resolved.message);
+    try {
+      const stat = await fs.promises.stat(resolved.path);
+      if (!stat.isFile()) return error('E_RESULT_REF_NOT_FILE', 'Tool-result ref is not a regular file.');
+      sources.push({ ref, path: resolved.path, bytes: stat.size });
+    } catch {
+      log.warn('persisted-result materialization failed', { phase: 'read' });
+      return error(
+        'E_RESULT_MATERIALIZE_READ',
+        'The persisted result could not be read. Re-run the original tool to regenerate the data.',
+      );
+    }
+  }
+
+  const created: string[] = [];
+  let release: (() => void) | undefined;
+  try {
+    await fs.promises.mkdir(opts.materializeDir, { recursive: true });
+    const root = await fs.promises.realpath(path.resolve(opts.materializeDir));
+    // Publication and rollback share one session-root lock: simultaneous
+    // batches must not replace or remove each other's deterministic copies.
+    release = await fileEditLock(root).acquire();
+    const files: Array<{ ref: string; path: string; bytes: number; encoding: 'utf8' }> = [];
+    for (const source of sources) {
+      // One working copy per ref: persisted results are write-once, so a
+      // repeat materialize of the same ref in a long session reuses the copy
+      // instead of stacking identical files until the conversation is deleted.
+      // Working copies are writable. Reuse only an independent regular file
+      // whose bytes still match; size alone misses same-length edits.
+      const destination = path.join(root, `result-${createHash('sha256').update(source.ref).digest('hex')}.txt`);
+      if (!isInside(root, destination)) {
+        throw new Error('materialized result path escaped its session root');
+      }
+      let reusable = false;
+      try {
+        const existing = await fs.promises.lstat(destination);
+        if (existing.isFile() && existing.nlink === 1 && existing.size === source.bytes) {
+          const sourceHash = await sha256OfFileStream(source.path);
+          reusable = sourceHash === await sha256OfFileStream(destination);
+        }
+      } catch { /* not materialized yet */ }
+      if (!reusable) {
+        await fs.promises.rm(destination, { force: true });
+        await fs.promises.copyFile(source.path, destination, fs.constants.COPYFILE_EXCL);
+        created.push(destination);
+      }
+      files.push({ ref: source.ref, path: destination, bytes: source.bytes, encoding: 'utf8' });
+    }
+    return { content: JSON.stringify({ files, dataContract: {
+      sourceBytes: 'unchanged',
+      validation: 'not-performed',
+      calculation: 'Validate required container structure and operand types before arithmetic; field presence alone is insufficient. '
+        + 'Missing/null containers are not empty collections, and missing/null operands are not zero. '
+        + 'Use only defaults explicitly defined by the task\'s rules.',
+    } }) };
+  } catch {
+    log.warn('persisted-result materialization failed', { phase: 'write' });
+    for (const file of created) {
+      try { await fs.promises.unlink(file); } catch { /* best-effort rollback */ }
+    }
+    return error(
+      'E_RESULT_MATERIALIZE_WRITE',
+      'The persisted result could not be materialized. Retry once or use search/read instead.',
+    );
+  } finally {
+    release?.();
+  }
 }
 
 function createQueryTool(opts: ToolResultToolsOpts): AgentTool {
@@ -322,7 +531,7 @@ function createQueryTool(opts: ToolResultToolsOpts): AgentTool {
       required: ['queries'],
     },
     async execute(input, ctx) {
-      const ledger = readLedger(ctx);
+      const ledger = readLedger(ctx, opts);
       const batch = batchItems(input, 'queries', ['ref', 'operation']);
       if (batch.error) return batch.error;
       const worker = opts.queryExecutor ? null : new PersistedToolResultQueryWorker();
@@ -372,7 +581,7 @@ function createSearchTool(opts: ToolResultToolsOpts): AgentTool {
       required: ['queries'],
     },
     async execute(input, ctx) {
-      const ledger = readLedger(ctx);
+      const ledger = readLedger(ctx, opts);
       const batch = batchItems(input, 'queries', ['ref', 'query']);
       if (batch.error) return batch.error;
       return executeBatch(batch.items, ledger, (item, maxOutputTokens) =>
@@ -413,7 +622,7 @@ function createReadChunkTool(opts: ToolResultToolsOpts): AgentTool {
       required: ['chunks'],
     },
     async execute(input, ctx) {
-      const ledger = readLedger(ctx);
+      const ledger = readLedger(ctx, opts);
       const batch = batchItems(input, 'chunks', ['ref', 'cursor']);
       if (batch.error) return batch.error;
       return executeBatch(batch.items, ledger, (item, maxOutputTokens) =>
@@ -422,11 +631,11 @@ function createReadChunkTool(opts: ToolResultToolsOpts): AgentTool {
   };
 }
 
-type RetrievalItemResult = { content: string; isError?: true };
+type RetrievalItemResult = Pick<ToolResult, 'content' | 'isError' | 'observations'>;
 
 function batchItems(
   input: Record<string, unknown>,
-  batchKey: 'queries' | 'chunks',
+  batchKey: 'queries' | 'chunks' | 'requests',
   legacyRequired: string[],
 ): { items: Record<string, unknown>[]; error?: never } | { items?: never; error: RetrievalItemResult } {
   const rawBatch = input[batchKey];
@@ -467,6 +676,7 @@ async function executeBatch(
 ): Promise<RetrievalItemResult> {
   const outputs: string[] = [];
   let successes = 0;
+  const failures: Array<{ index: number; code: string }> = [];
   let remainingOutputTokens = Math.min(
     TOOL_RESULT_ROUND_MAX_TOKENS,
     ledger?.remainingTokens ?? TOOL_RESULT_ROUND_MAX_TOKENS,
@@ -484,6 +694,11 @@ async function executeBatch(
     );
     if (itemBudget < 1) break;
     const result = await executeItem(item, itemBudget);
+    // Inspect the owning item's status before rendering/truncation. Source
+    // excerpts may themselves quote tool-error text; those are not failures.
+    if (result.isError) failures.push({ index,
+      code: /^<tool-error code="([A-Z][A-Z0-9_]{0,63})">/.exec(result.content)?.[1]
+        ?? 'E_RESULT_ITEM_FAILED' });
     const content = prefixWithinTokenBudget(result.content, itemBudget);
     outputs.push(content);
     remainingOutputTokens = Math.max(
@@ -492,9 +707,14 @@ async function executeBatch(
     );
     if (!result.isError) successes++;
   }
-  if (!outputs.length) return budgetError();
+  const observations = { resultRetrievalBatch: {
+    requested: items.length, attempted: outputs.length, succeeded: successes,
+    failed: failures.length, skipped: items.length - outputs.length, failures,
+  } };
+  if (!outputs.length) return { ...budgetError(), observations };
   return {
     content: outputs.join('\n'),
+    observations,
     ...(successes === 0 ? { isError: true as const } : {}),
   };
 }
@@ -515,6 +735,7 @@ async function executeQueryItem(
   const request: ToolResultAggregateRequest = {
     operation,
     ...(typeof input.dataset === 'string' ? { dataset: input.dataset } : {}),
+    ...(typeof input.explode === 'string' ? { explode: input.explode } : {}),
     ...(typeof input.field === 'string' ? { field: input.field } : {}),
     ...(Array.isArray(input.filters) ? {
       filters: input.filters.map((filter) => (
@@ -558,9 +779,7 @@ function queryTooLargeResult(): Extract<ToolResultAggregateResult, { ok: false }
   return {
     ok: false,
     code: 'E_RESULT_QUERY_TOO_LARGE',
-    message:
-      `This result exceeds the ${TOOL_RESULT_QUERY_MAX_INPUT_BYTES}-byte deterministic query limit. `
-      + 'Use search or paged read instead.',
+    message: TOOL_RESULT_QUERY_TOO_LARGE_MESSAGE,
   };
 }
 
@@ -590,6 +809,7 @@ function renderAggregateResult(
 ): string {
   const render = (rows: typeof result.rows, truncated: boolean): string => (
     `<tool-result-query ref="${escapeAttr(ref)}" operation="${escapeAttr(request.operation)}" dataset="${escapeAttr(result.dataset)}" `
+    + `${request.explode ? `explode="${escapeAttr(request.explode)}" ` : ''}`
     + `source_type="${escapeAttr(result.kind)}" unit="${escapeAttr(result.unit)}" scanned="${result.scanned}" matched="${result.matched}" groups="${result.groups}" truncated="${truncated ? 'true' : 'false'}">\n`
     + `${JSON.stringify(rows)}\n`
     + '</tool-result-query>'
@@ -608,6 +828,7 @@ function canonicalAggregateRequest(request: ToolResultAggregateRequest): string 
   return JSON.stringify({
     operation: request.operation,
     dataset: request.dataset || '',
+    explode: request.explode || '',
     field: request.field || '',
     filters: request.filters || [],
     groupBy: request.groupBy || [],
@@ -871,7 +1092,12 @@ function readUtf8CharacterRanges(
   return pieces.map((parts) => parts.join(''));
 }
 
-function readLedger(ctx: ToolContext): ToolResultReadLedger | null {
+function readLedger(ctx: ToolContext, opts: ToolResultToolsOpts): ToolResultReadLedger | null {
+  // Program child results stay inside the isolated runtime and are governed
+  // by run_program's call/result/wall-clock limits. Do not charge those bytes
+  // to the model-facing 4K retrieval ledger; only run_program's final compact
+  // output crosses into conversation context.
+  if (opts.isProgrammaticToolCallContext(ctx)) return null;
   const value = ctx.state.toolResultReadLedger;
   if (!value || typeof value !== 'object') return null;
   const record = value as Partial<ToolResultReadLedger>;
@@ -900,7 +1126,7 @@ function commitRead(ledger: ToolResultReadLedger | null, key: string, usedTokens
 function budgetError(): ReturnType<typeof error> {
   return error(
     'E_RESULT_READ_BUDGET',
-    'The 4K-token persisted-result read budget for this model step is exhausted. Use the excerpts already loaded, continue with another task step, or synthesize the result before reading more.',
+    'The shared 4K-token query/search/read observation budget for this model step is exhausted. Reuse prior observations. For full-data calculations, materialize the same ref and process its working copy with an available local runtime.',
   );
 }
 

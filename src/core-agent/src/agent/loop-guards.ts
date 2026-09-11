@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 /**
  * Run-scoped spin guards for the agent loop, extracted from `runWithProvider`
  * so the counters, thresholds, and verdicts live in one place and can be
@@ -13,8 +15,9 @@
  *
  * 2) Progress governor — a model can spin without ever repeating itself by
  *    varying filenames, cursors, or search terms. Each round is classified by
- *    observed outcomes; failed/plan-only rounds and read/search-only drift get
- *    separate, deliberately different budgets (productive work is unbounded).
+ *    observed outcomes. Failed/plan-only rounds get an advisory nudge only:
+ *    that coarse classification cannot prove the task is stuck. Extended
+ *    read/search-only drift retains its separate bounded window.
  *
  * The class owns counting and verdicts ONLY. The loop keeps ownership of
  * everything with wider context: round classification (it needs execution
@@ -36,17 +39,143 @@ export const LOOP_HARD = 5;
  *  is bounded by the tool-round cap like any other unproductive work. */
 export const NEAR_DUP_LOOP_WARN = 6;
 
-/** Progress-governor budgets. Failed/plan-only rounds stall fast (nudge at 2,
- *  stop at 4); read/search-only exploration is legitimate work that just needs
- *  a longer leash (nudge at 8, stop at 20). Only a productive round resets
- *  either window, so alternating bookkeeping and discovery cannot evade both. */
+/** Progress-governor budgets. Failed/plan-only rounds nudge at 2 but never
+ *  terminate the run: exact-repeat/failure guards plus the global tool-loop and
+ *  timeout budgets own forced termination. Read/search-only exploration keeps
+ *  a longer bounded window (nudge at 8, stop at 20). */
 export const RUN_NO_PROGRESS_NUDGE_ROUNDS = 2;
-export const RUN_NO_PROGRESS_STOP_ROUNDS = 4;
 export const RUN_DISCOVERY_NUDGE_ROUNDS = 8;
 export const RUN_DISCOVERY_STOP_ROUNDS = 20;
 
-/** What a whole tool round amounted to, judged from observed outcomes. */
-export type ToolRoundProgress = "none" | "discovery" | "productive";
+/** Repeated tool failures use a separate run-scoped episode tracker. The
+ * second matching diagnostic produces one tool-agnostic model control. An
+ * exact operation may be blocked before a third execution only when the first
+ * two failures had no successful tool outcome between them; any intervening
+ * success can have changed a prerequisite, so fuzzy/cross-progress matches
+ * remain warning-only. */
+export const REPEATED_TOOL_FAILURE_NUDGE_ATTEMPTS = 2;
+export const REPEATED_TOOL_FAILURE_BLOCK_PRIOR_ATTEMPTS = 2;
+const MAX_TRACKED_FAILURE_EPISODES = 64;
+
+type FailureExecutionObservation = {
+  status?: string;
+  exitCode?: number | null;
+  timedOut?: boolean;
+  outputLimitExceeded?: boolean;
+};
+
+export type ToolFailureResultLike = {
+  content: string;
+  observations?: { execution?: FailureExecutionObservation };
+  failureContext?: {
+    kind?: string;
+    scope?: string;
+    complete?: boolean;
+    issueCount?: number;
+    issueCodes?: string[];
+  };
+};
+
+export type RepeatedToolFailureObservation = {
+  fingerprint: string;
+  failures: number;
+  exactFailuresSinceSuccess: number;
+};
+
+export type RepeatedToolFailureBlock = {
+  fingerprint: string;
+  failures: number;
+  message: string;
+};
+
+type ExactFailureEpisode = {
+  fingerprint: string;
+  fuzzyKey: string;
+  failures: number;
+  failuresSinceSuccess: number;
+  successEpoch: number;
+};
+
+type FuzzyFailureEpisode = {
+  operationCounts: Map<string, number>;
+  totalFailures: number;
+  nudged: boolean;
+  kind: "diagnostic" | "deterministic_validation";
+};
+
+function deterministicValidationScope(result: ToolFailureResultLike): string | null {
+  const context = result.failureContext;
+  if (
+    context?.kind !== "deterministic_validation"
+    || context.complete !== true
+    || typeof context.scope !== "string"
+  ) return null;
+  const scope = context.scope.trim().toLowerCase();
+  return scope ? scope.slice(0, 256) : null;
+}
+
+function normalizedFailureDiagnostic(content: string): string {
+  const raw = String(content || "");
+  const stderr = raw.match(/<stderr>\s*([\s\S]*?)\s*<\/stderr>/i)?.[1];
+  const code = raw.match(/\bcode=["']([^"']+)["']/i)?.[1];
+  let diagnostic = stderr || raw;
+  diagnostic = diagnostic
+    .replace(/<command-result\b[^>]*>/gi, " ")
+    .replace(/<\/command-result>/gi, " ")
+    .replace(/<\/?(?:stdout|stderr)>/gi, " ")
+    .replace(/https?:\/\/\S+/gi, "<url>")
+    .replace(/(?:[A-Za-z]:\\|\/)(?:[^\s<>"']+[\\/])*[^\s<>"']*/g, "<path>")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi, "<uuid>")
+    .replace(/\b0x[0-9a-f]+\b/gi, "<hex>")
+    .replace(/\b\d+\b/g, "<n>")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  return `${code ? `code:${code.toLowerCase()} ` : ""}${diagnostic}`.slice(0, 2_048);
+}
+
+function failureFingerprint(
+  result: ToolFailureResultLike,
+  groupDeterministicValidationScope: boolean,
+): string {
+  const execution = result.observations?.execution;
+  const validationScope = groupDeterministicValidationScope
+    ? deterministicValidationScope(result)
+    : null;
+  const basis = [
+    execution?.status || "error",
+    execution?.exitCode ?? "",
+    execution?.timedOut ? "timed_out" : "",
+    execution?.outputLimitExceeded ? "output_limit" : "",
+    validationScope
+      ? `deterministic_validation:${validationScope}`
+      : normalizedFailureDiagnostic(result.content),
+  ].join("\u0000");
+  return `sha256:${createHash("sha256").update(basis).digest("hex")}`;
+}
+
+/** Stable, non-reversible grouping identity for a failed result. Complete
+ * deterministic validators deliberately group changing blocker diagnostics by
+ * scope so one convergence warning covers the whole validation episode. Raw
+ * tool output is never retained in the episode tracker or emitted to logs or
+ * model controls. */
+export function toolFailureFingerprint(result: ToolFailureResultLike): string {
+  return failureFingerprint(result, true);
+}
+
+/** Exact-operation blocking remains diagnostic-sensitive. A stable validation
+ * scope may group changing blockers for a warning, but must not turn a newly
+ * observed blocker set (including one caused by an out-of-band state change)
+ * into a hard repeat. */
+function exactToolFailureFingerprint(result: ToolFailureResultLike): string {
+  return failureFingerprint(result, false);
+}
+
+/** What a whole tool round amounted to, judged from observed outcomes.
+ * `neutral` is successful coordination that neither advances the user's
+ * artifact nor demonstrates a failed attempt (for example, loading tools or
+ * recording a plan). */
+export type ToolRoundProgress = "neutral" | "none" | "discovery" | "productive";
 
 /** Tools that only LOOK at state. A round made purely of these is exploration:
  *  legitimate, but bounded separately from productive work. */
@@ -68,7 +197,8 @@ export function mergeToolRoundProgress(
 ): ToolRoundProgress {
   if (current === "productive" || next === "productive") return "productive";
   if (current === "discovery" || next === "discovery") return "discovery";
-  return "none";
+  if (current === "none" || next === "none") return "none";
+  return "neutral";
 }
 
 /** Stable signature of a tool call for loop detection: name + canonical args.
@@ -136,9 +266,9 @@ export type ProgressGovernorOutcome = {
   /** Fire this nudge through the request-control channel (the caller owns
    *  wording, delivery, and logging). At most one per stalled episode. */
   nudge: { kind: "no_progress" | "discovery"; rounds: number } | null;
-  /** Stop the run: the bounded stall window is exhausted. The caller builds
-   *  the fallback result; `stalledRounds` feeds its wording and logs. */
-  stop: { kind: "no_progress" | "discovery"; stalledRounds: number } | null;
+  /** Stop the run only when the bounded discovery-only window is exhausted.
+   *  Coarse no-progress classification is advisory and cannot terminate. */
+  stop: { kind: "discovery"; stalledRounds: number } | null;
 };
 
 export class LoopGuards {
@@ -158,9 +288,18 @@ export class LoopGuards {
   private noProgressEpisodeNudged = false;
   private discoveryEpisodeNudged = false;
 
-  /** Unsuccessful (failed/plan-only) tool rounds since the last productive
-   *  result, for request-metadata telemetry. Discovery does not reset it; only
-   *  a productive round or user steer does. */
+  // ── Repeated failure episodes ──
+  // These host-only records survive context compaction because LoopGuards is
+  // run-scoped. Exact operation state supports a conservative execution block;
+  // matching diagnostics across changed inputs remain warning-only.
+  private successEpoch = 0;
+  private exactFailureEpisodes = new Map<string, ExactFailureEpisode>();
+  private fuzzyFailureEpisodes = new Map<string, FuzzyFailureEpisode>();
+  private pendingFailureNudge: string | null = null;
+
+  /** Unsuccessful tool rounds since the last productive result, for
+   *  request-metadata telemetry. Discovery and successful coordination do not
+   *  reset or increment it; only a productive round or user steer resets it. */
   get consecutiveNoProgressRounds(): number {
     return this.noProgressRounds;
   }
@@ -171,8 +310,161 @@ export class LoopGuards {
   repetitiveToolCallsDetected = false;
   noProgressNudgeSent = false;
   discoveryStallNudgeSent = false;
-  noProgressStopped = false;
   discoveryStallStopped = false;
+  repeatedToolFailureNudgeSent = false;
+  repeatedToolFailureBlocked = false;
+
+  private removeExactFailureEpisode(exactSignature: string): void {
+    const exact = this.exactFailureEpisodes.get(exactSignature);
+    if (!exact) return;
+    this.exactFailureEpisodes.delete(exactSignature);
+    const fuzzy = this.fuzzyFailureEpisodes.get(exact.fuzzyKey);
+    if (!fuzzy) return;
+    const contribution = fuzzy.operationCounts.get(exactSignature) || 0;
+    fuzzy.operationCounts.delete(exactSignature);
+    fuzzy.totalFailures = Math.max(0, fuzzy.totalFailures - contribution);
+    if (fuzzy.totalFailures === 0) this.fuzzyFailureEpisodes.delete(exact.fuzzyKey);
+  }
+
+  private trimFailureEpisodes(): void {
+    while (this.exactFailureEpisodes.size > MAX_TRACKED_FAILURE_EPISODES) {
+      const oldest = this.exactFailureEpisodes.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.removeExactFailureEpisode(oldest);
+    }
+    while (this.fuzzyFailureEpisodes.size > MAX_TRACKED_FAILURE_EPISODES) {
+      const oldest = this.fuzzyFailureEpisodes.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.fuzzyFailureEpisodes.delete(oldest);
+    }
+  }
+
+  /** Record one real failed execution. Matching diagnostics — or one declared
+   * complete deterministic-validation scope — produce a warning. Only an exact
+   * operation with the same diagnostic twice since the last successful tool
+   * outcome becomes blockable. */
+  observeToolFailure(
+    call: { name: string; input: unknown },
+    result: ToolFailureResultLike,
+  ): RepeatedToolFailureObservation {
+    const exactSignature = toolCallSignature(call);
+    const groupingFingerprint = toolFailureFingerprint(result);
+    const fingerprint = exactToolFailureFingerprint(result);
+    const failureKind = deterministicValidationScope(result)
+      ? "deterministic_validation" as const
+      : "diagnostic" as const;
+    const fuzzyKey = `${call.name}\u0000${groupingFingerprint}`;
+    const prior = this.exactFailureEpisodes.get(exactSignature);
+    if (prior && prior.fingerprint !== fingerprint) {
+      // A deterministic validator can report a different blocker set for the
+      // same call and still belong to the same warning episode. Preserve that
+      // episode's history while resetting only the diagnostic-sensitive hard
+      // block counter. A genuinely different grouping key keeps the existing
+      // removal behavior.
+      if (prior.fuzzyKey === fuzzyKey) this.exactFailureEpisodes.delete(exactSignature);
+      else this.removeExactFailureEpisode(exactSignature);
+    }
+
+    const current = this.exactFailureEpisodes.get(exactSignature);
+    const sameSuccessEpoch = current?.successEpoch === this.successEpoch;
+    const exact: ExactFailureEpisode = current
+      ? {
+          ...current,
+          failures: current.failures + 1,
+          failuresSinceSuccess: sameSuccessEpoch ? current.failuresSinceSuccess + 1 : 1,
+          successEpoch: this.successEpoch,
+        }
+      : {
+          fingerprint,
+          fuzzyKey,
+          failures: 1,
+          failuresSinceSuccess: 1,
+          successEpoch: this.successEpoch,
+        };
+    this.exactFailureEpisodes.delete(exactSignature);
+    this.exactFailureEpisodes.set(exactSignature, exact);
+
+    let fuzzy = this.fuzzyFailureEpisodes.get(fuzzyKey);
+    if (!fuzzy) {
+      fuzzy = {
+        operationCounts: new Map<string, number>(),
+        totalFailures: 0,
+        nudged: false,
+        kind: failureKind,
+      };
+      this.fuzzyFailureEpisodes.set(fuzzyKey, fuzzy);
+    }
+    fuzzy.operationCounts.set(exactSignature, (fuzzy.operationCounts.get(exactSignature) || 0) + 1);
+    fuzzy.totalFailures++;
+    if (
+      fuzzy.totalFailures >= REPEATED_TOOL_FAILURE_NUDGE_ATTEMPTS
+      && !fuzzy.nudged
+    ) {
+      fuzzy.nudged = true;
+      this.pendingFailureNudge = fuzzy.kind === "deterministic_validation"
+        ? `The same deterministic validation scope has failed ${fuzzy.totalFailures} times, even if the individual blocker codes changed. `
+          + "Treat the latest tool result as the complete current blocker set and repair all listed blockers together before validating again. "
+          + "If the result was persisted, read its result ref first; do not retry unchanged input."
+        : `The same tool failure has occurred ${fuzzy.totalFailures} times. `
+          + "Do not submit an equivalent attempt again. Re-check the input or prerequisites, "
+          + "choose a materially different approach, or stop and report the blocker and completed work.";
+    }
+    this.trimFailureEpisodes();
+    return {
+      fingerprint,
+      failures: fuzzy.totalFailures,
+      exactFailuresSinceSuccess: exact.failuresSinceSuccess,
+    };
+  }
+
+  /** A successful tool can have changed a prerequisite, so it re-opens exact
+   * execution. It does NOT erase unrelated failure episodes. A success of the
+   * same exact operation additionally resolves that operation's episode. */
+  observeToolSuccess(call: { name: string; input: unknown }): void {
+    this.successEpoch++;
+    this.removeExactFailureEpisode(toolCallSignature(call));
+  }
+
+  /** Called immediately before execution, after any earlier sequential tools
+   * in the same model response had a chance to repair prerequisites. */
+  repeatedFailureBlockForCall(
+    call: { name: string; input: unknown },
+  ): RepeatedToolFailureBlock | null {
+    const exact = this.exactFailureEpisodes.get(toolCallSignature(call));
+    if (
+      !exact
+      || exact.failuresSinceSuccess < REPEATED_TOOL_FAILURE_BLOCK_PRIOR_ATTEMPTS
+      || exact.successEpoch !== this.successEpoch
+    ) return null;
+    this.repeatedToolFailureBlocked = true;
+    return {
+      fingerprint: exact.fingerprint,
+      failures: exact.failuresSinceSuccess,
+      message:
+        `This equivalent operation was not executed because it already failed ${exact.failuresSinceSuccess} times with the same error. `
+        + "Re-check the input or prerequisites, choose a materially different approach, "
+        + "or stop and report the blocker and completed work.",
+    };
+  }
+
+  takePendingFailureNudge(): string | null {
+    const nudge = this.pendingFailureNudge;
+    if (nudge) {
+      this.pendingFailureNudge = null;
+      this.repeatedToolFailureNudgeSent = true;
+    }
+    return nudge;
+  }
+
+  discardPendingFailureNudge(): void {
+    this.pendingFailureNudge = null;
+  }
+
+  /** A specialized repeated-failure result already tells the model why the
+   * exact operation was blocked, so suppress the older generic repeat prompt. */
+  discardPendingRepeatNudge(): void {
+    this.pendingRepeatNudge = null;
+  }
 
   /**
    * Feed one round's PROPOSED calls (afterModel, before execution) through
@@ -244,6 +536,7 @@ export class LoopGuards {
   observeRoundOutcome(input: {
     progress: ToolRoundProgress;
     freshEpisode: boolean;
+    suppressNoProgressNudge?: boolean;
   }): ProgressGovernorOutcome {
     if (input.freshEpisode) {
       this.noProgressRounds = 0;
@@ -257,7 +550,7 @@ export class LoopGuards {
       this.discoveryEpisodeNudged = false;
     } else if (input.progress === "discovery") {
       this.discoveryOnlyRounds++;
-    } else {
+    } else if (input.progress === "none") {
       this.noProgressRounds++;
     }
 
@@ -267,8 +560,10 @@ export class LoopGuards {
         && this.noProgressRounds >= RUN_NO_PROGRESS_NUDGE_ROUNDS
         && !this.noProgressEpisodeNudged) {
       this.noProgressEpisodeNudged = true;
-      this.noProgressNudgeSent = true;
-      nudge = { kind: "no_progress", rounds: this.noProgressRounds };
+      if (!input.suppressNoProgressNudge) {
+        this.noProgressNudgeSent = true;
+        nudge = { kind: "no_progress", rounds: this.noProgressRounds };
+      }
     } else if (!input.freshEpisode
         && input.progress === "discovery"
         && this.discoveryOnlyRounds >= RUN_DISCOVERY_NUDGE_ROUNDS
@@ -279,10 +574,7 @@ export class LoopGuards {
     }
 
     let stop: ProgressGovernorOutcome["stop"] = null;
-    if (this.noProgressRounds >= RUN_NO_PROGRESS_STOP_ROUNDS) {
-      this.noProgressStopped = true;
-      stop = { kind: "no_progress", stalledRounds: this.noProgressRounds };
-    } else if (this.discoveryOnlyRounds >= RUN_DISCOVERY_STOP_ROUNDS) {
+    if (this.discoveryOnlyRounds >= RUN_DISCOVERY_STOP_ROUNDS) {
       this.discoveryStallStopped = true;
       stop = { kind: "discovery", stalledRounds: this.discoveryOnlyRounds };
     }

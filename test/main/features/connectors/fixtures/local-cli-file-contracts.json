@@ -1,0 +1,427 @@
+{
+  "versions": {
+    "lark": "1.0.93",
+    "wecom": "1.2.0",
+    "dingtalk": "1.0.61"
+  },
+  "contracts": {
+    "lark-upload": {
+      "name": "im files create",
+      "description": "上传文件。Identity: supports `user` and `bot`; user identity requires `im:resource` scope on the UAT",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "data",
+          "file"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "carrier": "--data",
+            "required": [
+              "file_name",
+              "file_type"
+            ],
+            "properties": {
+              "duration": {
+                "type": "integer",
+                "description": "文件的时长（视频、音频），单位：毫秒。不传值时无法显示文件的具体时长",
+                "example": 3000
+              },
+              "file_name": {
+                "type": "string",
+                "description": "带后缀的文件名",
+                "example": "测试视频.mp4"
+              },
+              "file_type": {
+                "type": "string",
+                "description": "待上传的文件类型",
+                "enum": [
+                  "opus",
+                  "mp4",
+                  "pdf",
+                  "doc",
+                  "xls",
+                  "ppt",
+                  "stream"
+                ],
+                "enumDescriptions": [
+                  "OPUS 音频文件。其他格式的音频文件，请转为 OPUS 格式后上传。可使用 ffmpeg 转换格式：`ffmpeg -i  SourceFile.mp3 -acodec libopus -ac 1 -ar 16000 TargetFile.opus`",
+                  "MP4 格式视频文件",
+                  "PDF 格式文件",
+                  "DOC 格式文件",
+                  "XLS 格式文件",
+                  "PPT 格式文件",
+                  "stream 格式文件。若上传文件不属于以上枚举类型，可以使用 stream 格式"
+                ],
+                "example": "mp4"
+              }
+            }
+          },
+          "file": {
+            "type": "object",
+            "description": "Binary file uploads. Each property is a file field with format:binary; CLI maps each to --file <key>=<path>.",
+            "carrier": "--file",
+            "required": [
+              "file"
+            ],
+            "properties": {
+              "file": {
+                "type": "string",
+                "description": "文件内容，具体的传值方式可参考请求体示例。; 注意：文件大小不得超过 30 MB，且不允许上传空文件",
+                "example": "二进制文件",
+                "format": "binary"
+              }
+            }
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "file_key": {
+            "type": "string",
+            "description": "文件的 Key",
+            "example": "file_456a92d6-c6ea-4de4-ac3f-7afcf44ac78g"
+          }
+        }
+      },
+      "_meta": {
+        "envelope_version": "1.0",
+        "scopes": [
+          "im:resource:upload",
+          "im:resource"
+        ],
+        "required_scopes": [],
+        "access_tokens": [
+          "bot",
+          "user"
+        ],
+        "danger": true,
+        "risk": "write",
+        "doc_url": "https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/file/create"
+      }
+    },
+    "lark-media-help": "Insert a local image or file at the end of a Lark document (4-step orchestration + auto-rollback)\n\nUsage:\n  lark-cli docs +media-insert [flags]\n\nFlags:\n      --align string       alignment: left | center | right\n      --as string          identity type: user | bot\n      --caption string     image caption text\n      --doc string         document URL or document_id\n      --dry-run            print request without executing\n      --file string        local file path (files > 20MB use multipart upload automatically)\n      --file-view string   file block rendering: card (default) | preview | inline; only applies when --type=file. preview renders audio/video as an inline player\n      --format string      output format: json (default) | pretty | table | ndjson | csv (default \"json\")\n      --from-clipboard     read image from system clipboard instead of a local file (macOS/Windows built-in; Linux requires xclip, xsel or wl-paste)\n      --height int         image display height in pixels (only for --type=image); if --width is omitted it is auto-computed from the source image aspect ratio\n  -h, --help               help for +media-insert\n  -q, --jq string          jq expression to filter JSON output\n      --json               shorthand for --format json\n      --type string        type: image | file (default \"image\")\n      --width int          image display width in pixels (only for --type=image); if --height is omitted it is auto-computed from the source image aspect ratio\n\nRisk: write\n",
+    "wecom-upload": {
+      "method": "media.upload",
+      "description": "上传媒体文件，返回 media_id",
+      "request": {
+        "$ref": "UploadFileReq"
+      },
+      "response": {
+        "$ref": "UploadFileRsp"
+      },
+      "schemas": {
+        "UploadFileReq": {
+          "type": "object",
+          "description": "表单字段 type/md5 由框架自动从 form-data 表单字段中填充",
+          "properties": {
+            "file_path": {
+              "type": "string",
+              "description": "上传文件的二进制数据，框架自动从 form-data 中提取",
+              "x-wecom-octet-stream": true
+            },
+            "type": {
+              "type": "string",
+              "description": "媒体类型（image/voice/video/file），从 form-data 表单字段获取",
+              "enum": [
+                "image",
+                "voice",
+                "file",
+                "video"
+              ]
+            }
+          }
+        },
+        "UploadFileRsp": {
+          "type": "object",
+          "description": "上传响应（CLI-Wrap 模式下框架自动序列化到 OpenClawHttpCallRsp.result）",
+          "properties": {
+            "created_at": {
+              "type": "string",
+              "description": "创建时间，格式 YYYY-MM-DD HH:MM:SS"
+            },
+            "media_id": {
+              "type": "string",
+              "description": "上传后的 media_id"
+            },
+            "type": {
+              "type": "string",
+              "description": "媒体类型（image/voice/video/file）",
+              "enum": [
+                "image",
+                "voice",
+                "file",
+                "video"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "wecom-send": {
+      "method": "message.aibot.send",
+      "description": "以智能机器人身份向指定单聊/群聊会话发送消息，支持 markdown/图片/文件/语音/视频",
+      "request": {
+        "$ref": "SendAibotMessageReq"
+      },
+      "response": {
+        "$ref": "SendAibotMessageRsp"
+      },
+      "schemas": {
+        "SendAibotMessageReq": {
+          "type": "object",
+          "properties": {
+            "chat_id": {
+              "type": "string",
+              "description": "会话 ID：单聊传接收成员的 userid，群聊传群会话 ID，由框架解密为 {id, type}"
+            },
+            "file": {
+              "type": "object",
+              "$ref": "AibotFileContent",
+              "description": "文件消息内容，msg_type=file 时必填；不传则请求失败"
+            },
+            "image": {
+              "type": "object",
+              "$ref": "AibotImageContent",
+              "description": "图片消息内容，msg_type=image 时必填；不传则请求失败"
+            },
+            "markdown": {
+              "type": "object",
+              "$ref": "AibotMarkdownContent",
+              "description": "markdown 消息内容，msg_type=markdown 时必填；不传则请求失败"
+            },
+            "msg_type": {
+              "type": "string",
+              "description": "消息类型：markdown（markdown 文本）、image（图片）、file（文件）、voice（语音）、video（视频）",
+              "enum": [
+                "markdown",
+                "image",
+                "file",
+                "voice",
+                "video"
+              ]
+            },
+            "video": {
+              "type": "object",
+              "$ref": "AibotVideoContent",
+              "description": "视频消息内容，msg_type=video 时必填；不传则请求失败"
+            },
+            "voice": {
+              "type": "object",
+              "$ref": "AibotVoiceContent",
+              "description": "语音消息内容，msg_type=voice 时必填；不传则请求失败"
+            }
+          },
+          "required": [
+            "chat_id",
+            "msg_type"
+          ]
+        },
+        "AibotFileContent": {
+          "type": "object",
+          "description": "机器人文件消息内容",
+          "properties": {
+            "media_id": {
+              "type": "string",
+              "description": "文件 media_id，由 file_upload 接口以 type=file 上传获得；文件名取上传时的原始文件名"
+            }
+          },
+          "required": [
+            "media_id"
+          ]
+        },
+        "AibotImageContent": {
+          "type": "object",
+          "description": "机器人图片消息内容",
+          "properties": {
+            "media_id": {
+              "type": "string",
+              "description": "图片 media_id，由 file_upload 接口以 type=image 上传获得"
+            }
+          },
+          "required": [
+            "media_id"
+          ]
+        },
+        "AibotVideoContent": {
+          "type": "object",
+          "description": "机器人视频消息内容",
+          "properties": {
+            "description": {
+              "type": "string",
+              "description": "视频描述；不传则不展示描述",
+              "maxLength": 512
+            },
+            "media_id": {
+              "type": "string",
+              "description": "视频 media_id，由 file_upload 接口以 type=video 上传获得"
+            },
+            "title": {
+              "type": "string",
+              "description": "视频标题；不传则使用上传时的原始文件名",
+              "maxLength": 128
+            }
+          },
+          "required": [
+            "media_id"
+          ]
+        },
+        "AibotVoiceContent": {
+          "type": "object",
+          "description": "机器人语音消息内容",
+          "properties": {
+            "media_id": {
+              "type": "string",
+              "description": "语音 media_id，由 file_upload 接口以 type=voice 上传获得，仅支持 AMR 格式"
+            }
+          },
+          "required": [
+            "media_id"
+          ]
+        },
+        "SendAibotMessageRsp": {
+          "type": "object",
+          "description": "发送结果由框架外壳的 errcode / errmsg 表达，但需要额外返回一个结果",
+          "properties": {
+            "success": {
+              "type": "boolean",
+              "description": "是否成功"
+            }
+          }
+        },
+        "AibotMarkdownContent": {
+          "type": "object",
+          "description": "机器人 markdown 消息内容",
+          "properties": {
+            "content": {
+              "type": "string",
+              "description": "markdown 正文，最长 20480 字节",
+              "minLength": 1,
+              "maxLength": 20480
+            }
+          },
+          "required": [
+            "content"
+          ]
+        }
+      }
+    },
+    "dingtalk-chart": {
+      "agent_summary": "创建浮动图表。",
+      "availability": "available",
+      "avoid_when": [
+        "更新已有图表用 chart update；删除用 chart delete；AI 表格图表走 aitable"
+      ],
+      "canonical_path": "sheet.chart_create",
+      "cli_path": "sheet chart create",
+      "confirmation": "not_required",
+      "description": "在钉钉电子表格的指定工作表中创建一个浮动图表。\n\n--properties 为 JSON 格式，包含 position（锚点位置）、dimensions（尺寸）、chart（图表配置）三个必填字段，\n以及可选的 offset（偏移量）。支持 stdin heredoc 和 @file 两种传入方式。\n\nchart.type 支持: column（柱形图）、bar（条形图）、columnStacked（堆积柱形图）、barStacked（堆积条形图）、\nline（折线图）、lineStacked（堆积折线图）、area（面积图）、areaStacked（堆积面积图）、\nareaPercentStacked（百分比堆积面积图）、pie（饼图）、doughnut（环形图）、scatter（散点图）、\nradar（雷达图）。\nchart.series[].value / chart.series[].name / chart.category 使用 A1 区域表示法（如 \"A2:B10\"），\n不指定 sheet 前缀时默认使用 --sheet-id 的值。\nposition.col 使用列字母表示法（如 \"A\"、\"AA\"），不支持数字形式。\n\n创建成功后返回新图表的完整信息，包含系统分配的 chart-id。",
+      "effect": "write",
+      "examples": [
+        "dws sheet chart create --node NODE_ID --sheet-id SHEET_ID --properties '{\"chartType\":\"bar\",\"range\":\"A1:B10\"}'"
+      ],
+      "idempotency": "unknown",
+      "interface_mode": "composite",
+      "interface_reason": "Reviewed unpinned remote adapter: this executable CLI wrapper calls a remote helper that is absent from the pinned MCP metadata snapshot; no single pinned semantically equivalent interface_ref can represent the command.",
+      "parameters": {
+        "node": {
+          "description": "表格文档 ID 或 URL (必填)",
+          "required": true,
+          "type": "string"
+        },
+        "properties": {
+          "description": "图表完整配置 JSON (必填，含 position/dimensions/chart)",
+          "example": "{\"position\":{\"row\":0,\"col\":\"A\"},\"dimensions\":{\"width\":600,\"height\":400},\"chart\":{\"type\":\"column\",\"series\":[{\"value\":[\"B2:B10\"]}],\"category\":[\"A2:A10\"]}}",
+          "format": "json",
+          "required": true,
+          "type": "string"
+        },
+        "sheet-id": {
+          "description": "工作表 ID (必填)",
+          "required": true,
+          "type": "string"
+        }
+      },
+      "risk": "medium",
+      "use_when": [
+        "需要在电子表格工作表上新建柱状/折线等浮动图表时"
+      ]
+    },
+    "dingtalk-upload": {
+      "agent_summary": "上传本地文件到钉盘或文档空间，或按节点 ID 确认覆盖已有文件",
+      "availability": "available",
+      "avoid_when": [
+        "常规场景不要拆成 upload-info + 手动 PUT + commit；仅自定义流式上传才用三步",
+        "要把文件作为文档正文附件插入改用 dws doc media insert",
+        "用户明确说文档空间且走 doc 兼容入口时可用 dws doc upload，默认仍推荐本命令",
+        "用户没有明确同意替换目标文件时不要使用 --node；新建上传应使用 --folder 或目标根目录"
+      ],
+      "canonical_path": "drive.upload",
+      "cli_path": "drive upload",
+      "confirmation": "not_required",
+      "description": "将本地文件上传（三步自动完成）。\n\n路由规则:\n  默认（无 --workspace）  → 上传到钉盘（我的文件或指定空间）\n  --workspace <id>        → 上传到文档空间/知识库\n\n流程:\n  1. 获取 OSS 上传凭证\n  2. HTTP PUT 上传文件二进制到 OSS\n  3. 提交文件入库\n\n上传位置: --folder 指定父目录，不传则上传到空间根目录。",
+      "dry_run": {
+        "preview_kind": "plan"
+      },
+      "effect": "write",
+      "examples": [
+        "dws drive upload --file ./report.pdf --format json",
+        "dws drive upload --file ./README.md --node <dentryUuid> --format json"
+      ],
+      "idempotency": "unknown",
+      "interface_mode": "composite",
+      "interface_reason": "命令包含多个 RPC、条件分派或本地 HTTP/文件步骤，不能绑定为单一 interface_ref",
+      "parameters": {
+        "convert": {
+          "description": "是否转换为钉钉在线文档 (仅文档空间上传时生效)",
+          "required": false,
+          "type": "boolean"
+        },
+        "file": {
+          "description": "本地文件路径 (必填)",
+          "required": true,
+          "type": "string"
+        },
+        "file-name": {
+          "description": "文件显示名称 (默认使用文件名)",
+          "required": false,
+          "type": "string"
+        },
+        "folder": {
+          "description": "父节点 ID，不传则上传到空间根目录 (可选，与 --node 互斥)",
+          "required": false,
+          "type": "string"
+        },
+        "mime-type": {
+          "description": "文件 MIME 类型，不传则自动推断 (可选)",
+          "required": false,
+          "type": "string"
+        },
+        "node": {
+          "description": "覆盖目标文件 ID，传入即覆盖已有文件（与 --folder 互斥）(可选)",
+          "required": false,
+          "type": "string"
+        },
+        "space-id": {
+          "description": "目标钉盘空间 ID，不传则使用「我的文件」 (可选)",
+          "required": false,
+          "type": "string"
+        },
+        "workspace": {
+          "description": "目标知识库 ID，传入时路由到文档空间上传 (可选)",
+          "required": false,
+          "type": "string"
+        }
+      },
+      "risk": "medium",
+      "use_when": [
+        "用户要把本地文件上传到钉盘/我的文件（首选一条命令自动完成凭证+PUT+提交）时",
+        "上传到知识库/文档空间时加 --workspace；需要转在线文档时加 --convert",
+        "用户明确要求用本地文件替换已有钉盘/文档空间文件时传 --node；该模式会覆盖远端内容并要求确认"
+      ]
+    },
+    "lark-array-help": "Upload one or more local files and append the returned file_token values to a Base attachment cell\n\nUsage:\n  lark-cli base +record-upload-attachment [flags]\n\nFlags:\n      --as string           identity type: user | bot\n      --base-token string   base token\n      --dry-run             print request without executing\n      --field-id string     field ID or name\n      --file stringArray    local file path; repeat to append multiple attachments in one cell; max 50 files, max 2GB each; files > 20MB use multipart upload automatically\n      --format string       output format: json (default) | pretty | table | ndjson | csv (default \"json\")\n  -h, --help                help for +record-upload-attachment\n  -q, --jq string           jq expression to filter JSON output\n      --json                shorthand for --format json\n      --record-id string    record ID\n      --table-id string     table ID (must start with tbl if ID) or name\n\nRisk: write\n\nTips:\n    • Example: lark-cli base +record-upload-attachment --base-token <base_token> --table-id <table_id> --record-id <record_id> --field-id <attachment_field_id> --file ./report.pdf\n    • Repeat --file to append multiple attachments: --file ./report.pdf --file ./screenshot.png\n    • Reuse returned file_token values for download/remove\n"
+  }
+}

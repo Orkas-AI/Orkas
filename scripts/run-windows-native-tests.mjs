@@ -35,6 +35,16 @@ run('powershell.exe', [
 });
 
 run(process.execPath, [
+  resolve(pcRoot, 'test', 'windows', 'windows-local-cli.integration.mjs'),
+], {
+  cwd: pcRoot,
+  env: process.env,
+  stdio: 'inherit',
+  timeout: 25 * 60_000,
+  windowsHide: true,
+});
+
+run(process.execPath, [
   runner,
   'run',
   '--maxWorkers=1',

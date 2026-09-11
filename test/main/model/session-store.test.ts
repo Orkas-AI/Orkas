@@ -165,6 +165,41 @@ describe('session-store.sessionFileFor', () => {
   });
 });
 
+describe('session-store.evictEphemeralSession (post-run cache eviction)', () => {
+  it('drops cached one-shot kinds but keeps conversation-backed kinds', async () => {
+    const store = await import('../../../src/main/model/core-agent/session-store');
+    // Seed the cache with one ephemeral and one resumable session.
+    await store.getSession('anon-evict001');
+    await store.getSession('gconv-evict001');
+    expect(store._cacheHas('anon-evict001')).toBe(true);
+    expect(store._cacheHas('gconv-evict001')).toBe(true);
+
+    // Ephemeral kind → evicted; conversation-backed kind → guarded no-op even
+    // when asked, since its cached instance is the cross-turn source of truth.
+    store.evictEphemeralSession(uid, 'anon-evict001');
+    store.evictEphemeralSession(uid, 'gconv-evict001');
+    expect(store._cacheHas('anon-evict001')).toBe(false);
+    expect(store._cacheHas('gconv-evict001')).toBe(true);
+  });
+
+  it('covers every ephemeral kind and tolerates non-cached ids', async () => {
+    const store = await import('../../../src/main/model/core-agent/session-store');
+    for (const id of [
+      'anon-e2',
+      'gworker-cid-e2',
+      'reflect-e2',
+      'extract-img-e2',
+    ]) {
+      await store.getSession(id);
+      expect(store._cacheHas(id), id).toBe(true);
+      store.evictEphemeralSession(uid, id);
+      expect(store._cacheHas(id), id).toBe(false);
+      // Second call on an already-evicted id is a no-op, not an error.
+      expect(() => store.evictEphemeralSession(uid, id)).not.toThrow();
+    }
+  });
+});
+
 // Per-agent cross-session-memory eligibility (pure helpers — no workspace/IO).
 describe('memoryScopeForSession (per-agent memory eligibility)', () => {
   it('parses the session kind anchor', async () => {
@@ -199,17 +234,15 @@ describe('memoryScopeForSession (per-agent memory eligibility)', () => {
 });
 
 describe('metacognitionAllowedForSession (write eligibility)', () => {
-  it('allows sessions that also receive the metacognition block', async () => {
+  it('keeps ordinary task sessions read-only even when they receive the metacognition block', async () => {
     const { metacognitionAllowedForSession } = await import('../../../src/main/model/core-agent/session-store');
-    // Read and write must travel together: revising a self-assessment the
-    // session cannot see is a blind write.
-    expect(metacognitionAllowedForSession('gconv-abc', '')).toBe(true);
-    expect(metacognitionAllowedForSession('gmember-cid-video-studio', 'video-studio')).toBe(true);
-    expect(metacognitionAllowedForSession('gworker-x', 'seo-geo')).toBe(true);
-    expect(metacognitionAllowedForSession('cli-x', 'video-studio')).toBe(true);
+    expect(metacognitionAllowedForSession('gconv-abc', '')).toBe(false);
+    expect(metacognitionAllowedForSession('gmember-cid-video-studio', 'video-studio')).toBe(false);
+    expect(metacognitionAllowedForSession('gworker-x', 'seo-geo')).toBe(false);
+    expect(metacognitionAllowedForSession('cli-x', 'video-studio')).toBe(false);
   });
 
-  it('allows reflection as the one deliberate write-only session', async () => {
+  it('allows reflection as the only metacognition write session', async () => {
     const { metacognitionAllowedForSession } = await import('../../../src/main/model/core-agent/session-store');
     // Persisting the assessment is the point of the session; the current
     // content reaches it through the review prompt, not the system block.
@@ -228,7 +261,7 @@ describe('metacognitionAllowedForSession (write eligibility)', () => {
     }
     // Even with an agent id in hand, authoring sessions stay out.
     expect(metacognitionAllowedForSession('agent-x', 'video-studio')).toBe(false);
-    // A malformed worker without an agent id has no scope to write into.
+    // A malformed worker without an agent id remains disallowed as well.
     expect(metacognitionAllowedForSession('gmember-cid-x', '')).toBe(false);
   });
 });

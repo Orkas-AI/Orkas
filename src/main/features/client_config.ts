@@ -532,6 +532,41 @@ export interface GoogleConnectorsConfig {
   gmail: ConnectorSwitchState;
 }
 
+export interface ServerComposioToolConfig {
+  slug: string;
+  name?: string;
+  description?: string;
+  input_schema?: Record<string, unknown>;
+  policy?: {
+    risk: 'R' | 'W' | 'H' | 'D';
+    confirmation: 'none' | 'preview' | 'fresh' | 'destructive';
+    idempotency: 'required' | 'when_supported' | 'not_applicable';
+    max_batch_size: number;
+    sensitive_fields: string[];
+    sensitive_operation?: string;
+  };
+}
+
+export interface ServerComposioConnectorConfig {
+  id: string;
+  display_name: string;
+  icon_svg?: string;
+  category: 'developer' | 'productivity' | 'communication' | 'search' | 'data' | 'commerce';
+  description_zh: string;
+  description_en: string;
+  description_ja?: string;
+  description_pt?: string;
+  requires_credits: true;
+  auth_mode: 'composio';
+  composio: {
+    toolkit: string;
+    auth_config_id: string;
+    tools?: ServerComposioToolConfig[];
+  };
+  transport_template: null;
+  usage_metering: { provider: 'composio'; credits_milli_per_call: number };
+}
+
 export interface AppUpdatePolicyConfig {
   min_version: string;
 }
@@ -779,6 +814,116 @@ function mergeGoogleConnectorsConfig(baseRaw: unknown, overrideRaw: unknown): Go
   };
 }
 
+const CONNECTOR_CATEGORIES = new Set([
+  'developer', 'productivity', 'communication', 'search', 'data', 'commerce',
+]);
+
+function normalizeComposioToolConfig(raw: unknown): ServerComposioToolConfig | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const slug = typeof r.slug === 'string' ? r.slug.trim() : '';
+  if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(slug)) return null;
+  const name = typeof r.name === 'string' && r.name.trim() ? r.name.trim() : undefined;
+  const description = typeof r.description === 'string' && r.description.trim() ? r.description.trim() : undefined;
+  const inputSchema = r.input_schema && typeof r.input_schema === 'object' && !Array.isArray(r.input_schema)
+    ? r.input_schema as Record<string, unknown>
+    : undefined;
+  const rawPolicy = r.policy && typeof r.policy === 'object' && !Array.isArray(r.policy)
+    ? r.policy as Record<string, unknown>
+    : null;
+  const risk = String(rawPolicy?.risk || '') as 'R' | 'W' | 'H' | 'D';
+  const confirmation = String(rawPolicy?.confirmation || '') as 'none' | 'preview' | 'fresh' | 'destructive';
+  const idempotency = String(rawPolicy?.idempotency || '') as 'required' | 'when_supported' | 'not_applicable';
+  const sensitiveFields = Array.isArray(rawPolicy?.sensitive_fields)
+    ? rawPolicy.sensitive_fields.filter((field): field is string => typeof field === 'string' && !!field.trim())
+    : [];
+  const hasPolicy = !!rawPolicy
+    && ['R', 'W', 'H', 'D'].includes(risk)
+    && ['none', 'preview', 'fresh', 'destructive'].includes(confirmation)
+    && ['required', 'when_supported', 'not_applicable'].includes(idempotency)
+    && typeof rawPolicy.max_batch_size === 'number'
+    && Number.isInteger(rawPolicy.max_batch_size)
+    && rawPolicy.max_batch_size > 0
+    && sensitiveFields.length === (Array.isArray(rawPolicy.sensitive_fields) ? rawPolicy.sensitive_fields.length : -1);
+  return {
+    slug,
+    ...(name ? { name } : {}),
+    ...(description ? { description } : {}),
+    ...(inputSchema ? { input_schema: inputSchema } : {}),
+    ...(hasPolicy ? {
+      policy: {
+        risk,
+        confirmation,
+        idempotency,
+        max_batch_size: rawPolicy!.max_batch_size as number,
+        sensitive_fields: sensitiveFields.map((field) => field.trim()),
+        ...(typeof rawPolicy?.sensitive_operation === 'string' && rawPolicy.sensitive_operation.trim()
+          ? { sensitive_operation: rawPolicy.sensitive_operation.trim() }
+          : {}),
+      },
+    } : {}),
+  };
+}
+
+function normalizeServerComposioConnector(raw: unknown): ServerComposioConnectorConfig | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const value = raw as Record<string, unknown>;
+  const id = typeof value.id === 'string' ? value.id.trim().toLowerCase() : '';
+  const category = typeof value.category === 'string' ? value.category.trim() : '';
+  if (!/^[a-z0-9][a-z0-9_-]{1,62}$/.test(id) || !CONNECTOR_CATEGORIES.has(category)) return null;
+  if (value.auth_mode !== 'composio') return null;
+  const composio = value.composio && typeof value.composio === 'object' && !Array.isArray(value.composio)
+    ? value.composio as Record<string, unknown>
+    : value;
+  const toolkit = typeof composio.toolkit === 'string' ? composio.toolkit.trim().toLowerCase() : '';
+  const authConfigId = typeof composio.auth_config_id === 'string' ? composio.auth_config_id.trim() : '';
+  if (!/^[a-z0-9][a-z0-9_-]{0,80}$/.test(toolkit) || !/^ac_[A-Za-z0-9_-]{6,}$/.test(authConfigId)) return null;
+  const metering = value.usage_metering as Record<string, unknown> | null | undefined;
+  const tariff = metering?.provider === 'composio' ? metering.credits_milli_per_call : undefined;
+  const toolsRaw = Array.isArray(composio.tools) ? composio.tools : [];
+  const tools = toolsRaw
+    .map((tool) => normalizeComposioToolConfig(tool))
+    .filter((tool): tool is ServerComposioToolConfig => !!tool);
+  return {
+    id,
+    display_name: typeof value.display_name === 'string' && value.display_name.trim()
+      ? value.display_name.trim()
+      : id,
+    ...(typeof value.icon_svg === 'string' && value.icon_svg.trim() ? { icon_svg: value.icon_svg.trim() } : {}),
+    category: category as ServerComposioConnectorConfig['category'],
+    description_zh: typeof value.description_zh === 'string' ? value.description_zh.trim() : '',
+    description_en: typeof value.description_en === 'string' ? value.description_en.trim() : '',
+    ...(typeof value.description_ja === 'string' ? { description_ja: value.description_ja.trim() } : {}),
+    ...(typeof value.description_pt === 'string' ? { description_pt: value.description_pt.trim() } : {}),
+    requires_credits: true,
+    auth_mode: 'composio',
+    composio: { toolkit, auth_config_id: authConfigId, ...(tools.length ? { tools } : {}) },
+    transport_template: null,
+    usage_metering: {
+      provider: 'composio',
+      credits_milli_per_call: typeof tariff === 'number' && Number.isSafeInteger(tariff) && tariff > 0
+        ? tariff : 420,
+    },
+  };
+}
+
+function normalizeServerComposioCatalog(raw: unknown): ServerComposioConnectorConfig[] {
+  if (!Array.isArray(raw)) return [];
+  const byId = new Map<string, ServerComposioConnectorConfig>();
+  for (const item of raw) {
+    const entry = normalizeServerComposioConnector(item);
+    if (entry) byId.set(entry.id, entry);
+  }
+  return Array.from(byId.values());
+}
+
+function mergeServerComposioCatalog(baseRaw: unknown, overrideRaw: unknown): ServerComposioConnectorConfig[] {
+  const byId = new Map<string, ServerComposioConnectorConfig>();
+  for (const entry of normalizeServerComposioCatalog(baseRaw)) byId.set(entry.id, entry);
+  for (const entry of normalizeServerComposioCatalog(overrideRaw)) byId.set(entry.id, entry);
+  return Array.from(byId.values());
+}
+
 function normalizeAppUpdatePolicyConfig(raw: unknown): Partial<AppUpdatePolicyConfig> {
   if (typeof raw === 'string') return { min_version: raw.trim() };
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
@@ -886,6 +1031,11 @@ clientConfig.registerDefault<GoogleConnectorsConfig>('google_connectors', DEFAUL
   merge: mergeGoogleConnectorsConfig,
 });
 
+clientConfig.registerDefault<ServerComposioConnectorConfig[]>('connectors.catalog', [], {
+  effect: 'immediate',
+  merge: mergeServerComposioCatalog,
+});
+
 clientConfig.registerDefault<boolean>('model.deepseek.enabled', true, {
   effect: 'immediate',
 });
@@ -943,6 +1093,10 @@ export function getGoogleConnectorsConfig(): GoogleConnectorsConfig {
     DEFAULT_GOOGLE_CONNECTORS_CONFIG,
     clientConfig.get('google_connectors', DEFAULT_GOOGLE_CONNECTORS_CONFIG),
   );
+}
+
+export function getServerConnectorCatalogConfig(): ServerComposioConnectorConfig[] {
+  return mergeServerComposioCatalog([], clientConfig.get('connectors.catalog', []));
 }
 
 export function isDeepSeekModelConfigEnabled(): boolean {

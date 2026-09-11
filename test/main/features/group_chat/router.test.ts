@@ -21,6 +21,31 @@ describe('group_chat router › parseMentions', () => {
     expect(parseMentions('@x, hello @y. and @z!')).toEqual(['x', 'y', 'z']);
   });
 
+  // CJK typing habit: no space before `@` ("…然后@PptMaker 做成…"). The CJK
+  // range is in the TOKEN class (CJK agent names) but must not act as a
+  // leading boundary blocker — that exact shape silently dropped the second
+  // mention on-device 2026-08-23 and the whole text went to one agent.
+  it('recognizes a mention directly after a CJK character (no space)', () => {
+    expect(parseMentions('写一篇介绍，然后@PptMaker 做成一份ppt文件', { names: ['PptMaker'] }))
+      .toEqual(['PptMaker']);
+    // Fallback class (no name list) behaves the same.
+    expect(parseMentions('先研究，再@Writer 总结')).toEqual(['Writer']);
+    // Rejected look-alikes: an ASCII word char before `@` is still an email
+    // shape, even inside CJK prose.
+    expect(parseMentions('邮件发到 user@example.com 即可')).toEqual([]);
+    expect(parseMentions('账号a@b也不算')).toEqual([]);
+  });
+
+  it.each([
+    '`@alice` then @bob review',
+    '``@alice `example` `` then @bob review',
+    '```ts\n@alice\n```\n@bob review',
+    '~~~xml\n@alice\n~~~\n@bob review',
+    '@bob review\n```\n@alice',
+  ])('only dispatches prose mentions when pasted content contains code: %s', (text) => {
+    expect(parseMentions(text)).toEqual(['bob']);
+  });
+
   it('returns [] on empty / non-string', () => {
     expect(parseMentions('')).toEqual([]);
   });
@@ -116,6 +141,41 @@ describe('group_chat router › resolveRecipients', () => {
     expect(r.hadExplicitMention).toBe(false);
   });
 
+  it('falls back to Commander for legacy multi-recipient defaults', () => {
+    const opts = { fromKind: 'user' as const, fromId: 'user', members,
+      activeRecipients: ['writer', 'commander'] };
+    expect(resolveRecipients({ ...opts, text: 'continue' }).to).toEqual(['commander']);
+    expect(resolveRecipients({ ...opts, text: '> @writer quoted\ncontinue' }).to).toEqual(['commander']);
+    expect(resolveRecipients({ ...opts, text: '@writer revise' }).to).toEqual(['writer']);
+    expect(resolveRecipients({ ...opts, text: 'done', fromKind: 'agent', fromId: 'writer' }).to).toEqual(['user']);
+  });
+
+  it.each([
+    ['check this', ['writer']],
+    ['  @commander check this', ['commander']],
+    ['check first @commander review', ['writer', 'commander']],
+    ['> @writer quoted\n @commander review', ['commander']],
+    ['@writer first @writer second', ['writer']],
+  ])('routes first-instruction ownership for %s', (text, expected) => {
+    expect(resolveRecipients({ fromKind: 'user', fromId: 'user', members, activeRecipient: 'writer', text }).to).toEqual(expected);
+  });
+
+  // Roster membership is a RECORD written at first dispatch, never a routing
+  // gate: a chip-selected agent has no roster row until it first runs, and
+  // gating on membership silently rerouted that first message to the
+  // commander ("给：Claude Code" answered by 指挥官, on-device 2026-08-23).
+  // The router therefore honors any non-reserved floor; the BUS owns
+  // validation against the enabled-agent registry and clears dead floors
+  // before calling in (bus e2e pins that half).
+  it('honors an off-roster floor — validation is the caller\'s, membership is not eligibility', () => {
+    const r = resolveRecipients({
+      fromKind: 'user', fromId: 'user', text: '你好', members,
+      activeRecipient: 'freshagent01',
+    });
+    expect(r.to).toEqual(['freshagent01']);
+    expect(r.hadExplicitMention).toBe(false);
+  });
+
   it('user explicit @commander overrides the floor (routes to commander)', () => {
     const r = resolveRecipients({
       fromKind: 'user', fromId: 'user', text: '@commander switch tasks', members,
@@ -134,12 +194,18 @@ describe('group_chat router › resolveRecipients', () => {
     expect(r.hadExplicitMention).toBe(true);
   });
 
-  it('floor agent no longer on the roster → falls back to [commander]', () => {
-    const r = resolveRecipients({
+  it('an absent/reserved floor falls back to [commander]', () => {
+    // Dead-floor protection (deleted/disabled agent) lives in the BUS's
+    // registry check now — it clears the floor before the router runs. The
+    // router's own fallback covers only "no floor at all" and the reserved
+    // ids, which are not agent routes.
+    expect(resolveRecipients({
       fromKind: 'user', fromId: 'user', text: 'still there?', members,
-      activeRecipient: 'ghost-agent-id',
-    });
-    expect(r.to).toEqual(['commander']);
+    }).to).toEqual(['commander']);
+    expect(resolveRecipients({
+      fromKind: 'user', fromId: 'user', text: 'still there?', members,
+      activeRecipient: 'commander',
+    }).to).toEqual(['commander']);
   });
 
   it('commander reply ignores the floor (commander/agent always → user)', () => {
@@ -403,5 +469,156 @@ describe('group_chat router › form encoding', () => {
     const fields = [{ id: 'q', label: 'Q', type: 'text' as const, default: '' }];
     expect(computeFormId('cid1', 'msg1', 'writer', fields))
       .toBe(computeFormId('cid1', 'msg1', 'writer', fields));
+  });
+});
+
+describe('group_chat router › segmentUserMentions (D9 §4.2.1)', () => {
+  // Fixture contract (repo rule: parser code needs accepted real shapes +
+  // rejected look-alikes). The segmenter is the deterministic core that
+  // retired same-text broadcast: a wrong split sends an agent another
+  // agent's instructions.
+  const IDS = { a: 'agent-aaa1', b: 'agent-bbb2', helper: 'agent-ccc3' };
+  const NAMES: Record<string, string> = { A: IDS.a, B: IDS.b, 'Writing Helper': IDS.helper, 写作助手: IDS.helper };
+  const opts = (recipientIds: string[] = Object.values(IDS)) => ({
+    tokenToId: (token: string) => NAMES[token] || null,
+    recipientIds: new Set(recipientIds),
+    names: Object.keys(NAMES),
+  });
+  const { segmentUserMentions } = require('../../../../src/main/features/group_chat/router');
+
+  it('assigns the first instruction to Commander and strips later routing tokens', () => {
+    const out = segmentUserMentions('明天上线前：@A 做a，输出到 docs/。@B 做b。', opts());
+    expect(out?.preamble).toBe('明天上线前：');
+    expect(out?.segments).toEqual([
+      { actorId: 'commander', instruction: '明天上线前：', group: 0 },
+      { actorId: IDS.a, instruction: '做a，输出到 docs/。', group: 1 },
+      { actorId: IDS.b, instruction: '做b。', group: 2 },
+    ]);
+  });
+
+  it('adjacent mentions share the following span (共同段) and the same group', () => {
+    const out = segmentUserMentions('@A @B 检查这份报告', opts());
+    expect(out?.segments).toEqual([
+      { actorId: IDS.a, instruction: '检查这份报告', group: 0 },
+      { actorId: IDS.b, instruction: '检查这份报告', group: 0 },
+    ]);
+  });
+
+  it('deduplicates an adjacent recipient group and skips Agents without descriptions', () => {
+    expect(segmentUserMentions('@A @A @B inspect', opts())?.segments).toEqual([
+      { actorId: IDS.a, instruction: 'inspect', group: 0 },
+      { actorId: IDS.b, instruction: 'inspect', group: 0 },
+    ]);
+    expect(segmentUserMentions('@A inspect @B', opts())?.segments).toEqual([
+      { actorId: IDS.a, instruction: 'inspect', group: 0 },
+    ]);
+    expect(segmentUserMentions('@A', opts())?.segments).toEqual([]);
+    expect(segmentUserMentions('@A @B ', opts())?.segments).toEqual([]);
+    expect(segmentUserMentions('> context\n@A', opts())?.segments).toEqual([]);
+  });
+
+  it('keeps literal code in the assigned instruction without dispatching its mentions', () => {
+    const text = '@A inspect `@B` and this example:\n```xml\n@B\n```\n@B verify';
+    expect(segmentUserMentions(text, opts())?.segments).toEqual([
+      { actorId: IDS.a, instruction: 'inspect `@B` and this example:\n```xml\n@B\n```', group: 0 },
+      { actorId: IDS.b, instruction: 'verify', group: 1 },
+    ]);
+  });
+
+  it('the same agent mentioned twice yields two ordered segments (no dedup)', () => {
+    const out = segmentUserMentions('@A first step @A second step', opts());
+    expect(out?.segments.map((s: any) => s.actorId)).toEqual([IDS.a, IDS.a]);
+    expect(out?.segments.map((s: any) => s.instruction)).toEqual(['first step', 'second step']);
+  });
+
+  it('matches multi-word and Chinese display names exactly', () => {
+    const out = segmentUserMentions('@Writing Helper polish the intro @写作助手 then the ending', opts());
+    expect(out?.segments.map((s: any) => s.actorId)).toEqual([IDS.helper, IDS.helper]);
+    expect(out?.segments[0].instruction).toBe('polish the intro');
+  });
+
+  it('does not copy the first instruction into an empty trailing segment', () => {
+    const out = segmentUserMentions('review the doc: @A rewrite it @B', opts());
+    expect(out?.segments).toEqual([
+      { actorId: 'commander', instruction: 'review the doc:', group: 0 },
+      { actorId: IDS.a, instruction: 'rewrite it', group: 1 },
+    ]);
+  });
+
+  // CJK prose puts no whitespace before `@` — the mention (and thus the
+  // second segment) must still open. This exact shape routed to ONE agent
+  // on-device 2026-08-23 ("…，然后@PptMaker 做成…" reached only the first
+  // mention's agent, with the second @ left as literal text).
+  it('a mention directly after a CJK character still opens a segment', () => {
+    const out = segmentUserMentions('@A 写一篇介绍，然后@B 做成一份ppt文件', opts());
+    expect(out?.segments).toEqual([
+      { actorId: IDS.a, instruction: '写一篇介绍，然后', group: 0 },
+      { actorId: IDS.b, instruction: '做成一份ppt文件', group: 1 },
+    ]);
+  });
+
+  // ── rejected look-alikes ────────────────────────────────────────────────
+
+  it('returns null for zero or one resolved mention (single-recipient path owns those)', () => {
+    expect(segmentUserMentions('just some text', opts())).toBeNull();
+    expect(segmentUserMentions('@A do the whole thing', opts())).toBeNull();
+    // Unresolvable tokens are not segment boundaries.
+    expect(segmentUserMentions('@A do it with @nobody', opts())).toBeNull();
+  });
+
+  it('mentions on blockquote lines never open segments', () => {
+    const out = segmentUserMentions('> quoted from @A earlier\n@A do a\n@B do b', opts());
+    expect(out?.segments.map((s: any) => s.actorId)).toEqual([IDS.a, IDS.b]);
+    // The quote line stays in the preamble text, not as its own segment.
+    expect(out?.preamble).toContain('quoted from @A earlier');
+  });
+
+  it('does not treat email-like tokens as mention boundaries', () => {
+    expect(segmentUserMentions('mail a@b and c@d then decide', opts())).toBeNull();
+  });
+
+  it('a mention resolving outside recipientIds is not a boundary', () => {
+    const out = segmentUserMentions('@A do a @B do b', opts([IDS.a]));
+    expect(out).toBeNull(); // only one span remains → single-recipient path
+  });
+
+  // ── D22 (user adjudication 2026-08-27): commander segments ────────────
+  // Commander participates only through an explicit mention; ordinary text
+  // before a mention stays shared context for the selected recipients.
+  const CMD = 'commander';
+  const d22opts = (recipientIds: string[] = Object.values(IDS)) => ({
+    ...opts(recipientIds),
+    tokenToId: (token: string) => NAMES[token]
+      || (token === '指挥官' || token.toLowerCase() === 'commander' ? CMD : null),
+    commanderId: CMD,
+  });
+
+  it('D22: an explicit commander mention opens its own segment instead of broadcasting', () => {
+    const out = segmentUserMentions('@指挥官 总结现状 @A 跑一遍测试', d22opts());
+    expect(out?.segments).toEqual([
+      { actorId: CMD, instruction: '总结现状', group: 0 },
+      { actorId: IDS.a, instruction: '跑一遍测试', group: 1 },
+    ]);
+  });
+
+  it.each(['commander', IDS.b])('assigns the unaddressed first instruction to the current %s', (defaultRecipient) => {
+    const out = segmentUserMentions('写一个登录页 @A 出这个页面的视觉稿', { ...d22opts(), defaultRecipient });
+    expect(out?.segments).toEqual([
+      { actorId: defaultRecipient, instruction: '写一个登录页', group: 0 },
+      { actorId: IDS.a, instruction: '出这个页面的视觉稿', group: 1 },
+    ]);
+  });
+
+  it('D22: a quote-only preamble stays shared context — no commander segment', () => {
+    const out = segmentUserMentions('> 引用的上下文\n@A 处理 @B 复核', d22opts());
+    expect(out?.segments).toEqual([
+      { actorId: IDS.a, instruction: '> 引用的上下文\n处理', group: 0 },
+      { actorId: IDS.b, instruction: '> 引用的上下文\n复核', group: 1 },
+    ]);
+  });
+
+  it('D22: a single mention with no substantive preamble keeps the single-recipient path', () => {
+    expect(segmentUserMentions('@A 单独做这件事', d22opts())).toBeNull();
+    expect(segmentUserMentions('> 只有引用\n@A 单独做', d22opts())).toBeNull();
   });
 });

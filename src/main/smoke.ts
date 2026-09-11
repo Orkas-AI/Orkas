@@ -40,13 +40,13 @@ async function section(name: string, fn: () => void | Promise<void>): Promise<vo
     await section('USERS_FILE at data root', () =>
       assert.strictEqual(paths.USERS_FILE, path.join(paths.WS_ROOT, 'users.json')));
     await section('userMarketplaceSkillsDir under local', () =>
-      assert.ok(paths.userMarketplaceSkillsDir('12345678').endsWith('/12345678/local/marketplace/skills')));
+      assert.strictEqual(paths.userMarketplaceSkillsDir('12345678'), path.join(paths.WS_ROOT, '12345678', 'local', 'marketplace', 'skills')));
     await section('userMarketplaceAgentsDir under local', () =>
-      assert.ok(paths.userMarketplaceAgentsDir('12345678').endsWith('/12345678/local/marketplace/agents')));
+      assert.strictEqual(paths.userMarketplaceAgentsDir('12345678'), path.join(paths.WS_ROOT, '12345678', 'local', 'marketplace', 'agents')));
     await section('userChatsDir in cloud', () =>
-      assert.ok(paths.userChatsDir('12345678').endsWith('/12345678/cloud/chats')));
+      assert.strictEqual(paths.userChatsDir('12345678'), path.join(paths.WS_ROOT, '12345678', 'cloud', 'chats')));
     await section('userAuthProfilesFile in local', () =>
-      assert.ok(paths.userAuthProfilesFile('12345678').endsWith('/12345678/local/config/auth-profiles.json')));
+      assert.strictEqual(paths.userAuthProfilesFile('12345678'), path.join(paths.WS_ROOT, '12345678', 'local', 'config', 'auth-profiles.json')));
 
     console.log('[smoke] storage');
     await section('nowIso matches YYYY-MM-DDTHH:MM:SS', () =>

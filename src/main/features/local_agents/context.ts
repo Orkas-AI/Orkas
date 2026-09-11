@@ -6,7 +6,7 @@
  * and the current task on every turn. This module keeps those regions distinct:
  *
  *   durableInstructions — low-churn agent/project/protocol guidance;
- *   turnPrompt          — only the current task and current-turn runtime data;
+ *   turnPrompt          — dynamic project/runtime data followed by the current task;
  *   recoveryContext     — bounded canonical context for a fresh session;
  *   incrementalContext  — bounded canonical delta for a resumed session.
  *
@@ -32,6 +32,14 @@ export interface CliContextPlan {
   version: 3;
   durableInstructions: string;
   durableHash: string;
+  /** Hash of the canonical Agent-memory block for resumable backends that
+   * support private Agent memory. The block itself remains dynamic turn
+   * context and is never synthesized when the store is empty. */
+  agentMemoryHash?: string;
+  /** Sorted fingerprints of the individual Agent-memory entries behind
+   * `agentMemoryHash`. A resumed session may keep running after appends;
+   * only a removed or edited entry it has already seen forces a reset. */
+  agentMemoryEntryHashes?: string[];
   turnPrompt: string;
   recoveryContext: string;
   incrementalContext: string;
@@ -66,14 +74,18 @@ export function fingerprintCliContext(value: string): string {
 
 export function buildCliDurableInstructions(input: {
   agentName: string;
+  intentRules?: string;
   workflow?: string;
   codingProtocol?: string;
-  projectInstructions?: string;
+  projectContext?: string;
   language: Lang;
 }): string {
   const blocks: string[] = [];
   const name = String(input.agentName || '').trim();
   if (name) blocks.push(`You are "${name}".`);
+
+  const intentRules = String(input.intentRules || '').trim();
+  if (intentRules) blocks.push(intentRules);
 
   const workflow = String(input.workflow || '').trim();
   if (workflow) blocks.push(`## Workflow\n\n${workflow}`);
@@ -81,8 +93,8 @@ export function buildCliDurableInstructions(input: {
   const codingProtocol = String(input.codingProtocol || '').trim();
   if (codingProtocol) blocks.push(codingProtocol);
 
-  const projectInstructions = String(input.projectInstructions || '').trim();
-  if (projectInstructions) blocks.push(projectInstructions);
+  const projectContext = String(input.projectContext || '').trim();
+  if (projectContext) blocks.push(projectContext);
 
   blocks.push(buildCompactCliLanguageInstruction(input.language));
   return blocks.filter(Boolean).join('\n\n');
@@ -90,10 +102,14 @@ export function buildCliDurableInstructions(input: {
 
 export function buildCliTurnPrompt(input: {
   task: string;
+  projectContext?: string;
   attachmentPaths?: string[];
   runtimeProtocol?: string;
 }): string {
   const blocks: string[] = [];
+  const projectContext = String(input.projectContext || '').trim();
+  if (projectContext) blocks.push(projectContext);
+
   const runtimeProtocol = String(input.runtimeProtocol || '').trim();
   if (runtimeProtocol) blocks.push(runtimeProtocol);
 
@@ -172,6 +188,8 @@ export function buildCliConversationContext(input: {
 
 export function createCliContextPlan(input: {
   durableInstructions: string;
+  agentMemoryHash?: string;
+  agentMemoryEntryHashes?: string[];
   turnPrompt: string;
   recoveryContext?: string;
   incrementalContext?: string;
@@ -182,6 +200,8 @@ export function createCliContextPlan(input: {
     version: 3,
     durableInstructions,
     durableHash: fingerprintCliContext(durableInstructions),
+    ...(input.agentMemoryHash ? { agentMemoryHash: input.agentMemoryHash } : {}),
+    ...(input.agentMemoryEntryHashes ? { agentMemoryEntryHashes: [...input.agentMemoryEntryHashes].sort() } : {}),
     turnPrompt: String(input.turnPrompt || '').trim(),
     recoveryContext: String(input.recoveryContext || '').trim(),
     incrementalContext: String(input.incrementalContext || '').trim(),

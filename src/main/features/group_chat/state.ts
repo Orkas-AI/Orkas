@@ -30,6 +30,9 @@ import {
   genId12, nowIso, readJson, writeJson, safeId,
 } from '../../storage';
 import { createLogger } from '../../logger';
+import { logErrorSummary, maskId } from '../../util/log-redact';
+
+import { readCodingDirectory, readCodingDirectoryFromStateFile, writeCodingDirectory, cloudConversationState } from '../local_agents/project-directory';
 
 const log = createLogger('group_chat.state');
 
@@ -92,6 +95,7 @@ export interface AgentHandoffAdmission {
   floorApplied: boolean;
   ledgerApplied: boolean;
   previousActiveRecipient?: string;
+  previousActiveRecipients?: string[];
   previousActiveRecipientSource?: StateFile['active_recipient_source'];
   previousLedger?: OrchestrationLedger;
 }
@@ -110,7 +114,7 @@ export interface StateFile {
    *  the directory or update this field. See `conv_workspace.ts` for the
    *  slug rules and the placeholder fallback. */
   workspace_dir?: string;
-  /** Project directory for coding-agent dispatches in
+  /** Device-local projection (never written to cloud state). Project directory for coding-agent dispatches in
    *  this conversation. Initialised on the first coding-agent turn from
    *  that agent's detail-page project-dir setting; missing setting =
    *  effective workspace path. Absolute path. Missing / empty → coding
@@ -124,6 +128,8 @@ export interface StateFile {
    *  picker (form-submit hook in `group_chat/index.ts`). Cleared
    *  whenever `coding_project_dir` is cleared. */
   coding_project_dir_explicit?: boolean;
+  /** Legacy selection without device provenance; never an execution root. */
+  coding_project_dir_pending?: string;
   /** Conversation-scoped absolute roots for file tools. Used by narrow
    *  system-created workflows such as sync-conflict resolution where the
    *  target file lives outside the active workspace. */
@@ -137,6 +143,11 @@ export interface StateFile {
    *  single source of truth for "who the user is talking to", mirrored to the
    *  renderer for free since `state_changed` carries the whole StateFile. */
   active_recipient?: string;
+  /** Monotonic choice generation; async handoffs must match their origin. */
+  active_recipient_revision?: number;
+  active_recipient_handoff_id?: string;
+  /** Legacy multi-recipient defaults are read as Commander and removed on write. */
+  active_recipients?: string[];
   /** Why the current floor was established. A direct user selection remains
    *  sticky after a normal external-CLI completion; a Commander hand-off may
    *  ask that Agent to return the floor when the handed-off interaction ends.
@@ -262,12 +273,36 @@ function ensureGroupDir(uid: string, cid: string, projectIdHint?: string | null)
   return d;
 }
 
+/** Per-Agent `visibility/` slices were derived copies of the canonical log;
+ *  the code that wrote and read them is gone, but existing conversations still
+ *  carry the directory (private data, never updated, still synced). Sweep it
+ *  once per process the first time a conversation's roster is read. */
+const _sweptLegacyVisibility = new Set<string>();
+
+function sweepLegacyVisibilityDir(uid: string, cid: string, groupDir: string): void {
+  const key = `${uid}\u0000${cid}`;
+  if (_sweptLegacyVisibility.has(key)) return;
+  _sweptLegacyVisibility.add(key);
+  const dir = path.join(groupDir, 'visibility');
+  if (!fs.existsSync(dir)) return;
+  void fsp.rm(dir, { recursive: true, force: true }).then(
+    () => log.info('legacy visibility slices removed', { cid: maskId(cid) }),
+    (err: unknown) => log.warn('legacy visibility sweep failed', { cid: maskId(cid), error: logErrorSummary(err) }),
+  );
+}
+
+export function _resetLegacyVisibilitySweepForTest(): void {
+  _sweptLegacyVisibility.clear();
+}
+
 export async function readMembers(
   uid: string,
   cid: string,
   projectIdHint?: string | null,
 ): Promise<MembersFile> {
-  const file = conversationLayout(uid, cid, projectIdHint).membersFile;
+  const layout = conversationLayout(uid, cid, projectIdHint);
+  sweepLegacyVisibilityDir(uid, cid, layout.groupDir);
+  const file = layout.membersFile;
   if (!fs.existsSync(file)) return { version: 1, actors: [] };
   try {
     const data: any = await readJson(file);
@@ -312,7 +347,7 @@ export async function addMember(
     const next: Actor = { ...actor, joined_at: nowIso() };
     members.actors.push(next);
     await writeMembers(uid, cid, members, projectIdHint);
-    log.info(`member-joined user=${uid} cid=${cid} actor=${actor.id} kind=${actor.kind}${actor.name ? ` name=${actor.name}` : ''}`);
+    log.info('member-joined', { uid: maskId(uid), cid: maskId(cid), actor: actor.id, kind: actor.kind });
     return true;
   });
 }
@@ -391,13 +426,20 @@ export async function renameAgentInMembers(
       log.warn(`write members failed user=${uid} cid=${cid}: ${(err as Error).message}`);
     }
   }
-  if (touched > 0) log.info(`renamed agent=${agentId} → "${newName}" in ${touched} conv(s) user=${uid}`);
+  if (touched > 0) log.info('renamed agent in members', { uid: maskId(uid), agent: agentId, conversations: touched });
   return touched;
 }
 
 // ── State IO ─────────────────────────────────────────────────────────────
 
-export async function readState(
+export async function readState(uid: string, cid: string, projectIdHint?: string | null): Promise<StateFile> {
+  const cloud = await readCloudState(uid, cid, projectIdHint);
+  return { ...cloudConversationState(cloud),
+    ...readCodingDirectoryFromStateFile(uid, cid, conversationLayout(uid, cid, projectIdHint).stateFile),
+  };
+}
+
+async function readCloudState(
   uid: string,
   cid: string,
   projectIdHint?: string | null,
@@ -410,8 +452,14 @@ export async function readState(
     const data: any = await readJson(file);
     if (data && typeof data === 'object') {
       const orchestrationLedger = _sanitizeOrchestrationLedger(data.orchestration_ledger);
+      const recipients = Array.isArray(data.active_recipients)
+        ? [...new Set<string>(data.active_recipients.filter((id: unknown) => (
+            typeof id === 'string' && safeId(id) && id !== USER_ID
+          )))] : [];
       return {
         version: 1,
+        ...(typeof data.active_recipient_handoff_id === 'string' ? { active_recipient_handoff_id: data.active_recipient_handoff_id } : {}),
+        active_recipient_revision: Number.isSafeInteger(data.active_recipient_revision) ? data.active_recipient_revision : 0,
         status: (data.status as GroupStatus) || 'idle',
         last_active_at: typeof data.last_active_at === 'string' ? data.last_active_at : nowIso(),
         in_flight: Array.isArray(data.in_flight) ? data.in_flight.filter((s: unknown) => typeof s === 'string') : [],
@@ -429,7 +477,7 @@ export async function readState(
               typeof s === 'string' && path.isAbsolute(s)
             )) }
           : {}),
-        ...(typeof data.active_recipient === 'string' && data.active_recipient
+        ...(recipients.length > 1 ? {} : typeof data.active_recipient === 'string' && data.active_recipient
           && data.active_recipient !== COMMANDER_ID
           ? {
               active_recipient: data.active_recipient,
@@ -471,7 +519,7 @@ export async function readState(
 
 async function writeStateRaw(uid: string, cid: string, s: StateFile): Promise<void> {
   ensureGroupDir(uid, cid);
-  await writeJson(conversationLayout(uid, cid).stateFile, s);
+  await writeJson(conversationLayout(uid, cid).stateFile, cloudConversationState(s));
 }
 
 // A compact local journal makes boot crash recovery proportional to the
@@ -637,12 +685,30 @@ export async function setActiveRecipient(
   cid: string,
   recipientId: string,
   source?: StateFile['active_recipient_source'],
+  expectedRevision?: number,
+  onApplied?: (state: StateFile) => void,
+): Promise<StateFile> {
+  return setActiveRecipients(uid, cid, [recipientId], source, expectedRevision, onApplied);
+}
+
+/** Persist a single default atomically; multi-recipient sends return to Commander. */
+export async function setActiveRecipients(
+  uid: string,
+  cid: string,
+  recipientIds: string[],
+  source?: StateFile['active_recipient_source'],
+  expectedRevision?: number,
+  onApplied?: (state: StateFile) => void,
 ): Promise<StateFile> {
   return _stateLock(uid, cid).runExclusive(async () => {
     const s = await readState(uid, cid);
+    if (expectedRevision !== undefined && (s.active_recipient_revision || 0) !== expectedRevision) return s;
+    const ids = [...new Set(recipientIds.filter((id) => id && id !== USER_ID))];
+    const recipientId = ids.length === 1 ? ids[0] : '';
     const next = (recipientId && recipientId !== COMMANDER_ID && recipientId !== USER_ID)
       ? recipientId : '';
     const previous = s.active_recipient || '';
+    delete s.active_recipients;
     if (next) {
       s.active_recipient = next;
       if (source) s.active_recipient_source = source;
@@ -651,8 +717,13 @@ export async function setActiveRecipient(
       delete s.active_recipient;
       delete s.active_recipient_source;
     }
+    if (source || previous !== next) {
+      s.active_recipient_revision = (s.active_recipient_revision || 0) + 1;
+      delete s.active_recipient_handoff_id;
+    }
     s.last_active_at = nowIso();
     await writeStateRaw(uid, cid, s);
+    onApplied?.(s);
     return s;
   });
 }
@@ -700,6 +771,7 @@ export async function beginAgentHandoff(
     ownerAgentId: string;
     ownerAgentName?: string;
     interactive: boolean;
+    expectedFloorRevision?: number;
     userGoal: string;
     handoffMessage: string;
     resumeInstruction?: string;
@@ -719,17 +791,24 @@ export async function beginAgentHandoff(
     const receipt: AgentHandoffAdmission = {
       token,
       ownerAgentId: params.ownerAgentId,
-      floorApplied: params.interactive,
+      floorApplied: params.interactive
+        && !s.active_recipient
+        && (params.expectedFloorRevision === undefined
+          || params.expectedFloorRevision === (s.active_recipient_revision || 0)),
       ledgerApplied: !!params.resumeInstruction?.trim(),
       ...(s.active_recipient ? { previousActiveRecipient: s.active_recipient } : {}),
+      ...(s.active_recipients ? { previousActiveRecipients: [...s.active_recipients] } : {}),
       ...(s.active_recipient_source
         ? { previousActiveRecipientSource: s.active_recipient_source }
         : {}),
       ...(previousLedger ? { previousLedger } : {}),
     };
-    if (params.interactive) {
+    if (receipt.floorApplied) {
+      delete s.active_recipients;
       s.active_recipient = params.ownerAgentId;
       s.active_recipient_source = 'commander_handoff';
+      s.active_recipient_handoff_id = token;
+      s.active_recipient_revision = (s.active_recipient_revision || 0) + 1;
     }
     const resumeInstruction = _cleanLedgerText(params.resumeInstruction || '');
     if (resumeInstruction) {
@@ -772,8 +851,15 @@ export async function rollbackAgentHandoff(
       receipt.floorApplied
       && s.active_recipient === receipt.ownerAgentId
       && s.active_recipient_source === 'commander_handoff'
+      && s.active_recipient_handoff_id === receipt.token
     ) {
-      if (receipt.previousActiveRecipient) {
+      delete s.active_recipient_handoff_id;
+      s.active_recipient_revision = (s.active_recipient_revision || 0) + 1;
+      if (receipt.previousActiveRecipients) {
+        s.active_recipients = [...receipt.previousActiveRecipients];
+        delete s.active_recipient;
+        s.active_recipient_source = 'user_selection';
+      } else if (receipt.previousActiveRecipient) {
         s.active_recipient = receipt.previousActiveRecipient;
         if (receipt.previousActiveRecipientSource) {
           s.active_recipient_source = receipt.previousActiveRecipientSource;
@@ -820,6 +906,8 @@ export async function clearOrchestrationForCancellation(
     if (s.active_recipient_source === 'commander_handoff') {
       delete s.active_recipient;
       delete s.active_recipient_source;
+      delete s.active_recipient_handoff_id;
+      s.active_recipient_revision = (s.active_recipient_revision || 0) + 1;
       changed = true;
     }
     if (changed) {
@@ -989,21 +1077,16 @@ export async function setWorkspaceDirOnce(uid: string, cid: string, dir: string)
  *  doesn't accidentally inherit a stale `true`. */
 export async function setCodingProjectDir(
   uid: string, cid: string, dir: string,
-  opts: { explicit: boolean },
+  opts: { explicit: boolean; needsConfirmation?: boolean },
 ): Promise<StateFile> {
   return _stateLock(uid, cid).runExclusive(async () => {
     const s = await readState(uid, cid);
     const trimmed = String(dir || '').trim();
-    if (trimmed) {
-      s.coding_project_dir = trimmed;
-      if (opts.explicit) s.coding_project_dir_explicit = true;
-      else delete s.coding_project_dir_explicit;
-    } else {
-      delete s.coding_project_dir;
-      delete s.coding_project_dir_explicit;
-    }
-    s.last_active_at = nowIso();
-    await writeStateRaw(uid, cid, s);
+    writeCodingDirectory(uid, cid, trimmed, opts.explicit, opts.needsConfirmation);
+    delete s.coding_project_dir;
+    delete s.coding_project_dir_explicit;
+    delete s.coding_project_dir_pending;
+    Object.assign(s, readCodingDirectory(uid, cid));
     return s;
   });
 }
@@ -1018,12 +1101,9 @@ export async function setCodingProjectDirOnce(
   return _stateLock(uid, cid).runExclusive(async () => {
     const s = await readState(uid, cid);
     const trimmed = String(dir || '').trim();
-    if (s.coding_project_dir || !trimmed) return { state: s, applied: false };
-    s.coding_project_dir = trimmed;
-    if (opts.explicit) s.coding_project_dir_explicit = true;
-    else delete s.coding_project_dir_explicit;
-    s.last_active_at = nowIso();
-    await writeStateRaw(uid, cid, s);
+    if (s.coding_project_dir || s.coding_project_dir_pending || !trimmed) return { state: s, applied: false };
+    writeCodingDirectory(uid, cid, trimmed, opts.explicit);
+    Object.assign(s, readCodingDirectory(uid, cid));
     return { state: s, applied: true };
   });
 }

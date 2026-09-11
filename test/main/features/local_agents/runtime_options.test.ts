@@ -243,6 +243,26 @@ describe('local_agents/runtime_options discovery parsing', () => {
 });
 
 describe('local_agents/runtime_options process boundary', () => {
+  it.each(['claude', 'codex', 'hermes', 'opencode', 'openclaw'] as const)(
+    'publishes the adapter-supported $cli permission levels even when discovery is unavailable',
+    async (cli) => {
+    const result = await getLocalCliRuntimeOptions({
+      type: cli,
+      path: null,
+      version: null,
+      available: false,
+      error: 'not_found',
+    }, process.cwd(), { force: true });
+
+    const expected = cli === 'openclaw'
+      ? ['inherit']
+      : (cli === 'opencode' ? ['full_access'] : ['inherit', 'ask', 'full_access']);
+    expect(result.permission_policies).toEqual(expected);
+    expect(result.can_select_permission).toBe(expected.length > 1);
+    expect(result.fixed_permission_policy).toBe(cli === 'opencode' ? 'full_access' : null);
+    expect(result.status).toBe('unavailable');
+  });
+
   it('reuses the bounded cache unless the caller explicitly refreshes it', async () => {
     const dir = makeTempDir();
     const counter = path.join(dir, 'counter.txt');
@@ -269,6 +289,9 @@ process.exit(2);
       can_select_model: true,
       can_select_thinking: true,
       thinking_kind: 'effort',
+      permission_policies: ['inherit', 'ask', 'full_access'],
+      can_select_permission: true,
+      fixed_permission_policy: null,
     });
     // This build answers no model list, so the documented aliases stand in.
     expect(first.models).toEqual([

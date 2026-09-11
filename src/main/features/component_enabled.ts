@@ -3,7 +3,8 @@
  * skills.
  *
  * Lives at `<uid>/cloud/config/component-enabled.json`, alongside
- * preferences.json and following the same cloud-sync policy.
+ * preferences.json and following the same cloud-sync policy. Local CLI connector
+ * overrides instead live in `<uid>/local/config/device-connector-enabled.json`.
  *
  * **Schema** (v1):
  * ```
@@ -43,8 +44,10 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import { userComponentEnabledFile } from '../paths';
+import { userComponentEnabledFile, userDeviceConnectorEnabledFile } from '../paths';
 import { createLogger } from '../logger';
+import { writeTextAtomicSync } from '../storage';
+import { connectorRecordsForScope, isDeviceLocalConnector, prepareDeviceLocalConnectorStorage } from './connectors/device-local';
 
 const log = createLogger('component-enabled');
 
@@ -86,8 +89,7 @@ function emptyFile(): ComponentEnabledFile {
 /** Read the per-user enabled-overrides file. Missing / corrupt → empty defaults.
  *  Old v1 files without a `connectors` field are auto-padded with `{}` (no migration needed —
  *  missing key = treat-as-enabled is the contract). */
-export function readEnabledMap(uid: string): ComponentEnabledFile {
-  const p = userComponentEnabledFile(uid);
+function readFile(p: string): ComponentEnabledFile {
   try {
     if (!fs.existsSync(p)) return emptyFile();
     const raw = fs.readFileSync(p, 'utf8');
@@ -104,6 +106,23 @@ export function readEnabledMap(uid: string): ComponentEnabledFile {
     log.warn(`read failed, using empty defaults: ${(err as Error).message}`);
     return emptyFile();
   }
+}
+
+export function readEnabledMap(uid: string): ComponentEnabledFile {
+  prepareDeviceLocalConnectorStorage(uid);
+  const cloud = readFile(userComponentEnabledFile(uid));
+  const local = readFile(userDeviceConnectorEnabledFile(uid));
+  return {
+    ...cloud,
+    connectors: { ...connectorRecordsForScope(cloud.connectors, false), ...connectorRecordsForScope(local.connectors, true) },
+    _item_updated_at: {
+      ...cloud._item_updated_at,
+      connectors: {
+        ...connectorRecordsForScope(cloud._item_updated_at?.connectors, false),
+        ...connectorRecordsForScope(local._item_updated_at?.connectors, true),
+      },
+    },
+  };
 }
 
 function sanitiseClocks(raw: unknown): ComponentEnabledFile['_item_updated_at'] {
@@ -154,12 +173,20 @@ function touchClock(
   file._item_updated_at = { ...clocks, [kind]: bucket };
 }
 
-function writeAtomic(uid: string, data: ComponentEnabledFile): void {
-  const p = userComponentEnabledFile(uid);
+function writeAtomic(uid: string, data: ComponentEnabledFile, local = false): void {
+  const p = local ? userDeviceConnectorEnabledFile(uid) : userComponentEnabledFile(uid);
+  const scoped: ComponentEnabledFile = {
+    ...data,
+    agents: local ? {} : data.agents,
+    skills: local ? {} : data.skills,
+    connectors: connectorRecordsForScope(data.connectors, local),
+    _item_updated_at: {
+      ...(local ? {} : data._item_updated_at),
+      connectors: connectorRecordsForScope(data._item_updated_at?.connectors, local),
+    },
+  };
   fs.mkdirSync(path.dirname(p), { recursive: true });
-  const tmp = `${p}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
-  fs.renameSync(tmp, p);
+  writeTextAtomicSync(p, JSON.stringify(scoped, null, 2), 'utf8');
 }
 
 /** Single resolver — used everywhere (`getSystemPromptBlock` / `_buildAgentsIndex` /
@@ -250,8 +277,9 @@ export function setConnectorEnabled(uid: string, connectorId: string, enabled: b
   if (enabled) delete next.connectors[connectorId];
   else next.connectors[connectorId] = false;
   touchClock(next, 'connectors', connectorId);
-  writeAtomic(uid, next);
-  _notifyDirty();
+  const local = isDeviceLocalConnector(connectorId);
+  writeAtomic(uid, next, local);
+  if (!local) _notifyDirty();
   log.info(`connector ${connectorId} → ${enabled ? 'enabled' : 'disabled'}`);
 }
 

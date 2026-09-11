@@ -69,6 +69,11 @@ import {
   createImageStudioTool,
   imageStudioStatePath,
 } from '../../../../src/main/model/core-agent/image-studio-tool';
+import {
+  beginImageStudioGeneration,
+  finishImageStudioGeneration,
+  imageGenerationControlStatePath,
+} from '../../../../src/main/features/image_production_control';
 
 const IMAGE_STUDIO_AGENT_ID = '814b61b027f0';
 const USER_ID = 'u-image-studio';
@@ -138,7 +143,7 @@ describe('image_studio tool', () => {
     const result = await tool.execute({ op: 'project.inspect', project_dir: projectDir }, { workingDir: root } as any);
     expect(result.isError).not.toBe(true);
     expect(result.content).toContain('"signature"');
-    expect(result.content).toContain('"route": "compose"');
+    expect(result.content).toContain('"route":"compose"');
   });
 
   it('does not attach visual evidence before deterministic project inspection passes', async () => {
@@ -320,6 +325,57 @@ describe('image_studio tool', () => {
     });
   });
 
+  it('returns every current manifest blocker and declares one complete validation scope', async () => {
+    const manifestPath = path.join(projectDir, 'image-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    manifest.references = [{
+      id: 'composition-source',
+      path: '/tmp/composition-source.png',
+      role: 'composition',
+      strength: 1,
+      required: false,
+      preserve: ['subject', 'crop', 'palette'],
+      may_change: [],
+      region_ids: [],
+    }];
+    manifest.reference_intent = {
+      mode: 'reproduce',
+      basis: 'user',
+      instructions: ['Reproduce the supplied composition exactly.'],
+      minimum_score: 90,
+    };
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+    const tool = createImageStudioTool({
+      userId: USER_ID,
+      turnId: 'validation-turn',
+      agentId: IMAGE_STUDIO_AGENT_ID,
+      extraRoots: [root],
+    });
+
+    const result = await tool.execute({
+      op: 'generation.quote',
+      project_dir: projectDir,
+      image_request_id: 'blocked-quote',
+    }, { workingDir: root } as any);
+
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse(result.content);
+    expect(parsed.inspection.blockers).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'E_MANIFEST_REFERENCE_PATH' }),
+      expect.objectContaining({ code: 'E_MANIFEST_REPRODUCE_REFERENCE_REQUIRED' }),
+    ]));
+    expect(result.failureContext).toMatchObject({
+      kind: 'deterministic_validation',
+      scope: expect.stringMatching(/^image_studio\.project:[0-9a-f]{32}$/),
+      complete: true,
+      issueCount: parsed.inspection.blockers.length,
+      issueCodes: expect.arrayContaining([
+        'E_MANIFEST_REFERENCE_PATH',
+        'E_MANIFEST_REPRODUCE_REFERENCE_REQUIRED',
+      ]),
+    });
+  });
+
   it('requires an exact generated-raster canvas before export without visual review', async () => {
     const generatedPath = path.join(projectDir, 'generated.png');
     fs.writeFileSync(generatedPath, electronImage.baseImage.toPNG());
@@ -407,6 +463,70 @@ describe('image_studio tool', () => {
     }, ctx);
     expect(exported.isError).not.toBe(true);
     expect(fs.existsSync(finalPath)).toBe(true);
+  });
+
+  it('resumes inspection from the current turn latest completed generation', async () => {
+    const manifestPath = path.join(projectDir, 'image-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    manifest.route = 'generate';
+    manifest.canvas = { width: 128, height: 128 };
+    manifest.generation_budget.max_calls = 1;
+    delete manifest.raster_source;
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+
+    const previousPath = path.join(projectDir, 'previous-turn.png');
+    const currentPath = path.join(projectDir, 'current-turn.png');
+    fs.writeFileSync(previousPath, electronImage.baseImage.toPNG());
+    fs.writeFileSync(currentPath, electronImage.baseImage.toPNG());
+    const stateAbsPath = imageGenerationControlStatePath(USER_ID, projectDir);
+    const previous = await beginImageStudioGeneration({
+      stateAbsPath,
+      projectDirAbs: projectDir,
+      requestId: 'previous-turn-image',
+      outputAbsPath: previousPath,
+      turnId: 'turn-previous',
+    });
+    await finishImageStudioGeneration({
+      stateAbsPath,
+      transactionId: previous.transaction.transaction_id,
+      ok: true,
+      outputPath: previousPath,
+    });
+    const current = await beginImageStudioGeneration({
+      stateAbsPath,
+      projectDirAbs: projectDir,
+      requestId: 'current-turn-image',
+      outputAbsPath: currentPath,
+      turnId: 'turn-current',
+    });
+    await finishImageStudioGeneration({
+      stateAbsPath,
+      transactionId: current.transaction.transaction_id,
+      ok: true,
+      outputPath: currentPath,
+    });
+
+    const tool = createImageStudioTool({
+      userId: USER_ID,
+      turnId: 'turn-current',
+      agentId: IMAGE_STUDIO_AGENT_ID,
+      extraRoots: [root],
+    });
+    const inspected = await tool.execute({
+      op: 'project.inspect',
+      project_dir: projectDir,
+    }, { workingDir: root } as any);
+
+    expect(inspected.isError).not.toBe(true);
+    expect(JSON.parse(inspected.content)).toMatchObject({
+      ok: true,
+      inspection: { source_path: currentPath },
+      current_candidate: {
+        status: 'validated',
+        path: currentPath,
+      },
+      recovery_context: { next_operation: 'project.export' },
+    });
   });
 
   it('keeps technical raster validation fail-closed without falling back to visual review', async () => {
@@ -555,14 +675,13 @@ describe('image_studio tool', () => {
     expect(inspected.isError).not.toBe(true);
     expect(inspected.images).toBeUndefined();
     expect(inspected.content).not.toContain('visual_evidence');
-    expect(JSON.parse(inspected.content)).toMatchObject({
-      inspection: {
-        route,
-        manifest: {
-          reference_intent: referenceIntent,
-          references: [reference],
-        },
-      },
+    const inspectedPayload = JSON.parse(inspected.content);
+    // The manifest is the file the model wrote; the result carries only the
+    // derived facts (route, counts, budget) — see K-3.
+    expect(inspectedPayload.inspection.manifest).toBeUndefined();
+    expect(inspectedPayload).toMatchObject({
+      inspection: { route },
+      recovery_context: { reference_count: 1 },
       current_candidate: {
         status: 'validated',
         path: generatedPath,
@@ -1214,8 +1333,8 @@ describe('image_studio tool', () => {
       timeout_ms: 5_000,
     }, { workingDir: root } as any);
     expect(first.isError).not.toBe(true);
-    expect(first.content).toContain('"generation_calls": 1');
-    expect(first.content).toContain('"calls_started": 1');
+    expect(first.content).toContain('"generation_calls":1');
+    expect(first.content).toContain('"calls_started":1');
     expect(fs.existsSync(path.join(projectDir, 'generated.png'))).toBe(true);
 
     const generatedPath = path.join(projectDir, 'generated.png');
@@ -1306,7 +1425,7 @@ describe('image_studio tool', () => {
       image_request_id: 'hero-initial',
     }, { workingDir: root } as any);
     expect(reused.isError).not.toBe(true);
-    expect(reused.content).toContain('"reused": true');
+    expect(reused.content).toContain('"reused":true');
     expect(fetchCalls).toBe(3);
   });
 

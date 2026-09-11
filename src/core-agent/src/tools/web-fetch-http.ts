@@ -36,14 +36,53 @@ export function decodeBytes(buffer: Buffer, charset: string): string {
   }
 }
 
+/**
+ * Non-2xx bodies are read only to classify blocked/challenge pages, never kept
+ * as evidence, so a small bound is enough to see a challenge marker while
+ * keeping a hostile error page bounded.
+ */
+export const MAX_WEB_FETCH_ERROR_BODY_BYTES = 256 * 1024;
+
 export type WebFetchResponseBody =
   | { ok: true; raw: string; contentType: string }
-  | { ok: false; error: string };
+  // `errorBody` is deliberately not named `raw`: callers discriminate this
+  // union with `"raw" in body`, so the failure variant must not expose that key.
+  | { ok: false; error: string; errorBody?: string };
+
+/** Read a bounded prefix of a body, or null when nothing could be read. */
+async function readBoundedBody(response: Response, limitBytes: number): Promise<Buffer | null> {
+  const reader = response.body?.getReader();
+  if (!reader) return null;
+
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (totalBytes < limitBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      totalBytes += value.byteLength;
+    }
+  } catch {
+    // Keep whatever arrived; a truncated challenge page still classifies.
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+  if (!chunks.length) return null;
+  return Buffer.concat(chunks).subarray(0, limitBytes);
+}
 
 /** Read and decode a response once while enforcing the common hard body limit. */
 export async function readWebFetchResponse(response: Response): Promise<WebFetchResponseBody> {
   if (!response.ok) {
-    return { ok: false, error: `HTTP ${response.status} ${response.statusText}` };
+    // Keep the body: a 401/403/503 that is really an anti-bot challenge only
+    // says so in its markup. Discarding it left callers with a bare status and
+    // no way to tell "needs credentials" from "blocked as a bot".
+    const error = `HTTP ${response.status} ${response.statusText}`;
+    const bytes = await readBoundedBody(response, MAX_WEB_FETCH_ERROR_BODY_BYTES);
+    if (!bytes?.byteLength) return { ok: false, error };
+    const charset = resolveCharset(response.headers.get("content-type") ?? "", bytes);
+    return { ok: false, error, errorBody: decodeBytes(bytes, charset) };
   }
 
   const declaredLength = Number(response.headers.get("content-length"));

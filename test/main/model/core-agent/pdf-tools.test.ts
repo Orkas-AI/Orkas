@@ -47,6 +47,24 @@ describe('PDF built-in tools', () => {
     expect(createPdfTools({}).map((entry) => entry.name)).toEqual(['edit_pdf', 'pdf_render']);
   });
 
+  it('advertises action requirements and rejects fields from another PDF action', async () => {
+    const edit = tool('edit_pdf');
+    const schema = edit.inputSchema as any;
+    expect(schema.properties.input_paths.description).toContain('Merge only');
+    expect(schema.properties.input_path.description).toContain('except merge');
+    expect(schema.properties.action.description).toContain('Overlay x/y/width/height are points');
+
+    const rejected = await edit.execute({
+      action: 'overlay_text',
+      input_path: 'source.pdf',
+      input_paths: ['wrong.pdf'],
+      output_path: 'output.pdf',
+      text: 'note',
+    }, context());
+    expect(rejected).toMatchObject({ isError: true });
+    expect(rejected.content).toContain('edit_pdf(overlay_text) does not accept: input_paths');
+  });
+
   it('keeps heavyweight PDF and canvas runtimes behind execution-time imports', () => {
     const source = fs.readFileSync(
       path.resolve(__dirname, '../../../../src/main/model/core-agent/pdf-tools.ts'),

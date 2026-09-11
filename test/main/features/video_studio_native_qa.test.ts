@@ -70,6 +70,7 @@ import {
 } from '../../../src/main/features/video_studio_state';
 import { registerProducedOutputHooks } from '../../../src/main/features/produced_output_hooks';
 import {
+  applyQaFindingWaivers,
   buildDesignReviewInputs,
   buildInspectFrameSamplePlan,
   buildPreviewFrameSamplePlan,
@@ -4901,6 +4902,100 @@ describe('native VideoStudio draft QA parity', () => {
     });
   });
 
+  it('S2 delivers a deliberately silent composition that owns only sfx', async () => {
+    // The user asked for a video with no narration and cinematic sfx. Owning
+    // that sfx means `audio.owner: "composition"` — the manifest contract even
+    // requires a track for it — but audio QA read the owner alone as "declares
+    // narration" and blocked delivery for the narration that was never meant
+    // to exist. On 2026-09-01 the escape was `owner: "none"`, which the same
+    // contract answers with "Audio tracks are not allowed", so the sfx track
+    // was deleted and mixed back in with ffmpeg after the render: the audio
+    // that shipped had passed none of these checks.
+    const p = tmpProject('silent-sfx-owned');
+    fs.mkdirSync(path.join(p.compositionDir, 'assets'), { recursive: true });
+    fs.writeFileSync(path.join(p.compositionDir, 'assets', 'cinematic-sfx.wav'), 'fake sfx');
+    fs.writeFileSync(path.join(p.compositionDir, 'index.html'), [
+      '<!doctype html>',
+      '<html><body>',
+      '<main data-composition-id="main" data-width="1920" data-height="1080" data-duration="10">',
+      '  <audio src="./assets/cinematic-sfx.wav" data-start="0" data-duration="10"></audio>',
+      '  <section class="clip" data-scene-id="cover" data-start="0" data-duration="10">'
+        + '<h1 data-role="title">Launch</h1></section>',
+      '</main>',
+      '</body></html>',
+    ].join('\n'), 'utf8');
+    const sfxOnlyAudio = {
+      owner: 'composition',
+      tracks: [{ id: 'cinematic-sfx', kind: 'sfx', src: 'assets/cinematic-sfx.wav', start: 0, duration: 10, volume: 0.9 }],
+    };
+    writeManifest(p.compositionDir, { audio: sfxOnlyAudio });
+
+    const preflight = await preflightComposition({ compositionDirAbs: p.compositionDir }, 'delivery');
+    expect(preflight.steps.audio_timing).toMatchObject({ ok: true, error_count: 0 });
+    expect(preflight.issues.map((issue) => issue.code)).not.toContain('NARRATION_DECLARED_BUT_SILENT');
+    expect(preflight.report).toMatchObject({ deferred_delivery_error_count: 0 });
+    expect(preflight.ok).toBe(true);
+
+    // Counterexample 1: narrated scenes with no narration audio are still a
+    // delivery blocker — the silence that IS a defect keeps its error. The
+    // manifest contract owns this one and answers first; the audio-QA form of
+    // it (NARRATION_REQUIRED_BUT_NOT_MATERIALIZED) is covered by the
+    // narration-materialization cases above.
+    const narrated = tmpProject('narrated-without-audio');
+    fs.mkdirSync(path.join(narrated.compositionDir, 'assets'), { recursive: true });
+    fs.writeFileSync(path.join(narrated.compositionDir, 'assets', 'cinematic-sfx.wav'), 'fake sfx');
+    fs.copyFileSync(
+      path.join(p.compositionDir, 'index.html'),
+      path.join(narrated.compositionDir, 'index.html'),
+    );
+    writeManifest(narrated.compositionDir, {
+      audio: sfxOnlyAudio,
+      scenes: [{
+        id: 'cover',
+        start: 0,
+        duration: 10,
+        approved_copy: ['Launch'],
+        narration_text: 'Speak once.',
+        narration_refs: [],
+        source_shots: [],
+        roles: ['title', 'visual'],
+      }],
+    });
+    const narratedPreflight = await preflightComposition(
+      { compositionDirAbs: narrated.compositionDir },
+      'delivery',
+    );
+    expect(narratedPreflight.ok).toBe(false);
+    expect(narratedPreflight.issues.map((issue) => issue.code))
+      .toContain('COMPOSITION_MANIFEST_NARRATION_TRACK_MISSING');
+
+    // Counterexample 2: a declared narration file that does not exist is still
+    // "declared but silent" — the finding keeps the case it was written for.
+    const declared = tmpProject('declared-narration-missing');
+    fs.copyFileSync(
+      path.join(p.compositionDir, 'index.html'),
+      path.join(declared.compositionDir, 'index.html'),
+    );
+    const declaredAudio = await runAudioTimingQa(
+      {
+        htmlPath: path.join(declared.compositionDir, 'index.html'),
+        html: '',
+        rootAttrs: {},
+        id: 'main',
+        width: 1920,
+        height: 1080,
+        durationSec: 10,
+        audioTracks: [],
+      },
+      { path: 'composition-manifest.json', exists: true, value: { audio: { owner: 'composition', narration: './assets/narration.mp3' } } },
+      { path: 'composition-manifest.json', exists: true, value: { audio: { owner: 'composition', narration: './assets/narration.mp3' }, scenes: [{ id: 'cover', start: 0, duration: 10 }] } },
+      { path: 'narration-map.json', exists: false, value: null },
+      declared.compositionDir,
+    );
+    expect((declaredAudio.issues as Array<Record<string, unknown>>).map((issue) => issue.code))
+      .toEqual(expect.arrayContaining(['NARRATION_ASSET_MISSING', 'NARRATION_DECLARED_BUT_SILENT']));
+  });
+
   it('S2 resolves the bundled whisper runtime without env-only setup', () => {
     const p = tmpProject('bundled-whisper-resolution');
     const runtimeRoot = path.join(p.root, 'runtime');
@@ -5151,6 +5246,37 @@ describe('native VideoStudio draft QA parity', () => {
     });
   });
 
+  it('keeps every known blocker while explicitly bounding only advisories', () => {
+    const findings = JSON.stringify({
+      issues: [
+        ...Array.from({ length: 20 }, (_, index) => ({
+          code: `BLOCK_${index}`,
+          severity: 'error',
+          message: `blocking issue ${index}`,
+        })),
+        ...Array.from({ length: 15 }, (_, index) => ({
+          code: `ADVISORY_${index}`,
+          severity: 'warning',
+          message: `advisory issue ${index}`,
+        })),
+      ],
+    });
+
+    expect(summarizeDraftInspectDisposition(findings)).toMatchObject({
+      blocking_error_count: 20,
+      advisory_count: 15,
+      blocking_issues_complete: true,
+      blocking_issues: expect.arrayContaining([
+        expect.objectContaining({ code: 'BLOCK_0' }),
+        expect.objectContaining({ code: 'BLOCK_19' }),
+      ]),
+      advisory_issues_omitted: 3,
+    });
+    const disposition = summarizeDraftInspectDisposition(findings) as any;
+    expect(disposition.blocking_issues).toHaveLength(20);
+    expect(disposition.advisory_issues).toHaveLength(12);
+  });
+
   it('blocks only high-confidence native visual findings with active-scene evidence', () => {
     expect(normalizeDraftInspectIssueSeverities([
       {
@@ -5334,6 +5460,64 @@ describe('native VideoStudio draft QA parity', () => {
     expect(String(htmlBlocked.findings)).toContain('DELIVERY_CAPTIONS_MISSING');
     expect(htmlBlocked.blocking_error_count).toBe(1);
   });
+
+  it('S1 clears an inspect blocker the user chose to skip, but never an unmeasured page', async () => {
+    // The inspect stop offers `waive_findings` — "skip this check and continue"
+    // — and the host accepts and stores the user's reply against the code. The
+    // rendered-frame QA above honors that waiver; inspect took the same
+    // `waivedQaFindings` and dropped it, so the next call returned the
+    // identical E_INSPECT_BLOCKED and the user was told the option they had
+    // just been given did not exist (2026-09-01). Preflight's own waiver pass
+    // cannot reach this: the cover-promise finding is appended after it, by
+    // inspect itself, which is why this verdict is built from that producer.
+    const cover = hookPromiseIssue({ visible_roles: [], visible_text: '' }, true);
+    expect(cover).toMatchObject({ code: 'HOOK_PROMISE_NOT_VISIBLE', severity: 'error' });
+    const verdict = (waivedCodes: string[]) => summarizeDraftInspectDisposition(JSON.stringify({
+      issues: dedupeInspectIssues(normalizeDraftInspectIssueSeverities(
+        applyQaFindingWaivers([cover!], waivedCodes),
+      )),
+    })) as Record<string, unknown>;
+
+    expect(verdict([])).toMatchObject({ fatal_error_count: 1, blocking_error_count: 1 });
+    expect(verdict(['HOOK_PROMISE_NOT_VISIBLE']))
+      .toMatchObject({ fatal_error_count: 0, blocking_error_count: 0 });
+    // The user accepted the frame, they did not unsee it.
+    const kept = (verdict(['HOOK_PROMISE_NOT_VISIBLE']).advisory_issues as Array<Record<string, unknown>>)
+      .find((issue) => issue.code === 'HOOK_PROMISE_NOT_VISIBLE');
+    expect(kept).toMatchObject({ waived_by_user: true, disposition: 'advisory' });
+    // A waiver names one finding; it is not a global pass.
+    expect(verdict(['TEXT_OVERFLOW'])).toMatchObject({ fatal_error_count: 1 });
+
+    // Counterexample through the real operation: a probe that never rendered
+    // the page produced no look for the user to accept, so "skip this check"
+    // must not skip the measurement. Waiving it leaves inspect blocked.
+    expect(qaFindingIsWaivable('INSPECT_RENDERER_FAILED')).toBe(false);
+    expect(qaFindingIsWaivable('INSPECT_RENDERER_TIMEOUT')).toBe(false);
+    // This suite runs Electron as plain Node (ELECTRON_RUN_AS_NODE), so
+    // `withCompositionWindow` cannot open a BrowserWindow and the probe
+    // reports exactly that. Asserting the blocker instead of assuming it keeps
+    // the case honest if the runtime ever gains a window — inspect's verdict
+    // on a REAL probe (the cover check clearing under the user's waiver) has
+    // no automated coverage for the same reason, and is verified by replaying
+    // a recorded composition under a GUI Electron run.
+    const p = tmpProject('inspect-waived-unmeasured');
+    writeHtml(p.compositionDir, 'Launch');
+    writeManifest(p.compositionDir);
+    const unmeasured = await inspectComposition({
+      compositionDirAbs: p.compositionDir,
+      waivedQaFindings: ['INSPECT_RENDERER_FAILED', 'INSPECT_RENDERER_TIMEOUT'],
+    }) as Record<string, unknown>;
+    const unmeasuredErrors = (JSON.parse(String(unmeasured.findings)).issues as Array<Record<string, unknown>>)
+      .filter((issue) => issue.severity === 'error')
+      .map((issue) => issue.code);
+    expect(unmeasuredErrors).toEqual(['INSPECT_RENDERER_FAILED']);
+    expect(unmeasured).toMatchObject({
+      ok: false,
+      errorCode: 'E_INSPECT_BLOCKED',
+      stage: 'runtime_probe',
+      fatal_error_count: 1,
+    });
+  }, 120_000);
 
   it('S3 reports blank/frozen sampled frames with contact-sheet evidence fields', () => {
     const qa = summarizeVideoFrameQa({

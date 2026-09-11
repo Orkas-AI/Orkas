@@ -1,8 +1,8 @@
 // Connectors panel — curated OAuth-only catalog of MCP-based integrations.
 //
 // Layout: a single scrollable grid view with two stacked sections — connected on top,
-// available below. No tab switching; same shape as the Skills panel's
-// Custom / Built-in split. Both groups hide themselves when empty.
+// available below, with category chips filtering the available section.
+// Both groups hide themselves when empty.
 //
 // Click model: only the action buttons on a card are clickable. Clicking elsewhere on a card
 // does nothing — users routinely hovered over cards to read descriptions and the old whole-card
@@ -18,7 +18,8 @@
 // second busy phase until exchange + provisioning completes.
 
 const _connectorsLog = createLogger('connectors');
-const _CONNECTORS_RENDER_CACHE_VERSION = 2;
+// Older caches can contain CLI connection states imported from another device.
+const _CONNECTORS_RENDER_CACHE_VERSION = 4;
 const _CONNECTORS_RENDER_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const _OAUTH_LAUNCH_THROTTLE_MS = 2000;
 let _connectorsLegacyCachePurged = false;
@@ -38,12 +39,119 @@ function _connectorTrackPayload(entry, instance) {
   const rawId = String(e.id || inst.id || '');
   const origin = inst.origin === 'custom' || e._custom || rawId.startsWith('custom-') ? 'custom' : 'catalog';
   return {
+    telemetry_version: 2,
     // Custom ids are derived from a user-authored display name. Keep that value out of analytics;
     // `origin` is the useful product dimension and `custom` is a stable low-cardinality bucket.
     connector_id: origin === 'custom' ? 'custom' : rawId,
     origin,
+    auth_mode: origin === 'custom' ? 'custom'
+      : ['server_bridge', 'mcp_dcr', 'composio', 'local_cli', 'local_api'].includes(e.auth_mode) ? e.auth_mode : 'unknown',
     is_bundle: !!(Array.isArray(e.bundle_member_ids) && e.bundle_member_ids.length),
   };
+}
+
+function _connectorRequiresCredits(entry) {
+  return !!(entry && entry.requires_credits === true);
+}
+
+function _connectorSetupRequirement(entry) {
+  const requirement = entry && entry.connection_setup && entry.connection_setup.requirement;
+  return requirement === 'provider_application' || requirement === 'business_qualification'
+    ? requirement
+    : '';
+}
+
+function _connectorCardBadges(entry) {
+  const badges = [];
+  if (_connectorRequiresCredits(entry)) {
+    badges.push(`<span class="connector-card-credit-badge is-credit">${escapeHtml(t('connectors.badge.credits_required'))}</span>`);
+  }
+  const requirement = _connectorSetupRequirement(entry);
+  if (requirement) {
+    const key = requirement === 'business_qualification'
+      ? 'connectors.badge.business_qualification'
+      : 'connectors.badge.provider_setup';
+    badges.push(`<span class="connector-card-credit-badge is-setup ${escapeHtml(requirement)}" title="${escapeHtml(t(key))}">${escapeHtml(t('connectors.badge.setup_required'))}</span>`);
+  }
+  return badges.length ? `<div class="connector-card-badges">${badges.join('')}</div>` : '';
+}
+
+function _connectorUnconnectedActionLabel(entry) {
+  return _connectorSetupRequirement(entry)
+    ? t('connectors.action.review_requirements')
+    : t('connectors.action.connect');
+}
+
+function _connectorSupportsSetupAssist(entry) {
+  if (!entry || entry._custom || _isConnectorVisibleDisabled(entry) || entry.unavailable_reason) return false;
+  const setup = entry.connection_setup;
+  if (entry.auth_mode === 'local_cli' || _connectorSetupRequirement(entry)
+      || (setup && Array.isArray(setup.fields) && setup.fields.length)) return true;
+  return (entry.connection_variants || []).some((variant) => {
+    const child = _catalogEntryById(variant.catalog_id);
+    return child && (child.auth_mode === 'local_cli' || _connectorSetupRequirement(child)
+      || (child.connection_setup && child.connection_setup.fields && child.connection_setup.fields.length));
+  });
+}
+
+const _connectorSetupAssistPending = new Set();
+
+/** Start a separate task without consuming composer drafts or protected form values. */
+async function _assistConnectorSetup(entry, button, onReady) {
+  if (!_connectorSupportsSetupAssist(entry) || _connectorSetupAssistPending.has(entry.id)) return;
+  if (!ensureModelConfigured()) return;
+  _connectorSetupAssistPending.add(entry.id);
+  if (button) {
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+  }
+  let cid = '';
+  let started = false;
+  try {
+    const name = _connectorDisplayName(entry) || entry.id;
+    const request = t('connectors.setup.assist_request', { name, id: entry.id });
+    const res = await apiFetch('/api/conversations/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        kind: 'normal', title: t('connectors.setup.assist_title', { name }),
+        assistance: { kind: 'connector_setup', connector_id: entry.id },
+      }),
+    });
+    const data = await res.json();
+    cid = data && data.ok && data.conversation && data.conversation.conversation_id;
+    if (!cid) throw new Error('conversation_create_failed');
+    conversations.unshift(data.conversation);
+    renderConversationList();
+    if (typeof onReady === 'function') onReady();
+    setView('conversation', cid, { skipLoad: true });
+    _restoreDraft(cid);
+    setChatRecipient('conversation', { kind: 'commander' });
+    const result = await sendInConversation(cid, request, { title_text: request }, {
+      onStarted: () => { started = true; },
+    });
+    if (!started && (!result || !result.started)) throw new Error('send_not_started');
+  } catch (_) {
+    // Started turns already own their visible error/retry path.
+    if (!started) {
+      if (cid && currentCid === cid) {
+        const input = document.getElementById('chat-input');
+        if (input && !input.value) {
+          input.value = t('connectors.setup.assist_request', {
+            name: _connectorDisplayName(entry) || entry.id, id: entry.id,
+          });
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      }
+      await uiAlert(t('connectors.setup.assist_failed'));
+    }
+  } finally {
+    _connectorSetupAssistPending.delete(entry.id);
+    if (button) {
+      button.disabled = false;
+      button.removeAttribute('aria-busy');
+    }
+  }
 }
 
 function _connectorTrackErrorType(err) {
@@ -102,6 +210,150 @@ let _connectorsState = {
    *  separately by `_oauthCallbackAttempts`. */
   connecting: new Set(),
 };
+let _connectorsSearchQuery = '';
+let _connectorsActiveCategory = '';
+
+// Reuse the Agent category vocabulary with a connector-specific browse order. Classify the
+// exposed capability: General holds cross-domain services, Office holds work/organization flows,
+// and E-commerce holds storefront, merchandise, fulfillment, and store-specific marketing.
+// The connector protocol's legacy categories remain intact.
+const _CONNECTOR_CATEGORY_CODES = ['ecommerce', 'office', 'rnd', 'creation', 'data', 'education', 'general'];
+const _CONNECTOR_CATEGORY_BY_ID = {
+  'google-classroom': 'education',
+
+  // Product design, localization, application membership, and development activity.
+  linear: 'rnd',
+  atlassian: 'rnd',
+  memberstack: 'rnd',
+  figma: 'rnd',
+  zeplin: 'rnd',
+  productboard: 'rnd',
+  crowdin: 'rnd',
+  wakatime: 'rnd',
+
+  // Content authoring and publishing, including social and newsletter channels.
+  webflow: 'creation',
+  canva: 'creation',
+  contentful: 'creation',
+  facebook: 'creation',
+  instagram: 'creation',
+  linkedin: 'creation',
+  pinterest: 'creation',
+  reddit: 'creation',
+  twitch: 'creation',
+  youtube: 'creation',
+  kit: 'creation',
+
+  'google-analytics': 'data',
+  segment: 'data',
+
+  // Office suites, meetings, customer operations, marketing, and business accounting.
+  feishu: 'office',
+  lark: 'office',
+  dingtalk: 'office',
+  wecom: 'office',
+  gsheets: 'office',
+  'google-meet': 'office',
+  'microsoft-teams': 'office',
+  roam: 'office',
+  webex: 'office',
+  zoom: 'office',
+  hubspot: 'office',
+  salesforce: 'office',
+  intercom: 'office',
+  zendesk: 'office',
+  mailchimp: 'office',
+  'active-campaign': 'office',
+  'customer-io': 'office',
+  'constant-contact': 'office',
+  'google-ads': 'office',
+  'pinterest-ads': 'office',
+  'reddit-ads': 'office',
+  quickbooks: 'office',
+  quaderno: 'office',
+  taxjar: 'office',
+  xero: 'office',
+  netsuite: 'office',
+  freshbooks: 'office',
+  moneybird: 'office',
+  harvest: 'office',
+  apaleo: 'office',
+  blackbaud: 'office',
+  servicem8: 'office',
+  eventbrite: 'office',
+
+  // Payment services are shared infrastructure; storefront subscriptions/licenses stay E-commerce.
+  stripe: 'general',
+  paypal: 'general',
+  'paypal-sandbox': 'general',
+  square: 'general',
+  'btcpay-server': 'general',
+  hitpay: 'general',
+  poof: 'general',
+  reloadly: 'general',
+
+  // File storage, delivery, links, forms, and personal utilities work across domains.
+  gdrive: 'general',
+  onedrive: 'general',
+  box: 'general',
+  dropbox: 'general',
+  'google-photos': 'general',
+  sendgrid: 'general',
+  dub: 'general',
+  linkhut: 'general',
+  typeform: 'general',
+  addresszen: 'general',
+  splitwise: 'general',
+  ynab: 'general',
+  exist: 'general',
+  yandex: 'general',
+  'cdr-platform': 'general',
+};
+const _CONNECTOR_CATEGORY_ALIASES = {
+  commerce: 'ecommerce',
+  developer: 'rnd',
+  productivity: 'office',
+  communication: 'general',
+  search: 'general',
+};
+
+function _connectorCategoryCode(entry) {
+  if (!entry || entry._custom) return 'general';
+  const assigned = Object.prototype.hasOwnProperty.call(_CONNECTOR_CATEGORY_BY_ID, entry.id)
+    ? _CONNECTOR_CATEGORY_BY_ID[entry.id] : '';
+  if (assigned) return assigned;
+  if (_CONNECTOR_CATEGORY_CODES.includes(entry.category)) return entry.category;
+  return Object.prototype.hasOwnProperty.call(_CONNECTOR_CATEGORY_ALIASES, entry.category)
+    ? _CONNECTOR_CATEGORY_ALIASES[entry.category] : 'general';
+}
+
+function _renderConnectorCategories(items) {
+  const present = new Set(items.map((item) => _connectorCategoryCode(item.entry)));
+  if (_connectorsActiveCategory && !present.has(_connectorsActiveCategory)) {
+    _connectorsActiveCategory = '';
+  }
+  const host = document.getElementById('connectors-categories');
+  if (!host) return;
+  if (!items.length) {
+    host.innerHTML = '';
+    return;
+  }
+  const codes = ['', ..._CONNECTOR_CATEGORY_CODES.filter((code) => present.has(code))];
+  host.innerHTML = codes.map((code) => {
+    const active = code === _connectorsActiveCategory;
+    const label = code ? t(`connectors.category.${code}`) : t('marketplace.all');
+    return `<button type="button" class="marketplace-chip${active ? ' is-active' : ''}" data-connectors-cat="${code}" aria-pressed="${active}">${escapeHtml(label)}</button>`;
+  }).join('');
+  host.querySelectorAll('[data-connectors-cat]').forEach((button) => {
+    button.addEventListener('click', () => {
+      _connectorsActiveCategory = button.dataset.connectorsCat || '';
+      _renderConnectorsGrid();
+      host.querySelector(`[data-connectors-cat="${_connectorsActiveCategory}"]`)?.focus();
+    });
+  });
+}
+
+let _connectorSetupDialogOpen = false;
 // Correlates an accepted start with the later callback/result push. Entries
 // intentionally remain when no callback arrives so a foreign result cannot
 // mutate the card state.
@@ -115,6 +367,10 @@ let _oauthLaunchToken = 0;
 // Keeping the attempt id prevents a late result from an older superseded flow from clearing a
 // newer callback's spinner on the same card.
 const _oauthCallbackAttempts = new Map();
+// Device-local CLI preparation is separate from account authorization. Each card has at most one
+// explicit preflight/install phase, and a failed install remains visible until retry or success.
+const _localCliInstallPhases = new Map();
+const _localCliInstallErrors = new Map();
 let _connectorsLoadSeq = 0;
 
 function _connectorsRenderCacheKey() {
@@ -239,6 +495,131 @@ function _instanceById(id) {
   return _connectorsState.instances.find((i) => i.id === id) || null;
 }
 
+function _catalogEntryById(id) {
+  return _connectorsState.catalog.find((entry) => entry && entry.id === id) || null;
+}
+
+function _connectorDisplayName(entry) {
+  if (!entry) return '';
+  const lang = (typeof getLang === 'function') ? getLang() : 'en';
+  return String(lang).startsWith('zh')
+    ? (entry.display_name_zh || entry.display_name || entry.id || '')
+    : (entry.display_name_en || entry.display_name || entry.id || '');
+}
+
+// Connector catalog copy supports all UI locales; agent/skill description fallback is separate.
+function _connectorCopy(item, field, lang) {
+  if (!item) return '';
+  const locale = String(lang || ((typeof getLang === 'function') ? getLang() : 'en')).toLowerCase().split(/[-_]/)[0];
+  return item[`${field}_${locale}`] || item[`${field}_en`] || item[`${field}_zh`] || '';
+}
+
+function _normalizeConnectorSearch(value) {
+  const raw = String(value == null ? '' : value);
+  try {
+    return raw.normalize('NFKC').toLocaleLowerCase();
+  } catch (_) {
+    return raw.toLocaleLowerCase();
+  }
+}
+
+/** Search every authored locale, independent of the current UI locale. */
+function _connectorSearchText(entry) {
+  if (!entry) return '';
+  const parts = [
+    entry.id,
+    entry.display_name,
+    entry.display_name_zh,
+    entry.display_name_en,
+    entry.description_zh,
+    entry.description_en,
+    entry.description_ja,
+    entry.description_pt,
+    entry.category,
+  ];
+  if (Array.isArray(entry.connection_variants)) {
+    for (const variant of entry.connection_variants) {
+      parts.push(variant.catalog_id, variant.label_zh, variant.label_en, variant.label_ja, variant.label_pt);
+      const concrete = _catalogEntryById(variant.catalog_id);
+      if (concrete && concrete !== entry) {
+        parts.push(
+          concrete.display_name,
+          concrete.display_name_zh,
+          concrete.display_name_en,
+          concrete.description_zh,
+          concrete.description_en,
+          concrete.description_ja,
+          concrete.description_pt,
+        );
+      }
+    }
+  }
+  // Hidden compatibility children (for example the old standalone Lark entry) remain searchable
+  // after the parent moves to a single automatic-detection connection flow.
+  for (const concrete of _connectorsState.catalog) {
+    if (!concrete || concrete.catalog_parent_id !== entry.id) continue;
+    parts.push(
+      concrete.id,
+      concrete.display_name,
+      concrete.display_name_zh,
+      concrete.display_name_en,
+      concrete.description_zh,
+      concrete.description_en,
+      concrete.description_ja,
+      concrete.description_pt,
+    );
+  }
+  if (Array.isArray(entry.bundle_member_ids)) {
+    for (const memberId of entry.bundle_member_ids) {
+      parts.push(memberId);
+      const member = _catalogEntryById(memberId);
+      if (member && member !== entry) {
+        parts.push(
+          member.display_name,
+          member.display_name_zh,
+          member.display_name_en,
+          member.description_zh,
+          member.description_en,
+          member.description_ja,
+          member.description_pt,
+        );
+      }
+    }
+  }
+  return parts.filter(Boolean).join(' ');
+}
+
+function _connectorMatchesSearch(entry, query) {
+  const terms = _normalizeConnectorSearch(query).trim().split(/\s+/).filter(Boolean);
+  if (!terms.length) return true;
+  const haystack = _normalizeConnectorSearch(_connectorSearchText(entry));
+  return terms.every((term) => haystack.includes(term));
+}
+
+/** Map a concrete environment variant back to the single product card that owns it. */
+function _catalogUiId(id) {
+  const entry = _catalogEntryById(id);
+  return (entry && entry.catalog_parent_id) || id;
+}
+
+function _instanceForCatalogEntry(entry) {
+  const variantIds = Array.isArray(entry && entry.connection_variants)
+    ? entry.connection_variants.map((variant) => variant.catalog_id)
+    : [];
+  for (const concrete of _connectorsState.catalog) {
+    if (concrete && concrete.catalog_parent_id === entry.id && !variantIds.includes(concrete.id)) {
+      variantIds.push(concrete.id);
+    }
+  }
+  if (variantIds.length && !variantIds.includes(entry.id)) variantIds.unshift(entry.id);
+  if (!variantIds.length) return _instanceById(entry.id);
+  const installed = variantIds.map((id) => _instanceById(id)).filter(Boolean);
+  return installed.find((inst) => inst.status && inst.status.kind === 'connected')
+    || installed.find((inst) => inst.status && inst.status.kind === 'degraded')
+    || installed[0]
+    || null;
+}
+
 // Build a synthetic ConnectorInstance for a bundle entry. Bundle entries have no real instance
 // (manager.connectViaOAuth provisions the N members instead) — but the renderer treats the
 // bundle as a single card, so we derive an instance-shaped object: status=connected iff all
@@ -290,10 +671,15 @@ function isConnectorLive(id) {
   return !!(inst && inst.status && inst.status.kind === 'connected' && inst.enabled !== false);
 }
 
+function _isLegacySandboxLocalApi(entry, instance) {
+  return !!(entry && entry.auth_mode === 'local_api' && instance && instance.connection_environment === 'sandbox');
+}
+
 function _isReconnectableError(entry, instance) {
   return !!(
     entry
-    && entry.transport_template
+    && !_isLegacySandboxLocalApi(entry, instance)
+    && (entry.transport_template || entry.auth_mode === 'composio')
     && instance
     && instance.status
     && instance.status.kind === 'error'
@@ -312,39 +698,11 @@ function _showConnectorUnsupportedToast() {
 }
 
 function _connectorErrorFallback(kind) {
-  const lang = (typeof getLang === 'function') ? getLang() : 'en';
-  const zh = String(lang).startsWith('zh');
-  const ja = String(lang).startsWith('ja');
-  if (kind === 'network') {
-    if (zh) return '暂时无法连接，请稍后重试';
-    if (ja) return '一時的に接続できません。しばらくしてから再試行してください';
-    return 'Temporarily unable to connect. Please try again later.';
-  }
-  if (kind === 'reconnect') {
-    if (zh) return '授权已失效，请重新连接';
-    if (ja) return '認証の有効期限が切れました。再接続してください';
-    return 'Authorization expired. Please reconnect.';
-  }
-  if (kind === 'secrets') {
-    if (zh) return '此设备暂时无法读取连接器密钥；请更新应用并重新登录后重试';
-    if (ja) return 'このデバイスではコネクターのキーを読み取れません。アプリを更新して再ログインしてください';
-    return 'This device cannot read the connector keys. Update the app and sign in again.';
-  }
-  return '';
+  return ['network', 'reconnect', 'secrets'].includes(kind) ? t(`connectors.errors.${kind}`) : '';
 }
 
 function _formatConnectorStatusError(message) {
-  const msg = String(message || '');
-  if (/connector_secrets_unavailable/i.test(msg)) {
-    return _connectorErrorFallback('secrets');
-  }
-  if (/fetch failed|network|timeout|timed out|econnreset|econnrefused|eai_again|enotfound|socket|connection (closed|reset|dropped)|terminated|\brefresh_failed\b|刷新授权失败|failed to refresh authorization|認証の更新に失敗|Falha ao atualizar a autorização/i.test(msg)) {
-    return _connectorErrorFallback('network');
-  }
-  if (/invalid_grant|connector_reconnect_required|reconnect required|grant not found|授权已失效|Authorization expired|認証の有効期限|A autorização expirou/i.test(msg)) {
-    return _connectorErrorFallback('reconnect');
-  }
-  return msg;
+  return message ? _formatConnectError({ error: message }) : '';
 }
 
 /** "上次验证 5 天前" for a degraded card. Returns '' when we never recorded a successful connect
@@ -370,8 +728,10 @@ function listUsableConnectorsForPicker() {
       const account = inst.oauth_grant && inst.oauth_grant.account_label ? inst.oauth_grant.account_label : '';
       return {
         id: inst.id,
-        name: inst.display_name || entry.display_name || inst.id,
-        description: pickDesc(entry, lang),
+        name: entry && !entry._custom
+          ? (_connectorDisplayName(entry) || inst.display_name || inst.id)
+          : (inst.display_name || entry.display_name || inst.id),
+        description: _connectorCopy(entry, 'description', lang),
         account,
       };
     })
@@ -381,13 +741,43 @@ function listUsableConnectorsForPicker() {
 window.focusConnectorById = async function focusConnectorById(id) {
   const targetId = String(id || '').trim();
   if (!targetId) return false;
-  await loadConnectors();
+  // The grid already shows the last completed load. Load first only when
+  // nothing has been painted yet or a load is still in flight, whose final
+  // paint would replace the card about to be focused.
+  if (!_connectorsState.catalog.length || _connectorsState.loading) await loadConnectors();
+  // An explicit navigation target must not depend on previous browse filters.
+  _connectorsSearchQuery = '';
+  _connectorsActiveCategory = '';
+  const search = document.getElementById('connectors-search-input');
+  if (search) search.value = '';
+  _renderConnectorsGrid();
   const card = Array.from(document.querySelectorAll('.connector-card[data-id]'))
     .find((candidate) => candidate.dataset.id === targetId);
   if (!card) return false;
   card.setAttribute('tabindex', '-1');
   card.scrollIntoView({ block: 'center', behavior: 'smooth' });
   card.focus({ preventScroll: true });
+  return true;
+};
+
+// Commander connector_setup/start and the compatible
+// open_app_view/connectors/configure route arrive here. For an unconfigured
+// catalog connector, continue into the same protected setup form as a card click.
+// Healthy/degraded/custom connectors keep the historical focus-only behavior;
+// a reconnectable error re-enters the guided setup path.
+window.openConnectorSetupById = async function openConnectorSetupById(id) {
+  const targetId = String(id || '').trim();
+  if (!targetId) return false;
+  await loadConnectors();
+  let entry = _catalogEntryById(targetId);
+  if (entry && entry.catalog_parent_id) entry = _catalogEntryById(entry.catalog_parent_id);
+  const installed = entry ? _instanceForCatalogEntry(entry) : null;
+  if (!entry || (installed && !installed.reauthorization_required && !_isReconnectableError(entry, installed))) {
+    return window.focusConnectorById(entry ? entry.id : targetId);
+  }
+  // The protected form is owned by the catalog, not by a filtered DOM card.
+  // A user opening it must not reopen the guide and revoke Commander control.
+  _runConnect(entry).catch(() => uiAlert(t('connectors.errors.connect_failed')));
   return true;
 };
 
@@ -424,6 +814,15 @@ function _renderConnectorsGrid() {
       _openAddCustomDialog();
     });
   }
+  const searchInput = document.getElementById('connectors-search-input');
+  if (searchInput && !searchInput.dataset.bound) {
+    searchInput.dataset.bound = '1';
+    searchInput.value = _connectorsSearchQuery;
+    searchInput.addEventListener('input', () => {
+      _connectorsSearchQuery = searchInput.value;
+      _renderConnectorsGrid();
+    });
+  }
 
   const groupConn = document.getElementById('connectors-group-connected');
   const groupAvail = document.getElementById('connectors-group-available');
@@ -449,8 +848,10 @@ function _renderConnectorsGrid() {
   const connectedItems = [];
   const availableItems = [];
   for (const entry of _connectorsState.catalog) {
+    if (entry.catalog_parent_id) continue;
     if (bundleMemberIds.has(entry.id)) continue;  // hide bundle members
-    let inst = _instanceById(entry.id);
+    if (!_connectorMatchesSearch(entry, _connectorsSearchQuery)) continue;
+    let inst = _instanceForCatalogEntry(entry);
     // For bundle entries: derive a synthetic "connected" instance when ALL members are
     // connected. The synthetic instance shape mirrors a real one so `_renderCatalogCard`
     // doesn't care it's a bundle.
@@ -469,13 +870,20 @@ function _renderConnectorsGrid() {
   for (const inst of _connectorsState.instances) {
     if (!inst || inst.origin !== 'custom') continue;
     const item = { entry: _entryFromInstance(inst), instance: inst };
+    if (!_connectorMatchesSearch(item.entry, _connectorsSearchQuery)) continue;
     if (inst.status && (inst.status.kind === 'connected' || inst.status.kind === 'degraded')) connectedItems.push(item);
     else availableItems.push(item);
   }
   // A→Z within each group (CLAUDE.md §8 inventory ordering).
-  const cmp = (a, b) => (a.entry.display_name || '').localeCompare(b.entry.display_name || '', undefined, { sensitivity: 'base', numeric: true });
+  const cmp = (a, b) => _connectorDisplayName(a.entry).localeCompare(_connectorDisplayName(b.entry), undefined, { sensitivity: 'base', numeric: true });
   connectedItems.sort(cmp);
   availableItems.sort(cmp);
+
+  // Build chips before category filtering so selecting a chip does not remove its siblings.
+  // A search or successful connection can remove the last match; recover to All in that case.
+  _renderConnectorCategories(availableItems);
+  const filteredAvailableItems = availableItems.filter((item) => !_connectorsActiveCategory
+    || _connectorCategoryCode(item.entry) === _connectorsActiveCategory);
 
   // Render each group.
   gridConn.innerHTML = '';
@@ -483,7 +891,7 @@ function _renderConnectorsGrid() {
   groupConn.style.display = connectedItems.length ? '' : 'none';
 
   gridAvail.innerHTML = '';
-  for (const it of availableItems) gridAvail.appendChild(_renderCatalogCard(it.entry, it.instance));
+  for (const it of filteredAvailableItems) gridAvail.appendChild(_renderCatalogCard(it.entry, it.instance));
   groupAvail.style.display = availableItems.length ? '' : 'none';
 
   if (_connectorsState.loading && !_connectorsState.catalog.length) {
@@ -491,7 +899,9 @@ function _renderConnectorsGrid() {
     empty.textContent = t('common.loading');
   } else if (!connectedItems.length && !availableItems.length) {
     empty.style.display = '';
-    empty.textContent = t('connectors.empty');
+    empty.textContent = _connectorsSearchQuery.trim()
+      ? t('connectors.search.empty')
+      : t('connectors.empty');
   } else {
     empty.style.display = 'none';
   }
@@ -500,15 +910,214 @@ function _renderConnectorsGrid() {
   const connCountEl = document.getElementById('connectors-group-connected-count');
   if (connCountEl) connCountEl.textContent = connectedItems.length > 0 ? String(connectedItems.length) : '';
   const availCountEl = document.getElementById('connectors-group-available-count');
-  if (availCountEl) availCountEl.textContent = availableItems.length > 0 ? String(availableItems.length) : '';
+  if (availCountEl) availCountEl.textContent = filteredAvailableItems.length > 0 ? String(filteredAvailableItems.length) : '';
+}
+
+function _connectorSetupFieldHtml(field, index, lang) {
+  const label = _connectorCopy(field, 'label', lang) || field.key;
+  const help = _connectorCopy(field, 'help', lang);
+  const controlId = `connector-setup-field-${index}`;
+  const helpId = help ? `${controlId}-help` : '';
+  const required = field.required === true;
+  const describedBy = helpId ? ` aria-describedby="${helpId}"` : '';
+  const requiredAttr = required ? ' required' : '';
+  let controlHtml;
+  if (field.input === 'choice' && Array.isArray(field.options)) {
+    const optionsHtml = field.options.map((option) => {
+      const optionLabel = _connectorCopy(option, 'label', lang) || option.value;
+      return `<option value="${escapeHtml(option.value)}">${escapeHtml(optionLabel)}</option>`;
+    }).join('');
+    controlHtml = `<select id="${controlId}" class="connectors-connect-control" data-connector-field data-field-index="${index}"${describedBy}${requiredAttr}>
+      <option value="">${escapeHtml(t('connectors.setup.select_placeholder'))}</option>
+      ${optionsHtml}
+    </select>`;
+  } else {
+    const inputType = field.input === 'secret' ? 'password' : 'text';
+    const autocomplete = field.input === 'secret' ? 'new-password' : 'off';
+    controlHtml = `<input type="${inputType}" id="${controlId}" class="connectors-connect-control" data-connector-field data-field-index="${index}" autocomplete="${autocomplete}" spellcheck="false"${describedBy}${requiredAttr} />`;
+  }
+  return `<div class="form-row">
+    <label for="${controlId}">${escapeHtml(label)}${required ? '<span class="connectors-required-mark" aria-hidden="true"> *</span>' : ''}</label>
+    ${controlHtml}
+    ${help ? `<span class="form-hint" id="${helpId}">${escapeHtml(help)}</span>` : ''}
+  </div>`;
+}
+
+function _connectorSetupMarkup(entry, fields, lang, dialogId) {
+  const titleId = `${dialogId}-title`;
+  const messageId = `${dialogId}-message`;
+  const setup = (entry && entry.connection_setup) || {};
+  const instructions = _connectorCopy(setup, 'instructions', lang);
+  const guideLabel = _connectorCopy(setup, 'guide_label', lang);
+  const guideUrl = String(setup.guide_url || '');
+  const callbackUrl = String(setup.callback_url || '');
+  const callbackHelp = _connectorCopy(setup, 'callback_help', lang);
+  const callbackHtml = callbackUrl ? `<div class="form-row">
+    <label for="${dialogId}-callback">${escapeHtml(t('connectors.setup.callback_label'))}</label>
+    <div class="connectors-setup-callback-row">
+      <input id="${dialogId}-callback" type="text" readonly value="${escapeHtml(callbackUrl)}" aria-describedby="${dialogId}-callback-help" />
+      <button type="button" class="btn" data-act="copy-setup-callback" aria-label="${escapeHtml(t('connectors.setup.copy_callback'))}">${escapeHtml(t('common.copy'))}</button>
+    </div>
+    <span class="form-hint" role="status" aria-live="polite" data-act="callback-copy-status"></span>
+    <span class="form-hint" id="${dialogId}-callback-help">${escapeHtml(callbackHelp)}</span>
+  </div>` : '';
+  const guideHtml = guideUrl && guideLabel
+    ? `<button type="button" class="connectors-setup-guide-link" data-act="open-setup-guide" data-url="${escapeHtml(guideUrl)}">${escapeHtml(guideLabel)}</button>`
+    : '';
+  return `
+    <div class="modal modal-card" role="dialog" aria-modal="true" aria-labelledby="${titleId}" aria-describedby="${messageId}">
+      <div class="connectors-connect-header">
+        <div class="modal-header">
+          <div class="modal-title" id="${titleId}">${escapeHtml(t('connectors.setup.form_title', { name: _connectorDisplayName(entry) || entry.id }))}</div>
+          ${_connectorSupportsSetupAssist(entry) ? `<button type="button" class="btn btn-sm" data-act="setup-assist">${escapeHtml(t('connectors.setup.assist'))}</button>` : ''}
+        </div>
+        <div class="connectors-connect-intro" id="${messageId}">${escapeHtml(t(entry.auth_mode === 'local_api' && setup.requirement ? 'connectors.setup.user_app_message' : 'connectors.setup.form_message'))}</div>
+      </div>
+      <form class="connectors-connect-form" data-act="setup-form">
+        <div class="connectors-connect-fields">
+        ${instructions || guideHtml ? `<div class="connectors-setup-guidance">
+          ${instructions ? `<div class="connectors-setup-instructions">${escapeHtml(instructions)}</div>` : ''}
+          ${guideHtml}
+        </div>` : ''}
+          ${callbackHtml}
+          ${fields.map((field, index) => _connectorSetupFieldHtml(field, index, lang)).join('')}
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn" data-act="cancel">${escapeHtml(t('common.cancel'))}</button>
+          <button type="submit" class="btn btn-primary" data-act="submit">${escapeHtml(t('connectors.action.connect'))}</button>
+        </div>
+      </form>
+    </div>`;
+}
+
+/** Refresh copy in place: input values, selected options, focus and event handlers stay intact. */
+function _refreshConnectorDialogCopy(overlay, markup) {
+  const template = document.createElement('div');
+  template.innerHTML = markup;
+  const selector = 'label, option, button, .modal-title, .form-hint:not([role="status"]), .connectors-connect-intro, .connectors-setup-instructions, .connector-custom-warning';
+  const current = Array.from(overlay.querySelectorAll(selector));
+  const translated = Array.from(template.querySelectorAll(selector));
+  if (current.length !== translated.length) return;
+  current.forEach((element, index) => {
+    // Only labels contain authored required-marker markup; all other targets are text-only.
+    if (element.tagName === 'LABEL') element.innerHTML = translated[index].innerHTML;
+    else element.textContent = translated[index].textContent;
+    const ariaLabel = translated[index].getAttribute('aria-label');
+    if (ariaLabel) element.setAttribute('aria-label', ariaLabel);
+  });
+}
+
+/** Collect every catalog-defined connection value in one reviewable, validated panel. */
+function _collectConnectionParameters(entry) {
+  const fields = entry && entry.connection_setup && entry.connection_setup.fields;
+  if (!Array.isArray(fields) || !fields.length) return Promise.resolve({});
+  if (_connectorSetupDialogOpen) return Promise.resolve(null);
+  _connectorSetupDialogOpen = true;
+  return new Promise((resolve) => {
+    const previousFocus = document.activeElement;
+    const dialogId = _uiNextDialogId();
+    const overlay = document.createElement('div');
+    overlay.id = 'connectors-connect-modal';
+    overlay.className = 'modal-overlay ui-dialog-overlay open';
+    const lang = (typeof getLang === 'function') ? getLang() : 'en';
+    overlay.innerHTML = _connectorSetupMarkup(entry, fields, lang, dialogId);
+    document.body.appendChild(overlay);
+
+    const form = overlay.querySelector('[data-act="setup-form"]');
+    const cancelBtn = overlay.querySelector('[data-act="cancel"]');
+    const guideBtn = overlay.querySelector('[data-act="open-setup-guide"]');
+    const controls = Array.from(overlay.querySelectorAll('[data-connector-field]'));
+    const firstControl = controls[0] || cancelBtn;
+    const releaseFocusGuard = _uiKeepDialogFocus(overlay, firstControl);
+    let callbackCopyStatusKey = '';
+    const onLanguageChanged = () => {
+      _refreshConnectorDialogCopy(overlay, _connectorSetupMarkup(entry, fields, getLang(), dialogId));
+      const copyStatus = overlay.querySelector('[data-act="callback-copy-status"]');
+      if (copyStatus && callbackCopyStatusKey) copyStatus.textContent = t(callbackCopyStatusKey);
+    };
+    window.addEventListener('i18n-change', onLanguageChanged);
+    let finished = false;
+    const finish = (value) => {
+      if (finished) return;
+      finished = true;
+      _connectorSetupDialogOpen = false;
+      document.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('i18n-change', onLanguageChanged);
+      releaseFocusGuard();
+      overlay.remove();
+      _uiRestoreDialogFocus(previousFocus);
+      resolve(value);
+    };
+    const onKey = (event) => {
+      if (event.isComposing || event.keyCode === 229) return;
+      if (!_uiIsTopDialogOverlay(overlay)) return;
+      if (_uiTrapDialogTab(overlay, event)) return;
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        finish(null);
+      }
+    };
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      if (!form.reportValidity()) return;
+      const values = {};
+      controls.forEach((control) => {
+        const field = fields[Number(control.dataset.fieldIndex)];
+        if (field) values[field.key] = control.value;
+      });
+      finish(values);
+    });
+    cancelBtn.addEventListener('click', () => finish(null));
+    const assistBtn = overlay.querySelector('[data-act="setup-assist"]');
+    if (assistBtn) assistBtn.addEventListener('click', () => {
+      _assistConnectorSetup(entry, assistBtn, () => finish(null));
+    });
+    if (entry.connection_setup.callback_url) {
+      const copyBtn = overlay.querySelector('[data-act="copy-setup-callback"]');
+      const copyStatus = overlay.querySelector('[data-act="callback-copy-status"]');
+      copyBtn.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(entry.connection_setup.callback_url);
+          callbackCopyStatusKey = 'chat.copy_done';
+        } catch (_) {
+          callbackCopyStatusKey = 'connectors.setup.copy_callback_failed';
+        }
+        copyStatus.textContent = t(callbackCopyStatusKey);
+      });
+    }
+    if (guideBtn) {
+      // A direct user click remains a normal external-link action. Web Assist
+      // is opened independently by the scoped Commander setup tool.
+      guideBtn.addEventListener('click', () => {
+        const url = String(guideBtn.dataset.url || '');
+        if (!url) return;
+        window.orkas.invoke('auth.openExternal', { url }).catch((error) => {
+          _connectorsLog.warn('connector setup guide could not be opened', {
+            connector_id: entry.id,
+            error: (error && error.message) || String(error),
+          });
+        });
+      });
+    }
+    document.addEventListener('keydown', onKey, true);
+    setTimeout(() => {
+      if (!finished && _uiIsTopDialogOverlay(overlay) && document.body.contains(overlay)) firstControl.focus();
+    }, 0);
+  });
 }
 
 function _renderCatalogCard(entry, instance) {
   const e = entry || _entryFromInstance(instance);
+  const displayName = _connectorDisplayName(e);
   const isOAuthPending = !!(e && e.unavailable_reason === 'oauth_pending');
   const isVisibleDisabled = _isConnectorVisibleDisabled(e);
   const connected = !!(instance && instance.status && instance.status.kind === 'connected');
-  const errored = !!(instance && instance.status && instance.status.kind === 'error');
+  // An interrupted first CLI setup is still available to connect. Its failure is reported for
+  // that attempt, rather than persisting as a service outage before it has ever been usable.
+  const unfinishedLocalCli = e.auth_mode === 'local_cli'
+    && !(instance && (instance.tools_cached_at > 0
+      || (Array.isArray(instance.tools_cache) && instance.tools_cache.length > 0)));
+  const errored = !!(instance && instance.status && instance.status.kind === 'error' && !unfinishedLocalCli);
   // Authorized + cached, but the last connect/refresh failed. Stays in this group (a 30s backend
   // blip must not reshuffle every card out of the list) but must never render as connected: the
   // card states the reason and how stale it is, and offers 重试 instead of 使用.
@@ -533,19 +1142,24 @@ function _renderCatalogCard(entry, instance) {
   const safeIconSvg = typeof sanitizeSvgIconHtml === 'function' ? sanitizeSvgIconHtml(e.icon_svg) : '';
   const iconHtml = safeIconSvg
     ? `<div class="connector-card-icon is-svg">${safeIconSvg}</div>`
-    : `<div class="connector-card-icon is-fallback" style="background:${brandTint}">${escapeHtml((e.display_name || '?').slice(0, 1).toUpperCase())}</div>`;
+    : `<div class="connector-card-icon is-fallback" style="background:${brandTint}">${escapeHtml((displayName || '?').slice(0, 1).toUpperCase())}</div>`;
   // Custom cards have no authored description — show the server summary
   // (url / command) so the user can tell their entries apart.
   const desc = e._custom
     ? _customTransportSummary(instance)
-    : pickDesc(e, (typeof getLang === 'function') ? getLang() : 'en');
+    : _connectorCopy(e, 'description');
 
   const accountLabel = (instance && instance.oauth_grant && instance.oauth_grant.account_label) || '';
-  const errorMsg = errored && instance && instance.status && instance.status.message;
+  const accountLine = accountLabel || '';
+  const errorMsg = errored && instance && instance.status && (_isLegacySandboxLocalApi(e, instance)
+    ? t('connectors.setup.sandbox_disconnect_required') : instance.status.message);
   const degradedMsg = degraded && instance && instance.status && instance.status.message;
   const degradedSince = degraded && instance && instance.status
     ? instance.status.last_verified_at
     : 0;
+  const installPhase = _localCliInstallPhases.get(e.id) || '';
+  const installError = _localCliInstallErrors.get(e.id) || null;
+  const permissionNotice = e.auth_mode === 'local_cli' && instance?.reauthorization_required;
 
   // The ⋯ menu lives on installed cards — it hosts the destructive disconnect action so it stays
   // one click away from accidental triggers. Un-connected / errored cards still surface the
@@ -565,9 +1179,15 @@ function _renderCatalogCard(entry, instance) {
   //   - default (uninstalled): connect (start OAuth)
   let action = '';
   const launchAttempt = _oauthLaunchAttempts.get(e.id) || null;
+  // Persisted/listed status can survive a restart; it is not proof of an active user attempt.
+  // Only the current launch, matched authorization callback, or explicit retry owns busy feedback.
   const isConnecting = (_connectorsState.connecting && _connectorsState.connecting.has(e.id))
     || _oauthCallbackAttempts.has(e.id);
-  if (isConnecting) {
+  if (installPhase === 'checking') {
+    action = `<button class="btn btn-sm btn-primary is-loading" data-act="connect" disabled aria-disabled="true" aria-busy="true">${escapeHtml(t('connectors.action.checking'))}</button>`;
+  } else if (installPhase === 'installing') {
+    action = `<button class="btn btn-sm btn-primary is-loading" data-act="connect" disabled aria-disabled="true" aria-busy="true">${escapeHtml(t('connectors.action.installing'))}</button>`;
+  } else if (isConnecting) {
     action = `<button class="btn btn-sm btn-primary is-loading" data-act="connect" disabled aria-disabled="true" aria-busy="true">${escapeHtml(t('connectors.action.connecting'))}</button>`;
   } else if (launchAttempt) {
     const throttleAttrs = launchAttempt.throttled ? ' disabled aria-disabled="true"' : '';
@@ -577,8 +1197,13 @@ function _renderCatalogCard(entry, instance) {
   } else if (isVisibleDisabled) {
     action = `<button class="btn btn-sm btn-primary" data-act="unsupported-connect">${escapeHtml(t('connectors.action.connect'))}</button>`;
   } else if (connected) {
-    const useTitle = escapeHtml(formatChatUseLabel({ kind: 'connector', id: e.id, name: e.display_name || e.id }));
+    const useTitle = escapeHtml(formatChatUseLabel({ kind: 'connector', id: e.id, name: displayName || e.id }));
     action = `<button class="agent-card-use connector-card-use" data-act="use-connector" title="${useTitle}" aria-label="${useTitle}" ${enabledFlag ? '' : 'disabled aria-disabled="true" tabindex="-1"'}>${escapeHtml(t('common.use'))}</button>`;
+    if (e.auth_mode === 'local_cli' && instance.reauthorization_required) {
+      action = `<button class="btn btn-sm btn-primary" data-act="connect">${escapeHtml(t('connectors.action.authorize_permissions'))}</button>${action}`;
+    }
+  } else if (e.auth_mode === 'local_cli' && instance && instance.reauthorization_required) {
+    action = `<button class="btn btn-sm btn-primary" data-act="connect">${escapeHtml(t('connectors.action.authorize_permissions'))}</button>`;
   } else if (degraded) {
     // Retry re-runs connect + token refresh (`connectors.refresh`) — NOT OAuth. The grant is fine;
     // what failed was reaching the backend. Offering "连接" here would send the user through a
@@ -595,18 +1220,23 @@ function _renderCatalogCard(entry, instance) {
     action = `<button class="btn btn-sm btn-primary" data-act="connect">${escapeHtml(t('connectors.action.connect'))}</button>`;
   } else if (errored) {
     action = `<button class="btn btn-sm btn-danger" data-act="disconnect">${escapeHtml(t('connectors.action.disconnect'))}</button>`;
+  } else if (installError) {
+    action = `<button class="btn btn-sm btn-primary" data-act="connect">${escapeHtml(t('connectors.action.retry_install'))}</button>`;
   } else {
-    action = `<button class="btn btn-sm btn-primary" data-act="connect">${escapeHtml(t('connectors.action.connect'))}</button>`;
+    action = `<button class="btn btn-sm btn-primary" data-act="connect">${escapeHtml(_connectorUnconnectedActionLabel(e))}</button>`;
   }
 
   let secondaryHtml = '';
-  if (errorMsg) {
+  if (installError) {
+    secondaryHtml = '<div class="connector-card-error"></div>';
+  } else if (errorMsg) {
     secondaryHtml = '<div class="connector-card-error"></div>';
   } else if (degradedMsg) {
     secondaryHtml = '<div class="connector-card-unverified"></div>';
   } else if (accountLabel) {
     secondaryHtml = '<div class="connector-card-account muted"></div>';
   }
+  const cardBadgesHtml = _connectorCardBadges(e);
 
   card.innerHTML = `
     <div class="connector-card-top">
@@ -618,13 +1248,35 @@ function _renderCatalogCard(entry, instance) {
       ${menuHtml}
     </div>
     <div class="connector-card-desc muted"></div>
-    <div class="connector-card-foot">${action}</div>
+    ${permissionNotice ? '<div class="connector-card-unverified" data-role="permission-notice"></div>' : ''}
+    <div class="connector-card-foot">${cardBadgesHtml}${action}</div>
   `;
-  card.querySelector('.connector-card-name').textContent = e.display_name;
+  card.querySelector('.connector-card-name').textContent = displayName;
   card.querySelector('.connector-card-desc').textContent = desc;
-  if (errorMsg) {
+  if (permissionNotice) {
+    const scopes = Array.isArray(instance.missing_permissions) ? instance.missing_permissions : [];
+    const permissionLabels = {
+      'im:message.send_as_user': 'send_as_user',
+      'chat.message:send': 'send_as_user',
+      'mail:send': 'send_mail',
+    };
+    const labels = [...new Set(scopes.map(scope => Object.hasOwn(permissionLabels, scope)
+      ? t('connectors.permissions.' + permissionLabels[scope]) : scope))];
+    const notice = card.querySelector('[data-role="permission-notice"]');
+    notice.textContent = labels.length
+      ? t('connectors.permissions.missing', { permissions: labels.join(', ') })
+      : t('connectors.permissions.limited');
+  }
+  if (installError) {
     const el = card.querySelector('.connector-card-error');
-    const text = `${t('connectors.status.error')}: ${_formatConnectorStatusError(errorMsg)}`;
+    const text = _formatLocalCliInstallError(installError, e);
+    el.textContent = text;
+    el.title = text;
+  } else if (errorMsg) {
+    const el = card.querySelector('.connector-card-error');
+    const reason = _isLegacySandboxLocalApi(e, instance)
+      ? t('connectors.setup.sandbox_disconnect_required') : _formatConnectorStatusError(errorMsg);
+    const text = `${t('connectors.status.error')}: ${reason}`;
     el.textContent = text;
     el.title = text;
   } else if (degradedMsg) {
@@ -650,8 +1302,8 @@ function _renderCatalogCard(entry, instance) {
       else if (act === 'disconnect') _quickDisconnect(e, instance);
       else if (act === 'menu') _openCardMenu(btn, e, instance);
       else if (act === 'use-connector' && enabledFlag) _useConnector(e, instance);
-      else if (act === 'retry-custom') _retryConnect(e, 'connector_custom_retry');
-      else if (act === 'retry-degraded') _retryConnect(e, 'connector_degraded_retry');
+      else if (act === 'retry-custom') _retryConnect(e, 'connector_custom_retry', instance);
+      else if (act === 'retry-degraded') _retryConnect(e, 'connector_degraded_retry', instance);
     });
   });
   return card;
@@ -729,7 +1381,8 @@ function _openCardMenu(anchorBtn, entry, instance) {
 function _useConnector(entry, instance) {
   if (!instance || !instance.status || instance.status.kind !== 'connected' || instance.enabled === false) return;
   const id = String((instance && instance.id) || (entry && entry.id) || '').trim();
-  const name = String((instance && instance.display_name) || (entry && entry.display_name) || id).trim();
+  const name = String((entry && !entry._custom && _connectorDisplayName(entry))
+    || (instance && instance.display_name) || (entry && entry.display_name) || id).trim();
   if (!id && !name) return;
   _connectorsTrackClick('connector_use', _connectorTrackPayload(entry, instance));
   setView('new-chat');
@@ -764,7 +1417,7 @@ async function _toggleConnectorEnabled(entry, instance, nextEnabled) {
           ...failure,
         });
         _logConnectorOperationFailure('connector_enable', { ...payload, ...failure });
-        uiAlert((res && res.error) || t('component.toggle_failed'));
+        uiAlert(_formatConnectError(res, 'component.toggle_failed'));
         return;
       }
     }
@@ -782,7 +1435,7 @@ async function _toggleConnectorEnabled(entry, instance, nextEnabled) {
       ...failure,
     });
     _logConnectorOperationFailure('connector_enable', { ...payload, ...failure });
-    uiAlert((err && err.message) || t('component.toggle_failed'));
+    uiAlert(_formatConnectError(err, 'component.toggle_failed'));
     return;
   }
   // Refresh is presentation work after the mutation committed. It must never overwrite the
@@ -805,12 +1458,16 @@ function _entryFromInstance(instance) {
 function _customTransportSummary(instance) {
   const tr = instance && instance.transport;
   if (!tr) return '';
+  if (tr.kind === 'stdio' && typeof tr.command === 'string' && Number.isInteger(tr.argument_count) && tr.argument_count >= 0) {
+    return tr.argument_count ? `${tr.command} (${t('connectors.custom.argument_count', { n: tr.argument_count })})` : tr.command;
+  }
   if (tr.kind === 'streamable-http' || tr.kind === 'stdio') return tr.summary || '';
   return '';
 }
 
 async function _quickDisconnect(entry, instance) {
-  const name = (instance && instance.display_name) || entry.display_name || entry.id;
+  const name = (!entry._custom && _connectorDisplayName(entry))
+    || (instance && instance.display_name) || entry.display_name || entry.id;
   const ok = await uiConfirmDanger({
     title: t('connectors.confirm_disconnect_title', { name }),
     message: t('connectors.confirm_disconnect_msg'),
@@ -840,7 +1497,7 @@ async function _quickDisconnect(entry, instance) {
           ...failure,
         });
         _logConnectorOperationFailure('connector_disconnect', { ...payload, ...failure });
-        uiAlert((res && res.error) || t('connectors.errors.remove_failed'));
+        uiAlert(_formatConnectError(res, 'connectors.errors.remove_failed'));
         return;
       }
     }
@@ -858,16 +1515,167 @@ async function _quickDisconnect(entry, instance) {
       ...failure,
     });
     _logConnectorOperationFailure('connector_disconnect', { ...payload, ...failure });
-    uiAlert((err && err.message) || t('connectors.errors.remove_failed'));
+    uiAlert(_formatConnectError(err, 'connectors.errors.remove_failed'));
     return;
   }
   await loadConnectors();
+}
+
+function _formatLocalCliInstallError(errLike, entry) {
+  const code = _connectorStructuredErrorCode(errLike);
+  const keyByCode = {
+    local_cli_runtime_missing: 'connectors.local_cli.install_runtime_missing',
+    local_cli_install_registry_unavailable: 'connectors.local_cli.install_registry_unavailable',
+    local_cli_install_integrity_mismatch: 'connectors.local_cli.install_integrity_mismatch',
+    local_cli_install_timeout: 'connectors.local_cli.install_timeout',
+    local_cli_install_failed: 'connectors.local_cli.install_failed',
+  };
+  const config = entry && entry.local_cli;
+  const cli = String((errLike && errLike.cli) || (config && config.executable) || 'CLI');
+  return t(keyByCode[code] || 'connectors.local_cli.install_failed', { cli });
+}
+
+async function _ensureLocalCliReady(uiEntry, targetEntry) {
+  if (!targetEntry || targetEntry.auth_mode !== 'local_cli' || !targetEntry.local_cli) return true;
+  const uiId = uiEntry.id;
+  if (_localCliInstallPhases.has(uiId)) return false;
+  const cli = targetEntry.local_cli.executable || 'CLI';
+  const startedAt = performance.now();
+  let reported = false;
+  const finish = (result, stage, error) => {
+    if (reported) return;
+    reported = true;
+    const rawCode = error && error.code;
+    const codes = ['local_cli_runtime_missing', 'local_cli_install_unsupported', 'local_cli_install_registry_unavailable',
+      'local_cli_install_integrity_unavailable', 'local_cli_install_integrity_mismatch',
+      'local_cli_install_timeout', 'local_cli_install_failed'];
+    const detail = {
+      ..._connectorTrackPayload(targetEntry, null), result, stage,
+      duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
+      ...(result === 'failure' ? {
+        error_code: codes.includes(rawCode) ? rawCode : 'local_cli_install_failed',
+        error_type: rawCode === 'local_cli_install_timeout' ? 'timeout' : 'runtime',
+      } : {}),
+    };
+    _connectorsTrackEvent('connector_cli_setup_result', detail);
+    if (result === 'failure') _logConnectorOperationFailure('connector_cli_setup', detail);
+  };
+
+  _localCliInstallPhases.set(uiId, 'checking');
+  _renderConnectorsGrid();
+  let statusResponse;
+  try {
+    statusResponse = await window.orkas.invoke('connectors.local_cli_status', {
+      catalog_id: targetEntry.id,
+    });
+  } catch (error) {
+    statusResponse = { ok: false, code: 'local_cli_install_failed', error };
+  }
+  _localCliInstallPhases.delete(uiId);
+  const status = statusResponse && statusResponse.status;
+  if (!statusResponse || !statusResponse.ok || !status) {
+    const failure = {
+      code: _connectorStructuredErrorCode(statusResponse) || 'local_cli_install_failed',
+      cli,
+    };
+    _localCliInstallErrors.set(uiId, failure);
+    finish('failure', 'cli_check', failure);
+    _renderConnectorsGrid();
+    uiAlert(_formatLocalCliInstallError(failure, targetEntry));
+    return false;
+  }
+  if (status.installed) {
+    finish('success', 'cli_check');
+    _localCliInstallErrors.delete(uiId);
+    _renderConnectorsGrid();
+    return true;
+  }
+  if (status.runtime_ready === false) {
+    const failure = { code: 'local_cli_runtime_missing', cli };
+    finish('failure', 'cli_check', failure);
+    _localCliInstallErrors.set(uiId, failure);
+    _renderConnectorsGrid();
+    uiAlert(_formatLocalCliInstallError(failure, targetEntry));
+    return false;
+  }
+
+  _localCliInstallErrors.delete(uiId);
+  _localCliInstallPhases.set(uiId, 'installing');
+  _renderConnectorsGrid();
+  try {
+    const result = await window.orkas.invoke('connectors.install_local_cli', {
+      catalog_id: targetEntry.id,
+    });
+    if (!result || !result.ok || !result.status || result.status.installed !== true) {
+      const failure = {
+        code: _connectorStructuredErrorCode(result) || 'local_cli_install_failed',
+        cli,
+      };
+      _localCliInstallErrors.set(uiId, failure);
+      finish('failure', 'cli_install', failure);
+      uiAlert(_formatLocalCliInstallError(failure, targetEntry));
+      return false;
+    }
+    _localCliInstallErrors.delete(uiId);
+    finish('success', 'cli_install');
+    return true;
+  } catch (error) {
+    const failure = {
+      code: _connectorStructuredErrorCode(error) || 'local_cli_install_failed',
+      cli,
+    };
+    _localCliInstallErrors.set(uiId, failure);
+    finish('failure', 'cli_install', failure);
+    uiAlert(_formatLocalCliInstallError(failure, targetEntry));
+    return false;
+  } finally {
+    _localCliInstallPhases.delete(uiId);
+    _renderConnectorsGrid();
+  }
 }
 
 async function _runConnect(entry) {
   if (_isConnectorVisibleDisabled(entry)) {
     _showConnectorUnsupportedToast();
     return;
+  }
+  if (_localCliInstallPhases.has(entry.id)) return;
+  const installed = _instanceForCatalogEntry(entry);
+  if (_isLegacySandboxLocalApi(entry, installed)) {
+    uiAlert(t('connectors.setup.sandbox_disconnect_required'));
+    return;
+  }
+  let targetEntry = entry;
+  const installedEntry = installed && _catalogEntryById(installed.id);
+  if (installedEntry && installedEntry.catalog_parent_id === entry.id) {
+    // Reauthorization of a legacy variant retains its original endpoint.
+    targetEntry = installedEntry;
+  } else if (Array.isArray(entry.connection_variants) && entry.connection_variants.length) {
+    const lang = (typeof getLang === 'function') ? getLang() : 'en';
+    const variantKind = entry.connection_variant_kind === 'region' ? 'region' : 'environment';
+    const choice = await uiChoice({
+      title: t(`connectors.setup.${variantKind}_title`, { name: _connectorDisplayName(entry) || entry.id }),
+      message: t(`connectors.setup.${variantKind}_message`),
+      choices: entry.connection_variants.map((variant) => ({
+        id: variant.catalog_id,
+        label: _connectorCopy(variant, 'label', lang),
+      })),
+    });
+    if (!choice) return;
+    targetEntry = _catalogEntryById(choice);
+    if (!targetEntry) {
+      uiAlert(t('connectors.errors.connect_failed'));
+      return;
+    }
+  }
+
+  if (targetEntry.auth_mode === 'local_cli' && !(await _ensureLocalCliReady(entry, targetEntry))) return;
+
+  let connectionParameters;
+  const fields = targetEntry.connection_setup && targetEntry.connection_setup.fields;
+  if (Array.isArray(fields) && fields.length) {
+    connectionParameters = await _collectConnectionParameters(targetEntry);
+    if (connectionParameters === null) return;
   }
   // The disabled button is the primary guard during the 2s launch throttle; this state guard also
   // closes the same-tick gap before re-render and protects programmatic/double invocations.
@@ -876,7 +1684,19 @@ async function _runConnect(entry) {
       || (activeLaunch && activeLaunch.throttled)
       || _oauthCallbackAttempts.has(entry.id)) return;
 
-  const payload = _connectorTrackPayload(entry, null);
+  if (targetEntry.requires_credits === true || targetEntry.auth_mode === 'composio') {
+    const credential = await window.orkas.invoke('orkasApi.getStatus');
+    if (!credential || !credential.ok || !credential.configured) {
+      setView('settings');
+      if (typeof window.activateSettingsTab === 'function') window.activateSettingsTab('credentials');
+      const input = document.getElementById('settings-orkas-api-key-input');
+      setTimeout(() => input && input.focus(), 0);
+      if (typeof uiToast === 'function') uiToast(t('connectors.errors.api_key_required'));
+      return;
+    }
+  }
+
+  const payload = { ..._connectorTrackPayload(entry, null), auth_mode: targetEntry.auth_mode };
   const startedAt = performance.now();
   const launchToken = ++_oauthLaunchToken;
   const launchAttempt = {
@@ -897,14 +1717,23 @@ async function _runConnect(entry) {
   _connectorsTrackClick('connector_connect', payload);
   let accepted = false;
   try {
-    const res = await window.orkas.invoke('connectors.start_oauth', { catalog_id: entry.id });
+    const res = await window.orkas.invoke('connectors.start_oauth', {
+      catalog_id: targetEntry.id,
+      ...(connectionParameters ? { connection_parameters: connectionParameters } : {}),
+    });
     if (res && res.ok && res.started && typeof res.attempt_id === 'string' && res.attempt_id) {
       accepted = true;
-      _pendingConnectAttempts.set(res.attempt_id, { payload, startedAt });
+      _pendingConnectAttempts.set(res.attempt_id, { payload, startedAt, uiCatalogId: entry.id });
       const launch = _oauthLaunchAttempts.get(entry.id);
       // The browser can take focus before IPC returns. Do not recreate feedback already cleared by
       // that blur; only correlate a launch phase that is still visible.
       if (launch && launch.token === launchToken) launch.attemptId = res.attempt_id;
+    } else if (res && !res.ok && res.requires_api_key) {
+      setView('settings');
+      if (typeof window.activateSettingsTab === 'function') window.activateSettingsTab('credentials');
+      const input = document.getElementById('settings-orkas-api-key-input');
+      setTimeout(() => input && input.focus(), 0);
+      if (typeof uiToast === 'function') uiToast(t('connectors.errors.api_key_required'));
     } else if (res && !res.ok) {
       _handleConnectFailure(payload, startedAt, res);
     } else {
@@ -936,30 +1765,38 @@ function _handleOAuthCallback(info) {
   // Ignore stale or foreign callbacks. Every renderer-initiated flow records its attempt as soon as
   // main accepts the launch, before an external browser can return to this process.
   if (!_pendingConnectAttempts.has(info.attempt_id)) return;
-  const launch = _oauthLaunchAttempts.get(info.catalog_id);
+  const pending = _pendingConnectAttempts.get(info.attempt_id);
+  const uiCatalogId = (pending && pending.uiCatalogId) || _catalogUiId(info.catalog_id);
+  const launch = _oauthLaunchAttempts.get(uiCatalogId);
   if (launch && launch.attemptId === info.attempt_id) {
     clearTimeout(launch.timeoutId);
-    _oauthLaunchAttempts.delete(info.catalog_id);
+    _oauthLaunchAttempts.delete(uiCatalogId);
   }
-  _oauthCallbackAttempts.set(info.catalog_id, info.attempt_id);
+  _oauthCallbackAttempts.set(uiCatalogId, info.attempt_id);
   _renderConnectorsGrid();
 }
 
+const _completedOAuthAttempts = new Set();
 function _handleOAuthConnectResult(info) {
   if (!info || typeof info.attempt_id !== 'string' || typeof info.catalog_id !== 'string') return;
+  // A repeated deep-link push must not multiply the success-rate denominator.
+  if (_completedOAuthAttempts.has(info.attempt_id)) return;
+  _completedOAuthAttempts.add(info.attempt_id);
+  if (_completedOAuthAttempts.size > 200) _completedOAuthAttempts.delete(_completedOAuthAttempts.values().next().value);
   let busyChanged = false;
-  const launch = _oauthLaunchAttempts.get(info.catalog_id);
+  const pending = _pendingConnectAttempts.get(info.attempt_id) || null;
+  const uiCatalogId = (pending && pending.uiCatalogId) || _catalogUiId(info.catalog_id);
+  const launch = _oauthLaunchAttempts.get(uiCatalogId);
   if (launch && launch.attemptId === info.attempt_id) {
     clearTimeout(launch.timeoutId);
-    _oauthLaunchAttempts.delete(info.catalog_id);
+    _oauthLaunchAttempts.delete(uiCatalogId);
     busyChanged = true;
   }
-  if (_oauthCallbackAttempts.get(info.catalog_id) === info.attempt_id) {
-    _oauthCallbackAttempts.delete(info.catalog_id);
+  if (_oauthCallbackAttempts.get(uiCatalogId) === info.attempt_id) {
+    _oauthCallbackAttempts.delete(uiCatalogId);
     busyChanged = true;
   }
   if (busyChanged) _renderConnectorsGrid();
-  const pending = _pendingConnectAttempts.get(info.attempt_id) || null;
   if (pending) _pendingConnectAttempts.delete(info.attempt_id);
   const entry = _connectorsState.catalog.find((item) => item && item.id === info.catalog_id) || { id: info.catalog_id };
   const payload = pending ? pending.payload : _connectorTrackPayload(entry, null);
@@ -968,29 +1805,34 @@ function _handleOAuthConnectResult(info) {
     : (Number.isFinite(info.duration_ms) ? info.duration_ms : 0);
 
   if (info.result === 'success') {
-    _connectorsTrackEvent('connector_connect_result', {
+    if (info.telemetry_reported !== true) _connectorsTrackEvent('connector_connect_result', {
       ...payload,
       result: 'success',
       duration_ms: Math.max(0, durationMs),
     });
   } else {
-    const errLike = { code: info.code || 'oauth_failed', error: info.error || 'connector authorization failed' };
+    const errLike = {
+      code: info.code || 'oauth_failed', error: info.error || 'connector authorization failed',
+      authorization_detail: info.authorization_detail,
+    };
     const cancelled = _reportConnectOutcome(payload, pending ? pending.startedAt : performance.now(), errLike, durationMs);
-    // A transport failure is rendered on the resulting connector card. Other asynchronous
-    // failures need an explicit alert now that the initiating IPC has already returned.
-    if (!cancelled && errLike.code !== 'mcp_connect_failed') uiAlert(_formatConnectError(errLike));
+    // Failed first CLI setups return to the ordinary Connect card, so report their transport
+    // failure here too. Other transports retain the resulting error on their connector card.
+    if (!cancelled && (errLike.code !== 'mcp_connect_failed' || entry.auth_mode === 'local_cli')) {
+      uiAlert(_formatConnectError(errLike));
+    }
   }
   if (currentView === 'connectors') loadConnectors();
 }
 
 /** Re-run connect + token refresh for an installed instance (`connectors.refresh`), never OAuth.
  *  Shared by the custom-server retry and the degraded-card retry. */
-async function _retryConnect(entry, event) {
+async function _retryConnect(entry, event, instance) {
   // Bundle cards are synthetic; only their member instances exist in main. Retry every member and
   // report success only when every latest status is actually connected.
   const ids = Array.isArray(entry.bundle_member_ids) && entry.bundle_member_ids.length
     ? entry.bundle_member_ids.slice()
-    : [entry.id];
+    : [(instance && instance.id) || entry.id];
   const payload = { ..._connectorTrackPayload(entry, null), instance_count: ids.length };
   const startedAt = performance.now();
   _connectorsTrackClick(event, payload);
@@ -1084,10 +1926,8 @@ function _parseEnvLines(text) {
 // for stdio the user types the exact command that will run on their machine,
 // and the warning line states that plainly. Submission funnels into the
 // single validated IPC route `connectors.add_custom`.
-function _openAddCustomDialog() {
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay ui-dialog-overlay open';
-  overlay.innerHTML = `
+function _customConnectorMarkup() {
+  return `
     <div class="modal modal-standard ui-dialog connector-custom-dialog" role="dialog" aria-modal="true" aria-labelledby="connector-custom-title">
       <div class="modal-title ui-dialog-title" id="connector-custom-title">${escapeHtml(t('connectors.custom.title'))}</div>
       <div class="modal-body">
@@ -1134,6 +1974,12 @@ function _openAddCustomDialog() {
       </div>
     </div>
   `;
+}
+
+function _openAddCustomDialog() {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay ui-dialog-overlay open';
+  overlay.innerHTML = _customConnectorMarkup();
   document.body.appendChild(overlay);
 
   const f = (name) => overlay.querySelector(`[data-f="${name}"]`);
@@ -1145,7 +1991,17 @@ function _openAddCustomDialog() {
     secStdio.style.display = stdio ? '' : 'none';
   });
 
-  const close = () => { document.removeEventListener('keydown', onKey, true); overlay.remove(); };
+  const onLanguageChanged = () => {
+    _refreshConnectorDialogCopy(overlay, _customConnectorMarkup());
+    const submit = overlay.querySelector('[data-act="ok"]');
+    if (submit.disabled) submit.textContent = t('connectors.action.connecting');
+  };
+  window.addEventListener('i18n-change', onLanguageChanged);
+  const close = () => {
+    document.removeEventListener('keydown', onKey, true);
+    window.removeEventListener('i18n-change', onLanguageChanged);
+    overlay.remove();
+  };
   const onKey = (ev) => {
     if (ev.isComposing || ev.keyCode === 229) return;
     if (ev.key === 'Escape') close();
@@ -1229,7 +2085,7 @@ function _openAddCustomDialog() {
           ...failure,
         });
         _logConnectorOperationFailure('connector_custom_add', { ...payload, ...failure });
-        uiAlert((res && res.error) || t('connectors.errors.connect_failed'));
+        uiAlert(_formatConnectError(res));
       }
     } catch (err) {
       const failure = _connectorFailureDetail(err, 'custom_add_exception');
@@ -1240,7 +2096,7 @@ function _openAddCustomDialog() {
         ...failure,
       });
       _logConnectorOperationFailure('connector_custom_add', { ...payload, ...failure });
-      uiAlert((err && err.message) || t('connectors.errors.connect_failed'));
+      uiAlert(_formatConnectError(err));
     } finally {
       okBtn.disabled = false;
       okBtn.textContent = t('connectors.custom.submit');
@@ -1250,20 +2106,42 @@ function _openAddCustomDialog() {
   setTimeout(() => f('name').focus(), 0);
 }
 
-function _formatConnectError(errLike) {
-  const code = errLike && errLike.code;
-  const msg = (errLike && (errLike.error || errLike.message)) || '';
-  if (code === 'connector_unsupported' || /connector_unsupported/i.test(String(msg))) {
-    return t('connectors.toast.unsupported');
+function _connectorStructuredErrorCode(errLike) {
+  if (!errLike || typeof errLike !== 'object') return '';
+  const nested = errLike.error && typeof errLike.error === 'object' ? errLike.error : null;
+  return String(errLike.code || errLike.error_code || (nested && nested.code) || '').trim().toLowerCase();
+}
+
+function _formatConnectError(errLike, fallbackKey = 'connectors.errors.connect_failed') {
+  const code = String((errLike && errLike.code) || '');
+  // Main supplies this dedicated, sanitized field; generic raw errors never opt in.
+  if (code === 'local_cli_authorization_failed' && typeof errLike.authorization_detail === 'string') {
+    const detail = errLike.authorization_detail.trim().slice(0, 1200);
+    if (detail) return t('connectors.errors.authorization_failed_detail', { detail });
   }
-  if (code === 'storage_unavailable') return t('connectors.errors.storage_unavailable');
-  if (code === 'missing_required_scopes' || /missing_required_scopes|missing required scopes/i.test(String(msg))) {
-    return t('connectors.errors.missing_required_scopes');
-  }
-  if (/fetch failed|network|timeout|timed out|econnreset|econnrefused|eai_again|enotfound/i.test(String(msg))) {
-    return _connectorErrorFallback('network');
-  }
-  return msg || t('connectors.errors.connect_failed');
+  const msg = String((errLike && (errLike.error || errLike.message)) || '');
+  const marker = code + ' ' + msg;
+  if (code === 'connector_production_only') return t('connectors.setup.production_only');
+  if (code === 'connector_sandbox_disconnect_required') return t('connectors.setup.sandbox_disconnect_required');
+  if (/connector_unsupported/i.test(marker)) return t('connectors.toast.unsupported');
+  if (/missing_required_scopes|missing required scopes/i.test(marker)) return t('connectors.errors.missing_required_scopes');
+  if (/storage_unavailable/i.test(marker)) return t('connectors.errors.storage_unavailable');
+  if (/connector_secrets_unavailable/i.test(marker)) return _connectorErrorFallback('secrets');
+  if (/local_api_credentials_missing|local_cli_credentials_missing/i.test(marker)) return _connectorErrorFallback('reconnect');
+  if (/invalid_grant|connector_reconnect_required|reconnect required|grant not found|授权已失效|Authorization expired|認証の有効期限|A autorização expirou/i.test(marker)) return _connectorErrorFallback('reconnect');
+  if (/seller_shop_mismatch/i.test(marker)) return t('connectors.seller.shop_mismatch');
+  if (/seller_request_failed/i.test(marker)) return t('connectors.seller.request_failed');
+  if (/HTTP 5\d{2}|exchange_http_5xx/i.test(marker)) return _connectorErrorFallback('network');
+  if (/fetch failed|network|timeout|timed out|econnreset|econnrefused|eai_again|enotfound|socket|connection (closed|reset|dropped)|terminated|refresh_failed|刷新授权失败|failed to refresh authorization|認証の更新に失敗|Falha ao atualizar a autorização/i.test(marker)) return _connectorErrorFallback('network');
+  if (/composio_not_configured|discord_client_invalid|unsupported_provider|invalid_catalog_id/i.test(marker)) return t('connectors.errors.service_configuration');
+  if (/does not advertise registration_endpoint|DCR unsupported|protected resource metadata missing|compatible token_endpoint_auth_method/i.test(marker)) return t('connectors.errors.service_configuration');
+  if (/DCR registration failed|token endpoint HTTP 4\d{2}|HTTP 40[13]/i.test(marker)) return t('connectors.errors.authorization_failed');
+  if (/state_expired|invalid_state|bad_state|oauth_code_invalid|exchange_http_4xx|missing_exchange_code/i.test(marker)) return t('connectors.errors.authorization_expired');
+  if (/local_api_authorization_failed|seller_authorization_failed/i.test(marker)) return t('connectors.seller.authorization_failed');
+  if (/local_cli_authorization_failed|provider_error|access_denied|authorization_failed|exchange_failed|dcr_registration_failed/i.test(marker)) return t('connectors.errors.authorization_failed');
+  if (/invalid (connector|Shopify|Lightspeed|Commerce Layer|WooCommerce|NetSuite|Shopee|TikTok|URL)|connector parameter required|unexpected connector|unknown connector parameter|connection parameters|invalid_configuration/i.test(marker)) return t('connectors.errors.invalid_configuration');
+  // Unstructured provider output is not a public error message.
+  return t(fallbackKey);
 }
 
 function escapeHtml(s) {
@@ -1341,7 +2219,7 @@ async function _drainConnectorInstallQueue() {
       if (controller) _connectorInstallControllers.set(requestId, controller);
       try {
         ok = await uiConfirm({
-          message: `${t('connectors.install_confirm.message', { name: info.display_name })}\n\n${info.summary}${warn}`,
+          message: `${t('connectors.install_confirm.message', { name: info.display_name })}\n\n${typeof info.target === 'string' ? t(info.kind === 'stdio' ? 'connectors.install_confirm.stdio_summary' : 'connectors.install_confirm.http_summary', { target: info.target }) : info.summary}${warn}`,
           okLabel: t('connectors.install_confirm.approve'),
           cancelLabel: t('connectors.install_confirm.decline'),
           ...(controller ? { signal: controller.signal } : {}),
@@ -1386,4 +2264,17 @@ async function _drainConnectorInstallQueue() {
   } finally {
     _connectorInstallDialogOpen = false;
   }
+}
+
+function _connectorActionMessage(info) {
+  const catalogEntry = _catalogEntryById(info.connector_id);
+  const displayName = catalogEntry ? _connectorDisplayName(catalogEntry) : (info.display_name || info.connector_id);
+  return [
+    `${t('connectors.action_confirm.connector')}: ${displayName}`,
+    `${t('connectors.action_confirm.action')}: ${info.action_name || info.tool_name}`,
+  ].join('\n');
+}
+
+function _connectorActionDetails(info) {
+  return String(info.arguments_preview || '{}');
 }

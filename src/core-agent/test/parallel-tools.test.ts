@@ -1,5 +1,9 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { AgentRunner, partitionToolBatches } from "../src/agent/runner.js";
+import { PersistentSession } from "../src/agent/persistent-session.js";
 import { createConfig } from "../src/config/loader.js";
 import { ProviderRegistry } from "../src/providers/registry.js";
 import { defineTool } from "../src/tools/base.js";
@@ -142,11 +146,15 @@ const finalResponse: CompletionResult = {
   model: "mock-model",
 };
 
-async function runCollect(tools: ReturnType<typeof defineTool>[], provider: LLMProvider) {
+async function runCollect(
+  tools: ReturnType<typeof defineTool>[],
+  provider: LLMProvider,
+  session?: PersistentSession,
+) {
   const registry = new ProviderRegistry();
   registry.registerFactory("mock", () => provider);
   const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
-  const runner = new AgentRunner({ config, providers: registry, tools });
+  const runner = new AgentRunner({ config, providers: registry, tools, session });
   const events: Array<{ type: string; [k: string]: unknown }> = [];
   for await (const ev of runner.runStream({ message: "go" })) {
     events.push(ev as { type: string; [k: string]: unknown });
@@ -186,6 +194,65 @@ describe("AgentRunner — parallel tool execution (G4)", () => {
     expect(msgs.indexOf("read_a-ok")).toBeGreaterThanOrEqual(0);
     expect(msgs.indexOf("read_a-ok")).toBeLessThan(msgs.indexOf("read_b-ok"));
     expect(msgs.indexOf("read_b-ok")).toBeLessThan(msgs.indexOf("read_c-ok"));
+  });
+
+  it("persists a settled parallel result batch with one context sidecar rewrite", async () => {
+    const sessionFile = path.join(
+      os.tmpdir(),
+      `core-agent-parallel-persistence-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`,
+    );
+    const contextFile = `${sessionFile}.context.json`;
+    const session = new PersistentSession({ sessionFile });
+    const { provider } = recordingProvider([
+      toolUseResponse([
+        { id: "persist-a", name: "read_a" },
+        { id: "persist-b", name: "read_b" },
+        { id: "persist-c", name: "read_c" },
+      ]),
+      finalResponse,
+    ]);
+    const tr = tracker();
+    const writeSpy = vi.spyOn(fs, "writeFileSync");
+    try {
+      await runCollect([
+        tr.tool("read_a", "parallel"),
+        tr.tool("read_b", "parallel"),
+        tr.tool("read_c", "parallel"),
+      ], provider, session);
+
+      const contextWrites = writeSpy.mock.calls.filter(
+        ([target]) => target === `${contextFile}.tmp`,
+      );
+      // The full run has five durability boundaries. Regressing to one sidecar
+      // rewrite per parallel result raises this from five to seven.
+      expect(contextWrites).toHaveLength(5);
+      expect(session.getExecutionPlan()).toBeUndefined();
+
+      const transcript = fs.readFileSync(sessionFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      const persistedResultIds = transcript.flatMap((message) => message.content)
+        .filter((item) => item.type === "tool_result")
+        .map((item) => item.toolUseId);
+      expect(persistedResultIds).toEqual(["persist-a", "persist-b", "persist-c"]);
+      expect(JSON.parse(fs.readFileSync(contextFile, "utf8")).completedWork)
+        .toHaveLength(3);
+
+      const restored = new PersistentSession({ sessionFile });
+      const restoredResultIds = restored.getMessages()
+        .flatMap((message) => message.content)
+        .filter((item) => item.type === "tool_result")
+        .map((item) => item.toolUseId);
+      expect(restoredResultIds).toEqual(["persist-a", "persist-b", "persist-c"]);
+      expect(restored.getSerializedContextState()?.completedWork)
+        .toHaveLength(3);
+    } finally {
+      writeSpy.mockRestore();
+      for (const target of [sessionFile, `${sessionFile}.tmp`, contextFile, `${contextFile}.tmp`]) {
+        try { fs.unlinkSync(target); } catch { /* ignore */ }
+      }
+    }
   });
 
   it("a failing tool in a parallel batch does not cancel its siblings", async () => {

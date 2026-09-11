@@ -61,6 +61,8 @@ let _settingsState = {
   taskNotificationPermissionTelemetryKey: '',
   clientConfigBound: false,
   recycleBound: false,
+  orkasApiCredential: null,
+  orkasApiEditing: false,
 };
 
 function _settingsTrackClick() {}
@@ -130,6 +132,7 @@ async function loadSettings() {
     _settingsSafeCall('settings image refresh', _settingsRefreshImageProfiles),
     _settingsSafeCall('settings video refresh', _settingsRefreshVideoProfiles),
     _settingsSafeCall('settings tts refresh', _settingsRefreshTtsProfiles),
+    _settingsSafeCall('settings Orkas API credential refresh', _settingsRefreshOrkasApiCredential),
     _settingsSafeCall('settings task notifications refresh', _settingsRefreshTaskNotifications),
     _settingsSafeCall('settings metacognition refresh', _settingsRefreshMetacognition),
     _settingsSafeCall('settings data root refresh', _settingsRefreshDataRoot),
@@ -1011,9 +1014,25 @@ async function _settingsRefreshEntries() {
 }
 
 function _settingsRenderOrkasApiCard() {
+  const credential = _settingsState.orkasApiCredential;
+  const configured = !!(credential && credential.configured);
+  const saved = document.getElementById('settings-orkas-api-saved');
+  const editor = document.getElementById('settings-orkas-api-editor');
+  const masked = document.getElementById('settings-orkas-api-key-masked');
+  const cancel = document.getElementById('settings-orkas-api-cancel');
+  if (saved) saved.hidden = !configured;
+  if (editor) editor.hidden = configured && !_settingsState.orkasApiEditing;
+  if (cancel) cancel.hidden = !configured || !_settingsState.orkasApiEditing;
+  if (masked) masked.textContent = configured ? String(credential.keyMasked || '') : '';
   const status = document.getElementById('settings-orkas-api-status');
   const key = status && status.getAttribute('data-i18n');
   if (status && key) status.textContent = t(key);
+}
+
+async function _settingsRefreshOrkasApiCredential() {
+  const res = await window.orkas.invoke('orkasApi.getStatus');
+  _settingsState.orkasApiCredential = res && res.ok ? res : null;
+  _settingsRenderOrkasApiCard();
 }
 
 async function _settingsRefreshAllCredentialSections() {
@@ -1024,6 +1043,7 @@ async function _settingsRefreshAllCredentialSections() {
     _settingsRefreshImageProfiles(),
     _settingsRefreshVideoProfiles(),
     _settingsRefreshTtsProfiles(),
+    _settingsRefreshOrkasApiCredential(),
   ]);
   await _settingsRenderPicker();
   await _settingsRenderEntries();
@@ -1038,8 +1058,11 @@ function _settingsBindOrkasApiOnce() {
   if (_settingsState.orkasApiBound) return;
   const createBtn = document.getElementById('settings-orkas-api-create-key');
   const configureBtn = document.getElementById('settings-orkas-api-configure');
+  const editBtn = document.getElementById('settings-orkas-api-edit');
+  const deleteBtn = document.getElementById('settings-orkas-api-delete');
+  const cancelBtn = document.getElementById('settings-orkas-api-cancel');
   const keyInput = document.getElementById('settings-orkas-api-key-input');
-  if (!createBtn || !configureBtn || !keyInput) return;
+  if (!createBtn || !configureBtn || !editBtn || !deleteBtn || !cancelBtn || !keyInput) return;
   _settingsState.orkasApiBound = true;
 
   createBtn.addEventListener('click', async () => {
@@ -1047,6 +1070,43 @@ function _settingsBindOrkasApiOnce() {
     const res = await window.orkas.invoke('auth.openExternal', { url });
     if (!res || !res.ok) {
       _settingsSetI18nStatus('settings-orkas-api-status', 'error', 'settings.orkas_api.open_failed');
+    }
+  });
+
+  editBtn.addEventListener('click', () => {
+    _settingsState.orkasApiEditing = true;
+    keyInput.value = '';
+    _settingsRenderOrkasApiCard();
+    keyInput.focus();
+  });
+
+  cancelBtn.addEventListener('click', () => {
+    _settingsState.orkasApiEditing = false;
+    keyInput.value = '';
+    _settingsRenderOrkasApiCard();
+  });
+
+  deleteBtn.addEventListener('click', async () => {
+    if (!(await uiConfirm(t('settings.orkas_api.delete_confirm')))) return;
+    deleteBtn.disabled = true;
+    try {
+      const res = await window.orkas.invoke('orkasApi.remove');
+      if (!res || !res.ok) throw new Error((res && res.error) || t('settings.orkas_api.delete_failed'));
+      _settingsState.orkasApiCredential = null;
+      _settingsState.orkasApiEditing = false;
+      await _settingsRefreshAllCredentialSections();
+      if (typeof refreshModelGuard === 'function') {
+        await Promise.resolve(refreshModelGuard()).catch(() => {});
+      }
+      _settingsSetStatus('settings-orkas-api-status', '', '');
+    } catch (err) {
+      _settingsSetStatus(
+        'settings-orkas-api-status',
+        'error',
+        (err && err.message) || t('settings.orkas_api.delete_failed'),
+      );
+    } finally {
+      deleteBtn.disabled = false;
     }
   });
 
@@ -1059,7 +1119,7 @@ function _settingsBindOrkasApiOnce() {
     configureBtn.disabled = true;
     _settingsSetI18nStatus('settings-orkas-api-status', 'busy', 'settings.orkas_api.configuring');
     try {
-      const res = await window.orkas.invoke('orkasApi.configureAll', { apiKey });
+      const res = await window.orkas.invoke('orkasApi.save', { apiKey });
       if (!res || !res.ok) {
         if (res && res.error) {
           _settingsSetStatus('settings-orkas-api-status', 'error', res.error);
@@ -1069,11 +1129,13 @@ function _settingsBindOrkasApiOnce() {
         return;
       }
       keyInput.value = '';
+      _settingsState.orkasApiCredential = res;
+      _settingsState.orkasApiEditing = false;
       await _settingsRefreshAllCredentialSections();
       if (typeof refreshModelGuard === 'function') {
         await Promise.resolve(refreshModelGuard()).catch(() => {});
       }
-      _settingsSetI18nStatus('settings-orkas-api-status', 'ok', 'settings.orkas_api.configure_ok');
+      _settingsSetStatus('settings-orkas-api-status', '', '');
     } catch (err) {
       if (err && err.message) {
         _settingsSetStatus('settings-orkas-api-status', 'error', err.message);
@@ -2382,7 +2444,6 @@ const _IMAGE_PROVIDER_OPTIONS = [
 ];
 
 function _imageProviderLabel(provider, model) {
-  if (provider === 'orkas-image') return 'Orkas · Image';
   const hit = _settingsImageProviderOptions().find((option) => (
     (option.provider || option.id) === provider
     && (!model || !option.model || option.model === model)

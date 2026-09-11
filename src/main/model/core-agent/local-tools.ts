@@ -101,6 +101,7 @@ import { uniquifyPathForWrite, renderRenameSignal } from '../../util/uniquify-pa
 import { isPathAllowed } from '../../util/path-sandbox';
 import { kindOf } from '../../features/file_indexer';
 import { getWorkspacePath } from '../../features/user_workspace';
+import * as projectFiles from '../../features/project_files';
 import {
   agentPrivateSkillsDir,
   globalSkillRoots,
@@ -130,7 +131,8 @@ import {
   waitForConfirmationVisible as waitForDeleteConfirmationVisible,
 } from './delete-file-confirm';
 import { fileEditLock } from '../../util/locks';
-import { checkEditFreshness, forgetRead, recordRead } from './read-tracker';
+import { fileFailure } from '../../../core-agent/src/tools/file-diagnostics';
+import { checkEditFreshness, forgetRead, getReadState, recordRead } from './read-tracker';
 import {
   canonicalFileRevisionPath,
   findAppendReplay,
@@ -165,8 +167,20 @@ const log = createLogger('local-tools');
 export interface ArtifactInteractionSmokeResult {
   ok: boolean;
   blockers: string[];
+  /** Non-blocking embed findings worth telling the author about, e.g. content
+   *  taller than the chat frame that will scroll rather than fit. */
+  warnings?: string[];
   controlsExercised?: number;
   observableEffects?: number;
+}
+
+/** What a successful write did to the target path. Editing, appending to, or
+ *  patching a file the user already had is not the same as producing one:
+ *  only the tool knows which happened, and a deliverable post-processor
+ *  downstream must not rewrite the former. */
+export interface ProducedFileWriteInfo {
+  /** The path already existed before this write. */
+  preExisting?: boolean;
 }
 
 export interface LocalToolsOpts {
@@ -211,20 +225,24 @@ export interface LocalToolsOpts {
   /** Mutable deny-only roots admitted after runner construction. File tools
    * may read them; local write/delete/bash paths must never mutate them. */
   runtimeReadOnlyRoots?: readonly string[];
+  /** Host-created, session-scoped working copies of persisted results. Bash
+   * may read files under these roots even in workspace-only mode; writes stay
+   * confined to the ordinary workspace and file tools gain no access. */
+  analysisInputRoots?: readonly string[];
   /** Exact logical Skill namespace already advertised to this runner. When
    * present, run-skill.cjs execution is confined to the matching bound root;
    * standalone callers that omit it retain the CLI's legacy discovery mode. */
   skillRuntimeBindings?: ReadonlyMap<string, SkillRuntimeBinding>;
   /** Fires with absolute path after every successful write (write_file,
    * append_file, edit_file, create_pdf). Lets chats.ts surface
-   * produced files to the UI. */
-  onFileWritten?: (absPath: string) => void | Promise<void>;
-  /** Validates and records the complete list declared through
-   * `publish_outputs`; returns only paths accepted by the active turn. */
+   * produced files to the UI. `info.preExisting` marks a write that only
+   * modified a file the user already had, so a caller that post-processes
+   * deliverables can leave the user's own files byte-identical. Producers
+   * that always create their output omit it. */
+  onFileWritten?: (absPath: string, info?: ProducedFileWriteInfo) => void | Promise<void>;
+  /** Filters and records the complete list declared through
+   * `publish_outputs`; returns only paths eligible for resource display. */
   onOutputsPublished?: (absPaths: string[]) => string[] | Promise<string[]>;
-  /** Returns existing current-turn files that are eligible for publication.
-   * Used only to make a rejected declaration recoverable without guessing. */
-  getPublishableOutputPaths?: () => string[];
   /** Fires after a successful `create_artifact` call. The caller (group_chat
    *  bus) collects these per turn and attaches `message.artifacts` to the
    *  assistant record so the renderer embeds each one in the bubble. */
@@ -703,7 +721,10 @@ async function emitBashProducedFiles(
   }
   if (opts.onFileWritten) {
     for (const abs of discovered) {
-      try { await opts.onFileWritten(abs); }
+      // The pre-command snapshot already answers "was this the user's file?":
+      // a path present in `before` was only modified by the command, not
+      // produced by it.
+      try { await opts.onFileWritten(abs, { preExisting: before.has(abs) }); }
       catch (err) { log.warn('onFileWritten callback failed', { path: logPathRef(abs), error: logErrorRef(err) }); }
     }
   }
@@ -1537,16 +1558,24 @@ function deleteRequiresUserConfirmation(opts: LocalToolsOpts, abs: string): bool
   return !isInWritableWorkspaceScope(opts, abs) && localAccessRequiresSensitiveApproval();
 }
 
-type BashPathToken = { type: 'word' | 'op'; value: string };
+type BashPathToken = { type: 'word' | 'op'; value: string; raw?: string };
 type BashPathSegment = {
   words: string[];
+  rawWords: string[];
   redirectTargets: string[];
   inputTargets: string[];
   separatorAfter?: string;
 };
-type BashPathCandidate = { raw: string; abs?: string; reason: string; dynamic?: boolean };
+/** `removesSource` marks an operand the command takes AWAY from where it is
+ *  now — an `rm`/`shred`/`Remove-Item` target, or an `mv` source. Those are
+ *  deletes as far as the user's file is concerned, whatever verb spelled it. */
+type BashPathCandidate = { raw: string; abs?: string; reason: string; dynamic?: boolean; removesSource?: boolean };
 type BashPathGateResult = { error: string | null; approvedReasons: LocalAccessRiskCategory[] };
-type BashFilesystemGuardResult = { result: ToolResult | null; approvedReasons: LocalAccessRiskCategory[] };
+type BashFilesystemGuardResult = {
+  result: ToolResult | null;
+  approvedReasons: LocalAccessRiskCategory[];
+  unresolvedPaths?: boolean;
+};
 
 const BASH_PATH_SEGMENT_OPS = new Set([';', '&&', '||', '|', '|&', '&']);
 const BASH_OUTPUT_REDIR_OPS = new Set(['>', '>>', '>|', '&>', '&>>', '1>', '1>>', '2>', '2>>']);
@@ -1561,18 +1590,11 @@ const BASH_SHRED_FLAGS_WITH_VALUE = new Set([
 ]);
 const BASH_DEST_LAST_OPERAND = new Set(['cp', 'install', 'rsync']);
 const BASH_READ_ALL_OPERANDS = new Set([
-  'cat', 'less', 'more', 'head', 'tail', 'wc', 'stat', 'file', 'du', 'ls', 'find',
+  'cat', 'less', 'more', 'head', 'tail', 'wc', 'stat', 'file', 'du', 'ls',
   'sort', 'uniq', 'cut', 'strings', 'realpath', 'readlink', 'open',
   'get-content', 'get-childitem', 'get-item', 'test-path', 'resolve-path',
 ]);
 const BASH_READ_PATTERN_FIRST_CMDS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack']);
-/** A path echoed back in a refusal, bounded. An unresolvable "target" can be a
- *  whole script body, and quoting all of it buries the instruction under it. */
-export function truncateForMessage(raw: string): string {
-  const oneLine = String(raw || '').replace(/\s+/g, ' ').trim();
-  return oneLine.length > 80 ? `${oneLine.slice(0, 79)}…` : oneLine;
-}
-
 const BASH_READ_SCRIPT_CMDS = new Set([
   'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish',
   'python', 'python3', 'node', 'ruby', 'perl', 'php',
@@ -1619,6 +1641,10 @@ const POWERSHELL_DELETE_FLAGS_WITH_VALUE = new Set([
   '-outbuffer',
   '-pipelinevariable',
 ]);
+const POWERSHELL_TRANSFER_FLAGS_WITH_VALUE = new Set([
+  ...POWERSHELL_DELETE_FLAGS_WITH_VALUE,
+  '-destination', '-filter', '-include', '-exclude', '-credential', '-fromsession', '-tosession',
+]);
 const POWERSHELL_DELETE_UNSAFE_FLAGS = new Set(['-recurse', '-include', '-exclude', '-filter']);
 const POWERSHELL_DELETE_SWITCHES = new Set([
   '-force', '-whatif', '-verbose', '-debug', '-confirm:$false',
@@ -1646,6 +1672,43 @@ function bashHeredocReceiverIsShell(prefix: string): boolean {
   }
   const effective = bashEffectiveCommand(words);
   return !!effective && BASH_POSIX_SHELL_CMDS.has(effective.cmd);
+}
+
+const BASH_SHELL_EVAL_CMDS = new Set(['eval', 'source', '.']);
+
+/** A heredoc whose receiver merely forwards stdin still becomes shell text
+ *  when a later stage of the same pipeline is a POSIX shell, `eval`/`source`,
+ *  or `xargs sh -c` (`cat <<'EOF' | bash`). Masking that payload would hide it
+ *  from the risk classifier that the approval flow depends on. */
+function bashHeredocPipelineReachesShell(rest: string): boolean {
+  let stage: string[] = [];
+  let expectOperand = false;
+  let skipDelimiter = true;
+  const stageIsShell = (words: string[]): boolean => {
+    const effective = bashEffectiveCommand(words);
+    if (!effective) return false;
+    if (BASH_POSIX_SHELL_CMDS.has(effective.cmd) || BASH_SHELL_EVAL_CMDS.has(effective.cmd)) return true;
+    return effective.cmd === 'xargs' && effective.args.some((arg) => BASH_POSIX_SHELL_CMDS.has(arg));
+  };
+  for (const token of tokenizeBashPathGuard(rest)) {
+    if (token.type === 'op') {
+      if (token.value === '|' || token.value === '|&') {
+        if (stageIsShell(stage)) return true;
+        stage = [];
+      } else if (BASH_PATH_SEGMENT_OPS.has(token.value)) {
+        // `;`, `&&`, `||`, `&` end the command list that consumes this heredoc.
+        return stageIsShell(stage);
+      }
+      expectOperand = BASH_OUTPUT_REDIR_OPS.has(token.value)
+        || BASH_FILE_INPUT_REDIR_OPS.has(token.value)
+        || BASH_NON_FILE_INPUT_REDIR_OPS.has(token.value);
+      continue;
+    }
+    if (skipDelimiter) { skipDelimiter = false; continue; }
+    if (expectOperand) { expectOperand = false; continue; }
+    stage.push(token.value);
+  }
+  return stageIsShell(stage);
 }
 
 /**
@@ -1725,7 +1788,12 @@ function bashHeredocSpecs(line: string): BashHeredocSpec[] {
       started = true;
     }
     if (started && delimiter) {
-      specs.push({ delimiter, stripTabs, shellPayload: bashHeredocReceiverIsShell(line.slice(0, i)) });
+      specs.push({
+        delimiter,
+        stripTabs,
+        shellPayload: bashHeredocReceiverIsShell(line.slice(0, i))
+          || bashHeredocPipelineReachesShell(line.slice(i + 2)),
+      });
     }
     i = Math.max(i, j - 1);
   }
@@ -1790,21 +1858,23 @@ function maskBashHeredocBodies(command: string): string {
   return analyzeBashHeredocs(command).shellSurface;
 }
 
-function tokenizeBashPathGuard(input: string): BashPathToken[] {
+function tokenizeBashPathGuard(input: string, executionSyntax = false): BashPathToken[] {
   const toks: BashPathToken[] = [];
   let cur = '';
   let hasCur = false;
   let quote: "'" | '"' | null = null;
   let escaped = false;
-  const push = () => {
-    if (!hasCur) return;
-    toks.push({ type: 'word', value: cur });
+  let wordStart: number | undefined;
+  const push = (end: number) => {
+    if (hasCur) toks.push({ type: 'word', value: cur, raw: input.slice(wordStart ?? end, end) });
+    wordStart = undefined;
     cur = '';
     hasCur = false;
   };
 
   for (let i = 0; i < input.length; i++) {
     const ch = input[i];
+    if (wordStart === undefined) wordStart = i;
     if (escaped) {
       cur += ch;
       hasCur = true;
@@ -1832,46 +1902,61 @@ function tokenizeBashPathGuard(input: string): BashPathToken[] {
       hasCur = true;
       continue;
     }
+    if (executionSyntax && ch === '#' && !hasCur) {
+      while (i < input.length && input[i] !== '\n' && input[i] !== '\r') i++;
+      wordStart = undefined;
+      toks.push({ type: 'op', value: ';' });
+      continue;
+    }
+    const groupingOperator = ch === '(' || ch === ')'
+      || (!hasCur && (ch === '{' || ch === '}') && /\s|$/.test(input[i + 1] || ''));
+    if (executionSyntax && groupingOperator) {
+      push(i);
+      toks.push({ type: 'op', value: ';' });
+      continue;
+    }
     if (/\s/.test(ch)) {
-      push();
+      push(i);
       if (ch === '\n' || ch === '\r') toks.push({ type: 'op', value: ';' });
       continue;
     }
 
     const three = input.slice(i, i + 3);
     if (three === '&>>' || three === '<<<' || /^\d>>$/.test(three)) {
-      push(); toks.push({ type: 'op', value: three }); i += 2; continue;
+      push(i); toks.push({ type: 'op', value: three }); i += 2; continue;
     }
     const two = input.slice(i, i + 2);
     if (['&&', '||', '|&', '>>', '>|', '&>', '<<'].includes(two) || /^\d>$/.test(two)) {
-      push(); toks.push({ type: 'op', value: two }); i += 1; continue;
+      push(i); toks.push({ type: 'op', value: two }); i += 1; continue;
     }
     if (ch === '|' || ch === '&' || ch === ';' || ch === '>' || ch === '<') {
-      push(); toks.push({ type: 'op', value: ch }); continue;
+      push(i); toks.push({ type: 'op', value: ch }); continue;
     }
     cur += ch;
     hasCur = true;
   }
-  push();
+  push(input.length);
   return toks;
 }
 
-function bashPathSegments(command: string): BashPathSegment[] {
+function bashPathSegments(command: string, executionSyntax = false): BashPathSegment[] {
   const out: BashPathSegment[] = [];
   let words: string[] = [];
+  let rawWords: string[] = [];
   let redirectTargets: string[] = [];
   let inputTargets: string[] = [];
   let expect: 'out' | 'in' | 'skip' | null = null;
   const push = (separatorAfter?: string) => {
     if (words.length || redirectTargets.length || inputTargets.length) {
-      out.push({ words, redirectTargets, inputTargets, ...(separatorAfter ? { separatorAfter } : {}) });
+      out.push({ words, rawWords, redirectTargets, inputTargets, ...(separatorAfter ? { separatorAfter } : {}) });
     }
     words = [];
+    rawWords = [];
     redirectTargets = [];
     inputTargets = [];
   };
 
-  for (const tok of tokenizeBashPathGuard(maskBashHeredocBodies(command))) {
+  for (const tok of tokenizeBashPathGuard(maskBashHeredocBodies(command), executionSyntax)) {
     if (tok.type === 'op') {
       if (BASH_PATH_SEGMENT_OPS.has(tok.value)) {
         push(tok.value);
@@ -1902,6 +1987,7 @@ function bashPathSegments(command: string): BashPathSegment[] {
       continue;
     }
     words.push(tok.value);
+    rawWords.push(tok.raw ?? tok.value);
   }
   push();
   return out;
@@ -1923,9 +2009,30 @@ function bashLiteralAssignmentValue(value: string): string | null {
 /** Resolve only assignments whose value is already a literal in a completed
  * shell statement. Temporary command assignments, pipelines, background jobs,
  * general loop variables, substitutions, and calculated PowerShell expressions
- * remain unresolved and fail closed. A narrow finite-loop case is expanded by
- * bashGuardCommandVariants before candidate collection. */
-function bashPersistentLiteralAssignments(segment: BashPathSegment): Record<string, string | null> | null {
+ * remain unresolved and require a runtime permission decision. A narrow
+ * finite-loop case is expanded by bashGuardCommandVariants before collection. */
+function bashPersistentLiteralAssignments(
+  segment: BashPathSegment,
+  hostPlatform: NodeJS.Platform,
+): Record<string, string | null> | null {
+  if (hostPlatform === 'win32') {
+    // Parse the original spelling: whitespace around '=' is optional, while a
+    // quoted "$name" is data rather than an assignment target. Cooked shell
+    // words lose both distinctions and PowerShell's literal backslashes.
+    const assignment = /^\$(?:env:)?([A-Za-z_][A-Za-z0-9_]*)\s*(\?\?=|[+*/%-]?=|\+\+|--)([\s\S]*)$/i.exec(segment.rawWords.join(' '));
+    if (assignment) {
+      const raw = assignment[3].trim();
+      let literal: string | null = null;
+      if (assignment[2] === '=' && segment.separatorAfter
+        && BASH_LITERAL_ASSIGNMENT_PERSIST_SEPARATORS.has(segment.separatorAfter)) {
+        if (/^'(?:[^']|'')*'$/.test(raw)) literal = raw.slice(1, -1).replace(/''/g, "'");
+        else if (/^"(?:[^"$`]|"")*"$/.test(raw)) literal = raw.slice(1, -1).replace(/""/g, '"');
+      }
+      // Computed, compound, or pipeline assignments invalidate an earlier
+      // literal. Never verify a later operation against the variable's old path.
+      return { [assignment[1]]: literal === null ? null : bashLiteralAssignmentValue(literal) };
+    }
+  }
   if (!segment.separatorAfter || !BASH_LITERAL_ASSIGNMENT_PERSIST_SEPARATORS.has(segment.separatorAfter)) return null;
   if (segment.words.length > 0 && segment.words.every((word) => BASH_PATH_ASSIGN_WORD_RE.test(word))) {
     const assignments: Record<string, string | null> = {};
@@ -1934,14 +2041,6 @@ function bashPersistentLiteralAssignments(segment: BashPathSegment): Record<stri
       assignments[match[1]] = match[2] ? null : bashLiteralAssignmentValue(match[3]);
     }
     return assignments;
-  }
-
-  if (segment.words.length >= 2 && segment.words[1] === '=') {
-    const match = /^\$(?:env:)?([A-Za-z_][A-Za-z0-9_]*)$/i.exec(segment.words[0]);
-    if (match) {
-      const value = segment.words.length === 3 ? bashLiteralAssignmentValue(segment.words[2]) : null;
-      return { [match[1]]: value };
-    }
   }
 
   const command = segment.words[0]?.toLowerCase();
@@ -2007,12 +2106,13 @@ function powershellLiteralLoopValues(raw: string): string[] | null {
 function bashPathSegmentsWithEnv(
   command: string,
   baseEnv: Record<string, string>,
+  hostPlatform: NodeJS.Platform = process.platform,
 ): Array<{ segment: BashPathSegment; env: Record<string, string> }> {
   const env = { ...baseEnv };
   const out: Array<{ segment: BashPathSegment; env: Record<string, string> }> = [];
   for (const segment of bashPathSegments(command)) {
     out.push({ segment, env: { ...env } });
-    const assignments = bashPersistentLiteralAssignments(segment);
+    const assignments = bashPersistentLiteralAssignments(segment, hostPlatform);
     if (assignments) updateBashPathEnv(env, assignments);
   }
   return out;
@@ -2071,7 +2171,7 @@ function bashGuardPathSegments(
   hostPlatform: NodeJS.Platform,
 ): Array<{ segment: BashPathSegment; env: Record<string, string> }> {
   return bashGuardCommandVariants(command, baseEnv, hostPlatform).flatMap((variant) => (
-    bashPathSegmentsWithEnv(variant.command, variant.env)
+    bashPathSegmentsWithEnv(variant.command, variant.env, hostPlatform)
   ));
 }
 
@@ -2126,6 +2226,23 @@ function bashProtectedRootMentionIsProvablyReadOnly(command: string): boolean {
   return true;
 }
 
+/** `find [-H|-L|-P] [-O…] [-D opts] starting-point… [expression]`: only the
+ *  leading operands before the first expression token are paths the command
+ *  reads. Expression operands (`-maxdepth 1`, `-type f`, `-name x`) are not
+ *  paths — gating them as such resolved `1`/`f` against the cwd and could
+ *  raise a bogus sensitive-path prompt (or deny) for a read-only listing. */
+function findStartingPoints(args: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '-H' || a === '-L' || a === '-P' || /^-O\d*$/.test(a)) continue;
+    if (a === '-D') { i += 1; continue; }
+    if (a.startsWith('-') || a === '(' || a === '!' || a === ',') break;
+    out.push(a);
+  }
+  return out;
+}
+
 function bashNonFlagOperands(args: string[], flagsWithValue: Set<string> = BASH_GENERIC_FLAGS_WITH_VALUE): string[] {
   const out: string[] = [];
   let endOfOptions = false;
@@ -2169,6 +2286,32 @@ function powershellDeleteOperands(args: string[]): string[] {
   }
   if (explicit.length) return explicit;
   return bashNonFlagOperands(args, POWERSHELL_DELETE_FLAGS_WITH_VALUE);
+}
+
+/** Move-Item and Copy-Item bind source and destination independently: either
+ * can be named while the other remains positional. Common parameter values
+ * such as `-ErrorAction Stop` are not filesystem operands. */
+function powershellTransferOperands(args: string[]): { sources: string[]; destination: string | null } {
+  const sources: string[] = [];
+  const positional: string[] = [];
+  let destination: string | null = null;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (!arg.startsWith('-')) {
+      positional.push(arg);
+      continue;
+    }
+    const colon = arg.indexOf(':');
+    const flag = (colon > 0 ? arg.slice(0, colon) : arg).toLowerCase();
+    if (!POWERSHELL_TRANSFER_FLAGS_WITH_VALUE.has(flag)) continue;
+    const value = colon > 0 ? arg.slice(colon + 1) : args[++i];
+    if (value === undefined) continue;
+    if (POWERSHELL_DELETE_PATH_FLAGS.has(flag)) sources.push(value);
+    else if (flag === '-destination') destination = value;
+  }
+  if (!sources.length && positional.length) sources.push(positional.shift()!);
+  if (destination === null) destination = positional.shift() ?? (sources.length ? '.' : null);
+  return { sources, destination };
 }
 
 function bashMutationOperands(cmd: string, args: string[]): string[] {
@@ -2345,10 +2488,50 @@ function addBashCandidate(
   reason: string,
   workingDir: string,
   env: Record<string, string>,
+  removesSource = false,
 ): void {
   const resolved = resolveBashCandidate(raw, workingDir, env);
   if (!resolved) return;
-  out.push({ raw, reason, ...(resolved.abs ? { abs: resolved.abs } : {}), ...(resolved.dynamic ? { dynamic: true } : {}) });
+  out.push({
+    raw,
+    reason,
+    ...(resolved.abs ? { abs: resolved.abs } : {}),
+    ...(resolved.dynamic ? { dynamic: true } : {}),
+    ...(removesSource ? { removesSource: true } : {}),
+  });
+}
+
+/** Split `mv` operands into the paths that lose their current location and
+ *  the one that gains them. `-t DIR` / `--target-directory=DIR` invert the
+ *  usual "last operand is the destination" shape: with either flag, every
+ *  positional operand is a source. */
+function bashMoveOperands(args: string[]): { sources: string[]; destination: string | null } {
+  let targetDir: string | null = null;
+  const positional: string[] = [];
+  let endOfOptions = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (!endOfOptions && a === '--') { endOfOptions = true; continue; }
+    if (!endOfOptions && a.startsWith('--target-directory=')) {
+      targetDir = a.slice('--target-directory='.length);
+      continue;
+    }
+    if (!endOfOptions && a.startsWith('-')) {
+      if (a === '-t' || a === '--target-directory') {
+        if (args[i + 1] !== undefined) targetDir = args[i + 1];
+        i += 1;
+        continue;
+      }
+      if (!a.includes('=') && BASH_GENERIC_FLAGS_WITH_VALUE.has(a)) i += 1;
+      continue;
+    }
+    positional.push(a);
+  }
+  if (targetDir !== null) return { sources: positional, destination: targetDir };
+  // A lone operand is a malformed `mv`; treat it as a source so the gate
+  // errs toward asking rather than toward silently relocating a file.
+  if (positional.length < 2) return { sources: positional, destination: null };
+  return { sources: positional.slice(0, -1), destination: positional[positional.length - 1] };
 }
 
 function addBashCurlTargets(out: BashPathCandidate[], args: string[], workingDir: string, env: Record<string, string>): void {
@@ -2458,15 +2641,26 @@ function collectBashMutationCandidates(
       }
     } else if (cmd === 'remove-item') {
       for (const operand of powershellDeleteOperands(args)) {
-        addBashCandidate(out, operand, cmd, workingDir, segmentEnv);
+        addBashCandidate(out, operand, cmd, workingDir, segmentEnv, true);
       }
     } else if (cmd === 'del' || cmd === 'erase') {
       for (const operand of windowsDeleteOperands(args)) {
-        addBashCandidate(out, operand, cmd, workingDir, segmentEnv);
+        addBashCandidate(out, operand, cmd, workingDir, segmentEnv, true);
       }
+    } else if (cmd === 'mv') {
+      const { sources, destination } = bashMoveOperands(args);
+      for (const operand of sources) addBashCandidate(out, operand, 'mv source', workingDir, segmentEnv, true);
+      if (destination !== null) addBashCandidate(out, destination, 'mv destination', workingDir, segmentEnv);
+    } else if (cmd === 'move-item' || cmd === 'copy-item') {
+      const { sources, destination } = powershellTransferOperands(args);
+      if (cmd === 'move-item') {
+        for (const operand of sources) addBashCandidate(out, operand, 'move-item source', workingDir, segmentEnv, true);
+      }
+      if (destination !== null) addBashCandidate(out, destination, `${cmd} destination`, workingDir, segmentEnv);
     } else if (BASH_MUTATE_ALL_OPERANDS.has(cmd)) {
+      const removesSource = BASH_DELETE_MUTATION_CMDS.has(cmd) || cmd === 'shred';
       for (const operand of bashMutationOperands(cmd, args)) {
-        addBashCandidate(out, operand, cmd, workingDir, segmentEnv);
+        addBashCandidate(out, operand, cmd, workingDir, segmentEnv, removesSource);
       }
     } else if (BASH_DEST_LAST_OPERAND.has(cmd)) {
       const operands = bashNonFlagOperands(args);
@@ -2523,7 +2717,9 @@ function collectBashReadCandidates(
     if (!eff) continue;
     const { cmd, args } = eff;
 
-    if (BASH_READ_ALL_OPERANDS.has(cmd)) {
+    if (cmd === 'find') {
+      for (const operand of findStartingPoints(args)) addBashCandidate(out, operand, cmd, workingDir, segmentEnv);
+    } else if (BASH_READ_ALL_OPERANDS.has(cmd)) {
       for (const operand of bashNonFlagOperands(args)) addBashCandidate(out, operand, cmd, workingDir, segmentEnv);
     } else if (BASH_READ_PATTERN_FIRST_CMDS.has(cmd)) {
       for (const operand of grepReadOperands(args)) addBashCandidate(out, operand, cmd, workingDir, segmentEnv);
@@ -2537,6 +2733,10 @@ function collectBashReadCandidates(
     } else if (BASH_DEST_LAST_OPERAND.has(cmd)) {
       const operands = bashNonFlagOperands(args);
       for (const operand of operands.slice(0, -1)) addBashCandidate(out, operand, `${cmd} source`, workingDir, segmentEnv);
+    } else if (cmd === 'copy-item') {
+      for (const operand of powershellTransferOperands(args).sources) {
+        addBashCandidate(out, operand, 'copy-item source', workingDir, segmentEnv);
+      }
     } else if (BASH_READ_SCRIPT_CMDS.has(cmd)) {
       const operand = bashScriptOperand(cmd, args);
       if (operand) addBashCandidate(out, operand, `${cmd} script`, workingDir, segmentEnv);
@@ -2555,11 +2755,17 @@ function bashScopedRootsFor(opts: LocalToolsOpts, workingDir: string): string[] 
   if (localAccessAllowsOutsideWorkspace()) return [];
   const roots = allowedRootsFor(opts);
   if (!opts.userId && workingDir) roots.push(workingDir);
+  if (opts.analysisInputRoots?.length) {
+    for (const root of opts.analysisInputRoots) if (root) roots.push(root);
+  }
   return roots;
 }
 
 function bashWritableRootsFor(opts: LocalToolsOpts, workingDir: string): string[] {
-  return bashScopedRootsFor(opts, workingDir);
+  if (localAccessAllowsOutsideWorkspace()) return [];
+  const roots = allowedRootsFor(opts);
+  if (!opts.userId && workingDir) roots.push(workingDir);
+  return roots;
 }
 
 function guardBashScopedPath(opts: LocalToolsOpts, abs: string, workingDir: string, access: 'read' | 'write'): string | null {
@@ -2567,7 +2773,9 @@ function guardBashScopedPath(opts: LocalToolsOpts, abs: string, workingDir: stri
     const protectedRoot = protectedRootForPath(opts, abs);
     if (protectedRoot) return protectedWriteError(abs, protectedRoot);
   }
-  const roots = bashScopedRootsFor(opts, workingDir);
+  const roots = access === 'read'
+    ? bashScopedRootsFor(opts, workingDir)
+    : bashWritableRootsFor(opts, workingDir);
   if (!roots.length) {
     return localAccessAllowsOutsideWorkspace()
       ? null
@@ -2596,7 +2804,56 @@ async function gateBashPathAccess(
 ): Promise<BashPathGateResult> {
   const denied = guardBashScopedPath(opts, abs, workingDir, access);
   if (denied) return { error: denied, approvedReasons: [] };
+  if (opts.analysisInputRoots?.length && isPathAllowed(abs, opts.analysisInputRoots)) {
+    return { error: null, approvedReasons: [] };
+  }
   return gateSensitiveLocalPathDetailed(opts, abs, 'bash', access, ctx);
+}
+
+/**
+ * Same rule as `delete_file`, enforced on the shell.
+ *
+ * `delete_file` makes removing a file outside the writable workspace cost a
+ * user click. Nothing used to apply that rule to `bash`, so `rm <file>` and
+ * especially `mv <file> /tmp/...` walked the same file out of the user's repo
+ * with no prompt at all — the confirm card was one `bash` call away from
+ * irrelevant, and a model that hits the card reliably finds the shell next.
+ *
+ * Scope is deliberately narrow: inside the writable workspace nothing
+ * changes (both tools remove outright there), and only paths that actually
+ * exist are gated, so a `rm -f` over a missing file stays quiet.
+ */
+async function gateBashSourceRemoval(
+  opts: LocalToolsOpts,
+  ctx: ToolContext | undefined,
+  command: string,
+  candidate: BashPathCandidate,
+): Promise<{ error: string | null; approvedReasons: LocalAccessRiskCategory[] }> {
+  if (!candidate.removesSource || !candidate.abs) return { error: null, approvedReasons: [] };
+  if (!localAccessRequiresSensitiveApproval()) return { error: null, approvedReasons: [] };
+  if (isInWritableWorkspaceScope(opts, candidate.abs)) return { error: null, approvedReasons: [] };
+  if (!fs.existsSync(candidate.abs)) return { error: null, approvedReasons: [] };
+  const decision = await requestBashDecision({
+    uid: opts.userId ?? '',
+    cid: opts.cid ?? '',
+    agentId: opts.agentId ?? '',
+    agentName: opts.agentName ?? opts.agentId ?? '',
+    command,
+    operation: candidate.reason,
+    subject: candidate.abs,
+    reasons: ['destructive'],
+    onWaiting: permissionWaitProgress(ctx, 'bash'),
+  });
+  if (decision !== 'deny') return { error: null, approvedReasons: ['destructive'] };
+  return {
+    error: errText(
+      'E_BASH_RISK_DENIED',
+      `the user declined to remove "${candidate.abs}", which is outside the writable workspace. `
+      + 'Do not retry, and do not move, rename, or overwrite it as a way around the prompt; '
+      + 'explain in prose what you intended and ask the user how to proceed.',
+    ),
+    approvedReasons: [],
+  };
 }
 
 function mergeRiskReasons(target: LocalAccessRiskCategory[], source: readonly LocalAccessRiskCategory[]): void {
@@ -2649,28 +2906,17 @@ async function guardBashPathCandidates(
   workingDir: string,
   candidates: BashPathCandidate[],
   access: 'read' | 'write',
+  command = '',
+  allowUnresolvedPaths = false,
 ): Promise<BashFilesystemGuardResult> {
   const approvedReasons: LocalAccessRiskCategory[] = [];
   const seen = new Set<string>();
+  // Unknown paths are an approval fact, not unsupported shell syntax. Check
+  // known targets first so an approval never overrides a concrete scope denial.
+  const unresolvedPaths = !allowUnresolvedPaths && candidates.some((c) => c.dynamic || !c.abs);
   for (const c of candidates) {
-    const key = c.abs || `dynamic:${c.raw}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    if (c.dynamic || !c.abs) {
-      return {
-        result: {
-          content: errText(
-            'E_BASH_DYNAMIC_PATH_UNSUPPORTED',
-            `The ${c.reason} target "${truncateForMessage(c.raw)}" uses an unresolved variable, command substitution, or glob that Orkas cannot verify. `
-            + (access === 'write'
-              ? 'Use an explicit path inside the workspace, or use write_file/edit_file/delete_file for file changes.'
-              : 'Resolve it to explicit readable paths before retrying.'),
-          ),
-          isError: true,
-        },
-        approvedReasons,
-      };
-    }
+    if (!c.abs || seen.has(c.abs)) continue;
+    seen.add(c.abs);
     const gated = await gateBashPathAccess(opts, c.abs, workingDir, access, ctx);
     mergeRiskReasons(approvedReasons, gated.approvedReasons);
     if (gated.error) {
@@ -2690,8 +2936,47 @@ async function guardBashPathCandidates(
         approvedReasons,
       };
     }
+    const removal = await gateBashSourceRemoval(opts, ctx, command, c);
+    mergeRiskReasons(approvedReasons, removal.approvedReasons);
+    if (removal.error) {
+      log.warn('bash out-of-workspace removal denied', {
+        user_id: maskId(opts.userId),
+        cid: maskId(opts.cid),
+        path: logPathRef(c.abs),
+        reason: c.reason,
+      });
+      return { result: { content: removal.error, isError: true }, approvedReasons };
+    }
   }
-  return { result: null, approvedReasons };
+  return { result: null, approvedReasons, unresolvedPaths };
+}
+
+/**
+ * `interactive_cli` deliberately skips the full path-scope guard: the login
+ * flows it exists for legitimately write outside the workspace (`~/.config`,
+ * keychains, token caches). Removals are a different question. Without this,
+ * `interactive_cli` would be the one shell entry point where a file can leave
+ * the user's disk without the confirmation `delete_file` and `bash` both ask
+ * for — and a gate with one open door is not a gate.
+ */
+async function guardInteractiveRemovalTargets(
+  opts: LocalToolsOpts,
+  ctx: ToolContext,
+  workingDir: string,
+  command: string,
+): Promise<BashFilesystemGuardResult> {
+  const env = bashEnvForPathResolution(ctx, workingDir);
+  const removals = collectBashMutationCandidates(
+    command,
+    workingDir,
+    env,
+    opts.hostPlatform ?? process.platform,
+  ).filter((candidate) => candidate.removesSource);
+  if (!removals.length) return { result: null, approvedReasons: [] };
+  return guardBashPathCandidates(
+    opts, ctx, workingDir, removals, 'write', command,
+    !localAccessRequiresSensitiveApproval(),
+  );
 }
 
 async function guardBashFilesystemTargets(
@@ -2699,6 +2984,7 @@ async function guardBashFilesystemTargets(
   input: Record<string, unknown>,
   ctx: ToolContext,
   workingDir: string,
+  allowUnresolvedPaths: boolean,
 ): Promise<BashFilesystemGuardResult> {
   const command = String(input.command ?? '');
   const env = bashEnvForPathResolution(ctx, workingDir);
@@ -2709,6 +2995,8 @@ async function guardBashFilesystemTargets(
     workingDir,
     collectBashMutationCandidates(command, workingDir, env, opts.hostPlatform ?? process.platform),
     'write',
+    command,
+    allowUnresolvedPaths,
   );
   mergeRiskReasons(approvedReasons, mutation.approvedReasons);
   if (mutation.result) return { result: mutation.result, approvedReasons };
@@ -2719,10 +3007,12 @@ async function guardBashFilesystemTargets(
     workingDir,
     collectBashReadCandidates(command, workingDir, env, opts.hostPlatform ?? process.platform),
     'read',
+    '',
+    allowUnresolvedPaths,
   );
   mergeRiskReasons(approvedReasons, read.approvedReasons);
   if (read.result) return { result: read.result, approvedReasons };
-  return { result: null, approvedReasons };
+  return { result: null, approvedReasons, unresolvedPaths: mutation.unresolvedPaths || read.unresolvedPaths };
 }
 
 function countOccurrences(haystack: string, needle: string): number {
@@ -2879,13 +3169,103 @@ function editRecoveryContext(body: string, needle: string, fileHash: string): st
   ].join('\n');
 }
 
-function extractRunSkillRefs(command: string): string[] {
+/** Read a POSIX command substitution as syntax; never evaluate it. */
+function shellCommandSubstitution(input: string, start: number, depth = 0): { body: string; end: number } | null {
+  if (depth >= 16) return null;
+  if (input[start] === '`') {
+    for (let i = start + 1; i < input.length; i++) {
+      if (input[i] === '\\') { i++; continue; }
+      if (input[i] === '`') return { body: input.slice(start + 1, i), end: i };
+    }
+    return null;
+  }
+  if (!input.startsWith('$(', start)) return null;
+  let nesting = 1;
+  let quote: "'" | '"' | null = null;
+  for (let i = start + 2; i < input.length; i++) {
+    const ch = input[i];
+    if (quote === "'") { if (ch === "'") quote = null; continue; }
+    if (ch === '\\') { i++; continue; }
+    const nested = (input.startsWith('$(', i) || ch === '`')
+      ? shellCommandSubstitution(input, i, depth + 1) : null;
+    if (nested) { i = nested.end; continue; }
+    if (quote === '"') { if (ch === '"') quote = null; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === '(') nesting++;
+    if (ch === ')' && --nesting === 0) return { body: input.slice(start + 2, i), end: i };
+  }
+  return null;
+}
+
+function extractRunSkillRefs(command: string, depth = 0, hostPlatform: NodeJS.Platform = process.platform): string[] {
   const out: string[] = [];
-  const re = /(?:^|[^\w.-])run-skill\.cjs["']?\s+(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9._:@+-]+))/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(command)) !== null) {
-    const ref = (m[1] || m[2] || m[3] || '').trim();
-    if (ref) out.push(ref);
+  // Substitutions execute even within double-quoted arguments to a data-only
+  // command. Single-quoted examples and non-shell heredoc bodies stay data.
+  if (hostPlatform !== 'win32' && depth < 4) {
+    const surface = maskBashHeredocBodies(command);
+    let quote: "'" | '"' | null = null;
+    for (let i = 0; i < surface.length; i++) {
+      const ch = surface[i];
+      if (quote === "'") { if (ch === "'") quote = null; continue; }
+      if (ch === '\\') { i++; continue; }
+      if (!quote && ch === '#' && (i === 0 || /[\s;&|]/.test(surface[i - 1]))) {
+        while (i < surface.length && surface[i] !== '\n') i++;
+        continue;
+      }
+      const substitution = (surface.startsWith('$(', i) || ch === '`')
+        ? shellCommandSubstitution(surface, i) : null;
+      if (substitution) {
+        out.push(...extractRunSkillRefs(substitution.body, depth + 1, hostPlatform));
+        i = substitution.end;
+        continue;
+      }
+      if (quote === '"') { if (ch === '"') quote = null; continue; }
+      if (ch === "'" || ch === '"') quote = ch;
+    }
+  }
+  const basename = (value: string): string => value.replace(/\\/g, '/').split('/').pop()!.toLowerCase();
+  const nodeValueOptions = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '--conditions', '-C']);
+  // Inspect executable/argv positions, never an arbitrary filename mention.
+  // In particular, `find ... -name run-skill.cjs -type f` does not invoke a
+  // Skill named "-type". The shared lexer also excludes redirected data.
+  for (const segment of bashPathSegments(command, true)) {
+    let start = 0;
+    while (segment.rawWords[start] === segment.words[start]
+      && ['if', 'then', 'elif', 'else', 'do', '!'].includes(segment.words[start])) start++;
+    const effective = bashEffectiveCommand(segment.words.slice(start));
+    if (!effective) continue;
+    const cmd = basename(effective.cmd);
+    const args = effective.args;
+    if (/^(?:bash|dash|ksh|sh|zsh|pwsh|powershell)(?:\.exe)?$/.test(cmd)) {
+      const isPowerShell = /^(?:pwsh|powershell)/.test(cmd);
+      const commandAt = args.findIndex((arg) => isPowerShell
+        ? /^(?:-command|-c)$/i.test(arg)
+        : /^-[a-z]*c[a-z]*$/i.test(arg));
+      if (depth < 4 && commandAt >= 0 && args[commandAt + 1]) {
+        out.push(...extractRunSkillRefs(args[commandAt + 1], depth + 1, isPowerShell ? 'win32' : 'linux'));
+      }
+      continue;
+    }
+    let ref: string | undefined;
+    if (cmd === 'run-skill.cjs') {
+      ref = args[0];
+    } else if (/^(?:node|nodejs)(?:\.exe)?$/.test(cmd)
+      || /^(?:\$(?:env:)?orkas_node|\$\{(?:env:)?orkas_node\}|%orkas_node%)$/.test(cmd)) {
+      for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        // Eval/print/check modes do not execute the following script operand.
+        if (/^(?:-[epc]|--eval|--print|--check)(?:=|$)/.test(arg) || /^-[ep].+/.test(arg)) break;
+        if (nodeValueOptions.has(arg)) { i++; continue; }
+        if (arg === '--') {
+          if (basename(args[i + 1] || '') === 'run-skill.cjs') ref = args[i + 2];
+          break;
+        }
+        if (arg.startsWith('-')) continue;
+        if (basename(arg) === 'run-skill.cjs') ref = args[i + 1];
+        break;
+      }
+    }
+    if (ref?.trim()) out.push(ref.trim());
   }
   return out;
 }
@@ -2899,7 +3279,7 @@ function resolveRunSkillRuntimeBinding(
   opts: LocalToolsOpts,
   command: string,
 ): RunSkillRuntimeResolution {
-  const refs = extractRunSkillRefs(command);
+  const refs = extractRunSkillRefs(command, 0, opts.hostPlatform ?? process.platform);
   if (!refs.length || opts.skillRuntimeBindings === undefined) return {};
   if (new RegExp(
     `\\b(?:ORKAS_RUN_SKILL_DIR|${DEEP_RESEARCH_EVIDENCE_ENV})\\b`,
@@ -3052,7 +3432,7 @@ function guardDisabledSkillBash(opts: LocalToolsOpts, command: string): string |
   const disabled = readDisabledSets(uid).skills;
   if (!disabled.size) return null;
 
-  for (const ref of extractRunSkillRefs(command)) {
+  for (const ref of extractRunSkillRefs(command, 0, opts.hostPlatform ?? process.platform)) {
     const bound = opts.skillRuntimeBindings?.get(ref);
     if (bound) {
       if (disabled.has(bound.id)) {
@@ -3321,7 +3701,7 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'bash',
     description:
-      'Run one shell command on the user\'s local machine and return its output. ' +
+      'Run one shell command on the user\'s local machine and return its output. Built-in Python and Node.js are available as `python` and `node`; use a script for deterministic transformations over many local files or records, and a dedicated tool for a targeted operation. ' +
       'Use process_session for persistent processes and interactive_cli for user-entered secrets or OAuth.',
     inputSchema: {
       ...(coreBashTool.inputSchema as Record<string, unknown>),
@@ -3330,7 +3710,7 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
         command: {
           type: 'string',
           description:
-            `Shell command. Write final script-generated deliverables under ${outputDirDescription}.`
+            `Shell command. Prefer simple, direct commands that are easy to verify. Write final script-generated deliverables under ${outputDirDescription}.`
             + windowsShellDescription,
         },
         allow_browser_runtime_install: {
@@ -3428,7 +3808,13 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
         return { content: unsupportedAuthErr, isError: true };
       }
       const workingDirForGuard = path.resolve(ctx.workingDir ?? '.');
-      const filesystemGate = await guardBashFilesystemTargets(opts, input, ctx, workingDirForGuard);
+      const filesystemGate = await guardBashFilesystemTargets(
+        opts,
+        input,
+        ctx,
+        workingDirForGuard,
+        !localAccessRequiresSensitiveApproval(mode),
+      );
       if (filesystemGate.result) return filesystemGate.result;
       // Approval modes prompt for configured sensitive categories. Host/global
       // package changes still enter approval in the otherwise non-prompting
@@ -3437,8 +3823,20 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
         const base = await classifyBashRiskIncludingScripts(command, workingDirForGuard);
         const approvalMode = localAccessRequiresSensitiveApproval(mode);
         const pathApprovalCoveredSensitive = filesystemGate.approvedReasons.includes('sensitive_path');
+        // The per-path removal gate above already asked about this command's
+        // out-of-workspace deletions, and named the exact file. Re-asking at
+        // command level is the same question twice.
+        const pathApprovalCoveredDestructive = filesystemGate.approvedReasons.includes('destructive');
+        // `all_files_auto` drops prompts for operations the user can look at
+        // and put back afterwards. An irreversible one offers no such review:
+        // the removed tree is not listed anywhere and the killed processes
+        // took their state with them, both before the user could see the
+        // command. Those stay in approval for the same reason host/global
+        // package changes already do.
         let baseReasons = approvalMode ? base.reasons : base.reasons.filter(
-          (reason) => reason === 'system_package_change' || reason === 'external_mutation',
+          (reason) => reason === 'system_package_change'
+            || reason === 'external_mutation'
+            || (reason === 'destructive' && base.irreversible.length > 0),
         );
         if (pathApprovalCoveredSensitive) {
           baseReasons = baseReasons.filter((reason) => reason !== 'sensitive_path');
@@ -3459,12 +3857,13 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
             baseReasons = baseReasons.filter((reason) => reason !== 'destructive');
           }
         }
-        const reasons = approvalMode
+        const reasons = (approvalMode
           ? classifyConfiguredBashCommand(base.shellSurface, baseReasons, {
             includePathPatterns: !pathApprovalCoveredSensitive,
           })
-          : baseReasons;
-        if (reasons.length) {
+          : baseReasons
+        ).filter((reason) => reason !== 'destructive' || !pathApprovalCoveredDestructive);
+        if (reasons.length || filesystemGate.unresolvedPaths) {
           const decision = await requestBashDecision({
             uid: opts.userId ?? '',
             cid: opts.cid ?? '',
@@ -3472,6 +3871,12 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
             agentName: opts.agentName ?? opts.agentId ?? '',
             command,
             reasons,
+            unresolvedPaths: filesystemGate.unresolvedPaths,
+            // Only meaningful while `destructive` survived the filter above;
+            // the dialog uses it to say why a non-prompting mode is asking.
+            ...(reasons.includes('destructive') && base.irreversible.length
+              ? { irreversible: base.irreversible }
+              : {}),
             externalMutations: base.externalMutations,
             onWaiting: permissionWaitProgress(ctx, 'bash'),
           });
@@ -3482,11 +3887,12 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
               agent_id: maskId(opts.agentId),
               command_chars: command.length,
               reasons,
+              unresolved_paths: filesystemGate.unresolvedPaths === true,
             });
             return {
               content: errText(
                 'E_BASH_RISK_DENIED',
-                `the user declined to run this command (flagged: ${reasons.join(', ')}). `
+                `this command was not approved (flagged: ${[...reasons, ...(filesystemGate.unresolvedPaths ? ['unresolved paths'] : [])].join(', ')}). `
                 + 'Do not retry the same command or work around the prompt; explain in prose what you intended and ask the user how to proceed.',
               ),
               isError: true,
@@ -3553,6 +3959,7 @@ async function gateInteractiveCliStart(
     allowNoBrowserAuth?: boolean;
     workingDir?: string;
     approvedReasons?: readonly LocalAccessRiskCategory[];
+    unresolvedPaths?: boolean;
   },
   ctx?: ToolContext,
 ): Promise<ToolResult | null> {
@@ -3616,7 +4023,9 @@ async function gateInteractiveCliStart(
     const approvalMode = localAccessRequiresSensitiveApproval(mode);
     const approvedReasons = settings?.approvedReasons ?? [];
     let baseReasons = (approvalMode ? base.reasons : base.reasons.filter(
-      (reason) => reason === 'system_package_change' || reason === 'external_mutation',
+      (reason) => reason === 'system_package_change'
+        || reason === 'external_mutation'
+        || (reason === 'destructive' && base.irreversible.length > 0),
     )).filter((reason) => !approvedReasons.includes(reason));
     const workingDir = path.resolve(settings?.workingDir ?? '.');
     if (baseReasons.includes('destructive')) {
@@ -3631,12 +4040,13 @@ async function gateInteractiveCliStart(
         baseReasons = baseReasons.filter((reason) => reason !== 'destructive');
       }
     }
-    const reasons = approvalMode
+    const reasons = (approvalMode
       ? classifyConfiguredBashCommand(base.shellSurface, baseReasons, {
         includePathPatterns: !approvedReasons.includes('sensitive_path'),
       })
-      : baseReasons;
-    if (reasons.length) {
+      : baseReasons
+    ).filter((reason) => !approvedReasons.includes(reason));
+    if (reasons.length || (approvalMode && settings?.unresolvedPaths)) {
       const decision = await requestBashDecision({
         uid: opts.userId ?? '',
         cid: opts.cid ?? '',
@@ -3644,6 +4054,10 @@ async function gateInteractiveCliStart(
         agentName: opts.agentName ?? opts.agentId ?? '',
         command,
         reasons,
+        unresolvedPaths: settings?.unresolvedPaths,
+        ...(reasons.includes('destructive') && base.irreversible.length
+          ? { irreversible: base.irreversible }
+          : {}),
         externalMutations: base.externalMutations,
         onWaiting: permissionWaitProgress(ctx, 'interactive_cli_start'),
       });
@@ -3654,11 +4068,12 @@ async function gateInteractiveCliStart(
           agent_id: maskId(opts.agentId),
           command_chars: command.length,
           reasons,
+          unresolved_paths: settings?.unresolvedPaths === true,
         });
         return {
           content: errText(
             'E_BASH_RISK_DENIED',
-            `the user declined to run this interactive command (flagged: ${reasons.join(', ')}). `
+            `this interactive command was not approved (flagged: ${[...reasons, ...(settings?.unresolvedPaths ? ['unresolved paths'] : [])].join(', ')}). `
             + 'Do not retry the same command or work around the prompt; explain in prose what you intended and ask the user how to proceed.',
           ),
           isError: true,
@@ -3767,14 +4182,19 @@ function createInteractiveCliStartTool(opts: LocalToolsOpts): AgentTool {
       const command = String(input.command ?? '').trim();
       if (!command) return { content: errText('E_BAD_INPUT', '`command` is required'), isError: true };
       const workingDir = path.resolve(ctx.workingDir ?? '.');
+      const removalGate = await guardInteractiveRemovalTargets(opts, ctx, workingDir, command);
+      if (removalGate.result) return removalGate.result;
       const gate = await gateInteractiveCliStart(opts, command, {
         allowNoBrowserAuth: input.allow_no_browser_auth === true,
         workingDir,
+        approvedReasons: removalGate.approvedReasons,
+        unresolvedPaths: removalGate.unresolvedPaths,
       }, ctx);
       if (gate) return gate;
       try { fs.mkdirSync(workingDir, { recursive: true }); }
       catch { /* spawn will report the canonical error */ }
       const view = startInteractiveCliSession({
+        presentation: 'agent_terminal',
         uid: opts.userId ?? '',
         cid: opts.cid,
         agentId: opts.agentId,
@@ -3805,7 +4225,7 @@ function createInteractiveCliStartTool(opts: LocalToolsOpts): AgentTool {
       const result = interactiveCliToolPayload(latest);
       return {
         content: JSON.stringify(result, null, 2),
-        ...(result.agent_should_stop === true ? { endTurn: true } : {}),
+        ...(result.agent_should_stop === true ? { endTurn: true, endTurnReason: 'waiting_input' as const } : {}),
       };
     },
   };
@@ -3833,7 +4253,7 @@ function createInteractiveCliReadTool(opts: LocalToolsOpts): AgentTool {
         );
         return {
           content: JSON.stringify(result, null, 2),
-          ...(result.agent_should_stop === true ? { endTurn: true } : {}),
+          ...(result.agent_should_stop === true ? { endTurn: true, endTurnReason: 'waiting_input' as const } : {}),
         };
       } catch (err) {
         return { content: errText('E_INTERACTIVE_CLI', (err as Error).message), isError: true };
@@ -3932,6 +4352,13 @@ function createInteractiveCliTool(opts: LocalToolsOpts): AgentTool {
   const read = createInteractiveCliReadTool(opts);
   const send = createInteractiveCliSendTool(opts);
   const close = createInteractiveCliCloseTool(opts);
+  type InteractiveCliAction = 'start' | 'read' | 'send' | 'close';
+  const actionFields: Readonly<Record<InteractiveCliAction, ReadonlySet<string>>> = {
+    start: new Set(['action', 'command', 'max_lifetime_ms', 'purpose', 'allow_no_browser_auth']),
+    read: new Set(['action', 'session_id']),
+    send: new Set(['action', 'session_id', 'input', 'add_newline']),
+    close: new Set(['action', 'session_id', 'force', 'reason']),
+  };
   return {
     name: 'interactive_cli',
     description:
@@ -3943,7 +4370,7 @@ function createInteractiveCliTool(opts: LocalToolsOpts): AgentTool {
         action: {
           type: 'string',
           enum: ['start', 'read', 'send', 'close'],
-          description: 'Lifecycle operation.',
+          description: 'start: command; read: session_id; send: session_id/input; close: session_id/force/reason. Use only its action-specific fields.',
         },
         command: { type: 'string', description: 'Start only. Shell command to launch.' },
         max_lifetime_ms: {
@@ -3965,17 +4392,38 @@ function createInteractiveCliTool(opts: LocalToolsOpts): AgentTool {
         reason: { type: 'string', description: 'Close only. Brief reason for a forced close.' },
       },
       required: ['action'],
+      oneOf: [
+        { properties: { action: { enum: ['start'] } }, required: ['action', 'command'] },
+        { properties: { action: { enum: ['read'] } }, required: ['action', 'session_id'] },
+        { properties: { action: { enum: ['send'] } }, required: ['action', 'session_id', 'input'] },
+        { properties: { action: { enum: ['close'] } }, required: ['action', 'session_id'] },
+      ],
     },
     async execute(input, ctx) {
-      const action = String(input.action ?? '');
+      const action = String(input.action ?? '') as InteractiveCliAction;
+      if (!(['start', 'read', 'send', 'close'] as const).includes(action)) {
+        return {
+          content: errText('E_BAD_INPUT', '`action` must be start, read, send, or close'),
+          isError: true,
+        };
+      }
+      const unexpected = Object.keys(input)
+        .filter((key) => !actionFields[action].has(key))
+        .sort();
+      if (unexpected.length) {
+        return {
+          content: errText(
+            'E_BAD_INPUT',
+            `interactive_cli(${action}) does not accept: ${unexpected.join(', ')}`,
+          ),
+          isError: true,
+        };
+      }
       if (action === 'start') return start.execute(input, ctx);
       if (action === 'read') return read.execute(input, ctx);
       if (action === 'send') return send.execute(input, ctx);
       if (action === 'close') return close.execute(input, ctx);
-      return {
-        content: errText('E_BAD_INPUT', '`action` must be start, read, send, or close'),
-        isError: true,
-      };
+      return close.execute(input, ctx);
     },
   };
 }
@@ -4057,11 +4505,19 @@ function createHostProcessTools(opts: LocalToolsOpts): AgentTool[] {
         const command = String(input.command ?? '').trim();
         if (!command) return { content: errText('E_BAD_INPUT', '`command` is required'), isError: true };
         const workingDir = path.resolve(ctx.workingDir ?? '.');
-        const filesystemGate = await guardBashFilesystemTargets(opts, input, ctx, workingDir);
+        const mode = getLocalExecMode();
+        const filesystemGate = await guardBashFilesystemTargets(
+          opts,
+          input,
+          ctx,
+          workingDir,
+          !localAccessRequiresSensitiveApproval(mode),
+        );
         if (filesystemGate.result) return filesystemGate.result;
         const gate = await gateInteractiveCliStart(opts, command, {
           workingDir,
           approvedReasons: filesystemGate.approvedReasons,
+          unresolvedPaths: filesystemGate.unresolvedPaths,
         }, ctx);
         if (gate) return gate;
         pruneProcessWorkspaceSnapshots();
@@ -4115,6 +4571,12 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
         log.warn('write_file scope reject', { user_id: maskId(opts.userId), path: logPathRef(inputAbs) });
         return { content: scopeErr, isError: true };
       }
+      // Read before the write decides it: once uniquify has run, an overwrite
+      // of the user's own file and a fresh create look identical on disk.
+      const targetExistedBeforeWrite = fs.existsSync(inputAbs);
+      // Probe+write hold one per-path lock: a concurrent same-target writer
+      // (parallel agent turn in the same conversation workspace) must see this
+      // write when it uniquifies, not race past the probe and clobber it.
       const { finalPath, renamed, result } = await uniquifyPathForWrite(
         inputAbs,
         isMineFor(opts),
@@ -4137,7 +4599,14 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
       }
       if (!result.isError && opts.onFileWritten) {
         try {
-          await opts.onFileWritten(finalPath);
+          // A uniquified path is new by construction, and overwriting our own
+          // earlier output is still production. Only an in-place write over a
+          // target the user already had keeps their file.
+          await opts.onFileWritten(finalPath, {
+            preExisting: finalPath === inputAbs
+              && targetExistedBeforeWrite
+              && !isMineFor(opts)(finalPath),
+          });
         } catch (err) {
           log.warn('onFileWritten callback failed', { error: logErrorRef(err) });
         }
@@ -4220,6 +4689,7 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
         return {
           content: errText('E_BAD_INPUT', 'copy `base_revision` from the preceding file result; legacy `expected_size` must be a non-negative safe integer byte size'),
           isError: true,
+          observations: fileFailure('E_BAD_INPUT', 'append_precondition', { stage: 'input', revision_provided: !!baseRevision, size_provided: hasExpectedSize, size_valid: hasExpectedSize && Number.isSafeInteger(expectedSize) && expectedSize >= 0 }),
         };
       }
 
@@ -4274,6 +4744,7 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
                   : `${abs}: base_revision is not available in this run; use the returned current revision`,
               )}\n<file path="${abs}" total_bytes="${before.length}" file_hash="${currentHash}" revision="${currentRevision}"/>`,
               isError: true,
+              observations: fileFailure(revisionRecord ? 'E_REVISION_PATH_MISMATCH' : 'E_REVISION_UNKNOWN', revisionRecord ? 'revision_path' : 'revision_unknown', { stage: 'freshness', revision_provided: true, revision_found: !!revisionRecord }),
             };
           }
           if (revisionRecord.hash !== currentHash || revisionRecord.size !== before.length) {
@@ -4304,6 +4775,7 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
                 `${abs}: base_revision no longer matches the current file; no bytes were written`,
               )}\n<file path="${abs}" total_bytes="${before.length}" file_hash="${currentHash}" revision="${currentRevision}"/>`,
               isError: true,
+              observations: fileFailure('E_STALE', 'revision_changed', { stage: 'freshness', revision_provided: true, revision_found: true, revision_matches: false }),
             };
           }
         }
@@ -4334,6 +4806,7 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
               `${abs}: expected ${expectedSize} bytes before append, current size is ${before.length}; use the returned revision and regenerate only the missing chunk`,
             )}\n<file path="${abs}" total_bytes="${before.length}" file_hash="${currentHash}" revision="${currentRevision}"/>`,
             isError: true,
+            observations: fileFailure('E_STALE', 'size_changed', { stage: 'freshness', revision_provided: false, size_provided: true, size_valid: true }),
           };
         }
 
@@ -4364,7 +4837,9 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
             resultHash: afterHash,
           });
         }
-        try { await opts.onFileWritten?.(abs); }
+        // append_file refuses a path it cannot read, so the target always
+        // pre-existed.
+        try { await opts.onFileWritten?.(abs, { preExisting: true }); }
         catch (err) { log.warn('onFileWritten callback failed', { error: logErrorRef(err) }); }
         return {
           content: appendFileReceipt(abs, chunk.length, after.length, afterHash, nextRevision, false),
@@ -4427,6 +4902,7 @@ function createHostApplyPatchTool(opts: LocalToolsOpts): AgentTool {
         currentHash: snapshot.hash,
       });
       if (!freshness) return undefined;
+      const baseline = editBaselineFacts(ctx, snapshot.path, snapshot.stat, snapshot.hash);
       recordRead(ctx, snapshot.path, snapshot.stat, snapshot.hash);
       // checkEditFreshness also serves edit_file, whose retry accepts an
       // expected_hash parameter. apply_patch has no such parameter: its safe
@@ -4441,6 +4917,7 @@ function createHostApplyPatchTool(opts: LocalToolsOpts): AgentTool {
           `${errText(freshness.code, patchFreshnessMessage)}\n`
           + patchRecoveryContext(snapshot.content, snapshot.hash),
         isError: true,
+        observations: fileFailure(freshness.code, freshness.code === 'E_NOT_READ' ? 'not_read' : 'file_changed', { stage: 'freshness', ...baseline }),
       };
     },
     validateContent(check) {
@@ -4453,7 +4930,9 @@ function createHostApplyPatchTool(opts: LocalToolsOpts): AgentTool {
       }
       if (file.operation !== 'delete') {
         recordRead(ctx, file.destinationPath, undefined, file.afterHash);
-        await opts.onFileWritten?.(file.destinationPath);
+        await opts.onFileWritten?.(file.destinationPath, {
+          preExisting: file.operation !== 'add',
+        });
       }
     },
   });
@@ -4462,6 +4941,15 @@ function createHostApplyPatchTool(opts: LocalToolsOpts): AgentTool {
     async execute(input, ctx) {
       return coreTool.execute(input, ctx);
     },
+  };
+}
+
+/** Diagnostic snapshot before recovery refreshes the read baseline. */
+function editBaselineFacts(ctx: ToolContext, abs: string, st: fs.Stats, currentHash: string) {
+  const seen = getReadState(ctx)?.get(abs);
+  return {
+    baseline_present: !!seen,
+    ...(seen ? { baseline_changed: seen.mtimeMs !== st.mtimeMs || seen.size !== st.size || (!!seen.hash && seen.hash !== currentHash) } : {}),
   };
 }
 
@@ -4552,6 +5040,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
           return { content: errText('E_EDIT_FAILED', `${abs}: read failed: ${msg}`), isError: true };
         }
         const currentHash = editableFileHash(body);
+        const baseline = editBaselineFacts(ctx, abs, st, currentHash);
 
         // Read-before-edit + OCC: a run-scoped baseline or an explicit hash
         // must identify the exact bytes being edited. A rejected attempt
@@ -4567,6 +5056,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
           return {
             content: `${errText(block.code, block.msg)}\n${editRecoveryContext(body, oldStr, currentHash)}`,
             isError: true,
+            observations: fileFailure(block.code, block.code === 'E_NOT_READ' ? 'not_read' : expectedHash ? 'expected_hash_changed' : 'file_changed', { stage: 'freshness', ...baseline, expected_hash_provided: !!expectedHash }),
           };
         }
 
@@ -4591,6 +5081,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
               editNoMatchReason(body, oldStr),
             ].filter(Boolean).join(' '))}\n${editRecoveryContext(body, oldStr, currentHash)}`,
             isError: true,
+            observations: fileFailure('E_NO_MATCH', 'no_match', { stage: 'match', ...baseline, expected_hash_provided: !!expectedHash, match_count: 0 }),
           };
         }
         if (count > 1 && !replaceAll) {
@@ -4600,6 +5091,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
               `${abs}: \`old_string\` matches ${count} occurrences. Provide more surrounding context to make it unique, or set replace_all=true.`,
             ),
             isError: true,
+            observations: fileFailure('E_MULTIPLE_MATCHES', 'ambiguous_match', { stage: 'match', ...baseline, match_count: count }),
           };
         }
 
@@ -4627,7 +5119,9 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
         log.info('edit_file applied', { user_id: maskId(opts.userId), path: logPathRef(abs), replaced });
 
         if (opts.onFileWritten) {
-          try { await opts.onFileWritten(abs); }
+          // edit_file only ever modifies a file that already had the matched
+          // text, so its target is never an Orkas-produced deliverable.
+          try { await opts.onFileWritten(abs, { preExisting: true }); }
           catch (err) { log.warn('onFileWritten callback failed', { error: logErrorRef(err) }); }
         }
 
@@ -4660,8 +5154,8 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
 }
 
 /** Declare the complete user-facing deliverable set for the current turn.
- * This tool does not read or write files. The group-chat owner validates each
- * normalized path against files actually written during the active turn. */
+ * This tool does not read or write files. The group-chat owner filters each
+ * normalized path to files eligible for user-facing resource display. */
 function createPublishOutputsTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'publish_outputs',
@@ -4703,23 +5197,6 @@ function createPublishOutputsTool(opts: LocalToolsOpts): AgentTool {
         const accepted = await opts.onOutputsPublished(normalized);
         const acceptedSet = new Set(Array.isArray(accepted) ? accepted.map((p) => path.resolve(p)) : []);
         const acceptedCount = normalized.filter((p) => acceptedSet.has(p)).length;
-        if (normalized.length > 0 && !acceptedCount) {
-          const eligiblePaths = [...new Set(
-            (opts.getPublishableOutputPaths?.() ?? [])
-              .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-              .map((item) => path.resolve(item)),
-          )].slice(0, 50);
-          const recovery = eligiblePaths.length
-            ? ` Retry publish_outputs once with an exact path from eligible_current_turn_paths=${JSON.stringify(eligiblePaths)}; do not edit, review, or regenerate the artifact.`
-            : ' No eligible current-turn output exists; do not guess another path or claim delivery.';
-          return {
-            content: errText(
-              'E_OUTPUT_NOT_PRODUCED',
-              `none of the requested paths were written in this turn.${recovery}`,
-            ),
-            isError: true,
-          };
-        }
         return {
           content: JSON.stringify({ published: acceptedCount, requested: normalized.length }),
         };
@@ -4729,6 +5206,63 @@ function createPublishOutputsTool(opts: LocalToolsOpts): AgentTool {
           isError: true,
         };
       }
+    },
+  };
+}
+
+/** `library_save` — copy a file the agent produced this turn into the project
+ *  资料库 (`contexts/`), where it becomes a durable, cloud-synced, KB-indexed
+ *  deliverable the user can open and review. Only offered in project
+ *  conversations (`opts.projectId` set). Delegates the copy + indexing + sync to
+ *  the `project_files` feature so the owning module keeps its invariants. */
+function createLibrarySaveTool(opts: LocalToolsOpts): AgentTool {
+  return {
+    name: 'library_save',
+    description:
+      'Copy a file produced in this turn from the active workspace into the project Library as a ' +
+      'durable, searchable deliverable, returning its Library path. Use this for finished deliverables, ' +
+      'not scratch files. Checkout provides an editable workspace copy and a revision for explicit replacement.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source_path: { type: 'string', description: 'Workspace file, absolute or relative to $working_dir. Save reads it; checkout creates it without overwriting.' },
+        name: { type: 'string', description: 'Optional library filename (defaults to the source filename).' },
+        action: { type: 'string', enum: ['save', 'checkout'], description: 'Default save creates a new Library file. Checkout requires name and copies an existing file to source_path.' },
+        expected_revision: { type: 'string', description: 'Save only: revision from checkout to replace that unchanged Library file. Omit to keep create-only behavior.' },
+      },
+      required: ['source_path'],
+    },
+    async execute(input, ctx): Promise<ToolResult> {
+      if (Object.keys(input).some((key) => !['source_path', 'name', 'action', 'expected_revision'].includes(key))
+          || (input.action !== undefined && input.action !== 'save' && input.action !== 'checkout')
+          || (input.expected_revision !== undefined && (typeof input.expected_revision !== 'string' || !input.expected_revision))) {
+        return { content: errText('E_BAD_INPUT', 'invalid library_save fields'), isError: true };
+      }
+      if (!opts.userId || !opts.projectId) {
+        return { content: errText('E_NO_PROJECT', 'library_save is only available inside a project conversation'), isError: true };
+      }
+      const rawSource = typeof input.source_path === 'string' ? input.source_path.trim() : '';
+      if (!rawSource) return { content: errText('E_BAD_INPUT', '`source_path` is required'), isError: true };
+      const sourceAbs = resolveAbs(ctx, rawSource);
+      // Path sandbox at entry: only a file the agent produced inside its own
+      // workspace may be copied into the shared, synced project library.
+      if (!isInWritableWorkspaceScope(opts, sourceAbs)) {
+        return { content: errText('E_PATH_OUT_OF_SCOPE', `source_path must be a file inside your workspace: ${sourceAbs}`), isError: true };
+      }
+      const name = typeof input.name === 'string' ? input.name.trim() : '';
+      const targetName = name || path.basename(sourceAbs);
+      if (input.action === 'checkout' && (!name || input.expected_revision !== undefined)) {
+        return { content: errText('E_BAD_INPUT', 'checkout requires name and does not accept expected_revision'), isError: true };
+      }
+      if (input.action === 'checkout' || input.expected_revision !== undefined) {
+        const result = input.action === 'checkout'
+          ? await projectFiles.checkoutProjectFile(opts.userId, opts.projectId, name, sourceAbs)
+          : await projectFiles.replaceProjectFileFromPath(opts.userId, opts.projectId, sourceAbs, targetName, input.expected_revision as string);
+        return { content: JSON.stringify(result.ok ? { ...result, path: result.name } : result), isError: !result.ok };
+      }
+      const r = await projectFiles.copyProjectEntryFromPath(opts.userId, opts.projectId, sourceAbs, targetName);
+      if (!r.ok) return { content: errText('E_LIBRARY_SAVE_FAILED', (r as { error: string }).error), isError: true };
+      return { content: JSON.stringify({ ok: true, path: r.name, bytes: r.bytes }) };
     },
   };
 }
@@ -5239,6 +5773,7 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
           return {
             ok: rendered.evidence.ok,
             blockers: rendered.evidence.blockers,
+            warnings: rendered.evidence.warnings,
             controlsExercised: interactions.controlsExercised,
             observableEffects:
               interactions.stateChangesObserved
@@ -5262,7 +5797,10 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
         };
       }
       if (!smoke.ok) {
-        const blockers = smoke.blockers.slice(0, 3).join('; ') || 'no observable interaction completed';
+        // Keep every known blocker. The shared tool-result token policy owns
+        // oversized-output persistence; truncating here would discard repair
+        // material before Result Store can preserve it.
+        const blockers = smoke.blockers.join('; ') || 'no observable interaction completed';
         const hasBlockedExternalAsset = smoke.blockers.some((blocker) => (
           /(?:external|remote|out[- ]of[- ]directory|network).{0,48}(?:block|denied|unavailable)|(?:image|resource).{0,48}(?:failed|blocked|unavailable)/i
             .test(blocker)
@@ -5303,14 +5841,26 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
         artifact_id: maskId(r.artifactId),
         file_count: Array.isArray((input as { files?: unknown }).files) ? ((input as { files: unknown[] }).files.length) : undefined,
       });
+      // The frame contract belongs here, not only in the `files` parameter
+      // description: this is the text the model actually reads back, and an
+      // artifact that does not know the box it lands in writes a full-screen
+      // shell and ships it clipped.
+      const smokeWarnings = (smoke.warnings ?? []).slice(0, 3);
       return {
         content:
           `Artifact "${r.title}" created (id ${r.artifactId}); interaction smoke passed ` +
-          `(${smoke.controlsExercised ?? 0} control(s), ${smoke.observableEffects ?? 0} observable effect(s)). ` +
+          `(${smoke.controlsExercised ?? 0} control(s), ${smoke.observableEffects ?? 0} observable effect(s)) ` +
+          `at desktop, chat-embed, and mobile viewports. ` +
           `It is now shown to the user inside this reply, so do NOT paste its HTML in your message. ` +
+          `Frame: the card opens ${chatArtifacts.ARTIFACT_FRAME.defaultHeight}px tall and grows to at most ` +
+          `${chatArtifacts.ARTIFACT_FRAME.maxHeight}px, at roughly ${chatArtifacts.ARTIFACT_FRAME.smokeWidth}px wide. ` +
+          `\`${chatArtifacts.BRIDGE_RELPATH}\` is injected for you and reports the content height, so lay the app out ` +
+          `at its natural height — a \`100vh\` or fixed full-screen shell takes whatever height the frame happens to ` +
+          `have and gets cut off. Content taller than the cap scrolls inside the frame. ` +
+          (smokeWarnings.length ? `Review: ${smokeWarnings.join(' | ')}. ` : '') +
           `To receive what the user does in it, the app calls ` +
           `parent.postMessage({ __orkasArtifact: true, type: "submit", payload: <json-serialisable value> }, "*") ` +
-          `(or, with <script src="__orkas/bridge.js"></script>, window.orkasArtifact.send(payload)); ` +
+          `(or window.orkasArtifact.send(payload) through the injected bridge); ` +
           `that becomes the user's next message to you.`,
       };
     },
@@ -5476,8 +6026,13 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
         cid: opts.cid,
         turn_id: opts.turnId,
       });
-      const cardVisible = await waitForDeleteConfirmationVisible(newToken);
-      if (!cardVisible) {
+      // Tri-state, not a boolean. `mounted` means the card exists but the
+      // user is on another view — it becomes clickable the moment they come
+      // back, so killing the token there strands a live card and forces the
+      // model to look for a way around the gate. Only `absent` (no renderer
+      // ack at all → nothing to click, ever) fails closed.
+      const cardVisibility = await waitForDeleteConfirmationVisible(newToken);
+      if (cardVisibility === 'absent') {
         cancelDeleteConfirmation(newToken);
         log.warn('delete_file confirmation card unavailable', {
           user_id: maskId(opts.userId),
@@ -5500,11 +6055,15 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
         turn_id: maskId(opts.turnId),
         path: logPathRef(abs),
         confirmation_id: maskId(newToken),
+        visibility: cardVisibility,
       });
       return {
         content:
           `requires_user_confirmation: "${rawPath}" is outside the current writable workspace scope and needs the user's confirmation card.\n` +
           `confirmation_token: ${newToken}\n` +
+          (cardVisibility === 'mounted'
+            ? 'The card is mounted but off-screen right now (the user is on another view). It stays valid — ask them to open this conversation and click it.\n'
+            : '') +
           `Next step: stop calling tools this turn after requesting all intended deletes. In your reply prose, tell the user what you plan to delete and ask them to click the card. ` +
           `On the user's next reply, call delete_file again with BOTH \`path\` and \`confirmation_token\` set to complete the deletion.`,
       };
@@ -5527,6 +6086,8 @@ export function createLocalTools(opts: LocalToolsOpts = {}): AgentTool[] {
     createHtmlPreviewTool(opts),
   ];
   if (opts.onOutputsPublished) tools.push(createPublishOutputsTool(opts));
+  // Project-only: save a produced file into the project library (`contexts/`).
+  if (opts.projectId) tools.push(createLibrarySaveTool(opts));
   // `create_artifact` only makes sense on a conversation surface that
   // renders the embedded result and routes interactions back — i.e. a `cid`
   // plus an `onArtifactCreated` sink (group chat). Edit chats / ad-hoc runs
@@ -5535,4 +6096,4 @@ export function createLocalTools(opts: LocalToolsOpts = {}): AgentTool[] {
   return tools;
 }
 
-export { createFileTools } from './file-tools';
+export { createFileTools, createProgramSourceLoader } from './file-tools';

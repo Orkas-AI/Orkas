@@ -20,6 +20,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { defineTool, type AgentTool, type ToolResult } from "./base.js";
+import { decodeNumericEntity } from "./web-fetch.js";
 import { createLogger } from "../shared/logger.js";
 
 const log = createLogger("web-search");
@@ -51,7 +52,7 @@ type SearchResult = {
 
 // ─── HTML helpers ─────────────────────────────────────────────────────────
 
-function decodeEntities(text: string): string {
+export function decodeEntities(text: string): string {
   return text
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
@@ -72,8 +73,8 @@ function decodeEntities(text: string): string {
     .replace(/&ldquo;/g, "\u201C")
     .replace(/&rdquo;/g, "\u201D")
     .replace(/\\u0027/g, "'")
-    .replace(/&#(\d+);/g, (_, num) => String.fromCharCode(parseInt(num, 10)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+    .replace(/&#(\d+);/g, (_, num) => decodeNumericEntity(parseInt(num, 10)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => decodeNumericEntity(parseInt(hex, 16)));
 }
 
 function stripTags(html: string): string {

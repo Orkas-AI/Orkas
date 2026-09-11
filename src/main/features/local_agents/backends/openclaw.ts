@@ -75,6 +75,7 @@ export const openclawBackend: LocalBackend = {
 
     const watchdog = armKillWatchdog(child, {
       timeoutMs: opts.timeoutMs,
+      deadlineAt: opts.deadlineAt,
       idleKillMs: opts.idleKillMs,
       lastEventAt: opts.lastEventAt,
     });
@@ -116,11 +117,16 @@ export const openclawBackend: LocalBackend = {
       };
       child.on('error', err => {
         log.warn('spawn error', { error: logErrorSummary(err) });
-        finish('failed', { error: (err as Error).message, stderrTail: tail.toString() });
+        finish('failed', {
+          error: (err as Error).message,
+          stderrTail: tail.toString(),
+          failureKind: 'cli_spawn',
+          retrySafe: true,
+        });
       });
       child.on('close', code => {
         if (opts.signal.aborted) return finish('cancelled');
-        if (watchdog.fired()) return finish('timeout', { error: `cli ${watchdog.reason()}`, stderrTail: tail.toString() });
+if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`, stderrTail: tail.toString() });
 
         const parsed = parseOpenclawReply(fullStderr);
         const replyText = parsed?.text || '';

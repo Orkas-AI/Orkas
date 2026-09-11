@@ -78,6 +78,107 @@ afterEach(() => {
 });
 
 describe('global recycle bin', () => {
+  it.each(['app-file', 'app-directory', 'sync-file'] as const)(
+    'rejects an ancestor symlink before a %s archive can import outside data',
+    async (entry) => {
+      const paths = await import('../../../src/main/paths');
+      const recycle = await import('../../../src/main/features/recycle_bin');
+      const outside = path.join(tmpDir, 'outside');
+      const link = path.join(paths.userCloudRoot(UID), 'contexts', 'linked');
+      await fsp.mkdir(outside);
+      await fsp.mkdir(path.dirname(link), { recursive: true });
+      await fsp.writeFile(path.join(outside, 'private.txt'), 'outside data');
+      await fsp.symlink(outside, link, process.platform === 'win32' ? 'junction' : 'dir');
+
+      const relPath = 'cloud/contexts/linked/private.txt';
+      if (entry === 'sync-file') {
+        await expect(recycle.createRecycleBatch(UID, [relPath])).resolves.toBeNull();
+      } else {
+        await expect(recycle.createAppRecycleBatchForCloudEntry(
+          UID, entry === 'app-file' ? relPath : 'cloud/contexts/linked', 'context',
+        )).rejects.toThrow();
+      }
+      expect(await recycle.listRecycleBatches(UID)).toEqual([]);
+      expect(await fsp.readFile(path.join(outside, 'private.txt'), 'utf8')).toBe('outside data');
+    },
+  );
+
+  it.each(['destination', 'archive'] as const)(
+    'retains a recoverable batch when its %s contains an ancestor symlink',
+    async (side) => {
+      const paths = await import('../../../src/main/paths');
+      const recycle = await import('../../../src/main/features/recycle_bin');
+      const relPath = 'cloud/contexts/folder/note.txt';
+      const source = path.join(paths.userCloudRoot(UID), 'contexts', 'folder', 'note.txt');
+      await fsp.mkdir(path.dirname(source), { recursive: true });
+      await fsp.writeFile(source, 'recoverable original');
+      const batch = await recycle.createAppRecycleBatchForCloudEntry(UID, relPath, 'context');
+      expect(batch?.items.map((item) => item.path)).toEqual([relPath]);
+      const archive = path.join(paths.userRecycleDir(UID), batch!.id, 'files', 'contexts', 'folder', 'note.txt');
+      await fsp.rm(path.dirname(source), { recursive: true });
+      const outside = path.join(tmpDir, 'outside');
+      await fsp.mkdir(outside);
+      const link = path.dirname(side === 'destination' ? source : archive);
+      if (side === 'archive') {
+        await fsp.rm(link, { recursive: true });
+        await fsp.writeFile(path.join(outside, 'note.txt'), 'unrelated private data');
+      }
+      await fsp.symlink(outside, link, process.platform === 'win32' ? 'junction' : 'dir');
+
+      const blocked = await recycle.restoreRecycleBatch(UID, batch!.id);
+      expect(blocked.restored_paths).toEqual([]);
+      expect(blocked.skipped_paths).toEqual([]);
+      expect(blocked.failed_paths).toEqual([relPath]);
+      expect(blocked.reactivated_paths).toEqual([]);
+      expect(await fsp.readdir(outside)).toEqual(side === 'archive' ? ['note.txt'] : []);
+      expect(fs.existsSync(source)).toBe(false);
+      if (side === 'archive') {
+        expect(await fsp.readFile(path.join(outside, 'note.txt'), 'utf8')).toBe('unrelated private data');
+      }
+      expect((await recycle.listRecycleBatches(UID)).map((item) => item.id)).toEqual([batch!.id]);
+
+      await fsp.unlink(link);
+      if (side === 'archive') {
+        await fsp.mkdir(link, { recursive: true });
+        await fsp.writeFile(archive, 'recoverable original');
+      }
+      const retried = await recycle.restoreRecycleBatch(UID, batch!.id);
+      expect(retried.failed_paths).toEqual([]);
+      expect(retried.restored_paths).toEqual([relPath]);
+      expect(await fsp.readFile(source, 'utf8')).toBe('recoverable original');
+    },
+  );
+
+  it('does not restore relationship metadata through an ancestor symlink', async () => {
+    const paths = await import('../../../src/main/paths');
+    const recycle = await import('../../../src/main/features/recycle_bin');
+    const relPath = 'cloud/contexts/note.txt';
+    const source = path.join(paths.userCloudRoot(UID), 'contexts', 'note.txt');
+    const pid = 'p_recovery';
+    const projectFile = paths.projectMetaFile(UID, pid);
+    await fsp.mkdir(path.dirname(source), { recursive: true });
+    await fsp.writeFile(source, 'recoverable original');
+    const batch = await recycle.createRecycleBatch(UID, [relPath], Date.now(), {
+      project_rows: [{ project_id: pid, name: 'Recovered Project' }],
+    });
+    await fsp.rm(source);
+    const outside = path.join(tmpDir, 'outside');
+    await fsp.mkdir(outside);
+    await fsp.mkdir(path.dirname(path.dirname(projectFile)), { recursive: true });
+    await fsp.symlink(outside, path.dirname(projectFile), process.platform === 'win32' ? 'junction' : 'dir');
+
+    const restored = await recycle.restoreRecycleBatch(UID, batch!.id);
+    expect(restored.restored_paths).toEqual([relPath]);
+    expect(restored.reactivated_paths).toEqual([]);
+    expect(await fsp.readdir(outside)).toEqual([]);
+    expect(await fsp.readFile(source, 'utf8')).toBe('recoverable original');
+
+    await fsp.unlink(path.dirname(projectFile));
+    const retried = await recycle.restoreRecycleBatch(UID, batch!.id);
+    expect(retried.reactivated_paths).toContain(`cloud/projects/${pid}/project.json`);
+    expect(JSON.parse(await fsp.readFile(projectFile, 'utf8')).name).toBe('Recovered Project');
+  });
+
   it('archives app-deleted conversations with project membership, attachments, and sessions', async () => {
     const paths = await import('../../../src/main/paths');
     const {

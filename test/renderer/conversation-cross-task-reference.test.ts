@@ -118,11 +118,11 @@ describe('conversation cross-task message reference UI', () => {
   it('sends references as structured sidecar data and persists them with drafts', () => {
     expect(conversationSource).toContain('const references = _referenceSnapshotsForQuotes(quotes)');
     expect(conversationSource).toContain('...(references.length ? { references } : {})');
-    expect(conversationSource).toMatch(/const titleText = \(typeof transformChatUseTokens === 'function'\)[\s\S]*?transformChatUseTokens\(raw\)/);
+    expect(conversationSource).toMatch(/const titleText = \(typeof transformChatUseTokens === 'function'\)[\s\S]*?transformChatUseTokens\(titleSeed\)/);
     expect(conversationSource).toContain('if (titleText) conv.title = _autoTitle(titleText)');
     expect(projectDetailSource).toContain('const references = (typeof _referenceSnapshotsForQuotes === \'function\')');
     expect(projectDetailSource).toContain('...(references.length ? { references } : {})');
-    expect(projectDetailSource).toMatch(/const titleText = \(typeof transformChatUseTokens === 'function'\)[\s\S]*?transformChatUseTokens\(raw\)/);
+    expect(projectDetailSource).toMatch(/const titleText = \(typeof transformChatUseTokens === 'function'\)[\s\S]*?transformChatUseTokens\(titleSeed\)/);
     expect(projectDetailSource).toContain('if (titleText) {');
     expect(indexSource).toContain('id="new-chat-quote-preview"');
     expect(indexSource).toContain('id="project-chat-quote-preview"');

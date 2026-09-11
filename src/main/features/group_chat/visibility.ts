@@ -1,38 +1,18 @@
-/**
- * Group-chat visibility — per-Agent authorized message slices.
- *
- * Bus calls `appendVisible` for every newly-emitted group message. The slice
- * is an authorization-bounded record for CLI recovery and host bookkeeping.
- * In-process Agent sessions do not replay it into a fresh model context;
- * unresolved continuity is retrieved explicitly through current-scope chat
- * history tools.
- *
- * Visibility rule per actor (also documented in CLAUDE.md §5):
- *   agent X   → messages where X is in {from, to, mentions} OR
- *               (from == commander && to includes X)
- *   commander → reads canonical `<cid>.jsonl`; no slice file
- *   user      → reads canonical `<cid>.jsonl`; no slice file
- */
+/** Group-chat message schema and canonical model-history projection. */
 
-import * as fs from 'node:fs';
-import * as fsp from 'node:fs/promises';
 import type { Message } from '#core-agent';
 
-import { conversationLayout } from '../../util/project-layout';
-import { appendJsonlAtomic, readJsonl } from '../../storage';
 import { COMMANDER_ID, USER_ID } from './state';
-import { createLogger } from '../../logger';
-
-const log = createLogger('group_chat.visibility');
 
 /** Provider-facing canonical-history projection contract. Bump this whenever
  * the serialized dialogue shape changes so persisted session tails and shared
  * summaries rebuild from the canonical JSONL instead of retaining an older
  * prompt-visible format. */
-export const GROUP_HISTORY_SOURCE_VERSION = 2;
+export const GROUP_HISTORY_SOURCE_VERSION = 5;
 
-export function groupConversationHistorySource(cid: string): string {
-  return `group-main-v${GROUP_HISTORY_SOURCE_VERSION}:${cid}`;
+export function groupConversationHistorySource(cid: string, actorId = COMMANDER_ID): string {
+  const source = `group-main-v${GROUP_HISTORY_SOURCE_VERSION}:${cid}`;
+  return actorId === COMMANDER_ID ? source : `${source}:actor:${encodeURIComponent(actorId)}`;
 }
 
 export interface ChatUseSelection {
@@ -73,9 +53,26 @@ export type GroupMessageFailureKind =
   | 'operation'
   | 'runtime';
 
+/**
+ * Counts of what a turn ran, taken from the host's process trail rather than
+ * from the model's recollection of it. Counts only — no tool arguments, paths,
+ * or output ever enter this shape.
+ */
+export interface TurnExecutionFacts {
+  /** Every tool invocation the turn started. */
+  tool_calls: number;
+  /** Calls that read state back: file/dir reads, searches, previews, fetches. */
+  reads: number;
+  /** Calls that changed a file. */
+  writes: number;
+  /** Shell / process invocations. */
+  commands: number;
+  /** Times the turn's own context was compacted away behind a checkpoint. */
+  compactions: number;
+}
+
 export interface GroupMessage {
-  /** Stable per-message id (not jsonl line index). Used by visibility +
-   * dedupe. */
+  /** Stable per-message id (not jsonl line index). Used by dedupe. */
   id: string;
   /** ISO timestamp. */
   ts: string;
@@ -100,18 +97,25 @@ export interface GroupMessage {
    * correct request even when newer messages were written before the turn
    * finished. Older records may omit it and use chronological fallback. */
   source_message_id?: string;
+  /** Conversation task-board row this end-of-turn reply settles
+   * (task_board.ts). Optional; older records and non-terminal rows omit it.
+   * Readers tolerate its absence — deletion tombstones drop it by design. */
+  task_id?: string;
   /** Host-generated status records are not model replies. Kept explicit so
    * recovery/reconciliation never claims a live actor placeholder merely
    * because the status row has the same sender. */
   system_kind?: 'reply_interrupted';
   /** Markdown text body. */
   text: string;
+  /** User bubble projection preserving authored Commander mentions. Routing
+   * and model history continue to use text/model_text; legacy rows omit it. */
+  display_text?: string;
   /** Structured failure origin. Older records omit this field and must not be
    * retroactively classified by inspecting localized HTML/text. */
   failure_kind?: GroupMessageFailureKind;
   /** Stable low-cardinality reason paired with `failure_kind`. */
   failure_code?: string;
-  /** Internal model-facing text. UI renders `text`; workers use this when
+  /** Internal model-facing text. UI renders `display_text` or `text`; workers use this when
    * present so system-created messages can stay terse for humans while
    * preserving full instructions for the model. */
   model_text?: string;
@@ -127,9 +131,19 @@ export interface GroupMessage {
   /** Absolute paths produced by local-exec tools during this turn (only on
    * commander/agent messages). */
   produced?: string[];
+  /** What the turn actually did, counted from the host's process trail.
+   * Present only on long turns, where the model's own account is written from
+   * a bounded view: the completed-work ledger renders a capped tail and
+   * compaction archives the raw results behind it. These counts are not
+   * bounded, which is why they are worth showing beside the summary. */
+  run_facts?: TurnExecutionFacts;
   /** Form widget payload — only on agent messages whose final text contained
    * a fenced agent-input-form block. */
   form?: import('./router').ChatFormPayload;
+  /** CLI-native non-blocking questions, independent of the terminal reply. */
+  cli_question?: { questions: import('../local_agents/backends/base').LocalCliAsyncQuestion[] };
+  /** Exact question-message identity and user-authored answers. */
+  cli_answer?: { message_id: string; answers: string[] };
   /** Quick-created / quick-edited agent meta — populated when the commander's
    * final text contained one or more `<agent>` containers. One entry per
    * successfully applied container; failed applications are not recorded. */
@@ -160,8 +174,8 @@ export interface GroupMessage {
    * plan card in UI). Set by `plan_set` first-time emission. */
   plan_announcement?: boolean;
   /** Internal plan-step dispatch from commander → agent. Persisted (so the
-   * agent's visibility slice has it for context) but hidden from the user
-   * view, since the user already saw the plan announcement. */
+   * canonical history can recover its task) but hidden from the user view,
+   * since the user already saw the plan announcement. */
   dispatch?: boolean;
   /** Host-owned recovery marker for a synchronous `dispatch_to` source (and
    * user retries derived from it). If that Agent bubble is retried after the
@@ -183,8 +197,7 @@ export interface GroupMessage {
    * assistant tool/lifecycle events. Stored on the actor's end-of-turn
    * message in the main `<cid>.jsonl` so a history reload can rerender the
    * trail (live UI accumulates it via `process` events; without persistence
-   * it vanishes on refresh). Intentionally stripped from visibility slices
-   * (agent worker LLM replays don't need it). */
+   * it vanishes on refresh). Model-history projection ignores it. */
   process?: Array<
     | { type: 'progress'; text: string }
     | { type: 'event'; event: { stream: string; data?: unknown } }
@@ -218,53 +231,6 @@ export interface MarketplaceInstallRequest {
   requested_at: string;
   resolved_at?: string;
   error?: string;
-}
-
-// ── Slice IO ─────────────────────────────────────────────────────────────
-
-function isVisibleTo(actorId: string, msg: GroupMessage): boolean {
-  if (actorId === COMMANDER_ID || actorId === USER_ID) return true;
-  if (msg.from === actorId) return true;
-  if (msg.to.includes(actorId)) return true;
-  if (msg.mentions && msg.mentions.includes(actorId)) return true;
-  // Commander → @<actor> messages: already covered by msg.to. Belt-and-suspenders.
-  if (msg.from === COMMANDER_ID && msg.to.includes(actorId)) return true;
-  return false;
-}
-
-/** Append the message to every actor's slice that should see it. */
-export async function appendVisible(uid: string, cid: string, msg: GroupMessage, actorIds: string[]): Promise<void> {
-  const layout = conversationLayout(uid, cid);
-  fs.mkdirSync(layout.visibilityDir, { recursive: true });
-  // One-way cleanup for conversations created before Commander switched to
-  // the canonical log. This file is derived data and is no longer read.
-  if (actorIds.includes(COMMANDER_ID)) {
-    try { await fsp.unlink(layout.visibilityFile(COMMANDER_ID)); }
-    catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-        log.warn(`purge legacy commander slice failed user=${uid} cid=${cid}: ${(err as Error).message}`);
-      }
-    }
-  }
-  for (const actorId of actorIds) {
-    // Commander and user read the canonical conversation record directly.
-    // Agent slices remain compatibility/targeted-task data; named in-process
-    // history and CLI recovery/deltas use the canonical log.
-    if (actorId === COMMANDER_ID || actorId === USER_ID) continue;
-    if (!isVisibleTo(actorId, msg)) continue;
-    const file = layout.visibilityFile(actorId);
-    try {
-      await appendJsonlAtomic<GroupMessage>(file, msg);
-    } catch (err) {
-      log.warn(`append visible failed user=${uid} cid=${cid} actor=${actorId}: ${(err as Error).message}`);
-    }
-  }
-}
-
-export async function readSlice(uid: string, cid: string, actorId: string, limit = 10_000): Promise<GroupMessage[]> {
-  const file = conversationLayout(uid, cid).visibilityFile(actorId);
-  if (!fs.existsSync(file)) return [];
-  return (await readJsonl<GroupMessage>(file, limit)).filter((msg) => !msg.deleted_at);
 }
 
 type CommanderHistoryRecord = {
@@ -316,11 +282,16 @@ function commanderHistoryRecord(
   };
 }
 
+/** Prefix of every host-authored note projected in the user role. A non-user
+ * actor body that contains it is a leaked echo, not a reply (see below). */
+const HOST_CONTEXT_NOTE_PREFIX = '[Conversation context note]';
+
 const LEAKED_HISTORY_SCAFFOLD_MARKERS = [
   '[Historical group conversation — completed user message]',
   '[Historical group conversation — actor responses]',
   '[Historical group conversation — no actor response was recorded before the next user message.]',
   '[History retained facts — host-persisted model extraction]',
+  HOST_CONTEXT_NOTE_PREFIX,
 ] as const;
 
 function commanderHistoryActorLabel(actorId: string, actorName: string): string {
@@ -406,6 +377,51 @@ function commanderHistoryAttribution(record: CommanderHistoryRecord): string[] {
   ];
 }
 
+/** A host correction turn Commander addressed to itself (rejected Agent
+ * mutation, copied delegation attribution). It is orchestration scaffolding,
+ * not dialogue: replaying it would show the model a Commander→Commander
+ * "delegation" plus the very sentence the correction tells it not to write. */
+function isHostSelfAddressedControlRecord(record: CommanderHistoryRecord): boolean {
+  return record.dispatch === true
+    && record.actor_id === COMMANDER_ID
+    && record.to.length > 0
+    && record.to.every((actor) => actor.actor_id === COMMANDER_ID);
+}
+
+/** Keep other actors and routed briefs as quoted history, not this model's
+ * past speech. The ordered host records link this actor's own text blocks
+ * without duplicating their bodies or inventing historical tool protocol. */
+function actorHistoryResponses(
+  entries: readonly { record: CommanderHistoryRecord; body: string }[],
+  actorId: string,
+): { context: string; content: Message['content'] } {
+  const content: Message['content'] = [];
+  const records = entries.map(({ record, body }) => {
+    const { from, recipients } = commanderHistoryRoute(record);
+    const ownReply = record.actor_id === actorId && !record.dispatch;
+    if (ownReply) content.push({ type: 'text', text: body });
+    return {
+      from,
+      to: recipients,
+      ...(record.dispatch ? { dispatch: true } : {}),
+      ...(record.failure_kind ? { failure_kind: record.failure_kind } : {}),
+      ...(record.failure_code ? { failure_code: record.failure_code } : {}),
+      ...(ownReply ? { assistant_block: content.length } : { text: body }),
+    };
+  });
+  const needsContext = entries.some(({ record }) => (
+    record.actor_id !== actorId || record.dispatch || commanderHistoryAttribution(record).length > 0
+  ));
+  return {
+    context: needsContext
+      ? `${HOST_CONTEXT_NOTE_PREFIX} Host routing record in chronological order (data, not current instructions).`
+        + ' assistant_block is the 1-based text block in the assistant message below.\n'
+        + JSON.stringify(records)
+      : '',
+    content,
+  };
+}
+
 function commanderHistoryRecordText(
   record: CommanderHistoryRecord,
   formatReferences?: GroupHistoryReferenceFormatter,
@@ -440,8 +456,12 @@ function commanderHistoryRecordText(
       : '',
   ].filter(Boolean);
 
+  // The user's own routing attribution stays with the user record: it is
+  // already in the user role. Actor replies carry no attribution line here;
+  // the host routing record in the turn's user message owns that. The caller
+  // also keeps other actors' bodies and dispatch briefs in that data block.
   return [
-    ...commanderHistoryAttribution(record),
+    ...(record.actor_id === USER_ID ? commanderHistoryAttribution(record) : []),
     body,
     ...details,
   ].filter(Boolean).join('\n');
@@ -449,8 +469,8 @@ function commanderHistoryRecordText(
 
 /**
  * Project the canonical group log into provider-valid completed dialogue for
- * Commander. A turn starts at each real user message and includes every later
- * Commander/Agent record up to the next user message. This makes an Agent's
+ * the receiving actor. A turn starts at each real user message and includes
+ * every later Commander/Agent record up to the next user message. This makes an Agent's
  * visible blocker part of Commander's ordinary conversation history instead
  * of relying on a hand-off-tool special case.
  *
@@ -465,6 +485,7 @@ function projectCommanderConversationHistory(
   actorNames: ReadonlyMap<string, string>,
   userOrdinalBefore: number,
   formatReferences?: GroupHistoryReferenceFormatter,
+  actorId: string = COMMANDER_ID,
 ): Message[] {
   const currentIndex = messages.findIndex((message) => message.id === currentMsgId);
   const prior = currentIndex >= 0 ? messages.slice(0, currentIndex) : [...messages];
@@ -482,25 +503,30 @@ function projectCommanderConversationHistory(
       active = null;
       return;
     }
-    const responses = active.responses
-      .map((record) => commanderHistoryRecordText(record, formatReferences))
-      .filter(Boolean);
+    const entries = active.responses
+      .map((record) => ({ record, body: commanderHistoryRecordText(record, formatReferences) }))
+      .filter((entry) => entry.body);
+    const response = actorHistoryResponses(entries, actorId);
     result.push({
       role: 'user',
       turnId: active.turnId,
-      content: [{
-        type: 'text',
-        text: commanderHistoryRecordText(active.user, formatReferences),
-      }],
+      content: [
+        {
+          type: 'text',
+          text: commanderHistoryRecordText(active.user, formatReferences),
+        },
+        ...(response.context ? [{ type: 'text' as const, text: response.context }] : []),
+      ],
     });
     result.push({
       role: 'assistant',
       turnId: active.turnId,
-      content: [{
+      // Session uses this row to track a completed user turn. If only other
+      // actors replied, keep an empty row: its final model view omits it while
+      // retaining the sourced history above. Do not fabricate an actor reply.
+      content: entries.length ? response.content : [{
         type: 'text',
-        text: responses.length
-          ? responses.join('\n\n')
-          : 'No actor response was recorded before the next user message.',
+        text: 'No actor response was recorded before the next user message.',
       }],
     });
     active = null;
@@ -519,7 +545,9 @@ function projectCommanderConversationHistory(
       continue;
     }
     if (!active || active.deleted || message.deleted_at) continue;
-    active.responses.push(commanderHistoryRecord(message, actorNames));
+    const record = commanderHistoryRecord(message, actorNames);
+    if (isHostSelfAddressedControlRecord(record)) continue;
+    active.responses.push(record);
   }
   flush();
   return result;
@@ -530,6 +558,7 @@ export function buildGroupConversationHistory(
   currentMsgId: string,
   actorNames: ReadonlyMap<string, string> = new Map(),
   formatReferences?: GroupHistoryReferenceFormatter,
+  actorId: string = COMMANDER_ID,
 ): Message[] {
   return projectCommanderConversationHistory(
     messages,
@@ -537,6 +566,7 @@ export function buildGroupConversationHistory(
     actorNames,
     0,
     formatReferences,
+    actorId,
   );
 }
 
@@ -554,6 +584,7 @@ export function buildGroupConversationHistoryTail(
   userOrdinalBefore: number,
   actorNames: ReadonlyMap<string, string> = new Map(),
   formatReferences?: GroupHistoryReferenceFormatter,
+  actorId: string = COMMANDER_ID,
 ): Message[] {
   return projectCommanderConversationHistory(
     messages,
@@ -561,20 +592,124 @@ export function buildGroupConversationHistoryTail(
     actorNames,
     Math.max(0, Math.floor(userOrdinalBefore)),
     formatReferences,
+    actorId,
   );
 }
 
 /** @see buildCommanderConversationHistory */
 export const buildCommanderConversationHistoryTail = buildGroupConversationHistoryTail;
 
-/** Drop an actor's slice file (called when an actor is removed from the
- *  group, or on conv delete via state.purgeGroupDir). */
-export async function purgeSlice(uid: string, cid: string, actorId: string): Promise<void> {
-  const file = conversationLayout(uid, cid).visibilityFile(actorId);
-  try { await fsp.unlink(file); }
-  catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log.warn(`purge slice failed user=${uid} cid=${cid} actor=${actorId}: ${(err as Error).message}`);
-    }
+/** Full canonical rebuilds replay at most this many completed user turns
+ * verbatim. A named actor first dispatched late in a long conversation used to
+ * have the whole log replayed into its fresh session — first-round input grew
+ * linearly with conversation length and was paid again by every late-joining
+ * actor (2026-08-21 task-execution review TX-3). The omitted prefix becomes
+ * one deterministic note pair; global user-turn ordinals are preserved, so the
+ * checkpoint tail boundary and the incremental path are unaffected. */
+export const FULL_REBASE_MAX_PRIOR_TURNS = 40;
+
+/** Hard pre-compaction ceiling for a canonical full rebuild. The ordinary
+ * Session token budgets still summarize below/after this boundary; this byte
+ * cap prevents a few unusually large completed turns from reaching session
+ * replacement, persistence, or the summarizer as an unbounded prefix. It
+ * excludes the current triggering message, which the runner adds separately. */
+export const FULL_REBASE_MAX_BYTES = 200 * 1024;
+
+function fullRebaseSerializedBytes(messages: readonly Message[]): number {
+  return Buffer.byteLength(JSON.stringify(messages), 'utf8');
+}
+
+function fullRebaseTurnGroups(messages: readonly Message[]): Message[][] {
+  const groups: Message[][] = [];
+  for (const message of messages) {
+    const current = groups.at(-1);
+    if (current?.[0]?.turnId === message.turnId) current.push(message);
+    else groups.push([message]);
   }
+  return groups;
+}
+
+function fullRebaseOmissionNote(
+  priorRows: readonly GroupMessage[],
+  priorUserRows: readonly GroupMessage[],
+  omittedTurns: number,
+): Message[] {
+  const nextKeptUser = priorUserRows[omittedTurns];
+  const nextKeptIndex = nextKeptUser ? priorRows.indexOf(nextKeptUser) : priorRows.length;
+  const omittedRows = priorRows.slice(0, nextKeptIndex);
+  const oldest = omittedRows[0]?.ts;
+  const newest = omittedRows[omittedRows.length - 1]?.ts;
+  const span = oldest && newest ? ` between ${oldest} and ${newest}` : '';
+  return [
+    {
+      role: 'user',
+      turnId: omittedTurns,
+      content: [{
+        type: 'text',
+        text: `${HOST_CONTEXT_NOTE_PREFIX} ${omittedRows.length} earlier messages`
+          + ` across ${omittedTurns} earlier user turns${span} are not replayed`
+          + ' here. The dispatch brief and referenced files carry the task'
+          + ' inputs. If an omitted detail is required, read it with the'
+          + ' chat_history tool when available, or ask for it; do not guess'
+          + ' omitted content.',
+      }],
+    },
+    {
+      role: 'assistant',
+      turnId: omittedTurns,
+      content: [{
+        type: 'text',
+        text: 'Understood. Proceeding from the replayed recent turns.',
+      }],
+    },
+  ];
+}
+
+/** Project a full canonical rebuild through two independent pre-compaction
+ * limits: at most 40 recent completed user turns, then at most 200 KiB of
+ * serialized provider history. The byte pass removes only complete oldest
+ * turns and includes its one omission note in the ceiling. The current user
+ * message is outside this projection, while retained global turn ids keep the
+ * Session checkpoint and later token compaction semantics unchanged. */
+export function projectFullRebaseMessages(
+  rows: readonly GroupMessage[],
+  currentMsgId: string,
+  actorNames: ReadonlyMap<string, string> = new Map(),
+  formatReferences?: GroupHistoryReferenceFormatter,
+  actorId: string = COMMANDER_ID,
+): Message[] {
+  const currentIndex = rows.findIndex((message) => message.id === currentMsgId);
+  const priorRows = currentIndex >= 0 ? rows.slice(0, currentIndex) : [...rows];
+  // Deleted user rows still count: the projector advances its user ordinal on
+  // every prior `from === user` row, so the cut must count the same way.
+  const priorUserRows = priorRows.filter((message) => message.from === USER_ID);
+  let omittedTurns = Math.max(0, priorUserRows.length - FULL_REBASE_MAX_PRIOR_TURNS);
+  const keptStart = omittedTurns > 0 ? rows.indexOf(priorUserRows[omittedTurns]) : 0;
+  const projected = omittedTurns > 0
+    ? buildGroupConversationHistoryTail(
+        rows.slice(keptStart),
+        currentMsgId,
+        omittedTurns,
+        actorNames,
+        formatReferences,
+        actorId,
+      )
+    : buildGroupConversationHistory(rows, currentMsgId, actorNames, formatReferences, actorId);
+  const groups = fullRebaseTurnGroups(projected);
+
+  let result = omittedTurns > 0
+    ? [...fullRebaseOmissionNote(priorRows, priorUserRows, omittedTurns), ...projected]
+    : projected;
+  while (groups.length > 0 && fullRebaseSerializedBytes(result) > FULL_REBASE_MAX_BYTES) {
+    const removed = groups.shift()!;
+    omittedTurns = Math.max(
+      omittedTurns,
+      ...removed.map((message) => message.turnId ?? 0),
+    );
+    result = [
+      ...fullRebaseOmissionNote(priorRows, priorUserRows, omittedTurns),
+      ...groups.flat(),
+    ];
+  }
+  return result;
 }

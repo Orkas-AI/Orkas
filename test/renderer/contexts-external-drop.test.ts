@@ -26,13 +26,15 @@ function loadContextsScript() {
     'utf8',
   );
   const monitorError = vi.fn();
+  const log = { error: vi.fn(), info: vi.fn(), warn: vi.fn() };
   const context: any = {
     AbortController,
     TextDecoder,
     clearTimeout,
     performance,
     setTimeout,
-    createLogger: () => ({ error: vi.fn(), info: vi.fn(), warn: vi.fn() }),
+    createLogger: () => log,
+    __log: log,
     escapeHtml: (value: unknown) => String(value ?? ''),
     t: (key: string, vars?: Record<string, unknown>) => `${key}:${JSON.stringify(vars || {})}`,
     window: {
@@ -449,6 +451,9 @@ describe('Library external file drag-and-drop', () => {
     expect(message).toContain(file.name);
     expect(message).not.toContain('EACCES');
     expect(message).not.toContain('private backend path');
+    expect(context.__log.warn).toHaveBeenCalledWith('library upload failed', expect.objectContaining({ error_code: 'upload_failed', failed_count: 1 }));
+    expect(JSON.stringify(context.__log.warn.mock.calls)).not.toContain('private backend path');
+    expect(JSON.stringify(context.__log.info.mock.calls)).not.toContain('Incoming');
   });
 
   it('confirms deletion with the basename instead of the full Library path', async () => {
@@ -484,11 +489,9 @@ describe('Library external file drag-and-drop', () => {
 
     await context.deleteCtxEntry('Research/private-note.md', 'file');
 
-    expect(event).toHaveBeenCalledTimes(1);
-    expect(event).toHaveBeenCalledWith('library_entry_action_result', expect.objectContaining({
-      result: 'success',
-      action: 'delete',
-    }));
+    expect(context.apiFetch).toHaveBeenCalledOnce();
+    expect(context.loadContexts).toHaveBeenCalledOnce();
+    expect(event).not.toHaveBeenCalled();
     expect(error).not.toHaveBeenCalled();
     expect(context.uiAlert).not.toHaveBeenCalled();
   });
@@ -508,9 +511,13 @@ describe('Library external file drag-and-drop', () => {
     await context.handleCtxNativeUpload('Research');
 
     expect(context.loadContexts).not.toHaveBeenCalled();
+    expect(context.uiAlert).toHaveBeenCalledOnce();
+    expect(context.__log.warn).toHaveBeenCalledWith('library upload failed', expect.objectContaining({ error_code: 'E_IPC_REQUEST' }));
+    expect(JSON.stringify(context.__log.warn.mock.calls)).not.toContain('private backend detail');
+    expect(event).not.toHaveBeenCalled();
   });
 
-  it('reports explicit native picker cancellation outside the upload success denominator', async () => {
+  it('keeps explicit native picker cancellation free of error feedback outside the upload success denominator', async () => {
     const context = loadContextsScript();
     const event = vi.fn();
     const error = vi.fn();

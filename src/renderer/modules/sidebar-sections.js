@@ -1,7 +1,14 @@
-// Top-level Projects and Tasks section collapse state.
+// Top-level Today, Projects and Tasks section collapse state.
 (function () {
   const STORAGE_KEY = 'sidebar.sectionCollapsed';
   const SECTION_CONFIG = [
+    {
+      name: 'today',
+      sectionSelector: '.sidebar-today-section',
+      toggleId: 'today-section-toggle',
+      bodyId: 'today-list',
+      labelKey: 'sidebar.today_tasks',
+    },
     {
       name: 'projects',
       sectionSelector: '.sidebar-projects-section',

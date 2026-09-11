@@ -1,10 +1,11 @@
 /**
  * Tiny ACP (Agent Communication Protocol) client used by ACP-speaking
- * CLIs (Hermes today; Kimi / Kiro will plug in here too).
+ * CLIs (Hermes and OpenCode today; Kimi / Kiro can plug in here too).
  *
  * ACP wire format: newline-delimited JSON-RPC 2.0 over stdio. We send
- * `initialize`, `session/new`, `session/prompt` and listen for
- * `session/update` notifications (text deltas + tool events) plus the
+ * `initialize`, `session/new`, `session/prompt`, answer native
+ * `session/request_permission` calls, and listen for `session/update`
+ * notifications (text deltas + tool events) plus the
  * id-matched `session/prompt` response (terminal). The protocol allows
  * arbitrary other notifications which we surface as raw `tool-event`
  * stream entries when their shape isn't recognized.
@@ -31,19 +32,24 @@ export interface AcpBackendDef {
   /** Logger name. */
   logName: string;
   /** Subcommand args for the CLI's ACP mode. e.g. `['acp']`. */
-  argv: string[];
+  argv: string[] | ((opts: BackendRunOptions) => string[]);
   /** Identifier we report via `clientInfo.name`. Cosmetic. */
   clientName: string;
+  /** Use the stabilized `session/resume` lifecycle when the runner supplies a
+   * native session id. Backends that omit this continue with fresh sessions. */
+  resume?: boolean;
   /** Extra env vars to merge with `process.env` when spawning. */
-  extraEnv?: Record<string, string>;
+  extraEnv?: Record<string, string> | ((opts: BackendRunOptions) => Record<string, string>);
 }
 
 export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
   const log = createLogger(def.logName);
   return {
     async run(opts: BackendRunOptions): Promise<void> {
-      const env = def.extraEnv ? { ...process.env, ...def.extraEnv } : process.env;
-      const child = spawnCli(opts.binPath, def.argv, opts.cwd, env);
+      const argv = typeof def.argv === 'function' ? def.argv(opts) : def.argv;
+      const extraEnv = typeof def.extraEnv === 'function' ? def.extraEnv(opts) : def.extraEnv;
+      const env = extraEnv ? { ...process.env, ...extraEnv } : process.env;
+      const child = spawnCli(opts.binPath, argv, opts.cwd, env);
       const detachAbort = bindAbort(child, opts.signal);
       const tail = new StderrTail();
       const startedAt = Date.now();
@@ -69,11 +75,12 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         pid: child.pid ?? -1,
         cwd: opts.cwd,
         cmd: opts.binPath,
-        args: def.argv,
+        args: argv,
       });
 
       const watchdog = armKillWatchdog(child, {
         timeoutMs: opts.timeoutMs,
+        deadlineAt: opts.deadlineAt,
         idleKillMs: opts.idleKillMs,
         lastEventAt: opts.lastEventAt,
       });
@@ -101,16 +108,19 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         mcpServers: [],
       };
       if (opts.modelOverride) sessionNewParams.model = opts.modelOverride;
+      const requestedResumeId = def.resume ? String(opts.resumeSessionId || '') : '';
 
-      let sessionNewSent = false;
-      const sendSessionNew = () => {
-        if (sessionNewSent) return;
-        sessionNewSent = true;
+      let sessionStartSent = false;
+      const sendSessionStart = () => {
+        if (sessionStartSent) return;
+        sessionStartSent = true;
         send({
           jsonrpc: '2.0',
           id: 2,
-          method: 'session/new',
-          params: sessionNewParams,
+          method: requestedResumeId ? 'session/resume' : 'session/new',
+          params: requestedResumeId
+            ? { sessionId: requestedResumeId, cwd: opts.cwd, mcpServers: [] }
+            : sessionNewParams,
         });
       };
 
@@ -129,6 +139,22 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           },
         });
       };
+      const onSessionReady = (id: string) => {
+        sessionId = id;
+        opts.onEvent({ type: 'status', status: 'session_ready', sessionId });
+        if (opts.modelOverride) {
+          send({
+            jsonrpc: '2.0', id: 3, method: 'session/set_model',
+            params: { sessionId: id, modelId: opts.modelOverride },
+          });
+          // Version-skewed ACP servers may accept the setter without
+          // replying. Never let optional selection block the task.
+          modelSetTimer = setTimeout(() => sendPrompt(id), 250);
+          if (typeof modelSetTimer.unref === 'function') modelSetTimer.unref();
+        } else {
+          sendPrompt(id);
+        }
+      };
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', chunk => {
         splitter.push(chunk, line => {
@@ -144,25 +170,89 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             opts.onEvent({ type: 'raw-line', line: trimmed });
             return;
           }
-          if (Number(env.id) === 1 && !env.error) sendSessionNew();
+          if (env?.method === 'session/request_permission' && env.id !== undefined) {
+            const params = env.params && typeof env.params === 'object' ? env.params : {};
+            const toolCall = params.toolCall && typeof params.toolCall === 'object'
+              ? params.toolCall
+              : {};
+            const rawInput = toolCall.rawInput && typeof toolCall.rawInput === 'object'
+              ? toolCall.rawInput
+              : {};
+            const options = Array.isArray(params.options) ? params.options : [];
+            const optionId = () => {
+              const once = options.find((option: any) => {
+                const id = String(option?.optionId || option?.option_id || '');
+                const kind = String(option?.kind || '');
+                return id === 'allow_once' || id === 'once' || kind === 'allow_once' || kind === 'once';
+              });
+              if (once) return String(once.optionId || once.option_id || 'allow_once');
+              // Version-skewed agents may expose a differently named allow
+              // choice. Prefer a non-persistent option and never select an
+              // explicit always/session grant on the user's behalf.
+              const bounded = options.find((option: any) => {
+                const id = String(option?.optionId || option?.option_id || '').toLowerCase();
+                const kind = String(option?.kind || '').toLowerCase();
+                return !id.includes('deny') && !id.includes('reject') && !id.includes('always') && !id.includes('session')
+                  && !kind.includes('deny') && !kind.includes('reject') && !kind.includes('always') && !kind.includes('session');
+              });
+              return bounded ? String(bounded.optionId || bounded.option_id || '') : '';
+            };
+            void (async () => {
+              const fullAccess = opts.permissionPolicy === 'full_access';
+              const decision = fullAccess
+                ? 'allow_once'
+                : await (opts.requestPermission?.({
+                  id: String(env.id),
+                  tool: String(toolCall.kind || 'command'),
+                  description: typeof rawInput.description === 'string'
+                    ? rawInput.description
+                    : typeof toolCall.title === 'string' ? toolCall.title : undefined,
+                  command: typeof rawInput.command === 'string' ? rawInput.command : undefined,
+                }) ?? Promise.resolve('deny'));
+              const selected = decision === 'deny' ? '' : optionId();
+              send({
+                jsonrpc: '2.0',
+                id: env.id,
+                result: {
+                  outcome: selected
+                    ? { outcome: 'selected', optionId: selected }
+                    : { outcome: 'cancelled' },
+                },
+              });
+              opts.onEvent({
+                type: 'permission-request',
+                id: String(env.id),
+                tool: String(toolCall.kind || 'command'),
+                ...(fullAccess
+                  ? { autoDecided: 'allow', reason: 'full_access' }
+                  : { decision: selected ? 'allow' : 'deny', reason: 'user' }),
+              });
+            })().catch((err) => {
+              log.warn('acp permission response failed', { error: logErrorSummary(err) });
+              send({
+                jsonrpc: '2.0',
+                id: env.id,
+                result: { outcome: { outcome: 'cancelled' } },
+              });
+            });
+            return;
+          }
+          if (Number(env.id) === 1 && !env.error) sendSessionStart();
           if (Number(env.id) === 3 && sessionId) sendPrompt(sessionId);
+          if (Number(env.id) === 2 && env.error) {
+            resultStatus = 'failed';
+            resultError = typeof env.error.message === 'string'
+              ? env.error.message
+              : 'ACP session could not be started';
+            try { child.stdin.end(); } catch { /* */ }
+            return;
+          }
+          if (Number(env.id) === 2 && requestedResumeId && !env.error) {
+            onSessionReady(requestedResumeId);
+            return;
+          }
           handleAcpMessage(env, {
-            onSessionNew: id => {
-              sessionId = id;
-              opts.onEvent({ type: 'status', status: 'session_ready', sessionId });
-              if (opts.modelOverride) {
-                send({
-                  jsonrpc: '2.0', id: 3, method: 'session/set_model',
-                  params: { sessionId: id, modelId: opts.modelOverride },
-                });
-                // Version-skewed ACP servers may accept the setter without
-                // replying. Never let optional selection block the task.
-                modelSetTimer = setTimeout(() => sendPrompt(id), 250);
-                if (typeof modelSetTimer.unref === 'function') modelSetTimer.unref();
-              } else {
-                sendPrompt(id);
-              }
-            },
+            onSessionNew: onSessionReady,
             onTextDelta: text => {
               resultText += text;
               opts.onEvent({ type: 'text-delta', text });
@@ -215,11 +305,11 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         });
       });
 
-      // Fire-and-forget timeout to be sure session/new goes; some CLIs
+      // Fire-and-forget timeout to be sure session start goes; some CLIs
       // ack initialize without printing anything we'd recognize as the
       // ack, and then sit idle. The one-shot guard prevents a late fallback
       // from creating a second session after a normal initialize response.
-      const initTimer = setTimeout(sendSessionNew, 250);
+      const initTimer = setTimeout(sendSessionStart, 250);
       if (typeof initTimer.unref === 'function') initTimer.unref();
 
       child.stderr.setEncoding('utf8');
@@ -259,11 +349,16 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         };
         child.on('error', err => {
           log.warn('acp spawn error', { error: logErrorSummary(err) });
-          finish('failed', { error: (err as Error).message, stderrTail: tail.toString() });
+          finish('failed', {
+            error: (err as Error).message,
+            stderrTail: tail.toString(),
+            failureKind: 'cli_spawn',
+            retrySafe: true,
+          });
         });
         child.on('close', code => {
           if (opts.signal.aborted) return finish('cancelled', { output: resultText });
-          if (watchdog.fired()) return finish('timeout', { error: `cli ${watchdog.reason()}`, output: resultText, stderrTail: tail.toString() });
+if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`, output: resultText, stderrTail: tail.toString() });
           if (code === 0 && resultStatus === 'completed') {
             // Demote silent failure: server claimed success via
             // stopReason=end_turn but never streamed any text AND

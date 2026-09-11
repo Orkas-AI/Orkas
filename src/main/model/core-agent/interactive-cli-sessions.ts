@@ -39,6 +39,8 @@ const INPUT_MAX_CHARS = 64 * 1024;
 export type InteractiveCliStatus = 'running' | 'exited' | 'error' | 'closed';
 export type InteractiveCliStream = 'stdout' | 'stderr';
 export type InteractiveCliPromptKind = 'auth_code' | 'secret' | 'confirm' | 'generic';
+/** Host-owned UI capability. Unclassified processes have no interactive presentation. */
+type InteractiveCliPresentation = 'agent_terminal' | 'browser_auth' | 'connector_input';
 
 export interface InteractiveCliSessionView {
   session_id: string;
@@ -63,7 +65,12 @@ export interface StartInteractiveCliSessionOpts {
   agentId?: string;
   agentName?: string;
   purpose?: string;
+  /** Executable path or shell command. When `args` is present this is spawned directly without
+   *  a shell, which is the required path for app-owned connector authorization helpers. */
   command: string;
+  args?: string[];
+  /** Only the Agent tool factory grants agent_terminal; never read from model arguments or output. */
+  presentation?: InteractiveCliPresentation;
   cwd: string;
   sandboxEnv?: Record<string, string>;
   maxLifetimeMs?: number;
@@ -76,6 +83,7 @@ interface Session {
   agentId: string;
   agentName: string;
   purpose: string;
+  presentation?: InteractiveCliPresentation;
   command: string;
   cwd: string;
   env: NodeJS.ProcessEnv;
@@ -198,6 +206,7 @@ function detectPrompt(text: string): { kind: InteractiveCliPromptKind; sensitive
 function broadcast(s: Session, payload: Record<string, unknown>): void {
   const scopedPayload = {
     ...payload,
+    ...(s.presentation ? { presentation: s.presentation } : {}),
     user_id: s.uid,
     conversation_id: s.cid,
   };
@@ -390,13 +399,21 @@ function viewOf(s: Session): InteractiveCliSessionView {
 export function startInteractiveCliSession(opts: StartInteractiveCliSessionOpts): InteractiveCliSessionView {
   const command = String(opts.command || '').trim();
   if (!command) throw new Error('missing command');
+  const directArgs = Array.isArray(opts.args) ? opts.args.map((arg) => String(arg)) : null;
+  const displayCommand = directArgs
+    ? [command, ...directArgs].map((part) => JSON.stringify(part)).join(' ')
+    : command;
   const cwd = path.resolve(String(opts.cwd || process.cwd()));
   try { fs.mkdirSync(cwd, { recursive: true }); } catch { /* spawn will report */ }
   const env = buildSandboxEnv(opts.sandboxEnv ?? {});
-  const shell = process.platform === 'win32'
-    ? defaultShellForPlatform()
-    : (process.env.SHELL || defaultShellForPlatform());
-  const invocation = buildShellInvocation(shell, command);
+  const invocation = directArgs
+    ? { command, args: directArgs }
+    : buildShellInvocation(
+      process.platform === 'win32'
+        ? defaultShellForPlatform()
+        : (process.env.SHELL || defaultShellForPlatform()),
+      command,
+    );
   const child = spawn(invocation.command, invocation.args, {
     cwd,
     env,
@@ -415,7 +432,12 @@ export function startInteractiveCliSession(opts: StartInteractiveCliSessionOpts)
     agentId: String(opts.agentId || ''),
     agentName: String(opts.agentName || ''),
     purpose: purposePreview(opts.purpose),
-    command,
+    // A terminal is a task-owned surface. Non-task callers cannot grant it just
+    // by supplying an Agent label or presentation; command execution is unchanged.
+    presentation: opts.presentation === 'agent_terminal'
+      ? (typeof opts.cid === 'string' && opts.cid.trim() ? opts.presentation : undefined)
+      : opts.presentation === 'browser_auth' || opts.presentation === 'connector_input' ? opts.presentation : undefined,
+    command: displayCommand,
     cwd,
     env,
     child,
@@ -460,7 +482,7 @@ export function startInteractiveCliSession(opts: StartInteractiveCliSessionOpts)
     type: 'started',
     session_id: id,
     ...(session.purpose ? { purpose: session.purpose } : {}),
-    command: commandPreview(command),
+    command: commandPreview(displayCommand),
     cwd,
     status: 'running',
     agent_name: session.agentName,
@@ -471,9 +493,31 @@ export function startInteractiveCliSession(opts: StartInteractiveCliSessionOpts)
     user_id: maskId(session.uid),
     cid: maskId(session.cid),
     agent_id: maskId(session.agentId),
-    command_chars: command.length,
+    command_chars: displayCommand.length,
   });
   return viewOf(session);
+}
+
+/** Wait for an app-owned interactive flow without polling. The renderer continues receiving
+ *  output/prompt events while this promise is pending. */
+export function waitInteractiveCliSession(
+  uid: string,
+  sessionId: string,
+): Promise<InteractiveCliSessionView> {
+  const session = assertOwnSession(uid, sessionId);
+  if (session.status !== 'running') return Promise.resolve(viewOf(session));
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      // The module's close/error listeners were registered before this waiter and have already
+      // finalized status/output by the time the queued callback runs.
+      setImmediate(() => resolve(viewOf(session)));
+    };
+    session.child.once('close', done);
+    session.child.once('error', done);
+  });
 }
 
 export function readInteractiveCliSession(uid: string, sessionId: string): InteractiveCliSessionView {

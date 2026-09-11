@@ -81,11 +81,9 @@ describe('system skills reconciliation', () => {
     const results = await systemSkills.reconcileAllForActiveUser();
     expect(results.map((r) => [r.id, r.action]).sort()).toEqual([
       ['agent-creator', 'created'],
-      ['autotask-creator', 'created'],
-      ['memory-manager', 'created'],
       ['package-installer', 'created'],
-      ['project-tasks', 'created'],
       ['skill-creator', 'created'],
+
     ]);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'agent-creator'), 'SKILL.md'))).toBe(true);
     expect(fs.existsSync(path.join(
@@ -93,10 +91,8 @@ describe('system skills reconciliation', () => {
       'references',
       'llm-agent-fields.md',
     ))).toBe(true);
-    expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'autotask-creator'), 'SKILL.md'))).toBe(true);
-    expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'memory-manager'), 'SKILL.md'))).toBe(true);
+    expect(fs.existsSync(paths.userSystemSkillDir(UID, 'memory-manager'))).toBe(false);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'package-installer'), 'SKILL.md'))).toBe(true);
-    expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'project-tasks'), 'SKILL.md'))).toBe(true);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'skill-creator'), 'SKILL.md'))).toBe(true);
     expect(fs.existsSync(path.join(
       paths.userSystemSkillDir(UID, 'skill-creator'),
@@ -121,17 +117,12 @@ describe('system skills reconciliation', () => {
     const results = await systemSkills.reconcileAllForUser(loginUid);
     expect(results.map((r) => [r.id, r.action]).sort()).toEqual([
       ['agent-creator', 'created'],
-      ['autotask-creator', 'created'],
-      ['memory-manager', 'created'],
       ['package-installer', 'created'],
-      ['project-tasks', 'created'],
       ['skill-creator', 'created'],
+
     ]);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(loginUid, 'agent-creator'), 'SKILL.md'))).toBe(true);
-    expect(fs.existsSync(path.join(paths.userSystemSkillDir(loginUid, 'autotask-creator'), 'SKILL.md'))).toBe(true);
-    expect(fs.existsSync(path.join(paths.userSystemSkillDir(loginUid, 'memory-manager'), 'SKILL.md'))).toBe(true);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(loginUid, 'package-installer'), 'SKILL.md'))).toBe(true);
-    expect(fs.existsSync(path.join(paths.userSystemSkillDir(loginUid, 'project-tasks'), 'SKILL.md'))).toBe(true);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(loginUid, 'skill-creator'), 'SKILL.md'))).toBe(true);
     expect(fs.existsSync(paths.userSystemSkillDir(UID, 'agent-creator'))).toBe(false);
   });
@@ -146,9 +137,6 @@ describe('system skills reconciliation', () => {
     fs.writeFileSync(path.join(paths.userSystemSkillDir(UID, 'agent-creator'), '_system.json'), '{}');
     const skipped = await systemSkills.reconcileAllForActiveUser();
     expect(skipped.map((r) => r.action)).toEqual([
-      'skipped',
-      'skipped',
-      'skipped',
       'skipped',
       'skipped',
       'skipped',
@@ -264,6 +252,37 @@ describe('system skills reconciliation', () => {
     expect(nextManifest.some((entry: any) => entry.id === retiredId)).toBe(false);
   });
 
+  it('removes retired task and memory Skills without losing saved memory or advertising stale references', async () => {
+    const users = await import('../../../src/main/features/users');
+    const systemSkills = await import('../../../src/main/features/system_skills');
+    const paths = await import('../../../src/main/paths');
+    users.activateUser(UID);
+    const memory = await import('../../../src/main/features/memory');
+    expect(memory.addEntry(UID, 'user', 'Prefer concise replies.').ok).toBe(true);
+    const retired = ['autotask-creator', 'auto-tasks', 'project-tasks', 'todo-tasks', 'memory-manager'];
+    for (const id of retired) {
+      const dir = paths.userSystemSkillDir(UID, id);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'SKILL.md'), `---\nname: ${id}\ndescription: Old task protocol\n---\n`);
+    }
+    fs.writeFileSync(paths.userSystemSkillsManifestFile(UID), JSON.stringify(
+      retired.map((id) => ({ id, update_at: 1 })),
+    ));
+    const results = await systemSkills.reconcileAllForUser(UID);
+    const registry = await import('../../../src/main/model/core-agent/skill-registry');
+    const bindings = new Map();
+    const roster = await registry.getSystemSkillsPromptBlock(UID, bindings);
+    for (const id of retired) {
+      expect(results).toContainEqual({ id, action: 'deleted' });
+      expect(fs.existsSync(paths.userSystemSkillDir(UID, id))).toBe(false);
+      expect(roster).not.toContain(id);
+      expect([...bindings.values()].some((binding) => binding.id === id)).toBe(false);
+    }
+    expect(roster).not.toContain('orkas-guide');
+    expect(memory.listEntries(UID, 'user').entries).toEqual(['Prefer concise replies.']);
+    expect((await systemSkills.reconcileAllForUser(UID)).every((result) => result.action === 'skipped')).toBe(true);
+  });
+
   it('deletes an untracked system Skill directory that is absent from the packaged manifest', async () => {
     const users = await import('../../../src/main/features/users');
     const systemSkills = await import('../../../src/main/features/system_skills');
@@ -358,10 +377,7 @@ describe('system skill contracts', () => {
   it('keeps every platform-managed system Skill bilingual without a generic description', () => {
     const ids = [
       'agent-creator',
-      'autotask-creator',
-      'memory-manager',
       'package-installer',
-      'project-tasks',
       'skill-creator',
     ];
     for (const id of ids) {
@@ -373,45 +389,16 @@ describe('system skill contracts', () => {
     }
   });
 
-  it('keeps the project backlog workflow in a triggerable system skill', () => {
-    const md = packagedSystemSkill('project-tasks');
-    const fm = frontmatterOf(md);
-
-    expect(fm).toMatch(/^name:\s*project-tasks$/m);
-    expect(fm).toMatch(/^description_zh:/m);
-    expect(fm).toMatch(/^description_en:/m);
-    expect(fm).toMatch(/^category:\s*"general"$/m);
-    expect(md).toContain('## Project status');
-    expect(md).toContain('project_tasks');
-    expect(md).toContain('depends_on');
-    expect(md).toContain('An `in_progress` task is already started');
-    expect(md).toContain('result_ref');
-    expect(md).toContain('evidence, not authority');
-    expect(md).toContain('never as a filesystem path');
-    expect(md).toContain('explicit complete or empty state is authoritative');
-  });
-
-  it('keeps durable-memory mutations in a triggerable system skill', () => {
-    const md = packagedSystemSkill('memory-manager');
-    const fm = frontmatterOf(md);
-
-    expect(fm).toMatch(/^name:\s*memory-manager$/m);
-    expect(fm).toMatch(/^description_zh:\s*/m);
-    expect(fm).toMatch(/^description_en:\s*/m);
-    expect(fm).toMatch(/remember this/i);
-    expect(fm).toMatch(/across future conversations/i);
-    expect(fm).toMatch(/read-only recall/i);
-    expect(md).toContain('target: "agent"');
-    expect(md).toContain('target: "user"');
-    expect(md).toContain('target: "shared"');
-    expect(md).toContain('target: "project"');
-    expect(md).toContain('project_instructions');
-    expect(md).toMatch(/Choose exactly one destination/i);
-    expect(md).toMatch(/base future proposals on this fact[\s\S]{0,80}project memory/i);
-    expect(md).toMatch(/full replacement/i);
-    expect(md).toMatch(/several records match[\s\S]{0,160}without mutating/i);
-    expect(md).toMatch(/exact tool, operation, and target/i);
-    expect(md).toMatch(/only after its tool result confirms success/i);
+  it('keeps task tools available without packaged task Skills', async () => {
+    const manifest = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'resources/builtin/system/skills/_system.json'), 'utf8'));
+    for (const retired of ['auto-tasks', 'todo-tasks']) {
+      expect(manifest.map((row: any) => row.id)).not.toContain(retired);
+    }
+    const rules = fs.readFileSync(path.resolve(process.cwd(), 'src/main/prompts/chat_project_tasks_rules.md'), 'utf8');
+    expect(rules).toContain('todo_tasks');
+    expect(rules).toContain('depends_on');
+    expect(rules).toContain('never complete blocked or unverified work');
+    expect(rules).not.toContain('system skill');
   });
 
   it('authors one shared action-authority boundary instead of blanket reconfirmation', () => {
@@ -457,6 +444,9 @@ describe('system skill contracts', () => {
     );
     expect(md).toContain(`at or below ${SKILL_DESCRIPTION_ROSTER_MAX_CHARS} characters`);
     expect(md).toContain('preserve the complete description up to that boundary');
+    // Roster overflow degrades lower-priority rows to their name; the guide
+    // must not promise that a description always reaches the prompt.
+    expect(md).toContain('when the roster exceeds its budget, lower-priority non-builtin entries are listed by name only and stay discoverable through `skill_search`');
     expect(md).toContain('Preserve faithful imported descriptions unless the user asks for a rewrite');
     expect(md).not.toMatch(/three-part dispatch format/i);
     expect(md).not.toContain('one-line function; suitable user phrasings; trigger words');

@@ -334,10 +334,8 @@ describe('PC core regression unit coverage', () => {
     expect(conv.project_id).toBe(project!.project_id);
 
     await projects.addAgentBinding(TEST_UID, project!.project_id, 'agent_a');
-    await projects.addSkillBinding(TEST_UID, project!.project_id, 'skill_a');
     expect(await projects.resolveProjectScope(TEST_UID, project!.project_id)).toEqual({
       agents: ['agent_a'],
-      skills: ['skill_a'],
     });
 
     await projects.removeAgentBinding(TEST_UID, project!.project_id, 'agent_a');

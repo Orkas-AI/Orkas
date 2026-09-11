@@ -10,7 +10,6 @@ describe("Config", () => {
       expect(config.agent.defaultProvider).toBe("anthropic");
       expect(config.agent.maxRetries).toBe(3);
       expect(config.agent.maxToolLoops).toBe(100);
-      expect(config.agent.thinkingLevel).toBeUndefined();
     });
 
     it("allows overriding specific fields", () => {
@@ -23,14 +22,6 @@ describe("Config", () => {
       // Defaults still applied
       expect(config.agent.maxRetries).toBe(3);
     });
-
-    it.each(["off", "low", "high"] as const)(
-      "preserves an explicit %s thinking override",
-      (thinkingLevel) => {
-        const config = createConfig({ agent: { thinkingLevel } });
-        expect(config.agent.thinkingLevel).toBe(thinkingLevel);
-      },
-    );
 
     it("strips a legacy memory-engine section from older config files", () => {
       // The retrieval-engine config was removed with the unwired engine
@@ -59,13 +50,6 @@ describe("Config", () => {
         agent: { defaultModel: "claude-opus-4-7" },
       });
       expect(result.success).toBe(true);
-    });
-
-    it("rejects invalid thinking level", () => {
-      const result = CoreAgentConfigSchema.safeParse({
-        agent: { thinkingLevel: "invalid" },
-      });
-      expect(result.success).toBe(false);
     });
 
     it("rejects negative maxRetries", () => {

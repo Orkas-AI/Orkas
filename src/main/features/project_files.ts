@@ -10,6 +10,7 @@
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
 import { Semaphore } from 'async-mutex';
 
 import { projectFilesDir } from '../paths';
@@ -19,10 +20,10 @@ import { invalidateFileCache } from './file_indexer';
 import { projectExists } from './projects';
 import * as projectLibraryIndexer from './project_library_indexer';
 import {
-  officeFileToPreviewHtml,
   officePreviewKindForExt,
   type OfficePreviewResult,
 } from '../util/office-preview';
+import { officeFileToPreviewHtml } from './office/office_preview_layout';
 import {
   assertLocalImportTarget,
   copyLocalFileAtomic,
@@ -142,11 +143,19 @@ function relPathFor(root: string, absPath: string): string {
   return path.relative(path.resolve(root), path.resolve(absPath)).split(path.sep).join('/');
 }
 
-function resolveUnder(root: string, relPath: string): string {
+async function resolveUnder(root: string, relPath: string): Promise<string> {
   const base = path.resolve(root);
   const abs = path.resolve(base, relPath);
   const rel = path.relative(base, abs);
   if (rel.startsWith('..') || path.isAbsolute(rel)) throw new Error('forbidden');
+  try {
+    await assertLocalImportTarget(base, abs);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'E_IMPORT_TARGET_SYMLINK') {
+      throw new Error('symlink_not_supported');
+    }
+    throw err;
+  }
   return abs;
 }
 
@@ -403,8 +412,10 @@ export async function uploadProjectFile(
     }
   }
 
-  const parent = path.dirname(safeName);
-  const targetDir = parent === '.' ? dir : resolveUnder(dir, parent);
+  let requestedTarget: string;
+  try { requestedTarget = await resolveUnder(dir, safeName); }
+  catch (err) { return { ok: false, error: (err as Error).message }; }
+  const targetDir = path.dirname(requestedTarget);
   try { fs.mkdirSync(targetDir, { recursive: true }); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   const target = uniqueTarget(targetDir, path.basename(safeName));
@@ -415,7 +426,13 @@ export async function uploadProjectFile(
   if (!info) return { ok: false, error: 'write failed' };
   projectLibraryIndexer.enqueue(userId, pid, info.relPath, 'upsert');
   _notifyDirty(userId, pid);
-  log.info(`upload user=${userId} pid=${pid} name=${info.relPath} kind=${info.kind} bytes=${info.bytes}`);
+  log.info('uploaded project library file', {
+    user_id: maskId(userId),
+    project_id: maskId(pid),
+    path: logPathRef(info.relPath),
+    kind: info.kind,
+    bytes: info.bytes,
+  });
   return { ok: true, info };
 }
 
@@ -448,7 +465,7 @@ export async function importProjectFileFromPath(
     }
     const info = await withLocalImportLock(`project:${userId}:${pid}`, async () => {
       const parent = path.dirname(safeName);
-      const targetDir = parent === '.' ? dir : resolveUnder(dir, parent);
+      const targetDir = parent === '.' ? dir : await resolveUnder(dir, parent);
       const target = uniqueTarget(targetDir, path.basename(safeName));
       await assertLocalImportTarget(dir, target);
       await fsp.mkdir(targetDir, { recursive: true });
@@ -495,7 +512,7 @@ export async function createProjectDir(
   } catch (err) { return { ok: false, error: (err as Error).message }; }
 
   let abs: string;
-  try { abs = resolveUnder(root, safePath); }
+  try { abs = await resolveUnder(root, safePath); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   if (fs.existsSync(abs)) {
     try {
@@ -520,7 +537,7 @@ export async function deleteProjectFile(userId: string, projectId: string, name:
 
   const dir = projectFilesDir(userId, pid);
   let abs: string;
-  try { abs = resolveUnder(dir, safeName); }
+  try { abs = await resolveUnder(dir, safeName); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   if (!fs.existsSync(abs)) return { ok: false, error: 'not_found' };
   try {
@@ -531,7 +548,7 @@ export async function deleteProjectFile(userId: string, projectId: string, name:
   projectLibraryIndexer.enqueue(userId, pid, safeName, 'delete');
   _notifyDeleted(pid, safeName);
   try { invalidateFileCache(userId, abs); }
-  catch (err) { log.warn(`invalidate cache ${abs}: ${(err as Error).message}`); }
+  catch (err) { log.warn('project file cache invalidation failed', { path: logPathRef(abs), error: logErrorSummary(err) }); }
   try {
     if (fs.existsSync(dir) && fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
   } catch { /* best-effort */ }
@@ -550,7 +567,7 @@ export async function deleteProjectEntry(userId: string, projectId: string, name
 
   const root = path.resolve(projectFilesDir(userId, pid));
   let abs: string;
-  try { abs = resolveUnder(root, safeName); }
+  try { abs = await resolveUnder(root, safeName); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   let st: fs.Stats;
   try { st = fs.statSync(abs); }
@@ -567,7 +584,7 @@ export async function deleteProjectEntry(userId: string, projectId: string, name
     projectLibraryIndexer.enqueue(userId, pid, file.relPath, 'delete');
     _notifyDeleted(pid, file.relPath);
     try { invalidateFileCache(userId, file.path); }
-    catch (err) { log.warn(`invalidate cache ${file.path}: ${(err as Error).message}`); }
+    catch (err) { log.warn('project file cache invalidation failed', { path: logPathRef(file.path), error: logErrorSummary(err) }); }
   }
   _notifyDirty(userId, pid);
   return { ok: true };
@@ -603,7 +620,7 @@ export async function resolveProjectFileAbsPath(
 
   const root = path.resolve(projectFilesDir(userId, pid));
   let abs: string;
-  try { abs = resolveUnder(root, safeName); }
+  try { abs = await resolveUnder(root, safeName); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   let st: fs.Stats;
   try { st = fs.lstatSync(abs); }
@@ -628,7 +645,7 @@ export async function resolveProjectEntryAbsPath(
   } catch (err) { return { ok: false, error: (err as Error).message }; }
   const root = path.resolve(projectFilesDir(userId, pid));
   let absPath: string;
-  try { absPath = resolveUnder(root, safeName); }
+  try { absPath = await resolveUnder(root, safeName); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   let st: fs.Stats;
   try { st = fs.lstatSync(absPath); }
@@ -702,7 +719,9 @@ export async function copyProjectEntryFromPath(
   let safeTarget: string;
   try { safeTarget = sourceStat.isDirectory() ? safeDirPath(targetName) : safeFileName(targetName); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
-  const targetAbs = resolveUnder(root, safeTarget);
+  let targetAbs: string;
+  try { targetAbs = await resolveUnder(root, safeTarget); }
+  catch (err) { return { ok: false, error: (err as Error).message }; }
   if (fs.existsSync(targetAbs)) return { ok: false, error: 'target_exists' };
   try {
     if (!fs.statSync(path.dirname(targetAbs)).isDirectory()) return { ok: false, error: 'not_found' };
@@ -729,6 +748,73 @@ export async function copyProjectEntryFromPath(
   }
   _notifyDirty(userId, pid);
   return { ok: true, name: safeTarget, fileCount: checked.fileCount, bytes: checked.bytes };
+}
+
+function projectFileRevision(userId: string, projectId: string, name: string, abs: string): string {
+  const hash = createHash('sha256').update(`${userId}\0${projectId}\0${name}\0`);
+  const fd = fs.openSync(abs, 'r');
+  const chunk = Buffer.allocUnsafe(64 * 1024);
+  try {
+    let bytes: number;
+    while ((bytes = fs.readSync(fd, chunk, 0, chunk.length, null)) > 0) hash.update(chunk.subarray(0, bytes));
+  } finally { fs.closeSync(fd); }
+  return hash.digest('hex');
+}
+
+/** Materialize the exact source bytes for editing, without overwriting workspace files. */
+export async function checkoutProjectFile(
+  userId: string, projectId: string, name: string, destination: string,
+): Promise<Result<{ name: string; bytes: number; revision: string }>> {
+  const resolved = await resolveProjectFileAbsPath(userId, projectId, name);
+  if (resolved.ok === false) return resolved;
+  try {
+    const checked = validateProjectCopySource(resolved.absPath);
+    if (checked.ok === false) return checked;
+    // No await between the copy and receipt: renderer and bridge writes cannot
+    // interleave. Hash the copy so the receipt always describes the bytes read.
+    fs.copyFileSync(resolved.absPath, destination, fs.constants.COPYFILE_EXCL);
+    return {
+      ok: true, name, bytes: checked.bytes,
+      revision: projectFileRevision(userId, projectId, safeFileName(name), destination),
+    };
+  } catch {
+    return { ok: false, error: 'checkout_failed: use a new workspace filename and an existing parent folder' };
+  }
+}
+
+/** Explicit compare-and-replace; the ordinary create-only copy path is unchanged. */
+export async function replaceProjectFileFromPath(
+  userId: string, projectId: string, source: string, name: string, expectedRevision: string,
+): Promise<Result<{ name: string; bytes: number; revision: string }>> {
+  if (!/^[a-f0-9]{64}$/.test(expectedRevision)) return { ok: false, error: 'invalid_revision: checkout the file first' };
+  const resolved = await resolveProjectFileAbsPath(userId, projectId, name);
+  if (resolved.ok === false) return resolved;
+  let temp = '';
+  try {
+    const safeName = safeFileName(name);
+    if (!fs.lstatSync(source).isFile() || fs.lstatSync(source).isSymbolicLink()) return { ok: false, error: 'source must be a regular file' };
+    const checked = validateProjectCopySource(source);
+    if (checked.ok === false) return checked;
+    if (checked.bytes > maxBytesFor(safeName)) return { ok: false, error: 'file_too_large' };
+    temp = path.join(path.dirname(resolved.absPath), `.orkas-replace-${randomUUID()}.tmp`);
+    fs.copyFileSync(source, temp, fs.constants.COPYFILE_EXCL);
+    if (projectFileRevision(userId, projectId, safeName, resolved.absPath) !== expectedRevision) {
+      return { ok: false, error: 'conflict: Library file changed; checkout again before saving' };
+    }
+    const revision = projectFileRevision(userId, projectId, safeName, temp);
+    // Keep compare + atomic publish synchronous so all main-process writers
+    // (including UI text edits) observe a single uninterrupted replacement.
+    fs.renameSync(temp, resolved.absPath);
+    temp = '';
+    try { invalidateFileCache(userId, resolved.absPath); } catch { /* rebuilt on next read */ }
+    projectLibraryIndexer.enqueue(userId, projectId, safeName, 'upsert');
+    _notifyDirty(userId, projectId);
+    return { ok: true, name: safeName, bytes: checked.bytes, revision };
+  } catch {
+    return { ok: false, error: 'replace_failed: check the source file and retry' };
+  } finally {
+    if (temp) { try { fs.unlinkSync(temp); } catch { /* best-effort staging cleanup */ } }
+  }
 }
 
 export async function readProjectTextFile(
@@ -769,7 +855,7 @@ export async function updateProjectTextFile(
   try { fs.writeFileSync(r.absPath, body, 'utf8'); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   try { invalidateFileCache(userId, r.absPath); }
-  catch (err) { log.warn(`invalidate cache ${r.absPath}: ${(err as Error).message}`); }
+  catch (err) { log.warn('project file cache invalidation failed', { path: logPathRef(r.absPath), error: logErrorSummary(err) }); }
   projectLibraryIndexer.enqueue(userId, projectId, name, 'upsert');
   _notifyDirty(userId, projectId);
   return { ok: true, name };
@@ -790,7 +876,7 @@ export async function renameProjectFile(
   } catch (err) { return { ok: false, error: (err as Error).message }; }
   const root = path.resolve(projectFilesDir(userId, pid));
   let src: string;
-  try { src = resolveUnder(root, safeOld); }
+  try { src = await resolveUnder(root, safeOld); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   let st: fs.Stats;
   try { st = fs.statSync(src); }
@@ -810,7 +896,7 @@ export async function renameProjectFile(
   if (type === 'dir' && safeNext.startsWith(`${safeOld}/`)) return { ok: false, error: 'forbidden' };
 
   let dst: string;
-  try { dst = resolveUnder(root, safeNext); }
+  try { dst = await resolveUnder(root, safeNext); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   if (fs.existsSync(dst)) return { ok: false, error: 'target_exists' };
   if (!fs.existsSync(path.dirname(dst))) return { ok: false, error: 'not_found' };
@@ -822,9 +908,9 @@ export async function renameProjectFile(
     const nextRel = type === 'dir'
       ? `${safeNext}${file.relPath.slice(safeOld.length)}`
       : safeNext;
-    const nextAbs = resolveUnder(root, nextRel);
+    const nextAbs = path.resolve(root, nextRel);
     try { invalidateFileCache(userId, file.path); invalidateFileCache(userId, nextAbs); }
-    catch (err) { log.warn(`invalidate cache rename ${file.relPath}: ${(err as Error).message}`); }
+    catch (err) { log.warn('renamed project file cache invalidation failed', { path: logPathRef(file.relPath), error: logErrorSummary(err) }); }
     projectLibraryIndexer.enqueue(userId, pid, file.relPath, 'delete');
     projectLibraryIndexer.enqueue(userId, pid, nextRel, 'upsert');
     _notifyDeleted(pid, file.relPath);
@@ -866,7 +952,11 @@ export async function readProjectDocxHtml(
     const html = await docxBufferToHtml(buf);
     return { ok: true, html };
   } catch (err) {
-    log.warn(`project docx→html ${projectId}/${name}: ${(err as Error).message}`);
+    log.warn('project DOCX preview failed', {
+      project_id: maskId(projectId),
+      path: logPathRef(name),
+      error: logErrorSummary(err),
+    });
     return { ok: false, error: (err as Error).message };
   }
 }
@@ -885,7 +975,11 @@ export async function readProjectOfficeHtml(
     const preview = await officeFileToPreviewHtml(kind, path.basename(r.absPath), r.absPath, buf);
     return { ok: true, ...preview };
   } catch (err) {
-    log.warn(`project office→html ${projectId}/${name}: ${(err as Error).message}`);
+    log.warn('project Office preview failed', {
+      project_id: maskId(projectId),
+      path: logPathRef(name),
+      error: logErrorSummary(err),
+    });
     return { ok: false, error: (err as Error).message };
   }
 }

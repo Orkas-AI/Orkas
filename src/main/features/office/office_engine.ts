@@ -56,23 +56,24 @@ const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
  * paths inside /Applications. A child process attributed to Orkas can then
  * make Chrome perform bundle-maintenance writes, which macOS reports as Orkas
  * trying to modify another app. Office document operations never need to
- * execute an installed app bundle, so deny that capability at the process
- * boundary. The default-allow profile keeps OfficeCLI's document, font,
- * network, and resident-process behavior unchanged.
+ * execute another installed app, so deny that capability at the process
+ * boundary. The exact bundled executable remains available for initial and
+ * resident launches when Orkas itself is installed under /Applications.
+ * Pass its real path as a sandbox parameter, never as profile source text.
  */
 export const MAC_OFFICECLI_SANDBOX_PROFILE = [
   '(version 1)',
   '(allow default)',
-  '(deny process-exec (subpath "/Applications"))',
-  '(deny process-exec (subpath "/System/Applications"))',
-  '(deny process-exec (subpath "/System/Cryptexes/App/System/Applications"))',
+  '(deny process-exec (require-all (subpath "/Applications") (require-not (literal (param "OFFICECLI_BINARY")))))',
+  '(deny process-exec (require-all (subpath "/System/Applications") (require-not (literal (param "OFFICECLI_BINARY")))))',
+  '(deny process-exec (require-all (subpath "/System/Cryptexes/App/System/Applications") (require-not (literal (param "OFFICECLI_BINARY")))))',
 ].join('');
 
 function officeCliSpawnCommand(bin: string, args: string[]): { command: string; args: string[] } {
   if (process.platform !== 'darwin') return { command: bin, args };
   return {
     command: '/usr/bin/sandbox-exec',
-    args: ['-p', MAC_OFFICECLI_SANDBOX_PROFILE, bin, ...args],
+    args: ['-D', `OFFICECLI_BINARY=${fs.realpathSync(bin)}`, '-p', MAC_OFFICECLI_SANDBOX_PROFILE, bin, ...args],
   };
 }
 

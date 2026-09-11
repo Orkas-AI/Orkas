@@ -138,6 +138,78 @@ class TechnicalDefaultsTest(unittest.TestCase):
         self.assertGreaterEqual(r["geo_score"], 0)
 
 
+class RobotsCaseAndWildcardTest(unittest.TestCase):
+    """UA tokens compare case-insensitively; 'Disallow: /*' equals a root
+    disallow; a specific path stays a non-block (look-alike guard)."""
+
+    def test_lowercase_ua_detected_with_canonical_name(self):
+        self.assertEqual(_robots_blocks_ai("User-agent: gptbot\nDisallow: /"),
+                         ["GPTBot"])
+
+    def test_mixed_case_ua_detected(self):
+        self.assertEqual(_robots_blocks_ai("User-Agent: claudebot\nDisallow: /"),
+                         ["ClaudeBot"])
+
+    def test_disallow_slash_star_is_root_block(self):
+        self.assertEqual(_robots_blocks_ai("User-agent: GPTBot\nDisallow: /*"),
+                         ["GPTBot"])
+
+    def test_disallow_specific_path_is_not_root_block(self):
+        self.assertEqual(_robots_blocks_ai("User-agent: gptbot\nDisallow: /private"), [])
+
+    def test_disallow_star_prefix_pattern_is_not_root_block(self):
+        # Look-alike: "/*x" is a pattern, not the whole-site wildcard.
+        self.assertEqual(_robots_blocks_ai("User-agent: GPTBot\nDisallow: /*x"), [])
+
+    def test_unknown_bot_still_ignored_case_insensitively(self):
+        self.assertEqual(_robots_blocks_ai("User-agent: randombot\nDisallow: /"), [])
+
+
+class NestedOrganizationTest(unittest.TestCase):
+    """Organization/sameAs are recognized one nesting level down (e.g.
+    Article -> publisher), not only at the top level / @graph."""
+
+    def test_publisher_nested_org_recognized(self):
+        page = dict(STRONG,
+                    structured_data_types=["Article"],
+                    structured_data=[{"@type": "Article", "headline": "t",
+                                      "publisher": {"@type": "Organization", "name": "X",
+                                                    "sameAs": ["https://github.com/x"]}}])
+        r = score_geo(crawl(page))
+        self.assertEqual(r["entity_status"], "recognized")
+        self.assertEqual(r["geo_dimensions"]["authority"], 100)
+        self.assertFalse(any("Organization" in rec["title"] for rec in r["geo_recommendations"]))
+
+    def test_author_list_nested_org_recognized(self):
+        page = dict(STRONG,
+                    structured_data_types=["Article"],
+                    structured_data=[{"@type": "Article",
+                                      "author": [{"@type": "Organization",
+                                                  "sameAs": ["https://x.example"]}]}])
+        self.assertEqual(score_geo(crawl(page))["entity_status"], "recognized")
+
+    def test_publisher_string_does_not_crash(self):
+        page = dict(STRONG,
+                    structured_data_types=["Article"],
+                    structured_data=[{"@type": "Article", "publisher": "X Corp",
+                                      "keywords": ["a", "b"]}])
+        r = score_geo(crawl(page))  # must not raise
+        self.assertEqual(r["entity_status"], "unrecognized")
+
+    def test_nested_dict_without_org_type_still_docked(self):
+        # Look-alike: a nested publisher object that is NOT typed Organization.
+        page = dict(STRONG,
+                    structured_data_types=["Article"],
+                    structured_data=[{"@type": "Article", "publisher": {"name": "X"}}])
+        r = score_geo(crawl(page))
+        self.assertEqual(r["entity_status"], "unrecognized")
+        self.assertTrue(any(rec["title"] == "No Organization entity"
+                            for rec in r["geo_recommendations"]))
+
+    def test_top_level_org_unchanged(self):
+        self.assertEqual(score_geo(crawl(STRONG))["entity_status"], "recognized")
+
+
 class RobotsMultiUAGroupTest(unittest.TestCase):
     def test_consecutive_user_agents_share_one_group(self):
         # Stacked User-agent lines form one group; both must be reported, not just the last.

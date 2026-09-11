@@ -38,6 +38,8 @@ export function isGoogleConnectorId(id: string): boolean {
 }
 
 export function connectorAvailabilityForId(id: string): ConnectorAvailability {
+  // Gmail and Drive use Composio; legacy Google OAuth switches do not govern them.
+  if (id === 'gmail' || id === 'gdrive') return 'enabled';
   if (!isGoogleConnectorId(id)) return 'enabled';
   const cfg = getGoogleConnectorsConfig();
   const overall = _overallStateToAvailability(cfg.google);

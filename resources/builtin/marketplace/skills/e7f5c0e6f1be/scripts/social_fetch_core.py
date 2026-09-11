@@ -10,7 +10,32 @@ import hashlib, json, os, re, shutil, subprocess, sys, time, urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-import requests
+# `requests` is a third-party dependency; in a stdlib-only sandbox a bare
+# import would kill the whole module (even for fetchers that never touch it)
+# with a raw traceback instead of the documented {"ok": false, ...} envelope.
+# Guard it like browser_cookie3/curl_cffi below and fail per-fetcher instead.
+try:
+    import requests
+except ImportError:
+    requests = None
+
+
+class MissingDependencyError(RuntimeError):
+    """A required third-party package is not installed in this environment."""
+
+
+def _require_requests(feature):
+    """Fail fast with a clear, JSON-envelope-friendly error when `requests`
+    is unavailable. Every `requests.` use in this module lives inside a
+    fetcher whose entrypoint calls this guard first (fetch_xhs, fetch_reddit,
+    and fetch_bilibili's no-curl_cffi fallback), so `requests` can never be
+    dereferenced as None."""
+    if requests is None:
+        raise MissingDependencyError(
+            f"missing dependency: the 'requests' package is required for {feature}. "
+            "Install it with: pip install requests"
+        )
+
 
 try:
     import browser_cookie3
@@ -254,6 +279,7 @@ _XHS_VALID_PUBLISH_TIMES = {'一天内', '一周内', '半年内', '不限'}
 _XHS_VALID_SORTS = {'最新', '最热'}
 
 def fetch_xhs(config):
+    _require_requests('the Xiaohongshu fetcher')
     log('🔴 Fetching Xiaohongshu...')
     diag = make_diag('Xiaohongshu')
     seen, notes = set(), []
@@ -456,6 +482,7 @@ def _reddit_get_json(urls, headers, cookies, timeout=30, retries=3, backoff=1.5)
 
 
 def fetch_reddit(config):
+    _require_requests('the Reddit fetcher')
     log('🟠 Fetching Reddit...')
     diag = make_diag('Reddit')
     seen, posts = set(), []
@@ -622,6 +649,8 @@ def fetch_bilibili(config):
     Requires curl_cffi for TLS fingerprint emulation (falls back to requests).
     Login via browser is strongly recommended.
     """
+    if not _CURL_CFFI_OK:
+        _require_requests('the Bilibili fetcher (curl_cffi is not installed either)')
     log('🟡 Fetching Bilibili...')
     diag = make_diag('Bilibili')
     seen, videos = set(), []

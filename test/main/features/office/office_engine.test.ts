@@ -51,6 +51,7 @@ describe('OfficeCLI engine', () => {
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-office-engine-'));
     mocks.bin = path.join(tmpDir, process.platform === 'win32' ? 'officecli.exe' : 'officecli');
+    fs.writeFileSync(mocks.bin, 'binary');
     mocks.spawn.mockReset();
     mocks.spawnSync.mockReset();
     mocks.killProcessTree.mockReset();
@@ -65,6 +66,7 @@ describe('OfficeCLI engine', () => {
   });
 
   it('does not cache a missing binary but retains a positive availability result', () => {
+    fs.rmSync(mocks.bin);
     expect(officeCliAvailable()).toBe(false);
     fs.writeFileSync(mocks.bin, 'binary');
     expect(officeCliAvailable()).toBe(true);
@@ -72,7 +74,8 @@ describe('OfficeCLI engine', () => {
     expect(officeCliAvailable()).toBe(true);
   });
 
-  it('spawns hidden with piped stdio, closes stdin, and captures output', async () => {
+  it.each(['darwin', 'win32', 'linux'] as const)('spawns hidden with piped stdio, closes stdin, and captures output on %s', async (platform) => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue(platform);
     const child = new FakeChild();
     mocks.spawn.mockReturnValue(child);
     vi.stubEnv('OFFICECLI_SKIP_UPDATE', '0');
@@ -80,7 +83,7 @@ describe('OfficeCLI engine', () => {
     const resultPromise = runOfficeCli(['batch', 'book.xlsx'], { cwd: tmpDir, stdin: '{"ops":[]}' });
     const expectedCommand = process.platform === 'darwin' ? '/usr/bin/sandbox-exec' : mocks.bin;
     const expectedArgs = process.platform === 'darwin'
-      ? ['-p', MAC_OFFICECLI_SANDBOX_PROFILE, mocks.bin, 'batch', 'book.xlsx']
+      ? ['-D', `OFFICECLI_BINARY=${fs.realpathSync(mocks.bin)}`, '-p', MAC_OFFICECLI_SANDBOX_PROFILE, mocks.bin, 'batch', 'book.xlsx']
       : ['batch', 'book.xlsx'];
     expect(mocks.spawn).toHaveBeenCalledWith(expectedCommand, expectedArgs, {
       cwd: tmpDir,
@@ -100,6 +103,8 @@ describe('OfficeCLI engine', () => {
   });
 
   it('prevents macOS OfficeCLI children from executing installed app bundles', async () => {
+    expect(MAC_OFFICECLI_SANDBOX_PROFILE)
+      .toBe(require('../../../../bin/officecli-policy-gate.cjs').MAC_OFFICECLI_SANDBOX_PROFILE);
     vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
     const child = new FakeChild();
     mocks.spawn.mockReturnValue(child);
@@ -107,12 +112,50 @@ describe('OfficeCLI engine', () => {
     const resultPromise = runOfficeCli(['view', 'deck.pptx', 'html'], { cwd: tmpDir });
     expect(mocks.spawn).toHaveBeenCalledWith(
       '/usr/bin/sandbox-exec',
-      ['-p', expect.stringContaining('(deny process-exec (subpath "/Applications"))'), mocks.bin,
+      ['-D', `OFFICECLI_BINARY=${fs.realpathSync(mocks.bin)}`, '-p', MAC_OFFICECLI_SANDBOX_PROFILE, mocks.bin,
         'view', 'deck.pptx', 'html'],
       expect.any(Object),
     );
     child.emit('close', 0);
     await expect(resultPromise).resolves.toMatchObject({ code: 0 });
+  });
+
+  it.skipIf(process.platform !== 'darwin')('starts the installed binary and its resident through a symlink while denying sibling executables', async () => {
+    const native = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const installRoot = fs.mkdtempSync('/Applications/orkas-office-engine-test-');
+    try {
+      const bundle = path.join(installRoot, 'Orkas Test ".app', 'Contents', 'Resources', 'officecli');
+      fs.mkdirSync(bundle, { recursive: true });
+      const binary = path.join(bundle, 'officecli');
+      const sibling = path.join(bundle, 'officecli-other');
+      // Compile an inert native fixture: copied Apple platform binaries cannot
+      // execute from arbitrary locations on every macOS release.
+      const compiled = native.spawnSync('/usr/bin/clang', ['-x', 'c', '-', '-o', binary], {
+        input: '#include <stdio.h>\n#include <unistd.h>\n'
+          + 'int main(int argc,char **argv){if(argc>1){execv(argv[1],argv+1);'
+          + 'perror("exec");return 70;}puts("started");return 0;}\n',
+        encoding: 'utf8', timeout: 30_000,
+      });
+      expect(compiled.error).toBeUndefined();
+      expect(compiled.status, compiled.stderr).toBe(0);
+      expect(compiled.stderr).toBe('');
+      fs.copyFileSync(binary, sibling);
+      fs.chmodSync(sibling, 0o755);
+      mocks.bin = path.join(installRoot, 'officecli-link');
+      fs.symlinkSync(binary, mocks.bin);
+      mocks.spawn.mockImplementation(native.spawn);
+
+      await expect(runOfficeCli([], { cwd: tmpDir, timeoutMs: 10_000 }))
+        .resolves.toEqual({ code: 0, stdout: 'started\n', stderr: '' });
+      await expect(runOfficeCli([binary], { cwd: tmpDir, timeoutMs: 10_000 }))
+        .resolves.toEqual({ code: 0, stdout: 'started\n', stderr: '' });
+      const denied = await runOfficeCli([sibling], { cwd: tmpDir, timeoutMs: 10_000 });
+      expect(denied.code).toBe(70);
+      expect(denied.stdout).toBe('');
+      expect(denied.stderr).toContain('Operation not permitted');
+    } finally {
+      fs.rmSync(installRoot, { recursive: true, force: true });
+    }
   });
 
   it('rejects a timeout immediately and terminates the entire process tree', async () => {

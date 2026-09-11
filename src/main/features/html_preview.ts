@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import type { BrowserWindow as ElectronBrowserWindow, Session } from 'electron';
 
+import { ARTIFACT_FRAME } from './chat_artifacts';
 import { isPathAllowed } from '../util/path-sandbox';
 import { hardenedWebPreferences } from '../util/window-security';
 
@@ -15,7 +16,7 @@ const HTML_PREVIEW_MAX_DIAGNOSTICS = 12;
 const HTML_PREVIEW_MAX_INTERACTION_FAILURE_SAMPLES = 10;
 const HTML_PREVIEW_MAX_DIAGNOSTIC_CHARS = 400;
 
-export type HtmlPreviewViewportName = 'desktop' | 'mobile';
+export type HtmlPreviewViewportName = 'desktop' | 'mobile' | 'embed';
 
 export interface HtmlPreviewViewport {
   name: HtmlPreviewViewportName;
@@ -41,6 +42,9 @@ export interface HtmlPreviewViewportEvidence {
   scrollWidth: number;
   scrollHeight: number;
   horizontalOverflowPx: number;
+  /** Content below the fold that no scroll — window or descendant — can
+   *  reach. Ordinary scrollable overflow reads as 0 here. */
+  unreachableOverflowPx: number;
   focusableCount: number;
   headingCount: number;
   missingAltCount: number;
@@ -204,13 +208,36 @@ const EVIDENCE_SCRIPT = `(() => {
     document.body?.scrollWidth || 0,
     viewportWidth
   );
+  // Content the user cannot get to at all: the page is taller than the
+  // viewport, the window will not scroll, and no descendant offers a scroll of
+  // its own. Ordinary scrollable overflow is fine and reads as 0; this is the
+  // shape a short embed frame turns a full-viewport layout into.
+  const scrollHeight = Math.max(document.documentElement.scrollHeight || 0, document.body?.scrollHeight || 0);
+  let unreachableOverflowPx = 0;
+  if (scrollHeight > viewportHeight + 1) {
+    const startScroll = window.scrollY;
+    window.scrollTo(0, scrollHeight);
+    const windowReach = window.scrollY;
+    window.scrollTo(0, startScroll);
+    let descendantReach = 0;
+    for (const element of Array.from(document.body?.querySelectorAll('*') || [])) {
+      const overflowY = getComputedStyle(element).overflowY;
+      if (overflowY !== 'auto' && overflowY !== 'scroll') continue;
+      descendantReach = Math.max(descendantReach, element.scrollHeight - element.clientHeight);
+    }
+    unreachableOverflowPx = Math.max(
+      0,
+      Math.ceil(scrollHeight - viewportHeight - Math.max(windowReach, descendantReach)),
+    );
+  }
   return {
     readyState: String(document.readyState || ''),
     title: String(document.title || '').slice(0, 200),
     visibleTextChars: bodyText.length,
     scrollWidth,
-    scrollHeight: Math.max(document.documentElement.scrollHeight || 0, document.body?.scrollHeight || 0),
+    scrollHeight,
     horizontalOverflowPx: Math.max(0, Math.ceil(scrollWidth - viewportWidth)),
+    unreachableOverflowPx,
     focusableCount,
     headingCount: document.querySelectorAll('h1,h2,h3,h4,h5,h6').length,
     missingAltCount: images.filter((img) => !img.hasAttribute('alt')).length,
@@ -1005,10 +1032,19 @@ export async function renderResponsiveHtmlPreview(
   }
 }
 
+// `desktop` stays first: it is the interaction and screenshot viewport, and
+// moving it would change what every existing artifact contract observes. The
+// embed entry is the one that matters for whether the user can see the thing —
+// a chat frame is roughly a third the width and half the height of the desktop
+// window these artifacts were being validated against.
 const ARTIFACT_SMOKE_VIEWPORTS = [
   { name: 'desktop' as const, width: 1280, height: 800 },
+  { name: 'embed' as const, width: ARTIFACT_FRAME.smokeWidth, height: ARTIFACT_FRAME.maxHeight },
   { name: 'mobile' as const, width: 390, height: 844 },
 ] as const;
+
+/** A few pixels of unreachable content is rounding, not a hidden control. */
+const ARTIFACT_EMBED_CLIP_TOLERANCE_PX = 8;
 
 /** Render an interactive chat artifact and require one observable behavior.
  *  The ordinary HTML preview remains valid for static documents; this stricter
@@ -1044,6 +1080,22 @@ export async function renderInteractiveHtmlSmoke(
   }
   const interactions = rendered.evidence.interactions;
   const blockers = [...rendered.evidence.blockers];
+  const warnings = [...rendered.evidence.warnings];
+  const embed = rendered.evidence.viewports.find((view) => view.name === 'embed');
+  if (embed) {
+    if (embed.unreachableOverflowPx > ARTIFACT_EMBED_CLIP_TOLERANCE_PX) {
+      blockers.push(
+        `embed: ${embed.unreachableOverflowPx}px of content sits below the ${embed.height}px chat frame `
+        + 'and nothing scrolls to reach it. Lay the app out at its content height; '
+        + 'a `100vh` / full-viewport shell collapses to whatever height the frame happens to have.',
+      );
+    } else if (embed.scrollHeight > embed.height + 1) {
+      warnings.push(
+        `embed: content is ${embed.scrollHeight}px tall, so the ${ARTIFACT_FRAME.maxHeight}px chat frame `
+        + 'will scroll — put the primary content and controls first.',
+      );
+    }
+  }
   if ((interactions.controlsExercised ?? 0) <= 0) {
     blockers.push('interactive artifact smoke found no operable control to exercise');
   }
@@ -1060,6 +1112,7 @@ export async function renderInteractiveHtmlSmoke(
       ...rendered.evidence,
       ok: blockers.length === 0,
       blockers,
+      warnings,
     },
   };
 }

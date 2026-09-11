@@ -23,7 +23,7 @@ afterEach(() => {
 });
 
 describe('group_chat message deletion', () => {
-  it('rewrites the main log and actor slices as tombstones and hides them from reads', async () => {
+  it('rewrites the canonical log as tombstones and hides deleted messages from reads', async () => {
     const layoutModule = await import('../../../../src/main/util/project-layout');
     const groupChat = await import('../../../../src/main/features/group_chat');
     const layout = layoutModule.conversationLayout(UID, CID);
@@ -33,8 +33,6 @@ describe('group_chat message deletion', () => {
     ];
     fs.mkdirSync(path.dirname(layout.messageFile), { recursive: true });
     fs.writeFileSync(layout.messageFile, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
-    fs.mkdirSync(layout.visibilityDir, { recursive: true });
-    fs.writeFileSync(layout.visibilityFile('agent-a'), rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
     const attachmentDir = layoutModule.chatAttachmentDirForConversation(UID, CID);
     fs.mkdirSync(attachmentDir, { recursive: true });
     const retainedAttachment = path.join(attachmentDir, 'retained.txt');
@@ -44,11 +42,7 @@ describe('group_chat message deletion', () => {
 
     expect(result).toMatchObject({ ok: true, deleted: ['delete-msg'] });
     const mainRows = fs.readFileSync(layout.messageFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
-    const sliceRows = fs.readFileSync(layout.visibilityFile('agent-a'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     expect(mainRows.find((row) => row.id === 'delete-msg')).toMatchObject({
-      text: '', deleted_by_user: true, _v: 1,
-    });
-    expect(sliceRows.find((row) => row.id === 'delete-msg')).toMatchObject({
       text: '', deleted_by_user: true, _v: 1,
     });
     expect((await groupChat.readMessages(UID, CID)).map((row) => row.id)).toEqual(['keep-msg']);

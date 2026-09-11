@@ -25,7 +25,7 @@ describe('project_instructions tool', () => {
     const instructions = (def.inputSchema.properties as any).instructions;
     expect(def.description.length).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_CHARS);
     expect(def.description).toContain('standing goal and rules');
-    expect(def.description).toContain('project_tasks');
+    expect(def.description).toContain('todo_tasks');
     expect(def.description).toContain('project memory');
     expect(instructions.description).toContain('Complete replacement');
     expect(instructions.description).toContain('existing content that still applies');

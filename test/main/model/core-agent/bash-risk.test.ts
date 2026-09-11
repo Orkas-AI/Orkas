@@ -414,3 +414,73 @@ describe('bash-risk › structure / edge cases', () => {
     expect(result.reasons).not.toContain('external_mutation');
   });
 });
+
+// `irreversible` is the subset of `destructive` that survives the otherwise
+// non-prompting all_files_auto mode, so the NOT-irreversible table is the one
+// that keeps that mode usable: everything a user can inspect and put back
+// afterwards must stay out of it.
+describe('bash risk classifier — irreversible actions', () => {
+  it.each([
+    // Recursive removal — the tree is gone and its children were never listed.
+    ['rm -rf /tmp/build', 'recursive_delete'],
+    ['rm -r ./cache', 'recursive_delete'],
+    ['rm --recursive ./cache', 'recursive_delete'],
+    ['Remove-Item -Path $profileRoot -Recurse -Force', 'recursive_delete'],
+    ['Remove-Item C:\\data -Recurse', 'recursive_delete'],
+    ['Remove-Item C:\\data -Rec', 'recursive_delete'],
+    ['rd /s /q C:\\data', 'recursive_delete'],
+    ['rmdir /s /q C:\\data', 'recursive_delete'],
+    ['del /s C:\\data\\*.tmp', 'recursive_delete'],
+    ['ri C:\\data -Recurse', 'recursive_delete'],
+    ['rmdir C:\\data -Recurse', 'recursive_delete'],
+    ['find ./cache -delete', 'recursive_delete'],
+    ['find ./cache -exec rm -rf {} +', 'recursive_delete'],
+    ['git clean -fdx', 'recursive_delete'],
+    // The reported incident reached the delete through a cmd wrapper.
+    ['cmd /c "rd /s /q C:\\Users\\a\\ChromeProfiles"', 'recursive_delete'],
+    // Process termination that names no specific process.
+    ['taskkill /F /IM chrome.exe /T', 'untargeted_process_kill'],
+    ['taskkill /IM chromedriver.exe', 'untargeted_process_kill'],
+    ['Get-Process chrome | Stop-Process -Force', 'untargeted_process_kill'],
+    ['Get-Process chrome | spps -Force', 'untargeted_process_kill'],
+    ['Stop-Process -Name chrome -Force', 'untargeted_process_kill'],
+    ['pkill -f chromedriver', 'untargeted_process_kill'],
+    ['killall chrome', 'untargeted_process_kill'],
+  ] as const)('flags %s as %s', (command, action) => {
+    expect(classifyBashCommand(command).irreversible).toContain(action);
+  });
+
+  it.each([
+    // Single-file deletes are destructive but reviewable — the user still has
+    // the surrounding directory and can see what is missing.
+    'rm -f build.log',
+    'rm out.txt',
+    'Remove-Item .\\out.txt -Force',
+    'del out.txt',
+    // A named process is the agent acting on something it can point at.
+    'Stop-Process -Id 10444 -Force',
+    'Stop-Process 10444',
+    'taskkill /PID 10444 /F',
+    'kill -9 10444',
+    // Reverting tracked files is destructive but recoverable from the repo.
+    'git checkout -- .',
+    'git reset --hard HEAD~1',
+    // Help and dry runs mutate nothing.
+    'rm --help',
+    'Stop-Process -Name chrome -WhatIf',
+    'pkill --list',
+    'find . -print',
+    'find . -exec rm -f {} +',
+    'git clean -ndx',
+    'git clean -fx',
+    'spps -WhatIf',
+  ])('leaves reviewable command out of irreversible: %s', (command) => {
+    expect(classifyBashCommand(command).irreversible).toEqual([]);
+  });
+
+  it('keeps reporting the broad category alongside the narrower finding', () => {
+    const result = classifyBashCommand('rm -rf /tmp/build');
+    expect(result.reasons).toContain('destructive');
+    expect(result.irreversible).toEqual(['recursive_delete']);
+  });
+});

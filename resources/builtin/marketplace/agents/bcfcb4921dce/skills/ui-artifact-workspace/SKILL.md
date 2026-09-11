@@ -26,8 +26,8 @@ When tools are off, emit the Revision Executor Contract near the start of the re
 Resolve the mode before editing:
 
 1. **Follow-up to an existing artifact**: reuse the exact artifact directory from the user's path, the current conversation, or its `artifact.json`. Inspect it before changing anything.
-2. **Implementation inside an existing app repo**: the real app source remains canonical. Edit the existing components, tokens, and routes in place; do not create a parallel copy that can drift. Create a standalone `ui-artifacts/<task-slug>/` preview only when the user also asks for a shareable design artifact.
-3. **New standalone artifact**: create `ui-artifacts/<task-slug>/` under the current writable workspace or supplied repo root. Use a short stable kebab-case slug derived from the product or feature, not a timestamp.
+2. **Implementation inside an existing app repo** — only when the user explicitly asked for changes to that repo's source: the real app source is canonical. Edit the existing components, tokens, and routes in place; do not create a parallel copy that can drift. Create a standalone `ui-artifacts/<task-slug>/` preview only when the user also asks for a shareable design artifact. Without that explicit ask this mode is unavailable: the repo is read-only, and the work goes to mode 3 plus a change proposal.
+3. **New standalone artifact**: create `ui-artifacts/<task-slug>/` under the current writable workspace. Use the supplied repo root only when repo writes were explicitly authorized; otherwise keep the directory outside the repo tree so a read-only repo stays untouched. Use a short stable kebab-case slug derived from the product or feature, not a timestamp.
 
 Never put a new standalone artifact directly in the workspace root. Never create `-v2`, `-final`, `-final-final`, or a timestamped sibling for an ordinary revision. A new sibling is valid only when the user explicitly asks to preserve the old version, compare alternatives, or fork the direction.
 
@@ -38,7 +38,7 @@ If several plausible prior artifact directories exist and the conversation does 
 - Default to `html` when the user does not specify a format.
 - Honor an explicit alternate format such as SVG, PDF, React, Vue, PNG, or Markdown instead of forcing an HTML final.
 - The independent directory rule still applies to alternate formats.
-- For target-repo implementation, follow the existing framework and file types. Do not wrap a requested React/Vue implementation in a separate HTML export unless the user also wants a standalone preview.
+- For authorized target-repo implementation, follow the existing framework and file types. Do not wrap a requested React/Vue implementation in a separate HTML export unless the user also wants a standalone preview.
 
 The manifest `format` and `entry` must match the actual deliverable. Supporting HTML previews may accompany an explicitly requested non-HTML final, but must not silently replace it.
 

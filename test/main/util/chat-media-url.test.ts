@@ -159,4 +159,51 @@ describe('util/chat-media-url', () => {
     const text = `${missing} chat-media://cid/c1/poster.png https://example.test/poster.png`;
     expect(versionChatMediaLocalUrlsInText(text)).toBe(text);
   });
+
+  it('resolves media an agent offered by a path relative to its own workspace', () => {
+    // An agent hands over the path it was given, and for files it produced in
+    // its cwd that is a relative one. The renderer upgrades a media
+    // destination to an <img>/<video> but has no base directory, so it
+    // requested the path against the app origin: on 2026-09-01 eight keyframes
+    // offered for approval all rendered as "image missing" while sitting on
+    // disk, next to a contact sheet that displayed because a tool had emitted
+    // it as an absolute URL.
+    const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-chat-media-relative-'));
+    try {
+      const frame = path.join(ws, 'project', 'composition', 'preview', '01-first-frame.png');
+      fs.mkdirSync(path.dirname(frame), { recursive: true });
+      fs.writeFileSync(frame, 'frame-bytes');
+      const notes = path.join(ws, 'project', 'notes.txt');
+      fs.writeFileSync(notes, 'plain text');
+      const outside = path.join(path.dirname(ws), `orkas-outside-${path.basename(ws)}.png`);
+      fs.writeFileSync(outside, 'outside');
+
+      const normalized = versionChatMediaLocalUrlsInText([
+        '[first frame](project/composition/preview/01-first-frame.png)',
+        '![sheet](./project/composition/preview/01-first-frame.png)',
+      ].join('\n'), ws);
+
+      expect(normalized).toContain(versionedChatMediaLocalUrl(frame));
+      expect(normalized.match(/chat-media:\/\/local\//g)).toHaveLength(2);
+      expect(normalized).toMatch(/\?v=\d+-\d+-11/);
+
+      // Nothing else becomes a local embed: a relative path that names no
+      // file, a non-media file, a remote URL, a fragment, and a traversal out
+      // of the workspace all keep their original text.
+      const untouched = [
+        '[gone](project/composition/preview/99-missing.png)',
+        '[notes](project/notes.txt)',
+        '[remote](https://example.test/hero.png)',
+        '[anchor](#section.png)',
+        `[escape](../${path.basename(outside)})`,
+      ].join('\n');
+      expect(versionChatMediaLocalUrlsInText(untouched, ws)).toBe(untouched);
+
+      // Without a base directory the relative destination is not guessed at.
+      expect(versionChatMediaLocalUrlsInText('[first frame](project/composition/preview/01-first-frame.png)'))
+        .toBe('[first frame](project/composition/preview/01-first-frame.png)');
+    } finally {
+      fs.rmSync(ws, { recursive: true, force: true });
+    }
+  });
 });

@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import { Mutex } from 'async-mutex';
 
 import { userLocalRoot } from '../paths';
+import { sha256OfFileStream } from '../util/sha256';
 import { projectVideoApprovalIntent } from './video_approval_identity';
 import { assessEstimatedNarrationFit, estimateNarrationDuration, narrationMeasurementOverruns } from './tts';
 
@@ -354,7 +355,8 @@ function sha256Text(value: string): string {
 }
 
 async function sha256File(absPath: string): Promise<string> {
-  return crypto.createHash('sha256').update(await fs.readFile(absPath)).digest('hex');
+  // Finished renders are large; hash the stream instead of buffering the file.
+  return sha256OfFileStream(absPath);
 }
 
 export function videoProductionControlStatePath(input: {

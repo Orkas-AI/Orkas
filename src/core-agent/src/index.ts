@@ -81,6 +81,7 @@ export type {
   AgentRunMeta,
   AgentRunTimings,
   AgentRunConvergenceSignal,
+  AgentRunTermination,
   AgentRunEvent,
   AgentRunSteerInput,
   AgentRunSteerMessage,
@@ -93,10 +94,18 @@ export type {
   ToolResult,
   ToolResultImage,
   ToolObservations,
+  ToolFailureContext,
   FileReadObservation,
   FileChangeObservation,
   CommandExecutionObservation,
   CommandStreamObservation,
+  CreateRunProgramToolOptions,
+  ProgrammaticToolAuthorization,
+  ProgrammaticToolInvokeOutcome,
+  ProgrammaticToolPolicy,
+  ProgramSourceLoadOutcome,
+  ProgramSourceLoader,
+  RunProgramLimits,
 } from "./tools/index.js";
 export {
   applyPatchTool,
@@ -112,10 +121,20 @@ export {
   defineTool,
   toToolDefinition,
   getBuiltinTools,
+  configureWebFetchRenderer,
   createExecutionPlanTool,
   runBuiltinWebSearch,
   WEB_SEARCH_DEFAULT_COUNT,
   WEB_SEARCH_MAX_COUNT,
+  createRunProgramTool,
+  DEFAULT_RUN_PROGRAM_LIMITS,
+  isProgrammaticToolCallContext,
+  markProgrammaticToolCallState,
+  RUN_PROGRAM_TOOL_NAME,
+} from "./tools/index.js";
+export type {
+  WebFetchRenderedPage,
+  WebFetchRenderer,
 } from "./tools/index.js";
 export type {
   ApplyPatchCommittedFile,

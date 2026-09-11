@@ -23,6 +23,8 @@ _WEIGHTS = {"citability": 0.25, "structure": 0.20, "multimodal": 0.15,
             "authority": 0.20, "technical": 0.20}
 _AI_BOTS = ("GPTBot", "OAI-SearchBot", "ChatGPT-User", "ClaudeBot", "Claude-SearchBot",
             "Claude-User", "PerplexityBot", "Perplexity-User", "Google-Extended", "CCBot")
+# robots.txt UA tokens are case-insensitive; map casefolded -> canonical name.
+_AI_BOTS_CF = {b.casefold(): b for b in _AI_BOTS}
 
 
 def _data_page(crawl_obj: dict) -> tuple[dict, dict]:
@@ -46,9 +48,32 @@ def _sd_nodes(structured_data):
     return out
 
 
+def _with_nested(nodes: list) -> list:
+    """Each node plus its one-level-nested dict values and list-of-dict items,
+    so `Article -> publisher: {@type: Organization}` is scanned too. One level
+    covers the common publisher/author/brand nesting; non-dict values (e.g.
+    `publisher: "name"`) are ignored."""
+    out = list(nodes)
+    for n in nodes:
+        for v in n.values():
+            if isinstance(v, dict):
+                out.append(v)
+            elif isinstance(v, list):
+                out.extend(x for x in v if isinstance(x, dict))
+    return out
+
+
+def _node_types(node: dict) -> list[str]:
+    t = node.get("@type")
+    if isinstance(t, list):
+        return [str(x) for x in t]
+    return [str(t)] if t else []
+
+
 def _robots_blocks_ai(robots_text: str) -> list[str]:
     """Return the AI/crawler user-agents that robots.txt disallows at root.
-    Light parser: track the current User-agent group and any 'Disallow: /'."""
+    Light parser: track the current User-agent group (case-insensitive names)
+    and any root disallow ('Disallow: /' or its wildcard form 'Disallow: /*')."""
     blocked = []
     if not robots_text:
         return blocked
@@ -70,10 +95,14 @@ def _robots_blocks_ai(robots_text: str) -> list[str]:
             prev_was_ua = True
             continue
         prev_was_ua = False
-        if k == "disallow" and v == "/":
+        if k == "disallow" and v in ("/", "/*"):
             for ua in cur:
-                if ua == "*" or ua in _AI_BOTS:
+                if ua == "*":
                     blocked.append(ua)
+                else:
+                    canon = _AI_BOTS_CF.get(ua.casefold())
+                    if canon:
+                        blocked.append(canon)
     return sorted(set(blocked))
 
 
@@ -133,9 +162,11 @@ def score_geo(crawl_obj: dict) -> dict:
                "alt coverage 100%", "alt still missing")
 
     # ── Authority & brand (entity resolution) ──
-    nodes = _sd_nodes(page.get("structured_data"))
+    nodes = _with_nested(_sd_nodes(page.get("structured_data")))
     types = page.get("structured_data_types") or []
-    has_org = "Organization" in types
+    # structured_data_types only lists top-level/@graph types, so also scan the
+    # (nested-inclusive) nodes: a publisher-nested Organization counts.
+    has_org = "Organization" in types or any("Organization" in _node_types(n) for n in nodes)
     has_sameas = any(n.get("sameAs") for n in nodes)
     if not has_org:
         deduct("authority", 30, "No Organization entity",

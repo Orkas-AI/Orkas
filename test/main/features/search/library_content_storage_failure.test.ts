@@ -46,11 +46,11 @@ async function loadSearchWithRealStores(projectId: string) {
   search.__searchTestHooks.setLibraryContentSearchProvider({
     embedQuery: async () => queryVector(),
     searchGlobal: (userId, vector, limit) => (
-      kb.searchExisting(userId, vector, { k: limit })
+      kb.search(userId, vector, { k: limit })
     ),
     listProjects: async () => [{ project_id: projectId, name: 'Project' }],
     searchProject: (userId, selectedProjectId, vector, limit) => (
-      projectLibrary.searchExisting(userId, selectedProjectId, vector, { k: limit })
+      projectLibrary.search(userId, selectedProjectId, vector, { k: limit })
     ),
   });
   return { search, kb };

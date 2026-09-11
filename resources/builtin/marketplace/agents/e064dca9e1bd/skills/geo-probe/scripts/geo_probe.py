@@ -389,6 +389,113 @@ def _subset_metrics(rows: list[dict], kind: str) -> dict:
             "citation_rate": round(cited / n, 3)}
 
 
+def _edit_distance(a: str, b: str, cap: int = 3) -> int:
+    """Levenshtein distance, short-circuited at `cap` (we only care about near ties)."""
+    if abs(len(a) - len(b)) > cap:
+        return cap + 1
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        if min(cur) > cap:
+            return cap + 1
+        prev = cur
+    return prev[-1]
+
+
+def _near_miss_tokens(text: str, brand: str, cap: int = 2) -> list[str]:
+    """Tokens that look like the brand but are not it — the homonym trap.
+
+    A third-party listing for a differently-spelled company ("Floatbot" on a
+    page you are about to cite as proof of "Floatboat"'s authority) shares no
+    token with the brand, so every exact-match test above reports `absent` and
+    the reference looks merely irrelevant rather than actively wrong. Naming
+    the near tie is what lets the report say "this is a different company"
+    instead of silently attributing someone else's reviews.
+    """
+    if len(brand) < 4:
+        return []
+    low = brand.lower()
+    # A page token is one word, so a multi-word brand ("Float Boat") can never
+    # be within two edits of the joined string. Compare against the brand's
+    # own words and its space-free form as well ("floatboat" ~ "floatbot").
+    targets = {low, low.replace(" ", "")} | {
+        t for t in _WORD_RE.findall(low) if len(t) >= 4
+    }
+    out = []
+    for tok in {t.lower() for t in _WORD_RE.findall(text or "")}:
+        if tok in targets or len(tok) < 4:
+            continue
+        if any(0 < _edit_distance(tok, target, cap) <= cap for target in targets):
+            out.append(tok)
+    return sorted(out)
+
+
+def disambiguate_references(payload: dict) -> dict:
+    """Decide whether an off-site page may be named as the brand's.
+
+    `score` applies this test to model ANSWER text; the same trap exists on the
+    other channel — pages the agent found itself with `web_search` and is about
+    to list as third-party authority. That channel had no gate, so a listing
+    for a same-sounding company could be reported as the brand's own. This op
+    is that gate, and it is deliberately unable to return Measured: a page the
+    target site does not control is never observed fact about the target.
+
+    Verdicts: `cited` (the domain appears), `corroborated` (brand token plus a
+    page-context term), `ambiguous` (brand token alone — could be a homonym),
+    `near_miss` (a token one or two edits from the brand, i.e. probably a
+    different company), `absent` (no signal).
+    """
+    brand = str(payload.get("brand") or "").strip()
+    domain = str(payload.get("domain") or "").strip()
+    context = [str(c).lower() for c in (payload.get("context_terms") or [])]
+    refs = payload.get("references") or []
+    rows, counts = [], {"cited": 0, "corroborated": 0, "ambiguous": 0,
+                        "near_miss": 0, "absent": 0}
+    for ref in refs:
+        if isinstance(ref, str):
+            ref = {"url": ref}
+        if not isinstance(ref, dict):
+            continue
+        blob = " ".join(str(ref.get(k) or "") for k in ("title", "snippet", "text", "url"))
+        m_dom = _mentions(blob, domain)
+        m_brand = _mentions(blob, brand)
+        hits = [t for t in context if _mentions(blob, t)]
+        near = _near_miss_tokens(blob, brand)
+        if m_dom:
+            verdict = "cited"
+        elif m_brand and (hits or not context):
+            verdict = "corroborated"
+        elif m_brand:
+            verdict = "ambiguous"
+        elif near:
+            verdict = "near_miss"
+        else:
+            verdict = "absent"
+        counts[verdict] += 1
+        rows.append({"url": ref.get("url"), "title": ref.get("title"),
+                     "verdict": verdict, "domain_present": bool(m_dom),
+                     "brand_token_present": bool(m_brand),
+                     "context_hits": hits, "near_miss_tokens": near,
+                     # Per-reference tier. Even a domain-cited off-site page is
+                     # someone else's statement about the target, so the ceiling
+                     # here is Estimated by construction.
+                     "data_tier": "Estimated" if verdict in ("cited", "corroborated")
+                                  else "unverified"})
+    citable = counts["cited"] + counts["corroborated"]
+    return {
+        "brand": brand, "domain": domain, "context_terms": context,
+        "references_checked": len(rows), "citable": citable,
+        "verdict_counts": counts, "references": rows,
+        "data_tier": "Estimated" if rows and citable == len(rows) else "unverified",
+        "note": ("Only `cited`/`corroborated` references may be named as the brand's. "
+                 "`near_miss` is the same-sounding-company trap (e.g. Floatbot vs "
+                 "Floatboat) and must be reported as a different entity, not dropped "
+                 "silently. This op never returns Measured."),
+    }
+
+
 def _load(path):
     raw = sys.stdin.read() if not path or path == "-" else open(path, encoding="utf-8").read()
     return json.loads(raw)
@@ -396,10 +503,11 @@ def _load(path):
 
 def main(argv):
     ap = argparse.ArgumentParser(prog="geo-probe")
-    ap.add_argument("--op", choices=["queries", "filter", "score"], required=True)
+    ap.add_argument("--op", choices=["queries", "filter", "score", "disambiguate"], required=True)
     ap.add_argument("--input", default=None,
                     help="queries: seo-crawl JSON; filter: {brand,domain,candidates[]}; "
-                         "score: answers payload (default stdin)")
+                         "score: answers payload; disambiguate: {brand,domain,context_terms[],"
+                         "references[]} (default stdin)")
     ap.add_argument("--brand", default=None)
     ap.add_argument("--domain", default=None)
     ap.add_argument("--competitors", default=None, help="comma-separated")
@@ -421,6 +529,13 @@ def main(argv):
         data = {"brand": brand, "domain": domain, **res,
                 "note": ("Every drop names its reason. A candidate set that silently loses its "
                          "unbranded rows is how a probe set becomes branded again.")}
+    elif args.op == "disambiguate":
+        payload = _load(args.input)
+        if args.brand:
+            payload["brand"] = args.brand
+        if args.domain:
+            payload["domain"] = args.domain
+        data = disambiguate_references(payload)
     else:
         payload = _load(args.input)
         if args.brand:

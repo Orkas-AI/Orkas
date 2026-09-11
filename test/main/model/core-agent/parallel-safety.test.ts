@@ -24,7 +24,7 @@ import type { AgentTool } from '#core-agent';
  *
  * Not built here (reviewed separately): run_worker / dispatch_to are
  * parallel-but-side-effectful, safe by construction (distinct sessions +
- * dispatchSlots cap + lock-serialized member-seed/jsonl-append) — asserted in
+ * workerSlots cap + lock-serialized member-seed/jsonl-append) — asserted in
  * bus-integration; web_fetch / web_search are core-agent builtins.
  */
 

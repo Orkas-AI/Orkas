@@ -16,7 +16,8 @@ import {
 import { setCurrentLang } from '../../../src/main/i18n';
 
 type AgentRunEvent =
-  | { type: 'text_delta'; text: string }
+  | { type: 'text_delta'; text: string; phase?: 'commentary' | 'final_answer' }
+  | { type: 'text_phase'; phase: 'commentary' | 'final_answer' }
   | { type: 'thinking'; phase: 'start' | 'progress' | 'end'; chars: number; text?: string }
   | { type: 'tool_delta'; name?: string; id: string; inputDelta: string; inputBytes?: number }
   | { type: 'tool_start'; name: string; id: string; input: unknown }
@@ -73,6 +74,7 @@ type AgentRunEvent =
       durationMs: number;
       outcome: 'completed' | 'failed';
       model: string;
+      stopReason?: 'end_turn' | 'tool_use' | 'max_tokens' | 'stop_sequence';
     }
   | {
       type: 'done';
@@ -87,6 +89,7 @@ type AgentRunEvent =
             statusCode?: number;
           };
           convergenceSignals?: string[];
+          termination?: { status: 'waiting_input'; reason: 'user_action_required' };
         };
       };
     };
@@ -135,9 +138,422 @@ it('keeps provider-call diagnostics internal', async () => {
   ]);
 
   expect(out).toEqual([
-    { type: 'delta', text: 'visible' },
+    { type: 'delta', text: 'visible', phase: 'final_answer' },
     { type: 'final', text: 'visible' },
   ]);
+});
+
+it('does not promote an earlier tool-round preamble when the terminal round has no answer', async () => {
+  const out = await collect([
+    { type: 'text_delta', text: "I'll check the source first." },
+    { type: 'tool_start', name: 'web_search', id: 'search-1', input: { query: 'docs' } },
+    { type: 'tool_end', name: 'web_search', id: 'search-1', result: 'source found' },
+    { type: 'thinking', phase: 'start', chars: 0 },
+    { type: 'thinking', phase: 'progress', chars: 42, text: 'Preparing the answer' },
+    { type: 'thinking', phase: 'end', chars: 42 },
+    { type: 'done', result: { text: '', meta: { error: null } } },
+  ], { nowMs: () => 0 });
+
+  expect(out).toContainEqual({
+    type: 'delta',
+    text: "I'll check the source first.",
+    phase: 'commentary',
+  });
+  expect(out.some((event) => event.type === 'final')).toBe(false);
+  expect(out.at(-1)).toEqual({
+    type: 'error',
+    text: 'empty response',
+    failureKind: 'model',
+    failureCode: 'empty_response',
+    failurePhase: 'provider_wait',
+  });
+});
+
+it('preserves an empty user-input boundary without a fabricated answer or model failure', async () => {
+  const out = await collect([{
+    type: 'done', result: { text: '', meta: {
+      error: null,
+      termination: { status: 'waiting_input', reason: 'user_action_required' },
+    } },
+  }]);
+  expect(out).toEqual([]);
+});
+
+it('does not let a user-input marker hide an explicit model failure', async () => {
+  const out = await collect([{
+    type: 'done', result: { text: '', meta: {
+      error: { kind: 'provider_error', message: 'provider failed' },
+      termination: { status: 'waiting_input', reason: 'user_action_required' },
+    } },
+  }]);
+  expect(out).toContainEqual(expect.objectContaining({ type: 'error', failureKind: 'model' }));
+});
+
+it('classifies phase-less text from structured model-round boundaries without inspecting prose', async () => {
+  const out = await collect([
+    { type: 'text_delta', text: 'This arbitrary sentence contains no status keywords.' },
+    {
+      type: 'provider_call',
+      durationMs: 10,
+      outcome: 'completed',
+      model: 'chat-model',
+      stopReason: 'tool_use',
+    },
+    { type: 'tool_start', name: 'lookup', id: 'lookup-1', input: {} },
+    { type: 'tool_end', name: 'lookup', id: 'lookup-1', result: 'ok' },
+    { type: 'text_delta', text: 'Running tools is mentioned here, but this is the final answer.' },
+    {
+      type: 'provider_call',
+      durationMs: 10,
+      outcome: 'completed',
+      model: 'chat-model',
+      stopReason: 'end_turn',
+    },
+    {
+      type: 'done',
+      result: {
+        text: 'Running tools is mentioned here, but this is the final answer.',
+        meta: { error: null },
+      },
+    },
+  ]);
+
+  expect(out).toContainEqual({
+    type: 'delta',
+    text: 'This arbitrary sentence contains no status keywords.',
+    phase: 'commentary',
+  });
+  expect(out).toContainEqual({
+    type: 'delta',
+    text: 'Running tools is mentioned here, but this is the final answer.',
+    phase: 'final_answer',
+  });
+});
+
+it('passes provider-native assistant phases through unchanged', async () => {
+  const out = await collect([
+    { type: 'text_delta', text: 'Checking the source.' },
+    { type: 'text_phase', phase: 'commentary' },
+    { type: 'text_delta', text: 'The answer is ready.' },
+    { type: 'text_phase', phase: 'final_answer' },
+    {
+      type: 'done',
+      result: { text: 'The answer is ready.', meta: { error: null } },
+    },
+  ]);
+
+  expect(out).toEqual([
+    { type: 'delta', text: 'Checking the source.', phase: 'commentary' },
+    { type: 'delta', text: 'The answer is ready.', phase: 'final_answer' },
+    { type: 'final', text: 'The answer is ready.' },
+  ]);
+});
+
+it('does not fabricate process prose when a tool round contains no assistant text', async () => {
+  const out = await collect([
+    { type: 'tool_start', name: 'lookup', id: 'lookup-1', input: {} },
+    { type: 'tool_end', name: 'lookup', id: 'lookup-1', result: 'ok' },
+    { type: 'text_delta', text: 'Only the final answer was emitted.' },
+    {
+      type: 'provider_call',
+      durationMs: 10,
+      outcome: 'completed',
+      model: 'chat-model',
+      stopReason: 'end_turn',
+    },
+    {
+      type: 'done',
+      result: {
+        text: 'Only the final answer was emitted.',
+        meta: { error: null },
+      },
+    },
+  ]);
+
+  expect(out.filter((event) => event.type === 'delta')).toEqual([
+    {
+      type: 'delta',
+      text: 'Only the final answer was emitted.',
+      phase: 'final_answer',
+    },
+  ]);
+});
+
+it('coalesces reasoning deltas that arrive within the live update interval', async () => {
+  const out = await collect([
+    { type: 'thinking', phase: 'start', chars: 0 },
+    { type: 'thinking', phase: 'progress', chars: 10, text: 'Reviewing ' },
+    { type: 'thinking', phase: 'progress', chars: 11, text: 'constraints' },
+    { type: 'thinking', phase: 'end', chars: 21 },
+    { type: 'text_delta', text: 'answer' },
+    { type: 'done', result: { text: 'answer', meta: { error: null } } },
+  ], { nowMs: () => 0 });
+
+  const reasoning = out.filter((event) => event.type === 'event'
+    && event.event?.stream === 'reasoning');
+  expect(reasoning).toEqual([
+    {
+      type: 'event',
+      event: { stream: 'reasoning', data: { phase: 'start', id: 'reasoning-1', chars: 0 } },
+    },
+    {
+      type: 'event',
+      event: {
+        stream: 'reasoning',
+        data: {
+          phase: 'progress',
+          id: 'reasoning-1',
+          chars: 10,
+          heartbeat: true,
+          summary_from: 0,
+          summary_delta: 'Reviewing',
+        },
+      },
+    },
+    {
+      type: 'event',
+      event: {
+        stream: 'reasoning',
+        data: {
+          phase: 'end',
+          id: 'reasoning-1',
+          chars: 21,
+          summary: 'Reviewing constraints',
+        },
+      },
+    },
+  ]);
+});
+
+it('flushes coalesced reasoning after 250ms even while the provider is silent', async () => {
+  let resumeProvider: (() => void) | null = null;
+  async function* pausedReasoning(): AsyncIterable<AgentRunEvent> {
+    yield { type: 'thinking', phase: 'start', chars: 0 };
+    yield { type: 'thinking', phase: 'progress', chars: 6, text: 'first ' };
+    yield { type: 'thinking', phase: 'progress', chars: 4, text: 'last' };
+    await new Promise<void>((resolve) => { resumeProvider = resolve; });
+    yield { type: 'thinking', phase: 'end', chars: 10 };
+  }
+
+  const gen = mapCoreAgentEvents(pausedReasoning() as AsyncIterable<any>, {
+    failureTrackingScope: {},
+  });
+  expect((await gen.next()).value.event.data.phase).toBe('start');
+  expect((await gen.next()).value.event.data).toMatchObject({
+    phase: 'progress',
+    chars: 6,
+    summary_delta: 'first',
+  });
+  await expect(gen.next()).resolves.toMatchObject({
+    done: false,
+    value: {
+      event: {
+        data: {
+          phase: 'progress',
+          chars: 10,
+          summary_delta: ' last',
+        },
+      },
+    },
+  });
+  resumeProvider?.();
+  await expect(gen.next()).resolves.toMatchObject({
+    done: false,
+    value: { event: { data: { phase: 'end', summary: 'first last' } } },
+  });
+  await gen.return({ finalText: '', error: null });
+});
+
+it('emits short reasoning progress before completion', async () => {
+  const out = await collect([
+    { type: 'thinking', phase: 'start', chars: 0 },
+    { type: 'thinking', phase: 'progress', chars: 12, text: 'Quick review' },
+    { type: 'thinking', phase: 'end', chars: 12 },
+    { type: 'text_delta', text: 'answer' },
+    { type: 'done', result: { text: 'answer', meta: { error: null } } },
+  ]);
+
+  const reasoning = out.filter((event) => event.type === 'event'
+    && event.event?.stream === 'reasoning');
+  expect(reasoning).toEqual([
+    {
+      type: 'event',
+      event: { stream: 'reasoning', data: { phase: 'start', id: 'reasoning-1', chars: 0 } },
+    },
+    {
+      type: 'event',
+      event: {
+        stream: 'reasoning',
+        data: {
+          phase: 'progress',
+          id: 'reasoning-1',
+          chars: 12,
+          heartbeat: true,
+          summary_from: 0,
+          summary_delta: 'Quick review',
+        },
+      },
+    },
+    {
+      type: 'event',
+      event: {
+        stream: 'reasoning',
+        data: { phase: 'end', id: 'reasoning-1', chars: 12, summary: 'Quick review' },
+      },
+    },
+  ]);
+});
+
+it('redacts and single-lines reasoning detail without truncating it', () => {
+  const sensitive = sanitizePublicReasoningSummary(
+    'Inspect /Users/test/Secret/plan.md then api_key=private-token\nContinue safely',
+  );
+  expect(sensitive).not.toContain('/Users/alice');
+  expect(sensitive).not.toContain('private-token');
+  expect(sensitive).not.toContain('\n');
+
+  const complete = `BEGIN_${'x'.repeat(10_000)}_END`;
+  expect(sanitizePublicReasoningSummary(complete)).toBe(complete);
+});
+
+it('bounds the live preview and completes the full sanitized reasoning detail', async () => {
+  const first = `BEGIN_${'a'.repeat(5_000)}`;
+  const second = `${'b'.repeat(5_000)}_END`;
+  const complete = first + second;
+  const out = await collect([
+    { type: 'thinking', phase: 'start', chars: 0 },
+    { type: 'thinking', phase: 'progress', chars: first.length, text: first },
+    { type: 'thinking', phase: 'progress', chars: second.length, text: second },
+    { type: 'thinking', phase: 'end', chars: complete.length },
+  ], { nowMs: () => 0 });
+
+  const reasoning = out.filter((event) => event.type === 'event'
+    && event.event?.stream === 'reasoning');
+  expect(reasoning).toHaveLength(3);
+  const summaries = reconstructReasoningSummaries(reasoning);
+  expect(summaries).toHaveLength(2);
+  expect(summaries[0]).toHaveLength(2_048);
+  expect(summaries[0]?.startsWith('…')).toBe(true);
+  expect(summaries[0]?.endsWith('a'.repeat(64))).toBe(true);
+  expect(summaries[1]).toBe(complete);
+  expect(reasoning.at(-1)?.event?.data?.summary).toBe(complete);
+});
+
+it('sanitizes sensitive reasoning assembled across provider-delta boundaries', async () => {
+  const first = 'Inspect /Users/test/Secret/plan.md then api_key=private-';
+  const second = 'token\nContinue safely';
+  const out = await collect([
+    { type: 'thinking', phase: 'start', chars: 0 },
+    { type: 'thinking', phase: 'progress', chars: first.length, text: first },
+    { type: 'thinking', phase: 'progress', chars: second.length, text: second },
+    { type: 'thinking', phase: 'end', chars: first.length + second.length },
+  ]);
+
+  const summaries = reconstructReasoningSummaries(out);
+
+  expect(summaries).toHaveLength(2);
+  for (const summary of summaries) {
+    expect(summary).not.toContain('/Users/alice');
+    expect(summary).not.toContain('private-token');
+    expect(summary).not.toContain('\n');
+  }
+  expect(summaries.at(-1)).toContain('Continue safely');
+});
+
+it('bounds progress events and live payload for a high-frequency reasoning stream', async () => {
+  const progress = Array.from({ length: 10_000 }, (_, index) => ({
+    type: 'thinking' as const,
+    phase: 'progress' as const,
+    chars: 1,
+    // A non-constant sequence catches dropped, duplicated, and reordered
+    // deltas; checking only the final length would miss all three failures.
+    text: String(index % 10),
+  }));
+  const complete = progress.map(event => event.text).join('');
+  const out = await collect([
+    { type: 'thinking', phase: 'start', chars: 0 },
+    ...progress,
+    { type: 'thinking', phase: 'end', chars: progress.length },
+  ], { nowMs: () => 0 });
+
+  const reasoning = out.filter((event) => event.type === 'event'
+    && event.event?.stream === 'reasoning');
+  const progressEvents = reasoning.filter((event) => event.event?.data?.phase === 'progress');
+  expect(progressEvents).toHaveLength(1);
+  expect(reasoning).toHaveLength(3);
+  expect(String(progressEvents[0]?.event?.data?.summary_delta || '').length)
+    .toBeLessThanOrEqual(2_048);
+  expect(reconstructReasoningSummaries(reasoning).at(-1)).toBe(complete);
+  expect(reasoning.at(-1)?.event?.data?.summary).toBe(complete);
+});
+
+it('flushes complete reasoning before a terminal done event without an explicit thinking end', async () => {
+  const out = await collect([
+    { type: 'thinking', phase: 'start', chars: 0 },
+    { type: 'thinking', phase: 'progress', chars: 6, text: 'first ' },
+    { type: 'thinking', phase: 'progress', chars: 4, text: 'last' },
+    { type: 'done', result: { text: '', meta: { error: { kind: 'timeout', message: 'stopped' } } } },
+  ], { nowMs: () => 0 });
+
+  const reasoning = out.filter((event) => event.type === 'event'
+    && event.event?.stream === 'reasoning');
+  expect(reasoning.at(-1)?.event?.data).toEqual({
+    phase: 'end',
+    id: 'reasoning-1',
+    chars: 10,
+    summary: 'first last',
+  });
+  expect(out.at(-1)?.type).toBe('error');
+});
+
+it('isolates consecutive reasoning lifecycles in the same model run', async () => {
+  const out = await collect([
+    { type: 'thinking', phase: 'start', chars: 0 },
+    { type: 'thinking', phase: 'progress', chars: 13, text: 'First segment' },
+    { type: 'thinking', phase: 'end', chars: 13 },
+    { type: 'thinking', phase: 'start', chars: 0 },
+    { type: 'thinking', phase: 'progress', chars: 14, text: 'Second segment' },
+    { type: 'thinking', phase: 'end', chars: 14 },
+  ]);
+
+  const completed = out.filter((event) => event.type === 'event'
+    && event.event?.stream === 'reasoning'
+    && event.event?.data?.phase === 'end');
+  expect(completed.map((event) => event.event?.data)).toEqual([
+    { phase: 'end', id: 'reasoning-1', chars: 13, summary: 'First segment' },
+    { phase: 'end', id: 'reasoning-2', chars: 14, summary: 'Second segment' },
+  ]);
+});
+
+it('keeps count-only reasoning providers compatible without fabricating detail', async () => {
+  const out = await collect([
+    { type: 'thinking', phase: 'start', chars: 0 },
+    { type: 'thinking', phase: 'progress', chars: 12 },
+    { type: 'thinking', phase: 'end', chars: 12 },
+    { type: 'text_delta', text: 'answer' },
+    { type: 'done', result: { text: 'answer', meta: { error: null } } },
+  ]);
+
+  const reasoning = out.filter((event) => event.type === 'event'
+    && event.event?.stream === 'reasoning');
+  expect(reasoning).toEqual([
+    {
+      type: 'event',
+      event: { stream: 'reasoning', data: { phase: 'start', id: 'reasoning-1', chars: 0 } },
+    },
+    {
+      type: 'event',
+      event: {
+        stream: 'reasoning',
+        data: { phase: 'progress', id: 'reasoning-1', chars: 12, heartbeat: true },
+      },
+    },
+    {
+      type: 'event',
+      event: { stream: 'reasoning', data: { phase: 'end', id: 'reasoning-1', chars: 12 } },
+    },
+  ]);
+  expect(out.at(-1)).toEqual({ type: 'final', text: 'answer' });
 });
 
 describe('event-mapper › tool_start / tool_end emit a single structured event', () => {
@@ -174,6 +590,62 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
         && (e.text.startsWith('▶ bash') || e.text.startsWith('✓ bash') || e.text.startsWith('✗ bash')),
     );
     expect(toolProgress).toEqual([]);
+  });
+
+  it('run_program end retains source identity without retaining a source path', async () => {
+    const sourceSha256 = `sha256:${'d'.repeat(64)}`;
+    const childCalls = {
+      attempted: 3,
+      succeeded: 2,
+      failed: 1,
+      failedTools: [{ name: 'read_files', count: 1 }],
+    };
+    const out = await collect([
+      { type: 'tool_start', name: 'run_program', id: 'rp1', input: { path: 'private-script.js' } },
+      {
+        type: 'tool_end',
+        name: 'run_program',
+        id: 'rp1',
+        result: 'Program completed.',
+        programExecution: { sourceKind: 'file', sourceSha256, childCalls },
+      },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ]);
+
+    const endEvent = out.find((event) => (
+      event.type === 'event' && event.event?.data?.phase === 'end'
+    ));
+    expect(endEvent.event.data).toMatchObject({
+      programSourceKind: 'file',
+      programSourceSha256: sourceSha256,
+      programChildCalls: childCalls,
+    });
+    expect(endEvent.event.data).not.toHaveProperty('programSourcePath');
+  });
+
+  it('read_files end retains bounded batch failures without adding paths', async () => {
+    const fileReadBatch = {
+      attempted: 3,
+      succeeded: 2,
+      failed: 1,
+      failures: [{ index: 2, code: 'E_NOT_FOUND' }],
+    };
+    const out = await collect([
+      {
+        type: 'tool_end',
+        name: 'read_files',
+        id: 'read-batch-1',
+        result: '<read-files count="3" errors="1" />',
+        fileReadBatch,
+      },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ]);
+
+    const endEvent = out.find((event) => (
+      event.type === 'event' && event.event?.data?.phase === 'end'
+    ));
+    expect(endEvent.event.data.fileReadBatch).toEqual(fileReadBatch);
+    expect(JSON.stringify(endEvent.event.data.fileReadBatch)).not.toContain('/Users/');
   });
 
   it('read_file tool → start event carries the path on `arguments`', async () => {
@@ -762,23 +1234,23 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     expect(endEvent.event.data.result_preview).toContain('exit 1');
   });
 
-  it('recoverable compacted-history guard metadata survives mapping for the renderer', async () => {
+  it('recoverable tool-guard metadata survives mapping for the renderer', async () => {
     const out = await collect([
       { type: 'tool_start', name: 'bash', id: 'c4', input: { command: 'old compacted preview' } },
       {
         type: 'tool_end',
         name: 'bash',
         id: 'c4',
-        result: 'Recoverable historical-placeholder input detected for bash. The bash tool is still available; this is not a tool limitation.',
+        result: 'Recoverable input problem detected for bash. The bash tool is still available; this is not a tool limitation.',
         isError: true,
-        errorCode: 'E_COMPACTED_HISTORY_PLACEHOLDER',
+        errorCode: 'E_RECOVERABLE_TOOL_GUARD',
         errorSeverity: 'recoverable',
       },
       { type: 'done', result: { text: '', meta: { error: null } } },
     ]);
     const endEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'end');
     expect(endEvent.event.data.isError).toBe(true);
-    expect(endEvent.event.data.errorCode).toBe('E_COMPACTED_HISTORY_PLACEHOLDER');
+    expect(endEvent.event.data.errorCode).toBe('E_RECOVERABLE_TOOL_GUARD');
     expect(endEvent.event.data.errorSeverity).toBe('recoverable');
     expect(endEvent.event.data.result_preview).toContain('tool is still available');
   });
@@ -1078,7 +1550,7 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
         },
       ]);
       expect(out).toEqual([
-        { type: 'delta', text: '已完成一部分' },
+        { type: 'delta', text: '已完成一部分', phase: 'commentary' },
         {
           type: 'error',
           text: '模型连接不稳定，请稍后再试。',
@@ -1209,7 +1681,7 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     // From the second consecutive endpoint-level failure the visible error
     // must say the endpoint itself is suspect and point at Settings; a
     // successful run clears the suspicion again.
-    const mapper = await import('../../../../src/main/model/core-agent/event-mapper');
+    const mapper = await import('../../../src/main/model/core-agent/event-mapper');
     mapper.resetCustomEndpointFailureTracking();
     const failureTrackingScope = {};
     const failedRun = () => collect([
@@ -1276,7 +1748,7 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     // from the first one, and recovery elsewhere must not erase the first
     // conversation's own streak. The visible guidance is the independent
     // oracle: each session must reach the threshold using only its own runs.
-    const mapper = await import('../../../../src/main/model/core-agent/event-mapper');
+    const mapper = await import('../../../src/main/model/core-agent/event-mapper');
     mapper.resetCustomEndpointFailureTracking();
     const sessionA = {};
     const sessionB = {};
@@ -1344,7 +1816,7 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     // W4-2: an 8B model with an 8192 cap truncated six replies in a row and
     // nothing ever said the model was the problem. One overrun stays quiet
     // (long answers legitimately overrun once); the second names the cap.
-    const mapper = await import('../../../../src/main/model/core-agent/event-mapper');
+    const mapper = await import('../../../src/main/model/core-agent/event-mapper');
     mapper.resetCustomEndpointFailureTracking();
     const failureTrackingScope = {};
     const overrun = () => collect([
@@ -1393,7 +1865,7 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     // Two conversations can hit the same small-model limit concurrently.
     // Neither user's first failure should be mislabeled as a repeated failure
     // because the other conversation failed or recovered.
-    const mapper = await import('../../../../src/main/model/core-agent/event-mapper');
+    const mapper = await import('../../../src/main/model/core-agent/event-mapper');
     mapper.resetCustomEndpointFailureTracking();
     const sessionA = {};
     const sessionB = {};

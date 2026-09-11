@@ -72,14 +72,21 @@ export function splitCommanderOrchestrationBlock(prompt: string): {
   stable: string;
   orchestrationBlock: string;
 } {
-  const marker = '\n\n## Orchestration state';
-  const idx = prompt.indexOf(marker);
+  const continuityMarker = '\n\n## Orchestration continuity';
+  const stateMarker = '\n\n## Orchestration state';
+  const continuityIdx = prompt.indexOf(continuityMarker);
+  const stateIdx = prompt.indexOf(stateMarker);
+  const marker = continuityIdx >= 0 ? continuityMarker : stateMarker;
+  const idx = continuityIdx >= 0 ? continuityIdx : stateIdx;
   if (idx < 0) return { stable: prompt, orchestrationBlock: '' };
   const blockStart = idx + 2;
-  const nextSection = prompt.slice(blockStart + marker.trimStart().length).search(/\n\n#{2,3} /);
+  const sectionSearchStart = continuityIdx >= 0 && stateIdx > continuityIdx
+    ? stateIdx + stateMarker.length
+    : blockStart + marker.trimStart().length;
+  const nextSection = prompt.slice(sectionSearchStart).search(/\n\n#{2,3} /);
   const blockEnd = nextSection < 0
     ? prompt.length
-    : blockStart + marker.trimStart().length + nextSection;
+    : sectionSearchStart + nextSection;
   return {
     stable: `${prompt.slice(0, idx)}${prompt.slice(blockEnd)}`.trim(),
     orchestrationBlock: prompt.slice(blockStart, blockEnd).trim(),
@@ -145,16 +152,16 @@ export function buildInputChannelProtocol(channel: AgentInputChannel): string {
     return [
       '### Input channel: plain prose',
       '',
-      'For a missing-input request, ask directly in plain language and stop. Keep it to at most 2-3 focused questions, name options inline only for a closed choice, and make clear that a direct reply is enough.',
+      'For a missing-input request, ask directly in plain language. Name options inline only for a closed choice, and make clear that a direct reply is enough.',
       '',
       '- Never emit an `<agent-input-form>` block; forms in earlier history are a retired protocol, not an example to follow.',
-      '- A legacy `<agent-input-submission>` may still arrive for an old form; read its values like ordinary user text and repeat the input decision.',
+      '- A legacy `<agent-input-submission>` may still arrive for an old form; read its values like ordinary user text.',
     ].join('\n');
   }
   return [
     '### Input channel: form',
     '',
-    'For a missing-input request, output exactly one `<agent-input-form>` block and stop. Do not put ordinary prose questions after it. Plain-text questions, numbered question lists, and "please confirm/tell me" prose are not input channels.',
+    'For a missing-input request, output exactly one `<agent-input-form>` block. Do not put ordinary prose questions after it. Plain-text questions, numbered question lists, and "please confirm/tell me" prose are not input channels.',
     '',
     'The block is an XML tag wrapping valid JSON, with tags on their own lines:',
     '',
@@ -171,10 +178,10 @@ export function buildInputChannelProtocol(channel: AgentInputChannel): string {
     '- `agent_id` can be omitted; the system fills it in as you. If present, it must equal you.',
     '- Field types: `text` / `textarea` / `select` / `multiselect` / `number` / `boolean` / `file` / `directory`.',
     '- `select` / `multiselect` must include `options: [{value,label}]`; `number` may include `min`/`max`; `file` may include `accept`.',
-    '- Ask for at most 2-3 focused missing fields. Prefer one plain question in a field label, or one `textarea` for free-form context, files, or examples; use multiple fields only for distinct typed values.',
+    '- Prefer one plain question in a field label, or one `textarea` for free-form context, files, or examples; use multiple fields only for distinct typed values.',
     '- Do not replace the form with a "need these details" section.',
     '',
-    'A reply arrives as `<agent-input-submission>`; use its values and repeat the input decision.',
+    'A reply arrives as `<agent-input-submission>`; use its values.',
   ].join('\n');
 }
 

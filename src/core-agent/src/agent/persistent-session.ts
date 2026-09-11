@@ -140,7 +140,7 @@ export class PersistentSession extends Session {
       try {
         const obj = JSON.parse(trimmed) as { role?: string; content?: unknown; turnId?: unknown };
         if (
-          (obj.role === "user" || obj.role === "assistant" || obj.role === "system") &&
+          (obj.role === "user" || obj.role === "assistant" || obj.role === "system" || obj.role === "developer") &&
           Array.isArray(obj.content)
         ) {
           super.addMessage(
@@ -311,10 +311,12 @@ export class PersistentSession extends Session {
       // collapsed into the cluster).
       const resultsByCallId = new Map<string, ToolResultContent>();
       let trailingImageMsgs: Message[] = [];
+      let lastResultId: string | undefined;
       let j = i + 1;
       while (j < messages.length) {
         const nx = messages[j];
         if (nx.role !== "user") break;
+        if (nx.turnId && m.turnId && nx.turnId !== m.turnId) break;
         const onlyToolResults = nx.content.every(
           (c) => (c as { type?: string }).type === "tool_result",
         );
@@ -324,6 +326,7 @@ export class PersistentSession extends Session {
         if (onlyToolResults) {
           for (const c of nx.content) {
             const tr = c as ToolResultContent;
+            lastResultId = tr.toolUseId;
             // First non-interrupted result wins; otherwise first-seen wins.
             // This drops duplicates (e.g. real result + later synthetic
             // interrupted, or two synthetic markers from repeated heals).
@@ -336,10 +339,17 @@ export class PersistentSession extends Session {
           }
           j++;
         } else if (onlyImages && resultsByCallId.size > 0) {
-          // Image trailer emitted by `addToolResult(...images)` — keep it
-          // attached after the merged tool_result message; doesn't break the
-          // cluster scan.
-          trailingImageMsgs.push(nx);
+          // Only old receipts lack the images array. A new receipt already
+          // owns its images (possibly none), so a following user image is real
+          // input even if it belongs to the same active UI turn.
+          const result = lastResultId ? resultsByCallId.get(lastResultId) : undefined;
+          if (result?.images !== undefined) break;
+          if (result) {
+            resultsByCallId.set(lastResultId!, { ...result,
+              images: [...(result.images ?? []), ...nx.content as NonNullable<ToolResultContent["images"]>],
+            });
+            changed = true;
+          } else trailingImageMsgs.push(nx);
           j++;
         } else {
           break;
@@ -355,6 +365,7 @@ export class PersistentSession extends Session {
           toolUseId: id,
           content: INTERRUPTED_TOOL_RESULT,
           isError: true,
+          images: [],
         });
       }
 
@@ -492,8 +503,9 @@ export class PersistentSession extends Session {
   }
 
   override updateExecutionPlan(update: ExecutionPlanUpdate): ExecutionPlanState {
+    const previousRevision = this.getExecutionPlan()?.revision;
     const plan = super.updateExecutionPlan(update);
-    this.requestContextWrite();
+    if (plan.revision !== previousRevision) this.requestContextWrite();
     return plan;
   }
 
@@ -521,8 +533,14 @@ export class PersistentSession extends Session {
     this.requestContextWrite();
   }
 
-  override applyActiveCheckpointSummary(summary: string, checkpointThroughMessageIndex: number): string {
-    const appliedSummary = super.applyActiveCheckpointSummary(summary, checkpointThroughMessageIndex);
+  override applyActiveCheckpointSummary(
+    summary: string,
+    checkpointThroughMessageIndex: number,
+    maxSummaryTokens?: number,
+  ): string {
+    const appliedSummary = super.applyActiveCheckpointSummary(
+      summary, checkpointThroughMessageIndex, maxSummaryTokens,
+    );
     this.requestContextWrite();
     return appliedSummary;
   }

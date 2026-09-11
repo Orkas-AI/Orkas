@@ -35,10 +35,10 @@ import { createLogger } from '../logger';
 import { t } from '../i18n';
 import { getActiveUserId } from './users';
 import {
-  officeFileToPreviewHtml,
   officePreviewKindForExt,
   type OfficePreviewResult,
 } from '../util/office-preview';
+import { officeFileToPreviewHtml } from './office/office_preview_layout';
 import {
   assertLocalImportTarget,
   copyLocalFileAtomic,

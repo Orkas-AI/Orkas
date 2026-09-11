@@ -26,6 +26,7 @@ import {
 import { conversationMessageReadFile, listProjectIds } from '../../util/project-layout';
 import { getActiveUserId } from '../users';
 import { createLogger } from '../../logger';
+import { logErrorSummary, logPathRef } from '../../util/log-redact';
 
 const log = createLogger('search');
 
@@ -114,7 +115,7 @@ function _markDirty(idxPath: string): void {
   const existing = _flushTimers.get(idxPath);
   if (existing) clearTimeout(existing);
   _flushTimers.set(idxPath, setTimeout(() => {
-    flushOne(idxPath).catch((err) => log.warn(`flush failed: ${err.message}`));
+    flushOne(idxPath).catch((err) => log.warn('flush failed', { error: logErrorSummary(err) }));
   }, FLUSH_DELAY_MS));
 }
 
@@ -134,7 +135,7 @@ export async function flushOne(idxPath: string): Promise<void> {
       try {
         const { size } = fs.statSync(idxPath);
         if (size > _FLUSH_SIZE_WARN) {
-          log.warn(`idx ${idxPath} is ${(size / 1024 / 1024).toFixed(1)}MB — consider sharding`);
+          log.warn('index exceeds size warning threshold', { path: logPathRef(idxPath), size_bytes: size });
         }
       } catch { /* ignore */ }
     } catch (err) {
@@ -142,7 +143,9 @@ export async function flushOne(idxPath: string): Promise<void> {
       // Retry with exponential-ish backoff so a transient disk error doesn't
       // strand the unflushed work forever.
       setTimeout(() => {
-        flushOne(idxPath).catch(() => {});
+        flushOne(idxPath).catch((err) => {
+          log.warn('retry flush failed', { error: logErrorSummary(err) });
+        });
       }, FLUSH_DELAY_MS * 5);
       throw err;
     }
@@ -150,7 +153,9 @@ export async function flushOne(idxPath: string): Promise<void> {
 }
 
 export async function flushAll(): Promise<void> {
-  await Promise.all(Array.from(_cache.keys()).map((p) => flushOne(p).catch(() => {})));
+  await Promise.all(Array.from(_cache.keys()).map((p) => flushOne(p).catch((err) => {
+    log.warn('flushAll entry failed', { error: logErrorSummary(err) });
+  })));
 }
 
 // ── Index ops (callers must hold the per-idx lock) ───────────────────────
@@ -693,8 +698,9 @@ async function _dropChatFile(userId: string, fileKey: string): Promise<void> {
 }
 
 export function dropChatConversation(userId: string, cid: string): Promise<void> {
-  return _dropChatFile(userId, cid).catch(() => {
+  return _dropChatFile(userId, cid).catch((err) => {
     _currentChatIndexes.delete(userId);
+    log.warn('drop chat conversation from index failed', { error: logErrorSummary(err) });
   });
 }
 

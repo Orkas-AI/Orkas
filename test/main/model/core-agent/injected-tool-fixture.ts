@@ -14,6 +14,7 @@ import { createVideoGenTool } from '../../../../src/main/model/core-agent/video-
 import { createLibraryTool } from '../../../../src/main/model/core-agent/kb-tools';
 import { createOfficeTools } from '../../../../src/main/model/core-agent/office-tools';
 import { createPdfTools } from '../../../../src/main/model/core-agent/pdf-tools';
+import { buildBrowserTool } from '../../../../src/main/features/group_chat/browser_tool';
 
 /**
  * Assemble the stable built-in tool corpus measured by both runner-facing
@@ -61,6 +62,7 @@ export function enumerateAllInjectedTools(): AgentTool[] {
   tools.push(...createLocalTools({
     userId,
     cid,
+    projectId: 'p_toolfixture01',
     onArtifactCreated: () => {},
     onOutputsPublished: (paths) => paths,
   }));
@@ -73,6 +75,16 @@ export function enumerateAllInjectedTools(): AgentTool[] {
   tools.push(createImageStudioTool({ userId, cid }));
   tools.push(...createOfficeTools({ userId, cid }));
   tools.push(...createPdfTools({ userId, cid }));
+  tools.push(buildBrowserTool({
+    tabs: () => ({ ok: true, tabs: [] }),
+    open: async () => ({ ok: true }),
+    navigate: async () => ({ ok: true }),
+    observe: async () => ({ ok: true, untrusted_content: true }),
+    act: async () => ({ ok: true }),
+    wait: async () => ({ ok: true }),
+    close: () => ({ ok: true, closed: true }),
+    retain: () => ({ ok: true }),
+  }));
 
   const byName = new Map<string, AgentTool>();
   for (const tool of tools) byName.set(tool.name, tool);
@@ -88,14 +100,16 @@ export function enumerateAllInjectedToolNames(): Set<string> {
   for (const name of [
     'tool_result',
     'project_instructions',
-    'project_tasks',
+    'todo_tasks',
+    'research_verify_citations',
     'video_studio',
     'list_connector_tools',
     'call_connector_tool',
     'add_custom_connector',
+    'connector_setup',
     'skill_search',
     'import_skill_package',
-    'auto_tasks_list',
+    'auto_tasks',
     'marketplace_search',
     'marketplace_request_install',
     'dispatch_to',
@@ -105,6 +119,7 @@ export function enumerateAllInjectedToolNames(): Set<string> {
     'app_health',
     'skill_manage',
     'tool_load',
+    'run_program',
   ]) names.add(name);
   return names;
 }

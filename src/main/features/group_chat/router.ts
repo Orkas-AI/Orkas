@@ -11,6 +11,7 @@ import {
   Actor, COMMANDER_ID, USER_ID, RESERVED_IDS,
 } from './state';
 import { safeId } from '../../storage';
+import { splitMarkdownProseCode } from '../../util/markdown-prose-code';
 
 // ── Mention parsing ──────────────────────────────────────────────────────
 
@@ -18,10 +19,15 @@ import { safeId } from '../../storage';
 // plus CJK Unified Ideographs so users can mention agents whose display
 // names use CJK characters. Token
 // boundaries:
-//   - leading: start-of-string or any non-token char
+//   - leading: start-of-string, any non-token char, OR a CJK char. CJK is
+//     in the token class (names) but deliberately NOT in the leading
+//     boundary: Chinese prose puts no space before `@` (`然后@PptMaker`),
+//     and blocking that silently dropped the mention — the message routed
+//     to one agent with the second `@` as literal text (observed on-device
+//     2026-08-23). Email addresses (`foo@example.com`) still don't trip
+//     this: their local part ends in an ASCII word char, which stays in
+//     the boundary's negated class.
 //   - trailing: matched greedily up to the first non-token char
-// Email addresses (`foo@example.com`) shouldn't trip this — the leading
-// boundary disqualifies them since `o` is in the char class.
 //
 // Multi-word display names ("Software Requirements Analyst") fall outside
 // this char class — for those we build a per-call regex that prepends an
@@ -30,7 +36,8 @@ import { safeId } from '../../storage';
 // unknown / partial tokens so behavior degrades gracefully when no name
 // list is available.
 const TOKEN_CLASS = '[A-Za-z0-9_一-鿿-]+';
-const FALLBACK_MENTION_RE = /(^|[^A-Za-z0-9_一-鿿-])@([A-Za-z0-9_一-鿿-]+)/gu;
+const LEADING_BOUNDARY = '(^|[^A-Za-z0-9_-])';
+const FALLBACK_MENTION_RE = /(^|[^A-Za-z0-9_-])@([A-Za-z0-9_一-鿿-]+)/gu;
 const RESERVED_ACTOR_ALIASES = ['指挥官', 'commander', '用户', 'user'] as const;
 
 function _escapeForRegex(s: string): string {
@@ -45,9 +52,25 @@ function _buildMentionRe(names?: readonly string[], includeFallback = true): Reg
   const sorted = [...names].sort((a, b) => b.length - a.length);
   const namedAlt = sorted.map(_escapeForRegex).join('|');
   if (!includeFallback) {
-    return new RegExp(`(^|[^A-Za-z0-9_一-鿿-])@(${namedAlt})`, 'gu');
+    return new RegExp(`${LEADING_BOUNDARY}@(${namedAlt})`, 'gu');
   }
-  return new RegExp(`(^|[^A-Za-z0-9_一-鿿-])@(${namedAlt}|${TOKEN_CLASS})`, 'gu');
+  return new RegExp(`${LEADING_BOUNDARY}@(${namedAlt}|${TOKEN_CLASS})`, 'gu');
+}
+
+// Keep offsets intact so parsing and segmentation use the same prose boundary.
+function routingMentionRanges(text: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  let offset = 0;
+  for (const segment of splitMarkdownProseCode(text)) {
+    if (segment.kind === 'code') ranges.push([offset, offset + segment.text.length]);
+    offset += segment.text.length;
+  }
+  offset = 0;
+  for (const line of text.split('\n')) {
+    if (/^\s*>/.test(line)) ranges.push([offset, offset + line.length]);
+    offset += line.length + 1;
+  }
+  return ranges;
 }
 
 /** Scan a message body for `@token` mentions. Deduped, in first-occurrence
@@ -77,19 +100,7 @@ export function parseMentions(
   opts?: { fromKind?: Actor['kind']; names?: readonly string[] },
 ): string[] {
   if (!text) return [];
-  // Markdown blockquote lines (`> ...`) are context the user pulled in
-  // from another bubble via the quote-reply feature. `@<name>` tokens
-  // inside the quote belong to the original author's outgoing routing,
-  // not the current user's — counting them as dispatch signals
-  // re-triggers whoever the original message addressed every time
-  // someone forwards it. Strip those lines from the routing-relevant
-  // view; the original `text` still flows through the bus unchanged so
-  // the persisted bubble keeps the quote intact.
-  const routingText = text
-    .split('\n')
-    .filter((line) => !/^\s*>/.test(line))
-    .join('\n');
-  if (!routingText) return [];
+  const excluded = routingMentionRanges(text);
   if (opts?.fromKind === 'commander') return [];
   const reservedOnly = opts?.fromKind === 'agent';
   const re = reservedOnly
@@ -98,7 +109,9 @@ export function parseMentions(
   const out: string[] = [];
   const seen = new Set<string>();
   let m: RegExpExecArray | null;
-  while ((m = re.exec(routingText)) !== null) {
+  while ((m = re.exec(text)) !== null) {
+    const start = m.index + m[1].length;
+    if (excluded.some(([a, b]) => start >= a && start < b)) continue;
     const token = m[2];
     if (!token || seen.has(token)) continue;
     seen.add(token);
@@ -137,6 +150,8 @@ export function buildMention(name: string): string {
 // ── Routing ──────────────────────────────────────────────────────────────
 
 export interface RouteResolution {
+  /** Present for segmented sends, including an empty plan for mention-only text. */
+  plan?: SegmentedMentions;
   /** Final recipient list (deduped, may include the sender's @-targets). */
   to: string[];
   /** Tokens that didn't resolve to any known actor. UI may surface these. */
@@ -169,12 +184,21 @@ export interface ResolveOpts {
    *  mentions in case the LLM falls back to ids. */
   resolveUnknown?: (token: string) => string | null;
   /** The conversation floor (`StateFile.active_recipient`): the agent the
-   *  commander handed the user off to. When a USER message carries no `@`
-   *  mention, it routes here instead of the commander, so the user keeps
-   *  talking to that agent without re-`@`-ing. Absent / commander ⇒ the
-   *  default (user → commander). Only consulted for the sender-default route;
-   *  an explicit `@<target>` the user types always wins for that message. */
+   *  commander handed the user off to, or the one the user picked on the
+   *  composer chip. When a USER message carries no `@` mention, it routes
+   *  here instead of the commander. Absent / commander ⇒ the default
+   *  (user → commander). It also owns prose before the first mention;
+   *  an opening `@<target>` replaces it.
+   *
+   *  VALIDATED BY THE CALLER: the bus checks the floor against the enabled
+   *  agent registry before passing it (roster membership is a lazily written
+   *  RECORD — first dispatch creates the row — never an eligibility gate;
+   *  gating on it silently rerouted a chip-selected agent's first message to
+   *  the commander, on-device 2026-08-23). A dead floor (deleted/disabled
+   *  agent) must be cleared by the caller, not passed here. */
   activeRecipient?: string;
+  /** Legacy input accepted for compatibility; a multi-default falls back to Commander. */
+  activeRecipients?: readonly string[];
 }
 
 /**
@@ -226,27 +250,38 @@ export function resolveRecipients(opts: ResolveOpts): RouteResolution {
     }
   }
   const resolved: string[] = [];
+  const tokenToId = new Map<string, string>();
   const unknown: string[] = [];
   for (const tok of tokens) {
+    const accept = (id: string) => { resolved.push(id); tokenToId.set(tok, id); };
     if (RESERVED_IDS.has(tok) || memberIds.has(tok)) {
-      resolved.push(tok);
+      accept(tok);
       continue;
     }
     // Try name → id (in current roster first, then global registry).
     const key = _normalizeNameKey(tok);
-    if (key === '指挥官') { resolved.push(COMMANDER_ID); continue; }
-    if (key === '用户') { resolved.push(USER_ID); continue; }
+    if (key === '指挥官') { accept(COMMANDER_ID); continue; }
+    if (key === '用户') { accept(USER_ID); continue; }
     const fromMembers = memberNameToId.get(key);
-    if (fromMembers) { resolved.push(fromMembers); continue; }
+    if (fromMembers) { accept(fromMembers); continue; }
     const fromGlobal = opts.agentNameToId?.get(key);
-    if (fromGlobal) { resolved.push(fromGlobal); continue; }
+    if (fromGlobal) { accept(fromGlobal); continue; }
     // Fallback: treat as a raw agent_id (for the rare LLM that emits ids).
     const r = opts.resolveUnknown?.(tok);
-    if (r && safeId(r)) { resolved.push(r); continue; }
+    if (r && safeId(r)) { accept(r); continue; }
     unknown.push(tok);
   }
 
   if (resolved.length) {
+    if (opts.fromKind === 'user') {
+      const plan = segmentUserMentions(opts.text, {
+        tokenToId: (token) => tokenToId.get(token) || null,
+        recipientIds: new Set(resolved), names: namesForParser,
+        commanderId: COMMANDER_ID,
+        defaultRecipient: opts.activeRecipient || COMMANDER_ID,
+      });
+      if (plan) return { to: [...new Set(plan.segments.map((s) => s.actorId))], unknown, hadExplicitMention: true, plan };
+    }
     // De-dupe (someone might @ the same actor twice).
     return { to: Array.from(new Set(resolved)), unknown, hadExplicitMention: true };
   }
@@ -272,15 +307,139 @@ export function resolveRecipients(opts: ResolveOpts): RouteResolution {
   // and `chat_commander.md`.
   let def: string;
   if (opts.fromKind === 'user') {
+    // The caller (bus) has already validated the floor against the enabled
+    // agent registry — see `activeRecipient` docs. No roster gate here:
+    // membership is a record written at first dispatch, not eligibility.
     const floor = opts.activeRecipient;
-    // Only honour a floor that is a real agent still on the roster (a deleted
-    // or absent agent falls back to commander, never a dead route).
-    def = (floor && floor !== COMMANDER_ID && floor !== USER_ID && memberIds.has(floor))
+    def = (floor && floor !== COMMANDER_ID && floor !== USER_ID)
       ? floor : COMMANDER_ID;
   } else {
     def = USER_ID;
   }
   return { to: [def], unknown, hadExplicitMention: false };
+}
+
+// ── D9 mention segmentation (task-board plan §4.2.1) ─────────────────────
+
+export interface MentionSegment {
+  /** Resolved assignee actor id. */
+  actorId: string;
+  /** This assignee's instruction: its own span (plus quote-only context), mention
+   * token stripped. */
+  instruction: string;
+  /** 0-based index of the mention group this segment came from. ADJACENT
+   * mentions (only whitespace between them) share one group; each further
+   * group is a later written span. The dispatcher uses the group count to
+   * decide whether the send has any cross-group ordering to honor. */
+  group: number;
+}
+
+export interface SegmentedMentions {
+  segments: MentionSegment[];
+  /** Raw text before the first mention (trimmed). Prose belongs to the default
+   * recipient; quote-only context is shared. */
+  preamble: string;
+}
+
+/**
+ * Split a user message into per-assignee instruction segments — the
+ * deterministic core that replaces same-text broadcast (D9, re-adjudicated
+ * 2026-08-27/D22). Rules:
+ *   - each resolved mention opens a segment extending to the next mention or
+ *     end of text; ADJACENT mentions (whitespace-only gap) share the
+ *     following span; repeated agents in one adjacent group are deduplicated; repeated
+ *     agents with separate descriptions keep their ordered segments; empty
+ *     descriptions do not dispatch; mentions in code or blockquote lines
+ *     never open segments (literal context, matching `parseMentions`);
+ *   - commander mentions (via `commanderId` in `tokenToId`) open ordinary
+ *     segments — an explicit `@指挥官 … @A …` send segments exactly like an
+ *     all-agent send instead of broadcasting the full text (D22);
+ *   - an unaddressed first instruction belongs to the current default recipient;
+ *     quote-only preambles remain shared context;
+ *   - cross-segment context flows through the serial `after` hand-off, not
+ *     through prefix duplication.
+ *
+ * Returns null for one described mention or no mentions — the caller keeps the ordinary
+ * single-recipient path. Mention-only input returns an empty plan so it
+ * cannot create a fallback task. No LLM participates (§4.2 principle 1); the
+ * composer preview bar is the user's misparse guard.
+ */
+export function segmentUserMentions(
+  text: string,
+  opts: {
+    /** Raw mention token → actor id (null = unresolvable). */
+    tokenToId: (token: string) => string | null;
+    /** Only mentions resolving into this set open segments. */
+    recipientIds: ReadonlySet<string>;
+    /** Display names for exact multi-word mention matching. */
+    names?: readonly string[];
+    /** Commander actor id. When set, explicit commander mentions open
+     * segments just like selected Agents. */
+    commanderId?: string;
+    /** Owner of an unaddressed first instruction; defaults to Commander. */
+    defaultRecipient?: string;
+  },
+): SegmentedMentions | null {
+  if (!text) return null;
+  const excluded = routingMentionRanges(text);
+  const inQuote = (pos: number) => excluded.some(([s, e]) => pos >= s && pos < e);
+
+  const re = _buildMentionRe(opts.names);
+  const spans: Array<{ start: number; end: number; id: string }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const token = m[2];
+    if (!token) continue;
+    const start = m.index + m[1].length; // the '@'
+    if (inQuote(start)) continue;
+    const id = opts.tokenToId(token);
+    if (!id) continue;
+    if (!opts.recipientIds.has(id) && id !== opts.commanderId) continue;
+    spans.push({ start, end: start + 1 + token.length, id });
+  }
+  if (!spans.length) return null;
+
+  const preamble = text.slice(0, spans[0].start).trim();
+  const hasFirstInstruction = preamble.split('\n').some((line) => line.trim() && !/^\s*>/.test(line));
+  if (spans.length < 2 && !hasFirstInstruction && text.slice(spans[0].end).trim()) return null;
+  // Group adjacent mentions: `@A @B do X` — nothing but whitespace between
+  // the spans — share the span that follows the group.
+  const groups: Array<{ ids: string[]; bodyStart: number }> = [];
+  for (let i = 0; i < spans.length; i += 1) {
+    const prev = groups[groups.length - 1];
+    const gapStart = i > 0 ? spans[i - 1].end : -1;
+    const adjacent = i > 0 && /^\s*$/.test(text.slice(gapStart, spans[i].start));
+    if (adjacent && prev) {
+      prev.ids.push(spans[i].id);
+      prev.bodyStart = spans[i].end;
+    } else {
+      groups.push({ ids: [spans[i].id], bodyStart: spans[i].end });
+    }
+  }
+  const segments: MentionSegment[] = hasFirstInstruction
+    ? [{ actorId: opts.defaultRecipient || opts.commanderId || COMMANDER_ID, instruction: preamble, group: 0 }]
+    : [];
+  // Body of group g runs from its bodyStart to the start of group g+1's
+  // FIRST mention (or end of text).
+  const groupFirstStart: number[] = [];
+  {
+    let spanIdx = 0;
+    for (const grp of groups) {
+      groupFirstStart.push(spans[spanIdx].start);
+      spanIdx += grp.ids.length;
+    }
+  }
+  for (let g = 0; g < groups.length; g += 1) {
+    const end = g + 1 < groups.length ? groupFirstStart[g + 1] : text.length;
+    const body = text.slice(groups[g].bodyStart, end).trim();
+    const instruction = !hasFirstInstruction && preamble
+      ? [preamble, body].filter(Boolean).join('\n') : body;
+    if (!body) continue;
+    for (const id of new Set(groups[g].ids)) {
+      segments.push({ actorId: id, instruction, group: g + (hasFirstInstruction ? 1 : 0) });
+    }
+  }
+  return { segments, preamble };
 }
 
 // ── Form payload + agent-container parsers (moved here so bus can apply
@@ -316,8 +475,8 @@ export interface ChatFormPayload {
 // won't accidentally render it as a code block on a parse miss.
 //
 // Legacy fenced ```agent-input-form block is kept as a fallback so old
-// jsonl history (chats/<cid>.jsonl + visibility/<aid>.jsonl) still
-// renders correctly. The fenced form had a token-split bug where some
+// canonical jsonl history still renders correctly. The fenced form had a
+// token-split bug where some
 // models emitted "```agent\n-input-form" — the tolerant `[\s\-]*` keeps
 // covering that until legacy data ages out.
 const FORM_XML_RE = /(?:^|\n)[ \t]*<agent-input-form>[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*<\/agent-input-form>[ \t]*(?=\n|$)/;
@@ -404,8 +563,7 @@ export function extractHandbackFromFinal(text: string): ExtractHandbackResult {
   // The cheap substring check above also passes on look-alikes (`<handbackfoo>`,
   // `<handback-note>`, prose mentioning the token) — only the strict marker regex
   // should count as a real hand-back, otherwise control is wrongly returned to
-  // the commander. (`g`-flag regex is stateful, so reset lastIndex before test.)
-  HANDBACK_RE.lastIndex = 0;
+  // the commander.
   const matches = Array.from(text.matchAll(HANDBACK_RE));
   if (!matches.length) return { cleanText: text };
   const reasons = new Set<HandbackReason>();

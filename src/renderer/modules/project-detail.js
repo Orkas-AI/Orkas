@@ -88,7 +88,7 @@ function _projectFileUploadPayload(fileList, source, targetDir) {
 }
 
 let _projectDetailPid = '';     // pid currently rendered in the panel
-let _projectDetailMeta = null;  // { project, agentDetails, skillDetails, files, libraryStatus? }
+let _projectDetailMeta = null;  // { project, agentDetails, files, libraryStatus? }
 let _projectKbStatusByName = {}; // {[name]: {status, chunks?, error?, kind?}}
 let _projectKbEventsHandle = null;
 let _projectKbEventsPid = '';
@@ -140,7 +140,8 @@ async function loadProjectDetail(pid) {
   }
   if (prevPid !== _projectDetailPid || !_projectDetailMeta) {
     _projectTodos = [];
-    _closeProjectTodoEditor();
+    _setTodoLoadError(false);
+    _renderProjectTodosList();
     _projectMemory = [];
     _projectMemoryEditor = null;
     _projectMemoryLoadSeq += 1;
@@ -151,7 +152,6 @@ async function loadProjectDetail(pid) {
         name: '',
       },
       agentDetails: [],
-      skillDetails: [],
       files: [],
       libraryStatus: null,
       instructions: null,
@@ -215,7 +215,6 @@ async function loadProjectDetail(pid) {
     _projectDetailMeta = {
       project: getRes.project,
       agentDetails: Array.isArray(listRes.agentDetails) ? listRes.agentDetails : [],
-      skillDetails: Array.isArray(listRes.skillDetails) ? listRes.skillDetails : [],
       files: fileTree,
       libraryStatus: kbRes?.ok ? kbRes : null,
       instructions: instrRes?.ok ? { content: String(instrRes.content || ''), limit: Number(instrRes.limit) || 4000 } : null,
@@ -285,9 +284,11 @@ function _renderProjectDetail({ hydrateSecondary = true } = {}) {
   _bindProjectInstructions();
   _bindProjectMemory();
   _bindProjectTodos();
+  _bindProjectDriver();
   if (hydrateSecondary) {
     _loadProjectTodos(_projectDetailPid).catch(() => { /* ignore */ });
     _loadProjectMemory(_projectDetailPid).catch(() => { /* ignore */ });
+    _loadProjectDriver(_projectDetailPid).catch(() => { /* ignore */ });
   }
 
   // Per-card count chips beside each card title.
@@ -297,7 +298,6 @@ function _renderProjectDetail({ hydrateSecondary = true } = {}) {
   applyDomI18n();
   _setProjectDetailRenameMode(_isProjectDetailRenameMode());
   _bindProjectAgentCards();
-  _bindRemoveButtons();
   _bindProjectFileRows();
   if (typeof refreshWorkspaceChip === 'function') refreshWorkspaceChip();
   if (typeof hydrateUiIcons === 'function') hydrateUiIcons(document.getElementById('project-detail-content'));
@@ -324,6 +324,10 @@ function _bindProjectDetailTabs() {
         _syncProjectDetailTabState();
         if (_projectDetailActiveTab === 'auto') {
           _ensureProjectAutoTabLoaded(_projectDetailPid);
+        } else if (_projectDetailActiveTab === 'todo') {
+          // Re-read the persisted project setting on entry so a change made by
+          // another surface/device is reflected by this tab's toggle.
+          _loadProjectDriver(_projectDetailPid);
         }
       });
       tab.addEventListener('keydown', (event) => {
@@ -569,6 +573,53 @@ function _bindProjectInstructions() {
   });
 }
 
+// The auto-advance driver creates its run conversation in the main process, so
+// (unlike a human-started run, which the renderer adds locally) the renderer
+// never learns of it. Main broadcasts `projects:advance` with the new
+// conversation; merge it into the shared list exactly like _submitProjectChat
+// does so it shows up as a running task immediately.
+function _onProjectAdvance(payload) {
+  const conv = payload && payload.conversation;
+  const pid = payload && payload.projectId;
+  if (!conv || !conv.conversation_id) return;
+  if (typeof conversations === 'undefined' || !Array.isArray(conversations)) return;
+  const idx = conversations.findIndex((c) => c && c.conversation_id === conv.conversation_id);
+  if (idx >= 0) conversations[idx] = { ...conversations[idx], ...conv };
+  else conversations.unshift(conv);
+  if (typeof renderConversationList === 'function') renderConversationList();
+  if (currentView === 'project' && _projectDetailMeta && pid === _projectDetailPid) {
+    _renderProjectAllTasks();
+  }
+  // Observe the background run so the conversation shows the same "in progress"
+  // breathing badge as a human-started one — a manual send observes its own run
+  // and marks the conv pending; a driver-started run has no such observer until
+  // we attach one here (idempotent; streams into no transcript when not open).
+  if (typeof _observeConversationRunFromPlanAction === 'function') {
+    _observeConversationRunFromPlanAction(conv.conversation_id, { attachExisting: true, allowWithController: true });
+  }
+}
+
+// A task was created/updated/deleted somewhere in the main process (the driver
+// flipping it to progress, the model's todo_tasks tool, sync). Refresh the
+// open project's to-do list so its status shows live instead of only after a
+// view reload.
+// Main fires one `projects:tasks-changed` per task file write, and a burst
+// (model creating N tasks, an advance plus its status flip, attachment
+// uploads) used to reload the full list N times (2026-08-28 review E1-7).
+const _PROJECT_TASKS_RELOAD_DEBOUNCE_MS = 150;
+let _projectTasksReloadTimer = null;
+function _onProjectTasksChanged(payload) {
+  const pid = payload && payload.projectId;
+  if (typeof _scheduleGlobalTodosRefresh === 'function') _scheduleGlobalTodosRefresh(pid);
+  if (!pid || pid !== _projectDetailPid || currentView !== 'project' || !_projectDetailMeta) return;
+  if (_projectTasksReloadTimer) clearTimeout(_projectTasksReloadTimer);
+  _projectTasksReloadTimer = setTimeout(() => {
+    _projectTasksReloadTimer = null;
+    if (pid !== _projectDetailPid || currentView !== 'project') return;
+    _loadProjectTodos(pid).catch(() => { /* the next reload will reconcile */ });
+  }, _PROJECT_TASKS_RELOAD_DEBOUNCE_MS);
+}
+
 /** "All tasks" tab pane: full list of conversations belonging to this
  *  project. Replaces the earlier capped "recent conversations" section
  *  (no view-all button — this IS the full list). */
@@ -598,7 +649,7 @@ function _renderProjectAllTasks() {
   }
   if (emptyEl) emptyEl.style.display = 'none';
   listEl.innerHTML = (typeof _renderConversationTimeBucketList === 'function')
-    ? _renderConversationTimeBucketList(convs, { nested: true })
+    ? _renderConversationTimeBucketList(convs, { nested: true, listId: 'project-tasks-list' })
     : convs
         .slice()
         .sort((a, b) => {
@@ -650,9 +701,6 @@ function _setProjectAutoTabCount(n) {
   if (el) el.textContent = String(Math.max(0, Number(n) || 0));
 }
 
-// ── Project To-do card (structured task board — features/project_tasks.ts) ──
-// Add through the shared side-card editor pattern, toggle open/done from the
-// whole row, and delete with the isolated × action. Owner remains display-only.
 // ── Project memory — the project's MEMORY.md: durable facts, decisions and
 //    outcomes scoped to this project. The commander and the user can write it;
 //    dispatched project agents receive it as read-only context.
@@ -930,6 +978,59 @@ function _bindProjectMemory() {
 let _projectTodos = [];
 let _projectTodoLoadSeq = 0;
 let _projectTodoMutating = false;
+let _todoEditorTaskId = null;
+// null means the editor is closed; '' is the valid account-global scope.
+let _todoEditorPid = null;
+let _todoEditorGeneration = 0;
+let _todoEditorReturnFocus = null;
+let _todoEditorReleaseFocus = null;
+let _todoEditorInitial = null;
+let _todoEditorProjectSelect = null;
+let _todoEditorStatusSelect = null;
+let _todoEditorAgentSelect = null;
+let _todoEditorAgents = [];
+let _todoEditorOwnerChanged = false;
+let _todoEditorAgentLoadSeq = 0;
+let _todoEditorAgentLoading = false;
+// Attachment editor state. `_todoEditorTid` is the task id the editor stages
+// attachments under: the real task id in edit mode, or a client pre-allocated
+// draft id in create mode (adopted by create on save, discarded on cancel).
+// `_todoEditorAttachments` = [{ tempId?, name, displayName, kind, bytes, status }],
+// same shape the composer/auto editors use so the chip render can be shared.
+let _todoEditorTid = null;
+let _todoEditorAttachments = [];
+let _todoEditorSavedTid = false; // true once a create-draft's files are adopted
+
+// A fresh `t_<12hex>` matching the backend TASK_ID_RE, so the editor can stage
+// attachments before the task JSON exists (create adopts the draft dir).
+function _genTodoTaskId() {
+  let hex = '';
+  for (let i = 0; i < 12; i += 1) hex += Math.floor(Math.random() * 16).toString(16);
+  return 't_' + hex;
+}
+
+// Lazily pin the id attachments upload to. Edit mode already has one.
+function _ensureTodoEditorTid() {
+  if (!_todoEditorTid) _todoEditorTid = _genTodoTaskId();
+  return _todoEditorTid;
+}
+
+function _todoAttachExtOf(name) {
+  if (typeof _chatAttachExtOf === 'function') return _chatAttachExtOf(name);
+  const i = String(name || '').lastIndexOf('.');
+  return i >= 0 ? String(name || '').slice(i).toLowerCase() : '';
+}
+
+function _todoAttachKind(name) {
+  if (typeof _chatAttachKindFromExt === 'function') return _chatAttachKindFromExt(_todoAttachExtOf(name));
+  return 'text';
+}
+
+// The composer's accepted-extension whitelist, so the to-do editor takes exactly
+// the same file types as the main chat composer.
+function _todoAttachAccept() {
+  return (typeof CHAT_ATTACH_ACCEPT !== 'undefined' && Array.isArray(CHAT_ATTACH_ACCEPT)) ? CHAT_ATTACH_ACCEPT : [];
+}
 
 async function _loadProjectTodos(pid) {
   const loadSeq = ++_projectTodoLoadSeq;
@@ -937,10 +1038,13 @@ async function _loadProjectTodos(pid) {
   let nextTodos = [];
   try {
     const res = await window.orkas.invoke('projects.tasks.list', { projectId: pid });
-    nextTodos = (res && res.ok && Array.isArray(res.tasks)) ? res.tasks : [];
+    if (!res?.ok || !Array.isArray(res.tasks)) throw new Error('load_failed');
+    nextTodos = res.tasks;
+    if (pid === _projectDetailPid && loadSeq === _projectTodoLoadSeq) _setTodoLoadError(false);
   } catch (err) {
-    _projectDetailLog.warn('load project todos failed', err);
-    nextTodos = [];
+    _projectDetailLog.warn('load project todos failed');
+    if (pid === _projectDetailPid && loadSeq === _projectTodoLoadSeq) _setTodoLoadError(true);
+    return;
   }
   // Ignore responses superseded by a mutation/newer refresh as well as
   // responses that belong to a project the user has already left.
@@ -949,60 +1053,223 @@ async function _loadProjectTodos(pid) {
   _renderProjectTodosList();
 }
 
-function _renderProjectTodosList() {
-  const listEl = document.getElementById('project-todo-list');
-  const emptyEl = document.getElementById('project-todo-empty');
-  const countEl = document.getElementById('project-todo-count');
-  if (!listEl) return;
-  const tasks = Array.isArray(_projectTodos) ? _projectTodos : [];
-  const total = tasks.length;
-  const done = tasks.filter((task) => task && task.status === 'done').length;
-  if (countEl) countEl.textContent = total > 0 ? `${done}/${total}` : '';
-  listEl.innerHTML = '';
-  listEl.style.display = total ? '' : 'none';
-  if (!total) { if (emptyEl) emptyEl.style.display = ''; return; }
-  if (emptyEl) emptyEl.style.display = 'none';
-  for (const task of tasks) {
-    if (!task || !task.id) continue;
-    const status = task.status || 'todo';
-    const row = document.createElement('div');
-    row.className = 'project-todo-item'
-      + (status === 'done' ? ' is-done' : '')
-      + (status === 'cancelled' ? ' is-cancelled' : '');
-    row.dataset.tid = task.id;
-    row.dataset.status = status;
+// Disclosure preferences are presentation-only and never rewrite task records.
+const _todoCollapsed = new Map();
+function _todoBoardStatus(status) {
+  return _PROJECT_TODO_STATUSES.includes(status) ? status : 'todo';
+}
 
-    const statusBtn = document.createElement('button');
-    statusBtn.type = 'button';
-    statusBtn.className = 'project-todo-status';
-    statusBtn.dataset.status = status;
-    statusBtn.title = t('project.todo.status_' + status);
-    statusBtn.setAttribute('aria-label', statusBtn.title);
-    row.appendChild(statusBtn);
+function _projectTodoContext() {
+  return { pid: _projectDetailPid, tasks: _projectTodos, agents: _projectDetailMeta?.agentDetails || [], project: _projectDetailMeta?.project };
+}
 
-    const titleEl = document.createElement('span');
-    titleEl.className = 'project-todo-title';
-    titleEl.textContent = task.title || '';
-    row.appendChild(titleEl);
+function _todoContextHasScope(context) {
+  return !!context && (context.global === true || !!context.pid);
+}
 
-    if (task.owner_agent) {
-      const owner = document.createElement('span');
-      owner.className = 'project-todo-owner muted';
-      owner.textContent = '@' + task.owner_agent;
-      row.appendChild(owner);
+function _renderTodoBoard(tasks, context, scope) {
+  const board = document.createElement('div');
+  board.className = 'todo-board';
+  for (const status of _PROJECT_TODO_STATUSES) {
+    const items = tasks.filter((task) => task?.id && _todoBoardStatus(task.status) === status);
+    const key = scope + ':' + status;
+    const collapsed = _todoCollapsed.has(key) ? _todoCollapsed.get(key) : status === 'done';
+    const column = document.createElement('section');
+    column.className = 'todo-column is-' + status;
+    column.dataset.status = status;
+    const header = document.createElement('div');
+    header.className = 'todo-column-head';
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'todo-collapse';
+    toggle.setAttribute('aria-expanded', String(!collapsed));
+    toggle.innerHTML = '<span class="project-todo-status-dot"></span><span>'
+      + escapeHtml(t('project.todo.status_' + status)) + '</span><span class="project-detail-tab-count">'
+      + items.length + '</span>'
+      + (typeof uiIconHtml === 'function' ? uiIconHtml('chevron-down', 'todo-disclosure-chevron') : '');
+    const body = document.createElement('div');
+    body.className = 'todo-column-body';
+    body.hidden = collapsed;
+    toggle.addEventListener('click', () => {
+      body.hidden = !body.hidden;
+      _todoCollapsed.set(key, body.hidden);
+      toggle.setAttribute('aria-expanded', String(!body.hidden));
+    });
+    header.appendChild(toggle);
+    for (const task of items) {
+      const taskContext = context.resolve ? context.resolve(task) : context;
+      body.appendChild(_renderTodoCard(task, taskContext));
     }
-
-    const del = document.createElement('button');
-    del.type = 'button';
-    del.className = 'project-todo-del';
-    del.dataset.action = 'todo-delete';
-    del.title = t('project.todo.delete');
-    del.setAttribute('aria-label', del.title);
-    del.textContent = '×';
-    row.appendChild(del);
-
-    listEl.appendChild(row);
+    if (!items.length) {
+      const empty = document.createElement('div');
+      empty.className = 'todo-column-empty muted';
+      empty.textContent = t('project.todo.empty');
+      body.appendChild(empty);
+    }
+    column.appendChild(header);
+    column.appendChild(body);
+    board.appendChild(column);
   }
+  return board;
+}
+
+function _setTodoLoadError(failed) {
+  const error = document.getElementById('project-todo-error');
+  if (error) error.hidden = !failed;
+}
+
+function _renderProjectTodosList() {
+  const tasks = _projectTodos || [];
+  const countEl = document.getElementById('project-todo-count');
+  if (countEl) countEl.textContent = String(tasks.length);
+  const listEl = document.getElementById('project-todo-list');
+  if (!listEl) return;
+  listEl.innerHTML = '';
+  listEl.style.display = '';
+  // The board always renders its four columns; each column carries its own
+  // empty hint, so there is no list-level empty element.
+  listEl.appendChild(_renderTodoBoard(tasks, _projectTodoContext(), 'project:' + _projectDetailPid));
+}
+
+function _renderTodoCard(task, context) {
+  const status = task.status || 'todo';
+  const row = document.createElement('div');
+  row.className = 'project-todo-item' + (status === 'done' ? ' is-done' : '');
+  row.dataset.tid = task.id;
+  row.dataset.status = status;
+
+  // The status chip and menu use the same four workflow states.
+  const statusSel = document.createElement('button');
+  statusSel.type = 'button';
+  statusSel.className = 'btn btn-sm project-todo-status-select is-' + status;
+  statusSel.dataset.action = 'todo-status';
+  statusSel.dataset.status = status;
+  statusSel.title = t('project.todo.status_' + status);
+  statusSel.setAttribute('aria-haspopup', 'menu');
+  statusSel.innerHTML = '<span class="project-todo-status-dot"></span>'
+    + `<span class="project-todo-status-label">${escapeHtml(t('project.todo.status_' + status))}</span>`
+    + (typeof uiIconHtml === 'function' ? uiIconHtml('chevron-down', 'project-todo-status-caret') : '');
+  const titleEl = document.createElement('button');
+  titleEl.type = 'button';
+  titleEl.dataset.action = 'todo-edit';
+  titleEl.className = 'project-todo-title';
+  titleEl.textContent = task.title || '';
+  row.appendChild(titleEl);
+  const menuBtn = document.createElement('button');
+  menuBtn.type = 'button';
+  menuBtn.className = 'project-todo-menu';
+  menuBtn.dataset.action = 'todo-menu';
+  menuBtn.title = t('project.todo.more');
+  menuBtn.setAttribute('aria-label', menuBtn.title);
+  menuBtn.setAttribute('aria-haspopup', 'menu');
+  menuBtn.innerHTML = typeof uiIconHtml === 'function'
+    ? uiIconHtml('more-horizontal', 'project-todo-menu-icon')
+    : '…';
+  row.appendChild(menuBtn);
+  if (task.detail) {
+    const detail = document.createElement('p');
+    detail.className = 'todo-card-detail';
+    detail.textContent = task.detail;
+    row.appendChild(detail);
+  }
+  row.dataset.pid = context.pid || '';
+  row.dataset.todoScope = context.global ? 'global' : 'project';
+  const metaRow = context.showProject ? document.createElement('div') : null;
+  if (metaRow) metaRow.className = 'todo-card-meta';
+  const appendMeta = (element) => (metaRow || row).appendChild(element);
+  if (context.showProject && context.project) {
+    const project = document.createElement(context.pid ? 'button' : 'span');
+    if (context.pid) {
+      project.type = 'button';
+      project.dataset.action = 'todo-project';
+    }
+    project.className = 'todo-card-project';
+    const projectIcon = typeof uiIconHtml === 'function'
+      ? uiIconHtml('folder', 'todo-card-project-icon')
+      : '';
+    project.innerHTML = projectIcon
+      + `<span class="todo-card-project-name">${escapeHtml(context.project.name)}</span>`;
+    appendMeta(project);
+  }
+
+  // Attachment indicator: a paperclip + count when the task carries files (they
+  // get copied into the conversation the task starts, like a chat attachment).
+  const attachCount = Array.isArray(task.attachments) ? task.attachments.length : 0;
+  if (attachCount > 0) {
+    const att = document.createElement('span');
+    att.className = 'project-todo-attach-badge';
+    att.title = t('project.todo.attach_count', { n: attachCount });
+    att.innerHTML = (typeof uiIconHtml === 'function' ? uiIconHtml('paperclip', 'project-todo-attach-badge-icon') : '')
+      + `<span>${attachCount}</span>`;
+    appendMeta(att);
+  }
+
+  // A task keeps the first conversation that created/worked it. Expose that
+  // durable back-link directly on every board that renders the task.
+  const conversationId = typeof task.origin_cid === 'string' ? task.origin_cid.trim() : '';
+  if (conversationId) {
+    const conversation = document.createElement('button');
+    conversation.type = 'button';
+    conversation.className = 'project-todo-conversation';
+    conversation.dataset.action = 'todo-conversation';
+    conversation.title = t('project.todo.open_conversation');
+    conversation.setAttribute('aria-label', conversation.title);
+    conversation.innerHTML = (typeof uiIconHtml === 'function'
+      ? uiIconHtml('message-square', 'project-todo-conversation-icon')
+      : '') + `<span>${escapeHtml(t('project.todo.conversation'))}</span>`;
+    appendMeta(conversation);
+  }
+
+  // Assignment chip: (re)assign the task to one of the project's bound agents
+  // or clear it. Global tasks use the account registry. Assigned → the owner's avatar + name (always visible);
+  // unassigned → a faint icon revealed on row hover. Click opens the menu
+  // built in _openTodoAssignMenu; the write goes through projects.tasks.update
+  // (owner_agent + owner_agent_id), the same fields the agent/LLM path uses.
+  {
+    const assignee = document.createElement('div');
+    assignee.className = 'project-todo-assignee';
+    const assign = document.createElement('button');
+    assign.type = 'button';
+    assign.className = 'btn btn-sm project-todo-assign';
+    assign.dataset.action = 'todo-assign';
+    let clear = null;
+    if (task.owner_agent_id || task.owner_agent) {
+      const ownerAgent = _findProjectAgent(task.owner_agent_id, task.owner_agent, context.agents);
+      const label = (ownerAgent && ownerAgent.name) || task.owner_agent || '';
+      const avatarHtml = (ownerAgent && typeof renderAvatarHtml === 'function')
+        ? renderAvatarHtml(ownerAgent.icon, ownerAgent.color, { size: 18, seed: ownerAgent.agent_id })
+        : '';
+      assign.innerHTML = `${avatarHtml}<span class="project-todo-assign-name">${escapeHtml(label)}</span>`;
+      assign.title = t('project.todo.assigned_to', { name: label });
+      assignee.classList.add('is-assigned');
+      clear = document.createElement('button');
+      clear.type = 'button';
+      clear.className = 'project-todo-assign-clear';
+      clear.dataset.action = 'todo-unassign';
+      clear.title = t('project.todo.assign_none');
+      clear.setAttribute('aria-label', clear.title);
+      clear.innerHTML = typeof uiIconHtml === 'function'
+        ? uiIconHtml('x', 'project-todo-assign-clear-icon')
+        : '×';
+    } else {
+      assign.classList.add('is-empty');
+      assign.innerHTML = typeof uiIconHtml === 'function'
+        ? uiIconHtml('users', 'project-todo-assign-icon')
+        : '+';
+      assign.title = t('project.todo.assign');
+    }
+    assign.setAttribute('aria-label', assign.title);
+    assignee.appendChild(assign);
+    if (clear) assignee.appendChild(clear);
+    appendMeta(assignee);
+  }
+
+  // Keep assignment on the left and status on the right of the card footer.
+  // Appending in visual order also keeps keyboard navigation predictable.
+  appendMeta(statusSel);
+  if (metaRow) row.appendChild(metaRow);
+
+  return row;
 }
 
 function _updateProjectTodoEditor() {
@@ -1011,23 +1278,284 @@ function _updateProjectTodoEditor() {
   const save = document.getElementById('project-todo-save');
   if (!input) return;
   if (counter) counter.textContent = `${input.value.length}/${input.maxLength}`;
-  if (save) save.disabled = _projectTodoMutating || !input.value.trim();
+  const busy = _projectTodoMutating || _todoEditorAttachments.some((a) => a.status === 'uploading');
+  if (save) save.disabled = busy || !input.value.trim();
+  const cancel = document.getElementById('project-todo-cancel');
+  if (cancel) cancel.disabled = busy;
+  const project = document.getElementById('project-todo-project');
+  const projectTrigger = project?.querySelector?.('.ai-select-trigger');
+  const projectDisabled = project?.dataset?.locked === '1' || _todoEditorAttachments.length > 0;
+  if (projectTrigger) {
+    projectTrigger.disabled = projectDisabled;
+    project?.classList?.toggle('is-disabled', projectDisabled);
+    if (projectDisabled) _todoEditorProjectSelect?.close?.();
+  }
+  const agentTrigger = document.getElementById('project-todo-agent')?.querySelector?.('.ai-select-trigger');
+  if (agentTrigger) agentTrigger.disabled = busy || _todoEditorAgentLoading;
 }
 
-function _openProjectTodoEditor() {
+function _ensureTodoEditorSelects() {
+  if (typeof _aiSelectMount !== 'function') return;
+  const project = document.getElementById('project-todo-project');
+  if (project && !_todoEditorProjectSelect) {
+    _todoEditorProjectSelect = _aiSelectMount(project, {
+      options: [],
+      value: '',
+      onChange: (value) => {
+        if (_todoEditorPid === null || _todoEditorTid || _todoEditorAttachments.length || _projectTodoMutating) return;
+        _todoEditorPid = value;
+        _todoEditorOwnerChanged = false;
+        void _loadTodoEditorAgents();
+      },
+    });
+  }
+  const status = document.getElementById('project-todo-status');
+  if (status && !_todoEditorStatusSelect) {
+    _todoEditorStatusSelect = _aiSelectMount(status, { options: [], value: 'todo' });
+  }
+  const agent = document.getElementById('project-todo-agent');
+  if (agent && !_todoEditorAgentSelect) {
+    _todoEditorAgentSelect = _aiSelectMount(agent, {
+      options: [], value: '', ariaLabel: t('project.todo.assign'),
+      onChange: () => { _todoEditorOwnerChanged = true; },
+    });
+  }
+}
+
+async function _loadTodoEditorAgents(task) {
+  if (!_todoEditorAgentSelect) return;
+  const seq = ++_todoEditorAgentLoadSeq;
+  const generation = _todoEditorGeneration;
+  const pid = _todoEditorPid;
+  _todoEditorAgents = [];
+  _todoEditorAgentLoading = true;
+  _todoEditorAgentSelect.close();
+  const options = [{ value: '', label: t('todo.unassigned') }];
+  // Keep historical owners visible without re-saving them on title-only edits.
+  const ownerValue = task?.owner_agent_id || task?.owner_agent || '';
+  if (ownerValue) options.push({ value: ownerValue, label: task.owner_agent || ownerValue, avatar: { seed: ownerValue } });
+  _todoEditorAgentSelect.setOptions(options, { value: ownerValue });
+  _updateProjectTodoEditor();
+  try {
+    const res = await window.orkas.invoke(pid ? 'projects.bindings.list' : 'agents.list',
+      pid ? { projectId: pid } : { summary: true });
+    if (seq !== _todoEditorAgentLoadSeq || generation !== _todoEditorGeneration || pid !== _todoEditorPid) return;
+    const agents = pid ? res?.agentDetails : res?.agents;
+    if (res?.ok === false || !Array.isArray(agents)) throw new Error('load_failed');
+    _todoEditorAgents = agents.filter((a) => a?.agent_id && (pid || a.enabled !== false))
+      .sort((a, b) => String(a.name || a.agent_id).localeCompare(String(b.name || b.agent_id)));
+    const owner = _findProjectAgent(task?.owner_agent_id, task?.owner_agent, _todoEditorAgents);
+    const value = owner?.agent_id || ownerValue;
+    const next = [{ value: '', label: t('todo.unassigned') },
+      ..._todoEditorAgents.map((a) => ({
+        value: a.agent_id, label: a.name || a.agent_id,
+        avatar: { icon: a.icon, color: a.color, seed: a.agent_id },
+      }))];
+    if (value && !next.some((a) => a.value === value)) next.push({ value, label: task.owner_agent || value, avatar: { seed: value } });
+    _todoEditorAgentSelect.setOptions(next, { value });
+  } catch {
+    if (seq === _todoEditorAgentLoadSeq && generation === _todoEditorGeneration) {
+      if (typeof uiAlert === 'function') uiAlert(t('project.todo.failed'));
+    }
+  } finally {
+    if (seq === _todoEditorAgentLoadSeq && generation === _todoEditorGeneration) {
+      _todoEditorAgentLoading = false;
+      _updateProjectTodoEditor();
+    }
+  }
+}
+
+// Render the editor's attachment chips, reusing the composer's chip markup +
+// file-icon helper so the look matches the main chat composer exactly.
+function _renderTodoEditorAttachments() {
+  const wrap = document.getElementById('project-todo-attachments');
+  if (!wrap) return;
+  const items = Array.isArray(_todoEditorAttachments) ? _todoEditorAttachments : [];
+  if (!items.length) { wrap.innerHTML = ''; wrap.hidden = true; return; }
+  wrap.hidden = false;
+  wrap.innerHTML = items.map((a, idx) => {
+    const displayName = (a && (a.displayName || a.name)) || '';
+    const kind = (a && a.kind) || _todoAttachKind(displayName);
+    const icon = (typeof _chatFileIconHtml === 'function') ? _chatFileIconHtml(displayName, kind) : '';
+    const busy = a && a.status === 'uploading';
+    const label = escapeHtml(displayName);
+    const spinner = busy ? `<span class="chat-attach-spinner" aria-label="${escapeHtml(t('chat.attach_uploading'))}"></span>` : '';
+    const removeBtn = busy ? '' : `<span class="chat-attach-remove" data-idx="${idx}" title="${escapeHtml(t('chat.attach_remove_title'))}">×</span>`;
+    return `<div class="chat-attach-chip${busy ? ' is-uploading' : ''}" data-idx="${idx}" data-name="${escapeHtml((a && a.name) || '')}" title="${label}">`
+      + `<span class="chat-attach-icon">${icon}</span>`
+      + `<span class="chat-attach-label">${label}</span>${spinner}${removeBtn}</div>`;
+  }).join('');
+  for (const rm of wrap.querySelectorAll('.chat-attach-remove')) {
+    rm.addEventListener('click', () => {
+      const item = _todoEditorAttachments[Number(rm.dataset.idx)];
+      if (item && item.name) _removeTodoEditorAttachment(item.name);
+    });
+  }
+}
+
+function _setTodoEditorAttachments(items) {
+  _todoEditorAttachments = Array.isArray(items) ? items : [];
+  _renderTodoEditorAttachments();
+  _updateProjectTodoEditor();
+}
+
+// Read files, keep only composer-accepted types, upload each (base64) to the
+// task's (possibly draft) attachment dir, showing an optimistic uploading chip.
+async function _todoPickAndUploadFiles(fileList) {
+  const files = Array.from(fileList || []).filter(Boolean);
+  if (!files.length || _todoEditorPid === null) return;
+  const pid = _todoEditorPid;
+  const generation = _todoEditorGeneration;
+  const accept = _todoAttachAccept();
+  const rejected = [];
+  const pending = [];
+  for (const file of files) {
+    const ext = _todoAttachExtOf(file.name);
+    if (accept.length && !accept.includes(ext)) { rejected.push(t('chat.attach_unsupported', { name: file.name || 'file' })); continue; }
+    pending.push(file);
+  }
+  if (rejected.length && typeof uiAlert === 'function') await uiAlert(t('chat.attach_rejected_prefix', { list: rejected.join('\n') }));
+  if (!pending.length || generation !== _todoEditorGeneration) return;
+
+  const tid = _ensureTodoEditorTid();
+  const placeholders = pending.map((file) => {
+    const tempId = `todo-att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    return { file, tempId, displayName: file.name, kind: _todoAttachKind(file.name) };
+  });
+  _setTodoEditorAttachments([
+    ..._todoEditorAttachments,
+    ...placeholders.map((p) => ({ tempId: p.tempId, name: p.displayName, displayName: p.displayName, kind: p.kind, bytes: p.file.size || 0, status: 'uploading' })),
+  ]);
+
+  await Promise.all(placeholders.map(async (p) => {
+    let ok = false;
+    let finalName = p.displayName;
+    try {
+      const dataBase64 = _arrayBufferToBase64(await p.file.arrayBuffer());
+      const res = await window.orkas.invoke('projects.tasks.attachments.upload', {
+        projectId: pid, taskId: tid, name: p.file.name, dataBase64,
+      });
+      if (res && res.name) { ok = true; finalName = res.name; }
+    } catch (err) {
+      _projectDetailLog.warn('todo attachment upload failed', err);
+    }
+    if (generation !== _todoEditorGeneration) return;
+    // Replace the placeholder by tempId: ready (with the server name) or drop it.
+    const next = _todoEditorAttachments.slice();
+    const idx = next.findIndex((it) => it && it.tempId === p.tempId);
+    if (idx < 0) return;
+    if (ok) next[idx] = { name: finalName, displayName: p.displayName, kind: _todoAttachKind(finalName), bytes: p.file.size || 0, status: 'ready' };
+    else next.splice(idx, 1);
+    _setTodoEditorAttachments(next);
+    _updateProjectTodoEditor();
+  }));
+}
+
+async function _removeTodoEditorAttachment(name) {
+  if (!name || _todoEditorPid === null || !_todoEditorTid) return;
+  const generation = _todoEditorGeneration;
+  try {
+    const res = await window.orkas.invoke('projects.tasks.attachments.delete', {
+      projectId: _todoEditorPid, taskId: _todoEditorTid, name,
+    });
+    if (!res?.ok) throw new Error('delete_failed');
+  } catch (_) {
+    _projectDetailLog.warn('todo attachment delete failed');
+    if (generation === _todoEditorGeneration && typeof uiAlert === 'function') uiAlert(t('project.todo.failed'));
+    return;
+  }
+  if (generation !== _todoEditorGeneration) return;
+  _setTodoEditorAttachments(_todoEditorAttachments.filter((a) => !a || a.name !== name));
+}
+
+// The shared dialog doubles as the create and edit surface. A task
+// argument switches it to edit mode (pre-filled title, Save updates that task);
+// no argument is create mode. _todoEditorTaskId is the current edit target.
+function _openProjectTodoEditor(task, context = _projectTodoContext(), status = 'todo') {
   const editor = document.getElementById('project-todo-add');
   const input = document.getElementById('project-todo-input');
-  if (!editor || !input) return;
+  if (!editor || !input || !_todoContextHasScope(context) || _projectTodoMutating || _todoEditorAttachments.some((a) => a.status === 'uploading')) return;
+  _closeProjectTodoEditor();
+  _todoEditorGeneration += 1;
+  _todoEditorPid = context.pid || '';
+  _todoEditorReturnFocus = document.activeElement;
+  _todoEditorTaskId = task && task.id ? task.id : null;
+  _todoEditorInitial = task ? { status: task.status || 'todo', owner_agent: task.owner_agent, owner_agent_id: task.owner_agent_id } : null;
+  // Edit stages attachments onto the real task; create lazily allocates a draft
+  // id on first attach (adopted by create on save, discarded on cancel).
+  _todoEditorTid = _todoEditorTaskId;
+  _todoEditorSavedTid = false;
+  _ensureTodoEditorSelects();
+  _todoEditorOwnerChanged = false;
+  void _loadTodoEditorAgents(task);
+  input.value = _todoEditorTaskId && task ? (task.title || '') : '';
+  const existing = (_todoEditorTaskId && task && Array.isArray(task.attachments)) ? task.attachments : [];
+  _setTodoEditorAttachments(existing.map((name) => ({ name, displayName: name, kind: _todoAttachKind(name), status: 'ready' })));
+  if (_todoEditorStatusSelect) {
+    const current = task?.status || status;
+    const statuses = [...new Set([..._PROJECT_TODO_STATUSES, current])];
+    _todoEditorStatusSelect.setOptions(
+      statuses.map((value) => ({ value, label: t('project.todo.status_' + value) })),
+      { value: current },
+    );
+  }
+  const projectInput = document.getElementById('project-todo-project');
+  if (projectInput && _todoEditorProjectSelect) {
+    const projects = context.projects || [context.project || { project_id: context.pid, name: _projectDetailMeta?.project?.name || '' }];
+    const options = [{ project_id: '', name: t('todo.global') }];
+    const seen = new Set(['']);
+    for (const project of projects) {
+      if (!project?.project_id || seen.has(project.project_id)) continue;
+      seen.add(project.project_id);
+      options.push(project);
+    }
+    _todoEditorProjectSelect.setOptions(
+      options.map((project) => ({ value: project.project_id, label: project.name })),
+      { value: context.pid || '' },
+    );
+    projectInput.dataset.locked = (!context.projects || !!task?.id) ? '1' : '0';
+  }
+  const heading = document.getElementById('project-todo-editor-title');
+  if (heading) {
+    heading.dataset.i18n = task?.id ? 'project.todo.edit' : 'project.todo.add';
+    heading.textContent = t(heading.dataset.i18n);
+  }
+  const overlay = document.getElementById('todo-editor-modal');
+  overlay?.classList.add('open');
+  if (overlay && typeof _uiKeepDialogFocus === 'function') _todoEditorReleaseFocus = _uiKeepDialogFocus(overlay, input);
   editor.hidden = false;
   _updateProjectTodoEditor();
   setTimeout(() => {
     input.focus();
-    const end = input.value.length;
-    input.setSelectionRange(end, end);
+    // Edit: select the whole title for quick replace. Create: caret at end.
+    if (_todoEditorTaskId) input.setSelectionRange(0, input.value.length);
+    else { const end = input.value.length; input.setSelectionRange(end, end); }
   }, 0);
 }
 
 function _closeProjectTodoEditor() {
+  if (_projectTodoMutating || _todoEditorAttachments.some((a) => a.status === 'uploading')) return;
+  _todoEditorGeneration += 1;
+  document.getElementById('todo-editor-modal')?.classList.remove('open');
+  _todoEditorAgentSelect?.close?.();
+  _todoEditorAgentLoading = false;
+  document.getElementById('project-todo-composer')?.classList.remove('drag-over');
+  _todoEditorReleaseFocus?.();
+  _todoEditorReleaseFocus = null;
+  // Create-mode cancel with staged-but-unsaved files: drop the draft dir so the
+  // uploads aren't orphaned. Edit-mode attachment changes are already persisted.
+  if (!_todoEditorSavedTid && !_todoEditorTaskId && _todoEditorTid && _todoEditorPid !== null) {
+    window.orkas.invoke('projects.tasks.attachments.discardDraft', { projectId: _todoEditorPid, taskId: _todoEditorTid })
+      .catch((err) => _projectDetailLog.warn('todo draft discard failed', err));
+  }
+  _todoEditorPid = null;
+  _todoEditorReturnFocus?.focus?.();
+  _todoEditorReturnFocus = null;
+  _todoEditorTaskId = null;
+  _todoEditorInitial = null;
+  _todoEditorTid = null;
+  _todoEditorSavedTid = false;
+  _setTodoEditorAttachments([]);
   const editor = document.getElementById('project-todo-add');
   const input = document.getElementById('project-todo-input');
   if (input) input.value = '';
@@ -1035,9 +1563,8 @@ function _closeProjectTodoEditor() {
   _updateProjectTodoEditor();
 }
 
-async function _todoMutate(fn) {
-  const pid = _projectDetailPid;
-  if (!pid || _projectTodoMutating) {
+async function _todoMutate(fn, pid = _projectDetailPid) {
+  if (pid === null || pid === undefined || _projectTodoMutating) {
     return { ok: false, failure: { error_code: 'mutation_blocked', error_type: 'state' } };
   }
   _projectTodoMutating = true;
@@ -1045,6 +1572,7 @@ async function _todoMutate(fn) {
   // Invalidate any list request that started before this mutation. Otherwise
   // its stale payload can repaint a task immediately after a successful delete.
   _projectTodoLoadSeq += 1;
+  if (typeof _invalidateGlobalTodoLoad === 'function') _invalidateGlobalTodoLoad();
   let ok = false;
   let failure = null;
   try {
@@ -1057,48 +1585,274 @@ async function _todoMutate(fn) {
   } catch (err) {
     failure = _projectDetailFailure(err, 'mutation_exception');
     _projectDetailLog.warn('project todo mutate failed', err);
+  }
+  if (!ok && typeof uiAlert === 'function') uiAlert(t('project.todo.failed'));
+  try {
+    if (pid && pid === _projectDetailPid) await _loadProjectTodos(pid);
+    if (typeof _refreshGlobalTodos === 'function') await _refreshGlobalTodos(pid);
   } finally {
     _projectTodoMutating = false;
     _updateProjectTodoEditor();
   }
-  if (!ok && typeof uiAlert === 'function') uiAlert(t('project.todo.failed'));
-  if (pid === _projectDetailPid) await _loadProjectTodos(pid);
   return { ok, failure };
 }
 
 async function _saveProjectTodoEditor() {
   const input = document.getElementById('project-todo-input');
   const title = String(input?.value || '').trim();
-  if (!title || !_projectDetailPid) return;
+  if (!title || _todoEditorPid === null || _projectTodoMutating || _todoEditorAttachments.some((a) => a.status === 'uploading')) return;
+  const pid = _todoEditorPid;
+  const generation = _todoEditorGeneration;
+  const status = _todoEditorStatusSelect?.getValue?.() || 'todo';
+  const taskId = _todoEditorTaskId;
+  const agentId = _todoEditorAgentSelect?.getValue?.() || '';
+  const agent = _todoEditorAgents.find((a) => a.agent_id === agentId)
+    || (agentId && agentId === (_todoEditorInitial?.owner_agent_id || _todoEditorInitial?.owner_agent)
+      ? { agent_id: _todoEditorInitial.owner_agent_id, name: _todoEditorInitial.owner_agent } : null);
+  const owner = (!taskId && agent) || (taskId && _todoEditorOwnerChanged)
+    ? { owner_agent: agent?.name || '', owner_agent_id: agent?.agent_id || '' } : {};
   const startedAt = Date.now();
-  const outcome = await _todoMutate(() => window.orkas.invoke('projects.tasks.create', {
-    projectId: _projectDetailPid,
-    title,
-  }));
+  // Create passes the pre-allocated draft id when files were staged so the
+  // persisted task adopts them. Edits update the existing task in place.
+  const outcome = await _todoMutate(() => (taskId
+    ? window.orkas.invoke('projects.tasks.update', {
+      projectId: pid,
+      taskId,
+      title,
+      ...(status !== _todoEditorInitial?.status ? { status } : {}),
+      ...owner,
+    })
+    : window.orkas.invoke('projects.tasks.create', {
+      projectId: pid,
+      title,
+      status,
+      ...owner,
+      ...(_todoEditorTid ? { taskId: _todoEditorTid } : {}),
+    })), pid);
   _projectTrackEvent('project_todo_action_result', {
     result: outcome.ok ? 'success' : 'failure',
-    action: 'create',
+    action: taskId ? 'edit' : 'create',
     duration_ms: Math.max(0, Date.now() - startedAt),
     ...(!outcome.ok ? outcome.failure : {}),
   });
-  if (!outcome.ok) _projectLogFailure('project_todo_action', { action: 'create', ...outcome.failure });
-  if (outcome.ok) _closeProjectTodoEditor();
+  if (!outcome.ok) {
+    _projectLogFailure('project_todo_action', { action: taskId ? 'edit' : 'create', ...outcome.failure });
+  } else if (generation === _todoEditorGeneration) {
+    if (!taskId) _todoEditorSavedTid = true;
+    _closeProjectTodoEditor();
+  }
 }
 
-function _nextProjectTodoStatus(status) {
-  return status === 'done' ? 'todo' : 'done';
+// The four workflow statuses shared by the board and its editing controls.
+const _PROJECT_TODO_STATUSES = ['todo', 'progress', 'review', 'done'];
+
+// Row status control: a dropdown of the four statuses, current one checked.
+function _openTodoStatusMenu(evt, tid, context = _projectTodoContext()) {
+  if (typeof showContextMenu !== 'function') return;
+  const task = (context.tasks || []).find((x) => x && x.id === tid);
+  if (!task) return;
+  const current = task.status || 'todo';
+  const items = _PROJECT_TODO_STATUSES.map((s) => ({
+    label: t('project.todo.status_' + s),
+    trailingIcon: s === current ? 'check' : undefined,
+    onClick: () => (s === current ? undefined : _setTodoStatus(tid, s, context)),
+  }));
+  showContextMenu(evt, items);
+}
+
+async function _setTodoStatus(tid, status, context = _projectTodoContext()) {
+  const task = (context.tasks || []).find((x) => x && x.id === tid);
+  const fromStatus = (task && task.status) || 'todo';
+  if (fromStatus === status) return;
+  const startedAt = Date.now();
+  const outcome = await _todoMutate(() => window.orkas.invoke('projects.tasks.update', {
+    projectId: context.pid,
+    taskId: tid,
+    status,
+  }), context.pid);
+  _projectTrackEvent('project_todo_toggle_result', {
+    result: outcome.ok ? 'success' : 'failure',
+    from_status: fromStatus,
+    to_status: status,
+    duration_ms: Date.now() - startedAt,
+    ...(!outcome.ok ? outcome.failure : {}),
+  });
+  if (!outcome.ok) {
+    _projectLogFailure('project_todo_toggle', {
+      from_status: fromStatus, to_status: status, ...outcome.failure,
+    });
+  }
+}
+
+// Look up an owner's avatar/name from the project's bound-agent details so the
+// chip can render a real avatar. Falls back to null (chip shows the stored
+// owner_agent name) if the owner is no longer a bound member.
+function _findProjectAgent(agentId, name, list = _projectDetailMeta?.agentDetails || []) {
+  if (agentId) {
+    const byId = list.find((a) => a && a.agent_id === agentId);
+    if (byId) return byId;
+  }
+  if (name) {
+    const byName = list.find((a) => a && a.name === name);
+    if (byName) return byName;
+  }
+  return null;
+}
+
+// Assign / reassign / clear the owner of a task. Owners must be project-bound
+// agents, or available account agents for global tasks; an empty
+// owner clears both fields. Passing agent=null unassigns.
+async function _assignTodoAgent(tid, agent, context = _projectTodoContext()) {
+  if (!_todoContextHasScope(context)) return;
+  const startedAt = Date.now();
+  const outcome = await _todoMutate(() => window.orkas.invoke('projects.tasks.update', {
+    projectId: context.pid,
+    taskId: tid,
+    owner_agent: agent ? String(agent.name || '') : '',
+    owner_agent_id: agent ? String(agent.agent_id || '') : '',
+  }), context.pid);
+  _projectTrackEvent('project_todo_assign_result', {
+    result: outcome.ok ? 'success' : 'failure',
+    action: agent ? 'assign' : 'clear',
+    duration_ms: Date.now() - startedAt,
+    ...(!outcome.ok ? outcome.failure : {}),
+  });
+  if (!outcome.ok) {
+    _projectLogFailure('project_todo_assign', {
+      action: agent ? 'assign' : 'clear', ...outcome.failure,
+    });
+  }
+}
+
+// Open the assignee menu anchored at the click: the project's bound agents plus
+// an unassign entry (when already assigned). Uses the shared context-menu, which
+// lives at the body level so the list re-render after a mutation can't destroy it.
+let _projectTodoRunning = false;
+
+// Dispatch a task in a new conversation through the project Commander or the
+// global assistant, then open it so the user can follow the work. Completion
+// and review decisions belong to the executor, not this navigation action.
+async function _runTodoTask(tid, context = _projectTodoContext()) {
+  if (_projectTodoRunning || !context) return;
+  if (typeof ensureModelConfigured === 'function' && !ensureModelConfigured()) return;
+  _projectTodoRunning = true;
+  const startedAt = Date.now();
+  let ok = false;
+  let cid = '';
+  let conversation = null;
+  try {
+    const res = await window.orkas.invoke('projects.tasks.run', {
+      projectId: context.pid,
+      taskId: tid,
+    });
+    ok = !!(res && res.ok);
+    cid = (res && res.cid) || '';
+    conversation = (res && res.conversation) || null;
+  } catch (err) {
+    _projectDetailLog.warn('project todo run failed', err);
+  } finally {
+    _projectTodoRunning = false;
+  }
+  _projectTrackEvent('project_todo_run_result', {
+    result: ok ? 'success' : 'failure',
+    duration_ms: Date.now() - startedAt,
+  });
+  if (!ok) {
+    _projectLogFailure('project_todo_run', { error_type: 'run_failed' });
+    if (typeof uiAlert === 'function') uiAlert(t('project.todo.run_failed'));
+    return;
+  }
+  // Surface the new conversation in the list, then open it.
+  if (conversation && typeof conversations !== 'undefined' && Array.isArray(conversations)) {
+    conversations.unshift(conversation);
+    if (typeof renderConversationList === 'function') renderConversationList();
+  }
+  if (typeof loadProjects === 'function') loadProjects(true);
+  if (cid && typeof setView === 'function') setView('conversation', cid);
+}
+
+async function _deleteTodoTask(tid, context = _projectTodoContext()) {
+  await _todoMutate(() => window.orkas.invoke('projects.tasks.delete', {
+    projectId: context.pid,
+    taskId: tid,
+  }), context.pid);
+}
+
+// Row overflow ("…") menu: process an open task, edit, delete. Uses the
+// shared body-level context menu so the list re-render can't tear it down.
+function _openTodoRowMenu(evt, tid, context = _projectTodoContext()) {
+  if (typeof showContextMenu !== 'function') return;
+  const task = (context.tasks || []).find((x) => x && x.id === tid);
+  if (!task) return;
+  const status = task.status || 'todo';
+  const runnable = status === 'todo' || status === 'progress' || status === 'review';
+  const items = [];
+  if (runnable) {
+    items.push({ label: t('project.todo.run'), onClick: () => _runTodoTask(tid, context) });
+  }
+  items.push({ label: t('project.todo.edit'), onClick: () => _openProjectTodoEditor(task, context) });
+  items.push({ label: t('project.todo.delete'), onClick: () => _deleteTodoTask(tid, context) });
+  showContextMenu(evt, items);
+}
+
+function _openTodoAssignMenu(evt, tid, context = _projectTodoContext()) {
+  if (!_todoContextHasScope(context) || typeof showContextMenu !== 'function') return;
+  const task = (context.tasks || []).find((x) => x && x.id === tid);
+  const agents = (context.agents || []).filter((a) => a && a.agent_id)
+    .slice().sort((a, b) => String(a.name || a.agent_id).localeCompare(String(b.name || b.agent_id)));
+  const items = [];
+  for (const a of agents) {
+    const isCurrent = !!task && (
+      (task.owner_agent_id && task.owner_agent_id === a.agent_id)
+      || (!task.owner_agent_id && task.owner_agent && task.owner_agent === a.name)
+    );
+    items.push({
+      label: a.name || a.agent_id,
+      avatar: { icon: a.icon, color: a.color, seed: a.agent_id },
+      trailingIcon: isCurrent ? 'check' : undefined,
+      onClick: () => (isCurrent ? undefined : _assignTodoAgent(tid, a, context)),
+    });
+  }
+  if (!agents.length) {
+    items.push({ label: t(context.global ? 'ai_select.empty' : 'project.todo.assign_no_agents'), disabled: true });
+  }
+  showContextMenu(evt, items);
 }
 
 function _bindProjectTodos() {
+  const retry = document.getElementById('project-todo-retry');
+  if (retry && retry.dataset.bound !== '1') {
+    retry.dataset.bound = '1';
+    retry.addEventListener('click', () => _loadProjectTodos(_projectDetailPid));
+  }
   const addBtn = document.getElementById('project-todo-add-btn');
   const input = document.getElementById('project-todo-input');
   const cancel = document.getElementById('project-todo-cancel');
   const save = document.getElementById('project-todo-save');
   const listEl = document.getElementById('project-todo-list');
+  const attachBtn = document.getElementById('project-todo-attach-btn');
+  const fileInput = document.getElementById('project-todo-file-input');
 
   if (addBtn && addBtn.dataset.bound !== '1') {
     addBtn.dataset.bound = '1';
-    addBtn.addEventListener('click', _openProjectTodoEditor);
+    addBtn.addEventListener('click', () => _openProjectTodoEditor());
+  }
+  if (attachBtn && attachBtn.dataset.bound !== '1') {
+    attachBtn.dataset.bound = '1';
+    attachBtn.addEventListener('click', () => fileInput?.click());
+  }
+  if (fileInput && fileInput.dataset.bound !== '1') {
+    fileInput.dataset.bound = '1';
+    const accept = _todoAttachAccept();
+    if (accept.length) fileInput.setAttribute('accept', accept.join(','));
+    fileInput.addEventListener('change', async () => {
+      // Snapshot to a real array BEFORE clearing the value: clearing empties the
+      // live FileList that `.files` returns, so capturing the reference then
+      // resetting would hand _todoPickAndUploadFiles an empty list.
+      const files = Array.from(fileInput.files || []);
+      fileInput.value = ''; // allow re-picking the same file
+      await _todoPickAndUploadFiles(files);
+    });
   }
   if (input && input.dataset.bound !== '1') {
     input.dataset.bound = '1';
@@ -1122,54 +1876,124 @@ function _bindProjectTodos() {
     save.dataset.bound = '1';
     save.addEventListener('click', _saveProjectTodoEditor);
   }
-  if (listEl && listEl.dataset.bound !== '1') {
-    listEl.dataset.bound = '1';
-    listEl.addEventListener('click', async (e) => {
-      const target = e.target;
-      const row = target?.closest?.('.project-todo-item');
-      const tid = row?.dataset.tid;
-      if (!tid || !_projectDetailPid || _projectTodoMutating) return;
-      const deleteBtn = target?.closest?.('[data-action="todo-delete"]');
-      if (deleteBtn) {
-        const startedAt = Date.now();
-        const outcome = await _todoMutate(() => window.orkas.invoke('projects.tasks.delete', {
-          projectId: _projectDetailPid,
-          taskId: tid,
-        }));
-        _projectTrackEvent('project_todo_action_result', {
-          result: outcome.ok ? 'success' : 'failure',
-          action: 'delete',
-          duration_ms: Math.max(0, Date.now() - startedAt),
-          ...(!outcome.ok ? outcome.failure : {}),
-        });
-        if (!outcome.ok) _projectLogFailure('project_todo_action', { action: 'delete', ...outcome.failure });
-        return;
+  _bindTodoDropAttach();
+  _bindTodoListActions(listEl, () => _projectTodoContext());
+}
+
+function _bindTodoDropAttach() {
+  const area = document.getElementById('project-todo-composer');
+  if (!area || area.dataset.dropBound === '1') return;
+  const isFileDrag = (event) => {
+    const types = event.dataTransfer?.types;
+    if (!types) return false;
+    for (let index = 0; index < types.length; index += 1) {
+      if (types[index] === 'Files') return true;
+    }
+    return false;
+  };
+  const allow = (event) => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+    area.classList.add('drag-over');
+  };
+  area.addEventListener('dragover', allow);
+  area.addEventListener('dragenter', allow);
+  area.addEventListener('dragleave', (event) => {
+    if (event.currentTarget.contains(event.relatedTarget)) return;
+    area.classList.remove('drag-over');
+  });
+  area.addEventListener('drop', (event) => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    area.classList.remove('drag-over');
+    _todoPickAndUploadFiles(event.dataTransfer.files);
+  });
+  area.dataset.dropBound = '1';
+}
+
+function _bindTodoListActions(listEl, resolveContext) {
+  if (!listEl || listEl.dataset.bound === '1') return;
+  listEl.dataset.bound = '1';
+  listEl.addEventListener('click', (e) => {
+    const row = e.target?.closest?.('.project-todo-item');
+    const tid = row?.dataset.tid;
+    if (!tid || _projectTodoMutating) return;
+    const context = resolveContext(row.dataset.pid);
+    if (!_todoContextHasScope(context)) return;
+    if (e.target.closest('[data-action="todo-project"]')) {
+      _projectDetailActiveTab = 'todo';
+      setView('project', context.pid);
+    } else if (e.target.closest('[data-action="todo-conversation"]')) {
+      const task = context.tasks.find((item) => item.id === tid);
+      const cid = typeof task?.origin_cid === 'string' ? task.origin_cid.trim() : '';
+      if (cid && typeof setView === 'function') {
+        setView('conversation', cid, { entryPoint: 'todo_associated_conversation' });
       }
-      const fromStatus = row.dataset.status || 'todo';
-      const nextStatus = _nextProjectTodoStatus(fromStatus);
-      const startedAt = Date.now();
-      const outcome = await _todoMutate(() => window.orkas.invoke('projects.tasks.update', {
-        projectId: _projectDetailPid,
-        taskId: tid,
-        status: nextStatus,
-      }));
-      const resultPayload = {
-        result: outcome.ok ? 'success' : 'failure',
-        from_status: fromStatus,
-        to_status: nextStatus,
-        duration_ms: Date.now() - startedAt,
-        ...(!outcome.ok ? outcome.failure : {}),
-      };
-      _projectTrackEvent('project_todo_toggle_result', resultPayload);
-      if (!outcome.ok) {
-        _projectLogFailure('project_todo_toggle', {
-          from_status: fromStatus,
-          to_status: nextStatus,
-          ...outcome.failure,
-        });
-      }
-    });
+    } else if (e.target.closest('[data-action="todo-unassign"]')) _assignTodoAgent(tid, null, context);
+    else if (e.target.closest('[data-action="todo-menu"]')) _openTodoRowMenu(e, tid, context);
+    else if (e.target.closest('[data-action="todo-assign"]')) _openTodoAssignMenu(e, tid, context);
+    else if (e.target.closest('[data-action="todo-status"]')) _openTodoStatusMenu(e, tid, context);
+    else if (e.target.closest('[data-action="todo-edit"]')) {
+      _openProjectTodoEditor(context.tasks.find((task) => task.id === tid), context);
+    }
+  });
+}
+
+let _projectDriverMutating = false;
+
+function _setProjectDriverToggleState(enabled) {
+  const btn = document.getElementById('project-driver-toggle');
+  if (!btn) return;
+  btn.hidden = false;
+  btn.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+}
+
+async function _loadProjectDriver(pid) {
+  if (!pid || !document.getElementById('project-driver-toggle')) return;
+  try {
+    const res = await window.orkas.invoke('projects.driver.get', { projectId: pid });
+    if (pid !== _projectDetailPid) return;
+    _setProjectDriverToggleState(!!(res && res.config && res.config.enabled));
+  } catch (err) {
+    _projectDetailLog.warn('load project driver failed', err);
   }
+}
+
+function _bindProjectDriver() {
+  const btn = document.getElementById('project-driver-toggle');
+  if (!btn || btn.dataset.bound === '1') return;
+  btn.dataset.bound = '1';
+  btn.addEventListener('click', async () => {
+    const pid = _projectDetailPid;
+    if (!pid || _projectDriverMutating) return;
+    const next = btn.getAttribute('aria-pressed') !== 'true';
+    _projectDriverMutating = true;
+    const startedAt = Date.now();
+    let ok = false;
+    try {
+      const res = await window.orkas.invoke('projects.driver.set', { projectId: pid, enabled: next });
+      ok = !!(res && res.ok !== false);
+      if (ok && pid === _projectDetailPid) {
+        _setProjectDriverToggleState(!!(res.config && res.config.enabled));
+        // The driver runs silently in the background; confirm the toggle and
+        // say what "on" means so the user isn't left guessing.
+        if (typeof uiToast === 'function') {
+          uiToast(t(next ? 'project.driver.enabled_toast' : 'project.driver.disabled_toast'),
+            { variant: next ? 'success' : 'info' });
+        }
+      }
+    } catch (err) {
+      _projectDetailLog.warn('project driver toggle failed', err);
+      if (typeof uiAlert === 'function') uiAlert(t('project.todo.failed'));
+    } finally {
+      _projectDriverMutating = false;
+    }
+    _projectTrackEvent('project_driver_toggle_result', {
+      result: ok ? 'success' : 'failure', enabled: next, duration_ms: Date.now() - startedAt,
+    });
+    if (!ok) _projectLogFailure('project_driver_toggle', { enabled: next, error_type: 'set_failed' });
+  });
 }
 
 function _renderProjectAgentCards(items) {
@@ -1313,58 +2137,41 @@ function _onProjectAgentMenuKeyDown(ev) {
 
 async function _removeProjectAgent(agentId) {
   if (!_projectDetailPid || !agentId) return;
+  const projectId = _projectDetailPid;
+  const startedAt = performance.now();
+  // One terminal result at the binding write boundary (analytics contract);
+  // the presentation refresh that follows is not part of the outcome.
+  _projectTrackClick('project_binding_remove', { binding_kind: 'agent' });
+  let removed = false;
   try {
     const res = await window.orkas.invoke('projects.bindings.remove', {
-      projectId: _projectDetailPid,
+      projectId,
       kind: 'agent',
       id: agentId,
     });
-    if (res && res.ok === false) throw new Error(res.error || 'remove_failed');
-    await loadProjectDetail(_projectDetailPid);
+    if (!res?.ok) throw res || new Error('remove_failed');
+    removed = true;
+    _projectTrackEvent('project_binding_remove_result', {
+      binding_kind: 'agent',
+      result: 'success',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
   } catch (err) {
+    const failure = _projectDetailFailure(err, 'binding_remove_failed');
+    _projectTrackEvent('project_binding_remove_result', {
+      binding_kind: 'agent',
+      result: 'failure',
+      duration_ms: Math.round(performance.now() - startedAt),
+      ...failure,
+    });
+    _projectLogFailure('project_binding_remove', { binding_kind: 'agent', ...failure });
     _projectDetailLog.warn('remove project agent failed', err);
+    return;
   }
-}
-
-function _renderBindingsRows(kind, items) {
-  const lang = _activeLang();
-  const removeLabel = escapeHtml(t('project.bindings.remove'));
-  const sorted = (items || []).slice().sort(_byDisplayName);
-  const rows = [];
-  for (const it of sorted) {
-    const id = (kind === 'agent') ? it.agent_id : it.id;
-    const name = escapeHtml(it.name || id);
-    const desc = kind === 'agent' ? '' : _pickItemDescription(it, lang);
-    const descHtml = desc ? `<div class="project-binding-desc">${escapeHtml(desc)}</div>` : '';
-    const sourceTag = _projectBindingSourceHtml(it.source, kind);
-    // Agents carry an avatar (icon + color seeded by agent_id) — mirrors
-    // the agents grid card chrome so a binding row reads as the same actor.
-    // Skills don't have an avatar in the spec; we leave the slot empty.
-    const avatarHtml = (kind === 'agent' && typeof renderAvatarHtml === 'function')
-      ? renderAvatarHtml(it.icon, it.color, {
-        size: 32, seed: it.agent_id, extraClass: 'project-binding-avatar',
-      })
-      : '';
-    rows.push(`
-      <div class="project-binding-row" data-kind="${kind}" data-id="${escapeHtml(id)}">
-        ${avatarHtml}
-        <div class="project-binding-main">
-          <div class="project-binding-head">
-            <span class="project-binding-name">${name}</span>
-            ${sourceTag}
-          </div>
-          ${descHtml}
-        </div>
-        <button type="button" class="project-binding-remove" data-action="remove"
-                title="${removeLabel}" aria-label="${removeLabel}">×</button>
-      </div>
-    `);
+  if (removed && projectId === _projectDetailPid) {
+    try { await loadProjectDetail(projectId); }
+    catch (err) { _projectDetailLog.warn('refresh failed', err); }
   }
-  if (!rows.length) {
-    const emptyKey = kind === 'agent' ? 'project.bindings.empty_agents' : 'project.bindings.empty_skills';
-    return `<div class="empty" data-i18n="${emptyKey}">${escapeHtml(t(emptyKey))}</div>`;
-  }
-  return rows.join('');
 }
 
 function _isProjectLibraryVectorizableKind(kind) {
@@ -2937,16 +3744,6 @@ function _stopProjectKbEventSubscription() {
   _projectKbEventsPid = '';
 }
 
-function _arrayBufferToBase64(buf) {
-  const bytes = new Uint8Array(buf || new ArrayBuffer(0));
-  let binary = '';
-  const step = 0x8000;
-  for (let i = 0; i < bytes.length; i += step) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + step, bytes.length)));
-  }
-  return btoa(binary);
-}
-
 function _setProjectFilesStatus(text) {
   const status = document.getElementById('project-files-status');
   if (!status) return;
@@ -3188,14 +3985,19 @@ async function _submitProjectChat() {
   const pendingUseSelections = (typeof getChatUseSelections === 'function')
     ? getChatUseSelections('project')
     : [];
-  const recipient = (typeof getChatRecipient === 'function')
-    ? getChatRecipient('project')
+  const recipient = (typeof _recipientSnapshotForSend === 'function')
+    ? _recipientSnapshotForSend('project')
     : null;
   const recipientType = recipient && recipient.kind ? recipient.kind : 'commander';
-  const draftItems = (typeof _chatAttachList === 'function')
+  // D23: capture the send's serial/parallel choice before the composer is
+  // cleared — the shape is read from the live textarea.
+  const multiDispatch = (typeof _composerEffectiveDispatchMode === 'function')
+    ? _composerEffectiveDispatchMode('project')
+    : null;
+  let draftItems = (typeof _chatAttachList === 'function')
     ? _chatAttachList(draftCid)
     : [];
-  const intendedAttachmentCount = draftItems.filter((item) => item && item.status !== 'error').length;
+  let intendedAttachmentCount = draftItems.filter((item) => item && item.status !== 'error').length;
   const modelTelemetry = typeof _chatModelTelemetryContext === 'function'
     ? _chatModelTelemetryContext()
     : {};
@@ -3231,7 +4033,12 @@ async function _submitProjectChat() {
     }
     return;
   }
-  if (draftItems.some((item) => item && item.status === 'uploading')) {
+  const releaseAttachmentSend = typeof _chatAttachTryBeginSend === 'function'
+    ? _chatAttachTryBeginSend(draftCid)
+    : (draftItems.some((item) => item && (item.status === 'uploading' || item.status === 'deleting'))
+      ? null
+      : (() => {}));
+  if (!releaseAttachmentSend) {
     const resultPayload = {
       result: 'failure',
       source_view: 'project',
@@ -3250,6 +4057,31 @@ async function _submitProjectChat() {
     if (typeof uiAlert === 'function') await uiAlert(t('chat.attach_still_uploading'));
     return;
   }
+  const attachmentSnapshot = typeof _chatAttachSnapshotForSend === 'function'
+    ? await _chatAttachSnapshotForSend(draftCid, { requireServerMatch: true })
+    : { ok: true, items: draftItems };
+  if (!attachmentSnapshot.ok) {
+    releaseAttachmentSend();
+    const resultPayload = {
+      result: 'failure',
+      source_view: 'project',
+      content_length: requestText.length,
+      attachment_count: intendedAttachmentCount,
+      duration_ms: Math.max(0, Math.round(performance.now() - sendAttemptStartedAt)),
+      failure_stage: 'preflight',
+      failure_reason: 'attachment_adopt_failed',
+      ...modelTelemetry,
+    };
+    if (typeof _trackChatSendResult === 'function') {
+      _trackChatSendResult('failure', resultPayload);
+    } else {
+      _projectTrackEvent('chat_send_result', resultPayload);
+    }
+    if (typeof uiAlert === 'function') await uiAlert(t('chat.attach_sync_failed'));
+    return;
+  }
+  draftItems = attachmentSnapshot.items;
+  intendedAttachmentCount = draftItems.length;
   const references = (typeof _referenceSnapshotsForQuotes === 'function')
     ? _referenceSnapshotsForQuotes(quotes)
     : [];
@@ -3260,12 +4092,17 @@ async function _submitProjectChat() {
   const withUse = (typeof transformWithChatUse === 'function')
     ? transformWithChatUse(requestText)
     : requestText;
-  const titleText = (typeof transformChatUseTokens === 'function')
-    ? transformChatUseTokens(raw)
+  const titleSeed = (typeof _titleSeedWithoutRoutingMentions === 'function')
+    ? _titleSeedWithoutRoutingMentions(raw, 'project')
     : raw;
+  const titleText = (typeof transformChatUseTokens === 'function')
+    ? transformChatUseTokens(titleSeed)
+    : titleSeed;
   const content = (typeof applyRecipientPrefix === 'function')
-    ? applyRecipientPrefix(withUse, 'project')
+    ? applyRecipientPrefix(withUse, 'project', { recipientSnapshot: recipient })
     : withUse;
+  const commanderDisplay = typeof _commanderMentionDisplayForSend === 'function'
+    ? _commanderMentionDisplayForSend(withUse, recipient, 'project') : {};
   if (btn) btn.disabled = true;
   let convId = '';
   let createdConversation = null;
@@ -3305,87 +4142,84 @@ async function _submitProjectChat() {
       await uiAlert(t('chat.create_conv_failed_with_reason', { reason: err?.message || err }));
     }
     if (btn) btn.disabled = false;
+    releaseAttachmentSend();
     return;
   }
 
   // Adopt the project composer's draft attachments (e.g. a KB file added via
   // "ask the commander about this file") into the new conversation — mirrors the
-  // new-chat draft adopt. No-op when there are none, so normal sends are
-  // unaffected.
+  // new-chat draft adopt. Always call it: renderer state can be empty while a
+  // completed main-process upload is already present in the draft directory.
   const _draftNames = draftItems
     .filter((item) => item && item.status !== 'error')
     .map((item) => item.name)
     .filter(Boolean);
   let _adopted = [];
-  if (_draftNames.length) {
-    let adoptionError = '';
-    try {
-      const aRes = await apiFetch('/api/conversations/attachments/adopt', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ from_cid: draftCid, to_cid: convId }),
-      });
-      const aData = await aRes.json();
-      if (!aData?.ok) {
-        adoptionError = String(aData?.error || 'attachment_adopt_failed');
+  let adoptionError = '';
+  try {
+    const aRes = await apiFetch('/api/conversations/attachments/adopt', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from_cid: draftCid, to_cid: convId }),
+    });
+    const aData = await aRes.json();
+    if (!aData?.ok) {
+      adoptionError = String(aData?.error || 'attachment_adopt_failed');
+    } else {
+      const adoptedItems = (Array.isArray(aData.items) ? aData.items : [])
+        .filter((item) => item?.sourceName && item?.targetName);
+      const adoptedSources = new Set(adoptedItems.map((item) => String(item.sourceName)));
+      if (_draftNames.some((name) => !adoptedSources.has(String(name)))) {
+        adoptionError = 'attachment_adopt_incomplete';
       } else {
-        const targetBySource = new Map(
-          (Array.isArray(aData.items) ? aData.items : [])
-            .filter((item) => item?.sourceName && item?.targetName)
-            .map((item) => [String(item.sourceName), String(item.targetName)]),
-        );
-        _adopted = _draftNames
-          .map((name) => targetBySource.get(name) || '')
-          .filter(Boolean);
-        if (_adopted.length !== _draftNames.length) {
-          adoptionError = 'attachment_adopt_incomplete';
-          _adopted = [];
-        }
+        _adopted = adoptedItems.map((item) => String(item.targetName));
       }
-    } catch (err) {
-      adoptionError = String(err?.message || err || 'attachment_adopt_failed');
     }
-    if (adoptionError) {
-      try {
-        const cleanup = await window.orkas.invoke('conversations.discardEmpty', {
-          cid: convId,
-          project_id: projectId,
-        });
-        if (!cleanup?.discarded) {
-          _projectDetailLog.warn('discard empty project conversation rejected', {
-            error_code: 'discard_empty_rejected',
-          });
-        }
-      } catch (_) {
-        _projectDetailLog.warn('discard empty project conversation failed', {
-          error_code: 'discard_empty_failed',
-        });
-      }
-      const resultPayload = {
-        result: 'failure',
-        source_view: 'project',
-        content_length: requestText.length,
-        attachment_count: intendedAttachmentCount,
-        duration_ms: Math.max(0, Math.round(performance.now() - sendAttemptStartedAt)),
-        failure_stage: 'preflight',
-        failure_reason: 'attachment_adopt_failed',
-        ...modelTelemetry,
-      };
-      if (typeof _trackChatSendResult === 'function') {
-        _trackChatSendResult('failure', resultPayload);
-      } else {
-        _projectTrackEvent('chat_send_result', resultPayload);
-      }
-      if (typeof uiAlert === 'function') {
-        await uiAlert(t('chat.attach_adopt_failed', { reason: adoptionError }));
-      }
-      if (btn) btn.disabled = false;
-      return;
-    }
-    if (typeof _chatAttachClear === 'function') {
-      _chatAttachClear(draftCid);
-    }
+  } catch (err) {
+    adoptionError = String(err?.message || err || 'attachment_adopt_failed');
   }
+  if (adoptionError) {
+    try {
+      const cleanup = await window.orkas.invoke('conversations.discardEmpty', {
+        cid: convId,
+        project_id: projectId,
+      });
+      if (!cleanup?.discarded) {
+        _projectDetailLog.warn('discard empty project conversation rejected', {
+          error_code: 'discard_empty_rejected',
+        });
+      }
+    } catch (_) {
+      _projectDetailLog.warn('discard empty project conversation failed', {
+        error_code: 'discard_empty_failed',
+      });
+    }
+    const resultPayload = {
+      result: 'failure',
+      source_view: 'project',
+      content_length: requestText.length,
+      attachment_count: intendedAttachmentCount,
+      duration_ms: Math.max(0, Math.round(performance.now() - sendAttemptStartedAt)),
+      failure_stage: 'preflight',
+      failure_reason: 'attachment_adopt_failed',
+      ...modelTelemetry,
+    };
+    if (typeof _trackChatSendResult === 'function') {
+      _trackChatSendResult('failure', resultPayload);
+    } else {
+      _projectTrackEvent('chat_send_result', resultPayload);
+    }
+    if (typeof uiAlert === 'function') {
+      await uiAlert(t('chat.attach_adopt_failed', { reason: adoptionError }));
+    }
+    if (btn) btn.disabled = false;
+    releaseAttachmentSend();
+    return;
+  }
+  if (typeof _chatAttachClear === 'function') {
+    _chatAttachClear(draftCid);
+  }
+  releaseAttachmentSend();
   if (createdConversation) {
     conversations.unshift(createdConversation);
     renderConversationList();
@@ -3396,8 +4230,10 @@ async function _submitProjectChat() {
 
   if (input) {
     input.value = '';
+    if (typeof _draftHadRecipient !== 'undefined') _draftHadRecipient.delete('project');
     if (typeof autoGrow === 'function') autoGrow(input, 180);
   }
+  if (typeof _updateComposerSeqToggle === 'function') _updateComposerSeqToggle('project');
   const chatInput = document.getElementById('chat-input');
   if (chatInput) {
     chatInput.value = '';
@@ -3405,15 +4241,17 @@ async function _submitProjectChat() {
   }
   if (typeof setView === 'function') setView('conversation', convId, { skipLoad: true });
   if (recipient && typeof setChatRecipient === 'function') {
-    setChatRecipient('conversation', recipient);
+    setChatRecipient('conversation', recipient.defaultRecipient || recipient);
   }
   if (btn) btn.disabled = false;
   if (typeof sendInCurrentConversation === 'function') {
     const extra = {
       title_text: titleText,
+      ...commanderDisplay,
       ...(_adopted.length ? { attachments: _adopted } : {}),
       ...(useSelections.length ? { use_selections: useSelections } : {}),
       ...(references.length ? { references } : {}),
+      ...(multiDispatch ? { multi_dispatch: multiDispatch } : {}),
     };
     if (typeof _rememberSentComposerSnapshot === 'function') {
       _rememberSentComposerSnapshot(convId, {
@@ -3423,7 +4261,7 @@ async function _submitProjectChat() {
         attachments: _adopted.map((name) => ({ name })),
       });
     }
-    await sendInCurrentConversation(content, Object.keys(extra).length ? extra : undefined);
+    await sendInCurrentConversation(content, Object.keys(extra).length ? extra : undefined, { restoreComposerOnFailure: true });
   }
 }
 
@@ -3450,10 +4288,10 @@ function _pickItemDescription(item, lang) {
   return (typeof pickDesc === 'function') ? pickDesc(item, lang) : '';
 }
 
-function _projectBindingSourceHtml(source, kind) {
+function _projectBindingSourceHtml(source) {
   if (!source) return '';
   const label = (typeof catalogSourceLabel === 'function')
-    ? catalogSourceLabel(source, kind === 'skill' ? 'skills' : 'agents')
+    ? catalogSourceLabel(source, 'agents')
     : String(source);
   if (!label) return '';
   const normalized = (typeof normalizeCatalogSource === 'function')
@@ -3462,54 +4300,15 @@ function _projectBindingSourceHtml(source, kind) {
   return `<span class="project-binding-source project-binding-source--${escapeHtml(normalized)}">${escapeHtml(label)}</span>`;
 }
 
-function _bindRemoveButtons() {
-  document.querySelectorAll('#project-detail-content [data-action="remove"]').forEach((btn) => {
-    btn.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      const row = btn.closest('.project-binding-row');
-      if (!row) return;
-      const kind = row.dataset.kind;
-      const id = row.dataset.id;
-      const projectId = _projectDetailPid;
-      const startedAt = performance.now();
-      _projectTrackClick('project_binding_remove', {
-        binding_kind: kind,
-      });
-      try {
-        const res = await window.orkas.invoke('projects.bindings.remove', {
-          projectId, kind, id,
-        });
-        if (!res?.ok) throw res || new Error('remove_failed');
-        _projectTrackEvent('project_binding_remove_result', {
-          binding_kind: kind,
-          result: 'success',
-          duration_ms: Math.round(performance.now() - startedAt),
-        });
-        if (projectId === _projectDetailPid) {
-          loadProjectDetail(projectId).catch((err) => _projectDetailLog.warn('refresh failed', err));
-        }
-      } catch (err) {
-        const failure = _projectDetailFailure(err, 'binding_remove_failed');
-        _projectTrackEvent('project_binding_remove_result', {
-          binding_kind: kind,
-          result: 'failure',
-          duration_ms: Math.round(performance.now() - startedAt),
-          ...failure,
-        });
-        _projectLogFailure('project_binding_remove', { binding_kind: kind, ...failure });
-        _projectDetailLog.warn('remove binding failed', err);
-      }
-    });
-  });
-}
-
 // ── Add picker (centered modal with search) ───────────────────────────
 
-async function _openAddPicker(kind) {
+async function _openAddPicker() {
   // Dispose any previously-open picker so re-clicks don't stack.
   document.getElementById('project-binding-picker-overlay')?.remove();
+  // `binding_kind` stays on the wire as a constant so the existing PMS
+  // Project funnel keeps reading these rows across the removal.
   _projectTrackClick('project_binding_picker_open', {
-    binding_kind: kind,
+    binding_kind: 'agent',
   });
 
   let candidates;
@@ -3518,14 +4317,14 @@ async function _openAddPicker(kind) {
       projectId: _projectDetailPid,
     });
     if (!res?.ok) throw new Error(res?.error || 'load_failed');
-    candidates = ((kind === 'agent') ? (res.agents || []) : (res.skills || [])).slice().sort(_byDisplayName);
+    candidates = (res.agents || []).slice().sort(_byDisplayName);
   } catch (err) {
     _projectDetailLog.warn('load candidates failed', err);
     return;
   }
 
-  const titleKey = kind === 'agent' ? 'project.bindings.picker_title_agents' : 'project.bindings.picker_title_skills';
-  const emptyKey = kind === 'agent' ? 'project.bindings.candidates_empty_agents' : 'project.bindings.candidates_empty_skills';
+  const titleKey = 'project.bindings.picker_title_agents';
+  const emptyKey = 'project.bindings.candidates_empty_agents';
   const closeText = escapeHtml(t('project.bindings.picker_close'));
   const searchPh = escapeHtml(t('project.bindings.picker_search_placeholder'));
 
@@ -3560,7 +4359,7 @@ async function _openAddPicker(kind) {
     const lang = _activeLang();
     const q = (searchEl.value || '').trim().toLocaleLowerCase();
     const filtered = !q ? candidates : candidates.filter((c) => {
-      const id = (kind === 'agent') ? c.agent_id : c.id;
+      const id = c.agent_id;
       const name = (c.name || '').toLocaleLowerCase();
       const desc = (_pickItemDescription(c, lang) || '').toLocaleLowerCase();
       return name.includes(q) || desc.includes(q) || (id || '').toLocaleLowerCase().includes(q);
@@ -3574,13 +4373,13 @@ async function _openAddPicker(kind) {
     }
     emptyEl.style.display = 'none';
     listEl.innerHTML = filtered.map((c) => {
-      const id = (kind === 'agent') ? c.agent_id : c.id;
+      const id = c.agent_id;
       const name = escapeHtml(c.name || id);
       const desc = _pickItemDescription(c, lang);
       const descHtml = desc ? `<div class="project-binding-desc muted">${escapeHtml(desc)}</div>` : '';
-      const source = _projectBindingSourceHtml(c.source, kind);
+      const source = _projectBindingSourceHtml(c.source);
       return `
-        <div class="project-binding-picker-item" data-kind="${kind}" data-id="${escapeHtml(id)}">
+        <div class="project-binding-picker-item" data-kind="agent" data-id="${escapeHtml(id)}">
           <div class="project-binding-main">
             <div class="project-binding-head">
               <span class="project-binding-name">${name}</span>
@@ -3620,7 +4419,7 @@ async function _openAddPicker(kind) {
           // Drop the picked id from the local candidate set so it
           // disappears from subsequent renders without a server round-trip.
           candidates = candidates.filter((c) => {
-            const cid = (k === 'agent') ? c.agent_id : c.id;
+            const cid = c.agent_id;
             return cid !== id;
           });
           render();
@@ -3794,9 +4593,26 @@ async function refreshConvProjectEmptyBanner(_cid) {
 // ── Boot wiring ────────────────────────────────────────────────────────
 
 function _initProjectDetailBindings() {
+  const todoOverlay = document.getElementById('todo-editor-modal');
+  todoOverlay?.addEventListener('click', (event) => {
+    if (event.target === todoOverlay) _closeProjectTodoEditor();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (!todoOverlay?.classList.contains('open') || !_uiIsTopDialogOverlay(todoOverlay)) return;
+    if (event.isComposing || event.keyCode === 229) return;
+    if (_uiTrapDialogTab(todoOverlay, event)) return;
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      _closeProjectTodoEditor();
+    }
+  });
+  if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
+    window.orkas.onPushEvent('projects:advance', _onProjectAdvance);
+    window.orkas.onPushEvent('projects:tasks-changed', _onProjectTasksChanged);
+  }
   document.getElementById('project-add-agent-btn')?.addEventListener('click', (e) => {
     e.stopPropagation();
-    _openAddPicker('agent');
+    _openAddPicker();
   });
   document.getElementById('project-action-rename')?.addEventListener('mousedown', (e) => {
     if (_isProjectDetailRenameMode()) e.preventDefault();
@@ -3866,6 +4682,11 @@ function _initProjectDetailBindings() {
   }
   window.addEventListener('i18n-change', () => {
     if (currentView === 'project' && _projectDetailMeta) _renderProjectDetail();
+    if (_todoEditorPid !== null && _todoEditorAgentSelect) {
+      _todoEditorAgentSelect.setAriaLabel(t('project.todo.assign'));
+      _todoEditorAgentSelect.setOptions(_todoEditorAgentSelect.state.options.map((option) =>
+        option.value ? option : { ...option, label: t('todo.unassigned') }));
+    }
   });
 }
 

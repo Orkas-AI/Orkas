@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
 
-// The project detail composer keeps ONE ephemeral recipient for every project
+// The project detail composer keeps one ephemeral recipient set for every project
 // (`conversation.js::_projectChatRecipient`). Opening a project must therefore
 // re-check that pick against the project the user is now looking at: the send
 // path turns the chip into an `@name` prefix and the group bus resolves
@@ -82,9 +82,8 @@ function mountProjectDetail(bindings: Bindings, held: string[] = []) {
               bindingCalls.push(pid);
               return answer(channel, {
                 ok: true,
-                bindings: { agents: bindings[pid] || [], skills: [] },
+                bindings: { agents: bindings[pid] || [] },
                 agentDetails: [],
-                skillDetails: [],
               });
             case 'projects.files.tree':
               return answer(channel, { ok: true, tree: [] });
@@ -106,7 +105,9 @@ function mountProjectDetail(bindings: Bindings, held: string[] = []) {
   });
   vm.runInContext(projectDetailSource, context, { filename: 'project-detail.js' });
   vm.runInContext(
-    extractFunction(conversationSource, 'validateRecipientAgainstProject'),
+    'const _COMMANDER = { kind: "commander", id: "", name: "" }; const _composerAgentScopes = new Map();\n'
+      + ['_normRecipient', '_recipientList', '_recipientSet', 'validateRecipientAgainstProject']
+        .map((name) => extractFunction(conversationSource, name)).join('\n'),
     context,
     { filename: 'conversation.js#validateRecipientAgainstProject' },
   );
@@ -121,6 +122,7 @@ function mountProjectDetail(bindings: Bindings, held: string[] = []) {
       if (target === 'project') __projectRecipient = next;
     }
     function _renderRecipientChip() {}
+    function _composerRecipientInput() { return null; }
     function __readProjectRecipient() { return JSON.parse(JSON.stringify(__projectRecipient)); }
     function __pickProjectAgent(id, name) { __projectRecipient = { kind: 'agent', id, name }; }
     _renderProjectDetail = function () {};
@@ -132,6 +134,9 @@ function mountProjectDetail(bindings: Bindings, held: string[] = []) {
     bindingCalls,
     pickAgent(id: string, name: string) {
       vm.runInContext(`__pickProjectAgent(${JSON.stringify(id)}, ${JSON.stringify(name)})`, context);
+    },
+    pickGroup(recipients: Recipient[]) {
+      vm.runInContext(`__projectRecipient = _recipientSet(${JSON.stringify(recipients)})`, context);
     },
     open(pid: string) {
       return vm.runInContext(`loadProjectDetail(${JSON.stringify(pid)})`, context) as Promise<void>;
@@ -157,7 +162,7 @@ describe('project composer recipient follows the open project', () => {
 
     await panel.open('p_beta');
 
-    expect(panel.recipient()).toEqual(COMMANDER);
+    expect(panel.recipient()).toMatchObject(COMMANDER);
   });
 
   it('keeps a pick the newly opened project is also bound to', async () => {
@@ -179,7 +184,7 @@ describe('project composer recipient follows the open project', () => {
     bindings.p_alpha = [];
     await panel.open('p_alpha'); // what `_removeProjectAgent` re-runs after a removal
 
-    expect(panel.recipient()).toEqual(COMMANDER);
+    expect(panel.recipient()).toMatchObject(COMMANDER);
   });
 
   it('clears the stale target before the rest of the project load finishes', async () => {
@@ -198,7 +203,7 @@ describe('project composer recipient follows the open project', () => {
     const second = panel.open('p_beta');
     await settle();
 
-    expect(panel.recipient()).toEqual(COMMANDER);
+    expect(panel.recipient()).toMatchObject(COMMANDER);
 
     panel.release('projects.files.tree');
     await second;
@@ -218,5 +223,13 @@ describe('project composer recipient follows the open project', () => {
 
     expect(panel.recipient()).toEqual({ kind: 'agent', id: 'agent_coder', name: 'Coder' });
     expect(panel.bindingCalls).toEqual(['p_alpha', 'p_beta']);
+  });
+
+  it('keeps the still-bound recipients when a project change removes one member of a set', async () => {
+    const panel = mountProjectDetail({ p_alpha: ['writer', 'coder'], p_beta: ['coder'] });
+    await panel.open('p_alpha');
+    panel.pickGroup([{ kind: 'agent', id: 'writer', name: 'Writer' }, { kind: 'agent', id: 'coder', name: 'Coder' }]);
+    await panel.open('p_beta');
+    expect(panel.recipient()).toMatchObject({ kind: 'agent', id: 'coder' });
   });
 });

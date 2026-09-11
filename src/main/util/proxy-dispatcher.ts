@@ -52,6 +52,9 @@ export interface BinaryFetchOptions {
   headers?: Record<string, string>;
   maxBytes?: number;
   redirect?: RequestRedirect;
+  /** Applied only to direct connections. Proxy routes deliberately leave
+   * destination resolution to the configured proxy. */
+  isAllowedDirectAddress?: (address: string) => boolean;
 }
 
 export type BinaryFetchLike = (
@@ -66,14 +69,14 @@ export interface BinaryDownloadOptions extends BinaryFetchOptions {
   validate?: (body: Buffer) => void;
 }
 
-export class BinaryFetchSizeError extends Error {
+class BinaryFetchSizeError extends Error {
   constructor(maxBytes: number) {
     super(`binary response exceeds ${maxBytes} bytes`);
     this.name = 'BinaryFetchSizeError';
   }
 }
 
-export class BinaryDownloadHttpError extends Error {
+class BinaryDownloadHttpError extends Error {
   readonly status: number;
 
   constructor(status: number, label: string) {
@@ -84,7 +87,7 @@ export class BinaryDownloadHttpError extends Error {
 }
 
 /** Statuses that may be temporary for a newly-published CDN object. */
-export function isRetriableBinaryDownloadStatus(status: number): boolean {
+function isRetriableBinaryDownloadStatus(status: number): boolean {
   return status === 404 || status === 409 || status === 425 || isRetriableHttpStatus(status);
 }
 
@@ -103,6 +106,7 @@ export type ChildProxyEnvironment = Record<string, string>;
 
 let _active: string | undefined;
 let _envActive = false;
+let _envConfig: EnvProxyConfig | undefined;
 let _originalFetchValue: FetchLike | undefined;
 let _baseFetch: FetchLike | undefined;
 let _fetchDelegate: FetchLike | undefined;
@@ -191,7 +195,7 @@ export function parseResolvedProxyRoute(result: string | undefined): ResolvedPro
 }
 
 /** Standard NO_PROXY host/port matching used by non-undici SDK adapters. */
-export function shouldBypassProxy(url: string, noProxy: string): boolean {
+function shouldBypassProxy(url: string, noProxy: string): boolean {
   let parsed: URL;
   try { parsed = new URL(url); } catch { return false; }
   const hostname = parsed.hostname.toLowerCase();
@@ -419,6 +423,13 @@ async function readBinaryFetchBody(response: Response, maxBytes?: number): Promi
 
 function createFetchBinary(fetchImpl: FetchLike): BinaryFetchLike {
   return async (url, options = {}) => {
+    const target = inputUrl(url);
+    const environmentProxyApplies = _envActive && _envConfig && target
+      ? envProxyAppliesToUrl(target, _envConfig)
+      : false;
+    if (options.isAllowedDirectAddress && !environmentProxyApplies) {
+      return await directBinaryFetchWithAddressPolicy(url, options);
+    }
     const response = await fetchImpl(url, {
       method: 'GET',
       ...(options.headers ? { headers: options.headers } : {}),
@@ -430,6 +441,106 @@ function createFetchBinary(fetchImpl: FetchLike): BinaryFetchLike {
       body: await readBinaryFetchBody(response, options.maxBytes),
     };
   };
+}
+
+/** Match the EnvHttpProxyAgent selection contract so a caller-specific direct
+ * address policy still applies to NO_PROXY routes without bypassing proxies. */
+export function envProxyAppliesToUrl(url: URL, config: EnvProxyConfig): boolean {
+  const proxy = url.protocol === 'https:' ? config.httpsProxy : config.httpProxy;
+  if (!proxy) return false;
+  const noProxy = config.noProxy.trim();
+  if (!noProxy) return true;
+  if (noProxy === '*') return false;
+  const hostname = url.host.replace(/:\d*$/, '').toLowerCase();
+  const port = Number.parseInt(url.port, 10) || (url.protocol === 'https:' ? 443 : 80);
+  for (const rawEntry of noProxy.split(/[,\s]/)) {
+    if (!rawEntry) continue;
+    const parsed = rawEntry.match(/^(.+):(\d+)$/);
+    const entryHostname = (parsed ? parsed[1] : rawEntry).replace(/^\*?\./, '').toLowerCase();
+    const entryPort = parsed ? Number.parseInt(parsed[2], 10) : 0;
+    if (entryPort && entryPort !== port) continue;
+    if (hostname === entryHostname || hostname.endsWith(`.${entryHostname}`)) return false;
+  }
+  return true;
+}
+
+/**
+ * Use the same DNS lookup that opens the direct socket, so validation cannot
+ * race a second resolution. This branch is never used for an environment or
+ * system proxy: those transports must resolve the destination themselves.
+ */
+async function directBinaryFetchWithAddressPolicy(
+  url: string,
+  options: BinaryFetchOptions,
+): Promise<BinaryFetchResult> {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { Agent, buildConnector, fetch: undiciFetch } = require('undici') as typeof import('undici');
+  const isAllowed = options.isAllowedDirectAddress as (address: string) => boolean;
+  const rejectAddress = () => new Error('direct download resolved to a disallowed address');
+  const baseConnect = buildConnector({
+    ...(DISPATCHER_OPTS.connect || {}),
+    lookup: ((hostname: string, lookupOptions: unknown, callback: (...args: unknown[]) => void) => {
+      // Requiring here avoids a separate preflight lookup: net.connect owns
+      // this exact resolution and connects to the returned address(es).
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const nodeDns = require('node:dns') as typeof import('node:dns');
+      nodeDns.lookup(hostname, lookupOptions as import('node:dns').LookupAllOptions, (err, address, family) => {
+        if (err) {
+          callback(err);
+          return;
+        }
+        const addresses = Array.isArray(address) ? address.map(entry => entry.address) : [address];
+        let allowed = false;
+        try {
+          allowed = addresses.length > 0 && addresses.every(candidate => isAllowed(candidate));
+        } catch {
+          allowed = false;
+        }
+        if (!allowed) {
+          callback(rejectAddress());
+          return;
+        }
+        callback(null, address, family);
+      });
+    }) as import('node:net').LookupFunction,
+  });
+  const dispatcher = new Agent({
+    headersTimeout: DISPATCHER_OPTS.headersTimeout,
+    bodyTimeout: DISPATCHER_OPTS.bodyTimeout,
+    connect(connectOptions, callback) {
+      baseConnect(connectOptions, (err, socket) => {
+        if (err || !socket) {
+          callback(err as Error, null);
+          return;
+        }
+        const address = socket.remoteAddress || '';
+        let allowed = false;
+        try { allowed = !!address && isAllowed(address); }
+        catch { allowed = false; }
+        if (!allowed) {
+          socket.destroy();
+          callback(rejectAddress(), null);
+          return;
+        }
+        callback(null, socket);
+      });
+    },
+  });
+  try {
+    const response = await undiciFetch(url, {
+      method: 'GET',
+      ...(options.headers ? { headers: options.headers } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
+      ...(options.redirect ? { redirect: options.redirect } : {}),
+      dispatcher,
+    });
+    return {
+      status: response.status,
+      body: await readBinaryFetchBody(response as unknown as Response, options.maxBytes),
+    };
+  } finally {
+    await dispatcher.close();
+  }
 }
 
 /**
@@ -585,20 +696,15 @@ function inputUrl(input: Parameters<FetchLike>[0]): URL | undefined {
  * cost while keeping runtime proxy changes responsive. Domain-rule proxy
  * configurations naturally map to the same cache key.
  */
-export function createSystemProxyFetch(
-  fallbackFetch: FetchLike,
-  systemFetch: FetchLike,
+/** Per-origin route resolution shared by the header and binary wrappers:
+ *  one PAC evaluation per origin per cache window, bounded origins, and a
+ *  resolution failure that reads as an unsupported route (fail closed). */
+function createProxyRouteResolver(
   resolveProxy: (url: string) => Promise<string>,
   routeCacheMs = SYSTEM_ROUTE_CACHE_MS,
-): FetchLike {
+): (url: URL) => Promise<ResolvedProxyRoute> {
   const cache = new Map<string, { expiresAt: number; route: Promise<ResolvedProxyRoute> }>();
-
-  return (async (input: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]) => {
-    const url = inputUrl(input);
-    if (!url || (url.protocol !== 'http:' && url.protocol !== 'https:')) {
-      return fallbackFetch(input, init);
-    }
-
+  return (url: URL) => {
     const now = Date.now();
     let entry = cache.get(url.origin);
     if (!entry || entry.expiresAt <= now) {
@@ -617,7 +723,24 @@ export function createSystemProxyFetch(
       entry = { expiresAt: now + Math.max(0, routeCacheMs), route };
       cache.set(url.origin, entry);
     }
-    const route = await entry.route;
+    return entry.route;
+  };
+}
+
+export function createSystemProxyFetch(
+  fallbackFetch: FetchLike,
+  systemFetch: FetchLike,
+  resolveProxy: (url: string) => Promise<string>,
+  routeCacheMs = SYSTEM_ROUTE_CACHE_MS,
+): FetchLike {
+  const resolveRoute = createProxyRouteResolver(resolveProxy, routeCacheMs);
+
+  return (async (input: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]) => {
+    const url = inputUrl(input);
+    if (!url || (url.protocol !== 'http:' && url.protocol !== 'https:')) {
+      return fallbackFetch(input, init);
+    }
+    const route = await resolveRoute(url);
     return route.kind === 'direct'
       ? fallbackFetch(input, init)
       : systemFetch(input, init);
@@ -635,7 +758,7 @@ export function createSystemProxyBinaryFetch(
   resolveProxy: (url: string) => Promise<string>,
   routeCacheMs = SYSTEM_ROUTE_CACHE_MS,
 ): BinaryFetchLike {
-  const cache = new Map<string, { expiresAt: number; route: Promise<ResolvedProxyRoute> }>();
+  const resolveRoute = createProxyRouteResolver(resolveProxy, routeCacheMs);
 
   return async (rawUrl, options = {}) => {
     let url: URL;
@@ -647,26 +770,7 @@ export function createSystemProxyBinaryFetch(
     if (url.protocol !== 'http:' && url.protocol !== 'https:') {
       return fallbackFetch(rawUrl, options);
     }
-
-    const now = Date.now();
-    let entry = cache.get(url.origin);
-    if (!entry || entry.expiresAt <= now) {
-      if (cache.size >= SYSTEM_ROUTE_CACHE_MAX_ORIGINS) {
-        for (const [origin, cached] of cache) {
-          if (cached.expiresAt <= now) cache.delete(origin);
-        }
-        if (cache.size >= SYSTEM_ROUTE_CACHE_MAX_ORIGINS) {
-          const oldestOrigin = cache.keys().next().value as string | undefined;
-          if (oldestOrigin) cache.delete(oldestOrigin);
-        }
-      }
-      const route = resolveProxy(url.href)
-        .then(parseResolvedProxyRoute)
-        .catch(() => ({ kind: 'unsupported', value: 'resolve_failed' }) as ResolvedProxyRoute);
-      entry = { expiresAt: now + Math.max(0, routeCacheMs), route };
-      cache.set(url.origin, entry);
-    }
-    const route = await entry.route;
+    const route = await resolveRoute(url);
     return route.kind === 'direct'
       ? fallbackFetch(rawUrl, options)
       : systemFetch(rawUrl, options);
@@ -674,7 +778,7 @@ export function createSystemProxyBinaryFetch(
 }
 
 /** Download bytes through the same direct/environment/system proxy policy as global fetch. */
-export async function fetchBinaryWithProxyPolicy(
+async function fetchBinaryWithProxyPolicy(
   url: string,
   options: BinaryFetchOptions = {},
 ): Promise<BinaryFetchResult> {
@@ -731,6 +835,7 @@ export async function installEnvProxyDispatcher(): Promise<boolean> {
       ...DISPATCHER_OPTS,
     }));
     _envActive = true;
+    _envConfig = config;
     const routes = [
       config.httpProxy ? `http=${redact(config.httpProxy)}` : '',
       config.httpsProxy ? `https=${redact(config.httpsProxy)}` : '',
@@ -743,6 +848,7 @@ export async function installEnvProxyDispatcher(): Promise<boolean> {
     return true;
   } catch (err) {
     _envActive = false;
+    _envConfig = undefined;
     log.warn('env proxy dispatcher install failed; system proxy may still be used after app-ready',
       logErrorSummary(err));
     return false;
@@ -806,6 +912,7 @@ export function _resetProxyRoutingForTests(): void {
   }
   _active = undefined;
   _envActive = false;
+  _envConfig = undefined;
   _originalFetchValue = undefined;
   _baseFetch = undefined;
   _fetchDelegate = undefined;

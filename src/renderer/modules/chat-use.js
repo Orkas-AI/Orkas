@@ -573,10 +573,15 @@ function _renderChatUseMirrorHtml(text, renderPlainHtml) {
   return html;
 }
 
+function _chatUseEditingTokens(text, inputId) {
+  return typeof _findChatComposerTokens === 'function'
+    ? _findChatComposerTokens(text, inputId) : _findChatUseTokens(text);
+}
+
 function _chatUseTokenDeleteRange(input, direction) {
   if (!input || typeof input.selectionStart !== 'number') return false;
   const value = String(input.value || '');
-  const tokens = _findChatUseTokens(value);
+  const tokens = _chatUseEditingTokens(value, input.id);
   if (!tokens.length) return false;
 
   if (input.selectionStart !== input.selectionEnd) {
@@ -618,11 +623,11 @@ function _deleteChatUseTokenAtCaret(input, direction) {
   return true;
 }
 
-function _chatUseTokenMoveTarget(text, caret, direction) {
+function _chatUseTokenMoveTarget(text, caret, direction, inputId) {
   const value = String(text || '');
   const pos = Number(caret);
   if (!Number.isFinite(pos)) return null;
-  const tokens = _findChatUseTokens(value);
+  const tokens = _chatUseEditingTokens(value, inputId);
   const hit = tokens.find((token) => {
     if (direction === 'forward') return pos >= token.start && pos < token.end;
     return (pos > token.start && pos <= token.end)
@@ -635,7 +640,7 @@ function _chatUseTokenMoveTarget(text, caret, direction) {
 function _moveChatUseTokenCaret(input, direction) {
   if (!input || typeof input.selectionStart !== 'number') return false;
   if (input.selectionStart !== input.selectionEnd) return false;
-  const next = _chatUseTokenMoveTarget(input.value || '', input.selectionStart, direction);
+  const next = _chatUseTokenMoveTarget(input.value || '', input.selectionStart, direction, input.id);
   if (next === null || next === input.selectionStart) return false;
   try { input.setSelectionRange(next, next); } catch (_) {}
   return true;

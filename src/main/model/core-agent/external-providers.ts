@@ -343,10 +343,11 @@ export async function createMoonshotProvider(config: CreateMoonshotProviderConfi
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com/v1';
 
 // Context windows from https://api-docs.deepseek.com/quick_start/pricing
-// (checked 2026-08). DeepSeek V4 series introduced 1M-token context via
+// (checked 2026-09-10). DeepSeek V4 series introduced 1M-token context via
 // Compressed Sparse Attention. Fallback 131072 for unknown ids (safe lower
 // bound; older deprecated v3 snapshots top out there).
 const DEEPSEEK_CONTEXT_WINDOW: Record<string, number> = {
+  'deepseek-flash':              1_048_576,
   'deepseek-v4-pro':              1_048_576,
   'deepseek-v4-flash-vision-exp': 1_048_576,
   'deepseek-v4-flash':            1_048_576,
@@ -357,10 +358,11 @@ function deepseekContextWindow(modelId: string): number {
 }
 
 // The official V4 pricing/spec table lists a 384K maximum output for Pro,
-// Flash, and Flash Vision Exp. pi-ai clamps only against remaining context,
+// Flash (including V4.1), and Flash Vision Exp. pi-ai clamps only against remaining context,
 // so preserving the provider's real cap avoids silently truncating long
 // reasoning + answers. Unknown/legacy ids retain a conservative 8192 fallback.
 const DEEPSEEK_MAX_OUTPUT_TOKENS: Record<string, number> = {
+  'deepseek-flash':              384_000,
   'deepseek-v4-pro':              384_000,
   'deepseek-v4-flash-vision-exp': 384_000,
   'deepseek-v4-flash':            384_000,
@@ -379,17 +381,10 @@ export function buildDeepSeekModel(modelId: string): Model<'openai-completions'>
     api: 'openai-completions',
     provider: 'deepseek' as any,
     baseUrl: DEEPSEEK_BASE_URL,
-    // Both V4 Pro and V4 Flash must be treated as reasoners: empirically
-    // V4 Flash also spontaneously returns `reasoning_content`, and once
-    // that lands in session history, subsequent turns missing
-    // `reasoning_effort` get rejected by DeepSeek (misleading error
-    // message "reasoning_content in the thinking mode must be passed
-    // back"). pi-ai's openai-completions adapter only attaches
-    // `reasoning_effort` when `model.reasoning === true` (see pi-ai
-    // openai-completions.js line 396), so we must mark every v4-* as
-    // true, paired with `defaultReasoning: 'low'` below so the request
-    // always carries the effort field.
-    reasoning: /^deepseek-v4-/.test(modelId),
+    // Keep V4 models and the V4.1 Flash alias reasoning-capable. This
+    // advertises support; it does not choose an effort level for the caller.
+    // createDeepSeekProvider preserves explicit choices through its payload hook.
+    reasoning: modelId === 'deepseek-flash' || /^deepseek-v4-/.test(modelId),
     // Official Pro/Flash aliases remain text-only. Flash Vision and remotely
     // configured models can declare supportsVision explicitly; an omitted
     // declaration defaults to visual for parity with user-defined endpoints.

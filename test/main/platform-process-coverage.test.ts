@@ -26,6 +26,10 @@ const PROCESS_OWNER_SUITE: Record<string, ProcessOwner> = {
     suite: 'src/core-agent/test/process-session.test.ts',
     evidence: 'getProcessSessionTools',
   },
+  'src/main/features/connectors/local-cli.ts': {
+    suite: 'test/main/features/connectors/local-cli.test.ts',
+    evidence: 'removeLocalCliAuthorization',
+  },
   'src/main/features/generation_reference_assets.ts': {
     suite: 'test/main/features/generation_reference_assets.test.ts',
     evidence: 'runReferenceFfmpegForTest',
@@ -61,10 +65,6 @@ const PROCESS_OWNER_SUITE: Record<string, ProcessOwner> = {
   'src/main/features/video_studio.ts': {
     suite: 'test/main/features/video_studio_native_qa.test.ts',
     evidence: 'runVideoProcessForTest',
-  },
-  'src/main/features/video_studio_delivery.ts': {
-    suite: 'test/main/features/video_studio_delivery.test.ts',
-    evidence: 'verifyProductionDelivery',
   },
   'src/main/model/core-agent/interactive-cli-sessions.ts': {
     suite: 'test/main/model/local-tools.test.ts',

@@ -13,7 +13,7 @@ function read(file: string): string {
 
 describe('Office preview fidelity contract', () => {
   it('routes Word, spreadsheet, and presentation files through the bundled layout renderer', () => {
-    const preview = read(path.join(mainRoot, 'util/office-preview.ts'));
+    const preview = read(path.join(mainRoot, 'features/office/office_preview_layout.ts'));
     const ipc = read(path.join(mainRoot, 'ipc/index.ts'));
     const contexts = read(path.join(mainRoot, 'features/contexts.ts'));
     const projects = read(path.join(mainRoot, 'features/project_files.ts'));

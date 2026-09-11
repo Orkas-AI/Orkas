@@ -282,7 +282,10 @@ function createBridgeSkillRunner(options) {
           timeoutTimer = null;
         }
         killProcessTree(child, 'SIGTERM');
-        forceKillTimer = setTimeout(() => killProcessTree(child, 'SIGKILL'), killGraceMs);
+        forceKillTimer = setTimeout(() => {
+          forceKillTimer = null;
+          killProcessTree(child, 'SIGKILL');
+        }, killGraceMs);
         settleTimer = setTimeout(() => finish(null, null), settleMs);
         if (typeof forceKillTimer.unref === 'function') forceKillTimer.unref();
         if (typeof settleTimer.unref === 'function') settleTimer.unref();
@@ -306,6 +309,9 @@ function createBridgeSkillRunner(options) {
         if (settled) return;
         settled = true;
         if (activeEntry) activeRuns.delete(activeEntry);
+        // A closed parent does not prove that quiet descendants have exited.
+        // Finish the pending tree termination before discarding its timer.
+        if (forceKillTimer) killProcessTree(child, 'SIGKILL');
         clearTimers();
         try { child?.stdout?.destroy(); } catch { /* best effort */ }
         try { child?.stderr?.destroy(); } catch { /* best effort */ }

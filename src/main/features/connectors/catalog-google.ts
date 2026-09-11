@@ -1,18 +1,7 @@
 /**
- * Google Workspace catalog entries — extracted from `catalog.ts` so the Google bundle and
- * per-service connectors stay isolated while still syncing to the open-source build. Both PC and the open-source build
- * include this file via a try/require in `catalog.ts`; the catch path only keeps older open-source
- * checkouts without this file from crashing.
- *
- * Includes:
- *   - `google-workspace` (one independent all-in-one connector backed by
- *     `bin/google-workspace-mcp-server.cjs`)
- *   - `gmail`, `gcal`, `gdocs`, `gsheets`, `gtasks` (5 independent per-service connectors,
- *     each backed by a local stdio adapter under `PC/bin/`)
- *
- * Adding a new Google service: drop a new entry here + `bin/<svc>-mcp-server.cjs` adapter,
- * Server's `_SCOPES_BY_CATALOG_ID` row, and wire the adapter into
- * `bin/google-workspace-mcp-server.cjs` if you want it covered by the all-in-one connector.
+ * Legacy Google OAuth catalog entries. Standalone Gmail is declared as Composio in
+ * catalog.ts; the Workspace bundle and adapters remain for compatibility.
+ * The hosted catalog currently publishes only Search Console from this module.
  */
 import type { CatalogEntry } from './types';
 
@@ -52,6 +41,8 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
     category: 'productivity',
     description_zh: '一次授权接入 Gmail、日历、文档、表格和任务；也可以单独连接各项服务。',
     description_en: 'Connect Gmail, Calendar, Docs, Sheets, and Tasks in one consent; individual services can also be connected separately.',
+    description_ja: "1 回の同意で Gmail、Calendar、Docs、Sheets、Tasks に接続します。各サービスを個別に接続することもできます。",
+    description_pt: "Conecte Gmail, Calendar, Docs, Sheets e Tasks com um único consentimento; os serviços também podem ser conectados separadamente.",
     auth_mode: 'server_bridge',
     oauth: { provider_id: 'google' },
     required_oauth_scopes: GOOGLE_WORKSPACE_SCOPES,
@@ -64,30 +55,14 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
     },
   },
   {
-    id: 'gmail',
-    display_name: 'Gmail',
-    icon_svg: '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#4285f4" d="M24 5.457v13.909c0 .904-.732 1.636-1.636 1.636h-3.819V11.73L12 16.64l-6.545-4.91v9.273H1.636A1.636 1.636 0 0 1 0 19.366V5.457c0-2.023 2.309-3.178 3.927-1.964L5.455 4.64 12 9.548l6.545-4.91 1.528-1.145C21.69 2.28 24 3.434 24 5.457z"/><path fill="#34a853" d="M5.455 21.003V11.73l-3.819-2.864v10.5c0 .904.732 1.637 1.636 1.637z"/><path fill="#ea4335" d="M18.545 21.003V11.73l3.819-2.864v10.5a1.636 1.636 0 0 1-1.636 1.637z"/><path fill="#fbbc04" d="M5.455 11.73 12 16.64l6.545-4.91V4.64L12 9.548 5.455 4.64z"/><path fill="#c5221f" d="M0 5.457v3.41l5.455 4.092V4.64L3.927 3.494C2.309 2.28 0 3.434 0 5.457z"/></svg>',
-    category: 'communication',
-    description_zh: '读 / 发邮件、整理收件箱。',
-    description_en: 'Read and send mail, organize the inbox.',
-    auth_mode: 'server_bridge',
-    oauth: { provider_id: 'google' },
-    required_oauth_scopes: GOOGLE_SCOPES.gmail,
-    transport_template: {
-      kind: 'stdio',
-      command: '${ORKAS_NODE}',
-      args: ['${ORKAS_PC_DIR}/bin/gmail-mcp-server.cjs'],
-      oauth_env_key: 'GOOGLE_ACCESS_TOKEN',
-      proxy_target_url: 'https://gmail.googleapis.com/',
-    },
-  },
-  {
     id: 'gcal',
     display_name: 'Google Calendar',
     icon_svg: '<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg"><path fill="#fff" d="M152.6 47.4H47.4v105.2h105.2z"/><path fill="#1a73e8" d="M152.6 200 200 152.6l-23.7-4.2-23.7 4.2-4.6 21.6z"/><path fill="#ea4335" d="M0 152.6v32.6c0 8.4 6.8 15.3 15.3 15.3h32.6l4.9-23.7-4.9-23.7-25-4.9z"/><path fill="#188038" d="M200 47.4V14.7c0-8.4-6.8-15.3-15.3-15.3h-32.6q-4.45 22.05-4.9 24.6.45 2.65 4.9 23.4 25 4.45 23.7 0z"/><path fill="#fbbc04" d="M200 47.4h-47.4v105.2H200z"/><path fill="#34a853" d="M152.6 152.6H47.4V200h105.2z"/><path fill="#4285f4" d="M152.6 0H15.3C6.8 0 0 6.8 0 15.3v137.3h47.4V47.4h105.2z"/><path fill="#4285f4" d="m69 130.5c-3.9-2.7-6.7-6.5-8.2-11.6l9.1-3.8c.8 3.2 2.4 5.7 4.5 7.5 2.1 1.8 4.7 2.7 7.7 2.7s5.7-.9 7.8-2.8 3.2-4.2 3.2-7-1.1-5.3-3.4-7.2-5.1-2.8-8.5-2.8h-5.3v-9h4.7c2.9 0 5.4-.8 7.5-2.4 2-1.6 3.1-3.8 3.1-6.5 0-2.5-.9-4.4-2.6-5.9s-3.9-2.2-6.5-2.2-4.6.7-6 2-2.5 3-3.1 4.9l-9-3.7c1.1-3.1 3.1-5.9 6.1-8.3 3-2.4 6.8-3.6 11.4-3.6 3.4 0 6.5.7 9.2 2 2.7 1.3 4.9 3.2 6.4 5.5 1.6 2.4 2.3 5 2.3 8 0 3-.7 5.5-2.2 7.6s-3.3 3.7-5.4 4.8v.5q4.05 1.65 6.6 5.1c2.55 3.45 2.6 5.1 2.6 8.5s-.8 6.2-2.5 8.8c-1.7 2.6-3.9 4.6-6.8 6.1q-4.35 2.25-9.6 2.25c-4.05 0-7.7-.9-10.8-2.6zm47.7-37.8-10 7.3-5-7.6 18-13h6.9v61.3h-10z"/></svg>',
     category: 'productivity',
     description_zh: '查看、创建、修改日历事件与会议。',
     description_en: 'View, create, and update calendar events and meetings.',
+    description_ja: "カレンダーの予定や会議を表示・作成・更新します。",
+    description_pt: "Consulte, crie e atualize eventos e reuniões do calendário.",
     auth_mode: 'server_bridge',
     oauth: { provider_id: 'google' },
     required_oauth_scopes: GOOGLE_SCOPES.gcal,
@@ -106,6 +81,8 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
     category: 'productivity',
     description_zh: '读 / 写 Google Docs 文档,自动化文档工作流。',
     description_en: 'Read, create, and manage Google Docs from your workflows.',
+    description_ja: "ワークフローから Google Docs 文書を読み取り・作成・管理します。",
+    description_pt: "Leia, crie e gerencie documentos Google Docs nos seus fluxos de trabalho.",
     auth_mode: 'server_bridge',
     oauth: { provider_id: 'google' },
     required_oauth_scopes: GOOGLE_SCOPES.gdocs,
@@ -124,6 +101,8 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
     category: 'data',
     description_zh: '把电子表格当作数据源,读写单元格与公式。',
     description_en: 'Use spreadsheets as a data source — read and write cells and formulas.',
+    description_ja: "スプレッドシートをデータソースとして使い、セルや数式を読み書きします。",
+    description_pt: "Use planilhas como fonte de dados: leia e escreva células e fórmulas.",
     auth_mode: 'server_bridge',
     oauth: { provider_id: 'google' },
     required_oauth_scopes: GOOGLE_SCOPES.gsheets,
@@ -142,6 +121,8 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
     category: 'productivity',
     description_zh: '把任务管理直接接入工作流。',
     description_en: 'Integrate task management directly into your workflows.',
+    description_ja: "タスク管理をワークフローに直接組み込みます。",
+    description_pt: "Integre o gerenciamento de tarefas diretamente aos seus fluxos de trabalho.",
     auth_mode: 'server_bridge',
     oauth: { provider_id: 'google' },
     required_oauth_scopes: GOOGLE_SCOPES.gtasks,
@@ -160,6 +141,8 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
     category: 'data',
     description_zh: '查看搜索流量、关键词、点击/曝光/排名、收录与站点地图状态。',
     description_en: 'View search traffic — queries, clicks/impressions/position, indexing and sitemap status.',
+    description_ja: "検索トラフィックのクエリ、クリック数、表示回数、順位、インデックス登録、サイトマップ状況を確認します。",
+    description_pt: "Consulte tráfego de pesquisa: consultas, cliques, impressões, posição, indexação e status de sitemaps.",
     auth_mode: 'server_bridge',
     oauth: { provider_id: 'google' },
     required_oauth_scopes: GOOGLE_SCOPES.gsearch_console,

@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { BrowserWindow as ElectronBrowserWindow, NativeImage as ElectronNativeImage } from 'electron';
 
 import { bundledFfmpegPaths, bundledWhisperPaths } from '../util/bundled-runtime';
+import { sha256OfFileStream } from '../util/sha256';
 import { versionedChatMediaLocalUrl } from '../util/chat-media-url';
 import { redactPaths } from '../util/redact';
 import { logErrorSummary } from '../util/log-redact';
@@ -29,6 +30,7 @@ import {
   designContractReadiness,
   DRAFT_REPAIR_MAX_PASSES,
   analyzeNativeImage,
+  applyQaFindingWaivers,
   regionContrast,
   buildDesignReviewInputs,
   buildDraftFrameSamplePlan,
@@ -636,7 +638,9 @@ async function upsertRenderProvenance(compositionDirAbs: string, entry: RenderPr
 
 async function sha256File(absPath: string): Promise<string | null> {
   try {
-    return crypto.createHash('sha256').update(await fs.readFile(absPath)).digest('hex');
+    // Rendered outputs reach hundreds of MB; hash the stream instead of
+    // buffering the whole file on the main thread.
+    return await sha256OfFileStream(absPath);
   } catch (err) {
     logOptionalReadFailure('video checksum read failed', err);
     return null;
@@ -1554,12 +1558,19 @@ async function withCompositionWindow<T>(
     width: meta.width,
     height: meta.height,
     useContentSize: true,
+    enableLargerThanScreen: true,
     backgroundColor: '#000000',
     webPreferences: hardenedWebPreferences({
       session: ses,
     }),
   });
   try {
+    // Electron centers new Windows/Linux windows within the display work
+    // area, which can shrink even a useContentSize window (1920x1080 became
+    // 1904x993 in production). Restore the approved viewport after constructor
+    // centering, before loading or measuring the composition. Resizing a
+    // cropped bitmap later would lose content and change the aspect ratio.
+    win.setContentSize(meta.width, meta.height);
     const destroyOnTimeout = () => {
       try { win.destroy(); } catch { /* best effort */ }
     };
@@ -2231,7 +2242,17 @@ export async function inspectComposition(p: CompositionOptions): Promise<VideoSt
         log.warn('persist scene isolation record failed', { error: logErrorSummary(err) });
       });
   }
-  const normalizedIssues = dedupeInspectIssues(normalizeDraftInspectIssueSeverities(issues));
+  // Honor the user's recorded QA waivers here too. `waive_findings` is one of
+  // the options the inspect stop offers the user, and the host accepts and
+  // persists their reply — but inspect was the one op on this shared path that
+  // took `waivedQaFindings` and never read it, so the waiver changed nothing
+  // and the next call returned the identical E_INSPECT_BLOCKED. On 2026-09-01
+  // a user picked "skip this check", the waiver was stored against their
+  // verbatim reply, and the agent still had to tell them it could not be
+  // skipped. Preflight's own waiver pass cannot cover this: the cover-promise
+  // and frame-sample findings are pushed after it, by inspect itself.
+  const waivedIssues = applyQaFindingWaivers(issues, p.waivedQaFindings);
+  const normalizedIssues = dedupeInspectIssues(normalizeDraftInspectIssueSeverities(waivedIssues));
   const findings = findingsJson(normalizedIssues, {
     engine: 'orkas-native',
     inspector_version: VIDEO_STUDIO_INSPECTOR_VERSION,

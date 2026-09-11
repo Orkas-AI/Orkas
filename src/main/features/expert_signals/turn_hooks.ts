@@ -235,8 +235,12 @@ export async function onUserMessage(args: {
 }): Promise<{ correctionDetected: boolean }> {
   try {
     cancelSilenceCheck(args.uid, args.cid);
-    const prev = _lastAgentMsg.get(_key(args.uid, args.cid));
+    const key = _key(args.uid, args.cid);
+    const prev = _lastAgentMsg.get(key);
     if (!prev) return { correctionDetected: false };
+    // Consumed: the pairing is one agent reply ↔ the next user message. Keeping
+    // the entry held one reply per conversation for the process lifetime.
+    _lastAgentMsg.delete(key);
 
     const detect = await _getDetectUserCorrection();
     const correctionDetected = detect(args.userMsg.text);

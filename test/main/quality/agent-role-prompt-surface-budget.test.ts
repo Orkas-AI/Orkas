@@ -13,14 +13,19 @@ const AGENT_PROMPT = path.join(
   'chat_agent_in_group.md',
 );
 
-// Measured below 7.25K after history, dependency, path, and memory procedures
+// Measured below 6.8K after history, dependency, path, tool-catalog, and memory procedures
 // moved to their production owners and the actor-authored result markers were
 // retired (host-observed execution outcomes own status). Keep the explicit
 // handback decision boundary resident: model regressions show that merging it
 // into a terse branch table confuses capability, recoverable-failure, and
-// missing-input outcomes.
-const WHOLE_PROMPT_CEILING = 7_250;
-const MEMORY_SECTION_CEILING = 650;
+// missing-input outcomes. Execution-time communication now has one resident
+// owner in shared rules, so its removed role-local copy releases this budget.
+// 2026-09-08: the memory "when to write" rule moved to the tool contract
+// (single owner), releasing ~250 characters; the ceiling follows the surface.
+const WHOLE_PROMPT_CEILING = 6_600;
+// Destinations, hand-off, and the success claim stay resident; the durability
+// decision is owned by the `cross_session_memory` description (2026-09-08).
+const MEMORY_SECTION_CEILING = 560;
 
 function section(body: string, heading: string): string {
   const start = body.indexOf(`## ${heading}`);

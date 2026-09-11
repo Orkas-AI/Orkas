@@ -6,6 +6,13 @@ const electronMock = vi.hoisted(() => ({
 const oauthEventMock = vi.hoisted(() => ({
   progress: vi.fn(),
 }));
+const localeMock = vi.hoisted(() => ({ lang: 'en' }));
+const loggerMock = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}));
 
 vi.mock('electron', () => ({
   app: {
@@ -25,11 +32,15 @@ vi.mock('../../../../src/main/features/connectors/_server_bridge', () => ({
 }));
 
 vi.mock('../../../../src/main/features/config', () => ({
-  getLanguage: () => 'en',
+  getLanguage: () => localeMock.lang,
 }));
 
 vi.mock('../../../../src/main/features/connectors/oauth-events', () => ({
   broadcastOAuthConnectProgress: oauthEventMock.progress,
+}));
+
+vi.mock('../../../../src/main/logger', () => ({
+  createLogger: () => loggerMock,
 }));
 
 function notionEntry() {
@@ -84,6 +95,19 @@ function stripeEntry() {
   } as any;
 }
 
+function netSuiteEntry(accountId = 'TENANTSECRET123') {
+  return {
+    id: 'netsuite',
+    display_name: 'Oracle NetSuite',
+    auth_mode: 'mcp_dcr',
+    transport_template: {
+      kind: 'streamable-http',
+      url: `https://${accountId.toLowerCase()}.suitetalk.api.netsuite.com/services/mcp/v1/suiteapp/com.netsuite.mcpstandardtools`,
+      oauth_header_key: 'Authorization',
+    },
+  } as any;
+}
+
 function jsonResponse(body: unknown, ok = true, status = ok ? 200 : 500) {
   return {
     ok,
@@ -94,6 +118,7 @@ function jsonResponse(body: unknown, ok = true, status = ok ? 200 : 500) {
 }
 
 beforeEach(() => {
+  localeMock.lang = 'en';
   vi.clearAllMocks();
   vi.resetModules();
 });
@@ -103,6 +128,153 @@ afterEach(() => {
 });
 
 describe('features/connectors/oauth-dcr', () => {
+  it.each(['zh', 'en', 'ja', 'pt'])('carries %s in fresh opaque states without changing registered callback URLs', async (lang) => {
+    localeMock.lang = lang;
+    const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const states: string[] = [];
+    const local = oauth.startLocalApiBrowserOAuth('shopee', (state, redirect) => {
+      states.push(state);
+      expect(redirect).toBe('https://orkas.ai/api/connectors/oauth/dcr-callback');
+      return `https://open.shopee.com/auth?state=${state}`;
+    }, vi.fn());
+    const cancelledLocal = expect(local).rejects.toMatchObject({ code: 'user_cancelled' });
+    oauth.cancelDcrOAuth();
+    await cancelledLocal;
+    electronMock.openExternal.mockClear();
+    vi.stubGlobal('fetch', vi.fn(async (raw: string) => {
+      const url = new URL(raw);
+      if (url.pathname.includes('oauth-protected-resource')) return jsonResponse({ authorization_servers: ['https://auth.notion.example'], resource: 'https://mcp.notion.example/mcp' });
+      if (url.pathname.includes('oauth-authorization-server')) return jsonResponse({ authorization_endpoint: 'https://auth.notion.example/authorize', token_endpoint: 'https://auth.notion.example/token', registration_endpoint: 'https://auth.notion.example/register' });
+      if (url.pathname === '/register') return jsonResponse({ client_id: 'client-1' });
+      throw new Error('unexpected request');
+    }));
+    const dcr = oauth.startMcpDcrOAuth('uid-1', notionEntry());
+    const cancelledDcr = expect(dcr).rejects.toMatchObject({ code: 'user_cancelled' });
+    await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledTimes(1));
+    const url = new URL(String(electronMock.openExternal.mock.calls[0][0]));
+    states.push(url.searchParams.get('state')!);
+    expect(url.searchParams.get('redirect_uri')).toBe('https://account.example/api/connectors/oauth/dcr-callback');
+    expect(url.searchParams.has('lang')).toBe(false);
+    expect(states[0]).not.toBe(states[1]);
+    for (const state of states) expect(state).toMatch(new RegExp(`^orkas1_${lang}_[A-Za-z0-9_-]{43}$`));
+    oauth.cancelDcrOAuth();
+    await cancelledDcr;
+  });
+
+  it.each([true, false])('does not let a cancelled DCR token response (success=%s) replace a new seller flow', async (success) => {
+    let finishToken!: (response: ReturnType<typeof jsonResponse>) => void;
+    const delayedToken = new Promise<ReturnType<typeof jsonResponse>>((resolve) => { finishToken = resolve; });
+    const fetchMock = vi.fn(async (raw: string) => {
+      const url = new URL(raw);
+      if (url.pathname.endsWith('/.well-known/oauth-protected-resource')) return jsonResponse({
+        authorization_servers: ['https://auth.notion.example'], resource: 'https://mcp.notion.example/mcp',
+      });
+      if (url.pathname.endsWith('/.well-known/oauth-authorization-server')) return jsonResponse({
+        authorization_endpoint: 'https://auth.notion.example/authorize',
+        token_endpoint: 'https://auth.notion.example/token', registration_endpoint: 'https://auth.notion.example/register',
+      });
+      if (url.pathname === '/register') return jsonResponse({ client_id: 'client-1', client_secret: 'secret-1' });
+      if (url.pathname.endsWith('/dcr-exchange')) return jsonResponse({ code: 0, oauth_code: 'one-use-code',
+        oauth_state: new URL(String(electronMock.openExternal.mock.calls.at(-1)![0])).searchParams.get('state') });
+      if (url.pathname === '/token') return delayedToken;
+      throw new Error('Unexpected request after cancellation');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const oldFlow = oauth.startMcpDcrOAuth('uid-1', notionEntry());
+    const cancelled = expect(oldFlow).rejects.toMatchObject({ code: 'user_cancelled' });
+    await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledTimes(1));
+    const oldCallback = oauth.handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?exchange_code=old');
+    await vi.waitFor(() => expect(fetchMock.mock.calls.some(([url]) => url.endsWith('/token'))).toBe(true));
+    const sellerExchange = vi.fn(async () => ({ access_token: 'seller-grant' }));
+    const next = oauth.startLocalApiBrowserOAuth('shopee', (state) => `https://open.shopee.com/auth?state=${state}`, sellerExchange);
+    await cancelled;
+    finishToken(jsonResponse({ access_token: 'old-grant', refresh_token: 'old-refresh' }, success, success ? 200 : 400));
+    await oldCallback;
+    expect(fetchMock.mock.calls.some(([url]) => url.endsWith('/dcr-store'))).toBe(false);
+    await oauth.handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?exchange_code=new');
+    await expect(next).resolves.toEqual({ access_token: 'seller-grant' });
+    expect(sellerExchange).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps account-scoped endpoints and provider response bodies out of diagnostics', async () => {
+    const accountSentinel = 'tenantsecret123';
+    const providerSentinel = 'provider-secret-response';
+    const discoveryFetch = vi.fn(async () => jsonResponse({ error: 'not_found' }, false, 404));
+    vi.stubGlobal('fetch', discoveryFetch);
+
+    const { startMcpDcrOAuth } = await import('../../../../src/main/features/connectors/oauth-dcr');
+    let discoveryError = '';
+    try {
+      await startMcpDcrOAuth('uid-1', netSuiteEntry(accountSentinel));
+    } catch (err) {
+      discoveryError = String((err as Error).message || err);
+    }
+    const discoveryEvidence = JSON.stringify({
+      error: discoveryError,
+      info: loggerMock.info.mock.calls,
+      warn: loggerMock.warn.mock.calls,
+      errorLogs: loggerMock.error.mock.calls,
+    }).toLowerCase();
+    expect(discoveryError).toContain('HTTP 404');
+    expect(discoveryEvidence).not.toContain(accountSentinel);
+
+    vi.clearAllMocks();
+    vi.resetModules();
+    const tokenFetch = vi.fn(async (url: string) => {
+      const rawUrl = String(url);
+      if (rawUrl.endsWith('/mcp/.well-known/oauth-protected-resource')) {
+        return jsonResponse({
+          authorization_servers: ['https://auth.notion.example'],
+          resource: 'https://mcp.notion.example/mcp',
+        });
+      }
+      if (rawUrl === 'https://auth.notion.example/.well-known/oauth-authorization-server') {
+        return jsonResponse({
+          authorization_endpoint: 'https://auth.notion.example/authorize',
+          token_endpoint: 'https://auth.notion.example/token',
+          registration_endpoint: 'https://auth.notion.example/register',
+        });
+      }
+      if (rawUrl === 'https://auth.notion.example/register') {
+        return jsonResponse({ client_id: 'client-1', client_secret: 'secret-1' });
+      }
+      if (rawUrl === 'https://account.example/api/connectors/oauth/dcr-exchange') {
+        const opened = new URL(String(electronMock.openExternal.mock.calls[0][0]));
+        return jsonResponse({
+          code: 0,
+          oauth_code: 'provider-code',
+          oauth_state: opened.searchParams.get('state'),
+        });
+      }
+      if (rawUrl === 'https://auth.notion.example/token') {
+        return jsonResponse({ error: 'invalid_grant', detail: providerSentinel }, false, 400);
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal('fetch', tokenFetch);
+    const oauthDcr = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const pending = oauthDcr.startMcpDcrOAuth('uid-1', notionEntry());
+    await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledTimes(1));
+    await oauthDcr.handleDcrCallbackUrl(
+      'orkas://connectors/oauth/dcr-callback?exchange_code=exchange-1',
+    );
+    let tokenError = '';
+    try {
+      await pending;
+    } catch (err) {
+      tokenError = String((err as Error).message || err);
+    }
+    expect(tokenError).toContain('token exchange failed');
+    const tokenEvidence = JSON.stringify({
+      error: tokenError,
+      info: loggerMock.info.mock.calls,
+      warn: loggerMock.warn.mock.calls,
+      errorLogs: loggerMock.error.mock.calls,
+    });
+    expect(tokenEvidence).not.toContain(providerSentinel);
+  });
+
   it('discovers DCR endpoints, registers a client, and opens an authorize URL with PKCE + resource', async () => {
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
       if (String(url).endsWith('/mcp/.well-known/oauth-protected-resource')) {

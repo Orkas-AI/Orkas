@@ -15,6 +15,13 @@ function commanderEvent(overrides: Partial<TurnFinishedEvent> = {}): TurnFinishe
 }
 
 describe('group_chat plan executor terminal delivery', () => {
+  it.each(['commander', 'agent'] as const)('preserves a %s user-input boundary without inventing a reply', async (kind) => {
+    const event = commanderEvent({ actor: { id: kind, kind }, errText: null, waitingForInput: true });
+    await expect(onTurnFinished('u1', 'c1', event)).resolves.toEqual({ kind: 'persist', text: '' });
+    await expect(onTurnFinished('u1', 'c1', { ...event, errText: 'provider failed', failureKind: 'model' }))
+      .resolves.toMatchObject({ kind: 'persist', failureKind: 'model' });
+  });
+
   it('keeps a successful hand_off_to empty tail silent', async () => {
     await expect(onTurnFinished('u1', 'c1', commanderEvent({ terminalDelivery: true })))
       .resolves.toEqual({ kind: 'silent' });
@@ -34,6 +41,20 @@ describe('group_chat plan executor terminal delivery', () => {
       kind: 'persist',
       text: '',
       produced: ['/tmp/final.pdf'],
+    });
+  });
+
+  it('uses partial abort output only to retain the status row and side effects', async () => {
+    await expect(onTurnFinished('u1', 'c1', commanderEvent({
+      actor: { id: 'office-writer', kind: 'agent' },
+      finalText: 'Working notes that are not a completed answer.',
+      errText: 'aborted',
+      aborted: true,
+      produced: ['/tmp/draft.docx'],
+    }))).resolves.toEqual({
+      kind: 'persist',
+      text: '',
+      produced: ['/tmp/draft.docx'],
     });
   });
 

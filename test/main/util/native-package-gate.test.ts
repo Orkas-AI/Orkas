@@ -67,6 +67,38 @@ function windowsFixture(): string {
   return root;
 }
 
+function macFixture(arch: string): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-native-gate-mac-'));
+  tempDirs.push(root);
+  const onnx = path.join(root, 'onnxruntime-node');
+  fs.mkdirSync(onnx, { recursive: true });
+  fs.writeFileSync(path.join(onnx, 'package.json'), JSON.stringify({ version: '1.21.0' }));
+  // Names come from the locked Sharp 0.35.4 / libvips 1.3.3 package payloads.
+  for (const relativePath of [
+    `@esbuild/darwin-${arch}/bin/esbuild`,
+    'esbuild/bin/esbuild',
+    `sqlite-vec-darwin-${arch}/vec0.dylib`,
+    `@napi-rs/canvas-darwin-${arch}/skia.darwin-${arch}.node`,
+    '@anush008/tokenizers-darwin-universal/tokenizers.darwin-universal.node',
+    'better-sqlite3/build/Release/better_sqlite3.node',
+    `onnxruntime-node/bin/napi-v3/darwin/${arch}/onnxruntime_binding.node`,
+    `onnxruntime-node/bin/napi-v3/darwin/${arch}/libonnxruntime.1.21.0.dylib`,
+    `@img/sharp-darwin-${arch}/lib/sharp-darwin-${arch}-0.35.4.node`,
+    `@img/sharp-libvips-darwin-${arch}/lib/libvips-cpp.8.18.6.dylib`,
+    'fsevents/fsevents.node',
+  ]) {
+    const file = path.join(root, relativePath);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const bytes = Buffer.alloc(32);
+    bytes.writeUInt32LE(0xfeedfacf, 0);
+    bytes.writeUInt32LE(arch === 'arm64' ? 0x0100000c : 0x01000007, 4);
+    bytes.writeUInt32LE(arch === 'arm64' ? 0 : 3, 8);
+    bytes.writeUInt32LE(6, 12);
+    fs.writeFileSync(file, bytes);
+  }
+  return root;
+}
+
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -74,6 +106,29 @@ afterEach(() => {
 });
 
 describe('native-package-gate', () => {
+  it('verifies current Windows Sharp payload and rejects a missing libvips DLL', () => {
+    const root = windowsFixture();
+    const lib = path.join(root, '@img/sharp-win32-x64/lib');
+    fs.renameSync(path.join(lib, 'sharp-win32-x64-0.35.3.node'), path.join(lib, 'sharp-win32-x64-0.35.4.node'));
+    fs.renameSync(path.join(lib, 'libvips-cpp-8.18.3.dll'), path.join(lib, 'libvips-cpp-8.18.6.dll'));
+    expect(verifyNativePackagePayload(root, 'win32', 'x64')).toEqual(
+      requiredNativeVerificationEntries('win32', 'x64'),
+    );
+    fs.rmSync(path.join(lib, 'libvips-cpp-8.18.6.dll'));
+    expect(() => verifyNativePackagePayload(root, 'win32', 'x64'))
+      .toThrow(/expected exactly one sharp-libvips-cpp/);
+  });
+
+  it.each(['arm64', 'x64'])('verifies current Mac %s payload and rejects a missing Sharp companion', (arch) => {
+    const root = macFixture(arch);
+    expect(verifyNativePackagePayload(root, 'darwin', arch)).toEqual(
+      requiredNativeVerificationEntries('darwin', arch),
+    );
+    fs.rmSync(path.join(root, `@img/sharp-libvips-darwin-${arch}/lib/libvips-cpp.8.18.6.dylib`));
+    expect(() => verifyNativePackagePayload(root, 'darwin', arch))
+      .toThrow(/expected exactly one sharp-libvips-cpp/);
+  });
+
   it('verifies every declared Windows native binary and its PE machine', () => {
     const root = windowsFixture();
     expect(verifyNativePackagePayload(root, 'win32', 'x64')).toEqual(

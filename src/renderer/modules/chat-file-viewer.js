@@ -1017,11 +1017,11 @@ async function _renderHtmlBody(absPath, displayName, cid, projectId) {
     if (seq === _viewerRenderSeq) _viewerFinishLoading(frameHost);
   }, { once: true });
   _viewerShowLoading();
-  _viewerAppendLoadingResource(frameHost);
-  // Start streamed navigation before the independent layout IPC. The layout
-  // scan is linear and constant-memory; large HTML therefore does not pay
-  // either phase serially or cross the renderer IPC boundary.
+  // Set the destination while detached: mounting a frame without src emits
+  // an about:blank load that consumes the one-shot readiness listener.
+  // Navigation and the independent layout scan still run in parallel.
   iframe.src = url;
+  _viewerAppendLoadingResource(frameHost);
   const payload = { path: absPath, htmlPreviewLayoutOnly: true };
   if (cid) payload.cid = cid;
   if (projectId) payload.projectId = projectId;

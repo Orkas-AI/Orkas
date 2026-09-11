@@ -169,6 +169,25 @@ describe('pending attachment preview', () => {
     expect(harness.warn).toHaveBeenCalledOnce();
   });
 
+  it('does not put conversation ids, filenames, or raw resolver errors in preview logs', async () => {
+    const privateMessage = '/Users/test/private-plan.md failed for session-secret';
+    const harness = createPreviewHarness({ ok: false, error: privateMessage });
+
+    await harness.openPreview('session-secret', {
+      name: 'private-plan.md',
+      status: 'ready',
+    });
+
+    const logged = JSON.stringify(harness.warn.mock.calls);
+    expect(logged).not.toContain('session-secret');
+    expect(logged).not.toContain('private-plan.md');
+    expect(logged).not.toContain(privateMessage);
+    expect(harness.warn).toHaveBeenCalledWith(
+      'attachments.absPath pending preview failed',
+      { failure_stage: 'resolve' },
+    );
+  });
+
   it('uses the same recovery when the path resolver throws', async () => {
     const harness = createPreviewHarness();
     harness.invoke.mockRejectedValueOnce(new Error('resolver unavailable'));

@@ -11,7 +11,7 @@ import { AgentRunner } from "../src/agent/runner.js";
 import { ProviderRegistry } from "../src/providers/registry.js";
 import { createConfig } from "../src/config/loader.js";
 import { defineTool } from "../src/tools/base.js";
-import type { LLMProvider, CompletionResult } from "../src/providers/base.js";
+import type { LLMProvider, CompletionParams, CompletionResult } from "../src/providers/base.js";
 
 // ���─ Helpers ──
 
@@ -61,7 +61,10 @@ function makeRunResult(overrides: Partial<AgentRunResult["meta"]> = {}): AgentRu
   };
 }
 
-function createMockProvider(responses: CompletionResult[]): LLMProvider {
+function createMockProvider(
+  responses: CompletionResult[],
+  onStream?: (params: CompletionParams) => void,
+): LLMProvider {
   let callIdx = 0;
   const pick = () =>
     callIdx >= responses.length ? responses[responses.length - 1] : responses[callIdx++];
@@ -71,7 +74,8 @@ function createMockProvider(responses: CompletionResult[]): LLMProvider {
     async complete(): Promise<CompletionResult> {
       return pick();
     },
-    async *stream() {
+    async *stream(params) {
+      onStream?.(params);
       const r = pick();
       yield { type: "message_start" as const };
       for (const c of r.content) {
@@ -441,6 +445,26 @@ describe("Evolution: skill_manage tool", () => {
 
   afterEach(cleanTmpDir);
 
+  it("describes action-specific parameters on the discriminator", () => {
+    const schema = tool.inputSchema as any;
+    const action = schema.properties.action;
+    expect(action.description).toContain("list: no fields");
+    expect(action.description).toContain("create: id/name/description/body");
+    expect(action.description).toContain("patch: id/old_string/new_string");
+    const branches = Object.fromEntries(schema.oneOf.map((branch: any) => [
+      branch.properties.action.enum[0],
+      branch.required,
+    ]));
+    expect(branches.patch).toEqual(["action", "id", "old_string", "new_string"]);
+    expect(branches.create).toEqual(["action", "id", "name", "description", "body"]);
+  });
+
+  it("rejects fields from another skill action", async () => {
+    const result = await tool.execute({ action: "list", id: "unrelated" }, ctx);
+    expect(result).toMatchObject({ isError: true });
+    expect(result.content).toContain("skill_manage(list) does not accept: id");
+  });
+
   it("list returns empty message when no skills", async () => {
     const result = await tool.execute({ action: "list" }, ctx);
     expect(result.content).toContain("No skills found");
@@ -578,6 +602,45 @@ describe("Evolution: AgentRunner integration", () => {
 
     const runner = new AgentRunner({ config, providers: registry, tools: [] });
     expect(runner.getSkillStore()).not.toBeNull();
+  });
+
+  it("advertises learned skills without assigning self-improvement work to the main task", async () => {
+    let systemPrompt = "";
+    const mockProvider = createMockProvider([
+      {
+        content: [{ type: "text", text: "done" }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+        model: "mock-model",
+      },
+    ], (params) => { systemPrompt = params.systemPrompt ?? ""; });
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const store = new SkillStore(skillsDir, makeConfig(skillsDir));
+    await store.create({
+      id: "incident-summary",
+      name: "Incident Summary",
+      description: "Summarize incidents from verified evidence.",
+      body: "Lead with user-visible impact.",
+    });
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model" },
+      evolution: { enabled: true, skillsDir },
+    });
+    const runner = new AgentRunner({
+      config,
+      providers: registry,
+      tools: [],
+      skillStore: store,
+    });
+
+    await runner.run({ message: "Summarize the incident", systemPrompt: "MAIN_TASK" });
+
+    expect(systemPrompt).toContain("MAIN_TASK");
+    expect(systemPrompt).toContain("Available Learned Skills");
+    expect(systemPrompt).toContain("Incident Summary");
+    expect(systemPrompt).not.toContain("Self-improvement: skills & metacognition");
+    expect(systemPrompt).not.toContain("continuously improving yourself");
   });
 
   it("does not register skill tools when evolution is disabled", () => {

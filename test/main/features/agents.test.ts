@@ -64,6 +64,98 @@ async function loadAgents() {
   return import('../../../src/main/features/agents');
 }
 
+async function agentDiagnosticText(): Promise<string> {
+  const { redact } = await vi.importActual<typeof import('../../../src/main/logger')>(
+    '../../../src/main/logger',
+  );
+  const logger = loggerSpies.byName.get('agents')!;
+  return JSON.stringify(
+    Object.values(logger).flatMap((spy) => spy.mock.calls).map((call) => call.map((value) => redact(value))),
+    (_key, value) => value instanceof Error
+      ? { name: value.name, message: value.message, stack: value.stack }
+      : value,
+  );
+}
+
+describe('agents › diagnostic privacy', () => {
+  beforeEach(async () => {
+    await loadAgents();
+    Object.values(loggerSpies.byName.get('agents')!).forEach((spy) => spy.mockClear());
+  });
+
+  it('keeps authored names private while creating and updating the persisted Agent', async () => {
+    const a = await loadAgents();
+    const agent = await a.createCustomAgent({ name: 'MergerDesk', description: 'Private diligence' });
+    expect(agent?.name).toBe('MergerDesk');
+    const updated = await a.updateCustomAgent(agent!.agent_id, { name: 'PrivateOps' });
+    expect(updated?.name).toBe('PrivateOps');
+    expect(JSON.parse(fs.readFileSync(path.join(customAgentsDir(), agent!.agent_id, 'agent.json'), 'utf8')).name)
+      .toBe('PrivateOps');
+    expect(loggerSpies.byName.get('agents')!.info).toHaveBeenCalled();
+    const logged = await agentDiagnosticText();
+    expect(logged).not.toContain('MergerDesk');
+    expect(logged).not.toContain('PrivateOps');
+  });
+
+  it('keeps rejected input values private without changing field recovery', async () => {
+    const a = await loadAgents();
+    const privateValue = 'Confidential acquisition terms';
+    const inputs = a.validateAgentInputs([
+      { id: privateValue, type: 'text', default: '' },
+      { id: 'bad_type', type: privateValue },
+      { id: 'approved', type: 'boolean', default: privateValue },
+      { id: 'region', type: 'select', default: privateValue, options: [{ value: 'all', label: 'All' }] },
+    ]);
+    expect(inputs.map(({ id, default: value }) => ({ id, value })))
+      .toEqual([{ id: 'approved', value: false }, { id: 'region', value: 'all' }]);
+    expect(loggerSpies.byName.get('agents')!.warn).toHaveBeenCalled();
+    expect(await agentDiagnosticText()).not.toContain(privateValue);
+  });
+
+  it.each(['profile', 'knowhow', 'standards', 'inputs'])(
+    'keeps malformed %s content private while retaining other field updates', async (tag) => {
+      const a = await loadAgents();
+      const privateValue = 'PrivateBudget';
+      const parsed = a.extractAgentFieldBlocks(
+        `<agent><name>KeptName</name><${tag}>[${privateValue}]</${tag}></agent>`,
+      );
+      expect(parsed.blocks).toEqual([{ name: 'KeptName' }]);
+      expect(loggerSpies.byName.get('agents')!.warn).toHaveBeenCalled();
+      expect(await agentDiagnosticText()).not.toContain(privateValue);
+    },
+  );
+
+  it('keeps unreadable install metadata private while leaving the Agent available', async () => {
+    writePlatformAgent('installed');
+    fs.writeFileSync(path.join(builtinAgentsDir(), 'installed', '_install.json'), '[PrivateInstallData]');
+    const a = await loadAgents();
+    expect((await a.getAgent('installed'))?.name).toBe('installed');
+    expect(loggerSpies.byName.get('agents')!.warn).toHaveBeenCalled();
+    const logged = await agentDiagnosticText();
+    expect(logged).not.toContain('PrivateInstallData');
+    expect(logged).not.toContain(tmpDir);
+  });
+
+  it('keeps a provider exception private in logs while preserving edit failure recovery', async () => {
+    writeCustomAgent('abc', { name: 'DraftAgent', workflow: 'Retained workflow' });
+    const privateValue = 'Private provider request excerpt';
+    streamImpl.current = async function* () {
+      yield { type: 'delta', text: 'Partial reply' };
+      throw new Error(privateValue);
+    };
+    const a = await loadAgents();
+    const events = [];
+    for await (const event of a.streamSendToAgentEditChat(TEST_UID, 'abc', 'Edit the draft')) events.push(event);
+    expect(events).toContainEqual({ type: 'error', text: expect.any(String) });
+    const messages = await a.getAgentChatMessages(TEST_UID, 'abc');
+    expect(messages.at(-1)?.content).toContain('Partial reply');
+    expect(messages.at(-1)?.content).toContain('Model response failed');
+    expect((await a.getAgent('abc'))?.workflow).toBe('Retained workflow');
+    expect(loggerSpies.byName.get('agents')!.error).toHaveBeenCalled();
+    expect(await agentDiagnosticText()).not.toContain(privateValue);
+  });
+});
+
 async function failNextBlockingAgentChat(text: string, error: string): Promise<void> {
   const client = await import('../../../src/main/model/client');
   vi.mocked(client.chatWithModel).mockResolvedValueOnce({
@@ -330,7 +422,7 @@ describe('agents › normalizeAgent', () => {
     }
   });
 
-  it('keeps new per-Agent overrides while ignoring the removed legacy model field', async () => {
+  it('keeps supported per-Agent CLI overrides while ignoring the removed legacy model field', async () => {
     const a = await loadAgents();
     const norm = a.normalizeAgent({
       agent_id: 'x', name: 'N',
@@ -339,6 +431,7 @@ describe('agents › normalizeAgent', () => {
         model: 'stale-legacy-model',
         model_override: 'claude-opus-4-7',
         thinking_level: 'high',
+        permission_policy: 'full_access',
         custom_args: ['--debug'],
       },
     } as any, 'custom');
@@ -346,6 +439,7 @@ describe('agents › normalizeAgent', () => {
       kind: 'cli', cli: 'claude',
       model_override: 'claude-opus-4-7',
       thinking_level: 'high',
+      permission_policy: 'full_access',
       custom_args: ['--debug'],
     });
     expect(a.isCliAgent(norm)).toBe(true);
@@ -384,6 +478,32 @@ describe('agents › normalizeAgent', () => {
       runtime: { kind: 'cli', cli: 'claude', model_override: 'safe\n--flag', thinking_level: 'x'.repeat(201) },
     } as any, 'custom');
     expect(norm?.runtime).toEqual({ kind: 'cli', cli: 'claude' });
+  });
+
+  it.each([
+    { cli: 'claude', policy: 'ask', expected: 'ask' },
+    { cli: 'claude', policy: 'full_access', expected: 'full_access' },
+    { cli: 'codex', policy: 'ask', expected: 'ask' },
+    { cli: 'codex', policy: 'full_access', expected: 'full_access' },
+    { cli: 'opencode', policy: 'full_access', expected: undefined },
+    { cli: 'opencode', policy: 'ask', expected: undefined },
+    { cli: 'hermes', policy: 'ask', expected: 'ask' },
+    { cli: 'hermes', policy: 'full_access', expected: 'full_access' },
+    { cli: 'openclaw', policy: 'ask', expected: undefined },
+    { cli: 'openclaw', policy: 'full_access', expected: undefined },
+    { cli: 'codex', policy: 'inherit', expected: undefined },
+    { cli: 'codex', policy: 'always', expected: undefined },
+  ])('normalizes $cli permission policy $policy to $expected', async ({ cli, policy, expected }) => {
+    const a = await loadAgents();
+    const runtime = a.normalizeAgent({
+      agent_id: `${cli}-agent`,
+      runtime: { kind: 'cli', cli, permission_policy: policy },
+    } as any, 'custom')?.runtime;
+
+    expect(runtime).toEqual({
+      kind: 'cli', cli,
+      ...(expected ? { permission_policy: expected } : {}),
+    });
   });
 
   it('drops malformed runtime entries (no field set)', async () => {
@@ -2206,37 +2326,80 @@ describe('agents › custom agent memory', () => {
     expect(fs.readFileSync(specFile, 'utf8')).toBe(beforeSpec);
   });
 
-  it('does not expose or mutate detail memory for external CLI agents', async () => {
-    writeCustomAgent('cli-agent', {
-      name: 'CliAgent',
-      runtime: { kind: 'cli', cli: 'codex' },
-    });
-    const memoryFile = path.join(customAgentsDir(), 'cli-agent', 'memory', 'MEMORY.md');
-    fs.mkdirSync(path.dirname(memoryFile), { recursive: true });
-    fs.writeFileSync(memoryFile, 'existing external memory', 'utf8');
-    const a = await loadAgents();
+  it.each(['claude', 'codex'])(
+    'supports detail-memory add, update, read, and remove for %s CLI agents', async (cli) => {
+      writeCustomAgent('cli-agent', {
+        name: 'CliAgent',
+        runtime: { kind: 'cli', cli },
+      });
+      const a = await loadAgents();
 
-    const reread = await a.getAgent('cli-agent');
-    expect(reread?.profile?.memory).toBeUndefined();
+      const added = await a.addCustomAgentMemory('cli-agent', 'new external memory');
+      expect(added).toMatchObject({ ok: true, entries: ['new external memory'] });
+      const canonicalMemoryFile = path.join(
+        tmpDir, TEST_UID, 'cloud', 'memory', 'agents', 'cli-agent', 'MEMORY.md',
+      );
+      expect(fs.readFileSync(canonicalMemoryFile, 'utf8')).toBe('new external memory');
+      expect((await a.getAgent('cli-agent'))?.profile?.memory?.map((entry) => entry.title))
+        .toEqual(['new external memory']);
 
-    const added = await a.addCustomAgentMemory('cli-agent', 'new external memory');
-    expect(added.ok).toBe(false);
-    expect(added.error).toContain('external CLI');
-    expect(fs.readFileSync(memoryFile, 'utf8')).toBe('existing external memory');
-  });
+      const updated = await a.updateCustomAgentMemory(
+        'cli-agent', 'new external memory', 'updated external memory',
+      );
+      expect(updated).toMatchObject({ ok: true, entries: ['updated external memory'] });
+      expect(fs.readFileSync(canonicalMemoryFile, 'utf8')).toBe('updated external memory');
 
-  it('does not add memory for platform-installed external CLI agents', async () => {
+      const removed = await a.removeCustomAgentMemory('cli-agent', 'updated external memory');
+      expect(removed).toMatchObject({ ok: true, entries: [] });
+      expect((await a.getAgent('cli-agent'))?.profile?.memory ?? []).toEqual([]);
+    },
+  );
+
+  it.each(['openclaw', 'opencode', 'hermes'])(
+    'keeps stored Agent memory hidden and read-only for unsupported %s CLI agents', async (cli) => {
+      writeCustomAgent('cli-agent', {
+        name: 'CliAgent',
+        runtime: { kind: 'cli', cli },
+      });
+      const memory = await import('../../../src/main/features/memory');
+      expect(memory.addAgentEntry(TEST_UID, 'cli-agent', 'preserved private memory'))
+        .toMatchObject({ ok: true });
+      const canonicalMemoryFile = path.join(
+        tmpDir, TEST_UID, 'cloud', 'memory', 'agents', 'cli-agent', 'MEMORY.md',
+      );
+      const a = await loadAgents();
+
+      expect((await a.getAgent('cli-agent'))?.profile?.memory).toBeUndefined();
+      for (const result of [
+        await a.addCustomAgentMemory('cli-agent', 'must not be added'),
+        await a.updateCustomAgentMemory('cli-agent', 'preserved private memory', 'must not replace'),
+        await a.removeCustomAgentMemory('cli-agent', 'preserved private memory'),
+      ]) {
+        expect(result).toMatchObject({
+          ok: false,
+          error: expect.stringContaining('only for Claude and Codex'),
+        });
+      }
+      expect(fs.readFileSync(canonicalMemoryFile, 'utf8')).toBe('preserved private memory');
+    },
+  );
+
+  it('supports platform-installed external CLI memory without mutating its installed spec', async () => {
     writePlatformAgent('platform-cli', {
       name: 'PlatformCli',
       runtime: { kind: 'cli', cli: 'codex' },
     });
+    const specFile = path.join(builtinAgentsDir(), 'platform-cli', 'agent.json');
+    const beforeSpec = fs.readFileSync(specFile, 'utf8');
     const a = await loadAgents();
 
     const added = await a.addCustomAgentMemory('platform-cli', 'new external memory');
-    expect(added.ok).toBe(false);
-    expect(added.error).toContain('external CLI');
+    expect(added).toMatchObject({ ok: true, entries: ['new external memory'] });
     const canonicalMemoryFile = path.join(tmpDir, TEST_UID, 'cloud', 'memory', 'agents', 'platform-cli', 'MEMORY.md');
-    expect(fs.existsSync(canonicalMemoryFile)).toBe(false);
+    expect(fs.readFileSync(canonicalMemoryFile, 'utf8')).toBe('new external memory');
+    expect((await a.getAgent('platform-cli'))?.profile?.memory?.map((entry) => entry.title))
+      .toEqual(['new external memory']);
+    expect(fs.readFileSync(specFile, 'utf8')).toBe(beforeSpec);
   });
 });
 
@@ -2430,16 +2593,16 @@ describe('agents › streamSendToAgentEditChat synthesized progress', () => {
     expect(JSON.stringify(history)).not.toContain('<agent>');
   });
 
-  it('normalizes and persists terminal runtime for live and restored edit chat', async () => {
+  it.each(['completed', 'waiting_input'])('persists a %s runtime for live and restored edit chat', async (terminalStatus) => {
     streamImpl.current = async function* () {
-      yield { type: 'final', text: 'done' };
+      if (terminalStatus === 'completed') yield { type: 'final', text: 'done' };
       yield {
         type: 'event',
         event: {
           stream: 'agent_run_result',
           data: {
             result: 'success',
-            terminal_status: 'completed',
+            terminal_status: terminalStatus,
             duration_ms: 42_000,
             provider_ms: 40_000,
             tool_ms: 2_000,
@@ -2462,14 +2625,15 @@ describe('agents › streamSendToAgentEditChat synthesized progress', () => {
       type: 'event',
       event: expect.objectContaining({
         stream: 'runtime',
-        data: expect.objectContaining({ phase: 'end', duration_ms: 42_000, status: 'success' }),
+        data: expect.objectContaining({ phase: 'end', duration_ms: 42_000, status: terminalStatus === 'waiting_input' ? 'waiting_input' : 'success' }),
       }),
     }));
 
     const chatPath = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'agent', 'abc', 'chat.jsonl');
     const rows = fs.readFileSync(chatPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(rows.at(-1)?.content).toBe(terminalStatus === 'waiting_input' ? '' : 'done');
     const runtime = rows.at(-1)?.process?.find((item: any) => item.event?.stream === 'runtime');
-    expect(runtime?.event?.data).toMatchObject({ phase: 'end', duration_ms: 42_000, status: 'success' });
+    expect(runtime?.event?.data).toMatchObject({ phase: 'end', duration_ms: 42_000, status: terminalStatus === 'waiting_input' ? 'waiting_input' : 'success' });
   });
 
   it('persists an aborted fallback runtime when no terminal receipt arrives', async () => {
@@ -2500,6 +2664,66 @@ describe('agents › streamSendToAgentEditChat synthesized progress', () => {
       errored: false,
     });
     expect(runtime?.event?.data?.duration_ms).toBeGreaterThanOrEqual(0);
+  });
+
+  it('keeps non-CLI commentary in the process rail and final-answer deltas in the reply', async () => {
+    streamImpl.current = async function* () {
+      yield { type: 'delta', text: 'Inspect ', phase: 'commentary' };
+      yield { type: 'delta', text: 'the agent.', phase: 'commentary' };
+      yield { type: 'delta', text: 'Updated reply.', phase: 'final_answer' };
+      yield { type: 'final', text: 'Updated reply.' };
+    };
+    writeCustomAgent('abc', { name: 'N' });
+
+    const a = await loadAgents();
+    const events: any[] = [];
+    for await (const event of a.streamSendToAgentEditChat('u1', 'abc', 'hi')) {
+      events.push(event);
+    }
+
+    expect(events.filter((event) => event.type === 'delta')).toEqual([
+      { type: 'delta', text: 'Inspect ', phase: 'commentary' },
+      { type: 'delta', text: 'the agent.', phase: 'commentary' },
+      { type: 'delta', text: 'Updated reply.', phase: 'final_answer' },
+    ]);
+    const chatPath = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'agent', 'abc', 'chat.jsonl');
+    const rows = fs.readFileSync(chatPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const assistant = rows.at(-1);
+    expect(assistant?.content).toBe('Updated reply.');
+    expect(assistant?.content).not.toContain('Inspect');
+    expect(assistant?.process).toContainEqual({
+      type: 'progress',
+      text: 'Inspect the agent.',
+      event: { stream: 'assistant', data: { phase: 'commentary' } },
+    });
+  });
+
+  it('does not promote interrupted commentary into the assistant reply', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    streamImpl.current = async function* () {
+      yield { type: 'delta', text: 'Checking the workflow.', phase: 'commentary' };
+      yield { type: 'delta', text: 'Visible partial.', phase: 'final_answer' };
+    };
+    writeCustomAgent('abc', { name: 'N' });
+
+    const a = await loadAgents();
+    for await (const _event of a.streamSendToAgentEditChat('u1', 'abc', 'hi', {
+      abortSignal: controller.signal,
+    })) {
+      // drain
+    }
+
+    const chatPath = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'agent', 'abc', 'chat.jsonl');
+    const rows = fs.readFileSync(chatPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const assistant = rows.at(-1);
+    expect(assistant?.content).toContain('Visible partial.');
+    expect(assistant?.content).toContain('(reply interrupted)');
+    expect(assistant?.content).not.toContain('Checking the workflow.');
+    expect(assistant?.process).toContainEqual(expect.objectContaining({
+      text: 'Checking the workflow.',
+      event: { stream: 'assistant', data: { phase: 'commentary' } },
+    }));
   });
 
   it('uses modelText for the model while persisting short visible content', async () => {

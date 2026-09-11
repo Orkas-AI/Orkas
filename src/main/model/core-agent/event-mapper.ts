@@ -5,7 +5,10 @@
  * `_IPC_ROUTES` + renderer `process` handling in renderer/app.js).
  *
  * Mapping rules:
- *   text_delta → accumulated into `finalText`; surfaced as {type:'final'} at done
+ *   text_delta → native phases pass through; phase-less provider text is
+ *                classified from structured model-round/tool events (never
+ *                from natural-language content). Tool-using rounds become
+ *                commentary; terminal rounds become final_answer.
  *   thinking   → structured reasoning lifecycle; this boundary sanitizes
  *                provider reasoning before UI/persistence, coalesces live
  *                updates, bounds their preview, and preserves full terminal text
@@ -269,6 +272,13 @@ function localizeKnownRunnerText(text: string, code?: string): string {
   if (trimmed === 'Run aborted') return t('model.run_aborted');
   if (trimmed === 'Max retries exceeded') return t('model.max_retries_exceeded');
   if (trimmed === 'empty response') return t('model.empty_response');
+  // context_status progress copy (agent/runner.ts::prepareContextBeforeModelCall).
+  // The runner emits stable English source strings; visible copy is localized
+  // here, the owning i18n chokepoint for runner-generated text.
+  if (trimmed === 'Compacting conversation history...') return t('model.context_history_summary_start');
+  if (trimmed === 'Conversation history compacted') return t('model.context_history_summary_done');
+  if (trimmed === 'Compacting current-turn tool context...') return t('model.context_active_compaction_start');
+  if (trimmed === 'Current-turn tool context compacted') return t('model.context_active_compaction_done');
   return text;
 }
 
@@ -635,6 +645,31 @@ export async function* mapCoreAgentEvents(
   let activeThinkingDirty = false;
   let thinkingProgressEmitted = false;
   let lastThinkingProgressMs = 0;
+  let pendingUnphasedText: string[] = [];
+  let waitingForInput = false;
+  let hasAssistantText = finalText.length > 0;
+
+  type AssistantTextPhase = 'commentary' | 'final_answer';
+  const phasedTextEvents = (
+    pieces: readonly string[],
+    phase: AssistantTextPhase,
+  ): StreamEvent[] => {
+    const output: StreamEvent[] = [];
+    for (const piece of pieces) {
+      if (!piece) continue;
+      hasAssistantText = true;
+      if (phase === 'final_answer') finalText += piece;
+      output.push({ type: 'delta', text: piece, phase });
+    }
+    return output;
+  };
+
+  const flushPendingText = (phase: AssistantTextPhase): StreamEvent[] => {
+    if (!pendingUnphasedText.length) return [];
+    const pieces = pendingUnphasedText;
+    pendingUnphasedText = [];
+    return phasedTextEvents(pieces, phase);
+  };
 
   const appendThinkingText = (value: string) => {
     if (value) pendingThinkingParts.push(value);
@@ -726,12 +761,6 @@ export async function* mapCoreAgentEvents(
 
   opts.registerReasoningAbortFlush?.(() => endThinking());
 
-  // Separator between turns (tool-loop interim commentary + final answer).
-  // Inserted lazily on the first delta of a new turn so we don't append a
-  // stray "\n\n" at the end of the accumulated text.
-  let turnStarted = finalText.length > 0;
-  let pendingSeparator = false;
-
   const eventIterator = events[Symbol.asyncIterator]();
   let nextEvent: Promise<IteratorResult<AgentRunEvent>> | null = null;
   const progressDue = Symbol('reasoning-progress-due');
@@ -787,17 +816,24 @@ export async function* mapCoreAgentEvents(
       case 'text_delta': {
         const piece = ev.text || '';
         if (!piece) break;
-        if (pendingSeparator) {
-          finalText += '\n\n';
-          yield { type: 'delta', text: '\n\n' };
-          pendingSeparator = false;
+        if (ev.phase === 'commentary' || ev.phase === 'final_answer') {
+          for (const event of phasedTextEvents([piece], ev.phase)) yield event;
+        } else {
+          // Chat Completions, Anthropic Messages, Gemini GenerateContent and
+          // other phase-less protocols all expose structured tool boundaries.
+          // Hold only this provider round until one of those boundaries tells
+          // us whether the text is commentary or the terminal answer.
+          pendingUnphasedText.push(piece);
         }
-        finalText += piece;
-        turnStarted = true;
-        // Surface each delta so the renderer can paint text as it arrives.
-        yield { type: 'delta', text: piece };
         break;
       }
+
+      case 'text_phase':
+        // Responses exposes the item phase as protocol metadata at text_end.
+        // It authoritatively classifies the buffered block without delaying
+        // until the whole provider request finishes.
+        for (const event of flushPendingText(ev.phase)) yield event;
+        break;
 
       case 'thinking': {
         if (ev.phase === 'start') {
@@ -825,6 +861,10 @@ export async function* mapCoreAgentEvents(
       }
 
       case 'tool_delta': {
+        // A structured tool-call delta proves that preceding unphased text in
+        // this provider round was a user-visible preamble/commentary. This is
+        // protocol inference only; no text content is inspected.
+        for (const event of flushPendingText('commentary')) yield event;
         const id = String(ev.id || '').trim();
         // An early row is useful only when every later event can address that
         // exact call. Never fall back to a shared or positional identity: two
@@ -853,6 +893,9 @@ export async function* mapCoreAgentEvents(
       }
 
       case 'tool_start': {
+        // Non-streaming providers may expose the tool boundary only when
+        // execution begins. It is still authoritative structured evidence.
+        for (const event of flushPendingText('commentary')) yield event;
         // Providers that do not stream tool-call deltas fall back to the
         // execution boundary. This remains exact for the lifecycle evidence
         // actually available rather than manufacturing model-wait time.
@@ -972,6 +1015,12 @@ export async function* mapCoreAgentEvents(
           ...(endToEndDurationMs !== null ? { end_to_end_duration_ms: endToEndDurationMs } : {}),
           ...(ev.errorCode ? { errorCode: ev.errorCode } : {}),
           ...(ev.errorSeverity ? { errorSeverity: ev.errorSeverity } : {}),
+          ...(ev.fileReadBatch ? { fileReadBatch: ev.fileReadBatch } : {}),
+          ...(ev.programExecution ? {
+            programSourceKind: ev.programExecution.sourceKind,
+            programSourceSha256: ev.programExecution.sourceSha256,
+            programChildCalls: ev.programExecution.childCalls,
+          } : {}),
           ...skillReadEventFields(skillMeta),
           ...agentReadEventFields(agentMeta),
           ...delegationMeta,
@@ -995,9 +1044,6 @@ export async function* mapCoreAgentEvents(
         // `✗ ...` on isError), where <phase_end> is i18n-resolved by
         // `_formatEventLine::phaseCn`, so the parallel
         // `✓ ${name} · ${preview}` progress yield was a duplicate. Removed.
-        // Next assistant text turn (if any) should be visually separated
-        // from the previous one — matches the old "join turns with \n\n" rule.
-        if (turnStarted) pendingSeparator = true;
         break;
       }
 
@@ -1059,6 +1105,14 @@ export async function* mapCoreAgentEvents(
       }
 
       case 'provider_call':
+        // `provider_call.stopReason` is the completed model round's structured
+        // terminal marker. It covers providers that return a complete tool
+        // call without streaming `tool_delta` first.
+        for (const event of flushPendingText(
+          ev.outcome === 'completed' && ev.stopReason !== 'tool_use'
+            ? 'final_answer'
+            : 'commentary',
+        )) yield event;
         // Internal latency telemetry. The user already sees streamed model
         // output/progress; rendering another row would add noise.
         break;
@@ -1090,6 +1144,13 @@ export async function* mapCoreAgentEvents(
 
       case 'done': {
         const result = ev.result;
+        waitingForInput = !result.meta.error && result.meta.termination?.status === 'waiting_input';
+        // Some custom/test providers omit provider_call. The run result is the
+        // final structured fallback: failures cannot promote partial prose to
+        // a final answer; successful no-tool completion can.
+        for (const event of flushPendingText(
+          result.meta.error ? 'commentary' : 'final_answer',
+        )) yield event;
         // Forward the accumulated token usage (input / output / cache read /
         // cache write) so downstream consumers — today just the dev archiver,
         // tomorrow a cost meter — can observe per-call spend. The devtools
@@ -1107,7 +1168,7 @@ export async function* mapCoreAgentEvents(
           error = localizeKnownRunnerError(result.meta.error, result.meta.provider);
           failureDetails = modelFailureDetails(
             result.meta.error,
-            finalText.length > 0,
+            hasAssistantText,
             result.meta.provider,
           );
           const endpointDiagnostic = customEndpointDiagnostic(
@@ -1137,9 +1198,11 @@ export async function* mapCoreAgentEvents(
             failureTracking.customEndpointConsecutiveFailures = 0;
           }
           failureTracking.consecutiveMaxTokensFailures = 0;
-          // Prefer the explicit `result.text` over our accumulated delta —
-          // the runner may have trimmed trailing whitespace etc.
-          if (result.text) finalText = localizeKnownRunnerText(result.text);
+          // The runner's terminal-round text is authoritative, including an
+          // empty value. Keeping deltas accumulated from an earlier tool round
+          // can otherwise turn a preamble into a successful final answer when
+          // the post-tool round emitted reasoning only.
+          finalText = localizeKnownRunnerText(result.text || '');
           if (
             finalText
             && result.meta.convergenceSignals?.includes('output_limit_unrecovered')
@@ -1160,11 +1223,16 @@ export async function* mapCoreAgentEvents(
     opts.registerReasoningAbortFlush?.(null);
   }
 
+  // A stream that ended without a provider/done boundary did not establish a
+  // final answer. Preserve any partial prose as process commentary instead of
+  // guessing from its wording or promoting it to a successful answer.
+  for (const event of flushPendingText('commentary')) yield event;
+
   if (error) {
     yield { type: 'error', text: error, ...failureDetails };
   } else if (finalText) {
     yield { type: 'final', text: finalText };
-  } else {
+  } else if (!waitingForInput) {
     yield {
       type: 'error',
       text: localizeKnownRunnerText('empty response'),

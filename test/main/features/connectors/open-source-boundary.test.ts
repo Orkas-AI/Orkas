@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { CONNECTOR_CATALOG } from '../../../../src/main/features/connectors/catalog';
@@ -7,13 +7,19 @@ const root = path.join(__dirname, '../../../..');
 const read = (rel: string) => fs.readFileSync(path.join(root, rel), 'utf8');
 
 describe('public connector boundary', () => {
-  it('keeps every catalog connector on a public OAuth mode without credit metering', () => {
-    expect(CONNECTOR_CATALOG).toHaveLength(21);
-    expect(CONNECTOR_CATALOG.filter((entry) => entry.auth_mode === 'mcp_dcr')).toHaveLength(11);
-    expect(CONNECTOR_CATALOG.filter((entry) => entry.auth_mode === 'server_bridge')).toHaveLength(10);
+  it('keeps public OAuth modes and confines credit metering to Composio', () => {
     for (const entry of CONNECTOR_CATALOG) {
-      expect(['server_bridge', 'mcp_dcr']).toContain(entry.auth_mode);
+      expect(['server_bridge', 'mcp_dcr', 'composio', 'local_cli', 'local_api']).toContain(entry.auth_mode);
       expect(entry.icon_svg).toMatch(/^<svg\b/);
+      if (entry.auth_mode === 'composio') {
+        expect(entry).toMatchObject({
+          requires_credits: true,
+          transport_template: null,
+          usage_metering: { provider: 'composio' },
+        });
+        expect(entry.oauth).toBeUndefined();
+        continue;
+      }
       if (entry.auth_mode === 'mcp_dcr') {
         expect(entry.transport_template?.kind).toBe('streamable-http');
         expect(entry.transport_template && 'url' in entry.transport_template
@@ -30,17 +36,32 @@ describe('public connector boundary', () => {
     }
   });
 
-  it('pins connector OAuth to the global HTTPS bridge with no loopback or environment override', () => {
-    const bridge = read('src/main/features/connectors/_server_bridge.ts');
-    const marketplace = read('src/main/features/marketplace.ts');
+  it.each([
+    [false, 'https://orkas.ai/api'],
+    [true, 'https://orkas.ai/api'],
+  ])('routes connectors to production for isPackaged=%s', async (isPackaged, expected) => {
+    vi.resetModules();
+    vi.doMock('electron', () => ({ app: { isPackaged } }));
+    const marketplaceBase = vi.fn(() => 'https://orkas.ai/api');
+    vi.doMock('../../../../src/main/features/marketplace', () => ({ apiBase: marketplaceBase }));
+    try {
+      const { accountApiBase, tokenStore } = await import('../../../../src/main/features/connectors/_server_bridge');
+      expect(accountApiBase()).toBe(expected);
+      expect(tokenStore.authHeaders()).toEqual({});
+      expect(marketplaceBase).toHaveBeenCalledOnce();
+    } finally {
+      vi.doUnmock('electron');
+      vi.doUnmock('../../../../src/main/features/marketplace');
+      vi.resetModules();
+    }
+  });
+
+  it('keeps connector endpoint selection centralized without arbitrary environment overrides', () => {
     const oauthSources = [
-      bridge,
       read('src/main/features/connectors/oauth.ts'),
       read('src/main/features/connectors/oauth-dcr.ts'),
+      read('src/main/features/connectors/manager.ts'),
     ].join('\n');
-
-    expect(bridge).toContain('return apiBase();');
-    expect(marketplace).toContain("const GLOBAL_PROD_API_BASE = 'https://orkas.ai' + '/api';");
     expect(oauthSources).not.toMatch(/http:\/\/(?:localhost|127\.0\.0\.1)|ORKAS_API_BASE_URL|OAUTH_REDIRECT_BASE/);
   });
 

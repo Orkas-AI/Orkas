@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { makeAcpBackend } from '../../../../src/main/features/local_agents/backends/_acp';
 
@@ -82,6 +82,267 @@ describe('local_agents/backends/_acp process lifecycle', () => {
       status: 'completed',
       output: 'ACP result',
       sessionId: 'acp-session-1',
+    });
+  });
+
+  it('resumes the requested ACP session and still asks Orkas for the current task permission', async () => {
+    const fakeAcpServer = String.raw`
+      let buffer = '';
+      let promptRequestId = null;
+      const send = (message) => process.stdout.write(JSON.stringify(message) + '\n');
+      process.stdin.setEncoding('utf8');
+      process.stdin.on('data', (chunk) => {
+        buffer += chunk;
+        let newline;
+        while ((newline = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          if (!line.trim()) continue;
+          const message = JSON.parse(line);
+          if (message.method === 'initialize') {
+            send({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: 1 } });
+          } else if (message.method === 'session/new') {
+            process.stderr.write('a resumable task must not create a fresh ACP session\n');
+            process.exit(8);
+          } else if (message.method === 'session/resume') {
+            if (message.params?.sessionId !== 'existing-acp-session') {
+              process.stderr.write('wrong ACP session resumed\n');
+              process.exit(7);
+            }
+            send({ jsonrpc: '2.0', id: message.id, result: { configOptions: [] } });
+          } else if (message.method === 'session/prompt') {
+            promptRequestId = message.id;
+            send({
+              jsonrpc: '2.0', id: 91, method: 'session/request_permission',
+              params: {
+                sessionId: 'existing-acp-session',
+                toolCall: {
+                  kind: 'execute', title: 'Commit changes',
+                  rawInput: { command: 'git commit -m test' },
+                },
+                options: [
+                  { optionId: 'allow_once', kind: 'allow_once' },
+                  { optionId: 'allow_always', kind: 'allow_always' },
+                  { optionId: 'deny', kind: 'reject_once' },
+                ],
+              },
+            });
+          } else if (message.id === 91) {
+            if (message.result?.outcome?.optionId !== 'allow_once') {
+              process.stderr.write('Orkas task approval leaked into a native session grant\n');
+              process.exit(6);
+            }
+            send({ jsonrpc: '2.0', method: 'session/update', params: {
+              sessionId: 'existing-acp-session',
+              update: { sessionUpdate: 'agent_message_chunk', content: { text: 'committed' } },
+            } });
+            send({ jsonrpc: '2.0', id: promptRequestId, result: { stopReason: 'end_turn' } });
+          }
+        }
+      });
+    `;
+    const backend = makeAcpBackend({
+      logName: 'local-agents:test-acp-resume-permission',
+      argv: ['-e', fakeAcpServer],
+      clientName: 'orkas-test',
+      resume: true,
+    });
+    const events: any[] = [];
+    const requestPermission = vi.fn(async () => 'allow_run' as const);
+
+    await backend.run({
+      binPath: TEST_NODE,
+      prompt: 'commit the changes',
+      resumeSessionId: 'existing-acp-session',
+      permissionPolicy: 'ask',
+      requestPermission,
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+      timeoutMs: 2_000,
+      onEvent: event => events.push(event),
+    });
+
+    expect(requestPermission).toHaveBeenCalledWith(expect.objectContaining({
+      tool: 'execute',
+      command: 'git commit -m test',
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'status',
+      status: 'session_ready',
+      sessionId: 'existing-acp-session',
+    }));
+    expect(events.at(-1)).toMatchObject({
+      type: 'done',
+      status: 'completed',
+      output: 'committed',
+      sessionId: 'existing-acp-session',
+    });
+  });
+
+  it('bridges Hermes ACP permission requests to a human decision', async () => {
+    const fakeAcpServer = String.raw`
+      let buffer = '';
+      let promptRequestId = null;
+      const send = (message) => process.stdout.write(JSON.stringify(message) + '\n');
+      process.stdin.setEncoding('utf8');
+      process.stdin.on('data', (chunk) => {
+        buffer += chunk;
+        let newline;
+        while ((newline = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          if (!line.trim()) continue;
+          const message = JSON.parse(line);
+          if (message.method === 'initialize') {
+            send({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: 1 } });
+          } else if (message.method === 'session/new') {
+            send({ jsonrpc: '2.0', id: message.id, result: { sessionId: 'acp-permission-session' } });
+          } else if (message.method === 'session/prompt') {
+            promptRequestId = message.id;
+            send({
+              jsonrpc: '2.0', id: 77, method: 'session/request_permission',
+              params: {
+                sessionId: 'acp-permission-session',
+                toolCall: {
+                  kind: 'execute', title: 'Run tests',
+                  rawInput: { command: 'npm test', description: 'Run tests' },
+                },
+                options: [
+                  { optionId: 'allow_once', kind: 'allow_once' },
+                  { optionId: 'session-grant', kind: 'allow_always' },
+                  { optionId: 'deny', kind: 'reject_once' },
+                ],
+              },
+            });
+          } else if (message.id === 77) {
+            if (message.result?.outcome?.optionId !== 'allow_once') {
+              process.stderr.write('permission response was not bounded to one native operation\n');
+              process.exit(7);
+            }
+            send({ jsonrpc: '2.0', method: 'session/update', params: {
+              sessionId: 'acp-permission-session',
+              update: { sessionUpdate: 'agent_message_chunk', content: { text: 'approved result' } },
+            } });
+            send({ jsonrpc: '2.0', id: promptRequestId, result: { stopReason: 'end_turn' } });
+          }
+        }
+      });
+    `;
+    const backend = makeAcpBackend({
+      logName: 'local-agents:test-acp-permission',
+      argv: ['-e', fakeAcpServer],
+      clientName: 'orkas-test',
+    });
+    const events: any[] = [];
+    const requestPermission = vi.fn(async () => 'allow_run' as const);
+
+    await backend.run({
+      binPath: TEST_NODE,
+      prompt: 'run tests',
+      permissionPolicy: 'ask',
+      requestPermission,
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+      timeoutMs: 2_000,
+      onEvent: event => events.push(event),
+    });
+
+    expect(requestPermission).toHaveBeenCalledWith(expect.objectContaining({
+      tool: 'execute',
+      command: 'npm test',
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'permission-request',
+      reason: 'user',
+      decision: 'allow',
+    }));
+    expect(events.at(-1)).toMatchObject({
+      type: 'done',
+      status: 'completed',
+      output: 'approved result',
+    });
+  });
+
+  it('returns a cancelled ACP outcome when the user denies the tool call', async () => {
+    const fakeAcpServer = String.raw`
+      let buffer = '';
+      let promptRequestId = null;
+      const send = (message) => process.stdout.write(JSON.stringify(message) + '\n');
+      process.stdin.setEncoding('utf8');
+      process.stdin.on('data', (chunk) => {
+        buffer += chunk;
+        let newline;
+        while ((newline = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          if (!line.trim()) continue;
+          const message = JSON.parse(line);
+          if (message.method === 'initialize') {
+            send({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: 1 } });
+          } else if (message.method === 'session/new') {
+            send({ jsonrpc: '2.0', id: message.id, result: { sessionId: 'acp-denied-session' } });
+          } else if (message.method === 'session/prompt') {
+            promptRequestId = message.id;
+            send({
+              jsonrpc: '2.0', id: 78, method: 'session/request_permission',
+              params: {
+                sessionId: 'acp-denied-session',
+                toolCall: {
+                  kind: 'execute', title: 'Delete protected file',
+                  rawInput: { command: 'rm protected.txt' },
+                },
+                options: [
+                  { optionId: 'allow_once', kind: 'allow_once' },
+                  { optionId: 'deny', kind: 'reject_once' },
+                ],
+              },
+            });
+          } else if (message.id === 78) {
+            if (message.result?.outcome?.outcome !== 'cancelled') {
+              process.stderr.write('permission request was not cancelled\n');
+              process.exit(7);
+            }
+            send({ jsonrpc: '2.0', method: 'session/update', params: {
+              sessionId: 'acp-denied-session',
+              update: { sessionUpdate: 'agent_message_chunk', content: { text: 'denied safely' } },
+            } });
+            send({ jsonrpc: '2.0', id: promptRequestId, result: { stopReason: 'end_turn' } });
+          }
+        }
+      });
+    `;
+    const backend = makeAcpBackend({
+      logName: 'local-agents:test-acp-denied',
+      argv: ['-e', fakeAcpServer],
+      clientName: 'orkas-test',
+    });
+    const events: any[] = [];
+    const requestPermission = vi.fn(async () => 'deny' as const);
+
+    await backend.run({
+      binPath: TEST_NODE,
+      prompt: 'delete the file',
+      permissionPolicy: 'ask',
+      requestPermission,
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+      timeoutMs: 2_000,
+      onEvent: event => events.push(event),
+    });
+
+    expect(requestPermission).toHaveBeenCalledWith(expect.objectContaining({
+      tool: 'execute',
+      command: 'rm protected.txt',
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'permission-request',
+      decision: 'deny',
+      reason: 'user',
+    }));
+    expect(events.at(-1)).toMatchObject({
+      type: 'done',
+      status: 'completed',
+      output: 'denied safely',
     });
   });
 

@@ -68,7 +68,130 @@ test.describe('new chat composer', () => {
       .toHaveText(['Orkas-1.5', 'Orkas-1.5 Pro']);
   });
 
-  test('keeps CLI separate and shares BYO model priority selection across composers', async ({ appPage, orkas }) => {
+  test('keeps explicit Commander mentions visible through send and history reload', async ({ modelOrkas }, testInfo) => {
+    const page = modelOrkas.page!;
+    await modelOrkas.invoke('agents.create', { name: 'DisplayWriter', description: 'Mention display fixture' });
+    await page.evaluate(async () => {
+      await (window as any).loadRendererFeature('agents');
+      await (window as any).loadAgents(true, { summary: true });
+    });
+    const draft = page.locator('.chat-rich-editor[data-rich-input-id="new-chat-input"]');
+    await draft.fill('@指挥官 @DisplayWriter 你好');
+    await page.locator('#new-chat-send-btn').click();
+    await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
+    const first = page.locator('#chat-history .chat-message.user .markdown-body').first();
+    await expect(first).toHaveText('@Commander @DisplayWriter 你好');
+    await expect(first.locator('.msg-mention')).toHaveText(['@Commander', '@DisplayWriter']);
+
+    const cid = await page.evaluate<string>('currentCid');
+    const readHistory = async () => (await modelOrkas.invoke<{ history: any[] }>(
+      'conversations.history', { cid, limit: 30 },
+    )).history;
+    await expect.poll(async () => (await readHistory()).filter((row) => row.from !== 'user').length).toBeGreaterThanOrEqual(2);
+    const user = (await readHistory()).find((row) => row.from === 'user');
+    expect(user.display_text).toBe('@指挥官 @DisplayWriter 你好');
+    expect(user.text).toBe('@DisplayWriter 你好');
+
+    // A panel selection writes the English transport alias, which is also authored.
+    const editor = page.locator('.chat-rich-editor[data-rich-input-id="chat-input"]');
+    await editor.fill('');
+    await editor.press('@');
+    await page.locator('#agent-picker [data-id="__commander__"]').click();
+    await editor.pressSequentially('continue');
+    await editor.press('Enter');
+    await expect(page.locator('#chat-history .chat-message.user .markdown-body').last()).toHaveText('@Commander continue');
+    await expect.poll(async () => (await readHistory()).filter((row) => row.from !== 'user').length).toBeGreaterThanOrEqual(3);
+    await page.reload();
+    await expect(first).toHaveText('@Commander @DisplayWriter 你好');
+    await expect(page.locator('#chat-history .chat-message.user .markdown-body').last()).toHaveText('@Commander continue');
+    // Visible names track the UI language, including already-rendered history
+    // and a pending draft; the saved authored text and routing stay unchanged.
+    await editor.fill('@commander pending');
+    for (const language of ['zh', 'ja', 'pt', 'en']) {
+      await page.evaluate(async (lang) => { await (window as any).setLang(lang); }, language);
+      const name = language === 'zh' ? '指挥官' : 'Commander';
+      await expect(first).toHaveText(`@${name} @DisplayWriter 你好`);
+      await expect(page.locator('#chat-history .chat-message.user .markdown-body').last()).toHaveText(`@${name} continue`);
+      await expect(editor.locator('.chat-use-inline-name')).toHaveText(name);
+      await expect(page.locator('#chat-input')).toHaveValue('@commander pending');
+    }
+    expect((await readHistory()).find((row) => row.from === 'user').display_text)
+      .toBe('@指挥官 @DisplayWriter 你好');
+    // HTML-looking canonical text must not bypass the authored projection.
+    await editor.fill('@commander <span>visible</span> `@commander` @commander-extra [@commander](https://example.com)');
+    await editor.press('Enter');
+    const last = page.locator('#chat-history .chat-message.user .markdown-body').last();
+    await expect(last).toHaveText('@Commander visible @commander @commander-extra @commander');
+    await expect(last.locator('code')).toHaveText('@commander');
+    await expect(last.locator('a')).toHaveText('@commander');
+    await expect(last.locator('.msg-mention')).toHaveText(['@Commander', '@commander-extra']);
+    await expect.poll(async () => (await modelOrkas.invoke<{ processing: boolean }>('groupChat.runtimeStatus', { cid })).processing)
+      .toBe(false);
+    await page.locator('#chat-history').screenshot({ path: testInfo.outputPath('commander-mentions-history.png') });
+  });
+
+  test('preserves a project composer mention while hiding its generated Commander prefix', async ({ modelOrkas }) => {
+    const page = modelOrkas.page!;
+    const { project } = await modelOrkas.invoke<{ project: { project_id: string } }>('projects.create', {
+      name: 'Commander mention display',
+    });
+    await page.evaluate((pid) => (window as any).setView('project', pid), project.project_id);
+    const editor = page.locator('.chat-rich-editor[data-rich-input-id="project-chat-input"]');
+    await editor.fill('first instruction @指挥官 second instruction');
+    await page.locator('#project-chat-send-btn').click();
+    await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
+    await expect(page.locator('#chat-history .chat-message.user .markdown-body').last())
+      .toHaveText('first instruction @Commander second instruction');
+    const cid = await page.evaluate<string>('currentCid');
+    await expect.poll(async () => (await modelOrkas.invoke<{ processing: boolean }>('groupChat.runtimeStatus', { cid })).processing)
+      .toBe(false);
+  });
+
+  test('matches typed and pasted Agent names only inside the current project', async ({ modelOrkas }) => {
+    const page = modelOrkas.page!;
+    const writer = await modelOrkas.invoke<{ agent: { agent_id: string } }>('agents.create', {
+      name: 'ScopedWriter', description: 'Project mention fixture',
+    });
+    await modelOrkas.invoke('agents.create', { name: 'OutsideResearcher', description: 'Unbound mention fixture' });
+    const { project } = await modelOrkas.invoke<{ project: { project_id: string } }>('projects.create', {
+      name: 'Scoped text mentions',
+    });
+    await modelOrkas.invoke('projects.bindings.add', {
+      projectId: project.project_id, kind: 'agent', id: writer.agent.agent_id,
+    });
+    await page.evaluate(async (pid) => {
+      await (window as any).loadRendererFeature('agents');
+      await (window as any).loadAgents(true, { summary: true });
+      (window as any).setView('project', pid);
+    }, project.project_id);
+    const editor = page.locator('.chat-rich-editor[data-rich-input-id="project-chat-input"]');
+    await editor.fill('@ScopedWriter draft A; ');
+    await expect(editor.locator('.chat-use-inline-name')).toHaveText('ScopedWriter');
+    await editor.press('End');
+    await editor.evaluate((element) => {
+      const clipboardData = new DataTransfer();
+      clipboardData.setData('text/plain', '@OutsideResearcher research B');
+      element.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData }));
+    });
+    await expect(editor.locator('.chat-use-inline-name')).toHaveText('ScopedWriter');
+    await expect(page.locator('#project-chat-input')).toHaveValue('@ScopedWriter draft A; @OutsideResearcher research B');
+    await page.locator('#project-chat-send-btn').click();
+    await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
+    const cid = await page.evaluate<string>('currentCid');
+    await expect.poll(async () => (await modelOrkas.invoke<{ processing: boolean }>('groupChat.runtimeStatus', { cid })).processing)
+      .toBe(false);
+    const { tasks } = await modelOrkas.invoke<{ tasks: Array<{ assignee: string; instruction: string }> }>(
+      'groupChat.tasks.list', { cid },
+    );
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].assignee).toBe(writer.agent.agent_id);
+    expect(tasks[0].instruction).toContain('draft A; @OutsideResearcher research B');
+    const continuation = page.locator('.chat-rich-editor[data-rich-input-id="chat-input"]');
+    await continuation.fill('@ScopedWriter continue; @OutsideResearcher remains text');
+    await expect(continuation.locator('.chat-use-inline-name')).toHaveText('ScopedWriter');
+  });
+
+  test('keeps CLI separate and shares model priority selection across composers', async ({ appPage, orkas }) => {
     await expect(appPage.locator('.new-chat-model-choices')).toHaveCount(0);
 
     const modelChips = appPage.locator('[data-composer-model-chip]');
@@ -212,9 +335,9 @@ test.describe('new chat composer', () => {
     expect(await versionList.evaluate((element) => element.parentElement === document.body)).toBe(true);
     const parentHeightAfter = await parentMenu.evaluate((element) => element.getBoundingClientRect().height);
     expect(Math.abs(parentHeightAfter - parentHeightBefore)).toBeLessThan(1);
-    await expect(versionList.locator('.composer-model-menu-version-item')).toHaveCount(5);
+    await expect(versionList.locator('.composer-model-menu-version-item')).toHaveCount(4);
     await expect(versionList.locator('.composer-model-menu-version-label'))
-      .toHaveText(['GPT-5.6 Sol', 'GPT-5.6 Terra', 'GPT-5.6 Luna', 'GPT-5.5', 'GPT-5.4']);
+      .toHaveText(['GPT-6 Astra', 'GPT-5.6 Sol', 'GPT-5.6 Terra', 'GPT-5.6 Luna']);
     await expect(versionList.locator('.composer-model-menu-version-current-dot')).toHaveCount(1);
     await expect(versionList.locator('.composer-model-menu-version-check')).toHaveCount(0);
     await versionList.locator(
@@ -269,10 +392,10 @@ test.describe('new chat composer', () => {
     await expect(appPage.locator('.settings-tab-pane[data-settings-pane="credentials"]')).toBeVisible();
   });
 
-  test('disables model selection while an external Agent is the recipient', async ({
-    appPage,
-    orkas,
-  }) => {
+  test('keeps model selection visible but disabled for picked and inline external Agent recipients', async ({
+    cliOrkas: orkas,
+  }, testInfo) => {
+    const appPage = orkas.page!;
     const created = await orkas.invoke<{
       agent: { agent_id: string; name: string };
     }>('agents.create', {
@@ -289,24 +412,277 @@ test.describe('new chat composer', () => {
 
     const modelChip = appPage.locator('[data-composer-model-chip="new-chat"]');
     await expect(modelChip).toBeEnabled();
+    await expect(modelChip).toBeVisible();
+
+    const picker = appPage.locator('#agent-picker');
+    const selected = appPage.locator('#agent-picker-selected');
+    const search = appPage.locator('#agent-picker-search');
+    const cliRow = appPage.locator(`.skill-picker-item[data-kind="agent"][data-id="${created.agent.agent_id}"]`);
+    const commanderRow = appPage.locator('.skill-picker-item[data-kind="agent"][data-id="__commander__"]');
+    const editor = appPage.locator('.chat-rich-editor[data-rich-input-id="new-chat-input"]');
+    const input = appPage.locator('#new-chat-input');
 
     await appPage.locator('#new-chat-recipient-chip').click();
-    await appPage.locator(
-      `.skill-picker-item[data-kind="agent"][data-id="${created.agent.agent_id}"]`,
-    ).click();
+    await expect(commanderRow).toHaveAttribute('aria-checked', 'true');
+    await expect(selected.getByRole('button', { name: 'Remove: Commander', exact: true })).toBeVisible();
+    await expect(commanderRow.locator('.recipient-picker-check')).toHaveCount(1);
+    expect(await commanderRow.evaluate((el) => getComputedStyle(el, '::after').content)).toBe('none');
+    await cliRow.click();
+    await expect(picker).toBeVisible();
+    await expect(cliRow).toBeFocused();
+    await expect(cliRow).toHaveAttribute('aria-checked', 'true');
+    await expect(cliRow.locator('.composer-model-menu-check')).toBeVisible();
+    await expect(selected.getByRole('button', { name: 'Remove: ComposerCli', exact: true })).toBeVisible();
+    await expect(input).toHaveValue('@ComposerCli ');
     await expect(appPage.locator('#new-chat-recipient-name')).toHaveText('ComposerCli');
     await expect(modelChip).toBeDisabled();
+    await expect(modelChip).toBeVisible();
+    await expect(modelChip).toHaveCSS('opacity', '0.55');
     await modelChip.evaluate((element) => (element as HTMLButtonElement).click());
     await expect(appPage.locator('#composer-model-menu')).toHaveCount(0);
 
-    await appPage.locator('#new-chat-recipient-chip').click();
-    await appPage.locator(
-      '.skill-picker-item[data-kind="agent"][data-id="__commander__"]',
-    ).click();
+    await commanderRow.press('Space');
+    await expect(commanderRow).toHaveAttribute('aria-checked', 'true');
+    await expect(cliRow).toHaveAttribute('aria-checked', 'true');
+    await expect(input).toHaveValue('@ComposerCli @commander ');
+    await expect(modelChip).toBeVisible();
     await expect(modelChip).toBeEnabled();
-    await modelChip.click();
-    await expect(appPage.locator('#composer-model-menu')).toBeVisible();
-    await appPage.keyboard.press('Escape');
+    await expect(selected.locator('.chat-recipient-name')).toHaveText(['ComposerCli', 'Commander']);
+    // The fixed header retains selected Agents even when search hides their rows.
+    await search.fill('ComposerCli');
+    await expect(commanderRow).toHaveCount(0);
+    await picker.screenshot({ path: testInfo.outputPath('selected-agent-header.png') });
+    await selected.getByRole('button', { name: 'Remove: Commander', exact: true }).click();
+    await expect(picker).toBeVisible();
+    await expect(input).toHaveValue('@ComposerCli ');
+    await expect(modelChip).toBeVisible();
+    await expect(modelChip).toBeDisabled();
+    await search.fill('');
+    await expect(commanderRow.locator('.recipient-picker-check')).toHaveCount(0);
+    await cliRow.press('Enter');
+    await expect(picker).toBeHidden();
+    await appPage.locator('#panel-new-chat .new-chat-input-wrapper').screenshot({
+      path: testInfo.outputPath('cli-recipient.png'),
+    });
+
+    // Reopening retains checkmarks; typing a new @ adds to explicit draft choices.
+    await appPage.locator('#new-chat-recipient-chip').click();
+    await expect(cliRow).toHaveAttribute('aria-checked', 'true');
+    await editor.click();
+    await editor.press('End');
+    await editor.press('@');
+    await expect(cliRow).toHaveAttribute('aria-checked', 'true');
+    await expect(cliRow.locator('.recipient-picker-check')).toBeVisible();
+    await expect(selected.getByRole('button', { name: 'Remove: ComposerCli', exact: true })).toBeVisible();
+    await expect(commanderRow).toHaveAttribute('aria-checked', 'false');
+    await commanderRow.press('Enter');
+    await expect(input).toHaveValue('@ComposerCli @commander ');
+    await expect(modelChip).toBeEnabled();
+    await expect(modelChip).toBeVisible();
+    await expect(appPage.locator('#new-chat-recipient-name')).toHaveText('ComposerCli, Commander');
+    // The @ entry keeps the same removable header, including when search
+    // hides every result. Removal must not insert a duplicate mention.
+    await editor.click();
+    await editor.press('End');
+    await editor.press('@');
+    await expect(selected.locator('.chat-recipient-name')).toHaveText(['ComposerCli', 'Commander']);
+    await picker.screenshot({ path: testInfo.outputPath('at-picker-selected-agents.png') });
+    await search.fill('no matching Agent');
+    await expect(picker.locator('.skill-picker-item')).toHaveCount(0);
+    await selected.getByRole('button', { name: 'Remove: ComposerCli', exact: true }).click();
+    await expect(input).toHaveValue('@commander ');
+    await selected.getByRole('button', { name: 'Remove: Commander', exact: true }).press('Enter');
+    await expect(input).toHaveValue('');
+    await expect(selected.getByRole('button', { name: 'Remove: Commander', exact: true })).toBeVisible();
+    await expect(selected.getByRole('button', { name: 'Remove: Commander', exact: true })).toBeFocused();
+    await expect(picker).toBeVisible();
+    await expect(appPage.locator('#new-chat-recipient-name')).toHaveText('Commander');
+    await search.fill('');
+    await expect(cliRow).toHaveAttribute('aria-checked', 'false');
+    await expect(commanderRow).toHaveAttribute('aria-checked', 'true');
+    expect(orkas.readCliState().invocations).toHaveLength(0);
+  });
+
+  test('renders and edits Agent mentions as the same atomic chips as Skills and Connectors', async ({ cliOrkas: orkas }, testInfo) => {
+    const appPage = orkas.page!;
+    const { agent } = await orkas.invoke<{ agent: { agent_id: string } }>('agents.create', {
+      name: 'OrkasCodex', description: 'Inline Agent chip fixture', runtime: { kind: 'cli', cli: 'codex' },
+    });
+    expect(agent?.agent_id).toBeTruthy();
+    await appPage.evaluate(async () => {
+      await (window as any).loadRendererFeature('agents');
+      await (window as any).loadAgents(true, { summary: true });
+    });
+    const editor = appPage.locator('.chat-rich-editor[data-rich-input-id="new-chat-input"]');
+    const input = appPage.locator('#new-chat-input');
+    const agentChip = editor.locator('[data-kind="agent"]');
+    const model = appPage.locator('[data-composer-model-chip="new-chat"]');
+    const selection = () => appPage.evaluate(() => (window as any).getChatRichComposerSelection('new-chat-input'));
+    const setCaret = async (position: number) => {
+      await appPage.evaluate((pos) => {
+        const input = document.getElementById('new-chat-input') as HTMLTextAreaElement;
+        input.focus();
+        input.setSelectionRange(pos, pos);
+      }, position);
+    };
+
+    await appPage.locator('#new-chat-recipient-chip').click();
+    await appPage.locator(`.skill-picker-item[data-id="${agent.agent_id}"]`).click();
+    await appPage.locator(`.skill-picker-item[data-id="${agent.agent_id}"]`).press('Enter');
+    await expect(agentChip).toHaveText('@OrkasCodex');
+    await expect(agentChip).toHaveAttribute('contenteditable', 'false');
+    await expect(model).toBeVisible();
+    await expect(model).toBeDisabled();
+    await setCaret('@OrkasCodex '.length);
+    await appPage.evaluate(() => {
+      (window as any).setChatSkill('new-chat', 'docs-fixture', 'Docs');
+      (window as any).setChatConnector('new-chat', 'drive-fixture', 'Google Drive');
+    });
+    const chips = editor.locator('.chat-use-inline-chip');
+    await expect(chips).toHaveCount(3);
+    const appearance = async (index: number) => {
+      await chips.nth(index).hover();
+      return chips.nth(index).evaluate((el) => {
+        const css = getComputedStyle(el);
+        const name = getComputedStyle(el.querySelector('.chat-use-inline-name')!);
+        return { background: css.backgroundColor, border: css.border, radius: css.borderRadius,
+          fontSize: css.fontSize, cursor: css.cursor, color: name.color };
+      });
+    };
+    const agentAppearance = await appearance(0);
+    expect(await appearance(1)).toEqual(agentAppearance);
+    expect(await appearance(2)).toEqual(agentAppearance);
+    await expect(agentChip).toHaveAttribute('title', '@OrkasCodex');
+    await appPage.locator('#panel-new-chat .new-chat-input-wrapper').screenshot({ path: testInfo.outputPath('agent-resource-chips.png') });
+
+    // Mouse clicks cannot place an editable caret inside any of the three chips.
+    for (let i = 0; i < 3; i += 1) {
+      const token = await chips.nth(i).getAttribute('data-token');
+      const value = await input.inputValue();
+      const start = value.indexOf(token!);
+      await chips.nth(i).click();
+      const caret = await selection();
+      expect([start, start + token!.length]).toContain(caret.start);
+      expect([start, start + token!.length]).toContain(caret.end);
+    }
+    await setCaret(0);
+    await editor.press('ArrowRight');
+    expect(await selection()).toEqual({ start: 11, end: 11 });
+    await editor.press('ArrowLeft');
+    expect(await selection()).toEqual({ start: 0, end: 0 });
+    await editor.press('Shift+ArrowRight');
+    expect(await selection()).toEqual({ start: 0, end: 11 });
+    await editor.press('ArrowLeft');
+    await editor.press('Delete');
+    await expect(agentChip).toHaveCount(0);
+    await expect(chips).toHaveCount(2);
+    await expect(model).toBeVisible();
+
+    // Pasted/typed names normalize too; deleting one chip retains the other recipient.
+    await editor.fill('@OrkasCodex @commander hello');
+    await expect(agentChip).toHaveCount(1);
+    await expect(editor.locator('[data-kind="commander"]')).toHaveCount(1);
+    await setCaret('@OrkasCodex '.length);
+    await editor.press('Backspace');
+    await expect(input).toHaveValue('@commander hello');
+    await expect(appPage.locator('#new-chat-recipient-name')).toHaveText('Commander');
+
+    // Drag across an Agent chip, then replace the selection with ordinary text.
+    await editor.fill('before @OrkasCodex after');
+    const box = (await agentChip.boundingBox())!;
+    await appPage.mouse.move(box.x - 1, box.y + box.height / 2);
+    await appPage.mouse.down();
+    await appPage.mouse.move(box.x + box.width + 1, box.y + box.height / 2, { steps: 8 });
+    await appPage.mouse.up();
+    const selected = await selection();
+    expect(selected.start).toBeLessThanOrEqual('before '.length);
+    expect(selected.end).toBeGreaterThanOrEqual('before @OrkasCodex'.length);
+    await appPage.keyboard.type('replacement');
+    await expect(agentChip).toHaveCount(0);
+    expect(await input.inputValue()).toMatch(/^before\s?replacement\s?after$/);
+
+    // Editing ordinary text beside an existing chip must preserve the caret.
+    await editor.fill('@OrkasCodex tail');
+    await setCaret(12);
+    await editor.press('x');
+    await editor.press('y');
+    await expect(input).toHaveValue('@OrkasCodex xytail');
+    expect(await selection()).toEqual({ start: 14, end: 14 });
+    expect(orkas.readCliState().invocations).toHaveLength(0);
+  });
+
+  test('resets multi-recipient sends to Commander and retains a later single CLI for follow-ups', async ({ cliOrkas }, testInfo) => {
+    const page = cliOrkas.page!;
+    const recipients = [];
+    for (const name of ['ComposerAlpha', 'ComposerBeta']) {
+      const result = await cliOrkas.invoke<{ agent: { agent_id: string; name: string } }>('agents.create', {
+        name, description: 'Deterministic recipient continuity fixture', runtime: { kind: 'cli', cli: 'codex' },
+      });
+      recipients.push(result.agent);
+    }
+    await page.evaluate(async () => {
+      await (window as any).loadRendererFeature('agents');
+      await (window as any).loadAgents(true, { summary: true });
+    });
+    const editor = page.locator('.chat-rich-editor[data-rich-input-id="new-chat-input"]');
+    const input = page.locator('#new-chat-input');
+    await editor.fill('你好，check the request');
+    await editor.press('Home');
+    await page.locator('#new-chat-recipient-chip').click();
+    await page.locator(`.skill-picker-item[data-id="${recipients[0].agent_id}"]`).click();
+    await page.locator(`.skill-picker-item[data-id="${recipients[0].agent_id}"]`).press('Enter');
+    await editor.press('Home');
+    for (let i = 0; i < 5; i++) await editor.press('ArrowRight');
+    await page.locator('#new-chat-recipient-chip').click();
+    await page.locator(`.skill-picker-item[data-id="${recipients[1].agent_id}"]`).click();
+    await expect(input).toHaveValue('@ComposerAlpha 你好， @ComposerBeta check the request');
+    await expect(page.locator('#new-chat-recipient-name')).toHaveText('ComposerAlpha, ComposerBeta');
+    await expect(page.locator('.skill-picker-item[data-id="__commander__"]')).toHaveAttribute('aria-checked', 'false');
+    await expect(page.locator('[data-composer-model-chip="new-chat"]')).toBeDisabled();
+    // Closing the panel restores the updated cursor; typed text stays after the chosen group.
+    await page.locator(`.skill-picker-item[data-id="${recipients[1].agent_id}"]`).press('Enter');
+    await expect(editor).toBeFocused();
+    await editor.press('X');
+    await expect(input).toHaveValue('@ComposerAlpha 你好， @ComposerBeta Xcheck the request');
+    // Reopening after moving to the end must use the new caret, including after cancellation.
+    await editor.press('End');
+    await page.locator('#new-chat-recipient-chip').click();
+    await page.locator('#agent-picker-selected').getByRole('button', { name: 'Remove: ComposerBeta', exact: true }).click();
+    await page.locator(`.skill-picker-item[data-id="${recipients[1].agent_id}"]`).click();
+    await expect(input).toHaveValue('@ComposerAlpha 你好， Xcheck the request @ComposerBeta ');
+    await page.locator(`.skill-picker-item[data-id="${recipients[1].agent_id}"]`).press('Enter');
+    await editor.pressSequentially('verify the result');
+    await expect(page.locator('#new-chat-recipient-name')).toHaveText('ComposerAlpha, ComposerBeta');
+    await page.locator('#panel-new-chat .new-chat-input-wrapper').screenshot({ path: testInfo.outputPath('recipient-caret.png') });
+    await page.locator('#new-chat-send-btn').click();
+    await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
+    const cid = await page.locator('#conversation-list .conv-item').first().getAttribute('data-cid');
+    expect(cid).toBeTruthy();
+    const replies = async () => {
+      const result = await cliOrkas.invoke<{ history: Array<{ from?: string; text?: string }> }>('conversations.history', { cid, limit: 30 });
+      return recipients.map((agent) => result.history.filter((row) => row.from === agent.agent_id && row.text?.includes('E2E_CODEX_DEFAULT_OK')).length);
+    };
+    await expect.poll(replies, { timeout: 30_000 }).toEqual([1, 1]);
+    const initialHistory = await cliOrkas.invoke<{ history: Array<{ from?: string; to?: string[] }> }>('conversations.history', { cid, limit: 30 });
+    expect(initialHistory.history.some((row) => row.from === 'commander')).toBe(false);
+    expect(initialHistory.history.find((row) => row.from === 'user')?.to).toEqual(recipients.map((agent) => agent.agent_id));
+    await expect(page.locator('#chat-recipient-name')).toHaveText('Commander');
+    await expect(page.locator('[data-composer-model-chip="conversation"]')).toBeVisible();
+    await expect(page.locator('[data-composer-model-chip="conversation"]')).toBeEnabled();
+    const followup = page.locator('.chat-rich-editor[data-rich-input-id="chat-input"]');
+    await followup.fill('@ComposerBeta summarize');
+    await expect(page.locator('#chat-recipient-name')).toHaveText('ComposerBeta');
+    await followup.press('Enter');
+    await expect.poll(replies, { timeout: 30_000 }).toEqual([1, 2]);
+    await expect(page.locator('#chat-recipient-name')).toHaveText('ComposerBeta');
+    await followup.fill('@ComposerBeta @ComposerBeta check the sources too @ComposerAlpha');
+    await followup.press('Enter');
+    await expect.poll(replies, { timeout: 30_000 }).toEqual([1, 3]);
+    await expect(page.locator('#chat-recipient-name')).toHaveText('ComposerBeta');
+    await followup.fill('@missing-agent explain `@ComposerAlpha`');
+    await followup.press('Enter');
+    await expect.poll(replies, { timeout: 30_000 }).toEqual([1, 4]);
+    await expect(page.locator('#chat-recipient-name')).toHaveText('ComposerBeta');
   });
 
   test('wires every home quick start to its localized prompt and configured owner', async ({
@@ -676,8 +1052,8 @@ test.describe('new chat composer', () => {
   test('rejects an oversized attachment without leaving a draft chip', async ({ orkas }) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     const oversized = orkas.createFixtureFile(
-      'E2E oversized.txt',
-      Buffer.alloc(5 * 1024 * 1024 + 1, 0x61),
+      'E2E oversized.png',
+      Buffer.alloc(20 * 1024 * 1024 + 1, 0x61),
     );
     await orkas.selectFilesOnNextDialog([oversized]);
     await orkas.page.locator('#new-chat-attach-btn').click();
@@ -721,15 +1097,15 @@ test.describe('new chat composer', () => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     const valid = orkas.createFixtureFile('E2E mixed valid.md', '# accepted\n');
     const oversized = orkas.createFixtureFile(
-      'E2E mixed oversized.txt',
-      Buffer.alloc(5 * 1024 * 1024 + 1, 0x61),
+      'E2E mixed oversized.png',
+      Buffer.alloc(20 * 1024 * 1024 + 1, 0x61),
     );
     const unsupported = orkas.createFixtureFile('E2E mixed rejected.exe', Buffer.from('not executable'));
     await orkas.selectFilesOnNextDialog([valid, oversized, unsupported]);
     await orkas.page.locator('#new-chat-attach-btn').click();
 
     const alert = orkas.page.locator('.ui-dialog-overlay:visible .ui-dialog');
-    await expect(alert).toContainText('E2E mixed oversized.txt');
+    await expect(alert).toContainText('E2E mixed oversized.png');
     await expect(alert).toContainText('E2E mixed rejected.exe');
     await alert.locator('[data-act="ok"]').click();
     const chips = orkas.page.locator('#new-chat-attachments .chat-attach-chip');
@@ -838,7 +1214,7 @@ test.describe('new chat composer', () => {
     expect(pending.items).toHaveLength(0);
 
     const relaunchedPage = await modelOrkas.relaunch();
-    await relaunchedPage.locator(`.conv-item[data-cid="${conversationId}"]`).click();
+    await relaunchedPage.locator(`#conversation-list .conv-item[data-cid="${conversationId}"]`).click();
     const restoredUserMessage = relaunchedPage.locator('#chat-history .chat-message.user');
     await expect(restoredUserMessage).toContainText(firstName);
     await expect(restoredUserMessage).toContainText(secondName);

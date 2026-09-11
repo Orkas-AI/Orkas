@@ -107,22 +107,22 @@ describe('prompts ↔ code contract', () => {
     expect(shared).not.toContain('## PDF rules');
     expect(shared).not.toContain('## Skill external dependencies');
     expect(shared).toMatch(/Web search rules|web_search|web_fetch/);
-    expect(shared).toMatch(/exact, change-prone operational claims[\s\S]{0,220}time-sensitive/i);
-    expect(shared).toMatch(/installation or update commands/i);
-    expect(shared).toMatch(/CLI or package names/i);
-    expect(shared).toMatch(/plan\/account availability/i);
+    expect(shared).toMatch(/time-sensitive factual answer/i);
+    expect(shared).toMatch(/installation\/update commands/i);
+    expect(shared).toMatch(/package names/i);
+    expect(shared).toMatch(/plan availability/i);
     expect(shared).toMatch(/model\/provider compatibility/i);
-    expect(shared).toMatch(/official documentation or releases/i);
+    expect(shared).toMatch(/current primary documentation or releases/i);
     expect(shared).toMatch(/chat-media:\/\/local/);
-    expect(shared).toContain('Complete the full scope authorized for this turn');
-    expect(shared).toMatch(/Explicit user-requested pause, review, or approval points limit it/i);
+    expect(shared).toContain('Complete the authorized scope');
+    expect(shared).toMatch(/user set a pause, review, or approval point/i);
     expect(shared).toContain('write the complete deliverable incrementally to a tracked file');
     expect(shared).toContain('keep the final chat reply to a concise summary and file link');
     expect(shared).toMatch(/current request permits file writes/i);
     expect(shared).toMatch(/explicit read-only or no-new-files constraint overrides this default/i);
     expect(shared).toMatch(/do not use mutating file or shell tools/i);
-    expect(shared).toContain('Use host-supplied current-conversation history');
-    expect(shared).toMatch(/Query conversation history only when exact context[\s\S]{0,180}omitted or compacted/i);
+    expect(shared).toContain('Prefer supplied current history and explicit references');
+    expect(shared).toMatch(/use history tools only when required context is absent/i);
     expect(shared).not.toContain('Finish it in one turn.');
     const composed = composeChatPrompt({
       main: 'ROLE\n\n## Runtime injection\nRUNTIME',
@@ -130,8 +130,8 @@ describe('prompts ↔ code contract', () => {
       languageDirective: 'LANGUAGE',
       runtimeDatetimeBlock: 'DATE',
     });
-    expect(composed).toContain('Complete the full scope authorized for this turn');
-    expect(composed.indexOf('Complete the full scope authorized for this turn'))
+    expect(composed).toContain('Complete the authorized scope');
+    expect(composed.indexOf('Complete the authorized scope'))
       .toBeLessThan(composed.indexOf('## Runtime injection'));
 
     // The commander/agent prompts should NOT redundantly contain the full
@@ -141,6 +141,9 @@ describe('prompts ↔ code contract', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
     const agentPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_agent_in_group.md'), 'utf-8');
     // Distinctive search rule phrase only in shared:
+    expect(shared).toContain('These updates are not final replies');
+    expect(commanderPrompt).not.toContain('These updates are not final replies');
+    expect(agentPrompt).not.toContain('These updates are not final replies');
     expect(commanderPrompt).not.toMatch(/single empty result is not a reason to give up/i);
     expect(agentPrompt).not.toMatch(/single empty result is not a reason to give up/i);
     // Distinctive PDF fallback phrase only in shared:
@@ -150,8 +153,9 @@ describe('prompts ↔ code contract', () => {
     expect(agentPrompt).not.toContain('does not inject the conversation transcript');
   });
 
-  it('the full user-intent policy stays in in-process prompts and out of compact CLI context', () => {
+  it('shares the intent core with every execution runtime while keeping input UI rules in-process', () => {
     const intentRules = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_user_intent_rules.md'), 'utf-8');
+    const inputRules = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_input_interaction_rules.md'), 'utf-8');
     const bus = readFile('src/main/features/group_chat/bus.ts');
     const cliContext = readFile('src/main/features/local_agents/context.ts');
 
@@ -164,12 +168,17 @@ describe('prompts ↔ code contract', () => {
     expect(intentRules).toMatch(/materially different action, target, or condition/i);
     expect(intentRules).toMatch(/privilege-, force-, destructive-scope-, cost-, or policy-expanding alternatives unselected unless authorized/i);
     expect(intentRules).toMatch(/required permission, deletion, billing, or signed-plan gate once/i);
-    expect(intentRules).toMatch(/closed domain defined by a tool, schema, runtime capability, or protocol/i);
-    expect(intentRules).toMatch(/open preferences/i);
-    expect(bus.match(/prompts\.load\('chat_user_intent_rules'/g)).toHaveLength(2);
-    expect(bus).toMatch(/stableFragments:\s*\[[\s\S]{0,160}?prompts\.load\('chat_user_intent_rules'/);
-    expect(cliContext).not.toContain('chat_user_intent_rules');
-    expect(cliContext).not.toContain('User intent and clarification');
+    expect(intentRules).not.toMatch(/closed domain defined by a tool, schema, runtime capability, or protocol/i);
+    expect(inputRules).toMatch(/closed domain defined by a tool, schema, runtime capability, or protocol/i);
+    expect(inputRules).toMatch(/open preferences/i);
+    expect(bus.match(/prompts\.load\('chat_user_intent_rules'/g)).toHaveLength(3);
+    expect(bus.match(/prompts\.load\('chat_input_interaction_rules'/g)).toHaveLength(2);
+    expect(bus.match(
+      /stableFragments:\s*\[[\s\S]{0,180}?chat_user_intent_rules[\s\S]{0,100}?chat_input_interaction_rules[\s\S]{0,100}?chat_shared_rules/g,
+    )).toHaveLength(2);
+    expect(bus).toMatch(/intentRules:\s*prompts\.load\('chat_user_intent_rules'/);
+    expect(cliContext).toMatch(/intentRules\?: string/);
+    expect(cliContext).toMatch(/if \(intentRules\) blocks\.push\(intentRules\)/);
   });
 
   it('does not add a repository-authored content-moderation layer to model prompts', () => {
@@ -220,12 +229,12 @@ describe('prompts ↔ code contract', () => {
     const commander = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
     const guidePath = path.join(PROJECT_ROOT, 'resources/builtin/system/skills/orkas-guide/SKILL.md');
 
-    expect(commander).toMatch(/running inside the installed desktop application/i);
-    expect(commander).toMatch(/not in a browser tab or web app/i);
-    expect(commander).toMatch(/account sign-in flow does not change the surface/i);
-    expect(commander).toMatch(/Do not infer a browser surface or browser-only controls/i);
-    expect(commander).toMatch(/local application[\s\S]{0,240}client shell[\s\S]{0,240}model location, network use, or billing/i);
-    expect(commander).toMatch(/do not infer on-device execution or free usage/i);
+    expect(commander).toMatch(/installed desktop application/i);
+    expect(commander).toMatch(/client shell does not imply browser-only controls/i);
+    expect(commander).toMatch(/on-device model execution, network isolation, or free usage/i);
+    expect(commander).not.toMatch(/Current-application guidance/i);
+    expect(commander).toMatch(/Match and read the owning System Skill before work/i);
+    expect(commander).not.toMatch(/visible features, paths, settings, models\/providers/i);
     expect(commander).not.toMatch(/microphone troubleshooting/i);
     expect(fs.existsSync(guidePath)).toBe(false);
   });
@@ -290,7 +299,7 @@ describe('prompts ↔ code contract', () => {
     expect(bus).not.toContain('### Agent strengths');
     expect(agentPrompt).not.toContain('capability_context');
     expect(bus).not.toContain('src.memory');
-    expect(bus).not.toContain('agent_memory');
+    expect(bus).not.toContain('context.agent_memory');
     expect(creatorSkill).toContain('`<knowhow>` is display-only');
     expect(creatorSkill).toContain('`<standards>` is display and runtime guidance');
     expect(creatorSkill).toContain('definition of done');
@@ -317,7 +326,6 @@ describe('prompts ↔ code contract', () => {
     const agentPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_agent_in_group.md'), 'utf-8');
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
     const sharedPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_shared_rules.md'), 'utf-8');
-    const memoryManager = readFile('resources/builtin/system/skills/memory-manager/SKILL.md');
     const memoryTool = readFile('src/core-agent/src/tools/memory-tool.ts');
 
     // The parameter description carries the compact routing contract in both
@@ -329,36 +337,36 @@ describe('prompts ↔ code contract', () => {
     // The project tier is schema-gated: offered only when the host marks the
     // session as belonging to a project.
     expect(memoryTool).toContain('includeProjectTier');
-    // Language rule: write in the user's current language, preserving literals.
-    expect(memoryTool).toContain('use project_tasks for task progress');
+    // Task progress is routed to todo_tasks, never into memory.
+    expect(memoryTool).toContain('Use todo_tasks for task progress');
 
-    expect(memoryManager).toMatch(/description_zh:.*未来对话持续生效/);
-    expect(memoryManager).toMatch(/description_en:.*across future conversations/i);
-    expect(memoryManager).toMatch(/description_en:.*ordinary file saving/i);
 
-    expect(agentPrompt).toMatch(/only for durable information useful in future conversations/i);
-    expect(agentPrompt).toMatch(/Never store current task progress, temporary plans, one-off status, or TODO\/dependency state/i);
+    // Requester decision 2026-09-08: the tool contract is the single owner of
+    // "when to write"; the resident prompt keeps destinations and hand-off only.
+    expect(agentPrompt).toMatch(/tool contract decides when durable state is worth writing/i);
+    expect(agentPrompt).not.toMatch(/Decide from meaning/i);
+    expect(agentPrompt).not.toMatch(/Never store current task progress/i);
+    expect(memoryTool).toContain('Decide from meaning, never trigger words');
+    expect(memoryTool).toContain('Do not store current-task progress');
     expect(agentPrompt).toMatch(/Use `agent` for a convention limited to this Agent/i);
     expect(agentPrompt).toMatch(/use `user` for a preference meant across Agents/i);
     expect(agentPrompt).toMatch(/choose other destinations from the tool contract/i);
-    expect(agentPrompt).toMatch(/Project memory\/instructions are read-only and preloaded/i);
-    expect(agentPrompt).toMatch(/Project memory\/instructions[\s\S]*For a requested mutation/i);
-    expect(agentPrompt).toMatch(/preserve it exactly in the project tier/i);
+    expect(agentPrompt).toMatch(/Project memory\/instructions are preloaded/i);
+    expect(agentPrompt).toMatch(/use their mutation tools for authorized changes within the current project/i);
+    expect(agentPrompt).not.toMatch(/Project memory\/instructions are read-only/i);
     expect(agentPrompt).toContain('<handback reason="capability_boundary" />');
-    expect(agentPrompt).toMatch(/for Commander to persist/i);
+    expect(agentPrompt).not.toMatch(/for Commander to persist/i);
     expect(agentPrompt).toMatch(/Claim a memory change only after the tool confirms success/i);
     expect(agentPrompt).not.toContain('`target: "agent"` =');
     expect(agentPrompt).not.toContain('`target: "user"` =');
     expect(agentPrompt).not.toContain('`target: "shared"` =');
     expect(agentPrompt).not.toContain('current response/UI language');
 
-    expect(commanderPrompt).toMatch(/Durable memory or project-instruction mutations are owned by the matching System Skill/i);
-    expect(memoryManager).toContain('`target: "agent"` for Commander\'s durable orchestration lessons');
-    expect(memoryManager).toContain('Do not put Commander-specific orchestration lessons in user or shared memory');
-    expect(memoryManager).toContain("Write in the user's current UI language");
+    expect(commanderPrompt).toMatch(/tool contracts own durable-state destinations and mutations/i);
+    expect(commanderPrompt).not.toContain('memory-manager');
+    expect(commanderPrompt).not.toMatch(/Decide from the intended future effect/i);
     expect(commanderPrompt).not.toContain('current response/UI language');
-    expect(sharedPrompt).toContain('current response/UI language');
-    expect(sharedPrompt).toMatch(/preserving proper nouns, commands, paths, identifiers, URLs/i);
+    expect(sharedPrompt).not.toContain('current response/UI language');
     expect(readFile('src/main/features/group_chat/bus.ts')).toContain("prompts.load('chat_shared_rules'");
   });
 
@@ -424,7 +432,7 @@ describe('prompts ↔ code contract', () => {
     const agentCreatorEntry = readFile('resources/builtin/system/skills/agent-creator/SKILL.md');
     const agentCreator = readFile('resources/builtin/system/skills/agent-creator/references/source-and-editing.md');
 
-    expect(commanderPrompt).toMatch(/Agent, Skill, automation, and external-package mutations/i);
+    expect(commanderPrompt).toMatch(/Agent, Skill, and external-package mutations/i);
     expect(commanderPrompt).not.toContain('agent-creator');
     expect(agentCreatorEntry).toMatch(/create an Agent, crystallize a conversation into one, or change its workflow/i);
     expect(agentCreator).toMatch(/concrete target before the current request/i);
@@ -462,17 +470,17 @@ describe('prompts ↔ code contract', () => {
 
   it('keeps the resident resource-change router compact and flexible', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
-    const start = commanderPrompt.indexOf('## Creating or editing an agent / skill / automation');
+    const start = commanderPrompt.indexOf('## Creating or editing an agent / skill');
     const end = commanderPrompt.indexOf('\n\n---\n\n## Resources you can use', start);
     const section = commanderPrompt.slice(start, end);
 
     expect(start).toBeGreaterThanOrEqual(0);
     expect(end).toBeGreaterThan(start);
     expect(section.length).toBeLessThan(1500);
-    expect(section).toMatch(/Agent, Skill, automation, and external-package mutations bypass normal capability routing/i);
+    expect(section).toMatch(/Agent, Skill, and external-package mutations bypass normal capability routing/i);
     expect(section).toMatch(/Match and read the owning System Skill before work/i);
     expect(section).toMatch(/description owns selection/i);
-    for (const skill of ['agent-creator', 'skill-creator', 'autotask-creator', 'package-installer']) {
+    for (const skill of ['agent-creator', 'skill-creator', 'auto-tasks', 'package-installer']) {
       expect(section).not.toContain(skill);
     }
     expect(section).not.toContain('<auto-task>');
@@ -502,33 +510,37 @@ describe('prompts ↔ code contract', () => {
     expect(section).not.toContain('consent-deps');
   });
 
-  it('commander prompt routes automation CRUD through autotask-creator', () => {
-    const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
-    const automationCreator = readFile('resources/builtin/system/skills/autotask-creator/SKILL.md');
-
-    expect(commanderPrompt).toMatch(/automation[\s\S]{0,80}mutations bypass normal capability routing/i);
-    expect(commanderPrompt).not.toContain('autotask-creator');
-    expect(commanderPrompt).not.toContain('schedule JSON');
-    expect(automationCreator).toContain('<auto-task>');
-    expect(automationCreator).toContain('auto_tasks_list');
+  it('uses the automation tool contract without a creator Skill read', () => {
+    const commanderPrompt = readFile('src/main/prompts/chat_commander.md');
+    expect(commanderPrompt).not.toContain('auto-tasks');
+    expect(commanderPrompt).not.toMatch(/automation[\s\S]{0,80}mutations bypass normal capability routing/i);
+    expect(fs.existsSync(path.join(PROMPTS_DIR, '../../..', 'resources/builtin/system/skills/auto-tasks/SKILL.md'))).toBe(false);
+    const contract = require('../../../bin/auto-tasks-contract.cjs');
+    const { z } = require('zod');
+    const shape = contract.shape(z, true);
+    expect(contract.description).toContain('not its execution outcome');
+    expect(shape.action.description).toContain('list first');
+    expect(shape.action.description).toMatch(/delete only when (?:removal is )?requested/i);
+    expect(shape.schedule.safeParse({ type: 'hourly', interval_hours: 6 }).success).toBe(true);
+    expect(shape.end_condition.safeParse({ type: 'count', max_runs: 10 }).success).toBe(true);
+    expect(shape.end_condition.safeParse(null).success).toBe(true);
   });
 
-  it('keeps memory reads resident and lazy-loads mutation details', () => {
+  it('uses memory tools without a mandatory Skill read', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
-    const memoryManager = readFile('resources/builtin/system/skills/memory-manager/SKILL.md');
-    const memorySection = commanderPrompt.match(/## Cross-session memory([\s\S]*?)## Orchestration continuity/)?.[1] ?? '';
+    const memorySection = commanderPrompt.match(/## Cross-session memory([\s\S]*?)## Routing-first algorithm/)?.[1] ?? '';
 
-    expect(memorySection.length).toBeLessThan(1_800);
+    expect(memorySection.length).toBeLessThan(900);
     expect(memorySection).toMatch(/Use injected memory and project instructions directly as read-only context/i);
-    expect(memorySection).toMatch(/mutations are owned by the matching System Skill/i);
-    expect(memorySection).toMatch(/select and read that System Skill before answering or calling its mutation tool/i);
-    expect(memorySection).toMatch(/intended future effect, not exact phrasing/i);
-    expect(memorySection).toMatch(/Never persist current task progress/i);
+    expect(memorySection).toMatch(/tool contracts own durable-state destinations and mutations/i);
+    expect(memorySection).not.toContain('memory-manager');
+    expect(memorySection).not.toMatch(/Read.*System Skill/i);
+    // Durable-state tools are usable directly; no retired Skill gate remains.
+    expect(memorySection).not.toMatch(/before answering or calling its mutation tool/i);
+    expect(memorySection).not.toMatch(/intended future effect, not exact phrasing/i);
+    expect(memorySection).not.toMatch(/Never persist current task progress/i);
     expect(memorySection).not.toContain('target: "agent"');
     expect(memorySection).not.toContain('Project instructions vs project memory');
-    expect(memoryManager).toContain('target: "agent"');
-    expect(memoryManager).toContain('target: "project"');
-    expect(memoryManager).toMatch(/`project_instructions` as a full replacement/i);
   });
 
   it('commander prompt keeps mutations, task completion, and recovery claims evidence-backed', () => {
@@ -538,18 +550,15 @@ describe('prompts ↔ code contract', () => {
       'utf-8',
     );
     const agentCreator = readSystemSkillBundle('agent-creator');
-    const projectTasksSkill = readFile('resources/builtin/system/skills/project-tasks/SKILL.md');
+    const projectTasksRulesText = readFile('src/main/prompts/chat_project_tasks_rules.md');
 
     expect(commanderPrompt).toContain('$project_tasks_rules');
-    expect(projectTasksRules).toMatch(/read the `project-tasks` system skill this turn/i);
-    expect(projectTasksRules).toMatch(/explicit complete or empty injected snapshot[\s\S]{0,160}without loading the skill/i);
-    expect(commanderPrompt).not.toMatch(/Agent's `done` label or task mutation is evidence, not authority/i);
-    expect(projectTasksSkill).toMatch(/Agent's `done` label or task mutation is evidence, not authority/i);
-    expect(projectTasksSkill).toMatch(/required source dataset, credential, or existing artifact[\s\S]{0,260}blocked or input-needed result/i);
-    expect(projectTasksSkill).toMatch(/required source data is missing[\s\S]{0,180}do not complete the task/i);
-    expect(projectTasksSkill).toMatch(/Correct any contradictory mutation/i);
-    expect(commanderPrompt).toMatch(/completed work\/artifacts that must be preserved unchanged/i);
-    expect(commanderPrompt).toMatch(/evidence and original outcome required for completion/i);
+    expect(projectTasksRules).not.toMatch(/read.*system skill/i);
+    expect(projectTasksRulesText).toContain('exact task id, acceptance criteria, and run-specific status rules');
+    expect(projectTasksRulesText).toContain('delivery evidence and the latest task state');
+    expect(projectTasksRulesText).toContain('a `done` label alone is insufficient');
+    expect(projectTasksRulesText).toContain('never complete blocked or unverified work');
+    expect(commanderPrompt).toMatch(/recovery brief must name the symptom, preserved work, remaining repair, required evidence, and original outcome/i);
     expect(agentCreator).toMatch(/No container, no mutation, no success claim/i);
     expect(agentCreator).toMatch(/never say\s+the Agent is ready, created, updated, installed, or available/i);
     expect(agentCreator).toMatch(/`agent_id` found in exported or supplied source as provenance, not mutation intent/i);
@@ -567,69 +576,49 @@ describe('prompts ↔ code contract', () => {
 
   it('commander prompt uses routing-first quality priority before direct self-service', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
-    const projectTasksSkill = readFile('resources/builtin/system/skills/project-tasks/SKILL.md');
+    const intentRules = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_user_intent_rules.md'), 'utf-8');
+    const projectTasksRulesText = readFile('src/main/prompts/chat_project_tasks_rules.md');
 
-    // Cost-saving must be a tie-breaker, not the routing objective. Installed
-    // agents are product capabilities; direct commander work is the fallback
-    // after capability routing.
     expect(commanderPrompt).toMatch(/Routing-first algorithm/i);
-    expect(commanderPrompt).toMatch(/Quality, correctness, and task completion come first/i);
-    expect(commanderPrompt).toMatch(/Cost, latency, and coordination overhead are tie-breakers/i);
-    expect(commanderPrompt).toMatch(/Do not start from "can I do this myself\?"/i);
+    expect(commanderPrompt).toMatch(/Choosing the owner, decomposition, sequencing, verification method, and recovery route[\s\S]{0,160}Commander's internal responsibility/i);
+    expect(commanderPrompt).toMatch(/Decide them without asking the user[\s\S]{0,140}shared user-intent rules/i);
+    expect(intentRules).toMatch(/Request new approval only for a materially different action, target, or condition/i);
+    expect(commanderPrompt).toMatch(/Quality, correctness, and completion come first/i);
+    expect(commanderPrompt).toMatch(/light outcome/i);
+    expect(commanderPrompt).toMatch(/Complete it directly/i);
+    expect(commanderPrompt).toMatch(/is never light/i);
+    expect(commanderPrompt).toMatch(/cost and latency break ties between comparable routes/i);
     expect(commanderPrompt).toMatch(/best owner for each user-visible outcome/i);
-    expect(commanderPrompt).toMatch(/installed agents are first-class capabilities/i);
-    expect(commanderPrompt).toMatch(/not expensive fallbacks/i);
-    expect(commanderPrompt).toMatch(/Direct commander self-service[\s\S]+only after the current agent pool has no stronger owner/i);
+    expect(commanderPrompt).toMatch(/Prefer a high-confidence enabled Agent match/i);
     expect(commanderPrompt).toMatch(/choosing, naming, or briefing an Agent is not routing/i);
     expect(commanderPrompt).toMatch(/builtin > platform > custom > external > global/i);
     expect(commanderPrompt).toMatch(/builtin > platform > custom/i);
-    expect(commanderPrompt).toMatch(/learning diagnosis/i);
-    expect(commanderPrompt).toMatch(/Commander-accessible blocker/i);
-    expect(commanderPrompt).toMatch(/must inspect and repair it with the available workspace tools first/i);
-    expect(commanderPrompt).toMatch(/Fresh contradictory evidence/i);
-    expect(commanderPrompt).toMatch(/reopens and invalidates the earlier completion claim/i);
-    expect(commanderPrompt).toMatch(/fixing the blocker alone is not completion/i);
-    expect(commanderPrompt).toMatch(/Say that correction plainly in the user-visible narration/i);
-    expect(projectTasksSkill).toMatch(/Never dispatch or start a task whose dependency is still open/i);
-    expect(projectTasksSkill).toMatch(/An `in_progress` task is already started/i);
-    expect(projectTasksSkill).toMatch(/generic request to "do what can be done now" is not an explicit retry/i);
-    expect(projectTasksSkill).toMatch(/Do not redispatch it as a recovery step/i);
-    expect(commanderPrompt).toMatch(/Do not call `publish_outputs` on it from the Commander turn/i);
-    expect(commanderPrompt).toMatch(/only accepts files Commander itself produced in the current turn/i);
+    expect(commanderPrompt).toMatch(/repair and validate it, then resume the original specialist outcome/i);
+    expect(commanderPrompt).toMatch(/Fresh user evidence[\s\S]{0,120}reopens the claim/i);
+    expect(commanderPrompt).toMatch(/repair alone is not completion/i);
+    expect(projectTasksRulesText).toContain('honor `depends_on` and defer tasks with open dependencies');
+    expect(projectTasksRulesText).toContain('Keep already `progress` work with its owner unless explicitly asked to retry or new input unblocks it');
+    expect(commanderPrompt).toMatch(/`publish_outputs` accepts only files Commander produced in its current turn/i);
   });
 
   it('commander prompt fans out multi-outcome specialist bundles before direct drafting', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
 
-    // A normal user request for distinct materials can map to several specialist
-    // agents; multi-agent routing is triggered by outcome diversity, not just
-    // task size.
-    expect(commanderPrompt).toMatch(/Keep outcomes separate/i);
-    expect(commanderPrompt).toMatch(/Multiple independent outcomes with different high-confidence owners/i);
-    expect(commanderPrompt).toMatch(/parallel `dispatch_to` calls when distinct named Agents own them/i);
-    expect(commanderPrompt).toMatch(/`run_worker` has no named target/i);
-    expect(commanderPrompt).toMatch(/SINGLE response/i);
-    expect(commanderPrompt).toMatch(/run concurrently/i);
-    expect(commanderPrompt).toMatch(/outcome diversity, not just task size/i);
-    expect(commanderPrompt).toMatch(/Do not collapse these into one direct response/i);
-    expect(commanderPrompt).toMatch(/research\/framework \+ tutoring\/diagnostic questions \+ parent\/user-facing copy/i);
+    expect(commanderPrompt).toMatch(/Do not collapse distinct user-visible materials into one task/i);
+    expect(commanderPrompt).toMatch(/independent outcomes with different named owners as parallel `dispatch_to` calls/i);
+    expect(commanderPrompt).toMatch(/in one response, then synthesize/i);
+    expect(commanderPrompt).toMatch(/multiple Agents for genuinely different outcomes, not merely because a task is large/i);
+    expect(commanderPrompt).toMatch(/never dispatch merely to look busy/i);
   });
 
   it('commander prompt covers both dependent-serial and independent-parallel delegation', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
 
-    // Dependent chains: one step at a time, deciding the next from the last.
-    expect(commanderPrompt).toMatch(/one at a time/i);
-    expect(commanderPrompt).toMatch(/decide and run the next/i);
-    // Independent named-Agent work fans out with dispatch_to; anonymous generic
-    // work may fan out with run_worker. Both are emitted in one response.
-    expect(commanderPrompt).toMatch(/single response/i);
-    expect(commanderPrompt).toMatch(/concurrently/i);
-    // Decoupling is the delegation gate: only cleanly-separable work is delegated;
-    // tightly-coupled work stays inline.
+    expect(commanderPrompt).toMatch(/dependent outcomes one at a time/i);
+    expect(commanderPrompt).toMatch(/decide the next from the full result/i);
+    expect(commanderPrompt).toMatch(/parallel `dispatch_to` calls in one response/i);
     expect(commanderPrompt).toMatch(/cleanly separable/i);
-    expect(commanderPrompt).toMatch(/coupled/i);
-    // Plan-DAG concepts must not creep back into the in-loop model.
+    expect(commanderPrompt).toMatch(/keep coupled reasoning with one owner/i);
     expect(commanderPrompt).not.toContain('parallel_group');
   });
 
@@ -637,12 +626,10 @@ describe('prompts ↔ code contract', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
     const bus = readFile('src/main/features/group_chat/bus.ts');
 
-    expect(commanderPrompt).toMatch(/Calling an anonymous worker is delegation, not self-execution/i);
-    expect(commanderPrompt).toMatch(/does not inherit your skills or evolving context/i);
-    expect(commanderPrompt).toMatch(/user explicitly requires you to do the work yourself/i);
-    expect(commanderPrompt).toMatch(/fallback for an unavailable (?:named )?agent/i);
+    expect(commanderPrompt).toMatch(/bounded, self-contained, anonymous scan/i);
+    expect(commanderPrompt).toMatch(/has no named-Agent skills or evolving context/i);
+    expect(commanderPrompt).toMatch(/not a substitute for Commander, an unavailable Agent/i);
     expect(commanderPrompt).toMatch(/coupled milestone chain/i);
-    expect(commanderPrompt).toMatch(/context-heavy scan over many independent inputs/i);
 
     expect(bus).toMatch(/ONE isolated auxiliary sub-task/);
     expect(bus).toMatch(/separate helper, not the commander itself/i);
@@ -658,12 +645,10 @@ describe('prompts ↔ code contract', () => {
 
     // The resident prompt carries one semantic decision and delegates lifecycle
     // details to the authoritative schemas instead of repeating them.
-    expect(commanderPrompt).toMatch(/hand_off_to\(\{ to, message, resume\? \}\)/);
-    expect(commanderPrompt).toMatch(/default to `hand_off_to\(\{ to, message, resume\? \}\)`/i);
-    expect(commanderPrompt).toMatch(/one Agent owns the remaining user-visible outcome/i);
-    expect(commanderPrompt).toMatch(/use `dispatch_to\(\{ to, message, resume\? \}\)`/i);
-    expect(commanderPrompt).toMatch(/another named action or synthesis across at least two distinct results/i);
-    expect(commanderPrompt).toMatch(/Follow the tool schemas for lifecycle and recovery details/i);
+    expect(commanderPrompt).toMatch(/Use `hand_off_to` when one Agent owns the remaining user-visible outcome/i);
+    expect(commanderPrompt).toMatch(/Use `dispatch_to` only when Commander must consume the result[\s\S]{0,120}synthesize at least two distinct results/i);
+    expect(commanderPrompt).toMatch(/Tool schemas own parameters and lifecycle details/i);
+    expect(commanderPrompt).not.toMatch(/(?:hand_off_to|dispatch_to|run_worker)\(\{/);
 
     // Single-owner final delivery and multi-result synthesis are mutually
     // exclusive in the model-visible tool contracts.
@@ -683,46 +668,30 @@ describe('prompts ↔ code contract', () => {
 
     // The latest message and visible history define what the user is asking
     // Commander to do now. Capability routing is a second decision.
-    expect(commanderPrompt).toMatch(/current intent[\s\S]{0,160}latest request[\s\S]{0,160}visible history/i);
-    const intentDecision = commanderPrompt.indexOf('Before choosing an owner, resolve the user\'s current intent');
+    expect(commanderPrompt).toMatch(/current intent from the latest request and visible history before choosing an owner/i);
+    const intentDecision = commanderPrompt.indexOf('Resolve the current intent');
     const routingDecision = commanderPrompt.indexOf('2. **Route after intent, before drafting.**');
     expect(intentDecision).toBeGreaterThanOrEqual(0);
     expect(routingDecision).toBeGreaterThan(intentDecision);
-    expect(commanderPrompt).toMatch(/contextual language understanding, not a keyword or category classifier/i);
-
-    // Intent-first is not self-service-first. The user may be asking for a
-    // specialist-owned deliverable, explicit delegation, or Commander
-    // intervention; those intents must produce different routes.
-    expect(commanderPrompt).toMatch(/intent-first[\s\S]{0,200}(?:not|does not mean).{0,80}self-service-first|(?:not|do not).{0,100}(?:prefer|default to).{0,80}self-service.{0,160}(?:intent|request)/i);
-    expect(commanderPrompt).toMatch(/requested outcome is specialist-owned/i);
-    expect(commanderPrompt).toMatch(/explicitly asks you to use or coordinate an Agent, honor that intent/i);
-    expect(commanderPrompt).toMatch(/keep the Agents-first routing/i);
-
-    // Asking Commander itself to repair an Agent-reported orchestration
-    // problem is not an instruction to replay the same task automatically.
-    expect(commanderPrompt).toMatch(/(?:address(?:es|ed)|asks?).{0,120}Commander[\s\S]{0,240}(?:repair|resolve|fix|处理|解决|修复)[\s\S]{0,240}(?:must not|do not|not automatically|先不要).{0,160}(?:redispatch|route|send|交回|派回)/i);
-    expect(commanderPrompt).toMatch(/(?:diagnose|inspect|understand|定位|检查|诊断).{0,120}(?:problem|blocker|failure|问题|阻塞|失败)[\s\S]{0,160}(?:before|then|再).{0,80}(?:redispatch|route|send|交回|派回)/i);
-
-    // A repeated Agent call is valid only after this intent/capability decision,
-    // with a materially useful instruction rather than an unchanged bounce.
-    expect(commanderPrompt).toMatch(/(?:same|previous).{0,80}agent[\s\S]{0,200}(?:materially|changed|new).{0,120}(?:input|instruction|capability|state)/i);
+    expect(commanderPrompt).toMatch(/Honor an explicit agent \/ skill \/ connector pick/i);
+    expect(commanderPrompt).toMatch(/Agent-reported blocker, diagnose it before routing again/i);
+    expect(commanderPrompt).toMatch(/changed input, instruction, capability, or state gives it a useful next step/i);
   });
 
   it('commander prompt separates conversation floor from suspended orchestration resume', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
+    const bus = readFile('src/main/features/group_chat/bus.ts');
 
-    expect(commanderPrompt).toMatch(/Orchestration continuity/i);
-    expect(commanderPrompt).toMatch(/Orchestration state/i);
-    expect(commanderPrompt).toMatch(/active_recipient[\s\S]+conversation floor/i);
-    expect(commanderPrompt).toMatch(/orchestration_ledger[\s\S]+suspended task/i);
-    expect(commanderPrompt).toMatch(/agent handoff or on a `dispatch_to` agent form/i);
     expect(commanderPrompt).toMatch(/\$orchestration_state/);
-    expect(commanderPrompt).toMatch(/<orchestration-resume>/);
-    expect(commanderPrompt).toMatch(/Do not re-ask for information already supplied by the agent or form/i);
-    expect(commanderPrompt).toMatch(/ledger status is `interrupted`/i);
-    expect(commanderPrompt).toMatch(/User-input blocking outcome inside a broader task/i);
+    expect(commanderPrompt).not.toMatch(/## Orchestration continuity/i);
+    expect(bus).toMatch(/if \(!ledger\) return ''/);
+    expect(bus).toMatch(/'## Orchestration continuity'/);
+    expect(bus).toMatch(/`active_recipient` is the conversation floor/);
+    expect(bus).toMatch(/`orchestration_ledger` is a suspended Commander-owned task/);
+    expect(bus).toMatch(/On `<orchestration-resume>`/);
+    expect(bus).toMatch(/If status is `interrupted`/);
     expect(commanderPrompt).toMatch(/<blocked-on-form/i);
-    expect(commanderPrompt).toMatch(/do not keep routing dependent work/i);
+    expect(commanderPrompt).toMatch(/stop dependent work and wait for orchestration resume/i);
   });
 
   it('agent prompt assigns distinct reasons to completed handoffs and direct capability boundaries', () => {
@@ -739,38 +708,37 @@ describe('prompts ↔ code contract', () => {
     expect(agentPrompt).toMatch(/Never combine handback with an input request/i);
   });
 
-  it('commander prompt blocks fabricated inputs without turning dependencies into Plan admission', () => {
+  it('commander prompt blocks fabricated inputs without adding planning-only control rounds', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
 
-    expect(commanderPrompt).toMatch(/required inputs, files, context, or user decisions/i);
-    expect(commanderPrompt).toMatch(/must not be fabricated/i);
+    expect(commanderPrompt).toMatch(/Never fabricate required inputs, files, context, or decisions/i);
     expect(commanderPrompt).toMatch(/own input schema/i);
-    expect(commanderPrompt).toMatch(/target Agent owns input sufficiency and any execution Plan/i);
-    expect(commanderPrompt).toMatch(/do not read a target's `agent\.json`, inspect or list workspace files, or create\/update a Commander Plan solely to prepare a terminal hand-off/i);
-    expect(commanderPrompt).toMatch(/read an Agent spec only when Commander must resolve a concrete non-terminal dependency or the user explicitly asks about that spec/i);
+    expect(commanderPrompt).toMatch(/owns input sufficiency and execution/i);
+    expect(commanderPrompt).toMatch(/Do not inspect an Agent spec or workspace files solely to prepare a terminal hand-off/i);
+    expect(commanderPrompt).toMatch(/inspect only a concrete dependency or a spec the user asked about/i);
     expect(commanderPrompt).not.toContain('inputs: read agent.json before dispatch');
-    expect(commanderPrompt).toMatch(/shared Plan rule when the remaining sequence is meaningfully multi-step/i);
-    expect(commanderPrompt).toMatch(/otherwise keep it in the live execution context/i);
-    expect(commanderPrompt).toMatch(/Session recovery and the orchestration ledger preserve continuity independently of Plan/i);
-    expect(commanderPrompt).not.toMatch(/milestone plan may preserve the goal\/progress/i);
+    expect(commanderPrompt).not.toMatch(/Commander Plan|execution Plan|Use a Plan/i);
   });
 
   it('commander starts a single-owner terminal hand-off without preparatory control rounds', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
 
-    expect(commanderPrompt).toMatch(/when one Agent owns the remaining user-visible outcome/i);
-    expect(commanderPrompt).toMatch(/default to `hand_off_to\(\{ to, message, resume\? \}\)` in the same response as the owner decision/i);
+    expect(commanderPrompt).toMatch(/Use `hand_off_to` when one Agent owns the remaining user-visible outcome/i);
+    expect(commanderPrompt).toMatch(/Choose and call the route in the same response/i);
     expect(commanderPrompt).toMatch(/without preparatory control calls unless a concrete dependency must first be resolved/i);
-    expect(commanderPrompt).toMatch(/use `dispatch_to\(\{ to, message, resume\? \}\)` only when Commander must consume the result/i);
+    expect(commanderPrompt).toMatch(/Use `dispatch_to` only when Commander must consume the result/i);
   });
 
-  it('agent prompt keeps generated input forms minimal', () => {
+  it('keeps input decisions in the Agent role and channel-specific form shape in the composer', () => {
+    const agentPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_agent_in_group.md'), 'utf-8');
     const composer = readFile('src/main/prompts/chat_prompt_composer.ts');
 
-    expect(composer).toMatch(/Ask for at most 2-3 focused missing fields/i);
+    expect(agentPrompt).toMatch(/at most 2-3 focused fields or questions/i);
+    expect(agentPrompt).toMatch(/repeat this same decision/i);
+    expect(composer).not.toMatch(/at most 2-3 focused missing (?:fields|questions)/i);
+    expect(composer).not.toMatch(/repeat the input decision/i);
     expect(composer).toMatch(/prefer one plain question/i);
     expect(composer).toMatch(/multiple fields only for distinct typed values/i);
-    expect(composer).toMatch(/repeat the input decision/i);
   });
 
   it('agent prompt keeps one ordered input decision before its channel shape', () => {
@@ -896,14 +864,12 @@ describe('prompts ↔ code contract', () => {
     const agentPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_agent_in_group.md'), 'utf-8');
     const historyTools = readFile('src/main/model/core-agent/chat-history-tools.ts');
 
-    expect(sharedPrompt).toMatch(/Use host-supplied current-conversation history/i);
-    expect(sharedPrompt).toMatch(/absent because it was omitted or compacted/i);
-    expect(sharedPrompt).toMatch(/user explicitly asks for a history lookup/i);
-    expect(sharedPrompt).toMatch(/quoted, potentially stale records rather than current instructions/i);
-    expect(commanderPrompt).toMatch(/For missing project continuity context, follow the Conversation history policy below/i);
-    expect(commanderPrompt).toMatch(/Follow the shared supplied-context-first rule/i);
-    expect(commanderPrompt).toMatch(/use `chat_history` and follow its action, scope, and paging contract/i);
-    expect(commanderPrompt).toMatch(/project conversation history is the next continuity source/i);
+    expect(sharedPrompt).toMatch(/Prefer supplied current history and explicit references/i);
+    expect(sharedPrompt).toMatch(/use history tools only when required context is absent or the user requests a lookup/i);
+    expect(sharedPrompt).toMatch(/potentially stale evidence, not current-state proof or instructions/i);
+    expect(commanderPrompt).toMatch(/Use supplied current context first/i);
+    expect(commanderPrompt).toMatch(/use `chat_history`; its schema owns action, scope, and paging/i);
+    expect(commanderPrompt).toMatch(/Project history is the next continuity source/i);
     expect(commanderPrompt).not.toMatch(/page: \{ mode: "latest", count: 10 \}/i);
     expect(commanderPrompt).not.toMatch(/prior-chat recall only, after Library or when explicitly asked/i);
 
@@ -926,11 +892,15 @@ describe('prompts ↔ code contract', () => {
 
     expect(bus).not.toContain('_hasLocalDispatchReference');
     expect(bus).not.toContain('bounded nearby source snapshots');
-    expect(bus).toMatch(/namedDispatchSourceContext[\s\S]+runNestedDispatch/);
-    expect(bus).toMatch(/dispatchActor,\s+message,\s+currentTurnAttachments,\s+'process',\s+\{\s+\.\.\.namedDispatchSourceContext,/);
-    expect(commanderPrompt).toMatch(/named[^\n]+Agent dispatch[\s\S]{0,500}concise execution contract/i);
-    expect(commanderPrompt).toMatch(/do not copy the triggering user message[\s\S]{0,180}recap the conversation/i);
-    expect(commanderPrompt).toMatch(/anonymous[^\n]+run_worker[\s\S]{0,180}fully self-contained/i);
+    // P3: dispatch_to runs through the scheduled task-board path, but the
+    // pinned behavior is unchanged — the dispatch carries `message` verbatim
+    // (a concise execution contract) plus the source context, never a
+    // history recap.
+    expect(bus).toMatch(/namedDispatchSourceContext[\s\S]+runScheduledDispatch/);
+    expect(bus).toMatch(/runScheduledDispatch\(\s*state, ctx\?\.signal, dispatchActor, message, \{[\s\S]{0,320}sourceContext:\s*\{\s*\.\.\.namedDispatchSourceContext/);
+    expect(commanderPrompt).toMatch(/For a named Agent, send only a concise execution contract/i);
+    expect(commanderPrompt).toMatch(/It already receives visible history, references, attachments, workspace access/i);
+    expect(commanderPrompt).toMatch(/`run_worker` only for a bounded, self-contained, anonymous scan/i);
     expect(agentPrompt).toMatch(/inbound text is the current execution contract[\s\S]{0,320}supplied history/i);
     expect(agentPrompt).not.toMatch(/Dispatcher-provided material must be in the inbound text/i);
   });
@@ -963,11 +933,9 @@ describe('prompts ↔ code contract', () => {
     expect(runner).not.toContain("## User language\\n'");
     expect(runner).toContain('splitCommanderAgentsBlock');
     expect(runner).not.toContain('splitCommanderPlanStateBlock');
-    // P2: only the orchestration ledger data, datetime, project status, and
-    // dynamically loaded tool-group state are per-turn volatile. The stable
-    // orchestration behavior remains in the system prompt. Execution-plan
-    // state is injected independently by Session at every model-loop tail, so
-    // the host must not maintain a second plan block.
+    // Conditional orchestration rules/data, datetime, the conversation board,
+    // and optional setup guidance ride the turn. SDK definitions and load receipts own
+    // activation state; neither the system nor turn tail duplicates it.
     expect(runner).toContain('splitCommanderOrchestrationBlock');
     expect(runner).toMatch(/if \(connectorBlock\) parts\.push\(connectorBlock\.trim\(\)\);\s+if \(systemSkillsBlock\) parts\.push\(systemSkillsBlock\.trim\(\)\);\s+if \(skillsBlock\) parts\.push\(skillsBlock\.trim\(\)\);\s+if \(agentsBlock\) parts\.push\(agentsBlock\);/);
     // User-authored project instructions are low-churn configuration and sit
@@ -982,11 +950,12 @@ describe('prompts ↔ code contract', () => {
     // Match the array structurally so formatting-only line wrapping does not
     // break the contract, while additions/removals/reordering still do.
     expect(runner).toMatch(
-      /const turnEphemeral = \[\s*orchestrationBlock,\s*volatileTail,\s*projectStatusBlock,\s*activeToolGroupsBlock,\s*\]/,
+      /const turnEphemeral = \[\s*orchestrationBlock,\s*volatileTail,\s*conversationBoardBlock,\s*connectorSetupBlock,\s*\]/,
     );
-    // The live project task board rides the turn (uncached), never the system prefix.
-    expect(runner).toContain('formatProjectStatusForTurn');
+    // Backlog state is read on demand, not injected into the prompt.
+    expect(runner).not.toContain('formatProjectStatusForTurn');
     expect(runner).not.toMatch(/parts\.push\(projectStatusBlock\)/);
+    expect(runner).not.toMatch(/parts\.push\(connectorSetupBlock\)/);
     expect(runner).not.toMatch(/parts\.push\(orchestrationBlock\)/);
     expect(runner).not.toMatch(/parts\.push\(volatileTail\)/);
     expect(runner).not.toMatch(/parts\.push\(activeToolGroupsBlock\)/);
@@ -1012,9 +981,7 @@ describe('prompts ↔ code contract', () => {
     expect(bus).toMatch(/CHANNEL_RETRY_FAILURE_CODES = new Set\(\[[\s\S]*?'provider_no_first_event'/);
 
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
-    // The disclosure clause lives on the <worker-error> recovery bullet: it
-    // must require naming the failed agent and forbid silent substitution.
-    expect(commanderPrompt).toMatch(/produce a failed specialist's outcome yourself[\s\S]{0,200}naming the agent/);
-    expect(commanderPrompt).toMatch(/Never silently replace an agent the user configured/);
+    expect(commanderPrompt).toMatch(/If Commander replaces a failed specialist, disclose the Agent briefly/i);
+    expect(commanderPrompt).toMatch(/never silently replace a user-selected Agent/i);
   });
 });

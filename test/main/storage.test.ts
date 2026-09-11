@@ -1,12 +1,15 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
+import nativeFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
   nowIso, genUserId, genId12, safeId,
   readJson, readJsonSync, writeJson, writeJsonSync,
   writeTextAtomicSync, appendJsonl, appendJsonlAtomic,
-  invalidateLineCount, readJsonl, readJsonlPage, readJsonlWindow, __storageTestHooks,
+  invalidateLineCount, readJsonl, readJsonlPage, readJsonlPageWithOffsets,
+  readJsonlWindow, __storageTestHooks,
 } from '../../src/main/storage';
 
 let tmpDir: string;
@@ -108,6 +111,32 @@ describe('storage › JSON IO', () => {
     expect(calls).toBe(3);
   });
 
+  it.each([false, true])('guarded snapshots respect ownership through rename retries (invalidated=%s)', async (invalidate) => {
+    const file = path.join(tmpDir, 'snapshot.json');
+    fs.writeFileSync(file, JSON.stringify({ revision: 2 }));
+    const rename = nativeFs.renameSync.bind(nativeFs);
+    let owned = true;
+    let attempts = 0;
+    const spy = vi.spyOn(nativeFs, 'renameSync').mockImplementation((from, to) => {
+      attempts += 1;
+      if (attempts < 3) {
+        if (invalidate) owned = false;
+        throw eperm();
+      }
+      rename(from, to);
+    });
+    syncBuiltinESMExports();
+    try {
+      await writeJson(file, { revision: 3 }, { shouldCommit: () => owned });
+      expect(readJsonSync(file)).toEqual({ revision: invalidate ? 2 : 3 });
+      expect(attempts).toBe(invalidate ? 1 : 3);
+      expect(fs.readdirSync(tmpDir)).toEqual(['snapshot.json']);
+    } finally {
+      spy.mockRestore();
+      syncBuiltinESMExports();
+    }
+  });
+
   it('readJson returns {} on missing file', async () => {
     expect(await readJson(path.join(tmpDir, 'missing.json'))).toEqual({});
   });
@@ -123,6 +152,17 @@ describe('storage › JSON IO', () => {
     writeJsonSync(p, { sync: true });
     expect(readJsonSync(p)).toEqual({ sync: true });
     expect(readJsonSync(path.join(tmpDir, 'missing.json'))).toEqual({});
+  });
+
+  it('writeTextAtomicSync carries the requested mode onto the target (0600 secrets)', () => {
+    const p = path.join(tmpDir, 'secrets.json');
+    writeTextAtomicSync(p, '{"s":1}', 'utf8', { mode: 0o600 });
+    expect(fs.readFileSync(p, 'utf8')).toBe('{"s":1}');
+    // No atomic tmp leftover next to the target.
+    expect(fs.readdirSync(tmpDir).filter((n) => n.startsWith('secrets.json.'))).toEqual([]);
+    if (process.platform !== 'win32') {
+      expect(fs.statSync(p).mode & 0o777).toBe(0o600);
+    }
   });
 
   it('writeJsonSync mkdirs nested parents', () => {
@@ -209,6 +249,46 @@ describe('storage › JSONL append/read', () => {
     expect(middle.records.map((r) => r.i)).toEqual([5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
     expect(oldest.records.map((r) => r.i)).toEqual([0, 1, 2, 3, 4]);
     expect(oldest.nextCursor).toBeNull();
+  });
+
+  it('reports source byte offsets for sparse page projections', async () => {
+    const p = path.join(tmpDir, 'offset-log.jsonl');
+    const rows = [
+      JSON.stringify({ i: 0, text: '短' }),
+      JSON.stringify({ i: 1, text: 'longer' }),
+      JSON.stringify({ i: 2, text: '尾' }),
+    ];
+    fs.writeFileSync(p, `${rows.join('\n')}\n`, 'utf8');
+
+    const page = await readJsonlPageWithOffsets<{ i: number }>(p, 2);
+
+    expect(page.entries.map(({ record }) => record.i)).toEqual([1, 2]);
+    expect(page.entries.map(({ start }) => start)).toEqual([
+      Buffer.byteLength(`${rows[0]}\n`, 'utf8'),
+      Buffer.byteLength(`${rows[0]}\n${rows[1]}\n`, 'utf8'),
+    ]);
+    expect(page.nextCursor).toBe(page.entries[0].start);
+  });
+
+  it('assembles multi-megabyte tail records without repeatedly copying partial prefixes', async () => {
+    const p = path.join(tmpDir, 'wide-records.jsonl');
+    const pad = 'x'.repeat(2 * 1024 * 1024);
+    const rows = Array.from({ length: 3 }, (_, i) => JSON.stringify({ i, pad }));
+    fs.writeFileSync(p, `${rows.join('\n')}\n`, 'utf8');
+    const concat = vi.spyOn(Buffer, 'concat');
+    try {
+      const page = await readJsonlPageWithOffsets<{ i: number }>(p, 2);
+
+      expect(page.entries.map(({ record }) => record.i)).toEqual([1, 2]);
+      expect(concat.mock.calls.length).toBeLessThanOrEqual(2);
+
+      concat.mockClear();
+      const window = await readJsonlWindow<{ i: number }>(p, 1, 2);
+      expect(window.records.map((record) => record.i)).toEqual([1, 2]);
+      expect(concat.mock.calls.length).toBeLessThanOrEqual(3);
+    } finally {
+      concat.mockRestore();
+    }
   });
 
   it('reads the page containing a parsed-record index in one bounded window', async () => {

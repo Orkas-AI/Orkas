@@ -158,43 +158,43 @@ export function boundMessagesForImageLimit(
 ): Message[] {
   const limit = Number.isFinite(rawLimit) ? Math.max(0, Math.trunc(rawLimit)) : 0;
   const totalImages = messages.reduce(
-    (sum, message) => sum + message.content.filter((content) => content.type === 'image').length,
+    (sum, message) => sum + messageImageCount(message),
     0,
   );
   if (totalImages <= limit) return messages;
 
   let remaining = limit;
-  const keptImageIndexes = new Map<number, Set<number>>();
-  for (let messageIndex = messages.length - 1; messageIndex >= 0 && remaining > 0; messageIndex -= 1) {
-    const content = messages[messageIndex].content;
-    for (let contentIndex = 0; contentIndex < content.length && remaining > 0; contentIndex += 1) {
-      if (content[contentIndex].type !== 'image') continue;
-      const indexes = keptImageIndexes.get(messageIndex) || new Set<number>();
-      indexes.add(contentIndex);
-      keptImageIndexes.set(messageIndex, indexes);
-      remaining -= 1;
-    }
-  }
-
   const projected: Message[] = [];
-  for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
     const message = messages[messageIndex];
-    const kept = keptImageIndexes.get(messageIndex);
-    const content = message.content.filter(
-      (item, contentIndex) => item.type !== 'image' || kept?.has(contentIndex),
-    );
+    const content: Message['content'] = [];
+    for (const item of message.content) {
+      if (item.type === 'image') {
+        if (remaining > 0) { content.push(item); remaining--; }
+      } else if (item.type === 'tool_result' && item.images?.length) {
+        const images = item.images.slice(0, remaining);
+        remaining -= images.length;
+        content.push({ ...item, images });
+      } else content.push(item);
+    }
     if (content.length === 0) continue;
-    projected.push(content.length === message.content.length ? message : { ...message, content });
+    projected.push({ ...message, content });
   }
+  projected.reverse();
   const omittedImages = totalImages - limit;
   const notice = limit > 0
     ? `<model-image-limit max_images="${limit}" omitted_images="${omittedImages}">Only the retained image blocks in this request are visually available. Use attachment manifest paths with read_files one image at a time for omitted images; do not claim visual processing from a listed path alone.</model-image-limit>`
     : `<model-image-limit max_images="0" omitted_images="${omittedImages}" vision_supported="false">This model cannot receive image blocks, including read_files image previews. Do not claim visual analysis. When ocr_file is available it may extract text; otherwise explain that a vision-capable model is required.</model-image-limit>`;
   projected.push({
-    role: 'user',
+    role: 'developer',
     content: [{ type: 'text', text: notice }],
   });
   return projected;
+}
+
+function messageImageCount(message: Message): number {
+  return message.content.reduce((sum, item) => sum
+    + (item.type === 'image' ? 1 : item.type === 'tool_result' ? item.images?.length ?? 0 : 0), 0);
 }
 
 export interface CreateRotatingProviderConfig {
@@ -311,7 +311,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
       // provider_fallback-style event plumbing (recorded in the plan doc).
       if (cand.maxInputImages === 0) {
         const dropped = params.messages.reduce(
-          (sum, message) => sum + message.content.filter((content) => content.type === 'image').length,
+          (sum, message) => sum + messageImageCount(message),
           0,
         );
         if (dropped > 0) {
@@ -897,7 +897,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
         // own mistake.
         if (cand.maxInputImages === 0 && !imagesOmittedAnnounced) {
           const omitted = params.messages.reduce(
-            (sum, message) => sum + message.content.filter((content) => content.type === 'image').length,
+            (sum, message) => sum + messageImageCount(message),
             0,
           );
           if (omitted > 0) {

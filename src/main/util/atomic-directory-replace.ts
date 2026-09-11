@@ -17,6 +17,51 @@ export interface AtomicDirectoryReplaceOptions {
  * Prepare a sibling directory, atomically activate it, then commit associated
  * metadata. Any activation/metadata failure restores the previous directory.
  */
+/** Staging and backup directories of replacements still in flight in this
+ *  process; the sweep below must never remove one of these. */
+const activeReplacementArtifacts = new Set<string>();
+
+const REPLACEMENT_ARTIFACT_RE = /^\.(.+)\.install-[^.]+(?:\.previous)?$/;
+
+/** Remove staging (`.<name>.install-*`) and backup (`*.previous`) directories a
+ *  crashed or killed replacement left under `parent`. They start with a dot,
+ *  so the install listings never showed them and nothing ever reclaimed
+ *  their space. Live artifacts are skipped. A previous-directory backup is
+ *  retained if activation never installed a real target directory: it may
+ *  contain the only recoverable copy of the user's prior content. */
+export async function sweepStaleReplacementArtifacts(
+  parent: string,
+  onCleanupError?: (err: unknown, artifactPath: string) => void,
+): Promise<string[]> {
+  let entries: fs.Dirent[];
+  try {
+    entries = await fsp.readdir(parent, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const removed: string[] = [];
+  for (const entry of entries) {
+    const match = REPLACEMENT_ARTIFACT_RE.exec(entry.name);
+    if (!entry.isDirectory() || !match) continue;
+    const artifact = path.join(parent, entry.name);
+    if (activeReplacementArtifacts.has(artifact)) continue;
+    if (entry.name.endsWith('.previous')) {
+      try {
+        if (!fs.lstatSync(path.join(parent, match[1])).isDirectory()) continue;
+      } catch {
+        continue;
+      }
+    }
+    try {
+      await fsp.rm(artifact, { recursive: true, force: true });
+      removed.push(artifact);
+    } catch (err) {
+      onCleanupError?.(err, artifact);
+    }
+  }
+  return removed;
+}
+
 export async function replaceDirectoryAtomically(
   target: string,
   prepare: (staged: string) => Promise<void>,
@@ -30,6 +75,8 @@ export async function replaceDirectoryAtomically(
   const backup = `${staged}.previous`;
   let previousMoved = false;
   let stagedActivated = false;
+  activeReplacementArtifacts.add(staged);
+  activeReplacementArtifacts.add(backup);
 
   try {
     await prepare(staged);
@@ -78,5 +125,8 @@ export async function replaceDirectoryAtomically(
       await fsp.rename(backup, target).catch(() => undefined);
     }
     throw err;
+  } finally {
+    activeReplacementArtifacts.delete(staged);
+    activeReplacementArtifacts.delete(backup);
   }
 }

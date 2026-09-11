@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
+import { createServer } from 'node:http';
 import {
   _resetProxyRoutingForTests,
   activeProxy,
@@ -9,6 +10,7 @@ import {
   createSystemProxyFetch,
   downloadBinaryWithProxyPolicy,
   envProxyConfig,
+  envProxyAppliesToUrl,
   envProxyUrl,
   installEnvProxyDispatcher,
   installSystemProxyDispatcher,
@@ -72,6 +74,18 @@ describe('util/proxy-dispatcher environment configuration', () => {
       httpProxy: 'http://proxy:8080',
       httpsProxy: 'http://proxy:8080',
     });
+  });
+
+  it('matches environment proxy and NO_PROXY host/port selection', () => {
+    const config = envProxyConfig({
+      HTTPS_PROXY: 'http://proxy.example:8080',
+      NO_PROXY: 'direct.example,.internal.example,port.example:8443',
+    });
+    expect(envProxyAppliesToUrl(new URL('https://cdn.example/file'), config)).toBe(true);
+    expect(envProxyAppliesToUrl(new URL('https://direct.example/file'), config)).toBe(false);
+    expect(envProxyAppliesToUrl(new URL('https://a.internal.example/file'), config)).toBe(false);
+    expect(envProxyAppliesToUrl(new URL('https://port.example:8443/file'), config)).toBe(false);
+    expect(envProxyAppliesToUrl(new URL('https://port.example/file'), config)).toBe(true);
   });
 
   it('uses ALL_PROXY as the final fallback and supports lowercase variables', () => {
@@ -300,10 +314,12 @@ describe('util/proxy-dispatcher per-request system routing', () => {
       status: 200,
       body: directBytes,
     });
+    const addressPolicy = vi.fn(() => false);
     const options = {
       headers: { Authorization: 'Bearer test' },
       maxBytes: 1024,
       redirect: 'error' as const,
+      isAllowedDirectAddress: addressPolicy,
     };
     await expect(routed('https://cdn.example/image.png', options)).resolves.toEqual({
       status: 200,
@@ -313,7 +329,88 @@ describe('util/proxy-dispatcher per-request system routing', () => {
     expect(fallback).toHaveBeenCalledOnce();
     expect(system).toHaveBeenCalledOnce();
     expect(system).toHaveBeenCalledWith('https://cdn.example/image.png', options);
+    expect(addressPolicy).not.toHaveBeenCalled();
     expect(resolveProxy).toHaveBeenCalledTimes(2);
+  });
+
+  it('checks the address selected by a direct connection before sending its GET', async () => {
+    let requestCount = 0;
+    const server = createServer((_req, res) => {
+      requestCount += 1;
+      res.writeHead(200).end('must not be requested');
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => resolve());
+    });
+    const address = server.address();
+    expect(address && typeof address !== 'string').toBe(true);
+    const checked: string[] = [];
+    try {
+      await expect(downloadBinaryWithProxyPolicy(
+        `http://localhost:${typeof address === 'string' || !address ? 0 : address.port}/private`,
+        {
+          label: 'direct address policy probe',
+          retries: 0,
+          isAllowedDirectAddress(candidate) {
+            checked.push(candidate);
+            return false;
+          },
+        },
+      )).rejects.toThrow();
+      expect(checked.length).toBeGreaterThan(0);
+      expect(requestCount).toBe(0);
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  it('leaves destination resolution to an explicitly configured environment proxy', async () => {
+    const { getGlobalDispatcher, setGlobalDispatcher } = await import('undici');
+    const originalDispatcher = getGlobalDispatcher();
+    const fetchMock = vi.fn(async () => new Response(new Uint8Array([1, 2, 3]), { status: 200 }));
+    const addressPolicy = vi.fn(() => false);
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    process.env.HTTP_PROXY = 'http://proxy.example:8080';
+    process.env.HTTPS_PROXY = 'http://proxy.example:8080';
+    try {
+      expect(await installEnvProxyDispatcher()).toBe(true);
+      await expect(downloadBinaryWithProxyPolicy('https://cdn.example/proxied.bin', {
+        label: 'environment-proxy download',
+        retries: 0,
+        isAllowedDirectAddress: addressPolicy,
+      })).resolves.toMatchObject({ status: 200, body: Buffer.from([1, 2, 3]) });
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(addressPolicy).not.toHaveBeenCalled();
+
+      let directRequestCount = 0;
+      const directServer = createServer((_req, res) => {
+        directRequestCount += 1;
+        res.writeHead(200).end('must not be requested');
+      });
+      await new Promise<void>((resolve, reject) => {
+        directServer.once('error', reject);
+        directServer.listen(0, '127.0.0.1', () => resolve());
+      });
+      const directAddress = directServer.address();
+      try {
+        await expect(downloadBinaryWithProxyPolicy(
+          `http://localhost:${typeof directAddress === 'string' || !directAddress ? 0 : directAddress.port}/private`,
+          {
+            label: 'environment NO_PROXY direct download',
+            retries: 0,
+            isAllowedDirectAddress: addressPolicy,
+          },
+        )).rejects.toThrow();
+        expect(addressPolicy).toHaveBeenCalled();
+        expect(directRequestCount).toBe(0);
+        expect(fetchMock).toHaveBeenCalledOnce();
+      } finally {
+        await new Promise<void>(resolve => directServer.close(() => resolve()));
+      }
+    } finally {
+      setGlobalDispatcher(originalDispatcher);
+    }
   });
 
   it('retries only the idempotent binary GET for transient transport, status, and validation failures', async () => {

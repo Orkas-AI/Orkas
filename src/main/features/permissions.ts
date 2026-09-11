@@ -1,7 +1,8 @@
 /**
- * Local access permission state.
+ * Operation permission state.
  *
- * This is the account-level, cloud-synced posture for local machine access.
+ * This is the account-level, cloud-synced posture for local machine access
+ * and connector action approval.
  * The product has three modes:
  *
  *   - `workspace_approval` — cautious. Agents may work inside the active

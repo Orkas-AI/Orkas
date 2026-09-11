@@ -5,6 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { ARTIFACT_FRAME } from '../../../src/main/features/chat_artifacts';
 import {
   renderInteractiveHtmlSmoke,
   renderResponsiveHtmlPreview,
@@ -22,14 +23,15 @@ afterEach(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-function pageEvidence(width: number, overflow = 0) {
+function pageEvidence(width: number, overflow = 0, unreachable = 0, scrollHeight = 900) {
   return {
     readyState: 'complete',
     title: 'Preview',
     visibleTextChars: 7,
     scrollWidth: width + overflow,
-    scrollHeight: 900,
+    scrollHeight,
     horizontalOverflowPx: overflow,
+    unreachableOverflowPx: unreachable,
     focusableCount: 1,
     headingCount: 1,
     missingAltCount: 0,
@@ -42,6 +44,8 @@ function pageEvidence(width: number, overflow = 0) {
 
 function fakeRuntime(options: {
   mobileOverflow?: number;
+  embedUnreachablePx?: number;
+  embedScrollHeight?: number;
   externalRequest?: boolean;
   consoleError?: string;
   downloadCandidate?: boolean;
@@ -148,12 +152,19 @@ function fakeRuntime(options: {
               failures: options.interactionFailures ?? [],
             };
           }
-          return script.startsWith('(async')
-            ? true
-            : pageEvidence(
-              Number(windowOptions.width),
-              Number(windowOptions.width) <= 480 ? options.mobileOverflow ?? 0 : 0,
-            );
+          {
+            const width = Number(windowOptions.width);
+            const isEmbed = width === ARTIFACT_FRAME.smokeWidth
+              && Number(windowOptions.height) === ARTIFACT_FRAME.maxHeight;
+            return script.startsWith('(async')
+              ? true
+              : pageEvidence(
+                width,
+                width <= 480 ? options.mobileOverflow ?? 0 : 0,
+                isEmbed ? options.embedUnreachablePx ?? 0 : 0,
+                isEmbed ? options.embedScrollHeight ?? 900 : 900,
+              );
+          }
         },
         capturePage: async () => ({
           getSize: () => ({ width: Number(windowOptions.width), height: Number(windowOptions.height) }),
@@ -534,6 +545,71 @@ describe('responsive HTML preview renderer', () => {
     expect(blocker).toContain('(4 more not shown)');
   });
 
+  /**
+   * 2026-08-26: the smoke validated at 1280x800 and 390x844 while the chat
+   * frame gives an artifact roughly 480x420. Three consecutive artifacts
+   * passed 9/9 and shipped clipped, because the one gate that runs before the
+   * card is exposed never measured the box the user gets.
+   */
+  it('measures the chat embed frame, not only a desktop window', async () => {
+    const runtime = fakeRuntime({ controlsExercised: 2, stateChangesObserved: 1 });
+    const result = await renderInteractiveHtmlSmoke(path.join(root, 'index.html'), runtime.deps);
+
+    expect(result.evidence.viewports.map((view) => view.name)).toContain('embed');
+    expect(result.evidence.viewports.find((view) => view.name === 'embed')).toMatchObject({
+      width: ARTIFACT_FRAME.smokeWidth,
+      height: ARTIFACT_FRAME.maxHeight,
+    });
+  });
+
+  it('blocks an artifact whose content the frame hides with no way to scroll to it', async () => {
+    const runtime = fakeRuntime({
+      controlsExercised: 2,
+      stateChangesObserved: 1,
+      embedScrollHeight: 694,
+      embedUnreachablePx: 254,
+    });
+    const result = await renderInteractiveHtmlSmoke(path.join(root, 'index.html'), runtime.deps);
+
+    expect(result.evidence.ok).toBe(false);
+    const blocker = result.evidence.blockers.find((item) => item.startsWith('embed:'));
+    expect(blocker).toContain('254px of content sits below');
+    expect(blocker).toContain(`${ARTIFACT_FRAME.maxHeight}px chat frame`);
+    // The remediation has to name the cause, or the next attempt is the same
+    // full-screen shell with different padding.
+    expect(blocker).toContain('100vh');
+  });
+
+  it('lets merely-tall content through with a warning instead of a refusal', async () => {
+    // Scrolling inside the frame is the documented behaviour, not a defect.
+    const runtime = fakeRuntime({
+      controlsExercised: 2,
+      stateChangesObserved: 1,
+      embedScrollHeight: 900,
+      embedUnreachablePx: 0,
+    });
+    const result = await renderInteractiveHtmlSmoke(path.join(root, 'index.html'), runtime.deps);
+
+    expect(result.evidence.ok).toBe(true);
+    expect(result.evidence.warnings.some((item) => (
+      item.startsWith('embed:') && item.includes('900px tall')
+    ))).toBe(true);
+  });
+
+  it('says nothing about the embed when the artifact fits the frame', async () => {
+    const runtime = fakeRuntime({
+      controlsExercised: 2,
+      stateChangesObserved: 1,
+      embedScrollHeight: ARTIFACT_FRAME.maxHeight - 40,
+      embedUnreachablePx: 0,
+    });
+    const result = await renderInteractiveHtmlSmoke(path.join(root, 'index.html'), runtime.deps);
+
+    expect(result.evidence.ok).toBe(true);
+    expect(result.evidence.blockers.some((item) => item.startsWith('embed:'))).toBe(false);
+    expect(result.evidence.warnings.some((item) => item.startsWith('embed:'))).toBe(false);
+  });
+
   it('requires an observable behavior only for interactive artifact smoke', async () => {
     const staticRuntime = fakeRuntime({ controlsExercised: 1, stateChangesObserved: 0 });
     const staticResult = await renderInteractiveHtmlSmoke(
@@ -567,7 +643,7 @@ describe('responsive HTML preview renderer', () => {
       controlsExercised: 2,
       stateChangesObserved: 1,
     });
-    expect(interactiveRuntime.bridgeAvailableAtLoad).toEqual([true, true]);
+    expect(interactiveRuntime.bridgeAvailableAtLoad).toEqual([true, true, true]);
     expect(interactiveRuntime.loadedEntryUrls.every((url) => (
       !fs.existsSync(path.dirname(fileURLToPath(url)))
     ))).toBe(true);

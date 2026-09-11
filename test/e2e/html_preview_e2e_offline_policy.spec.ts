@@ -2,6 +2,7 @@ import { createServer } from 'node:http';
 import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
+import type { ElectronApplication } from '@playwright/test';
 
 import { chatMediaLocalUrl } from '../../src/main/util/chat-media-url';
 import { expect, test } from './fixtures/orkas';
@@ -10,6 +11,26 @@ const PNG_1X1 = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
   'base64',
 );
+
+// Delay the actual document response, leaving layout IPC and the renderer's
+// native iframe load events intact. Each test owns an isolated Electron app.
+async function holdFirstHtmlResponse(app: ElectronApplication, html: string) {
+  await app.evaluate(({ protocol }, content) => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const gate = { release, requested: false };
+    (globalThis as any).__htmlResponseGate = gate;
+    protocol.unhandle('chat-media');
+    protocol.handle('chat-media', async () => {
+      if (!gate.requested) {
+        gate.requested = true;
+        await pending;
+      }
+      return new Response(content, { headers: { 'Content-Type': 'text/html' } });
+    });
+  }, html);
+  return () => app.evaluate(() => (globalThis as any).__htmlResponseGate.release());
+}
 
 test.describe('local HTML offline preview', () => {
   test('keeps layout inference responsive for long HTML with blocking resource tags', async ({
@@ -44,37 +65,69 @@ test.describe('local HTML offline preview', () => {
     const htmlPath = orkas.createWorkspaceFile('loading-preview.html', `<!doctype html>
 <html><body><main id="ready">preview-ready</main></body></html>`);
 
-    await appPage.evaluate((pathValue) => {
-      const globals = window as any;
-      const originalLoaded = globals._viewerHtmlIframeLoaded;
-      const originalReveal = globals._viewerMaybeRevealHtml;
-      let pendingState: unknown = null;
-      let revealArgs: unknown[] | null = null;
-      globals._viewerHtmlIframeLoaded = (state: unknown) => { pendingState = state; };
-      globals._viewerMaybeRevealHtml = (...args: unknown[]) => {
-        revealArgs = args;
-        return originalReveal(...args);
-      };
-      globals.__releaseHtmlPreviewIframe = () => {
-        globals._viewerHtmlIframeLoaded = originalLoaded;
-        globals._viewerMaybeRevealHtml = originalReveal;
-        if (pendingState) originalLoaded(pendingState);
-        if (revealArgs) originalReveal(...revealArgs);
-      };
-      void (window as any).openChatFileViewer(pathValue, 'loading-preview.html');
-    }, htmlPath);
+    const release = await holdFirstHtmlResponse(orkas.electronApp!,
+      '<!doctype html><main id="ready">preview-ready</main>');
+    try {
+      // This resolves after layout IPC, while the HTML response remains held.
+      await appPage.evaluate((pathValue) => (
+        (window as any).openChatFileViewer(pathValue, 'loading-preview.html')
+      ), htmlPath);
 
-    const viewer = appPage.locator('.chat-file-viewer');
-    const body = viewer.locator('.chat-file-viewer-body');
-    await expect(viewer).toHaveClass(/is-open/);
-    await expect(body).toHaveAttribute('aria-busy', 'true');
-    await expect(body.locator('.chat-file-viewer-loading')).toBeVisible();
-    await expect(body.locator('.chat-file-viewer-html')).toHaveCSS('visibility', 'hidden');
+      const viewer = appPage.locator('.chat-file-viewer');
+      const body = viewer.locator('.chat-file-viewer-body');
+      await expect(viewer).toHaveClass(/is-open/);
+      await expect(body).toHaveAttribute('aria-busy', 'true');
+      await expect(body.locator('.chat-file-viewer-loading')).toBeVisible();
+      await expect(body.locator('.chat-file-viewer-html')).toHaveCSS('visibility', 'hidden');
 
-    await appPage.evaluate(() => (window as any).__releaseHtmlPreviewIframe());
-    await expect(body).not.toHaveAttribute('aria-busy', 'true');
-    await expect(body.locator('.chat-file-viewer-loading')).toHaveCount(0);
-    await expect(body.locator('.chat-file-viewer-html')).toHaveCSS('visibility', 'visible');
+      await release();
+      await expect(body).not.toHaveAttribute('aria-busy', 'true');
+      await expect(body.locator('.chat-file-viewer-loading')).toHaveCount(0);
+      await expect(body.locator('.chat-file-viewer-html')).toHaveCSS('visibility', 'visible');
+      await expect(body.locator('iframe').contentFrame().locator('#ready')).toHaveText('preview-ready');
+    } finally {
+      await release();
+    }
+  });
+
+  test('closes a pending preview without waiting and reopens a working document', async ({
+    appPage,
+    orkas,
+  }) => {
+    const htmlPath = orkas.createWorkspaceFile('reopen-preview.html', '<!doctype html><main>preview</main>');
+    const release = await holdFirstHtmlResponse(orkas.electronApp!,
+      '<!doctype html><button id="action" onclick="this.textContent=\'done\'">ready</button>');
+    try {
+      await appPage.evaluate((pathValue) => (
+        (window as any).openChatFileViewer(pathValue, 'reopen-preview.html')
+      ), htmlPath);
+      await expect.poll(() => orkas.electronApp!.evaluate(() => (
+        (globalThis as any).__htmlResponseGate.requested
+      ))).toBe(true);
+      const viewer = appPage.locator('.chat-file-viewer');
+      await viewer.locator('.chat-file-viewer-close').click();
+      await expect(viewer).toBeHidden();
+      await expect(viewer.locator('iframe')).toHaveCount(0);
+
+      // Reopen while the old response is still held, then let that stale
+      // response finish. It must not dismiss or overwrite the new preview.
+      await appPage.evaluate((pathValue) => (
+        (window as any).openChatFileViewer(pathValue, 'reopen-preview.html')
+      ), htmlPath);
+      await release();
+      const body = viewer.locator('.chat-file-viewer-body');
+      await expect(body).not.toHaveAttribute('aria-busy', 'true');
+      await expect(body.locator('iframe')).toHaveCSS('visibility', 'visible');
+      const action = viewer.locator('iframe').contentFrame().locator('#action');
+      await expect(action).toHaveText('ready');
+      await action.press('Enter');
+      await expect(action).toHaveText('done');
+      await viewer.locator('.chat-file-viewer-close').click();
+      await expect(viewer).toBeHidden();
+      await expect(viewer.locator('iframe')).toHaveCount(0);
+    } finally {
+      await release();
+    }
   });
 
   test('runs self-contained code while blocking remote code, assets, connections, and navigation', async ({

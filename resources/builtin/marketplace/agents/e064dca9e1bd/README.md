@@ -10,7 +10,7 @@ A built-in agent ships as **platform marketplace content** (DB + COS, `default_i
 ## Layout
 
 ```
-agent.json                       # workflow (4 modes) / skill_list / inputs(url, repo_path) / category=data / output_format=dashboard
+agent.json                       # workflow (6 modes) / skill_list / inputs(url, repo_path) / category=data / output_format=dashboard
 skills/                          # all agent-private (ownerAgent: e064dca9e1bd), Python stdlib-only, via bin/run-skill.cjs
   seo-crawl/        crawl.py + url_safety.py   # fetch (SSRF-guarded, proxy-aware) or --file; ~30 on-page fields + text_sample + robots
   seo-tech-audit/   audit.py                   # technical findings + health score
@@ -21,6 +21,7 @@ skills/                          # all agent-private (ownerAgent: e064dca9e1bd),
   seo-opportunity/  opportunity.py             # one-run keyword opportunity pool + GEO gaps
   seo-monitor/      monitor.py                 # baseline snapshot + drift compare (rule engine)
   seo-report/       report.py                  # merge findings/opportunities/SoV → :::dashboard spec + ACTION-PLAN.md
+  seo-backlink-value/ backlink_value.py        # backlink offer valuation: veto gate → 48-bracket price band → type multiplier → quote verdict / rank
 ```
 
 ## Modes (agent.json workflow)
@@ -30,6 +31,7 @@ skills/                          # all agent-private (ownerAgent: e064dca9e1bd),
 - **monitor**: re-crawl → snapshot → drift-compare vs `baseline.json` → dashboard + Alert; refresh baseline. Schedule via an `auto_task` that dispatches `monitor` (no extra infra).
 - **apply** (needs a local repo path): edit source (title/meta/canonical/alt/headings/robots/sitemap/llms.txt/JSON-LD) under a confirm gate + `changelog.jsonl`, then re-test edited files via `seo-crawl --file`. Never commits/publishes.
 - **content**: brief → write/optimize (answer-first, quotable, FAQ schema) → self-check → DRAFT (publishing = apply + confirmation).
+- **backlink**: value one or more link offers via `seo-backlink-value` (`--op evaluate|rank`). The agent acquires metrics itself: connected SEO provider → free Tranco rank/history + RDAP registration + `site:` count via `web_fetch`/`web_search` (passed as `proxies`, result labelled `public_proxy`) → user; paid tools' web UIs are never scraped.
 
 ## Test
 

@@ -10,9 +10,9 @@
  *   connectors.refresh       → { tools, instance }
  *   connectors.set_subtools  → { instance }
  *
- * Catalog installs are OAuth-only — no API-key fallback. Server-bridge providers use an
- * Orkas-registered OAuth app; MCP DCR providers issue a per-device client whose credentials stay
- * in the encrypted local registry. Custom MCP servers are the separate, explicitly user-authored
+ * Catalog installs use provider OAuth. Paid Composio rows authenticate Orkas Server with the
+ * user's shared Orkas API Key, while ordinary server-bridge and MCP DCR providers keep their
+ * existing open-device flow. Custom MCP servers are the separate, explicitly user-authored
  * path: `connectors.add_custom` is the single validated route
  * (features/connectors/custom-transport.ts), the renderer form is the consent surface, and the
  * stored transport lives inside `secrets_enc`. See docs/plans/open-ecosystem-architecture.md §C.
@@ -23,6 +23,8 @@ import * as connectors from '../features/connectors';
 import type { ConnectorInstance, ConnectorStatus, ToolSchema } from '../features/connectors';
 import { isConnectorEnabled, setConnectorEnabled } from '../features/component_enabled';
 import { catalogWithAvailability, isConnectorRuntimeEnabled } from '../features/connectors/availability';
+import { requireConnectorApiKey } from '../features/connectors/api-key';
+import { checkLocalCliPermissions, localCliMissingPermissions } from '../features/connectors/local-cli';
 
 /**
  * Renderer-safe view of a connector instance. The hydrated `ConnectorInstance`
@@ -38,8 +40,9 @@ interface ClientConnectorInstance {
   id: string;
   display_name: string;
   origin?: 'catalog' | 'custom';
+  connection_environment?: 'sandbox' | 'live';
   transport?:
-    | { kind: 'stdio'; summary: string }
+    | { kind: 'stdio'; summary: string; command?: string; argument_count?: number }
     | { kind: 'streamable-http'; summary: string };
   enabled_subtools: string[] | null;
   tools_cache: ToolSchema[];
@@ -49,6 +52,8 @@ interface ClientConnectorInstance {
   created_at: string;
   updated_at: string;
   enabled?: boolean;
+  reauthorization_required?: boolean;
+  missing_permissions?: string[];
 }
 
 function _safeTransportSummary(inst: ConnectorInstance): ClientConnectorInstance['transport'] | undefined {
@@ -58,7 +63,7 @@ function _safeTransportSummary(inst: ConnectorInstance): ClientConnectorInstance
     const command = path.basename(transport.command || '');
     const argCount = transport.args?.length ?? 0;
     const suffix = argCount === 1 ? '1 arg' : `${argCount} args`;
-    return { kind: 'stdio', summary: argCount > 0 ? `${command} (${suffix})` : command };
+    return { kind: 'stdio', summary: argCount > 0 ? `${command} (${suffix})` : command, command, argument_count: argCount };
   }
   try {
     const url = new URL(transport.url);
@@ -73,7 +78,7 @@ function _safeTransportSummary(inst: ConnectorInstance): ClientConnectorInstance
 }
 
 /** Strip every secret-bearing field; never spread the raw instance to the renderer. */
-function toClientInstance(inst: ConnectorInstance, enabled?: boolean): ClientConnectorInstance {
+function toClientInstance(inst: ConnectorInstance, enabled?: boolean, uid?: string): ClientConnectorInstance {
   const transport = _safeTransportSummary(inst);
   const out: ClientConnectorInstance = {
     id: inst.id,
@@ -87,24 +92,39 @@ function toClientInstance(inst: ConnectorInstance, enabled?: boolean): ClientCon
     created_at: inst.created_at,
     updated_at: inst.updated_at,
   };
+  const environment = inst.connection_parameters?.environment;
+  if (environment === 'sandbox' || environment === 'live') out.connection_environment = environment;
   if (inst.oauth_grant?.account_label) {
     out.oauth_grant = { account_label: inst.oauth_grant.account_label };
+  } else if (inst.composio_grant?.account_label) {
+    out.oauth_grant = { account_label: inst.composio_grant.account_label };
   }
   if (typeof enabled === 'boolean') out.enabled = enabled;
+  if (uid && inst.origin !== 'custom') {
+    const missing = localCliMissingPermissions(uid, inst.id);
+    if (missing !== null) {
+      out.reauthorization_required = true;
+      out.missing_permissions = missing;
+    }
+  }
   return out;
 }
 
 export const _toClientInstanceForTest = toClientInstance;
 
+export async function removeApiKeyConnectorsForCredentialChange(userId: string): Promise<number> {
+  return connectors.removeApiKeyConnectors(userId);
+}
+
 export const invokeHandlers = {
-  'connectors.catalog': async () => ({ catalog: catalogWithAvailability(connectors.CONNECTOR_CATALOG) }),
+  'connectors.catalog': async () => ({ catalog: catalogWithAvailability(connectors.connectorCatalog()) }),
 
   'connectors.list': async (_payload: unknown, ctx: { userId: string }) => {
     // Attach the per-user `enabled` flag so the renderer can render the "停用 / 启用" toggle
     // without a second IPC. Defaults to true when the user hasn't toggled it (the file only
     // stores `false` overrides — see features/component_enabled.ts).
     const raw = connectors.listInstances(ctx.userId).filter((inst) => isConnectorRuntimeEnabled(inst.id));
-    const instances = raw.map((inst) => toClientInstance(inst, isConnectorEnabled(ctx.userId, inst.id)));
+    const instances = raw.map((inst) => toClientInstance(inst, isConnectorEnabled(ctx.userId, inst.id), ctx.userId));
     return { instances };
   },
 
@@ -114,9 +134,17 @@ export const invokeHandlers = {
    *  happens to call one of its tools. TTL + live-connection checks live in the manager, so repeat
    *  panel opens cost nothing — see `verifyUsableConnectors` for the full cost rationale. */
   'connectors.verify': async (_payload: unknown, ctx: { userId: string }) => {
-    const verified = await connectors.verifyUsableConnectors(ctx.userId, 'connectors_panel');
+    const catalog = connectors.connectorCatalog();
+    const checks = connectors.listInstances(ctx.userId).filter(inst => inst.origin !== 'custom'
+      && isConnectorRuntimeEnabled(inst.id)).map(inst => {
+      const entry = catalog.find(entry => entry.id === inst.id);
+      return entry ? checkLocalCliPermissions(ctx.userId, entry) : Promise.resolve();
+    });
+    const [verified] = await Promise.all([
+      connectors.verifyUsableConnectors(ctx.userId, 'connectors_panel'), ...checks,
+    ]);
     const raw = connectors.listInstances(ctx.userId).filter((inst) => isConnectorRuntimeEnabled(inst.id));
-    const instances = raw.map((inst) => toClientInstance(inst, isConnectorEnabled(ctx.userId, inst.id)));
+    const instances = raw.map((inst) => toClientInstance(inst, isConnectorEnabled(ctx.userId, inst.id), ctx.userId));
     return { verified, instances };
   },
 
@@ -130,10 +158,55 @@ export const invokeHandlers = {
     return { ok: true, enabled: payload.enabled };
   },
 
-  'connectors.start_oauth': async (payload: { catalog_id?: unknown }, ctx: { userId: string }) => {
+  'connectors.start_oauth': async (payload: { catalog_id?: unknown; connection_parameters?: unknown }, ctx: { userId: string }) => {
     if (typeof payload?.catalog_id !== 'string') throw new Error('invalid catalog_id');
-    const started = connectors.beginOAuthConnect(ctx.userId, payload.catalog_id);
+    const entry = connectors.findCatalogEntry(payload.catalog_id);
+    if (entry?.auth_mode === 'composio' || entry?.requires_credits) {
+      try {
+        requireConnectorApiKey();
+      } catch (err) {
+        return {
+          ok: false,
+          code: String((err as { code?: unknown }).code || 'orkas_api_key_required'),
+          error: String((err as Error).message || 'Configure an Orkas API Key first.'),
+          requires_api_key: true,
+          settings_tab: 'credentials',
+        };
+      }
+    }
+    const started = payload.connection_parameters === undefined
+      ? connectors.beginOAuthConnect(ctx.userId, payload.catalog_id)
+      : connectors.beginOAuthConnect(ctx.userId, payload.catalog_id, payload.connection_parameters);
     return { started: true, attempt_id: started.attempt_id };
+  },
+
+  'connectors.local_cli_status': async (
+    payload: { catalog_id?: unknown },
+    ctx: { userId: string },
+  ) => {
+    if (typeof payload?.catalog_id !== 'string') throw new Error('invalid catalog_id');
+    const entry = connectors.findCatalogEntry(payload.catalog_id);
+    if (!entry || entry.auth_mode !== 'local_cli' || !entry.local_cli) {
+      throw new Error('catalog entry is not a local CLI connector');
+    }
+    return { status: connectors.localCliInstallStatus(ctx.userId, entry) };
+  },
+
+  'connectors.install_local_cli': async (
+    payload: { catalog_id?: unknown },
+    ctx: { userId: string },
+  ) => {
+    if (typeof payload?.catalog_id !== 'string') throw new Error('invalid catalog_id');
+    const entry = connectors.findCatalogEntry(payload.catalog_id);
+    if (!entry || entry.auth_mode !== 'local_cli' || !entry.local_cli) {
+      throw new Error('catalog entry is not a local CLI connector');
+    }
+    return { status: await connectors.installLocalCli(ctx.userId, entry) };
+  },
+
+  'connectors.open_local_cli_auth_url': async (payload: { url?: unknown }) => {
+    await connectors.openLocalCliAuthorizationUrl(payload?.url);
+    return { opened: true };
   },
 
   'connectors.cancel_oauth': async () => {
@@ -152,6 +225,16 @@ export const invokeHandlers = {
     return { handled: installConfirm.respond(payload.request_id, payload.approved) };
   },
 
+  /** Renderer answer to a per-action sensitive connector confirmation. */
+  'connectors.action_confirm_response': async (payload: { request_id?: unknown; approved?: unknown; scope?: unknown }) => {
+    if (typeof payload?.request_id !== 'string' || !payload.request_id) throw new Error('invalid request_id');
+    if (typeof payload?.approved !== 'boolean') throw new Error('invalid approved flag');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const actionConfirm = require('../features/connectors/action_confirm') as typeof import('../features/connectors/action_confirm');
+    if (payload.scope !== undefined && payload.scope !== 'once' && payload.scope !== 'task') throw new Error('invalid approval scope');
+    return { handled: actionConfirm.respond(payload.request_id, payload.approved, payload.scope === 'task' ? 'task' : 'once') };
+  },
+
   'connectors.add_custom': async (
     payload: { display_name?: unknown; transport?: unknown },
     ctx: { userId: string },
@@ -162,7 +245,7 @@ export const invokeHandlers = {
       display_name: payload?.display_name as string,
       transport: payload?.transport as never,
     });
-    return { instance: toClientInstance(instance, isConnectorEnabled(ctx.userId, instance.id)) };
+    return { instance: toClientInstance(instance, isConnectorEnabled(ctx.userId, instance.id), ctx.userId) };
   },
 
   'connectors.remove': async (payload: { id?: unknown }, ctx: { userId: string }) => {
@@ -176,9 +259,13 @@ export const invokeHandlers = {
     const tools = await connectors.refreshTools(ctx.userId, payload.id);
     const instance = connectors.getInstance(ctx.userId, payload.id);
     if (!instance) throw new Error('instance not found after refresh');
+    if (instance.origin !== 'custom') {
+      const entry = connectors.connectorCatalog().find(entry => entry.id === instance.id);
+      if (entry) await checkLocalCliPermissions(ctx.userId, entry, true);
+    }
     return {
       tools,
-      instance: toClientInstance(instance, isConnectorEnabled(ctx.userId, instance.id)),
+      instance: toClientInstance(instance, isConnectorEnabled(ctx.userId, instance.id), ctx.userId),
     };
   },
 
@@ -194,7 +281,7 @@ export const invokeHandlers = {
     } else throw new Error('subtools must be null or string[]');
     const instance = await connectors.setEnabledSubtools(ctx.userId, payload.id, subset);
     if (!instance) throw new Error('instance not found');
-    return { instance: toClientInstance(instance, isConnectorEnabled(ctx.userId, instance.id)) };
+    return { instance: toClientInstance(instance, isConnectorEnabled(ctx.userId, instance.id), ctx.userId) };
   },
 
   'connectors.google_sheets_authorize_files': async (

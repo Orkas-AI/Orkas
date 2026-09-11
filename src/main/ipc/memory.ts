@@ -21,6 +21,7 @@ import * as path from 'node:path';
 import { shell } from 'electron';
 import * as memory from '../features/memory';
 import * as projects from '../features/projects';
+import { localCliSupportsAgentMemory } from '../features/local_agents/registry';
 import type { MemoryScope } from '../features/memory';
 import { userMemoryFile, userProfileFile, userMemoryDir, agentMemoryFile, projectMemoryFile } from '../paths';
 import { createLogger } from '../logger';
@@ -54,15 +55,29 @@ function fileForScope(userId: string, scope: MemoryScope): string {
 }
 
 /** Resolve and authorize a renderer-supplied scope before any memory read or
- * write. Path construction performs the segment validation; the ownership
- * check prevents a valid-looking but stale/foreign project id from creating an
- * orphan `projects/<pid>/MEMORY.md` directory. */
+ * write. Path construction performs segment validation. Project ownership and
+ * Agent capability checks prevent valid-looking stale ids or unsupported CLI
+ * runtimes from bypassing their ordinary detail-page contracts. */
 async function resolveScope(userId: string, payload: any): Promise<MemoryScope> {
   const scope = normScope(payload);
   fileForScope(userId, scope);
   if (typeof scope === 'object' && 'project' in scope
       && !(await projects.projectExists(userId, scope.project))) {
     throw new Error('project_not_found');
+  }
+  if (typeof scope === 'object' && 'agent' in scope) {
+    // Commander is a host-owned synthetic Agent with no agent.json. Its
+    // private memory uses the same scoped file and detail-page controls.
+    if (scope.agent === 'commander') return scope;
+    // IPC requests are bound to the active account by the central dispatcher;
+    // use the Agent feature as the source of truth for custom + marketplace
+    // resolution instead of treating a memory directory as proof of an Agent.
+    const agents = await import('../features/agents');
+    const agent = await agents.getAgent(scope.agent);
+    if (!agent) throw new Error('agent_not_found');
+    if (agent.runtime?.kind === 'cli' && !localCliSupportsAgentMemory(agent.runtime.cli)) {
+      throw new Error('agent memory is supported only for Claude and Codex CLI agents');
+    }
   }
   return scope;
 }

@@ -14,13 +14,16 @@
  */
 
 import { createLogger } from '../../../logger.js';
+import { AGENT_EXECUTION_MAX_MS } from '../../../util/agent-execution-budget.js';
 import { logErrorSummary } from '../../../util/log-redact.js';
+import { CliInputCancellation, CliInputNotSentError } from '../cli_input_cancel.js';
 import {
   type LocalBackend,
   type LocalActiveRunIngress,
   type LocalActiveRunInput,
   type BackendRunOptions,
   type LocalEvent,
+  type LocalCliPermissionDecision,
   StderrTail,
   spawnCli,
   reapCliAfterProtocolTerminal,
@@ -33,10 +36,9 @@ import {
 
 const log = createLogger('local-agents:claude');
 
-/** Hard cap for one continuous background phase. Foreground model/tool work
- *  keeps the ordinary runner watchdog; only a protocol result with live tasks
- *  switches to this deliberately wide, non-sliding budget. */
-export const CLAUDE_BACKGROUND_TIMEOUT_MS = 24 * 60 * 60_000;
+/** Compatibility export for existing background probes; production uses the
+ *  shared dispatch watchdog in both foreground and background phases. */
+export const CLAUDE_BACKGROUND_TIMEOUT_MS = AGENT_EXECUTION_MAX_MS;
 /** Grace for the CLI to answer our `interrupt` before stdin closes. */
 const GRACEFUL_STOP_MS = 2_000;
 
@@ -59,6 +61,7 @@ export const claudeBackend: LocalBackend = {
     const child = spawnCli(opts.binPath, args, opts.cwd);
     const tail = new StderrTail();
     const startedAt = Date.now();
+    const deadlineAt = Math.min(opts.deadlineAt ?? Infinity, startedAt + opts.timeoutMs);
 
     let sessionId: string | undefined;
     let exited = false;
@@ -100,25 +103,23 @@ export const claudeBackend: LocalBackend = {
       args,
     });
 
-    const armForegroundWatchdog = (): ReturnType<typeof armKillWatchdog> => {
-      return armKillWatchdog(child, {
-        timeoutMs: opts.timeoutMs,
-        idleKillMs: opts.idleKillMs,
-        lastEventAt: opts.lastEventAt,
-      });
-    };
-    let watchdog = armForegroundWatchdog();
+    const watchdog = armKillWatchdog(child, {
+      timeoutMs: opts.timeoutMs,
+      deadlineAt,
+      idleKillMs: opts.idleKillMs,
+      lastEventAt: opts.lastEventAt,
+    });
 
     // Serialize user messages and control responses through one writer. Claude
     // Code's stream-json stdin is a multiplexed protocol; concurrent writes
     // must never interleave records or let a steer overtake a pending approval
     // response.
     let stdinWrites: Promise<void> = Promise.resolve();
-    const writeInputRecord = (record: Record<string, unknown>): Promise<void> => {
+    const writeInputRecord = (record: Record<string, unknown>, cancellationSignal?: AbortSignal): Promise<void> => {
       const line = `${JSON.stringify(record)}\n`;
       const write = stdinWrites.then(() => new Promise<void>((resolve, reject) => {
-        if (exited || child.stdin.destroyed || !child.stdin.writable) {
-          reject(new Error('claude stdin is no longer writable'));
+        if (exited || cancellationSignal?.aborted || child.stdin.destroyed || !child.stdin.writable) {
+          reject(new CliInputNotSentError('claude stdin is no longer writable'));
           return;
         }
         child.stdin.write(line, (err?: Error | null) => {
@@ -308,10 +309,7 @@ export const claudeBackend: LocalBackend = {
       if (phase === 'foreground' || stopping || exited) return;
       phase = 'foreground';
       clearBackgroundTimer();
-      watchdog.disarm();
-      // This is a new foreground epoch. The old foreground wall-clock and idle
-      // ages are deliberately not inherited from the background wait.
-      watchdog = armForegroundWatchdog();
+      // Foreground and background share the dispatch watchdog and deadline.
       log.info('claude background run resumed foreground', {
         durationMs: Date.now() - startedAt,
         liveTasks: liveTasks.size,
@@ -321,13 +319,16 @@ export const claudeBackend: LocalBackend = {
     const enterBackground = (): void => {
       if (phase === 'background' || stopping || exited) return;
       phase = 'background';
-      watchdog.disarm();
-      const timeoutMs = backgroundTimeoutMs();
-      backgroundTimer = setTimeout(() => {
-        backgroundTimedOut = true;
-        gracefulStop('background timeout');
-      }, timeoutMs);
-      if (typeof backgroundTimer.unref === 'function') backgroundTimer.unref();
+      const timeoutMs = Math.max(0, Math.min(backgroundTimeoutMs(), deadlineAt - Date.now()));
+      // Retain the explicit shortened probe override, never a second default
+      // production budget. Re-entering this phase cannot move the run deadline.
+      if (backgroundTimeoutMs() < CLAUDE_BACKGROUND_TIMEOUT_MS) {
+        backgroundTimer = setTimeout(() => {
+          backgroundTimedOut = true;
+          gracefulStop('background timeout');
+        }, timeoutMs);
+        backgroundTimer.unref?.();
+      }
       log.info('claude run entered background phase', {
         timeoutMs,
         liveTasks: liveTasks.size,
@@ -353,9 +354,8 @@ export const claudeBackend: LocalBackend = {
       }
     };
 
-    /** Every stream event stays on the same host turn. A real model/tool event
-     *  after a background result is the phase boundary that restores the
-     *  ordinary foreground watchdog with fresh clocks. */
+    /** Every stream event stays on the same host turn. Real model/tool activity
+     *  resumes foreground presentation without resetting either run budget. */
     const emit = (event: LocalEvent): void => {
       trackTask(event);
       opts.onEvent(event);
@@ -366,9 +366,9 @@ export const claudeBackend: LocalBackend = {
     // claude code's stream-json protocol uses stdin for two channels:
     //   1. The user message that kicks off the turn (one and done).
     //   2. `control_response` records replying to claude's
-    //      `control_request` (tool-use permission, hook gates). Even
-    //      with `--permission-mode bypassPermissions`, MCP tools / user
-    //      hooks still gate via this channel and the process blocks
+    //      `control_request` (tool-use permission, hook gates). The CLI
+    //      can send these under its inherited policy or an explicit Orkas
+    //      policy, and the process blocks
     //      waiting for a stdin response we never send if we close
     //      stdin here. That's the "silent hang for 20 minutes" symptom
     //      users report — fix by writing the prompt without `.end()`
@@ -382,31 +382,119 @@ export const claudeBackend: LocalBackend = {
       },
     };
     void writeInputRecord(initialInput).catch((err) => {
-      log.warn('claude initial input write failed', { error: logErrorSummary(err) });
+      // A spawn failure closes stdin and reports its own terminal error. Do not
+      // turn the resulting asynchronous EPIPE into a second, misleading warning.
+      if (!exited) {
+        log.warn('claude initial input write failed', { error: logErrorSummary(err) });
+      }
     });
 
-    /** Auto-allow control_request — claude code asks for tool-use /
-     *  hook permission through this channel. We're a daemon-style
-     *  dispatcher (no interactive UI yet for approval), so the only
-     *  sane response is to allow and surface a permission-request
-     *  event to the rail for visibility. Schema mirrors multica's
-     *  daemon (`server/pkg/agent/claude.go::handleControlRequest`). */
-    const respondToControlRequest = (msg: any): void => {
+    /** Serialize native approval requests so two concurrent tool gates cannot
+     * overtake each other while the renderer is waiting for a decision. */
+    let permissionResponseQueue = Promise.resolve();
+    const userInputRequests = new Map<string, AbortController>();
+    const inputCancellations = new Map<string, { requestId: string; cancellation: CliInputCancellation }>();
+    const cancelUserInputs = (): void => {
+      for (const controller of userInputRequests.values()) controller.abort();
+      userInputRequests.clear();
+      inputCancellations.clear();
+    };
+    const respondToControlRequest = async (msg: any, inputSignal?: AbortSignal): Promise<void> => {
+      if (exited || inputSignal?.aborted) return;
       const req = msg?.request || {};
       const inputMap = (req.input && typeof req.input === 'object') ? req.input : {};
+      if (req.subtype === 'can_use_tool' && req.tool_name === 'AskUserQuestion') {
+        const toolUseId = typeof req.tool_use_id === 'string' ? req.tool_use_id : '';
+        const cancellation = inputSignal && toolUseId ? new CliInputCancellation(inputSignal, () => writeInputRecord({
+          type: 'control_response',
+          response: {
+            subtype: 'success', request_id: msg.request_id,
+            response: { behavior: 'deny', message: 'The user did not answer this question.' },
+          },
+        }, inputSignal)) : undefined;
+        if (cancellation) inputCancellations.set(toolUseId, { requestId: msg.request_id, cancellation });
+        const original = Array.isArray(inputMap.questions) ? inputMap.questions : [];
+        const questions = original.slice(0, 4).map((question: any, index: number) => ({
+          id: `question-${index}`,
+          question: typeof question?.question === 'string' ? question.question : '',
+          header: typeof question?.header === 'string' ? question.header : undefined,
+          options: (Array.isArray(question?.options) ? question.options : [])
+            .filter((option: any) => typeof option?.label === 'string')
+            .map((option: any) => ({ label: option.label, description: option.description })),
+          multiSelect: question?.multiSelect === true,
+          isOther: true,
+        }));
+        let answer: import('./base').LocalCliUserInputResponse = { cancelled: true, answers: {} };
+        if (questions.length && questions.every((question: { question: string }) => question.question)
+            && opts.requestUserInput) {
+          try {
+            answer = await opts.requestUserInput({
+              id: String(msg.request_id || ''), questions, isBlocking: true, signal: inputSignal,
+              cancel: cancellation?.cancel,
+            });
+          } catch (err) {
+            log.warn('claude user-input request failed', { error: logErrorSummary(err) });
+          }
+        }
+        if (inputSignal?.aborted || exited || cancellation?.mayHaveSent) return;
+        const answered = !answer.cancelled && questions.length > 0
+          && questions.every((question: { id: string }) => answer.answers[question.id]?.some(value => value.trim()));
+        const answers = Object.fromEntries(questions.map((question: { id: string; question: string }) => [
+          question.question, (answer.answers[question.id] || []).join(', '),
+        ]));
+        await writeInputRecord({
+          type: 'control_response',
+          response: {
+            subtype: 'success', request_id: msg.request_id,
+            response: answered
+              ? { behavior: 'allow', updatedInput: { ...inputMap, answers } }
+              : { behavior: 'deny', message: 'The user did not answer this question.' },
+          },
+        });
+        emit({ type: 'status', status: 'running' });
+        return;
+      }
+      const fullAccess = opts.permissionPolicy === 'full_access';
+      let decision: LocalCliPermissionDecision = fullAccess ? 'allow_once' : 'deny';
+      if (!fullAccess && opts.requestPermission) {
+        try {
+          decision = await opts.requestPermission({
+            id: String(msg.request_id || ''),
+            tool: String(req.tool_name || req.subtype || ''),
+            description: typeof req.description === 'string' ? req.description : undefined,
+            command: typeof inputMap.command === 'string' ? inputMap.command : undefined,
+            subject: typeof inputMap.file_path === 'string'
+              ? inputMap.file_path
+              : typeof inputMap.path === 'string'
+                ? inputMap.path
+                : typeof inputMap.url === 'string' ? inputMap.url : undefined,
+          });
+        } catch (err) {
+          log.warn('claude host permission request failed; denying', { error: logErrorSummary(err) });
+        }
+      }
+      const allowed = decision !== 'deny';
       const response = {
         type: 'control_response',
         response: {
           subtype: 'success',
           request_id: msg.request_id,
-          response: {
-            behavior: 'allow',
-            updatedInput: inputMap,
-          },
+          response: allowed
+            ? { behavior: 'allow', updatedInput: inputMap }
+            : { behavior: 'deny', message: 'The user denied this permission request.' },
         },
       };
-      void writeInputRecord(response).catch((err) => {
+      await writeInputRecord(response).catch((err) => {
         log.warn('claude control_response write failed', { error: logErrorSummary(err) });
+      });
+      emit({
+        type: 'permission-request',
+        id: String(msg.request_id || ''),
+        tool: String(req.tool_name || ''),
+        input: inputMap,
+        ...(fullAccess
+          ? { autoDecided: 'allow', reason: 'full_access' }
+          : { decision: allowed ? 'allow' : 'deny', reason: 'user' }),
       });
     };
 
@@ -442,16 +530,39 @@ export const claudeBackend: LocalBackend = {
         // rail event. Handled outside mapClaudeEvent so the mapper
         // stays a pure translator (no I/O, easier to unit-test).
         if (obj?.type === 'control_request') {
-          respondToControlRequest(obj);
-          emit({
-            type: 'permission-request',
-            id: String(obj.request_id || ''),
-            tool: String(obj?.request?.tool_name || ''),
-            input: obj?.request?.input ?? {},
-            autoDecided: 'allow',
-            reason: 'bypass',
-          });
+          const inputController = obj.request?.subtype === 'can_use_tool' && obj.request?.tool_name === 'AskUserQuestion'
+            ? new AbortController() : undefined;
+          if (inputController) userInputRequests.set(obj.request_id, inputController);
+          permissionResponseQueue = permissionResponseQueue
+            .then(() => respondToControlRequest(obj, inputController?.signal))
+            .catch((err) => {
+              log.warn('claude permission response failed', { error: logErrorSummary(err) });
+            }).finally(() => {
+              if (inputController && userInputRequests.get(obj.request_id) === inputController) {
+                userInputRequests.delete(obj.request_id);
+              }
+              for (const [id, entry] of inputCancellations) {
+                if (entry.requestId === obj.request_id) inputCancellations.delete(id);
+              }
+            });
           return;
+        }
+        if (obj?.type === 'control_cancel_request') {
+          userInputRequests.get(obj.request_id)?.abort();
+          userInputRequests.delete(obj.request_id);
+          return;
+        }
+        // Only the result for this exact tool invocation proves the CLI has
+        // finished the declined question. Text, unrelated tool results, and
+        // successful stdin writes cannot acknowledge a cancellation.
+        if (obj?.type === 'user' && Array.isArray(obj.message?.content)) {
+          for (const part of obj.message.content) {
+            if (part?.type !== 'tool_result') continue;
+            const entry = inputCancellations.get(part.tool_use_id);
+            if (!entry) continue;
+            entry.cancellation.confirm();
+            userInputRequests.get(entry.requestId)?.abort();
+          }
         }
         // Side-channel: each `assistant` block carries a `message.usage`
         // snapshot for that turn-piece. Multica accumulates these per
@@ -521,12 +632,14 @@ export const claudeBackend: LocalBackend = {
               finishRun('timeout', {
                 error: `claude timed out: exceeded ${backgroundTimeoutMs()}ms background cap`,
                 timeoutPhase: 'background',
+                timeoutKind: 'wall',
                 stderrTail: tail.toString(),
               });
             } else if (watchdog.fired()) {
               finishRun('timeout', {
                 error: `claude ${watchdog.reason()}`,
-                timeoutPhase: 'foreground',
+                timeoutKind: watchdog.fired(),
+                timeoutPhase: phase,
                 stderrTail: tail.toString(),
               });
             } else {
@@ -561,6 +674,7 @@ export const claudeBackend: LocalBackend = {
         if (exited) return;
         publishActiveIngress(false);
         exited = true;
+        cancelUserInputs();
         clearBackgroundTimer();
         if (gracefulStopTimer) {
           clearTimeout(gracefulStopTimer);
@@ -575,7 +689,12 @@ export const claudeBackend: LocalBackend = {
 
       child.on('error', err => {
         log.warn('claude spawn error', { error: logErrorSummary(err) });
-        finish('failed', { error: (err as Error).message, stderrTail: tail.toString() });
+        finish('failed', {
+          error: (err as Error).message,
+          stderrTail: tail.toString(),
+          failureKind: 'cli_spawn',
+          retrySafe: true,
+        });
       });
       child.on('close', code => {
         if (backgroundRegistered) {
@@ -588,13 +707,15 @@ export const claudeBackend: LocalBackend = {
           return finish('timeout', {
             error: `claude timed out: exceeded ${backgroundTimeoutMs()}ms background cap`,
             timeoutPhase: 'background',
+            timeoutKind: 'wall',
             stderrTail: tail.toString(),
           });
         }
         if (watchdog.fired()) {
           return finish('timeout', {
             error: `claude ${watchdog.reason()}`,
-            timeoutPhase: 'foreground',
+            timeoutKind: watchdog.fired(),
+            timeoutPhase: phase,
             stderrTail: tail.toString(),
           });
         }
@@ -612,11 +733,11 @@ export const claudeBackend: LocalBackend = {
 };
 
 /** Args mirroring the multica skeleton, distilled to what we actually
- *  use in v1: stream-json in/out, `--print` (non-interactive), and
- *  bypass permissions for daemon-style execution. Missing runtime overrides
- *  deliberately leave model and effort to Claude Code configuration. */
+ *  use in v1: stream-json in/out and `--print` (non-interactive). Missing
+ *  model/effort/permission overrides deliberately leave selection to Claude
+ *  Code when the Agent has no explicit value. */
 export function buildClaudeArgs(opts: Pick<BackendRunOptions,
-  'resumeSessionId' | 'customArgs' | 'bridge' | 'systemPrompt' | 'modelOverride' | 'thinkingLevel'
+  'resumeSessionId' | 'customArgs' | 'bridge' | 'systemPrompt' | 'modelOverride' | 'thinkingLevel' | 'permissionPolicy'
 >): string[] {
   // `--include-partial-messages` is the flag that turns claude code's
   // stream-json output from "one assistant message per completed turn"
@@ -631,8 +752,10 @@ export function buildClaudeArgs(opts: Pick<BackendRunOptions,
     '--include-partial-messages',
     '--include-hook-events',
     '--verbose',
-    '--permission-mode', 'bypassPermissions',
-    '--dangerously-skip-permissions',
+    // The response transport is also required for AskUserQuestion under
+    // inherited/full-access policies; the CLI still owns permission mode.
+    '--permission-prompt-tool', 'stdio',
+    ...buildClaudePermissionArgs(opts.permissionPolicy || 'inherit'),
   ];
   if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
   if (opts.modelOverride) args.push('--model', opts.modelOverride);
@@ -655,6 +778,18 @@ export function buildClaudeArgs(opts: Pick<BackendRunOptions,
   }
   if (opts.customArgs && opts.customArgs.length) args.push(...opts.customArgs);
   return args;
+}
+
+export function buildClaudePermissionArgs(
+  policy: NonNullable<BackendRunOptions['permissionPolicy']>,
+): string[] {
+  if (policy === 'ask') {
+    return ['--permission-mode', 'default'];
+  }
+  if (policy === 'full_access') {
+    return ['--permission-mode', 'bypassPermissions', '--dangerously-skip-permissions'];
+  }
+  return [];
 }
 
 /** Translate one parsed claude stream-json record into our event model.

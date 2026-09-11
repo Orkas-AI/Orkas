@@ -1,11 +1,13 @@
 /**
  * OpenCode CLI backend.
  *
- * Correct invocation (per multica `opencode.go`; my earlier
- * `_text.ts` template was wrong — opencode doesn't take stdin and
- * `--print` isn't a flag):
+ * OpenCode runs through its one-shot NDJSON transport in automatic mode:
  *
- *   opencode run --format json --dir <absolute-cwd> [--session <id>] <prompt>
+ *   opencode run --auto --format json --dir <absolute-cwd> [--session <id>] <prompt>
+ *
+ * The run protocol cannot carry an interactive permission decision back to
+ * the CLI. Orkas therefore treats this adapter as fixed full access instead
+ * of presenting an approval selector that could leave the process blocked.
  *
  * Notes:
  *   - Prompt is passed as the LAST positional argv (NOT stdin).
@@ -36,10 +38,11 @@ import {
 
 const log = createLogger('local-agents:opencode');
 
-export const opencodeBackend: LocalBackend = {
+const opencodeRunBackend: LocalBackend = {
   async run(opts: BackendRunOptions): Promise<void> {
     const args = buildOpencodeArgs(opts);
-    const child = spawnCli(opts.binPath, args, opts.cwd);
+    const env = buildOpencodeEnv(opts.bridge);
+    const child = spawnCli(opts.binPath, args, opts.cwd, env);
     const detachAbort = bindAbort(child, opts.signal);
     const tail = new StderrTail();
     const startedAt = Date.now();
@@ -64,6 +67,7 @@ export const opencodeBackend: LocalBackend = {
 
     const watchdog = armKillWatchdog(child, {
       timeoutMs: opts.timeoutMs,
+      deadlineAt: opts.deadlineAt,
       idleKillMs: opts.idleKillMs,
       lastEventAt: opts.lastEventAt,
     });
@@ -130,11 +134,16 @@ export const opencodeBackend: LocalBackend = {
       };
       child.on('error', err => {
         log.warn('spawn error', { error: logErrorSummary(err) });
-        finish('failed', { error: (err as Error).message, stderrTail: tail.toString() });
+        finish('failed', {
+          error: (err as Error).message,
+          stderrTail: tail.toString(),
+          failureKind: 'cli_spawn',
+          retrySafe: true,
+        });
       });
       child.on('close', code => {
         if (opts.signal.aborted) return finish('cancelled', { output: textOut });
-        if (watchdog.fired()) return finish('timeout', { error: `cli ${watchdog.reason()}`, output: textOut, stderrTail: tail.toString() });
+if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`, output: textOut, stderrTail: tail.toString() });
         if (code === 0 && (resultStatus === 'completed' || resultStatus === undefined)) {
           return finish('completed', { output: textOut });
         }
@@ -146,13 +155,57 @@ export const opencodeBackend: LocalBackend = {
   },
 };
 
+export const opencodeBackend: LocalBackend = opencodeRunBackend;
+
+/** Inline runtime configuration is merged by OpenCode after its config files.
+ * Preserve inherited JSON/JSONC settings and other MCP servers; never write a
+ * global/project config or place the bridge configuration in prompt/argv.
+ * https://opencode.ai/docs/config/#precedence-order */
+export function buildOpencodeEnv(
+  bridge: BackendRunOptions['bridge'],
+  inherited: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...inherited, OPENCODE_PERMISSION: JSON.stringify('allow') };
+  if (!bridge) return env;
+  const raw = inherited.OPENCODE_CONFIG_CONTENT || '{}';
+  let config: Record<string, unknown>;
+  try {
+    // Match strings first so URLs, escaped quotes, and comment-looking text
+    // remain literal. JSON.parse still owns syntax validation after removing
+    // JSONC comments and trailing commas outside strings.
+    const uncommented = raw.replace(/"(?:\\[\s\S]|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\//g,
+      (part) => part.startsWith('/') ? ' ' : part);
+    const json = uncommented.replace(/("(?:\\[\s\S]|[^"\\])*")|,\s*(?=[}\]])/g,
+      (_part, quoted) => quoted || '');
+    config = JSON.parse(json);
+    if (!config || typeof config !== 'object' || Array.isArray(config)
+      || (config.mcp !== undefined && (!config.mcp || typeof config.mcp !== 'object' || Array.isArray(config.mcp)))) {
+      throw new Error('invalid config shape');
+    }
+  } catch {
+    // Never include inline config in an error: it can contain credentials.
+    throw new Error('OpenCode inline configuration must be a JSON/JSONC object with an object-valued mcp section');
+  }
+  env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
+    ...config,
+    mcp: {
+      ...config.mcp as Record<string, unknown>,
+      orkas: {
+        type: 'local', command: [bridge.server.command, ...bridge.server.args],
+        environment: bridge.server.env, enabled: true,
+      },
+    },
+  });
+  return env;
+}
+
 export function buildOpencodeArgs(opts: Pick<BackendRunOptions,
   'resumeSessionId' | 'customArgs' | 'prompt' | 'modelOverride' | 'thinkingLevel' | 'cwd'
 >): string[] {
   const args = [
     'run',
+    '--auto',
     '--format', 'json',
-    '--dangerously-skip-permissions',
   ];
   if (opts.resumeSessionId) args.push('--session', opts.resumeSessionId);
   if (opts.modelOverride) args.push('--model', opts.modelOverride);

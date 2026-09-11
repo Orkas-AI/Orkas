@@ -25,7 +25,6 @@ export {
   cloneWorkspaceObservationState,
   emptyWorkspaceObservationState,
   normalizeWorkspaceObservationState,
-  renderWorkspaceContext,
   renderWorkspaceDiff,
 } from "./workspace-state.js";
 export type {
@@ -40,6 +39,7 @@ export type {
   AgentRunMeta,
   AgentRunTimings,
   AgentRunConvergenceSignal,
+  AgentRunTermination,
   AgentRunEvent,
   AgentRunSteerInput,
   AgentRunSteerMessage,

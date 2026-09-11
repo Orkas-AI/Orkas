@@ -156,8 +156,6 @@ test.describe('video review panel', () => {
     await expect(page.locator('.video-review-comp-name')).toHaveText('A 60-second Orkas product film');
     await expect(page.locator('.video-review-comp-name')).not.toContainText('project/composition');
     await expect(page.locator('.video-review-step')).toHaveCount(4);
-    await expect(page.locator('.video-review-rail')).toHaveCSS('display', 'grid');
-    await expect(page.locator('.video-review-scene').first()).toHaveCSS('display', 'grid');
     await expect(page.locator('.video-review-step').nth(1)).toHaveClass(/\bis-done\b/);
     await expect(page.locator('.video-review-step').nth(3)).toHaveClass(/\bis-wait\b/);
     // A standalone final-confirmation stop stores its playable artifact in

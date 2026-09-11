@@ -14,7 +14,7 @@
 const { execSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
-const { verifyNativePackagePayload } = require('../bin/native-package-gate.cjs');
+const { verifyNativePackagePayload, sharpPreparationFiles } = require('../bin/native-package-gate.cjs');
 const {
   verifyRuntimeRoot,
   verifyWindowsVcAppLocalFiles,
@@ -352,14 +352,6 @@ function verifyPackedNativePayload(nodeModules, targetPlatform, targetArch) {
       `${tokenizersPackage} binary`,
       path.join(tokenizersPackageDir(nodeModules, tokenizersPackage), 'tokenizers.darwin-universal.node'),
     );
-    requiredFile(
-      `${sharpPackages.binding} binding`,
-      path.join(packageDir(nodeModules, `@img/${sharpPackages.binding}`), 'lib', `sharp-darwin-${targetArch}-${sharpVersion}.node`),
-    );
-    requiredFile(
-      `${sharpPackages.libvips} runtime`,
-      path.join(packageDir(nodeModules, `@img/${sharpPackages.libvips}`), 'lib', 'libvips-cpp.8.18.3.dylib'),
-    );
   } else if (targetPlatform === 'win32') {
     requiredFile(
       `${esbuildPackage} binary`,
@@ -377,18 +369,10 @@ function verifyPackedNativePayload(nodeModules, targetPlatform, targetArch) {
       `${tokenizersPackage} binary`,
       path.join(tokenizersPackageDir(nodeModules, tokenizersPackage), 'tokenizers.win32-x64-msvc.node'),
     );
-    requiredFile(
-      `${sharpPackages.binding} binding`,
-      path.join(packageDir(nodeModules, `@img/${sharpPackages.binding}`), 'lib', `sharp-win32-x64-${sharpVersion}.node`),
-    );
-    requiredFile(
-      `${sharpPackages.binding} libvips C++ runtime`,
-      path.join(packageDir(nodeModules, `@img/${sharpPackages.binding}`), 'lib', 'libvips-cpp-8.18.3.dll'),
-    );
-    requiredFile(
-      `${sharpPackages.binding} libvips runtime`,
-      path.join(packageDir(nodeModules, `@img/${sharpPackages.binding}`), 'lib', 'libvips-42.dll'),
-    );
+  }
+
+  for (const [kind, relativeFile] of Object.entries(sharpPreparationFiles(targetPlatform, targetArch, sharpVersion))) {
+    requiredFile(`sharp ${kind}`, path.join(nodeModules, relativeFile));
   }
 
   requiredFile(

@@ -11,6 +11,8 @@ const CSS_PATH = path.join(__dirname, '../../src/renderer/style.css');
  *  time and the style simply does not render. */
 const RUNTIME_INJECTED = new Set([
   '--sidebar-width', // modules/sidebar-resize.js
+  '--sidebar-alert-duration', // modules/sidebar_status.js; sidebar-membership-summary.test.ts
+  '--sidebar-alert-overflow', // modules/sidebar_status.js; sidebar-membership-summary.test.ts
   '--avatar-bg', // modules/avatar.js
   '--avatar-fg', // modules/avatar.js
   '--depth', // modules/conversation-info.js

@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import * as path from 'node:path';
 
-import { slugifyConvTitle } from '../../../../src/main/features/group_chat/conv_workspace';
+import {
+  resolveConversationWorkspaceChild,
+  slugifyConvTitle,
+} from '../../../../src/main/features/group_chat/conv_workspace';
 
 
 describe('conversation workspace slug', () => {
@@ -31,5 +35,28 @@ describe('conversation workspace slug', () => {
   it('caps names at 32 code units without leaving a trailing hyphen', () => {
     expect(slugifyConvTitle('a'.repeat(31) + '-' + 'tail')).toBe('a'.repeat(31));
     expect(slugifyConvTitle('b'.repeat(40))).toBe('b'.repeat(32));
+  });
+});
+
+describe('conversation workspace persisted directory', () => {
+  it.each([
+    '../../outside',
+    '..\\outside',
+    '/tmp/outside',
+    'C:\\outside',
+    '.',
+    '..',
+    'nested/child',
+    'trailing.',
+    'trailing ',
+    'bad:name',
+    `oversized-${'x'.repeat(256)}`,
+  ])('rejects unsafe synced basename %j', (workspaceDir) => {
+    expect(resolveConversationWorkspaceChild('/workspace/root', workspaceDir)).toBe('');
+  });
+
+  it('keeps a generated Unicode basename directly under the workspace root', () => {
+    expect(resolveConversationWorkspaceChild('/workspace/root', 'project-你好-１２-test'))
+      .toBe(path.resolve('/workspace/root/project-你好-１２-test'));
   });
 });

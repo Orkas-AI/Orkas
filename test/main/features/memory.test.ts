@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
+import nativeFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -383,6 +385,44 @@ describe('memory › formatForSystemPrompt', () => {
   });
 });
 
+// ── formatProjectMemoryForReadOnlyTurn (project-tier only, for CLI agents) ──
+
+describe('memory › formatProjectMemoryForReadOnlyTurn', () => {
+  it('returns empty string when the project store is empty', async () => {
+    const mem = await loadMemory();
+    expect(mem.formatProjectMemoryForReadOnlyTurn('u1', 'p_x')).toBe('');
+  });
+
+  it('renders the project tier under a project-memory heading', async () => {
+    const mem = await loadMemory();
+    mem.addEntry('u1', { project: 'p_x' }, 'decided to use SQLite for local store');
+    const block = mem.formatProjectMemoryForReadOnlyTurn('u1', 'p_x');
+    expect(block).toContain('Project memory');
+    expect(block).toContain('decided to use SQLite for local store');
+  });
+
+  it('carries ONLY the project tier — never the global user/shared tiers', async () => {
+    const mem = await loadMemory();
+    mem.addEntry('u1', 'user', 'role: founder');                  // global user tier
+    mem.addEntry('u1', 'memory', 'company shared fact here');     // global shared tier
+    mem.addEntry('u1', { project: 'p_x' }, 'this project ships weekly');
+    const block = mem.formatProjectMemoryForReadOnlyTurn('u1', 'p_x');
+    expect(block).toContain('this project ships weekly');         // project tier present
+    expect(block).not.toContain('role: founder');                // user tier excluded
+    expect(block).not.toContain('company shared fact here');      // shared tier excluded
+    expect(block).not.toContain('User profile');
+  });
+
+  it('isolates by project — another project\'s notes do not leak', async () => {
+    const mem = await loadMemory();
+    mem.addEntry('u1', { project: 'p_a' }, 'A-only project note');
+    mem.addEntry('u1', { project: 'p_b' }, 'B-only project note');
+    const block = mem.formatProjectMemoryForReadOnlyTurn('u1', 'p_a');
+    expect(block).toContain('A-only project note');
+    expect(block).not.toContain('B-only project note');
+  });
+});
+
 // ── Security: injection scanning ────────────────────────────────
 
 describe('memory › security', () => {
@@ -582,7 +622,70 @@ describe('memory › user isolation', () => {
 
 // ── Per-agent scope (three-tier: user / shared / agent) ─────────────
 
+describe('memory › four-tier durable lifecycle', () => {
+  it('writes every tier to its canonical file, reloads it, and preserves scope isolation', async () => {
+    let mem = await loadMemory();
+    const uid = 'u-lifecycle';
+    const projectId = 'p-lifecycle';
+    const agentId = 'writer';
+    const otherAgentId = 'researcher';
+
+    expect(mem.addEntry(uid, 'user', 'prefers concise Chinese')).toMatchObject({ ok: true });
+    expect(mem.addEntry(uid, 'memory', 'Orion is named 猎户 in Chinese')).toMatchObject({ ok: true });
+    expect(mem.addEntry(uid, { project: projectId }, 'release codename is Nimbus-42'))
+      .toMatchObject({ ok: true });
+    expect(mem.addAgentEntry(uid, agentId, 'offer three titles before release copy'))
+      .toMatchObject({ ok: true });
+
+    const files = {
+      user: path.join(tmpDir, uid, 'cloud', 'memory', 'USER.md'),
+      shared: path.join(tmpDir, uid, 'cloud', 'memory', 'MEMORY.md'),
+      project: path.join(tmpDir, uid, 'cloud', 'projects', projectId, 'MEMORY.md'),
+      agent: path.join(tmpDir, uid, 'cloud', 'memory', 'agents', agentId, 'MEMORY.md'),
+    };
+    expect(fs.readFileSync(files.user, 'utf8')).toBe('prefers concise Chinese');
+    expect(fs.readFileSync(files.shared, 'utf8')).toBe('Orion is named 猎户 in Chinese');
+    expect(fs.readFileSync(files.project, 'utf8')).toBe('release codename is Nimbus-42');
+    expect(fs.readFileSync(files.agent, 'utf8')).toBe('offer three titles before release copy');
+
+    // Simulate a fresh process/session: no module cache may be required for recall.
+    vi.resetModules();
+    mem = await loadMemory();
+    expect(mem.listEntries(uid, 'user').entries).toEqual(['prefers concise Chinese']);
+    expect(mem.listEntries(uid, 'memory').entries).toEqual(['Orion is named 猎户 in Chinese']);
+    expect(mem.listEntries(uid, { project: projectId }).entries)
+      .toEqual(['release codename is Nimbus-42']);
+    expect(mem.listAgentEntries(uid, agentId).entries)
+      .toEqual(['offer three titles before release copy']);
+
+    const writerContext = mem.formatForSystemPrompt(uid, agentId, projectId);
+    expect(writerContext).toContain('prefers concise Chinese');
+    expect(writerContext).toContain('Orion is named 猎户 in Chinese');
+    expect(writerContext).toContain('release codename is Nimbus-42');
+    expect(writerContext).toContain('offer three titles before release copy');
+
+    const otherAgentContext = mem.formatForSystemPrompt(uid, otherAgentId, projectId);
+    expect(otherAgentContext).toContain('prefers concise Chinese');
+    expect(otherAgentContext).toContain('Orion is named 猎户 in Chinese');
+    expect(otherAgentContext).toContain('release codename is Nimbus-42');
+    expect(otherAgentContext).not.toContain('offer three titles before release copy');
+
+    const otherProjectContext = mem.formatForSystemPrompt(uid, agentId, 'p-other');
+    expect(otherProjectContext).not.toContain('release codename is Nimbus-42');
+    expect(otherProjectContext).toContain('offer three titles before release copy');
+  });
+});
+
 describe('memory › per-agent scope', () => {
+  it('does not render an Agent-memory placeholder when that store is empty', async () => {
+    const mem = await loadMemory();
+
+    expect(mem.formatAgentForSystemPrompt('u1', 'video-studio', 'Video Studio')).toBe('');
+    mem.addAgentEntry('u1', 'video-studio', 'prefer a concise closing frame');
+    expect(mem.formatAgentForSystemPrompt('u1', 'video-studio', 'Video Studio'))
+      .toContain('prefer a concise closing frame');
+  });
+
   it('routes user / shared / agent writes to separate stores that do not bleed', async () => {
     const mem = await loadMemory();
     mem.addEntry('u1', 'user', 'replies in Chinese');               // tier: user (global)
@@ -834,4 +937,35 @@ describe('memory › project tier', () => {
     expect(() => mem.listEntries('u1', { project: 'a/b' })).toThrow(/invalid project id/);
     expect(() => mem.formatForSystemPrompt('u1', 'a1', '..')).toThrow(/invalid project id/);
   });
+});
+
+
+describe('memory › failed publication recovery', () => {
+  it.each(['user', 'memory', { project: 'recovery-project' }, { agent: 'writer' }] as const)(
+    'preserves existing %j memory after disk failure and accepts a fresh-session retry', async (scope) => {
+      let mem = await loadMemory();
+      expect(mem.addEntry('recovery-user', scope, 'Release owner is Mira')).toMatchObject({ ok: true });
+      const rename = nativeFs.renameSync.bind(nativeFs);
+      const fault = Object.assign(new Error('injected disk full'), { code: 'ENOSPC' });
+      const spy = vi.spyOn(nativeFs, 'renameSync').mockImplementation((from, to) => {
+        if (String(to).startsWith(tmpDir)) throw fault;
+        rename(from, to);
+      });
+      syncBuiltinESMExports();
+      try {
+        expect(() => mem.replaceEntry('recovery-user', scope, 'Release owner is Mira', 'Release owner is Chen'))
+          .toThrow(fault);
+        expect(mem.listEntries('recovery-user', scope).entries).toEqual(['Release owner is Mira']);
+      } finally {
+        spy.mockRestore();
+        syncBuiltinESMExports();
+      }
+      vi.resetModules();
+      mem = await loadMemory();
+      expect(mem.listEntries('recovery-user', scope).entries).toEqual(['Release owner is Mira']);
+      expect(mem.replaceEntry('recovery-user', scope, 'Release owner is Mira', 'Release owner is Chen').ok).toBe(true);
+      vi.resetModules();
+      expect((await loadMemory()).listEntries('recovery-user', scope).entries).toEqual(['Release owner is Chen']);
+    },
+  );
 });

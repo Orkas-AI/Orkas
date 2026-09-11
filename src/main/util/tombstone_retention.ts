@@ -1,4 +1,4 @@
-export const TOMBSTONE_RETENTION_DAYS = 30;
+const TOMBSTONE_RETENTION_DAYS = 30;
 export const TOMBSTONE_RETENTION_MS = TOMBSTONE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 
 interface RetentionOptions {

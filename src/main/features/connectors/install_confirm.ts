@@ -12,8 +12,8 @@
  * `connectors.install_confirm_response` IPC. No answer within the timeout
  * (or no renderer) ⇒ declined.
  *
- * Mirrors features/local_agents/bridge_permissions.ts; kept separate
- * because connectors and local_agents are different feature domains.
+ * This remains separate from external-CLI action permissions because an MCP
+ * installation grants a new transport rather than approving one run action.
  */
 
 import * as crypto from 'node:crypto';
@@ -33,6 +33,8 @@ export interface InstallConfirmInfo {
   display_name: string;
   /** Human-readable one-liner of what will run / be contacted. */
   summary: string;
+  /** Raw consent target; renderer localizes the prefix without altering the command/URL. */
+  target?: string;
   kind: Transport['kind'];
   cid: string;
 }
@@ -76,6 +78,8 @@ export async function requestInstallConfirm(opts: {
     request_id: requestId,
     display_name: opts.displayName,
     summary: _summarize(opts.displayName, opts.transport),
+    target: opts.transport.kind === 'streamable-http'
+      ? opts.transport.url : [opts.transport.command, ...(opts.transport.args || [])].join(' '),
     kind: opts.transport.kind,
     cid: opts.cid,
   };

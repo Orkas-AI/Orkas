@@ -150,8 +150,8 @@ describe('provider_catalog › CURATED_MODELS', () => {
     expect(portalIds).toEqual(directIds);
   });
 
-  it('exposes the current GPT-5.6 family for OpenAI and OpenAI Codex', () => {
-    const expected = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4'];
+  it('exposes GPT-6 and the current GPT-5.6 family for OpenAI and OpenAI Codex', () => {
+    const expected = ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
     expect((CURATED_MODELS.openai || []).map((m) => m.id)).toEqual(expected);
     expect((CURATED_MODELS['openai-codex'] || []).map((m) => m.id)).toEqual(expected);
   });
@@ -182,6 +182,7 @@ describe('provider_catalog › CURATED_MODELS', () => {
       .filter((id) => id.includes('/claude-'));
     expect(claudeIds).toEqual([
       'anthropic/claude-opus-5',
+      'anthropic/claude-fable-5.1',
       'anthropic/claude-fable-5',
       'anthropic/claude-sonnet-5',
     ]);
@@ -192,10 +193,44 @@ describe('provider_catalog › CURATED_MODELS', () => {
       .map((m) => m.id)
       .filter((id) => id.startsWith('openai/gpt-'));
     expect(ids).toEqual([
+      'openai/gpt-6-astra',
       'openai/gpt-5.6-sol',
       'openai/gpt-5.6-terra',
       'openai/gpt-5.6-luna',
     ]);
+  });
+
+  it('resolves the OpenRouter V4.1 Flash shortcut with vision before the SDK catalogs it', () => {
+    const modelId = 'deepseek/deepseek-v4.1-flash';
+    const catalog = {
+      getPiModel(provider: string, id: string) {
+        if (provider === 'openrouter' && id === modelId) return undefined;
+        return (getBuiltinModel as (p: string, m: string) => any)(provider, id);
+      },
+    };
+    expect(curatedModelsFor('openrouter')).toContainEqual(expect.objectContaining({
+      id: modelId,
+      name: 'DeepSeek V4.1 Flash',
+    }));
+    const resolved = resolveConfiguredPiModel(catalog, 'openrouter', modelId);
+    expect(resolved).toMatchObject({
+      requestedModelId: modelId,
+      isConfiguredFallback: true,
+      needsCustomModel: true,
+      model: {
+        id: modelId,
+        name: 'DeepSeek V4.1 Flash',
+        provider: 'openrouter',
+        api: 'openai-completions',
+        baseUrl: 'https://openrouter.ai/api/v1',
+        reasoning: true,
+        input: ['text', 'image'],
+        contextWindow: 1_048_576,
+        maxTokens: 384_000,
+        compat: { thinkingFormat: 'openrouter', requiresReasoningContentOnAssistantMessages: true },
+      },
+    });
+    expect(modelInputImageLimit('openrouter', modelId, resolved?.model)).toBe(20);
   });
 
   it('curatedModelsFor returns a shallow copy safe to mutate', () => {
@@ -204,6 +239,39 @@ describe('provider_catalog › CURATED_MODELS', () => {
     expect(a).not.toBe(b);
     a.pop();
     expect(curatedModelsFor('anthropic').length).toBe(b.length);
+  });
+
+  it('resolves the OpenRouter V4.1 Flash shortcut with vision before the SDK catalogs it', () => {
+    const modelId = 'deepseek/deepseek-v4.1-flash';
+    const catalog = {
+      getPiModel(provider: string, id: string) {
+        if (provider === 'openrouter' && id === modelId) return undefined;
+        return (getBuiltinModel as (p: string, m: string) => any)(provider, id);
+      },
+    };
+    expect(curatedModelsFor('openrouter')).toContainEqual(expect.objectContaining({
+      id: modelId,
+      name: 'DeepSeek V4.1 Flash',
+    }));
+    const resolved = resolveConfiguredPiModel(catalog, 'openrouter', modelId);
+    expect(resolved).toMatchObject({
+      requestedModelId: modelId,
+      isConfiguredFallback: true,
+      needsCustomModel: true,
+      model: {
+        id: modelId,
+        name: 'DeepSeek V4.1 Flash',
+        provider: 'openrouter',
+        api: 'openai-completions',
+        baseUrl: 'https://openrouter.ai/api/v1',
+        reasoning: true,
+        input: ['text', 'image'],
+        contextWindow: 1_048_576,
+        maxTokens: 384_000,
+        compat: { thinkingFormat: 'openrouter', requiresReasoningContentOnAssistantMessages: true },
+      },
+    });
+    expect(modelInputImageLimit('openrouter', modelId, resolved?.model)).toBe(20);
   });
 
   it('curatedModelsFor returns [] for unknown providers (triggers pi-ai fallback)', () => {

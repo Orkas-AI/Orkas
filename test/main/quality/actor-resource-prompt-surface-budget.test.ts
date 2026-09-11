@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 const PROMPTS = path.join(__dirname, '..', '..', '..', 'src', 'main', 'prompts');
-const COMMANDER_RESOURCE_CEILING = 2_250;
+const COMMANDER_RESOURCE_CEILING = 1_300;
 const AGENT_CONTEXT_CEILING = 1_000;
 
 function section(file: string, heading: string): string {

@@ -10,11 +10,10 @@
  *      — decide whether the bus should persist a user-visible bubble or stay
  *        silent (and what that bubble carries). No plan state is touched.
  *
- * The former plan-engine exports (`onPlanSet`, `reconcile`,
- * `reconcileAfterStepTransition`, `recordPersistedStepMessage`, `retryStep`,
- * `skipStep`, `continuePlan`, `failInProgressSteps`) survive only as inert
- * no-ops so the bus / ipc / index callers keep compiling; their cross-layer
- * removal happens in the plan-storage teardown stage.
+ * The former plan-engine no-op exports were removed with the plan-storage
+ * teardown; `onTurnFinished` and its two types are the entire surface. This
+ * file is NOT a leftover shell — the bus calls it after every turn, and the
+ * conversation task board derives task terminality from the same result.
  */
 
 import { t } from '../../i18n';
@@ -39,6 +38,8 @@ export interface TurnFinishedEvent {
   form?: ChatFormPayload;
   /** Lightweight multi-turn marker extracted from agent final text. */
   planInteraction?: 'open' | 'closed';
+  /** A host tool yielded to its user-input surface without a model reply. */
+  waitingForInput?: boolean;
   /** Files written via local-exec tools during this turn. */
   produced: string[];
   /** Agents created or updated from `<agent>...</agent>` containers
@@ -112,7 +113,7 @@ function outcomeForDirectTurn(evt: TurnFinishedEvent): TurnOutcome {
   // agent emits ONLY an `agent-input-form` block — bus's form extraction
   // strips it, leaving finalText empty; without this check we'd fall to the
   // "agent empty" branch and replace the form with "(no reply)".
-  const hasSideEffect = !!evt.form || (!!evt.createdAgents && evt.createdAgents.length > 0) || (!!evt.createdSkills && evt.createdSkills.length > 0) || (evt.produced && evt.produced.length > 0);
+  const hasSideEffect = !!evt.form || evt.waitingForInput === true || (!!evt.createdAgents && evt.createdAgents.length > 0) || (!!evt.createdSkills && evt.createdSkills.length > 0) || (evt.produced && evt.produced.length > 0);
   if ((evt.finalText && evt.finalText.trim()) || hasSideEffect) {
     // When the stream errored mid-turn but partial text / side effects
     // already landed, append the error pill instead of dropping the partial.
@@ -150,16 +151,18 @@ function outcomeForDirectTurn(evt: TurnFinishedEvent): TurnOutcome {
   };
 }
 
-/** Aborted-turn outcome: salvage partial reply + side effects, NO "(stopped)"
- * suffix (bus appends that once). No salvageable content AND no side effect →
- * silent (renderer cleans the placeholder). */
+/** Aborted-turn outcome: partial text decides whether the turn needs a durable
+ * row, but it is not promoted to a final answer. The bus replaces the empty
+ * body with the localized interrupted status and keeps process history plus
+ * completed side effects. No partial content AND no side effect → silent
+ * (renderer cleans the placeholder). */
 function abortOutcome(evt: TurnFinishedEvent): TurnOutcome {
   const partial = (evt.finalText || '').trim();
   const hasSideEffect = !!evt.form || (!!evt.createdAgents && evt.createdAgents.length > 0) || (!!evt.createdSkills && evt.createdSkills.length > 0) || (evt.produced && evt.produced.length > 0);
   if (!partial && !hasSideEffect) return { kind: 'silent' };
   return {
     kind: 'persist',
-    text: evt.finalText || '',
+    text: '',
     ...(evt.form ? { form: evt.form } : {}),
     ...(evt.produced && evt.produced.length ? { produced: evt.produced } : {}),
     ...(evt.createdAgents && evt.createdAgents.length ? { createdAgents: evt.createdAgents } : {}),

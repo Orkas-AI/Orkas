@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { toToolDefinition } from '../src/tools/base.js';
+import { TOOL_DESCRIPTION_SOFT_BUDGET_CHARS, toToolDefinition } from '../src/tools/base.js';
 import { createCrossSessionMemoryTool, type MemoryToolHandler } from '../src/tools/memory-tool.js';
 
 function mockHandler(): MemoryToolHandler {
@@ -40,12 +40,24 @@ describe('createCrossSessionMemoryTool', () => {
     try {
       const def = toToolDefinition(createCrossSessionMemoryTool(mockHandler()));
       const properties = def.inputSchema.properties as Record<string, Record<string, unknown>>;
-      expect(def.description).toContain('durable cross-session memory');
+      expect(def.description).toContain('Manage durable agent, shared, or user memory');
+      expect(def.description).toContain('Call this tool before replying whenever');
+      expect(def.description).toContain('establishes, corrects, or invalidates');
+      expect(def.description).toContain('stable, reusable information');
+      expect(def.description).toContain('should affect future conversations');
+      expect(def.description).toContain('even without an explicit save request');
+      expect(def.description).toContain('Decide from meaning, never trigger words');
+      expect(def.description).toContain('Do not store current-task progress');
+      expect(def.description.length).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_CHARS);
       expect(properties.target.description).toContain('Defaults to agent');
       expect(properties.target.description).toContain('shared: rare cross-project facts');
       expect(properties.target.description).toContain('user: stable user-wide profile/preferences');
       expect(properties.action.description).toContain('already injected');
       expect(properties.action.description).toContain('use list only');
+      expect(properties.action.description).toContain('Omit unrelated fields');
+      expect(def.inputSchema.additionalProperties).toBe(false);
+      expect(def.inputSchema.oneOf).toHaveLength(4);
+      expect(warn).not.toHaveBeenCalled();
     } finally {
       warn.mockRestore();
     }
@@ -169,6 +181,17 @@ describe('cross_session_memory › list', () => {
     expect(parsed.ok).toBe(true);
     expect(parsed.entries).toEqual(['entry1', 'entry2']);
   });
+
+  it('rejects content fields owned by write actions', async () => {
+    const handler = mockHandler();
+    const result = await createCrossSessionMemoryTool(handler).execute(
+      { action: 'list', target: 'user', content: 'unrelated' },
+      dummyCtx,
+    );
+    expect(result).toMatchObject({ isError: true });
+    expect(JSON.parse(result.content).error).toContain('fields not allowed for list');
+    expect(handler.list).not.toHaveBeenCalled();
+  });
 });
 
 describe('cross_session_memory › error handling', () => {
@@ -212,6 +235,11 @@ describe('cross_session_memory › error handling', () => {
 describe('cross_session_memory › project tier', () => {
   it('adds project selection semantics only when includeProjectTier', () => {
     const withProject = createCrossSessionMemoryTool(mockHandler(), { includeProjectTier: true });
+    expect(withProject.description).toContain('Call this tool before replying whenever');
+    expect(withProject.description).toContain('even without an explicit save request');
+    expect(withProject.description).toContain('Decide from meaning, never trigger words');
+    expect(withProject.description).toContain('Use todo_tasks for task progress');
+    expect(withProject.description.length).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_CHARS);
     expect((withProject.inputSchema as any).properties.target.enum).toEqual(['agent', 'project', 'shared', 'user']);
     expect((withProject.inputSchema as any).properties.target.description)
       .toContain('project: project-specific facts and decisions');
@@ -232,6 +260,9 @@ describe('cross_session_memory › project tier', () => {
   it('read-only sub-agent may list the project tier but not add/replace/remove', async () => {
     const handler = mockHandler();
     const tool = createCrossSessionMemoryTool(handler, { includeProjectTier: true, projectTierReadOnly: true });
+
+    expect(tool.description).toContain('Project memory is read-only; only Commander may write it.');
+    expect(tool.description.length).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_CHARS);
 
     // The relevant target parameter tells this actor it cannot write project memory.
     expect((tool.inputSchema as any).properties.target.description).toContain('Project is read-only');

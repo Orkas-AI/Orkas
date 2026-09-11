@@ -122,8 +122,10 @@ describe('project state tools → durable feature stores', () => {
     }, ctx);
     expect(created.isError).toBe(false);
     const taskId = JSON.parse(created.content).task.id as string;
-    expect(await state.projectTasks.formatProjectStatusForTurn(UID, state.pid))
-      .toContain('Implement webhook retries');
+    const listed = await state.tasksTool.execute({ action: 'list' }, ctx);
+    expect(JSON.parse(listed.content).tasks).toEqual([
+      expect.objectContaining({ id: taskId, title: 'Implement webhook retries', status: 'todo' }),
+    ]);
 
     const completed = await state.tasksTool.execute({
       action: 'complete',
@@ -131,9 +133,9 @@ describe('project state tools → durable feature stores', () => {
       result_ref: 'chat-checkout-result',
     }, ctx);
     expect(completed.isError).toBe(false);
-    const finalStatus = await state.projectTasks.formatProjectStatusForTurn(UID, state.pid);
-    expect(finalStatus).toContain('Progress: 1/1 done, 0 open.');
-    expect(finalStatus).toContain('No open tasks — all are done/cancelled.');
+    const finalStatus = JSON.parse((await state.tasksTool.execute({ action: 'list' }, ctx)).content);
+    expect(finalStatus.progress).toMatchObject({ total: 1, done: 1, open: 0 });
+    expect(finalStatus.tasks[0]).toMatchObject({ id: taskId, status: 'done', result_ref: 'chat-checkout-result' });
   });
 
   it('enforces sub-agent project-memory read-only mode against the same real store', async () => {

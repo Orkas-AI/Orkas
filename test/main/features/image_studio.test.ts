@@ -233,6 +233,113 @@ describe('ImageStudio project contract', () => {
     ]));
   });
 
+  it('reports reference-local and reproduction blockers in one validation pass', () => {
+    const invalid = validateImageStudioManifest(manifest({
+      references: [{
+        id: 'composition-source',
+        path: '/tmp/composition-source.png',
+        role: 'composition',
+        strength: 1,
+        required: false,
+        preserve: ['subject', 'crop', 'palette'],
+        may_change: [],
+        region_ids: [],
+      }],
+      reference_intent: {
+        mode: 'reproduce',
+        basis: 'user',
+        instructions: ['Reproduce the supplied composition exactly.'],
+        minimum_score: 90,
+      },
+    }));
+
+    expect(invalid.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'E_MANIFEST_REFERENCE_PATH',
+        message: expect.stringContaining('references[0].path'),
+      }),
+      expect.objectContaining({
+        code: 'E_MANIFEST_REPRODUCE_REFERENCE_REQUIRED',
+        message: expect.stringContaining('references[0].required'),
+      }),
+    ]));
+
+    const repaired = validateImageStudioManifest(manifest({
+      references: [{
+        id: 'composition-source',
+        path: 'assets/composition-source.png',
+        role: 'composition',
+        strength: 1,
+        required: true,
+        preserve: ['subject', 'crop', 'palette'],
+        may_change: [],
+        region_ids: [],
+      }],
+      reference_intent: {
+        mode: 'reproduce',
+        basis: 'user',
+        instructions: ['Reproduce the supplied composition exactly.'],
+        minimum_score: 90,
+      },
+    }));
+    expect(repaired.issues).toEqual([]);
+  });
+
+  it('lists the accepted values when a reference role is invalid', () => {
+    const invalid = validateImageStudioManifest(manifest({
+      references: [{
+        id: 'source',
+        path: 'assets/source.png',
+        role: 'photo',
+        strength: 1,
+        required: true,
+        preserve: [],
+        may_change: [],
+        region_ids: [],
+      }],
+    }));
+
+    expect(invalid.issues.find((issue) => issue.code === 'E_MANIFEST_REFERENCE_ROLE')?.message)
+      .toContain('style, identity, composition, structure, content, mask, or edit_source');
+  });
+
+  it('does not hide dependent reference or route blockers behind malformed child fields', () => {
+    const invalidReference = validateImageStudioManifest(manifest({
+      references: [{
+        id: 'regional-source',
+        path: '/tmp/regional-source.png',
+        role: 'style',
+        strength: 1,
+        required: false,
+        preserve: [],
+        may_change: [],
+        region_ids: ['hero'],
+      }],
+    }));
+    expect(invalidReference.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'E_MANIFEST_REFERENCE_PATH' }),
+      expect.objectContaining({ code: 'E_MANIFEST_REFERENCE_REGION_PLAN_REQUIRED' }),
+    ]));
+
+    const invalidComposeControl = validateImageStudioManifest(manifest({
+      generation_contract: {
+        negative_prompt: [],
+        controls: [{
+          type: 'depth',
+          reference_id: 'missing-reference',
+          strength: 2,
+          start: 0,
+          end: 1,
+        }],
+      },
+    }));
+    expect(invalidComposeControl.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'E_MANIFEST_CONTROL_REFERENCE' }),
+      expect.objectContaining({ code: 'E_MANIFEST_CONTROL_STRENGTH' }),
+      expect.objectContaining({ code: 'E_COMPOSE_GENERATION_CONTROLS' }),
+    ]));
+  });
+
   it('enforces the reference score declared by edit or reproduction intent', () => {
     const scorecard = compileImageQualityScorecard({
       intent_alignment: 92,

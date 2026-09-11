@@ -1,46 +1,39 @@
 /**
- * Singleton wrapper around `fastembed`'s FlagEmbedding. Initialized lazily on
- * the first `embed()` call — model load is ~1-2s (tokenizer + ONNX session).
- * Subsequent calls reuse the session.
+ * KB embedder — supervisor for an ISOLATED `fastembed` (bge-small-zh) worker.
  *
- * Embedder is global (not per-uid): the model is identical for every user,
- * just a shared inference engine. There's no per-uid state.
+ * The ONNX inference runs in a dedicated Electron `utilityProcess`
+ * (`bin/kb-embed-worker.cjs`), NOT in the main process. onnxruntime-node's
+ * native inference has taken the whole app down before (SIGSEGV during
+ * vectorization; SIGTRAP inside `BFCArena::AllocateRawInternal` on batch=64) —
+ * a native fault escapes every JS handler, so in-process a bad chunk/batch/
+ * platform build killed every window + in-flight conversation. Out-of-process,
+ * a crash only kills the worker: in-flight embeds reject and the next call
+ * respawns. Mirrors the isolation `ocr_runtime.ts` already has for its ONNX.
  *
- * A previous iteration spawned 2 `worker_threads` each holding its own
- * FlagEmbedding to get real parallelism. That crashed hard (SIGSEGV) during
- * vectorization — two `worker_threads` both racing onnxruntime-node's native
- * init (OpenMP threadpool + native allocators) is a known-unsafe pattern.
- * Reverted to single-session; parallelism lives on the cross-file pipeline
- * in `kb_indexer.ts` instead. If we want true embed parallelism in future,
- * use `child_process` (separate OS process per session) rather than threads.
+ * Public API (`embedTexts` / `embedQuery` / `closeEmbedder`) is unchanged, so
+ * every caller (vec_store, kb_indexer, project_library_indexer, rerank/kb
+ * tools) and every `vi.mock('../features/kb_embed')` keep working as-is.
  *
- * Testability: the whole module is mock-friendly via `vi.mock('../features/kb_embed')`.
- * Tests should mock to avoid the 95MB model load on every test run.
+ * The embedder is global (model is identical for all users; no per-uid state).
+ * Concurrency: the worker serializes embeds on one session; the supervisor
+ * multiplexes concurrent callers by request id and the worker answers in order.
  */
 
-import { Mutex } from 'async-mutex';
+import * as path from 'node:path';
 
-import { embeddingModelDir } from '../paths';
+import { embeddingModelDir, PC_ROOT } from '../paths';
 import { createLogger } from '../logger';
 
 const log = createLogger('kb_embed');
 
-/**
- * Chunks per forward pass. Kept at 32 — previously tried 64 and hit a hard
- * onnxruntime-node crash (`SIGTRAP` inside `BFCArena::AllocateRawInternal`
- * during the transformer attention compute) because attention memory scales
- * `batch × seq²`: doubling the batch doubles the peak allocation, which
- * pushed it past what Electron's process could service. 32 is the known-
- * stable ceiling for bge-small-zh on desktop hardware.
- */
 const EMBED_BATCH_SIZE = 32;
 
-// Loaded lazily so test code that mocks this module never touches fastembed.
-// Use require() deliberately: fastembed's ESM entry imports `tar` as a default
-// export, which breaks with tar@7. The CJS entry stays compatible.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let _embedder: any = null;
-const _initLock = new Mutex();
+// If the worker dies this many times inside the window, stop respawning for a
+// cooldown and fail fast — a persistent native fault (bad platform build) must
+// not become a tight respawn + 95MB-model-reload loop.
+const CRASH_WINDOW_MS = 60_000;
+const MAX_CRASHES_IN_WINDOW = 4;
+const CRASH_COOLDOWN_MS = 30_000;
 
 function nativeEmbedLoadCode(err: unknown): string {
   const code = (err as { code?: unknown } | null)?.code;
@@ -54,64 +47,148 @@ function nativeEmbedLoadCode(err: unknown): string {
   return 'E_LIBRARY_NATIVE_EMBED_LOAD';
 }
 
-function normalizeEmbedLoadError(err: unknown): unknown {
-  const code = nativeEmbedLoadCode(err);
-  if (!code) return err;
+function embedWorkerError(msg: { error?: unknown; errorCode?: unknown }): Error {
+  const code = String(msg.errorCode || '');
   const component = code === 'E_LIBRARY_NATIVE_ONNX_LOAD'
     ? 'onnxruntime'
     : code === 'E_LIBRARY_NATIVE_TOKENIZERS_LOAD'
       ? 'tokenizers'
-      : 'embedding runtime';
-  const wrapped = new Error(`${component} native module failed to load`, { cause: err });
-  (wrapped as Error & { code: string }).code = code;
-  return wrapped;
+      : code === 'E_LIBRARY_NATIVE_EMBED_LOAD'
+        ? 'embedding runtime'
+        : '';
+  const err = new Error(component
+    ? `${component} native module failed to load`
+    : String(msg.error || 'embed failed')) as Error & { code?: string };
+  if (code) err.code = code;
+  return err;
 }
 
-async function initEmbedder(): Promise<void> {
-  if (_embedder) return;
-  await _initLock.runExclusive(async () => {
-    if (_embedder) return;
-    const started = Date.now();
-    try {
-      // fastembed eagerly loads both native dependencies from its CJS entry.
-      // Classify a dlopen failure here while the original stack still names
-      // the failing package; downstream telemetry intentionally omits paths
-      // and raw exception text.
-      const { FlagEmbedding, EmbeddingModel } = require('fastembed') as typeof import('fastembed');
-      _embedder = await FlagEmbedding.init({
-        model: EmbeddingModel.BGESmallZH,
-        cacheDir: embeddingModelDir(),
-        // Model files come bundled with the installer (see resources/embedding-model);
-        // any attempt to download is a bug — never silently spinner-download.
-        showDownloadProgress: false,
-      });
-    } catch (err) {
-      throw normalizeEmbedLoadError(err);
-    }
-    log.info(`initialized in ${Date.now() - started}ms (model=bge-small-zh-v1.5, dim=512)`);
+/** Minimal transport the supervisor needs from a worker. The default wraps an
+ *  Electron utilityProcess; tests inject a fake so the correlation + crash
+ *  logic runs without an Electron runtime. */
+export interface EmbedChannel {
+  postMessage(msg: unknown): void;
+  onMessage(cb: (msg: any) => void): void;
+  onExit(cb: (code: number) => void): void;
+  kill(): void;
+}
+
+type ChannelFactory = () => EmbedChannel;
+
+let _channel: EmbedChannel | null = null;
+let _reqSeq = 0;
+const _pending = new Map<number, { resolve: (v: number[][]) => void; reject: (e: Error) => void }>();
+let _crashTimes: number[] = [];
+let _cooldownUntil = 0;
+
+let _channelFactory: ChannelFactory | null = null;
+
+/** Test seam: inject a fake channel factory (null → real utilityProcess). */
+export function _setEmbedChannelFactoryForTest(factory: ChannelFactory | null): void {
+  _teardownChannel(new Error('embed channel factory replaced'));
+  _channelFactory = factory;
+  _crashTimes = [];
+  _cooldownUntil = 0;
+}
+
+function _defaultChannelFactory(): EmbedChannel {
+  // Lazy require — Electron isn't present under vitest, and this path is never
+  // reached in tests (they inject a factory).
+  // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+  const { app, utilityProcess } = require('electron') as typeof import('electron');
+  const packaged = !!app && app.isPackaged;
+  const base = packaged ? PC_ROOT.replace(/\bapp\.asar\b/, 'app.asar.unpacked') : PC_ROOT;
+  const scriptPath = path.join(base, 'bin', 'kb-embed-worker.cjs');
+  const child = utilityProcess.fork(scriptPath, [], {
+    serviceName: 'orkas-kb-embed',
+    env: { ...process.env, ORKAS_EMBED_MODEL_DIR: embeddingModelDir() },
   });
+  return {
+    postMessage: (msg) => child.postMessage(msg),
+    onMessage: (cb) => child.on('message', (msg) => cb(msg)),
+    onExit: (cb) => child.on('exit', (code) => cb(code)),
+    kill: () => { try { child.kill(); } catch { /* already gone */ } },
+  };
+}
+
+function _teardownChannel(reason: Error): void {
+  const ch = _channel;
+  _channel = null;
+  if (ch) { try { ch.kill(); } catch { /* ignore */ } }
+  if (_pending.size) {
+    const pend = [..._pending.values()];
+    _pending.clear();
+    for (const p of pend) p.reject(reason);
+  }
+}
+
+function _ensureChannel(): EmbedChannel {
+  if (_channel) return _channel;
+  const now = Date.now();
+  if (now < _cooldownUntil) {
+    throw new Error('embedder worker is cooling down after repeated crashes');
+  }
+  const factory = _channelFactory || _defaultChannelFactory;
+  const ch = factory();
+  _channel = ch;
+  ch.onMessage((msg) => {
+    if (!msg || typeof msg.id !== 'number') return;
+    const p = _pending.get(msg.id);
+    if (!p) return;
+    _pending.delete(msg.id);
+    if (msg.ok) p.resolve(Array.isArray(msg.vectors) ? msg.vectors : []);
+    else p.reject(embedWorkerError(msg));
+  });
+  ch.onExit((code) => {
+    // Only react to the CURRENT channel's exit — a stale handler from a
+    // replaced channel must not tear down its successor.
+    if (_channel !== ch) return;
+    const at = Date.now();
+    _crashTimes = _crashTimes.filter((t) => at - t < CRASH_WINDOW_MS);
+    _crashTimes.push(at);
+    if (_crashTimes.length >= MAX_CRASHES_IN_WINDOW) {
+      _cooldownUntil = at + CRASH_COOLDOWN_MS;
+      log.error(`embedder worker crashed ${_crashTimes.length}x in ${CRASH_WINDOW_MS / 1000}s (code=${code}); cooling down ${CRASH_COOLDOWN_MS / 1000}s`);
+    } else {
+      log.warn(`embedder worker exited (code=${code}); will respawn on next embed`);
+    }
+    _teardownChannel(new Error('embedder worker exited'));
+  });
+  return ch;
 }
 
 /**
  * Produce a 512-dim unit-normalised embedding for each input text. Preserves
- * input order 1:1. Throws on empty input or model load failure.
+ * input order 1:1. Throws on empty input, worker crash, or model load failure.
  */
-export async function embedTexts(texts: string[]): Promise<number[][]> {
-  if (!texts.length) return [];
-  await initEmbedder();
-  const out: number[][] = [];
-  const gen = _embedder.embed(texts, EMBED_BATCH_SIZE);
-  for await (const batch of gen) {
-    // Each yield: batch of TypedArray / number[] embeddings. Normalise to plain
-    // number[] so downstream encoding to Float32Array is unambiguous.
-    for (const v of batch) {
-      out.push(Array.isArray(v) ? v : Array.from(v as ArrayLike<number>));
+export function embedTexts(texts: string[]): Promise<number[][]> {
+  if (!texts.length) return Promise.resolve([]);
+  let ch: EmbedChannel;
+  try { ch = _ensureChannel(); }
+  catch (err) { return Promise.reject(err as Error); }
+  const id = ++_reqSeq;
+  return new Promise<number[][]>((resolve, reject) => {
+    _pending.set(id, {
+      resolve: (vectors) => {
+        if (vectors.length !== texts.length) {
+          reject(new Error(`embed count mismatch: ${vectors.length} vectors vs ${texts.length} texts`));
+          return;
+        }
+        // A clean batch resets the crash budget so a later isolated crash isn't
+        // judged against ancient history.
+        _crashTimes = [];
+        resolve(vectors);
+      },
+      reject,
+    });
+    try {
+      ch.postMessage({ id, type: 'embed', texts, batchSize: EMBED_BATCH_SIZE });
+    } catch (err) {
+      _pending.delete(id);
+      _teardownChannel(new Error('embedder worker send failed'));
+      reject(err as Error);
     }
-  }
-  if (out.length !== texts.length) {
-    throw new Error(`embed count mismatch: ${out.length} vectors vs ${texts.length} texts`);
-  }
-  return out;
+  });
 }
 
 /** Embed a single query. Shortcut for `embedTexts([q])[0]`. */
@@ -120,17 +197,9 @@ export async function embedQuery(query: string): Promise<number[]> {
   return vs[0];
 }
 
-/** Close + release the ONNX session. Should be called on app shutdown. */
+/** Kill the worker + reject in-flight embeds. Called on app shutdown. */
 export function closeEmbedder(): void {
-  if (!_embedder) return;
-  try {
-    // fastembed doesn't expose a release API; we just drop the reference and
-    // let GC clean up the ONNX InferenceSession. onnxruntime-node has a known
-    // mutex race on process-exit teardown — harmless but noisy.
-    _embedder = null;
-  } catch (err) {
-    log.warn(`close: ${(err as Error).message}`);
-  }
+  _teardownChannel(new Error('embedder closed'));
 }
 
 export function _nativeEmbedLoadCodeForTests(err: unknown): string {

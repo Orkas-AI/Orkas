@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs/promises";
+import { createHash } from "node:crypto";
 import {
   SandboxExecutor,
   augmentPath,
@@ -63,7 +64,19 @@ describe("SandboxExecutor", () => {
       shell: "invalid\0shell",
     });
 
-    const result = await sandbox.execute("echo must-not-run");
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let result;
+    try {
+      result = await sandbox.execute("echo must-not-run");
+      expect(warning).toHaveBeenCalledWith("[sandbox]", "Shell process failed to start", expect.objectContaining({
+        command_hash: createHash("sha256").update("echo must-not-run").digest("hex").slice(0, 12),
+        error_code: "ERR_INVALID_ARG_VALUE", phase: "spawn", platform: process.platform,
+      }));
+      expect(JSON.stringify(warning.mock.calls)).not.toContain("invalid");
+      expect(JSON.stringify(warning.mock.calls)).not.toContain("echo must-not-run");
+    } finally {
+      warning.mockRestore();
+    }
 
     expect(result).toMatchObject({
       stdout: "",
@@ -84,7 +97,18 @@ describe("SandboxExecutor", () => {
       shell: missingShell,
     });
 
-    const result = await sandbox.execute("echo must-not-run");
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let result;
+    try {
+      result = await sandbox.execute("echo must-not-run");
+      expect(warning).toHaveBeenCalledWith("[sandbox]", "Shell process failed to start", expect.objectContaining({
+        command_hash: createHash("sha256").update("echo must-not-run").digest("hex").slice(0, 12),
+        error_code: "ENOENT", phase: "spawn", platform: process.platform,
+      }));
+      expect(JSON.stringify(warning.mock.calls)).not.toContain(missingShell);
+    } finally {
+      warning.mockRestore();
+    }
 
     expect(result).toMatchObject({
       stdout: "",
@@ -483,6 +507,7 @@ describe("augmentPath", () => {
   describe("executeBackground", () => {
     it("returns a pid immediately and writes output to the log file", async () => {
       const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-bg-"));
+      const diagnostics = vi.spyOn(console, "info").mockImplementation(() => {});
       try {
         const logPath = path.join(dir, "run.log");
         const sandbox = new SandboxExecutor({ workingDir: dir });
@@ -492,6 +517,10 @@ describe("augmentPath", () => {
         );
         expect(error).toBeUndefined();
         expect(typeof pid).toBe("number");
+        const logged = JSON.stringify(diagnostics.mock.calls);
+        expect(logged).toContain(`pid=${pid}`);
+        expect(logged).not.toContain(dir);
+        expect(logged).not.toContain("run.log");
         // PowerShell cold-start plus native scanner latency can exceed two
         // seconds on loaded Windows hosts. Background launch is deliberately
         // asynchronous, so allow a bounded platform-specific startup window.
@@ -504,6 +533,7 @@ describe("augmentPath", () => {
         expect(body).toContain("done");
         await waitForProcessExit(pid!);
       } finally {
+        diagnostics.mockRestore();
         await removeTree(dir);
       }
     }, NATIVE_SHELL_TEST_TIMEOUT_MS);

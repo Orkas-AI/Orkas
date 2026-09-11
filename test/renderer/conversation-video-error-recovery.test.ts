@@ -174,8 +174,8 @@ function emit(listeners: Map<string, Listener[]>, type: string, event: Record<st
 }
 
 describe('markdown video error recovery', () => {
-  it('falls back immediately to the remote URL, then switches a live preview to the downloaded local file', () => {
-    const invoke = vi.fn();
+  it('keeps a failed local preview inert until the downloaded local file is ready', async () => {
+    const invoke = vi.fn(async () => ({ diagnosis: 'missing', media_kind: 'video' }));
     const { listeners, shell, video, applyMaterializedMedia } = loadHarness(invoke);
     const remoteUrl = 'https://cdn.example/render?id=clip-1';
     const localUrl = 'chat-media://cid/conversation-1/cli-remote-aabbccddeeff001122334455.mp4';
@@ -189,11 +189,10 @@ describe('markdown video error recovery', () => {
 
     emit(listeners, 'error', { target: video });
 
-    expect(video.getAttribute('src')).toBe(remoteUrl);
-    expect(video.dataset.orkasRemoteFallbackAttempted).toBe('1');
-    expect(video.loadCalls).toBe(1);
-    expect(openButton.hidden).toBe(true);
-    expect(invoke).not.toHaveBeenCalled();
+    expect(video.getAttribute('src')).toBe(localUrl);
+    expect(video.dataset.orkasRemoteFallbackAttempted).toBeUndefined();
+    expect(video.loadCalls).toBe(0);
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith('media.diagnose', { url: video.currentSrc }));
 
     const updated = applyMaterializedMedia({
       remote_url: remoteUrl,
@@ -204,7 +203,7 @@ describe('markdown video error recovery', () => {
     expect(updated).toBe(1);
     expect(video.getAttribute('src')).toBe(localUrl);
     expect(video.dataset.orkasRemoteFallbackAttempted).toBeUndefined();
-    expect(video.loadCalls).toBe(2);
+    expect(video.loadCalls).toBe(1);
     expect(openButton.hidden).toBe(false);
     expect(openButton.getAttribute('data-video-src')).toBe(localUrl);
   });

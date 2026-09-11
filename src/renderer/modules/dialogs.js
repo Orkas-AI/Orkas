@@ -283,7 +283,13 @@ function uiConfirmDanger({ title, message, dangerLabel, cancelLabel } = {}) {
 // `choices: [{ id, label, style? }]` — `style` may be 'primary' (default),
 // 'danger', or '' for the neutral .btn look. `leadingChoices` renders one
 // or more neutral/contextual choices on the left edge of the actions row.
-function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLabel, signal } = {}) {
+/** `choiceLayout: 'group'` lays the choices out as a wrapping group above the
+ * action row, the way the native-question card in the composer dock renders
+ * its options. Prose labels (a CLI question's options) need it: the action
+ * row is one non-wrapping line, so more than a few of them collapse to their
+ * min-width and the labels wrap into unreadable columns. The default keeps
+ * short confirm choices beside cancel on the action row. */
+function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLabel, signal, multiple = false, choiceLayout = 'actions' } = {}) {
   return new Promise((resolve) => {
     if (signal && signal.aborted) {
       resolve(null);
@@ -307,14 +313,21 @@ function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLab
     };
     const leadingChoiceHtml = leadingChoices.map((c) => renderChoice(c, 'ui-choice-leading')).join('');
     const choiceHtml = choices.map((c) => renderChoice(c)).join('');
+    const groupedChoices = choiceLayout === 'group';
+    const choiceGroupHtml = groupedChoices
+      ? `<div class="ui-dialog-choices" role="group" aria-labelledby="${messageId}">${choiceHtml}</div>`
+      : '';
+    const selectedIds = new Set();
     overlay.innerHTML = `
       <div class="modal ui-dialog modal-standard" role="dialog" aria-modal="true" aria-labelledby="${title ? titleId : messageId}"${title ? ` aria-describedby="${messageId}"` : ''}>
         ${titleHtml}
         <div class="modal-body ui-dialog-message" id="${messageId}">${msgHtml}</div>
+        ${choiceGroupHtml}
         <div class="modal-actions">
           ${leadingChoiceHtml}
           <button class="btn" data-act="cancel">${cancelText}</button>
-          ${choiceHtml}
+          ${groupedChoices ? '' : choiceHtml}
+          ${multiple ? `<button class="btn btn-primary" data-act="confirm" disabled>${escapeHtml(_dialogLabel('common.confirm', 'Confirm'))}</button>` : ''}
         </div>
       </div>
     `;
@@ -346,8 +359,21 @@ function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLab
     const onAbort = () => finish(null);
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
     overlay.querySelectorAll('[data-act="choice"]').forEach((btn) => {
-      btn.addEventListener('click', () => finish(btn.dataset.id || null));
+      if (multiple) {
+        btn.setAttribute('aria-pressed', 'false');
+        btn.classList.remove('btn-primary');
+      }
+      btn.addEventListener('click', () => {
+        if (!multiple) { finish(btn.dataset.id || null); return; }
+        const id = btn.dataset.id;
+        if (selectedIds.has(id)) selectedIds.delete(id);
+        else selectedIds.add(id);
+        btn.setAttribute('aria-pressed', String(selectedIds.has(id)));
+        btn.classList.toggle('btn-primary', selectedIds.has(id));
+        overlay.querySelector('[data-act="confirm"]').disabled = selectedIds.size === 0;
+      });
     });
+    if (multiple) overlay.querySelector('[data-act="confirm"]').addEventListener('click', () => finish([...selectedIds]));
     cancelBtn.addEventListener('click', () => finish(null));
     document.addEventListener('keydown', onKey, true);
     setTimeout(() => {
@@ -360,6 +386,11 @@ function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLab
 // null on cancel. Mirrors native `prompt()` semantics.
 function uiPrompt(message, defaultValue = '', options = {}) {
   return new Promise((resolve) => {
+    const signal = options && options.signal;
+    if (signal && signal.aborted) {
+      resolve(null);
+      return;
+    }
     const previousFocus = document.activeElement;
     const dialogId = _uiNextDialogId();
     const messageId = `${dialogId}-message`;
@@ -372,7 +403,7 @@ function uiPrompt(message, defaultValue = '', options = {}) {
       <div class="modal ui-dialog modal-standard" role="dialog" aria-modal="true" aria-labelledby="${messageId}">
         <div class="modal-body ui-dialog-message" id="${messageId}">${msgHtml}</div>
         <div class="form-row" style="margin-top:12px;margin-bottom:0">
-          <input type="text" class="ui-dialog-input" aria-labelledby="${messageId}" />
+          <input type="${options && options.secret ? 'password' : 'text'}" class="ui-dialog-input" aria-labelledby="${messageId}" />
         </div>
         <div class="modal-actions">
           <button class="btn" data-act="cancel">${cancelText}</button>
@@ -410,10 +441,13 @@ function uiPrompt(message, defaultValue = '', options = {}) {
       finished = true;
       document.removeEventListener('keydown', onKey, true);
       releaseFocusGuard();
+      if (signal) signal.removeEventListener('abort', onAbort);
       overlay.remove();
       _uiRestoreDialogFocus(previousFocus);
       resolve(val);
     };
+    const onAbort = () => finish(null);
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
     okBtn.addEventListener('click', () => finish(input.value));
     cancelBtn.addEventListener('click', () => finish(null));
     document.addEventListener('keydown', onKey, true);

@@ -106,8 +106,10 @@ describe('i18n › t() lookup', () => {
 
   it('localizes actionable external-agent terminal states', () => {
     setCurrentLang('zh');
-    expect(t('cli_agent.run_failed_detail', { name: 'Codex' }))
-      .toContain('请确认对应 CLI 已登录且可正常运行');
+    expect(t('cli_agent.run_failed_detail', { name: 'Codex', message: 'server error' }))
+      .toContain('server error');
+    expect(t('cli_agent.error_detail_missing'))
+      .toBe('未提供具体错误信息');
     expect(t('cli_agent.timeout_detail', { name: 'OpenClaw' }))
       .toContain('长时间没有响应');
     expect(t('cli_agent.session_expired_detail', { name: 'Claude Code' }))

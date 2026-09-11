@@ -132,4 +132,4 @@ Each finding should point to an implementable change:
 - State to add.
 - Copy or label adjustment if it affects usability.
 
-If the user asks you to fix the UI and a repo is available, switch to implementation after the review and verify the rendered result.
+A review ends at the findings. Switch to implementation, and only then verify the rendered result, when the user explicitly asked you to change that repo's source — "fix it", "apply these", or a named file to edit. Asking for a review is not asking for a patch.

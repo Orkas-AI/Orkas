@@ -24,6 +24,10 @@ describe('createMetacognitionTool', () => {
     expect((tool.inputSchema as any).properties.action).toBeDefined();
     expect((tool.inputSchema as any).properties.target).toBeDefined();
     expect((tool.inputSchema as any).required).toEqual(['action', 'target']);
+    expect((tool.inputSchema as any).additionalProperties).toBe(false);
+    expect((tool.inputSchema as any).oneOf).toHaveLength(2);
+    expect((tool.inputSchema as any).properties.action.description)
+      .toContain('Omit unrelated fields');
   });
 
   it('omits the limit block when no limits are supplied', () => {
@@ -76,6 +80,17 @@ describe('metacognition › read', () => {
     const tool = createMetacognitionTool(handler);
     await tool.execute({ action: 'read', target: 'strategies' }, dummyCtx);
     expect(handler.read).toHaveBeenCalledWith('strategies');
+  });
+
+  it('rejects write-only content instead of silently ignoring it', async () => {
+    const handler = mockHandler();
+    const result = await createMetacognitionTool(handler).execute(
+      { action: 'read', target: 'strategies', content: 'unrelated' },
+      dummyCtx,
+    );
+    expect(result).toMatchObject({ isError: true });
+    expect(JSON.parse(result.content).error).toContain('not allowed for read');
+    expect(handler.read).not.toHaveBeenCalled();
   });
 });
 

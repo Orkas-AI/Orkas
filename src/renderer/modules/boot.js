@@ -225,13 +225,21 @@ function _migrateLegacyLocalStorageKeys() {
       }
       localStorage.removeItem(oldK);
     }
+    // Drafts keep their content across the rename. Legacy local-queue keys
+    // (`orkas_queue_*`) are deleted instead of renamed — the renderer-local
+    // message queue is retired and queued work lives on the backend board.
+    // (`queue_<cid>` keys a pre-board build left behind are inert and get
+    // removed when their conversation is deleted.)
     const toRename = [];
+    const toDrop = [];
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
-      if (k && (k.startsWith('orkas_queue_') || k.startsWith('orkas_draft_'))) {
-        toRename.push(k);
-      }
+      if (!k) continue;
+      if (k.startsWith('orkas_draft_')) toRename.push(k);
+      else if (k.startsWith('orkas_queue_')) toDrop.push(k);
     }
+    // Collected first: removing while indexing localStorage skips keys.
+    for (const k of toDrop) localStorage.removeItem(k);
     for (const k of toRename) {
       const newK = k.replace(/^orkas_/, '');
       const v = localStorage.getItem(k);
@@ -286,6 +294,7 @@ function _lazyFeaturePanel(view) {
     : view === 'settings' ? 'panel-settings'
     : view === 'announcements' ? 'panel-announcements'
     : view === 'project' ? 'panel-project'
+    : view === 'todos' ? 'panel-todos'
     : view === 'auto' ? 'panel-auto'
     : view === 'marketplace' ? 'panel-marketplace'
     : view === 'devtools' ? 'panel-devtools'
@@ -377,6 +386,7 @@ function setView(view, cid, opts = {}) {
     _bootLog.info('view change', { view, cid: cid || undefined });
   }
   currentView = view;
+  window.WebAssist?.setContext(view, cid);
   _saveLastView(view, cid);
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
   const panelId = view === 'new-chat' ? 'panel-new-chat'
@@ -390,12 +400,14 @@ function setView(view, cid, opts = {}) {
                 : view === 'memory' ? 'panel-memory'
                 : view === 'devtools' ? 'panel-devtools'
                 : view === 'project' ? 'panel-project'
+                : view === 'todos' ? 'panel-todos'
                 : view === 'marketplace' ? 'panel-marketplace'
                 : 'panel-conversation';
   document.getElementById(panelId).classList.add('active');
 
   document.getElementById('new-chat-btn').classList.toggle('active', view === 'new-chat');
   document.getElementById('auto-btn')?.classList.toggle('active', view === 'auto');
+  document.getElementById('todos-btn')?.classList.toggle('active', view === 'todos');
   document.getElementById('agents-btn').classList.toggle('active', view === 'agents');
   document.getElementById('skills-btn').classList.toggle('active', view === 'skills');
   document.getElementById('connectors-btn')?.classList.toggle('active', view === 'connectors');
@@ -414,6 +426,8 @@ function setView(view, cid, opts = {}) {
       if (typeof renderMemoryPage === 'function') renderMemoryPage();
     });
   }
+
+  window.CliAsyncInput?.showConversation(view === 'conversation' ? cid : null);
   if (view === 'conversation' && cid) {
     currentCid = cid;
     // Opening the task is the read boundary for its completed reply. This also
@@ -442,8 +456,15 @@ function setView(view, cid, opts = {}) {
       if (typeof _replayBufferedGroupEvents === 'function') _replayBufferedGroupEvents(cid);
     } else if (!streamBubbleAlive) {
       loadConversationHistory(cid, opts.historyTarget ? { searchTarget: opts.historyTarget } : undefined);
-    } else if (opts.historyTarget && typeof _revealConversationHistorySearchTarget === 'function') {
-      _revealConversationHistorySearchTarget(cid, opts.historyTarget);
+    } else {
+      if (opts.historyTarget && typeof _revealConversationHistorySearchTarget === 'function') {
+        _revealConversationHistorySearchTarget(cid, opts.historyTarget);
+      }
+      // This transcript is already mounted, so it has no history-load
+      // completion callback to schedule the secondary turn-navigation index.
+      if (typeof _scheduleConversationTurnNavigation === 'function') {
+        _scheduleConversationTurnNavigation(cid);
+      }
     }
     // If this conversation is still pending a response, re-attach loading indicator
     if (isConvPending(cid) && !opts.skipLoad && !streamBubbleAlive) {
@@ -451,9 +472,13 @@ function setView(view, cid, opts = {}) {
       // Will be (re)appended after history loads — handled in loadConversationHistory
       if (state) state.needsIndicator = true;
     }
-    // Restore input draft + queue panel for this conversation
+    // Restore input draft for this conversation
     if (!opts.skipLoad) _restoreDraft(cid);
-    renderMessageQueue(cid);
+    // The task board follows the conversation: paint THIS session's rows (or
+    // hide the panel when it has none) — an idle conversation never reaches
+    // the runtime-state sync points that would otherwise repaint it, so
+    // without this the previous session's board stayed on screen.
+    if (window.TaskBoard) window.TaskBoard.sync(cid);
     // Attachment chips: bind the "+" button once, redraw chip area for the
     // current cid, and resync with the server in case the previous visit
     // left files on disk without their dataUrl.
@@ -462,12 +487,9 @@ function setView(view, cid, opts = {}) {
     if (!opts.skipLoad && typeof _chatAttachRefreshFromServer === 'function') {
       _chatAttachRefreshFromServer(cid);
     }
-    // History hydration owns queue dispatch after restoring active_recipient.
     _updateConvSendUI(cid);
     setTimeout(() => focusChatComposerIfIdle('chat-input'), 50);
   } else if (view === 'new-chat') {
-    // Leaving conversation view: hide any queue panel remnants.
-    renderMessageQueue(null);
     currentCid = null;
     // Reset the new-chat ephemeral recipient back to commander every time
     // the landing page is entered — the user explicitly asked for a clean
@@ -537,6 +559,11 @@ function setView(view, cid, opts = {}) {
         if (typeof loadContexts === 'function') loadContexts();
       });
     });
+  } else if (view === 'todos') {
+    currentCid = null;
+    _deferSidebarNavWork('todos-tab-load', () => {
+      _loadViewFeature('project', 'todos', () => loadGlobalTodos());
+    });
   } else if (view === 'auto') {
     currentCid = null;
     // Force-refresh on every tab visit: a scheduled fire or remote sync pull
@@ -580,5 +607,6 @@ function setView(view, cid, opts = {}) {
   } else {
     currentCid = null;
   }
+  if (typeof syncInteractiveCliVisibility === 'function') syncInteractiveCliVisibility();
   if (typeof renderProjectsSection === 'function') renderProjectsSection();
 }

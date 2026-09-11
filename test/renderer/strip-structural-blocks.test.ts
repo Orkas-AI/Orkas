@@ -1163,6 +1163,25 @@ describe('<skill-meta> final safety strip', () => {
     const out = _stripSurvivingStructuralBlocks(buf);
     expect(out).toBe('done\n\ntail');
   });
+
+  it('replaces edit metadata and package markers during streaming', () => {
+    expect(_replaceOuterTagBlocks(
+      'checking\n<skill-meta><category>data</category></skill-meta>\nready',
+      'skill-meta',
+      PH,
+    )).toBe(`checking\n${PH}\nready`);
+    expect(_replaceOuterTagBlocks(
+      'installed\n<skill-as-package name="demo"/>',
+      'skill-as-package',
+      PH,
+    )).toBe(`installed\n${PH}`);
+  });
+
+  it('strips a leaked package handoff marker from settled output', () => {
+    expect(_stripSurvivingStructuralBlocks(
+      'installed\n<skill-as-package name="demo"/>',
+    )).toBe('installed');
+  });
 });
 
 describe('<auto-task> final safety strip', () => {

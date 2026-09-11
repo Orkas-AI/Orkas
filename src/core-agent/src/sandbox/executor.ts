@@ -12,7 +12,9 @@ import {
 import fs from "node:fs";
 import path from "node:path";
 import { TextDecoder } from "node:util";
+import { createHash } from "node:crypto";
 import { createLogger } from "../shared/logger.js";
+import { errorCodeForLog } from "../shared/errors.js";
 import {
   ProcessOutputCapture,
   type StreamedToolOutput,
@@ -570,6 +572,12 @@ export class SandboxExecutor {
    */
   async execute(command: string): Promise<SandboxResult> {
     const startTime = Date.now();
+    const logStartFailure = (error: unknown) => log.warn("Shell process failed to start", {
+      phase: "spawn",
+      error_code: errorCodeForLog(error),
+      platform: process.platform,
+      command_hash: createHash("sha256").update(command).digest("hex").slice(0, 12),
+    });
 
     // Check for blocked commands
     const violation = this.checkBlockedCommand(command);
@@ -647,6 +655,7 @@ export class SandboxExecutor {
           windowsHide: true,
         }) as ChildProcessWithoutNullStreams;
       } catch (error) {
+        logStartFailure(error);
         stdoutCapture?.discard();
         stderrCapture?.discard();
         const stderr = formatProcessStartFailure(error);
@@ -790,6 +799,7 @@ export class SandboxExecutor {
 
       child.on("error", (err) => {
         if (settled) return;
+        logStartFailure(err);
         const message = formatProcessStartFailure(err);
         if (stderrCapture) stderrCapture.append(Buffer.from(message));
         else {
@@ -838,7 +848,7 @@ export class SandboxExecutor {
       });
       child.unref();
       const pid = child.pid ?? null;
-      log.info(`background command started pid=${pid} log=${logPath}`);
+      log.info(`background command started pid=${pid}`);
       return { pid };
     } catch (err) {
       return { pid: null, error: (err as Error).message };

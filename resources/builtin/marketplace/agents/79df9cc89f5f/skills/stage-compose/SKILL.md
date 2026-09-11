@@ -102,7 +102,9 @@ export is not a scene-only shortcut.
    script, or second structural contract. Before authoring it, read
    [manifest-and-authoring.md](references/manifest-and-authoring.md), which owns
    schema, scaffold, language, art direction, and offline authoring rules.
-4. For standalone narration, call `speech.capabilities`, select a returned
+4. For applicable standalone narration (the default for explainers and promos
+   unless the user explicitly requests silent/music-only delivery or the video
+   preserves existing spoken/lip-synced audio), call `speech.capabilities`, select a returned
    locale-compatible `route_ref` + `voice_ref`, write exact intent, then run the
    free `composition.check_narration_fit`. Open the plan stop only when
    `gate_b_ready:true`.
@@ -146,7 +148,7 @@ export is not a scene-only shortcut.
     plus QA headline through `gate-control`.
 
 The default path is: direction -> candidate manifest -> free narration fit ->
-one plan confirmation -> doctor -> native scaffold -> optional narration ->
+one plan confirmation -> doctor -> native scaffold -> planned narration when applicable ->
 VisualDirectionV1/resolved-frame authoring -> inspect/snapshot -> preview ->
 draft -> final confirmation -> export. `VideoProductionStateV1` is durable state;
 call status/reconcile rather than inventing or skipping a stage. Never write or

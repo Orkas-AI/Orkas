@@ -50,6 +50,27 @@ type PdfAction =
   | 'overlay_image'
   | 'fill_form';
 
+const PDF_COMMON_OVERLAY_FIELDS = [
+  'action', 'input_path', 'output_path', 'pages', 'x', 'y', 'width', 'height',
+  'opacity', 'rotation',
+] as const;
+
+const PDF_ACTION_FIELDS: Readonly<Record<PdfAction, ReadonlySet<string>>> = {
+  merge: new Set(['action', 'input_paths', 'output_path']),
+  extract_pages: new Set(['action', 'input_path', 'output_path', 'pages']),
+  delete_pages: new Set(['action', 'input_path', 'output_path', 'pages']),
+  reorder_pages: new Set(['action', 'input_path', 'output_path', 'page_order']),
+  rotate_pages: new Set(['action', 'input_path', 'output_path', 'pages', 'degrees']),
+  watermark: new Set([
+    ...PDF_COMMON_OVERLAY_FIELDS, 'text', 'font_size', 'color', 'background_color',
+  ]),
+  overlay_text: new Set([
+    ...PDF_COMMON_OVERLAY_FIELDS, 'text', 'font_size', 'color', 'background_color',
+  ]),
+  overlay_image: new Set([...PDF_COMMON_OVERLAY_FIELDS, 'image_path']),
+  fill_form: new Set(['action', 'input_path', 'output_path', 'pages', 'fields', 'flatten_form']),
+};
+
 export interface PdfToolsOpts {
   userId?: string;
   cid?: string;
@@ -400,26 +421,27 @@ function createEditPdfTool(opts: PdfToolsOpts): AgentTool {
         action: {
           type: 'string',
           enum: ['merge', 'extract_pages', 'delete_pages', 'reorder_pages', 'rotate_pages', 'watermark', 'overlay_text', 'overlay_image', 'fill_form'],
+          description: 'merge uses input_paths; others use input_path; omit unrelated fields. Overlay x/y/width/height are points from bottom-left; opacity is 0.01-1 and rotation is degrees.',
         },
-        input_path: { type: 'string', description: 'Source PDF except for merge.' },
-        input_paths: { type: 'array', items: { type: 'string' }, description: 'Ordered source PDFs for merge.' },
+        input_path: { type: 'string', description: 'All actions except merge.' },
+        input_paths: { type: 'array', items: { type: 'string' }, description: 'Merge only; at least two ordered PDFs.' },
         output_path: { type: 'string', description: 'Output .pdf; must differ from every input.' },
-        pages: { type: 'array', items: { type: 'number' }, description: 'Optional 1-based pages; omit for all where allowed.' },
-        page_order: { type: 'array', items: { type: 'number' }, description: 'Full 1-based order for reorder_pages.' },
-        degrees: { type: 'number', description: 'Rotation amount; multiple of 90.' },
-        text: { type: 'string', description: 'Text for watermark or overlay_text.' },
-        image_path: { type: 'string', description: 'PNG/JPEG path for overlay_image.' },
-        x: { type: 'number', description: 'Overlay x in points from bottom-left.' },
-        y: { type: 'number', description: 'Overlay y in points from bottom-left.' },
+        pages: { type: 'array', items: { type: 'number' }, description: 'Optional 1-based pages for page/overlay/form actions.' },
+        page_order: { type: 'array', items: { type: 'number' }, description: 'reorder_pages: full 1-based order.' },
+        degrees: { type: 'number', description: 'rotate_pages: multiple of 90.' },
+        text: { type: 'string', description: 'watermark/overlay_text text.' },
+        image_path: { type: 'string', description: 'overlay_image PNG/JPEG path.' },
+        x: { type: 'number' },
+        y: { type: 'number' },
         width: { type: 'number' },
         height: { type: 'number' },
-        font_size: { type: 'number' },
-        color: { type: 'string', description: 'CSS color for rendered overlay text.' },
-        background_color: { type: 'string', description: 'Optional CSS background color for overlay text.' },
+        font_size: { type: 'number', description: 'Text overlay font size in points.' },
+        color: { type: 'string', description: 'Text overlay CSS color.' },
+        background_color: { type: 'string', description: 'Optional text background CSS color.' },
         opacity: { type: 'number' },
         rotation: { type: 'number' },
-        fields: { type: 'object', additionalProperties: true, description: 'Form values keyed by exact PDF field name.' },
-        flatten_form: { type: 'boolean', description: 'Flatten filled form fields into page content.' },
+        fields: { type: 'object', additionalProperties: true, description: 'fill_form only: values by exact field name.' },
+        flatten_form: { type: 'boolean', description: 'fill_form: flatten filled fields.' },
       },
       required: ['action', 'output_path'],
     },
@@ -431,6 +453,13 @@ function createEditPdfTool(opts: PdfToolsOpts): AgentTool {
         'watermark', 'overlay_text', 'overlay_image', 'fill_form',
       ]);
       if (!validActions.has(action)) return errResult('E_BAD_INPUT', 'unsupported PDF action');
+      const unexpected = Object.keys(input).filter((key) => !PDF_ACTION_FIELDS[action].has(key)).sort();
+      if (unexpected.length) {
+        return errResult(
+          'E_BAD_INPUT',
+          `edit_pdf(${action}) does not accept: ${unexpected.join(', ')}`,
+        );
+      }
 
       const outputPath = resolvePath(ctx, input.output_path);
       if (path.extname(outputPath).toLowerCase() !== '.pdf') {

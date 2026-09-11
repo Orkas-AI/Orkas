@@ -16,6 +16,7 @@
  * Currently inhabited by:
  *   - `marketplace/`  — marketplace content cache (features/marketplace_cache.ts)
  *   - `catalogs/`     — versioned Agent/Skill list snapshots (features/agents.ts + skills.ts)
+ *   - `conversation-history/` — renderer-facing sparse history pages + lazy tool results
  *
  * Future migration candidates (NOT yet moved — would need each owner to update its path
  * helpers): `file_cache/` → `cache/file_cache/`, `tool-results/` → `cache/tool-results/`.

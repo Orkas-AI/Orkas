@@ -1,26 +1,14 @@
 [
   {
     "id": "agent-creator",
-    "update_at": 1787478516000
-  },
-  {
-    "id": "autotask-creator",
-    "update_at": 1786956601000
-  },
-  {
-    "id": "memory-manager",
-    "update_at": 1786869792000
+    "update_at": 1788369718929
   },
   {
     "id": "package-installer",
     "update_at": 1786867800000
   },
   {
-    "id": "project-tasks",
-    "update_at": 1786867800000
-  },
-  {
     "id": "skill-creator",
-    "update_at": 1786936332000
+    "update_at": 1788864369300
   }
 ]

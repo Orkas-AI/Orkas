@@ -23,6 +23,10 @@
  *   - external_mutation — writes to databases, remote hosts/files, deployed
  *                       services, external APIs, registries, or control planes.
  *
+ * Alongside the categories it reports `irreversible`: the subset of
+ * destructive shapes that cannot be reviewed or undone once they run. Modes
+ * that skip category approval still gate on those — see `IrreversibleAction`.
+ *
  * Known gap (accepted for v1): a command name fully hidden behind command
  * substitution (`$(echo cu)rl ...`) is not decomposed. The common exfil
  * shape (`curl .../$(cat secret)`) is still caught because the visible
@@ -46,10 +50,27 @@ export type RiskCategory =
   | 'system_package_change'
   | 'external_mutation';
 
+/**
+ * A destructive step whose effect cannot be reviewed or undone after it runs.
+ *
+ * `destructive` is far broader: deleting one generated file trips it, and that
+ * is exactly the kind of thing a user turns approval off for. These two shapes
+ * are different in kind — the removed tree is not listed anywhere afterwards,
+ * and the killed processes took their in-memory state with them — so they are
+ * reported separately. The caller keeps them in approval even in the otherwise
+ * non-prompting `all_files_auto` mode, the same way host/global package
+ * changes already stay there.
+ *
+ * Known gap (shared with the categories above): a command hidden behind
+ * `-EncodedCommand` is opaque and is only marked `destructive`.
+ */
+export type IrreversibleAction = 'recursive_delete' | 'untargeted_process_kill';
+
 export interface RiskResult {
   risky: boolean;
   reasons: RiskCategory[];
   externalMutations: ExternalMutationFinding[];
+  irreversible: IrreversibleAction[];
 }
 
 // ── Tokenizer ──────────────────────────────────────────────────────────────
@@ -457,6 +478,7 @@ function matchPipeToShell(seg: Segment): boolean {
 
 const RAW_DEVICE_RE = /^\/dev\/(sd|hd|nvme|disk|rdisk|mapper)/i;
 const POSIX_PROCESS_TERMINATORS = new Set(['kill', 'pkill', 'killall']);
+const POWERSHELL_STOP_PROCESS_CMDS = new Set(['stop-process', 'spps']);
 const SIGNAL_NAME_RE = /^-(?:sig)?(?:abrt|alrm|bus|chld|cld|cont|emt|fpe|hup|ill|info|int|io|iot|kill|lost|pipe|poll|prof|pwr|quit|segv|stkflt|stop|sys|term|trap|tstp|ttin|ttou|urg|usr1|usr2|vtalrm|winch|xcpu|xfsz)$/i;
 
 function hasRecursiveFlag(args: string[]): boolean {
@@ -518,7 +540,7 @@ function matchProcessTermination(cmd: string, args: string[]): boolean {
     ));
   }
 
-  if (cmd === 'stop-process') {
+  if (POWERSHELL_STOP_PROCESS_CMDS.has(cmd)) {
     if (lower.some((arg) => arg === '-whatif' || arg === '-whatif:$true')) return false;
     // Like Remove-Item, Stop-Process accepts pipeline input and may therefore
     // terminate a process even without an explicit operand in this stage.
@@ -572,7 +594,7 @@ function matchDestructive(cmd: string, args: string[], seg: Segment): boolean {
   if (cmd === 'dd') return true;
   if (/^mkfs/.test(cmd)) return true;
   if (cmd === 'shred' || cmd === 'fdisk' || cmd === 'parted' || cmd === 'sgdisk') return true;
-  if (cmd === 'remove-item' || cmd === 'del' || cmd === 'erase' || cmd === 'rd' || cmd === 'clear-content') {
+  if (cmd === 'remove-item' || cmd === 'ri' || cmd === 'del' || cmd === 'erase' || cmd === 'rd' || cmd === 'clear-content') {
     if (args.some((arg) => arg === '-?' || arg === '/?' || arg === '--help')) return false;
     // PowerShell accepts pipeline input, so `Get-ChildItem | Remove-Item`
     // remains destructive even when this stage has no explicit operand.
@@ -580,10 +602,90 @@ function matchDestructive(cmd: string, args: string[], seg: Segment): boolean {
   }
   if (cmd === 'clear-disk' || cmd === 'format-volume' || cmd === 'initialize-disk'
     || cmd === 'remove-partition' || cmd === 'diskpart' || cmd === 'format') return true;
+  if (cmd === 'find') {
+    if (args.some((arg) => arg.toLowerCase() === '-delete')) return true;
+    for (const nested of findExecutedCommands(args)) {
+      if (matchDestructive(nested.cmd, nested.args, { stages: [], redirectTargets: [], hasSubstitution: false })) {
+        return true;
+      }
+    }
+  }
   // redirect / dd into a raw device
   if (seg.redirectTargets.some((t) => RAW_DEVICE_RE.test(t))) return true;
   if (cmd === 'tee' && args.some((t) => RAW_DEVICE_RE.test(t))) return true;
   return false;
+}
+
+/** PowerShell accepts any unambiguous prefix of a parameter name, so
+ *  `-Recurse` also arrives as `-Recurs` / `-Recur` / `-Rec`. */
+const POWERSHELL_RECURSE_RE = /^-rec(?:u(?:r(?:se?)?)?)?$/i;
+const POWERSHELL_REMOVE_ITEM_CMDS = new Set(['remove-item', 'del', 'erase', 'rd', 'ri', 'rm', 'rmdir']);
+
+function findExecutedCommands(args: string[]): Array<{ cmd: string; args: string[] }> {
+  const commands: Array<{ cmd: string; args: string[] }> = [];
+  for (let index = 0; index < args.length; index++) {
+    const marker = args[index].toLowerCase();
+    if (marker !== '-exec' && marker !== '-execdir') continue;
+    let end = index + 1;
+    while (end < args.length && args[end] !== ';' && args[end] !== '+') end++;
+    const nested = effectiveCommand(args.slice(index + 1, end));
+    if (nested) commands.push(nested);
+    index = end;
+  }
+  return commands;
+}
+
+function matchIrreversible(cmd: string, args: string[]): IrreversibleAction | null {
+  if (hasHelpOrVersion(args)) return null;
+  const lower = args.map((arg) => arg.toLowerCase());
+
+  // Removing a whole tree. No shell delete goes to a trash, and the removed
+  // children are never enumerated anywhere the user could review later.
+  if (cmd === 'rm' && hasRecursiveFlag(args)) return 'recursive_delete';
+  if (POWERSHELL_REMOVE_ITEM_CMDS.has(cmd)
+    && lower.some((arg) => POWERSHELL_RECURSE_RE.test(arg))) {
+    return 'recursive_delete';
+  }
+  if ((cmd === 'rd' || cmd === 'rmdir' || cmd === 'del' || cmd === 'erase')
+    && lower.some((arg) => arg === '/s')) return 'recursive_delete';
+  if (cmd === 'find') {
+    if (lower.includes('-delete')) return 'recursive_delete';
+    for (const nested of findExecutedCommands(args)) {
+      const action = matchIrreversible(nested.cmd, nested.args);
+      if (action) return action;
+    }
+  }
+  if (cmd === 'git') {
+    const { action, index } = gitAction(args);
+    const rest = args.slice(index + 1).map((arg) => arg.toLowerCase());
+    if (action === 'clean'
+      && !rest.some((arg) => arg === '-n' || arg === '--dry-run' || /^-[^-]*n/.test(arg))
+      && rest.some((arg) => arg === '-d' || /^-[^-]*d/.test(arg))) {
+      return 'recursive_delete';
+    }
+  }
+
+  // Terminating processes the command never named. `taskkill /IM chrome.exe`
+  // and `Get-Process chrome | Stop-Process` end every match on the machine,
+  // including sessions the user started outside this task, and whatever those
+  // processes held in memory is gone. A specific pid is the agent acting on
+  // something it can point at, so it stays auto-approved.
+  if (cmd === 'taskkill' || cmd === 'taskkill.exe') {
+    return lower.some((arg) => arg === '/t' || arg === '/im' || /^\/im:.+/i.test(arg))
+      ? 'untargeted_process_kill'
+      : null;
+  }
+  if (POWERSHELL_STOP_PROCESS_CMDS.has(cmd)) {
+    if (lower.some((arg) => arg === '-whatif' || arg === '-whatif:$true')) return null;
+    // `-Id 123` names the process; so does the positional form `Stop-Process 123`.
+    if (lower.some((arg) => arg === '-id') || lower.some((arg) => /^\d+$/.test(arg))) return null;
+    return 'untargeted_process_kill';
+  }
+  if (cmd === 'pkill' || cmd === 'killall') {
+    if (lower.some((arg) => arg === '-l' || arg === '--list')) return null;
+    return 'untargeted_process_kill';
+  }
+  return null;
 }
 
 // Credential / key material — sensitive on ANY access (read is exfil prep).
@@ -965,8 +1067,9 @@ function matchSystemPackageChange(cmd: string, args: string[]): boolean {
 function classifyBashCommandInternal(command: string, depth: number): RiskResult {
   const reasons = new Set<RiskCategory>();
   const externalMutations: ExternalMutationFinding[] = [];
+  const irreversible = new Set<IrreversibleAction>();
   const cmd = String(command ?? '');
-  if (!cmd.trim()) return { risky: false, reasons: [], externalMutations: [] };
+  if (!cmd.trim()) return { risky: false, reasons: [], externalMutations: [], irreversible: [] };
 
   // Fork bomb — operator soup the tokenizer can't meaningfully decompose;
   // matched on the raw despaced string.
@@ -999,6 +1102,8 @@ function classifyBashCommandInternal(command: string, depth: number): RiskResult
 
       if (matchNetwork(c, args, seg)) reasons.add('network_egress');
       if (matchDestructive(c, args, seg)) reasons.add('destructive');
+      const irreversibleAction = matchIrreversible(c, args);
+      if (irreversibleAction) irreversible.add(irreversibleAction);
       if (matchSensitive(c, args, seg, allWords)) reasons.add('sensitive_path');
       if (matchSystemPackageChange(c, args)) reasons.add('system_package_change');
       const externalMutation = classifyExternalMutationCommand(c, args);
@@ -1018,12 +1123,18 @@ function classifyBashCommandInternal(command: string, depth: number): RiskResult
       if (wrapped?.command && depth < 4) {
         const nested = classifyBashCommandInternal(wrapped.command, depth + 1);
         for (const reason of nested.reasons) reasons.add(reason);
+        for (const action of nested.irreversible) irreversible.add(action);
         externalMutations.push(...nested.externalMutations);
       }
     }
   }
 
-  return { risky: reasons.size > 0, reasons: [...reasons], externalMutations };
+  return {
+    risky: reasons.size > 0,
+    reasons: [...reasons],
+    externalMutations,
+    irreversible: [...irreversible],
+  };
 }
 
 export function classifyBashCommand(command: string): RiskResult {

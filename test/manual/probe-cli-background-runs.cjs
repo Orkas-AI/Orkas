@@ -48,7 +48,8 @@ const PROMPT = [
 
 const INJECTED = 'Reply with exactly the word INJECTED_OK. Do not call any tool.';
 
-// Mirrors buildClaudeArgs() minus the per-run bridge/system-prompt wiring.
+// Mirrors buildClaudeArgs() with inherited CLI permissions, minus the per-run
+// bridge/system-prompt wiring.
 const ARGS = [
   '-p',
   '--output-format', 'stream-json',
@@ -56,8 +57,6 @@ const ARGS = [
   '--include-partial-messages',
   '--include-hook-events',
   '--verbose',
-  '--permission-mode', 'bypassPermissions',
-  '--dangerously-skip-permissions',
   '--model', MODEL,
 ];
 

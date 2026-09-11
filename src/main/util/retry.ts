@@ -3,8 +3,8 @@ import { logErrorRef } from './log-redact';
 
 const log = createLogger('retry');
 
-export const DEFAULT_NETWORK_RETRY_ATTEMPTS = 3;
-export const DEFAULT_NETWORK_RETRY_DELAYS_MS = [500, 1_000, 2_000];
+const DEFAULT_NETWORK_RETRY_ATTEMPTS = 3;
+const DEFAULT_NETWORK_RETRY_DELAYS_MS = [500, 1_000, 2_000];
 
 type FetchImplementation = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 interface RetryOptions {

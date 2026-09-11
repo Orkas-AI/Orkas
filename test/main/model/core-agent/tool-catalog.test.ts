@@ -121,7 +121,10 @@ describe('tool-catalog', () => {
     expect(missing, `Injected tools missing from TOOL_CATALOG: ${missing.join(', ')}`).toEqual([]);
     const stale = [...catalog].filter((n) => !injected.has(n));
     expect(stale, `Catalog tools missing from injected fixture: ${stale.join(', ')}`).toEqual([]);
-    expect(catalog.size).toBe(56);
+    expect(catalog.has('auto_tasks')).toBe(true);
+    for (const retired of ['read_file', 'stat_file', 'auto_tasks_list']) {
+      expect(catalog.has(retired)).toBe(false);
+    }
   });
 
   it('TOOL_CATALOG has no duplicate names', () => {
@@ -184,6 +187,29 @@ describe('tool-catalog', () => {
     expect(problems).toEqual([]);
   });
 
+  it('loads the citation verifier with web evidence for exactly its four declared owners', () => {
+    expect(TOOL_CATALOG.find((entry) => entry.name === 'research_verify_citations'))
+      .toMatchObject({
+        loadGroups: ['web'],
+        ownerAgent: ['78900d8758bc', '5dd962efb425', '17c0a2e95df3', '7083ff63b398'],
+      });
+    expect(toolNamesForGroups(['web'])).toEqual(expect.arrayContaining([
+      'web_search',
+      'web_fetch',
+      'browser',
+      'research_verify_citations',
+    ]));
+    expect(toolNamesForGroups(['library'])).not.toContain('research_verify_citations');
+    expect(TOOL_CATALOG.find((entry) => entry.name === 'browser'))
+      .toMatchObject({ loadGroups: ['web'] });
+    expect(toolNamesForAgentGroups(['web'])).toContain('browser');
+    expect(isToolVisibleToAgent('browser', '173d4235a431')).toBe(true);
+    for (const agentId of ['78900d8758bc', '5dd962efb425', '17c0a2e95df3', '7083ff63b398']) {
+      expect(isToolVisibleToAgent('research_verify_citations', agentId), agentId).toBe(true);
+    }
+    expect(isToolVisibleToAgent('research_verify_citations', '173d4235a431')).toBe(false);
+  });
+
   it('every packaged official Agent declares canonical loadable groups', () => {
     const root = path.join(process.cwd(), 'resources', 'builtin', 'marketplace', 'agents');
     const files = fs.readdirSync(root)
@@ -217,6 +243,7 @@ describe('tool-catalog', () => {
     expect(LOADABLE_TOOL_GROUP_IDS).toContain('management');
     expect(LOADABLE_TOOL_GROUP_IDS).toEqual(expect.arrayContaining([
       'management.app',
+      'management.projects',
       'management.skills',
       'management.marketplace',
       'management.automation',
@@ -229,6 +256,7 @@ describe('tool-catalog', () => {
     expect(TOOL_GROUPS.filter((group) => group.parent === 'management').map((group) => group.id))
       .toEqual([
         'management.app',
+        'management.projects',
         'management.skills',
         'management.marketplace',
         'management.automation',
@@ -246,36 +274,41 @@ describe('tool-catalog', () => {
       .toEqual(['runtime']);
     expect(TOOL_CATALOG.find((entry) => entry.name === 'add_custom_connector'))
       .toMatchObject({ loadGroups: ['connectors'], agentAssignable: false });
+    expect(TOOL_CATALOG.find((entry) => entry.name === 'connector_setup'))
+      .toMatchObject({ loadGroups: ['connectors'], agentAssignable: false });
     expect(toolNamesForGroups(['connectors'])).toEqual([
-      'list_connector_tools', 'call_connector_tool', 'add_custom_connector',
+      'list_connector_tools', 'call_connector_tool', 'add_custom_connector', 'connector_setup',
     ]);
     expect(toolNamesForAgentGroups(['connectors'])).toEqual([
       'list_connector_tools', 'call_connector_tool',
     ]);
     expect(isToolVisibleToAgent('add_custom_connector', 'custom-agent')).toBe(false);
+    expect(isToolVisibleToAgent('connector_setup', 'custom-agent')).toBe(false);
     expect(toolNamesForGroups(['management.skills'])).toEqual([
       'skill_search', 'import_skill_package',
     ]);
     expect(toolNamesForGroups(['management.marketplace'])).toEqual([
       'marketplace_search', 'marketplace_request_install',
     ]);
-    expect(toolNamesForGroups(['management.automation'])).toEqual(['auto_tasks_list']);
+    expect(toolNamesForGroups(['management.automation'])).toEqual(['auto_tasks']);
     expect(toolNamesForGroups(['management.app'])).toEqual(['open_app_view', 'app_health']);
     // Keep the broad parent as an explicit compatibility alias while new
     // runtime calls can load only the focused child they need.
     expect(expandToolGroups(['management'])).toEqual([
       'management',
       'management.app',
+      'management.projects',
       'management.skills',
       'management.marketplace',
       'management.automation',
     ]);
     expect(toolNamesForGroups(['management'])).toEqual([
+      'todo_tasks',
       'skill_search',
       'import_skill_package',
       'marketplace_search',
       'marketplace_request_install',
-      'auto_tasks_list',
+      'auto_tasks',
       'open_app_view',
       'app_health',
     ]);
@@ -300,13 +333,13 @@ describe('tool-catalog', () => {
 
   it('splits output, editing, command, session, and media capabilities without weakening parent compatibility', () => {
     expect(toolNamesForGroups(['workspace.write.output'])).toEqual([
-      'write_file', 'append_file', 'publish_outputs',
+      'write_file', 'append_file', 'publish_outputs', 'library_save',
     ]);
     expect(toolNamesForGroups(['workspace.write.edit'])).toEqual([
       'apply_patch', 'edit_file', 'delete_file', 'workspace_diff',
     ]);
     expect(toolNamesForGroups(['workspace.write'])).toEqual([
-      'write_file', 'append_file', 'publish_outputs',
+      'write_file', 'append_file', 'publish_outputs', 'library_save',
       'apply_patch', 'edit_file', 'delete_file', 'workspace_diff',
     ]);
     expect(toolNamesForGroups(['workspace.execute.command'])).toEqual(['bash']);
@@ -337,6 +370,16 @@ describe('tool-catalog', () => {
     expect(canonicalizeAgentToolGroups([
       'workspace', 'workspace.write.output', 'workspace.execute.command',
     ])).toEqual(['workspace']);
+  });
+
+  it('advertises deterministic batch scripts before and after command-tool activation', () => {
+    const group = TOOL_GROUPS.find((entry) => entry.id === 'workspace.execute.command');
+    const bash = TOOL_CATALOG.find((entry) => entry.name === 'bash');
+
+    expect(group?.summary).toMatch(/Python\/Node scripts/i);
+    expect(group?.summary).toMatch(/deterministic local and batch processing/i);
+    expect(bash?.summary).toMatch(/Python\/Node scripts/i);
+    expect(bash?.summary).toMatch(/deterministic local and batch processing/i);
   });
 
   it('enforces each built-in Agent fixed capability boundary', () => {
@@ -450,13 +493,13 @@ describe('tool-catalog', () => {
     const fingerprint = createHash('sha256')
       .update(JSON.stringify(schemas))
       .digest('hex');
+    // Requester-confirmed schema repair: chat_history closes each action
+    // branch so search/read cannot advertise fields the executor rejects.
+    // Existing runtime operations, scope grants, and legacy calls are unchanged.
     expect(
       fingerprint,
       'A model-visible field, enum, bound, default, or required rule changed; review it as a schema change, not description cleanup.',
-    // Reviewed 168 parity additions: image URL/role/negative-prompt inputs and
-    // ImageStudio/VideoStudio production transaction identifiers. Existing
-    // required inputs and tool visibility remain unchanged.
-    ).toBe('68660ba57a038f6c2ad728e822af5ae70abe13d2b1410a9e8a5d2443b84ed05e');
+    ).toBe('5606c89ec9be9bfc0d7a6c09b67c98940ed36a4e14381294b741e4434a93f76c');
   });
 
   it('keeps the reviewed stable tool corpus within the description budgets', () => {
@@ -537,6 +580,9 @@ describe('tool-catalog', () => {
 
     const editPdf = toolByName('edit_pdf');
     expect(editPdf.description).not.toContain('page numbers are 1-based');
+    expect(propertyDescription(editPdf, 'action')).toContain('omit unrelated fields');
+    expect(propertyDescription(editPdf, 'input_paths')).toContain('Merge only');
+    expect(propertyDescription(editPdf, 'fields')).toContain('fill_form only');
     expect(propertyDescription(editPdf, 'pages')).toContain('1-based pages');
 
     const renderPdf = toolByName('pdf_render');
@@ -564,6 +610,12 @@ describe('tool-catalog', () => {
     const editOffice = toolByName('edit_office');
     expect(editOffice.description).not.toContain('set(path');
     expect(propertyDescription(editOffice, 'operations')).toContain('set(path, props)');
+    const officeOperation = ((editOffice.inputSchema as any).properties.operations.items.properties);
+    expect(officeOperation.action.description).toContain('omit unrelated fields');
+
+    for (const name of ['process_session', 'interactive_cli']) {
+      expect(propertyDescription(toolByName(name), 'action')).toContain('only its action-specific fields');
+    }
 
     const pptx = toolByName('create_pptx');
     expect(pptx.description).not.toContain('Positions and sizes use');
@@ -591,6 +643,7 @@ describe('tool-catalog', () => {
       chat_history: ['search', 'page', 'earlier work', 'quoted', 'stale', 'library'],
       web_search: ['search', 'titles', 'urls', 'snippets', 'web_fetch'],
       web_fetch: ['fetch', 'url', 'readable extracted text'],
+      browser: ['visible browser tabs', 'observe', 'page_id', 'element_ref', 'untrusted', 'user'],
       office_review: ['validate', 'render', 'check_and_render', 'pages'],
       generate_image: ['generate', 'image', 'prompt', 'output_path', 'reference'],
       generate_speech: ['narration', 'text', 'output_path', 'target_duration'],
@@ -631,6 +684,13 @@ describe('isToolVisibleToAgent (ownerAgent gate)', () => {
     // commander dispatch tools + core-agent builtins aren't catalog entries
     expect(isToolVisibleToAgent('dispatch_to', '')).toBe(true);
     expect(isToolVisibleToAgent('run_worker', 'video-studio')).toBe(true);
+  });
+
+  it('keeps image_studio private to the built-in ImageStudio agent', () => {
+    expect(isToolVisibleToAgent('image_studio', '814b61b027f0')).toBe(true);
+    expect(isToolVisibleToAgent('image_studio', '')).toBe(false);
+    expect(isToolVisibleToAgent('image_studio', '79df9cc89f5f')).toBe(false);
+    expect(isToolVisibleToAgent('video_studio', '814b61b027f0')).toBe(false);
   });
 
   it('keeps image_studio private to the built-in ImageStudio agent', () => {

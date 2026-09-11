@@ -30,6 +30,38 @@ function permissionPushes() {
 }
 
 describe('bash-permissions', () => {
+  it('requires a fresh one-time decision for unresolved paths even after a task grant', async () => {
+    const granted = ask({ reasons: ['sensitive_path'] });
+    bp.respond(permissionPushes()[0].payload.request_id, 'allow_run');
+    expect(await granted).toBe('allow_run');
+
+    const uncertain = ask({ reasons: ['sensitive_path'], unresolvedPaths: true });
+    expect(permissionPushes()).toHaveLength(2);
+    expect(permissionPushes()[1].payload).toMatchObject({ unresolved_paths: true, can_allow_run: false });
+    bp.respond(permissionPushes()[1].payload.request_id, 'allow_run');
+    expect(await uncertain).toBe('allow_once');
+
+    const next = ask({ reasons: [], unresolvedPaths: true });
+    expect(permissionPushes()).toHaveLength(3);
+    bp.respond(permissionPushes()[2].payload.request_id, 'deny');
+    expect(await next).toBe('deny');
+  });
+
+  it('carries the irreversible finding to the dialog, and omits it otherwise', async () => {
+    const withFinding = ask({ irreversible: ['recursive_delete', 'recursive_delete'] });
+    expect(permissionPushes()[0].payload.irreversible).toEqual(['recursive_delete']);
+    bp.respond(permissionPushes()[0].payload.request_id, 'deny');
+    await withFinding;
+
+    pushed = [];
+    const plain = ask();
+    // An ordinary sensitive prompt must not grow an empty array the dialog
+    // would have to special-case.
+    expect(permissionPushes()[0].payload).not.toHaveProperty('irreversible');
+    bp.respond(permissionPushes()[0].payload.request_id, 'deny');
+    await plain;
+  });
+
   it('pushes a request and resolves with the user verdict (allow_once)', async () => {
     const p = ask();
     expect(pushed).toHaveLength(1);

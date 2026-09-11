@@ -92,7 +92,7 @@ function loadComposer() {
       }
     }
     const document = { createElement: (t) => new FakeEl(t), createTextNode: (v) => new FakeText(v) };
-    const _findChatUseTokens = () => [];
+    const _findChatComposerTokens = () => [];
     const _chatRichCreateUseChip = () => document.createElement('span');
     function makeEditor() { return new FakeEl('div'); }
   `;

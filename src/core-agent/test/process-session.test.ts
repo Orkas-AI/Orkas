@@ -91,6 +91,29 @@ describe("persistent process sessions", () => {
     await expect(fs.stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("advertises action requirements and rejects fields from another lifecycle action", async () => {
+    const processSession = tool("process_session");
+    const schema = processSession.inputSchema as any;
+    const branches = Object.fromEntries(schema.oneOf.map((branch: any) => [
+      branch.properties.action.enum[0],
+      branch.required,
+    ]));
+    expect(branches).toEqual({
+      start: ["action", "command"],
+      read: ["action", "session_id"],
+      write: ["action", "session_id", "chars"],
+      stop: ["action", "session_id"],
+    });
+
+    const rejected = await processSession.execute({
+      action: "read",
+      session_id: "proc-missing",
+      command: "must-not-run",
+    }, context("owner-a"));
+    expect(rejected).toMatchObject({ isError: true });
+    expect(rejected.content).toContain("process_session(read) does not accept: command");
+  });
+
   it("streams cursor-based output across separate Agent tool contexts", async () => {
     const command = shellInvoke(TEST_NODE, [
       "-e",

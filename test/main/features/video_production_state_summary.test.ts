@@ -85,30 +85,33 @@ describe('production state summary payload', () => {
     // The journal appends at the end, so the tail is the recent end. Slicing
     // the wrong end would silently hand the model operations it has already
     // moved past — a stale-evidence bug no size assertion would catch. The
-    // probe rides error_code because the second harvest (2026-08-23) dropped
-    // per-entry timestamps from the echo.
+    // oracle rides `error_code` because it is one of the few fields the
+    // slimmed projection still carries (2026-08-23 second harvest).
     const state = stateWith(15, 100);
-    state.operation_journal = state.operation_journal!.map((entry, index) => ({
+    state.operation_journal = state.operation_journal.map((entry, index) => ({
       ...entry,
+      status: 'failed' as const,
       error_code: `E_${index}`,
-    }));
+    })) as typeof state.operation_journal;
     const summary = summarizeVideoProductionState(state) as Record<string, any>;
 
-    expect(summary.operation_journal[0].error_code).toBe('E_90');
     expect(summary.operation_journal.at(-1).error_code).toBe('E_99');
+    expect(summary.operation_journal[0].error_code).toBe('E_90');
   });
 
-  it('keeps the verdict fields and drops the ledger bookkeeping', () => {
-    // First pass (2026-08-08) dropped `operation_id`/`input_hash`. The second
-    // harvest (2026-08-23, synced from release_1.7.0) also drops turn ids,
-    // per-entry paths, and timestamps: re-measured on live runs they were 37%
-    // of every state echo with zero prompt/skill readers, and the newest
-    // failure's findings_path rides the result top level. What an entry still
-    // says: which operation, how it ended, and whether a crashed attempt
-    // burns the same-input budget.
+  it('keeps only the journal fields a reader acts on', () => {
+    // Second-harvest contract (de2fcdaa1, re-measured 2026-08-23): an echoed
+    // entry says which operation, how it ended, and — for crash recovery —
+    // whether the interrupted attempt burns a same-input retry. Everything
+    // else had zero prompt/skill readers at 37% of every state echo: ids and
+    // hashes a model cannot compute, double timestamps, and the absolute
+    // findings/output paths whose actionable copy (the most recent failure)
+    // already rides the result top level. Exact-equality oracle so a field
+    // creeping back in fails the harvest, not just a field going missing.
     const state = stateWith(1, 1);
     state.operation_journal[0] = {
       ...state.operation_journal[0],
+      status: 'failed' as const,
       operation_id: 'op-uuid',
       input_hash: 'e'.repeat(64),
       turn_id: 'turn-7',
@@ -120,7 +123,7 @@ describe('production state summary payload', () => {
 
     expect(entry).toEqual({
       op: 'composition.snapshot',
-      status: 'passed',
+      status: 'failed',
       error_code: 'E_SNAPSHOT_FAILED',
       consumes_same_input_attempt: false,
     });

@@ -321,6 +321,14 @@ function _refreshUnreadTaskIndicators(projectIdOverride) {
   }
   _taskUnreadSetDot(document.getElementById?.('tasks-unread-dot'), globalCount > 0);
   _taskUnreadSetDot(document.getElementById?.('projects-unread-dot'), projectsCount > 0);
+  // The Today section mirrors rows that also live under Tasks or a Project, so
+  // its header follows the rows it currently shows rather than an ownership
+  // count; the loop above has just settled each row's `has-unread` class.
+  const todayList = document.getElementById?.('today-list');
+  _taskUnreadSetDot(
+    document.getElementById?.('today-unread-dot'),
+    !!todayList?.querySelector?.('.conv-item.has-unread'),
+  );
 
   for (const dot of document.querySelectorAll?.('[data-project-unread-dot]') || []) {
     _taskUnreadSetDot(dot, _taskUnreadProjectCount(dot.dataset?.projectUnreadDot) > 0);
@@ -330,7 +338,7 @@ function _refreshUnreadTaskIndicators(projectIdOverride) {
 function _handleTaskTerminalUnread(payload) {
   if (!payload || payload.type !== 'terminal') return false;
   const status = String(payload.status || '').trim().toLowerCase();
-  if (!['completed', 'failed', 'waiting_input'].includes(status)) return false;
+  if (!['completed', 'stopped', 'failed', 'waiting_input'].includes(status)) return false;
   return _markConversationUnread(payload.conversation_id, {
     finishedAt: payload.finished_at_ms,
   });

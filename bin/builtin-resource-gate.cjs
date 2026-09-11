@@ -33,10 +33,7 @@ const AVATAR_COLORS = new Set(
 const REQUIRED_BUILTIN_INVENTORY = Object.freeze({
   system_skills: Object.freeze([
     'agent-creator',
-    'autotask-creator',
-    'memory-manager',
     'package-installer',
-    'project-tasks',
     'skill-creator',
   ]),
   marketplace_agents: Object.freeze([
@@ -52,6 +49,7 @@ const REQUIRED_BUILTIN_INVENTORY = Object.freeze({
   ]),
   marketplace_skills: Object.freeze([
     '081c15ffbab4',
+    '08837be6032e',
     '36bd44ae956c',
     '6743aa0797a2',
     '68fb048b85cb',

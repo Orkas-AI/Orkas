@@ -1526,7 +1526,7 @@ describe('rotating-provider › cross-provider fallback', () => {
     expect(bounded.flatMap((message) => message.content)
       .some((content) => content.type === 'image')).toBe(false);
     expect(bounded).toEqual([{
-      role: 'user',
+      role: 'developer',
       content: [{
         type: 'text',
         text: expect.stringContaining('vision_supported="false"'),
@@ -2194,3 +2194,21 @@ it('complete() latches a network-exhausted candidate after a fallback succeeds, 
     expect(getCooldown('p1')).toBeUndefined();
   });
 });
+
+it('applies image limits to native tool-result images without mutating their receipts', () => {
+    const messages: CompletionParams['messages'] = [{ role: 'user', content: [
+      { type: 'image', data: 'old', mediaType: 'image/png' },
+    ] }, { role: 'assistant', content: [{ type: 'tool_use', id: 'img', name: 'read_files', input: {} }] },
+    { role: 'user', content: [{ type: 'tool_result', toolUseId: 'img', content: 'Preview loaded', images: [
+      { type: 'image', data: 'desktop', mediaType: 'image/png' },
+      { type: 'image', data: 'mobile', mediaType: 'image/png' },
+    ] }] }];
+    const before = structuredClone(messages);
+    const limited = boundMessagesForImageLimit(messages, 1);
+    expect(limited.flatMap((m) => m.content).find((c) => c.type === 'tool_result')).toMatchObject({
+      toolUseId: 'img', content: 'Preview loaded', images: [{ data: 'desktop' }],
+    });
+    expect(limited.at(-1)?.role).toBe('developer');
+    expect(JSON.stringify(boundMessagesForImageLimit(messages, 0))).not.toContain('"data"');
+    expect(messages).toEqual(before);
+  });

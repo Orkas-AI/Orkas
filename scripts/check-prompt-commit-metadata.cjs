@@ -44,6 +44,12 @@ function isSystemPromptProducerChange(file, diff) {
   return SYSTEM_PROMPT_DIFF_SIGNAL.test(changedLines.join('\n'));
 }
 
+function findSystemPromptProducerFiles(files, readDiff) {
+  return files
+    .filter((file) => SYSTEM_PROMPT_PRODUCER_PATHS.has(file))
+    .filter((file) => isSystemPromptProducerChange(file, readDiff(file)));
+}
+
 function validateCommitMetadata(message, files, producerFiles = []) {
   const promptFiles = [...new Set([
     ...files.filter(isPromptFacingPath),
@@ -134,11 +140,9 @@ function stagedSystemPromptProducerFiles(repoRoot) {
     'diff', '--cached', '--no-renames', '--name-only', '--diff-filter=ACMRD', '--',
   ], repoRoot);
   const files = output ? output.split('\n').filter(Boolean) : [];
-  return files.filter((file) => {
-    if (!SYSTEM_PROMPT_PRODUCER_PATHS.has(file)) return false;
-    const diff = runGit(['diff', '--cached', '--no-ext-diff', '--unified=0', '--', file], repoRoot);
-    return isSystemPromptProducerChange(file, diff);
-  });
+  return findSystemPromptProducerFiles(files, (file) => (
+    runGit(['diff', '--cached', '--no-ext-diff', '--unified=0', '--', file], repoRoot)
+  ));
 }
 
 function main() {
@@ -161,8 +165,8 @@ function main() {
     // commits; the local commit-msg hook separately checks manual resolutions.
     if (parents.length > 1) continue;
     const files = changedFilesForCommit(repoRoot, commit, parents);
-    const producerFiles = files.filter((file) => (
-      isSystemPromptProducerChange(file, diffForCommitFile(repoRoot, commit, parents, file))
+    const producerFiles = findSystemPromptProducerFiles(files, (file) => (
+      diffForCommitFile(repoRoot, commit, parents, file)
     ));
     const message = runGit(['show', '-s', '--format=%B', commit], repoRoot);
     const problems = validateCommitMetadata(message, files, producerFiles);
@@ -181,6 +185,7 @@ function main() {
 }
 
 module.exports = {
+  findSystemPromptProducerFiles,
   isPromptFacingPath,
   isSystemPromptProducerChange,
   isSystemPromptSourcePath,

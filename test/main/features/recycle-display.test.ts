@@ -22,9 +22,9 @@ afterEach(() => {
 
 describe('recycle display preview', () => {
   it('shows skill edit chats as edit conversations and skills as skills', async () => {
-    const users = await import('../../../../src/main/features/users');
+    const users = await import('../../../src/main/features/users');
     users.activateUser(UID);
-    const paths = await import('../../../../src/main/paths');
+    const paths = await import('../../../src/main/paths');
     const skillDir = path.join(paths.userCloudRoot(UID), 'skills', 'academic-tutor');
     fs.mkdirSync(skillDir, { recursive: true });
     fs.writeFileSync(
@@ -32,7 +32,7 @@ describe('recycle display preview', () => {
       '---\nname: Academic Tutor\n---\n',
     );
 
-    const { buildRecycleDisplayPreview } = await import('../../../../src/main/features/recycle_bin');
+    const { buildRecycleDisplayPreview } = await import('../../../src/main/features/recycle_bin');
     const items = await buildRecycleDisplayPreview(UID, [
       'cloud/chats/skill/academic-tutor/chat.json',
       'cloud/chats/skill/academic-tutor/chat.jsonl',
@@ -50,9 +50,9 @@ describe('recycle display preview', () => {
   });
 
   it('hides edit chats when their parent skill is deleted', async () => {
-    const users = await import('../../../../src/main/features/users');
+    const users = await import('../../../src/main/features/users');
     users.activateUser(UID);
-    const paths = await import('../../../../src/main/paths');
+    const paths = await import('../../../src/main/paths');
     const skillDir = path.join(paths.userCloudRoot(UID), 'skills', 'academic-tutor');
     fs.mkdirSync(skillDir, { recursive: true });
     fs.writeFileSync(
@@ -60,7 +60,7 @@ describe('recycle display preview', () => {
       '---\nname: Academic Tutor\n---\n',
     );
 
-    const { buildRecycleDisplayPreview } = await import('../../../../src/main/features/recycle_bin');
+    const { buildRecycleDisplayPreview } = await import('../../../src/main/features/recycle_bin');
     const items = await buildRecycleDisplayPreview(UID, [
       'cloud/chats/skill/academic-tutor/chat.json',
       'cloud/chats/skill/academic-tutor/chat.jsonl',
@@ -80,9 +80,9 @@ describe('recycle display preview', () => {
   });
 
   it('collapses legacy recycle display items for skill edit sessions', async () => {
-    const users = await import('../../../../src/main/features/users');
+    const users = await import('../../../src/main/features/users');
     users.activateUser(UID);
-    const paths = await import('../../../../src/main/paths');
+    const paths = await import('../../../src/main/paths');
     const batchId = '2026-06-01T12-15-09-000Z-study-planner';
     const batchDir = path.join(paths.userRecycleDir(UID), batchId);
     await fs.promises.mkdir(batchDir, { recursive: true });
@@ -102,7 +102,7 @@ describe('recycle display preview', () => {
       ],
     }));
 
-    const { listRecycleBatches } = await import('../../../../src/main/features/recycle_bin');
+    const { listRecycleBatches } = await import('../../../src/main/features/recycle_bin');
     const [batch] = await listRecycleBatches(UID);
     expect(batch.display_items).toEqual([
       {
@@ -115,9 +115,9 @@ describe('recycle display preview', () => {
   });
 
   it('hides supplemental file rows when a legacy recycle batch has a core skill item', async () => {
-    const users = await import('../../../../src/main/features/users');
+    const users = await import('../../../src/main/features/users');
     users.activateUser(UID);
-    const paths = await import('../../../../src/main/paths');
+    const paths = await import('../../../src/main/paths');
     const batchId = '2026-06-02T08-00-00-000Z-spec-driven-development';
     const batchDir = path.join(paths.userRecycleDir(UID), batchId);
     await fs.promises.mkdir(batchDir, { recursive: true });
@@ -153,7 +153,7 @@ describe('recycle display preview', () => {
       ],
     }));
 
-    const { listRecycleBatches } = await import('../../../../src/main/features/recycle_bin');
+    const { listRecycleBatches } = await import('../../../src/main/features/recycle_bin');
     const [batch] = await listRecycleBatches(UID);
     expect(batch.display_items).toEqual([
       {

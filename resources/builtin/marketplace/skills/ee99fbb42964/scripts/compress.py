@@ -86,6 +86,17 @@ def tokenize(s: str) -> list:
     return terms
 
 
+def _effective_len(s: str) -> int:
+    """Length for the minimum-fragment gate.
+
+    CJK text carries substantially more information per character than
+    whitespace-delimited Latin prose. Weighting CJK characters keeps short but
+    substantive CJK evidence from being discarded as noise.
+    """
+    cjk = sum(match.end() - match.start() for match in _CJK_RUN_RE.finditer(s))
+    return len(s) + 2 * cjk
+
+
 def chunk_text(text: str, max_chunk_chars: int = MAX_CHUNK_CHARS) -> list:
     """Split into passages: by blank-line paragraphs, further split by sentence
     when a paragraph exceeds max_chunk_chars. Fragments below MIN_CHUNK_CHARS are
@@ -97,7 +108,7 @@ def chunk_text(text: str, max_chunk_chars: int = MAX_CHUNK_CHARS) -> list:
         if not para:
             continue
         if len(para) <= max_chunk_chars:
-            if len(para) >= MIN_CHUNK_CHARS:
+            if _effective_len(para) >= MIN_CHUNK_CHARS:
                 chunks.append(para)
             continue
         # Pack sentences up to the cap so we never emit a > MAX_CHUNK_CHARS chunk.
@@ -107,7 +118,7 @@ def chunk_text(text: str, max_chunk_chars: int = MAX_CHUNK_CHARS) -> list:
             if not sent:
                 continue
             if buf and len(buf) + 1 + len(sent) > max_chunk_chars:
-                if len(buf) >= MIN_CHUNK_CHARS:
+                if _effective_len(buf) >= MIN_CHUNK_CHARS:
                     chunks.append(buf)
                 buf = sent
             else:
@@ -116,7 +127,7 @@ def chunk_text(text: str, max_chunk_chars: int = MAX_CHUNK_CHARS) -> list:
             while len(buf) > max_chunk_chars:
                 chunks.append(buf[:max_chunk_chars])
                 buf = buf[max_chunk_chars:]
-        if len(buf) >= MIN_CHUNK_CHARS:
+        if _effective_len(buf) >= MIN_CHUNK_CHARS:
             chunks.append(buf)
     return chunks
 

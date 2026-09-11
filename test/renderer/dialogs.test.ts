@@ -25,9 +25,15 @@ class FakeClassList {
   contains(name: string): boolean {
     return this.element.className.split(/\s+/).includes(name);
   }
+
+  toggle(name: string, force: boolean): void {
+    if (force) this.add(name);
+    else this.remove(name);
+  }
 }
 
 class FakeElement {
+  disabled = false;
   className = '';
   id = '';
   value = '';
@@ -56,6 +62,7 @@ class FakeElement {
       button.className = match[1];
       button.dataset.act = match[2];
       if (match[3] !== undefined) button.dataset.id = match[3];
+      button.disabled = match[0].includes(' disabled');
       this.appendChild(button);
     }
     if (value.includes('class="ui-dialog-input"')) {
@@ -104,6 +111,7 @@ class FakeElement {
   }
 
   click(): void {
+    if (this.disabled) return;
     for (const listener of this.listeners.get('click') || []) listener({ target: this });
   }
 
@@ -233,6 +241,64 @@ function overlays(ctx: any): FakeElement[] {
 }
 
 describe('shared renderer dialogs', () => {
+  it('lets a user select and deselect multiple choices, committing only on explicit confirmation', async () => {
+    const ctx = loadDialogs();
+    const result = ctx.uiChoice({ title: 'Checks', multiple: true, choices: [{ id: 'unit', label: 'Unit' }, { id: 'integration', label: 'Integration' }] });
+    const overlay = overlays(ctx)[0];
+    const confirm = overlay.querySelector('[data-act="confirm"]')!;
+    const choices = overlay.querySelectorAll('[data-act="choice"]');
+    expect(confirm.disabled).toBe(true);
+    choices[0].click();
+    choices[1].click();
+    choices[0].click();
+    expect(overlays(ctx)).toHaveLength(1);
+    expect(choices[0].attributes.get('aria-pressed')).toBe('false');
+    expect(choices[1].attributes.get('aria-pressed')).toBe('true');
+    confirm.click();
+    expect(await result).toEqual(['integration']);
+  });
+  it('groups a question dialog\'s choices above the action row and keeps confirm choices beside cancel', async () => {
+    // A CLI question sends prose options. On the action row (one non-wrapping
+    // line) more than a few of them collapse to their min-width and the labels
+    // wrap into columns, which is what the 2026-09-09 report showed. The
+    // grouped layout is the one the composer-dock question card already uses.
+    const ctx = loadDialogs();
+    const question = ctx.uiChoice({
+      title: 'Needs your input',
+      message: 'Which remote branch should this land on?',
+      choiceLayout: 'group',
+      choices: [
+        { id: 'option-0', label: 'Create origin/release_2.0.0' },
+        { id: 'option-1', label: 'Advance origin/release_1.7.0' },
+        { id: 'other', label: 'Other' },
+      ],
+    });
+    const grouped = overlays(ctx)[0];
+    const groupedHtml = grouped.innerHTML;
+    expect(groupedHtml).toContain('<div class="ui-dialog-choices"');
+    expect(groupedHtml.indexOf('data-act="choice"'))
+      .toBeGreaterThan(groupedHtml.indexOf('ui-dialog-choices'));
+    expect(groupedHtml.indexOf('data-act="choice"'))
+      .toBeLessThan(groupedHtml.indexOf('modal-actions'));
+    expect(groupedHtml.lastIndexOf('data-act="choice"'))
+      .toBeLessThan(groupedHtml.indexOf('modal-actions'));
+    // The group is still the same clickable contract.
+    grouped.querySelectorAll('[data-act="choice"]')[1].click();
+    expect(await question).toBe('option-1');
+
+    // A two-button confirm keeps its choices on the action row beside cancel.
+    const confirmChoice = ctx.uiChoice({
+      message: 'Disable cloud sync?',
+      choices: [{ id: 'keep', label: 'Keep the cloud copy', style: 'primary' }],
+    });
+    const rowed = overlays(ctx)[0];
+    expect(rowed.innerHTML).not.toContain('ui-dialog-choices');
+    expect(rowed.innerHTML.indexOf('data-act="choice"'))
+      .toBeGreaterThan(rowed.innerHTML.indexOf('modal-actions'));
+    rowed.querySelector('[data-act="choice"]')!.click();
+    expect(await confirmChoice).toBe('keep');
+  });
+
   it('keeps cancel keyboard intent, exposes an accessible name, escapes text, and restores focus', async () => {
     const ctx = loadDialogs();
     const background = ctx._document.createElement('button');
@@ -354,6 +420,21 @@ describe('shared renderer dialogs', () => {
 
     ctx._document.dispatchKey({ key: 'Enter', keyCode: 13, target: input });
     await expect(result).resolves.toBe('最终名称');
+  });
+
+  it('supports secret prompts and removes them when the native request is cancelled', async () => {
+    const ctx = loadDialogs();
+    const controller = new AbortController();
+    const result = ctx.uiPrompt('Enter token', '', {
+      signal: controller.signal,
+      secret: true,
+    });
+    const overlay = overlays(ctx)[0];
+
+    expect(overlay.innerHTML).toContain('type="password"');
+    controller.abort();
+    await expect(result).resolves.toBeNull();
+    expect(overlays(ctx)).toHaveLength(0);
   });
 
   it('requires an explicit danger or choice button and returns its stable value', async () => {

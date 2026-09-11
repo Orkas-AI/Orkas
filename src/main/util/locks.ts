@@ -11,19 +11,109 @@
 
 import { Mutex, Semaphore, type MutexInterface, type SemaphoreInterface } from 'async-mutex';
 
-const sessionLocks = new Map<string, MutexInterface>();
+/**
+ * Keyed mutex registry whose entries disappear once nobody holds or waits on
+ * them. The maps used to grow forever: every session id and, since
+ * `uniquify-path` took a per-path lock for every write, every path ever
+ * written kept a Mutex alive. Deleting an entry while a waiter still held the
+ * old Mutex would break exclusion (the next caller would get a fresh Mutex),
+ * so handles resolve the shared entry on every operation and reference-count
+ * it: acquire/wait increments, release decrements, and the entry is dropped
+ * only at zero with the mutex unlocked.
+ */
+class KeyedMutexRegistry {
+  private readonly entries = new Map<string, { mutex: Mutex; refs: number }>();
 
-/** Return (creating on demand) the Mutex for a session id. */
-export function sessionLock(sessionId: string): MutexInterface {
-  let m = sessionLocks.get(sessionId);
-  if (!m) {
-    m = new Mutex();
-    sessionLocks.set(sessionId, m);
+  handle(key: string): MutexInterface {
+    return new KeyedMutexHandle(this, key);
   }
-  return m;
+
+  size(): number {
+    return this.entries.size;
+  }
+
+  retain(key: string): { mutex: Mutex; refs: number } {
+    let entry = this.entries.get(key);
+    if (!entry) {
+      entry = { mutex: new Mutex(), refs: 0 };
+      this.entries.set(key, entry);
+    }
+    entry.refs += 1;
+    return entry;
+  }
+
+  release(key: string, entry: { mutex: Mutex; refs: number }): void {
+    entry.refs -= 1;
+    if (entry.refs <= 0 && !entry.mutex.isLocked() && this.entries.get(key) === entry) {
+      this.entries.delete(key);
+    }
+  }
+
+  peek(key: string): Mutex | undefined {
+    return this.entries.get(key)?.mutex;
+  }
 }
 
-const fileEditLocks = new Map<string, MutexInterface>();
+class KeyedMutexHandle implements MutexInterface {
+  constructor(private readonly registry: KeyedMutexRegistry, private readonly key: string) {}
+
+  async acquire(priority?: number): Promise<MutexInterface.Releaser> {
+    const entry = this.registry.retain(this.key);
+    let release: MutexInterface.Releaser;
+    try {
+      release = await entry.mutex.acquire(priority);
+    } catch (err) {
+      this.registry.release(this.key, entry);
+      throw err;
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      release();
+      this.registry.release(this.key, entry);
+    };
+  }
+
+  async runExclusive<T>(callback: () => Promise<T> | T, priority?: number): Promise<T> {
+    const release = await this.acquire(priority);
+    try {
+      return await callback();
+    } finally {
+      release();
+    }
+  }
+
+  async waitForUnlock(priority?: number): Promise<void> {
+    const entry = this.registry.retain(this.key);
+    try {
+      await entry.mutex.waitForUnlock(priority);
+    } finally {
+      this.registry.release(this.key, entry);
+    }
+  }
+
+  isLocked(): boolean {
+    return this.registry.peek(this.key)?.isLocked() ?? false;
+  }
+
+  release(): void {
+    this.registry.peek(this.key)?.release();
+  }
+
+  cancel(): void {
+    this.registry.peek(this.key)?.cancel();
+  }
+}
+
+const sessionLocks = new KeyedMutexRegistry();
+
+/** Return the Mutex handle for a session id. */
+export function sessionLock(sessionId: string): MutexInterface {
+  return sessionLocks.handle(sessionId);
+}
+
+const fileEditLocks = new KeyedMutexRegistry();
 
 /** Per-file Mutex (keyed by absolute path) serializing the read-modify-write
  *  inside `edit_file`. Parallel workers run on separate runs but share one
@@ -31,12 +121,12 @@ const fileEditLocks = new Map<string, MutexInterface>();
  *  otherwise interleave stat→read→write and lose an update; this makes the
  *  freshness check + write atomic per file. Distinct files never contend. */
 export function fileEditLock(absPath: string): MutexInterface {
-  let m = fileEditLocks.get(absPath);
-  if (!m) {
-    m = new Mutex();
-    fileEditLocks.set(absPath, m);
-  }
-  return m;
+  return fileEditLocks.handle(absPath);
+}
+
+/** Live entry counts, for tests that prove the registries do not grow. */
+export function _keyedLockCountsForTest(): { sessions: number; files: number } {
+  return { sessions: sessionLocks.size(), files: fileEditLocks.size() };
 }
 
 /** Cap concurrent LLM calls across all users. */
@@ -50,12 +140,17 @@ export const globalSlots: SemaphoreInterface = new Semaphore(10);
  *  calls unbounded by `globalSlots`. Lower than `globalSlots` because each
  *  nested run is itself a full LLM turn. Only the commander dispatches
  *  (workers/agents get no dispatch tools), so this is never acquired
- *  re-entrantly — no deadlock. Override with ORKAS_MAX_DISPATCH_CONCURRENCY. */
-const _dispatchCap = (() => {
+ *  re-entrantly — no deadlock. Override with ORKAS_MAX_DISPATCH_CONCURRENCY.
+ *
+ *  D10 (conversation-task-board plan): this gate is the ANONYMOUS-worker
+ *  gate — renamed from `dispatchSlots`, semantics and default unchanged. It
+ *  never governs named task-board executions; those go through the separate
+ *  `agentTaskSlots` gate below, and the two never contend. */
+const _workerCap = (() => {
   const n = Number.parseInt(process.env.ORKAS_MAX_DISPATCH_CONCURRENCY ?? '', 10);
   return Number.isFinite(n) && n > 0 ? n : 4;
 })();
-export const dispatchSlots: SemaphoreInterface = new Semaphore(_dispatchCap);
+export const workerSlots: SemaphoreInterface = new Semaphore(_workerCap);
 
 export type Releaser = MutexInterface.Releaser;
 
@@ -103,4 +198,3 @@ export async function acquireSemWithTimeout(
     throw err;
   }
 }
-

@@ -25,9 +25,14 @@ export const MIN_VERSIONS: Record<string, string> = {
   // catalog in Settings is a separate concern and must not determine CLI
   // compatibility.
   codex: '0.145.0',
+  // Approval-mode dispatch uses OpenCode's stdio ACP transport so native
+  // permission requests can be reviewed in Orkas. This is the oldest release
+  // line validated against that session/resume + permission contract.
+  opencode: '1.18.0',
 };
 
 const VERSION_RE = /v?(\d+)\.(\d+)\.(\d+)/;
+const VERSION_TOKEN_RE = /v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?/;
 
 export type Semver = { major: number; minor: number; patch: number };
 
@@ -71,7 +76,14 @@ export function checkMinVersion(cli: string, detected: string | null): string | 
 }
 
 export type VersionProbeResult =
-  | { status: 'success'; version: string }
+  | {
+      status: 'success';
+      /** Core MAJOR.MINOR.PATCH retained for minimum-version checks. */
+      version: string;
+      /** Full semantic version when the CLI reports a prerelease. */
+      fullVersion?: string;
+      prerelease?: true;
+    }
   | { status: 'timeout' | 'failed'; version: null };
 
 /**
@@ -148,13 +160,18 @@ export async function detectVersionResult(
       // hide a valid stderr version.
       const text = `${stdout}\n${stderr}`.trim();
       if (!text) return finish({ status: 'failed', version: null });
-      const sv = parseSemver(text);
-      if (!sv) return finish({ status: 'failed', version: null });
+      const token = VERSION_TOKEN_RE.exec(text);
+      const sv = token ? parseSemver(token[0]) : null;
+      if (!sv || !token) return finish({ status: 'failed', version: null });
+      const prerelease = token[4] ? `-${token[4]}` : '';
       // Return the matched semver string so callers store a clean value
       // (the raw line may carry product names / notes we don't want).
       finish({
         status: 'success',
         version: `${sv.major}.${sv.minor}.${sv.patch}`,
+        ...(prerelease
+          ? { fullVersion: `${sv.major}.${sv.minor}.${sv.patch}${prerelease}`, prerelease: true as const }
+          : {}),
       });
     });
   });

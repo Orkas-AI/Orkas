@@ -76,12 +76,15 @@ test.describe('projects', () => {
     await page.locator('#project-memory-editor-save').click();
     await expect(page.locator('.project-memory-item', { hasText: 'The release checklist is the source of truth.' })).toBeVisible();
 
+    await page.locator('[data-project-tab="todo"]').click();
+    await expect(page.locator('[data-project-panel="todo"]')).toBeVisible();
     await page.locator('#project-todo-add-btn').click();
     await page.locator('#project-todo-input').fill('Run the desktop E2E regression');
     await page.locator('#project-todo-save').click();
     let todo = page.locator('.project-todo-item', { hasText: 'Run the desktop E2E regression' });
     await expect(todo).toHaveAttribute('data-status', 'todo');
-    await todo.locator('.project-todo-status').click();
+    await todo.locator('[data-action="todo-status"]').click();
+    await page.locator('.context-menu-item', { hasText: 'Done' }).click();
     await expect(todo).toHaveAttribute('data-status', 'done');
 
     page = await orkas.relaunch();
@@ -95,11 +98,23 @@ test.describe('projects', () => {
     await page.locator('[data-project-side-tabs="context"] [data-project-side-tab="memory"]').click();
     const memory = page.locator('.project-memory-item', { hasText: 'The release checklist is the source of truth.' });
     await expect(memory).toBeVisible();
+    await page.locator('[data-project-tab="todo"]').click();
+    await expect(page.locator('[data-project-panel="todo"]')).toBeVisible();
     todo = page.locator('.project-todo-item', { hasText: 'Run the desktop E2E regression' });
     await expect(todo).toHaveAttribute('data-status', 'done');
+    await expect(todo.locator('[data-action="todo-menu"]')).toHaveCount(1);
 
-    await todo.locator('[data-action="todo-delete"]').click();
+    // The card no longer exposes an overflow menu. Remove the fixture through
+    // the owning IPC boundary after persistence has been observed so this case
+    // does not preserve an obsolete UI action merely for cleanup.
+    const projectRows = await orkas.invoke<{ projects: Array<{ project_id: string; name: string }> }>('projects.list');
+    const projectId = projectRows.projects.find((project) => project.name === projectName)?.project_id;
+    const taskId = await todo.getAttribute('data-tid');
+    expect(projectId).toBeTruthy();
+    expect(taskId).toBeTruthy();
+    await orkas.invoke('projects.tasks.delete', { projectId, taskId });
     await expect(todo).toHaveCount(0);
+    await page.locator('[data-project-tab="tasks"]').click();
     await memory.locator('[data-action="project-memory-delete"]').click();
     await expect(page.locator('.ui-dialog-overlay:visible .ui-dialog')).toBeVisible();
     await page.locator('.ui-dialog-overlay:visible [data-act="ok"]').click();

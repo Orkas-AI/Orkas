@@ -54,6 +54,13 @@ ABSOLUTE_CAPS = {
 NEAR_DUP_JACCARD = 0.8   # reordered / same-token sub-question rephrasings
 
 _WORD_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z'\-]*", re.UNICODE)
+# Han (incl. ext-A / compat), kana, and hangul runs — mirrors compress.py.
+# Without CJK tokens two pure-Chinese rephrasings of the same sub-question
+# produced empty token sets, the `toks and prev` guard skipped the Jaccard
+# check, and the duplicate burned a second fetch budget.
+_CJK_RE = re.compile(
+    "[\u3005\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7a3]+"
+)
 _WS_RE = re.compile(r"\s+")
 _STOP = {"what", "how", "why", "who", "when", "where", "which", "is", "are", "do",
          "does", "did", "the", "a", "an", "of", "to", "in", "on", "for", "and",
@@ -66,8 +73,14 @@ def _norm_q(q: str) -> str:
 
 
 def _tok(q: str) -> list:
-    return [w for w in (m.group(0).lower() for m in _WORD_RE.finditer(q or ""))
+    text = q or ""
+    toks = [w for w in (m.group(0).lower() for m in _WORD_RE.finditer(text))
             if len(w) >= 2 and w not in _STOP]
+    for m in _CJK_RE.finditer(text):
+        run = m.group(0)
+        toks.extend([run] if len(run) <= 2 else
+                    [run[i:i + 2] for i in range(len(run) - 1)])
+    return toks
 
 
 def _num(v) -> float:

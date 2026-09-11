@@ -1,11 +1,15 @@
 [CmdletBinding()]
 param(
-    [string]$PcRoot = (Split-Path -Parent $PSScriptRoot),
+    [string]$PcRoot = '',
     [string]$Architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+if (-not $PcRoot) {
+    $PcRoot = Split-Path -Parent $PSScriptRoot
+}
 
 $runtimeRoot = Join-Path $PcRoot 'resources\runtime'
 $manifestPath = Join-Path $runtimeRoot 'manifest.json'

@@ -9,6 +9,7 @@
 import * as fs from 'node:fs';
 
 import { userAuthProfilesFile } from '../paths';
+import { writeTextAtomicSync } from '../storage';
 import * as localSecrets from './local-secret-store';
 import { createLogger } from '../logger';
 import { logErrorSummary, maskId } from './log-redact';
@@ -106,14 +107,9 @@ export function rekeyUserLocalSecretsAfterLocalIdChange(opts: {
 
   try {
     const out = localSecrets.encryptLocalSecret(authSecretContext(targetOwner), dec.plaintext);
-    const tmp = `${file}.rekey.tmp`;
-    try {
-      fs.writeFileSync(tmp, out, { encoding: 'utf8', mode: 0o600 });
-      fs.renameSync(tmp, file);
-    } catch (err) {
-      try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort temp cleanup */ }
-      throw err;
-    }
+    // Atomic: a torn write here corrupts every BYOK provider credential at once
+    // (the loader falls back to an empty store — silent loss, not a crash).
+    writeTextAtomicSync(file, out, 'utf8', { mode: 0o600 });
     log.info('auth profiles rekeyed after uid directory change', {
       fromLocalId: maskId(opts.fromLocalId),
       toLocalId: maskId(opts.toLocalId),

@@ -4,6 +4,7 @@ const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { sharpPreparationFiles } = require('../bin/native-package-gate.cjs');
 const {
   ensureFile,
   isMachArch,
@@ -108,6 +109,7 @@ function expectedState(targetArch) {
     scriptHashes: scriptHashes({
       prepareMacNativeDeps: __filename,
       nativePrepareCache: CACHE_HELPER,
+      nativePackageGate: require.resolve('../bin/native-package-gate.cjs'),
     }),
     packages: {
       [`@esbuild/darwin-${targetArch}`]: readLockPackage(LOCK_FILE, `@esbuild/darwin-${targetArch}`),
@@ -137,12 +139,13 @@ function main() {
 
   const state = expectedState(targetArch);
   const sharpVersion = state.packages[`@img/sharp-darwin-${targetArch}`];
+  const sharpFiles = sharpPreparationFiles('darwin', targetArch, sharpVersion);
   const required = {
     esbuild: path.join(PC_DIR, 'node_modules', '@esbuild', `darwin-${targetArch}`, 'bin', 'esbuild'),
     sqliteVec: path.join(PC_DIR, 'node_modules', `sqlite-vec-darwin-${targetArch}`, 'vec0.dylib'),
     canvas: path.join(PC_DIR, 'node_modules', '@napi-rs', `canvas-darwin-${targetArch}`, `skia.darwin-${targetArch}.node`),
-    sharp: path.join(PC_DIR, 'node_modules', '@img', `sharp-darwin-${targetArch}`, 'lib', `sharp-darwin-${targetArch}-${sharpVersion}.node`),
-    sharpVips: path.join(PC_DIR, 'node_modules', '@img', `sharp-libvips-darwin-${targetArch}`, 'lib', 'libvips-cpp.8.18.3.dylib'),
+    sharp: path.join(PC_DIR, 'node_modules', sharpFiles.binding),
+    sharpVips: path.join(PC_DIR, 'node_modules', sharpFiles.cpp),
   };
   const requiredFiles = Object.values(required);
   const targetFilesMatch = () => requiredFiles.every((file) => isMachArch(file, targetArch));

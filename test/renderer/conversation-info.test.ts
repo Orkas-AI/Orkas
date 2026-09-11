@@ -121,23 +121,42 @@ function renderFilesHtml(snapshot: {
 }
 
 describe('ConversationInfo files tab', () => {
-  it('renders the live workspace file listing and drops stale produced files under that root', async () => {
+  // Membership now arrives already merged from
+  // `features/conversation_outputs.ts`; what the panel still owns is where each
+  // entry lands. A file written outside the workspace has no tree position, and
+  // hanging it off the tree root made it read as a workspace file.
+  it('puts workspace files in the tree and everything else in its own group', async () => {
     const html = await renderFilesHtml({
-      history: [
-        { produced: ['/tmp/workspace/deleted.md', '/tmp/outside.md'] },
-      ],
+      history: [],
       files: {
-        root: '/tmp/workspace',
         rootExists: true,
         truncated: false,
-        count: 1,
+        count: 3,
         items: [
           {
+            origin: 'workspace',
             path: '/tmp/workspace/batch/skill_large-batch.md',
             relPath: 'batch/skill_large-batch.md',
             name: 'skill_large-batch.md',
             bytes: 12,
             mtime: 1700000000000,
+          },
+          {
+            origin: 'outside',
+            path: '/tmp/outside.md',
+            relPath: '',
+            name: 'outside.md',
+            bytes: 8,
+            mtime: 1700000001000,
+          },
+          {
+            origin: 'artifact',
+            artifactId: 'a_calc',
+            title: 'Pricing calculator',
+            name: 'Pricing calculator',
+            relPath: '',
+            bytes: 4096,
+            mtime: 1700000002000,
           },
         ],
       },
@@ -145,15 +164,25 @@ describe('ConversationInfo files tab', () => {
 
     expect(html).toContain('batch');
     expect(html).toContain('skill_large-batch.md');
-    expect(html).toContain('/tmp/outside.md');
-    expect(html).not.toContain('deleted.md');
     expect(html).toContain('draggable="true"');
-    expect(html).toContain('conversation-info-file-menu-btn');
     expect(html).toContain('ctx-row-menu-btn conversation-info-file-menu-btn');
     expect(html).toContain('[more-horizontal]');
     expect(html).toContain('data-entry-kind="dir"');
     expect(html).toContain('data-entry-kind="text"');
     expect(html).not.toMatch(/<details[^>]*\sopen(?:\s|>|=)/);
+
+    // The stray file keeps its full path (a basename cannot tell two apart)
+    // and is marked so it never reads as part of the tree above it.
+    expect(html).toContain('/tmp/outside.md');
+    expect(html).toContain('conversation-info-file is-outside');
+    // The artifact opens through the `chat-app://` frame, so it carries an id
+    // and no file path.
+    expect(html).toContain('data-artifact-id="a_calc"');
+    expect(html).toContain('Pricing calculator');
+    expect(html).not.toContain('data-file-path="undefined"');
+    // Both extra groups render after the workspace tree.
+    expect(html.indexOf('conversation-info-group'))
+      .toBeGreaterThan(html.indexOf('skill_large-batch.md'));
   });
 
   it('marks unsupported workspace files distinctly for Library menu filtering', async () => {
@@ -326,30 +355,41 @@ describe('ConversationInfo files tab', () => {
     expect(html).not.toContain('Loading');
   });
 
-  it('counts deduped visible files instead of adding workspace and history rows', async () => {
+  // The tab badge is the user's cue that a turn produced something. An
+  // artifact is one of those things, so leaving it out of the count would
+  // report "no files" for a conversation that just built an app.
+  it('counts every listed output, artifacts included', async () => {
     const result = await renderFilesResult({
-      history: [
-        { produced: ['/tmp/workspace/calc.html'] },
-      ],
+      history: [],
       files: {
-        root: '/tmp/workspace',
         rootExists: true,
         truncated: false,
-        count: 1,
+        count: 2,
         items: [
           {
+            origin: 'workspace',
             path: '/tmp/workspace/calc.html',
             relPath: 'calc.html',
             name: 'calc.html',
             bytes: 42,
             mtime: 1700000000000,
           },
+          {
+            origin: 'artifact',
+            artifactId: 'a_calc',
+            title: 'Pricing calculator',
+            name: 'Pricing calculator',
+            relPath: '',
+            bytes: 4096,
+            mtime: 1700000002000,
+          },
         ],
       },
     });
 
     expect((result.html.match(/data-file-path=/g) || []).length).toBe(1);
-    expect(result.counts.files).toBe('1');
+    expect((result.html.match(/data-artifact-id=/g) || []).length).toBe(1);
+    expect(result.counts.files).toBe('2');
   });
 
   it('does not show internal attachment kind labels in the attachment row meta', async () => {

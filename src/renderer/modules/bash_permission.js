@@ -1,7 +1,7 @@
 // Sensitive-operation prompts — under approval access modes, when an
-// in-process agent wants to run a command or access a path the classifier
-// flagged as sensitive, main pushes `bash:permission` and this module shows an
-// allow-once / deny choice, plus a task-scoped choice only when main marks the
+// agent wants to run a command, access a path, or call a connector that main
+// flagged as sensitive, this module shows an allow-once / deny choice, plus
+// a task-scoped choice only when main marks the
 // category and actor eligible, alongside the durable local-access mode switch.
 // Waiting for a human click is kept alive on the main side with progress
 // heartbeats; Renderer never widens main's operation-approval boundary.
@@ -13,11 +13,14 @@ const _bashPermLog = createLogger('bash-permission');
 const _bashPermQueue = [];
 let _bashPermDialogOpen = false;
 const _bashPermCancelled = new Set();
+const _bashPermTaskApproved = new Set();
 const _bashPermDialogClosers = new Map();
 
 const _BASH_PERMISSION_MODES = ['workspace_approval', 'all_files_approval', 'all_files_auto'];
 const _BASH_PERMISSION_DEFAULT_MODE = 'all_files_approval';
+const _CLI_PERMISSION_POLICIES = ['inherit', 'ask', 'full_access'];
 const _BASH_PERMISSION_RISK_CATEGORIES = ['network_egress', 'destructive', 'priv_esc', 'sensitive_path', 'system_package_change', 'external_mutation'];
+const _BASH_IRREVERSIBLE_ACTIONS = ['recursive_delete', 'untargeted_process_kill'];
 
 function _bashPermissionVisibilityState() {
   try {
@@ -43,23 +46,56 @@ function _bashPermissionCategories(info) {
   return [...new Set(reasons.filter((reason) => _BASH_PERMISSION_RISK_CATEGORIES.includes(reason)))].join('|');
 }
 
+// Whether the new-in-auto-mode gate is doing useful work or only adding
+// clicks is only answerable if the verdict carries the finding that caused it.
+// Same closed-world/pipe-joined shape as `categories`; no path or command.
+function _bashPermissionIrreversible(info) {
+  const list = Array.isArray(info && info.irreversible) ? info.irreversible : [];
+  return [...new Set(list.filter((a) => _BASH_IRREVERSIBLE_ACTIONS.includes(a)))].join('|');
+}
+
 function _bashPermissionReceivedAt(info, fallback = Date.now()) {
   const value = Number(info && info._renderer_received_at_ms);
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
 function _bashTrackCancelledPermission(info, currentMode, errorCode = 'request_cancelled') {
-  _bashPermissionTelemetry('bash_risk_prompt_result', {
-    result: 'cancelled',
-    decision: 'none',
-    effective_decision: 'deny',
+  const approved = _bashPermTaskApproved.delete(info.request_id);
+  _bashTrackPermissionResult(info, {
+    result: approved ? 'success' : 'cancelled',
+    decision: approved ? 'allow_run' : 'none',
+    effective_decision: approved ? 'allow_run' : 'deny',
     ...(currentMode ? { mode: currentMode } : {}),
     mode_changed: false,
     categories: _bashPermissionCategories(info),
+    ...(_bashPermissionIrreversible(info) ? { irreversible: _bashPermissionIrreversible(info) } : {}),
     duration_ms: Math.max(0, Date.now() - _bashPermissionReceivedAt(info)),
-    error_type: 'state',
-    error_code: errorCode,
+    ...(approved ? {} : { error_type: 'state', error_code: errorCode }),
   });
+}
+
+function _bashTrackPermissionResult(info, properties) {
+  if (info._permission_kind === 'connector') {
+    // Custom MCP ids derive from a user-authored display name and their tool
+    // names are server-defined free text: report the stable `custom` bucket and
+    // omit the tool name (same coarsening as connectors.js `_connectorTrackPayload`).
+    const rawConnectorId = String(info.connector_id || '');
+    const customConnector = rawConnectorId.startsWith('custom-');
+    _bashPermissionTelemetry('connector_action_confirmation_result', {
+      connector_id: customConnector ? 'custom' : rawConnectorId,
+      ...(customConnector ? {} : { tool_name: String(info.tool_name || '') }),
+      risk: info.risk || '',
+      sensitive_operation: info.sensitive_operation || '',
+      decision: properties.effective_decision === 'deny' ? 'denied' : 'approved',
+      result: properties.result,
+      duration_ms: properties.duration_ms,
+      ...((typeof window.getOnboardingTelemetryContext === 'function')
+        ? window.getOnboardingTelemetryContext(info.cid)
+        : {}),
+    });
+    return;
+  }
+  _bashPermissionTelemetry('bash_risk_prompt_result', properties);
 }
 
 function _bashIsMode(mode) {
@@ -93,6 +129,29 @@ function _bashReasonText(reasons) {
   return labels.filter(Boolean).join(t('bash.permission.reason_sep'));
 }
 
+// Main keeps irreversible steps in approval even under all_files_auto. Without
+// a word about why, a user who deliberately turned prompts off reads the
+// dialog as the setting having failed, so the note names the mode explicitly.
+function _bashIrreversibleText(info, currentMode) {
+  const list = Array.isArray(info && info.irreversible) ? info.irreversible : [];
+  const labels = [...new Set(list.filter((a) => _BASH_IRREVERSIBLE_ACTIONS.includes(a)))]
+    .map((a) => _bashT(`bash.permission.irreversible.${a}`, ''))
+    .filter(Boolean);
+  if (!labels.length) return '';
+  const actions = labels.join(t('bash.permission.reason_sep'));
+  if (currentMode !== 'all_files_auto') {
+    return _bashT('bash.permission.irreversible_note', '')
+      ? t('bash.permission.irreversible_note', { actions })
+      : '';
+  }
+  // Name the level the way Settings does, read from the same key, so the user
+  // can connect the sentence to the switch they actually flipped.
+  const mode = _bashT('settings.localexec.mode.all_files_auto', 'all_files_auto');
+  return _bashT('bash.permission.irreversible_auto_note', '')
+    ? t('bash.permission.irreversible_auto_note', { actions, mode })
+    : '';
+}
+
 const _BASH_EXTERNAL_MUTATION_KINDS = [
   'database_write', 'remote_command', 'remote_file_write', 'service_change',
   'deployment_change', 'external_api_write', 'remote_publish', 'external_launch',
@@ -120,6 +179,23 @@ function _bashPermissionModeOptions() {
   }));
 }
 
+function _bashIsCliPermissionPolicy(policy) {
+  return _CLI_PERMISSION_POLICIES.includes(policy);
+}
+
+function _bashCliPermissionModeOptions(info) {
+  const cli = String(info && info.cli || '').trim();
+  const advertised = Array.isArray(info && info.permission_policies)
+    ? info.permission_policies.filter(_bashIsCliPermissionPolicy)
+    : ['inherit'];
+  const policies = [...new Set(advertised.length ? advertised : ['inherit'])];
+  return policies.map((policy) => ({
+    mode: policy,
+    label: t(`agents.cli_permission_${policy}`),
+    desc: t(`agents.cli_permission_${policy}_desc`, { cli }),
+  }));
+}
+
 function _bashAgentLabel(info) {
   const id = String((info && (info.agent_id || info.agentId)) || '').trim();
   const name = String((info && (info.agent_name || info.agentName)) || '').trim();
@@ -128,6 +204,23 @@ function _bashAgentLabel(info) {
     return _bashT('chat.from_commander', 'Commander');
   }
   return name || id || t('bash.permission.agent_fallback');
+}
+
+function _bashPermissionConversationTitle(info) {
+  const direct = String(info && info.conversation_title || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 160);
+  if (direct) return direct;
+  const cid = String(info && info.cid || '').trim();
+  try {
+    const conv = cid && typeof conversations !== 'undefined' && Array.isArray(conversations)
+      ? conversations.find((item) => item && item.conversation_id === cid)
+      : null;
+    return String(conv && conv.title || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+  } catch (_) {
+    return '';
+  }
 }
 
 async function _getBashPermissionCurrentMode() {
@@ -155,60 +248,29 @@ async function _setBashPermissionMode(mode) {
 function _showBashPermissionModeDialog({
   title,
   message,
+  details,
+  detailsLabel,
   currentMode,
   requestId,
   onPresented,
   allowRun = true,
   showModeControl = true,
+  modes = _bashPermissionModeOptions(),
+  modeValidator = _bashIsMode,
+  defaultMode = _BASH_PERMISSION_DEFAULT_MODE,
+  modeTitle = _bashT('bash.permission.mode_title', 'Permission level'),
+  modeHint = _bashT('bash.permission.mode_hint', 'You can also change this later in Settings > Tool execution permissions.'),
 }) {
-  const modes = _bashPermissionModeOptions();
-  const safeCurrentMode = _bashIsMode(currentMode) ? currentMode : _BASH_PERMISSION_DEFAULT_MODE;
-  const modeTitle = _bashT('bash.permission.mode_title', 'Permission level');
-  const modeHint = _bashT('bash.permission.mode_hint', 'You can also change this later in Settings > Tool execution permissions.');
-
-  // Test harness hook: production always uses the DOM dialog below.
-  try {
-    const hook = window && window.__orkasBashPermissionDialogForTest;
-    if (typeof hook === 'function') {
-      return new Promise((resolve) => {
-        let finished = false;
-        const finish = (result) => {
-          if (finished) return;
-          finished = true;
-          if (requestId) _bashPermDialogClosers.delete(requestId);
-          resolve(result);
-        };
-        if (requestId) {
-          _bashPermDialogClosers.set(requestId, () => finish({
-            choice: 'deny',
-            mode: safeCurrentMode,
-            cancelled: true,
-          }));
-          if (_bashPermCancelled.has(requestId)) {
-            finish({ choice: 'deny', mode: safeCurrentMode, cancelled: true });
-            return;
-          }
-        }
-        try { if (typeof onPresented === 'function') onPresented(); } catch (_) { /* telemetry only */ }
-        Promise.resolve(hook({
-          title,
-          message,
-          currentMode: safeCurrentMode,
-          modeTitle,
-          modeHint,
-          modes,
-          allowRun,
-          showModeControl,
-        })).then(finish, () => finish({ choice: 'deny', mode: safeCurrentMode }));
-      });
-    }
-  } catch (_) { /* ignore test hook lookup failures */ }
+  const safeCurrentMode = modeValidator(currentMode) ? currentMode : defaultMode;
 
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay ui-dialog-overlay open';
     const titleHtml = title ? `<div class="modal-title ui-dialog-title">${_bashEscapeHtml(title)}</div>` : '';
     const msgHtml = _bashEscapeHtml(message).replace(/\n/g, '<br />');
+    const detailsChevronHtml = details && typeof window.uiIconHtml === 'function'
+      ? window.uiIconHtml('chevron-down', 'sidebar-section-chevron') : '';
+    const detailsHtml = details ? `<details class="bash-permission-details"><summary>${detailsChevronHtml}${_bashEscapeHtml(detailsLabel)}</summary><pre>${_bashEscapeHtml(details)}</pre></details>` : '';
     let selectedModeValue = safeCurrentMode;
     const selectedItem = () => modes.find((item) => item.mode === selectedModeValue) || modes.find((item) => item.mode === safeCurrentMode) || modes[0];
     const modeHtml = modes.map((item) => `
@@ -236,9 +298,9 @@ function _showBashPermissionModeDialog({
       : '';
 
     overlay.innerHTML = `
-      <div class="modal modal-standard ui-dialog bash-permission-dialog" role="dialog" aria-modal="true">
+      <div class="modal modal-standard ui-dialog bash-permission-dialog" role="dialog" aria-modal="true" aria-label="${_bashEscapeHtml(title)}">
         ${titleHtml}
-        <div class="modal-body ui-dialog-message bash-permission-message">${msgHtml}</div>
+        <div class="modal-body ui-dialog-message bash-permission-message">${msgHtml}${detailsHtml}</div>
         <div class="bash-permission-footer">
           <div class="modal-actions bash-permission-actions">
             ${modeControlHtml}
@@ -258,7 +320,7 @@ function _showBashPermissionModeDialog({
     try { if (typeof onPresented === 'function') onPresented(); } catch (_) { /* telemetry only */ }
 
     const selectedMode = () => {
-      return _bashIsMode(selectedModeValue) ? selectedModeValue : safeCurrentMode;
+      return modeValidator(selectedModeValue) ? selectedModeValue : safeCurrentMode;
     };
     const modeTrigger = overlay.querySelector('.bash-permission-mode-trigger');
     const modeMenu = overlay.querySelector('.bash-permission-mode-menu');
@@ -320,7 +382,7 @@ function _showBashPermissionModeDialog({
     modeOptions.forEach((btn) => {
       btn.addEventListener('click', () => {
         const mode = btn.dataset.mode;
-        if (_bashIsMode(mode)) {
+        if (modeValidator(mode)) {
           selectedModeValue = mode;
           updateModeUi();
         }
@@ -378,13 +440,17 @@ async function _showBashPermissionDialog(info) {
     _bashTrackCancelledPermission(info, null);
     return;
   }
+  const isConnector = info._permission_kind === 'connector';
   const agent = _bashAgentLabel(info);
-  const reasonsText = _bashReasonText(info.reasons);
+  const reasonsText = [
+    _bashReasonText(info.reasons),
+    info.unresolved_paths === true ? t('bash.permission.unresolved_paths') : '',
+  ].filter(Boolean).join(t('bash.permission.reason_sep'));
   const command = String(info.command || '');
   const operation = String(info.operation || '').trim();
   const subject = String(info.subject || '').trim();
-  const isAction = !!(operation || subject);
-  const baseMessage = isAction
+  const isAction = isConnector || !!(operation || subject);
+  const baseMessage = isConnector ? _connectorActionMessage(info) : isAction
     ? t('bash.permission.action_message', {
       agent,
       operation: operation || t('bash.permission.action_fallback'),
@@ -392,35 +458,62 @@ async function _showBashPermissionDialog(info) {
     }) + (subject ? `\n\n${subject}` : '')
     : t('bash.permission.message', { agent, reasons: reasonsText }) + '\n\n' + command;
   const externalMutationText = _bashExternalMutationText(info.external_mutations);
-  const message = baseMessage + (externalMutationText ? `\n\n${externalMutationText}` : '');
 
   const currentMode = await _getBashPermissionCurrentMode();
   if (_bashPermCancelled.delete(requestId)) {
     _bashTrackCancelledPermission(info, currentMode);
     return;
   }
+  // Needs the resolved mode: the same step is worth flagging in every mode,
+  // but only an all_files_auto user is owed an explanation for being asked.
+  const message = [
+    baseMessage,
+    _bashIrreversibleText(info, currentMode),
+    externalMutationText,
+  ].filter(Boolean).join('\n\n');
   let presented = false;
-  const isSensitiveApproval = Array.isArray(info.reasons)
-    && info.reasons.some((reason) => _BASH_PERMISSION_RISK_CATEGORIES.includes(reason));
-  const canAllowRun = !isSensitiveApproval || info.can_allow_run === true;
-  const result = await _showBashPermissionModeDialog({
-    title: t(isAction ? 'bash.permission.action_title' : 'bash.permission.title'),
-    message,
-    currentMode,
-    requestId,
-    allowRun: canAllowRun,
-    showModeControl: true,
-    onPresented: () => {
-      if (presented) return;
-      presented = true;
-      _bashPermissionTelemetry('bash_risk_prompt_presented', {
-        categories: _bashPermissionCategories(info),
-        mode: currentMode,
-        visibility_state: _bashPermissionVisibilityState(),
-        queue_wait_ms: Math.max(0, Date.now() - _bashPermissionReceivedAt(info, startedAt)),
+  const isSensitiveApproval = isConnector || (Array.isArray(info.reasons)
+    && info.reasons.some((reason) => _BASH_PERMISSION_RISK_CATEGORIES.includes(reason)));
+  const canAllowRun = isConnector ? info.can_allow_run === true
+    : info.unresolved_paths !== true && (!isSensitiveApproval || info.can_allow_run === true);
+  // An earlier queued permission can switch the account to Trusted while this
+  // connector waits. Its host gate already checked availability/prohibitions.
+  let result;
+  let dialogFailed = false;
+  try {
+    result = isConnector && currentMode === 'all_files_auto'
+      ? { choice: 'allow_once', mode: currentMode }
+      : await _showBashPermissionModeDialog({
+        title: t(isAction ? 'bash.permission.action_title' : 'bash.permission.title'),
+        message,
+        ...(isConnector ? {
+          details: _connectorActionDetails(info),
+          detailsLabel: t('connectors.action_confirm.details'),
+        } : {}),
+        currentMode,
+        requestId,
+        allowRun: canAllowRun,
+        showModeControl: true,
+        onPresented: () => {
+          if (isConnector) return;
+          if (presented) return;
+          presented = true;
+          _bashPermissionTelemetry('bash_risk_prompt_presented', {
+            categories: _bashPermissionCategories(info),
+            ...(_bashPermissionIrreversible(info) ? { irreversible: _bashPermissionIrreversible(info) } : {}),
+            mode: currentMode,
+            visibility_state: _bashPermissionVisibilityState(),
+            queue_wait_ms: Math.max(0, Date.now() - _bashPermissionReceivedAt(info, startedAt)),
+          });
+        },
       });
-    },
-  });
+  } catch (err) {
+    dialogFailed = true;
+    result = { choice: 'deny', mode: currentMode };
+    _bashPermLog.warn('operation permission dialog failed', {
+      error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+    });
+  }
   if (result && result.cancelled) {
     _bashPermCancelled.delete(requestId);
     _bashTrackCancelledPermission(info, currentMode);
@@ -451,6 +544,10 @@ async function _showBashPermissionDialog(info) {
     if (ok) effectiveMode = selectedMode;
     else decision = 'deny';
   }
+  if (_bashPermCancelled.delete(requestId)) {
+    _bashTrackCancelledPermission(info, effectiveMode);
+    return;
+  }
 
   const baseResult = {
     decision: requestedDecision,
@@ -458,21 +555,25 @@ async function _showBashPermissionDialog(info) {
     mode: effectiveMode,
     mode_changed: effectiveMode !== currentMode,
     categories: _bashPermissionCategories(info),
+    ...(_bashPermissionIrreversible(info) ? { irreversible: _bashPermissionIrreversible(info) } : {}),
   };
   try {
-    const response = await window.orkas.invoke('bash.permission_response', {
-      request_id: info.request_id,
-      decision,
-    });
+    const response = await window.orkas.invoke(
+      isConnector ? 'connectors.action_confirm_response' : 'bash.permission_response',
+      isConnector
+        ? { request_id: info.request_id, approved: decision !== 'deny', ...(decision === 'allow_run' ? { scope: 'task' } : {}) }
+        : { request_id: info.request_id, decision },
+    );
     const failed = !response || response.ok === false;
     const stale = !failed && response.handled === false;
     try {
-      if (window.Monitor) Monitor.event('bash_risk_prompt_result', {
+      _bashTrackPermissionResult(info, {
         ...baseResult,
-        result: failed ? 'failure' : (stale ? 'cancelled' : 'success'),
+        result: failed || dialogFailed ? 'failure' : (stale ? 'cancelled' : 'success'),
         duration_ms: Math.max(0, Date.now() - startedAt),
-        ...(failed
-          ? { error_code: 'response_failed', error_type: 'ipc' }
+        ...(dialogFailed
+          ? { error_code: 'dialog_failed', error_type: 'ui' }
+          : failed ? { error_code: 'response_failed', error_type: 'ipc' }
           : (stale ? { error_code: 'stale_request', error_type: 'state' } : {})),
       });
     } catch (_e) { /* permission delivery must not depend on observability */ }
@@ -481,7 +582,7 @@ async function _showBashPermissionDialog(info) {
       error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
     });
     try {
-      if (window.Monitor) Monitor.event('bash_risk_prompt_result', {
+      _bashTrackPermissionResult(info, {
         ...baseResult,
         result: 'failure',
         duration_ms: Math.max(0, Date.now() - startedAt),
@@ -499,10 +600,142 @@ async function _drainBashPermissionQueue() {
   try {
     while (_bashPermQueue.length) {
       const info = _bashPermQueue.shift();
-      await _showBashPermissionDialog(info);
+      if (info && info._permission_kind === 'local-agent') {
+        await _showLocalAgentPermissionDialog(info);
+      } else {
+        await _showBashPermissionDialog(info);
+      }
     }
   } finally {
     _bashPermDialogOpen = false;
+  }
+}
+
+async function _showLocalAgentPermissionDialog(info) {
+  const startedAt = Date.now();
+  const requestId = String(info && info.request_id || '');
+  if (_bashPermCancelled.delete(requestId)) return;
+  const isConnectorPermission = info && info.permission_kind === 'connector';
+  const agent = _bashAgentLabel(info);
+  const conversationTitle = _bashPermissionConversationTitle(info);
+  const action = String(info && (info.tool || info.description) || '').trim()
+    || t('agents.cli_permission_action_fallback');
+  const details = [];
+  const description = String(info && info.description || '').trim();
+  const command = String(info && info.command || '').trim();
+  const subject = String(info && info.subject || '').trim();
+  if (description && description !== action) details.push(description);
+  if (command) details.push(command);
+  if (subject) details.push(subject);
+  const permission = [action, ...details]
+    .map((value) => String(value || '').replace(/\s+/g, ' ').trim())
+    .filter((value, index, values) => value && values.indexOf(value) === index)
+    .join(' · ');
+  const message = [
+    t('agents.cli_permission_task', { title: conversationTitle || t('chat.new_conv_title') }),
+    t('agents.cli_permission_requested', { permission }),
+  ].join('\n');
+  const currentMode = _bashIsCliPermissionPolicy(info && info.permission_policy)
+    ? info.permission_policy
+    : 'inherit';
+  const modes = _bashCliPermissionModeOptions(info);
+  const result = await _showBashPermissionModeDialog({
+    title: t('agents.cli_permission_prompt_title'),
+    message,
+    currentMode,
+    requestId,
+    allowRun: info && info.can_allow_run === true,
+    showModeControl: true,
+    modes,
+    modeValidator: _bashIsCliPermissionPolicy,
+    defaultMode: 'inherit',
+    modeTitle: t('agents.cli_permission'),
+    modeHint: t('agents.cli_permission_mode_hint', { agent }),
+  });
+  if (result && result.cancelled) {
+    _bashPermCancelled.delete(requestId);
+    return;
+  }
+  const choice = result && typeof result === 'object' ? result.choice : result;
+  const selectedMode = _bashIsCliPermissionPolicy(result && result.mode)
+    ? result.mode
+    : currentMode;
+  const decision = choice === 'allow_run'
+    ? 'allow_run'
+    : choice === 'allow_once' ? 'allow_once' : 'deny';
+  let response = null;
+  let telemetryResult = 'success';
+  let effectiveDecision = decision;
+  let errorCode = '';
+  let errorType = '';
+  try {
+    response = await window.orkas.invoke('localAgents.permissionResponse', {
+      request_id: requestId,
+      decision,
+      permission_policy: selectedMode,
+    });
+    if (!response || response.ok === false) {
+      telemetryResult = 'failure';
+      effectiveDecision = 'deny';
+      errorCode = 'response_failed';
+      errorType = 'ipc';
+    } else if (response.handled === false) {
+      telemetryResult = 'cancelled';
+      effectiveDecision = 'deny';
+      errorCode = 'stale_request';
+      errorType = 'state';
+    } else {
+      const returnedDecision = response.decision;
+      if (returnedDecision === 'allow_once' || returnedDecision === 'allow_run' || returnedDecision === 'deny') {
+        effectiveDecision = returnedDecision;
+      }
+      if (decision !== 'deny' && response.policy_saved === false) {
+        telemetryResult = 'failure';
+        effectiveDecision = 'deny';
+        errorCode = 'permission_level_save_failed';
+        errorType = 'storage';
+      }
+    }
+  } catch (err) {
+    telemetryResult = 'failure';
+    effectiveDecision = 'deny';
+    errorCode = 'response_failed';
+    errorType = 'ipc';
+    _bashPermLog.warn('external CLI permission response failed', {
+      error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+    });
+  }
+  if (isConnectorPermission) {
+    _bashPermissionTelemetry('connector_bridge_permission_result', {
+      result: telemetryResult,
+      decision,
+      effective_decision: effectiveDecision,
+      duration_ms: Math.max(0, Date.now() - startedAt),
+      ...(errorCode ? { error_code: errorCode } : {}),
+      ...(errorType ? { error_type: errorType } : {}),
+    });
+  }
+  _bashPermCancelled.delete(requestId);
+}
+
+function _cancelBashPermissionRequests(payload, kind) {
+  const ids = Array.isArray(payload && payload.request_ids)
+    ? payload.request_ids.filter((id) => typeof id === 'string')
+    : [];
+  const cancelled = new Set(ids);
+  for (const id of ids) {
+    if (kind === 'connector' && payload.approved === true) _bashPermTaskApproved.add(id);
+    _bashPermCancelled.add(id);
+    const close = _bashPermDialogClosers.get(id);
+    if (close) close();
+  }
+  for (let i = _bashPermQueue.length - 1; i >= 0; i -= 1) {
+    const info = _bashPermQueue[i];
+    if (info && info._permission_kind === kind && cancelled.has(info.request_id)) {
+      _bashPermQueue.splice(i, 1);
+      _bashPermCancelled.delete(info.request_id);
+      if (kind !== 'local-agent') _bashTrackCancelledPermission(info, null);
+    }
   }
 }
 
@@ -516,30 +749,38 @@ if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
       };
       _bashPermissionTelemetry('bash_risk_prompt_requested', {
         categories: _bashPermissionCategories(info),
+        ...(_bashPermissionIrreversible(info) ? { irreversible: _bashPermissionIrreversible(info) } : {}),
         visibility_state: _bashPermissionVisibilityState(),
       });
       _bashPermQueue.push(queuedInfo);
       _drainBashPermissionQueue();
     });
     window.orkas.onPushEvent('bash:permission_cancelled', (payload) => {
-      const ids = Array.isArray(payload && payload.request_ids)
-        ? payload.request_ids.filter((id) => typeof id === 'string')
-        : [];
-      for (const id of ids) {
-        _bashPermCancelled.add(id);
-        const close = _bashPermDialogClosers.get(id);
-        if (close) close();
-      }
-      if (ids.length) {
-        const cancelled = new Set(ids);
-        for (let i = _bashPermQueue.length - 1; i >= 0; i -= 1) {
-          if (cancelled.has(_bashPermQueue[i] && _bashPermQueue[i].request_id)) {
-            const [info] = _bashPermQueue.splice(i, 1);
-            _bashPermCancelled.delete(info.request_id);
-            _bashTrackCancelledPermission(info, null);
-          }
-        }
-      }
+      _cancelBashPermissionRequests(payload, undefined);
+    });
+    window.orkas.onPushEvent('local-agent:permission', (info) => {
+      if (!info || typeof info.request_id !== 'string') return;
+      _bashPermQueue.push({
+        ...info,
+        _permission_kind: 'local-agent',
+        _renderer_received_at_ms: Date.now(),
+      });
+      _drainBashPermissionQueue();
+    });
+    window.orkas.onPushEvent('local-agent:permission_cancelled', (payload) => {
+      _cancelBashPermissionRequests(payload, 'local-agent');
+    });
+    window.orkas.onPushEvent('connectors:action-confirm', (info) => {
+      if (!info || typeof info.request_id !== 'string') return;
+      _bashPermQueue.push({
+        ...info,
+        _permission_kind: 'connector',
+        _renderer_received_at_ms: Date.now(),
+      });
+      _drainBashPermissionQueue();
+    });
+    window.orkas.onPushEvent('connectors:action-confirm-cancelled', (payload) => {
+      _cancelBashPermissionRequests(payload, 'connector');
     });
   } catch (_err) { /* push channel unavailable; bash calls deny on timeout */ }
 }

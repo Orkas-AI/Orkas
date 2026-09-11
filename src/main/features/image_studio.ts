@@ -127,6 +127,16 @@ export interface ImageStudioIssue {
   message: string;
 }
 
+type ImageStudioReferenceValidationView = {
+  index: number;
+  id?: string;
+  role?: ImageStudioReferenceRole;
+  required: boolean;
+  preserve?: string[];
+  mayChange?: string[];
+  regionIds?: string[];
+};
+
 export interface ImageStudioRequiredCopyLayout {
   copy: string;
   lineGlyphCounts: number[];
@@ -193,7 +203,8 @@ export interface ImageStudioEvidenceState {
 }
 
 const ROUTES = new Set<ImageStudioRoute>(['compose', 'hybrid', 'generate', 'edit']);
-const REFERENCE_ROLES = new Set<ImageStudioReferenceRole>(['style', 'identity', 'composition', 'structure', 'content', 'mask', 'edit_source']);
+const REFERENCE_ROLE_VALUES: readonly ImageStudioReferenceRole[] = ['style', 'identity', 'composition', 'structure', 'content', 'mask', 'edit_source'];
+const REFERENCE_ROLES = new Set<ImageStudioReferenceRole>(REFERENCE_ROLE_VALUES);
 const REFERENCE_INTENT_MODES = new Set<ImageStudioReferenceIntentMode>(['reproduce', 'edit', 'guide']);
 const REFERENCE_INTENT_BASES = new Set<ImageStudioReferenceIntentBasis>(['user', 'inferred']);
 const REGION_DEPTHS = new Set<ImageStudioRegionDepth>(['background', 'midground', 'foreground']);
@@ -474,11 +485,12 @@ export function validateImageStudioManifest(value: unknown): {
   if (rasterSource !== undefined && !rasterSource) pushIssue(issues, 'E_MANIFEST_RASTER_SOURCE', 'raster_source must be a non-empty relative path when present.');
 
   const references: ImageStudioReference[] = [];
+  const referenceValidationViews: ImageStudioReferenceValidationView[] = [];
   const referenceIds = new Set<string>();
+  const rawReferences: unknown[] = Array.isArray(value.references) ? value.references : [];
   if (value.references !== undefined && !Array.isArray(value.references)) {
     pushIssue(issues, 'E_MANIFEST_REFERENCES', 'references must be an array when present.');
   } else {
-    const rawReferences: unknown[] = Array.isArray(value.references) ? value.references : [];
     for (const [index, raw] of rawReferences.entries()) {
       if (!isRecord(raw)) {
         pushIssue(issues, 'E_MANIFEST_REFERENCE', `references[${index}] must be an object.`);
@@ -491,11 +503,22 @@ export function validateImageStudioManifest(value: unknown): {
       const preserve = optionalStringArray(raw.preserve);
       const mayChange = optionalStringArray(raw.may_change);
       const regionIds = optionalStringArray(raw.region_ids);
+      referenceValidationViews.push({
+        index,
+        ...(id ? { id } : {}),
+        ...(role ? { role } : {}),
+        required: raw.required === true,
+        ...(preserve ? { preserve } : {}),
+        ...(mayChange ? { mayChange } : {}),
+        ...(regionIds ? { regionIds } : {}),
+      });
       if (!id) pushIssue(issues, 'E_MANIFEST_REFERENCE_ID', `references[${index}].id must be a safe identifier.`);
       else if (referenceIds.has(id)) pushIssue(issues, 'E_MANIFEST_REFERENCE_ID_DUPLICATE', `Duplicate reference id: ${id}`);
       else referenceIds.add(id);
       if (!refPath) pushIssue(issues, 'E_MANIFEST_REFERENCE_PATH', `references[${index}].path must be a project-relative local path without query or fragment.`);
-      if (!role || !REFERENCE_ROLES.has(role)) pushIssue(issues, 'E_MANIFEST_REFERENCE_ROLE', `references[${index}].role is invalid.`);
+      if (!role || !REFERENCE_ROLES.has(role)) {
+        pushIssue(issues, 'E_MANIFEST_REFERENCE_ROLE', `references[${index}].role must be style, identity, composition, structure, content, mask, or edit_source.`);
+      }
       if (strength === null) pushIssue(issues, 'E_MANIFEST_REFERENCE_STRENGTH', `references[${index}].strength must be from 0 to 1.`);
       if (!preserve) pushIssue(issues, 'E_MANIFEST_REFERENCE_PRESERVE', `references[${index}].preserve must be a string array.`);
       if (!mayChange) pushIssue(issues, 'E_MANIFEST_REFERENCE_MAY_CHANGE', `references[${index}].may_change must be a string array.`);
@@ -519,8 +542,9 @@ export function validateImageStudioManifest(value: unknown): {
   }
 
   let referenceIntent: ImageStudioReferenceIntent | undefined;
-  if (value.reference_intent !== undefined || references.length) {
-    const inferredEdit = route === 'edit' || references.some((reference) => reference.role === 'edit_source');
+  if (value.reference_intent !== undefined || rawReferences.length) {
+    const inferredEdit = route === 'edit'
+      || referenceValidationViews.some((reference) => reference.role === 'edit_source');
     const rawIntent = value.reference_intent !== undefined
       ? (isRecord(value.reference_intent) ? value.reference_intent : {})
       : {
@@ -560,18 +584,35 @@ export function validateImageStudioManifest(value: unknown): {
       if (route !== 'edit' && route !== 'hybrid') {
         pushIssue(issues, 'E_MANIFEST_EDIT_ROUTE', 'edit reference intent requires the EDIT or HYBRID route.');
       }
-      const editSources = references.filter((reference) => reference.role === 'edit_source');
+      const editSources = referenceValidationViews
+        .filter((reference) => reference.role === 'edit_source');
       if (!editSources.length) {
         pushIssue(issues, 'E_MANIFEST_EDIT_SOURCE_REQUIRED', 'edit reference intent requires a reference with role edit_source.');
       } else if (editSources.some((reference) => !reference.required)) {
-        pushIssue(issues, 'E_MANIFEST_EDIT_SOURCE_REQUIRED', 'every edit_source reference must be required.');
+        const indexes = editSources
+          .filter((reference) => !reference.required)
+          .map(({ index }) => `references[${index}].required`)
+          .join(', ');
+        pushIssue(issues, 'E_MANIFEST_EDIT_SOURCE_REQUIRED', `${indexes} must be true for edit_source references.`);
       }
-      if (editSources.some((reference) => !reference.preserve.length || !reference.may_change.length)) {
+      if (editSources.some((reference) => (
+        !!reference.preserve
+        && !!reference.mayChange
+        && (!reference.preserve.length || !reference.mayChange.length)
+      ))) {
         pushIssue(issues, 'E_MANIFEST_EDIT_BOUNDARY_REQUIRED', 'edit_source references require non-empty preserve and may_change boundaries.');
       }
     }
-    if (mode === 'reproduce' && references.some((reference) => !reference.required)) {
-      pushIssue(issues, 'E_MANIFEST_REPRODUCE_REFERENCE_REQUIRED', 'references used for reproduction must be required.');
+    if (mode === 'reproduce') {
+      for (const reference of referenceValidationViews) {
+        if (!reference.required) {
+          pushIssue(
+            issues,
+            'E_MANIFEST_REPRODUCE_REFERENCE_REQUIRED',
+            `references[${reference.index}].required must be true for reproduction.`,
+          );
+        }
+      }
     }
     if (mode && REFERENCE_INTENT_MODES.has(mode)
       && basis && REFERENCE_INTENT_BASES.has(basis)
@@ -638,11 +679,15 @@ export function validateImageStudioManifest(value: unknown): {
       for (const id of readingOrder) if (!regionIds.has(id)) pushIssue(issues, 'E_MANIFEST_READING_ORDER_UNKNOWN', `visual_plan.reading_order references unknown region: ${id}`);
       for (const id of regionIds) if (!readingOrder.includes(id)) pushIssue(issues, 'E_MANIFEST_READING_ORDER_INCOMPLETE', `visual_plan.reading_order is missing region: ${id}`);
     }
-    for (const reference of references) {
-      for (const id of reference.region_ids) if (!regionIds.has(id)) pushIssue(issues, 'E_MANIFEST_REFERENCE_REGION_UNKNOWN', `Reference ${reference.id} targets unknown region: ${id}`);
+    for (const reference of referenceValidationViews) {
+      for (const id of reference.regionIds || []) {
+        if (!regionIds.has(id)) {
+          pushIssue(issues, 'E_MANIFEST_REFERENCE_REGION_UNKNOWN', `Reference ${reference.id || reference.index} targets unknown region: ${id}`);
+        }
+      }
     }
     if (globalDescription && readingOrder && regions.length) visualPlan = { global_description: globalDescription, reading_order: readingOrder, regions };
-  } else if (references.some((item) => item.region_ids.length > 0)) {
+  } else if (referenceValidationViews.some((reference) => (reference.regionIds?.length || 0) > 0)) {
     pushIssue(issues, 'E_MANIFEST_REFERENCE_REGION_PLAN_REQUIRED', 'references[].region_ids requires visual_plan.');
   }
 
@@ -651,11 +696,11 @@ export function validateImageStudioManifest(value: unknown): {
     const rawContract = isRecord(value.generation_contract) ? value.generation_contract : {};
     const negativePrompt = optionalStringArray(rawContract.negative_prompt);
     const controls: ImageStudioGenerationControl[] = [];
+    const rawControls: unknown[] = Array.isArray(rawContract.controls) ? rawContract.controls : [];
     if (!negativePrompt) pushIssue(issues, 'E_MANIFEST_NEGATIVE_PROMPT', 'generation_contract.negative_prompt must be a string array.');
     if (rawContract.controls !== undefined && !Array.isArray(rawContract.controls)) {
       pushIssue(issues, 'E_MANIFEST_GENERATION_CONTROLS', 'generation_contract.controls must be an array.');
     } else {
-      const rawControls: unknown[] = Array.isArray(rawContract.controls) ? rawContract.controls : [];
       for (const [index, raw] of rawControls.entries()) {
         if (!isRecord(raw)) {
           pushIssue(issues, 'E_MANIFEST_GENERATION_CONTROL', `generation_contract.controls[${index}] must be an object.`);
@@ -679,7 +724,7 @@ export function validateImageStudioManifest(value: unknown): {
       if (!Number.isSafeInteger(parsedSeed) || parsedSeed < 0) pushIssue(issues, 'E_MANIFEST_GENERATION_SEED', 'generation_contract.seed must be a non-negative safe integer.');
       else seed = parsedSeed;
     }
-    if (route === 'compose' && controls.length) pushIssue(issues, 'E_COMPOSE_GENERATION_CONTROLS', 'COMPOSE cannot declare provider generation controls.');
+    if (route === 'compose' && rawControls.length) pushIssue(issues, 'E_COMPOSE_GENERATION_CONTROLS', 'COMPOSE cannot declare provider generation controls.');
     if (negativePrompt) generationContract = { negative_prompt: negativePrompt, controls, ...(seed !== undefined ? { seed } : {}) };
   }
 

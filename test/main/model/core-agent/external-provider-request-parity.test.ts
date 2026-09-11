@@ -20,8 +20,14 @@ describe('external provider request policy', () => {
     expect(payload.messages[1]).not.toHaveProperty('tool_call_id');
   });
 
-  it('does not silently choose low reasoning for a direct DeepSeek request', async () => {
-    await createDeepSeekProvider({ apiKey: 'fixture', modelId: 'deepseek-v4-flash' });
+  it.each(['deepseek-v4-flash', 'deepseek-flash'])('does not silently choose low reasoning for a direct %s request', async (modelId) => {
+    await createDeepSeekProvider({ apiKey: 'fixture', modelId });
     expect(configs.at(-1).defaultReasoning).toBeUndefined();
+    expect(configs.at(-1).customModel).toMatchObject({ id: modelId, reasoning: true });
+    if (modelId === 'deepseek-flash') {
+      expect(configs.at(-1).customModel).toMatchObject({
+        name: 'DeepSeek V4.1 Flash', input: ['text', 'image'], contextWindow: 1_048_576, maxTokens: 384_000,
+      });
+    }
   });
 });

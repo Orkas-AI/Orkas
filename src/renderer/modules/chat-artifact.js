@@ -27,6 +27,10 @@
 // `sendInCurrentConversation` / read `currentCid` directly.
 
 (function () {
+  // Canonical source is `ARTIFACT_FRAME` in main/features/chat_artifacts.ts —
+  // `create_artifact`'s pre-exposure smoke validates against these exact
+  // numbers, so the two must not drift. `chat-artifact-frame-contract.test.ts`
+  // pins them together.
   const DEFAULT_FRAME_HEIGHT = 420;   // px, until the artifact reports its own
   const MAX_FRAME_HEIGHT = 640;       // px, clamp; the iframe scrolls past this
   const MIN_FRAME_HEIGHT = 80;        // px
@@ -527,6 +531,10 @@
     }
   }
 
+  // The conversation info panel lists artifacts too (an artifact bundle lives
+  // outside the workspace, so a file scan can never see it). It opens them
+  // through this same frame rather than building a second viewer.
+  window.openChatArtifactViewer = _openViewer;
   window.renderChatArtifact = renderChatArtifact;
   window.mountMessageArtifacts = mountMessageArtifacts;
   window.encodeArtifactResult = encodeArtifactResult;

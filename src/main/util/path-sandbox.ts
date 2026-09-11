@@ -47,6 +47,22 @@ function comparisonKey(p: string): string {
 }
 
 /**
+ * Resolve a root exactly the way `isPathAllowed` resolves it, so a caller
+ * that checks many candidates against one fixed root can pay the root's
+ * realpath walk once and pass `{ rootsResolved: true }` afterwards.
+ */
+export function resolveSandboxRoot(root: string): string {
+  return realOrResolve(root);
+}
+
+export interface PathAllowedOptions {
+  /** Every entry of `allowedRoots` came from `resolveSandboxRoot`, so the
+   *  per-call root realpath walk is skipped. Candidates are always resolved;
+   *  an unresolved symlinked root therefore fails closed. */
+  rootsResolved?: boolean;
+}
+
+/**
  * Is `candidate` inside any of `allowedRoots`?
  *
  * Both sides are normalized via realpath to resist symlink escape. A path
@@ -58,7 +74,11 @@ function comparisonKey(p: string): string {
  * Returns false for empty inputs, relative candidate paths, or empty
  * roots list.
  */
-export function isPathAllowed(candidate: string, allowedRoots: readonly string[]): boolean {
+export function isPathAllowed(
+  candidate: string,
+  allowedRoots: readonly string[],
+  options: PathAllowedOptions = {},
+): boolean {
   if (!candidate || !allowedRoots.length) return false;
   if (!path.isAbsolute(candidate)) return false;
 
@@ -66,7 +86,7 @@ export function isPathAllowed(candidate: string, allowedRoots: readonly string[]
   const candidateKey = comparisonKey(realCand);
   for (const root of allowedRoots) {
     if (!root || !path.isAbsolute(root)) continue;
-    const realRoot = realOrResolve(root);
+    const realRoot = options.rootsResolved ? root : realOrResolve(root);
     const rootKey = comparisonKey(realRoot);
     if (candidateKey === rootKey) return true;
     if (candidateKey.startsWith(rootKey + path.sep)) return true;

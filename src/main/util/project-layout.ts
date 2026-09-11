@@ -13,8 +13,6 @@ import {
   projectGroupChatMembersFile,
   projectGroupChatStateFile,
   projectGroupChatPlanFile,
-  projectGroupChatVisibilityDir,
-  projectGroupChatVisibilityFile,
   userSessionsDir,
   userSessionFile,
   sessionCloudToolResultsDir,
@@ -83,11 +81,11 @@ export function listProjectIds(uid: string): string[] {
   return out;
 }
 
-export function projectExistsForLayout(uid: string, pid: string): boolean {
+function projectExistsForLayout(uid: string, pid: string): boolean {
   return safeId(pid) && fs.existsSync(projectMetaFile(uid, pid));
 }
 
-export function listProjectConversationIds(uid: string): string[] {
+function listProjectConversationIds(uid: string): string[] {
   const out = new Set<string>();
   for (const pid of listProjectIds(uid)) {
     for (const row of readJsonArray(projectChatIndexFile(uid, pid))) {
@@ -172,8 +170,6 @@ export interface ConversationLayout {
   membersFile: string;
   stateFile: string;
   planFile: string;
-  visibilityDir: string;
-  visibilityFile(actorId: string): string;
   messageRelPath: string;
   indexRelPath: string;
 }
@@ -191,8 +187,6 @@ export function conversationLayout(uid: string, cid: string, projectHint?: strin
       membersFile: projectGroupChatMembersFile(uid, pid, cid),
       stateFile: projectGroupChatStateFile(uid, pid, cid),
       planFile: projectGroupChatPlanFile(uid, pid, cid),
-      visibilityDir: projectGroupChatVisibilityDir(uid, pid, cid),
-      visibilityFile: (actorId: string) => projectGroupChatVisibilityFile(uid, pid, cid, actorId),
       messageRelPath: `cloud/projects/${pid}/chats/${cid}.jsonl`,
       indexRelPath: `cloud/projects/${pid}/chats/_index.json`,
     };
@@ -209,8 +203,6 @@ export function conversationLayout(uid: string, cid: string, projectHint?: strin
     membersFile: path.join(groupDir, 'members.json'),
     stateFile: path.join(groupDir, 'state.json'),
     planFile: path.join(groupDir, 'plan.json'),
-    visibilityDir: path.join(groupDir, 'visibility'),
-    visibilityFile: (actorId: string) => path.join(groupDir, 'visibility', `${actorId}.jsonl`),
     messageRelPath: `cloud/chats/${cid}.jsonl`,
     indexRelPath: 'cloud/chats/_index.json',
   };
@@ -233,7 +225,7 @@ export function conversationMessageReadFile(uid: string, cid: string, projectHin
   return path.join(userChatsDir(uid), `${cid}.jsonl`);
 }
 
-export function cidFromProjectSessionId(uid: string, sessionId: string): string | null {
+function cidFromProjectSessionId(uid: string, sessionId: string): string | null {
   if (sessionId.startsWith('gconv-')) {
     const cid = sessionId.slice('gconv-'.length);
     return safeId(cid) ? cid : null;
@@ -248,7 +240,7 @@ export function cidFromProjectSessionId(uid: string, sessionId: string): string 
   return safeId(fallback) ? fallback : null;
 }
 
-export function projectIdForSession(uid: string, sessionId: string): string | null {
+function projectIdForSession(uid: string, sessionId: string): string | null {
   const cid = cidFromProjectSessionId(uid, sessionId);
   return cid ? findProjectIdForConversation(uid, cid) : null;
 }
@@ -339,7 +331,7 @@ export function globalAutoTaskLocation(uid: string, taskId: string): AutoTaskLoc
   };
 }
 
-export function projectAutoTaskLocation(uid: string, pid: string, taskId: string): AutoTaskLocation {
+function projectAutoTaskLocation(uid: string, pid: string, taskId: string): AutoTaskLocation {
   return {
     taskId,
     projectId: pid,

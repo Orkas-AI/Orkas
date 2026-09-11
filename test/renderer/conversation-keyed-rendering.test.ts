@@ -215,6 +215,28 @@ function loadRenderer(cid: string) {
 const CID = 'c1';
 const TURN = 'turn-1';
 
+describe('keyed rendering › reconnect history', () => {
+  it('recovers missing replies once without merging same-text replies from different turns', async () => {
+    const { context, container, appended, finalized } = loadRenderer(CID);
+    const first = { id: 'saved-1', from: 'commander', to: ['user'], text: 'Saved answer',
+      ts: '2026-09-10T12:00:00Z', turn_id: 'first-turn', seg: 0 };
+    const second = { ...first, id: 'saved-2', turn_id: 'second-turn' };
+    const live = new FakeNode();
+    live.dataset.renderKey = 's:first-turn:0';
+    live.dataset.placeholder = '1';
+    container.appendChild(live);
+
+    await context._recoverPolledVisibleMessages(CID, [first]);
+    await context._recoverPolledVisibleMessages(CID, [first, second]);
+    await context._recoverPolledVisibleMessages(CID, [first, second]);
+
+    expect(container.rows.map(row => row.dataset.msgId)).toEqual(['saved-1', 'saved-2']);
+    expect(container.rows[0]).toBe(live);
+    expect(appended).toHaveLength(1);
+    expect(finalized.map(item => item.gm.text)).toEqual(['Saved answer']);
+  });
+});
+
 function delta(seg: number, text: string, actor = 'commander') {
   return { type: 'process', cid: CID, actor, turn_id: TURN, seg, data: { type: 'delta', text } };
 }
@@ -656,5 +678,85 @@ describe('keyed rendering › row identity invariant', () => {
     context._handleGroupBusEvent(CID, null, segMessage(0, 'instant reply', 'msg-0'));
 
     assertRowIdentityInvariant(container);
+  });
+});
+
+describe('keyed rendering › terminal hand-off with an end-of-turn record', () => {
+  // 2026-09-09 production case: Commander narrates the hand-off as commentary
+  // beside the hand_off_to call (no prose delta, so segment 0 is retired at the
+  // boundary), persists its end-of-turn record as segment 1, and the agent
+  // starts. The hand-off is not interactive, so the floor never moves to the
+  // agent. A level-triggered snapshot that still lists the finished Commander
+  // turn — and any late bookkeeping event — must not mint a second Commander
+  // bubble beside the agent's live reply.
+  function handoffPrelude(context: any) {
+    context._handleGroupBusEvent(CID, null, {
+      type: 'state_changed', cid: CID,
+      state: { status: 'running', in_flight: ['commander'] },
+      active_turns: [{ actor: 'commander', turn_id: TURN, started_at_ms: 1 }],
+    });
+    context._handleGroupBusEvent(CID, null, {
+      type: 'process', cid: CID, actor: 'commander', turn_id: TURN, seg: 0,
+      data: { type: 'event', event: { stream: 'tool', data: { phase: 'start', id: 't1', name: 'hand_off_to' } } },
+    });
+    context._handleGroupBusEvent(CID, null, {
+      type: 'process', cid: CID, actor: 'commander', turn_id: TURN, seg: 0,
+      data: { type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 't1', name: 'hand_off_to', isError: false } } },
+    });
+    context._handleGroupBusEvent(CID, null, { type: 'segment_boundary', cid: CID, actor: 'commander', turn_id: TURN });
+    context._handleGroupBusEvent(CID, null, {
+      type: 'message', cid: CID, turn_id: TURN,
+      msg: { id: 'dispatch-1', from: 'commander', to: ['agent-a'], text: 'Compare the strategies.', ts: '2026-09-09T19:22:49', dispatch: true },
+    });
+    context._handleGroupBusEvent(CID, null, {
+      type: 'message', cid: CID, turn_id: TURN, seg: 1, turn_end: true,
+      msg: {
+        id: 'msg-end', from: 'commander', to: ['user'], text: 'I will hand this to @agent-a.',
+        ts: '2026-09-09T19:22:49', turn_id: TURN, seg: 1, mentions: ['agent-a'],
+        process: [{ type: 'progress', text: 'I will hand this to @agent-a.' }],
+      },
+    });
+  }
+
+  it('does not reopen a Commander row from a stale snapshot after the end-of-turn record', () => {
+    const { context, container } = loadRenderer(CID);
+    handoffPrelude(context);
+    expect(commanderRows(container)).toHaveLength(1);
+
+    // The snapshot emitted while the agent queue item was being admitted still
+    // names the Commander turn; it can arrive after the record was rendered.
+    context._handleGroupBusEvent(CID, null, {
+      type: 'state_changed', cid: CID,
+      state: { status: 'running', in_flight: ['commander'] },
+      active_turns: [{ actor: 'commander', turn_id: TURN, started_at_ms: 1 }],
+    });
+    // Late bookkeeping for the finished turn (segment index unknown to the emitter).
+    context._handleGroupBusEvent(CID, null, {
+      type: 'process', cid: CID, actor: 'commander', turn_id: TURN,
+      data: { type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 't1', name: 'hand_off_to', isError: false } } },
+    });
+    context._handleGroupBusEvent(CID, null, {
+      type: 'state_changed', cid: CID,
+      state: { status: 'running', in_flight: ['agent-a'] },
+      active_turns: [{ actor: 'agent-a', turn_id: 'turn-a', started_at_ms: 2 }],
+    });
+    context._handleGroupBusEvent(CID, null, delta(0, 'Working on it.', 'agent-a'));
+
+    const rows = commanderRows(container);
+    expect(rows.map((row) => row.dataset.msgId), 'only the persisted end-of-turn record').toEqual(['msg-end']);
+    expect(container.rows.filter((row) => row.dataset.fromActor === 'agent-a')).toHaveLength(1);
+  });
+
+  it('still lets a later segment stream after a mid-turn segment record (negative control)', () => {
+    const { context, container } = loadRenderer(CID);
+    context._handleGroupBusEvent(CID, null, delta(0, 'Handing this over.'));
+    context._handleGroupBusEvent(CID, null, segMessage(0, 'Handing this over.', 'msg-0'));
+    context._handleGroupBusEvent(CID, null, {
+      type: 'state_changed', cid: CID,
+      state: { status: 'running', in_flight: ['commander'] },
+      active_turns: [{ actor: 'commander', turn_id: TURN, started_at_ms: 1 }],
+    });
+    context._handleGroupBusEvent(CID, null, delta(1, 'Here is the synthesis.'));
+    expect(commanderRows(container), 'a mid-turn record does not end the turn').toHaveLength(2);
   });
 });

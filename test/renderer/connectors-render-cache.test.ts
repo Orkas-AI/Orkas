@@ -54,6 +54,72 @@ function loadConnectorsRenderer() {
 }
 
 describe('connectors renderer cache', () => {
+  it('renders the credit tag only from explicit display metadata', () => {
+    const { context } = loadConnectorsRenderer();
+
+    const explicit = context._connectorCardBadges({ requires_credits: true });
+    const disabled = context._connectorCardBadges({
+      requires_credits: false,
+      usage_metering: {
+        provider: 'composio',
+        credits_milli_per_call: 250,
+      },
+    });
+    const usageOnly = context._connectorCardBadges({
+      usage_metering: {
+        provider: 'composio',
+        credits_milli_per_call: 250,
+      },
+    });
+
+    expect(explicit).toContain('<div class="connector-card-badges">');
+    expect(explicit).toContain('connector-card-credit-badge is-credit');
+    // Metered-but-free entries render no badge wrapper at all, like plain entries.
+    expect(disabled).toBe('');
+    expect(usageOnly).toBe('');
+  });
+
+  it('uses one compact setup label while keeping specific requirements in the tooltip', () => {
+    const { context } = loadConnectorsRenderer();
+
+    const ordinary = context._connectorCardBadges({ id: 'ordinary' });
+    const providerSetup = context._connectorCardBadges({
+      id: 'taobao-tmall-seller',
+      connection_setup: { requirement: 'provider_application' },
+    });
+    const businessQualification = context._connectorCardBadges({
+      id: 'douyin-shop-seller',
+      requires_credits: true,
+      connection_setup: { requirement: 'business_qualification' },
+    });
+
+    expect(ordinary).toBe('');
+    expect(providerSetup).toContain('provider_application');
+    expect(providerSetup).toContain('title="connectors.badge.provider_setup"');
+    expect(providerSetup).toContain('>connectors.badge.setup_required</span>');
+    expect(businessQualification).toContain('business_qualification');
+    expect(businessQualification).toContain('title="connectors.badge.business_qualification"');
+    expect(businessQualification).toContain('>connectors.badge.setup_required</span>');
+    expect(businessQualification).toContain('connectors.badge.credits_required');
+    expect(context._connectorUnconnectedActionLabel({ id: 'ordinary' }))
+      .toBe('connectors.action.connect');
+    expect(context._connectorUnconnectedActionLabel({
+      connection_setup: { requirement: 'provider_application' },
+    })).toBe('connectors.action.review_requirements');
+  });
+
+  it('keeps the setup badge concise in every renderer locale', () => {
+    const { context } = loadConnectorsRenderer();
+    for (const [lang, label] of [['zh', '需配置'], ['en', 'Setup required'], ['ja', '要設定'], ['pt', 'Requer configuração']]) {
+      const locale = JSON.parse(fs.readFileSync(path.join(__dirname, `../../src/renderer/locales/${lang}.json`), 'utf8'));
+      context.t = (key: string) => locale[key] || key;
+      for (const requirement of ['provider_application', 'business_qualification']) {
+        const html = context._connectorCardBadges({ connection_setup: { requirement } });
+        expect(html, `${lang}: ${requirement}`).toContain(`>${label}</span>`);
+      }
+    }
+  });
+
   it('does not persist errored connector instances', () => {
     const { context, storage } = loadConnectorsRenderer();
 
@@ -66,17 +132,17 @@ describe('connectors renderer cache', () => {
       _persistConnectorsRenderCache();
     `, context);
 
-    const raw = storage.get('orkas.connectors.renderCache.v2.u-cache');
+    const raw = storage.get('orkas.connectors.renderCache.v4.u-cache');
     expect(raw).toBeTruthy();
     const parsed = JSON.parse(raw!);
-    expect(parsed.version).toBe(2);
+    expect(parsed.version).toBe(4);
     expect(parsed.instances).toEqual([{ id: 'notion', status: { kind: 'connected', since: 1 } }]);
   });
 
   it('drops errored connector instances while hydrating cached state', () => {
     const { context, storage } = loadConnectorsRenderer();
-    storage.set('orkas.connectors.renderCache.v2.u-cache', JSON.stringify({
-      version: 2,
+    storage.set('orkas.connectors.renderCache.v4.u-cache', JSON.stringify({
+      version: 4,
       updated_at: Date.now(),
       catalog: [{ id: 'github', display_name: 'GitHub' }],
       instances: [
@@ -105,6 +171,17 @@ describe('connectors renderer cache', () => {
     storage.set('orkas.connectors.renderCache.v2.u-cache', JSON.stringify({
       version: 2,
       updated_at: Date.now(),
+      instances: [{ id: 'dingtalk', display_name: '钉钉', status: { kind: 'connected', since: 1 } }],
+    }));
+    storage.set('orkas.connectors.renderCache.v3.u-cache', JSON.stringify({
+      version: 3,
+      updated_at: Date.now(),
+      instances: [{ id: 'feishu', status: { kind: 'connected', since: 1 } }],
+    }));
+    expect(vm.runInContext('_hydrateConnectorsRenderCache()', context)).toBe(false);
+    storage.set('orkas.connectors.renderCache.v4.u-cache', JSON.stringify({
+      version: 4,
+      updated_at: Date.now(),
       instances: [{ id: 'notion', status: { kind: 'connected', since: 1 } }],
     }));
     storage.set('some.other.key', 'keep');
@@ -112,7 +189,9 @@ describe('connectors renderer cache', () => {
     vm.runInContext('_purgeLegacyConnectorsRenderCaches();', context);
 
     expect(storage.has('orkas.connectors.renderCache.v1.u-cache')).toBe(false);
-    expect(storage.has('orkas.connectors.renderCache.v2.u-cache')).toBe(true);
+    expect(storage.has('orkas.connectors.renderCache.v2.u-cache')).toBe(false);
+    expect(storage.has('orkas.connectors.renderCache.v3.u-cache')).toBe(false);
+    expect(storage.has('orkas.connectors.renderCache.v4.u-cache')).toBe(true);
     expect(storage.has('some.other.key')).toBe(true);
   });
 });

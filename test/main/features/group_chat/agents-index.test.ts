@@ -189,6 +189,40 @@ describe('agents_index block — header + per-entry shape', () => {
     );
   });
 
+  it('keeps a full authored routing description that exceeds the Skill roster ceiling', async () => {
+    // Built-in agent descriptions carry phrasings plus a trailing trigger list
+    // and run past 512 characters; the Skill ceiling used to cut exactly the
+    // trigger terms the Commander routes on.
+    const triggers = 'Triggers: deep research, evidence analysis, literature review, trend report, industry research, source verification, citation check, research plan.';
+    const description = `${'Run multi-source research and deliver a cited report. '.repeat(10)}${triggers}`;
+    expect(description.length).toBeGreaterThan(512);
+    expect(description.length).toBeLessThanOrEqual(800);
+    writeAgent(customAgentsDir(), 'long-routing', {
+      name: 'LongRouting',
+      description_zh: '',
+      description_en: description,
+    });
+    const text = await buildBlock(TEST_UID);
+    expect(text).toContain(`@LongRouting (Source: custom, id: long-routing) — ${description}`);
+    expect(text).not.toContain('…');
+  });
+
+  it('still bounds a runaway description at the agent roster ceiling', async () => {
+    const description = `${'Do everything for every request. '.repeat(30)}Triggers: tail-marker`;
+    expect(description.length).toBeGreaterThan(800);
+    writeAgent(customAgentsDir(), 'runaway', {
+      name: 'Runaway',
+      description_zh: '',
+      description_en: description,
+    });
+    const text = await buildBlock(TEST_UID);
+    const line = text.split('\n').find((row) => row.startsWith('- @Runaway')) ?? '';
+    expect(line).toContain('(Source: custom, id: runaway) — Do everything');
+    expect(line.endsWith('…')).toBe(true);
+    expect(line).not.toContain('tail-marker');
+    expect(line.length).toBeLessThan(description.length);
+  });
+
   it('uses English for the internal roster under a Chinese UI and falls back to Chinese', async () => {
     writeAgent(customAgentsDir(), 'bilingual-desc', {
       name: 'BilingualDesc',
@@ -218,6 +252,13 @@ describe('agents_index block — header + per-entry shape', () => {
 describe('Commander project-task prompt gating', () => {
   it('keeps project rules static and omits them entirely outside a project', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
+    const chats = await import('../../../../src/main/features/chats');
+    const projects = await import('../../../../src/main/features/projects');
+    const createdProject = await projects.createProject(TEST_UID, 'Prompt contract');
+    if (!createdProject.ok) throw new Error('Project fixture creation failed');
+    const projectId = createdProject.project.project_id;
+    await chats.createConversation(TEST_UID, { conversationId: 'non-project-conversation', title: 'Direct work' });
+    await chats.createConversation(TEST_UID, { conversationId: 'project-conversation', projectId, title: 'Project work' });
     const nonProject = await bus._buildCommanderSystemPromptForTest(
       TEST_UID,
       'non-project-conversation',
@@ -227,7 +268,7 @@ describe('Commander project-task prompt gating', () => {
     const project = await bus._buildCommanderSystemPromptForTest(
       TEST_UID,
       'project-conversation',
-      'project-a',
+      projectId,
       'en',
     );
 
@@ -236,8 +277,16 @@ describe('Commander project-task prompt gating', () => {
     expect(project).toContain('### Project tasks (the work backlog)');
     expect(project).not.toContain('$project_tasks_rules');
     expect(project.indexOf('### Project tasks (the work backlog)'))
-      .toBeLessThan(project.indexOf('## Orchestration continuity'));
-    expect(project.indexOf('## Orchestration continuity'))
       .toBeLessThan(project.indexOf('## Runtime injection'));
+    expect(nonProject).not.toContain('## Orchestration continuity');
+    expect(project).not.toContain('## Orchestration continuity');
+    for (const prompt of [nonProject, project]) {
+      // Both Commander variants must support useful execution-time prose;
+      // neither requires a preamble before the first tool.
+      expect(prompt).toContain('one or two sentences when appropriate');
+      expect(prompt.match(/These updates are not final replies/g)).toHaveLength(1);
+      expect(prompt.indexOf('These updates are not final replies')).toBeLessThan(prompt.indexOf('## Runtime injection'));
+      expect(prompt.includes('before the first tool call')).toBe(false);
+    }
   });
 });

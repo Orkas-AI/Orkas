@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { SKILL_ROSTER_MAX_CHARS } from '../../../src/main/util/skill-description-policy';
 
 // skill-registry.ts wraps core-agent's SkillLoader. To test allowlist
 // filtering without pulling in the real core-agent import, we write fake
@@ -221,6 +222,206 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     const text = await getSystemPromptBlock({ agentId: 'agent-a', allowlist: [] });
     expect(text).toContain('private-helper');
     expect(text).not.toContain('translate');
+  });
+
+  it('treats skill_list as Agent defaults: own private stays resident and every undeclared shared Skill stays lazy', async () => {
+    writeSkill(builtinDir(), 'builtin-core', 'Builtin Core', 'always resident builtin', { seed_source: 'builtin' });
+    writeSkill(builtinDir(), 'installed-extra', 'Installed Extra', 'lazy installed capability');
+    writeSkill(customDir(), 'custom-extra', 'Custom Extra', 'lazy custom capability');
+    writeSkill(agentPrivateDir('agent-a'), 'private-core', 'Private Core', 'owner-only private protocol');
+    const { getSystemPromptBlock } = await loadRegistry();
+
+    const missing = await getSystemPromptBlock({ agentId: 'agent-a', includeSkillSearchHint: true });
+    const empty = await getSystemPromptBlock({ agentId: 'agent-a', allowlist: [], includeSkillSearchHint: true });
+    for (const text of [missing, empty]) {
+      expect(text).not.toContain('Builtin Core');
+      expect(text).toContain('Private Core');
+      expect(text).toContain('owner-only private protocol');
+      expect(text).not.toContain('Installed Extra');
+      expect(text).not.toContain('Custom Extra');
+      expect(text).toContain('skill_search');
+    }
+
+    const configured = await getSystemPromptBlock({
+      agentId: 'agent-a',
+      allowlist: ['builtin-core', 'custom-extra'],
+      includeSkillSearchHint: true,
+    });
+    expect(configured).toContain('Builtin Core');
+    expect(configured).toContain('Custom Extra');
+    expect(configured).toContain('Private Core');
+    expect(configured).not.toContain('Installed Extra');
+  });
+
+  it('does not impose a Skill-count limit while the routing index fits', async () => {
+    for (let i = 0; i < 60; i += 1) {
+      const id = `small-${String(i).padStart(2, '0')}`;
+      writeSkill(customDir(), id, id, 'd');
+    }
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock({ runtimeBindings: new Map() });
+
+    expect(text.length).toBeLessThanOrEqual(SKILL_ROSTER_MAX_CHARS);
+    expect((text.match(/^- \*\*/gm) || [])).toHaveLength(60);
+    expect(text).toContain('small-59');
+  });
+
+  it('compacts an overflowing roster by source while preserving mandatory and explicit descriptions', async () => {
+    const detail = (marker: string) => `${marker} ${'routing detail '.repeat(35)}`;
+    writeSkill(builtinDir(), 'builtin-core', 'Builtin Core', detail('BUILTIN-FULL'), { seed_source: 'builtin' });
+    for (let i = 0; i < 25; i += 1) {
+      writeSkill(builtinDir(), `installed-${i}`, `Installed ${i}`, detail(`INSTALLED-DETAIL-${i}`));
+      writeSkill(customDir(), `custom-${i}`, `Custom ${i}`, detail(`CUSTOM-DETAIL-${i}`));
+    }
+    const runtimeBindings = new Map();
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock({
+      runtimeBindings,
+      includeSkillSearchHint: true,
+      forceOpenSkillRefs: [{ id: 'custom-24', source: 'custom' }],
+    });
+
+    expect(text.length).toBeLessThanOrEqual(SKILL_ROSTER_MAX_CHARS);
+    expect(text).toContain('BUILTIN-FULL');
+    expect(text).toContain('CUSTOM-DETAIL-24');
+    // Gradual compaction: the top-ranked searchable rows (platform before
+    // custom, then registry order) keep their descriptions while the budget
+    // lasts; only the tail degrades to name-only rows.
+    expect(text).toContain('Installed 0');
+    expect(text).toContain('INSTALLED-DETAIL-0');
+    const detailedInstalled = [...text.matchAll(/INSTALLED-DETAIL-(\d+)/g)].map((m) => m[1]);
+    expect(detailedInstalled.length).toBeGreaterThan(0);
+    expect(detailedInstalled.length).toBeLessThan(25);
+    // Registry order is the id order, so the described rows form its prefix.
+    const registryOrder = Array.from({ length: 25 }, (_, i) => String(i)).sort();
+    expect(detailedInstalled).toEqual(registryOrder.slice(0, detailedInstalled.length));
+    expect(text).toContain('Installed 24');
+    expect(text).toContain('Custom 0');
+    expect(text).not.toContain('CUSTOM-DETAIL-0');
+  });
+
+  it('degrades nothing while the described roster fits and everything searchable when only names fit', async () => {
+    const detail = (marker: string) => `${marker} ${'routing detail '.repeat(30)}`;
+    writeSkill(builtinDir(), 'builtin-core', 'Builtin Core', detail('BUILTIN-FULL'), { seed_source: 'builtin' });
+    for (let i = 0; i < 4; i += 1) writeSkill(customDir(), `custom-${i}`, `Custom ${i}`, detail(`CUSTOM-DETAIL-${i}`));
+    const { getSystemPromptBlock } = await loadRegistry();
+    const fits = await getSystemPromptBlock({ runtimeBindings: new Map(), includeSkillSearchHint: true });
+    for (let i = 0; i < 4; i += 1) expect(fits).toContain(`CUSTOM-DETAIL-${i}`);
+
+    for (let i = 4; i < 40; i += 1) writeSkill(customDir(), `custom-${i}`, `Custom ${i}`, detail(`CUSTOM-DETAIL-${i}`));
+    const { getSystemPromptBlock: reloaded } = await loadRegistry();
+    const crowded = await reloaded({ runtimeBindings: new Map(), includeSkillSearchHint: true });
+    expect(crowded.length).toBeLessThanOrEqual(SKILL_ROSTER_MAX_CHARS);
+    expect(crowded).toContain('BUILTIN-FULL');
+    // Every name still fits, so names are kept first; the first-ranked rows
+    // keep their detail and only the tail degrades to name-only rows.
+    for (let i = 0; i < 40; i += 1) expect(crowded).toContain(`Custom ${i}`);
+    expect(crowded).toContain('CUSTOM-DETAIL-0');
+    expect(crowded).not.toContain('CUSTOM-DETAIL-39');
+  });
+
+  it('retains platform-installed name rows before custom rows when name-only entries must be omitted', async () => {
+    const detail = `${'routing detail '.repeat(34)}END`;
+    const platformIds: string[] = [];
+    const customIds: string[] = [];
+    for (let i = 0; i < 25; i += 1) {
+      const suffix = String(i).padStart(3, '0');
+      const id = `platform-priority-${suffix}`;
+      platformIds.push(id);
+      writeSkill(builtinDir(), id, `Platform Priority ${suffix} ${'p'.repeat(30)}`, detail);
+    }
+    for (let i = 0; i < 140; i += 1) {
+      const suffix = String(i).padStart(3, '0');
+      const id = `custom-priority-${suffix}`;
+      customIds.push(id);
+      writeSkill(customDir(), id, `Custom Priority ${suffix} ${'c'.repeat(32)}`, detail);
+    }
+
+    const runtimeBindings = new Map<string, any>();
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock({
+      runtimeBindings,
+      includeSkillSearchHint: true,
+    });
+    const boundIds = new Set([...runtimeBindings.values()].map((binding) => binding.id));
+
+    expect(text.length).toBeLessThanOrEqual(SKILL_ROSTER_MAX_CHARS);
+    expect(platformIds.every((id) => boundIds.has(id))).toBe(true);
+    expect(customIds.some((id) => boundIds.has(id))).toBe(true);
+    expect(customIds.some((id) => !boundIds.has(id))).toBe(true);
+    expect(text).not.toContain('routing detail');
+  });
+
+  it('keeps Agent-private routing detail resident while compacting searchable shared rows', async () => {
+    const detail = (marker: string) => `${marker} ${'routing detail '.repeat(34)}`;
+    writeSkill(agentPrivateDir('agent-a'), 'private-required', 'Private Required', detail('PRIVATE-FULL'));
+    for (let i = 0; i < 50; i += 1) {
+      writeSkill(customDir(), `shared-${i}`, `Shared ${i}`, detail(`SHARED-${i}`));
+    }
+
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock({
+      agentId: 'agent-a',
+      allowlist: Array.from({ length: 50 }, (_, i) => `shared-${i}`),
+      includeSkillSearchHint: true,
+      runtimeBindings: new Map(),
+    });
+
+    expect(text.length).toBeLessThanOrEqual(SKILL_ROSTER_MAX_CHARS);
+    expect(text).toContain('PRIVATE-FULL');
+    expect(text).toContain('Shared 0');
+    // Gradual compaction keeps the first-ranked shared descriptions and
+    // degrades the tail; the private detail is never traded away.
+    expect(text).toContain('SHARED-0');
+    expect(text).not.toContain('SHARED-49');
+    const described = [...text.matchAll(/SHARED-(\d+)/g)].length;
+    expect(described).toBeGreaterThan(0);
+    expect(described).toBeLessThan(50);
+  });
+
+  it('omits only searchable tail rows when even the name-only roster overflows', async () => {
+    const ids: string[] = [];
+    for (let i = 0; i < 180; i += 1) {
+      const id = `searchable-${String(i).padStart(3, '0')}`;
+      ids.push(id);
+      writeSkill(customDir(), id, `${id}-${'x'.repeat(55)}`, `capability marker ${id}`);
+    }
+    const runtimeBindings = new Map<string, any>();
+    const advertised: string[] = [];
+    const displayNames = new Map<string, string>();
+    const { bindRuntimeSkillTarget, getSystemPromptBlock, searchAvailableSkills } = await loadRegistry();
+    const text = await getSystemPromptBlock({
+      runtimeBindings,
+      includeSkillSearchHint: true,
+      displayNameById: displayNames,
+      onSkillAdvertised: (id) => advertised.push(id),
+    });
+    const boundIds = new Set([...runtimeBindings.values()].map((binding) => binding.id));
+    const omitted = ids.find((id) => !boundIds.has(id));
+
+    expect(text.length).toBeLessThanOrEqual(SKILL_ROSTER_MAX_CHARS);
+    expect(omitted).toBeTruthy();
+    expect(text).not.toContain(omitted!);
+    expect(advertised).not.toContain(omitted!);
+    expect(displayNames.has(omitted!)).toBe(false);
+    const residentRefs = new Set(
+      [...runtimeBindings.values()].flatMap((binding) => [binding.id, binding.name]),
+    );
+    const found = await searchAvailableSkills(TEST_UID, omitted!, 5, undefined, 0, residentRefs);
+    expect(found.rows[0]).toEqual(expect.objectContaining({ id: omitted, source: 'custom' }));
+    const row = found.rows[0];
+    const ref = bindRuntimeSkillTarget({
+      id: row.id,
+      name: row.name,
+      root: path.dirname(row.read_path),
+      entry: row.read_path,
+      source: row.source,
+    }, runtimeBindings);
+    expect(runtimeBindings.get(ref)).toMatchObject({
+      id: omitted,
+      root: path.join(path.resolve(customDir()), omitted!),
+      entry: path.join(path.resolve(customDir()), omitted!, 'SKILL.md'),
+    });
   });
 
   it('does not render self-evolved skills — core-agent evolution injects those, not this block', async () => {
@@ -453,7 +654,7 @@ describe('skill-registry › getSystemSkillsPromptBlock', () => {
 
   it('renders system skills in a separate block with SYSTEM_SKILLS_ROOT', async () => {
     writeSkill(systemDir(), 'agent-creator', 'agent-creator', 'Create agents');
-    writeSkill(systemDir(), 'autotask-creator', 'autotask-creator', 'Create automations');
+    writeSkill(systemDir(), 'fixture-automation-guide', 'fixture-automation-guide', 'Create automations');
     writeSkill(
       systemDir(),
       'orkas-guide',
@@ -463,8 +664,8 @@ describe('skill-registry › getSystemSkillsPromptBlock', () => {
     writeSkill(systemDir(), 'package-installer', 'package-installer', 'Install packages');
     writeSkill(
       systemDir(),
-      'project-tasks',
-      'project-tasks',
+      'fixture-backlog-guide',
+      'fixture-backlog-guide',
       'Manage or execute the structured project backlog',
     );
     writeSkill(systemDir(), 'skill-creator', 'skill-creator', 'Create skills');
@@ -484,22 +685,22 @@ describe('skill-registry › getSystemSkillsPromptBlock', () => {
     expect(systemText).toContain('Load only system SKILL.md files in that call');
     expect(systemText).toContain('read attachments and other task sources afterward.');
     expect(systemText).toContain('**agent-creator**');
-    expect(systemText).toContain('**autotask-creator**');
+    expect(systemText).toContain('**fixture-automation-guide**');
     expect(systemText).toContain('**orkas-guide**');
     expect(systemText).toContain('questions about how to use current Orkas application features');
     expect(systemText).toContain('distinct product-usage question within a mixed request');
     expect(systemText).toContain('Do not guide Commander execution');
     expect(systemText).toContain('**package-installer**');
-    expect(systemText).toContain('**project-tasks**');
+    expect(systemText).toContain('**fixture-backlog-guide**');
     expect(systemText).toContain('structured project backlog');
     expect(systemText).toContain('**skill-creator**');
 
     const regularText = await getSystemPromptBlock();
     expect(regularText).not.toContain('agent-creator');
-    expect(regularText).not.toContain('autotask-creator');
+    expect(regularText).not.toContain('fixture-automation-guide');
     expect(regularText).not.toContain('orkas-guide');
     expect(regularText).not.toContain('package-installer');
-    expect(regularText).not.toContain('project-tasks');
+    expect(regularText).not.toContain('fixture-backlog-guide');
     expect(regularText).not.toContain('skill-creator');
   });
 
@@ -517,20 +718,20 @@ describe('skill-registry › getSystemSkillsPromptBlock', () => {
 
   it('can exclude a context-specific system skill without changing the catalog', async () => {
     writeSkill(systemDir(), 'agent-creator', 'agent-creator', 'Create agents');
-    writeSkill(systemDir(), 'project-tasks', 'project-tasks', 'Manage the project backlog');
+    writeSkill(systemDir(), 'fixture-backlog-guide', 'fixture-backlog-guide', 'Manage the project backlog');
     const { getSystemSkillsPromptBlock } = await loadRegistry();
 
     const nonProjectText = await getSystemSkillsPromptBlock(
       TEST_UID,
       undefined,
       undefined,
-      ['project-tasks'],
+      ['fixture-backlog-guide'],
     );
     const projectText = await getSystemSkillsPromptBlock(TEST_UID);
 
     expect(nonProjectText).toContain('**agent-creator**');
-    expect(nonProjectText).not.toContain('**project-tasks**');
-    expect(projectText).toContain('**project-tasks**');
+    expect(nonProjectText).not.toContain('**fixture-backlog-guide**');
+    expect(projectText).toContain('**fixture-backlog-guide**');
   });
 
   it('registers system skills in the same run-scoped logical namespace', async () => {

@@ -1,4 +1,5 @@
 import * as crypto from 'crypto';
+import * as fs from 'node:fs';
 import * as path from 'path';
 
 import { sanitizeLogTextForUpload } from './log-sanitize';
@@ -127,4 +128,32 @@ export function safeUrlAction(rawUrl: string): string {
   } catch {
     return '<non-url>';
   }
+}
+
+/** Fingerprint only shipped first-party file-tool sources, never workspace data.
+ * Together with boot appVersion this distinguishes builds of the same version.
+ * Missing sources yield an explicit gap, never a misleading partial build id. */
+export function fileToolBuildRef(appRoot: string): Record<string, unknown> {
+  const sources = [
+    'src/main/model/core-agent/file-tools.ts',
+    'src/main/model/core-agent/local-tools.ts',
+    'src/main/model/core-agent/read-tracker.ts',
+    'src/core-agent/src/tools/apply-patch.ts',
+    'src/core-agent/src/tools/file-diagnostics.ts',
+    'src/core-agent/src/tools/base.ts',
+    'src/core-agent/src/agent/runner.ts',
+  ];
+  const hash = crypto.createHash('sha256');
+  let unavailable = 0;
+  for (const source of sources) {
+    try {
+      const target = path.join(appRoot, source);
+      if (fs.statSync(target).size > 2 * 1024 * 1024) { unavailable++; continue; }
+      const bytes = fs.readFileSync(target);
+      hash.update(source).update('\0').update(bytes).update('\0');
+    } catch { unavailable++; }
+  }
+  return unavailable
+    ? { status: 'incomplete', unavailable_sources: unavailable }
+    : { status: 'complete', source_hash: hash.digest('hex') };
 }

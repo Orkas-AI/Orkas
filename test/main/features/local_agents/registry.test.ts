@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import log from 'electron-log/main';
 import {
+  cachedCliFallbackCandidate,
   detectAll,
   detectOne,
   detectPreferredVersion,
@@ -11,12 +12,20 @@ import {
   findAllInstalled,
   invalidateCache,
   localCliCapabilities,
+  localCliDefaultPermissionPolicy,
+  localCliSupportsAgentMemory,
   localCliSearchDirs,
   localCliResumeStrategy,
+  noteCliCandidateFailure,
+  noteCliCandidateSuccess,
+  resolveCli,
+  resolveCliForDispatch,
+  warmLocalClis,
   LOCAL_CLI_CAPABILITIES,
   LOCAL_CLI_TYPES,
   VERSION_PROBE_TIMEOUT_MS,
 } from '../../../../src/main/features/local_agents/registry';
+import { MIN_VERSIONS } from '../../../../src/main/features/local_agents/version';
 
 const isWindows = process.platform === 'win32';
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
@@ -31,7 +40,9 @@ describe('local CLI context capabilities', () => {
         durableInstructionScope: 'invocation',
         codingProjectDirectory: true,
         orkasBridge: true,
+        agentMemory: true,
         activeRunIngress: 'stream-json',
+        permissionPolicies: ['inherit', 'ask', 'full_access'],
       },
       codex: {
         resume: 'native',
@@ -39,7 +50,9 @@ describe('local CLI context capabilities', () => {
         durableInstructionScope: 'session',
         codingProjectDirectory: true,
         orkasBridge: true,
+        agentMemory: true,
         activeRunIngress: 'codex-app-server',
+        permissionPolicies: ['inherit', 'ask', 'full_access'],
       },
       openclaw: {
         resume: 'session-id',
@@ -47,15 +60,19 @@ describe('local CLI context capabilities', () => {
         durableInstructionScope: 'session',
         codingProjectDirectory: false,
         orkasBridge: false,
+        agentMemory: false,
         activeRunIngress: 'none',
+        permissionPolicies: ['inherit'],
       },
       opencode: {
         resume: 'native',
         instructionChannel: 'user-message',
         durableInstructionScope: 'session',
         codingProjectDirectory: true,
-        orkasBridge: false,
+        orkasBridge: true,
+        agentMemory: false,
         activeRunIngress: 'none',
+        permissionPolicies: ['full_access'],
       },
       hermes: {
         resume: 'none',
@@ -63,7 +80,9 @@ describe('local CLI context capabilities', () => {
         durableInstructionScope: 'invocation',
         codingProjectDirectory: false,
         orkasBridge: false,
+        agentMemory: false,
         activeRunIngress: 'none',
+        permissionPolicies: ['inherit', 'ask', 'full_access'],
       },
     });
   });
@@ -75,9 +94,32 @@ describe('local CLI context capabilities', () => {
       durableInstructionScope: 'invocation',
       codingProjectDirectory: false,
       orkasBridge: false,
+      agentMemory: false,
       activeRunIngress: 'none',
+      permissionPolicies: ['inherit'],
     });
     expect(localCliResumeStrategy('unknown')).toBe('none');
+    expect(localCliDefaultPermissionPolicy('unknown')).toBe('inherit');
+    expect(localCliDefaultPermissionPolicy('opencode')).toBe('full_access');
+  });
+
+  it('enables Agent memory only for Claude and Codex', () => {
+    expect(LOCAL_CLI_TYPES.filter(localCliSupportsAgentMemory)).toEqual(['claude', 'codex']);
+    expect(localCliSupportsAgentMemory('openclaw')).toBe(false);
+    expect(localCliSupportsAgentMemory('opencode')).toBe(false);
+    expect(localCliSupportsAgentMemory('hermes')).toBe(false);
+    expect(localCliSupportsAgentMemory('unknown')).toBe(false);
+  });
+});
+
+describe('local CLI startup warmup contract', () => {
+  it('registers the shared registry probe as deferred idle process work', () => {
+    const mainSource = fs.readFileSync(path.resolve(process.cwd(), 'src/main/index.ts'), 'utf8');
+    expect(mainSource).toContain("registerDeferred('local-agents:warm-cli-registry'");
+    expect(mainSource).toMatch(/local-agents:warm-cli-registry[\s\S]+warmLocalClis\(signal\)[\s\S]+idleProcess/);
+    // A serial barrier would delay the schedulers registered after it (S9-1).
+    expect(mainSource).toMatch(/local-agents:warm-cli-registry[\s\S]{0,400}\}, 'parallel', 0, idleProcess\)/);
+    expect(mainSource).toMatch(/const idleProcess = \{[\s\S]+resourceClass: 'process'[\s\S]+preferIdle: true/);
   });
 });
 
@@ -416,6 +458,49 @@ describe('local_agents/registry', () => {
     expect(r.available).toBe(true);
   });
 
+  it('prefers a stable Codex from any source and reuses the cached fallback after failure', async () => {
+    const alphaDir = path.join(tmpDir, 'bundled-alpha');
+    const stableDir = path.join(tmpDir, 'standalone-stable');
+    const alphaBin = writeMockCli(path.join(alphaDir, 'codex'), 'codex-cli 0.151.0-alpha.7.2');
+    const stableBin = writeMockCli(path.join(stableDir, 'codex'), 'codex-cli 0.146.0');
+    process.env.PATH = `${alphaDir}${path.delimiter}${stableDir}`;
+
+    const selected = await detectOne('codex', { searchDirs: [] });
+    expect(isWindows ? selected.path?.toLowerCase() : selected.path).toBe(isWindows ? stableBin.toLowerCase() : stableBin);
+    expect(selected.version).toBe('0.146.0');
+
+    noteCliCandidateFailure(selected);
+    const fallback = cachedCliFallbackCandidate(selected);
+    expect(fallback).toMatchObject({
+      version: '0.151.0',
+      fullVersion: '0.151.0-alpha.7.2',
+      prerelease: true,
+      available: true,
+    });
+
+    expect(isWindows ? fallback!.path?.toLowerCase() : fallback!.path).toBe(isWindows ? alphaBin.toLowerCase() : alphaBin);
+
+    noteCliCandidateSuccess(fallback!);
+  });
+
+  it('keeps a ranked fallback pool for non-Codex CLIs too', async () => {
+    const newestDir = path.join(tmpDir, 'newest-claude');
+    const olderDir = path.join(tmpDir, 'older-claude');
+    const newestBin = writeMockCli(path.join(newestDir, 'claude'), '2.2.0');
+    const olderBin = writeMockCli(path.join(olderDir, 'claude'), '2.1.0');
+    process.env.PATH = `${olderDir}${path.delimiter}${newestDir}`;
+
+    const selected = await detectOne('claude', { searchDirs: [] });
+    expect(isWindows ? selected.path?.toLowerCase() : selected.path).toBe(isWindows ? newestBin.toLowerCase() : newestBin);
+    noteCliCandidateFailure(selected);
+    expect(cachedCliFallbackCandidate(selected)).toMatchObject({
+      type: 'claude', version: '2.1.0', available: true,
+    });
+    const fallback = cachedCliFallbackCandidate(selected)!;
+    expect(isWindows ? fallback.path?.toLowerCase() : fallback.path).toBe(isWindows ? olderBin.toLowerCase() : olderBin);
+    noteCliCandidateSuccess(cachedCliFallbackCandidate(selected)!);
+  });
+
   it('keeps ORKAS_CODEX_PATH authoritative even when a newer Codex is discoverable', async () => {
     const pinned = writeMockCli(path.join(tmpDir, 'pinned-codex'), 'codex-cli 0.145.0');
     const newerDir = path.join(tmpDir, 'newer-codex');
@@ -518,7 +603,7 @@ describe('local_agents/registry', () => {
 
   it('detectAll keeps results cached for the process lifetime until forced', async () => {
     const now = vi.spyOn(Date, 'now').mockReturnValue(1_000);
-    const fake = writeMockCli(path.join(tmpDir, 'ok-opencode'), '0.10.0');
+    const fake = writeMockCli(path.join(tmpDir, 'ok-opencode'), MIN_VERSIONS.opencode);
     process.env.PATH = '';
     process.env.ORKAS_OPENCODE_PATH = fake;
 
@@ -565,6 +650,83 @@ describe('local_agents/registry', () => {
       '--version',
       'version',
     ]);
+  });
+
+  it('lets dispatch join the startup idle probe instead of launching another process', async () => {
+    const probeLog = path.join(tmpDir, 'warm-probe-calls.log');
+    const fake = writeCountingMockCli(path.join(tmpDir, 'counting-claude'), probeLog);
+    process.env.PATH = '';
+    process.env.ORKAS_CLAUDE_PATH = fake;
+    process.env.ORKAS_CODEX_PATH = path.join(tmpDir, 'missing-codex');
+    process.env.ORKAS_OPENCLAW_PATH = path.join(tmpDir, 'missing-openclaw');
+    process.env.ORKAS_OPENCODE_PATH = path.join(tmpDir, 'missing-opencode');
+    process.env.ORKAS_HERMES_PATH = path.join(tmpDir, 'missing-hermes');
+
+    const [warm, dispatched] = await Promise.all([
+      warmLocalClis(),
+      resolveCliForDispatch('claude'),
+    ]);
+
+    expect(dispatched).toMatchObject({ type: 'claude', path: fake, available: true });
+    expect(warm.find(entry => entry.type === 'claude')).toBe(dispatched);
+    expect(fs.readFileSync(probeLog, 'utf8').trim().split(/\r?\n/)).toEqual(['--version']);
+  });
+
+  it('reuses a validated dispatch result indefinitely while its file identity is unchanged', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000);
+    const probeLog = path.join(tmpDir, 'dispatch-probe-calls.log');
+    const fake = writeCountingMockCli(path.join(tmpDir, 'counting-claude'), probeLog);
+    process.env.PATH = '';
+    process.env.ORKAS_CLAUDE_PATH = fake;
+
+    const first = await resolveCliForDispatch('claude');
+    now.mockReturnValue(86_401_000);
+    const second = await resolveCliForDispatch('claude');
+
+    expect(second).toBe(first);
+    expect(fs.readFileSync(probeLog, 'utf8').trim().split(/\r?\n/)).toEqual(['--version']);
+  });
+
+  it('re-probes dispatch after an upgrade or uninstall and sees a later reinstall', async () => {
+    const fake = writeMockCli(path.join(tmpDir, 'mutable-claude'), '2.1.0');
+    process.env.PATH = '';
+    process.env.ORKAS_CLAUDE_PATH = fake;
+
+    expect(await resolveCliForDispatch('claude')).toMatchObject({ version: '2.1.0', available: true });
+    writeMockCli(path.join(tmpDir, 'mutable-claude'), '2.10.0');
+    expect(await resolveCliForDispatch('claude')).toMatchObject({ version: '2.10.0', available: true });
+
+    fs.rmSync(fake);
+    expect(await resolveCliForDispatch('claude')).toMatchObject({ available: false, error: 'not_found' });
+    writeMockCli(path.join(tmpDir, 'mutable-claude'), '2.11.0');
+    expect(await resolveCliForDispatch('claude')).toMatchObject({ version: '2.11.0', available: true });
+  });
+
+  it('shares a normal cached resolver result across UI and runtime callers', async () => {
+    const probeLog = path.join(tmpDir, 'shared-resolver-probe-calls.log');
+    const fake = writeCountingMockCli(path.join(tmpDir, 'counting-claude'), probeLog);
+    process.env.PATH = '';
+    process.env.ORKAS_CLAUDE_PATH = fake;
+
+    const [first, second] = await Promise.all([resolveCli('claude'), resolveCli('claude')]);
+    expect(second).toBe(first);
+    expect(fs.readFileSync(probeLog, 'utf8').trim().split(/\r?\n/)).toEqual(['--version']);
+  });
+
+  it('lets a forced UI refresh join and retain an in-flight startup probe', async () => {
+    const probeLog = path.join(tmpDir, 'forced-join-probe-calls.log');
+    const fake = writeCountingMockCli(path.join(tmpDir, 'counting-claude'), probeLog);
+    process.env.PATH = '';
+    process.env.ORKAS_CLAUDE_PATH = fake;
+
+    const startupProbe = resolveCli('claude');
+    const uiRefresh = resolveCli('claude', { force: true });
+    const [startupEntry, uiEntry] = await Promise.all([startupProbe, uiRefresh]);
+    const laterDispatch = await resolveCliForDispatch('claude');
+
+    expect(uiEntry).toBe(startupEntry);
+    expect(laterDispatch).toBe(startupEntry);
+    expect(fs.readFileSync(probeLog, 'utf8').trim().split(/\r?\n/)).toEqual(['--version']);
   });
 });
 

@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   beginImageStudioGeneration,
   finishImageStudioGeneration,
+  latestCompletedImageStudioGenerationOutput,
   readImageGenerationControlState,
   summarizeImageGenerationBudget,
 } from '../../../src/main/features/image_production_control';
@@ -43,6 +44,54 @@ afterEach(() => {
 });
 
 describe('ImageStudio generation control', () => {
+  it('selects only the latest completed output in the requested turn', () => {
+    const state = {
+      schema_version: 1 as const,
+      project_dir: root,
+      route: 'generate' as const,
+      max_calls: 2,
+      transactions: [
+        {
+          transaction_id: 'old-completed',
+          request_id: 'old-completed',
+          turn_id: 'turn-1',
+          status: 'completed' as const,
+          planned_output_path: path.join(root, 'old.png'),
+          output_path: path.join(root, 'old.png'),
+          started_at: '2026-08-27T00:00:00.000Z',
+          finished_at: '2026-08-27T00:00:01.000Z',
+        },
+        {
+          transaction_id: 'current-completed',
+          request_id: 'current-completed',
+          turn_id: 'turn-2',
+          status: 'completed' as const,
+          planned_output_path: path.join(root, 'current.png'),
+          output_path: path.join(root, 'current.png'),
+          started_at: '2026-08-27T00:00:02.000Z',
+          finished_at: '2026-08-27T00:00:03.000Z',
+        },
+        {
+          transaction_id: 'current-pending',
+          request_id: 'current-pending',
+          turn_id: 'turn-2',
+          status: 'pending' as const,
+          planned_output_path: path.join(root, 'pending.png'),
+          started_at: '2026-08-27T00:00:04.000Z',
+        },
+      ],
+      updated_at: '2026-08-27T00:00:04.000Z',
+    };
+
+    expect(latestCompletedImageStudioGenerationOutput(state, 'turn-2'))
+      .toBe(path.join(root, 'current.png'));
+    expect(latestCompletedImageStudioGenerationOutput(state, 'missing-turn')).toBeUndefined();
+    expect(latestCompletedImageStudioGenerationOutput({
+      ...state,
+      transactions: state.transactions.filter((transaction) => transaction.status !== 'completed'),
+    }, 'turn-2')).toBeUndefined();
+  });
+
   it('hard-blocks image generation on COMPOSE', async () => {
     writeManifest('compose', 0);
     await expect(beginImageStudioGeneration({

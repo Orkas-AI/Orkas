@@ -43,10 +43,13 @@ function createElement() {
 }
 
 function createHarness(initialState: unknown = {}) {
+  const todaySection = createElement();
   const projectsSection = createElement();
   const tasksSection = createElement();
+  const todayToggle = createElement();
   const projectsToggle = createElement();
   const tasksToggle = createElement();
+  const todayBody = createElement();
   const projectsBody = createElement();
   const tasksBody = createElement();
   const values = new Map<string, string>([
@@ -61,8 +64,10 @@ function createHarness(initialState: unknown = {}) {
     },
   };
   const byId: Record<string, any> = {
+    'today-section-toggle': todayToggle,
     'projects-section-toggle': projectsToggle,
     'tasks-section-toggle': tasksToggle,
+    'today-list': todayBody,
     'projects-list': projectsBody,
     'conversation-list': tasksBody,
   };
@@ -71,12 +76,14 @@ function createHarness(initialState: unknown = {}) {
       return byId[id] ?? null;
     },
     querySelector(selector: string) {
+      if (selector === '.sidebar-today-section') return todaySection;
       if (selector === '.sidebar-projects-section') return projectsSection;
       if (selector === '.sidebar-conversations-section') return tasksSection;
       return null;
     },
   };
   const translate = (key: string, params?: { section?: string }) => {
+    if (key === 'sidebar.today_tasks') return "Today's Tasks";
     if (key === 'sidebar.projects') return 'Projects';
     if (key === 'sidebar.conversations') return 'Tasks';
     if (key === 'sidebar.section_collapse') return `Collapse ${params?.section}`;
@@ -87,10 +94,13 @@ function createHarness(initialState: unknown = {}) {
     document,
     storage,
     values,
+    todaySection,
     projectsSection,
     tasksSection,
+    todayToggle,
     projectsToggle,
     tasksToggle,
+    todayBody,
     projectsBody,
     tasksBody,
     translate,
@@ -98,11 +108,17 @@ function createHarness(initialState: unknown = {}) {
 }
 
 describe('sidebar top-level section collapse', () => {
-  it('restores Projects and Tasks independently with accessible toggle state', () => {
+  it('restores Today, Projects and Tasks independently with accessible toggle state', () => {
+    // State persisted before the Today section existed carries no `today`
+    // key; the new section must open, not inherit a neighbour's state.
     const harness = createHarness({ projects: true, tasks: false });
 
     initSidebarSections(harness.document, harness.storage, harness.translate);
 
+    expect(harness.todayBody.hidden).toBe(false);
+    expect(harness.todaySection.classList.contains('is-collapsed')).toBe(false);
+    expect(harness.todayToggle.getAttribute('aria-expanded')).toBe('true');
+    expect(harness.todayToggle.getAttribute('aria-label')).toBe("Collapse Today's Tasks");
     expect(harness.projectsBody.hidden).toBe(true);
     expect(harness.tasksBody.hidden).toBe(false);
     expect(harness.projectsSection.classList.contains('is-collapsed')).toBe(true);
@@ -121,7 +137,19 @@ describe('sidebar top-level section collapse', () => {
 
     expect(harness.projectsBody.hidden).toBe(true);
     expect(harness.tasksBody.hidden).toBe(true);
+    expect(harness.todayBody.hidden).toBe(false);
     expect(JSON.parse(harness.values.get(STORAGE_KEY) || '{}')).toEqual({
+      today: false,
+      projects: true,
+      tasks: true,
+    });
+
+    harness.todayToggle.click();
+
+    expect(harness.todayBody.hidden).toBe(true);
+    expect(harness.projectsBody.hidden).toBe(true);
+    expect(JSON.parse(harness.values.get(STORAGE_KEY) || '{}')).toEqual({
+      today: true,
       projects: true,
       tasks: true,
     });
@@ -157,9 +185,10 @@ describe('sidebar top-level section collapse', () => {
     const storage = { getItem: () => '{bad json', setItem() {} };
     expect(readCollapsedState(storage)).toEqual({});
 
-    const harness = createHarness({ projects: 'true', tasks: 1 });
+    const harness = createHarness({ today: 'yes', projects: 'true', tasks: 1 });
     initSidebarSections(harness.document, harness.storage, harness.translate);
 
+    expect(harness.todayBody.hidden).toBe(false);
     expect(harness.projectsBody.hidden).toBe(false);
     expect(harness.tasksBody.hidden).toBe(false);
   });

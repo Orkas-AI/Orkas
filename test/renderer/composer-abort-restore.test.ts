@@ -69,7 +69,6 @@ function loadQueueDraft(stored = new Map<string, string>()) {
     document: {
       getElementById: (id: string) => (id === 'chat-input' ? input : null),
     },
-    _QUEUE_KEY: (cid: string) => `queue:${cid}`,
     _DRAFT_KEY: (cid: string) => `draft:${cid}`,
     _updateConvSidebarBadge: vi.fn(),
     _updateConvSendUI: vi.fn(),
@@ -171,28 +170,15 @@ describe('composer restore after a user stop', () => {
     expect(context._restoreSentComposerSnapshot('conv-a')).toBe(false);
   });
 
-  it('restores the raw message, not the dispatched payload', () => {
+  it('restores the authored multi-recipient draft with its original single default', () => {
     const { context, input, recipientsByCid } = loadQueueDraft();
     context.currentCid = 'conv-a';
-    context.messageQueues.set('conv-a', [{
-      id: 'q1',
-      content: 'draft the release note',
-      use: { kind: 'skill', id: 'writer', name: 'writer' },
-      recipient: { kind: 'agent', id: 'agent-writer', name: 'Writer' },
-    }]);
-
-    context._dispatchNextQueued('conv-a');
-
-    // What went to the model carries the routing tag and the expanded skill.
-    const [, dispatched] = context.sendInConversation.mock.calls[0];
-    expect(dispatched).toBe('@Writer use writer skill: draft the release note');
-
+    context._rememberSentComposerSnapshot('conv-a', {
+      ...AUTHORED, text: 'review first @Reviewer check',
+      recipient: { kind: 'group', recipients: [AUTHORED.recipient, { kind: 'agent', id: 'reviewer', name: 'Reviewer' }], defaultRecipient: AUTHORED.recipient },
+    });
     expect(context._restoreSentComposerSnapshot('conv-a')).toBe(true);
-    // What comes back is re-sendable: the recipient lives in the chip and the
-    // skill in an inline token, so sending again cannot double-apply either.
-    expect(input.value).toBe('[skill:writer] draft the release note');
-    expect(input.value).not.toContain('@Writer');
-    expect(input.value).not.toContain('use writer skill:');
+    expect(input.value).toBe('review first @Reviewer check');
     expect(recipientsByCid.get('conv-a')).toMatchObject({ kind: 'agent', id: 'agent-writer' });
   });
 
@@ -206,20 +192,6 @@ describe('composer restore after a user stop', () => {
     expect(input.value).toBe('actually, hold on');
     input.value = '';
     expect(context._restoreSentComposerSnapshot('conv-a')).toBe(false);
-  });
-
-  it('leaves a queued-item edit that owns the composer untouched', () => {
-    const { context, input, stored } = loadQueueDraft();
-    context.currentCid = 'conv-a';
-    context.messageQueues.set('conv-a', [{ id: 'q1', content: 'queued follow-up', direct: true }]);
-    context._rememberSentComposerSnapshot('conv-a', AUTHORED);
-
-    context._startQueueItemEdit('conv-a', { dataset: { qid: 'q1' } });
-    expect(context._restoreSentComposerSnapshot('conv-a')).toBe(false);
-
-    expect(input.value).toBe('queued follow-up');
-    expect(context._isQueueItemEditing('conv-a')).toBe(true);
-    expect(JSON.parse(stored.get('queue:conv-a')!)[0].composer_edit).toBeTruthy();
   });
 
   it('writes a draft instead of painting a conversation that is not open', () => {
@@ -246,35 +218,6 @@ describe('composer restore after a user stop', () => {
     expect(context._restoreSentComposerSnapshot('conv-a')).toBe(false);
   });
 
-  it('drops the snapshot when the dispatch never leaves the renderer', () => {
-    const { context } = loadQueueDraft();
-    context.currentCid = 'conv-a';
-    context.sendInConversation = vi.fn(() => { throw new Error('model not configured'); });
-    context.messageQueues.set('conv-a', [{ id: 'q1', content: 'queued item', direct: true }]);
-
-    context._dispatchNextQueued('conv-a');
-
-    // The item is still queued; a later stop belongs to whatever turn is
-    // actually running, not to this message.
-    expect(context.messageQueues.get('conv-a')).toHaveLength(1);
-    expect(context._restoreSentComposerSnapshot('conv-a')).toBe(false);
-  });
-
-  it('drops the snapshot when steering the live turn fails', async () => {
-    const { context } = loadQueueDraft();
-    context.currentCid = 'conv-a';
-    // Send-now only exists while a turn is running, so the failure must not
-    // fall through into a fresh dispatch.
-    context.isConvPending = () => true;
-    context.apiFetch = vi.fn(() => Promise.reject(new Error('offline')));
-    const item = { id: 'q1', content: 'steer the turn', direct: true };
-    context.messageQueues.set('conv-a', [item]);
-
-    await context._sendQueuedMessageIntoActiveRun('conv-a', item);
-
-    expect(context._restoreSentComposerSnapshot('conv-a')).toBe(false);
-  });
-
   it('supersedes the previous snapshot when the next message starts a turn', () => {
     const { context, input } = loadQueueDraft();
     context.currentCid = 'conv-a';
@@ -295,6 +238,7 @@ describe('stop and settlement wiring', () => {
       Set,
       Promise,
       pendingConvs: new Map([['conv-a', { controller: { abort: vi.fn() }, aborted: false }]]),
+      _groupPlaceholders: new Map(),
       currentCid: 'conv-a',
       _trackTaskStopClick: vi.fn(),
       _restoreSentComposerSnapshot: restore,
@@ -305,11 +249,15 @@ describe('stop and settlement wiring', () => {
       _refreshTaskSurfacesAfterAbort: vi.fn(),
       _updateConvSidebarBadge: vi.fn(),
       _updateConvSendUI: vi.fn(),
+      _streamingMarkAborted: vi.fn(),
       stopPolling: vi.fn(),
       document: { getElementById: () => null },
     };
     vm.createContext(context);
-    vm.runInContext(`${extractFunction('abortConvStream')}`, context, { filename: 'abort.js' });
+    vm.runInContext(`
+      ${extractFunction('_settleConversationPlaceholdersOnAbort')}
+      ${extractFunction('abortConvStream')}
+    `, context, { filename: 'abort.js' });
     context.abortConvStream('conv-a', options);
     return restore;
   }

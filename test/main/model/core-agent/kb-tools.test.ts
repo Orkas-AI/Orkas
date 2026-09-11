@@ -467,12 +467,22 @@ describe('kb-tools › shape', () => {
     expect(library.inputSchema.required).toEqual(['action']);
   });
 
-  it('advertises the union schema while enforcing action-specific fields', async () => {
+  it('advertises action-discriminated schemas while enforcing action-specific fields', async () => {
     const library = await createLibrary();
-    expect(library.inputSchema.properties).toHaveProperty('scope');
-    expect(library.inputSchema.properties).toHaveProperty('query');
-    expect(library.inputSchema.properties).toHaveProperty('path');
-    expect(library.inputSchema.additionalProperties).toBe(false);
+    const schema = library.inputSchema as any;
+    const branches = Object.fromEntries(schema.oneOf.map((branch: any) => [
+      branch.properties.action.enum[0], branch,
+    ]));
+    expect(schema.properties).toHaveProperty('scope');
+    expect(schema.properties).toHaveProperty('query');
+    expect(schema.properties).toHaveProperty('path');
+    expect(schema.additionalProperties).toBe(false);
+    expect(schema.oneOf).toHaveLength(3);
+    expect(Object.keys(branches.list.properties)).toEqual(['action']);
+    expect(Object.keys(branches.search.properties)).toEqual(['action']);
+    expect(Object.keys(branches.read.properties)).toEqual(['action']);
+    expect(branches.search.required).toEqual(['action', 'query']);
+    expect(branches.read.required).toEqual(['action', 'path']);
 
     const missingAction = await library.execute({ query: 'alpha' }, ctxFor());
     const crossActionField = await library.execute({

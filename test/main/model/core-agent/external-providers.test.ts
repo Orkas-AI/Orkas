@@ -7,7 +7,7 @@ import {
   buildOrkasApiModel,
   createMoonshotProvider,
 } from '../../../../src/main/model/core-agent/external-providers';
-import { modelInputImageLimit } from '../../../../src/main/model/provider_catalog';
+import { isSelectableModel, modelInputImageLimit } from '../../../../src/main/model/provider_catalog';
 
 describe('external-providers › custom OpenAI-compatible model', () => {
   const runtimeConfig = {
@@ -93,6 +93,18 @@ describe('external-providers › DeepSeek model capabilities', () => {
       maxTokens: 384_000,
     });
     expect(modelInputImageLimit('deepseek', 'deepseek-v4-flash-vision-exp', model)).toBe(20);
+  });
+
+  it('selects the canonical V4.1 Flash alias with vision and reasoning capabilities', () => {
+    expect(isSelectableModel('deepseek', 'deepseek-flash')).toBe(true);
+    const model = buildDeepSeekModel('deepseek-flash');
+    expect(model).toMatchObject({
+      id: 'deepseek-flash', name: 'DeepSeek V4.1 Flash',
+      api: 'openai-completions', baseUrl: 'https://api.deepseek.com/v1',
+      reasoning: true, input: ['text', 'image'],
+      contextWindow: 1_048_576, maxTokens: 384_000,
+    });
+    expect(modelInputImageLimit('deepseek', 'deepseek-flash', model)).toBe(20);
   });
 
   it('defaults unknown direct DeepSeek models to vision while known aliases remain text-only', () => {

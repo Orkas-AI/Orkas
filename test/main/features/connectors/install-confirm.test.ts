@@ -53,6 +53,7 @@ describe('connectors/install_confirm', () => {
       });
       expect(pushed).toHaveLength(1);
       expect(pushed[0].summary).toContain('npx -y srv');
+      expect(pushed[0].target).toBe('npx -y srv');
       expect(pushed[0].kind).toBe('stdio');
       expect(ic.respond(pushed[0].request_id, true)).toBe(true);
       await expect(p).resolves.toBe(true);

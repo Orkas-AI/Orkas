@@ -16,7 +16,6 @@ DNS-rebinding window.
 from __future__ import annotations
 
 import argparse
-import gzip
 from html import unescape
 import http.client
 import json
@@ -43,12 +42,38 @@ MAX_REDIRECTS = 5
 MAX_BODY_BYTES = 5 * 1024 * 1024  # 5 MB cap; SEO pages are small, guard runaways.
 
 _WORD_RE = re.compile(r"\b[\w'-]+\b", re.UNICODE)
+# CJK scripts write words without spaces: kana U+3040-30FF, han ext-A
+# U+3400-4DBF, han unified U+4E00-9FFF, hangul U+AC00-D7A3, han compatibility
+# U+F900-FAFF. Counted per character; ~2 chars approximate one word.
+_CJK_CHAR_RE = re.compile(
+    "[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7a3\uf900-\ufaff]")
+# <meta charset="..."> / <meta http-equiv=... content="...; charset=...">, as a
+# bytes regex so the charset can be sniffed BEFORE the body is decoded.
+_META_CHARSET_B_RE = re.compile(
+    rb"<meta\b[^>]*charset\s*=\s*[\"']?\s*([A-Za-z0-9_\-]+)", re.IGNORECASE)
 _RAW_ANCHOR_HREF_RE = re.compile(
     r"<a\b[^>]*\bhref\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'=<>`]+))",
     re.IGNORECASE,
 )
 _SKIP_TEXT_TAGS = {"script", "style", "noscript", "template", "head", "svg"}
 _HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+# Block-level tags that end one paragraph of body text and start the next.
+# Used to recover the FIRST content block (see first_content_block); a block
+# tag closes the current block so a heading between two paragraphs can't merge
+# them, and each list item / cell counts as its own block.
+_BLOCK_TAGS = {
+    "p", "div", "section", "article", "main", "aside", "header", "footer",
+    "li", "ul", "ol", "dl", "dd", "dt", "tr", "td", "th", "table",
+    "blockquote", "pre", "figure", "figcaption", "br", "hr", "nav",
+} | _HEADING_TAGS
+# Page-chrome containers whose text is NOT body prose: nav menus, the masthead,
+# the footer, sidebars. Their text still flows into visible_text/word_count, but
+# it is kept out of the content-block stream so first_content_block returns the
+# first real paragraph, not a nav menu — otherwise a page with a top nav would
+# always look like it "buries the answer".
+_NONBODY_TAGS = {"nav", "header", "footer", "aside"}
+# Latin (". ! ?") and CJK ("。！？") sentence terminators.
+_SENTENCE_END_RE = re.compile("[.!?。！？]")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -74,19 +99,66 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
 
 
+def _bounded_inflate(raw: bytes, wbits: int) -> bytes:
+    """Stream-decompress `raw`, capping OUTPUT at MAX_BODY_BYTES + 1 bytes so a
+    tiny compressed payload cannot inflate without bound (decompression bomb).
+    The caller treats output past MAX_BODY_BYTES as a truncated body."""
+    d = zlib.decompressobj(wbits)
+    out = bytearray()
+    data = raw
+    while data and len(out) <= MAX_BODY_BYTES:
+        # max_length must stay >= 1: zlib treats max_length=0 as "no limit".
+        out.extend(d.decompress(data, MAX_BODY_BYTES + 1 - len(out)))
+        data = d.unconsumed_tail
+    return bytes(out)
+
+
 def _decode_body(raw: bytes, encoding: str) -> bytes:
     enc = (encoding or "").lower().strip()
-    try:
-        if enc == "gzip":
-            return gzip.decompress(raw)
-        if enc == "deflate":
-            try:
-                return zlib.decompress(raw)
-            except zlib.error:
-                return zlib.decompress(raw, -zlib.MAX_WBITS)
-    except (OSError, zlib.error):
+    if enc == "gzip":
+        wbits_options = (16 + zlib.MAX_WBITS,)
+    elif enc == "deflate":
+        wbits_options = (zlib.MAX_WBITS, -zlib.MAX_WBITS)  # zlib-wrapped, then raw
+    else:
         return raw
-    return raw
+    for wbits in wbits_options:
+        try:
+            return _bounded_inflate(raw, wbits)
+        except zlib.error:
+            continue
+    return raw  # corrupt stream -> best-effort raw passthrough, as before
+
+
+def _finalize_body(raw: bytes, content_encoding: str) -> tuple[bytes, bool]:
+    """Apply the MAX_BODY_BYTES cap to both the raw and the decompressed body.
+    Returns (body, truncated); an over-cap decompressed body is truncated the
+    same way an oversized raw body is."""
+    truncated = len(raw) > MAX_BODY_BYTES
+    if truncated:
+        raw = raw[:MAX_BODY_BYTES]
+    body = _decode_body(raw, content_encoding)
+    if len(body) > MAX_BODY_BYTES:
+        truncated = True
+        body = body[:MAX_BODY_BYTES]
+    return body, truncated
+
+
+def _sniff_meta_charset(body: bytes) -> str | None:
+    """Charset declared by a <meta> tag in the first 2 KiB of the (still
+    undecoded) body. Used only when the Content-Type header names none; an
+    unknown codec name is handled by the decode fallback."""
+    m = _META_CHARSET_B_RE.search(body[:2048])
+    return m.group(1).decode("ascii") if m else None
+
+
+def _decode_text(body: bytes, content_type: str) -> str:
+    """Header charset wins; otherwise the meta-declared charset; else utf-8.
+    Unknown/broken codecs fall back to utf-8 with replacement."""
+    charset = _charset_from_content_type(content_type) or _sniff_meta_charset(body) or "utf-8"
+    try:
+        return body.decode(charset, errors="replace")
+    except (LookupError, UnicodeDecodeError):
+        return body.decode("utf-8", errors="replace")
 
 
 def _charset_from_content_type(ct: str) -> str | None:
@@ -98,7 +170,7 @@ def _no_proxy_match(host: str, no_proxy: str) -> bool:
     host = host.lower()
     for entry in re.split(r"[,;]", no_proxy or ""):
         e = entry.strip().lower().lstrip("*").lstrip(".")
-        if e and (host == e or host.endswith("." + e) or host.endswith(e)):
+        if e and (host == e or host.endswith("." + e)):
             return True
     return False
 
@@ -179,15 +251,8 @@ def _fetch_once(url: str, timeout: float, ua: str) -> dict:
     finally:
         conn.close()
 
-    truncated = len(raw) > MAX_BODY_BYTES
-    if truncated:
-        raw = raw[:MAX_BODY_BYTES]
-    body = _decode_body(raw, headers.get("content-encoding", ""))
-    charset = _charset_from_content_type(headers.get("content-type", "")) or "utf-8"
-    try:
-        text = body.decode(charset, errors="replace")
-    except (LookupError, UnicodeDecodeError):
-        text = body.decode("utf-8", errors="replace")
+    body, truncated = _finalize_body(raw, headers.get("content-encoding", ""))
+    text = _decode_text(body, headers.get("content-type", ""))
 
     return {
         "final_url": normalized,
@@ -237,6 +302,9 @@ class _PageParser(HTMLParser):
         self.anchors: list[str] = []
         self.jsonld_raw: list[str] = []
         self._text_parts: list[str] = []
+        self._blocks: list[str] = []       # completed body-prose blocks, in order
+        self._block_buf: list[str] = []     # text of the block currently open
+        self._nonbody_depth = 0             # inside nav/header/footer/aside
         self._skip_depth = 0
         self._in_title = False
         self._heading_level = 0
@@ -268,12 +336,20 @@ class _PageParser(HTMLParser):
                 self._jsonld_buf = []
         if tag in _SKIP_TEXT_TAGS:
             self._skip_depth += 1
+        # A block boundary closes the paragraph that was open; entering a
+        # chrome container marks its text as non-body until the matching close.
+        if tag in _BLOCK_TAGS:
+            self._flush_block()
+        if tag in _NONBODY_TAGS:
+            self._nonbody_depth += 1
 
     def handle_startendtag(self, tag, attrs):
         # void/self-closing forms (e.g. <meta .../>, <img .../>, <link .../>)
         self.handle_starttag(tag, attrs)
         if tag in _SKIP_TEXT_TAGS:
             self._skip_depth -= 1
+        if tag in _NONBODY_TAGS and self._nonbody_depth > 0:
+            self._nonbody_depth -= 1
         if tag in _HEADING_TAGS:
             self._heading_level = 0
 
@@ -287,6 +363,10 @@ class _PageParser(HTMLParser):
         elif tag in _HEADING_TAGS and self._heading_level:
             self.headings.append({"level": self._heading_level, "text": "".join(self._heading_buf).strip()})
             self._heading_level = 0
+        if tag in _BLOCK_TAGS:
+            self._flush_block()
+        if tag in _NONBODY_TAGS and self._nonbody_depth > 0:
+            self._nonbody_depth -= 1
         if tag in _SKIP_TEXT_TAGS and self._skip_depth > 0:
             self._skip_depth -= 1
 
@@ -299,9 +379,44 @@ class _PageParser(HTMLParser):
             self._heading_buf.append(data)
         if self._skip_depth == 0:
             self._text_parts.append(data)
+            # Body-prose block stream: exclude heading text (own field) and
+            # page-chrome containers so first_content_block is the first real
+            # paragraph. visible_text/text_sample/word_count are unaffected.
+            if self._heading_level == 0 and self._nonbody_depth == 0:
+                self._block_buf.append(data)
 
     def visible_text(self) -> str:
         return " ".join("".join(self._text_parts).split())
+
+    def _flush_block(self) -> None:
+        block = " ".join("".join(self._block_buf).split())
+        if block:
+            self._blocks.append(block)
+        self._block_buf = []
+
+    def first_content_block(self) -> str:
+        """First paragraph-level block of body prose (headings and nav/header/
+        footer/aside excluded). The old first_paragraph was the first 320 chars
+        of the whole page — never < 60 chars, so the answer-first signal
+        (content.py / geo_score.py test len(first) < 60) could never fire."""
+        self._flush_block()  # capture a trailing block with no closing tag
+        for block in self._blocks:
+            if block:
+                return block
+        return ""
+
+
+def _count_words(text: str) -> int:
+    """Latin-style word count plus CJK characters at ~2 chars per word.
+
+    The word-boundary regex sees an unbroken CJK run as ONE token, so a Chinese
+    page would report word_count 1-10. Count CJK characters separately (2 chars
+    approximate 1 word, rounded up) and the remaining text as before."""
+    cjk = len(_CJK_CHAR_RE.findall(text))
+    if not cjk:
+        return len(_WORD_RE.findall(text))
+    latin = len(_WORD_RE.findall(_CJK_CHAR_RE.sub(" ", text)))
+    return latin + (cjk + 1) // 2
 
 
 def _norm(s):
@@ -397,7 +512,7 @@ def extract_fields(html: str, page_url: str, *, status: int | None = 200,
     h1s = [h["text"] for h in p.headings if h["level"] == 1]
     heading_order = [h["level"] for h in p.headings]
     text = p.visible_text()
-    word_count = len(_WORD_RE.findall(text))
+    word_count = _count_words(text)
 
     noindex = bool(meta_robots and "noindex" in meta_robots.lower())
     # Indexability needs both halves. The directive is in the HTML, but the 200
@@ -447,7 +562,7 @@ def extract_fields(html: str, page_url: str, *, status: int | None = 200,
         "hreflang_tags": hreflangs,
         "is_indexable": is_indexable,
         "noindex": noindex,
-        "first_paragraph": _first_sentence(text),
+        "first_paragraph": _first_sentence(p.first_content_block()),
         "text_length": len(text),
         "text_sample": text[:20000],
     }
@@ -455,7 +570,12 @@ def extract_fields(html: str, page_url: str, *, status: int | None = 200,
 
 def _first_sentence(text: str, limit: int = 320) -> str:
     t = text.strip()
-    return t[:limit]
+    if not t:
+        return ""
+    m = _SENTENCE_END_RE.search(t)
+    if m and m.end() <= limit:
+        return t[:m.end()].strip()
+    return t[:limit].strip()
 
 
 _REPRESENTATIVE_PATH_HINTS = (

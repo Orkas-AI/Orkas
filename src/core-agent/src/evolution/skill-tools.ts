@@ -20,6 +20,14 @@ export function createSkillManageTool(
   store: SkillStore,
   onCreated?: (id: string) => void,
 ): AgentTool {
+  type SkillManageAction = "create" | "read" | "patch" | "list" | "delete";
+  const actionFields: Readonly<Record<SkillManageAction, ReadonlySet<string>>> = {
+    list: new Set(["action"]),
+    read: new Set(["action", "id"]),
+    delete: new Set(["action", "id"]),
+    create: new Set(["action", "id", "name", "description", "body", "tags"]),
+    patch: new Set(["action", "id", "old_string", "new_string", "replace_all"]),
+  };
   return defineTool({
     name: "skill_manage",
     description:
@@ -30,6 +38,7 @@ export function createSkillManageTool(
         action: {
           type: "string",
           enum: ["create", "read", "patch", "list", "delete"],
+          description: "list: no fields; read/delete: id; create: id/name/description/body; patch: id/old_string/new_string. Omit other-action fields.",
         },
         id: {
           type: "string",
@@ -69,9 +78,35 @@ export function createSkillManageTool(
       },
       required: ["action"],
       additionalProperties: false,
+      oneOf: [
+        { properties: { action: { enum: ["list"] } }, required: ["action"] },
+        { properties: { action: { enum: ["read"] } }, required: ["action", "id"] },
+        { properties: { action: { enum: ["delete"] } }, required: ["action", "id"] },
+        {
+          properties: { action: { enum: ["create"] } },
+          required: ["action", "id", "name", "description", "body"],
+        },
+        {
+          properties: { action: { enum: ["patch"] } },
+          required: ["action", "id", "old_string", "new_string"],
+        },
+      ],
     },
     async execute(input) {
-      const action = input.action as string;
+      const action = input.action as SkillManageAction;
+
+      if (!(["create", "read", "patch", "list", "delete"] as const).includes(action)) {
+        return { content: `Unknown action: ${String(action)}`, isError: true };
+      }
+      const unexpected = Object.keys(input)
+        .filter((key) => !actionFields[action].has(key))
+        .sort();
+      if (unexpected.length) {
+        return {
+          content: `Error: skill_manage(${action}) does not accept: ${unexpected.join(", ")}`,
+          isError: true,
+        };
+      }
 
       try {
         switch (action) {

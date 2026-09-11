@@ -1,13 +1,17 @@
 """Unit tests for seo-report dashboard + action plan + schema validation."""
 
+import json
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 from report import build_action_plan, build_dashboard, merge_audits, validate_dashboard  # noqa: E402
+from report import validate_data_tiers, _DATA_TIERS  # noqa: E402
 from report import _tone_for_percent, _health_tone, _data_of_optional  # noqa: E402
+from report import main as report_main  # noqa: E402
 
 AUDIT = {"ok": True, "data": {
     "health_score": 51,
@@ -341,6 +345,59 @@ class GeoProbeTruncationTest(unittest.TestCase):
         self.assertIn("+1 more prompts", md)
 
 
+class DefensiveLoadTest(unittest.TestCase):
+    """Optional --opportunities / --geo-probe / --add inputs load defensively:
+    a missing or invalid file is skipped and noted, never fatal to the report.
+    The primary --audit stays strict."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.audit_path = self._write("audit.json", AUDIT)
+
+    def _write(self, name, obj, raw=None):
+        p = os.path.join(self.tmp, name)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(raw if raw is not None else json.dumps(obj))
+        return p
+
+    def test_missing_geo_probe_path_still_reports(self):
+        env = report_main(["--audit", self.audit_path,
+                           "--geo-probe", os.path.join(self.tmp, "missing.json")])
+        self.assertTrue(env["ok"])
+        self.assertEqual(env["health_score"], 51)
+        self.assertNotIn("GEO Mention SoV", str(env["dashboard"]))
+        self.assertTrue(any(s.startswith("geo-probe:") for s in env["skipped_inputs"]))
+
+    def test_invalid_opportunities_json_skipped_with_note(self):
+        bad = self._write("opps.json", None, raw="{not valid json")
+        env = report_main(["--audit", self.audit_path, "--opportunities", bad])
+        self.assertTrue(env["ok"])
+        self.assertNotIn("Keyword opportunities", str(env["dashboard"]))
+        self.assertTrue(any(s.startswith("opportunities:") for s in env["skipped_inputs"]))
+
+    def test_missing_add_skipped_with_note(self):
+        env = report_main(["--audit", self.audit_path,
+                           "--add", os.path.join(self.tmp, "cwv-never-written.json")])
+        self.assertTrue(env["ok"])
+        self.assertEqual(env["health_score"], 51)  # merge of primary only
+        self.assertTrue(any(s.startswith("add:") for s in env["skipped_inputs"]))
+
+    def test_valid_optional_paths_still_merge(self):
+        opp = self._write("opportunities.json", OPPORTUNITIES)
+        probe = self._write("geo-probe.json", GEO_PROBE)
+        env = report_main(["--audit", self.audit_path,
+                           "--opportunities", opp, "--geo-probe", probe])
+        self.assertTrue(env["ok"])
+        text = str(env["dashboard"])
+        self.assertIn("Keyword opportunities", text)
+        self.assertIn("GEO Mention SoV", text)
+        self.assertNotIn("skipped_inputs", env)
+
+    def test_primary_audit_stays_strict(self):
+        with self.assertRaises(OSError):
+            report_main(["--audit", os.path.join(self.tmp, "nope.json")])
+
+
 class NonNumericProbeTest(unittest.TestCase):
     def test_non_numeric_competitor_share_does_not_crash(self):
         # An upstream/LLM-derived probe can carry a junk value; it must coerce to
@@ -455,6 +512,79 @@ class LocalFileDisclosureTest(unittest.TestCase):
         self.assertIn("- Evidence: live fetch", plan)
         self.assertNotIn("Not assessed:", plan)
         self.assertNotIn("covers assessed checks only", plan)
+
+
+
+class DataTierGateTest(unittest.TestCase):
+    """`data_tier` decides how strongly a line reads, so it may not be inferred.
+
+    Regression source: a 2026-08-30 report printed three vendor-documentation
+    claims as Measured. Findings and geo_recommendations defaulted to "Measured"
+    here while opportunities and the probe defaulted to "Estimated", so an item
+    that arrived without a tier — i.e. one that never went through a Skill's
+    provenance check — silently acquired the strongest label in the vocabulary.
+    """
+
+    def _audit_without_tier(self):
+        audit = json.loads(json.dumps(AUDIT))
+        del audit["data"]["findings"][0]["data_tier"]
+        return audit
+
+    def test_missing_tier_renders_as_estimated_not_measured(self):
+        plan = build_action_plan(self._audit_without_tier())
+        self.assertIn("- Data tier: Estimated", plan)
+        # The critical finding is the one whose tier was removed; it must not be
+        # the line that now claims Measured.
+        critical = plan.split("### 1.")[1].split("###")[0]
+        self.assertIn("Data tier: Estimated", critical)
+
+    def test_geo_recommendation_missing_tier_also_defaults_down(self):
+        audit = json.loads(json.dumps(AUDIT))
+        audit["data"]["geo_score"] = 60
+        audit["data"]["geo_recommendations"] = [
+            {"title": "Add Organization", "evidence": "no JSON-LD",
+             "recommendation": "Add it.", "leading_indicator": "entity resolves",
+             "failure_criterion": "still none"},
+        ]
+        self.assertIn("- Data tier: Estimated", build_action_plan(audit))
+
+    def test_validate_rejects_a_missing_tier(self):
+        with self.assertRaises(ValueError) as ctx:
+            validate_data_tiers(self._audit_without_tier())
+        self.assertIn("findings[0]", str(ctx.exception))
+        self.assertIn("data_tier", str(ctx.exception))
+
+    def test_validate_rejects_an_unknown_tier(self):
+        audit = json.loads(json.dumps(AUDIT))
+        audit["data"]["findings"][1]["data_tier"] = "Verified"
+        with self.assertRaises(ValueError) as ctx:
+            validate_data_tiers(audit)
+        self.assertIn("findings[1]", str(ctx.exception))
+
+    def test_validate_rejects_a_case_variant(self):
+        """`measured` is not `Measured`; the renderer compares exact strings."""
+        audit = json.loads(json.dumps(AUDIT))
+        audit["data"]["findings"][0]["data_tier"] = "measured"
+        with self.assertRaises(ValueError):
+            validate_data_tiers(audit)
+
+    def test_validate_accepts_a_fully_labelled_set(self):
+        validate_data_tiers(AUDIT)  # must not raise
+
+    def test_validate_covers_opportunities_and_the_probe(self):
+        opps = {"ok": True, "data": {"opportunities": [
+            {"query": "q", "recommended_action": "a", "leading_indicator": "l",
+             "failure_criterion": "f"},
+        ]}}
+        with self.assertRaises(ValueError) as ctx:
+            validate_data_tiers(AUDIT, opps)
+        self.assertIn("opportunities[0]", str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:
+            validate_data_tiers(AUDIT, None, {"ok": True, "data": {"brand": "x"}})
+        self.assertIn("geo_probe[0]", str(ctx.exception))
+
+    def test_tier_vocabulary_is_the_documented_three(self):
+        self.assertEqual(set(_DATA_TIERS), {"Measured", "Estimated", "unverified"})
 
 
 if __name__ == "__main__":

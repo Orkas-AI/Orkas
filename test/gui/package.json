@@ -1,0 +1,5 @@
+{
+  "private": true,
+  "type": "module",
+  "description": "Deterministic canaries that need a real GUI Electron main process. The GUI host imports its runner with import(), which only sees a named main() export when the directory is ESM."
+}

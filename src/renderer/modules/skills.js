@@ -1638,8 +1638,16 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
       : (fallbackDesc ? [['description', fallbackDesc]] : []));
   });
 
+  // Staleness guard for the body, mirroring the skillMdPromise guard above but
+  // including the file: rapid skill OR same-skill file switching must not let a
+  // slower earlier response overwrite the newer selection's body (header/name
+  // already show the new selection — a stale body silently mismatches them).
+  const stale = () => _selectedSkill?.id !== id
+    || _selectedSkill?.source !== source
+    || _selectedSkill?.filepath !== filepath;
   try {
     const data = await mainPromise;
+    if (stale()) return;
     if (data.ok) {
       const editable = _skillEditMode && _skillEditSkillId === id && canEditThisSkill;
       if (editable) _renderSkillFileEditor(body, data.content || '', data.ext);
@@ -1648,6 +1656,7 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
       body.innerHTML = `<span style="color:var(--danger)">${escapeHtml(data.error)}</span>`;
     }
   } catch (e) {
+    if (stale()) return;
     body.innerHTML = `<span style="color:var(--danger)">${escapeHtml(t('skills.load_failed'))}</span>`;
   }
   // Release the loading-time minHeight pin so the body collapses to the
