@@ -6,6 +6,7 @@ import * as fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { reviewInspectStderr, inspectCanaryExitCode } from './inspect-canary-logs.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pcDir = path.resolve(here, '../..');
@@ -22,9 +23,15 @@ const child = spawn(require('electron'), [path.join(here, 'electron-main.mjs')],
   cwd: pcDir, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
 });
 let stderrBytes = 0;
+let stderrText = '';
 let timedOut = false;
 child.stdout.on('data', chunk => process.stdout.write(chunk));
-child.stderr.on('data', chunk => { stderrBytes += chunk.length; process.stderr.write(chunk); });
+child.stderr.setEncoding('utf8');
+child.stderr.on('data', chunk => {
+  stderrBytes += Buffer.byteLength(chunk);
+  if (stderrBytes <= 1024 * 1024) stderrText += chunk;
+  process.stderr.write(chunk);
+});
 const stop = () => child.kill('SIGTERM');
 const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
 for (const signal of signals) process.on(signal, stop);
@@ -35,9 +42,13 @@ try {
     child.once('close', code => resolve(code ?? 1));
   });
   if (timedOut) process.stderr.write('[inspect-canary] GUI host exceeded the 180s deadline\n');
-  // All child output is retained above. Unclassified stderr fails closed.
-  if (stderrBytes) process.stderr.write('[inspect-canary] process log review failed: unexpected stderr\n');
-  process.exitCode = code || (timedOut || stderrBytes ? 1 : 0);
+  // All child output stays visible. Only bounded, reviewed Linux baseline
+  // diagnostics receive warning classifications; unknown output fails closed.
+  const report = reviewInspectStderr(stderrText);
+  if (stderrBytes > 1024 * 1024) report.unexpected++;
+  process.stdout.write(`[inspect-canary] process log review: ${JSON.stringify(report)}\n`);
+  if (report.unexpected) process.stderr.write('[inspect-canary] process log review failed: unexpected stderr\n');
+  process.exitCode = inspectCanaryExitCode(code, timedOut, report);
 } finally {
   clearTimeout(timeout);
   for (const signal of signals) process.off(signal, stop);

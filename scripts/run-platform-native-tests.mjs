@@ -20,6 +20,7 @@ if (!['win32', 'darwin', 'linux'].includes(process.platform)) {
 // runs after dependency provisioning in the platform-specific Windows and
 // Linux lanes because it requires downloaded FFmpeg, model, and native payloads.
 const commonSuites = [
+  'test/main/util/inspect-canary-logs.test.ts',
   'src/core-agent/test/oauth-flow.test.ts',
   'src/core-agent/test/tools.test.ts',
   'src/core-agent/test/process-session.test.ts',
