@@ -94,6 +94,8 @@ import * as skillsFeat from '../skills';
 import * as autoTasksFeat from '../auto_tasks';
 import * as planExecutor from './plan_executor';
 import * as taskBoard from './task_board';
+import { registerCliAsyncInput, answerCliAsyncInput, closeCliAsyncInputs, finishCliAsyncInputs } from './cli_async_input';
+import { emitTaskIntervention } from '../../util/task-intervention-events';
 import {
   userSkillsDir, userAgentsDir,
   userMarketplaceSkillsDir, userMarketplaceAgentsDir,
@@ -124,8 +126,8 @@ import {
   type AppNavRequest,
 } from './app_nav';
 import { APP_HEALTH_DOMAINS, collectAppHealth, isAppHealthDomain } from './app_health';
-import { buildBrowserTool } from './browser_tool';
-import { beginBrowserTaskRun, browserTaskRunId, finishBrowserTaskRun } from '../web_assist_lifecycle';
+import { buildConversationBrowserTool } from './browser_tool';
+import { beginBrowserTaskRun, finishBrowserTaskRun } from '../web_assist_lifecycle';
 import { buildConnectorSetupTool } from './connector_setup_tool';
 import { createSkillTurnBuffer, onAgentTurnEnd, onUserMessage } from '../expert_signals/turn_hooks';
 import {
@@ -1446,6 +1448,9 @@ function _recordTaskRunTerminalReply(
   ) return;
   if (params.failure_kind || params.failure_code) {
     run.failedReplyObserved = true;
+    // A later visible failure invalidates an earlier successful handback.
+    // A subsequent successful reply may still establish real recovery.
+    run.successfulReplyObserved = false;
     const kind = params.failure_kind || 'runtime';
     const diagnostic = _taskFailureDiagnostic(
       kind,
@@ -1726,6 +1731,61 @@ async function appendMain(
   } catch (err) {
     log.warn('bumpConversationActivity failed', { uid, cid, error: (err as Error)?.message });
   }
+}
+
+/** Persist a native question beside the active reply without settling it. */
+async function publishCliAsyncQuestion(
+  uid: string, cid: string, actor: { id: string; kind: ActorKind }, turnId: string,
+  data: Record<string, unknown>,
+): Promise<void> {
+  const state = _cids.get(cidKey(uid, cid));
+  if (!state || state.terminating) return;
+  const questions = Array.isArray(data.questions)
+    ? data.questions as import('../local_agents/backends/base').LocalCliAsyncQuestion[] : [];
+  const message: GroupMessage = {
+    id: genId12(), ts: nowIso(), from: actor.id, to: [USER_ID], turn_id: turnId,
+    text: typeof data.text === 'string' ? data.text : '',
+    ...(questions.length ? { cli_question: { questions } } : {}),
+  };
+  await appendMain(uid, cid, message, { senderKind: actor.kind, senderId: actor.id, agentIds: [actor.id] });
+  if (questions.length) registerCliAsyncInput({
+    uid, cid, turnId, messageId: message.id, questions, inputId: genId12(),
+    ingress: () => {
+      const live = _executionForActor(state, actor.id);
+      return !state.terminating && live?.running && live.currentTurnId === turnId
+        ? live.currentTurnIngress || null : null;
+    },
+    save: async (text, answers, inputId) => {
+      // An index write may fail after the append succeeded. Re-read by the
+      // stable input id before retrying persistence, without re-delivery.
+      const rows = await readJsonl<GroupMessage>(conversationMessageReadFile(uid, cid));
+      const existing = rows.find(row => row.id === inputId);
+      const reply: GroupMessage = existing || {
+        id: inputId, ts: nowIso(), from: USER_ID, to: [actor.id], text,
+        cli_answer: { message_id: message.id, answers: answers.slice() },
+      };
+      if (!existing) await appendMain(uid, cid, reply, { senderKind: 'user', senderId: USER_ID, agentIds: [actor.id] });
+      emit(state, { type: 'message', cid, msg: reply });
+      return reply;
+    },
+  });
+  emit(state, { type: 'message', cid, msg: message, turn_end: false });
+  if (questions.length) emitTaskIntervention({
+    attention_id: `cli-question:${message.id}`,
+    user_id: uid,
+    conversation_id: cid,
+    kind: 'interactive_cli_input',
+  });
+}
+
+export async function submitCliAsyncInput(uid: string, cid: string, messageId: string, answers: unknown) {
+  if (!safeId(cid) || !safeId(messageId)) return { ok: false as const, error: 'expired' };
+  const rows = await readJsonl<GroupMessage>(conversationMessageReadFile(uid, cid));
+  const existing = rows.find(row => row.from === USER_ID && row.cli_answer?.message_id === messageId);
+  if (existing) return JSON.stringify(existing.cli_answer!.answers) === JSON.stringify(answers)
+    ? { ok: true as const, message: existing }
+    : { ok: false as const, error: 'already_answered' };
+  return answerCliAsyncInput(uid, cid, messageId, answers);
 }
 
 type CommanderHistoryCheckpointV1 = {
@@ -2241,6 +2301,23 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   const fromActor = members.actors.find((a) => a.id === fromActorId);
   const fromKind: ActorKind = fromActor?.kind || (fromActorId === USER_ID ? 'user' : fromActorId === COMMANDER_ID ? 'commander' : 'agent');
 
+  // Resolve the project before parsing names: an unavailable Agent is plain
+  // text, not a segment that can be discarded after routing.
+  let projectAgentIds: Set<string> | null = null;
+  try {
+    const { getConversation } = await import('../chats');
+    const conv = await getConversation(uid, cid);
+    if (conv?.project_id) {
+      const { resolveProjectScope } = await import('../projects');
+      const scope = await resolveProjectScope(uid, conv.project_id);
+      if (scope) projectAgentIds = new Set(scope.agents);
+    }
+  } catch (err) {
+    log.warn('project recipient scope unavailable', { cid: maskId(cid), error: logErrorSummary(err) });
+  }
+  const eligibleRecipient = (id: string) => RESERVED_IDS.has(id)
+    || ((!projectAgentIds || projectAgentIds.has(id)) && isAgentEnabled(uid, id));
+
   // The conversation floor: a no-`@` USER message routes here (the agent the
   // commander handed off to, or the one the user picked on the chip), else
   // the commander. Only read for user messages — commander/agent messages
@@ -2263,7 +2340,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
       let floorValid = false;
       try {
         const floorAgent = await agentsFeat.getAgent(floorRecipient);
-        floorValid = !!floorAgent && isAgentEnabled(uid, floorAgent.agent_id);
+        floorValid = !!floorAgent && eligibleRecipient(floorAgent.agent_id);
       } catch { floorValid = false; }
       if (!floorValid) floorRecipient = '';
     }
@@ -2305,7 +2382,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
         if (a.enabled === false) continue;
         if (a.name) {
           const key = a.name.toLowerCase().replace(/\s+/g, '');
-          agentNameToId.set(key, a.agent_id);
+          if (eligibleRecipient(a.agent_id)) agentNameToId.set(key, a.agent_id);
           agentDisplayNames.push(a.name);
         }
       }
@@ -2316,7 +2393,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
       fromKind,
       fromId: fromActorId,
       text,
-      members: members.actors,
+      members: members.actors.filter((actor) => eligibleRecipient(actor.id)),
       agentNameToId,
       agentDisplayNames,
       ...(floorRecipient ? { activeRecipient: floorRecipient } : {}),
@@ -2335,7 +2412,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     if (!safeId(token)) continue;
     try {
       const ag = await agentsFeat.getAgent(token);
-      if (ag && isAgentEnabled(uid, ag.agent_id)) {
+      if (ag && eligibleRecipient(ag.agent_id)) {
         resolvedRawIds.set(token, ag.agent_id);
       }
     } catch (err) {
@@ -2357,36 +2434,8 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   }
   to = Array.from(new Set(to));
 
-  // Project scope at dispatch time: if the conversation belongs to a
-  // project, drop any recipient agent_id that isn't bound to the project
-  // (CLAUDE.md §6 — "if recipient unavailable, hand off to commander").
-  // Reserved ids (user / commander) always pass through. After filtering,
-  // an empty `to` falls through to the sender-default rule below — for
-  // user-initiated text that means "go to commander", which is the
-  // explicit hand-off the requirement asks for. Cheap: one project.json
-  // + bindings.json read,
-  // resolveProjectScope already memoises file existence checks. Skipped
-  // when the conv has no project_id (orphan = unrestricted).
-  try {
-    const { getConversation } = await import('../chats');
-    const conv = await getConversation(uid, cid);
-    const projectId = (conv as any)?.project_id;
-    if (typeof projectId === 'string' && projectId) {
-      const projectsFeat = await import('../projects');
-      const scope = await projectsFeat.resolveProjectScope(uid, projectId);
-      if (scope) {
-        const bound = new Set(scope.agents);
-        const before = to;
-        to = to.filter((id) => RESERVED_IDS.has(id) || bound.has(id));
-        if (to.length !== before.length) {
-          const dropped = before.filter((id) => !to.includes(id));
-          log.info(`dispatch project-scope drop cid=${cid} pid=${projectId} from=${fromActorId} dropped=${dropped.join(',')}`);
-        }
-      }
-    }
-  } catch (err) {
-    log.warn(`project-scope filter cid=${cid}: ${(err as Error).message}`);
-  }
+  // Keep the dispatch guard for structured/forced targets as well.
+  if (projectAgentIds) to = to.filter((id) => RESERVED_IDS.has(id) || projectAgentIds.has(id));
 
   // Default fallback: if nothing resolved (and no force), use sender-default.
   // Mirror router.ts's rule: user → commander; commander/agent → user.
@@ -2709,6 +2758,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
       let boardTaskId: string | undefined;
       try {
         const created = await taskBoard.createTask(uid, cid, {
+          admissionPending: true,
           assignee: actor.id,
           instruction: seg.instruction,
           createdBy: 'user',
@@ -2778,6 +2828,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
       if (!boardTaskId) {
         try {
           const created = await taskBoard.createTask(uid, cid, {
+            admissionPending: true,
             assignee: actor.id,
             instruction: persistedText,
             createdBy: params.terminalHandoff
@@ -3837,7 +3888,17 @@ async function _admitLoop(state: CidState): Promise<void> {
         }
         break;
       }
-      if (!admitted) return;
+      if (!admitted) {
+        // Only rows left behind by the actual admission gates are waiting.
+        // Publish before settling this pass so list and event consumers see
+        // the same fact; elapsed time never makes a fresh send a queue.
+        const queuedIds = state.queue.flatMap((item) => item.taskId ? [item.taskId] : []);
+        if (queuedIds.length) {
+          const waiting = await taskBoard.confirmQueued(state.uid, state.cid, queuedIds);
+          for (const task of waiting) emit(state, { type: 'task_state', cid: state.cid, task });
+        }
+        return;
+      }
     }
   } finally {
     state.admitting = false;
@@ -7873,6 +7934,7 @@ async function runScheduledDispatch(
   // the board itself, so there is no "board unavailable" branch to fall back
   // from.
   const boardTask = await taskBoard.createTask(state.uid, state.cid, {
+    admissionPending: true,
     assignee: actor.id,
     instruction: task,
     createdBy: 'commander',
@@ -8171,30 +8233,6 @@ function buildSkillSearchTool(
   };
 }
 
-function buildConversationBrowserTool(uid: string, cid: string): AgentTool {
-  const runId = browserTaskRunId(uid, cid);
-  async function withBrowser(
-    run: (web: typeof import('../web_assist')) => Record<string, unknown> | Promise<Record<string, unknown>>,
-  ): Promise<Record<string, unknown>> {
-    const ended = () => !runId || browserTaskRunId(uid, cid) !== runId;
-    const endedResult = { ok: false, code: 'task_run_ended', error: 'This browser task turn has ended.' };
-    if (ended()) return endedResult;
-    const web = await import('../web_assist');
-    if (ended()) return endedResult;
-    return run(web);
-  }
-  return buildBrowserTool({
-    tabs: () => withBrowser(web => web.listModelWebAssistTabs(uid, cid)),
-    open: input => withBrowser(web => web.openModelWebAssist(uid, cid, input)),
-    navigate: input => withBrowser(web => web.navigateModelWebAssist(uid, cid, input)),
-    observe: tabId => withBrowser(web => web.observeModelWebAssist(uid, cid, tabId)),
-    act: input => withBrowser(web => web.actOnModelWebAssist(uid, cid, input)),
-    wait: input => withBrowser(web => web.waitForModelWebAssist(uid, cid, input)),
-    close: tabId => withBrowser(web => web.closeModelWebAssistTab(uid, cid, tabId)),
-    retain: (tabId, retention) => withBrowser(web => web.retainModelWebAssistTab(uid, cid, tabId, retention)),
-  });
-}
-
 function _currentTurnAuthorizesImportPath(
   currentTurnPayload: string,
   sourcePath: string,
@@ -8352,83 +8390,6 @@ async function buildCommanderExtraTools(
         ...(failures.length ? { failures } : {}),
         instruction: 'Report the imported Skill names. Do not re-emit unchanged package files.',
       });
-    },
-  });
-
-  tools.push({
-    name: 'auto_tasks_list',
-    description: [
-      currentProjectId ? 'List automation tasks in the current project. This is read-only.' : 'List automation tasks for the active user and return their task ids and current configuration. This is read-only.',
-    ].join(' '),
-    inputSchema: {
-      type: 'object',
-      properties: {
-        project_id: {
-          type: 'string',
-          description: currentProjectId ? 'Only __current__ or the current project id is accepted.' : 'Optional project id filter. Use "__current__" for the current conversation project when one exists.',
-        },
-        include_global: {
-          type: 'boolean',
-          description: currentProjectId ? 'Must be false in a project conversation.' : 'When project_id is "__current__", also include global tasks with no project. Default false.',
-        },
-        limit: {
-          type: 'number',
-          description: 'Maximum tasks to return (1-200). Default 50.',
-        },
-      },
-      additionalProperties: false,
-    },
-    async execute(input) {
-      const limit = _clampLimit(input?.limit, 50, 1, 200);
-      const rawProject = _trimText(input?.project_id, 128);
-      const includeGlobal = input?.include_global === true;
-      try {
-        let tasks: autoTasksFeat.AutoTask[];
-        if (currentProjectId) {
-          if (includeGlobal || (rawProject && rawProject !== '__current__' && rawProject !== currentProjectId)) return _toolError('project_scope_mismatch');
-          tasks = await autoTasksFeat.listTasks(uid, { projectId: currentProjectId });
-        } else if (rawProject === '__current__') {
-          if (currentProjectId) {
-            tasks = await autoTasksFeat.listTasks(uid, { projectId: currentProjectId });
-            if (includeGlobal) {
-              const globalTasks = await autoTasksFeat.listTasks(uid, { projectId: null });
-              tasks = [...tasks, ...globalTasks];
-            }
-          } else {
-            tasks = await autoTasksFeat.listTasks(uid, includeGlobal ? { projectId: null } : undefined);
-          }
-        } else if (rawProject) {
-          tasks = await autoTasksFeat.listTasks(uid, { projectId: rawProject });
-        } else {
-          tasks = await autoTasksFeat.listTasks(uid);
-        }
-        return _toolJson({
-          ok: true,
-          current_project_id: currentProjectId || '',
-          tasks: tasks.slice(0, limit).map((t) => ({
-            id: t.id,
-            title: t.title || '',
-            content: t.content,
-            enabled: t.enabled,
-            schedule: t.schedule,
-            ...(t.end_condition ? { end_condition: t.end_condition } : {}),
-            ...(t.end_condition?.type === 'count'
-              ? { scheduled_run_count: t.scheduled_run_count || 0 }
-              : {}),
-            recipient: t.recipient || { kind: 'commander' },
-            ...(t.skill ? { skill: t.skill } : {}),
-            ...(t.connector ? { connector: t.connector } : {}),
-            ...(t.project_id ? { project_id: t.project_id } : {}),
-            attachments: Array.isArray(t.attachments) ? t.attachments : [],
-            device_name: t.device_name || '',
-            last_run_at: t.last_run_at || '',
-            created_at: t.created_at,
-            updated_at: t.updated_at,
-          })),
-        });
-      } catch (err) {
-        return _toolError((err as Error).message || 'auto_tasks_list failed');
-      }
     },
   });
 
@@ -9476,6 +9437,7 @@ registerUserSwitchHook('group-chat-bus', (previousUid) => {
 // ── Cleanup ──────────────────────────────────────────────────────────────
 
 export async function dropConv(uid: string, cid: string): Promise<void> {
+  closeCliAsyncInputs(uid, cid);
   const k = cidKey(uid, cid);
   const state = _cids.get(k);
   if (!state) return;
@@ -9818,6 +9780,7 @@ async function _runCliAgentTurn(opts: {
   // retry a pre-execution rejection with bounded recovery; either way, clear
   // the stale binding before persisting any replacement session.
   let resumeRejected = false;
+  let asyncMessageWrites = Promise.resolve();
   const result = await runner.run({
     uid: opts.uid,
     cid: opts.cid,
@@ -9851,6 +9814,12 @@ async function _runCliAgentTurn(opts: {
       // treats every event as an unrecognized shape and only the final
       // text appears at turn-end.
       switch (e.type) {
+        case 'async-message':
+          asyncMessageWrites = asyncMessageWrites.then(() => publishCliAsyncQuestion(
+            opts.uid, opts.cid, opts.actor, opts.item.turnId, e,
+          ));
+          void asyncMessageWrites.catch(() => {});
+          break;
         case 'text-delta':
           if (typeof (e as any).text === 'string') {
             const text = (e as any).text as string;
@@ -10040,6 +10009,9 @@ async function _runCliAgentTurn(opts: {
           opts.onProcess({ type: 'event', event: { stream: 'cli', data: e as unknown as Record<string, unknown> } });
       }
     },
+  }).finally(async () => {
+    try { await asyncMessageWrites; }
+    finally { await finishCliAsyncInputs(opts.uid, opts.cid, opts.item.turnId); }
   });
 
   if (resolvedCliModel) {

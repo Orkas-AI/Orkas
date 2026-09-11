@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { Mutex } from "async-mutex";
 import {
   AgentRunner,
@@ -2826,7 +2827,91 @@ describe("AgentRunner", () => {
     expect(done && done.type === "done" ? done.result.text : "").toBe("The tool failed, but I handled it.");
   });
 
-  it("does not write raw failed tool results into runtime logs", async () => {
+  it.each(["sequential", "parallel", "programmatic"] as const)("retains private failure evidence and logs typed command facts through %s calls", async (mode) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "command-diagnostics-"));
+    const sessionFile = path.join(root, "session.jsonl");
+    const body = "private output ".repeat(40) + "/Users/test/private.txt sk-private-secret";
+    const inputs = [1, 2].map((index) => ({ index, command: `private-command-${index}` }));
+    const requests: CompletionParams[] = [];
+    const provider = createMockProvider([
+      {
+        content: mode === "programmatic" ? [{ type: "tool_use", id: "program", name: "run_program", input: {
+          code: `for (const input of ${JSON.stringify(inputs)}) { const result = await tools.probe(input); text(result.content); }`,
+        } }] : inputs.map((input, index) => ({ type: "tool_use", id: `call-${index}`, name: "probe", input })),
+        stopReason: "tool_use", usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 }, model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "failure inspected" }], stopReason: "end_turn",
+        usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 }, model: "mock-model",
+      },
+    ], (params) => requests.push(structuredClone(params)));
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const probe = defineTool({
+      name: "probe", description: "Synthetic command executor", inputSchema: { type: "object" },
+      executionMode: mode === "parallel" ? "parallel" : "sequential",
+      async execute(input) {
+        const timedOut = input.index === 2;
+        return { content: `${body}:${input.index}`, isError: true, observations: {
+          fileFailure: { code: "E_BAD_INPUT", reason: "range_integer", stage: "input", item_index: 1, start_type: "string", start_integer: false },
+          execution: {
+          status: timedOut ? "timed_out" : "failed", exitCode: timedOut ? null : 2,
+          durationMs: 123, timedOut, outputLimitExceeded: false,
+          stdout: { bytes: 10848, truncated: true, ref: "/Users/test/private-stdout" },
+          stderr: { bytes: 720, truncated: false, ref: "sk-private-secret" },
+        } } };
+      },
+    });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const runner = new AgentRunner({
+        config: createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } }),
+        providers: registry, tools: [probe], session: new PersistentSession({ sessionFile }),
+        programmaticToolPolicy: { isEligible: (name) => name === "probe", authorize: () => ({ allowed: true }) },
+      });
+      expect((await runner.run({ message: "Inspect the command failures", workingDir: root })).text).toBe("failure inspected");
+      const logs = warning.mock.calls.filter((call) => call[1] === "Tool returned error");
+      expect(logs).toHaveLength(2);
+      for (let index = 0; index < logs.length; index++) {
+        const diagnostic = logs[index][2];
+        expect(diagnostic).toMatchObject({
+          tool: "probe", input_digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+          runner_ref: expect.stringMatching(/^[0-9a-f]{24}$/),
+          batch_sequence: mode === "sequential" ? index + 1 : 1,
+          execution_mode: mode === "sequential" ? "single" : mode,
+          file_failure: { code: "E_BAD_INPUT", reason: "range_integer", stage: "input", item_index: 1, start_type: "string", start_integer: false },
+          command_hash: createHash("sha256").update(inputs[index].command).digest("hex").slice(0, 12),
+          session_hash: createHash("sha256").update("session").digest("hex").slice(0, 12),
+          call_hash: createHash("sha256").update(mode === "programmatic" ? `program-${index + 1}` : `call-${index}`).digest("hex").slice(0, 12),
+          output_storage: "inline",
+          result: { text_hash: createHash("sha256").update(`${body}:${index + 1}`).digest("hex").slice(0, 12) },
+          execution: {
+            status: index === 1 ? "timed_out" : "failed", exit_code: index === 1 ? null : 2,
+            duration_ms: 123, timed_out: index === 1, output_limit_exceeded: false,
+            stdout_bytes: 10848, stderr_bytes: 720, stdout_truncated: true, stderr_truncated: false,
+          },
+        });
+      }
+      expect(logs[0][2].input_digest).not.toBe(logs[1][2].input_digest);
+      expect(logs[0][2].runner_ref).toBe(logs[1][2].runner_ref);
+      expect(JSON.stringify(requests[1].messages)).not.toContain('fileFailure');
+      expect(JSON.stringify(requests[1].messages)).not.toContain('range_integer');
+      const serializedLogs = JSON.stringify(warning.mock.calls);
+      for (const secret of [body, "/Users/alice", "sk-private-secret", "private-command"]) {
+        expect(serializedLogs).not.toContain(secret);
+      }
+      // Only private history and provider context carry the full diagnostic body.
+      const restored = new PersistentSession({ sessionFile });
+      expect(JSON.stringify(restored.getMessages())).toContain(body);
+      expect(JSON.stringify(requests[1].messages)).toContain(body);
+      expect(warning.mock.calls.filter((call) => call[1] !== "Tool returned error")).toEqual([]);
+    } finally {
+      warning.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, true])("does not write private failure content or malformed metadata into logs (malformed=%s)", async (malformed) => {
     const privateResult = "/Users/test/private-plan.md contains sk-private-secret";
     const provider = createMockProvider([
       {
@@ -2849,7 +2934,17 @@ describe("AgentRunner", () => {
       description: "returns a private synthetic failure",
       inputSchema: { type: "object" },
       async execute() {
-        return { content: privateResult, isError: true };
+        return { content: privateResult, isError: true, ...(malformed ? {
+          persistedOutput: { path: privateResult, size: 123, ref: privateResult },
+          observations: {
+          fileFailure: { code: "E_BAD_INPUT", reason: "range_integer", stage: privateResult, start_type: privateResult, item_index: -1, start_integer: privateResult, path: privateResult, content: privateResult } as any,
+          execution: {
+            status: privateResult, exitCode: privateResult, durationMs: Infinity,
+            timedOut: privateResult, outputLimitExceeded: privateResult,
+            stdout: { bytes: -1, truncated: privateResult, ref: privateResult },
+            stderr: { bytes: privateResult, truncated: privateResult },
+          } as unknown as NonNullable<ToolResult["observations"]>["execution"],
+        } } : {}) };
       },
     });
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -2863,17 +2958,25 @@ describe("AgentRunner", () => {
       expect(warning).toHaveBeenCalledWith(
         "[agent-runner]",
         "Tool returned error",
-        {
+        expect.objectContaining({
           tool: "probe",
           result: {
             text_hash: expect.stringMatching(/^[0-9a-f]{12}$/),
             text_chars: privateResult.length,
           },
-        },
+        }),
       );
       expect(JSON.stringify(warning.mock.calls)).not.toContain(privateResult);
       expect(JSON.stringify(warning.mock.calls)).not.toContain("/Users/test");
       expect(JSON.stringify(warning.mock.calls)).not.toContain("sk-private-secret");
+      const diagnostic = warning.mock.calls.find((call) => call[1] === "Tool returned error")?.[2];
+      expect(JSON.parse(JSON.stringify(diagnostic)).execution).toEqual(malformed ? { status: "unknown" } : undefined);
+      expect(diagnostic.file_failure).toEqual(malformed ? { code: "E_BAD_INPUT", reason: "range_integer" } : undefined);
+      expect(diagnostic).toMatchObject({
+        output_storage: malformed ? "persisted" : "inline",
+        ...(malformed ? { output_ref_hash: createHash("sha256").update(privateResult).digest("hex").slice(0, 12) } : {}),
+      });
+      expect(diagnostic).not.toHaveProperty("session_hash");
     } finally {
       warning.mockRestore();
     }
@@ -4652,6 +4755,42 @@ describe("AgentRunner", () => {
       type: "done",
       result: { text: "recovered", meta: { stopReason: "end_turn" } },
     });
+  });
+
+  it("preserves retry events without logging private provider error text", async () => {
+    const privateMessage = "retry-private-body-canary customer draft";
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let calls = 0;
+    const provider: LLMProvider = {
+      id: "mock", name: "Mock",
+      async complete() { throw new Error("complete not used"); },
+      async *stream() {
+        if (++calls === 1) throw new RateLimitError(privateMessage, 0);
+        yield* streamCompletionResult({
+          content: [{ type: "text", text: "recovered" }], stopReason: "end_turn",
+          usage: { inputTokens: 4, outputTokens: 2, totalTokens: 6 }, model: "mock-model",
+        });
+      },
+      async validateAuth() { return true; },
+    };
+    try {
+      const registry = new ProviderRegistry();
+      registry.registerFactory("mock", () => provider);
+      const runner = new AgentRunner({
+        config: createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model", maxRetries: 1 } }),
+        providers: registry, tools: [], evolution: { enabled: false },
+      });
+      const events = await collectRunEvents(runner, "recover");
+      expect(calls).toBe(2);
+      expect(events.filter((event) => event.type === "retry")).toEqual([
+        expect.objectContaining({ attempt: 1, reason: expect.stringContaining(privateMessage), waitMs: 0 }),
+      ]);
+      expect(events.at(-1)).toMatchObject({ type: "done", result: { text: "recovered" } });
+      expect(warning).toHaveBeenCalled();
+      expect(JSON.stringify(warning.mock.calls)).not.toContain(privateMessage);
+    } finally {
+      warning.mockRestore();
+    }
   });
 
   it("stops immediately when storage is full", async () => {

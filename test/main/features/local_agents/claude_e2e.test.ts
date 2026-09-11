@@ -14,6 +14,7 @@ import {
   CLAUDE_BACKGROUND_TIMEOUT_MS,
   claudeBackend,
 } from '../../../../src/main/features/local_agents/backends/claude';
+import * as userInput from '../../../../src/main/features/local_agents/cli_user_input';
 
 const isWindows = process.platform === 'win32';
 const itPosix = isWindows ? it.skip : it;
@@ -409,6 +410,122 @@ process.exit(7);
     const done = events[events.length - 1];
     expect(done.status).toBe('completed');
   }, 15_000);
+
+  it.each([
+    { outcome: 'answered', policy: 'inherit' },
+    { outcome: 'answered', policy: 'ask' },
+    { outcome: 'answered', policy: 'full_access' },
+    { outcome: 'cancelled', policy: 'full_access' },
+    { outcome: 'unavailable', policy: 'full_access' },
+  ] as const)('handles AskUserQuestion as user input: $outcome with $policy', async ({ outcome, policy }) => {
+    const tracePath = path.join(tmpDir, 'question-response.json');
+    const fake = writeNodeExecutable(tmpDir, 'claude-question', `
+const fs = require('node:fs');
+const promptFlag = process.argv.indexOf('--permission-prompt-tool');
+if (promptFlag === -1 || process.argv[promptFlag + 1] !== 'stdio') process.exit(2);
+require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+  const record = JSON.parse(line);
+  if (record.type === 'user') {
+    process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'test-question' }) + '\\n');
+    process.stdout.write(JSON.stringify({ type: 'control_request', request_id: 'ask-1', request: { subtype: 'can_use_tool', tool_name: 'AskUserQuestion', input: { questions: [
+      { question: 'Which scope?', header: 'Scope', options: [{ label: 'Current', description: 'This folder' }], multiSelect: false },
+      { question: 'Which checks?', header: 'Checks', options: [{ label: 'Unit' }, { label: 'Integration' }], multiSelect: true }
+    ] } } }) + '\\n');
+  } else if (record.type === 'control_response') {
+    fs.writeFileSync(${JSON.stringify(tracePath)}, JSON.stringify(record));
+    process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', result: 'Continued after input.' }) + '\\n');
+  }
+});
+`);
+    const requestPermission = vi.fn();
+    const requestUserInput = vi.fn(async (_request: unknown) => ({ cancelled: outcome === 'cancelled', answers: { 'question-0': ['Custom scope'], 'question-1': ['Unit', 'Integration'] } }));
+    const events: any[] = [];
+    await claudeBackend.run({
+      binPath: fake, prompt: 'inspect files', cwd: tmpDir, signal: new AbortController().signal,
+      timeoutMs: 3000, permissionPolicy: policy, requestPermission,
+      ...(outcome !== 'unavailable' ? { requestUserInput } : {}), onEvent: event => events.push(event),
+    });
+    const response = JSON.parse(fs.readFileSync(tracePath, 'utf8')).response.response;
+    expect(requestPermission).not.toHaveBeenCalled();
+    if (outcome === 'answered') {
+      expect(requestUserInput.mock.calls[0][0]).toMatchObject({ isBlocking: true, questions: [
+        { id: 'question-0', isOther: true, multiSelect: false }, { id: 'question-1', isOther: true, multiSelect: true },
+      ] });
+      expect(response).toMatchObject({ behavior: 'allow', updatedInput: { answers: { 'Which scope?': 'Custom scope', 'Which checks?': 'Unit, Integration' } } });
+    } else {
+      expect(response.behavior).toBe('deny');
+      expect(response.updatedInput).toBeUndefined();
+    }
+    expect(events.some(event => event.type === 'permission-request')).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: 'done', status: 'completed' });
+  });
+
+  it.each(['cancel', 'terminal'])('closes Claude input on native %s and never answers a withdrawn question', async boundary => {
+    const trace = path.join(tmpDir, 'cancelled-input.json');
+    const fake = writeNodeExecutable(tmpDir, 'claude-cancel-input', `
+const fs = require('node:fs');
+const responses = [];
+const send = msg => process.stdout.write(JSON.stringify(msg) + '\\n');
+const finish = () => send({ type: 'result', subtype: 'success', result: 'CLI continued.' });
+let users = 0;
+require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+  const msg = JSON.parse(line);
+  fs.writeFileSync(${JSON.stringify(trace)}, JSON.stringify(responses));
+  if (msg.type === 'user' && ++users === 1) {
+    send({ type: 'system', subtype: 'init', session_id: 'test-input-cancel' });
+    for (const id of ['ask-1', 'ask-2', 'ask-3']) send({ type: 'control_request', request_id: id, request: {
+      subtype: 'can_use_tool', tool_name: 'AskUserQuestion', input: { questions: [{ question: id, options: [{ label: 'Current' }] }] },
+    } });
+  } else if (msg.type === 'user') {
+    if (${JSON.stringify(boundary)} === 'terminal') finish();
+    else {
+      send({ type: 'control_cancel_request', request_id: 'unknown-request' });
+      send({ type: 'control_cancel_request', request_id: 'ask-2' });
+      send({ type: 'control_cancel_request', request_id: 'ask-1' });
+    }
+  } else if (msg.type === 'control_response') {
+    responses.push(msg);
+    fs.writeFileSync(${JSON.stringify(trace)}, JSON.stringify(responses));
+    if (msg.response.request_id === 'ask-3') finish();
+  }
+});
+`);
+    const deliveries: Array<{ channel: string; payload: any }> = [];
+    const requests: string[] = [];
+    const events: any[] = [];
+    let ingress: any;
+    userInput._setBroadcastForTest((channel, payload) => { deliveries.push({ channel, payload }); });
+    const run = claudeBackend.run({
+      binPath: fake, prompt: 'inspect', cwd: tmpDir, signal: new AbortController().signal,
+      timeoutMs: 5000, onEvent: event => events.push(event), onActiveRunIngress: value => { ingress = value; },
+      requestUserInput: request => {
+        requests.push(request.id!);
+        return userInput.requestUserInput({ uid: 'u-input', cid: 'c-input', runId: 'claude-input', agentId: 'claude', agentName: 'Claude', cli: 'claude', request });
+      },
+    });
+    try {
+      // Startup shares the fixture's run budget; it is not an answer timeout.
+      await vi.waitFor(() => expect(deliveries.filter(row => row.channel === 'local-agent:user-input')).toHaveLength(1), { timeout: 5000 });
+      const firstId = deliveries[0].payload.request_id;
+      await ingress.submit({ id: 'test-control', text: 'continue' });
+      await vi.waitFor(() => expect(deliveries.some(row => row.channel === 'local-agent:user-input_cancelled' && row.payload.request_ids.includes(firstId))).toBe(true));
+      expect(userInput.respond(firstId, 'u-input', { 'question-0': ['Late'] })).toEqual({ handled: false });
+      if (boundary === 'cancel') {
+        await vi.waitFor(() => expect(requests).toEqual(['ask-1', 'ask-3']));
+        const lastId = deliveries.filter(row => row.channel === 'local-agent:user-input').at(-1)!.payload.request_id;
+        expect(userInput.respond(lastId, 'u-input', { 'question-0': ['Current'] })).toEqual({ handled: true, cancelled: false });
+      }
+      await run;
+      const replies = JSON.parse(fs.readFileSync(trace, 'utf8'));
+      expect(replies.map((row: any) => row.response.request_id)).toEqual(boundary === 'cancel' ? ['ask-3'] : []);
+      if (boundary === 'cancel') expect(replies[0].response.response.updatedInput.answers).toEqual({ 'ask-3': 'Current' });
+      else expect(requests).toEqual(['ask-1']);
+      expect(events.at(-1)).toMatchObject({ type: 'done', status: 'completed' });
+    } finally {
+      await run;
+      userInput._resetForTest();
+    }
+  });
 
   it('bridges a control_request to the host and returns the user decision', async () => {
     // fake CLI: reads the prompt, emits init + a control_request, then

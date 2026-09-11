@@ -140,6 +140,10 @@ export interface GroupMessage {
   /** Form widget payload — only on agent messages whose final text contained
    * a fenced agent-input-form block. */
   form?: import('./router').ChatFormPayload;
+  /** CLI-native non-blocking questions, independent of the terminal reply. */
+  cli_question?: { questions: import('../local_agents/backends/base').LocalCliAsyncQuestion[] };
+  /** Exact question-message identity and user-authored answers. */
+  cli_answer?: { message_id: string; answers: string[] };
   /** Quick-created / quick-edited agent meta — populated when the commander's
    * final text contained one or more `<agent>` containers. One entry per
    * successfully applied container; failed applications are not recorded. */

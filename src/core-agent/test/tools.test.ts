@@ -1487,13 +1487,31 @@ describe("Tools", () => {
       });
     });
 
-    it("returns error for failing command", async () => {
+    it.each([1, 2])("preserves both output streams on exit %i and can execute a corrected command", async (exitCode) => {
       const tools = getBuiltinTools();
       const bash = tools.find((t) => t.name === "bash")!;
-
-      const ctx: ToolContext = { state: {} };
-      const result = await bash.execute({ command: "false" }, ctx);
-      expect(result.isError).toBe(true);
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "core-bash-failure-"));
+      const ctx: ToolContext = { workingDir: tmpDir, state: {} };
+      const stdout = "progress ".repeat(40) + "stdout-tail";
+      const stderr = "diagnostic ".repeat(40) + "stderr-tail";
+      try {
+        const result = await bash.execute({ command: shellInvoke(TEST_NODE, ["-e",
+          `process.stdout.write(${JSON.stringify(stdout)}); process.stderr.write(${JSON.stringify(stderr)}); process.exitCode = ${exitCode};`,
+        ]) }, ctx);
+        expect(result.isError).toBe(true);
+        expect(result.content).toContain(`<stdout>\n${stdout}\n</stdout>`);
+        expect(result.content).toContain(`<stderr>\n${stderr}\n</stderr>`);
+        expect(result.observations?.execution).toMatchObject({
+          status: "failed", exitCode, timedOut: false, outputLimitExceeded: false,
+          stdout: { bytes: Buffer.byteLength(stdout), truncated: false },
+          stderr: { bytes: Buffer.byteLength(stderr), truncated: false },
+        });
+        const recovered = await bash.execute({ command: shellInvoke(TEST_NODE, ["-e", "process.stdout.write('recovered')"]) }, ctx);
+        expect(recovered.isError).toBeUndefined();
+        expect(recovered.content).toContain("<stdout>\nrecovered\n</stdout>");
+      } finally {
+        await fs.rm(tmpDir, { recursive: true, force: true });
+      }
     });
 
     it("reports a shell start failure without escalating to a tool exception", async () => {

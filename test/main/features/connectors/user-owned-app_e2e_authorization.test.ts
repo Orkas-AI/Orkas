@@ -117,7 +117,12 @@ describe('user-owned app authorization journey', () => {
     for (const row of cases) {
       const entry = findCatalogEntry(row.id)!;
       const setup = entry.connection_setup!;
-      expect(setup.fields.map((field) => field.key).sort()).toEqual(Object.keys(row.input).sort());
+      const optionalKeys = row.id === 'ebay-seller' ? ['signing_key_jwe', 'signing_private_key'] : [];
+      expect(setup.fields.map((field) => field.key).sort()).toEqual([...Object.keys(row.input), ...optionalKeys].sort());
+      expect(setup.fields.filter((field) => field.required).map((field) => field.key).sort()).toEqual(Object.keys(row.input).sort());
+      for (const key of optionalKeys) {
+        expect(setup.fields.find((field) => field.key === key)).toMatchObject({ required: false, input: 'secret', storage: 'credential' });
+      }
       expect(setup.guide_url).toMatch(/^https:\/\//);
       expect(setup.instructions_zh).toMatch(prerequisites[row.id][0]);
       expect(setup.instructions_en).toMatch(prerequisites[row.id][1]);

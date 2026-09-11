@@ -106,6 +106,7 @@ describe('packaged-entrypoint-gate', () => {
     );
     expect(gate.BUILD_ONLY_BIN_FILES).toContain('packaged-entrypoint-gate.cjs');
     expect(gate.BUILD_ONLY_BIN_FILES).toContain('packaged-dependency-gate.cjs');
+    expect(gate.PACKAGED_BIN_HELPERS).toContain('auto-tasks-contract.cjs');
     expect(gate.PACKAGED_BIN_HELPERS).toContain('bridge-skill-runner.cjs');
     expect(gate.PACKAGED_BIN_HELPERS).toContain('local-cli-lark.cjs');
     expect(gate.PACKAGED_BIN_HELPERS).toContain('proxy-bootstrap.cjs');
@@ -159,6 +160,15 @@ describe('packaged-entrypoint-gate', () => {
     expect(() => gate.verifyPackagedEntrypointPayload(pcRoot, { projectRoot: process.cwd() }))
       .toThrow(/missing esbuild loader lib\/main\.js/);
   });
+
+  it.each(['browser-tool-contract.cjs', 'ebay-signature.cjs'])(
+    'blocks a package missing the runtime helper %s', (name) => {
+      const pcRoot = packagedFixture();
+      fs.rmSync(path.join(pcRoot, 'bin', name));
+      expect(() => gate.verifyPackagedEntrypointPayload(pcRoot, { projectRoot: process.cwd() }))
+        .toThrow(`missing: ${name}`);
+    },
+  );
 
   it('rejects a missing shared Shopify scope module in the packaged payload and real adapter startup', () => {
     const pcRoot = packagedRuntimeFixture();

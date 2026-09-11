@@ -1,4 +1,17 @@
-import { expect, test } from './fixtures/orkas';
+import { expect, test as base, OrkasTestApp } from './fixtures/orkas';
+
+// The assignment journey exercises both account-scoped agents and execution.
+const test = base.extend({
+  modelOrkas: async ({}, use, testInfo) => {
+    const app = new OrkasTestApp(testInfo, { modelStub: true });
+    try {
+      await app.launch();
+      await use(app);
+    } finally {
+      await app.dispose();
+    }
+  },
+});
 
 test('manages the same backlog from global and project boards with independent disclosures', async ({ connectorOrkas: orkas }, testInfo) => {
   const page = orkas.page!;
@@ -34,7 +47,7 @@ test('manages the same backlog from global and project boards with independent d
   await expect(header.locator('.todo-page-actions')).toBeVisible();
   await expect(header.locator('.todo-page-description')).toHaveCount(0);
   await expect(page.locator('#todos-project-filter')).toHaveCount(0);
-  await expect(page.locator('#todos-add-btn')).toHaveText('+添加');
+  await expect(page.locator('#todos-add-btn')).toHaveText('+创建');
   await expect(page.locator('#todos-add-btn')).not.toHaveClass(/btn-primary/);
   await expect(content.locator('.todo-project-group')).toHaveCount(2);
   await expect(content.getByText('空项目', { exact: true })).toHaveCount(0);
@@ -145,7 +158,7 @@ test('manages the same backlog from global and project boards with independent d
   await page.locator('#todos-add-btn').click();
   await expect(page.locator('#project-todo-project')).toHaveAttribute('data-value', '');
   await expect(page.locator('#project-todo-project .ai-select-label')).toHaveText('全局');
-  await expect(page.locator('.todo-editor-select .ai-select-caret')).toHaveCount(2);
+  await expect(page.locator('#project-todo-agent .ai-select-trigger')).toBeEnabled();
   await expect(page.locator('#project-todo-close')).toHaveCount(0);
   await expect(page.locator('.todo-editor-content-field > span')).toHaveText('具体内容');
   await expect(page.locator('#project-todo-detail')).toHaveCount(0);
@@ -312,7 +325,7 @@ test('manages the same backlog from global and project boards with independent d
   await expect(page.locator('#project-chat-input')).toBeVisible();
   await expect(page.locator('.project-detail-side')).toBeVisible();
   await expect(page.locator('#project-todo-owner-filter')).toHaveCount(0);
-  await expect(page.locator('#project-todo-add-btn')).toHaveText('+添加');
+  await expect(page.locator('#project-todo-add-btn')).toHaveText('+创建');
   await expect(page.locator('#project-todo-add-btn')).not.toHaveClass(/btn-primary/);
   await expect(page.locator('#project-driver-toggle')).toBeVisible();
   await expect(page.locator('#project-driver-toggle')).toHaveAttribute('aria-pressed', 'true');
@@ -362,4 +375,62 @@ test('manages the same backlog from global and project boards with independent d
   await expect(removed).toHaveCount(0);
   const final = await orkas.invoke<{ tasks: Array<{ id: string }> }>('projects.tasks.list', { projectId: b });
   expect(final.tasks.some((item) => item.id === created.id)).toBe(false);
+});
+
+test('assigns global and project todos in the editor and keeps cards and saved owners in sync', async ({ modelOrkas: orkas }, testInfo) => {
+  const page = orkas.page!;
+  await page.evaluate(() => (window as any).setLang('zh'));
+  const { agents } = await orkas.invoke<{ agents: Array<{ agent_id: string; name: string; enabled: boolean }> }>('agents.list', { summary: true });
+  const agent = agents.find((a) => a.enabled !== false)!;
+  expect(agent).toBeDefined();
+  const { project } = await orkas.invoke<{ project: { project_id: string } }>('projects.create', { name: 'Assignment project' });
+  const pid = project.project_id;
+  await orkas.invoke('projects.bindings.add', { projectId: pid, kind: 'agent', id: agent.agent_id });
+  await page.locator('#todos-btn').click();
+  const agentControl = page.locator('#project-todo-agent');
+  const chooseAgent = async (value: string) => {
+    await expect(agentControl.locator('.ai-select-trigger')).toBeEnabled();
+    await agentControl.locator('.ai-select-trigger').click();
+    await page.locator(`#project-todo-agent-listbox .ai-select-item[data-value="${value}"]`).click();
+  };
+  for (const scope of ['', pid]) {
+    await page.locator('#todos-add-btn').click();
+    if (scope) {
+      await page.locator('#project-todo-project .ai-select-trigger').click();
+      await page.locator(`#project-todo-project-listbox .ai-select-item[data-value="${scope}"]`).click();
+    }
+    await chooseAgent(agent.agent_id);
+    const title = scope ? 'Project assigned task' : 'Global assigned task';
+    await page.locator('#project-todo-input').fill(title);
+    if (!scope) await page.screenshot({ path: testInfo.outputPath('todo-agent-editor.png') });
+    await page.locator('#project-todo-save').click();
+    await expect(page.locator('#todo-editor-modal')).not.toHaveClass(/open/);
+    const card = page.locator('#todos-content .project-todo-item', { hasText: title });
+    await expect(card.locator('.project-todo-assign')).toContainText(agent.name);
+    let tasks = await orkas.invoke<{ tasks: any[] }>('projects.tasks.list', { projectId: scope });
+    expect(tasks.tasks.find((t) => t.title === title)).toMatchObject({ owner_agent_id: agent.agent_id, owner_agent: agent.name });
+    await card.locator('[data-action="todo-edit"]').click();
+    await expect(agentControl).toHaveAttribute('data-value', agent.agent_id);
+    await chooseAgent('');
+    await page.locator('#project-todo-save').click();
+    await expect(card.locator('.project-todo-assign')).toHaveClass(/is-empty/);
+    tasks = await orkas.invoke<{ tasks: any[] }>('projects.tasks.list', { projectId: scope });
+    expect(tasks.tasks.find((t) => t.title === title)).not.toHaveProperty('owner_agent_id');
+    if (!scope) {
+      await card.locator('.project-todo-assign').click();
+      await page.locator('.context-menu-item', { hasText: agent.name }).click();
+      await expect(card.locator('.project-todo-assign')).toContainText(agent.name);
+      const assigned = await orkas.invoke<{ tasks: any[] }>('projects.tasks.list', { projectId: '' });
+      const task = assigned.tasks.find((t) => t.title === title);
+      orkas.setModelTextReplies(['Assignment received']);
+      const result = await orkas.invoke<{ ok: boolean; cid: string }>('projects.tasks.run', { projectId: '', taskId: task.id });
+      expect(result.ok).toBe(true);
+      const history = await orkas.invoke<{ history: any[] }>('conversations.history', { cid: result.cid, limit: 20 });
+      expect(history.history.find((message) => message.from === 'user')?.to).toEqual([agent.agent_id]);
+      await expect.poll(async () => {
+        const messages = await orkas.invoke<{ history: any[] }>('conversations.history', { cid: result.cid, limit: 20 });
+        return messages.history.some((message) => message.from === agent.agent_id && message.text.includes('Assignment received'));
+      }).toBe(true);
+    }
+  }
 });

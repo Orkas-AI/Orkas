@@ -3417,8 +3417,12 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'app.openDataRoot': async () => {
     const target = WS_ROOT;
     if (!fs.existsSync(target)) throw new Error('data root not found');
-    shell.openPath(target);
-    return { ok: true, path: target };
+    try {
+      const openError = await shell.openPath(target);
+      if (!openError) return { ok: true, path: target };
+    } catch { /* Native exceptions and error strings both mean opening failed. */ }
+    // Native failure text may contain private paths; return a bounded result.
+    return { ok: false, code: 'E_DATA_ROOT_OPEN', error: 'Could not open the data folder. Try again.' };
   },
 
   // Internal debug panel data is stripped from the open-source build. Keep stable

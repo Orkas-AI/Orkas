@@ -39,8 +39,11 @@ export interface ProjectTaskView {
 
 export interface ProjectTasksProgress { total: number; done: number; open: number; }
 
+export interface ProjectTasksQuery { offset?: number; limit?: number; status?: ProjectTaskStatus; }
+
 export interface ProjectTasksToolHandler {
-  list(): Promise<{ ok: boolean; tasks: ProjectTaskView[]; progress: ProjectTasksProgress }>;
+  list(query?: ProjectTasksQuery): Promise<{ ok: boolean; tasks: ProjectTaskView[]; progress: ProjectTasksProgress; total: number; next_offset: number | null }>;
+  get(taskId: string): Promise<{ ok: boolean; error?: string; task?: ProjectTaskView }>;
   create(input: {
     title: string; detail?: string; owner?: string; status?: ProjectTaskStatus;
   }): Promise<{ ok: boolean; error?: string; task?: ProjectTaskView; alreadyExists?: boolean }>;
@@ -70,13 +73,14 @@ export interface CreateProjectTasksToolOptions {
   readOnly?: boolean;
 }
 
-const READONLY_NOTE = `\n\nNOTE: this backlog is READ-ONLY for you. You can list tasks; deliver your result to the dispatching agent for a status update.`;
+const READONLY_NOTE = `\n\nNOTE: this backlog is READ-ONLY for you. You can list/get tasks; deliver your result to the dispatching agent for a status update.`;
 
-type ProjectTaskAction = 'list_projects' | 'list' | 'create' | 'update' | 'complete';
+type ProjectTaskAction = 'list_projects' | 'list' | 'get' | 'create' | 'update' | 'complete';
 
 const PROJECT_TASK_ACTION_FIELDS: Readonly<Record<ProjectTaskAction, ReadonlySet<string>>> = {
   list_projects: new Set(['action']),
-  list: new Set(['action']),
+  list: new Set(['action', 'offset', 'limit', 'status']),
+  get: new Set(['action', 'task_id']),
   create: new Set(['action', 'title', 'detail', 'status', 'owner']),
   update: new Set(['action', 'task_id', 'title', 'detail', 'status', 'owner', 'result_ref']),
   complete: new Set(['action', 'task_id', 'result_ref']),
@@ -86,8 +90,8 @@ export function createProjectTasksTool(source: ProjectTasksToolHandler | Project
   const readOnly = !!opts.readOnly;
   const selector = 'resolveProject' in source ? source : undefined;
   if (readOnly && selector) throw new Error('Restricted project tasks require a bound project handler');
-  const actions = readOnly ? ['list'] : [
-    ...(selector ? ['list_projects'] : []), 'list', 'create', 'update', 'complete',
+  const actions = readOnly ? ['list', 'get'] : [
+    ...(selector ? ['list_projects'] : []), 'list', 'get', 'create', 'update', 'complete',
   ];
   return {
     name: 'todo_tasks',
@@ -101,7 +105,7 @@ export function createProjectTasksTool(source: ProjectTasksToolHandler | Project
         action: {
           type: 'string',
           enum: actions,
-          description: 'list: read tasks; create: title/detail/status/owner; update: task_id + changes; complete: task_id/result_ref after verified delivery. Omit unrelated fields.'
+          description: 'list: summaries, matching total, next_offset, project-wide progress; get: full detail. complete requires verified delivery. Omit unrelated fields.'
             + (selector
               ? ' Task actions need project; list_projects takes no extras.'
               : ''),
@@ -109,11 +113,13 @@ export function createProjectTasksTool(source: ProjectTasksToolHandler | Project
         ...(selector ? {
           project: { type: 'string', minLength: 1, description: 'Exact project name or project_id from list_projects. Required for task actions; ambiguous names need an explicit id.' },
         } : {}),
-        task_id: { type: 'string', description: 'Target task id (required for update and complete).' },
+        task_id: { type: 'string', minLength: 1, description: 'Target task id (required for get, update and complete).' },
+        offset: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER, description: 'List only; default 0. Continue with next_offset until null, keeping the same filters.' },
+        limit: { type: 'integer', minimum: 1, maximum: 50, description: 'List only; default 20. Pages may be smaller to bound result size.' },
         title: { type: 'string', description: 'Task title (required for create).' },
         detail: { type: 'string', description: 'Optional task detail for create/update.' },
         owner: { type: 'string', description: "Owner agent DISPLAY NAME (as shown in the agents list), not an id." },
-        status: { type: 'string', enum: [...TASK_STATUSES], description: "Follow the current run's target status. Use done only for verified delivery; review awaits required human approval. Failed or unverified work must not be completed." },
+        status: { type: 'string', enum: [...TASK_STATUSES], description: "List: filter by state; omitted includes all. Create/update: follow the run's target status. done requires verified delivery; review awaits required human approval. Keep failed or unverified work open." },
         result_ref: { type: 'string', description: "Delivering conversation, artifact, or file reference. In a Project conversation, save produced project files with library_save and use its returned path; outside one, use the file path." },
       },
       required: ['action'],
@@ -122,7 +128,7 @@ export function createProjectTasksTool(source: ProjectTasksToolHandler | Project
         required: [
           ...(selector && action !== 'list_projects' ? ['project'] : []),
           ...(action === 'create' ? ['title'] : []),
-          ...(action === 'update' || action === 'complete' ? ['task_id'] : []),
+          ...(['get', 'update', 'complete'].includes(action) ? ['task_id'] : []),
         ],
       })),
     },
@@ -138,7 +144,7 @@ export function createProjectTasksTool(source: ProjectTasksToolHandler | Project
 
       const fail = (error: string): ToolResult => ({ content: JSON.stringify({ ok: false, error }), isError: true });
 
-      if (readOnly && action !== 'list') {
+      if (readOnly && action !== 'list' && action !== 'get') {
         return fail('the task backlog is read-only for you');
       }
       if (!actions.includes(action)) return fail(`unknown action: ${action}`);
@@ -155,6 +161,8 @@ export function createProjectTasksTool(source: ProjectTasksToolHandler | Project
       if (input.status !== undefined && !TASK_STATUSES.includes(input.status as ProjectTaskStatus)) {
         return fail(`invalid task status; allowed: ${TASK_STATUSES.join(', ')}`);
       }
+      if (input.offset !== undefined && (!Number.isSafeInteger(input.offset) || (input.offset as number) < 0)) return fail('offset must be a nonnegative safe integer');
+      if (input.limit !== undefined && (!Number.isSafeInteger(input.limit) || (input.limit as number) < 1 || (input.limit as number) > 50)) return fail('limit must be an integer from 1 to 50');
       if (action === 'update' && !['title', 'detail', 'owner', 'status', 'result_ref'].some((field) => input[field] !== undefined)) return fail('update requires changes');
 
       try {
@@ -163,7 +171,7 @@ export function createProjectTasksTool(source: ProjectTasksToolHandler | Project
         }
         // Validate call prerequisites before project lookup or any mutation.
         if (action === 'create' && !title.trim()) return fail('"title" is required for create');
-        if ((action === 'update' || action === 'complete') && !taskId) return fail('"task_id" is required for update and complete');
+        if (['get', 'update', 'complete'].includes(action) && !taskId.trim()) return fail('"task_id" is required for get, update and complete');
         let handler: ProjectTasksToolHandler;
         let project: ProjectTaskProject | undefined;
         if (selector) {
@@ -182,9 +190,10 @@ export function createProjectTasksTool(source: ProjectTasksToolHandler | Project
         });
         switch (action) {
           case 'list': {
-            const r = await handler.list();
+            const r = await handler.list({ offset: input.offset as number | undefined, limit: input.limit as number | undefined, status });
             return result(r);
           }
+          case 'get': return result(await handler.get(taskId));
           case 'create': {
             const r = await handler.create({ title, detail, owner, status });
             const receipt = r.ok

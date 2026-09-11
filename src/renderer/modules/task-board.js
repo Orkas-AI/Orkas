@@ -78,45 +78,16 @@ function _taskBoardDropOrder(tasks, taskId, targetId, afterTarget) {
 // it above the composer. A lone queued row remains visible because its user
 // message is not persisted until admission (D21), and a lone blocked row
 // remains visible because the board owns its run-anyway/cancel recovery.
-// A newly observed lone queued row gets a short stabilization window: every
-// ordinary send is created queued just before the same admission pass claims
-// it, and painting that host-only transition makes the whole panel flash.
+// Initial admission is not actual waiting: the host marks newly created
+// rows until its scheduler either starts them or confirms they must queue.
 // Pure decision function — renderer tests extract it.
-function _taskBoardVisibility(liveRows, deferFreshLoneQueued = false) {
+function _taskBoardVisibility(liveRows) {
   const rows = Array.isArray(liveRows) ? liveRows : [];
-  const isFreshLoneQueued = deferFreshLoneQueued
-    && rows.length === 1
-    && rows[0]
-    && rows[0].status === 'queued';
   const hasStandaloneControl = rows.some((task) => (
-    task && (task.status === 'queued' || task.status === 'blocked')
+    task && (task.status === 'blocked'
+      || (task.status === 'queued' && task.admission_pending !== true))
   ));
-  return { visible: !isFreshLoneQueued && (rows.length >= 2 || hasStandaloneControl) };
-}
-
-const _TASK_BOARD_LONE_QUEUED_REVEAL_DELAY_MS = 200;
-const _taskBoardQueuedRevealTimers = new Map(); // cid → { taskId, timer }
-
-function _taskBoardCancelQueuedReveal(cid, taskId) {
-  const pending = _taskBoardQueuedRevealTimers.get(cid);
-  if (!pending) return;
-  if (taskId && pending.taskId !== taskId) return;
-  clearTimeout(pending.timer);
-  _taskBoardQueuedRevealTimers.delete(cid);
-}
-
-function _taskBoardScheduleQueuedReveal(cid, taskId) {
-  if (!cid || !taskId) return;
-  _taskBoardCancelQueuedReveal(cid);
-  const pending = { taskId, timer: null };
-  pending.timer = setTimeout(() => {
-    if (_taskBoardQueuedRevealTimers.get(cid) !== pending) return;
-    _taskBoardQueuedRevealTimers.delete(cid);
-    if (typeof currentCid === 'undefined' || currentCid === cid) {
-      _taskBoardRender(cid);
-    }
-  }, _TASK_BOARD_LONE_QUEUED_REVEAL_DELAY_MS);
-  _taskBoardQueuedRevealTimers.set(cid, pending);
+  return { visible: rows.length >= 2 || hasStandaloneControl };
 }
 
 // Latest-batch display retains failed/stopped outcomes alongside live work;
@@ -164,14 +135,18 @@ function _taskBoardDisplayRows(tasks, batchIds) {
 // TERMINAL on disk always overwrites the in-memory snapshot. Terminal states
 // are absorbing (nothing transitions out of done/stopped/failed/cancelled; the board
 // persists before the event fires), so the disk row can never be staler than
-// a live-looking cached one. Non-terminal disk rows only fill gaps — a
-// concurrent bus event may already have written a fresher running/waiting
-// snapshot, and rows carry no version to compare.
+// a live-looking cached one. Initial admission also settles only once, so
+// a confirmed queue/start can replace that initial snapshot after a missed
+// event. Other non-terminal rows only fill gaps: a concurrent bus event may
+// already have written a fresher running/waiting snapshot.
 const _TASK_BOARD_TERMINAL = new Set(['done', 'stopped', 'failed', 'cancelled']);
 function _taskBoardMergeSeedRows(map, rows) {
   for (const task of (Array.isArray(rows) ? rows : [])) {
     if (!task || !task.task_id) continue;
-    if (_TASK_BOARD_TERMINAL.has(task.status) || !map.has(task.task_id)) {
+    const cached = map.get(task.task_id);
+    const admissionSettled = cached?.status === 'queued'
+      && cached.admission_pending === true && task.admission_pending !== true;
+    if (_TASK_BOARD_TERMINAL.has(task.status) || !cached || admissionSettled) {
       map.set(task.task_id, task);
     }
   }
@@ -193,7 +168,6 @@ function _taskBoardOnEvent(cid, evData) {
   const task = evData && evData.task;
   if (!cid || !task || !task.task_id) return;
   const m = _taskBoardMapFor(cid);
-  const firstObservation = !m.has(task.task_id);
   // A task id this board has never seen starts (or joins) the current batch;
   // if everything tracked is already terminal, the new task opens a FRESH
   // batch and the previous run's terminal rows leave the active board view.
@@ -201,14 +175,6 @@ function _taskBoardOnEvent(cid, evData) {
     _taskBoardBatchIds.set(cid, _taskBoardBatchAfterCreate(_taskBoardBatchIds.get(cid), m, task.task_id));
   }
   m.set(task.task_id, task);
-  const freshLoneQueued = firstObservation
-    && task.status === 'queued'
-    && _taskBoardLiveRows([...m.values()]).length === 1;
-  if (freshLoneQueued) {
-    _taskBoardScheduleQueuedReveal(cid, task.task_id);
-  } else if (task.status !== 'queued' || task.absorbed_into_turn_id) {
-    _taskBoardCancelQueuedReveal(cid, task.task_id);
-  }
   if (task.status !== 'queued' || task.absorbed_into_turn_id) {
     _taskBoardSendingNow.delete(`${cid}:${task.task_id}`);
   }
@@ -345,15 +311,7 @@ function _taskBoardRender(cid) {
   }
   const all = cid ? [..._taskBoardMapFor(cid).values()] : [];
   const rows = _taskBoardLiveRows(all);
-  const loneQueued = rows.length === 1 && rows[0] && rows[0].status === 'queued'
-    ? rows[0]
-    : null;
-  const pendingReveal = _taskBoardQueuedRevealTimers.get(cid);
-  const deferFreshLoneQueued = !!loneQueued
-    && pendingReveal
-    && pendingReveal.taskId === loneQueued.task_id;
-  if (!deferFreshLoneQueued) _taskBoardCancelQueuedReveal(cid);
-  const decision = _taskBoardVisibility(rows, deferFreshLoneQueued);
+  const decision = _taskBoardVisibility(rows);
   if (!decision.visible) {
     panel.style.display = 'none';
     list.innerHTML = '';
@@ -368,7 +326,7 @@ function _taskBoardRender(cid) {
   const collapsed = cid ? _taskBoardCollapsedCids.has(cid) : false;
   list.style.display = collapsed ? 'none' : '';
   const chevron = document.getElementById('chat-task-board-chevron');
-  if (chevron) chevron.textContent = collapsed ? '▸' : '▾';
+  if (chevron) chevron.style.transform = collapsed ? 'rotate(-90deg)' : '';
   const displayRows = cid ? _taskBoardDisplayRows(all, _taskBoardBatchIds.get(cid)) : [];
   if (countEl) countEl.textContent = String(displayRows.length);
   if (hintEl) hintEl.textContent = t('chat.task_board_counts', { running, queued });

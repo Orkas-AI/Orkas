@@ -26,6 +26,7 @@ describe('delivered task intervention signals', () => {
   it.each([
     ['bash:permission', { request_id: 'req-1', cid: 'c1' }, 'sensitive_operation'],
     ['local-agent:permission', { request_id: 'req-cli', cid: 'c-cli' }, 'sensitive_operation'],
+    ['local-agent:user-input', { request_id: 'req-question', cid: 'c-question' }, 'interactive_cli_input'],
     ['local-agent:permission', { request_id: 'req-2', cid: 'c2', permission_kind: 'connector' }, 'connector_permission'],
     ['connectors:install-confirm', { request_id: 'req-3', cid: 'c3' }, 'connector_install'],
     ['delete_file.confirmation_required', { confirm_id: 'req-4', cid: 'c4' }, 'delete_confirmation'],
@@ -38,6 +39,7 @@ describe('delivered task intervention signals', () => {
       ...payload,
       command: 'private command',
       path: '/private/path',
+      questions: [{ question: 'Private question', options: [{ label: 'Private option' }] }],
     }, 'u1')).toBe(true);
 
     expect(listener).toHaveBeenCalledOnce();
@@ -49,6 +51,7 @@ describe('delivered task intervention signals', () => {
     });
     expect(JSON.stringify(listener.mock.calls)).not.toContain('private command');
     expect(JSON.stringify(listener.mock.calls)).not.toContain('/private/path');
+    expect(JSON.stringify(listener.mock.calls)).not.toContain('Private question');
   });
 
   it('rejects malformed or unroutable look-alikes instead of raising false attention', () => {
@@ -57,6 +60,9 @@ describe('delivered task intervention signals', () => {
 
     expect(captureDeliveredTaskIntervention('bash:permission_cancelled', {
       request_id: 'req-1', cid: 'c1',
+    }, 'u1')).toBe(false);
+    expect(captureDeliveredTaskIntervention('local-agent:user-input_cancelled', {
+      request_id: 'req-question', cid: 'c-question',
     }, 'u1')).toBe(false);
     expect(captureDeliveredTaskIntervention('bash:permission', {
       request_id: 'req-1',

@@ -67,7 +67,6 @@ const BEHAVIOR_SUITE_BY_TOOL: Record<string, string> = {
   marketplace_search: 'test/main/features/group_chat/bus-integration.test.ts',
   marketplace_request_install: 'test/main/features/group_chat/bus-integration.test.ts',
   auto_tasks: 'test/main/features/auto_tasks_tool.test.ts',
-  auto_tasks_list: 'test/main/features/group_chat/bus-integration.test.ts',
   dispatch_to: 'test/main/features/group_chat/bus-integration.test.ts',
   hand_off_to: 'test/main/features/group_chat/bus-integration.test.ts',
   run_worker: 'test/main/features/group_chat/bus-integration.test.ts',

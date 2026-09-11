@@ -146,7 +146,7 @@ import { getBootDeviceProfile } from './util/boot-device-profile';
 
 import * as storage from './storage';
 import { initLogger, createLogger } from './logger';
-import { logErrorSummary } from './util/log-redact';
+import { fileToolBuildRef, logErrorSummary } from './util/log-redact';
 initLogger();
 const log = createLogger('orkas');
 const marketplaceBootLog = createLogger('marketplace_boot');
@@ -593,6 +593,7 @@ function registerIpc(): void {
 async function runBootSelfCheck(): Promise<void> {
   const diag = {
     appVersion: app.getVersion(),
+    fileToolsBuild: fileToolBuildRef(paths.APP_ROOT),
     packaged: app.isPackaged,
     appRoot: paths.APP_ROOT,
     wsRoot: paths.WS_ROOT,

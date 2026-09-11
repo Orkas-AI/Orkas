@@ -98,10 +98,11 @@ describe('project to-do controls', () => {
       { pid: 'p_test', tasks: [], agents: [] },
     );
     expect(unlinked.children.some((child: any) => child.dataset?.action === 'todo-conversation')).toBe(false);
-    for (const [is_running, key] of [[true, 'running'], [false, 'idle'], [null, 'unknown']] as const) {
+    // Host execution facts are available to models, without adding a visible card indicator.
+    for (const is_running of [true, false, null]) {
       const executionCard = context._renderTodoCard({ ...task, is_running }, { pid: 'p_test', tasks: [], agents: [] });
       const badge = executionCard.children.find((child: any) => child.dataset?.role === 'todo-execution');
-      expect(badge?.textContent).toBe(translations[`project.todo.execution.${key}`]);
+      expect(badge).toBeUndefined();
     }
 
     context._bindTodoListActions(list, () => ({ pid: 'p_test', tasks: [task], agents: [] }));

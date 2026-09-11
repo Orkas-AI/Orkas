@@ -18,7 +18,8 @@
  * Owner reference: `owner_agent` is a display NAME (LLM/user-facing; ids are
  * error-prone for an LLM to write). `owner_agent_id` is the resolved id, kept
  * for a stable link across agent rename. This layer only VALIDATES an
- * already-resolved `owner_agent_id` against the project bindings; the name→id
+ * already-resolved `owner_agent_id` against project bindings or the available
+ * account registry for global tasks; the name→id
  * resolution lives with the caller (P0 UI picks from bound agents; the P1
  * `todo_tasks` tool resolves before calling here).
  */
@@ -43,6 +44,8 @@ import { createLogger } from '../logger';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { ALLOWED_EXTENSIONS } from './chat_attachments';
 import * as projects from './projects';
+import * as agents from './agents';
+import { getActiveUserId } from './users';
 
 const log = createLogger('project-tasks');
 
@@ -62,7 +65,7 @@ export interface ProjectTask {
   status: TaskStatus;
   /** Agent display NAME (user/LLM-facing). */
   owner_agent?: string;
-  /** Resolved agent id (stable across rename); validated against bindings. */
+  /** Resolved agent id (stable across rename); validated against its scope. */
   owner_agent_id?: string;
   /** 'user' or an agent display name. */
   created_by: string;
@@ -278,8 +281,8 @@ function _notifyDeleted(pid: string, tid: string): void {
   }
 }
 
-/** Resolve the owner: an `owner_agent_id`, if given, must be one of the
- *  project's bound agents. Returns the fields to persist, or 'owner_not_bound'. */
+/** Validate a project-bound owner or an available account-global owner.
+ * Returns the fields to persist, or 'owner_not_bound'. */
 async function _resolveOwner(
   uid: string,
   pid: string,
@@ -288,7 +291,14 @@ async function _resolveOwner(
   const id = typeof input.owner_agent_id === 'string' ? input.owner_agent_id.trim() : '';
   const name = clampStr(input.owner_agent, 200);
   if (!id && !name) return {};
-  if (!pid) return 'owner_not_bound';
+  if (!pid) {
+    // The registry is scoped to the active account. Never resolve an owner
+    // for a different account through that registry.
+    if (!id || getActiveUserId() !== uid) return 'owner_not_bound';
+    const agent = (await agents.listAgentSummaries()).find((a) => a.agent_id === id && a.enabled !== false);
+    if (!agent || getActiveUserId() !== uid) return 'owner_not_bound';
+    return { owner_agent: agent.name, owner_agent_id: agent.agent_id };
+  }
   if (id) {
     const bindings = await projects.getBindings(uid, pid);
     if (!bindings.agents.includes(id)) return 'owner_not_bound';

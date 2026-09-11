@@ -1104,6 +1104,17 @@ async function _patchInstallMeta(dir: string, patch: Partial<InstallMeta>): Prom
   await _writeInstallMeta(dir, next);
 }
 
+/** Builtin installs have no remote URL until their first online resolution. */
+function _hasDownloadUrl(value: unknown): value is string {
+  if (typeof value !== 'string' || !value.trim()) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' || url.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
 /** Fetch agent.json from the cloud URL recorded in the manifest, write to the per-machine
  *  install target. Wipe-and-replace so a previous version doesn't leave stale fields. */
 async function _pullAgent(uid: string, row: AgentInstall, opts: MarketplaceReconcileOptions = {}): Promise<void> {
@@ -1113,11 +1124,12 @@ async function _pullAgent(uid: string, row: AgentInstall, opts: MarketplaceRecon
 async function _pullAgentLocked(uid: string, row: AgentInstall, opts: MarketplaceReconcileOptions = {}): Promise<void> {
   let current = row;
   _assertContinue(opts);
-  let res = await fetchWithRetry(`marketplace:pull-agent:${row.id}`, current.agent_json_url, undefined, {
-    timeoutMs: MARKETPLACE_AGENT_JSON_DOWNLOAD_TIMEOUT_MS,
-  });
-  const needsDetailRefresh = !res.ok && res.status === 404;
-  if (needsDetailRefresh) {
+  let res = _hasDownloadUrl(current.agent_json_url)
+    ? await fetchWithRetry(`marketplace:pull-agent:${row.id}`, current.agent_json_url, undefined, {
+      timeoutMs: MARKETPLACE_AGENT_JSON_DOWNLOAD_TIMEOUT_MS,
+    })
+    : null;
+  if (!res || res.status === 404) {
     _assertContinue(opts);
     const fresh = await postJson<{
       agent_json: Record<string, unknown>;
@@ -1133,7 +1145,9 @@ async function _pullAgentLocked(uid: string, row: AgentInstall, opts: Marketplac
       min_app_version?: string;
       minAppVersion?: string;
     }>('/marketplace/agents/detail', { id: row.id });
+    _assertContinue(opts);
     _assertRefreshedVersion('agent', row.id, row.version, fresh.version);
+    if (!_hasDownloadUrl(fresh.agent_json_url)) throw new Error('agent detail missing a valid download URL');
     const minAppVersion = _normalizeMinAppVersion(fresh, fresh.agent_json);
     current = {
       ...row,
@@ -1220,11 +1234,12 @@ async function _pullSkill(uid: string, row: SkillInstall, opts: MarketplaceRecon
 async function _pullSkillLocked(uid: string, row: SkillInstall, opts: MarketplaceReconcileOptions = {}): Promise<void> {
   let current = row;
   _assertContinue(opts);
-  let downloaded = await downloadMarketplaceBundle(`marketplace:pull-skill:${row.id}`, current.bundle_url, {
-    assertContinue: () => _assertContinue(opts),
-  });
-  let res = downloaded.response;
-  if (!res.ok && res.status === 404) {
+  let downloaded = _hasDownloadUrl(current.bundle_url)
+    ? await downloadMarketplaceBundle(`marketplace:pull-skill:${row.id}`, current.bundle_url, {
+      assertContinue: () => _assertContinue(opts),
+    })
+    : null;
+  if (!downloaded || downloaded.response.status === 404) {
     _assertContinue(opts);
     const fresh = await postJson<{
       bundle_url: string;
@@ -1238,7 +1253,9 @@ async function _pullSkillLocked(uid: string, row: SkillInstall, opts: Marketplac
       min_app_version?: string;
       minAppVersion?: string;
     }>('/marketplace/skills/bundle', { id: row.id });
+    _assertContinue(opts);
     _assertRefreshedVersion('skill', row.id, row.version, fresh.version);
+    if (!_hasDownloadUrl(fresh.bundle_url)) throw new Error('skill detail missing a valid download URL');
     const minAppVersion = _normalizeMinAppVersion(fresh);
     current = {
       ...row,
@@ -1254,8 +1271,8 @@ async function _pullSkillLocked(uid: string, row: SkillInstall, opts: Marketplac
     downloaded = await downloadMarketplaceBundle(`marketplace:pull-skill:${row.id}:fresh`, current.bundle_url, {
       assertContinue: () => _assertContinue(opts),
     });
-    res = downloaded.response;
   }
+  const res = downloaded.response;
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   if (!downloaded.buffer) throw new Error('skill bundle response body missing');
   _assertContinue(opts);

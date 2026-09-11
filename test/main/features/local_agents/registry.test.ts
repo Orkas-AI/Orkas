@@ -466,18 +466,19 @@ describe('local_agents/registry', () => {
     process.env.PATH = `${alphaDir}${path.delimiter}${stableDir}`;
 
     const selected = await detectOne('codex', { searchDirs: [] });
-    expect(selected.path).toBe(stableBin);
+    expect(isWindows ? selected.path?.toLowerCase() : selected.path).toBe(isWindows ? stableBin.toLowerCase() : stableBin);
     expect(selected.version).toBe('0.146.0');
 
     noteCliCandidateFailure(selected);
     const fallback = cachedCliFallbackCandidate(selected);
     expect(fallback).toMatchObject({
-      path: alphaBin,
       version: '0.151.0',
       fullVersion: '0.151.0-alpha.7.2',
       prerelease: true,
       available: true,
     });
+
+    expect(isWindows ? fallback!.path?.toLowerCase() : fallback!.path).toBe(isWindows ? alphaBin.toLowerCase() : alphaBin);
 
     noteCliCandidateSuccess(fallback!);
   });
@@ -490,11 +491,13 @@ describe('local_agents/registry', () => {
     process.env.PATH = `${olderDir}${path.delimiter}${newestDir}`;
 
     const selected = await detectOne('claude', { searchDirs: [] });
-    expect(selected.path).toBe(newestBin);
+    expect(isWindows ? selected.path?.toLowerCase() : selected.path).toBe(isWindows ? newestBin.toLowerCase() : newestBin);
     noteCliCandidateFailure(selected);
     expect(cachedCliFallbackCandidate(selected)).toMatchObject({
-      type: 'claude', path: olderBin, version: '2.1.0', available: true,
+      type: 'claude', version: '2.1.0', available: true,
     });
+    const fallback = cachedCliFallbackCandidate(selected)!;
+    expect(isWindows ? fallback.path?.toLowerCase() : fallback.path).toBe(isWindows ? olderBin.toLowerCase() : olderBin);
     noteCliCandidateSuccess(cachedCliFallbackCandidate(selected)!);
   });
 

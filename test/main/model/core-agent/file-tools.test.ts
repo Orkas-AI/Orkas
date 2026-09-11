@@ -439,6 +439,22 @@ describe('file-tools › read_file (text)', () => {
     expect(chars.content).toContain('covered="4-7"');
   });
 
+  it.each([
+    { range: { unit: 'line', start: 'private value', end: 4 }, reason: 'range_integer', facts: { start_type: 'string', start_integer: false, end_integer: true } },
+    { range: { unit: 'line', start: 2, end: 1 }, reason: 'range_order', facts: { start_in_bounds: true, ordered: false } },
+    { range: { unit: 'line', start: 0, end: 2 }, reason: 'range_order', facts: { start_in_bounds: false, ordered: true } },
+    { range: { unit: 'line', start: 1 }, reason: 'range_integer', facts: { end_present: false, end_type: 'undefined' } },
+  ])('preserves batch range diagnostic facts for $reason', async ({ range, reason, facts }) => {
+    const { tools, wsDir } = await buildTools();
+    const target = path.join(wsDir, 'private-target.txt');
+    fs.writeFileSync(target, 'private body');
+    const result = await run(getTool(tools, 'read_files'), { paths: [{ path: target }, { path: target, range }] });
+    expect(result.isError).toBe(true);
+    expect(result.observations?.fileFailure).toMatchObject({ code: 'E_BAD_INPUT', reason, stage: 'input', item_index: 1, ...facts });
+    expect(JSON.stringify(result.observations)).not.toContain('private');
+    expect(fs.readFileSync(target, 'utf8')).toBe('private body');
+  });
+
   it('rejects malformed tagged ranges and mixed tagged/legacy addressing', async () => {
     const { tools, wsDir } = await buildTools();
     const p = path.join(wsDir, 'invalid-range.txt');
@@ -2072,6 +2088,28 @@ describe('file-tools › grep_files', () => {
   // The model reaches for `root: <a file>` often enough that refusing it cost a
   // round trip every time, and the two cases in production both retried the
   // same shape before recovering.
+  it('records the observed target type without reading a special file', async () => {
+    const { tools, wsDir } = await buildTools();
+    const target = path.join(wsDir, 'special.txt');
+    fs.writeFileSync(target, 'private body');
+    const mutableFs = nodeRequire('node:fs') as typeof fs;
+    const original = mutableFs.statSync;
+    const stat = original(target);
+    const spy = vi.spyOn(mutableFs, 'statSync').mockImplementation(((value: any, ...args: any[]) => {
+      if (String(value) === target) return Object.assign(Object.create(stat), { isFile: () => false, isDirectory: () => false });
+      return (original as any)(value, ...args);
+    }) as any);
+    syncBuiltinESMExports();
+    try {
+      const result = await run(getTool(tools, 'grep_files'), { root: target, pattern: 'private' });
+      expect(result.isError).toBe(true);
+      expect(result.observations?.fileFailure).toEqual({ code: 'E_NOT_DIRECTORY', reason: 'target_type', stage: 'stat', target_type: 'other' });
+      expect(result.content).not.toContain('private body');
+      expect(JSON.stringify(result.observations)).not.toContain(target);
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    expect(fs.readFileSync(target, 'utf8')).toBe('private body');
+  });
+
   it('searches inside a single file when root names one', async () => {
     const { tools, wsDir } = await buildTools();
     fs.writeFileSync(path.join(wsDir, 'a.md'), 'line with banana\nother line');

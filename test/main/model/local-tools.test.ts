@@ -7,6 +7,22 @@ import * as path from 'node:path';
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 const SHELL_SUCCESS_TIMEOUT_MS = process.platform === 'win32' ? 15_000 : 5_000;
 
+// Each spelling runs through the platform-independent gate and real Windows
+// execution. Native filesystem bytes, preserved inputs, and process exit status
+// are independent oracles for quoting, path resolution, and shell compatibility.
+const POWERSHELL_PATH_ASSIGNMENTS = [
+  { label: 'compact double-quoted absolute path', spacing: '=', separator: '; ', quote: '"', relative: false, variable: '$script', reference: '$SCRIPT', tool: 'bash' },
+  { label: 'spaced single-quoted absolute path', spacing: ' = ', separator: '\r\n', quote: "'", relative: false, variable: '$script', reference: '$SCRIPT', tool: 'bash' },
+  { label: 'right-spaced single-quoted relative path', spacing: '= ', separator: '\n', quote: "'", relative: true, variable: '$script', reference: '$SCRIPT', tool: 'bash' },
+  { label: 'left-spaced double-quoted relative path', spacing: ' =', separator: '; ', quote: '"', relative: true, variable: '$script', reference: '$SCRIPT', tool: 'bash' },
+  { label: 'tabbed environment path', spacing: '\t=\t', separator: '\r\n', quote: '"', relative: false, variable: '$ENV:ORKAS_TEST_PATH_TARGET', reference: '$env:orkas_test_path_target', tool: 'bash' },
+  { label: 'compact environment path in a persistent process', spacing: '=', separator: '\n', quote: "'", relative: true, variable: '$env:ORKAS_TEST_PATH_TARGET', reference: '$ENV:orkas_test_path_target', tool: 'process_session' },
+] as const;
+
+function powershellPathLiteral(value: string, quote: string): string {
+  return quote + (quote === "'" ? value.replace(/'/g, "''") : value) + quote;
+}
+
 function testNodeCommand(script: string): string {
   if (process.platform === 'win32') {
     const quote = (value: string) => `'${value.replace(/'/g, "''")}'`;
@@ -373,7 +389,9 @@ describe('local-tools › bash access modes', () => {
       const scratch = path.join(tmpDir, 'scratch.log');
       fs.writeFileSync(scratch, 'noise');
       const res = await bash.execute(
-        { command: `rm -f ${scratch}`, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS },
+        { command: process.platform === 'win32'
+          ? `Remove-Item -Force -LiteralPath '${scratch.replaceAll("'", "''")}'`
+          : `rm -f '${scratch.replaceAll("'", "'\\''")}'`, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS },
         makeCtx(),
       );
       expect(res.isError).toBeFalsy();
@@ -681,7 +699,7 @@ describe('local-tools › bash filesystem mutation scope', () => {
     }
   });
 
-  it('blocks unresolved dynamic bash write targets in workspace-only mode', async () => {
+  it('does not execute unresolved writes without an approval in workspace-only mode', async () => {
     const { lt, perm } = await loadModules();
     perm.setLocalExecMode('workspace_approval');
     await setTmpWorkspace();
@@ -691,8 +709,41 @@ describe('local-tools › bash filesystem mutation scope', () => {
       timeoutMs: 5000,
     }, makeCtx());
     expect(res.isError).toBe(true);
-    expect(res.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+    expect(res.content).toContain('E_BASH_RISK_DENIED');
   });
+
+  it.each(['bash', 'process_session'])(
+    'rejects a known out-of-scope write mixed with an unresolved path before %s asks or executes',
+    async (toolName) => {
+      const { lt, perm } = await loadModules();
+      const bp = await import('../../../src/main/model/core-agent/bash-permissions');
+      perm.setLocalExecMode('workspace_approval');
+      await setTmpWorkspace();
+      const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-mixed-targets-'));
+      const outside = path.join(outsideDir, 'keep.txt');
+      fs.writeFileSync(outside, 'original');
+      const requests: unknown[] = [];
+      bp._setBroadcastForTest((_channel: string, info: any) => {
+        requests.push(info);
+        bp.respond(info.request_id, 'allow_once');
+      });
+      try {
+        const command = process.platform === 'win32'
+          ? `$target = Join-Path (Get-Location) "dynamic.txt"; Set-Content -LiteralPath "$target" -Value changed; Set-Content -LiteralPath ${powershellPathLiteral(outside, "'")} -Value changed`
+          : `target="$(pwd)/dynamic.txt"; printf changed > "$target"; printf changed > ${JSON.stringify(outside)}`;
+        const tool = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find(t => t.name === toolName)!;
+        const result = await tool.execute({ action: 'start', command }, makeCtx());
+        expect(result.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+        expect(result.isError).toBe(true);
+        expect(requests).toEqual([]);
+        expect(fs.readFileSync(outside, 'utf8')).toBe('original');
+        expect(fs.existsSync(path.join(tmpDir, 'dynamic.txt'))).toBe(false);
+      } finally {
+        bp._resetForTest();
+        fs.rmSync(outsideDir, { recursive: true, force: true });
+      }
+    },
+  );
 
   it('invalidates a prior literal when a later assignment becomes dynamic', async () => {
     const { lt, perm } = await loadModules();
@@ -704,13 +755,13 @@ describe('local-tools › bash filesystem mutation scope', () => {
       : `TARGET=${JSON.stringify(path.join(tmpDir, 'safe.txt'))}; TARGET="$UNKNOWN_BASH_TARGET"; cat "$TARGET"`;
     const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
     expect(res.isError).toBe(true);
-    expect(res.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+    expect(res.content).toContain('E_BASH_RISK_DENIED');
 
     if (process.platform !== 'win32') {
       const loopCommand = `TARGET=${JSON.stringify(path.join(tmpDir, 'safe.txt'))}; for TARGET in "$UNKNOWN_BASH_TARGET"; do true; done && cat "$TARGET"`;
       const loopRes = await bash.execute({ command: loopCommand, timeoutMs: 5000 }, makeCtx());
       expect(loopRes.isError).toBe(true);
-      expect(loopRes.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+      expect(loopRes.content).toContain('E_BASH_RISK_DENIED');
     }
   });
 
@@ -762,7 +813,7 @@ describe('local-tools › bash filesystem mutation scope', () => {
     },
   );
 
-  it('rejects runtime-computed read, write, move, and removal paths in all_files_approval', async () => {
+  it('preserves files when runtime-computed read, write, move, and removal commands are denied', async () => {
     const { lt, perm } = await loadModules();
     const bashPerms = await import('../../../src/main/model/core-agent/bash-permissions');
     perm.setLocalExecMode('all_files_approval');
@@ -790,13 +841,15 @@ describe('local-tools › bash filesystem mutation scope', () => {
           'target="$(pwd)/dynamic-remove.txt"; rm -f "$target"',
         ];
     bashPerms._setBroadcastForTest((_channel: string, info: any) => {
-      bashPerms.respond(info.request_id, 'allow_once');
+      expect(info.unresolved_paths).toBe(true);
+      expect(info.can_allow_run).toBe(false);
+      bashPerms.respond(info.request_id, 'deny');
     });
     try {
       for (const command of commands) {
         const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
         expect(res.isError, `command=${command} content=${res.content}`).toBe(true);
-        expect(res.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+        expect(res.content).toContain('E_BASH_RISK_DENIED');
       }
       expect(fs.readFileSync(readTarget, 'utf8')).toBe('must not be read');
       expect(fs.existsSync(writeTarget)).toBe(false);
@@ -807,6 +860,41 @@ describe('local-tools › bash filesystem mutation scope', () => {
       bashPerms._setBroadcastForTest(null);
     }
   });
+
+  it.each(['workspace_approval', 'all_files_approval'] as const)(
+    'executes computed paths, multi-statement loops and pipelines once after approval in %s',
+    async (mode) => {
+      const { lt, perm } = await loadModules();
+      const bp = await import('../../../src/main/model/core-agent/bash-permissions');
+      perm.setLocalExecMode(mode);
+      await setTmpWorkspace();
+      fs.writeFileSync(path.join(tmpDir, 'input.txt'), 'input-bytes\n');
+      let request: any;
+      bp._setBroadcastForTest((_channel: string, info: any) => { request = info; });
+      const command = process.platform === 'win32'
+        ? '$target = $(Add-Content -LiteralPath "count.txt" -Value once; Join-Path (Get-Location) "result.txt"); foreach ($f in (Get-ChildItem -Name "input*.txt")) { Get-Content -LiteralPath "$f" | Out-String | Add-Content -LiteralPath "$target"; Add-Content -LiteralPath "$target" -Value done }'
+        : 'target="$(printf once >> count.txt; pwd)/result.txt"; for f in input*.txt; do cat "$f" | cat >> "$target"; printf done >> "$target"; done';
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find(t => t.name === 'bash')!;
+      try {
+        const execution = bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+        await vi.waitFor(() => expect(request?.unresolved_paths).toBe(true));
+        expect(request.can_allow_run).toBe(false);
+        // Preflight must not evaluate substitutions or partially run the script.
+        expect(fs.existsSync(path.join(tmpDir, 'count.txt'))).toBe(false);
+        expect(fs.existsSync(path.join(tmpDir, 'result.txt'))).toBe(false);
+        bp.respond(request.request_id, 'allow_once');
+        const result = await execution;
+        expect(result.isError, result.content).toBeFalsy();
+        expect(fs.readFileSync(path.join(tmpDir, 'count.txt'), 'utf8').trim()).toBe('once');
+        const output = fs.readFileSync(path.join(tmpDir, 'result.txt'), 'utf8');
+        expect(output).toContain('input-bytes');
+        expect(output).toContain('done');
+        expect(fs.readFileSync(path.join(tmpDir, 'input.txt'), 'utf8')).toBe('input-bytes\n');
+      } finally {
+        bp._resetForTest();
+      }
+    },
+  );
 
   it('checks PowerShell transfer sources and destinations before starting shell sessions', async () => {
     const { lt, perm } = await loadModules();
@@ -825,13 +913,13 @@ describe('local-tools › bash filesystem mutation scope', () => {
       for (const command of commands) {
         const result = await tool.execute({ action: 'start', command }, makeCtx());
         expect(result.isError, `${name}: ${command}`).toBe(true);
-        expect(result.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+        expect(result.content).toContain('E_BASH_RISK_DENIED');
       }
     }
     const interactive = tools.find((tool) => tool.name === 'interactive_cli')!;
     const result = await interactive.execute({ action: 'start', command: commands[0] }, makeCtx());
     expect(result.isError).toBe(true);
-    expect(result.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+    expect(result.content).toContain('E_BASH_RISK_DENIED');
     expect(fs.readFileSync(path.join(tmpDir, 'source.txt'), 'utf8')).toBe('keep source');
     expect(fs.existsSync(path.join(tmpDir, 'target.txt'))).toBe(false);
   });
@@ -906,7 +994,7 @@ describe('local-tools › bash filesystem mutation scope', () => {
     expect(res.content).toContain('batch-3');
   });
 
-  it('accepts at most 256 literal loop expansions and rejects the next item before execution', async () => {
+  it('resolves 256 literal loop values and requires approval beyond the analysis bound', async () => {
     const { lt, perm } = await loadModules();
     perm.setLocalExecMode('workspace_approval');
     await setTmpWorkspace();
@@ -932,8 +1020,7 @@ describe('local-tools › bash filesystem mutation scope', () => {
       : `for i in ${posixValues} 257; do cat "bounded-$i.txt"; done`;
     const rejected = await bash.execute({ command: rejectedCommand, timeoutMs: 5000 }, makeCtx());
     expect(rejected.isError).toBe(true);
-    expect(rejected.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
-    expect(rejected.content).toContain('resolve it to explicit readable paths before retrying.');
+    expect(rejected.content).toContain('E_BASH_RISK_DENIED');
   });
 
   it('checks every finite loop expansion against the workspace boundary', async () => {
@@ -972,7 +1059,7 @@ describe('local-tools › bash filesystem mutation scope', () => {
     }
   });
 
-  it('still blocks loop paths whose values require runtime evaluation', async () => {
+  it('requires approval for runtime loop values and multi-command loop bodies', async () => {
     const { lt, perm } = await loadModules();
     perm.setLocalExecMode('workspace_approval');
     await setTmpWorkspace();
@@ -984,8 +1071,7 @@ describe('local-tools › bash filesystem mutation scope', () => {
     const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
 
     expect(res.isError).toBe(true);
-    expect(res.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
-    expect(res.content).toContain('resolve it to explicit readable paths before retrying.');
+    expect(res.content).toContain('E_BASH_RISK_DENIED');
     expect(res.content).not.toContain('all-files access mode');
 
     const multiCommandLoop = process.platform === 'win32'
@@ -993,7 +1079,7 @@ describe('local-tools › bash filesystem mutation scope', () => {
       : 'for i in 1 2; do true; cat "perf_batch_B$i.txt"; done';
     const multiCommandRes = await bash.execute({ command: multiCommandLoop, timeoutMs: 5000 }, makeCtx());
     expect(multiCommandRes.isError).toBe(true);
-    expect(multiCommandRes.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+    expect(multiCommandRes.content).toContain('E_BASH_RISK_DENIED');
   });
 
   it('does not parse JavaScript inside a POSIX heredoc as shell redirections', async () => {
@@ -1038,6 +1124,230 @@ describe('local-tools › bash filesystem mutation scope', () => {
       expect(res.content).toContain('literal assignment ok');
     },
   );
+
+  it.each(POWERSHELL_PATH_ASSIGNMENTS)('resolves PowerShell literal assignments: $label', async (fixture) => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const { bashTool } = await import('../../../src/core-agent/src/tools/builtin');
+    const { processSessionTool } = await import('../../../src/core-agent/src/tools/process-session');
+    const coreTool = fixture.tool === 'bash' ? bashTool : processSessionTool;
+    const execute = vi.spyOn(coreTool, 'execute').mockResolvedValue({ content: 'shell accepted' });
+    try {
+      const target = path.join(tmpDir, "字体 script's output.txt");
+      const literal = powershellPathLiteral(fixture.relative ? path.relative(tmpDir, target) : target, fixture.quote);
+      const command = `${fixture.variable}${fixture.spacing}${literal}${fixture.separator}Set-Content -LiteralPath ${fixture.reference} -Value ok`;
+      const tool = lt.createLocalTools({ userId: 'u1', cid: 'c1', hostPlatform: 'win32' }).find((candidate) => candidate.name === fixture.tool)!;
+      const input = fixture.tool === 'bash' ? { command } : { action: 'start', command };
+      const result = await tool.execute(input, makeCtx());
+      expect(result.isError, result.content).toBeFalsy();
+      expect(execute).toHaveBeenCalledOnce();
+      expect(execute.mock.calls[0][0].command).toBe(command);
+    } finally {
+      execute.mockRestore();
+    }
+  });
+
+  it.each([
+    '$script=Join-Path "root" "computed.txt"',
+    '$script =Join-Path "root" "computed.txt"',
+    '$script=$unknown',
+    '$script=Get-Location',
+    '$script="safe.txt" + $unknown',
+    '$script="escaped`npath"',
+    '$script="prefix-$unknown"',
+    '$script+="suffix"',
+    '$script += "suffix"',
+    '$script++',
+    '$script="safe.txt" | Write-Output',
+  ])('invalidates a prior PowerShell path before an unresolved reassignment: %s', async (assignment) => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const { bashTool } = await import('../../../src/core-agent/src/tools/builtin');
+    const execute = vi.spyOn(bashTool, 'execute').mockResolvedValue({ content: 'must not execute' });
+    const target = path.join(tmpDir, 'preserved.txt');
+    fs.writeFileSync(target, 'preserve original');
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', hostPlatform: 'win32' }).find((tool) => tool.name === 'bash')!;
+      const result = await bash.execute({
+        command: `$script = '${target}'; ${assignment}; Set-Content -LiteralPath $script -Value changed`,
+      }, makeCtx());
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain('E_BASH_RISK_DENIED');
+      expect(execute).not.toHaveBeenCalled();
+      expect(fs.readFileSync(target, 'utf8')).toBe('preserve original');
+    } finally {
+      execute.mockRestore();
+    }
+  });
+
+  it('checks the latest compact PowerShell assignment against workspace scope through both shell tools', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const { bashTool } = await import('../../../src/core-agent/src/tools/builtin');
+    const { processSessionTool } = await import('../../../src/core-agent/src/tools/process-session');
+    const execute = vi.spyOn(bashTool, 'execute').mockResolvedValue({ content: 'must not execute' });
+    const start = vi.spyOn(processSessionTool, 'execute').mockResolvedValue({ content: 'must not execute' });
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-ps-assigned-outside-'));
+    const outside = path.join(outsideDir, 'blocked.txt');
+    try {
+      const tools = lt.createLocalTools({ userId: 'u1', cid: 'c1', hostPlatform: 'win32' });
+      for (const name of ['bash', 'process_session']) {
+        const result = await tools.find((tool) => tool.name === name)!.execute({
+          action: 'start',
+          command: `$script = '${path.join(tmpDir, 'safe.txt')}'; $SCRIPT='${outside}'; Set-Content -LiteralPath $script -Value nope`,
+        }, makeCtx());
+        expect(result.isError).toBe(true);
+        expect(result.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+        expect(fs.existsSync(outside)).toBe(false);
+        expect(fs.existsSync(path.join(tmpDir, 'safe.txt'))).toBe(false);
+      }
+      expect(execute).not.toHaveBeenCalled();
+      expect(start).not.toHaveBeenCalled();
+    } finally {
+      execute.mockRestore();
+      start.mockRestore();
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['win32', "'$script=\"safe.txt\"'; Set-Content -LiteralPath $script -Value nope"],
+    ['win32', "'$script' = 'safe.txt'; Set-Content -LiteralPath $script -Value nope"],
+    ['darwin', '$script="safe.txt"; cat "$script"'],
+  ] as const)('does not resolve quoted assignment text or foreign shell syntax on %s: %s', async (hostPlatform, command) => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const { bashTool } = await import('../../../src/core-agent/src/tools/builtin');
+    const execute = vi.spyOn(bashTool, 'execute').mockResolvedValue({ content: 'must not execute' });
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', hostPlatform }).find((tool) => tool.name === 'bash')!;
+      const result = await bash.execute({ command }, makeCtx());
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain('E_BASH_RISK_DENIED');
+      expect(execute).not.toHaveBeenCalled();
+    } finally {
+      execute.mockRestore();
+    }
+  });
+
+  it.runIf(process.platform === 'win32').each(POWERSHELL_PATH_ASSIGNMENTS)('executes native PowerShell path assignment: $label', async (fixture) => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const cwd = path.join(tmpDir, '工作区 with spaces');
+    const first = path.join(cwd, 'unchanged.txt');
+    const target = path.join(cwd, '子目录', "字体 script's output.txt");
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(first, 'preserve original');
+    const literal = powershellPathLiteral(fixture.relative ? path.relative(cwd, target) : target, fixture.quote);
+    const command = `$ErrorActionPreference = 'Stop'; ${fixture.variable} = ${powershellPathLiteral(first, "'")}${fixture.separator}${fixture.variable}${fixture.spacing}${literal}${fixture.separator}Set-Content -LiteralPath ${fixture.reference} -Value 'literal assignment ok' -Encoding utf8; Get-Content -LiteralPath ${fixture.reference}`;
+    const tool = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((candidate) => candidate.name === fixture.tool)!;
+    const ctx = { ...makeCtx(), workingDir: cwd };
+    let sessionId: string | undefined;
+    try {
+      if (fixture.tool === 'bash') {
+        const result = await tool.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, ctx);
+        expect(result.isError, result.content).toBeFalsy();
+        expect(result.observations?.execution).toMatchObject({ status: 'succeeded', exitCode: 0 });
+        expect(result.content).not.toContain('<stderr>');
+        expect(result.content).toContain('literal assignment ok');
+      } else {
+        let result = await tool.execute({ action: 'start', command }, ctx);
+        expect(result.isError, result.content).toBeFalsy();
+        let payload = JSON.parse(result.content);
+        sessionId = payload.session_id;
+        expect(sessionId).toBeTruthy();
+        const deadline = Date.now() + SHELL_SUCCESS_TIMEOUT_MS;
+        while (payload.status === 'running' && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          result = await tool.execute({ action: 'read', session_id: sessionId }, ctx);
+          expect(result.isError, result.content).toBeFalsy();
+          payload = JSON.parse(result.content);
+        }
+        expect(payload).toMatchObject({ status: 'exited', exit_code: 0 });
+        expect(payload.output.trim()).toBe('literal assignment ok');
+      }
+      expect(fs.readFileSync(target, 'utf8').replace(/^\uFEFF/, '').trim()).toBe('literal assignment ok');
+      expect(fs.readFileSync(first, 'utf8')).toBe('preserve original');
+      expect(fs.readdirSync(path.dirname(target))).toEqual([path.basename(target)]);
+    } finally {
+      if (sessionId) {
+        try { await tool.execute({ action: 'stop', session_id: sessionId }, ctx); }
+        finally {
+          const sessions = await import('../../../src/core-agent/src/tools/process-session');
+          await sessions._resetProcessSessionsForTest();
+        }
+      }
+    }
+  });
+
+  it.runIf(process.platform === 'win32').each(['computed', 'compound', 'outside'] as const)(
+    'blocks native PowerShell %s reassignment before any command can change files', async (kind) => {
+      const { lt, perm } = await loadModules();
+      perm.setLocalExecMode('workspace_approval');
+      await setTmpWorkspace();
+      const workspace = path.join(tmpDir, 'workspace');
+      const sibling = path.join(tmpDir, 'workspace-other');
+      fs.mkdirSync(workspace);
+      fs.mkdirSync(sibling);
+      const ws = await import('../../../src/main/features/user_workspace');
+      expect(ws.setWorkspacePath('u1', workspace).ok).toBe(true);
+      const original = path.join(workspace, 'original.txt');
+      const compound = original + '.other';
+      const outside = path.join(sibling, 'outside.txt');
+      const marker = path.join(workspace, 'must-not-start.txt');
+      for (const file of [original, compound, outside]) fs.writeFileSync(file, 'preserve original');
+      const assignment = kind === 'computed'
+        ? "$script=Join-Path (Get-Location) 'original.txt'"
+        : kind === 'compound'
+          ? "$script+='.other'"
+          : `$SCRIPT=${powershellPathLiteral(path.relative(workspace, outside), "'")}`;
+      const command = `Set-Content -LiteralPath ${powershellPathLiteral(marker, "'")} -Value started; $script=${powershellPathLiteral(original, "'")}; ${assignment}; Set-Content -LiteralPath $script -Value changed`;
+      const tools = lt.createLocalTools({ userId: 'u1', cid: 'c1' });
+      try {
+        for (const name of ['bash', 'process_session']) {
+          const input = name === 'bash' ? { command } : { action: 'start', command };
+          const result = await tools.find((tool) => tool.name === name)!.execute(input, { ...makeCtx(), workingDir: workspace });
+          expect(result.isError).toBe(true);
+          expect(result.content).toContain(kind === 'outside' ? 'E_BASH_PATH_OUT_OF_SCOPE' : 'E_BASH_RISK_DENIED');
+          expect(fs.existsSync(marker)).toBe(false);
+          for (const file of [original, compound, outside]) expect(fs.readFileSync(file, 'utf8')).toBe('preserve original');
+        }
+      } finally {
+        const sessions = await import('../../../src/core-agent/src/tools/process-session');
+        await sessions._resetProcessSessionsForTest();
+      }
+    },
+  );
+
+  it.runIf(process.platform === 'win32')('blocks unapproved computed PowerShell writes and permits explicit workspace targets', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const target = path.join(tmpDir, 'recovered output.txt');
+    const marker = path.join(tmpDir, 'blocked-command-started.txt');
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((tool) => tool.name === 'bash')!;
+    const blocked = await bash.execute({
+      command: `Set-Content -LiteralPath ${powershellPathLiteral(marker, "'")} -Value started; $script=Join-Path (Get-Location) 'recovered output.txt'; Set-Content -LiteralPath $script -Value wrong`,
+    }, makeCtx());
+    expect(blocked.isError).toBe(true);
+    expect(blocked.content).toContain('E_BASH_RISK_DENIED');
+    expect(fs.existsSync(marker)).toBe(false);
+    expect(fs.existsSync(target)).toBe(false);
+    const recovered = await bash.execute({
+      command: `$ErrorActionPreference = 'Stop'; Set-Content -LiteralPath ${powershellPathLiteral(target, "'")} -Value recovered -Encoding utf8`,
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx());
+    expect(recovered.isError, recovered.content).toBeFalsy();
+    expect(recovered.observations?.execution).toMatchObject({ status: 'succeeded', exitCode: 0 });
+    expect(recovered.content).not.toContain('<stderr>');
+    expect(fs.readFileSync(target, 'utf8').replace(/^\uFEFF/, '').trim()).toBe('recovered');
+    expect(fs.existsSync(marker)).toBe(false);
+  });
 
   it('still blocks a literal-assigned path when its resolved target is outside scope', async () => {
     const { lt, perm } = await loadModules();
@@ -1741,6 +2051,62 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
     }
   });
 
+  it.each(['bash', 'process_session', 'interactive_cli', 'run_program'])(
+    'holds %s dynamic removal until approval and preserves files on cancellation',
+    async (toolName) => {
+      const { lt, perm, bashPerms } = await loadWithBashPerms();
+      perm.setLocalExecMode('workspace_approval');
+      await setTmpWorkspace();
+      const target = path.join(tmpDir, 'dynamic-remove.txt');
+      fs.writeFileSync(target, 'preserve until approved');
+      const command = process.platform === 'win32'
+        ? '$target = Join-Path (Get-Location) "dynamic-remove.txt"; Remove-Item -Force -LiteralPath "$target"'
+        : 'target="$(pwd)/dynamic-remove.txt"; rm -f "$target"';
+      const requests: any[] = [];
+      bashPerms._setBroadcastForTest((channel: string, info: any) => {
+        if (channel === 'bash:permission') requests.push(info);
+      });
+      const tool = lt.createLocalTools(OPTS).find(item => item.name === (toolName === 'run_program' ? 'bash' : toolName))!;
+      const execute = async () => {
+        if (toolName !== 'run_program') return tool.execute({ action: 'start', command }, makeCtx());
+        const { createRunProgramTool } = await import('../../../src/core-agent/src/tools/run-program');
+        const { createProgrammaticToolPolicy } = await import('../../../src/main/model/core-agent/programmatic-tool-policy');
+        const policy = createProgrammaticToolPolicy({ userId: 'u1' });
+        const program = createRunProgramTool({
+          listToolNames: () => ['bash'].filter(name => policy.isEligible(name)),
+          invokeTool: async (name, input, parentCtx) => {
+            const authorization = await policy.authorize(name, input, parentCtx);
+            if (!authorization.allowed) return { status: 'denied', ...authorization };
+            return { status: 'completed', result: await tool.execute(input, parentCtx) };
+          },
+        });
+        return program.execute({ code: `json(await tools.bash(${JSON.stringify({ command })}));` }, makeCtx());
+      };
+      try {
+        const cancelled = execute();
+        await vi.waitFor(() => expect(requests).toHaveLength(1));
+        expect(requests[0]).toMatchObject({ unresolved_paths: true, can_allow_run: false });
+        expect(fs.readFileSync(target, 'utf8')).toBe('preserve until approved');
+        bashPerms.cancelForCid('c1');
+        expect((await cancelled).content).toContain('E_BASH_RISK_DENIED');
+        expect(fs.readFileSync(target, 'utf8')).toBe('preserve until approved');
+
+        const approved = execute();
+        await vi.waitFor(() => expect(requests).toHaveLength(2));
+        expect(fs.existsSync(target)).toBe(true);
+        // A stale approval cannot release the fresh command.
+        bashPerms.respond(requests[0].request_id, 'allow_once');
+        expect(fs.existsSync(target)).toBe(true);
+        bashPerms.respond(requests[1].request_id, 'allow_once');
+        const result = await approved;
+        expect(result.isError, result.content).toBeFalsy();
+        await vi.waitFor(() => expect(fs.existsSync(target)).toBe(false));
+      } finally {
+        bashPerms._resetForTest();
+      }
+    },
+  );
+
   it('runs a non-risky command without prompting under workspace_approval', async () => {
     const { lt, perm, bashPerms } = await loadWithBashPerms();
     perm.setLocalExecMode('workspace_approval');
@@ -1774,7 +2140,7 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
 
       if (shouldReject) {
         expect(res.isError).toBe(true);
-        expect(res.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+        expect(res.content).toContain('E_BASH_RISK_DENIED');
         expect(fs.existsSync(target)).toBe(false);
         return;
       }
@@ -2717,6 +3083,7 @@ describe('local-tools › append_file', () => {
     }, round());
     expect(refused.isError).toBe(true);
     expect(refused.content).toContain('E_REVISION_UNKNOWN');
+    expect(refused.observations?.fileFailure).toMatchObject({ reason: 'revision_unknown', revision_provided: true, revision_found: false });
     const offered = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(refused.content)?.[1];
     expect(offered).toBeTruthy();
     const retried = await append.execute({
@@ -2735,6 +3102,80 @@ describe('local-tools › append_file', () => {
     }, makeCtx());
     expect(foreign.isError).toBe(true);
     expect(foreign.content).toContain('E_REVISION_UNKNOWN');
+  });
+
+  it('appends to a file this run did not create, using the revision read_files returned', async () => {
+    // 2026-08-09 DeepResearcher E2E: appending to a fixture ledger failed three
+    // times (2x E_REVISION_UNKNOWN, 1x E_BAD_INPUT) and tripped the no-progress
+    // nudge, after which the agent abandoned per-row appends and invented a
+    // batched row shape the skill does not define — losing the acceptance
+    // feature. read_files now issues a revision (fff689156), so the documented
+    // path works; every existing append case starts from write_file, so nothing
+    // covered the read-first shape that actually failed.
+    const { lt, perm } = await loadModules();
+    const ft = await import('../../../src/main/model/core-agent/file-tools');
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const tools = lt.createLocalTools({ userId: 'u1' });
+    const append = tools.find((tool) => tool.name === 'append_file')!;
+    const read = ft.createFileTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'read_files')!;
+    const ctx = makeCtx();
+
+    // Pre-existing file: written to disk directly, never through a tool.
+    const relativePath = 'ledger.jsonl';
+    const absolutePath = path.join(tmpDir, relativePath);
+    fs.writeFileSync(absolutePath, '{"kind":"fetch","n":1}\n', 'utf8');
+
+    const readBack = await read.execute({ paths: [{ path: absolutePath }] }, ctx);
+    expect(readBack.isError).toBeFalsy();
+    const revision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(readBack.content)?.[1];
+    expect(revision, 'read_files must hand back a revision for a text file').toBeTruthy();
+
+    const appended = await append.execute({
+      path: relativePath,
+      content: '{"kind":"fetch","n":2}\n',
+      base_revision: revision,
+    }, ctx);
+    expect(appended.isError, appended.content).toBeFalsy();
+    expect(fs.readFileSync(absolutePath, 'utf8'))
+      .toBe('{"kind":"fetch","n":1}\n{"kind":"fetch","n":2}\n');
+
+    // A revision read from one file must not authorise appending to another.
+    const otherPath = path.join(tmpDir, 'other.jsonl');
+    fs.writeFileSync(otherPath, 'x\n', 'utf8');
+    const crossed = await append.execute({
+      path: 'other.jsonl',
+      content: 'must not land\n',
+      base_revision: revision,
+    }, ctx);
+    expect(crossed.isError).toBe(true);
+    expect(crossed.content).toContain('E_REVISION_PATH_MISMATCH');
+    expect(crossed.observations?.fileFailure).toMatchObject({ reason: 'revision_path', revision_found: true });
+    expect(fs.readFileSync(otherPath, 'utf8')).toBe('x\n');
+
+    // A revision that predates an outside change is stale and writes nothing.
+    const staleRead = await read.execute({ paths: [{ path: absolutePath }] }, ctx);
+    const staleRevision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(staleRead.content)?.[1];
+    fs.appendFileSync(absolutePath, '{"kind":"fetch","n":3}\n', 'utf8');
+    const before = fs.readFileSync(absolutePath, 'utf8');
+    const stale = await append.execute({
+      path: relativePath,
+      content: '{"kind":"fetch","n":4}\n',
+      base_revision: staleRevision,
+    }, ctx);
+    expect(stale.isError).toBe(true);
+    expect(stale.observations?.fileFailure).toMatchObject({ reason: 'revision_changed', revision_matches: false });
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(before);
+    // The refusal hands back the current revision so the next attempt succeeds.
+    const recovered = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(stale.content)?.[1];
+    expect(recovered).toBeTruthy();
+    const retry = await append.execute({
+      path: relativePath,
+      content: '{"kind":"fetch","n":4}\n',
+      base_revision: recovered,
+    }, ctx);
+    expect(retry.isError, retry.content).toBeFalsy();
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(`${before}{"kind":"fetch","n":4}\n`);
   });
 
   it('rejects empty content or a missing concurrency baseline without changing the file', async () => {
@@ -2766,6 +3207,7 @@ describe('local-tools › append_file', () => {
     }, ctx);
     expect(missingBaseline.isError).toBe(true);
     expect(missingBaseline.content).toContain('E_BAD_INPUT');
+    expect(missingBaseline.observations?.fileFailure).toMatchObject({ reason: 'append_precondition', revision_provided: false, size_provided: false, size_valid: false });
     expect(fs.readFileSync(absolutePath, 'utf8')).toBe('kept');
     expect(onFileWritten).toHaveBeenCalledTimes(1);
   });

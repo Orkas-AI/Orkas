@@ -1972,7 +1972,8 @@ function _findChatComposerTokens(text, inputId = '') {
   const src = String(text || '');
   const resources = typeof _findChatUseTokens === 'function' ? _findChatUseTokens(src) : [];
   if (inputId === 'auto-task-input') return resources;
-  const mentions = _resolvedMentionSpans(src)
+  const target = inputId === 'new-chat-input' ? 'new-chat' : inputId === 'project-chat-input' ? 'project' : 'conversation';
+  const mentions = _resolvedMentionSpans(src, undefined, target)
     .filter((mention) => !resources.some((token) => mention.start < token.end && token.start < mention.end))
     .map((mention) => ({
       start: mention.start,
@@ -2543,10 +2544,12 @@ function _projectIdForConversation(cid) {
  *  (project detail load) skip the second IPC and decide inside its own
  *  load-sequence guard, so a slow response for a project the user already
  *  left cannot clear the chip of the one they are on. */
+const _composerAgentScopes = new Map();
+
 async function validateRecipientAgainstProject(target, pid, boundAgentIds) {
-  const cur = _activeRecipient(target);
-  if (!cur || cur.kind === 'commander') return;
-  if (!pid) return;
+  if (!pid) { _composerAgentScopes.delete(target); return; }
+  const pendingScope = { pid, ids: new Set() };
+  _composerAgentScopes.set(target, pendingScope);
   try {
     let bound = boundAgentIds ? new Set(boundAgentIds) : null;
     if (!bound) {
@@ -2554,6 +2557,13 @@ async function validateRecipientAgainstProject(target, pid, boundAgentIds) {
       if (!res || !res.ok) return;
       bound = new Set((res.bindings && res.bindings.agents) || []);
     }
+    if (_composerAgentScopes.get(target) !== pendingScope) return;
+    pendingScope.ids = bound;
+    _renderRecipientChip(target);
+    const input = _composerRecipientInput(target);
+    if (input && typeof syncChatRichComposerFromTextarea === 'function') syncChatRichComposerFromTextarea(input);
+    if (typeof _updateComposerSeqToggle === 'function') _updateComposerSeqToggle(target);
+    const cur = _activeRecipient(target);
     const recipients = _recipientList(cur);
     const eligible = recipients.filter((r) => r.kind === 'commander' || bound.has(r.id));
     if (eligible.length !== recipients.length) {
@@ -2670,9 +2680,9 @@ function _composerMentionGroups(text, spans) {
   return groups.filter((group, index) => text.slice(group.end, groups[index + 1]?.start ?? text.length).trim());
 }
 
-function _composerDispatchShape(text, knownAgents) {
+function _composerDispatchShape(text, knownAgents, target) {
   const body = String(text || '');
-  const spans = _resolvedMentionSpans(body, knownAgents);
+  const spans = _resolvedMentionSpans(body, knownAgents, target);
   if (!spans.length) return { segments: 0, groups: 0 };
   const groups = _composerMentionGroups(body, spans);
   const preamble = body.slice(0, spans[0].start).split('\n')
@@ -2708,7 +2718,7 @@ function _composerDispatchShapeFor(target) {
   const ta = row ? document.getElementById(row[2]) : null;
   return _composerDispatchShape(
     ta ? ta.value : '',
-    (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) ? _agentsCache : [],
+    undefined, target,
   );
 }
 
@@ -2741,11 +2751,22 @@ function _updateComposerSeqToggle(target) {
 
 // Share resolved recipient identities between the routing preview and model
 // control. Unknown tokens and quoted lines do not replace the default target.
-function _resolvedMentionSpans(text, agents) {
+function _resolvedMentionSpans(text, agents, target = 'conversation') {
   const body = String(text || '');
   if (!body || body.indexOf('@') < 0) return [];
   const known = new Map();
-  const available = agents || (typeof _agentsCache !== 'undefined' ? _agentsCache : []);
+  let available = agents || (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache) ? _agentsCache : []);
+  if (!agents) {
+    const pid = target === 'project'
+      ? (typeof _projectDetailPid !== 'undefined' ? _projectDetailPid : '')
+      : target === 'new-chat' ? ''
+        : (typeof currentCid !== 'undefined' && typeof conversations !== 'undefined' && Array.isArray(conversations)
+          ? conversations.find((conv) => conv.conversation_id === currentCid)?.project_id : '');
+    if (pid) {
+      const scope = _composerAgentScopes.get(target);
+      available = available.filter((agent) => scope?.pid === pid && scope.ids.has(agent.agent_id));
+    }
+  }
   if (Array.isArray(available)) {
     for (const a of available) {
       if (a && a.name && a.enabled !== false) known.set(String(a.name).toLowerCase().replace(/\s+/g, ''), {
@@ -2775,9 +2796,9 @@ function _resolvedMentionSpans(text, agents) {
 // user's request: drop the mentions the recipient resolver recognises and
 // leave unknown or quoted `@names` as ordinary words. A mention-only body
 // keeps its raw text rather than producing an empty title seed.
-function _titleSeedWithoutRoutingMentions(raw) {
+function _titleSeedWithoutRoutingMentions(raw, target = 'conversation') {
   const body = String(raw || '');
-  const spans = _resolvedMentionSpans(body);
+  const spans = _resolvedMentionSpans(body, undefined, target);
   if (!spans.length) return body;
   let text = '';
   let cursor = 0;
@@ -2794,33 +2815,33 @@ function _titleSeedWithoutRoutingMentions(raw) {
   return text || body;
 }
 
-function _explicitMentionRecipients(text) {
+function _explicitMentionRecipients(text, target = 'conversation') {
   const out = [];
-  for (const { recipient } of _resolvedMentionSpans(text)) {
+  for (const { recipient } of _resolvedMentionSpans(text, undefined, target)) {
     if (!out.some((r) => r.kind === recipient.kind && r.id === recipient.id)) out.push(recipient);
   }
   return out;
 }
 
-function _resolvedMentionRecipients(text) {
-  return _explicitMentionRecipients(text);
+function _resolvedMentionRecipients(text, target = 'conversation') {
+  return _explicitMentionRecipients(text, target);
 }
 
 // Prose before the first mention inherits the default; quotes stay context.
-function _composerHasUnaddressedInstruction(text) {
-  const spans = _resolvedMentionSpans(text);
+function _composerHasUnaddressedInstruction(text, target = 'conversation') {
+  const spans = _resolvedMentionSpans(text, undefined, target);
   return spans.length > 0 && String(text).slice(0, spans[0].start).split('\n')
     .some((line) => line.trim() && !/^\s*>/.test(line));
 }
 
 function _composerMessageRecipients(target, text, forSend = false) {
-  const spans = _resolvedMentionSpans(text);
+  const spans = _resolvedMentionSpans(text, undefined, target);
   const explicit = forSend
     ? _composerMentionGroups(String(text || ''), spans).flatMap((group) => group.recipients)
-    : _explicitMentionRecipients(text);
+    : _explicitMentionRecipients(text, target);
   const active = _activeRecipient(target);
   const fallback = active.kind === 'group' ? _COMMANDER : active;
-  const recipients = !spans.length || _composerHasUnaddressedInstruction(text)
+  const recipients = !spans.length || _composerHasUnaddressedInstruction(text, target)
     ? [fallback, ...explicit] : explicit;
   return _recipientList(_recipientSet(recipients)).map((r) => r.kind === 'commander'
     ? { ...r, name: t('chat.recipient_commander') } : r);
@@ -2836,7 +2857,7 @@ function _toggleComposerRecipient(target, recipient) {
   const ta = _composerRecipientInput(target);
   if (!ta) return;
   let text = String(ta.value || '');
-  const spans = _resolvedMentionSpans(text);
+  const spans = _resolvedMentionSpans(text, undefined, target);
   const matches = (r) => r.kind === recipient.kind && r.id === recipient.id;
   const matching = spans.filter(({ recipient: r }) => matches(r));
   let caret = typeof ta.selectionStart === 'number' ? ta.selectionStart : text.length;
@@ -2869,7 +2890,7 @@ function _toggleComposerRecipient(target, recipient) {
   }
   ta.value = text;
   try { ta.setSelectionRange(caret, selectionEnd); } catch (_) {}
-  if (!_explicitMentionRecipients(text).length) setChatRecipient(target, _COMMANDER);
+  if (!_explicitMentionRecipients(text, target).length) setChatRecipient(target, _COMMANDER);
   ta.dispatchEvent(new Event('input', { bubbles: true }));
   if (typeof autoGrow === 'function') autoGrow(ta, 200);
 }
@@ -2878,7 +2899,7 @@ const _draftHadRecipient = new Map();
 
 function _syncComposerRecipientInput(target) {
   const ta = _composerRecipientInput(target);
-  if (_draftHadRecipient.get(target) && !_explicitMentionRecipients(ta?.value || '').length) {
+  if (_draftHadRecipient.get(target) && !_explicitMentionRecipients(ta?.value || '', target).length) {
     setChatRecipient(target, _COMMANDER);
   }
   _renderRecipientChip(target);
@@ -2888,8 +2909,8 @@ function _syncComposerRecipientInput(target) {
   }
 }
 
-function _resolvedMentionLabels(text) {
-  return _resolvedMentionRecipients(text).map((recipient) => recipient.name);
+function _resolvedMentionLabels(text, target = 'conversation') {
+  return _resolvedMentionRecipients(text, target).map((recipient) => recipient.name);
 }
 
 /** The routing preview for the composer `target` owns. All three group-chat
@@ -2900,7 +2921,7 @@ function _mentionPreviewRecipients(target) {
     : (target === 'project' ? 'project-chat-input' : 'chat-input');
   const ta = document.getElementById(id);
   const text = ta ? String(ta.value || '') : '';
-  return _explicitMentionRecipients(text).length ? _composerMessageRecipients(target, text) : [];
+  return _explicitMentionRecipients(text, target).length ? _composerMessageRecipients(target, text) : [];
 }
 
 function _mentionPreviewLabels(target) {
@@ -2908,14 +2929,14 @@ function _mentionPreviewLabels(target) {
 }
 
 /** True for known routing mentions outside quoted lines. */
-function _textCarriesRoutingMention(text) {
-  return _resolvedMentionLabels(text).length > 0;
+function _textCarriesRoutingMention(text, target = 'conversation') {
+  return _resolvedMentionLabels(text, target).length > 0;
 }
 
 function _renderRecipientChip(target) {
   const targets = target ? [target] : ['conversation', 'new-chat', 'project'];
   for (const tg of targets) {
-    _draftHadRecipient.set(tg, _explicitMentionRecipients(_composerRecipientInput(tg)?.value || '').length > 0);
+    _draftHadRecipient.set(tg, _explicitMentionRecipients(_composerRecipientInput(tg)?.value || '', tg).length > 0);
     const id = tg === 'new-chat'
       ? 'new-chat-recipient-name'
       : (tg === 'project' ? 'project-chat-recipient-name' : 'chat-recipient-name');
@@ -3735,7 +3756,7 @@ function onEnterConversationView() {
   if (currentCid && Array.isArray(conversations)) {
     const conv = conversations.find((c) => c && c.conversation_id === currentCid);
     const pid = (conv && conv.project_id) || '';
-    if (pid && typeof validateRecipientAgainstProject === 'function') {
+    if (typeof validateRecipientAgainstProject === 'function') {
       validateRecipientAgainstProject('conversation', pid);
     }
   }
@@ -3795,6 +3816,7 @@ function _forgetCidRecipient(cid) {
   setGroupConversationBusy(cid, false);
   _latestInFlight.delete(cid);
   _latestActiveTurns.delete(cid);
+  window.CliAsyncInput?.forget(cid);
   const infoTimer = _conversationInfoFileRefreshTimers.get(cid);
   if (infoTimer) clearTimeout(infoTimer);
   _conversationInfoFileRefreshTimers.delete(cid);
@@ -3829,6 +3851,7 @@ const _latestActiveTurns = new Map(); // cid → authoritative active_turns with
 // state_changed, abort) so a reload mid-queue restores the live board.
 function _syncTaskBoardForRuntimeState(cid) {
   if (window.TaskBoard) window.TaskBoard.sync(cid);
+  window.CliAsyncInput?.setActiveTurns(cid, _latestActiveTurns.get(cid));
 }
 const _runtimeRecoveryTimers = new Map(); // cid → timeout id
 const _lastGroupWorkEventAt = new Map(); // cid → ms timestamp of process/artifact/assistant message
@@ -4268,9 +4291,9 @@ function _stripCommanderRoutingMentionsForDisplay(raw) {
 
 // Capture explicit mentions before prefix synthesis; text shape here is the
 // output of our own prefix helper, not a guess about the user's intent.
-function _commanderMentionDisplayForSend(raw, snapshot) {
-  if (!_explicitMentionRecipients(raw).some((recipient) => recipient.kind === 'commander')) return {};
-  const content = _applyRecipientPrefixWithSnapshot(raw, snapshot);
+function _commanderMentionDisplayForSend(raw, snapshot, target = 'conversation') {
+  if (!_explicitMentionRecipients(raw, target).some((recipient) => recipient.kind === 'commander')) return {};
+  const content = _applyRecipientPrefixWithSnapshot(raw, snapshot, target);
   const generated = content === '@commander ' + raw || content === '@commander\n' + raw;
   return { commander_mention_display: generated ? 'hide_generated_prefix' : 'preserve' };
 }
@@ -4324,14 +4347,14 @@ function _recipientPrefixName(r) {
   return display || r.name || r.id;
 }
 
-function _applyRecipientPrefixWithSnapshot(raw, snapshot) {
+function _applyRecipientPrefixWithSnapshot(raw, snapshot, target = 'conversation') {
   const text = String(raw || '');
   const snap = _normaliseRecipientSnapshot(snapshot);
   if (!snap) return raw;
   // Freeze the unaddressed first instruction's owner at send time. A leading
   // mention already names its owner and must replace the default.
-  if (_textCarriesRoutingMention(text)) {
-    if (!_composerHasUnaddressedInstruction(text)) return text;
+  if (_textCarriesRoutingMention(text, target)) {
+    if (!_composerHasUnaddressedInstruction(text, target)) return text;
     const owner = snap.defaultRecipient || _COMMANDER;
     const name = owner.kind === 'agent' ? _recipientPrefixName(owner) : 'commander';
     return '@' + name + (/^\s*>/.test(text) ? '\n' : ' ') + text;
@@ -4353,9 +4376,9 @@ function _applyRecipientPrefixWithSnapshot(raw, snapshot) {
 
 function applyRecipientPrefix(raw, target, opts = {}) {
   if (opts && opts.recipientSnapshot) {
-    return _applyRecipientPrefixWithSnapshot(raw, opts.recipientSnapshot);
+    return _applyRecipientPrefixWithSnapshot(raw, opts.recipientSnapshot, target);
   }
-  return _applyRecipientPrefixWithSnapshot(raw, _recipientSnapshotForSend(target || 'conversation'));
+  return _applyRecipientPrefixWithSnapshot(raw, _recipientSnapshotForSend(target || 'conversation'), target);
 }
 
 if (typeof window !== 'undefined') {
@@ -4775,6 +4798,8 @@ function _groupMsgToLegacy(gm) {
     ...(gm.run_facts && typeof gm.run_facts === 'object' ? { run_facts: gm.run_facts } : {}),
     ...(Array.isArray(gm.references) && gm.references.length ? { references: gm.references } : {}),
     ...(gm.form ? { form: gm.form } : {}),
+    ...(gm.cli_question ? { cli_question: gm.cli_question } : {}),
+    ...(gm.cli_answer ? { cli_answer: gm.cli_answer } : {}),
     ...(_normalizeCreatedAgents(gm) ? { created_agents: _normalizeCreatedAgents(gm) } : {}),
     ...(_normalizeCreatedSkills(gm) ? { created_skills: _normalizeCreatedSkills(gm) } : {}),
     ...(Array.isArray(gm.artifacts) && gm.artifacts.length ? { artifacts: gm.artifacts } : {}),
@@ -5767,6 +5792,9 @@ window.addChatAttachmentsFromPaths = async function addChatAttachmentsFromPaths(
 function _addReadyDraftAttachment(cid, info) {
   if (!info || !info.name) return;
   const items = _chatAttachList(cid).slice();
+  // The storage owner can reuse the same pending file across Library imports.
+  // Match upload completion: one stored attachment owns one removable chip.
+  if (items.some((item) => item.name === info.name && item.status !== 'uploading')) return;
   items.push({
     name: info.name,
     displayName: info.displayName || info.name,
@@ -7568,6 +7596,8 @@ async function _loadOlderConversationHistory(cid, before) {
         if (cid !== currentCid || row.parentElement !== container) return;
 
         const rawHistory = Array.isArray(data.history) ? data.history : [];
+        // Hydrate replies before questions so answered history never flashes an active form.
+        for (const message of rawHistory) window.CliAsyncInput?.observe(cid, message);
         rawRows += rawHistory.length;
         page = _collapseSupersededInterruptionRecords(
           rawHistory.filter((gm) => (
@@ -7856,6 +7886,8 @@ async function loadConversationHistory(cid, opts = {}) {
     // canonical history still carries dispatches for task recovery.
     const renderStartedAt = performance.now();
     const rawHistory = Array.isArray(data.history) ? data.history : [];
+    // Hydrate replies before questions so answered history never flashes an active form.
+    for (const message of rawHistory) window.CliAsyncInput?.observe(cid, message);
     const responseIndexes = Array.isArray(data.history_indexes) ? data.history_indexes : [];
     const responsePageStart = Number(data.page_start);
     const indexedHistory = rawHistory.map((gm, offset) => {
@@ -7945,6 +7977,7 @@ async function loadConversationHistory(cid, opts = {}) {
     const hasActiveTurnsField = Array.isArray(convMeta.active_turns);
     const activeTurns = _normaliseActiveTurns(convMeta.active_turns);
     _latestActiveTurns.set(cid, hasActiveTurnsField ? activeTurns : []);
+    window.CliAsyncInput?.setActiveTurns(cid, hasActiveTurnsField ? activeTurns : undefined);
     const wasPendingBeforeHistoryRecovery = isConvPending(cid);
     if (processingFresh && !wasPendingBeforeHistoryRecovery) {
       setGroupConversationBusy(cid, true);
@@ -8790,6 +8823,18 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   const archive = opts.archive !== false;   // default on for backwards compat
   const historyHydration = opts.historyHydration === true;
 
+  // Native questions belong to the composer dock, never to a transcript row.
+  // Apply this before ordinary rendering for both live events and history reads.
+  if (message.role === 'assistant' && message.cli_question) {
+    const questionCid = opts.cid || currentCid;
+    window.CliAsyncInput?.showQuestion(message, {
+      cid: questionCid,
+      actorLabel: _groupActorLabel(message._from || '') || message._from_label || t('chat.from_agent_unknown'),
+      onAnswer: gm => _renderOrClaimPersistedUserMessage(questionCid, gm),
+    });
+    return null;
+  }
+
   // Dedupe by `_msg_id`: when the user switches conv tabs during a
   // streaming turn, the same persisted message can reach the renderer
   // twice — once via `loadConversationHistory` reading jsonl on
@@ -8961,6 +9006,8 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   _hydrateActorHeaderLinks(msgDiv);
   if (createdAgentHtml) _hydrateMessageCreatedAgentChip(msgDiv);
   if (createdSkillHtml) _hydrateMessageCreatedSkillChip(msgDiv);
+  if (message.cli_answer) window.CliAsyncInput?.observe(opts.cid || currentCid, message);
+
   // Interactive input-form widget (assistant messages only). Appended inside
   // the bubble after markdown + chips so it reads as "reply text → confirm
   // this form". See chat-input-form.js for the widget implementation.
@@ -10753,14 +10800,14 @@ async function handleNewChatSubmit() {
   // routing mentions (panel-inserted or typed) and `content` may gain an
   // injected leading `@Agent`, while task titles describe only the user's
   // request.
-  const titleSeed = _titleSeedWithoutRoutingMentions(raw);
+  const titleSeed = _titleSeedWithoutRoutingMentions(raw, 'new-chat');
   const titleText = (typeof transformChatUseTokens === 'function')
     ? transformChatUseTokens(titleSeed)
     : titleSeed;
   const content = applyRecipientPrefix(transformWithChatUse(requestText), 'new-chat', {
     recipientSnapshot,
   });
-  const commanderDisplay = _commanderMentionDisplayForSend(transformWithChatUse(requestText), recipientSnapshot);
+  const commanderDisplay = _commanderMentionDisplayForSend(transformWithChatUse(requestText), recipientSnapshot, 'new-chat');
   const draftNames = draftItems.filter((a) => a.status !== 'error').map((a) => a.name);
   _convLog.info('new chat submit', {
     content_length: content.length,
@@ -12897,9 +12944,8 @@ function _setProcessSummaryRuntime(root, durationText) {
   _refreshProcessSummaryLabel(details);
 }
 
-// The disclosure header only names the elapsed-time value. Liveness belongs
-// below the chronological work body, where it remains visible until final
-// output or an exception settles the turn.
+// The disclosure header names elapsed time. Its live state lasts until the
+// turn settles; a text phase alone does not end execution.
 function _refreshProcessSummaryLabel(details) {
   if (!details) return;
   const label = details.querySelector?.('.stream-process-label');
@@ -13293,8 +13339,8 @@ function _streamingSetFinal(msg, text, { archive = false } = {}) {
     live.textContent = t('chat.stream_done');
   }
 
-  // `_completeProcessDisclosure` already collapsed the chronological work
-  // stream at the first body token (or here for one-shot final events).
+  // The terminal reply closes the chronological work stream, including when
+  // its body started streaming before the turn finished.
 }
 
 // Seal the current commentary row at the commentary → final boundary. Current
@@ -14466,6 +14512,33 @@ function _dropSupersededTurnRows(cid, actorId, turnId, currentSeg) {
   }
 }
 
+/** Mark the row that holds a turn's official end-of-turn record. Once it
+ * exists the turn is over: no later stream, snapshot or bookkeeping event may
+ * open another row for that turn id. */
+function _stampTurnEndRow(node, gm, isTurnEnd) {
+  if (!node || !node.dataset || !gm) return;
+  if (gm.turn_id && !node.dataset.turnId) node.dataset.turnId = String(gm.turn_id);
+  if (isTurnEnd && gm.turn_id) node.dataset.turnEnd = '1';
+}
+
+/** True when this turn already rendered its official end-of-turn record. A
+ * level-triggered `state_changed` snapshot can still list the turn (it was
+ * captured while the hand-off admission and the end-of-turn write raced), and
+ * a bookkeeping event for it can arrive after the record; neither may mint a
+ * fresh streaming row — that row would sit as an empty "thinking" bubble
+ * beside the delegate's reply with nothing left to consume it. */
+function _turnHasEndedRow(cid, turnId) {
+  const tid = _normaliseTurnId(turnId);
+  if (!tid) return false;
+  const container = document.getElementById('chat-history');
+  if (!container) return false;
+  for (const node of Array.from(container.querySelectorAll('.chat-message[data-turn-id]'))) {
+    const ds = node && node.dataset ? node.dataset : null;
+    if (ds && ds.turnId === tid && ds.turnEnd === '1') return true;
+  }
+  return false;
+}
+
 function _unpersistedTurnRows(cid, actorId, turnId) {
   const tid = _normaliseTurnId(turnId);
   const container = document.getElementById('chat-history');
@@ -14612,6 +14685,9 @@ function _ensureActorPlaceholder(cid, actorId, fallbackPh, turnId, triggerMsgId,
   const allowFallback = !!actorId && actorId !== 'commander';
   const renderKey = tid ? _segmentRenderKey(tid, seg) : _pendingRenderKey(actorId);
   if (!renderKey) return null;
+  // The turn already delivered its end-of-turn record: it is over, whatever a
+  // stale snapshot or a late bookkeeping event still says about it.
+  if (tid && _turnHasEndedRow(cid, tid)) return null;
 
   let ph = _findRenderNode(cid, renderKey);
   if (ph) {
@@ -14929,6 +15005,7 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
 //   { type: 'aborted', cid }
 function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {}) {
   if (!evData || typeof evData !== 'object') return;
+  if (evData.type === 'message') window.CliAsyncInput?.observe(cid, evData.msg);
   if (evData.type === 'agent_run_result') {
     return;
   }
@@ -15080,12 +15157,14 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
         || _adoptFallbackRowForMessage(cid, gm, streamingMsg);
       if (ph && ph.parentElement) {
         _finalizeActorPlaceholder(ph, gm, cid, archive);
+        _stampTurnEndRow(ph, gm, isTurnEnd);
       } else {
         const recordKey = _messageRenderKey(gm);
         if (recordKey) _reportUnclaimedKeyedRecord(cid, gm, recordKey);
         const legacy = _groupMsgToLegacy(gm);
         const bubble = appendChatMessage(legacy, true, { cid, archive });
         if (bubble) bubble.dataset.fromActor = String(gm.from || '');
+        if (bubble) _stampTurnEndRow(bubble, gm, isTurnEnd);
         // Cache-refresh parity with `_mountCreatedAgentChip`: the placeholder
         // path goes through it (which calls loadAgents/loadSkills(true)),
         // but this fallback runs appendChatMessage directly which only
@@ -15597,8 +15676,8 @@ function _stripDashboardBlocksForStream(buf) {
 }
 
 // Phase-aware streaming renderer. Commentary stays in the chronological work
-// body. The first final-answer (or legacy unphased) delta settles and collapses
-// that work body, then reveals `[data-role=final]` and paints markdown.
+// body. A final-answer (or legacy unphased) delta seals the commentary row,
+// then reveals `[data-role=final]` while the work body and clock remain live.
 // `_streamingSetFinal` still performs the canonical terminal repaint.
 //
 // Render throttling: every delta accumulates into `dataset.streamBuf`
@@ -15707,7 +15786,10 @@ function _streamingAppendFinalDelta(msg, piece, phase = '') {
     _streamingAppendCommentaryDelta(msg, piece);
     return;
   }
-  _completeProcessDisclosure(msg);
+  // A final_answer item may be an asynchronous question followed by more
+  // work in the same turn. Text delivery does not own execution completion;
+  // keep the process disclosure and clock live until a terminal handler runs.
+  _sealStreamingCommentary(msg);
   const finalEl = msg.querySelector('[data-role="final"]');
   if (!finalEl) return;
   if (phase) msg.dataset.streamPhase = String(phase);

@@ -1,6 +1,6 @@
 // Structured user-input bridge for native local CLI turns.
 //
-// Codex app-server may pause a running turn and ask up to three questions.
+// Codex and Claude Code can pause a running turn for structured questions.
 // Main pushes a bounded request here; dialogs are serialized, cancellable,
 // and answers return only through IPC (never through the chat transcript).
 
@@ -34,8 +34,21 @@
         message: questionMessage(question),
         choices,
         signal,
+        ...(question.multiSelect === true ? { multiple: true } : {}),
       });
       if (selected === null) return null;
+      if (Array.isArray(selected)) {
+        const answers = selected.filter(id => id !== 'other').map(id => {
+          const index = Number(String(id).replace('option-', ''));
+          return Number.isInteger(index) && options[index] ? String(options[index].label || '') : '';
+        }).filter(Boolean);
+        if (selected.includes('other')) {
+          const other = await uiPrompt(question.question || '', '', { signal });
+          if (other === null) return null;
+          if (String(other).trim()) answers.push(String(other));
+        }
+        return answers;
+      }
       if (selected === 'other') {
         const other = await uiPrompt(question.question || '', '', { signal });
         return other === null ? null : [String(other)];

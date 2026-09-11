@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
@@ -43,9 +43,9 @@ function runLiveRows(tasks: unknown): any[] {
   );
 }
 
-function runVisibility(liveRows: unknown, deferFreshLoneQueued = false): { visible: boolean } {
+function runVisibility(liveRows: unknown): { visible: boolean } {
   return vm.runInNewContext(
-    `${extractFunction('_taskBoardVisibility')}; _taskBoardVisibility(${JSON.stringify(liveRows)}, ${deferFreshLoneQueued});`,
+    `${extractFunction('_taskBoardVisibility')}; _taskBoardVisibility(${JSON.stringify(liveRows)});`,
     {},
   );
 }
@@ -342,6 +342,16 @@ describe('renderer task board › seed/resync merge (terminal-wins)', () => {
     expect(merged.get('t1').status).toBe('stopped');
   });
 
+  it('does not let a stale admission seed hide an already confirmed queue or revive a running task', () => {
+    for (const status of ['queued', 'running']) {
+      const merged = new Map(runMerge(
+        [['t1', { task_id: 't1', status }]],
+        [{ task_id: 't1', status: 'queued', admission_pending: true }],
+      ));
+      expect(merged.get('t1')).toEqual({ task_id: 't1', status });
+    }
+  });
+
   it('a non-terminal disk row never clobbers an existing snapshot but fills gaps', () => {
     const merged = new Map(runMerge(
       [['t1', { task_id: 't1', status: 'waiting_input' }]],
@@ -416,25 +426,57 @@ describe('renderer task board › visibility (multi-task only, adjudicated 2026-
     ]);
   });
 
-  it('suppresses the queued-to-running admission blip but reveals work that remains queued', () => {
-    // Scenario value: an ordinary send is created as queued before the same
-    // admission pass claims it. That host-only transition must not flash a
-    // queue panel, while a genuinely parked message must still gain its only
-    // visible/cancellable surface after the short stabilization window.
-    const queued = [{ task_id: 'ordinary-send', status: 'queued' }];
-    expect(runVisibility(queued, true)).toEqual({ visible: false });
-    expect(runVisibility(queued, false)).toEqual({ visible: true });
-
-    // The delay is narrowly scoped: recovery controls and real multi-task
-    // work surface immediately, and a restored queue with no fresh deadline
-    // remains visible without an extra wait.
-    expect(runVisibility([{ task_id: 'blocked', status: 'blocked' }], true))
-      .toEqual({ visible: true });
-    expect(runVisibility([
-      { task_id: 'running', status: 'running' },
-      { task_id: 'queued', status: 'queued' },
-    ], true)).toEqual({ visible: true });
+  it('does not treat an ordinary admission as a standalone queue, regardless of elapsed time', () => {
+    const pending = [{ task_id: 'ordinary-send', status: 'queued', admission_pending: true }];
+    expect(runVisibility(pending)).toEqual({ visible: false });
+    expect(runVisibility([{ ...pending[0], admission_pending: false }])).toEqual({ visible: true });
+    expect(runVisibility([{ ...pending[0], status: 'running' }])).toEqual({ visible: false });
+    expect(runVisibility([{ ...pending[0], status: 'blocked' }])).toEqual({ visible: true });
+    expect(runVisibility([...pending, { task_id: 'other', status: 'running' }])).toEqual({ visible: true });
   });
+
+  it.each(['event-first', 'seed-first'])(
+    'keeps a slow ordinary send hidden with %s delivery, then exposes a confirmed queue', async (order) => {
+      vi.useFakeTimers();
+      try {
+        const list: any = { dataset: {}, style: {}, innerHTML: '', querySelectorAll: () => [], addEventListener() {} };
+        const panel: any = { style: {}, querySelector: () => null, addEventListener() {} };
+        let snapshot: any = { task_id: 'send', assignee: 'commander', status: 'queued', admission_pending: true };
+        const context: any = {
+          window: {}, currentCid: 'c1', setTimeout, clearTimeout,
+          document: { addEventListener() {}, getElementById: (id: string) => id === 'chat-task-board' ? panel : id === 'chat-task-board-list' ? list : null },
+          t: (key: string) => key, escapeHtml: (v: unknown) => String(v ?? ''), uiIconHtml: () => '',
+          apiFetch: async () => ({ json: async () => ({ ok: true, tasks: [snapshot] }) }),
+        };
+        vm.createContext(context);
+        vm.runInContext(source, context);
+        const board = context.window.TaskBoard;
+        if (order === 'seed-first') await board.sync('c1');
+        board.onEvent('c1', { type: 'task_created', task: snapshot });
+        if (order === 'event-first') await board.sync('c1');
+        expect(panel.style.display).toBe('none');
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(panel.style.display).toBe('none');
+        // Recover a missed queue confirmation through the task-list response.
+        snapshot = { task_id: 'send', assignee: 'commander', status: 'queued' };
+        board.resync('c1');
+        await vi.runAllTimersAsync();
+        expect(panel.style.display).toBe('');
+        expect(list.innerHTML).toContain('data-act="task-cancel"');
+        board.onEvent('c1', { type: 'task_state', task: { ...snapshot, status: 'running' } });
+        expect(panel.style.display).toBe('none');
+        // Retraction is not a latch: later concurrency in this same board
+        // resurfaces, and its terminal rows cannot keep the panel visible.
+        const other = { task_id: 'second', assignee: 'commander', status: 'queued', admission_pending: true };
+        board.onEvent('c1', { type: 'task_created', task: other });
+        expect(panel.style.display).toBe('');
+        board.onEvent('c1', { type: 'task_state', task: { ...other, status: 'cancelled' } });
+        expect(panel.style.display).toBe('none');
+        board.onEvent('c1', { type: 'task_state', task: { ...snapshot, status: 'done' } });
+        expect(panel.style.display).toBe('none');
+      } finally { vi.useRealTimers(); }
+    },
+  );
 
   it('counts only filtered live work, so terminal or absorbed batch rows cannot pin the board', () => {
     const taskSets = [

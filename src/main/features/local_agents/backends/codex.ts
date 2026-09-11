@@ -159,9 +159,10 @@ export class CodexActivityHeartbeat {
  * pure accumulator makes version-skew fallbacks deterministic and testable. */
 export class CodexAgentMessageAccumulator {
   private readonly phases = new Map<string, LocalTextPhase>();
+  private readonly asyncItems = new Set<string>();
+  private readonly deliveredAsyncItems = new Set<string>();
   private readonly streamedByItem = new Map<string, string>();
-  private allText = '';
-  private finalAnswerText = '';
+  private readonly chunks: Array<{ text: string; itemId: string; phase?: LocalTextPhase }> = [];
 
   rememberItem(raw: unknown): void {
     const item = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
@@ -169,6 +170,7 @@ export class CodexAgentMessageAccumulator {
     const itemId = typeof item.id === 'string' ? item.id : '';
     const phase = normalizeLocalTextPhase(item.phase);
     if (itemId && phase) this.phases.set(itemId, phase);
+    if (itemId && item.delivery === 'async') this.asyncItems.add(itemId);
   }
 
   appendDelta(raw: unknown): { text: string; itemId?: string; phase?: LocalTextPhase } | null {
@@ -176,6 +178,7 @@ export class CodexAgentMessageAccumulator {
     const text = typeof params.delta === 'string' ? params.delta : '';
     if (!text) return null;
     const itemId = typeof params.itemId === 'string' ? params.itemId : '';
+    if (this.asyncItems.has(itemId)) return null;
     return this.append(text, itemId, normalizeLocalTextPhase(params.phase) || this.phases.get(itemId));
   }
 
@@ -183,6 +186,7 @@ export class CodexAgentMessageAccumulator {
     const item = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
     if (item.type !== 'agentMessage') return null;
     this.rememberItem(item);
+    if (item.delivery === 'async' || this.asyncItems.has(String(item.id || ''))) return null;
     const text = typeof item.text === 'string' ? item.text : '';
     if (!text) return null;
     const itemId = typeof item.id === 'string' ? item.id : '';
@@ -198,11 +202,31 @@ export class CodexAgentMessageAccumulator {
   }
 
   output(): string {
-    return this.finalAnswerText || this.allText;
+    const chunks = this.chunks.filter(chunk => !this.asyncItems.has(chunk.itemId));
+    return chunks.filter(chunk => chunk.phase === 'final_answer').map(chunk => chunk.text).join('')
+      || chunks.map(chunk => chunk.text).join('');
   }
 
   hasText(): boolean {
-    return this.allText.length > 0;
+    return this.chunks.some(chunk => !this.asyncItems.has(chunk.itemId) && !!chunk.text);
+  }
+
+  completedAsyncMessage(raw: unknown): LocalEvent | null {
+    const item = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+    if (item.type !== 'agentMessage' || item.delivery !== 'async') return null;
+    const itemId = typeof item.id === 'string' ? item.id : '';
+    if (!itemId || this.deliveredAsyncItems.has(itemId)) return null;
+    this.rememberItem(item);
+    const questions = (Array.isArray(item.questions) ? item.questions : [])
+      .filter((q): q is { title: string; options?: unknown } => !!q && typeof q.title === 'string' && !!q.title.trim())
+      .map(q => ({
+        title: q.title,
+        ...(Array.isArray(q.options) ? { options: q.options.filter((v): v is string => typeof v === 'string' && !!v.trim()) } : {}),
+      }));
+    const text = typeof item.text === 'string' ? item.text : '';
+    if (!text && !questions.length) return null;
+    this.deliveredAsyncItems.add(itemId);
+    return { type: 'async-message', itemId, text, questions };
   }
 
   private append(
@@ -210,8 +234,7 @@ export class CodexAgentMessageAccumulator {
     itemId: string,
     phase?: LocalTextPhase,
   ): { text: string; itemId?: string; phase?: LocalTextPhase } {
-    this.allText += text;
-    if (phase === 'final_answer') this.finalAnswerText += text;
+    this.chunks.push({ text, itemId, phase });
     if (itemId) this.streamedByItem.set(itemId, (this.streamedByItem.get(itemId) || '') + text);
     return {
       text,
@@ -340,6 +363,7 @@ export const codexBackend: LocalBackend = {
     // ─── JSON-RPC client state ────────────────────────────────────────
     let nextRpcId = 1;
     const pending = new Map<number, { method: string; resolve: (r: any) => void; reject: (e: Error) => void }>();
+    const userInputRequests = new Map<string | number, AbortController>();
     let threadId: string | undefined;
     let activeTurnId: string | undefined;
     let turnStarted = false;
@@ -432,7 +456,7 @@ export const codexBackend: LocalBackend = {
       });
     };
 
-    const respondToUserInputRequest = async (env: any): Promise<void> => {
+    const respondToUserInputRequest = async (env: any, signal: AbortSignal): Promise<void> => {
       const params = env?.params && typeof env.params === 'object' ? env.params : {};
       const questions = (Array.isArray(params.questions) ? params.questions : [])
         .map((question: any) => ({
@@ -451,6 +475,7 @@ export const codexBackend: LocalBackend = {
       const response = opts.requestUserInput
         ? await opts.requestUserInput({
             id: typeof params.itemId === 'string' ? params.itemId : String(env.id),
+            signal,
             questions,
             ...(typeof params.isBlocking === 'boolean' ? { isBlocking: params.isBlocking } : {}),
             ...(Number.isFinite(params.autoResolutionMs)
@@ -461,6 +486,7 @@ export const codexBackend: LocalBackend = {
             cancelled: true,
             answers: Object.fromEntries(questions.map((question: { id: string }) => [question.id, []])),
           };
+      if (signal.aborted) return;
       const answers = Object.fromEntries(questions.map((question: { id: string }) => [
         question.id,
         {
@@ -532,6 +558,8 @@ export const codexBackend: LocalBackend = {
     };
 
     const closePending = (err: Error) => {
+      for (const controller of userInputRequests.values()) controller.abort();
+      userInputRequests.clear();
       for (const { reject } of pending.values()) reject(err);
       pending.clear();
     };
@@ -580,13 +608,18 @@ export const codexBackend: LocalBackend = {
               });
             });
           } else if (env.method === CODEX_USER_INPUT_REQUEST_METHOD) {
-            void respondToUserInputRequest(env).catch((err) => {
+            const controller = new AbortController();
+            userInputRequests.set(env.id, controller);
+            void respondToUserInputRequest(env, controller.signal).catch((err) => {
+              if (controller.signal.aborted) return;
               log.warn('codex user-input response failed', { error: logErrorSummary(err) });
               sendLine({
                 jsonrpc: '2.0',
                 id: env.id,
                 error: { code: -32603, message: 'User input request could not be completed.' },
               });
+            }).finally(() => {
+              if (userInputRequests.get(env.id) === controller) userInputRequests.delete(env.id);
             });
           } else if (CODEX_OPTIONAL_SERVER_REQUEST_METHODS.has(env.method)) {
             // These callbacks require an explicit client capability or a
@@ -687,6 +720,11 @@ export const codexBackend: LocalBackend = {
       if (exited) return;
       const eventThreadId = typeof params.threadId === 'string' ? params.threadId : '';
       if (threadId && eventThreadId && eventThreadId !== threadId) return;
+      if (method === 'serverRequest/resolved') {
+        userInputRequests.get(params.requestId)?.abort();
+        userInputRequests.delete(params.requestId);
+        return;
+      }
 
       // Newer Codex builds stream public reasoning summaries separately from
       // raw reasoning text. Summary pulses may update the live activity label,
@@ -827,7 +865,9 @@ export const codexBackend: LocalBackend = {
             phase: 'result',
           });
         } else if (item.type === 'agentMessage') {
-          emitTextDelta(agentMessages.appendCompletedFallback(item));
+          const asyncMessage = agentMessages.completedAsyncMessage(item);
+          if (asyncMessage) opts.onEvent(asyncMessage);
+          else emitTextDelta(agentMessages.appendCompletedFallback(item));
         } else if (item.type === 'agentReasoning' || item.type === 'reasoning') {
           completeReasoning(itemId || 'reasoning', item);
         } else {

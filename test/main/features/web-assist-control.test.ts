@@ -1242,6 +1242,37 @@ describe('Web Assist controlled connector lifecycle', () => {
     }
   });
 
+  it.each(['model', 'user', 'connector'] as const)('preserves user edits when %s opens at capacity', async (origin) => {
+    const { renderer } = electronMock;
+    const cid = `c-edited-limit-${origin}`;
+    bindWebAssistConversation('u1', cid, renderer);
+    const ids: string[] = [];
+    const pages: any[] = [];
+    for (let index = 0; index < 10; index++) {
+      const opened = await openModelWebAssist('u1', cid, { url: `https://example.com/${index}` });
+      expect(opened.ok).toBe(true);
+      ids.push(String(opened.active_tab_id));
+      pages.push(electronMock.page);
+      if (index === 0) pages[0].emit('before-input-event', {}, { type: 'keyDown', key: 'a' });
+    }
+    const open = () => origin === 'model'
+      ? openModelWebAssist('u1', cid, { url: 'https://example.com/new' })
+      : origin === 'connector'
+        ? openControlledWebAssist('u1', cid, { scope: 'connector_setup', scopeId: 'shop', url: 'https://example.com/new' })
+        : addWebAssistTab('u1', renderer, { conversationId: cid });
+    expect(await open()).toMatchObject({ ok: true });
+    expect(pages[0].isDestroyed()).toBe(false);
+    expect(pages[1].isDestroyed()).toBe(true);
+    expect(listModelWebAssistTabs('u1', cid).tabs).toHaveLength(10);
+    // With every inactive page edited, opening must fail without losing work.
+    for (const page of pages.filter(page => !page.isDestroyed())) {
+      page.emit('before-input-event', {}, { type: 'keyDown', key: 'b' });
+    }
+    expect(await open()).toMatchObject({ ok: false, code: 'too_many_tabs' });
+    expect(pages.filter(page => !page.isDestroyed())).toHaveLength(9);
+    expect(listModelWebAssistTabs('u1', cid).tabs).toHaveLength(10);
+  });
+
   it('protects handoffs, connector setup, loading pages and authorization popups from capacity cleanup', async () => {
     const { renderer } = electronMock;
     const cid = 'c-protected-limit';

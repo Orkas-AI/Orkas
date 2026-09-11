@@ -789,7 +789,7 @@ describe('features/connectors/manager authorization recovery', () => {
     expect(mocks.mcp.callTool).toHaveBeenCalledTimes(1);
   });
 
-  
+
 
   it('does not disconnect the next account after waiting for the old local connection to close', async () => {
     const registry = await import('../../../../src/main/features/connectors/registry');

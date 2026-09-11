@@ -44,13 +44,15 @@ function _globalTodoScopeProject(pid) {
 async function _loadGlobalTodoGroup(project) {
   const pid = project.project_id || '';
   if (!pid) {
-    const [globalRes, globalDriver] = await Promise.all([
+    const [globalRes, globalDriver, agentRes] = await Promise.all([
       window.orkas.invoke('projects.tasks.list', {}),
       window.orkas.invoke('projects.driver.get', { projectId: '' }),
+      window.orkas.invoke('agents.list', { summary: true }),
     ]);
     if (!globalRes?.ok || !Array.isArray(globalRes.tasks)) throw new Error('load_failed');
     if (!globalRes.tasks.length) return null;
-    return { project, tasks: globalRes.tasks, agents: [], driverEnabled: !!globalDriver?.config?.enabled };
+    if (!Array.isArray(agentRes?.agents)) throw new Error('load_failed');
+    return { project, tasks: globalRes.tasks, agents: agentRes.agents.filter((a) => a.enabled !== false), driverEnabled: !!globalDriver?.config?.enabled };
   }
   const tasks = await window.orkas.invoke('projects.tasks.list', { projectId: pid });
   if (!tasks?.ok || !Array.isArray(tasks.tasks)) throw new Error('load_failed');
@@ -278,8 +280,8 @@ function _renderGlobalTodos() {
       _openProjectTodoEditor(null, { ...context, projects: undefined });
     });
     header.appendChild(toggle);
+    if (group === groups[0]) header.appendChild(_renderGlobalTodoDriverHint());
     header.appendChild(_renderGlobalTodoDriverToggle(group, false));
-    header.appendChild(_renderGlobalTodoDriverHint());
     header.appendChild(add);
     section.appendChild(header);
     section.appendChild(board);

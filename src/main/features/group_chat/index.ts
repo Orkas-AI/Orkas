@@ -91,6 +91,7 @@ export async function runtimeStatus(
  *  starts emitting events on the same microtask cycle as send's return —
  *  if subscribe runs after send, those first events are lost. */
 export const subscribeBus = subscribe;
+export { submitCliAsyncInput } from './bus';
 
 import type { ChatUseSelection, ChatMessageReference, GroupMessage } from './visibility';
 import {

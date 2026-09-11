@@ -4,6 +4,7 @@
 const sellerApi = require('./marketplace-seller-api.cjs');
 const storefrontApi = require('./merchant-platform-api.cjs');
 const shopifySetupRequirements = require('./shopify-setup-requirements.cjs');
+const { refundSignatureHeaders } = require('./ebay-signature.cjs');
 const { withRequestSignal, requestFetch, credentialOperation, requestFailureCode, httpFailureCode } = require('./commerce-request-context.cjs');
 
 require('./proxy-bootstrap.cjs');
@@ -2100,8 +2101,12 @@ async function ebayRequest(config, method, path, p = {}) {
     headers['content-type'] = 'application/json';
     init.body = JSON.stringify(p.body);
   }
+  const url = `${ebayBase(config)}${path}${queryString(p.query)}`;
+  if (method === 'POST' && path.endsWith('/issue_refund')) {
+    Object.assign(headers, refundSignatureHeaders(config.credentials, url, method, init.body));
+  }
   try {
-    return await fetchJson(`${ebayBase(config)}${path}${queryString(p.query)}`, init);
+    return await fetchJson(url, init);
   } catch (error) {
     const status = String(error?.message || '').match(/HTTP (\d{3})/)?.[1];
     throw commerceError(error?.code, `eBay request failed${status ? ` (HTTP ${status})` : ''}`);
@@ -4602,11 +4607,13 @@ const DIAGNOSTIC_CODES = new Set([
 async function callToolResult(name, args = {}, env = process.env) {
   try {
     const result = await callTool(name, args, env);
-    // Recognize the product-owned seller outcome and Square's documented errors
-    // array, never provider prose. Preserve reconciliation data and never retry
+    // Recognize the product-owned seller outcome and documented provider failure
+    // arrays, never provider prose. Preserve reconciliation data and never retry
     // an update which may already have changed some resources.
     const partial = (sellerApi.isSellerProvider(result.provider) && result.result?.status === 'partial_or_failed')
-      || (result.provider === 'square' && Array.isArray(result.result?.errors) && result.result.errors.length > 0);
+      || (result.provider === 'square' && Array.isArray(result.result?.errors) && result.result.errors.length > 0)
+      || (result.provider === 'weimob_wos' && result.action === 'inventory.update'
+        && Array.isArray(result.result?.failList) && result.result.failList.length > 0);
     return { ...(partial ? { isError: true, _meta: { orkas: { errorCode: 'E_TOOL_CALL_UPSTREAM' } } } : {}),
       content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
   } catch (error) {

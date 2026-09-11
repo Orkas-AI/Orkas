@@ -29,6 +29,7 @@ vi.mock('../../../src/main/features/chats', () => ({
 }));
 vi.mock('../../../src/main/features/group_chat', () => ({
   send: vi.fn(),
+  setFloor: vi.fn(async () => ({ ok: true })),
   busIsQuiescent: () => true,
 }));
 
@@ -81,6 +82,34 @@ async function seedProject(projects: any, name = 'Iterate'): Promise<string> {
 }
 
 describe('project to-do › end-to-end', () => {
+  it.each(['manual', 'auto'])('dispatches a globally assigned task through the selected agent for %s processing', async (mode) => {
+    const { pt, runner, groupChat, chats } = await load();
+    const agents = await import('../../../src/main/features/agents');
+    const owner = await agents.createCustomAgent({ name: 'GlobalSpecialist' });
+    if (!owner) throw new Error('agent fixture failed');
+    const created = await pt.createTask(UID, '', { title: 'Assigned global work', owner_agent_id: owner.agent_id });
+    if (!created.ok) throw new Error('task fixture failed');
+    const run = () => mode === 'manual' ? runner.runTaskNow(UID, '', created.task.id) : runner.advance(UID, '', created.task);
+    const result = await run();
+    expect(result.ok).toBe(true);
+    expect(groupChat.setFloor).toHaveBeenCalledWith(UID, result.cid, owner.agent_id);
+    expect(groupChat.send).toHaveBeenCalledWith(expect.objectContaining({ cid: result.cid, text: created.task.title }));
+    expect(vi.mocked(groupChat.setFloor).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(groupChat.send).mock.invocationCallOrder[0]);
+    expect(await pt.getTask(UID, '', created.task.id)).toMatchObject({ owner_agent_id: owner.agent_id, status: 'progress', origin_cid: result.cid });
+
+    // Losing the selected agent must not silently run the default assistant.
+    await pt.updateTask(UID, '', created.task.id, { status: 'todo' });
+    vi.mocked(groupChat.setFloor).mockResolvedValueOnce({ ok: false, error: 'unknown agent' } as never);
+    expect((await run()).ok).toBe(false);
+    expect(groupChat.send).toHaveBeenCalledTimes(1);
+    expect(chats.deleteConversation).toHaveBeenCalledWith(UID, 'c_2', null);
+    expect((await pt.getTask(UID, '', created.task.id))?.status).toBe('todo');
+    agents.setAgentEnabledForActiveUser(owner.agent_id, false);
+    expect((await run()).ok).toBe(false);
+    expect(groupChat.send).toHaveBeenCalledTimes(1);
+    expect(chats.deleteConversation).toHaveBeenCalledWith(UID, 'c_3', null);
+    expect((await pt.getTask(UID, '', created.task.id))?.status).toBe('todo');
+  });
   it('processes a task again from review while preserving its brief and first conversation', async () => {
     const { pt, runner, projects, groupChat } = await load();
     const pid = await seedProject(projects);

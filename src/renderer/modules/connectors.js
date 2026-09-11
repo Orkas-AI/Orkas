@@ -1112,7 +1112,12 @@ function _renderCatalogCard(entry, instance) {
   const isOAuthPending = !!(e && e.unavailable_reason === 'oauth_pending');
   const isVisibleDisabled = _isConnectorVisibleDisabled(e);
   const connected = !!(instance && instance.status && instance.status.kind === 'connected');
-  const errored = !!(instance && instance.status && instance.status.kind === 'error');
+  // An interrupted first CLI setup is still available to connect. Its failure is reported for
+  // that attempt, rather than persisting as a service outage before it has ever been usable.
+  const unfinishedLocalCli = e.auth_mode === 'local_cli'
+    && !(instance && (instance.tools_cached_at > 0
+      || (Array.isArray(instance.tools_cache) && instance.tools_cache.length > 0)));
+  const errored = !!(instance && instance.status && instance.status.kind === 'error' && !unfinishedLocalCli);
   // Authorized + cached, but the last connect/refresh failed. Stays in this group (a 30s backend
   // blip must not reshuffle every card out of the list) but must never render as connected: the
   // card states the reason and how stale it is, and offers 重试 instead of 使用.
@@ -1165,7 +1170,7 @@ function _renderCatalogCard(entry, instance) {
     : '';
 
   // Bottom-row action:
-  //   - connecting: listed initialization or retry/callback finalization stays disabled until completion.
+  //   - connecting: retry/callback finalization stays disabled until completion.
   //   - browser launch: keep the spinner until blur, but disable only during the 2s throttle.
   //   - connected: use in the Commander composer; enable / disable lives in the ⋯ menu
   //   - errored:   disconnect (recover from a stuck error state)
@@ -1173,9 +1178,10 @@ function _renderCatalogCard(entry, instance) {
   //   - default (uninstalled): connect (start OAuth)
   let action = '';
   const launchAttempt = _oauthLaunchAttempts.get(e.id) || null;
+  // Persisted/listed status can survive a restart; it is not proof of an active user attempt.
+  // Only the current launch, matched authorization callback, or explicit retry owns busy feedback.
   const isConnecting = (_connectorsState.connecting && _connectorsState.connecting.has(e.id))
-    || _oauthCallbackAttempts.has(e.id)
-    || (instance && instance.status && instance.status.kind === 'connecting');
+    || _oauthCallbackAttempts.has(e.id);
   if (installPhase === 'checking') {
     action = `<button class="btn btn-sm btn-primary is-loading" data-act="connect" disabled aria-disabled="true" aria-busy="true">${escapeHtml(t('connectors.action.checking'))}</button>`;
   } else if (installPhase === 'installing') {
@@ -1789,9 +1795,11 @@ function _handleOAuthConnectResult(info) {
       authorization_detail: info.authorization_detail,
     };
     const cancelled = _reportConnectOutcome(payload, pending ? pending.startedAt : performance.now(), errLike, durationMs);
-    // A transport failure is rendered on the resulting connector card. Other asynchronous
-    // failures need an explicit alert now that the initiating IPC has already returned.
-    if (!cancelled && errLike.code !== 'mcp_connect_failed') uiAlert(_formatConnectError(errLike));
+    // Failed first CLI setups return to the ordinary Connect card, so report their transport
+    // failure here too. Other transports retain the resulting error on their connector card.
+    if (!cancelled && (errLike.code !== 'mcp_connect_failed' || entry.auth_mode === 'local_cli')) {
+      uiAlert(_formatConnectError(errLike));
+    }
   }
   if (currentView === 'connectors') loadConnectors();
 }

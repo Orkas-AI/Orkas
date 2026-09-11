@@ -277,6 +277,7 @@ function loadHarness(
       const dict: Record<string, string> = {
         'bash.permission.title': 'Run this command?',
         'bash.permission.message': '{agent} wants {reasons}:',
+        'bash.permission.unresolved_paths': 'uses file paths that cannot be determined before execution',
         'bash.permission.action_title': 'Allow this sensitive action?',
         'bash.permission.action_message': '{agent} wants {operation}, which {reasons}:',
         'bash.permission.action_fallback': 'local action',
@@ -1057,6 +1058,25 @@ describe('renderer bash permission prompt', () => {
       });
     },
   );
+
+  it.each([{ reasons: [] }, { reasons: ['sensitive_path'] }])('explains unresolved paths and offers only one-time approval with $reasons', async ({ reasons }) => {
+    const h = loadHarness('allow_once');
+    h.pushHandler({
+      request_id: 'req-unresolved',
+      agent_name: 'Agent',
+      command: 'cat "$target"',
+      reasons,
+      unresolved_paths: true,
+      can_allow_run: true,
+    });
+    await flush();
+    expect(h.dialogs[0]).toMatchObject({ allowRun: false, choices: ['allow_once'] });
+    expect(h.dialogs[0].message).toContain('uses file paths that cannot be determined before execution');
+    expect(h.invokeCalls).toContainEqual({
+      channel: 'bash.permission_response',
+      payload: { request_id: 'req-unresolved', decision: 'allow_once' },
+    });
+  });
 
   it('offers task-level but never durable approval for system package changes', async () => {
     const h = loadHarness('allow_run');

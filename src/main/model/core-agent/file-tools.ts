@@ -26,6 +26,7 @@
  * write_file) live in local-tools.ts.
  */
 
+import { fileFailure, type FileFailureDiagnostic } from '../../../core-agent/src/tools/file-diagnostics';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -526,8 +527,8 @@ type ReadAddress = {
 };
 
 type ReadAddressResult =
-  | { address: ReadAddress; error?: never }
-  | { address?: never; error: string };
+  | { address: ReadAddress; error?: never; diagnostic?: never }
+  | { address?: never; error: string; diagnostic?: FileFailureDiagnostic };
 
 const LEGACY_READ_RANGE_KEYS = ['charStart', 'charEnd', 'lineStart', 'lineEnd'] as const;
 
@@ -552,33 +553,41 @@ function taggedReadRangeSchema(): Record<string, unknown> {
  * already-running conversations and non-model callers. New and legacy forms
  * cannot be combined because their precedence would otherwise be ambiguous. */
 function parseReadAddress(input: Record<string, unknown>): ReadAddressResult {
+  const invalid = (error: string, reason: FileFailureDiagnostic['reason'], facts: Omit<FileFailureDiagnostic, 'code' | 'reason'> = {}): ReadAddressResult => ({
+    error, diagnostic: { code: 'E_BAD_INPUT', reason, stage: 'input', ...facts },
+  });
   const rawRange = input.range;
   if (rawRange !== undefined) {
     if (LEGACY_READ_RANGE_KEYS.some((key) => input[key] !== undefined)) {
-      return { error: '`range` cannot be combined with legacy flat range fields' };
+      return invalid('`range` cannot be combined with legacy flat range fields', 'range_conflict');
     }
     if (!rawRange || typeof rawRange !== 'object' || Array.isArray(rawRange)) {
-      return { error: '`range` must be an object with unit, start, and end' };
+      return invalid('`range` must be an object with unit, start, and end', 'range_shape');
     }
     const range = rawRange as Record<string, unknown>;
     const unit = range.unit;
     const start = range.start;
     const end = range.end;
     if (unit !== 'line' && unit !== 'char') {
-      return { error: '`range.unit` must be "line" or "char"' };
+      return invalid('`range.unit` must be "line" or "char"', 'range_unit');
     }
+    const valueType = (value: unknown): FileFailureDiagnostic['start_type'] => value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+    const rangeFacts = {
+      start_present: start !== undefined, end_present: end !== undefined,
+      start_type: valueType(start), end_type: valueType(end),
+      start_integer: Number.isInteger(start), end_integer: Number.isInteger(end),
+    };
     if (!Number.isInteger(start) || !Number.isInteger(end)) {
-      return { error: '`range.start` and `range.end` must be integers' };
+      return invalid('`range.start` and `range.end` must be integers', 'range_integer', rangeFacts);
     }
     const numericStart = start as number;
     const numericEnd = end as number;
     const minimumStart = unit === 'line' ? 1 : 0;
     if (numericStart < minimumStart || numericEnd < numericStart) {
-      return {
-        error: unit === 'line'
+      return invalid(unit === 'line'
           ? '`range` line positions must satisfy 1 <= start <= end'
           : '`range` character positions must satisfy 0 <= start <= end',
-      };
+        'range_order', { ...rangeFacts, start_in_bounds: numericStart >= minimumStart, ordered: numericEnd >= numericStart });
     }
     return unit === 'line'
       ? { address: { lineStart: numericStart, lineEnd: numericEnd } }
@@ -588,7 +597,7 @@ function parseReadAddress(input: Record<string, unknown>): ReadAddressResult {
   const hasCharRange = typeof input.charStart === 'number' || typeof input.charEnd === 'number';
   const hasLineRange = typeof input.lineStart === 'number' || typeof input.lineEnd === 'number';
   if (hasCharRange && hasLineRange) {
-    return { error: 'use either charStart/charEnd or lineStart/lineEnd, not both' };
+    return invalid('use either charStart/charEnd or lineStart/lineEnd, not both', 'range_conflict');
   }
   return {
     address: {
@@ -633,6 +642,7 @@ function createReadFileTool(
         return {
           content: errText('E_BAD_INPUT', parsedAddress.error),
           isError: true,
+          observations: { fileFailure: parsedAddress.diagnostic },
         };
       }
       const { address } = parsedAddress;
@@ -1103,12 +1113,14 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
       const parsedAddresses = requests.map((entry) => parseReadAddress(entry));
       const invalidAddressIndex = parsedAddresses.findIndex((entry) => entry.error !== undefined);
       if (invalidAddressIndex >= 0) {
+        const diagnostic = parsedAddresses[invalidAddressIndex].diagnostic;
         return {
           content: errText(
             'E_BAD_INPUT',
             `read_files item ${invalidAddressIndex + 1}: ${parsedAddresses[invalidAddressIndex].error}`,
           ),
           isError: true,
+          observations: diagnostic ? { fileFailure: { ...diagnostic, item_index: invalidAddressIndex } } : undefined,
         };
       }
 
@@ -1826,10 +1838,15 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
               `${requestedRootDisplay}: ${displayErrorMessage(err, requestedRoot, requestedRootDisplay)}`,
             ),
             isError: true,
+            observations: fileFailure('E_NOT_FOUND', ['ENOENT', 'ENOTDIR'].includes(String((err as NodeJS.ErrnoException).code)) ? 'target_missing' : 'target_stat', {
+              stage: 'stat', target_type: ['ENOENT', 'ENOTDIR'].includes(String((err as NodeJS.ErrnoException).code)) ? 'missing' : 'unknown',
+            }),
           };
         }
         if (!st.isDirectory() && !st.isFile()) {
-          return { content: errText('E_NOT_DIRECTORY', `${requestedRootDisplay}: not a directory`), isError: true };
+          return { content: errText('E_NOT_DIRECTORY', `${requestedRootDisplay}: not a directory`), isError: true,
+            observations: fileFailure('E_NOT_DIRECTORY', 'target_type', { stage: 'stat', target_type: 'other' }),
+          };
         }
         // "Search inside this one file" is the same request at a narrower
         // scope, and the model asks for it often enough that refusing cost a

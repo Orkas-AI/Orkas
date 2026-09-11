@@ -128,7 +128,7 @@ export function writeContentForUser(
   // Security scan
   const threat = scanForInjection(trimmed);
   if (threat) {
-    log.warn(`blocked metacognition write (${threat}): ${trimmed.slice(0, 80)}...`);
+    log.warn('blocked metacognition write', { threat, chars: trimmed.length });
     return {
       ok: false,
       error: `blocked: suspicious content (${threat})`,

@@ -1,3 +1,4 @@
+import { fileFailure, type FileFailureDiagnostic } from "./file-diagnostics.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -151,26 +152,23 @@ function patchHeaderHint(header: string): string {
 /** Parse the file-oriented patch envelope used by Codex-style apply_patch.
  * It is intentionally a general text transaction, not a coding-mode protocol. */
 export function parseApplyPatch(patch: unknown): ParsedPatchFile[] | ToolResult {
+  const invalid = (code: FileFailureDiagnostic["code"], message: string, reason: FileFailureDiagnostic["reason"], facts: Omit<FileFailureDiagnostic, "code" | "reason"> = {}): ToolResult => ({
+    content: patchError(code, message), isError: true,
+    observations: fileFailure(code, reason, { stage: "parse", ...facts }),
+  });
   if (typeof patch !== "string" || !patch) {
-    return { content: patchError("E_BAD_INPUT", "`patch` must be a non-empty string"), isError: true };
+    return invalid("E_BAD_INPUT", "`patch` must be a non-empty string", "patch_input");
   }
   if (patch.length > APPLY_PATCH_MAX_CHARS) {
-    return {
-      content: patchError("E_PATCH_TOO_LARGE", `patch exceeds ${APPLY_PATCH_MAX_CHARS} characters`),
-      isError: true,
-    };
+    return invalid("E_PATCH_TOO_LARGE", `patch exceeds ${APPLY_PATCH_MAX_CHARS} characters`, "patch_size");
   }
 
   const lines = patch.replace(/\r\n?/g, "\n").split("\n");
   while (lines.length && lines[lines.length - 1] === "") lines.pop();
+  const beginMarker = lines[0] === "*** Begin Patch";
+  const endMarker = lines[lines.length - 1] === "*** End Patch";
   if (lines.shift() !== "*** Begin Patch" || lines.pop() !== "*** End Patch") {
-    return {
-      content: patchError(
-        "E_PATCH_FORMAT",
-        "patch must start with `*** Begin Patch` and end with `*** End Patch`",
-      ),
-      isError: true,
-    };
+    return invalid("E_PATCH_FORMAT", "patch must start with `*** Begin Patch` and end with `*** End Patch`", "patch_envelope", { begin_marker: beginMarker, end_marker: endMarker });
   }
 
   const files: ParsedPatchFile[] = [];
@@ -178,20 +176,14 @@ export function parseApplyPatch(patch: unknown): ParsedPatchFile[] | ToolResult 
   let hunkCount = 0;
   while (index < lines.length) {
     if (files.length >= APPLY_PATCH_MAX_FILES) {
-      return {
-        content: patchError(
-          "E_PATCH_TOO_LARGE",
-          `patch contains more than ${APPLY_PATCH_MAX_FILES} file operations`,
-        ),
-        isError: true,
-      };
+      return invalid("E_PATCH_TOO_LARGE", `patch contains more than ${APPLY_PATCH_MAX_FILES} file operations`, "file_limit");
     }
 
     const header = lines[index++];
     if (header.startsWith("*** Add File:")) {
       const filePath = patchPathFromHeader(header, "*** Add File:");
       if (!filePath) {
-        return { content: patchError("E_PATCH_FORMAT", "Add File requires a non-empty path"), isError: true };
+        return invalid("E_PATCH_FORMAT", "Add File requires a non-empty path", "file_path", { line: index + 1, file_index: files.length + 1 });
       }
       const contentLines: string[] = [];
       let noNewlineAtEnd = false;
@@ -203,13 +195,7 @@ export function parseApplyPatch(patch: unknown): ParsedPatchFile[] | ToolResult 
           continue;
         }
         if (!line.startsWith("+")) {
-          return {
-            content: patchError(
-              "E_PATCH_FORMAT",
-              `${filePath}: every Add File content line must start with +`,
-            ),
-            isError: true,
-          };
+          return invalid("E_PATCH_FORMAT", `${filePath}: every Add File content line must start with +`, "add_line_prefix", { line: index + 2, file_index: files.length + 1 });
         }
         contentLines.push(line.slice(1));
         index++;
@@ -222,62 +208,42 @@ export function parseApplyPatch(patch: unknown): ParsedPatchFile[] | ToolResult 
     if (header.startsWith("*** Delete File:")) {
       const filePath = patchPathFromHeader(header, "*** Delete File:");
       if (!filePath) {
-        return { content: patchError("E_PATCH_FORMAT", "Delete File requires a non-empty path"), isError: true };
+        return invalid("E_PATCH_FORMAT", "Delete File requires a non-empty path", "file_path", { line: index + 1, file_index: files.length + 1 });
       }
       if (index < lines.length && !isPatchFileHeader(lines[index])) {
-        return {
-          content: patchError("E_PATCH_FORMAT", `${filePath}: Delete File does not accept content lines`),
-          isError: true,
-        };
+        return invalid("E_PATCH_FORMAT", `${filePath}: Delete File does not accept content lines`, "delete_content", { line: index + 2, file_index: files.length + 1 });
       }
       files.push({ type: "delete", path: filePath });
       continue;
     }
 
     if (!header.startsWith("*** Update File:")) {
-      return {
-        content: patchError(
-          "E_PATCH_FORMAT",
-          `expected \`*** Add File: <path>\`, \`*** Delete File: <path>\`, or \`*** Update File: <path>\`;`
-            + ` received: ${header}${patchHeaderHint(header)}`,
-        ),
-        isError: true,
-      };
+      return invalid("E_PATCH_FORMAT", `expected \`*** Add File: <path>\`, \`*** Delete File: <path>\`, or \`*** Update File: <path>\`;`
+            + ` received: ${header}${patchHeaderHint(header)}`, "file_header", { line: index + 1, file_index: files.length + 1 });
     }
 
     const filePath = patchPathFromHeader(header, "*** Update File:");
     if (!filePath) {
-      return { content: patchError("E_PATCH_FORMAT", "Update File requires a non-empty path"), isError: true };
+      return invalid("E_PATCH_FORMAT", "Update File requires a non-empty path", "file_path", { line: index + 1, file_index: files.length + 1 });
     }
     let moveTo: string | undefined;
     if (lines[index]?.startsWith("*** Move to:")) {
       moveTo = patchPathFromHeader(lines[index++], "*** Move to:") ?? undefined;
       if (!moveTo) {
-        return {
-          content: patchError("E_PATCH_FORMAT", `${filePath}: Move to requires a non-empty path`),
-          isError: true,
-        };
+        return invalid("E_PATCH_FORMAT", `${filePath}: Move to requires a non-empty path`, "file_path", { line: index + 1, file_index: files.length + 1 });
       }
     }
 
     const hunks: ParsedPatchHunk[] = [];
     while (index < lines.length && !isPatchFileHeader(lines[index])) {
+      const hunkLine = index + 2;
       const hunkHeader = lines[index++];
       if (!hunkHeader.startsWith("@@")) {
-        return {
-          content: patchError("E_PATCH_FORMAT", `${filePath}: expected a hunk beginning with @@`),
-          isError: true,
-        };
+        return invalid("E_PATCH_FORMAT", `${filePath}: expected a hunk beginning with @@`, "hunk_header", { line: index + 1, file_index: files.length + 1, hunk_index: hunks.length + 1 });
       }
       hunkCount++;
       if (hunkCount > APPLY_PATCH_MAX_HUNKS) {
-        return {
-          content: patchError(
-            "E_PATCH_TOO_LARGE",
-            `patch contains more than ${APPLY_PATCH_MAX_HUNKS} hunks`,
-          ),
-          isError: true,
-        };
+        return invalid("E_PATCH_TOO_LARGE", `patch contains more than ${APPLY_PATCH_MAX_HUNKS} hunks`, "hunk_limit", { line: index + 1, file_index: files.length + 1, hunk_index: hunks.length + 1 });
       }
 
       let locator = hunkHeader.slice(2).trim();
@@ -300,25 +266,13 @@ export function parseApplyPatch(patch: unknown): ParsedPatchFile[] | ToolResult 
         }
         const kind = line[0];
         if (kind !== " " && kind !== "+" && kind !== "-") {
-          return {
-            content: patchError(
-              "E_PATCH_FORMAT",
-              `${filePath}: hunk lines must start with space, +, or -`,
-            ),
-            isError: true,
-          };
+          return invalid("E_PATCH_FORMAT", `${filePath}: hunk lines must start with space, +, or -`, "hunk_line_prefix", { line: index + 2, file_index: files.length + 1, hunk_index: hunks.length + 1 });
         }
         hunkLines.push({ kind, text: line.slice(1) });
         index++;
       }
       if (!hunkLines.some((line) => line.kind === "+" || line.kind === "-")) {
-        return {
-          content: patchError(
-            "E_PATCH_FORMAT",
-            `${filePath}: each hunk must add or remove at least one line`,
-          ),
-          isError: true,
-        };
+        return invalid("E_PATCH_FORMAT", `${filePath}: each hunk must add or remove at least one line`, "hunk_without_changes", { line: hunkLine, file_index: files.length + 1, hunk_index: hunks.length + 1, added_lines: 0, removed_lines: 0, context_lines: hunkLines.length });
       }
       hunks.push({
         ...(locator ? { header: locator } : {}),
@@ -328,16 +282,13 @@ export function parseApplyPatch(patch: unknown): ParsedPatchFile[] | ToolResult 
       });
     }
     if (!hunks.length) {
-      return {
-        content: patchError("E_PATCH_FORMAT", `${filePath}: Update File requires at least one hunk`),
-        isError: true,
-      };
+      return invalid("E_PATCH_FORMAT", `${filePath}: Update File requires at least one hunk`, "missing_hunk", { line: index + 1, file_index: files.length + 1 });
     }
     files.push({ type: "update", path: filePath, ...(moveTo ? { moveTo } : {}), hunks });
   }
 
   if (!files.length) {
-    return { content: patchError("E_PATCH_FORMAT", "patch contains no file operations"), isError: true };
+    return invalid("E_PATCH_FORMAT", "patch contains no file operations", "empty_patch");
   }
   return files;
 }
@@ -395,6 +346,7 @@ export function applyPatchHunks(
             `${filePath}: hunk ${hunkIndex + 1} is a pure insertion without unique context or End of File`,
           ),
           isError: true,
+          observations: fileFailure("E_PATCH_AMBIGUOUS", "insertion_without_anchor", { stage: "match", hunk_index: hunkIndex + 1, match_count: anchorPositions.length }),
         };
       }
     } else {
@@ -407,6 +359,7 @@ export function applyPatchHunks(
             `${filePath}: hunk ${hunkIndex + 1} does not match the current file`,
           ),
           isError: true,
+          observations: fileFailure("E_PATCH_NO_MATCH", "no_match", { stage: "match", hunk_index: hunkIndex + 1, match_count: 0 }),
         };
       }
       if (positions.length > 1) {
@@ -416,6 +369,7 @@ export function applyPatchHunks(
             `${filePath}: hunk ${hunkIndex + 1} matches ${positions.length} locations; include more unchanged context`,
           ),
           isError: true,
+          observations: fileFailure("E_PATCH_AMBIGUOUS", "ambiguous_match", { stage: "match", hunk_index: hunkIndex + 1, match_count: positions.length }),
         };
       }
       position = positions[0];

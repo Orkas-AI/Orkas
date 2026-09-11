@@ -303,6 +303,13 @@ async function seedDisabledSkill() {
 }
 
 describe('group_chat bus integration › unexpected host-turn failure recovery', () => {
+  // Cold module transformation is fixture setup, not failure/retry latency.
+  // On a loaded host it exceeded this case's 10s business-flow budget before
+  // enqueue was reached. Preserve that budget and isolate the import cost.
+  beforeEach(async () => {
+    await import('../../../../src/main/features/group_chat');
+  }, 60_000);
+
   // Scenario: the user submits an ordinary Commander task, but the host
   // boundary fails before the model turn starts. The transcript must retain
   // the request, surface one structured/retryable failure, and remain usable.
@@ -1572,24 +1579,15 @@ describe('group_chat bus integration › direct agent handback', () => {
 });
 
 describe('group_chat bus integration › Commander utility tools', () => {
-  it('executes automation listing, shared Skill search, and marketplace input boundaries', async () => {
+  it('executes shared Skill search and marketplace boundaries without the retired automation alias', async () => {
     const cid = newCid();
     const state = await import('../../../../src/main/features/group_chat/state');
     const bus = await import('../../../../src/main/features/group_chat/bus');
-    const autoTasks = await import('../../../../src/main/features/auto_tasks');
     const paths = await import('../../../../src/main/paths');
     const sid = state.buildGconvSessionId(cid);
     const globalRoot = paths.globalSkillRoots()[0]!;
     const discoveredSkillDir = path.join(globalRoot, 'bus-global-discovery-test');
     const secondSkillDir = path.join(globalRoot, 'zz-bus-global-discovery-test');
-    const createdTask = await autoTasks.createTask(TEST_UID, {
-      id: 'at_68686868',
-      content: 'Inspect the service every six hours.',
-      enabled: false,
-      schedule: { type: 'hourly', interval_hours: 6 },
-      end_condition: { type: 'count', max_runs: 4 },
-    });
-    expect(createdTask.ok).toBe(true);
     fs.mkdirSync(discoveredSkillDir, { recursive: true });
     fs.writeFileSync(path.join(discoveredSkillDir, 'SKILL.md'), [
       '---',
@@ -1610,7 +1608,6 @@ describe('group_chat bus integration › Commander utility tools', () => {
     ].join('\n'));
 
     _setScript(sid, [
-      { type: '__call_tool__', name: 'auto_tasks_list', input: { limit: 1 } },
       { type: '__call_tool__', name: 'skill_search', input: { query: '', limit: 1 } },
       { type: '__call_tool__', name: 'skill_search', input: { query: '', limit: 1, offset: 1 } },
       { type: '__call_tool__', name: 'marketplace_search', input: { query: '' } },
@@ -1629,12 +1626,12 @@ describe('group_chat bus integration › Commander utility tools', () => {
 
     const offered = _recordedCalls.find((call) => call.sid === sid)?.extraToolNames ?? [];
     expect(offered).toEqual(expect.arrayContaining([
-      'auto_tasks_list',
       'browser',
       'skill_search',
       'marketplace_search',
       'marketplace_request_install',
     ]));
+    expect(offered).not.toContain('auto_tasks_list');
     const commanderCall = _recordedCalls.find((call) => call.sid === sid)!;
     expect(commanderCall.readOnlyExtraRoots).not.toContain(globalRoot);
     expect(commanderCall.runtimeReadOnlyRoots).toContain(discoveredSkillDir);
@@ -1656,7 +1653,6 @@ describe('group_chat bus integration › Commander utility tools', () => {
     expect(byName('marketplace_search').description).toContain('without installing');
     expect(byName('marketplace_search').description).not.toContain('only when installed capabilities');
     expect(byName('marketplace_request_install').description).not.toContain('stop and wait');
-    expect(byName('auto_tasks_list').description).not.toContain('before an update');
     expect(byName('dispatch_to').description).not.toContain('canonical conversation history');
     expect(byName('dispatch_to').description).toMatch(/^NON-TERMINAL delegation:/);
     expect(byName('dispatch_to').description).toContain('another dispatch, a tool call, or synthesis across at least two distinct results');
@@ -1695,15 +1691,6 @@ describe('group_chat bus integration › Commander utility tools', () => {
       results: [{ read_path: '@skill/zz-bus-global-discovery-test' }],
     });
     expect(skillPages[1]).not.toHaveProperty('next_offset');
-    expect(results.auto_tasks_list).toMatchObject({
-      ok: true,
-      tasks: [{
-        id: 'at_68686868',
-        schedule: { type: 'hourly', interval_hours: 6 },
-        end_condition: { type: 'count', max_runs: 4 },
-        scheduled_run_count: 0,
-      }],
-    });
     expect(results.skill_search).toMatchObject({
       ok: true,
       results: expect.any(Array),
@@ -4948,6 +4935,54 @@ describe('group_chat bus integration › task terminal boundary', () => {
     });
     unsubscribe();
   }, 10_000);
+
+  it.each([
+    { agentFails: false, commanderFails: true, expectedStatus: 'failed' },
+    { agentFails: true, commanderFails: false, expectedStatus: 'completed' },
+  ])('settles the final visible outcome after dispatch: $expectedStatus', async ({ agentFails, commanderFails, expectedStatus }) => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const terminals: any[] = [];
+    const unsubscribe = bus.subscribeTaskTerminals((event) => {
+      if (event.conversation_id === cid) terminals.push(event);
+    });
+    const failure = {
+      type: 'error', text: 'provider unavailable', failureKind: 'model',
+      failureCode: 'provider_unavailable', failurePhase: 'provider_wait',
+    };
+    _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [
+      agentFails ? failure : { type: 'final', text: 'Draft prepared for review.' },
+    ]);
+    _setScript(state.buildGconvSessionId(cid), [
+      { type: '__call_tool__', name: 'dispatch_to', input: { to: AGENT_NAME, message: 'Prepare the draft.' } },
+      commanderFails ? failure : { type: 'final', text: 'Recovered and finished the review.' },
+    ]);
+    try {
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Prepare and review the draft.' });
+      await waitForQuiescent(TEST_UID, cid, 4000);
+      expect(await waitUntil(() => terminals.length === 1)).toBe(true);
+      const replies = (await groupChat.readMessages(TEST_UID, cid))
+        .filter((m: any) => m.from !== 'user' && !m.dispatch);
+      expect(replies.some((m: any) => m.from === AGENT_ID)).toBe(true);
+      expect(replies.at(-1)?.from).toBe('commander');
+      expect(terminals).toHaveLength(1);
+      expect(terminals[0].status).toBe(expectedStatus);
+      if (commanderFails) {
+        expect(replies.at(-1)?.failure_code).toBe('provider_unavailable');
+        expect(terminals[0].failure).toMatchObject({
+          failure_kind: 'model', error_code: 'provider_unavailable', failure_phase: 'provider_wait',
+        });
+        expect(terminals[0].recovered).not.toBe(true);
+      } else {
+        expect(terminals[0]).toMatchObject({ recovered: true });
+        expect(terminals[0].failure).toBeUndefined();
+      }
+    } finally {
+      unsubscribe();
+    }
+  }, 12_000);
 
   it('does not classify actor failure prose as an execution failure', async () => {
     const cid = newCid();

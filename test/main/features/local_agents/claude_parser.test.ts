@@ -570,6 +570,7 @@ describe('local_agents/backends/claude › Orkas permissions', () => {
     expect(args).not.toContain('--permission-mode');
     expect(args).not.toContain('--dangerously-skip-permissions');
     expect(args).toContain('--include-hook-events');
+    expect(args.slice(args.indexOf('--permission-prompt-tool'), args.indexOf('--permission-prompt-tool') + 2)).toEqual(['--permission-prompt-tool', 'stdio']);
     expect(args).not.toContain('--model');
   });
 

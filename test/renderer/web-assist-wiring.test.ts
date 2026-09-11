@@ -330,6 +330,14 @@ describe('Web Assist renderer wiring', () => {
     expect(indexSource).toContain('id="conversation-info-resize"');
   });
 
+  it('offers only the supported task-detail destinations in the shipped page', () => {
+    // A leftover Tasks tab renders the Files empty state under the wrong label.
+    // Read the real page: synthetic controller fixtures cannot catch that drift.
+    const tabs = [...indexSource.matchAll(/<button\b[^>]*\bdata-info-tab="([^"]+)"[^>]*>/g)];
+    expect(tabs.map((match) => match[1])).toEqual(['files', 'attachments', 'browser']);
+    expect(tabs.filter((match) => /\bis-active\b/.test(match[0])).map((match) => match[1])).toEqual(['files']);
+  });
+
   it('keeps the current URL in main when opening the system browser', () => {
     expect(webAssistSource).toContain("invoke('webAssist.openExternal', {})");
     expect(webAssistSource).not.toMatch(/webAssist\.openExternal'\s*,\s*\{\s*url/);

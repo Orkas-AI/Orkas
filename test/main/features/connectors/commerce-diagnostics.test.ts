@@ -19,9 +19,13 @@ function setup(provider = 'square') {
   const key = randomBytes(32).toString('base64url');
   const file = path.join(dir, 'credentials.enc');
   const credentials = provider === 'shopify' ? { client_id: 'fixture-app', client_secret: 'fixture-secret' }
+    : provider === 'weimob_wos' ? { client_id: 'fixture-app', client_secret: 'fixture-secret',
+      access_token: 'fixture-token', expires_at: Date.now() + 3_600_000,
+      identity: { business_operation_system_id: '123' } }
     : provider === 'woocommerce' ? { consumer_key: `ck_${'a'.repeat(40)}`, consumer_secret: `cs_${'b'.repeat(40)}` }
       : { access_token: 'fixture-token' };
   const metadata = provider === 'shopify' ? { shop_domain: 'fixture.myshopify.com' }
+    : provider === 'weimob_wos' ? { shop_id: '123', shop_type: 'business_operation_system_id' }
     : provider === 'lightspeed' ? { store_domain: 'fixture.retail.lightspeed.app' }
     : provider === 'woocommerce' ? { store_url: 'https://fixture.example.com' } : { environment: 'sandbox' };
   writeCredentialFile(file, key, { provider, ...credentials });
@@ -81,6 +85,40 @@ describe('commerce faults preserve public error codes without leaking private pr
     expect(fetchMock).toHaveBeenCalledOnce();
     const next = await adapter.callToolResult('execute_destructive', args, env);
     expect(next.isError).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('reports Weimob stock item failures without replaying successful items or leaking reconciliation data to public diagnostics', async () => {
+    // Official WOS stock/update example: code.errcode=0 can accompany data.failList.
+    // https://doc.weimobcloud.com/detail?childMenuId=1&id=3140&isold=2&menuId=19&tag=3805
+    const { adapter, env } = setup('weimob_wos');
+    const failList = [{ goodsId: 456, skuIdSet: [789], message: privateMarker }];
+    const fetchMock = vi.fn().mockResolvedValueOnce(json(200, { code: { errcode: '0' }, data: { failList } }))
+      .mockResolvedValueOnce(json(200, { code: { errcode: '0' }, data: { failList: [] } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const payload = { basicInfo: { vid: 123 }, goodsList: [{ goodsId: 456,
+      skuList: [{ skuId: 789, stockNum: 10 }, { skuId: 790, stockNum: 20 }] }] };
+    const result = await adapter.callToolResult('execute_high_impact', {
+      action: 'inventory.update', parameters: { payload },
+    }, env);
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).result).toEqual({ failList });
+    expect(result._meta.orkas.errorCode).toBe('E_TOOL_CALL_UPSTREAM');
+    expect(JSON.stringify(result._meta)).not.toContain(privateMarker);
+    expect(JSON.stringify(result._meta)).not.toContain('789');
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const request = fetchMock.mock.calls[0];
+    expect(new URL(String(request[0])).pathname).toBe('/apigw/weimob_shop/v2.0/stock/update');
+    expect(request[1].method).toBe('POST');
+    expect(JSON.parse(request[1].body)).toEqual({ ...payload, quantityEditType: 0 });
+    // An explicit, reconciled follow-up updates only the failed SKU, never the batch automatically.
+    const reconciled = { ...payload, goodsList: [{ goodsId: 456, skuList: [{ skuId: 789, stockNum: 10 }] }] };
+    const next = await adapter.callToolResult('execute_high_impact', {
+      action: 'inventory.update', parameters: { payload: reconciled },
+    }, env);
+    expect(next.isError).toBeUndefined();
+    expect(JSON.parse(next.content[0].text).result).toEqual({ failList: [] });
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body).goodsList).toEqual(reconciled.goodsList);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 

@@ -14,6 +14,29 @@ import {
 const PNG_1X1_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6nKsAAAAASUVORK5CYII=';
 
 describe('local_agents/backends/codex › phased agent messages', () => {
+  it('preserves every asynchronous question and option provided by the native protocol', () => {
+    const messages = new CodexAgentMessageAccumulator();
+    const questions = Array.from({ length: 4 }, (_, i) => ({ title: `Choice ${i + 1}?`, options: Array.from({ length: 13 }, (_, n) => `Option ${n + 1}`) }));
+    expect(messages.completedAsyncMessage({ id: 'many', type: 'agentMessage', delivery: 'async', questions })?.questions).toEqual(questions);
+  });
+  it.each(['completed-only', 'streamed', 'late-metadata'])('keeps an %s async question out of the final result and delivers it once', shape => {
+    const messages = new CodexAgentMessageAccumulator();
+    const item = { id: 'ask-1', type: 'agentMessage', phase: 'final_answer', delivery: 'async', text: 'Which folder?', questions: [{ title: 'Which folder?', options: ['Current', 'All'] }] };
+    if (shape === 'streamed') {
+      messages.rememberItem(item);
+      expect(messages.appendDelta({ itemId: item.id, delta: item.text })).toBeNull();
+    } else if (shape === 'late-metadata') {
+      messages.appendDelta({ itemId: item.id, phase: 'final_answer', delta: item.text });
+    }
+    expect(messages.completedAsyncMessage(item)).toEqual({ type: 'async-message', itemId: item.id, text: item.text, questions: item.questions });
+    expect(messages.appendCompletedFallback(item)).toBeNull();
+    expect(messages.completedAsyncMessage(item)).toBeNull();
+    expect(messages.hasText()).toBe(false);
+    messages.appendCompletedFallback({ id: 'final', type: 'agentMessage', phase: 'final_answer', text: 'Finished.' });
+    expect(messages.output()).toBe('Finished.');
+    expect(messages.completedAsyncMessage({ ...item, id: 'lookalike', delivery: null })).toBeNull();
+  });
+
   it('maps item phases onto deltas and resolves only the final answer', () => {
     const messages = new CodexAgentMessageAccumulator();
     messages.rememberItem({ id: 'comment-1', type: 'agentMessage', phase: 'commentary' });

@@ -13,11 +13,10 @@ test.describe('connectors', () => {
     expect(await categories.locator('button').evaluateAll((buttons) => buttons.slice(0, 3).map((button) => button.getAttribute('data-connectors-cat'))))
       .toEqual(['', 'ecommerce', 'office']);
     await categories.locator('[data-connectors-cat="general"]').click();
-    for (const id of ['stripe', 'paypal', 'gmail', 'dropbox', 'typeform', 'exist']) {
+    for (const id of ['stripe', 'paypal', 'gmail', 'gdrive', 'dropbox', 'typeform', 'exist']) {
       await expect(available.locator(`[data-id="${id}"]`)).toHaveCount(1);
     }
-    // Standalone Gmail is available through Composio; legacy Google remains disabled.
-    await expect(available.locator('[data-id="gdrive"]')).toHaveCount(0);
+    // Standalone Gmail and Drive use Composio; the legacy Google bundle remains disabled.
     await expect(available.locator('[data-id="google-workspace"]')).toHaveCount(0);
     await expect(available.locator('[data-id="shopify-admin"]')).toHaveCount(0);
     await categories.locator('[data-connectors-cat="office"]').click();
@@ -45,14 +44,49 @@ test.describe('connectors', () => {
     await expect(available.locator('[data-id="youtube"]')).toHaveCount(1);
     await expect(available.locator('[data-id="github"]')).toHaveCount(0);
     for (const [lang, label] of [['zh', '创作'], ['en', 'Creation'], ['ja', '創作'], ['pt', 'Criação']]) {
-      await appPage.evaluate((next) => { (window as any).setLang(next); }, lang);
+      await appPage.evaluate((next) => (window as any).setLang(next), lang);
       await expect(categories.locator('[aria-pressed="true"]')).toHaveText(label);
     }
-    await appPage.evaluate(() => { (window as any).setLang('zh'); });
+    await appPage.evaluate(() => (window as any).setLang('zh'));
     await categories.locator('[data-connectors-cat=""]').click();
+    // Setup and credit labels remain compact metadata, with the action at the opposite edge.
+    // Read the shipped stylesheet through Chromium so missing CSS cannot pass on markup alone.
+    const checkCardBadges = async () => {
+      for (const variant of ['is-setup', 'is-credit']) {
+        const badge = available.locator(`.connector-card-credit-badge.${variant}`).first();
+        await expect(badge).toHaveCSS('font-size', '11px');
+        await expect(badge).toHaveCSS('border-radius', '6px');
+        // Query and measure in the same browser turn; language updates replace cards.
+        const layout = await badge.evaluateAll(([element]) => {
+          const footer = element.closest('.connector-card-foot')!;
+          const action = footer.querySelector('button')!;
+          const labelRect = element.getBoundingClientRect();
+          const actionRect = action.getBoundingClientRect();
+          const footerRect = footer.getBoundingClientRect();
+          return {
+            leftInset: labelRect.left - footerRect.left,
+            gap: actionRect.left - labelRect.right,
+            centerDifference: Math.abs((labelRect.top + labelRect.bottom - actionRect.top - actionRect.bottom) / 2),
+            actionOverflow: actionRect.right - footerRect.right,
+          };
+        });
+        expect(layout.leftInset).toBeLessThanOrEqual(1);
+        expect(layout.gap).toBeGreaterThanOrEqual(7);
+        expect(layout.centerDifference).toBeLessThanOrEqual(1);
+        expect(layout.actionOverflow).toBeLessThanOrEqual(1);
+      }
+      await expect(available.locator('.connector-card-credit-badge.is-credit').first())
+        .toHaveCSS('background-color', 'rgb(255, 248, 225)');
+    };
+    for (const lang of ['zh', 'en', 'ja', 'pt']) {
+      await appPage.evaluate((next) => (window as any).setLang(next), lang);
+      await checkCardBadges();
+    }
+    await appPage.evaluate(() => (window as any).setLang('zh'));
     await appPage.locator('#panel-connectors').screenshot({ path: testInfo.outputPath('connector-categories-desktop.png') });
     await appPage.setViewportSize({ width: 760, height: 820 });
     await expect(categories.locator('[data-connectors-cat="office"]')).toBeVisible();
+    await checkCardBadges();
     expect(await categories.evaluate((host) => [...host.querySelectorAll('button')].every((button) => {
       const rect = button.getBoundingClientRect();
       const bounds = host.getBoundingClientRect();

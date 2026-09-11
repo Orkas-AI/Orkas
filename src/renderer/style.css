@@ -17,6 +17,9 @@
   --primary-hover: #4945c0;
   --primary-soft: #e8e8fe;
   --primary-text: #4945c0;
+  --credit-text: #9a5b00;
+  --credit-border: #e7b84b;
+  --credit-soft: #fff8e1;
   --success: #16a34a;
   --success-soft: #dcfce7;
   --warn: #d97706;
@@ -8543,10 +8546,10 @@ body.is-conversation-info-resizing * { cursor: col-resize !important; }
 }
 
 .chat-queue-chevron {
-  display: inline-block;
-  margin-right: 4px;
-  color: #94a3b8;
-  font-size: 11px;
+  display: inline-flex;
+  vertical-align: middle;
+  margin-right: 5px;
+  color: var(--muted);
 }
 
 .chat-queue-agent-group + .chat-queue-agent-group {
@@ -9982,6 +9985,52 @@ body.is-conversation-info-resizing * { cursor: col-resize !important; }
   flex: 1 1 auto;
   min-width: 0;
 }
+
+/* Composer surfaces reserve one shared vertical stack. Long task/question or
+   attachment lists scroll inside it while the message composer stays usable. */
+#panel-conversation .chat-input-wrapper {
+  display: flex;
+  flex-direction: column;
+  /* Keep the header and a readable slice of history above the floating stack. */
+  max-height: calc(100% - 180px);
+}
+.chat-composer-panels {
+  width: 80%;
+  margin: 0 auto;
+  min-height: 0;
+  max-height: 50vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  pointer-events: auto;
+  flex: 0 1 auto;
+  scrollbar-width: thin;
+}
+.chat-composer-panels > .chat-queue {
+  width: 100%;
+  max-width: 100%;
+  margin: 0 0 8px;
+}
+.chat-composer-panels > .chat-input-overlay {
+  position: static;
+  transform: none;
+}
+.chat-composer-panels .chat-attachments:not(:empty) { margin-bottom: 8px; }
+#panel-conversation .chat-input-wrapper > .chat-input-area {
+  width: 80%;
+  flex: 0 0 auto;
+}
+#chat-cli-questions[hidden] { display: none; }
+#chat-cli-questions .cli-question-panel {
+  width: 100%;
+  min-width: 0;
+  margin: 0 0 8px;
+  background: var(--surface);
+  box-shadow: 0 6px 20px rgba(15, 23, 42, 0.08);
+}
+.cli-question-panel .form-field { margin-bottom: 8px; }
+.cli-question-panel .form-field-label { color: var(--text); overflow-wrap: anywhere; }
+.cli-question-panel .form-field-checkgroup .btn { white-space: normal; text-align: left; }
+.cli-question-panel .form-field-textarea { resize: none; }
 
 
 .chat-skill-btn,
@@ -15284,6 +15333,13 @@ body.is-conversation-info-resizing * { cursor: col-resize !important; }
   border: 1px solid var(--border-strong);
   padding: 1px 7px;
 }
+.connector-card-credit-badge.is-credit {
+  border-color: var(--credit-border);
+  background: var(--credit-soft);
+  color: var(--credit-text);
+  font-weight: 700;
+  letter-spacing: 0;
+}
 /* Footer row: chips on the left flex-1, install/uninstall button hugged to the right via
    `flex-shrink:0` so it never collapses before the chips. Replaces the old vertically-stacked
    `.marketplace-card-meta` + `.marketplace-card-actions` arrangement. */
@@ -16624,6 +16680,32 @@ body.is-conversation-info-resizing * { cursor: col-resize !important; }
   overflow: hidden;
   text-wrap: pretty;
 }
+.connector-card-badges {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 6px;
+  align-items: center;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.connector-card-credit-badge {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  min-height: 22px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(37, 99, 235, 0.18);
+  background: rgba(37, 99, 235, 0.04);
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .connector-card-credit-badge.is-setup {
   min-height: 20px;
   padding: 2px 6px;
@@ -16695,6 +16777,9 @@ body.is-conversation-info-resizing * { cursor: col-resize !important; }
 }
 .connector-card-foot .btn {
   flex: 0 0 auto;
+}
+.connector-card-foot .connector-card-badges:empty {
+  display: none;
 }
 .connector-card-foot .btn-link {
   background: transparent;

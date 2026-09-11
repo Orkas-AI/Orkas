@@ -1094,22 +1094,18 @@ export function createPiProvider(config: {
               }
               const errorServerFallbackReason = serverFallbackReasonFromResponseId(event.error.responseId);
               const responseModel = resolvedResponseModel(event.error, model.id);
-              // Surface everything we can from the stream error event.
-              // pi-ai's fetch layer swallows the original Error(cause chain)
-              // and only keeps `.message` on `errorMessage`; any extra field
-              // the provider adapter exposes (kind/reason/statusCode/...) is
-              // still useful and worth logging. Without this the caller
-              // sees a bare "fetch failed" string and has no path to the
-              // real undici / SDK cause.
+              // Provider messages can echo user content. Preserve them on the
+              // error event while keeping persisted diagnostics metadata-only.
               try {
                 const pe = (event as any).error;
                 const peKeys = pe && typeof pe === 'object' ? Object.keys(pe) : [];
-                log.warn(
-                  `stream error provider=${providerId} model=${model.id} ` +
-                  `msg="${String(pe?.errorMessage || '').slice(0, 200)}" ` +
-                  `reason=${pe?.stopReason ?? '-'} ` +
-                  `fields=${JSON.stringify(peKeys)}`,
-                );
+                log.warn("provider stream failed", {
+                  provider: providerId,
+                  model: model.id,
+                  reason: pe?.stopReason === "aborted" ? "aborted" : "error",
+                  messageChars: typeof pe?.errorMessage === "string" ? pe.errorMessage.length : 0,
+                  fieldCount: peKeys.length,
+                });
               } catch (_) { /* best-effort */ }
               yield {
                 type: "error",

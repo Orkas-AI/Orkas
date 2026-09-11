@@ -22,6 +22,7 @@ describe('conversation › _forgetCidRecipient', () => {
     // the renderer's lifetime. Deleting a conversation is the natural
     // boundary; entries of other conversations must survive.
     const globals = {
+      window: { CliAsyncInput: { forget: vi.fn() } },
       _recipientByCid: { c1: 'agent-a' },
       _saveRecipientMap: vi.fn(),
       _autoRecipientByCid: new Map([['c1', 1]]),
@@ -43,6 +44,7 @@ describe('conversation › _forgetCidRecipient', () => {
     const forget = vm.runInNewContext(`(${extractFunction('_forgetCidRecipient')})`, globals);
 
     forget('c1');
+    expect(globals.window.CliAsyncInput.forget).toHaveBeenCalledExactlyOnceWith('c1');
 
     expect(globals._serverFloorRevisionByCid.has('c1')).toBe(false);
     expect(globals._serverFloorRevisionByCid.get('c2')).toBe(1);

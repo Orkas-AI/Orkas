@@ -12,7 +12,18 @@
  * probe, plus the new-chat landing page silently collapsing a two-agent
  * request to one (2026-08-26).
  */
-import { expect, test } from './fixtures/orkas';
+import { expect, test as base } from './fixtures/orkas';
+import type { Page } from '@playwright/test';
+
+// Opening an existing-conversation fixture includes the app's cold feature
+// imports and a seed turn. Give setup its own bounded budget so it cannot
+// consume the assertions' time on a loaded test host. Landing-page coverage
+// below deliberately does not request this fixture.
+const test = base.extend<{ boardPage: Page }>({
+  boardPage: [async ({ modelOrkas }, use) => {
+    await use(await openConversation(modelOrkas, 'task board'));
+  }, { timeout: 60_000 }],
+});
 
 async function openConversation(
   app: import('./fixtures/orkas').OrkasTestApp,
@@ -46,11 +57,11 @@ test.describe('task board scheduling (D18 serial chain)', () => {
     timeout: process.platform === 'win32' ? 120_000 : 60_000,
   });
 
-  test('retracts when one task remains and resurfaces for later concurrent work', async ({
-    modelOrkas,
+  test('retracts when a serial multi-task run drains to one task', async ({
+    modelOrkas, boardPage,
   }) => {
     const app = modelOrkas;
-    const page = await openConversation(app, 'serial');
+    const page = boardPage;
     const board = page.locator('#chat-task-board');
     const rows = page.locator('#chat-task-board-list .chat-queue-item');
     const before = app.modelRequests.length;
@@ -100,9 +111,13 @@ test.describe('task board scheduling (D18 serial chain)', () => {
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/, { timeout: 20_000 });
     await expect(board).toBeHidden();
 
-    // Retraction is not a one-way latch. A later ordinary single task stays
-    // lightweight, then a second queued task must surface the same board
-    // again so the user can see and control the new concurrency.
+  });
+
+  test('keeps ordinary admission hidden and surfaces a later queued send', async ({ modelOrkas, boardPage }) => {
+    const app = modelOrkas;
+    const page = boardPage;
+    const board = page.locator('#chat-task-board');
+    const rows = page.locator('#chat-task-board-list .chat-queue-item');
     const afterFirstBatch = app.modelRequests.length;
     app.setModelMode('controlled-slow');
     const input = page.locator('#chat-input');
@@ -200,10 +215,10 @@ test.describe('task board scheduling (D18 serial chain)', () => {
   });
 
   test('runs a substantive preamble through Commander before the mentioned Agent (D22)', async ({
-    modelOrkas,
+    modelOrkas, boardPage,
   }) => {
     const app = modelOrkas;
-    const page = await openConversation(app, 'd22');
+    const page = boardPage;
     const before = app.modelRequests.length;
     app.setModelMode('controlled-slow');
 
@@ -238,10 +253,10 @@ test.describe('task board scheduling (D18 serial chain)', () => {
   });
 
   test('stopping the running predecessor blocks the successor visibly; run-anyway releases it visibly', async ({
-    modelOrkas,
+    modelOrkas, boardPage,
   }) => {
     const app = modelOrkas;
-    const page = await openConversation(app, 'blocked');
+    const page = boardPage;
     const board = page.locator('#chat-task-board');
     const rows = page.locator('#chat-task-board-list .chat-queue-item');
     const before = app.modelRequests.length;
@@ -272,9 +287,9 @@ test.describe('task board scheduling (D18 serial chain)', () => {
     await expect(board).toBeHidden({ timeout: 10_000 });
   });
 
-  test('groups by agent, drags queued messages only within that agent, and removes cancelled sends', async ({ modelOrkas }, testInfo) => {
+  test('groups by agent, drags queued messages only within that agent, and removes cancelled sends', async ({ modelOrkas, boardPage }, testInfo) => {
     const app = modelOrkas;
-    const page = await openConversation(app, 'agent-queue-drag');
+    const page = boardPage;
     const before = app.modelRequests.length;
     const input = page.locator('#chat-input');
     const rows = page.locator('#chat-task-board-list .chat-queue-item');
@@ -282,6 +297,10 @@ test.describe('task board scheduling (D18 serial chain)', () => {
     const send = async (text: string) => {
       await input.fill(text);
       await input.press('Enter');
+      // This scenario prepares distinct accepted sends before testing drag
+      // order. A key event alone does not await the async send: filling the
+      // next draft early lets the previous acknowledgement clear that draft.
+      await expect(input).toHaveValue('');
     };
     const row = (text: string) => rows.filter({ hasText: text });
     app.setModelMode('controlled-slow');
@@ -420,9 +439,9 @@ test.describe('task board scheduling (D18 serial chain)', () => {
     await expect(page.locator('#chat-task-board')).toBeHidden();
   });
 
-  test('sends an already-queued task into its matching active turn', async ({ modelOrkas }) => {
+  test('sends an already-queued task into its matching active turn', async ({ modelOrkas, boardPage }) => {
     const app = modelOrkas;
-    const page = await openConversation(app, 'queue-send-now');
+    const page = boardPage;
     const rows = page.locator('#chat-task-board-list .chat-queue-item');
     const before = app.modelRequests.length;
 

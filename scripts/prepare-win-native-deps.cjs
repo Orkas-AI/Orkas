@@ -164,7 +164,7 @@ function main() {
     canvas: path.join(PC_DIR, 'node_modules', '@napi-rs', 'canvas-win32-x64-msvc', 'skia.win32-x64-msvc.node'),
     tokenizers: path.join(PC_DIR, 'node_modules', '@anush008', 'tokenizers-win32-x64-msvc', 'tokenizers.win32-x64-msvc.node'),
     sharp: path.join(PC_DIR, 'node_modules', '@img', 'sharp-win32-x64', 'lib', `sharp-win32-x64-${sharpVersion}.node`),
-    sharpVipsCpp: path.join(PC_DIR, 'node_modules', '@img', 'sharp-win32-x64', 'lib', 'libvips-cpp-8.18.3.dll'),
+    sharpVipsCpp: path.join(PC_DIR, 'node_modules', '@img', 'sharp-win32-x64', 'lib', 'libvips-cpp-8.18.6.dll'),
     sharpVips: path.join(PC_DIR, 'node_modules', '@img', 'sharp-win32-x64', 'lib', 'libvips-42.dll'),
   };
 

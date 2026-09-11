@@ -1062,6 +1062,42 @@ describe('local_agents/runner', () => {
     expect((await runner.run(opts)).status).toBe('completed');
   });
 
+  it.each(['claude', 'codex', 'opencode'] as const)('gives a projectless %s task browser access that expires with its conversation turn', async (cli) => {
+    const life = await import('../../../../src/main/features/web_assist_lifecycle');
+    const cid = 'c-projectless-browser';
+    life.beginBrowserTaskRun(TEST_UID, cid, 'browser-turn');
+    mockDetect.mockResolvedValue({ type: cli, available: true, path: `/fake/${cli}`, version: '1.0.0' });
+    let envFile: string | undefined;
+    const backend = async ({ bridge, onEvent }: any) => {
+      expect(bridge).toBeDefined();
+      envFile = bridge.server.env.ORKAS_BRIDGE_ENV_FILE;
+      life.finishBrowserTaskRun(TEST_UID, cid, 'browser-turn');
+      const reply = await callRunnerBridge(bridge, 'browser', { operation: 'tabs' });
+      expect(reply).toMatchObject({ ok: true, result: { isError: true } });
+      expect(JSON.parse(reply.result.content)).toMatchObject({ ok: false, code: 'task_run_ended' });
+      expect((await callRunnerBridge(bridge, 'todo_tasks', { action: 'list' })).ok).toBe(false);
+      if (cli === 'opencode') {
+        expect((await callRunnerBridge(bridge, 'skills.list', {})).ok).toBe(false);
+        expect((await callRunnerBridge(bridge, 'connectors.list', {})).ok).toBe(false);
+      }
+      onEvent({ type: 'done', status: 'completed', output: 'Browser authority expired.' });
+    };
+    mockBackendImpl = mockCodexBackendImpl = mockOpencodeBackendImpl = backend;
+    try {
+      const runner = await loadRunner();
+      const result = await runner.run({
+        uid: TEST_UID, cid, agentId: 'agent-x', currentMessageId: 'message-x',
+        cli, prompt: 'Use this conversation browser', cwd: tmpDir,
+        signal: new AbortController().signal, onEvent: () => {},
+      });
+      expect(result.status).toBe('completed');
+      expect(envFile).toBeDefined();
+      expect(fs.existsSync(envFile!)).toBe(false);
+    } finally {
+      life.finishBrowserTaskRun(TEST_UID, cid, 'browser-turn');
+    }
+  });
+
   it('returns a structured Commander handoff recorded through the live run bridge', async () => {
     mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
     mockBackendImpl = async ({ bridge, onEvent }) => {
@@ -1508,12 +1544,15 @@ describe('local_agents/runner', () => {
     });
   });
 
-  it('does not fresh-retry after a resumed session has begun executing', async () => {
+  it.each([
+    { type: 'status', status: 'running' },
+    { type: 'async-message', itemId: 'ask-1', text: 'Choose a scope.', questions: [{ title: 'Which scope?' }] },
+  ])('does not fresh-retry after a resumed session has emitted $type', async activity => {
     mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
     let attempts = 0;
     mockBackendImpl = async (opts) => {
       attempts += 1;
-      opts.onEvent({ type: 'status', status: 'running' });
+      opts.onEvent(activity as any);
       opts.onEvent({ type: 'stderr-line', line: 'session expired after execution began' });
       opts.onEvent({ type: 'done', status: 'failed', error: 'failed after execution' });
     };

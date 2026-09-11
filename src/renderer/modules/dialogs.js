@@ -283,7 +283,7 @@ function uiConfirmDanger({ title, message, dangerLabel, cancelLabel } = {}) {
 // `choices: [{ id, label, style? }]` — `style` may be 'primary' (default),
 // 'danger', or '' for the neutral .btn look. `leadingChoices` renders one
 // or more neutral/contextual choices on the left edge of the actions row.
-function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLabel, signal } = {}) {
+function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLabel, signal, multiple = false } = {}) {
   return new Promise((resolve) => {
     if (signal && signal.aborted) {
       resolve(null);
@@ -307,6 +307,7 @@ function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLab
     };
     const leadingChoiceHtml = leadingChoices.map((c) => renderChoice(c, 'ui-choice-leading')).join('');
     const choiceHtml = choices.map((c) => renderChoice(c)).join('');
+    const selectedIds = new Set();
     overlay.innerHTML = `
       <div class="modal ui-dialog modal-standard" role="dialog" aria-modal="true" aria-labelledby="${title ? titleId : messageId}"${title ? ` aria-describedby="${messageId}"` : ''}>
         ${titleHtml}
@@ -315,6 +316,7 @@ function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLab
           ${leadingChoiceHtml}
           <button class="btn" data-act="cancel">${cancelText}</button>
           ${choiceHtml}
+          ${multiple ? `<button class="btn btn-primary" data-act="confirm" disabled>${escapeHtml(_dialogLabel('common.confirm', 'Confirm'))}</button>` : ''}
         </div>
       </div>
     `;
@@ -346,8 +348,21 @@ function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLab
     const onAbort = () => finish(null);
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
     overlay.querySelectorAll('[data-act="choice"]').forEach((btn) => {
-      btn.addEventListener('click', () => finish(btn.dataset.id || null));
+      if (multiple) {
+        btn.setAttribute('aria-pressed', 'false');
+        btn.classList.remove('btn-primary');
+      }
+      btn.addEventListener('click', () => {
+        if (!multiple) { finish(btn.dataset.id || null); return; }
+        const id = btn.dataset.id;
+        if (selectedIds.has(id)) selectedIds.delete(id);
+        else selectedIds.add(id);
+        btn.setAttribute('aria-pressed', String(selectedIds.has(id)));
+        btn.classList.toggle('btn-primary', selectedIds.has(id));
+        overlay.querySelector('[data-act="confirm"]').disabled = selectedIds.size === 0;
+      });
     });
+    if (multiple) overlay.querySelector('[data-act="confirm"]').addEventListener('click', () => finish([...selectedIds]));
     cancelBtn.addEventListener('click', () => finish(null));
     document.addEventListener('keydown', onKey, true);
     setTimeout(() => {

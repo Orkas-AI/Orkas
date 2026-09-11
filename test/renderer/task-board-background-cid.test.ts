@@ -60,8 +60,6 @@ function applyEvents(
     _taskBoardTasks: new Map(),
     _taskBoardBatchIds: new Map(),
     _taskBoardSendingNow: new Set(),
-    _taskBoardQueuedRevealTimers: new Map(),
-    _TASK_BOARD_LONE_QUEUED_REVEAL_DELAY_MS: 200,
     _TASK_BOARD_TERMINAL: new Set(['done', 'stopped', 'failed', 'cancelled']),
     currentCid: visibleCid,
     renders: [] as string[],
@@ -71,8 +69,6 @@ function applyEvents(
   const src = [
     extractFunction(boardSource, '_taskBoardMapFor'),
     extractFunction(boardSource, '_taskBoardLiveRows'),
-    extractFunction(boardSource, '_taskBoardCancelQueuedReveal'),
-    extractFunction(boardSource, '_taskBoardScheduleQueuedReveal'),
     extractFunction(boardSource, '_taskBoardBatchAfterCreate'),
     extractFunction(boardSource, '_taskBoardOnEvent'),
   ].join('\n');

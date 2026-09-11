@@ -1016,11 +1016,17 @@ function _autoRenderList() {
           <span class="auto-group-name">${escapeHtml(name)}</span>
           <span class="auto-group-count">${group.tasks.length}</span>
         </button>
+        ${!group.projectId || _autoProjectExists(group.projectId) ? `
+          <button type="button" class="project-todo-menu auto-group-add" aria-label="${escapeHtml(t('auto.create_btn') + ' · ' + name)}" title="${escapeHtml(t('auto.create_btn'))}">
+            ${_autoUiIcon('plus')}
+          </button>` : ''}
       </div>
       <div class="auto-group-list"${expanded ? '' : ' hidden'}></div>`;
     const groupList = section.querySelector('.auto-group-list');
     groupList.id = `auto-group-list-${group.projectId || 'global'}`;
     const toggle = section.querySelector('.auto-group-toggle');
+    const add = section.querySelector('.auto-group-add');
+    if (add) add.addEventListener('click', () => openAutoTaskDialog({ initialProjectId: group.projectId }));
     toggle.setAttribute('aria-controls', groupList.id);
     toggle.addEventListener('click', () => {
       const next = toggle.getAttribute('aria-expanded') !== 'true';
@@ -2389,6 +2395,7 @@ function _autoResetForm() {
  *  opts.projectId? — pre-bind the task to this project AND hide the project
  *                    picker (project-detail entry mode). For the global tab,
  *                    omit this — the user picks the project inside the modal.
+ *  opts.initialProjectId? — preselect a project while keeping the picker visible.
  *  opts.onSaved?   — callback (task) => void, fired after a successful save.
  *                    Project-detail uses this to refresh its list. */
 function openAutoTaskDialog(opts = {}) {
@@ -2408,8 +2415,8 @@ function openAutoTaskDialog(opts = {}) {
   if (projectRow) projectRow.hidden = !showProjectRow;
   if (showProjectRow && _autoProjectSel) {
     _autoProjectSel.setOptions(_autoProjectOptions());
-    // Seed: edit → task's current project_id; create → empty (none).
-    _autoProjectSel.setValue(task && task.project_id ? _autoValidProjectId(task.project_id) : '');
+    // Editing keeps the task's scope; group creation starts in that group.
+    _autoProjectSel.setValue(_autoValidProjectId(task ? task.project_id : opts.initialProjectId));
   }
 
   if (task) _autoFillForm(task);

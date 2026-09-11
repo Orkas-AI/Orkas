@@ -426,6 +426,8 @@ function setView(view, cid, opts = {}) {
       if (typeof renderMemoryPage === 'function') renderMemoryPage();
     });
   }
+
+  window.CliAsyncInput?.showConversation(view === 'conversation' ? cid : null);
   if (view === 'conversation' && cid) {
     currentCid = cid;
     // Opening the task is the read boundary for its completed reply. This also

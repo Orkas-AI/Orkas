@@ -57,6 +57,8 @@ export interface BashPermissionInfo {
   /** Optional subject for non-shell operations, typically a path. */
   subject?: string;
   reasons: RiskCategory[];
+  /** A path could not be determined before execution; approval is one-time. */
+  unresolved_paths?: boolean;
   /** Why this is being asked at all in a mode that otherwise skips prompts:
    *  the step cannot be reviewed or undone once it runs. Empty/absent for an
    *  ordinary sensitive operation. */
@@ -153,12 +155,13 @@ export async function requestBashDecision(opts: {
   subject?: string;
   reasons: RiskCategory[];
   irreversible?: IrreversibleAction[];
+  unresolvedPaths?: boolean;
   externalMutations?: ExternalMutationFinding[];
   onWaiting?: (elapsedMs: number) => void;
 }): Promise<BashDecision> {
   const reasons = [...new Set(opts.reasons)];
   const actorId = grantActorId(opts.agentId, opts.agentName);
-  if (isCoveredByRunGrant(opts.uid, opts.cid, actorId, reasons)) {
+  if (!opts.unresolvedPaths && isCoveredByRunGrant(opts.uid, opts.cid, actorId, reasons)) {
     log.info('bash permission covered by task grant', {
       cid: maskId(opts.cid),
       agent_id: maskId(opts.agentId),
@@ -167,7 +170,7 @@ export async function requestBashDecision(opts: {
     });
     return 'allow_run';
   }
-  const taskGrantEligible = canAllowRun(opts.uid, opts.cid, actorId, reasons);
+  const taskGrantEligible = !opts.unresolvedPaths && canAllowRun(opts.uid, opts.cid, actorId, reasons);
   const requestId = crypto.randomBytes(8).toString('hex');
   const command = opts.command.length > COMMAND_PREVIEW_MAX
     ? `${opts.command.slice(0, COMMAND_PREVIEW_MAX)}…`
@@ -180,18 +183,20 @@ export async function requestBashDecision(opts: {
     ...(opts.operation ? { operation: opts.operation } : {}),
     ...(opts.subject ? { subject: opts.subject } : {}),
     reasons,
+    ...(opts.unresolvedPaths ? { unresolved_paths: true } : {}),
     ...(opts.irreversible?.length ? { irreversible: [...new Set(opts.irreversible)] } : {}),
     can_allow_run: taskGrantEligible,
     ...(opts.externalMutations?.length ? { external_mutations: opts.externalMutations.slice(0, 8) } : {}),
     cid: opts.cid,
   };
 
-  // Privacy: log categories + length only, never the command text (CLAUDE.md).
+  // Privacy: log bounded risk facts + length, never command/path text (CLAUDE.md).
   log.info('bash permission requested', {
     request_id: maskId(requestId),
     cid: maskId(opts.cid),
     agent_id: maskId(opts.agentId),
     reasons,
+    unresolved_paths: opts.unresolvedPaths === true,
     command_chars: opts.command.length,
   });
 

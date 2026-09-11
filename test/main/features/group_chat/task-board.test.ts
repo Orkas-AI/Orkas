@@ -65,6 +65,32 @@ afterEach(async () => {
 });
 
 describe('task_board › lifecycle', () => {
+  it('preserves pending admission through sync, confirms only waiting rows, and cancels it on restart', async () => {
+    const tb = await board();
+    const create = () => tb.createTask(TEST_UID, TEST_CID, {
+      assignee: 'commander', instruction: 'Ordinary send', createdBy: 'user', admissionPending: true,
+    });
+    const waiting = await create();
+    const running = await create();
+    const cancelled = await create();
+    const pending = await create();
+    expect((await readSnapshot()).every((row) => row.admission_pending === true)).toBe(true);
+    tb.dropBoard(TEST_UID, TEST_CID, { persistPending: false });
+    expect((await tb.listTasks(TEST_UID, TEST_CID)).every((row) => row.admission_pending === true)).toBe(true);
+    await tb.claimTask(TEST_UID, TEST_CID, running.task_id);
+    await tb.cancelPending(TEST_UID, TEST_CID, cancelled.task_id);
+    const ids = [waiting.task_id, running.task_id, cancelled.task_id];
+    expect((await tb.confirmQueued(TEST_UID, TEST_CID, ids)).map((row) => row.task_id)).toEqual([waiting.task_id]);
+    expect(await tb.confirmQueued(TEST_UID, TEST_CID, ids)).toEqual([]);
+    const rows = await readSnapshot();
+    expect(rows.find((row) => row.task_id === waiting.task_id).admission_pending).toBeUndefined();
+    expect(rows.find((row) => row.task_id === running.task_id).status).toBe('running');
+    expect(rows.find((row) => row.task_id === cancelled.task_id).status).toBe('cancelled');
+    expect(rows.find((row) => row.task_id === pending.task_id).admission_pending).toBe(true);
+    tb._resetForTest();
+    expect((await tb.listTasks(TEST_UID, TEST_CID)).every((row) => row.status === 'cancelled' && !row.admission_pending)).toBe(true);
+  });
+
   it('reports only associated execution activity, with independent project/account and current-actor scope', async () => {
     const tb = await board();
     const taskId = 't_123456789abc';

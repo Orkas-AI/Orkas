@@ -236,6 +236,7 @@ describe('wrapToolWithCap', () => {
       content: original,
       isError: true,
       failureContext,
+      observations: { fileFailure: { code: "E_NO_MATCH", reason: "no_match", match_count: 0 } },
     }), {
       maxInlineTokens: 200,
       toolResultsDir: dir,
@@ -243,6 +244,8 @@ describe('wrapToolWithCap', () => {
     const result = await tool.execute({}, ctx);
     expect(result.isError).toBe(true);
     expect(result.failureContext).toEqual(failureContext);
+    expect(result.observations?.fileFailure).toEqual({ code: "E_NO_MATCH", reason: "no_match", match_count: 0 });
+    expect(result.content).not.toContain("fileFailure");
     expect(result.content).toContain('status="error"');
     expect(fs.readdirSync(dir)).toHaveLength(1);
   });

@@ -1203,6 +1203,45 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(m.actors.find((a) => a.id === AGENT_ID)?.name).toBe(AGENT_NAME);
   });
 
+  it.each(['name', 'id'])('keeps unbound @%s text inside the eligible instruction instead of dropping it', async (mentionKind) => {
+    const paths = await import('../../../../src/main/paths');
+    const projects = await import('../../../../src/main/features/projects');
+    const chats = await import('../../../../src/main/features/chats');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const otherId = 'abc123def456';
+    const otherName = 'Researcher';
+    fs.mkdirSync(paths.agentDir(TEST_UID, otherId), { recursive: true });
+    fs.writeFileSync(path.join(paths.agentDir(TEST_UID, otherId), 'agent.json'), JSON.stringify({
+      agent_id: otherId, name: otherName, created_at: 't', updated_at: 't',
+    }));
+    const project = await projects.createProject(TEST_UID, 'Scoped mentions');
+    if (!project.ok) throw new Error('project fixture failed');
+    await projects.addAgentBinding(TEST_UID, project.project.project_id, AGENT_ID);
+    const { conversation_id: cid } = await chats.createConversation(TEST_UID, {
+      kind: 'normal', projectId: project.project.project_id,
+    });
+    cidsToDrop.add(cid);
+    // A historical roster entry must not restore an Agent removed from the project.
+    await state.ensureAgentMember(TEST_UID, cid, otherId, otherName);
+    const tasks: any[] = [];
+    const unsubscribe = bus.subscribe(TEST_UID, cid, (event) => {
+      if (event.type === 'task_created') tasks.push(event.task);
+    });
+    try {
+      const suffix = `implement A; @${mentionKind === 'name' ? otherName : otherId} research B`;
+      const msg = await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: `@${AGENT_NAME} ${suffix}` });
+      await waitForQuiescent(TEST_UID, cid);
+      expect(msg.to).toEqual([AGENT_ID]);
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0].assignee).toBe(AGENT_ID);
+      // Single-recipient routing retains its existing leading mention. The
+      // contract here is complete instruction preservation, not prefix styling.
+      expect(tasks[0].instruction.endsWith(suffix)).toBe(true);
+      expect(streamProbe.messages.some((message) => message.includes('research B'))).toBe(true);
+    } finally { unsubscribe(); }
+  });
+
   it('passes the named Agent tool_list to its in-process model turn', async () => {
     const paths = await import('../../../../src/main/paths');
     const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
@@ -2330,6 +2369,57 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       streamGate.releaseActiveTurn = null;
       await waitForQuiescent(TEST_UID, testCase.cid);
     }
+  });
+
+  it('keeps native async questions and their answers separate from the terminal reply without queueing another run', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+    const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+    spec.runtime = { kind: 'cli', cli: 'codex' };
+    fs.writeFileSync(agentFile, JSON.stringify(spec));
+    cliRunMock.nextResult = { runId: 'question-run', status: 'completed', output: 'Finished inspecting.' };
+    cliRunMock.activeIngress = { submit: vi.fn(async () => ({ mode: 'steered' })) };
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const cid = 'cid-cli-async-question';
+    const { subscribeTaskInterventions } = await import('../../../../src/main/util/task-intervention-events');
+    const attention = vi.fn();
+    const stopAttention = subscribeTaskInterventions(attention);
+    cidsToDrop.add(cid);
+    const events: any[] = [];
+    const unsub = bus.subscribe(TEST_UID, cid, event => events.push(event));
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Inspect this project.', forceTo: [AGENT_ID] });
+    await vi.waitFor(() => expect(cliRunMock.calls).toHaveLength(1));
+    cliRunMock.calls[0].onEvent({ type: 'async-message', itemId: 'native-question', text: 'Which scope?', questions: [{ title: 'Which scope?', options: ['Current', 'All'] }] });
+    await vi.waitFor(() => expect(events.some(event => event.msg?.cli_question)).toBe(true));
+    const questionEvent = events.find(event => event.msg?.cli_question);
+    expect(questionEvent.turn_end).toBe(false);
+    expect(questionEvent.msg.cli_question).not.toHaveProperty('expires_at_ms');
+    expect(bus.runtimeSnapshot(TEST_UID, cid).activeTurns).toHaveLength(1);
+    const questionId = questionEvent.msg.id;
+    expect(attention).toHaveBeenCalledExactlyOnceWith({
+      attention_id: `cli-question:${questionId}`, user_id: TEST_UID,
+      conversation_id: cid, kind: 'interactive_cli_input',
+    });
+    const [first, second] = await Promise.all([
+      bus.submitCliAsyncInput(TEST_UID, cid, questionId, ['Current']),
+      bus.submitCliAsyncInput(TEST_UID, cid, questionId, ['Current']),
+    ]);
+    expect(first.ok).toBe(true);
+    expect(second).toEqual(first);
+    expect(cliRunMock.activeIngress.submit).toHaveBeenCalledOnce();
+    expect(cliRunMock.activeIngress.submit.mock.calls[0][0].text).toBe('Which scope?\nCurrent');
+    cliRunMock.releaseActiveIngressRun?.();
+    cliRunMock.releaseActiveIngressRun = null;
+    await waitForQuiescent(TEST_UID, cid);
+    const rows = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(rows.map(row => row.text)).toEqual(['Inspect this project.', 'Which scope?', 'Which scope?\nCurrent', 'Finished inspecting.']);
+    expect(rows[2].cli_answer).toEqual({ message_id: questionId, answers: ['Current'] });
+    expect(rows[1].cli_question).not.toHaveProperty('expires_at_ms');
+    expect(await bus.submitCliAsyncInput(TEST_UID, cid, questionId, ['Current'])).toEqual(first);
+    expect(cliRunMock.calls).toHaveLength(1);
+    expect(attention).toHaveBeenCalledOnce();
+    stopAttention();
+    unsub();
   });
 
   it('uses explicit control without analytics attribution to steer the same native CLI run', async () => {
@@ -5079,6 +5169,51 @@ describe('deferred user-message bubble (queued-until-execution, 2026-08-27)', ()
     return Math.floor(Date.now() / 1000) * 1000;
   }
 
+  it.each(['commander', 'agent'])(
+    'keeps slow %s admission distinct from real queuing in both task events and list snapshots', async (recipient) => {
+      const storage = await import('../../../../src/main/storage');
+      const originalAppend = storage.appendJsonlAtomic;
+      let release: () => void = () => {};
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let entered: () => void = () => {};
+      const started = new Promise<void>((resolve) => { entered = resolve; });
+      const append = vi.spyOn(storage, 'appendJsonlAtomic').mockImplementation(async (...args) => {
+        entered();
+        await gate;
+        return originalAppend(...args);
+      });
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const cid = `cid-slow-admission-${recipient}`;
+      cidsToDrop.add(cid);
+      const events: any[] = [];
+      const unsubscribe = bus.subscribe(TEST_UID, cid, (event) => events.push(event));
+      const sending = bus.enqueue({
+        uid: TEST_UID, cid, fromActorId: 'user',
+        text: recipient === 'agent' ? `@${AGENT_NAME} ordinary message` : 'ordinary message',
+      });
+      try {
+        await started;
+        expect(await userRows(cid)).toEqual([]);
+        const rows = await bus.listConversationTasks(TEST_UID, cid);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({ status: 'queued', admission_pending: true });
+        expect(events.find((event) => event.type === 'task_created')?.task)
+          .toMatchObject({ task_id: rows[0].task_id, admission_pending: true });
+        expect(events.some((event) => event.type === 'message')).toBe(false);
+      } finally {
+        release();
+        await sending;
+        await waitForQuiescent(TEST_UID, cid, 5000);
+        append.mockRestore();
+        unsubscribe();
+      }
+      expect(await userRows(cid)).toHaveLength(1);
+      expect(events.filter((event) => event.task?.status === 'queued')
+        .every((event) => event.task.admission_pending === true)).toBe(true);
+      expect((await bus.listConversationTasks(TEST_UID, cid))[0].admission_pending).toBeUndefined();
+    },
+  );
+
   it('keeps a queued busy-send out of history until its turn starts, then persists it in execution order', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const taskBoard = await import('../../../../src/main/features/group_chat/task_board');
@@ -5097,6 +5232,7 @@ describe('deferred user-message bubble (queued-until-execution, 2026-08-27)', ()
       const rows = await taskBoard.listTasks(TEST_UID, cid);
       const queued = rows.find((t) => t.status === 'queued');
       expect(queued?.instruction).toBe('queued follow-up text');
+      expect(queued?.admission_pending).toBeUndefined();
     } finally {
       release();
       streamProbe.slowGate = null;

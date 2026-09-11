@@ -141,6 +141,8 @@ test('surfaces produced files, outside files, and artifacts for one conversation
   await page.locator('#conversation-info-toggle').click();
   const panel = page.locator('#conversation-info-panel');
   await expect(panel).toBeVisible();
+  await expect(panel.locator('[data-info-tab]')).toHaveCount(3);
+  await expect(panel.locator('[data-info-tab].is-active')).toHaveAttribute('data-info-tab', 'files');
   // Workspace files keep their tree position; the artifact and the stray file
   // get their own sections instead of being hung off the tree root.
   await expect(panel.locator('.conversation-info-dir-name')).toHaveText('reports');

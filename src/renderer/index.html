@@ -225,26 +225,24 @@
               </div>
             </nav>
             <div class="chat-input-wrapper">
-              <!-- Conversation task board: surfaces when a second live task
-                   exists, then stays PINNED above the composer showing the
-                   latest batch's state; the header toggles collapse (wired by
-                   task-board.js). Reuses the chat-queue style family. -->
-              <div class="chat-queue" id="chat-task-board" style="display:none">
-                <div class="chat-queue-header">
-                  <span class="chat-queue-label"><span class="chat-queue-chevron" id="chat-task-board-chevron" aria-hidden="true">▾</span><span data-i18n="chat.task_board_label">Tasks</span> <span class="chat-queue-count" id="chat-task-board-count">0</span></span>
-                  <span class="chat-queue-hint" id="chat-task-board-hint"></span>
+              <div class="chat-composer-panels">
+                <div id="chat-cli-questions" hidden></div>
+                <!-- Conversation task board: surfaces when a second live task
+                     exists, then stays PINNED above the composer showing the
+                     latest batch's state; the header toggles collapse (wired by
+                     task-board.js). Reuses the chat-queue style family. -->
+                <div class="chat-queue" id="chat-task-board" style="display:none">
+                  <div class="chat-queue-header">
+                    <span class="chat-queue-label"><span class="chat-queue-chevron" id="chat-task-board-chevron" aria-hidden="true" data-ui-icon="chevron-down" data-ui-icon-class="ui-icon chat-queue-agent-chevron"></span><span data-i18n="chat.task_board_label">Tasks</span> <span class="chat-queue-count" id="chat-task-board-count">0</span></span>
+                    <span class="chat-queue-hint" id="chat-task-board-hint"></span>
+                  </div>
+                  <div class="chat-queue-list" id="chat-task-board-list"></div>
                 </div>
-                <div class="chat-queue-list" id="chat-task-board-list"></div>
-              </div>
-              <div class="chat-input-area">
-                <!-- Floats above the input box for the attachments strip only.
-                     Plan rail moved up into #chat-plan-strip (between header
-                     and chat history); workspace chip moved into the bottom
-                     bar (Step 3); both leave the overlay carrying only the
-                     attachments preview. -->
                 <div class="chat-input-overlay">
                   <div class="chat-attachments" id="chat-attachments" style="display:none"></div>
                 </div>
+              </div>
+              <div class="chat-input-area">
                 <div class="chat-quote-preview" id="chat-quote-preview" style="display:none"></div>
                 <textarea id="chat-input" data-i18n-placeholder="chat.input_placeholder" placeholder="Type @ to choose agents, skills, connectors." rows="2"></textarea>
                 <!-- Composer bottom bar order matches PC/docs/design/PATTERNS.md
@@ -297,12 +295,7 @@
                  chrome (underline + bold + soft-primary chip) handled in CSS
                  via .is-active. -->
             <div class="conversation-info-tabs" role="tablist">
-              <button type="button" class="conversation-info-tab is-active" data-info-tab="tasks">
-                <span data-ui-icon="clipboard-list" data-ui-icon-class="conversation-info-tab-icon"></span>
-                <span class="conversation-info-tab-label" data-i18n="conversation_info.tab_tasks">Tasks</span>
-                <span class="conversation-info-tab-count" id="conversation-info-tab-count-tasks"></span>
-              </button>
-              <button type="button" class="conversation-info-tab" data-info-tab="files">
+              <button type="button" class="conversation-info-tab is-active" data-info-tab="files">
                 <span data-ui-icon="folder" data-ui-icon-class="conversation-info-tab-icon"></span>
                 <span class="conversation-info-tab-label" data-i18n="conversation_info.tab_files">Files</span>
                 <span class="conversation-info-tab-count" id="conversation-info-tab-count-files"></span>
@@ -646,7 +639,7 @@
                   <button class="btn btn-sm" type="button" data-todo-group="project" aria-pressed="true" data-i18n="todo.by_project">By project</button>
                   <button class="btn btn-sm" type="button" data-todo-group="status" aria-pressed="false" data-i18n="todo.by_status">By status</button>
                 </div>
-                <button class="btn btn-sm" id="todos-add-btn" type="button" data-i18n="todo.add_short">+ Add</button>
+                <button class="btn btn-sm" id="todos-add-btn" type="button" data-i18n="todo.add_short">+ Create</button>
               </div>
             </header>
             <div class="todos-workarea">
@@ -746,10 +739,10 @@
                     <div class="project-todo-tab-head">
                       <button type="button" class="btn btn-sm project-driver-toggle" id="project-driver-toggle"
                               data-i18n="project.driver.toggle" data-i18n-title="project.driver.toggle_hint"
-                              title="When enabled, AI handles to-dos automatically for you to review when finished." aria-pressed="false">Auto</button>
-                      <span class="form-hint" data-i18n="project.driver.toggle_hint">When enabled, AI handles to-dos automatically for you to review when finished.</span>
+                              title="AI handles to-dos automatically for you to review when finished." aria-pressed="false">Auto</button>
+                      <span class="form-hint" data-i18n="project.driver.toggle_hint">AI handles to-dos automatically for you to review when finished.</span>
                       <button type="button" class="btn btn-sm" id="project-todo-add-btn"
-                              data-i18n="todo.add_short" data-i18n-title="project.todo.add" title="Add task">+ Add</button>
+                              data-i18n="todo.add_short" data-i18n-title="project.todo.add" title="Create task">+ Create</button>
                     </div>
                     <div class="todo-load-error" id="project-todo-error" role="status" hidden><span data-i18n="todo.load_failed">Could not load tasks. Try again.</span><button class="btn btn-sm" id="project-todo-retry" data-i18n="chat.retry_btn">Retry</button></div>
                     <div class="project-tasks-list project-todo-list" id="project-todo-list"></div>
@@ -1325,7 +1318,7 @@
   <div class="modal-overlay ui-dialog-overlay" id="todo-editor-modal">
     <div class="modal modal-standard todo-editor-dialog" role="dialog" aria-modal="true" aria-labelledby="project-todo-editor-title">
       <div class="modal-header todo-editor-header">
-        <h2 class="modal-title" id="project-todo-editor-title" data-i18n="project.todo.add">Add task</h2>
+        <h2 class="modal-title" id="project-todo-editor-title" data-i18n="project.todo.add">Create task</h2>
       </div>
       <div class="project-todo-add" id="project-todo-add" hidden>
         <label class="todo-editor-field todo-editor-content-field"><span data-i18n="todo.task_title">What needs to be done</span>
@@ -1334,7 +1327,7 @@
               <div class="chat-attachments project-todo-attachments" id="project-todo-attachments" hidden></div>
             </div>
             <textarea id="project-todo-input" rows="3" maxlength="200"
-                      data-i18n-placeholder="project.todo.placeholder" placeholder="Add a task…"></textarea>
+                      data-i18n-placeholder="project.todo.placeholder" placeholder="Create a task…"></textarea>
             <div class="chat-bottom-bar todo-editor-composer-bar">
               <button type="button" class="chat-attach-btn project-todo-attach-btn" id="project-todo-attach-btn"
                       data-i18n-title="project.todo.attach" data-i18n-aria-label="project.todo.attach" title="Attach files" aria-label="Attach files">+</button>
@@ -1348,6 +1341,7 @@
           <label class="todo-editor-field"><span data-i18n="todo.project">Project</span><span class="todo-editor-select" id="project-todo-project"></span></label>
           <label class="todo-editor-field"><span data-i18n="todo.status">Status</span><span class="todo-editor-select" id="project-todo-status"></span></label>
         </div>
+        <label class="todo-editor-field"><span data-i18n="project.todo.assign">Assign agent</span><span class="todo-editor-select" id="project-todo-agent"></span></label>
         <div class="modal-actions todo-editor-actions">
           <button type="button" class="btn" id="project-todo-cancel" data-i18n="project.todo.cancel">Cancel</button>
           <button type="button" class="btn btn-primary" id="project-todo-save" data-i18n="project.todo.save" disabled>Save</button>
@@ -1751,6 +1745,7 @@
   <script src="./modules/avatar-picker.js"></script>
   <script src="./modules/chat-input-form.js"></script>
   <script src="./modules/local_agent_user_input.js"></script>
+  <script src="./modules/cli_async_input.js"></script>
   <script src="./modules/chat-lightbox.js"></script>
   <script src="./modules/icons.js"></script>
   <script src="./modules/web-assist.js"></script>

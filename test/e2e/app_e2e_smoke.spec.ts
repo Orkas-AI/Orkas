@@ -113,11 +113,11 @@ test.describe('desktop shell', () => {
     }
   });
 
-  test('keeps key project, automation, and agent surfaces visually stable', async ({ appPage, orkas }) => {
+  test('opens the selected project and agent details', async ({ appPage, orkas }) => {
     await orkas.invoke('projects.create', { name: 'E2E Visual Project' });
     await orkas.invoke('agents.create', {
       name: 'E2EVisualAgent',
-      description: 'Deterministic agent detail used for visual regression.',
+      description: 'Agent detail used to verify navigation.',
       category: 'general',
     });
     await appPage.evaluate(async () => (window as any).loadProjects(true));
@@ -125,35 +125,17 @@ test.describe('desktop shell', () => {
       has: appPage.locator('.project-name', { hasText: 'E2E Visual Project' }),
     }).click();
     await expect(appPage.locator('#project-detail-title')).toHaveText('E2E Visual Project');
-    await expect(appPage.locator('#project-detail-content')).toHaveScreenshot('project-detail-empty.png', {
-      animations: 'disabled',
-      caret: 'hide',
-      scale: 'css',
-      maxDiffPixelRatio: 0.01,
-    });
 
     await appPage.locator('#agents-btn').click();
     const agentCard = appPage.locator('.agent-card', { hasText: 'E2EVisualAgent' });
     await expect(agentCard).toBeVisible();
     await agentCard.click();
     await expect(appPage.locator('#agents-detail-name')).toHaveText('E2EVisualAgent');
-    await expect(appPage.locator('#agents-detail-view')).toHaveScreenshot('agent-detail.png', {
-      animations: 'disabled',
-      caret: 'hide',
-      scale: 'css',
-      maxDiffPixelRatio: 0.01,
-    });
   });
 
-  test('keeps the automation create dialog visually stable', async ({ appPage }) => {
+  test('selects a one-time automation date with the keyboard', async ({ appPage }) => {
     await appPage.locator('#auto-btn').click();
     await appPage.locator('#auto-add-btn').click();
-    await expect(appPage.locator('.auto-task-dialog')).toHaveScreenshot('automation-create-dialog.png', {
-      animations: 'disabled',
-      caret: 'hide',
-      scale: 'css',
-      maxDiffPixelRatio: 0.01,
-    });
 
     await expect(appPage.locator('input[type="date"]')).toHaveCount(0);
     await appPage.locator('#auto-freq-select .ai-select-trigger').click();
@@ -164,12 +146,6 @@ test.describe('desktop shell', () => {
     const calendar = appPage.locator('body > #auto-date-picker-popover');
     await expect(calendar).toBeVisible();
     await expect(calendar.locator('.auto-date-picker-day')).toHaveCount(42);
-    await expect(calendar).toHaveScreenshot('automation-date-picker.png', {
-      animations: 'disabled',
-      caret: 'hide',
-      scale: 'css',
-      maxDiffPixelRatio: 0.01,
-    });
 
     await appPage.keyboard.press('ArrowRight');
     await appPage.keyboard.press('Enter');

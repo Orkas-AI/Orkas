@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { Compile } from 'typebox/compile';
 import { drainMainRuntimeForTest } from '../../../helpers/drain-main-runtime';
 
 vi.mock('../../../../src/main/logger', () => ({
@@ -668,20 +669,64 @@ describe('chat-history-tools › shape', () => {
   it('exposes one chat_history tool with search and read actions', async () => {
     const [, , chatHistory] = await createChatHistoryActions({ userId: TEST_UID });
     const schema = chatHistory.inputSchema as any;
-    const branches = Object.fromEntries(schema.oneOf.map((branch: any) => [
-      branch.properties.action.enum[0], branch,
-    ]));
     expect(chatHistory.name).toBe('chat_history');
     expect(schema.properties.action.enum).toEqual(['search', 'read']);
     expect(schema.properties.scope.enum).toEqual(['current', 'all']);
     expect(chatHistory.inputSchema.required).toEqual(['action']);
-    expect(chatHistory.inputSchema.additionalProperties).toBe(false);
     expect(JSON.stringify(chatHistory.inputSchema)).not.toMatch(/project/i);
     expect(schema.oneOf).toHaveLength(2);
-    expect(Object.keys(branches.search.properties)).toEqual(['action']);
-    expect(Object.keys(branches.read.properties)).toEqual(['action']);
-    expect(branches.search.required).toEqual(['action', 'query']);
-    expect(branches.read.required).toEqual(['action']);
+  });
+
+  it.each([false, true])('keeps action-specific schema validation aligned with execution (currentOnly=%s)', async (currentOnly) => {
+    writeConversation('current', 'Current task', [
+      { id: 'prior', from: 'user', text: 'contractword previous decision' },
+      { id: 'trigger', from: 'user', text: 'Find the earlier decision' },
+    ]);
+    writeConversation('sibling', 'Earlier task', [
+      { id: 'earlier', from: 'commander', text: 'contractword sibling decision' },
+    ]);
+    const [, , tool] = await createChatHistoryActions({
+      userId: TEST_UID,
+      currentCid: 'current',
+      currentMessageId: 'trigger',
+      allowedScopes: currentOnly ? ['current'] : ['current', 'all'],
+    });
+    const { buildPiContextForTest } = await import('../../../../src/core-agent/src/providers/pi-provider');
+    const { toToolDefinition } = await import('../../../../src/core-agent/src/tools');
+    const providerContext = buildPiContextForTest([], undefined, [toToolDefinition(tool)]);
+    const schema = Compile(JSON.parse(JSON.stringify(providerContext.tools![0].parameters)));
+    const scope = currentOnly ? 'current' : 'all';
+    const search = { action: 'search', scope, query: 'contractword', k: 2 };
+    const read = {
+      action: 'read', scope,
+      ...(currentOnly ? {} : { cid: 'sibling' }),
+      page: { mode: 'latest', count: 1 },
+    };
+    for (const valid of [search, read]) {
+      expect(schema.Check(valid), JSON.stringify(valid)).toBe(true);
+      const result = await tool.execute(valid, ctxFor());
+      expect(result.isError).toBeFalsy();
+      expect(result.content).toContain('contractword');
+    }
+    // These are valid field types but belong to a different action. The
+    // sampled search+cid failure must be excluded by the advertised schema.
+    for (const invalid of [
+      { ...search, cid: 'sibling' },
+      { ...read, query: 'contractword' },
+      { ...read, k: 2 },
+      { ...read, include_current: true },
+      { ...search, unknown_field: true },
+    ]) {
+      expect(schema.Check(invalid), JSON.stringify(invalid)).toBe(false);
+      const result = await tool.execute(invalid, ctxFor());
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain('unsupported field(s)');
+    }
+    expect(schema.Check({ action: 'search', scope })).toBe(false);
+    expect(schema.Check({ ...search, action: 'invalid' })).toBe(false);
+    // Legacy search+page is still tolerated at execution, but must not be
+    // advertised to models generating new calls.
+    expect(schema.Check({ ...search, page: read.page })).toBe(false);
   });
 
   it('keeps action guidance on the tool and paging semantics on their fields', async () => {

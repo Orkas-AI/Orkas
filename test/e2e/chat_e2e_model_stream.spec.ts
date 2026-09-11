@@ -128,6 +128,117 @@ test.describe('real chat pipeline with a local model', () => {
     expect(modelOrkas.modelRequests).toHaveLength(1);
   });
 
+  test('displays Chat Completions commentary between real tools before completion and after relaunch', async ({ modelOrkas }, testInfo) => {
+    const config = '{"limit":100}\n';
+    const orders = '[{"amount":60},{"amount":70}]\n';
+    const configPath = modelOrkas.createWorkspaceFile('commentary/config.json', config);
+    const ordersPath = modelOrkas.createWorkspaceFile('commentary/orders.json', orders);
+    const first = '我先读取**限额配置**。\n\n确认后核对订单。';
+    const second = '限额已确认。\n\n继续核对**订单数据**。';
+    const final = '订单总额为 130，超过限额 100，超出 30。';
+    await modelOrkas.setChatCommentaryScenario({
+      reads: [{ path: configPath, commentary: first }, { path: ordersPath, commentary: second }],
+      finalText: final,
+    });
+    let page = await sendNewChat(modelOrkas, '读取 commentary 目录中的配置和订单数据，核对订单总额是否超过配置中的限额。');
+    const prose = () => page.locator('#chat-history .stream-process-commentary');
+    const tool = (index: number) => page.locator(
+      `#chat-history .stream-process-line[data-process-call-id="tool:call-e2e-commentary-${index}"]`,
+    );
+    const openOperations = async () => {
+      for (const group of await page.locator('#chat-history .stream-process-compact-group').all()) {
+        if (!await group.evaluate((element: HTMLDetailsElement) => element.open)) {
+          await group.locator('.stream-process-compact-summary').click();
+        }
+      }
+    };
+    const assertProse = async (count: number) => {
+      await expect(prose()).toHaveCount(count);
+      await expect(prose().nth(0)).toBeVisible();
+      await expect(prose().nth(0).locator('p')).toHaveText(['我先读取限额配置。', '确认后核对订单。']);
+      await expect(prose().nth(0).locator('strong')).toHaveText('限额配置');
+      if (count === 2) {
+        await expect(prose().nth(1)).toBeVisible();
+        await expect(prose().nth(1).locator('p')).toHaveText(['限额已确认。', '继续核对订单数据。']);
+        await expect(prose().nth(1).locator('strong')).toHaveText('订单数据');
+      }
+    };
+    const assertOrder = async () => {
+      const rows = page.locator('#chat-history .stream-process-commentary, #chat-history .stream-process-line[data-process-call-id^="tool:call-e2e-commentary-"]');
+      await expect(rows).toHaveCount(4);
+      expect(await rows.evaluateAll((elements) => elements.map((el) => (
+        el.classList.contains('stream-process-commentary') ? 'text' : el.getAttribute('data-process-call-id')
+      )))).toEqual(['text', 'tool:call-e2e-commentary-1', 'text', 'tool:call-e2e-commentary-2']);
+    };
+
+    await expect.poll(() => modelOrkas.commentaryStage).toBe(1);
+    await assertProse(1);
+    await expect(tool(1)).toHaveCount(1);
+    await openOperations();
+    await expect(tool(1)).toBeVisible();
+    await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
+    await expect(page.locator('#chat-history [data-role="final"]:visible')).toHaveCount(0);
+    modelOrkas.releaseCommentaryStage();
+
+    await expect.poll(() => modelOrkas.commentaryStage).toBe(2);
+    await assertProse(2);
+    await expect(tool(2)).toHaveCount(1);
+    await openOperations();
+    await expect(tool(1)).toContainText('Done');
+    await expect(tool(2)).toBeVisible();
+    await assertOrder();
+    await expect(page.locator('#chat-history [data-role="final"]:visible')).toHaveCount(0);
+    await testInfo.attach('commentary-before-completion', {
+      body: await page.screenshot({ path: testInfo.outputPath('commentary-before-completion.png') }),
+      contentType: 'image/png',
+    });
+    modelOrkas.releaseCommentaryStage();
+
+    await expect.poll(() => modelOrkas.commentaryStage).toBe(3);
+    await expect(tool(2)).toContainText('Done');
+    await assertProse(2);
+    await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
+    const requests = modelOrkas.modelRequests;
+    expect(requests).toHaveLength(3);
+    expect(requests.every((request) => request.model === 'e2e-chat-commentary' && request.stream === true)).toBe(true);
+    expect(modelOrkas.apiRequests.filter((request) => request.path.endsWith('/responses'))).toHaveLength(0);
+    expect(modelOrkas.apiRequests.filter((request) => request.path.endsWith('/chat/completions'))).toHaveLength(3);
+    // Observe actual tool results on the following requests; a scripted tool
+    // name alone would not prove the files were read by the production tool.
+    for (const [index, expected] of [[1, '"limit":100'], [2, '"amount":70']] as const) {
+      const messages = requests[index].messages as Array<{ role: string; content: unknown }>;
+      expect(messages.filter((message) => message.role === 'tool').some((message) => String(message.content).includes(expected))).toBe(true);
+    }
+    modelOrkas.releaseCommentaryStage();
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+    await expect(page.locator('#chat-history [data-role="final"]')).toHaveText(final);
+    expect(readFileSync(configPath, 'utf8')).toBe(config);
+    expect(readFileSync(ordersPath, 'utf8')).toBe(orders);
+    const cid = await page.locator('#conversation-list .conv-item.active').getAttribute('data-cid');
+    expect(cid).toBeTruthy();
+
+    page = await modelOrkas.relaunch();
+    await page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
+    const process = page.locator('#chat-history .chat-message.assistant .stream-process');
+    await expect(process).toBeVisible();
+    if (!await process.evaluate((element: HTMLDetailsElement) => element.open)) {
+      await process.locator('.stream-process-summary').click();
+    }
+    await assertProse(2);
+    await assertOrder();
+    await openOperations();
+    await expect(tool(1)).toBeVisible();
+    await expect(tool(2)).toBeVisible();
+    const restoredAnswer = page.locator('#chat-history .chat-message.assistant .markdown-body').filter({ hasText: final });
+    await expect(restoredAnswer).toHaveText(final);
+    expect(await restoredAnswer.evaluate((element) => element.closest('.stream-process') === null)).toBe(true);
+    await testInfo.attach('commentary-after-relaunch', {
+      body: await page.screenshot({ path: testInfo.outputPath('commentary-after-relaunch.png') }),
+      contentType: 'image/png',
+    });
+    expect(modelOrkas.modelRequests).toHaveLength(3);
+  });
+
   test('shows a started tool action before delayed arguments and replaces only that lifecycle row', async ({ modelOrkas }) => {
     const outputPath = path.join(modelOrkas.userWorkspaceRoot, 'delayed-process.html');
     expect(existsSync(outputPath)).toBe(false);

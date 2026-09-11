@@ -76,6 +76,7 @@ function normalizeField(field: CatalogConnectionField, raw: unknown): string {
     if (value.length < 8) throw new Error(`invalid connector secret: ${field.key}`);
     return value;
   }
+  if (field.format === 'ebay_signing_private_key' || field.format === 'ebay_signing_key_jwe') return value;
   if (['bigcommerce_store_hash', 'shopline_store_domain', 'shoplazza_store_domain'].includes(field.format)) {
     const storefrontApi = require(path.join(pcDirForChild(), 'bin/storefront-admin-api.cjs'));
     return storefrontApi.normalizeBinding(field.format.split('_')[0], value);
@@ -271,10 +272,14 @@ export function normalizeLocalApiConnectionInput(entry: CatalogEntry, raw: unkno
   const metadata: Record<string, string> = {};
   const credentials: Record<string, string> = {};
   for (const field of fields) {
+    if (!field.required && (raw[field.key] === undefined || raw[field.key] === '')) continue;
     const value = normalizeField(field, raw[field.key]);
     (field.storage === 'credential' ? credentials : metadata)[field.key] = value;
   }
   if (PRODUCTION_ONLY_LOCAL_API_PROVIDERS.has(entry.local_api!.provider)) metadata.environment = 'live';
+  if (entry.local_api?.provider === 'ebay') {
+    require(path.join(pcDirForChild(), 'bin/ebay-signature.cjs')).signingKey(credentials);
+  }
   if (entry.local_api?.provider === 'ebay'
       && !EBAY_MARKETPLACE_LOCALES[metadata.marketplace_id]?.includes(metadata.content_language)) {
     throw new Error('eBay listing language is not supported by the selected marketplace');

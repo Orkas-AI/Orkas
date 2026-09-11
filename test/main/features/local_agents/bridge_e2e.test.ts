@@ -30,6 +30,13 @@ vi.mock('../../../../src/main/features/connectors', async (importOriginal) => {
   };
 });
 
+const browserHost = vi.hoisted(() => ({
+  openModelWebAssist: vi.fn(async () => ({ ok: true, active_tab_id: '0123456789ab' })),
+  observeModelWebAssist: vi.fn(async () => ({ ok: true, page_id: 'page-1', untrusted_content: true, text: 'Settings' })),
+  actOnModelWebAssist: vi.fn(async () => ({ ok: true })),
+}));
+vi.mock('../../../../src/main/features/web_assist', () => browserHost);
+
 // End-to-end: a real `bin/orkas-bridge.cjs` process (the MCP server a CLI
 // agent spawns) speaking MCP JSON-RPC over stdio, proxying to a live
 // bridge host. Pins the riskiest seam: SDK absolute-path requires + zod
@@ -57,7 +64,11 @@ beforeEach(async () => {
   users.activateUser(TEST_UID);
 });
 
-afterEach(() => {
+afterEach(async () => {
+  const corpus = await import('../../../../src/main/features/library_corpus');
+  const stores = await import('../../../../src/main/features/vec_store');
+  corpus._resetLibraryCorporaForTests();
+  stores.closeAllVecStores();
   vi.doUnmock('../../../../src/main/features/project_library_indexer');
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   if (prevHome === undefined) delete process.env.HOME;
@@ -311,6 +322,63 @@ function bridgeDescriptionBudgetProblems(tools: any[]): string[] {
 }
 
 describe('orkas-bridge.cjs › MCP stdio e2e', () => {
+  it.each(['claude', 'codex', 'opencode'] as const)('lets %s use the task browser over MCP with the native contract and recovery receipts', async (cli) => {
+    const life = await import('../../../../src/main/features/web_assist_lifecycle');
+    const label = `browser-${cli}`;
+    const cid = `c-${label}`;
+    life.beginBrowserTaskRun(TEST_UID, cid, label);
+    browserHost.openModelWebAssist.mockClear();
+    browserHost.observeModelWebAssist.mockClear();
+    browserHost.actOnModelWebAssist.mockClear();
+    const bridge = await startLifecycleBridge(label, undefined, cli);
+    const client = new McpStdioClient(bridge.serverEnv);
+    try {
+      await client.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'vitest', version: '0' } });
+      client.notify('notifications/initialized');
+      const listed = await client.request(2, 'tools/list', {});
+      const definition = listed.result.tools.find((tool: any) => tool.name === 'browser');
+      expect(definition).toBeTruthy();
+      const { buildConversationBrowserTool } = await import('../../../../src/main/features/group_chat/browser_tool');
+      const native = buildConversationBrowserTool(TEST_UID, cid);
+      expect(definition.description).toBe(native.description);
+      expect(definition.inputSchema.properties).toEqual(native.inputSchema.properties);
+      expect(definition.inputSchema.additionalProperties).toBe(false);
+      expect(bridgeDescriptionBudgetProblems([definition])).toEqual([]);
+      if (cli === 'opencode') expect(listed.result.tools.map((tool: any) => tool.name)).toEqual(['browser']);
+      let id = 3;
+      const call = async (args: Record<string, unknown>) => (await client.request(id++, 'tools/call', { name: 'browser', arguments: args })).result;
+      const opened = await call({ operation: 'open', url: 'https://example.com/settings' });
+      expect(JSON.parse(opened.content[0].text)).toEqual({ ok: true, active_tab_id: '0123456789ab' });
+      expect(browserHost.openModelWebAssist).toHaveBeenCalledWith(TEST_UID, cid, { url: 'https://example.com/settings' });
+      const observed = await call({ operation: 'observe', tab_id: '0123456789ab' });
+      expect(JSON.parse(observed.content[0].text)).toMatchObject({ page_id: 'page-1', untrusted_content: true });
+      // The host owns safety and stale-page decisions; MCP must preserve both
+      // the error status and the actionable receipt instead of hiding its code.
+      for (const code of ['stale_page', 'user_action_required', 'unknown_tab']) {
+        browserHost.actOnModelWebAssist.mockResolvedValueOnce({ ok: false, code, error: 'Observe the task page or complete the protected action yourself.' } as any);
+        const result = await call({ operation: 'act', tab_id: '0123456789ab', page_id: 'page-1', element_ref: 'e1', page_action: 'click' });
+        expect(result.isError).toBe(true);
+        expect(JSON.parse(result.content[0].text)).toMatchObject({ ok: false, code });
+      }
+      const forged = await call({ operation: 'open', url: 'https://example.com/forged', cid: 'other-task' });
+      expect(forged.isError).toBe(true);
+      expect(browserHost.openModelWebAssist).toHaveBeenCalledTimes(1);
+      life.finishBrowserTaskRun(TEST_UID, cid, label);
+      life.beginBrowserTaskRun(TEST_UID, cid, `${label}-replacement`);
+      const stale = await call({ operation: 'open', url: 'https://example.com/stale' });
+      expect(stale.isError).toBe(true);
+      expect(JSON.parse(stale.content[0].text).code).toBe('task_run_ended');
+      expect(browserHost.openModelWebAssist).toHaveBeenCalledTimes(1);
+    } finally {
+      client.kill();
+      await client.waitForExit();
+      client.assertCleanOutput();
+      await bridge.close();
+      life.finishBrowserTaskRun(TEST_UID, cid, `${label}-replacement`);
+      life.finishBrowserTaskRun(TEST_UID, cid, label);
+    }
+  });
+
   it('lets the OpenCode backend read tasks through its runtime MCP config without adding them to the prompt', async () => {
     const projects = await import('../../../../src/main/features/projects');
     const tasks = await import('../../../../src/main/features/project_tasks');
@@ -395,11 +463,27 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         expect(bridgeDescriptionBudgetProblems([tool])).toEqual([]);
         expect(tool.inputSchema.properties).not.toHaveProperty('project');
         expect(tool.inputSchema.properties.status.enum).toEqual(['todo', 'progress', 'review', 'done']);
+        const { createProjectTasksTool } = await import('../../../../src/core-agent/src/tools/project-tasks-tool');
+        const { createProjectTasksHandler } = await import('../../../../src/main/features/project_tasks_tool_handler');
+        const native = createProjectTasksTool(createProjectTasksHandler(TEST_UID, pid, 'c-tasks-true', new Map()));
+        for (const field of ['offset', 'limit', 'status', 'task_id']) {
+          expect(tool.inputSchema.properties[field]).toEqual((native.inputSchema as any).properties[field]);
+        }
         const autoTasks = await import('../../../../src/main/features/auto_tasks');
         const automation = await client.request(20, 'tools/call', { name: 'auto_tasks', arguments: { action: 'create', content: 'Daily report', schedule: { type: 'daily', hour: 9, minute: 0 }, enabled: false } });
         expect(automation.result.isError).toBeFalsy();
         const automationId = JSON.parse(automation.result.content[0].text).taskId;
         expect(await autoTasks.getTask(TEST_UID, automationId)).toMatchObject({ project_id: pid, enabled: false });
+        const { createAutoTasksTool } = await import('../../../../src/main/features/auto_tasks_tool');
+        const nativeAuto = createAutoTasksTool({ userId: TEST_UID, projectId: pid });
+        const queryAuto = { action: 'list', enabled: false, offset: 0, limit: 1 };
+        const autoPage = await client.request(90, 'tools/call', { name: 'auto_tasks', arguments: queryAuto });
+        const nativeAutoPage = JSON.parse((await nativeAuto.execute(queryAuto, { state: {} })).content);
+        expect(JSON.parse(autoPage.result.content[0].text)).toEqual(nativeAutoPage);
+        expect(nativeAutoPage).toMatchObject({ total: 1, next_offset: null });
+        expect(nativeAutoPage.tasks[0]).not.toHaveProperty('content');
+        const autoDetail = await client.request(91, 'tools/call', { name: 'auto_tasks', arguments: { action: 'get', task_id: automationId } });
+        expect(JSON.parse(autoDetail.result.content[0].text).task.content).toBe('Daily report');
         const enabled = await client.request(21, 'tools/call', { name: 'auto_tasks', arguments: { action: 'enable', task_id: automationId } });
         expect(enabled.result.isError).toBeFalsy();
         expect((await autoTasks.getTask(TEST_UID, automationId))?.enabled).toBe(true);
@@ -411,6 +495,8 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         const forbidden = await client.request(24, 'tools/call', { name: 'auto_tasks', arguments: { action: 'enable', task_id: global.task.id } });
         expect(forbidden.result?.isError || forbidden.error).toBeTruthy();
         expect((await autoTasks.getTask(TEST_UID, global.task.id))?.enabled).toBe(false);
+        const foreignDetail = await client.request(92, 'tools/call', { name: 'auto_tasks', arguments: { action: 'get', task_id: global.task.id } });
+        expect(foreignDetail.result?.isError || foreignDetail.error).toBeTruthy();
         const override = await client.request(25, 'tools/call', { name: 'auto_tasks', arguments: { action: 'update', task_id: automationId, project_id: null } });
         expect(override.result?.isError || override.error).toBeTruthy();
         const disabled = await client.request(26, 'tools/call', { name: 'auto_tasks', arguments: { action: 'disable', task_id: automationId } });
@@ -449,11 +535,16 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         const complete = await client.request(7, 'tools/call', { name: 'todo_tasks', arguments: { action: 'complete', task_id: task.id, result_ref: 'verified-1' } });
         expect(complete.result.isError).toBeFalsy();
         expect(await tasks.getTask(TEST_UID, pid, task.id)).toMatchObject({ status: 'done', result_ref: 'verified-1', origin_cid: 'c-tasks-true' });
-        const { createProjectTasksHandler } = await import('../../../../src/main/features/project_tasks_tool_handler');
         const reopened = await createProjectTasksHandler(TEST_UID, pid, 'new-native-chat', new Map()).update(task.id, { status: 'todo' });
         expect(reopened.task).toMatchObject({ status: 'todo', origin_cid: 'c-tasks-true', result_ref: 'verified-1' });
         const reread = await client.request(28, 'tools/call', { name: 'todo_tasks', arguments: { action: 'list' } });
         expect(JSON.parse(reread.result.content[0].text).tasks).toContainEqual(expect.objectContaining({ id: task.id, status: 'todo' }));
+        const queryTodo = { action: 'list', offset: 0, limit: 50, status: 'todo' };
+        const page = await client.request(93, 'tools/call', { name: 'todo_tasks', arguments: queryTodo });
+        expect(JSON.parse(page.result.content[0].text)).toEqual(JSON.parse((await native.execute(queryTodo, { state: {} })).content));
+        expect(JSON.parse(page.result.content[0].text).tasks[0]).not.toHaveProperty('detail');
+        const detail = await client.request(94, 'tools/call', { name: 'todo_tasks', arguments: { action: 'get', task_id: task.id } });
+        expect(JSON.parse(detail.result.content[0].text).task).toMatchObject({ detail: 'Retained requirement', result_ref: 'verified-1' });
       } finally {
         client.kill();
         await client.waitForExit();
@@ -515,6 +606,7 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         'orkas_kb_list', 'orkas_kb_search', 'orkas_kb_read',
         'chat_search', 'chat_read',
       ]));
+      expect(names).not.toContain('browser');
       expect(names).not.toContain('orkas_list_connector_tools');
       expect(names).not.toContain('orkas_call_connector_tool');
       expect(bridgeDescriptionBudgetProblems(tools.result.tools)).toEqual([]);

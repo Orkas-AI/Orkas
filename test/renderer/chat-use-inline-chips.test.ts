@@ -17,13 +17,16 @@ const composerHelpers = [
   return conversationSource.slice(from, to);
 }).join('\n');
 
-function loadChatUseHelpers() {
+function loadChatUseHelpers(projectId = '', boundIds: string[] = []) {
   const start = skillsSource.indexOf('// ─── Chat-input inline use chips');
   const end = skillsSource.indexOf('// Chat composers are part of the startup shell', start);
   if (start < 0 || end < 0) throw new Error('missing chat use helper block');
   const block = skillsSource.slice(start, end);
   return vm.runInNewContext(`
-    const currentCid = '';
+    const currentCid = 'current';
+    const conversations = [{ conversation_id: 'current', project_id: ${JSON.stringify(projectId)} }];
+    const _projectDetailPid = ${JSON.stringify(projectId)};
+    const _composerAgentScopes = new Map(['conversation', 'project'].map((target) => [target, { pid: ${JSON.stringify(projectId)}, ids: new Set(${JSON.stringify(boundIds)}) }]));
     const _COMMANDER = { kind: 'commander', id: '', name: '' };
     const _agentsCache = [
       { agent_id: 'cli', name: 'Orkas Codex' },
@@ -77,6 +80,20 @@ function loadChatUseHelpers() {
 }
 
 describe('chat use inline chips', () => {
+  it.each(['chat-input', 'project-chat-input'])('only chips project-bound names in typed or pasted text: %s', (inputId) => {
+    const h = loadChatUseHelpers('project-a', ['writer']);
+    const text = '@写作助手 draft A; @Orkas Codex inspect B; @Disabled do C';
+    expect(h.composerTokens(text, inputId).map((token: any) => token.selection.id)).toEqual(['writer']);
+    expect(h.composerTokens(text, 'new-chat-input').map((token: any) => token.selection.id)).toEqual(['writer', 'cli']);
+    expect(h.transform(text)).toBe(text);
+  });
+
+  it('keeps all non-reserved @names as text in a project with no Agent bindings', () => {
+    const h = loadChatUseHelpers('empty-project');
+    expect(h.composerTokens('@Orkas Codex inspect; @Commander help', 'chat-input')
+      .map((token: any) => token.selection.kind)).toEqual(['commander']);
+  });
+
   it('serializes multiple skill and connector tokens into localized plain text', () => {
     const h = loadChatUseHelpers();
     const text = [

@@ -696,7 +696,7 @@ describe('connector catalog', () => {
         transport_template: null,
         usage_metering: {
           provider: 'composio',
-          credits_milli_per_call: id === 'gmail' ? 250 : 420,
+          credits_milli_per_call: 420,
         },
       });
     }

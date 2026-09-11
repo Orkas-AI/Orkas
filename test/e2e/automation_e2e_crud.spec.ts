@@ -119,9 +119,23 @@ test.describe('automation', () => {
     await expect(group10.locator('.auto-group-list')).toBeHidden();
     await expect(row2.locator('.auto-row-convs')).toBeVisible();
 
-    // The page-level create action assigns the selected project to its group.
+    // A collapsed group's create entry preselects its project without expanding it.
+    await group10.locator('.auto-group-add').click();
+    await expect(page.locator('#auto-task-dialog-overlay')).toBeVisible();
+    await expect(page.locator('#auto-row-project')).toBeVisible();
+    await expect(page.locator('#auto-project-select')).toHaveAttribute('data-value', project10.project.project_id);
+    await expect(group10.locator('.auto-group-list')).toBeHidden();
+    await page.locator('#auto-dialog-cancel-btn').click();
+    await expect(page.locator('#auto-task-dialog-overlay')).toBeHidden();
+
+    // Page-level creation must not inherit the previously selected group.
     await page.locator('#auto-add-btn').click();
-    await selectAiOption(page, '#auto-project-select', 'Automation 2');
+    await expect(page.locator('#auto-project-select')).toHaveAttribute('data-value', '');
+    await page.locator('#auto-dialog-cancel-btn').click();
+
+    // Group creation persists the preselected project without another selection.
+    await group2.locator('.auto-group-add').click();
+    await expect(page.locator('#auto-project-select')).toHaveAttribute('data-value', project2.project.project_id);
     await page.locator('#auto-task-input').fill('Prepare a project follow-up');
     await page.locator('#auto-title-input').fill('Project follow-up');
     await page.locator('#auto-enabled-input').uncheck();
@@ -134,6 +148,9 @@ test.describe('automation', () => {
     });
     await expect(group10.locator('.auto-group-list')).toBeHidden();
     await expect(row2.locator('.auto-row-convs')).toBeVisible();
+    await globalGroup.locator('.auto-group-add').click();
+    await expect(page.locator('#auto-project-select')).toHaveAttribute('data-value', '');
+    await page.locator('#auto-dialog-cancel-btn').click();
     await page.evaluate(async () => (window as any).setLang('zh'));
     await expect(groupNames).toHaveText(['全局', 'Automation 1', 'Automation 2']);
     await expect(group10.locator('.auto-group-list')).toBeHidden();

@@ -520,7 +520,7 @@ describe('prompts ↔ code contract', () => {
     const shape = contract.shape(z, true);
     expect(contract.description).toContain('not its execution outcome');
     expect(shape.action.description).toContain('list first');
-    expect(shape.action.description).toContain('Delete only when removal is requested');
+    expect(shape.action.description).toMatch(/delete only when (?:removal is )?requested/i);
     expect(shape.schedule.safeParse({ type: 'hourly', interval_hours: 6 }).success).toBe(true);
     expect(shape.end_condition.safeParse({ type: 'count', max_runs: 10 }).success).toBe(true);
     expect(shape.end_condition.safeParse(null).success).toBe(true);

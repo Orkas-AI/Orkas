@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import * as userInput from '../../../../src/main/features/local_agents/cli_user_input';
-import { permissionResponseTimeoutMs } from '../../../../src/main/features/local_agents/cli_permissions';
 import { notifyUserSwitch } from '../../../../src/main/features/user-switch-hooks';
 
 afterEach(() => {
@@ -41,22 +40,24 @@ describe('local_agents/cli_user_input', () => {
     });
   });
 
-  it('settles an unanswered blocking request at the host deadline and makes the late renderer reply stale', async () => {
-    // Same contract as permission prompts: the host bounds the wait, so a user
-    // who stepped away does not hold the task and its CLI slot for the 2 h wall
-    // cap, and a reply that arrives after the deadline is stale.
+  it.each(['codex', 'claude'])('keeps an unanswered %s request open without a CLI deadline, then closes only the CLI-cancelled request', async cli => {
     vi.useFakeTimers();
     const deliveries: Array<{ channel: string; payload: any }> = [];
     userInput._setBroadcastForTest((channel, payload) => { deliveries.push({ channel, payload }); });
-    const pending = request({ request: {
+    const controller = new AbortController();
+    const pending = request({ cli, request: {
       id: 'native-request-deadline', isBlocking: true,
+      signal: controller.signal,
       questions: [{ id: 'environment', question: 'Choose target', options: [{ label: 'staging' }] }],
     } });
     const requestId = deliveries[0].payload.request_id as string;
 
-    vi.advanceTimersByTime(permissionResponseTimeoutMs() - 1);
+    let settled = false;
+    void pending.then(() => { settled = true; });
+    await vi.advanceTimersByTimeAsync(20 * 60_000);
+    expect(settled).toBe(false);
     expect(deliveries.some((entry) => entry.channel === 'local-agent:user-input_cancelled')).toBe(false);
-    vi.advanceTimersByTime(1);
+    controller.abort();
 
     await expect(pending).resolves.toEqual({ cancelled: true, answers: { environment: [] } });
     expect(deliveries).toContainEqual({
@@ -148,7 +149,7 @@ describe('local_agents/cli_user_input', () => {
     await expect(survivor).resolves.toMatchObject({ cancelled: false });
   });
 
-  it('honors the protocol auto-resolution deadline without leaving a native request pending', async () => {
+  it.each([0, 25, 20 * 60_000])('honors the CLI auto-resolution interval of %s ms without imposing a host cap', async autoResolutionMs => {
     vi.useFakeTimers();
     const deliveries: Array<{ channel: string; payload: any }> = [];
     userInput._setBroadcastForTest((channel, payload) => {
@@ -157,14 +158,29 @@ describe('local_agents/cli_user_input', () => {
     const pending = request({
       request: {
         id: 'native-auto',
-        autoResolutionMs: 25,
+        autoResolutionMs,
         questions: [{ id: 'environment', question: 'Choose target' }],
       },
     });
 
-    await vi.advanceTimersByTimeAsync(25);
+    if (autoResolutionMs > 0) {
+      await vi.advanceTimersByTimeAsync(autoResolutionMs - 1);
+      expect(deliveries.at(-1)).toMatchObject({ channel: 'local-agent:user-input' });
+    }
+    await vi.advanceTimersByTimeAsync(autoResolutionMs > 0 ? 1 : 0);
     await expect(pending).resolves.toEqual({ cancelled: true, answers: { environment: [] } });
     expect(deliveries.at(-1)).toMatchObject({ channel: 'local-agent:user-input_cancelled' });
+    expect(userInput.respond(deliveries[0].payload.request_id, 'u1', { environment: ['staging'] })).toEqual({ handled: false });
+  });
+
+  it('does not reopen a request already cancelled by the CLI before the host can show it', async () => {
+    const broadcast = vi.fn();
+    userInput._setBroadcastForTest(broadcast);
+    const controller = new AbortController();
+    controller.abort();
+    await expect(request({ request: { signal: controller.signal, questions: [{ id: 'environment', question: 'Choose target' }] } }))
+      .resolves.toEqual({ cancelled: true, answers: { environment: [] } });
+    expect(broadcast).not.toHaveBeenCalled();
   });
 
   it('cancels requests owned by the previous account on user switch', async () => {

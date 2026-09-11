@@ -4041,6 +4041,10 @@ async function _refreshAgentPickerProjectContext(anchorId) {
       const res = await window.orkas.invoke('projects.bindings.list', { projectId: _pickerProjectId });
       if (refreshSeq === _pickerProjectContextSeq && res?.ok) {
         _pickerBoundAgentIds = new Set((res.bindings && res.bindings.agents) || []);
+        const target = _targetFromPickerAnchor(anchorId);
+        if (target !== 'auto' && typeof validateRecipientAgainstProject === 'function') {
+          await validateRecipientAgainstProject(target, _pickerProjectId, [..._pickerBoundAgentIds]);
+        }
       }
     } catch (_) { /* keep Library project scope; backend/file-tree handles stale ids */ }
     finally {

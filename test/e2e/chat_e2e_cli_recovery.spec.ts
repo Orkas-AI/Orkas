@@ -267,11 +267,12 @@ test.describe('CLI Agent runtime settings', () => {
       .toHaveAttribute('data-value', '');
     await expect(page.locator('#agents-detail-cli-settings [data-role="thinking"]'))
       .toHaveAttribute('data-value', '');
-    const afterModelSwitch = await cliOrkas.invoke<{ agent: { runtime: Record<string, unknown> } }>(
+    // The selector updates optimistically; its data-value does not acknowledge
+    // the asynchronous agents.update persistence boundary.
+    const persistedRuntime = async () => (await cliOrkas.invoke<{ agent: { runtime: Record<string, unknown> } }>(
       'agents.get', { agent_id: agentId },
-    );
-    expect(afterModelSwitch.agent.runtime).toEqual({ kind: 'cli', cli: 'codex' });
-    expect(afterModelSwitch.agent.runtime).not.toHaveProperty('thinking_level');
+    )).agent.runtime;
+    await expect.poll(persistedRuntime).toEqual({ kind: 'cli', cli: 'codex' });
 
     await selectAiOption(page, '#agents-detail-cli-settings [data-role="model"]', 'gpt-e2e-deep');
     await expect(page.locator('#agents-detail-cli-settings [data-role="model"]'))
@@ -280,6 +281,9 @@ test.describe('CLI Agent runtime settings', () => {
     await expect(page.locator('#agents-detail-cli-settings [data-role="thinking"]'))
       .toHaveAttribute('data-value', 'low');
 
+    await expect.poll(persistedRuntime).toEqual({
+      kind: 'cli', cli: 'codex', model_override: 'gpt-e2e-deep', thinking_level: 'low',
+    });
     const relaunchedPage = await cliOrkas.relaunch();
     await relaunchedPage.locator('#agents-btn').click();
     await relaunchedPage.locator(`.agent-card[data-id="${agentId}"]`).click();
@@ -321,19 +325,14 @@ test.describe('CLI Agent runtime settings', () => {
     await selectAiOption(relaunchedPage, '#agents-detail-cli-settings [data-role="thinking"]', '');
     await expect(relaunchedPage.locator('#agents-detail-cli-settings [data-role="thinking"]'))
       .toHaveAttribute('data-value', '');
-    const afterThinkingReset = await cliOrkas.invoke<{ agent: { runtime: Record<string, unknown> } }>(
-      'agents.get', { agent_id: agentId },
-    );
-    expect(afterThinkingReset.agent.runtime).toMatchObject({ model_override: 'gpt-e2e-deep' });
-    expect(afterThinkingReset.agent.runtime).not.toHaveProperty('thinking_level');
+    await expect.poll(persistedRuntime).toEqual({
+      kind: 'cli', cli: 'codex', model_override: 'gpt-e2e-deep',
+    });
 
     await selectAiOption(relaunchedPage, '#agents-detail-cli-settings [data-role="model"]', '');
     await expect(relaunchedPage.locator('#agents-detail-cli-settings [data-role="model"]'))
       .toHaveAttribute('data-value', '');
-    const afterDefaultReset = await cliOrkas.invoke<{ agent: { runtime: Record<string, unknown> } }>(
-      'agents.get', { agent_id: agentId },
-    );
-    expect(afterDefaultReset.agent.runtime).toEqual({ kind: 'cli', cli: 'codex' });
+    await expect.poll(persistedRuntime).toEqual({ kind: 'cli', cli: 'codex' });
 
     await relaunchedPage.locator('#agent-use-btn').click();
     await sendNewChat(relaunchedPage, 'E2E_CODEX_AVATAR_AFTER_RUNTIME_SETTINGS');

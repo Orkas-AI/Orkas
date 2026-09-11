@@ -608,6 +608,58 @@ describe('direct commerce stdio adapter', () => {
       .toThrow('Walmart dynamic sandbox is available only for the US market');
   });
 
+  it.each(['ed25519', 'rsa'])('signs only eBay refunds with the encrypted %s key and exact UTF-8 request body', async (kind) => {
+    const pair = kind === 'rsa'
+      ? crypto.generateKeyPairSync('rsa', { modulusLength: 2048 })
+      : crypto.generateKeyPairSync('ed25519');
+    const privateKey = pair.privateKey.export({ format: 'der', type: 'pkcs8' }).toString('base64');
+    const jwe = 'header.encrypted.iv.ciphertext.tag';
+    const env = envFor('ebay', {
+      access_token: 'fixture-access', expires_at: Date.now() + 3_600_000,
+      signing_private_key: privateKey, signing_key_jwe: jwe,
+      identity: { environment: 'live', marketplace_id: 'EBAY_US', content_language: 'en-US' },
+    }, { environment: 'live', marketplace_id: 'EBAY_US', content_language: 'en-US' });
+    const fetchMock = vi.fn(async () => response(200, { refundId: 'refund-1' }));
+    vi.stubGlobal('fetch', fetchMock);
+    const body = { reasonForRefund: 'OTHER', comment: '退货 café', refundAmount: { value: '2.00', currency: 'USD' } };
+    await adapter.callTool('execute_high_impact', {
+      action: 'orders.issue_refund', parameters: { order_id: 'order:1', body },
+    }, env);
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('https://api.ebay.com/sell/fulfillment/v1/order/order%3A1/issue_refund');
+    expect(init.body).toBe(JSON.stringify(body));
+    const headers = init.headers as Record<string, string>;
+    const digest = `sha-256=:${crypto.createHash('sha256').update(JSON.stringify(body), 'utf8').digest('base64')}:`;
+    expect(headers['content-digest']).toBe(digest);
+    expect(headers['signature-input']).toMatch(/^sig1=\("content-digest" "x-ebay-signature-key" "@method" "@path" "@authority"\);created=\d+$/);
+    const signatureBase = [
+      `"content-digest": ${digest}`, `"x-ebay-signature-key": ${jwe}`, '"@method": POST',
+      '"@path": /sell/fulfillment/v1/order/order%3A1/issue_refund', '"@authority": api.ebay.com',
+      `"@signature-params": ${headers['signature-input'].slice(5)}`,
+    ].join('\n');
+    const signature = Buffer.from(headers.signature.slice(6, -1), 'base64');
+    expect(crypto.verify(kind === 'rsa' ? 'sha256' : null, Buffer.from(signatureBase), pair.publicKey, signature)).toBe(true);
+    expect(crypto.verify(kind === 'rsa' ? 'sha256' : null, Buffer.from(signatureBase.replace('POST', 'GET')), pair.publicKey, signature)).toBe(false);
+    expect(fs.readFileSync(env.ORKAS_LOCAL_API_CREDENTIAL_FILE!, 'utf8')).not.toContain(privateKey);
+    await adapter.callTool('execute_read', { action: 'orders.list', parameters: {} }, env);
+    expect((fetchMock.mock.calls[1] as unknown as [string, RequestInit])[1].headers).not.toHaveProperty('signature');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('preserves unsigned eBay refunds and rejects incomplete signing configuration without sending a refund', async () => {
+    const fetchMock = vi.fn(async () => response(200, { refundId: 'refund-1' }));
+    vi.stubGlobal('fetch', fetchMock);
+    const metadata = { environment: 'sandbox', marketplace_id: 'EBAY_GB', content_language: 'en-GB' };
+    const credentials = { access_token: 'fixture-access', expires_at: Date.now() + 3_600_000, identity: metadata };
+    const args = { action: 'orders.issue_refund', parameters: { order_id: 'order-1', body: {} } };
+    await adapter.callTool('execute_high_impact', args, envFor('ebay', credentials, metadata));
+    expect((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].headers).not.toHaveProperty('signature');
+    await expect(adapter.callTool('execute_high_impact', args, envFor('ebay', {
+      ...credentials, signing_key_jwe: 'private-fixture-not-to-log',
+    }, metadata))).rejects.toThrow('invalid eBay signing credentials');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('refreshes eBay OAuth locally and binds every action to one environment and marketplace', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response(200, {

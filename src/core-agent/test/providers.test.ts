@@ -11,7 +11,29 @@ import type { Message, MessageContent } from "../src/shared/types.js";
 import type { Model } from "@earendil-works/pi-ai";
 
 describe("Providers (pi-ai backed)", () => {
-it("keeps tool-image compatibility trailers below host instruction authority in Chat Completions", async () => {
+  it("preserves stream errors without logging their private message", async () => {
+    const privateMessage = "provider-private-body-canary customer draft";
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const provider = createPiProvider({
+        provider: "openai", model: "gpt-5.5", apiKey: "test",
+        onPayload() { throw new Error(privateMessage); },
+      });
+      const events: StreamEvent[] = [];
+      for await (const event of provider.stream({
+        model: "gpt-5.5", messages: [{ role: "user", content: [{ type: "text", text: "probe" }] }],
+      })) events.push(event);
+      const errors = events.filter((event) => event.type === "error");
+      expect(errors).toHaveLength(1);
+      expect(errors[0].error.message).toContain(privateMessage);
+      expect(warning).toHaveBeenCalled();
+      expect(JSON.stringify(warning.mock.calls)).not.toContain(privateMessage);
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it("keeps tool-image compatibility trailers below host instruction authority in Chat Completions", async () => {
     let captured: any;
     const provider = createPiProvider({ provider: "openai", apiKey: "test", customModel: {
       api: "openai-completions", provider: "openai", id: "gpt-test", name: "test",
@@ -246,7 +268,8 @@ it("reads Responses text phase only from structured signature metadata", () => {
 
       capturedPayload = undefined;
       const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
-      for await (const _event of provider.stream({
+      const errors: string[] = [];
+      for await (const event of provider.stream({
         model: model.id,
         messages: [{ role: "user", content: [{ type: "text", text: "read the file" }] }],
         tools: [{
@@ -260,10 +283,13 @@ it("reads Responses text phase only from structured signature metadata", () => {
         }],
       })) {
         // The payload hook intentionally aborts before network I/O.
+        if (event.type === "error") errors.push(event.error.message);
       }
       const warningText = warning.mock.calls.flat().join(" ");
       warning.mockRestore();
-      expect(warningText).toContain("payload captured before network");
+      expect(errors).toEqual([expect.stringContaining("payload captured before network")]);
+      expect(warningText).toContain("provider stream failed");
+      expect(warningText).not.toContain("payload captured before network");
       expect(capturedPayload).toMatchObject({
         tools: [{ type: "function", function: { name: "read_file" } }],
       });
@@ -305,16 +331,24 @@ it("reads Responses text phase only from structured signature metadata", () => {
         .rejects.toThrow(/payload captured before network/);
 
       const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
-      for await (const _event of provider.stream({ ...base, reasoning: "off" })) {
+      const errors: string[] = [];
+      for await (const event of provider.stream({ ...base, reasoning: "off" })) {
         // The payload hook intentionally aborts before network I/O.
+        if (event.type === "error") errors.push(event.error.message);
       }
-      for await (const _event of provider.stream({ ...base, reasoning: "high" })) {
+      for await (const event of provider.stream({ ...base, reasoning: "high" })) {
         // The payload hook intentionally aborts before network I/O.
+        if (event.type === "error") errors.push(event.error.message);
       }
       const warningText = warning.mock.calls.map((call) => call.join(" "));
       warning.mockRestore();
+      expect(errors).toEqual([
+        expect.stringContaining("payload captured before network"),
+        expect.stringContaining("payload captured before network"),
+      ]);
       expect(warningText).toHaveLength(2);
-      expect(warningText.every((line) => line.includes("payload captured before network"))).toBe(true);
+      expect(warningText.every((line) => line.includes("provider stream failed"))).toBe(true);
+      expect(warningText.join(" ")).not.toContain("payload captured before network");
 
       expect(payloads[0]).toMatchObject({ thinking: { type: "disabled" } });
       expect(payloads[1]).toMatchObject({
@@ -1373,7 +1407,12 @@ it.each(["truncated", "aborted"] as const)("does not complete a %s OpenRouter Cl
         const errorPattern = failure === "aborted" ? /abort/i : /stream ended/i;
         expect(errors[0].error.message).toMatch(errorPattern);
         expect(requestCount).toBe(1);
-        expect(warning.mock.calls).toEqual([["[pi-provider]", expect.stringMatching(errorPattern)]]);
+        expect(warning.mock.calls).toEqual([["[pi-provider]", "provider stream failed", {
+          provider: "openrouter", model: modelId,
+          reason: failure === "aborted" ? "aborted" : "error",
+          messageChars: expect.any(Number), fieldCount: expect.any(Number),
+        }]]);
+        expect(JSON.stringify(warning.mock.calls)).not.toContain(errors[0].error.message);
 
         warning.mockClear();
         const retryEvents: StreamEvent[] = [];

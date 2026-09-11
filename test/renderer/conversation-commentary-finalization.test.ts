@@ -28,7 +28,6 @@ function loadCommentaryHarness() {
     msg._commentaryBuf = '';
     msg._commentaryLine = null;
   });
-  const complete = vi.fn();
   const paint = vi.fn((_msg, finalEl, text) => { finalEl.innerHTML = text; });
   const context = {
     _streamingAppendCommentaryDelta: (msg: any, text: string) => {
@@ -37,7 +36,6 @@ function loadCommentaryHarness() {
       msg._commentaryBuf = String(msg._commentaryBuf || '') + text;
     },
     _sealStreamingCommentary: seal,
-    _completeProcessDisclosure: complete,
     _isRepeatedPriorTurnCommentary: () => false,
     _cancelPendingStreamRaf: cancel,
     _streamingDisplayText: (value: string) => value,
@@ -50,7 +48,7 @@ function loadCommentaryHarness() {
     extractFunction('_streamingAppendFinalDelta'),
   ].join('\n');
   const api = vm.runInNewContext(`${funcs}\n({ finalize: _streamingFinalizeCommentary, append: _streamingAppendFinalDelta });`, context);
-  return { ...api, commentary, cancel, seal, complete, paint };
+  return { ...api, commentary, cancel, seal, paint };
 }
 
 describe('conversation commentary finalization', () => {
@@ -71,7 +69,7 @@ describe('conversation commentary finalization', () => {
   });
 
   it('keeps commentary in the process stream and starts body text only at final_answer', () => {
-    const { finalize, append, commentary, cancel, complete, paint } = loadCommentaryHarness();
+    const { finalize, append, commentary, cancel, paint } = loadCommentaryHarness();
     const finalEl = { style: { display: 'none' }, innerHTML: '' };
     const msg: any = {
       dataset: {},
@@ -87,7 +85,6 @@ describe('conversation commentary finalization', () => {
 
     expect(commentary).toEqual(['live commentary']);
     expect(cancel).toHaveBeenCalledOnce();
-    expect(complete).toHaveBeenCalledOnce();
     expect(msg.dataset.streamBuf).toBe('Final answer');
     expect(msg.dataset.finalText).toBe('Final answer');
     expect(finalEl.style.display).toBe('');

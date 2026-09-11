@@ -74,6 +74,7 @@ export function captureDeliveredTaskIntervention(
     'bash:permission': 'sensitive_operation',
     'connectors:install-confirm': 'connector_install',
     'delete_file.confirmation_required': 'delete_confirmation',
+    'local-agent:user-input': 'interactive_cli_input',
   };
   const requestKind = channel === 'local-agent:permission'
     ? (stringField(record, 'permission_kind') === 'connector'

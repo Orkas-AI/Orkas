@@ -83,9 +83,9 @@ describe('group_chat state › legacy visibility slices', () => {
     fs.writeFileSync(path.join(groupDir, 'members.json'), JSON.stringify({ version: 1, actors: [{ id: 'agent-a', kind: 'agent', name: 'A' }] }));
 
     const members = await s.readMembers(TEST_UID, TEST_CID);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-
-    expect(fs.existsSync(path.join(groupDir, 'visibility'))).toBe(false);
+    // The roster read schedules background filesystem IO; wait for its result
+    // instead of assuming the host completes recursive deletion within 20ms.
+    await vi.waitFor(() => expect(fs.existsSync(path.join(groupDir, 'visibility'))).toBe(false));
     // Negative control: the canonical roster file is untouched and still read.
     expect(fs.existsSync(path.join(groupDir, 'members.json'))).toBe(true);
     expect(members.actors.map((a) => a.id)).toEqual(['agent-a']);

@@ -121,9 +121,10 @@ describe('tool-catalog', () => {
     expect(missing, `Injected tools missing from TOOL_CATALOG: ${missing.join(', ')}`).toEqual([]);
     const stale = [...catalog].filter((n) => !injected.has(n));
     expect(stale, `Catalog tools missing from injected fixture: ${stale.join(', ')}`).toEqual([]);
-    // Merged catalog keeps the 1.7 additions while retiring the duplicate
-    // read_file/stat_file surfaces from 1.6.6.
-    expect(catalog.size).toBe(62);
+    expect(catalog.has('auto_tasks')).toBe(true);
+    for (const retired of ['read_file', 'stat_file', 'auto_tasks_list']) {
+      expect(catalog.has(retired)).toBe(false);
+    }
   });
 
   it('TOOL_CATALOG has no duplicate names', () => {
@@ -289,7 +290,7 @@ describe('tool-catalog', () => {
     expect(toolNamesForGroups(['management.marketplace'])).toEqual([
       'marketplace_search', 'marketplace_request_install',
     ]);
-    expect(toolNamesForGroups(['management.automation'])).toEqual(['auto_tasks', 'auto_tasks_list']);
+    expect(toolNamesForGroups(['management.automation'])).toEqual(['auto_tasks']);
     expect(toolNamesForGroups(['management.app'])).toEqual(['open_app_view', 'app_health']);
     // Keep the broad parent as an explicit compatibility alias while new
     // runtime calls can load only the focused child they need.
@@ -308,7 +309,6 @@ describe('tool-catalog', () => {
       'marketplace_search',
       'marketplace_request_install',
       'auto_tasks',
-      'auto_tasks_list',
       'open_app_view',
       'app_health',
     ]);
@@ -493,14 +493,13 @@ describe('tool-catalog', () => {
     const fingerprint = createHash('sha256')
       .update(JSON.stringify(schemas))
       .digest('hex');
-    // Reviewed schema change: browser.retain adds explicit temporary cleanup;
-    // unmarked tabs now persist. Approved Library editing also adds optional
-    // action/expected_revision; source_path remains required and saves default
-    // to create-only. Both parent schema fingerprints were verified separately.
+    // Requester-confirmed schema repair: chat_history closes each action
+    // branch so search/read cannot advertise fields the executor rejects.
+    // Existing runtime operations, scope grants, and legacy calls are unchanged.
     expect(
       fingerprint,
       'A model-visible field, enum, bound, default, or required rule changed; review it as a schema change, not description cleanup.',
-    ).toBe('9455f9b629d1dc54029f3a89bb88a923c01c3d9e5258ee6b157fb1fb3e62b191');
+    ).toBe('5606c89ec9be9bfc0d7a6c09b67c98940ed36a4e14381294b741e4434a93f76c');
   });
 
   it('keeps the reviewed stable tool corpus within the description budgets', () => {

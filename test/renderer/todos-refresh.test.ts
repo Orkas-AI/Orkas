@@ -44,6 +44,7 @@ function backlogFixture(options: { gate?: (channel: string, args: any) => Promis
     if (channel === 'projects.list') {
       return { ok: true, projects: [{ project_id: 'b', name: 'Beta' }, { project_id: 'a', name: 'Alpha' }] };
     }
+    if (channel === 'agents.list') return { agents: [] };
     if (channel === 'projects.bindings.list') return { ok: true, agentDetails: [{ agent_id: `agent-${pid}` }] };
     if (channel === 'projects.driver.get') return { config: { enabled: false } };
     if (channel === 'projects.tasks.list') {
@@ -207,6 +208,7 @@ describe('global backlog refresh and recovery', () => {
     let fail = false;
     const h = harness(async (channel, args) => {
       if (channel === 'projects.list') return { ok: true, projects: [{ project_id: 'b', name: 'Beta' }, { project_id: 'a', name: 'Alpha' }] };
+      if (channel === 'agents.list') return { agents: [] };
       if (channel === 'projects.bindings.list') return { ok: true, agentDetails: [] };
       if (channel === 'projects.tasks.list' && !args.projectId) return { ok: true, tasks: [] };
       if (args.projectId === 'b' && fail) return { ok: false };
@@ -234,6 +236,7 @@ describe('global backlog refresh and recovery', () => {
     const firstReadStarted = new Promise<void>((resolve) => { started = resolve; });
     const h = harness(async (channel, args) => {
       if (channel === 'projects.list') return { ok: true, projects: [{ project_id: 'a', name: 'Alpha' }] };
+      if (channel === 'agents.list') return { agents: [] };
       if (channel === 'projects.bindings.list') return { ok: true, agentDetails: [] };
       if (channel === 'projects.tasks.list' && !args.projectId) return { ok: true, tasks: [] };
       if (++calls === 1) { started(); return old; }

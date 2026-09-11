@@ -2,6 +2,7 @@
 import * as projectTasks from './project_tasks';
 import type { ProjectTasksToolHandler } from '../../core-agent/src/tools/project-tasks-tool';
 import { backlogExecutionSnapshot, type BacklogRunIdentity } from './group_chat/task_board';
+import { taskSummaryPage } from './task_query';
 
 export function createProjectTasksHandler(
   uid: string, pid: string, cid: string, agentDisplayNameById: ReadonlyMap<string, string>,
@@ -40,17 +41,22 @@ export function createProjectTasksHandler(
     };
   };
   return {
-    list: async () => {
+    list: async (query = {}) => {
       const tasks = await projectTasks.listTasks(uid, pid);
       const executions = backlogExecutionSnapshot(uid, pid, cid, execution);
+      const summaries = tasks.filter((task) => query.status === undefined || task.status === query.status).map((task) => {
+        const { detail: _detail, result_ref: _resultRef, ...summary } = projectTasks.taskView(task);
+        return { ...summary, ...(executions.get(task.id) || { is_running: null, is_current_run: false }) };
+      });
       return {
         ok: true,
-        tasks: tasks.map((task) => ({
-          ...projectTasks.taskView(task),
-          ...(executions.get(task.id) || { is_running: null, is_current_run: false }),
-        })),
+        ...taskSummaryPage(summaries, query.offset, query.limit),
         progress: projectTasks.computeProgress(tasks),
       };
+    },
+    get: async (taskId) => {
+      const task = await projectTasks.getTask(uid, pid, taskId);
+      return task ? { ok: true, task: toView(task) } : { ok: false, error: 'task_not_found' };
     },
     create: async (input: { title: string; detail?: string; owner?: string; status?: projectTasks.TaskStatus }) => {
       let ownerFields: { owner_agent?: string; owner_agent_id?: string } = {};

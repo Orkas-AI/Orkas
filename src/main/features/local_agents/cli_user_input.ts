@@ -18,7 +18,6 @@ import type {
   LocalCliUserInputResponse,
 } from './backends/base.js';
 import type { LocalCliType } from './registry.js';
-import { permissionResponseTimeoutMs } from './cli_permissions.js';
 
 const log = createLogger('local-agents:user-input');
 const WAITING_HEARTBEAT_MS = 25_000;
@@ -35,6 +34,7 @@ interface Pending {
   resolve: (response: LocalCliUserInputResponse) => void;
   heartbeat?: NodeJS.Timeout;
   autoResolve?: NodeJS.Timeout;
+  detachAbort?: () => void;
 }
 
 const pending = new Map<string, Pending>();
@@ -48,11 +48,11 @@ function bounded(value: unknown, max: number): string {
   return text.length > max ? text.slice(0, max) : text;
 }
 
-function normalizeQuestions(raw: LocalCliUserInputQuestion[]): LocalCliUserInputQuestion[] {
+function normalizeQuestions(raw: LocalCliUserInputQuestion[], limit = MAX_QUESTIONS): LocalCliUserInputQuestion[] {
   const seen = new Set<string>();
   const questions: LocalCliUserInputQuestion[] = [];
   for (const item of Array.isArray(raw) ? raw : []) {
-    if (questions.length >= MAX_QUESTIONS) break;
+    if (questions.length >= limit) break;
     const id = bounded(item?.id, MAX_LABEL);
     const question = bounded(item?.question, MAX_TEXT);
     if (!id || !question || seen.has(id)) continue;
@@ -75,6 +75,7 @@ function normalizeQuestions(raw: LocalCliUserInputQuestion[]): LocalCliUserInput
       ...(options.length ? { options } : {}),
       ...(item.isOther === true ? { isOther: true } : {}),
       ...(item.isSecret === true ? { isSecret: true } : {}),
+      ...(item.multiSelect === true ? { multiSelect: true } : {}),
     });
   }
   return questions;
@@ -104,6 +105,7 @@ function settle(requestId: string, response: LocalCliUserInputResponse): boolean
   pending.delete(requestId);
   if (entry.heartbeat) clearInterval(entry.heartbeat);
   if (entry.autoResolve) clearTimeout(entry.autoResolve);
+  entry.detachAbort?.();
   entry.resolve(response);
   return true;
 }
@@ -119,9 +121,9 @@ export async function requestUserInput(opts: {
   request: LocalCliUserInputRequest;
   onWaiting?: (elapsedMs: number) => void;
 }): Promise<LocalCliUserInputResponse> {
-  const questions = normalizeQuestions(opts.request.questions);
+  const questions = normalizeQuestions(opts.request.questions, opts.cli === 'claude' ? 4 : MAX_QUESTIONS);
   const questionIds = questions.map(question => question.id);
-  if (!questions.length) return emptyResponse(questionIds);
+  if (!questions.length || opts.request.signal?.aborted) return emptyResponse(questionIds);
   const requestId = crypto.randomBytes(8).toString('hex');
   const payload = {
     request_id: requestId,
@@ -156,29 +158,34 @@ export async function requestUserInput(opts: {
     };
     const entry: Pending = { uid: opts.uid, runId: opts.runId, questionIds, resolve };
     pending.set(requestId, entry);
+    const cancel = () => {
+      if (settle(requestId, emptyResponse(questionIds))) {
+        broadcast('local-agent:user-input_cancelled', { request_ids: [requestId] });
+      }
+    };
+    const signal = opts.request.signal;
+    if (signal) {
+      signal.addEventListener('abort', cancel, { once: true });
+      entry.detachAbort = () => signal.removeEventListener('abort', cancel);
+    }
     if (!broadcast('local-agent:user-input', payload)) {
       settle(requestId, emptyResponse(questionIds));
       return;
     }
+    if (!pending.has(requestId)) return;
     notifyWaiting();
+    if (!pending.has(requestId)) return;
     if (opts.onWaiting) {
       entry.heartbeat = setInterval(notifyWaiting, WAITING_HEARTBEAT_MS);
       entry.heartbeat.unref?.();
     }
-    // The wait is bounded by the host, like a permission prompt: a user who
-    // stepped away must not leave the task, its queue and its CLI slot held
-    // until the 2 h wall cap. Codex's own autoResolutionMs may shorten it.
+    // Legacy Codex requests may explicitly delegate auto-resolution to the
+    // client. Absence of a protocol deadline never implies a host timeout.
     const rawAutoMs = opts.request.autoResolutionMs;
-    const hostDeadlineMs = permissionResponseTimeoutMs();
-    const deadlineMs = Number.isFinite(rawAutoMs) && Number(rawAutoMs) >= 0
-      ? Math.min(Number(rawAutoMs), hostDeadlineMs)
-      : hostDeadlineMs;
-    entry.autoResolve = setTimeout(() => {
-      if (settle(requestId, emptyResponse(questionIds))) {
-        broadcast('local-agent:user-input_cancelled', { request_ids: [requestId] });
-      }
-    }, deadlineMs);
-    entry.autoResolve.unref?.();
+    if (Number.isFinite(rawAutoMs) && Number(rawAutoMs) >= 0) {
+      entry.autoResolve = setTimeout(cancel, Number(rawAutoMs));
+      entry.autoResolve.unref?.();
+    }
   });
 }
 

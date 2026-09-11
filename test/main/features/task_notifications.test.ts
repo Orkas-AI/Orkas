@@ -124,12 +124,12 @@ describe('task completion notifications', () => {
     expect(openConversation).toHaveBeenCalledWith('c1', status, 'u1');
   });
 
-  it('uses the same background policy and waiting-input navigation for an in-progress user intervention', () => {
+  it.each(['sensitive_operation', 'interactive_cli_input'] as const)('uses background notification and waiting-input navigation for %s', kind => {
     interventionListener({
-      attention_id: 'sensitive_operation:req-1',
+      attention_id: `${kind}:req-1`,
       user_id: 'u1',
       conversation_id: 'c1',
-      kind: 'sensitive_operation',
+      kind,
     });
 
     expect(createNotification).toHaveBeenCalledWith({

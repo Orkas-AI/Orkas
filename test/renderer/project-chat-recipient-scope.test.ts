@@ -105,7 +105,7 @@ function mountProjectDetail(bindings: Bindings, held: string[] = []) {
   });
   vm.runInContext(projectDetailSource, context, { filename: 'project-detail.js' });
   vm.runInContext(
-    'const _COMMANDER = { kind: "commander", id: "", name: "" };\n'
+    'const _COMMANDER = { kind: "commander", id: "", name: "" }; const _composerAgentScopes = new Map();\n'
       + ['_normRecipient', '_recipientList', '_recipientSet', 'validateRecipientAgainstProject']
         .map((name) => extractFunction(conversationSource, name)).join('\n'),
     context,
@@ -122,6 +122,7 @@ function mountProjectDetail(bindings: Bindings, held: string[] = []) {
       if (target === 'project') __projectRecipient = next;
     }
     function _renderRecipientChip() {}
+    function _composerRecipientInput() { return null; }
     function __readProjectRecipient() { return JSON.parse(JSON.stringify(__projectRecipient)); }
     function __pickProjectAgent(id, name) { __projectRecipient = { kind: 'agent', id, name }; }
     _renderProjectDetail = function () {};

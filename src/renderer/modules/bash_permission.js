@@ -436,7 +436,10 @@ async function _showBashPermissionDialog(info) {
   }
   const isConnector = info._permission_kind === 'connector';
   const agent = _bashAgentLabel(info);
-  const reasonsText = _bashReasonText(info.reasons);
+  const reasonsText = [
+    _bashReasonText(info.reasons),
+    info.unresolved_paths === true ? t('bash.permission.unresolved_paths') : '',
+  ].filter(Boolean).join(t('bash.permission.reason_sep'));
   const command = String(info.command || '');
   const operation = String(info.operation || '').trim();
   const subject = String(info.subject || '').trim();
@@ -467,7 +470,8 @@ async function _showBashPermissionDialog(info) {
     && info.reasons.some((reason) => _BASH_PERMISSION_RISK_CATEGORIES.includes(reason)));
   // Connector approvals bind the exact account, operation and arguments, like
   // other external mutations. A task grant must not widen that approval.
-  const canAllowRun = !isConnector && (!isSensitiveApproval || info.can_allow_run === true);
+  const canAllowRun = !isConnector && info.unresolved_paths !== true
+    && (!isSensitiveApproval || info.can_allow_run === true);
   // An earlier queued permission can switch the account to Trusted while this
   // connector waits. Its host gate already checked availability/prohibitions.
   let result;

@@ -54,9 +54,9 @@ describe('main-process layer boundaries', () => {
   it('detects a util module that reaches into features/ or model/ (negative control)', () => {
     const file = path.join(UTIL_ROOT, 'example.ts');
     expect(layerViolations(file, "import { runOfficeCli } from '../features/office/office_engine';\n"))
-      .toEqual(['util/example.ts -> ../features/office/office_engine']);
+      .toEqual([`${path.join('util', 'example.ts')} -> ../features/office/office_engine`]);
     expect(layerViolations(file, "import type { Foo } from '../model/core-agent/runner';\n"))
-      .toEqual(['util/example.ts -> ../model/core-agent/runner']);
+      .toEqual([`${path.join('util', 'example.ts')} -> ../model/core-agent/runner`]);
     // Same-layer, parent-level and lazy references are allowed.
     expect(layerViolations(file, [
       "import { x } from './log-redact';",

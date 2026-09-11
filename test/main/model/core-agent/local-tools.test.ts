@@ -21,6 +21,7 @@ describe('local-tools › Windows PowerShell compatibility preflight', () => {
   it('rejects high-confidence POSIX syntax before execution and leaves PowerShell syntax alone', async () => {
     const { windowsPowerShellCompatibilityError } = await import('../../../../src/main/model/core-agent/local-tools');
     expect(windowsPowerShellCompatibilityError('npm install && npm test', 'win32')).toContain('E_SHELL_SYNTAX_MISMATCH');
+    expect(windowsPowerShellCompatibilityError("cat <<'TEXT'\nnode run-skill.cjs missing-skill probe\nTEXT", 'win32')).toContain('POSIX heredoc');
     expect(windowsPowerShellCompatibilityError('export TOKEN=x; head -n 3 a.txt > /dev/null', 'win32')).toContain('source/export');
     expect(windowsPowerShellCompatibilityError('mkdir -p api core/data core/analysis', 'win32')).toContain('POSIX mkdir -p');
     expect(windowsPowerShellCompatibilityError('$env:TOKEN = "x"; Get-Content a.txt | Select-Object -First 3', 'win32')).toBeNull();
@@ -53,28 +54,32 @@ describe('local-tools › Windows PowerShell compatibility preflight', () => {
     expect(fs.existsSync(marker)).toBe(false);
   });
 
-  // In an approval mode the guard cannot verify where a runtime variable
-  // points, so it refuses — correctly (only the non-prompting all_files_auto
-  // mode accepts an unprovable path). What it never said is that assigning the
-  // path literally in the same command does resolve, which left the model
-  // retrying blind.
-  it('points an unresolvable write target at the escape that already works', async () => {
+  it('requests one-time permission for an unresolved PowerShell write before execution', async () => {
     await allFilesApproval();
     const localTools = await import('../../../../src/main/model/core-agent/local-tools');
-    const tools = localTools.createLocalTools({ userId: UID, cid: CID, hostPlatform: 'win32' });
-    const bash = tools.find((tool) => tool.name === 'bash')!;
-    const ctx = { workingDir: tmpDir, signal: undefined, state: {} } as any;
-
-    const blocked = await bash.execute({ command: 'Write-Output hi > $out' }, ctx);
-
-    expect(blocked).toMatchObject({ isError: true });
-    expect(blocked.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
-    expect(blocked.content).toContain('assigned to a literal earlier in this same command');
+    const bp = await import('../../../../src/main/model/core-agent/bash-permissions');
+    const requests: any[] = [];
+    bp._setBroadcastForTest((_channel, info: any) => {
+      requests.push(info);
+      bp.respond(info.request_id, 'deny');
+    });
+    try {
+      const bash = localTools.createLocalTools({ userId: UID, cid: CID, hostPlatform: 'win32' })
+        .find((tool) => tool.name === 'bash')!;
+      const result = await bash.execute({ command: 'Write-Output hi > $out' }, {
+        workingDir: tmpDir, state: {},
+      } as any);
+      expect(result).toMatchObject({ isError: true });
+      expect(result.content).toContain('E_BASH_RISK_DENIED');
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toMatchObject({ unresolved_paths: true, can_allow_run: false });
+    } finally {
+      bp._setBroadcastForTest(null);
+      bp._resetForTest();
+    }
   });
 
-  it('accepts the literal assignment the refusal recommends', async () => {
-    // Guards the message against drift: if this stopped resolving, the advice
-    // above would send the model in a circle.
+  it('accepts a literal assignment without a dynamic-path refusal', async () => {
     await allFilesAuto();
     const localTools = await import('../../../../src/main/model/core-agent/local-tools');
     const tools = localTools.createLocalTools({ userId: UID, cid: CID, hostPlatform: 'win32' });
@@ -534,6 +539,110 @@ describe('local-tools › bash › disabled skills', () => {
 });
 
 describe('local-tools › bash › run-scoped Skill binding', () => {
+  it.runIf(process.platform !== 'win32')('finds the runner file without attempting to execute a Skill', async () => {
+    await allFilesAuto();
+    fs.writeFileSync(path.join(tmpDir, 'run-skill.cjs'), 'throw new Error("must not execute");');
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const bash = createLocalTools({ userId: UID, skillRuntimeBindings: new Map() })
+      .find((tool) => tool.name === 'bash')!;
+    const result = await bash.execute({ command: "find . -name 'run-skill.cjs' -type f" }, {
+      workingDir: tmpDir, state: {},
+    } as any);
+    expect(result.isError, result.content).toBeFalsy();
+    expect(result.content).toContain('./run-skill.cjs');
+    expect(result.content).not.toContain('must not execute');
+  });
+
+  it('binds only executable Skill operands and preserves the multiple-root refusal', async () => {
+    await allFilesAuto();
+    const core = await import('../../../../src/core-agent/src/tools/builtin');
+    const executedRoots: unknown[] = [];
+    const execute = vi.spyOn(core.bashTool, 'execute').mockImplementation(async (_input, ctx) => {
+      executedRoots.push((ctx.state.sandboxEnv as any)?.ORKAS_RUN_SKILL_DIR);
+      return { content: 'bound command executed' };
+    });
+    try {
+      const binding = (id: string) => ({ id, name: id, root: path.join(tmpDir, id), entry: path.join(tmpDir, id, 'SKILL.md'), source: 'custom' });
+      const first = binding('first-skill');
+      const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+      const bash = createLocalTools({
+        userId: UID,
+        skillRuntimeBindings: new Map([['first-skill', first], ['second-skill', binding('second-skill')]]),
+      }).find((tool) => tool.name === 'bash')!;
+      const ctx = { workingDir: tmpDir, state: {} } as any;
+      const result = await bash.execute({ command: "printf '%s' 'run-skill.cjs missing-skill'; node run-skill.cjs first-skill probe" }, ctx);
+      expect(result.isError, result.content).toBeFalsy();
+      expect(executedRoots).toEqual([first.root]);
+      expect(ctx.state.sandboxEnv ?? {}).not.toHaveProperty('ORKAS_RUN_SKILL_DIR');
+      const rejected = await bash.execute({ command: 'node run-skill.cjs first-skill probe; node run-skill.cjs second-skill probe' }, ctx);
+      expect(rejected.isError).toBe(true);
+      expect(rejected.content).toContain('E_SKILL_MULTI_ROOT');
+      expect(execute).toHaveBeenCalledOnce();
+    } finally { execute.mockRestore(); }
+  });
+
+  it.each([
+    'find . -name run-skill.cjs -type f',
+    "find . -name 'run-skill.cjs' -type f",
+    "printf '%s\\n' 'run-skill.cjs missing-skill'",
+    'node other.cjs run-skill.cjs missing-skill',
+    "node -e 'console.log(1)' run-skill.cjs missing-skill",
+    "cat <<'TEXT'\nnode run-skill.cjs missing-skill probe\nTEXT",
+    'printf ok # ignored; node run-skill.cjs missing-skill probe',
+    'node --check run-skill.cjs missing-skill',
+    'node --eval="console.log(1)" run-skill.cjs missing-skill',
+    "printf '%s' '$(node run-skill.cjs missing-skill probe)'",
+  ])('does not treat filename/text operands as Skill execution: %s', async (command) => {
+    await allFilesAuto();
+    const core = await import('../../../../src/core-agent/src/tools/builtin');
+    const execute = vi.spyOn(core.bashTool, 'execute').mockResolvedValue({ content: 'ordinary command executed' });
+    try {
+      const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+      // These POSIX parser fixtures mock execution; their grammar must not
+      // inherit the test machine's native shell.
+      const bash = createLocalTools({ userId: UID, skillRuntimeBindings: new Map(), hostPlatform: 'linux' })
+        .find((tool) => tool.name === 'bash')!;
+      const ctx = { workingDir: tmpDir, state: {} } as any;
+      const result = await bash.execute({ command }, ctx);
+      expect(result.isError, result.content).toBeFalsy();
+      expect(result.content).toContain('ordinary command executed');
+      expect(execute).toHaveBeenCalledOnce();
+      expect(ctx.state.sandboxEnv ?? {}).not.toHaveProperty('ORKAS_RUN_SKILL_DIR');
+    } finally { execute.mockRestore(); }
+  });
+
+  it.each([
+    'node run-skill.cjs missing-skill probe',
+    'node --require preload.cjs run-skill.cjs missing-skill probe',
+    'env MODE=test node run-skill.cjs missing-skill probe',
+    'printf ok; node run-skill.cjs missing-skill probe',
+    'printf ok | node run-skill.cjs missing-skill probe',
+    'if true; then node run-skill.cjs missing-skill probe; fi',
+    '(node run-skill.cjs missing-skill probe)',
+    'for entry in one; do node run-skill.cjs missing-skill probe; done',
+    'node -- run-skill.cjs missing-skill probe',
+    "bash -c 'node run-skill.cjs missing-skill probe'",
+    ...(process.platform === 'win32' ? [] : [
+      'printf "%s" "$(node run-skill.cjs missing-skill probe)"',
+      'printf "%s" "`node run-skill.cjs missing-skill probe`"',
+    ]),
+    '& "$env:ORKAS_NODE" "$env:ORKAS_PC_DIR/bin/run-skill.cjs" missing-skill probe',
+  ])('rejects an unbound actual Skill invocation before any execution: %s', async (command) => {
+    await allFilesAuto();
+    const core = await import('../../../../src/core-agent/src/tools/builtin');
+    const execute = vi.spyOn(core.bashTool, 'execute').mockResolvedValue({ content: 'must not run' });
+    try {
+      const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+      const bash = createLocalTools({ userId: UID, skillRuntimeBindings: new Map() })
+        .find((tool) => tool.name === 'bash')!;
+      const result = await bash.execute({ command }, { workingDir: tmpDir, state: {} } as any);
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain('E_SKILL_NOT_AVAILABLE');
+      expect(result.content).toContain('@skill/missing-skill');
+      expect(execute).not.toHaveBeenCalled();
+    } finally { execute.mockRestore(); }
+  });
+
   it('executes the exact @skill binding instead of rescanning a same-id installed directory', async () => {
     await allFilesAuto();
     const paths = await import('../../../../src/main/paths');
@@ -1548,6 +1657,7 @@ describe('local-tools › apply_patch › transactional text changes', () => {
 
     expect(result.isError).toBe(true);
     expect(result.content).toContain('E_STALE');
+    expect(result.observations?.fileFailure).toMatchObject({ reason: 'file_changed', baseline_present: true, baseline_changed: true });
     expect(fs.readFileSync(source, 'utf8')).toBe('const value = 2;\n');
   });
 
@@ -1833,8 +1943,27 @@ describe('local-tools › edit_file › read-before-edit + OCC', () => {
     const r = await edit.execute({ path: p, old_string: 'hello', new_string: 'hi' }, runCtx());
     expect(r.isError).toBe(true);
     expect(r.content).toContain('E_NOT_READ');
+    expect(r.observations?.fileFailure).toMatchObject({ reason: 'not_read', baseline_present: false });
     expect(r.content).toContain('<edit-recovery file_hash="sha256:');
     expect(fs.readFileSync(p, 'utf8')).toBe('hello world'); // untouched
+  });
+
+  it('distinguishes unmatched submitted text from a file changed after reading', async () => {
+    await allFilesAuto();
+    const { edit, wsDir } = await buildEditTool();
+    const read = await buildReadTool();
+    const target = path.join(wsDir, 'private-target.md');
+    fs.writeFileSync(target, 'private actual text');
+    const ctx = runCtx();
+    await read.execute({ paths: [{ path: target }] }, ctx);
+    const result = await edit.execute({ path: target, old_string: 'private incorrect text', new_string: 'fixed' }, ctx);
+    expect(result.isError).toBe(true);
+    expect(result.observations?.fileFailure).toMatchObject({ reason: 'no_match', match_count: 0, baseline_present: true, baseline_changed: false });
+    expect(JSON.stringify(result.observations)).not.toContain('private');
+    expect(fs.readFileSync(target, 'utf8')).toBe('private actual text');
+    const recovery = await edit.execute({ path: target, old_string: 'private actual text', new_string: 'fixed' }, ctx);
+    expect(recovery.isError).toBeFalsy();
+    expect(fs.readFileSync(target, 'utf8')).toBe('fixed');
   });
 
   it('allows the edit after read_files stamps the baseline, end to end', async () => {
@@ -1865,6 +1994,8 @@ describe('local-tools › edit_file › read-before-edit + OCC', () => {
     const r = await edit.execute({ path: p, old_string: 'hello', new_string: 'hi' }, ctx);
     expect(r.isError).toBe(true);
     expect(r.content).toContain('E_STALE');
+    expect(r.observations?.fileFailure).toMatchObject({ reason: 'file_changed', baseline_present: true, baseline_changed: true });
+    expect(fs.readFileSync(p, 'utf8')).toBe('hello brave new world');
     expect(r.content).toContain('Retry with expected_hash=');
   });
 
@@ -2219,24 +2350,6 @@ describe('local-tools › direct CLI › script progress scanner', () => {
     expect(line).toContain('42%');
     expect(line).toContain('t=13s');
     expect(formatScriptProgress({})).toBe('script progress');
-  });
-});
-
-// An unresolvable target used to be quoted back in full and introduced by a
-// doubled command name: a live refusal read `bash bash script target "set -euo
-// pipefail\ncd /Users/...` with the whole script inline, burying the sentence
-// that said what to do (2026-08-10). The reason already names the command, and
-// a target that is script-sized is not readable as a path.
-describe('bash path refusal wording', () => {
-  it('quotes an unresolvable target once and bounded', async () => {
-    const { truncateForMessage } = await import('../../../../src/main/model/core-agent/local-tools');
-    const script = 'set -euo pipefail\ncd /Users/test/work\n'.repeat(20);
-    const shown = truncateForMessage(script);
-    expect(shown.length).toBeLessThanOrEqual(80);
-    expect(shown).not.toContain('\n');
-    expect(shown.endsWith('…')).toBe(true);
-    // An ordinary path is left exactly as written.
-    expect(truncateForMessage('project/render/run.sh')).toBe('project/render/run.sh');
   });
 });
 

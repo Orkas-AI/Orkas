@@ -391,9 +391,54 @@ export const claudeBackend: LocalBackend = {
     /** Serialize native approval requests so two concurrent tool gates cannot
      * overtake each other while the renderer is waiting for a decision. */
     let permissionResponseQueue = Promise.resolve();
-    const respondToControlRequest = async (msg: any): Promise<void> => {
+    const userInputRequests = new Map<string, AbortController>();
+    const cancelUserInputs = (): void => {
+      for (const controller of userInputRequests.values()) controller.abort();
+      userInputRequests.clear();
+    };
+    const respondToControlRequest = async (msg: any, inputSignal?: AbortSignal): Promise<void> => {
+      if (exited || inputSignal?.aborted) return;
       const req = msg?.request || {};
       const inputMap = (req.input && typeof req.input === 'object') ? req.input : {};
+      if (req.subtype === 'can_use_tool' && req.tool_name === 'AskUserQuestion') {
+        const original = Array.isArray(inputMap.questions) ? inputMap.questions : [];
+        const questions = original.slice(0, 4).map((question: any, index: number) => ({
+          id: `question-${index}`,
+          question: typeof question?.question === 'string' ? question.question : '',
+          header: typeof question?.header === 'string' ? question.header : undefined,
+          options: (Array.isArray(question?.options) ? question.options : [])
+            .filter((option: any) => typeof option?.label === 'string')
+            .map((option: any) => ({ label: option.label, description: option.description })),
+          multiSelect: question?.multiSelect === true,
+          isOther: true,
+        }));
+        let answer: import('./base').LocalCliUserInputResponse = { cancelled: true, answers: {} };
+        if (questions.length && questions.every((question: { question: string }) => question.question)
+            && opts.requestUserInput) {
+          try {
+            answer = await opts.requestUserInput({ id: String(msg.request_id || ''), questions, isBlocking: true, signal: inputSignal });
+          } catch (err) {
+            log.warn('claude user-input request failed', { error: logErrorSummary(err) });
+          }
+        }
+        if (inputSignal?.aborted || exited) return;
+        const answered = !answer.cancelled && questions.length > 0
+          && questions.every((question: { id: string }) => answer.answers[question.id]?.some(value => value.trim()));
+        const answers = Object.fromEntries(questions.map((question: { id: string; question: string }) => [
+          question.question, (answer.answers[question.id] || []).join(', '),
+        ]));
+        await writeInputRecord({
+          type: 'control_response',
+          response: {
+            subtype: 'success', request_id: msg.request_id,
+            response: answered
+              ? { behavior: 'allow', updatedInput: { ...inputMap, answers } }
+              : { behavior: 'deny', message: 'The user did not answer this question.' },
+          },
+        });
+        emit({ type: 'status', status: 'running' });
+        return;
+      }
       const fullAccess = opts.permissionPolicy === 'full_access';
       let decision: LocalCliPermissionDecision = fullAccess ? 'allow_once' : 'deny';
       if (!fullAccess && opts.requestPermission) {
@@ -470,11 +515,23 @@ export const claudeBackend: LocalBackend = {
         // rail event. Handled outside mapClaudeEvent so the mapper
         // stays a pure translator (no I/O, easier to unit-test).
         if (obj?.type === 'control_request') {
+          const inputController = obj.request?.subtype === 'can_use_tool' && obj.request?.tool_name === 'AskUserQuestion'
+            ? new AbortController() : undefined;
+          if (inputController) userInputRequests.set(obj.request_id, inputController);
           permissionResponseQueue = permissionResponseQueue
-            .then(() => respondToControlRequest(obj))
+            .then(() => respondToControlRequest(obj, inputController?.signal))
             .catch((err) => {
               log.warn('claude permission response failed', { error: logErrorSummary(err) });
+            }).finally(() => {
+              if (inputController && userInputRequests.get(obj.request_id) === inputController) {
+                userInputRequests.delete(obj.request_id);
+              }
             });
+          return;
+        }
+        if (obj?.type === 'control_cancel_request') {
+          userInputRequests.get(obj.request_id)?.abort();
+          userInputRequests.delete(obj.request_id);
           return;
         }
         // Side-channel: each `assistant` block carries a `message.usage`
@@ -587,6 +644,7 @@ export const claudeBackend: LocalBackend = {
         if (exited) return;
         publishActiveIngress(false);
         exited = true;
+        cancelUserInputs();
         clearBackgroundTimer();
         if (gracefulStopTimer) {
           clearTimeout(gracefulStopTimer);
@@ -664,6 +722,9 @@ export function buildClaudeArgs(opts: Pick<BackendRunOptions,
     '--include-partial-messages',
     '--include-hook-events',
     '--verbose',
+    // The response transport is also required for AskUserQuestion under
+    // inherited/full-access policies; the CLI still owns permission mode.
+    '--permission-prompt-tool', 'stdio',
     ...buildClaudePermissionArgs(opts.permissionPolicy || 'inherit'),
   ];
   if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
@@ -693,13 +754,7 @@ export function buildClaudePermissionArgs(
   policy: NonNullable<BackendRunOptions['permissionPolicy']>,
 ): string[] {
   if (policy === 'ask') {
-    return [
-      '--permission-mode', 'default',
-      // Non-interactive stream-json runs need an explicit stdio reviewer;
-      // otherwise Claude may deny/hang locally without emitting the
-      // control_request that Orkas is waiting to present.
-      '--permission-prompt-tool', 'stdio',
-    ];
+    return ['--permission-mode', 'default'];
   }
   if (policy === 'full_access') {
     return ['--permission-mode', 'bypassPermissions', '--dangerously-skip-permissions'];

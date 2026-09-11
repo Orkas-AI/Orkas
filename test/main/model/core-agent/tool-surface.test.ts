@@ -141,7 +141,7 @@ describe('tool-surface', () => {
     const surface = createToolSurfaceController({
       availableToolNames: [
         'read_files', 'write_file', 'web_search', 'open_app_view', 'app_health',
-        'skill_search', 'marketplace_search', 'auto_tasks_list', 'tool_load',
+        'skill_search', 'marketplace_search', 'auto_tasks', 'tool_load',
       ],
       configuredGroups: ['workspace.read'],
       scopedEligible: true,
@@ -422,7 +422,7 @@ describe('tool-surface', () => {
     const surface = createToolSurfaceController({
       availableToolNames: [
         'open_app_view', 'app_health', 'skill_search', 'marketplace_search',
-        'auto_tasks_list', 'skill_manage', 'tool_load',
+        'auto_tasks', 'skill_manage', 'tool_load',
       ],
       // A stale or bypassed Agent config must not preload a runtime-only group.
       configuredGroups: ['management'],
@@ -436,7 +436,7 @@ describe('tool-surface', () => {
     expect(surface.isActive('app_health')).toBe(false);
     expect(surface.isActive('skill_search')).toBe(false);
     expect(surface.isActive('marketplace_search')).toBe(false);
-    expect(surface.isActive('auto_tasks_list')).toBe(false);
+    expect(surface.isActive('auto_tasks')).toBe(false);
     expect(states.at(-1)?.loadedGroups).toEqual([]);
 
     expect(JSON.parse(surface.load(['management.skills']).content)).toMatchObject({
@@ -447,7 +447,7 @@ describe('tool-surface', () => {
     expect(surface.isActive('skill_search')).toBe(true);
     expect(surface.isActive('app_health')).toBe(false);
     expect(surface.isActive('marketplace_search')).toBe(false);
-    expect(surface.isActive('auto_tasks_list')).toBe(false);
+    expect(surface.isActive('auto_tasks')).toBe(false);
     expect(states.at(-1)?.loadedGroups).toEqual([]);
 
     expect(JSON.parse(surface.load(['management.app']).content)).toMatchObject({
@@ -459,20 +459,20 @@ describe('tool-surface', () => {
     expect(surface.isActive('app_health')).toBe(true);
     expect(surface.isActive('skill_search')).toBe(true);
     expect(surface.isActive('marketplace_search')).toBe(false);
-    expect(surface.isActive('auto_tasks_list')).toBe(false);
+    expect(surface.isActive('auto_tasks')).toBe(false);
 
     expect(JSON.parse(surface.load(['management.automation']).content)).toMatchObject({
       ok: true,
       newly_loaded: ['management.automation'],
       unavailable: [],
     });
-    expect(surface.isActive('auto_tasks_list')).toBe(true);
+    expect(surface.isActive('auto_tasks')).toBe(true);
     expect(surface.isActive('marketplace_search')).toBe(false);
     expect(surface.runtimeStats()).toEqual({
       loadCalls: 3,
       newlyLoadedGroups: ['management.app', 'management.skills', 'management.automation'],
       newlyActivatedToolNames: [
-        'skill_search', 'open_app_view', 'app_health', 'auto_tasks_list',
+        'skill_search', 'open_app_view', 'app_health', 'auto_tasks',
       ],
     });
   });

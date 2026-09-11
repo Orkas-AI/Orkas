@@ -206,7 +206,7 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
   { name: 'cross_session_memory', loadGroups: ['context'], summary: 'Read or update cross-session memory.' },
   { name: 'metacognition', loadGroups: ['context'], summary: 'Read or update agent competence and strategies.' },
   { name: 'project_instructions', loadGroups: ['context'], summary: 'Update project standing instructions.' },
-  { name: 'todo_tasks', loadGroups: ['management.projects'], summary: 'Manage a selected project backlog.' },
+  { name: 'todo_tasks', loadGroups: ['management.projects'], programmatic: { mode: 'allow' }, summary: 'Manage a selected project backlog.' },
 
   { name: 'dispatch_to', loadGroups: ['orchestration'], summary: 'Delegate visible work and continue the commander turn.' },
   { name: 'hand_off_to', loadGroups: ['orchestration'], summary: 'Transfer terminal ownership to another Agent.' },
@@ -217,8 +217,7 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
   { name: 'skill_manage', loadGroups: ['runtime'], summary: 'Manage an Agent-owned learned skill.' },
   { name: 'marketplace_search', loadGroups: ['management.marketplace'], programmatic: { mode: 'conditional', policy: 'catalog-read' }, summary: 'Search the marketplace.' },
   { name: 'marketplace_request_install', loadGroups: ['management.marketplace'], summary: 'Request a user-confirmed marketplace installation.' },
-  { name: 'auto_tasks', loadGroups: ['management.automation'], summary: 'Manage scheduled automations.' },
-  { name: 'auto_tasks_list', loadGroups: ['management.automation'], programmatic: { mode: 'allow' }, summary: 'List schedules.' },
+  { name: 'auto_tasks', loadGroups: ['management.automation'], programmatic: { mode: 'allow' }, summary: 'Manage scheduled automations.' },
   { name: 'open_app_view', loadGroups: ['management.app'], summary: 'Stage a click-to-open navigation card to an app surface.' },
   { name: 'app_health', loadGroups: ['management.app'], programmatic: { mode: 'allow' }, summary: 'Read-only sanitized app diagnosis snapshot.' },
 

@@ -87,6 +87,11 @@ type AgentFanoutTarget = {
   finalText: string;
 };
 type ModelToolScenario =
+  | {
+    kind: 'chat-commentary';
+    reads: Array<{ path: string; commentary: string }>;
+    finalText: string;
+  }
   | { kind: 'connector'; connectorId: string }
   | { kind: 'agent-authoring'; finalText: string }
   | {
@@ -263,6 +268,14 @@ const fs = require('node:fs');
 const args = process.argv.slice(2);
 if (args.includes('--version') || args[0] === 'version') {
   process.stdout.write('99.0.0\n');
+  process.exit(0);
+}
+if (args[0] === 'models') {
+  process.stdout.write('openai/gpt-e2e\n');
+  process.exit(0);
+}
+if (args[0] === 'run' && args.includes('--help')) {
+  process.stdout.write('Usage: opencode run --model <id> --variant <name>\n');
   process.exit(0);
 }
 const statePath = process.env.ORKAS_E2E_CLI_STATE;
@@ -793,6 +806,8 @@ export class OrkasTestApp {
   private modelToolScenario: ModelToolScenario | null = null;
   private modelToolScenarioRequestStart = 0;
   private pendingAgentHandoffReply: (() => void) | null = null;
+  private pendingCommentaryReply: (() => void) | null = null;
+  commentaryStage = 0;
   private modelTextReplies: string[] = [];
   private libraryImageDescriptionReplies: string[] = [];
 
@@ -985,7 +1000,7 @@ export class OrkasTestApp {
         }>('agents.list');
         return result.agents.some((agent) => agent.agent_id === '173d4235a431');
       }, { timeout: 20_000 }).toBe(true);
-    
+
   }
 
   async relaunch(): Promise<Page> {
@@ -1453,6 +1468,31 @@ export class OrkasTestApp {
     }
     this.modelToolScenarioRequestStart = this.modelRequests.length;
     this.modelToolScenario = { kind: 'commander-segments', ...input };
+  }
+
+  /** Exercise the Chat adapter itself, without the managed Responses bridge. */
+  async setChatCommentaryScenario(input: {
+    reads: Array<{ path: string; commentary: string }>;
+    finalText: string;
+  }): Promise<void> {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    const entry = await this.invoke<{ entryId: string }>('auth.addCustomModelEntry', {
+      label: 'Local Chat commentary',
+      baseUrl: `${this.apiBaseUrl}/v1`,
+      model: 'e2e-chat-commentary',
+      apiKey: 'local-e2e-unused-key',
+    });
+    await this.invoke('auth.selectEntry', { entryId: entry.entryId });
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = { kind: 'chat-commentary', ...input };
+    this.commentaryStage = 0;
+  }
+
+  releaseCommentaryStage(): void {
+    const release = this.pendingCommentaryReply;
+    if (!release) throw new Error('No commentary response is waiting for release');
+    this.pendingCommentaryReply = null;
+    release();
   }
 
   setProjectHistoryScenario(query: string, sourceCid: string, finalText: string): void {
@@ -2461,6 +2501,53 @@ export class OrkasTestApp {
           return true;
         };
 
+        if (scenario?.kind === 'chat-commentary') {
+          // No phase metadata is supplied: classification belongs to the real
+          // Chat adapter/runner/mapper. Hold the stream at observable barriers
+          // so an end-of-task-only repaint cannot pass the live assertions.
+          if (isResponses || requestNumber > scenario.reads.length + 1) {
+            response.destroy(new Error('Unexpected commentary protocol or request count'));
+            return;
+          }
+          const read = scenario.reads[requestNumber - 1];
+          if (!read) {
+            this.pendingCommentaryReply = () => finishImmediately(finalTextEvents(scenario.finalText));
+            this.commentaryStage = requestNumber;
+            return;
+          }
+          const chars = Array.from(read.commentary);
+          const pieces: string[] = [];
+          for (let offset = 0; offset < chars.length; offset += 3) pieces.push(chars.slice(offset, offset + 3).join(''));
+          const frames = Buffer.from(pieces.map((content) => `data: ${JSON.stringify({
+            ...base, choices: [{ index: 0, delta: { content }, finish_reason: null }],
+          })}\n\n`).join(''));
+          // Split a Chinese UTF-8 character across transport chunks as well as
+          // splitting the logical text across multiple SSE messages.
+          const split = frames.indexOf(Buffer.from(chars[0])) + 1;
+          response.write(frames.subarray(0, split));
+          const timer = setTimeout(() => {
+            this.modelTimers.delete(timer);
+            if (response.destroyed) return;
+            response.write(frames.subarray(split));
+            writeEvent({
+              ...base,
+              choices: [{ index: 0, delta: { tool_calls: [{
+                index: 0, id: `call-e2e-commentary-${requestNumber}`, type: 'function',
+                function: { name: 'read_files', arguments: '' },
+              }] }, finish_reason: null }],
+            });
+            this.pendingCommentaryReply = () => finishImmediately([
+              { ...base, choices: [{ index: 0, delta: { tool_calls: [{
+                index: 0, function: { arguments: JSON.stringify({ paths: [{ path: read.path }] }) },
+              }] }, finish_reason: null }] },
+              { ...base, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+            ]);
+            this.commentaryStage = requestNumber;
+          }, 20);
+          this.modelTimers.add(timer);
+          return;
+        }
+
         const requestText = JSON.stringify(requestBody);
         if (requestText.includes('Library image-understanding assistant')) {
           const imageDescription = this.libraryImageDescriptionReplies.shift();
@@ -3039,6 +3126,7 @@ export class OrkasTestApp {
     this.controlledModelStream?.releaseChunk();
     this.controlledModelStream?.releaseFinish();
     this.controlledModelStream = null;
+    this.pendingCommentaryReply = null;
     for (const timer of this.modelTimers) clearTimeout(timer);
     this.modelTimers.clear();
     if ('closeAllConnections' in server && typeof server.closeAllConnections === 'function') {

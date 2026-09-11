@@ -174,14 +174,14 @@ describe('CLI upgrade visible outcomes', () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it('keeps a real device authorization failure visible and clears it after authorization is restored and rechecked', async () => {
+  it('keeps a first device authorization failure reconnectable and clears it after authorization is restored and rechecked', async () => {
     const { entry, cloud, feature } = await setup(true);
     probe.listTools.mockRejectedValueOnce(new Error('official lark-cli account is not authorized; reconnect this connector'));
     await feature.bootstrap(uid);
     const failed = feature.listInstances(uid);
     expect(failed[0].status.kind).toBe('error');
     expect(card(entry, failed).live).toBe(false);
-    expect(card(entry, failed).error).toContain('异常');
+    expect(card(entry, failed).error).toBe('');
     expect(card(entry, failed).html).toContain('data-act="connect"');
     expect(card(entry, failed).html).not.toContain('data-act="use-connector"');
     expect(JSON.parse(fs.readFileSync(cloud, 'utf8')).connections.feishu).toBeUndefined();

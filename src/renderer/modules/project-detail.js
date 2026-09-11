@@ -987,6 +987,11 @@ let _todoEditorReleaseFocus = null;
 let _todoEditorInitial = null;
 let _todoEditorProjectSelect = null;
 let _todoEditorStatusSelect = null;
+let _todoEditorAgentSelect = null;
+let _todoEditorAgents = [];
+let _todoEditorOwnerChanged = false;
+let _todoEditorAgentLoadSeq = 0;
+let _todoEditorAgentLoading = false;
 // Attachment editor state. `_todoEditorTid` is the task id the editor stages
 // attachments under: the real task id in edit mode, or a client pre-allocated
 // draft id in create mode (adopted by create on save, discarded on cancel).
@@ -1201,14 +1206,6 @@ function _renderTodoCard(task, context) {
 
   // A task keeps the first conversation that created/worked it. Expose that
   // durable back-link directly on every board that renders the task.
-  if (task.is_running === true || task.status === 'progress' || task.status === 'review') {
-    const execution = document.createElement('span');
-    execution.className = 'project-todo-attach-badge';
-    execution.dataset.role = 'todo-execution';
-    const state = task.is_running === true ? 'running' : task.is_running === false ? 'idle' : 'unknown';
-    execution.textContent = t(`project.todo.execution.${state}`);
-    appendMeta(execution);
-  }
   const conversationId = typeof task.origin_cid === 'string' ? task.origin_cid.trim() : '';
   if (conversationId) {
     const conversation = document.createElement('button');
@@ -1224,11 +1221,11 @@ function _renderTodoCard(task, context) {
   }
 
   // Assignment chip: (re)assign the task to one of the project's bound agents
-  // or clear it. Assigned → the owner's avatar + name (always visible);
+  // or clear it. Global tasks use the account registry. Assigned → the owner's avatar + name (always visible);
   // unassigned → a faint icon revealed on row hover. Click opens the menu
   // built in _openTodoAssignMenu; the write goes through projects.tasks.update
   // (owner_agent + owner_agent_id), the same fields the agent/LLM path uses.
-  if (!context.global) {
+  {
     const assignee = document.createElement('div');
     assignee.className = 'project-todo-assignee';
     const assign = document.createElement('button');
@@ -1293,6 +1290,8 @@ function _updateProjectTodoEditor() {
     project?.classList?.toggle('is-disabled', projectDisabled);
     if (projectDisabled) _todoEditorProjectSelect?.close?.();
   }
+  const agentTrigger = document.getElementById('project-todo-agent')?.querySelector?.('.ai-select-trigger');
+  if (agentTrigger) agentTrigger.disabled = busy || _todoEditorAgentLoading;
 }
 
 function _ensureTodoEditorSelects() {
@@ -1305,12 +1304,61 @@ function _ensureTodoEditorSelects() {
       onChange: (value) => {
         if (_todoEditorPid === null || _todoEditorTid || _todoEditorAttachments.length || _projectTodoMutating) return;
         _todoEditorPid = value;
+        _todoEditorOwnerChanged = false;
+        void _loadTodoEditorAgents();
       },
     });
   }
   const status = document.getElementById('project-todo-status');
   if (status && !_todoEditorStatusSelect) {
     _todoEditorStatusSelect = _aiSelectMount(status, { options: [], value: 'todo' });
+  }
+  const agent = document.getElementById('project-todo-agent');
+  if (agent && !_todoEditorAgentSelect) {
+    _todoEditorAgentSelect = _aiSelectMount(agent, {
+      options: [], value: '', ariaLabel: t('project.todo.assign'),
+      onChange: () => { _todoEditorOwnerChanged = true; },
+    });
+  }
+}
+
+async function _loadTodoEditorAgents(task) {
+  if (!_todoEditorAgentSelect) return;
+  const seq = ++_todoEditorAgentLoadSeq;
+  const generation = _todoEditorGeneration;
+  const pid = _todoEditorPid;
+  _todoEditorAgents = [];
+  _todoEditorAgentLoading = true;
+  _todoEditorAgentSelect.close();
+  const options = [{ value: '', label: t('todo.unassigned') }];
+  // Keep historical owners visible without re-saving them on title-only edits.
+  const ownerValue = task?.owner_agent_id || task?.owner_agent || '';
+  if (ownerValue) options.push({ value: ownerValue, label: task.owner_agent || ownerValue });
+  _todoEditorAgentSelect.setOptions(options, { value: ownerValue });
+  _updateProjectTodoEditor();
+  try {
+    const res = await window.orkas.invoke(pid ? 'projects.bindings.list' : 'agents.list',
+      pid ? { projectId: pid } : { summary: true });
+    if (seq !== _todoEditorAgentLoadSeq || generation !== _todoEditorGeneration || pid !== _todoEditorPid) return;
+    const agents = pid ? res?.agentDetails : res?.agents;
+    if (res?.ok === false || !Array.isArray(agents)) throw new Error('load_failed');
+    _todoEditorAgents = agents.filter((a) => a?.agent_id && (pid || a.enabled !== false))
+      .sort((a, b) => String(a.name || a.agent_id).localeCompare(String(b.name || b.agent_id)));
+    const owner = _findProjectAgent(task?.owner_agent_id, task?.owner_agent, _todoEditorAgents);
+    const value = owner?.agent_id || ownerValue;
+    const next = [{ value: '', label: t('todo.unassigned') },
+      ..._todoEditorAgents.map((a) => ({ value: a.agent_id, label: a.name || a.agent_id }))];
+    if (value && !next.some((a) => a.value === value)) next.push({ value, label: task.owner_agent || value });
+    _todoEditorAgentSelect.setOptions(next, { value });
+  } catch {
+    if (seq === _todoEditorAgentLoadSeq && generation === _todoEditorGeneration) {
+      if (typeof uiAlert === 'function') uiAlert(t('project.todo.failed'));
+    }
+  } finally {
+    if (seq === _todoEditorAgentLoadSeq && generation === _todoEditorGeneration) {
+      _todoEditorAgentLoading = false;
+      _updateProjectTodoEditor();
+    }
   }
 }
 
@@ -1429,12 +1477,14 @@ function _openProjectTodoEditor(task, context = _projectTodoContext(), status = 
   _todoEditorPid = context.pid || '';
   _todoEditorReturnFocus = document.activeElement;
   _todoEditorTaskId = task && task.id ? task.id : null;
-  _todoEditorInitial = task ? { status: task.status || 'todo' } : null;
+  _todoEditorInitial = task ? { status: task.status || 'todo', owner_agent: task.owner_agent, owner_agent_id: task.owner_agent_id } : null;
   // Edit stages attachments onto the real task; create lazily allocates a draft
   // id on first attach (adopted by create on save, discarded on cancel).
   _todoEditorTid = _todoEditorTaskId;
   _todoEditorSavedTid = false;
   _ensureTodoEditorSelects();
+  _todoEditorOwnerChanged = false;
+  void _loadTodoEditorAgents(task);
   input.value = _todoEditorTaskId && task ? (task.title || '') : '';
   const existing = (_todoEditorTaskId && task && Array.isArray(task.attachments)) ? task.attachments : [];
   _setTodoEditorAttachments(existing.map((name) => ({ name, displayName: name, kind: _todoAttachKind(name), status: 'ready' })));
@@ -1484,6 +1534,8 @@ function _closeProjectTodoEditor() {
   if (_projectTodoMutating || _todoEditorAttachments.some((a) => a.status === 'uploading')) return;
   _todoEditorGeneration += 1;
   document.getElementById('todo-editor-modal')?.classList.remove('open');
+  _todoEditorAgentSelect?.close?.();
+  _todoEditorAgentLoading = false;
   document.getElementById('project-todo-composer')?.classList.remove('drag-over');
   _todoEditorReleaseFocus?.();
   _todoEditorReleaseFocus = null;
@@ -1550,6 +1602,12 @@ async function _saveProjectTodoEditor() {
   const generation = _todoEditorGeneration;
   const status = _todoEditorStatusSelect?.getValue?.() || 'todo';
   const taskId = _todoEditorTaskId;
+  const agentId = _todoEditorAgentSelect?.getValue?.() || '';
+  const agent = _todoEditorAgents.find((a) => a.agent_id === agentId)
+    || (agentId && agentId === (_todoEditorInitial?.owner_agent_id || _todoEditorInitial?.owner_agent)
+      ? { agent_id: _todoEditorInitial.owner_agent_id, name: _todoEditorInitial.owner_agent } : null);
+  const owner = (!taskId && agent) || (taskId && _todoEditorOwnerChanged)
+    ? { owner_agent: agent?.name || '', owner_agent_id: agent?.agent_id || '' } : {};
   const startedAt = Date.now();
   // Create passes the pre-allocated draft id when files were staged so the
   // persisted task adopts them. Edits update the existing task in place.
@@ -1559,11 +1617,13 @@ async function _saveProjectTodoEditor() {
       taskId,
       title,
       ...(status !== _todoEditorInitial?.status ? { status } : {}),
+      ...owner,
     })
     : window.orkas.invoke('projects.tasks.create', {
       projectId: pid,
       title,
       status,
+      ...owner,
       ...(_todoEditorTid ? { taskId: _todoEditorTid } : {}),
     })), pid);
   _projectTrackEvent('project_todo_action_result', {
@@ -1637,10 +1697,10 @@ function _findProjectAgent(agentId, name, list = _projectDetailMeta?.agentDetail
 }
 
 // Assign / reassign / clear the owner of a task. Owners must be project-bound
-// agents (the backend validates owner_agent_id against the bindings); an empty
+// agents, or available account agents for global tasks; an empty
 // owner clears both fields. Passing agent=null unassigns.
 async function _assignTodoAgent(tid, agent, context = _projectTodoContext()) {
-  if (context.global || !context.pid) return;
+  if (!_todoContextHasScope(context)) return;
   const startedAt = Date.now();
   const outcome = await _todoMutate(() => window.orkas.invoke('projects.tasks.update', {
     projectId: context.pid,
@@ -1733,9 +1793,10 @@ function _openTodoRowMenu(evt, tid, context = _projectTodoContext()) {
 }
 
 function _openTodoAssignMenu(evt, tid, context = _projectTodoContext()) {
-  if (context.global || !context.pid || typeof showContextMenu !== 'function') return;
+  if (!_todoContextHasScope(context) || typeof showContextMenu !== 'function') return;
   const task = (context.tasks || []).find((x) => x && x.id === tid);
-  const agents = (context.agents || []).filter((a) => a && a.agent_id);
+  const agents = (context.agents || []).filter((a) => a && a.agent_id)
+    .slice().sort((a, b) => String(a.name || a.agent_id).localeCompare(String(b.name || b.agent_id)));
   const items = [];
   for (const a of agents) {
     const isCurrent = !!task && (
@@ -1750,7 +1811,7 @@ function _openTodoAssignMenu(evt, tid, context = _projectTodoContext()) {
     });
   }
   if (!agents.length) {
-    items.push({ label: t('project.todo.assign_no_agents'), disabled: true });
+    items.push({ label: t(context.global ? 'ai_select.empty' : 'project.todo.assign_no_agents'), disabled: true });
   }
   showContextMenu(evt, items);
 }
@@ -4029,7 +4090,7 @@ async function _submitProjectChat() {
     ? transformWithChatUse(requestText)
     : requestText;
   const titleSeed = (typeof _titleSeedWithoutRoutingMentions === 'function')
-    ? _titleSeedWithoutRoutingMentions(raw)
+    ? _titleSeedWithoutRoutingMentions(raw, 'project')
     : raw;
   const titleText = (typeof transformChatUseTokens === 'function')
     ? transformChatUseTokens(titleSeed)
@@ -4038,7 +4099,7 @@ async function _submitProjectChat() {
     ? applyRecipientPrefix(withUse, 'project', { recipientSnapshot: recipient })
     : withUse;
   const commanderDisplay = typeof _commanderMentionDisplayForSend === 'function'
-    ? _commanderMentionDisplayForSend(withUse, recipient) : {};
+    ? _commanderMentionDisplayForSend(withUse, recipient, 'project') : {};
   if (btn) btn.disabled = true;
   let convId = '';
   let createdConversation = null;
@@ -4618,6 +4679,11 @@ function _initProjectDetailBindings() {
   }
   window.addEventListener('i18n-change', () => {
     if (currentView === 'project' && _projectDetailMeta) _renderProjectDetail();
+    if (_todoEditorPid !== null && _todoEditorAgentSelect) {
+      _todoEditorAgentSelect.setAriaLabel(t('project.todo.assign'));
+      _todoEditorAgentSelect.setOptions(_todoEditorAgentSelect.state.options.map((option) =>
+        option.value ? option : { ...option, label: t('todo.unassigned') }));
+    }
   });
 }
 

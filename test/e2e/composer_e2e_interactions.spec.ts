@@ -147,6 +147,50 @@ test.describe('new chat composer', () => {
       .toBe(false);
   });
 
+  test('matches typed and pasted Agent names only inside the current project', async ({ modelOrkas }) => {
+    const page = modelOrkas.page!;
+    const writer = await modelOrkas.invoke<{ agent: { agent_id: string } }>('agents.create', {
+      name: 'ScopedWriter', description: 'Project mention fixture',
+    });
+    await modelOrkas.invoke('agents.create', { name: 'OutsideResearcher', description: 'Unbound mention fixture' });
+    const { project } = await modelOrkas.invoke<{ project: { project_id: string } }>('projects.create', {
+      name: 'Scoped text mentions',
+    });
+    await modelOrkas.invoke('projects.bindings.add', {
+      projectId: project.project_id, kind: 'agent', id: writer.agent.agent_id,
+    });
+    await page.evaluate(async (pid) => {
+      await (window as any).loadRendererFeature('agents');
+      await (window as any).loadAgents(true, { summary: true });
+      (window as any).setView('project', pid);
+    }, project.project_id);
+    const editor = page.locator('.chat-rich-editor[data-rich-input-id="project-chat-input"]');
+    await editor.fill('@ScopedWriter draft A; ');
+    await expect(editor.locator('.chat-use-inline-name')).toHaveText('ScopedWriter');
+    await editor.press('End');
+    await editor.evaluate((element) => {
+      const clipboardData = new DataTransfer();
+      clipboardData.setData('text/plain', '@OutsideResearcher research B');
+      element.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData }));
+    });
+    await expect(editor.locator('.chat-use-inline-name')).toHaveText('ScopedWriter');
+    await expect(page.locator('#project-chat-input')).toHaveValue('@ScopedWriter draft A; @OutsideResearcher research B');
+    await page.locator('#project-chat-send-btn').click();
+    await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
+    const cid = await page.evaluate<string>('currentCid');
+    await expect.poll(async () => (await modelOrkas.invoke<{ processing: boolean }>('groupChat.runtimeStatus', { cid })).processing)
+      .toBe(false);
+    const { tasks } = await modelOrkas.invoke<{ tasks: Array<{ assignee: string; instruction: string }> }>(
+      'groupChat.tasks.list', { cid },
+    );
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].assignee).toBe(writer.agent.agent_id);
+    expect(tasks[0].instruction).toContain('draft A; @OutsideResearcher research B');
+    const continuation = page.locator('.chat-rich-editor[data-rich-input-id="chat-input"]');
+    await continuation.fill('@ScopedWriter continue; @OutsideResearcher remains text');
+    await expect(continuation.locator('.chat-use-inline-name')).toHaveText('ScopedWriter');
+  });
+
   test('keeps CLI separate and shares model priority selection across composers', async ({ appPage, orkas }) => {
     await expect(appPage.locator('.new-chat-model-choices')).toHaveCount(0);
 

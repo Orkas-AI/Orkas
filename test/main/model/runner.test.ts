@@ -996,7 +996,7 @@ describe('runner › scoped tool loading', () => {
     expect(JSON.parse((await bound.execute({ action: 'list' }, context)).content).tasks)
       .toContainEqual(expect.objectContaining({ title: 'AGENT_BACKLOG_ON_DEMAND' }));
     expect(agent.runner.getActiveToolDefinitions().map((tool) => tool.name)).toContain('todo_tasks');
-    expect(bound.inputSchema.properties.action.enum).toEqual(['list', 'create', 'update', 'complete']);
+    expect(bound.inputSchema.properties.action.enum).toEqual(['list', 'get', 'create', 'update', 'complete']);
     expect((await bound.execute({ action: 'update', task_id: agentTask.task.id, status: 'review', result_ref: 'artifact-1' }, context)).isError).toBeFalsy();
     expect(await tasks.getTask(uid, first.project.project_id, agentTask.task.id)).toMatchObject({ status: 'review', result_ref: 'artifact-1', origin_cid: 'agent-result' });
     expect((await bound.execute({ action: 'complete', task_id: agentTask.task.id }, context)).isError).toBeFalsy();
@@ -1886,6 +1886,133 @@ describe('runner › scoped tool loading', () => {
     expect(refusal).toContain('workspace.execute.command');
   });
 
+  it.each(['gconv', 'gmember'])('lets %s batch task reads and mutations through run_program with bound scope', async (kind) => {
+    process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
+    const uid = 'programmatic-task-scope';
+    await configureUser(uid);
+    const projects = await import('../../../src/main/features/projects');
+    const todos = await import('../../../src/main/features/project_tasks');
+    const automations = await import('../../../src/main/features/auto_tasks');
+    const current = await projects.createProject(uid, 'Current');
+    const other = await projects.createProject(uid, 'Other');
+    if (!current.ok || !other.ok) throw new Error('project fixture failed');
+    const pid = current.project.project_id;
+    const otherPid = other.project.project_id;
+    const foreignTodo = await todos.createTask(uid, otherPid, { title: 'Foreign todo' });
+    const foreignAuto = await automations.createTask(uid, {
+      content: 'Foreign automation', project_id: otherPid, enabled: false,
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    if (!foreignTodo.ok || !foreignAuto.ok) throw new Error('task fixture failed');
+    const { buildRunner } = await loadRunner();
+    const built = await buildRunner({
+      sessionId: `${kind}-programmatic-tasks`, userId: uid, projectId: pid, cid: 'task-origin',
+      ...(kind === 'gmember' ? { agentId: 'named-agent', toolList: [] } : {}),
+    });
+    const tools = (built.runner as any).tools;
+    const result = await tools.get('run_program').execute({ code: `
+      async function call(name, args) {
+        const r = await tools[name](args);
+        if (!r.ok) throw new Error(r.content);
+        return JSON.parse(r.content);
+      }
+      const [todo, auto] = await Promise.all([
+        call('todo_tasks', {action:'create', title:'Program todo', detail:'Full task detail'}),
+        call('auto_tasks', {action:'create', content:'Full automation detail', enabled:false,
+          schedule:{type:'daily',hour:9,minute:0}})
+      ]);
+      await Promise.all([
+        call('todo_tasks', {action:'update', task_id:todo.task.id, status:'review'}),
+        call('auto_tasks', {action:'update', task_id:auto.taskId, title:'Edited automation'})
+      ]);
+      const summaries = await Promise.all([
+        call('todo_tasks', {action:'list', status:'review', limit:1}),
+        call('auto_tasks', {action:'list', enabled:false, limit:1})
+      ]);
+      const details = await Promise.all([
+        call('todo_tasks', {action:'get', task_id:todo.task.id}),
+        call('auto_tasks', {action:'get', task_id:auto.taskId})
+      ]);
+      await call('todo_tasks', {action:'complete', task_id:todo.task.id, result_ref:'verified-delivery'});
+      await call('auto_tasks', {action:'enable', task_id:auto.taskId});
+      await call('auto_tasks', {action:'disable', task_id:auto.taskId});
+      json({todoId:todo.task.id, autoId:auto.taskId, summaries, details});
+    ` }, { workingDir: tmpDir, state: {} });
+    expect(result.isError, result.content).not.toBe(true);
+    const receipt = JSON.parse(result.content.slice(result.content.lastIndexOf('\n') + 1));
+    expect(receipt.summaries).toMatchObject([
+      { total: 1, next_offset: null, tasks: [{ status: 'review' }] },
+      { total: 1, next_offset: null, tasks: [{ enabled: false }] },
+    ]);
+    expect(receipt.details).toMatchObject([
+      { task: { detail: 'Full task detail' } }, { task: { content: 'Full automation detail' } },
+    ]);
+    expect(await todos.getTask(uid, pid, receipt.todoId)).toMatchObject({
+      status: 'done', origin_cid: 'task-origin', result_ref: 'verified-delivery',
+    });
+    expect(await automations.getTask(uid, receipt.autoId)).toMatchObject({
+      title: 'Edited automation', content: 'Full automation detail', project_id: pid, enabled: false,
+    });
+    const denied = await tools.get('run_program').execute({ code: `
+      const attempts = await Promise.all([
+        tools.todo_tasks({action:'get',task_id:${JSON.stringify(foreignTodo.task.id)}}),
+        tools.todo_tasks({action:'update',task_id:${JSON.stringify(foreignTodo.task.id)},status:'done'}),
+        tools.todo_tasks({action:'list',project:${JSON.stringify(otherPid)}}),
+        tools.auto_tasks({action:'get',task_id:${JSON.stringify(foreignAuto.task.id)}}),
+        tools.auto_tasks({action:'delete',task_id:${JSON.stringify(foreignAuto.task.id)}}),
+        tools.auto_tasks({action:'list',project_id:${JSON.stringify(otherPid)}})
+      ]);
+      json(attempts.map(r=>({ok:r.ok,error:JSON.parse(r.content).error})));
+    ` }, { workingDir: tmpDir, state: {} });
+    const failures = JSON.parse(denied.content.slice(denied.content.lastIndexOf('\n') + 1));
+    expect(failures).toHaveLength(6);
+    for (const failure of failures) expect(failure).toMatchObject({ ok: false, error: expect.any(String) });
+    expect(await todos.getTask(uid, otherPid, foreignTodo.task.id)).toEqual(foreignTodo.task);
+    expect(await automations.getTask(uid, foreignAuto.task.id)).toEqual(foreignAuto.task);
+    const deleted = await tools.get('run_program').execute({ code:
+      `const r=await tools.auto_tasks({action:'delete',task_id:${JSON.stringify(receipt.autoId)}}); json({ok:r.ok});`,
+    }, { workingDir: tmpDir, state: {} });
+    expect(deleted.content).toContain('"ok":true');
+    expect(await automations.getTask(uid, receipt.autoId)).toBeNull();
+  });
+
+  it('keeps programmatic task writes unavailable to anonymous workers and unbound Agents', async () => {
+    process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
+    const uid = 'programmatic-task-readonly';
+    await configureUser(uid);
+    const projects = await import('../../../src/main/features/projects');
+    const todos = await import('../../../src/main/features/project_tasks');
+    const project = await projects.createProject(uid, 'Worker project');
+    if (!project.ok) throw new Error('project fixture failed');
+    const pid = project.project.project_id;
+    const task = await todos.createTask(uid, pid, { title: 'Read only', detail: 'Complete detail' });
+    if (!task.ok) throw new Error('task fixture failed');
+    const { buildRunner } = await loadRunner();
+    const worker = await buildRunner({ sessionId: 'gworker-programmatic-task', userId: uid, projectId: pid, agentId: 'scoped-worker' });
+    const result = await (worker.runner as any).tools.get('run_program').execute({ code: `
+      const read = await tools.todo_tasks({action:'get',task_id:${JSON.stringify(task.task.id)}});
+      const write = await tools.todo_tasks({action:'update',task_id:${JSON.stringify(task.task.id)},status:'done'});
+      json({read:JSON.parse(read.content),write:write.ok,writeError:JSON.parse(write.content).error,
+        automationAvailable:typeof tools.auto_tasks !== 'undefined'});
+    ` }, { workingDir: tmpDir, state: {} });
+    expect(result.isError, result.content).not.toBe(true);
+    expect(JSON.parse(result.content.slice(result.content.lastIndexOf('\n') + 1))).toMatchObject({
+      read: { task: { detail: 'Complete detail' } }, write: false,
+      writeError: expect.stringContaining('read-only'), automationAvailable: false,
+    });
+    expect(await todos.getTask(uid, pid, task.task.id)).toEqual(task.task);
+    const anonymous = await buildRunner({ sessionId: 'gworker-programmatic-anonymous', userId: uid, projectId: pid });
+    const anonymousTools = await (anonymous.runner as any).tools.get('run_program').execute({ code:
+      "json({todo:typeof tools.todo_tasks,auto:typeof tools.auto_tasks});",
+    }, { workingDir: tmpDir, state: {} });
+    expect(anonymousTools.content).toContain('"todo":"undefined","auto":"undefined"');
+    const agent = await buildRunner({ sessionId: 'gmember-programmatic-unbound', userId: uid, agentId: 'named-agent', toolList: [] });
+    const absent = await (agent.runner as any).tools.get('run_program').execute({ code:
+      "json({todo:typeof tools.todo_tasks,auto:typeof tools.auto_tasks});",
+    }, { workingDir: tmpDir, state: {} });
+    expect(absent.content).toContain('"todo":"undefined","auto":"undefined"');
+  });
+
   it('keeps run_program independent of the directly active tool surface', async () => {
     process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
     const uid = 'runner-programmatic-workspace-tools';
@@ -2032,7 +2159,7 @@ describe('runner › scoped tool loading', () => {
     await configureUser(uid);
     const { buildRunner } = await loadRunner();
     const managementCalls: string[] = [];
-    const managementTools = ['marketplace_search', 'auto_tasks_list'].map((name) => ({
+    const managementTools = ['marketplace_search'].map((name) => ({
       name,
       description: `Test ${name} boundary.`,
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
@@ -2069,7 +2196,7 @@ describe('runner › scoped tool loading', () => {
       newly_loaded: ['management.marketplace'],
     });
     expect(runner.activeTools().map((tool) => tool.name)).toContain('marketplace_search');
-    expect(runner.activeTools().map((tool) => tool.name)).not.toContain('auto_tasks_list');
+    expect(runner.activeTools().map((tool) => tool.name)).not.toContain('auto_tasks');
     expect(managementCalls).toEqual([]);
 
     const searchResult = await runner.tools.get('marketplace_search')?.execute(
@@ -2093,6 +2220,21 @@ describe('runner › scoped tool loading', () => {
       webToolUsed: false,
     });
     expect(built.toolSurfaceTelemetry().loadedSchemaChars).toBeGreaterThan(0);
+
+    expect(runner.tools.has('auto_tasks_list')).toBe(false);
+    const automationLoad = await runner.tools.get('tool_load')?.execute(
+      { groups: ['management.automation'] },
+      { workingDir: tmpDir, state: {} },
+    );
+    expect(JSON.parse(automationLoad?.content || '{}')).toMatchObject({ ok: true });
+    expect(runner.activeTools().map((tool) => tool.name)).toContain('auto_tasks');
+    expect(runner.activeTools().map((tool) => tool.name)).not.toContain('auto_tasks_list');
+    const schedules = await runner.tools.get('auto_tasks')?.execute(
+      { action: 'list' }, { workingDir: tmpDir, state: {} },
+    );
+    expect(JSON.parse(schedules?.content || '{}')).toMatchObject({
+      ok: true, tasks: [], total: 0, next_offset: null,
+    });
 
     const sessions = await import('../../../src/main/model/core-agent/session-store');
     expect((await sessions.getSessionForUser(uid, 'gconv-scoped-management'))

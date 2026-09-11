@@ -8,6 +8,7 @@ import {
   CodexActivityHeartbeat,
   codexBackend,
 } from '../../../../src/main/features/local_agents/backends/codex';
+import * as userInput from '../../../../src/main/features/local_agents/cli_user_input';
 
 const describePosix = process.platform === 'win32' ? describe.skip : describe;
 
@@ -39,6 +40,7 @@ const specialScenarios = [
   'approval',
   'user-input-146',
   'user-input-151',
+  'async-question',
   'unknown-request',
   'hang',
 ];
@@ -235,6 +237,11 @@ process.stdin.on('data', (chunk) => {
               permissions: { fileSystem: { read: ['/workspace'] } },
             },
           });
+        } else if (scenario === 'async-question') {
+          const item = { id: 'async-question', type: 'agentMessage', phase: 'final_answer', delivery: 'async', text: 'Which scope?', questions: [{ title: 'Which scope?', options: ['Current', 'All'] }] };
+          send({ jsonrpc: '2.0', method: 'item/completed', params: { threadId: 'fresh-thread', turnId: 'turn-1', item } });
+          send({ jsonrpc: '2.0', method: 'item/completed', params: { threadId: 'fresh-thread', turnId: 'turn-1', item } });
+          send({ jsonrpc: '2.0', method: 'item/started', params: { threadId: 'fresh-thread', item: { id: 'continued-work', type: 'commandExecution', command: 'pwd' } } });
         } else if (scenario === 'user-input-146' || scenario === 'user-input-151') {
           send({
             jsonrpc: '2.0',
@@ -1098,6 +1105,27 @@ if (scenario.endsWith('-lingers') || scenario === 'hang' || scenario === 'bootst
     expect(ingressStates.at(-1)).toBeNull();
   });
 
+  it('delivers an async question once while work continues and accepts its answer on the same turn', async () => {
+    const events: any[] = [];
+    let ingress: any;
+    const requestUserInput = vi.fn();
+    const run = codexBackend.run({
+      binPath: fakeCodexPath, prompt: 'inspect scope', customArgs: ['--async-question'],
+      cwd: tempDir, signal: new AbortController().signal, timeoutMs: 3000,
+      requestUserInput,
+      onEvent: event => events.push(event),
+      onActiveRunIngress: value => { if (value) ingress = value; },
+    });
+    await vi.waitFor(() => expect(events.some(event => event.tool === 'exec_command')).toBe(true));
+    expect(events.filter(event => event.type === 'async-message')).toHaveLength(1);
+    expect(events.some(event => event.type === 'done')).toBe(false);
+    expect(requestUserInput).not.toHaveBeenCalled();
+    expect(await ingress.submit({ id: 'answer-1', text: 'Which scope?\nCurrent' })).toMatchObject({ mode: 'steered' });
+    await run;
+    expect(events.at(-1)).toMatchObject({ type: 'done', status: 'completed' });
+    expect(events.at(-1).output).not.toContain('Which scope?');
+  });
+
   it('retains a Codex steer as a follow-up when the native turn rejects it', async () => {
     let resolveIngress!: (value: any) => void;
     const ingressReady = new Promise<any>((resolve) => { resolveIngress = resolve; });
@@ -1178,6 +1206,7 @@ if (scenario.endsWith('-lingers') || scenario === 'hang' || scenario === 'bootst
 
     expect(requestUserInput).toHaveBeenCalledWith({
       id: 'user-input-1',
+      signal: expect.any(AbortSignal),
       questions: [{
         id: 'environment',
         header: 'Environment',
@@ -1191,6 +1220,67 @@ if (scenario.endsWith('-lingers') || scenario === 'hang' || scenario === 'bootst
     expect(events.at(-1)).toMatchObject({
       type: 'done', status: 'completed', output: 'staging selected',
     });
+  });
+
+  it.each(['resolved', 'completed'])('closes native questions on CLI %s without sending stale RPC replies', async boundary => {
+    const executable = path.join(tempDir, `question-${boundary}`);
+    const trace = path.join(tempDir, `question-${boundary}.json`);
+    fs.writeFileSync(executable, `#!/usr/bin/env node
+const fs = require('node:fs');
+const received = [];
+const send = msg => process.stdout.write(JSON.stringify(msg) + '\\n');
+const finish = () => send({ method: 'turn/completed', params: { threadId: 'fresh-thread', turn: { id: 'turn-1', status: 'completed' } } });
+require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+  const msg = JSON.parse(line);
+  received.push(msg);
+  fs.writeFileSync(${JSON.stringify(trace)}, JSON.stringify(received));
+  if (msg.method === 'initialize') send({ id: msg.id, result: {} });
+  if (msg.method === 'thread/start') send({ id: msg.id, result: { threadId: 'fresh-thread' } });
+  if (msg.method === 'turn/start') {
+    send({ id: msg.id, result: { turn: { id: 'turn-1' } } });
+    send({ method: 'turn/started', params: { threadId: 'fresh-thread', turn: { id: 'turn-1' } } });
+    for (const id of [94, 95]) send({ id, method: 'item/tool/requestUserInput', params: {
+      threadId: 'fresh-thread', turnId: 'turn-1', itemId: 'question-' + id,
+      questions: [{ id: 'scope', question: 'Choose scope' }], isBlocking: true,
+    } });
+  }
+  if (msg.method === 'turn/steer') {
+    send({ method: 'serverRequest/resolved', params: { threadId: 'other-thread', requestId: 95 } });
+    send({ method: 'serverRequest/resolved', params: { threadId: 'fresh-thread', requestId: 94 } });
+    send({ id: msg.id, result: { turnId: 'turn-1' } });
+    if (${JSON.stringify(boundary)} === 'completed') finish();
+  }
+  if (msg.id === 95 && msg.result) finish();
+});
+`, { mode: 0o755 });
+    const deliveries: Array<{ channel: string; payload: any }> = [];
+    const events: any[] = [];
+    let ingress: any;
+    userInput._setBroadcastForTest((channel, payload) => { deliveries.push({ channel, payload }); });
+    const run = codexBackend.run({
+      binPath: executable, prompt: 'inspect', cwd: tempDir, signal: new AbortController().signal,
+      timeoutMs: 5000, onEvent: event => events.push(event), onActiveRunIngress: value => { ingress = value; },
+      requestUserInput: request => userInput.requestUserInput({ uid: 'u-input', cid: 'c-input', runId: 'codex-input', agentId: 'codex', agentName: 'Codex', cli: 'codex', request }),
+    });
+    try {
+      // Startup shares the fixture's run budget; it is not an answer timeout.
+      await vi.waitFor(() => expect(deliveries.filter(row => row.channel === 'local-agent:user-input')).toHaveLength(2), { timeout: 5000 });
+      const ids = deliveries.filter(row => row.channel === 'local-agent:user-input').map(row => row.payload.request_id);
+      await ingress.submit({ id: 'test-control', text: 'continue' });
+      await vi.waitFor(() => expect(deliveries.some(row => row.channel === 'local-agent:user-input_cancelled' && row.payload.request_ids.includes(ids[0]))).toBe(true));
+      expect(userInput.respond(ids[0], 'u-input', { scope: ['Late'] })).toEqual({ handled: false });
+      if (boundary === 'resolved') {
+        expect(userInput.respond(ids[1], 'u-input', { scope: ['Current'] })).toEqual({ handled: true, cancelled: false });
+      }
+      await run;
+      expect(userInput.respond(ids[1], 'u-input', { scope: ['Late'] })).toEqual({ handled: false });
+      const replies = JSON.parse(fs.readFileSync(trace, 'utf8')).filter((row: any) => !row.method && [94, 95].includes(row.id));
+      expect(replies).toEqual(boundary === 'resolved' ? [{ jsonrpc: '2.0', id: 95, result: { answers: { scope: { answers: ['Current'] } } } }] : []);
+      expect(events.at(-1)).toMatchObject({ type: 'done', status: 'completed' });
+    } finally {
+      await run;
+      userInput._resetForTest();
+    }
   });
 
   it('fails an unknown app-server request immediately instead of waiting for the watchdog', async () => {

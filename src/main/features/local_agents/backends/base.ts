@@ -29,6 +29,7 @@ type SpawnFn = typeof spawn;
 export type LocalEventType =
   | 'process-info'
   | 'text-delta'
+  | 'async-message'
   | 'thinking'
   | 'tool-event'
   | 'media-output'
@@ -69,6 +70,7 @@ export interface LocalEvent {
    *  each emit site; a minimal index:
    *    process-info:       { pid, cwd, cmd, args, sessionId? }
    *    text-delta:         { text, phase?: 'commentary'|'final_answer', itemId? }
+   *    async-message:      { text, itemId, questions: LocalCliAsyncQuestion[] }
    *    thinking:           { text?, summary? } backend-side;
    *                        { chars, summary?, itemId?, heartbeat?, synthetic? } after the
    *                        runner boundary (summary is bounded; raw reasoning
@@ -122,6 +124,14 @@ export interface LocalCliUserInputQuestion {
   options?: LocalCliUserInputOption[];
   isOther?: boolean;
   isSecret?: boolean;
+  multiSelect?: boolean;
+}
+
+/** Non-blocking messages are delivered independently of a turn's final body.
+ * Replies use the active-turn ingress, not a tool-request RPC response. */
+export interface LocalCliAsyncQuestion {
+  title: string;
+  options?: string[];
 }
 
 export interface LocalCliUserInputRequest {
@@ -129,6 +139,8 @@ export interface LocalCliUserInputRequest {
   questions: LocalCliUserInputQuestion[];
   isBlocking?: boolean;
   autoResolutionMs?: number;
+  /** Aborted when the CLI clears this specific request or its run ends. */
+  signal?: AbortSignal;
 }
 
 export interface LocalCliUserInputResponse {

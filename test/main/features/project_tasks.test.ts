@@ -89,6 +89,27 @@ describe('project_tasks › global scope', () => {
     for (const secret of [TEST_UID, tid, filename, tmpDir, 'private content']) expect(output).not.toContain(secret);
   });
 
+  it('persists a registered global owner, rejects unavailable or cross-account owners, and clears assignment', async () => {
+    const { pt } = await setup();
+    const agents = await import('../../../src/main/features/agents');
+    const owner = await agents.createCustomAgent({ name: 'GlobalOwner' });
+    if (!owner) throw new Error('agent fixture failed');
+    const created = await pt.createTask(TEST_UID, '', { title: 'Assigned globally', owner_agent_id: owner.agent_id, owner_agent: 'Stale name' });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(await pt.getTask(TEST_UID, '', created.task.id)).toMatchObject({ owner_agent: 'GlobalOwner', owner_agent_id: owner.agent_id });
+    expect(await pt.updateTask(TEST_UID, '', created.task.id, { owner_agent_id: 'missing' }))
+      .toEqual({ ok: false, error: 'owner_not_bound' });
+    expect(await pt.createTask('other-account', '', { title: 'Wrong account', owner_agent_id: owner.agent_id }))
+      .toEqual({ ok: false, error: 'owner_not_bound' });
+    expect(await pt.listTasks('other-account', '')).toEqual([]);
+    expect((await pt.getTask(TEST_UID, '', created.task.id))?.owner_agent_id).toBe(owner.agent_id);
+    agents.setAgentEnabledForActiveUser(owner.agent_id, false);
+    expect(await pt.updateTask(TEST_UID, '', created.task.id, { owner_agent_id: owner.agent_id }))
+      .toEqual({ ok: false, error: 'owner_not_bound' });
+    expect((await pt.updateTask(TEST_UID, '', created.task.id, { owner_agent: '', owner_agent_id: '' })).ok).toBe(true);
+    expect(await pt.getTask(TEST_UID, '', created.task.id)).not.toHaveProperty('owner_agent_id');
+  });
   it('isolates identical task ids and attachment names across accounts and scopes after reload', async () => {
     const { pt, projects, pid } = await setup();
     const other = await projects.createProject(TEST_UID, 'Other project');

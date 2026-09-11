@@ -1033,22 +1033,37 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
 
   it.each([
     { id: 'github', display_name: 'GitHub', auth_mode: 'server_bridge' },
+    { id: 'dingtalk', display_name: 'DingTalk', auth_mode: 'local_cli' },
     { id: 'feishu', display_name: 'Feishu', auth_mode: 'local_cli' },
-  ])('shows $id initialization from listed state when callback feedback is absent', (entry) => {
-    const ctx = loadConnectorsRenderer();
+    { id: 'wecom', display_name: 'WeCom', auth_mode: 'local_cli' },
+  ])('keeps $id connect available on startup despite a persisted connecting status', async (entry) => {
     const instance = { id: entry.id, status: { kind: 'connecting' } };
-    ctx.__setInstances([instance]);
+    const invoke = vi.fn(async (channel: string) => channel === 'connectors.catalog'
+      ? { ok: true, catalog: [entry] }
+      : { ok: true, instances: [instance] });
+    const ctx = loadConnectorsRenderer(invoke);
+    await ctx.loadConnectors();
+    const restarted = loadConnectorsRenderer();
+    const cacheKey = ctx._connectorsRenderCacheKey();
+    restarted.localStorage.setItem(cacheKey, ctx.localStorage.getItem(cacheKey));
+    expect(restarted._hydrateConnectorsRenderCache()).toBe(true);
 
-    const pending = ctx._renderCatalogCard(entry, instance).innerHTML;
-    expect(pending).toContain('connectors.action.connecting');
-    expect(pending).toContain('is-loading');
-    expect(pending).toContain('disabled');
-    expect(pending).toContain('aria-busy="true"');
-    expect(pending).not.toContain('data-act="use-connector"');
-    expect(ctx.isConnectorLive(entry.id)).toBe(false);
-    ctx.__emitWindow('blur');
-    ctx.__advanceTimers(5000);
-    expect(ctx._renderCatalogCard(entry, instance).innerHTML).toContain('is-loading');
+    // Both the live list and the next launch's first-paint cache describe stored state,
+    // not an authorization attempt in this renderer session.
+    for (const surface of [ctx, restarted]) {
+      surface.__emitPush('connectors:oauth-callback', {
+        attempt_id: 'previous-session', catalog_id: entry.id,
+      });
+      const card = surface._renderCatalogCard(entry, surface._instanceById(entry.id)).innerHTML;
+      expect(card).toContain('data-act="connect"');
+      expect(card).toContain('>connectors.action.connect</button>');
+      expect(card).not.toContain('is-loading');
+      expect(card).not.toContain('disabled');
+      expect(card).not.toContain('aria-busy="true"');
+      expect(card).not.toContain('data-act="use-connector"');
+      expect(surface.isConnectorLive(entry.id)).toBe(false);
+    }
+    expect(invoke.mock.calls.map(([channel]) => channel)).toEqual(['connectors.catalog', 'connectors.list']);
 
     const ready = { ...instance, status: { kind: 'connected' } };
     ctx.__setInstances([ready]);
@@ -1061,7 +1076,56 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     const failureCard = ctx._renderCatalogCard(entry, failed);
     expect(failureCard.innerHTML).not.toContain('is-loading');
     expect(failureCard.innerHTML).not.toContain('data-act="use-connector"');
-    expect(failureCard.querySelector('.connector-card-error').textContent).toContain('connectors.status.error');
+    if (entry.auth_mode === 'local_cli') {
+      expect(failureCard.innerHTML).not.toContain('connector-card-error');
+      expect(failureCard.innerHTML).toContain('>connectors.action.connect</button>');
+    } else {
+      expect(failureCard.querySelector('.connector-card-error').textContent).toContain('connectors.status.error');
+    }
+    expect(ctx.isConnectorLive(entry.id)).toBe(false);
+  });
+
+  it('leaves an unfinished DingTalk setup available after restart and reports a new failure once', async () => {
+    const entry = {
+      id: 'dingtalk', display_name: 'DingTalk', auth_mode: 'local_cli',
+      local_cli: { executable: 'dws' },
+    };
+    let instance: any = {
+      id: entry.id, tools_cache: [], tools_cached_at: 0,
+      status: { kind: 'error', message: 'connection failed' },
+    };
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'connectors.catalog') return { ok: true, catalog: [entry] };
+      if (channel === 'connectors.list') return { ok: true, instances: [instance] };
+      if (channel === 'connectors.local_cli_status') return { ok: true, status: { installed: true } };
+      return { ok: true, started: true, attempt_id: 'dingtalk-retry' };
+    });
+    const ctx = loadConnectorsRenderer(invoke);
+    const card = () => ctx._renderCatalogCard(entry, ctx._instanceById(entry.id)).innerHTML;
+    await ctx.loadConnectors();
+    expect(card()).toContain('>connectors.action.connect</button>');
+    expect(card()).not.toContain('connector-card-error');
+    expect(ctx.__alerts).toEqual([]);
+
+    await ctx._runConnect(entry);
+    expect(card()).toContain('is-loading');
+    expect(card()).not.toContain('connector-card-error');
+    const failure = {
+      attempt_id: 'dingtalk-retry', catalog_id: entry.id,
+      result: 'failure', code: 'mcp_connect_failed', error: 'connection failed',
+    };
+    ctx.__emitPush('connectors:oauth-result', failure);
+    ctx.__emitPush('connectors:oauth-result', failure);
+    await ctx.loadConnectors();
+    expect(ctx.__alerts).toHaveLength(1);
+    expect(card()).not.toContain('is-loading');
+    expect(card()).not.toContain('connector-card-error');
+    expect(card()).toContain('>connectors.action.connect</button>');
+
+    // A previously usable connector losing access remains a real service error.
+    instance = { ...instance, tools_cached_at: 1, tools_cache: [{ name: 'execute_read' }] };
+    await ctx.loadConnectors();
+    expect(card()).toContain('connector-card-error');
     expect(ctx.isConnectorLive(entry.id)).toBe(false);
   });
 
@@ -1094,8 +1158,16 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     expect(ctx._renderCatalogCard(entry, null).innerHTML).not.toContain('is-loading');
   });
 
-  it('shows disabled loading immediately, clears launch feedback on blur, then tracks callback finalization', async () => {
+  it.each([
+    { id: 'github', display_name: 'GitHub', auth_mode: 'server_bridge' },
+    { id: 'dingtalk', display_name: 'DingTalk', auth_mode: 'local_cli', local_cli: { executable: 'dws' } },
+    { id: 'feishu', display_name: 'Feishu', auth_mode: 'local_cli', local_cli: { executable: 'lark-cli' } },
+    { id: 'wecom', display_name: 'WeCom', auth_mode: 'local_cli', local_cli: { executable: 'wecom-cli' } },
+  ])('tracks $id loading through user launch, blur, authorization callback and completion', async (entry) => {
     const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'connectors.local_cli_status') {
+        return { ok: true, status: { installed: true, runtime_ready: true } };
+      }
       if (channel === 'connectors.start_oauth') {
         return { ok: true, started: true, attempt_id: 'attempt-loading' };
       }
@@ -1104,7 +1176,6 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
       return { ok: true };
     });
     const ctx = loadConnectorsRenderer(invoke);
-    const entry = { id: 'github', display_name: 'GitHub' };
 
     await ctx._runConnect(entry);
     expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('is-loading');
@@ -1117,7 +1188,7 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
 
     ctx.__emitPush('connectors:oauth-callback', {
       attempt_id: 'attempt-loading',
-      catalog_id: 'github',
+      catalog_id: entry.id,
     });
     expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('is-loading');
     expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('connectors.action.connecting');
@@ -1127,7 +1198,7 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     // A stale terminal event must not clear the active callback's feedback.
     ctx.__emitPush('connectors:oauth-result', {
       attempt_id: 'older-attempt',
-      catalog_id: 'github',
+      catalog_id: entry.id,
       result: 'cancelled',
       code: 'superseded',
       duration_ms: 1,
@@ -1136,7 +1207,7 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
 
     ctx.__emitPush('connectors:oauth-result', {
       attempt_id: 'attempt-loading',
-      catalog_id: 'github',
+      catalog_id: entry.id,
       result: 'success',
       duration_ms: 18,
     });

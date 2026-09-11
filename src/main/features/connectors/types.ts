@@ -208,7 +208,7 @@ export interface CatalogConnectionField {
   help_en?: string;
   help_ja?: string;
   help_pt?: string;
-  required: true;
+  required: boolean;
   /** Local-API fields marked credential are encrypted in the device-only connector store and
    *  never copied into the synced connector registry. */
   storage?: 'metadata' | 'credential';
@@ -236,6 +236,8 @@ export interface CatalogConnectionField {
     | 'ebay_marketplace'
     | 'ebay_content_language'
     | 'ebay_ru_name'
+    | 'ebay_signing_private_key'
+    | 'ebay_signing_key_jwe'
     | 'ebay_redirect_uri'
     | 'etsy_shop_id'
     | 'etsy_keystring'

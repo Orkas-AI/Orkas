@@ -93,6 +93,10 @@ export interface ConversationTask {
   instruction: string;
   attachments?: string[];
   status: ConversationTaskStatus;
+  /** A newly queued row has not yet been evaluated by the scheduler. It is
+   * not a standalone waiting surface until admission leaves it queued.
+   * Absent on legacy rows, which retain their existing queue controls. */
+  admission_pending?: boolean;
   created_by: ConversationTaskCreatedBy;
   /** P3: commander sub-tasks point at their orchestration turn's task. */
   parent_task_id?: string;
@@ -220,6 +224,7 @@ function normalizeTask(raw: any, cid: string): ConversationTask | null {
     created_by: createdBy,
     created_at: typeof raw.created_at === 'string' ? raw.created_at : nowIso(),
   };
+  if (raw.admission_pending === true && status === 'queued') t.admission_pending = true;
   if (Array.isArray(raw.attachments)) {
     const atts = raw.attachments.filter((a: unknown) => typeof a === 'string');
     if (atts.length) t.attachments = atts;
@@ -292,6 +297,7 @@ function loadBoardSync(b: BoardState): void {
     if (!liveTaskIds?.has(t.task_id)
       && (t.status === 'queued' || t.status === 'running' || t.status === 'blocked')) {
       t.status = 'cancelled';
+      delete t.admission_pending;
       const now = nowIso();
       t.ended_at = t.ended_at || now;
       stampTaskSync(t, now);
@@ -445,6 +451,8 @@ export interface CreateTaskInput {
   after?: string;
   /** Create directly in running state (lazy claim of a pre-board item). */
   running?: boolean;
+  /** The scheduler will distinguish initial admission from actual waiting. */
+  admissionPending?: boolean;
   /** Caller-supplied id. The worker loop pre-generates it synchronously so
    * the QueueItem can carry the id without awaiting board IO on the hot
    * path between claiming a turn and arming its AbortController. */
@@ -464,6 +472,7 @@ export function createTask(
       assignee: input.assignee,
       instruction: input.instruction,
       status: input.running ? 'running' : 'queued',
+      ...(!input.running && input.admissionPending ? { admission_pending: true } : {}),
       created_by: input.createdBy,
       created_at: now,
       ...(input.attachments && input.attachments.length ? { attachments: input.attachments.slice() } : {}),
@@ -476,6 +485,26 @@ export function createTask(
     };
     b.tasks.push(t);
     return { ...t };
+  });
+}
+
+/** Publish actual waiting only after a scheduler pass found no admissible
+ * item. The pending flag is one-way, so list resync can recover a missed
+ * confirmation without reviving an older initial-admission snapshot. */
+export function confirmQueued(
+  uid: string,
+  cid: string,
+  taskIds: string[],
+): Promise<ConversationTask[]> {
+  const ids = new Set(taskIds);
+  return withBoard(uid, cid, (b) => {
+    const changed: ConversationTask[] = [];
+    for (const t of b.tasks) {
+      if (!ids.has(t.task_id) || t.status !== 'queued' || t.admission_pending !== true) continue;
+      delete t.admission_pending;
+      changed.push({ ...t });
+    }
+    return changed;
   });
 }
 
@@ -504,6 +533,7 @@ export function claimTask(
       return { running: null, superseded: [] };
     }
     t.status = 'running';
+    delete t.admission_pending;
     t.started_at = nowIso();
     if (opts?.absorbedIntoTurnId) t.absorbed_into_turn_id = opts.absorbedIntoTurnId;
     if (opts?.absorbedIntoTaskId) t.absorbed_into_task_id = opts.absorbedIntoTaskId;
@@ -552,6 +582,7 @@ export function finishTask(
     if (!t) return null;
     if (TERMINAL_STATUSES.has(t.status)) return null;
     t.status = terminal;
+    delete t.admission_pending;
     if (terminal !== 'waiting_input') t.ended_at = nowIso();
     if (opts?.resultMsgId) t.result_msg_id = opts.resultMsgId;
     if (opts?.resume) t.resume = { ...t.resume, ...opts.resume };
@@ -573,6 +604,7 @@ export function cancelPending(
     if (!t) return null;
     if (t.status !== 'queued' && t.status !== 'waiting_input' && t.status !== 'blocked') return null;
     t.status = 'cancelled';
+    delete t.admission_pending;
     t.ended_at = nowIso();
     return { ...t };
   });
@@ -625,6 +657,7 @@ export function markBlocked(
     const t = b.tasks.find((x) => x.task_id === taskId);
     if (!t || t.status !== 'queued') return null;
     t.status = 'blocked';
+    delete t.admission_pending;
     return { ...t };
   });
 }

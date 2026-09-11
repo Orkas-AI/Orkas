@@ -435,7 +435,6 @@ describe('Office built-in tools', () => {
       stdout: '',
       stderr: 'Resident is running but the batch could not be delivered (main pipe busy or unresponsive).',
     });
-    h.runOfficeCli.mockResolvedValueOnce({ code: 0, stdout: 'ok', stderr: '' });
 
     const result = await getTool('create_pptx').execute({
       path: 'retry-resident.pptx',
@@ -446,11 +445,58 @@ describe('Office built-in tools', () => {
     expect(result.isError).toBeUndefined();
     const batchCalls = h.runOfficeCli.mock.calls.filter(([args]) => args[0] === 'batch');
     expect(batchCalls).toHaveLength(2);
-    expect(batchCalls[1][0][1]).toBe(batchCalls[0][0][1]);
+    expect(batchCalls[1][0][1]).not.toBe(batchCalls[0][0][1]);
     expect(h.closeOfficeFile).toHaveBeenCalledWith(
       batchCalls[0][0][1],
       path.dirname(batchCalls[0][0][1]),
     );
+  });
+
+  it.each([false, true])('restarts private creation after ambiguous delivery without duplicating writes (failure=%s)', async (retryFails) => {
+    const target = path.join(h.workspace, 'ambiguous.xlsx');
+    fs.writeFileSync(target, 'prior-owned-file');
+    produced.add(target);
+    let batches = 0;
+    const inputStates: string[] = [];
+    h.runOfficeCli.mockImplementation(async (args: string[]) => {
+      if (args[0] === 'create') fs.writeFileSync(args[1], 'pristine');
+      if (args[0] === 'batch') {
+        batches += 1;
+        // A committed non-idempotent edit can lose its reply. Never replay it
+        // against the mutated staging file or overwrite the prior final file.
+        inputStates.push(fs.readFileSync(args[1], 'utf8'));
+        fs.appendFileSync(args[1], ':one-sheet');
+        if (batches === 1 || retryFails) return {
+          code: 3, stdout: '', stderr: 'batch could not be delivered (main pipe busy)',
+        };
+      }
+      return { code: 0, stdout: 'ok', stderr: '' };
+    });
+    const result = await getTool('create_xlsx').execute({
+      path: target, rows: [['value']], preview: false,
+    }, ctx());
+    expect(batches).toBe(2);
+    expect(inputStates).toEqual(['pristine', 'pristine']);
+    expect(fs.readFileSync(target, 'utf8')).toBe(retryFails ? 'prior-owned-file' : 'pristine:one-sheet');
+    expect(Boolean(result.isError)).toBe(retryFails);
+    expect(onFileWritten).toHaveBeenCalledTimes(retryFails ? 0 : 1);
+    expect(fs.readdirSync(h.workspace)).toEqual(['ambiguous.xlsx']);
+  });
+
+  it('does not restart or publish creation when cancelled after ambiguous delivery', async () => {
+    const abort = new AbortController();
+    h.runOfficeCli.mockImplementationOnce(async (args: string[]) => {
+      fs.writeFileSync(args[1], 'pristine');
+      return { code: 0, stdout: '', stderr: '' };
+    }).mockResolvedValueOnce({ code: 3, stdout: '', stderr: 'batch could not be delivered' });
+    h.closeOfficeFile.mockImplementationOnce(async () => { abort.abort(); });
+    const result = await getTool('create_xlsx').execute({
+      path: 'cancelled.xlsx', rows: [['value']], preview: false,
+    }, ctx({ signal: abort.signal }));
+    expect(result.isError).toBe(true);
+    expect(h.runOfficeCli).toHaveBeenCalledTimes(2);
+    expect(onFileWritten).not.toHaveBeenCalled();
+    expect(fs.readdirSync(h.workspace)).toEqual([]);
   });
 
   it('keeps a prior conversation-produced workbook intact when a recreate batch fails', async () => {

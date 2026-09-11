@@ -7342,7 +7342,124 @@ describe('conversation process metadata formatting', () => {
     expect(disclosureSummary.getAttribute('tabindex')).toBeNull();
   });
 
-  it('collapses and unlocks process details when body output or an exception begins', () => {
+  it.each(['completed', 'failed', 'cancelled'])(
+    'keeps reply text and subsequent work live until the turn is %s', (terminal) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-09-09T09:00:00Z'));
+      try {
+        const context = loadConversationRenderer();
+        const details = createProcessTestElement('details');
+        details.className = 'stream-process';
+        details.style = { display: '' };
+        const runtime = createProcessTestElement('span');
+        runtime.className = 'stream-process-runtime';
+        const summary = createProcessTestElement('summary');
+        summary.className = 'stream-process-summary';
+        const label = createProcessTestElement('span');
+        label.className = 'stream-process-label';
+        const body = createProcessTestElement('div');
+        body.className = 'stream-process-body';
+        for (const node of [runtime, summary, label, body]) details.appendChild(node);
+        const finalEl = createProcessTestElement('div');
+        finalEl.style = { display: 'none' };
+        const msg: any = {
+          dataset: {},
+          isConnected: true,
+          querySelector(selector: string) {
+            if (selector === '[data-role="process-container"]' || selector === '.stream-process') return details;
+            if (selector === '[data-role="process"]') return body;
+            if (selector === '[data-role="final"]') return finalEl;
+            return null;
+          },
+        };
+        context.currentCid = 'live-cid';
+        context.groupBusyConvs.set('live-cid', true);
+        context._ensureActorPlaceholder = () => msg;
+        context._advanceStreamingMessageActivityPosition = () => {};
+        context._paintStreamingFinalMarkdown = (_msg: any, target: any, text: string) => {
+          target.innerHTML = text;
+        };
+        context.renderMarkdownFull = escapeHtml;
+        context._attachAssistantActions = () => {};
+        context._attachFailedAssistantActions = () => {};
+        context._attachInterruptedAssistantActions = () => {};
+        context.document.createElement = createProcessTestElement;
+        context._stickProcessBottomIfPinned = () => {};
+        context._stickBottomFromMsg = () => {};
+        const processEvent = (data: any) => context._handleGroupBusEvent('live-cid', msg, {
+          type: 'process', actor: 'codex', turn_id: 'live-turn', data,
+        });
+
+        context._setProcessSummaryState(msg, 'active');
+        context._streamingUpdateActivity(msg);
+        vi.advanceTimersByTime(38_000);
+        expect(runtime.textContent).toBe('38s');
+
+        // Codex delivers asynchronous questions as final_answer text before
+        // continuing the same turn. Ordinary answer deltas are nonterminal too.
+        const text = terminal === 'completed' ? 'The results are ' : 'Which source should I use?';
+        processEvent({ type: 'delta', phase: 'final_answer', text });
+        vi.advanceTimersByTime(12_000);
+        expect(finalEl.innerHTML).toBe(text);
+        expect(runtime.textContent).toBe('50s');
+        expect(details.open).toBe(true);
+        expect(details.dataset.processState).toBe('active');
+
+        if (terminal === 'completed') {
+          processEvent({ type: 'delta', phase: 'final_answer', text: 'ready.' });
+        } else {
+          // The incident continued with commentary after the async question.
+          // That reopens the details even if an earlier delta stopped liveness.
+          processEvent({ type: 'delta', phase: 'commentary', text: 'Continuing the search.' });
+          processEvent({ type: 'event', event: {
+            stream: 'cli', data: { type: 'status', status: 'tool-progress', heartbeat: true },
+          } });
+          expect(body.children).toHaveLength(1);
+          expect(details.open).toBe(true);
+        }
+        vi.advanceTimersByTime(15_000);
+        expect(runtime.textContent).toBe('1m 5s');
+        expect(context.groupBusyConvs.has('live-cid')).toBe(true);
+
+        // Disclosure state is not an execution terminal. Preserve a folded
+        // process while the clock advances, including after row reattachment.
+        details.open = false;
+        vi.advanceTimersByTime(10_000);
+        expect(runtime.textContent).toBe('1m 15s');
+        expect(details.open).toBe(false);
+        msg.isConnected = false;
+        vi.advanceTimersByTime(1_000);
+        expect(vi.getTimerCount()).toBe(0);
+        msg.isConnected = true;
+        context._startPlaceholderActivity(msg, Date.parse('2026-09-09T09:00:00Z'));
+        vi.advanceTimersByTime(4_000);
+        expect(runtime.textContent).toBe('1m 20s');
+        expect(details.open).toBe(false);
+
+        processEvent({ type: 'event', event: {
+          stream: 'runtime', data: { phase: 'end', duration_ms: 79_000 },
+        } });
+        if (terminal === 'completed') context._streamingSetFinal(msg, 'The results are ready.');
+        else if (terminal === 'failed') context._streamingSetError(msg, 'Could not finish.');
+        else context._streamingMarkAborted(msg);
+
+        expect(runtime.textContent).toBe('1m 19s');
+        expect(details.open).toBeFalsy();
+        expect(details.dataset.processState).toBe('complete');
+        expect(vi.getTimerCount()).toBe(0);
+        const terminalBody = finalEl.innerHTML;
+        vi.advanceTimersByTime(20_000);
+        context._streamingUpdateActivityFromEvent(msg);
+        expect(runtime.textContent).toBe('1m 19s');
+        expect(finalEl.innerHTML).toBe(terminalBody);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it('collapses and unlocks process details when the turn finishes', () => {
     const context = loadConversationRenderer();
     const attributes = new Map<string, string>([['aria-disabled', 'true'], ['tabindex', '-1']]);
     const summary = {

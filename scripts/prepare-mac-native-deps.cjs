@@ -142,7 +142,7 @@ function main() {
     sqliteVec: path.join(PC_DIR, 'node_modules', `sqlite-vec-darwin-${targetArch}`, 'vec0.dylib'),
     canvas: path.join(PC_DIR, 'node_modules', '@napi-rs', `canvas-darwin-${targetArch}`, `skia.darwin-${targetArch}.node`),
     sharp: path.join(PC_DIR, 'node_modules', '@img', `sharp-darwin-${targetArch}`, 'lib', `sharp-darwin-${targetArch}-${sharpVersion}.node`),
-    sharpVips: path.join(PC_DIR, 'node_modules', '@img', `sharp-libvips-darwin-${targetArch}`, 'lib', 'libvips-cpp.8.18.3.dylib'),
+    sharpVips: path.join(PC_DIR, 'node_modules', '@img', `sharp-libvips-darwin-${targetArch}`, 'lib', 'libvips-cpp.8.18.6.dylib'),
   };
   const requiredFiles = Object.values(required);
   const targetFilesMatch = () => requiredFiles.every((file) => isMachArch(file, targetArch));

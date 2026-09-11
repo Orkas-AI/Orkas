@@ -22,6 +22,7 @@ import { LOCAL_COMMERCE_ENTRIES } from './catalog-local-commerce';
 import { REMOTE_COMMERCE_ENTRIES } from './catalog-remote-commerce';
 import type { CatalogEntry } from './types';
 
+const GOOGLE_DRIVE_ICON_SVG = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#1e88e5" d="M4.5 20.5h15L24 12.7h-15z"/><path fill="#fbc02d" d="M9 12.7h15L16.5 0h-15z"/><path fill="#43a047" d="M0 20.5h4.5L16.5 0H12z"/></svg>';
 const MICROSOFT_ICON_SVG = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#f25022" d="M1 1h10v10H1z"/><path fill="#7fba00" d="M13 1h10v10H13z"/><path fill="#00a4ef" d="M1 13h10v10H1z"/><path fill="#ffb900" d="M13 13h10v10H13z"/></svg>';
 const ONEDRIVE_ICON_SVG = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#0364b8" d="M9.5 8.2a6.1 6.1 0 0 1 11.4 2.6 4.8 4.8 0 0 1-1.7 9.3H8.1z"/><path fill="#0078d4" d="M9.5 8.2a7.1 7.1 0 0 0-7 6.1 3.7 3.7 0 0 0 1.2 7.2h4.4l11.1-11.4a6 6 0 0 0-9.7-1.9z"/><path fill="#1490df" d="M2.5 14.3A5.4 5.4 0 0 1 8 11.6l3.3 3.9-3.2 4.6H3.7a3.7 3.7 0 0 1-1.2-5.8z"/></svg>';
 
@@ -41,6 +42,16 @@ function composioCatalogEntry(entry: Omit<CatalogEntry, 'auth_mode' | 'transport
 }
 
 export const CONNECTOR_CATALOG: CatalogEntry[] = [
+  composioCatalogEntry({
+    id: 'gdrive',
+    display_name: 'Google Drive',
+    icon_svg: GOOGLE_DRIVE_ICON_SVG,
+    category: 'productivity',
+    description_zh: '搜索、读取、创建和整理 Google Drive 文件。',
+    description_en: 'Search, read, create, and organize Google Drive files.',
+    description_ja: "Google Drive のファイルを検索・読み取り・作成・整理します。",
+    description_pt: "Pesquise, leia, crie e organize arquivos Google Drive.",
+  }),
   composioCatalogEntry({
     id: 'outlook',
     display_name: 'Outlook',
@@ -324,7 +335,7 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     requires_credits: true,
     auth_mode: 'composio',
     transport_template: null,
-    usage_metering: { provider: 'composio', credits_milli_per_call: 250 },
+    usage_metering: { provider: 'composio', credits_milli_per_call: 420 },
   },
   ...GOOGLE_ENTRIES,
   {

@@ -1039,7 +1039,7 @@ function tabCapacityVictims(
     && tab.lifetime.retention !== 'handoff'
     && tab.lifetime.retention !== 'deliverable'
     && tab.controlContext?.scope !== 'connector_setup'
-    && !tab.loading && !tab.assistantAction
+    && !tab.loading && !tab.assistantAction && !tab.edited
     && !tab.authorizationPopups.size
   )).slice(0, needed);
   return removable.length < needed ? null : removable;

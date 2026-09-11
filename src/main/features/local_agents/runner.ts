@@ -84,6 +84,7 @@ export {
 } from './media.js';
 import type { BridgeCapability, BridgeHandle, CommanderHandoffRequest } from './bridge.js';
 import { registerUserSwitchHook } from '../user-switch-hooks.js';
+import { browserTaskRunId } from '../web_assist_lifecycle.js';
 import {
   MAX_IMAGE_ATTACHMENT_BYTES,
   resolveAttachmentAbsPath,
@@ -1829,6 +1830,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
       if (e.type === 'done' && resumeRejected) e.resumeRejected = true;
       if (
         e.type === 'text-delta'
+        || e.type === 'async-message'
         || e.type === 'tool-event'
         || e.type === 'media-output'
         || e.type === 'file-change'
@@ -1890,7 +1892,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   let backgroundRunEntered = false;
   let backgroundTaskCount = 0;
   if (_bridgeSupported(opts.cli) && process.env.ORKAS_BRIDGE_DISABLED !== '1'
-    && (opts.cli !== 'opencode' || opts.projectId)) {
+    && (opts.cli !== 'opencode' || opts.projectId || browserTaskRunId(opts.uid, opts.cid))) {
     try {
       const [{ startBridge }, { buildSkillSandboxEnv }] = await Promise.all([
         import('./bridge.js'),

@@ -238,6 +238,8 @@
     });
     tabsEl.addEventListener('keydown', (event) => {
       if (event.isComposing || event.keyCode === 229) return;
+      // Native buttons own Enter/Space; tab activation must not cancel close.
+      if (event.target.closest('[data-close-tab]')) return;
       const tab = event.target.closest('.web-assist-tab[data-tab-id]');
       if (!tab || !['Enter', ' '].includes(event.key)) return;
       event.preventDefault();

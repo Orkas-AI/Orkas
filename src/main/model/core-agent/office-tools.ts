@@ -502,12 +502,21 @@ async function runCreate(
       let batched = await runOfficeCli(['batch', workPath], {
         cwd: tempDir, stdin: serializeOfficeBatch(args.ops), ...(ctx.signal ? { signal: ctx.signal } : {}),
       });
-      // A freshly-created file can very rarely leave OfficeCLI's detached
-      // resident alive but not accepting its next batch yet. Close that stale
-      // resident and retry exactly once. Other validation/authoring failures
-      // remain model-visible and are never retried blindly.
+      // A lost resident reply does not prove the batch was unapplied. Restart
+      // this private creation once at a new path; never replay non-idempotent
+      // operations against the possibly mutated file. Existing user files and
+      // ordinary authoring/validation failures are not retry targets.
       if (batched.code !== 0 && isResidentDeliveryFailure(batched)) {
         await closeOfficeFile(workPath, tempDir);
+        ctx.signal?.throwIfAborted();
+        const retryDir = fs.mkdtempSync(path.join(tempDir, 'retry-'));
+        workPath = path.join(retryDir, path.basename(finalPath));
+        const recreated = await runOfficeCli(['create', workPath, ...args.createFlags], {
+          cwd: tempDir, ...(ctx.signal ? { signal: ctx.signal } : {}),
+        });
+        if (recreated.code !== 0) {
+          return errResult('E_OFFICE_CREATE_FAILED', recreated.stderr || recreated.stdout || `exit ${recreated.code}`);
+        }
         batched = await runOfficeCli(['batch', workPath], {
           cwd: tempDir, stdin: serializeOfficeBatch(args.ops), ...(ctx.signal ? { signal: ctx.signal } : {}),
         });

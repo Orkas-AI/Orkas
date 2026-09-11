@@ -1,3 +1,4 @@
+import type { FileFailureDiagnostic } from "./file-diagnostics.js";
 import type { ToolDefinition } from "../providers/base.js";
 import { createLogger } from "../shared/logger.js";
 
@@ -91,6 +92,8 @@ export type CommandExecutionObservation = {
 };
 
 export type ToolObservations = {
+  /** Diagnostic-only validator facts. Never affect routing or provider content. */
+  fileFailure?: FileFailureDiagnostic;
   /** Host-only outcomes from Result Store retrieval, including failures hidden
    * by a partially successful outer call. Never serialized into model content. */
   resultRetrievalBatch?: {

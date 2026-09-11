@@ -1,4 +1,5 @@
-import { createHash } from "node:crypto";
+import { fileFailureForLog } from "../tools/file-diagnostics.js";
+import { createHash, randomBytes } from "node:crypto";
 import type {
   Message,
   MessageContent,
@@ -545,6 +546,42 @@ function logTextRef(value: unknown): { text_hash: string; text_chars: number } {
   return {
     text_hash: createHash("sha256").update(text).digest("hex").slice(0, 12),
     text_chars: text.length,
+  };
+}
+
+function toolFailureForLog(call: ToolUseCall, result: ToolResult, sessionId?: string, correlation?: { runner_ref: string; batch_sequence: number; execution_mode: "single" | "parallel" | "programmatic" }): Record<string, unknown> {
+  const execution = result.observations?.execution;
+  const fileFailure = fileFailureForLog(result.observations?.fileFailure);
+  const count = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value : undefined;
+  const flag = (value: unknown) => typeof value === "boolean" ? value : undefined;
+  return {
+    tool: call.name,
+    ...correlation,
+    ...(fileFailure ? { file_failure: fileFailure } : {}),
+    ...(sessionId ? { session_hash: logTextRef(sessionId).text_hash } : {}),
+    call_hash: logTextRef(call.id).text_hash,
+    input_digest: stableToolInputDigest(call),
+    ...(typeof call.input.command === "string" ? { command_hash: logTextRef(call.input.command).text_hash } : {}),
+    result: logTextRef(result.content),
+    output_storage: result.persistedOutput ? "persisted" : "inline",
+    ...(result.persistedOutput ? { output_ref_hash: logTextRef(result.persistedOutput.ref).text_hash } : {}),
+    ...(execution ? {
+      // Select scalar facts explicitly: stream refs and future fields may be private.
+      execution: {
+        status: ["succeeded", "failed", "timed_out", "aborted", "output_limit", "start_failed"].includes(execution.status)
+          ? execution.status : "unknown",
+        exit_code: execution.exitCode === null ? null
+          : typeof execution.exitCode === "number" && Number.isSafeInteger(execution.exitCode) ? execution.exitCode : undefined,
+        duration_ms: count(execution.durationMs),
+        timed_out: flag(execution.timedOut),
+        output_limit_exceeded: flag(execution.outputLimitExceeded),
+        stdout_bytes: count(execution.stdout?.bytes),
+        stderr_bytes: count(execution.stderr?.bytes),
+        stdout_truncated: flag(execution.stdout?.truncated),
+        stderr_truncated: flag(execution.stderr?.truncated),
+      },
+    } : {}),
   };
 }
 
@@ -1201,6 +1238,8 @@ export class AgentRunner {
   private readonly toolContextState: Record<string, unknown>;
   private readonly programmaticToolPolicy: ProgrammaticToolPolicy | null;
   private programmaticToolCallSequence = 0;
+  private readonly diagnosticRunnerRef = randomBytes(12).toString("hex");
+  private diagnosticBatchSequence = 0;
   private programmaticSequentialTail: Promise<void> = Promise.resolve();
 
   constructor(opts: {
@@ -1442,6 +1481,12 @@ export class AgentRunner {
         code: "E_PROGRAM_ABORTED",
         reason: "Program execution was cancelled while a tool call was running.",
       };
+    }
+    if (outcome.result.isError) {
+      log.warn("Tool returned error", toolFailureForLog(
+        { type: "tool_use", id: callId, name, input }, outcome.result, this.session.getSessionId(),
+        { runner_ref: this.diagnosticRunnerRef, batch_sequence: this.diagnosticBatchSequence, execution_mode: "programmatic" },
+      ));
     }
     return { status: "completed", result: outcome.result };
   }
@@ -2731,6 +2776,8 @@ export class AgentRunner {
 
         for (let batchIndex = 0; batchIndex < toolBatches.length; batchIndex++) {
           const batch = toolBatches[batchIndex];
+          this.diagnosticBatchSequence++;
+          const diagnosticCorrelation = { runner_ref: this.diagnosticRunnerRef, batch_sequence: this.diagnosticBatchSequence, execution_mode: batch.length === 1 ? "single" as const : "parallel" as const };
           if (batch.length === 1) {
             // ── Sequential: one tool (unchanged per-call behavior) ──
             const call = batch[0];
@@ -2905,10 +2952,7 @@ export class AgentRunner {
             }
             if (outcome.stalled) {
               permanentToolErrors++;
-              log.warn("Tool stalled", {
-                tool: call.name,
-                result: logTextRef(toolResult.content),
-              });
+              log.warn("Tool stalled", toolFailureForLog(call, toolResult, this.session.getSessionId(), diagnosticCorrelation));
             } else if (outcome.err) {
               const isTransient = isRetryableError(outcome.err);
               log.error(`Tool ${call.name} failed (${isTransient ? 'transient' : 'permanent'}); details withheld`);
@@ -2916,10 +2960,7 @@ export class AgentRunner {
               else permanentToolErrors++;
             } else if (toolResult.isError && !outcome.recoverable) {
               permanentToolErrors++;
-              log.warn("Tool returned error", {
-                tool: call.name,
-                result: logTextRef(toolResult.content),
-              });
+              log.warn("Tool returned error", toolFailureForLog(call, toolResult, this.session.getSessionId(), diagnosticCorrelation));
             }
             if (endTurnRequested || boundarySynthesisRequested) {
               terminalBatchIndex = batchIndex;
@@ -3082,10 +3123,7 @@ export class AgentRunner {
                 // The guard already logged and surfaced the synthetic result.
               } else if (c.stalled) {
                 permanentToolErrors++;
-                log.warn("Tool stalled", {
-                  tool: call.name,
-                  result: logTextRef(c.result.content),
-                });
+                log.warn("Tool stalled", toolFailureForLog(call, c.result, this.session.getSessionId(), diagnosticCorrelation));
               } else if (c.err) {
                 const isTransient = isRetryableError(c.err);
                 log.error(`Tool ${call.name} failed (${isTransient ? 'transient' : 'permanent'}); details withheld`);
@@ -3093,10 +3131,7 @@ export class AgentRunner {
                 else permanentToolErrors++;
               } else if (c.result.isError && !c.recoverable) {
                 permanentToolErrors++;
-                log.warn("Tool returned error", {
-                  tool: call.name,
-                  result: logTextRef(c.result.content),
-                });
+                log.warn("Tool returned error", toolFailureForLog(call, c.result, this.session.getSessionId(), diagnosticCorrelation));
               }
             }
           });
@@ -3593,7 +3628,12 @@ export class AgentRunner {
         if (retryKind && attempt < maxRetries) {
           const waitMs = retryDelayMs(err, attempt);
           const reason = formatError(err);
-          log.warn(`Retryable ${retryKind} error (attempt ${attempt + 1}/${maxRetries}): ${reason}, waiting ${waitMs}ms`);
+          log.warn("retrying provider request", {
+            kind: retryKind,
+            attempt: attempt + 1,
+            maxRetries,
+            waitMs,
+          });
           visibleRetryAttempt += 1;
           yield { type: "retry", attempt: visibleRetryAttempt, reason, waitMs };
           const retryWaitStartedAt = Date.now();

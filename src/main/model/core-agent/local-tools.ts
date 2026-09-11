@@ -131,7 +131,8 @@ import {
   waitForConfirmationVisible as waitForDeleteConfirmationVisible,
 } from './delete-file-confirm';
 import { fileEditLock } from '../../util/locks';
-import { checkEditFreshness, forgetRead, recordRead } from './read-tracker';
+import { fileFailure } from '../../../core-agent/src/tools/file-diagnostics';
+import { checkEditFreshness, forgetRead, getReadState, recordRead } from './read-tracker';
 import {
   canonicalFileRevisionPath,
   findAppendReplay,
@@ -1557,9 +1558,10 @@ function deleteRequiresUserConfirmation(opts: LocalToolsOpts, abs: string): bool
   return !isInWritableWorkspaceScope(opts, abs) && localAccessRequiresSensitiveApproval();
 }
 
-type BashPathToken = { type: 'word' | 'op'; value: string };
+type BashPathToken = { type: 'word' | 'op'; value: string; raw?: string };
 type BashPathSegment = {
   words: string[];
+  rawWords: string[];
   redirectTargets: string[];
   inputTargets: string[];
   separatorAfter?: string;
@@ -1569,7 +1571,11 @@ type BashPathSegment = {
  *  deletes as far as the user's file is concerned, whatever verb spelled it. */
 type BashPathCandidate = { raw: string; abs?: string; reason: string; dynamic?: boolean; removesSource?: boolean };
 type BashPathGateResult = { error: string | null; approvedReasons: LocalAccessRiskCategory[] };
-type BashFilesystemGuardResult = { result: ToolResult | null; approvedReasons: LocalAccessRiskCategory[] };
+type BashFilesystemGuardResult = {
+  result: ToolResult | null;
+  approvedReasons: LocalAccessRiskCategory[];
+  unresolvedPaths?: boolean;
+};
 
 const BASH_PATH_SEGMENT_OPS = new Set([';', '&&', '||', '|', '|&', '&']);
 const BASH_OUTPUT_REDIR_OPS = new Set(['>', '>>', '>|', '&>', '&>>', '1>', '1>>', '2>', '2>>']);
@@ -1589,13 +1595,6 @@ const BASH_READ_ALL_OPERANDS = new Set([
   'get-content', 'get-childitem', 'get-item', 'test-path', 'resolve-path',
 ]);
 const BASH_READ_PATTERN_FIRST_CMDS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack']);
-/** A path echoed back in a refusal, bounded. An unresolvable "target" can be a
- *  whole script body, and quoting all of it buries the instruction under it. */
-export function truncateForMessage(raw: string): string {
-  const oneLine = String(raw || '').replace(/\s+/g, ' ').trim();
-  return oneLine.length > 80 ? `${oneLine.slice(0, 79)}…` : oneLine;
-}
-
 const BASH_READ_SCRIPT_CMDS = new Set([
   'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish',
   'python', 'python3', 'node', 'ruby', 'perl', 'php',
@@ -1859,21 +1858,23 @@ function maskBashHeredocBodies(command: string): string {
   return analyzeBashHeredocs(command).shellSurface;
 }
 
-function tokenizeBashPathGuard(input: string): BashPathToken[] {
+function tokenizeBashPathGuard(input: string, executionSyntax = false): BashPathToken[] {
   const toks: BashPathToken[] = [];
   let cur = '';
   let hasCur = false;
   let quote: "'" | '"' | null = null;
   let escaped = false;
-  const push = () => {
-    if (!hasCur) return;
-    toks.push({ type: 'word', value: cur });
+  let wordStart: number | undefined;
+  const push = (end: number) => {
+    if (hasCur) toks.push({ type: 'word', value: cur, raw: input.slice(wordStart ?? end, end) });
+    wordStart = undefined;
     cur = '';
     hasCur = false;
   };
 
   for (let i = 0; i < input.length; i++) {
     const ch = input[i];
+    if (wordStart === undefined) wordStart = i;
     if (escaped) {
       cur += ch;
       hasCur = true;
@@ -1901,46 +1902,61 @@ function tokenizeBashPathGuard(input: string): BashPathToken[] {
       hasCur = true;
       continue;
     }
+    if (executionSyntax && ch === '#' && !hasCur) {
+      while (i < input.length && input[i] !== '\n' && input[i] !== '\r') i++;
+      wordStart = undefined;
+      toks.push({ type: 'op', value: ';' });
+      continue;
+    }
+    const groupingOperator = ch === '(' || ch === ')'
+      || (!hasCur && (ch === '{' || ch === '}') && /\s|$/.test(input[i + 1] || ''));
+    if (executionSyntax && groupingOperator) {
+      push(i);
+      toks.push({ type: 'op', value: ';' });
+      continue;
+    }
     if (/\s/.test(ch)) {
-      push();
+      push(i);
       if (ch === '\n' || ch === '\r') toks.push({ type: 'op', value: ';' });
       continue;
     }
 
     const three = input.slice(i, i + 3);
     if (three === '&>>' || three === '<<<' || /^\d>>$/.test(three)) {
-      push(); toks.push({ type: 'op', value: three }); i += 2; continue;
+      push(i); toks.push({ type: 'op', value: three }); i += 2; continue;
     }
     const two = input.slice(i, i + 2);
     if (['&&', '||', '|&', '>>', '>|', '&>', '<<'].includes(two) || /^\d>$/.test(two)) {
-      push(); toks.push({ type: 'op', value: two }); i += 1; continue;
+      push(i); toks.push({ type: 'op', value: two }); i += 1; continue;
     }
     if (ch === '|' || ch === '&' || ch === ';' || ch === '>' || ch === '<') {
-      push(); toks.push({ type: 'op', value: ch }); continue;
+      push(i); toks.push({ type: 'op', value: ch }); continue;
     }
     cur += ch;
     hasCur = true;
   }
-  push();
+  push(input.length);
   return toks;
 }
 
-function bashPathSegments(command: string): BashPathSegment[] {
+function bashPathSegments(command: string, executionSyntax = false): BashPathSegment[] {
   const out: BashPathSegment[] = [];
   let words: string[] = [];
+  let rawWords: string[] = [];
   let redirectTargets: string[] = [];
   let inputTargets: string[] = [];
   let expect: 'out' | 'in' | 'skip' | null = null;
   const push = (separatorAfter?: string) => {
     if (words.length || redirectTargets.length || inputTargets.length) {
-      out.push({ words, redirectTargets, inputTargets, ...(separatorAfter ? { separatorAfter } : {}) });
+      out.push({ words, rawWords, redirectTargets, inputTargets, ...(separatorAfter ? { separatorAfter } : {}) });
     }
     words = [];
+    rawWords = [];
     redirectTargets = [];
     inputTargets = [];
   };
 
-  for (const tok of tokenizeBashPathGuard(maskBashHeredocBodies(command))) {
+  for (const tok of tokenizeBashPathGuard(maskBashHeredocBodies(command), executionSyntax)) {
     if (tok.type === 'op') {
       if (BASH_PATH_SEGMENT_OPS.has(tok.value)) {
         push(tok.value);
@@ -1971,6 +1987,7 @@ function bashPathSegments(command: string): BashPathSegment[] {
       continue;
     }
     words.push(tok.value);
+    rawWords.push(tok.raw ?? tok.value);
   }
   push();
   return out;
@@ -1992,9 +2009,30 @@ function bashLiteralAssignmentValue(value: string): string | null {
 /** Resolve only assignments whose value is already a literal in a completed
  * shell statement. Temporary command assignments, pipelines, background jobs,
  * general loop variables, substitutions, and calculated PowerShell expressions
- * remain unresolved and fail closed. A narrow finite-loop case is expanded by
- * bashGuardCommandVariants before candidate collection. */
-function bashPersistentLiteralAssignments(segment: BashPathSegment): Record<string, string | null> | null {
+ * remain unresolved and require a runtime permission decision. A narrow
+ * finite-loop case is expanded by bashGuardCommandVariants before collection. */
+function bashPersistentLiteralAssignments(
+  segment: BashPathSegment,
+  hostPlatform: NodeJS.Platform,
+): Record<string, string | null> | null {
+  if (hostPlatform === 'win32') {
+    // Parse the original spelling: whitespace around '=' is optional, while a
+    // quoted "$name" is data rather than an assignment target. Cooked shell
+    // words lose both distinctions and PowerShell's literal backslashes.
+    const assignment = /^\$(?:env:)?([A-Za-z_][A-Za-z0-9_]*)\s*(\?\?=|[+*/%-]?=|\+\+|--)([\s\S]*)$/i.exec(segment.rawWords.join(' '));
+    if (assignment) {
+      const raw = assignment[3].trim();
+      let literal: string | null = null;
+      if (assignment[2] === '=' && segment.separatorAfter
+        && BASH_LITERAL_ASSIGNMENT_PERSIST_SEPARATORS.has(segment.separatorAfter)) {
+        if (/^'(?:[^']|'')*'$/.test(raw)) literal = raw.slice(1, -1).replace(/''/g, "'");
+        else if (/^"(?:[^"$`]|"")*"$/.test(raw)) literal = raw.slice(1, -1).replace(/""/g, '"');
+      }
+      // Computed, compound, or pipeline assignments invalidate an earlier
+      // literal. Never verify a later operation against the variable's old path.
+      return { [assignment[1]]: literal === null ? null : bashLiteralAssignmentValue(literal) };
+    }
+  }
   if (!segment.separatorAfter || !BASH_LITERAL_ASSIGNMENT_PERSIST_SEPARATORS.has(segment.separatorAfter)) return null;
   if (segment.words.length > 0 && segment.words.every((word) => BASH_PATH_ASSIGN_WORD_RE.test(word))) {
     const assignments: Record<string, string | null> = {};
@@ -2003,14 +2041,6 @@ function bashPersistentLiteralAssignments(segment: BashPathSegment): Record<stri
       assignments[match[1]] = match[2] ? null : bashLiteralAssignmentValue(match[3]);
     }
     return assignments;
-  }
-
-  if (segment.words.length >= 2 && segment.words[1] === '=') {
-    const match = /^\$(?:env:)?([A-Za-z_][A-Za-z0-9_]*)$/i.exec(segment.words[0]);
-    if (match) {
-      const value = segment.words.length === 3 ? bashLiteralAssignmentValue(segment.words[2]) : null;
-      return { [match[1]]: value };
-    }
   }
 
   const command = segment.words[0]?.toLowerCase();
@@ -2076,12 +2106,13 @@ function powershellLiteralLoopValues(raw: string): string[] | null {
 function bashPathSegmentsWithEnv(
   command: string,
   baseEnv: Record<string, string>,
+  hostPlatform: NodeJS.Platform = process.platform,
 ): Array<{ segment: BashPathSegment; env: Record<string, string> }> {
   const env = { ...baseEnv };
   const out: Array<{ segment: BashPathSegment; env: Record<string, string> }> = [];
   for (const segment of bashPathSegments(command)) {
     out.push({ segment, env: { ...env } });
-    const assignments = bashPersistentLiteralAssignments(segment);
+    const assignments = bashPersistentLiteralAssignments(segment, hostPlatform);
     if (assignments) updateBashPathEnv(env, assignments);
   }
   return out;
@@ -2140,7 +2171,7 @@ function bashGuardPathSegments(
   hostPlatform: NodeJS.Platform,
 ): Array<{ segment: BashPathSegment; env: Record<string, string> }> {
   return bashGuardCommandVariants(command, baseEnv, hostPlatform).flatMap((variant) => (
-    bashPathSegmentsWithEnv(variant.command, variant.env)
+    bashPathSegmentsWithEnv(variant.command, variant.env, hostPlatform)
   ));
 }
 
@@ -2880,37 +2911,9 @@ async function guardBashPathCandidates(
 ): Promise<BashFilesystemGuardResult> {
   const approvedReasons: LocalAccessRiskCategory[] = [];
   const seen = new Set<string>();
-  // Unresolvable paths first, before any gate can raise a prompt: asking the
-  // user to approve a command that is about to be refused anyway trains them
-  // to click through the prompts that matter.
-  for (const c of candidates) {
-    if (!c.dynamic && c.abs) continue;
-    // Only the explicitly non-prompting all_files_auto mode may accept a path
-    // whose runtime value cannot be proven here. all_files_approval still has
-    // to resolve the target so sensitive/protected/removal gates can enforce
-    // the permission the user selected. Known sandbox variables, literal
-    // assignments, and statically rooted globs are resolved before this point.
-    // Workspace-only modes likewise fail closed because an unresolved value
-    // could escape their declared roots.
-    if (allowUnresolvedPaths) continue;
-    return {
-      result: {
-        content: errText(
-          'E_BASH_DYNAMIC_PATH_UNSUPPORTED',
-          `The ${c.reason} target "${truncateForMessage(c.raw)}" uses an unresolved variable, command substitution, or glob that Orkas cannot verify. `
-          // Assigning the path literally in the same command already resolves
-          // here (bashPersistentLiteralAssignments, across `;` and `&&`), but
-          // nothing said so, and the retries in production were blind.
-          + 'A variable assigned to a literal earlier in this same command does resolve, e.g. `$out = "C:\\ws\\a.txt"; ... > $out`. '
-          + (access === 'write'
-            ? 'Otherwise use an explicit path inside the workspace, or use write_file/edit_file/delete_file for file changes.'
-            : 'Otherwise resolve it to explicit readable paths before retrying.'),
-        ),
-        isError: true,
-      },
-      approvedReasons,
-    };
-  }
+  // Unknown paths are an approval fact, not unsupported shell syntax. Check
+  // known targets first so an approval never overrides a concrete scope denial.
+  const unresolvedPaths = !allowUnresolvedPaths && candidates.some((c) => c.dynamic || !c.abs);
   for (const c of candidates) {
     if (!c.abs || seen.has(c.abs)) continue;
     seen.add(c.abs);
@@ -2945,7 +2948,7 @@ async function guardBashPathCandidates(
       return { result: { content: removal.error, isError: true }, approvedReasons };
     }
   }
-  return { result: null, approvedReasons };
+  return { result: null, approvedReasons, unresolvedPaths };
 }
 
 /**
@@ -2970,7 +2973,10 @@ async function guardInteractiveRemovalTargets(
     opts.hostPlatform ?? process.platform,
   ).filter((candidate) => candidate.removesSource);
   if (!removals.length) return { result: null, approvedReasons: [] };
-  return guardBashPathCandidates(opts, ctx, workingDir, removals, 'write', command);
+  return guardBashPathCandidates(
+    opts, ctx, workingDir, removals, 'write', command,
+    !localAccessRequiresSensitiveApproval(),
+  );
 }
 
 async function guardBashFilesystemTargets(
@@ -3006,7 +3012,7 @@ async function guardBashFilesystemTargets(
   );
   mergeRiskReasons(approvedReasons, read.approvedReasons);
   if (read.result) return { result: read.result, approvedReasons };
-  return { result: null, approvedReasons };
+  return { result: null, approvedReasons, unresolvedPaths: mutation.unresolvedPaths || read.unresolvedPaths };
 }
 
 function countOccurrences(haystack: string, needle: string): number {
@@ -3163,13 +3169,103 @@ function editRecoveryContext(body: string, needle: string, fileHash: string): st
   ].join('\n');
 }
 
-function extractRunSkillRefs(command: string): string[] {
+/** Read a POSIX command substitution as syntax; never evaluate it. */
+function shellCommandSubstitution(input: string, start: number, depth = 0): { body: string; end: number } | null {
+  if (depth >= 16) return null;
+  if (input[start] === '`') {
+    for (let i = start + 1; i < input.length; i++) {
+      if (input[i] === '\\') { i++; continue; }
+      if (input[i] === '`') return { body: input.slice(start + 1, i), end: i };
+    }
+    return null;
+  }
+  if (!input.startsWith('$(', start)) return null;
+  let nesting = 1;
+  let quote: "'" | '"' | null = null;
+  for (let i = start + 2; i < input.length; i++) {
+    const ch = input[i];
+    if (quote === "'") { if (ch === "'") quote = null; continue; }
+    if (ch === '\\') { i++; continue; }
+    const nested = (input.startsWith('$(', i) || ch === '`')
+      ? shellCommandSubstitution(input, i, depth + 1) : null;
+    if (nested) { i = nested.end; continue; }
+    if (quote === '"') { if (ch === '"') quote = null; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === '(') nesting++;
+    if (ch === ')' && --nesting === 0) return { body: input.slice(start + 2, i), end: i };
+  }
+  return null;
+}
+
+function extractRunSkillRefs(command: string, depth = 0, hostPlatform: NodeJS.Platform = process.platform): string[] {
   const out: string[] = [];
-  const re = /(?:^|[^\w.-])run-skill\.cjs["']?\s+(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9._:@+-]+))/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(command)) !== null) {
-    const ref = (m[1] || m[2] || m[3] || '').trim();
-    if (ref) out.push(ref);
+  // Substitutions execute even within double-quoted arguments to a data-only
+  // command. Single-quoted examples and non-shell heredoc bodies stay data.
+  if (hostPlatform !== 'win32' && depth < 4) {
+    const surface = maskBashHeredocBodies(command);
+    let quote: "'" | '"' | null = null;
+    for (let i = 0; i < surface.length; i++) {
+      const ch = surface[i];
+      if (quote === "'") { if (ch === "'") quote = null; continue; }
+      if (ch === '\\') { i++; continue; }
+      if (!quote && ch === '#' && (i === 0 || /[\s;&|]/.test(surface[i - 1]))) {
+        while (i < surface.length && surface[i] !== '\n') i++;
+        continue;
+      }
+      const substitution = (surface.startsWith('$(', i) || ch === '`')
+        ? shellCommandSubstitution(surface, i) : null;
+      if (substitution) {
+        out.push(...extractRunSkillRefs(substitution.body, depth + 1, hostPlatform));
+        i = substitution.end;
+        continue;
+      }
+      if (quote === '"') { if (ch === '"') quote = null; continue; }
+      if (ch === "'" || ch === '"') quote = ch;
+    }
+  }
+  const basename = (value: string): string => value.replace(/\\/g, '/').split('/').pop()!.toLowerCase();
+  const nodeValueOptions = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '--conditions', '-C']);
+  // Inspect executable/argv positions, never an arbitrary filename mention.
+  // In particular, `find ... -name run-skill.cjs -type f` does not invoke a
+  // Skill named "-type". The shared lexer also excludes redirected data.
+  for (const segment of bashPathSegments(command, true)) {
+    let start = 0;
+    while (segment.rawWords[start] === segment.words[start]
+      && ['if', 'then', 'elif', 'else', 'do', '!'].includes(segment.words[start])) start++;
+    const effective = bashEffectiveCommand(segment.words.slice(start));
+    if (!effective) continue;
+    const cmd = basename(effective.cmd);
+    const args = effective.args;
+    if (/^(?:bash|dash|ksh|sh|zsh|pwsh|powershell)(?:\.exe)?$/.test(cmd)) {
+      const isPowerShell = /^(?:pwsh|powershell)/.test(cmd);
+      const commandAt = args.findIndex((arg) => isPowerShell
+        ? /^(?:-command|-c)$/i.test(arg)
+        : /^-[a-z]*c[a-z]*$/i.test(arg));
+      if (depth < 4 && commandAt >= 0 && args[commandAt + 1]) {
+        out.push(...extractRunSkillRefs(args[commandAt + 1], depth + 1, isPowerShell ? 'win32' : 'linux'));
+      }
+      continue;
+    }
+    let ref: string | undefined;
+    if (cmd === 'run-skill.cjs') {
+      ref = args[0];
+    } else if (/^(?:node|nodejs)(?:\.exe)?$/.test(cmd)
+      || /^(?:\$(?:env:)?orkas_node|\$\{(?:env:)?orkas_node\}|%orkas_node%)$/.test(cmd)) {
+      for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        // Eval/print/check modes do not execute the following script operand.
+        if (/^(?:-[epc]|--eval|--print|--check)(?:=|$)/.test(arg) || /^-[ep].+/.test(arg)) break;
+        if (nodeValueOptions.has(arg)) { i++; continue; }
+        if (arg === '--') {
+          if (basename(args[i + 1] || '') === 'run-skill.cjs') ref = args[i + 2];
+          break;
+        }
+        if (arg.startsWith('-')) continue;
+        if (basename(arg) === 'run-skill.cjs') ref = args[i + 1];
+        break;
+      }
+    }
+    if (ref?.trim()) out.push(ref.trim());
   }
   return out;
 }
@@ -3183,7 +3279,7 @@ function resolveRunSkillRuntimeBinding(
   opts: LocalToolsOpts,
   command: string,
 ): RunSkillRuntimeResolution {
-  const refs = extractRunSkillRefs(command);
+  const refs = extractRunSkillRefs(command, 0, opts.hostPlatform ?? process.platform);
   if (!refs.length || opts.skillRuntimeBindings === undefined) return {};
   if (new RegExp(
     `\\b(?:ORKAS_RUN_SKILL_DIR|${DEEP_RESEARCH_EVIDENCE_ENV})\\b`,
@@ -3336,7 +3432,7 @@ function guardDisabledSkillBash(opts: LocalToolsOpts, command: string): string |
   const disabled = readDisabledSets(uid).skills;
   if (!disabled.size) return null;
 
-  for (const ref of extractRunSkillRefs(command)) {
+  for (const ref of extractRunSkillRefs(command, 0, opts.hostPlatform ?? process.platform)) {
     const bound = opts.skillRuntimeBindings?.get(ref);
     if (bound) {
       if (disabled.has(bound.id)) {
@@ -3614,7 +3710,7 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
         command: {
           type: 'string',
           description:
-            `Shell command. Write final script-generated deliverables under ${outputDirDescription}.`
+            `Shell command. Prefer simple, direct commands that are easy to verify. Write final script-generated deliverables under ${outputDirDescription}.`
             + windowsShellDescription,
         },
         allow_browser_runtime_install: {
@@ -3767,7 +3863,7 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
           })
           : baseReasons
         ).filter((reason) => reason !== 'destructive' || !pathApprovalCoveredDestructive);
-        if (reasons.length) {
+        if (reasons.length || filesystemGate.unresolvedPaths) {
           const decision = await requestBashDecision({
             uid: opts.userId ?? '',
             cid: opts.cid ?? '',
@@ -3775,6 +3871,7 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
             agentName: opts.agentName ?? opts.agentId ?? '',
             command,
             reasons,
+            unresolvedPaths: filesystemGate.unresolvedPaths,
             // Only meaningful while `destructive` survived the filter above;
             // the dialog uses it to say why a non-prompting mode is asking.
             ...(reasons.includes('destructive') && base.irreversible.length
@@ -3790,11 +3887,12 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
               agent_id: maskId(opts.agentId),
               command_chars: command.length,
               reasons,
+              unresolved_paths: filesystemGate.unresolvedPaths === true,
             });
             return {
               content: errText(
                 'E_BASH_RISK_DENIED',
-                `the user declined to run this command (flagged: ${reasons.join(', ')}). `
+                `this command was not approved (flagged: ${[...reasons, ...(filesystemGate.unresolvedPaths ? ['unresolved paths'] : [])].join(', ')}). `
                 + 'Do not retry the same command or work around the prompt; explain in prose what you intended and ask the user how to proceed.',
               ),
               isError: true,
@@ -3861,6 +3959,7 @@ async function gateInteractiveCliStart(
     allowNoBrowserAuth?: boolean;
     workingDir?: string;
     approvedReasons?: readonly LocalAccessRiskCategory[];
+    unresolvedPaths?: boolean;
   },
   ctx?: ToolContext,
 ): Promise<ToolResult | null> {
@@ -3947,7 +4046,7 @@ async function gateInteractiveCliStart(
       })
       : baseReasons
     ).filter((reason) => !approvedReasons.includes(reason));
-    if (reasons.length) {
+    if (reasons.length || (approvalMode && settings?.unresolvedPaths)) {
       const decision = await requestBashDecision({
         uid: opts.userId ?? '',
         cid: opts.cid ?? '',
@@ -3955,6 +4054,7 @@ async function gateInteractiveCliStart(
         agentName: opts.agentName ?? opts.agentId ?? '',
         command,
         reasons,
+        unresolvedPaths: settings?.unresolvedPaths,
         ...(reasons.includes('destructive') && base.irreversible.length
           ? { irreversible: base.irreversible }
           : {}),
@@ -3968,11 +4068,12 @@ async function gateInteractiveCliStart(
           agent_id: maskId(opts.agentId),
           command_chars: command.length,
           reasons,
+          unresolved_paths: settings?.unresolvedPaths === true,
         });
         return {
           content: errText(
             'E_BASH_RISK_DENIED',
-            `the user declined to run this interactive command (flagged: ${reasons.join(', ')}). `
+            `this interactive command was not approved (flagged: ${[...reasons, ...(settings?.unresolvedPaths ? ['unresolved paths'] : [])].join(', ')}). `
             + 'Do not retry the same command or work around the prompt; explain in prose what you intended and ask the user how to proceed.',
           ),
           isError: true,
@@ -4087,6 +4188,7 @@ function createInteractiveCliStartTool(opts: LocalToolsOpts): AgentTool {
         allowNoBrowserAuth: input.allow_no_browser_auth === true,
         workingDir,
         approvedReasons: removalGate.approvedReasons,
+        unresolvedPaths: removalGate.unresolvedPaths,
       }, ctx);
       if (gate) return gate;
       try { fs.mkdirSync(workingDir, { recursive: true }); }
@@ -4415,6 +4517,7 @@ function createHostProcessTools(opts: LocalToolsOpts): AgentTool[] {
         const gate = await gateInteractiveCliStart(opts, command, {
           workingDir,
           approvedReasons: filesystemGate.approvedReasons,
+          unresolvedPaths: filesystemGate.unresolvedPaths,
         }, ctx);
         if (gate) return gate;
         pruneProcessWorkspaceSnapshots();
@@ -4586,6 +4689,7 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
         return {
           content: errText('E_BAD_INPUT', 'copy `base_revision` from the preceding file result; legacy `expected_size` must be a non-negative safe integer byte size'),
           isError: true,
+          observations: fileFailure('E_BAD_INPUT', 'append_precondition', { stage: 'input', revision_provided: !!baseRevision, size_provided: hasExpectedSize, size_valid: hasExpectedSize && Number.isSafeInteger(expectedSize) && expectedSize >= 0 }),
         };
       }
 
@@ -4640,6 +4744,7 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
                   : `${abs}: base_revision is not available in this run; use the returned current revision`,
               )}\n<file path="${abs}" total_bytes="${before.length}" file_hash="${currentHash}" revision="${currentRevision}"/>`,
               isError: true,
+              observations: fileFailure(revisionRecord ? 'E_REVISION_PATH_MISMATCH' : 'E_REVISION_UNKNOWN', revisionRecord ? 'revision_path' : 'revision_unknown', { stage: 'freshness', revision_provided: true, revision_found: !!revisionRecord }),
             };
           }
           if (revisionRecord.hash !== currentHash || revisionRecord.size !== before.length) {
@@ -4670,6 +4775,7 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
                 `${abs}: base_revision no longer matches the current file; no bytes were written`,
               )}\n<file path="${abs}" total_bytes="${before.length}" file_hash="${currentHash}" revision="${currentRevision}"/>`,
               isError: true,
+              observations: fileFailure('E_STALE', 'revision_changed', { stage: 'freshness', revision_provided: true, revision_found: true, revision_matches: false }),
             };
           }
         }
@@ -4700,6 +4806,7 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
               `${abs}: expected ${expectedSize} bytes before append, current size is ${before.length}; use the returned revision and regenerate only the missing chunk`,
             )}\n<file path="${abs}" total_bytes="${before.length}" file_hash="${currentHash}" revision="${currentRevision}"/>`,
             isError: true,
+            observations: fileFailure('E_STALE', 'size_changed', { stage: 'freshness', revision_provided: false, size_provided: true, size_valid: true }),
           };
         }
 
@@ -4795,6 +4902,7 @@ function createHostApplyPatchTool(opts: LocalToolsOpts): AgentTool {
         currentHash: snapshot.hash,
       });
       if (!freshness) return undefined;
+      const baseline = editBaselineFacts(ctx, snapshot.path, snapshot.stat, snapshot.hash);
       recordRead(ctx, snapshot.path, snapshot.stat, snapshot.hash);
       // checkEditFreshness also serves edit_file, whose retry accepts an
       // expected_hash parameter. apply_patch has no such parameter: its safe
@@ -4809,6 +4917,7 @@ function createHostApplyPatchTool(opts: LocalToolsOpts): AgentTool {
           `${errText(freshness.code, patchFreshnessMessage)}\n`
           + patchRecoveryContext(snapshot.content, snapshot.hash),
         isError: true,
+        observations: fileFailure(freshness.code, freshness.code === 'E_NOT_READ' ? 'not_read' : 'file_changed', { stage: 'freshness', ...baseline }),
       };
     },
     validateContent(check) {
@@ -4832,6 +4941,15 @@ function createHostApplyPatchTool(opts: LocalToolsOpts): AgentTool {
     async execute(input, ctx) {
       return coreTool.execute(input, ctx);
     },
+  };
+}
+
+/** Diagnostic snapshot before recovery refreshes the read baseline. */
+function editBaselineFacts(ctx: ToolContext, abs: string, st: fs.Stats, currentHash: string) {
+  const seen = getReadState(ctx)?.get(abs);
+  return {
+    baseline_present: !!seen,
+    ...(seen ? { baseline_changed: seen.mtimeMs !== st.mtimeMs || seen.size !== st.size || (!!seen.hash && seen.hash !== currentHash) } : {}),
   };
 }
 
@@ -4922,6 +5040,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
           return { content: errText('E_EDIT_FAILED', `${abs}: read failed: ${msg}`), isError: true };
         }
         const currentHash = editableFileHash(body);
+        const baseline = editBaselineFacts(ctx, abs, st, currentHash);
 
         // Read-before-edit + OCC: a run-scoped baseline or an explicit hash
         // must identify the exact bytes being edited. A rejected attempt
@@ -4937,6 +5056,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
           return {
             content: `${errText(block.code, block.msg)}\n${editRecoveryContext(body, oldStr, currentHash)}`,
             isError: true,
+            observations: fileFailure(block.code, block.code === 'E_NOT_READ' ? 'not_read' : expectedHash ? 'expected_hash_changed' : 'file_changed', { stage: 'freshness', ...baseline, expected_hash_provided: !!expectedHash }),
           };
         }
 
@@ -4961,6 +5081,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
               editNoMatchReason(body, oldStr),
             ].filter(Boolean).join(' '))}\n${editRecoveryContext(body, oldStr, currentHash)}`,
             isError: true,
+            observations: fileFailure('E_NO_MATCH', 'no_match', { stage: 'match', ...baseline, expected_hash_provided: !!expectedHash, match_count: 0 }),
           };
         }
         if (count > 1 && !replaceAll) {
@@ -4970,6 +5091,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
               `${abs}: \`old_string\` matches ${count} occurrences. Provide more surrounding context to make it unique, or set replace_all=true.`,
             ),
             isError: true,
+            observations: fileFailure('E_MULTIPLE_MATCHES', 'ambiguous_match', { stage: 'match', ...baseline, match_count: count }),
           };
         }
 

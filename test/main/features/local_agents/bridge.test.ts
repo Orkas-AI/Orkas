@@ -50,6 +50,11 @@ vi.mock('../../../../src/main/features/connectors/action_confirm', () => ({
   requestActionConfirm: bridgeActionConfirmMock.request,
 }));
 
+const browserHost = vi.hoisted(() => ({
+  openModelWebAssist: vi.fn(async (..._args: any[]): Promise<Record<string, unknown>> => ({ ok: true })),
+}));
+vi.mock('../../../../src/main/features/web_assist', () => browserHost);
+
 // orkas-bridge host: socket auth + skills surface + KB scope + permission gate.
 // Connector methods are covered by their own feature tests; here we pin the
 // bridge-specific contracts (token, path discipline, scope plumbing, gating).
@@ -258,11 +263,15 @@ describe('local_agents/bridge › auth + skills', () => {
       expect(second.result.next_offset).toBeNull();
       const all = [...first.result.tasks, ...second.result.tasks];
       expect(all).toEqual(expect.arrayContaining([
-        expect.objectContaining({ title: 'first', detail: 'full detail' }),
+        expect.objectContaining({ title: 'first' }),
         expect.objectContaining({ title: 'second', depends_on: [created.task.id] }),
       ]));
       expect((await read({ action: 'update', task_id: created.task.id, status: 'review', result_ref: 'artifact-1' })).ok).toBe(true);
       expect((await read({ action: 'list' })).result.tasks).toContainEqual(expect.objectContaining({ id: created.task.id, status: 'review' }));
+      const filtered = (await read({ action: 'list', status: 'review', limit: 1 })).result;
+      expect(filtered).toMatchObject({ total: 1, next_offset: null, tasks: [{ id: created.task.id }], progress: { total: 2 } });
+      expect(filtered.tasks[0]).not.toHaveProperty('detail');
+      expect((await read({ action: 'get', task_id: created.task.id })).result.task).toMatchObject({ detail: 'full detail', result_ref: 'artifact-1' });
       for (const params of [
         { action: 'create', title: 'forbidden', project: other.project.project_id },
         { action: 'create', title: 'forbidden', userId: 'other-account' },
@@ -278,6 +287,9 @@ describe('local_agents/bridge › auth + skills', () => {
         { action: 'complete', task_id: created.task.id, userId: 'other-account' },
         { action: 'complete', task_id: foreign.task.id },
         { action: 'complete', task_id: privateTask.task.id },
+        { action: 'get', task_id: foreign.task.id },
+        { action: 'get', task_id: privateTask.task.id },
+        { action: 'get', task_id: created.task.id, project: other.project.project_id },
         { action: 'list', project: other.project.project_id },
         { action: 'list', userId: 'another-user' },
         { action: 'list', offset: -1 },
@@ -380,15 +392,15 @@ describe('local_agents/bridge › auth + skills', () => {
     } finally { await bridge.close(); }
   });
 
-  it('pages large multilingual task records without losing details or leaking internal owner ids', async () => {
+  it('shares native summary pagination and retrieves full multilingual details through get', async () => {
     const projects = await import('../../../../src/main/features/projects');
     const tasks = await import('../../../../src/main/features/project_tasks');
     const project = await projects.createProject(TEST_UID, 'Large backlog');
     if (!project.ok) throw new Error('project fixture failed');
     const pid = project.project.project_id;
     const detail = '待办内容'.repeat(500);
-    for (let index = 0; index < 9; index++) {
-      expect((await tasks.createTask(TEST_UID, pid, { title: `task ${index}`, detail })).ok).toBe(true);
+    for (let index = 0; index < 55; index++) {
+      expect((await tasks.createTask(TEST_UID, pid, { title: `task ${index}-${'长'.repeat(180)}`, detail, status: index % 2 ? 'todo' : 'done' })).ok).toBe(true);
     }
     const bridge = await startTestBridge({ projectId: pid });
     try {
@@ -403,20 +415,34 @@ describe('local_agents/bridge › auth + skills', () => {
         expect((reply as any).ok).toBe(true);
         const page = (reply as any).result;
         expect(Buffer.byteLength(JSON.stringify(page), 'utf8')).toBeLessThan(33_000);
-        expect(page.progress.total).toBe(9);
+        expect(page.progress.total).toBe(55);
         expect(page.tasks.length).toBeGreaterThan(0);
         for (const task of page.tasks) {
-          expect(task.detail).toBe(detail);
+          expect(task).not.toHaveProperty('detail');
           expect(task).not.toHaveProperty('owner_agent_id');
         }
         received.push(...page.tasks);
-        expect(pages).toBeLessThanOrEqual(9);
+        expect(pages).toBeLessThanOrEqual(55);
         if (page.next_offset !== null) expect(page.next_offset).toBe(offset! + page.tasks.length);
         offset = page.next_offset;
       } while (offset !== null);
       expect(pages).toBeGreaterThan(1);
-      expect(received).toHaveLength(9);
-      expect(new Set(received.map((task) => task.id)).size).toBe(9);
+      const { createProjectTasksHandler } = await import('../../../../src/main/features/project_tasks_tool_handler');
+      const native = createProjectTasksHandler(TEST_UID, pid, 'c1', new Map());
+      expect(await native.list()).toMatchObject({ total: 55, next_offset: 20 });
+      expect((await native.list()).tasks).toHaveLength(20);
+      expect(await native.list({ status: 'review' })).toMatchObject({ tasks: [], total: 0, next_offset: null, progress: { total: 55 } });
+      expect(await native.list({ status: 'done', offset: 28 })).toMatchObject({ tasks: [], total: 28, next_offset: null });
+      expect(await native.list({ offset: 999 })).toMatchObject({ tasks: [], total: 55, next_offset: null });
+      const nativePage = await native.list({ offset: 50, limit: 50 });
+      expect(nativePage.tasks.map(task => task.id)).toEqual(received.slice(50).map(task => task.id));
+      const full = await rpcOnce(bridge.socketPath, {
+        id: 100, token: bridge.token, method: 'todo_tasks', params: { action: 'get', task_id: received[0].id },
+      });
+      expect((full.reply as any).result.task.detail).toBe(detail);
+      expect((full.reply as any).result).toEqual(await native.get(received[0].id));
+      expect(received).toHaveLength(55);
+      expect(new Set(received.map((task) => task.id)).size).toBe(55);
     } finally { await bridge.close(); }
   });
 
@@ -1348,6 +1374,86 @@ describe('local_agents/bridge › current conversation history', () => {
       expect((denied.reply as any).error).toContain('not allowed for this agent');
     } finally {
       await bridge.close();
+    }
+  });
+});
+
+
+describe('CLI browser lifetime and isolation', () => {
+  it.each(['openclaw', 'hermes'] as const)('does not grant browser to unsupported %s transport even in a task', async (cli) => {
+    const life = await import('../../../../src/main/features/web_assist_lifecycle');
+    life.beginBrowserTaskRun(TEST_UID, 'c1', 'browser-denied');
+    const bridge = await startTestBridge({ cli });
+    try {
+      expect(bridge.capabilities).not.toContain('browser');
+      const result = await rpcOnce(bridge.socketPath, { id: 1, token: bridge.token, method: 'browser', params: { operation: 'tabs' } });
+      expect(result.reply).toMatchObject({ ok: false, error: 'unknown method: browser' });
+    } finally {
+      await bridge.close();
+      life.finishBrowserTaskRun(TEST_UID, 'c1', 'browser-denied');
+    }
+  });
+
+  it.each(['task-end', 'account-change', 'bridge-close', 'call-cancel'] as const)('serializes browser work and rejects queued mutations after %s', async (change) => {
+    const life = await import('../../../../src/main/features/web_assist_lifecycle');
+    const users = await import('../../../../src/main/features/users');
+    life.beginBrowserTaskRun(TEST_UID, 'c1', 'browser-queue');
+    const bridge = await startTestBridge();
+    let started!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    browserHost.openModelWebAssist.mockReset().mockImplementation(async () => {
+      started();
+      await gate;
+      return { ok: true };
+    });
+    const socket = net.createConnection(bridge.socketPath);
+    socket.setEncoding('utf8');
+    let buffer = '';
+    const waiters = new Map<number, (value: any) => void>();
+    const request = (id: number, method: string, params: Record<string, unknown>) => new Promise<any>(resolve => {
+      waiters.set(id, resolve);
+      socket.write(JSON.stringify({ id, token: bridge.token, method, params }) + '\n');
+    });
+    socket.on('data', chunk => {
+      buffer += chunk;
+      let index: number;
+      while ((index = buffer.indexOf('\n')) >= 0) {
+        const reply = JSON.parse(buffer.slice(0, index));
+        buffer = buffer.slice(index + 1);
+        waiters.get(reply.id)?.(reply);
+        waiters.delete(reply.id);
+      }
+    });
+    socket.on('close', () => { for (const done of waiters.values()) done(null); waiters.clear(); });
+    socket.on('error', () => {});
+    await new Promise<void>(resolve => socket.once('connect', resolve));
+    const first = request(1, 'browser', { operation: 'open', url: 'https://example.com/first' });
+    await entered;
+    const second = request(2, 'browser', { operation: 'open', url: 'https://example.com/second' });
+    // A later frame on the same socket proves the second action was admitted
+    // while the first is pending; it must not run before that action settles.
+    await request(3, 'unknown-read-barrier', {});
+    expect(browserHost.openModelWebAssist).toHaveBeenCalledTimes(1);
+    try {
+      if (change === 'task-end') life.finishBrowserTaskRun(TEST_UID, 'c1', 'browser-queue');
+      if (change === 'account-change') users.activateUser('other-account');
+      if (change === 'bridge-close') await bridge.close();
+      if (change === 'call-cancel') expect(await request(4, 'connectors.cancel', { call_id: 2 })).toMatchObject({ result: { cancelled: true } });
+      release();
+      const [, queued] = await Promise.all([first, second]);
+      if (change === 'bridge-close') expect(queued).toBeNull();
+      else {
+        expect(queued).toMatchObject({ ok: true, result: { isError: true } });
+        expect(JSON.parse(queued.result.content).code).toBe('task_run_ended');
+      }
+      expect(browserHost.openModelWebAssist).toHaveBeenCalledTimes(1);
+    } finally {
+      release();
+      socket.destroy();
+      if (change !== 'bridge-close') await bridge.close();
+      life.finishBrowserTaskRun(TEST_UID, 'c1', 'browser-queue');
     }
   });
 });

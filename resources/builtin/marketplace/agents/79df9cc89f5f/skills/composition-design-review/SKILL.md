@@ -45,7 +45,7 @@ Blockers:
 - Text is unreadable in the supplied evidence frame, hides the approved promise/CTA, or materially blocks comprehension because of size, safe-zone, overlap, occlusion, or contrast.
 - The draft report's `contract_html` step says approved scene copy, canvas, assets, or runtime dependencies do not match the model-authored HTML.
 - Visual language contradicts an explicit style source or ignores required brand tokens.
-- A reference image or video loses a declared preserve axis, changes something outside `may_change`, violates layout/temporal anchors, misses a requested edit, or is scored below `reference_fidelity.verification.minimum_score`.
+- A reference image or video loses a declared preserve axis, changes something outside `may_change`, violates layout/temporal anchors, or misses a requested edit.
 - The piece reads as a slideshow when the approved promise was motion graphics.
 - Motion hides the message, distracts from the focal point, or breaks narration timing.
 - A protected logo/asset/layout was copied without ownership or permission.

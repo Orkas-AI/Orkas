@@ -51,9 +51,10 @@ const EXPECTED_PROGRAMMATIC_TOOL_NAMES = [
   'list_connector_tools',
   'call_connector_tool',
   'chat_history',
+  'todo_tasks',
+  'auto_tasks',
   'skill_search',
   'marketplace_search',
-  'auto_tasks_list',
   'app_health',
   'tool_result',
 ] as const;
@@ -83,9 +84,10 @@ const VALID_PROGRAMMATIC_INPUTS: Record<ProgrammaticToolName, Record<string, unk
   list_connector_tools: { connector_id: 'github' },
   call_connector_tool: { connector_id: 'github', tool_name: 'get_items', args: {} },
   chat_history: {},
+  todo_tasks: { action: 'list' },
+  auto_tasks: { action: 'list' },
   skill_search: { query: 'pdf' },
   marketplace_search: { query: 'pdf' },
-  auto_tasks_list: {},
   app_health: {},
   tool_result: {},
 };

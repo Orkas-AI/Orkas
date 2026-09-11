@@ -121,10 +121,12 @@ function nativePackageContract(nodeModules, platform, arch) {
       id: 'sharp-binding',
       candidates: mac
         ? [
+            `@img/sharp-darwin-${arch}/lib/sharp-darwin-${arch}-0.35.4.node`,
             `@img/sharp-darwin-${arch}/lib/sharp-darwin-${arch}-0.35.3.node`,
             `@img/sharp-darwin-${arch}/lib/sharp-darwin-${arch}.node`,
           ]
         : [
+            '@img/sharp-win32-x64/lib/sharp-win32-x64-0.35.4.node',
             '@img/sharp-win32-x64/lib/sharp-win32-x64-0.35.3.node',
             '@img/sharp-win32-x64/lib/sharp-win32-x64.node',
           ],
@@ -133,10 +135,12 @@ function nativePackageContract(nodeModules, platform, arch) {
       id: 'sharp-libvips-cpp',
       candidates: mac
         ? [
+            `@img/sharp-libvips-darwin-${arch}/lib/libvips-cpp.8.18.6.dylib`,
             `@img/sharp-libvips-darwin-${arch}/lib/libvips-cpp.8.18.3.dylib`,
             `@img/sharp-libvips-darwin-${arch}/lib/libvips-cpp.8.17.3.dylib`,
           ]
         : [
+            '@img/sharp-win32-x64/lib/libvips-cpp-8.18.6.dll',
             '@img/sharp-win32-x64/lib/libvips-cpp-8.18.3.dll',
             '@img/sharp-win32-x64/lib/libvips-cpp-8.17.3.dll',
           ],

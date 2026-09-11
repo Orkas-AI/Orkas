@@ -121,6 +121,20 @@ describe('renderer local Agent structured user input', () => {
     });
   });
 
+  it('returns multiple selected labels and a custom answer to a native question', async () => {
+    const harness = loadHarness();
+    harness.uiChoice.mockResolvedValue(['option-0', 'option-1', 'other']);
+    harness.uiPrompt.mockResolvedValue('Canary');
+    harness.push('local-agent:user-input', {
+      request_id: 'multi-question', questions: [{ ...choiceQuestion, multiSelect: true, isOther: true }],
+    });
+    await flush();
+    expect(harness.uiChoice.mock.calls[0][0].multiple).toBe(true);
+    expect(harness.invoke).toHaveBeenCalledWith('localAgents.userInputResponse', {
+      request_id: 'multi-question', cancelled: false, answers: { environment: ['Staging', 'Production', 'Canary'] },
+    });
+  });
+
   it.each(['choice', 'text'])('maps a dismissed %s dialog to a cancelled response without leaking earlier answers', async (dismissed) => {
     const harness = loadHarness();
     harness.uiChoice.mockResolvedValue(dismissed === 'choice' ? null : 'option-0');

@@ -108,13 +108,17 @@ const PACKAGED_BIN_ENTRYPOINTS = Object.freeze([
 // surfaces themselves. App-owned connector entrypoints load this proxy
 // bootstrap so their fetch can follow the route selected by Electron main.
 const PACKAGED_BIN_HELPERS = Object.freeze([
+  // Shared automation schema loaded by both the packaged Orkas bridge and
+  // the in-process auto_tasks tool.
   'auto-tasks-contract.cjs',
+  'browser-tool-contract.cjs',
   'bridge-skill-runner.cjs',
   // Loaded by the retained Google Workspace bundle, never a standalone catalog transport.
   'gmail-mcp-server.cjs',
   // Lark CLI shortcut contract required by local-cli-mcp-server.cjs.
   'local-cli-lark.cjs',
   'commerce-request-context.cjs',
+  'ebay-signature.cjs',
   'shopify-setup-requirements.cjs',
   'local-api-credential-codec.cjs',
   'marketplace-seller-api.cjs',

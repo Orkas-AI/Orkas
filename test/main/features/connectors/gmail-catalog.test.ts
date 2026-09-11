@@ -26,7 +26,7 @@ describe('Gmail catalog migration', () => {
     expect(visible.filter((entry) => entry.id === 'gmail')).toHaveLength(1);
     expect(visible.find((entry) => entry.id === 'gmail')).toMatchObject({
       auth_mode: 'composio', requires_credits: true, transport_template: null,
-      usage_metering: { provider: 'composio', credits_milli_per_call: 250 },
+      usage_metering: { provider: 'composio', credits_milli_per_call: 420 },
     });
     expect(findCatalogEntry('gmail')?.oauth).toBeUndefined();
     expect(GOOGLE_ENTRIES.some((entry) => entry.id === 'gmail')).toBe(false);
@@ -50,5 +50,17 @@ describe('Gmail catalog migration', () => {
       usage_metering: { credits_milli_per_call: 500 },
     });
     expect(findCatalogEntry('github')?.auth_mode).toBe('server_bridge');
+  });
+
+  it('exposes Google Drive through Composio before remote configuration and retains server tool metadata', () => {
+    const drive = () => catalogWithAvailability(connectorCatalog()).filter(entry => entry.id === 'gdrive');
+    expect(drive()).toHaveLength(1);
+    expect(drive()[0]).toMatchObject({ auth_mode: 'composio', requires_credits: true, transport_template: null });
+    expect(drive()[0].oauth).toBeUndefined();
+    expect(() => assertConnectorRuntimeEnabled('gdrive')).not.toThrow();
+    config.catalog = [{ id: 'gdrive', auth_mode: 'composio', composio: { toolkit: 'googledrive', tools: [{ slug: 'GOOGLEDRIVE_LIST_FILES' }] } }];
+    expect(drive()).toHaveLength(1);
+    expect(drive()[0].composio?.tools).toEqual([{ slug: 'GOOGLEDRIVE_LIST_FILES' }]);
+    expect(() => assertConnectorRuntimeEnabled('gsearch-console')).toThrow('connector_unsupported');
   });
 });

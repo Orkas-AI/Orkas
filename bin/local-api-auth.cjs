@@ -538,6 +538,10 @@ async function authorizeEbay(env) {
   }), 'eBay seller verification');
   return {
     provider: 'ebay', client_id: clientId, client_secret: clientSecret,
+    ...(env.credentials.signing_private_key ? {
+      signing_private_key: env.credentials.signing_private_key,
+      signing_key_jwe: env.credentials.signing_key_jwe,
+    } : {}),
     ru_name: ruName, redirect_uri: redirectUri,
     access_token: token.access_token, refresh_token: token.refresh_token,
     token_type: token.token_type || 'Bearer', scope: token.scope || EBAY_SCOPES.join(' '),

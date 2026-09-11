@@ -34,7 +34,11 @@ const fsp = fs.promises;
 // so existing users get their chat history searchable again on next launch
 // (the alternative — leaving v3 — would only fix newly-modified jsonl files
 // because reconcile keys off mtime+size, not schema correctness).
-export const SCHEMA_VERSION = 4;
+// v5 restores null-prototype dictionaries after JSON loading. Earlier readers
+// could mistake tokens such as `constructor` for inherited properties and
+// persist partially indexed documents. Rebuild those derived snapshots once
+// from source files, even when their recorded mtime/size still matches.
+export const SCHEMA_VERSION = 5;
 
 export type IndexKind = 'context' | 'chat';
 
@@ -76,9 +80,12 @@ export async function loadIndex(idxPath: string, kind: IndexKind): Promise<Index
     const raw = await fsp.readFile(idxPath, 'utf8');
     const idx = JSON.parse(raw);
     if (idx && idx.version === SCHEMA_VERSION && idx.kind === kind) {
-      idx.files    = idx.files    || Object.create(null);
-      idx.docs     = idx.docs     || Object.create(null);
-      idx.postings = idx.postings || Object.create(null);
+      // JSON.parse does not preserve the null prototype used by emptyIndex.
+      // Copy own keys into dictionaries so every filename/token remains data,
+      // including __proto__, and absent terms never resolve through Object.
+      idx.files    = Object.assign(Object.create(null), idx.files);
+      idx.docs     = Object.assign(Object.create(null), idx.docs);
+      idx.postings = Object.assign(Object.create(null), idx.postings);
       return idx as Index;
     }
   } catch { /* missing / corrupt / wrong schema — caller rebuilds */ }

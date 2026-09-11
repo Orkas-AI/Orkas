@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { generateKeyPairSync } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
@@ -100,6 +101,56 @@ afterEach(() => {
 });
 
 describe('device-local commerce API credentials', () => {
+  it('retains eBay signing credentials through OAuth without sending them to token or privilege endpoints', async () => {
+    const signing_private_key = generateKeyPairSync('ed25519').privateKey
+      .export({ format: 'der', type: 'pkcs8' }).toString('base64');
+    const signing_key_jwe = 'header.encrypted.iv.ciphertext.tag';
+    const fetchMock = vi.fn(async (url: string, init: RequestInit) => ({
+      ok: true, status: 200,
+      text: async () => JSON.stringify(url.endsWith('/token') ? {
+        access_token: 'access-fixture', refresh_token: 'refresh-fixture',
+        scope: localApiAuth.EBAY_SCOPES.join(' '),
+      } : { sellingLimit: {} }),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const result = await require('../../../../bin/local-api-auth.cjs').authorizeEbay({
+        oauthCode: 'fixture-code', metadata: { environment: 'live', marketplace_id: 'EBAY_US', content_language: 'en-US' },
+        credentials: { client_id: 'fixture-app', client_secret: 'fixture-secret', ru_name: 'Fixture-RuName',
+          redirect_uri: 'https://orkas.test/callback', signing_private_key, signing_key_jwe },
+      });
+      expect(result).toMatchObject({ signing_private_key, signing_key_jwe, access_token: 'access-fixture' });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(JSON.stringify(fetchMock.mock.calls)).not.toContain(signing_private_key);
+      expect(JSON.stringify(fetchMock.mock.calls)).not.toContain(signing_key_jwe);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('keeps optional eBay signing secrets out of metadata and requires a valid pair', () => {
+    const raw = { marketplace_id: 'EBAY_US', content_language: 'en-US', client_id: 'fixture-app',
+      client_secret: 'fixture-secret', ru_name: 'Fixture-RuName' };
+    const signing_private_key = generateKeyPairSync('ed25519').privateKey
+      .export({ format: 'der', type: 'pkcs8' }).toString('base64');
+    const signing_key_jwe = 'header.encrypted.iv.ciphertext.tag';
+    const normalized = normalizeLocalApiConnectionInput(entry('ebay-seller'), {
+      ...raw, signing_private_key, signing_key_jwe,
+    });
+    expect(normalized.credentials).toMatchObject({ signing_private_key, signing_key_jwe });
+    expect(normalized.metadata).not.toHaveProperty('signing_private_key');
+    expect(normalized.metadata).not.toHaveProperty('signing_key_jwe');
+    expect(normalizeLocalApiConnectionInput(entry('ebay-seller'), {
+      ...raw, signing_private_key: '', signing_key_jwe: '',
+    })).toEqual(normalizeLocalApiConnectionInput(entry('ebay-seller'), raw));
+    for (const invalid of [
+      { signing_private_key }, { signing_key_jwe },
+      { signing_private_key: 'not-a-key', signing_key_jwe },
+      { signing_private_key, signing_key_jwe: 'injected\r\nheader' },
+    ]) expect(() => normalizeLocalApiConnectionInput(entry('ebay-seller'), { ...raw, ...invalid })).toThrow(/invalid/);
+    expect(() => normalizeLocalApiConnectionInput(entry('ebay-seller'), {
+      ...raw, client_secret: '',
+    })).toThrow(/required/);
+  });
+
   it('validates pasted OAuth callbacks, CSRF state, redirect binding, and complete seller scopes', () => {
     expect(localApiAuth.parseCallback(
       'https://merchant.example.com/oauth/etsy?code=authorization-code&state=strong-state',
@@ -412,7 +463,7 @@ describe('device-local commerce API credentials', () => {
     expect(stored).toEqual({
       kind: 'stdio',
       command: '/opt/orkas/runtime/node',
-      args: [expect.stringMatching(/\/bin\/direct-commerce-mcp-server\.cjs$/)],
+      args: [path.resolve(__dirname, '../../../../bin/direct-commerce-mcp-server.cjs')],
       cwd: localApiRuntimeDir(TEST_UID, 'shopify-admin'),
     });
     expect(stored.kind === 'stdio' ? stored.env : undefined).toBeUndefined();
@@ -480,7 +531,7 @@ describe('device-local commerce API credentials', () => {
     expect(interactiveMocks.start).toHaveBeenCalledWith(expect.objectContaining({
       uid: TEST_UID,
       command: '/opt/orkas/runtime/node',
-      args: [expect.stringMatching(/\/bin\/local-api-auth\.cjs$/)],
+      args: [path.resolve(__dirname, '../../../../bin/local-api-auth.cjs')],
       presentation: 'browser_auth',
       sandboxEnv: expect.objectContaining({
         ORKAS_LOCAL_API_PROVIDER: 'constant_contact',

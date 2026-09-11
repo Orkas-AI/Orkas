@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs/promises";
+import { createHash } from "node:crypto";
 import {
   SandboxExecutor,
   augmentPath,
@@ -63,7 +64,19 @@ describe("SandboxExecutor", () => {
       shell: "invalid\0shell",
     });
 
-    const result = await sandbox.execute("echo must-not-run");
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let result;
+    try {
+      result = await sandbox.execute("echo must-not-run");
+      expect(warning).toHaveBeenCalledWith("[sandbox]", "Shell process failed to start", expect.objectContaining({
+        command_hash: createHash("sha256").update("echo must-not-run").digest("hex").slice(0, 12),
+        error_code: "ERR_INVALID_ARG_VALUE", phase: "spawn", platform: process.platform,
+      }));
+      expect(JSON.stringify(warning.mock.calls)).not.toContain("invalid");
+      expect(JSON.stringify(warning.mock.calls)).not.toContain("echo must-not-run");
+    } finally {
+      warning.mockRestore();
+    }
 
     expect(result).toMatchObject({
       stdout: "",
@@ -84,7 +97,18 @@ describe("SandboxExecutor", () => {
       shell: missingShell,
     });
 
-    const result = await sandbox.execute("echo must-not-run");
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let result;
+    try {
+      result = await sandbox.execute("echo must-not-run");
+      expect(warning).toHaveBeenCalledWith("[sandbox]", "Shell process failed to start", expect.objectContaining({
+        command_hash: createHash("sha256").update("echo must-not-run").digest("hex").slice(0, 12),
+        error_code: "ENOENT", phase: "spawn", platform: process.platform,
+      }));
+      expect(JSON.stringify(warning.mock.calls)).not.toContain(missingShell);
+    } finally {
+      warning.mockRestore();
+    }
 
     expect(result).toMatchObject({
       stdout: "",

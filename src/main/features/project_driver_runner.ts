@@ -28,6 +28,7 @@ import * as chats from './chats';
 import * as groupChat from './group_chat';
 import { busIsQuiescent } from './group_chat';
 import * as projects from './projects';
+import * as agents from './agents';
 import * as projectTasks from './project_tasks';
 import type { ProjectTask } from './project_tasks';
 import * as driver from './project_driver';
@@ -43,6 +44,21 @@ const DRIVER_TICK_MS = 60 * 1000;
 // identical. Share a dispatch guard across manual starts and auto-advance until
 // enqueue/rollback finishes; a later explicit retry remains allowed.
 const _dispatchingTasks = new Set<string>();
+
+async function _selectGlobalTaskOwner(uid: string, pid: string, task: ProjectTask, cid: string): Promise<boolean> {
+  if (pid || !task.owner_agent_id) return true;
+  if (getActiveUserId() !== uid) return false;
+  try {
+    const agent = (await agents.listAgentSummaries()).find((a) => a.agent_id === task.owner_agent_id && a.enabled !== false);
+    if (!agent || getActiveUserId() !== uid) return false;
+    return (await groupChat.setFloor(uid, cid, agent.agent_id)).ok;
+  } catch {
+    // Selection precedes the status write. A lookup failure must not roll back
+    // a status transition made by another caller while this lookup was pending.
+    log.warn('global task owner selection failed');
+    return false;
+  }
+}
 
 async function _prepareRunStatus(
   uid: string, pid: string, tid: string, expected: ProjectTask['status'],
@@ -172,6 +188,10 @@ export async function advance(uid: string, pid: string, task: ProjectTask): Prom
     return { ok: false };
   }
   try {
+    if (!(await _selectGlobalTaskOwner(uid, pid, task, cid))) {
+      await rollback();
+      return { ok: false };
+    }
     if (!(await _prepareRunStatus(uid, pid, task.id, task.status))) {
       log.warn('advance status update rejected', { uid: maskId(uid), pid: maskId(pid), task: maskId(task.id) });
       await rollback();
@@ -238,7 +258,7 @@ function _runSeedText(task: ProjectTask, pid: string): string {
 
 /** User-triggered "run this task now": open a fresh conversation, route project
  *  work through its Commander (which delegates to the assigned owner), or route
- *  a global task to the default assistant. Review-stage transitions belong to
+ *  a global task to its selected Agent (or the default assistant). Review-stage transitions belong to
  *  the executor; other runnable tasks are marked progress at startup. Mirrors
  *  advance()'s create→send→rollback shape and — like auto_tasks.runTaskNow — is
  *  NOT gated by the driver's cooldown/daily-cap/lease; a manual run is explicit.
@@ -279,6 +299,10 @@ export async function runTaskNow(
     return { ok: false, error: 'status_update_failed' };
   }
   try {
+    if (!(await _selectGlobalTaskOwner(uid, pid, task, cid))) {
+      await rollback();
+      return { ok: false, error: 'owner_not_bound' };
+    }
     if (!(await _prepareRunStatus(uid, pid, tid, task.status))) {
       log.warn('runTaskNow status update rejected', { uid: maskId(uid), pid: maskId(pid), tid: maskId(tid) });
       await rollback();

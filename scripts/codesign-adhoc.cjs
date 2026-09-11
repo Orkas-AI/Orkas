@@ -358,7 +358,7 @@ function verifyPackedNativePayload(nodeModules, targetPlatform, targetArch) {
     );
     requiredFile(
       `${sharpPackages.libvips} runtime`,
-      path.join(packageDir(nodeModules, `@img/${sharpPackages.libvips}`), 'lib', 'libvips-cpp.8.18.3.dylib'),
+      path.join(packageDir(nodeModules, `@img/${sharpPackages.libvips}`), 'lib', 'libvips-cpp.8.18.6.dylib'),
     );
   } else if (targetPlatform === 'win32') {
     requiredFile(
@@ -383,7 +383,7 @@ function verifyPackedNativePayload(nodeModules, targetPlatform, targetArch) {
     );
     requiredFile(
       `${sharpPackages.binding} libvips C++ runtime`,
-      path.join(packageDir(nodeModules, `@img/${sharpPackages.binding}`), 'lib', 'libvips-cpp-8.18.3.dll'),
+      path.join(packageDir(nodeModules, `@img/${sharpPackages.binding}`), 'lib', 'libvips-cpp-8.18.6.dll'),
     );
     requiredFile(
       `${sharpPackages.binding} libvips runtime`,

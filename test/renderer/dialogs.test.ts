@@ -25,9 +25,15 @@ class FakeClassList {
   contains(name: string): boolean {
     return this.element.className.split(/\s+/).includes(name);
   }
+
+  toggle(name: string, force: boolean): void {
+    if (force) this.add(name);
+    else this.remove(name);
+  }
 }
 
 class FakeElement {
+  disabled = false;
   className = '';
   id = '';
   value = '';
@@ -56,6 +62,7 @@ class FakeElement {
       button.className = match[1];
       button.dataset.act = match[2];
       if (match[3] !== undefined) button.dataset.id = match[3];
+      button.disabled = match[0].includes(' disabled');
       this.appendChild(button);
     }
     if (value.includes('class="ui-dialog-input"')) {
@@ -104,6 +111,7 @@ class FakeElement {
   }
 
   click(): void {
+    if (this.disabled) return;
     for (const listener of this.listeners.get('click') || []) listener({ target: this });
   }
 
@@ -233,6 +241,22 @@ function overlays(ctx: any): FakeElement[] {
 }
 
 describe('shared renderer dialogs', () => {
+  it('lets a user select and deselect multiple choices, committing only on explicit confirmation', async () => {
+    const ctx = loadDialogs();
+    const result = ctx.uiChoice({ title: 'Checks', multiple: true, choices: [{ id: 'unit', label: 'Unit' }, { id: 'integration', label: 'Integration' }] });
+    const overlay = overlays(ctx)[0];
+    const confirm = overlay.querySelector('[data-act="confirm"]')!;
+    const choices = overlay.querySelectorAll('[data-act="choice"]');
+    expect(confirm.disabled).toBe(true);
+    choices[0].click();
+    choices[1].click();
+    choices[0].click();
+    expect(overlays(ctx)).toHaveLength(1);
+    expect(choices[0].attributes.get('aria-pressed')).toBe('false');
+    expect(choices[1].attributes.get('aria-pressed')).toBe('true');
+    confirm.click();
+    expect(await result).toEqual(['integration']);
+  });
   it('keeps cancel keyboard intent, exposes an accessible name, escapes text, and restores focus', async () => {
     const ctx = loadDialogs();
     const background = ctx._document.createElement('button');

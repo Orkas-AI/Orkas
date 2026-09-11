@@ -102,7 +102,7 @@ describe('official local CLI connector runtime', () => {
     expect(transport).toMatchObject({
       kind: 'stdio',
       command: '/opt/orkas/runtime/node',
-      args: [expect.stringMatching(/\/bin\/local-cli-mcp-server\.cjs$/)],
+      args: [path.resolve(__dirname, '../../../../bin/local-cli-mcp-server.cjs')],
       cwd: path.join(userLocalConfigDir('account-a'), 'connector-cli', 'feishu'),
       env: {
         ORKAS_LOCAL_CLI_PROVIDER: 'lark',
@@ -421,7 +421,7 @@ describe('official local CLI connector runtime', () => {
       expect(interactiveMocks.start).toHaveBeenCalledWith(expect.objectContaining({
         uid: 'account-a',
         command: '/opt/orkas/runtime/node',
-        args: [expect.stringMatching(/\/bin\/local-cli-auth\.cjs$/)],
+        args: [path.resolve(__dirname, '../../../../bin/local-cli-auth.cjs')],
         purpose: expect.any(String),
         presentation: id === 'xero' ? 'connector_input' : 'browser_auth',
         sandboxEnv: expect.objectContaining({
