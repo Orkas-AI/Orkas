@@ -434,3 +434,76 @@ test('assigns global and project todos in the editor and keeps cards and saved o
     }
   }
 });
+
+// A status column can hold more to-dos than the board is tall. The board is a
+// flex child of the scrolling panel, so such a column is shrunk to the panel
+// instead of overflowing it, and without a scroller of its own it simply clipped
+// the rest of the cards away with no way to reach them. The single card in a
+// column that cannot overflow is the oracle for "kept its own height": a body
+// that fits by squashing its cards would scroll too, and would be just as
+// unusable.
+test('reaches every to-do in a column taller than the board', async ({ connectorOrkas: orkas }, testInfo) => {
+  const page = orkas.page!;
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.evaluate(() => (window as any).setLang('zh'));
+  const created = await orkas.invoke<{ project: { project_id: string } }>('projects.create', { name: '滚动验证' });
+  const pid = created.project.project_id;
+  const detail = '一段足够长的说明文字，用来让卡片高度接近真实情况，从而让这一列超出看板高度。';
+  for (let index = 1; index <= 15; index += 1) {
+    await orkas.invoke('projects.tasks.create', { projectId: pid, title: `待办 ${index}`, status: 'todo', detail });
+  }
+  await orkas.invoke('projects.tasks.create', { projectId: pid, title: '对照待办', status: 'progress', detail });
+  const measure = (sel: string, viewSel: string) => page.evaluate(({ sel, viewSel }) => {
+    const column = document.querySelector(`${sel} .todo-column.is-todo`) as HTMLElement;
+    const body = column.querySelector('.todo-column-body') as HTMLElement;
+    const head = column.querySelector('.todo-column-head') as HTMLElement;
+    const cards = Array.from(column.querySelectorAll('.project-todo-item')) as HTMLElement[];
+    const reference = document.querySelector(`${sel} .todo-column.is-progress .project-todo-item`) as HTMLElement;
+    const last = cards[cards.length - 1].getBoundingClientRect();
+    const view = (document.querySelector(viewSel) as HTMLElement).getBoundingClientRect();
+    return {
+      cards: cards.length,
+      cardHeight: Math.round(last.height),
+      referenceHeight: Math.round(reference.getBoundingClientRect().height),
+      hiddenInBody: body.scrollHeight - body.clientHeight,
+      headTop: Math.round(head.getBoundingClientRect().top),
+      lastVisible: last.bottom <= view.bottom + 1 && last.top >= view.top - 1,
+    };
+  }, { sel, viewSel });
+
+  // The global page scrolls as one list, so a column there must not turn into a
+  // second scroller nested inside it.
+  await page.locator('#todos-btn').click();
+  await page.locator('[data-todo-group="status"]').click();
+  await expect(page.locator('#todos-content .todo-column.is-todo .project-todo-item')).toHaveCount(15);
+  const globalBefore = await measure('#todos-content', '#todos-content');
+  expect(globalBefore.hiddenInBody).toBeLessThanOrEqual(2);
+  expect(globalBefore.cardHeight).toBeGreaterThanOrEqual(globalBefore.referenceHeight - 2);
+  await page.evaluate(() => {
+    const list = document.querySelector('#todos-content') as HTMLElement;
+    list.scrollTop = list.scrollHeight;
+  });
+  expect((await measure('#todos-content', '#todos-content')).lastVisible).toBe(true);
+
+  // The project board gives each column its own scroller instead.
+  await page.locator('#todos-content .project-todo-item').first().locator('.todo-card-project').click();
+  await expect(page.locator('#project-detail-title')).toHaveText('滚动验证');
+  await page.locator('[data-project-tab="todo"]').click();
+  const body = page.locator('#project-todo-list .todo-column.is-todo .todo-column-body');
+  await expect(page.locator('#project-todo-list .todo-column.is-todo .project-todo-item')).toHaveCount(15);
+  const before = await measure('#project-todo-list', '#project-todo-list .todo-column.is-todo');
+  expect(before.cards).toBe(15);
+  expect(before.cardHeight).toBeGreaterThanOrEqual(before.referenceHeight - 2);
+  expect(before.hiddenInBody).toBeGreaterThan(100);
+  expect(before.lastVisible).toBe(false);
+  const box = (await body.boundingBox())!;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.wheel(0, 600);
+  await expect.poll(async () => body.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+  await body.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+  const after = await measure('#project-todo-list', '#project-todo-list .todo-column.is-todo');
+  expect(after.lastVisible).toBe(true);
+  expect(after.cardHeight).toBeGreaterThanOrEqual(after.referenceHeight - 2);
+  expect(after.headTop).toBe(before.headTop);
+  await page.screenshot({ path: testInfo.outputPath('todo-column-scroll.png') });
+});
