@@ -28,6 +28,20 @@ jobs:
         run: npm ci --include=optional
       - name: Exercise the supported repair command and target Electron operations
         run: npm run native:repair
+      - name: Collect native child diagnostics on a failed clean CI installation
+        if: failure()
+        shell: bash
+        run: |
+          node <<'NODE'
+          const { spawnSync } = require('node:child_process');
+          const { verifyNativeDependencies } = require('./scripts/verify-native-dependencies.cjs');
+          verifyNativeDependencies({ spawn: (...args) => {
+            const result = spawnSync(...args);
+            console.log(JSON.stringify({ status: result.status, signal: result.signal,
+              stdout: result.stdout, stderr: result.stderr, error: result.error?.code }));
+            return result;
+          } });
+          NODE
       - name: Verify that repair preserved the manifests
         run: git diff --exit-code -- package.json package-lock.json
       - name: Run native dependency regression cases under Electron
