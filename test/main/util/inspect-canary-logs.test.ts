@@ -9,16 +9,16 @@ const trace = '(Use `electron --trace-warnings ...` to show where the warning wa
 
 describe('GUI canary process diagnostics', () => {
   it('reports reviewed Linux baseline diagnostics separately from functional success', () => {
-    const report = reviewInspectStderr([dbus, owner, sharp, trace, glib, 'Unable to revert mtime: /usr/share/fonts/truetype/noto'].join('\r\n'), 'linux');
+    const report = reviewInspectStderr([dbus, owner, 'Unable to revert mtime: /usr/share/fonts/truetype/noto'].join('\r\n'), 'linux');
     expect(report).toEqual({ unexpected: 0, warnings: {
-      'dbus-address': 1, 'dbus-owner': 1, 'sharp-linux': 1, 'sharp-trace': 1, 'glib-sharp': 1, 'system-font-mtime': 1,
+      'dbus-address': 1, 'dbus-owner': 1, 'system-font-mtime': 1,
     } });
     expect(inspectCanaryExitCode(0, false, report)).toBe(0);
     expect(inspectCanaryExitCode(2, false, report)).toBe(2);
     expect(inspectCanaryExitCode(0, true, report)).toBe(1);
   });
 
-  it.each(['darwin', 'win32'])('keeps Linux diagnostics fatal on %s', platform => {
+  it.each(['darwin', 'win32', 'linux'])('rejects an Electron/sharp collision on %s', platform => {
     expect(reviewInspectStderr(sharp, platform).unexpected).toBe(1);
   });
 
@@ -33,7 +33,7 @@ describe('GUI canary process diagnostics', () => {
   });
 
   it('rejects an unbounded warning loop and unexplained GLib or trace output', () => {
-    expect(reviewInspectStderr(`${sharp}\n${Array(101).fill(glib).join('\n')}`, 'linux').unexpected).toBe(1);
+    expect(reviewInspectStderr(Array(21).fill(dbus).join('\n'), 'linux').unexpected).toBe(1);
     expect(reviewInspectStderr(glib, 'linux').unexpected).toBe(1);
     expect(reviewInspectStderr(trace, 'linux').unexpected).toBe(1);
   });

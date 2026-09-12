@@ -44,6 +44,14 @@ jobs:
           NODE
       - name: Verify that repair preserved the manifests
         run: git diff --exit-code -- package.json package-lock.json
+      - name: Restore standard read-only system font permissions on Linux
+        if: runner.os == 'Linux'
+        run: |
+          stat -c '%u:%g %a %n' /usr/share/fonts /usr/share/fonts/truetype
+          # Fontconfig cannot restore root-owned directory timestamps after
+          # removing legacy UUID files from runner-writable font directories.
+          # Keep system fonts readable and writable only by their owner.
+          sudo chmod -R go-w /usr/share/fonts
       - name: Run native dependency regression cases under Electron
         run: >-
           npm run test:js -- --maxWorkers=1

@@ -56,6 +56,12 @@ jobs:
             sudo apt-get install --yes xvfb
           fi
 
+      - name: Restore standard read-only system font permissions
+        run: |
+          stat -c '%u:%g %a %n' /usr/share/fonts /usr/share/fonts/truetype
+          # Avoid Fontconfig mutating root-owned runner-writable font trees.
+          sudo chmod -R go-w /usr/share/fonts
+
       - name: Prepare and verify built-in Linux dependencies
         run: node scripts/ensure-dev-dependencies.cjs
 
