@@ -58,6 +58,20 @@ describe('isolated bundled-Node image processing', () => {
     }
   });
 
+  it('renders SVG contact-sheet text in stock Node without native diagnostics', async () => {
+    let stderr = '';
+    const images = client({ spawn: (...args: Parameters<typeof fork>) => {
+      const child = fork(...args);
+      child.stderr!.on('data', chunk => { stderr += String(chunk); });
+      children.push(child);
+      return child;
+    } });
+    const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="320" height="80"><rect width="320" height="80" fill="white"/><text x="12" y="48" font-family="sans-serif" font-size="24">Contact sheet</text></svg>');
+    const result = await images.request('encode', svg, { format: 'png', density: 96 });
+    expect(result.data.readUInt32BE(16)).toBeGreaterThanOrEqual(320);
+    expect(stderr).toBe('');
+  });
+
   it('surfaces invalid images and remains usable without restarting or replaying the failed request', async () => {
     const images = client();
     await expect(images.request('metadata', Buffer.from('not-an-image'))).rejects.toThrow('E_IMAGE_PROCESS');
