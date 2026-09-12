@@ -1760,7 +1760,11 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 .todo-board { display: grid; grid-template-columns: repeat(4, minmax(190px, 1fr)); gap: 0; align-items: stretch; overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface); }
 .todo-board[hidden], .todo-column-body[hidden], .todo-load-error[hidden] { display: none; }
 .project-todo-list { overflow: auto; min-height: 0; }
-.todo-column { min-width: 0; border: 0; border-right: 1px solid var(--border); border-radius: 0; background: transparent; overflow: hidden; }
+/* The board is a flex child of the scrolling list, so a column taller than the
+   panel is shrunk to it instead of overflowing, and the list's own scrollbar
+   never appears: 15 to-dos left 1379px of cards clipped and unreachable. Each
+   column scrolls its own body, which also keeps the status header in place. */
+.todo-column { min-width: 0; display: flex; flex-direction: column; min-height: 0; border: 0; border-right: 1px solid var(--border); border-radius: 0; background: transparent; overflow: hidden; }
 .todo-column:last-child { border-right: 0; }
 .todo-column-head { display: flex; align-items: center; min-height: 44px; padding: 0 10px; gap: 4px; }
 .todo-collapse { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; color: var(--text-2); font: inherit; font-size: 12px; font-weight: 600; border: 0; background: transparent; padding: 10px 2px; cursor: pointer; text-align: left; }
@@ -1770,7 +1774,10 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 .todo-column.is-progress > .todo-column-head .project-todo-status-dot { background: var(--primary); }
 .todo-column.is-review > .todo-column-head .project-todo-status-dot { background: var(--warn-text); }
 .todo-column.is-done > .todo-column-head .project-todo-status-dot { background: var(--success); }
-.todo-column-body { display: flex; flex-direction: column; gap: 8px; padding: 10px; border-top: 1px solid var(--border); }
+.todo-column-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 10px; border-top: 1px solid var(--border); }
+/* Cards keep their own height inside the scroller; as flex children they would
+   otherwise be squashed to fit the column instead of scrolling. */
+.todo-column-body > * { flex: 0 0 auto; }
 .todo-column-empty { width: 100%; padding: 12px 0; font-size: 11px; text-align: center; }
 .todo-board .project-todo-item { position: relative; display: flex; flex-wrap: wrap; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); box-shadow: 0 1px 2px rgba(15, 23, 42, .03); cursor: default; }
 .todo-board .project-todo-item:hover { border-color: var(--border-strong); }
