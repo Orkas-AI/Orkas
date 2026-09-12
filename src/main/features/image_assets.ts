@@ -2,9 +2,10 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-import type { Sharp, SharpConstructor } from 'sharp';
+import type { Metadata, OutputInfo } from 'sharp';
 
 import { isPathAllowed } from '../util/path-sandbox';
+import { encodeImage, imageMetadata } from '../util/sharp-runtime';
 
 export interface ImageAssetProcessResult {
   output_path: string;
@@ -44,19 +45,6 @@ function assertProjectFile(projectDirAbs: string, absPath: string, label: string
   }
 }
 
-async function loadSharp(): Promise<SharpConstructor> {
-  try {
-    const module = await import('sharp');
-    const factory = module.default;
-    if (typeof factory !== 'function') {
-      throw new Error('sharp did not expose a callable default export');
-    }
-    return factory;
-  } catch (error) {
-    throw new Error(`E_SHARP_UNAVAILABLE: the image output validator is unavailable (${(error as Error).message}).`);
-  }
-}
-
 export async function inspectImageAssetBuffer(buffer: Buffer): Promise<{
   format: string;
   width: number;
@@ -65,11 +53,11 @@ export async function inspectImageAssetBuffer(buffer: Buffer): Promise<{
   bytes: number;
 }> {
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) throw new Error('E_IMAGE_ASSET_INVALID: image response is empty.');
-  const sharp = await loadSharp();
-  let metadata: Awaited<ReturnType<Sharp['metadata']>>;
+  let metadata: Metadata;
   try {
-    metadata = await sharp(buffer, { failOn: 'error', limitInputPixels: MAX_AREA }).metadata();
+    metadata = await imageMetadata(buffer, { failOn: 'error', limitInputPixels: MAX_AREA });
   } catch (error) {
+    if (String((error as NodeJS.ErrnoException).code || '').startsWith('E_IMAGE_RUNTIME_')) throw error;
     throw new Error(`E_IMAGE_ASSET_INVALID: workflow output is not a readable image (${(error as Error).message}).`);
   }
   if (!metadata.format || !metadata.width || !metadata.height) throw new Error('E_IMAGE_ASSET_INVALID: workflow output has no image dimensions.');
@@ -98,10 +86,10 @@ export async function prepareLosslessModelImage(buffer: Buffer): Promise<Lossles
   if (inspected.format !== 'png') {
     throw new Error('E_IMAGE_ASSET_FORMAT: lossless model preprocessing requires PNG input.');
   }
-  const sharp = await loadSharp();
-  const webp = await sharp(buffer, { failOn: 'error', limitInputPixels: MAX_AREA })
-    .webp({ lossless: true, effort: 4 })
-    .toBuffer();
+  const { data: webp } = await encodeImage(buffer, {
+    failOn: 'error', limitInputPixels: MAX_AREA,
+    format: 'webp', encodeOptions: { lossless: true, effort: 4 },
+  });
   const useWebp = webp.length < buffer.length;
   const selected = useWebp ? webp : buffer;
   return {
@@ -130,16 +118,16 @@ export async function writeImageAssetBuffer(input: {
   }
   await inspectImageAssetBuffer(input.buffer);
   const quality = input.quality === undefined ? 95 : finiteInteger(input.quality, 'quality', 1, 100);
-  const sharp = await loadSharp();
-  let pipeline = sharp(input.buffer, { failOn: 'error', limitInputPixels: MAX_AREA });
-  if (extension === '.png') pipeline = pipeline.png({ quality });
-  else if (extension === '.webp') pipeline = pipeline.webp({ quality });
-  else pipeline = pipeline.jpeg({ quality });
+  const encoded = await encodeImage(input.buffer, {
+    failOn: 'error', limitInputPixels: MAX_AREA,
+    format: extension === '.png' ? 'png' : extension === '.webp' ? 'webp' : 'jpeg',
+    encodeOptions: { quality },
+  });
   await fs.mkdir(path.dirname(outputAbsPath), { recursive: true });
   const temporaryPath = `${outputAbsPath}.${process.pid}.${randomUUID()}.tmp${extension}`;
-  let info: Awaited<ReturnType<Sharp['toFile']>>;
+  const info: OutputInfo = encoded.info;
   try {
-    info = await pipeline.toFile(temporaryPath);
+    await fs.writeFile(temporaryPath, encoded.data);
     // A sibling hard link publishes the fully-written inode atomically and,
     // unlike rename, refuses to replace an existing path on every supported
     // platform. This also closes the race between the caller's uniquify check

@@ -20,6 +20,8 @@ if (!['win32', 'darwin', 'linux'].includes(process.platform)) {
 // runs after dependency provisioning in the platform-specific Windows and
 // Linux lanes because it requires downloaded FFmpeg, model, and native payloads.
 const commonSuites = [
+  'test/main/util/verify-native-dependencies.test.ts',
+  'test/main/util/ensure-sqlite-electron-abi.test.ts',
   'test/main/util/inspect-canary-logs.test.ts',
   'src/core-agent/test/oauth-flow.test.ts',
   'src/core-agent/test/tools.test.ts',
@@ -72,7 +74,6 @@ const platformSuites = process.platform === 'win32'
         'test/main/util/linux-source-dependencies.test.ts',
         'test/main/util/officecli-fetch.test.ts',
         'test/main/util/ensure-dev-dependencies.test.ts',
-        'test/main/util/ensure-sqlite-electron-abi.test.ts',
       ];
 
 console.log(`[platform-native-tests] host=${process.platform}; suites=${commonSuites.length + platformSuites.length}`);

@@ -121,7 +121,7 @@ Orkas 是一个开源、本地优先的多智能体桌面应用。一个超强�
 Claude Desktop 是单个助理；CrewAI 和 LangChain 是代码优先的框架。Orkas 是一个本地优先的多智能体桌面应用：指挥官协调多个专业智能体，数据与 key 留在本地，每个智能体拥有私有技能与记忆。见[逐项对比](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas)。
 
 **支持哪些平台？**
-macOS（Apple 芯片与 Intel）和 Windows 10+ 提供安装包。基于 glibc 2.34+ 的 Linux x64/arm64 目前从源码运行，暂时没有安装包。本地语音转写通过首次启动时准备的固定版本 whisper.cpp 运行时提供。当前不支持 Alpine 及其他基于 musl 的发行版。源码启动需要 Node 20+；只有在原生 npm 包没有匹配的预编译二进制、必须本地编译时，才额外需要 Python 3 和 C/C++ 构建工具链。
+macOS（Apple 芯片与 Intel）和 Windows 10+ 提供安装包。基于 glibc 2.34+ 的 Linux x64/arm64 目前从源码运行，暂时没有安装包。本地语音转写通过首次启动时准备的固定版本 whisper.cpp 运行时提供。当前不支持 Alpine 及其他基于 musl 的发行版。源码启动需要 Node 22.12+；只有在原生 npm 包没有匹配的预编译二进制、必须本地编译时，才额外需要 Python 3 和 C/C++ 构建工具链。
 
 **Orkas 免费且开源吗？**
 是的 —— 应用本身 MIT 许可证、免费使用。自带模型 key 时，你只需为你的模型服务商付费，Orkas 不抽成。此外，桌面版还提供一个可选的内置 **Orkas 模型**，供不想自己配置 key 的用户使用 —— 这部分由 Orkas 按 credits 计费（会员或 credits 包）。它完全可选，其余所有功能用你自己的 key 即可。[价格 →](https://orkas.ai/pricing/?source=gh-orkas)
@@ -132,7 +132,7 @@ macOS（Apple 芯片与 Intel）和 Windows 10+ 提供安装包。基于 glibc 2
 
 想直接用安装包？见上方 [下载](#下载)。以下是从源码运行的方式 —— 也是目前在 Linux 上运行 Orkas 的方式：
 
-**环境要求**：Node 20+ · macOS / Windows 10+ / 基于 glibc 2.34+ 的 Linux x64 或 arm64。建议保留 Python 3 与 C/C++ 构建工具链，用于少数原生模块需要源码编译的兜底场景。
+**环境要求**：Node 22.12+ · macOS / Windows 10+ / 基于 glibc 2.34+ 的 Linux x64 或 arm64。建议保留 Python 3 与 C/C++ 构建工具链，用于少数原生模块需要源码编译的兜底场景。
 
 ```bash
 git clone https://github.com/Orkas-AI/Orkas.git
@@ -144,6 +144,11 @@ run.cmd            # Windows
 Linux 源码运行需要 glibc 2.34+，不支持 Alpine 及其他基于 musl 的发行版。本地语音转写会在首次源码启动时下载并校验目标架构对应的 whisper.cpp 运行时及多语言模型。
 
 `run.sh` / `run.cmd` 会在首次启动时安装 lockfile 固定的 npm 依赖，并准备固定版本的 Python、uv、Node、嵌入模型（约 95 MB）、OfficeCLI、FFmpeg、whisper.cpp 与多语言语音模型。Linux 启动还会在 Electron ABI 下验证平台原生模块及 Whisper 运行时后再打开应用。OCR 与 Skill 专属 Python 包会在首次使用对应功能时安装到隔离的本地环境。首次启动会在 `~/.orkas/`（macOS / Linux）或 `<最小的非系统盘>:\.orkas\`（Windows）下创建工作区。随后进入 **设置 → AI 服务商** 配置 API key 或 OAuth。
+
+遇到原生依赖错误时，请使用 Node.js 24 LTS（最低 22.12.0），在此源码目录执行
+`npm run native:repair`。它会恢复可选依赖、修复 Electron 对应的 SQLite，并验证 SQL、
+sqlite-vec，并准备随包 Node、在独立进程中验证 sharp 后才报告成功。只检查、不安装可运行 `npm run native:check`。
+详见[原生依赖安装与排错说明](docs/native-dependencies.md)。
 
 ---
 

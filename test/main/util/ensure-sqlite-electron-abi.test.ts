@@ -23,6 +23,17 @@ const OPTIONS = {
 };
 
 describe('SQLite Electron ABI repair orchestration', () => {
+  it.each([
+    ['successful rebuild with an unloadable addon', 1, 0],
+    ['interrupted rebuild after successful prebuild extraction', 0, null],
+  ])('rejects %s instead of allowing startup', (_label, prebuildStatus, rebuildStatus) => {
+    const statuses = [1, prebuildStatus, 1, rebuildStatus, 1, 1];
+    const spawn = vi.fn(() => ({ status: statuses.shift(), stderr: 'ABI mismatch' }));
+    const logError = vi.fn();
+    expect(ensureSqliteElectronAbi({ ...OPTIONS, spawn, logError })).not.toBe(0);
+    expect(logError).toHaveBeenCalledWith(expect.stringContaining('Electron ABI probe failed'));
+  });
+
   it('adds macOS SDK C++ headers without leaking Electron-as-Node into rebuild helpers', () => {
     expect(nativeBuildEnvironment({
       env: {

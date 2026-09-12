@@ -16,34 +16,9 @@ function requireCondition(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-async function probeSqlite() {
-  const Database = require('better-sqlite3');
-  const sqliteVec = require('sqlite-vec');
-  const db = new Database(':memory:');
-  try {
-    sqliteVec.load(db);
-    const row = db.prepare('SELECT vec_version() AS version').get();
-    requireCondition(typeof row?.version === 'string' && row.version.length > 0, 'sqlite-vec returned no version');
-  } finally {
-    db.close();
-  }
-}
-
-async function probeSharp() {
-  const sharp = require('sharp');
-  const png = await sharp({
-    create: {
-      width: 2,
-      height: 2,
-      channels: 4,
-      background: { r: 20, g: 40, b: 60, alpha: 1 },
-    },
-  }).png().toBuffer();
-  requireCondition(
-    png.length > 8 && png.subarray(1, 4).toString('ascii') === 'PNG',
-    'sharp did not produce a PNG',
-  );
-}
+const native = require('./native-dependency-probe.cjs');
+const probeSqlite = () => native.probeSqlite(require);
+const probeSharp = () => require('./verify-native-dependencies.cjs').verifySharpRuntime();
 
 async function probeCanvas() {
   const { createCanvas } = require('@napi-rs/canvas');

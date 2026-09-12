@@ -8,6 +8,7 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
+const { assertBootstrapNode } = require('./verify-native-dependencies.cjs');
 
 const PC_DIR = path.resolve(__dirname, '..');
 const PKG = path.join(PC_DIR, 'package.json');
@@ -728,6 +729,11 @@ function patchElectronAppName() {
 }
 
 function main() {
+  try { assertBootstrapNode(); }
+  catch (error) {
+    console.error(`[Orkas] ${error.message}`);
+    process.exit(1);
+  }
   if (!fs.existsSync(PKG)) {
     console.error('[Orkas] 找不到 package.json：', PKG);
     process.exit(1);

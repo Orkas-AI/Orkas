@@ -69,7 +69,7 @@ wait_for_relaunch_owner() {
 wait_for_relaunch_owner
 
 if ! command -v node >/dev/null 2>&1; then
-  echo "[Orkas] Node.js 20+ is required to bootstrap the source checkout. Install Node.js, then run ./run.sh again." >&2
+  echo "[Orkas] Node.js 22.12+ is required to bootstrap the source checkout. Install Node.js, then run ./run.sh again." >&2
   exit 1
 fi
 

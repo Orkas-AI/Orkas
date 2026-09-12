@@ -46,6 +46,9 @@ const INTERNAL_ENTRYPOINT_CONSUMERS = Object.freeze({
   'kb-embed-worker.cjs': Object.freeze([
     'src/main/features/kb_embed.ts',
   ]),
+  'sharp-worker.cjs': Object.freeze([
+    'src/main/util/sharp-runtime.ts',
+  ]),
   'orkas-bridge.cjs': Object.freeze([
     'src/main/features/local_agents/bridge.ts',
     'src/main/features/local_agents/runner.ts',
@@ -282,6 +285,11 @@ function assertExactFiles(label, actual, expected) {
   }
 }
 
+const PACKAGED_IMAGE_RUNTIME_UNPACK_GLOBS = Object.freeze([
+  'node_modules/sharp/**/*', 'node_modules/@img/**/*',
+  'node_modules/detect-libc/**/*', 'node_modules/semver/**/*',
+]);
+
 function verifyBuildFilesConfig(build) {
   const files = Array.isArray(build?.files) ? build.files.map(String) : [];
   const asarUnpack = Array.isArray(build?.asarUnpack) ? build.asarUnpack.map(String) : [];
@@ -291,7 +299,7 @@ function verifyBuildFilesConfig(build) {
   if (!asarUnpack.includes('bin/**/*')) {
     throw new Error('[packaged-entrypoint-gate] build.asarUnpack must include bin/**/*');
   }
-  for (const glob of PACKAGED_MCP_RUNTIME_UNPACK_GLOBS) {
+  for (const glob of [...PACKAGED_MCP_RUNTIME_UNPACK_GLOBS, ...PACKAGED_IMAGE_RUNTIME_UNPACK_GLOBS]) {
     if (!files.includes(glob)) {
       throw new Error(`[packaged-entrypoint-gate] build.files must include ${glob}`);
     }
@@ -575,6 +583,7 @@ function verifyPackagedEntrypointPayload(pcRoot, options = {}) {
 }
 
 module.exports = {
+  PACKAGED_IMAGE_RUNTIME_UNPACK_GLOBS,
   BUILD_ONLY_BIN_FILES,
   CONNECTOR_CATALOG_ENTRYPOINTS,
   CONNECTOR_AUTH_ENTRYPOINTS,

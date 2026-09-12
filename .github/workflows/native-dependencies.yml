@@ -1,0 +1,64 @@
+name: Native dependency repair
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-dependencies:
+    name: Native dependencies (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-22.04-arm, windows-2022, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install the locked dependencies, including native optional packages
+        run: npm ci --include=optional
+      - name: Exercise the supported repair command and both target runtimes
+        run: npm run native:repair
+      - name: Collect native child diagnostics on a failed clean CI installation
+        if: failure()
+        shell: bash
+        run: |
+          node <<'NODE'
+          const { spawnSync } = require('node:child_process');
+          const { verifyNativeDependencies } = require('./scripts/verify-native-dependencies.cjs');
+          verifyNativeDependencies({ spawn: (...args) => {
+            const result = spawnSync(...args);
+            console.log(JSON.stringify({ status: result.status, signal: result.signal,
+              stdout: result.stdout, stderr: result.stderr, error: result.error?.code }));
+            return result;
+          } });
+          NODE
+      - name: Verify that repair preserved the manifests
+        run: git diff --exit-code -- package.json package-lock.json
+      - name: Restore standard read-only system font permissions on Linux
+        if: runner.os == 'Linux'
+        run: |
+          stat -c '%u:%g %a %n' /usr/share/fonts /usr/share/fonts/truetype
+          # Fontconfig cannot restore root-owned directory timestamps after
+          # removing legacy UUID files from runner-writable font directories.
+          # Keep system fonts readable and writable only by their owner.
+          sudo chmod -R go-w /usr/share/fonts
+      - name: Run native dependency regression cases under Electron
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/util/sharp-runtime.test.ts
+          test/main/features/image_assets.test.ts
+          test/main/util/verify-native-dependencies.test.ts
+          test/main/util/ensure-sqlite-electron-abi.test.ts
+          test/main/util/ensure-deps.test.ts
+          test/main/util/ensure-dev-dependencies.test.ts
+          test/main/util/linux-source-dependencies.test.ts

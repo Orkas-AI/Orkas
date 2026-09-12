@@ -23,6 +23,7 @@ function shouldProvisionWhisper(platform = process.platform, arch = process.arch
 }
 
 function main() {
+  run('Node bootstrap', 'scripts/verify-native-dependencies.cjs', ['--host-only']);
   console.log(`[dev-deps] preparing built-in dependencies for ${process.platform}-${process.arch}`);
   if (process.platform === 'linux') {
     run('Linux host preflight', 'scripts/verify-linux-source-dependencies.cjs', ['--host-only']);
@@ -46,6 +47,7 @@ function main() {
       '--arch', process.arch,
     ]);
   }
+  run('native dependencies', 'scripts/verify-native-dependencies.cjs');
   // Whisper ships pinned prebuilt CLIs for a fixed target list only. On hosts
   // without a contract target the fetch script must keep failing (packaging
   // gates rely on that strictness); here it is simply not required — speech

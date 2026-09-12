@@ -1,0 +1,2 @@
+# Vite cannot transform hashbang ESM scripts with CRLF line endings.
+*.mjs text eol=lf

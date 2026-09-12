@@ -11,6 +11,7 @@ import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { delimiter, dirname, posix, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import nativeDependencies from './verify-native-dependencies.cjs';
 
 export const SQLITE_ABI_PROBE_TIMEOUT_MS = 30_000;
 export const SQLITE_ABI_INSTALL_TIMEOUT_MS = 5 * 60_000;
@@ -165,10 +166,12 @@ export function ensureSqliteElectronAbi({
     + `(${describeResult(result)}); source rebuild also failed (${describeResult(rebuildResult)})`,
   );
   probeElectronAbi();
-  return rebuildResult.status ?? result.status ?? 1;
+  // Installer exit codes cannot override the failed runtime probes.
+  return rebuildResult.status || result.status || 1;
 }
 
 function main() {
+  nativeDependencies.assertBootstrapNode();
   const here = dirname(fileURLToPath(import.meta.url));
   const pcRoot = resolve(here, '..');
   const require_ = createRequire(import.meta.url);

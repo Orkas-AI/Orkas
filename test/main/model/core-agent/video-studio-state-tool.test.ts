@@ -149,7 +149,8 @@ vi.mock('../../../../src/main/features/tts_capabilities', async (importOriginal)
   };
 });
 
-vi.mock('../../../../src/main/util/bundled-runtime', () => ({
+vi.mock('../../../../src/main/util/bundled-runtime', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../../../src/main/util/bundled-runtime')>(),
   bundledFfmpegPaths: () => ({ ffmpeg: process.execPath, ffprobe: process.execPath }),
   bundledWhisperPaths: () => ({ cli: process.execPath, model: process.execPath }),
 }));
