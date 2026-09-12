@@ -59,3 +59,11 @@ Do not run plain `npm rebuild` to switch this shared tree to the system Node
 ABI, and do not run `npx vitest` directly: `npm test`/`npm run test:js` use the
 Electron test wrapper. Packaged desktop users should reinstall the correct
 platform/architecture installer rather than rebuild addons locally.
+
+On Linux, sharp documents a known conflict with GLib symbols exported by
+Electron. If all operations pass and stderr contains only this recognized
+diagnostic, the check prints an explicit warning and includes it in the JSON
+result. This proves the tested operations, not every image format/workload.
+Unknown native diagnostics or failed operations still fail the check. Repeating
+an ABI rebuild does not resolve this upstream risk; see
+[sharp's Electron/Linux conflict](https://sharp.pixelplumbing.com/install#electron-and-linux).

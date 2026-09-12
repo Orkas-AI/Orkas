@@ -6,12 +6,23 @@ import vm from 'node:vm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const requirePackage = createRequire(path.join(process.cwd(), 'package.json'));
-const { assertBootstrapNode, verifyNativeDependencies, PROBE_TIMEOUT_MS } = requirePackage('./scripts/verify-native-dependencies.cjs');
+const { assertBootstrapNode, nativeWarnings, verifyNativeDependencies, PROBE_TIMEOUT_MS } = requirePackage('./scripts/verify-native-dependencies.cjs');
 const { probeSqlite, probeSharp } = requirePackage('./scripts/native-dependency-probe.cjs');
 const temporary: string[] = [];
+const linuxSharpWarning = "(process:123): GLib-GObject-CRITICAL **: 03:37:35.946: g_object_ref: assertion 'G_IS_OBJECT (object)' failed\n(node:123) [SharpElectronLinux] Warning: Binaries provided by Electron for use on Linux may be incompatible with sharp - see https://sharp.pixelplumbing.com/install#electron-and-linux\n(Use `electron --trace-warnings ...` to show where the warning was created)\n";
 afterEach(() => { for (const dir of temporary.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
 describe('source native dependency readiness', () => {
+  it('preserves the known Linux sharp/GLib conflict as an explicit warning', () => {
+    expect(nativeWarnings(linuxSharpWarning, 'linux')).toEqual([expect.stringContaining('known Electron/Linux GLib conflict')]);
+    expect(nativeWarnings('', 'linux')).toEqual([]);
+  });
+
+  it('never classifies unrelated native diagnostics as the known Linux warning', () => {
+    expect(nativeWarnings(linuxSharpWarning + 'segmentation fault', 'linux')).toBeNull();
+    expect(nativeWarnings(linuxSharpWarning, 'darwin')).toBeNull();
+    expect(nativeWarnings('GLib-GObject-CRITICAL: unknown failure', 'linux')).toBeNull();
+  });
   it.each(['20.19.0', '22.11.0', 'invalid', '22.12', '22.12.0-rc.1'])('rejects unsupported bootstrap Node %s before installation', version => {
     expect(() => assertBootstrapNode(version)).toThrow(/Node.js 22.12.0\+.*Node.js 24 LTS/);
   });
@@ -76,6 +87,7 @@ describe('source native dependency readiness', () => {
     ['incomplete success', { status: 0, stdout: '{"status":"passed"}' }],
     ['timeout', { status: null, error: { code: 'ETIMEDOUT' } }],
     ['loader failure', { status: 1, stderr: '/private/location: missing DLL' }],
+    ['known warning without functional proof', { status: 0, stdout: '{"status":"passed"}', stderr: linuxSharpWarning }],
   ])('rejects %s with an actionable error', (_label, result) => {
     const spawn = vi.fn(() => result);
     expect(() => verifyNativeDependencies({ spawn })).toThrow(/native:repair/);

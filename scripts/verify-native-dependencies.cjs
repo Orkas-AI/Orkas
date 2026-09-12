@@ -11,6 +11,20 @@ const MINIMUM_NODE_VERSION = '22.12.0';
 const PROBE_TIMEOUT_MS = 60_000;
 const root = path.resolve(__dirname, '..');
 
+// Electron's Linux GLib symbols can conflict with sharp's bundled GLib even
+// when image operations succeed. Preserve this upstream warning explicitly;
+// never let it excuse a failed operation or any unrelated native diagnostic.
+function nativeWarnings(stderr, platform = process.platform) {
+  const lines = String(stderr || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  if (!lines.length) return [];
+  const sharpWarning = /^\(node:\d+\) \[SharpElectronLinux\] Warning: Binaries provided by Electron for use on Linux may be incompatible with sharp - see https:\/\/sharp\.pixelplumbing\.com\/install#electron-and-linux$/;
+  const glibWarning = /^\(process:\d+\): GLib-GObject-CRITICAL \*\*: [\d:.]+: g_object_(?:un)?ref: assertion 'G_IS_OBJECT \(object\)' failed$/;
+  const traceHint = /^\(Use `electron --trace-warnings \.\.\.` to show where the warning was created\)$/;
+  if (platform !== 'linux' || !lines.some(line => sharpWarning.test(line))
+    || !lines.every(line => sharpWarning.test(line) || glibWarning.test(line) || traceHint.test(line))) return null;
+  return ['sharp completed PNG encoding/decoding, but reported the known Electron/Linux GLib conflict. Rebuilding SQLite does not resolve this risk; see https://sharp.pixelplumbing.com/install#electron-and-linux.'];
+}
+
 // Built-ins only: this preflight also runs before node_modules exists.
 function assertBootstrapNode(version = process.versions.node) {
   const parts = String(version).split('.');
@@ -58,7 +72,8 @@ function verifyNativeDependencies({ packageRoot = root, spawn = spawnSync, env =
   });
   let record;
   try { record = JSON.parse(String(result.stdout || '').trim()); } catch { /* fail closed */ }
-  if (result.error || result.status !== 0 || String(result.stderr || '').trim()
+  const warnings = nativeWarnings(result.stderr);
+  if (result.error || result.status !== 0 || warnings === null
     || record?.status !== 'passed' || record.electron !== electronVersion
     || record.platform !== process.platform || record.arch !== process.arch
     || typeof record.sqliteVec !== 'string' || !record.sqliteVec
@@ -70,7 +85,7 @@ function verifyNativeDependencies({ packageRoot = root, spawn = spawnSync, env =
     const reason = result.error?.code === 'ETIMEDOUT' ? 'timed out' : 'failed';
     throw new Error(`Native dependency verification ${reason}${known ? ` (${known})` : ''} for Electron ${electronVersion} on ${process.platform}-${process.arch}. Run npm run native:repair; check optional packages, the target architecture and system shared libraries.`);
   }
-  return record;
+  return { ...record, ...(warnings.length ? { warnings } : {}) };
 }
 
 if (require.main === module) {
@@ -78,11 +93,15 @@ if (require.main === module) {
     const args = process.argv.slice(2);
     if (args.length > 1 || (args.length === 1 && args[0] !== '--host-only')) throw new Error('Use --host-only or no arguments.');
     assertBootstrapNode();
-    if (process.argv[2] !== '--host-only') console.log(JSON.stringify(verifyNativeDependencies()));
+    if (process.argv[2] !== '--host-only') {
+      const result = verifyNativeDependencies();
+      for (const warning of result.warnings || []) console.warn(`[native-deps] ${warning}`);
+      console.log(JSON.stringify(result));
+    }
   } catch (error) {
     console.error(`[native-deps] ${error.message}`);
     process.exitCode = 1;
   }
 }
 
-module.exports = { MINIMUM_NODE_VERSION, PROBE_TIMEOUT_MS, assertBootstrapNode, verifyNativeDependencies };
+module.exports = { MINIMUM_NODE_VERSION, PROBE_TIMEOUT_MS, assertBootstrapNode, nativeWarnings, verifyNativeDependencies };
