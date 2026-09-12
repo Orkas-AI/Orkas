@@ -86,7 +86,7 @@ describe('Linux source dependency contract', () => {
     })).toThrow(/glibc 2\.34\+ is required/);
     expect(() => assertLinuxHost({
       platform: 'linux', arch: 'x64', nodeVersion: '18.20.0', glibcVersionRuntime: '2.39',
-    })).toThrow(/Node\.js 20\+ is required/);
+    })).toThrow(/Node\.js 22\.12\.0\+ is required/);
     expect(() => assertLinuxHost({
       platform: 'linux', arch: 'riscv64', nodeVersion: '24.17.0', glibcVersionRuntime: '2.39',
     })).toThrow(/support x64 and arm64/);
@@ -174,7 +174,7 @@ describe('Linux source dependency contract', () => {
     );
 
     const launcher = fs.readFileSync(path.join(process.cwd(), 'run.sh'), 'utf8');
-    expect(launcher).toContain('Node.js 20+ is required to bootstrap the source checkout');
+    expect(launcher).toContain('Node.js 22.12+ is required to bootstrap the source checkout');
     expect(launcher).toContain('verify-linux-source-dependencies.cjs\" --host-only');
   });
 });

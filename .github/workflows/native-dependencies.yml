@@ -1,0 +1,40 @@
+name: Native dependency repair
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-dependencies:
+    name: Native dependencies (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-22.04-arm, windows-2022, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install the locked dependencies, including native optional packages
+        run: npm ci --include=optional
+      - name: Exercise the supported repair command and target Electron operations
+        run: npm run native:repair
+      - name: Verify that repair preserved the manifests
+        run: git diff --exit-code -- package.json package-lock.json
+      - name: Run native dependency regression cases under Electron
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/util/verify-native-dependencies.test.ts
+          test/main/util/ensure-sqlite-electron-abi.test.ts
+          test/main/util/ensure-deps.test.ts
+          test/main/util/ensure-dev-dependencies.test.ts
+          test/main/util/linux-source-dependencies.test.ts

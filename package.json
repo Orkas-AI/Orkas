@@ -51,7 +51,9 @@
     "rebuild:sqlite:electron": "node scripts/ensure-sqlite-electron-abi.mjs",
     "postinstall": "node scripts/ensure-sqlite-electron-abi.mjs && node scripts/fetch-embedding-model.mjs",
     "prepare": "node scripts/install-git-hooks.mjs",
-    "prepack": "node scripts/ensure-dev-dependencies.cjs && node bin/officecli-policy-gate.cjs --require-host-binary"
+    "prepack": "node scripts/ensure-dev-dependencies.cjs && node bin/officecli-policy-gate.cjs --require-host-binary",
+    "native:check": "node scripts/verify-native-dependencies.cjs",
+    "native:repair": "node scripts/verify-native-dependencies.cjs --host-only && npm install --include=optional --no-save && npm run native:check"
   },
   "devDependencies": {
     "@electron/asar": "3.4.1",
@@ -277,5 +279,8 @@
       }
     }
   },
-  "license": "MIT"
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.12.0"
+  }
 }

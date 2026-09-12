@@ -14,7 +14,8 @@ const {
 } = require('../bin/runtime-gate.cjs');
 
 const PC_ROOT = path.resolve(__dirname, '..');
-const MINIMUM_NODE_MAJOR = 20;
+const { assertBootstrapNode } = require('./verify-native-dependencies.cjs');
+const MINIMUM_NODE_MAJOR = 22;
 // The official whisper.cpp v1.9.1 Ubuntu x64/arm64 releases require symbols
 // through GLIBC_2.34, so the source bootstrap must reject older hosts before
 // downloading runtimes that cannot execute there.
@@ -56,9 +57,7 @@ function assertLinuxHost({
     throw new Error(`unsupported Linux architecture ${arch}; Orkas source runs support x64 and arm64`);
   }
   const nodeMajor = Number.parseInt(String(nodeVersion).split('.', 1)[0], 10);
-  if (!Number.isFinite(nodeMajor) || nodeMajor < MINIMUM_NODE_MAJOR) {
-    throw new Error(`Node.js ${MINIMUM_NODE_MAJOR}+ is required; found ${nodeVersion || 'unknown'}`);
-  }
+  assertBootstrapNode(nodeVersion);
   if (!glibcVersionRuntime) {
     throw new Error('glibc is required; Alpine and other musl-based Linux distributions are not supported');
   }
