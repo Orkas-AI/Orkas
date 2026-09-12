@@ -6,23 +6,13 @@ import vm from 'node:vm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const requirePackage = createRequire(path.join(process.cwd(), 'package.json'));
-const { assertBootstrapNode, nativeWarnings, verifyNativeDependencies, PROBE_TIMEOUT_MS } = requirePackage('./scripts/verify-native-dependencies.cjs');
-const { probeSqlite, probeSharp } = requirePackage('./scripts/native-dependency-probe.cjs');
+const { assertBootstrapNode, verifySharpRuntime, verifyNativeDependencies, PROBE_TIMEOUT_MS } = requirePackage('./scripts/verify-native-dependencies.cjs');
+const { probeSqlite } = requirePackage('./scripts/native-dependency-probe.cjs');
 const temporary: string[] = [];
 const linuxSharpWarning = "(process:123): GLib-GObject-CRITICAL **: 03:37:35.946: g_object_ref: assertion 'G_IS_OBJECT (object)' failed\n(node:123) [SharpElectronLinux] Warning: Binaries provided by Electron for use on Linux may be incompatible with sharp - see https://sharp.pixelplumbing.com/install#electron-and-linux\n(Use `electron --trace-warnings ...` to show where the warning was created)\n";
 afterEach(() => { for (const dir of temporary.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
 describe('source native dependency readiness', () => {
-  it('preserves the known Linux sharp/GLib conflict as an explicit warning', () => {
-    expect(nativeWarnings(linuxSharpWarning, 'linux')).toEqual([expect.stringContaining('known Electron/Linux GLib conflict')]);
-    expect(nativeWarnings('', 'linux')).toEqual([]);
-  });
-
-  it('never classifies unrelated native diagnostics as the known Linux warning', () => {
-    expect(nativeWarnings(linuxSharpWarning + 'segmentation fault', 'linux')).toBeNull();
-    expect(nativeWarnings(linuxSharpWarning, 'darwin')).toBeNull();
-    expect(nativeWarnings('GLib-GObject-CRITICAL: unknown failure', 'linux')).toBeNull();
-  });
   it.each(['20.19.0', '22.11.0', 'invalid', '22.12', '22.12.0-rc.1'])('rejects unsupported bootstrap Node %s before installation', version => {
     expect(() => assertBootstrapNode(version)).toThrow(/Node.js 22.12.0\+.*Node.js 24 LTS/);
   });
@@ -30,10 +20,10 @@ describe('source native dependency readiness', () => {
     expect(() => assertBootstrapNode(version)).not.toThrow();
   });
 
-  it('performs real SQL, vector distance and PNG encoding/decoding under the test Electron', async () => {
+  it('performs SQL/vector operations in Electron and PNG operations in bundled Node', async () => {
     expect(process.versions.electron).toBeTruthy();
     expect(await probeSqlite(requirePackage)).toMatchObject({ vectorDistance: 5 });
-    expect(await probeSharp(requirePackage)).toEqual({ sharp: 'png-2x2' });
+    expect(verifySharpRuntime()).toMatchObject({ sharp: 'png-2x2', electron: null });
   });
 
   it('runs the complete check in the installed Electron child', () => {
@@ -53,14 +43,6 @@ describe('source native dependency readiness', () => {
     await expect(probeSqlite(req)).rejects.toThrow(/sqlite-vec.*native:repair/);
     expect(close).toHaveBeenCalledOnce();
     await expect(probeSqlite(req)).rejects.not.toThrow('/private');
-  });
-
-  it('rejects an image engine that loads but cannot decode its output', async () => {
-    const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-    const sharp = (input: unknown) => Buffer.isBuffer(input)
-      ? { metadata: async () => ({ format: 'png', width: 1, height: 2 }) }
-      : { png: () => ({ toBuffer: async () => png }) };
-    await expect(probeSharp(() => sharp)).rejects.toThrow(/sharp.*PNG encoding\/decoding/);
   });
 
   it('rejects dependency version drift before launching any child', () => {
@@ -95,6 +77,27 @@ describe('source native dependency readiness', () => {
     expect(spawn.mock.calls[0][2]).toMatchObject({ timeout: PROBE_TIMEOUT_MS, env: { ELECTRON_RUN_AS_NODE: '1' } });
   });
 
+  it('rejects a missing bundled Node without falling back to Electron', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-image-runtime-'));
+    temporary.push(root);
+    const spawn = vi.fn();
+    expect(() => verifySharpRuntime({ packageRoot: root, spawn })).toThrow(/bundled Node.*native:repair/);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['missing functional proof', { status: 0, stdout: '{"status":"passed"}' }],
+    ['native diagnostic', { status: 0, stderr: linuxSharpWarning }],
+    ['loader failure', { status: 1, stderr: '/private/image.dll: missing library' }],
+    ['timeout', { status: null, error: { code: 'ETIMEDOUT' } }],
+  ])('rejects image runtime %s without exposing private diagnostics', (_label, result) => {
+    const spawn = vi.fn(() => result);
+    expect(() => verifySharpRuntime({ spawn })).toThrow(/native:repair/);
+    expect(() => verifySharpRuntime({ spawn })).not.toThrow('/private');
+    expect(spawn.mock.calls[0][2].env).not.toHaveProperty('ELECTRON_RUN_AS_NODE');
+    expect(spawn.mock.calls[0][2].timeout).toBe(PROBE_TIMEOUT_MS);
+  });
+
   it('stops development preparation before reporting readiness when the native check fails', () => {
     const calls: string[] = [];
     const output: string[] = [];
@@ -121,7 +124,7 @@ describe('source native dependency readiness', () => {
   it('keeps one repair command guarded before install and verified afterward', () => {
     const pkg = requirePackage('./package.json');
     expect(pkg.engines.node).toBe('>=22.12.0');
-    expect(pkg.scripts['native:repair']).toBe('node scripts/verify-native-dependencies.cjs --host-only && npm install --include=optional --no-save && npm run native:check');
+    expect(pkg.scripts['native:repair']).toBe('node scripts/verify-native-dependencies.cjs --host-only && npm install --include=optional --no-save && node bin/ensure-runtime.cjs --kind node && npm run native:check');
     expect(pkg.scripts['native:check']).toBe('node scripts/verify-native-dependencies.cjs');
   });
 });

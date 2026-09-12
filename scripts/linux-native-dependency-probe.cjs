@@ -18,7 +18,7 @@ function requireCondition(condition, message) {
 
 const native = require('./native-dependency-probe.cjs');
 const probeSqlite = () => native.probeSqlite(require);
-const probeSharp = () => native.probeSharp(require);
+const probeSharp = () => require('./verify-native-dependencies.cjs').verifySharpRuntime();
 
 async function probeCanvas() {
   const { createCanvas } = require('@napi-rs/canvas');

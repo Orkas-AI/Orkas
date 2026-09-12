@@ -147,7 +147,7 @@ Linux 源码运行需要 glibc 2.34+，不支持 Alpine 及其他基于 musl 的
 
 遇到原生依赖错误时，请使用 Node.js 24 LTS（最低 22.12.0），在此源码目录执行
 `npm run native:repair`。它会恢复可选依赖、修复 Electron 对应的 SQLite，并验证 SQL、
-sqlite-vec 和 sharp 后才报告成功。只检查、不安装可运行 `npm run native:check`。
+sqlite-vec，并准备随包 Node、在独立进程中验证 sharp 后才报告成功。只检查、不安装可运行 `npm run native:check`。
 详见[原生依赖安装与排错说明](docs/native-dependencies.md)。
 
 ---

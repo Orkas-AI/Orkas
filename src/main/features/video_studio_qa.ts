@@ -10,6 +10,7 @@ import {
   resolveApprovedShotReference,
 } from './video_studio_source_alignment';
 import { projectModelVisibleIssues } from '../util/tool-issue-policy';
+import { encodeImage } from '../util/sharp-runtime';
 
 export type Issue = {
   code: string;
@@ -3014,15 +3015,15 @@ export async function writeFrameContactSheet(
   // contact sheet as the primary preview. Conversation attachments render PNG
   // consistently, whereas an SVG attachment may be shown as a file chip and
   // leave the separately published first frame looking like the whole preview.
-  const sharpModule = await import('sharp');
-  const sharp = sharpModule.default;
-  await sharp(Buffer.from(svg), {
+  const { data } = await encodeImage(Buffer.from(svg), {
+    format: 'png',
     density: 96,
     failOn: 'error',
     // librsvg reports density-adjusted pixels (96/72 on some builds), so keep
     // a bounded margin above the declared sheet geometry.
     limitInputPixels: Math.max(1, Math.min(100_000_000, width * height * 4)),
-  }).png().toFile(pngPath);
+  });
+  await fs.writeFile(pngPath, data);
   return pngPath;
 }
 

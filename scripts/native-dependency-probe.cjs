@@ -27,24 +27,4 @@ async function probeSqlite(requirePackage, resolveExtensionPath = value => value
   }
 }
 
-async function probeSharp(requirePackage) {
-  try {
-    const sharp = requirePackage('sharp');
-    const png = await sharp({ create: {
-      width: 2, height: 2, channels: 4,
-      background: { r: 20, g: 40, b: 60, alpha: 1 },
-    } }).png().toBuffer();
-    if (!Buffer.isBuffer(png) || !png.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
-      throw new Error('PNG encoding failed');
-    }
-    const metadata = await sharp(png).metadata();
-    if (metadata.format !== 'png' || metadata.width !== 2 || metadata.height !== 2) {
-      throw new Error('PNG decoding failed');
-    }
-    return { sharp: 'png-2x2' };
-  } catch (error) {
-    throw new Error('sharp could not complete PNG encoding/decoding; run npm run native:repair with optional dependencies enabled, or reinstall the matching desktop installer.');
-  }
-}
-
-module.exports = { probeSharp, probeSqlite };
+module.exports = { probeSqlite };

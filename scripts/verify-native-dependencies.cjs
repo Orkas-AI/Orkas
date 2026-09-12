@@ -5,24 +5,32 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { createRequire } = require('node:module');
 const { spawnSync } = require('node:child_process');
-const { probeSharp, probeSqlite } = require('./native-dependency-probe.cjs');
+const { probeSqlite } = require('./native-dependency-probe.cjs');
 
 const MINIMUM_NODE_VERSION = '22.12.0';
 const PROBE_TIMEOUT_MS = 60_000;
 const root = path.resolve(__dirname, '..');
 
-// Electron's Linux GLib symbols can conflict with sharp's bundled GLib even
-// when image operations succeed. Preserve this upstream warning explicitly;
-// never let it excuse a failed operation or any unrelated native diagnostic.
-function nativeWarnings(stderr, platform = process.platform) {
-  const lines = String(stderr || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-  if (!lines.length) return [];
-  const sharpWarning = /^\(node:\d+\) \[SharpElectronLinux\] Warning: Binaries provided by Electron for use on Linux may be incompatible with sharp - see https:\/\/sharp\.pixelplumbing\.com\/install#electron-and-linux$/;
-  const glibWarning = /^\(process:\d+\): GLib-GObject-CRITICAL \*\*: [\d:.]+: g_object_(?:un)?ref: assertion 'G_IS_OBJECT \(object\)' failed$/;
-  const traceHint = /^\(Use `electron --trace-warnings \.\.\.` to show where the warning was created\)$/;
-  if (platform !== 'linux' || !lines.some(line => sharpWarning.test(line))
-    || !lines.every(line => sharpWarning.test(line) || glibWarning.test(line) || traceHint.test(line))) return null;
-  return ['sharp completed PNG encoding/decoding, but reported the known Electron/Linux GLib conflict. Rebuilding SQLite does not resolve this risk; see https://sharp.pixelplumbing.com/install#electron-and-linux.'];
+function verifySharpRuntime({ packageRoot = root, spawn = spawnSync, env = process.env } = {}) {
+  let nodeExecutable;
+  let nodeVersion;
+  try {
+    const { verifyRuntimeDir } = require('../bin/runtime-gate.cjs');
+    const runtimeRoot = path.join(packageRoot, 'resources', 'runtime');
+    const manifest = JSON.parse(fs.readFileSync(path.join(runtimeRoot, 'manifest.json'), 'utf8'));
+    const key = `${process.platform}-${process.arch}`;
+    nodeVersion = manifest.node.version;
+    nodeExecutable = verifyRuntimeDir('node', path.join(runtimeRoot, 'node', key), key,
+      manifest.node, manifest.node.assets[key], process.platform, process.arch);
+  } catch {
+    throw new Error('The bundled Node image runtime is missing or invalid; run npm run native:repair.');
+  }
+  const { probeImageRuntime } = require('../bin/sharp-worker.cjs');
+  const record = probeImageRuntime(nodeExecutable, path.join(packageRoot, 'bin', 'sharp-worker.cjs'), spawn, env);
+  if (record.node !== nodeVersion || record.platform !== process.platform || record.arch !== process.arch) {
+    throw new Error('sharp failed verification in the bundled Node image runtime; run npm run native:repair.');
+  }
+  return record;
 }
 
 // Built-ins only: this preflight also runs before node_modules exists.
@@ -59,8 +67,7 @@ function verifyNativeDependencies({ packageRoot = root, spawn = spawnSync, env =
     const requirePackage = createRequire(${JSON.stringify(path.join(packageRoot, 'package.json'))});
     (async () => {
       const sqlite = await (${probeSqlite.toString()})(requirePackage);
-      const sharp = await (${probeSharp.toString()})(requirePackage);
-      console.log(JSON.stringify({status:'passed', ...sqlite, ...sharp,
+      console.log(JSON.stringify({status:'passed', ...sqlite,
         platform:process.platform, arch:process.arch, electron:process.versions.electron,
         node:process.versions.node, modules:process.versions.modules, napi:process.versions.napi}));
     })().catch(error => { console.error(error.message); process.exitCode = 1; });
@@ -72,12 +79,11 @@ function verifyNativeDependencies({ packageRoot = root, spawn = spawnSync, env =
   });
   let record;
   try { record = JSON.parse(String(result.stdout || '').trim()); } catch { /* fail closed */ }
-  const warnings = nativeWarnings(result.stderr);
-  if (result.error || result.status !== 0 || warnings === null
+  if (result.error || result.status !== 0 || String(result.stderr || '').trim()
     || record?.status !== 'passed' || record.electron !== electronVersion
     || record.platform !== process.platform || record.arch !== process.arch
     || typeof record.sqliteVec !== 'string' || !record.sqliteVec
-    || record.vectorDistance !== 5 || record.sharp !== 'png-2x2') {
+    || record.vectorDistance !== 5) {
     // Only relay the bounded messages authored by our probe. Native stderr can
     // contain private paths; unknown loader failures keep the recovery context.
     const known = ['better-sqlite3', 'sqlite-vec', 'sharp'].find(name =>
@@ -85,7 +91,8 @@ function verifyNativeDependencies({ packageRoot = root, spawn = spawnSync, env =
     const reason = result.error?.code === 'ETIMEDOUT' ? 'timed out' : 'failed';
     throw new Error(`Native dependency verification ${reason}${known ? ` (${known})` : ''} for Electron ${electronVersion} on ${process.platform}-${process.arch}. Run npm run native:repair; check optional packages, the target architecture and system shared libraries.`);
   }
-  return { ...record, ...(warnings.length ? { warnings } : {}) };
+  const imageRuntime = verifySharpRuntime({ packageRoot, spawn, env });
+  return { ...record, sharp: imageRuntime.sharp, imageRuntime };
 }
 
 if (require.main === module) {
@@ -95,7 +102,6 @@ if (require.main === module) {
     assertBootstrapNode();
     if (process.argv[2] !== '--host-only') {
       const result = verifyNativeDependencies();
-      for (const warning of result.warnings || []) console.warn(`[native-deps] ${warning}`);
       console.log(JSON.stringify(result));
     }
   } catch (error) {
@@ -104,4 +110,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { MINIMUM_NODE_VERSION, PROBE_TIMEOUT_MS, assertBootstrapNode, nativeWarnings, verifyNativeDependencies };
+module.exports = { MINIMUM_NODE_VERSION, PROBE_TIMEOUT_MS, assertBootstrapNode, verifySharpRuntime, verifyNativeDependencies };

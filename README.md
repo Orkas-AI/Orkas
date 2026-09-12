@@ -147,7 +147,8 @@ Linux source runs require glibc 2.34+. Alpine and other musl-based distributions
 
 Native dependency errors: use Node.js 24 LTS (minimum 22.12.0), then run
 `npm run native:repair` from this checkout. This restores optional packages,
-repairs SQLite for Electron and checks SQL, sqlite-vec and sharp before success.
+repairs SQLite for Electron, prepares bundled Node for isolated image processing,
+and checks SQL, sqlite-vec and sharp before success.
 Use `npm run native:check` for a check without installation.
 See [native dependency setup and troubleshooting](docs/native-dependencies.md).
 

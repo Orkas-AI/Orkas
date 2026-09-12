@@ -1603,6 +1603,10 @@ if (!gotLock) {
         const kbEmbed = await import('./features/kb_embed');
         kbEmbed.closeEmbedder();
       } catch (err) { createLogger('kb_embed').warn('close failed', { error: logErrorSummary(err) }); }
+      try {
+        const images = await import('./util/sharp-runtime');
+        images.closeImageRuntime();
+      } catch { createLogger('image-runtime').warn('image runtime shutdown failed'); }
       const webAssistSessions = await import('./features/web_assist_session');
       await webAssistSessions.flushWebAssistSessions();
       await sweepOfficeResidents('quit');
