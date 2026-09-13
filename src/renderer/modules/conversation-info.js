@@ -723,6 +723,7 @@ const ConversationInfo = (() => {
     const panel = document.getElementById('conversation-info-panel');
     const toggle = document.getElementById('conversation-info-toggle');
     if (panel) panel.hidden = !_open;
+    if (_open) _applyPanelWidth();
     if (toggle) {
       toggle.classList.toggle('is-active', _open);
       toggle.setAttribute('aria-expanded', _open ? 'true' : 'false');
@@ -1291,8 +1292,8 @@ const ConversationInfo = (() => {
     if (!panel || !container) return;
     const available = container.getBoundingClientRect().width;
     if (available <= 0) return;
-    const minimum = Math.min(320, available);
-    const maximum = Math.max(minimum, available - Math.min(420, available * 0.5));
+    const minimum = Math.min(400, available);
+    const maximum = Math.max(minimum, Math.floor(window.innerWidth * 0.3));
     _panelWidth = Math.round(Math.max(minimum, Math.min(_panelWidth, maximum)));
     panel.style.width = `${_panelWidth}px`;
     panel.style.flexBasis = `${_panelWidth}px`;

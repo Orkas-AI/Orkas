@@ -851,6 +851,10 @@ test('task-details browser supports tabs, address navigation, resizing, and view
     expect(chat!.width).toBeGreaterThan(250);
     expect((await native())!.bounds.x).toBeGreaterThanOrEqual(Math.floor(box.x));
     const handle = page.locator('#conversation-info-resize');
+    await expect(handle).toHaveAttribute('aria-valuemin', '400');
+    await expect(handle).toHaveAttribute('aria-valuemax', '400');
+    await expect.poll(async () => (await details.boundingBox())!.width).toBe(400);
+    const nativeWidth = (await native())!.bounds.width;
     const grip = (await handle.boundingBox())!;
     const pageBeforeResize = (await native())!.id;
     const resizeDocument = () => orkas.electronApp!.evaluate(({ webContents }, id) => (
@@ -861,15 +865,15 @@ test('task-details browser supports tabs, address navigation, resizing, and view
     await page.mouse.down();
     await page.mouse.move(grip.x + 85, grip.y + 100);
     // Assert while the pointer is still held, not only after release.
-    await expect.poll(async () => (await native())?.bounds.width).toBeLessThan(box.width - 40);
+    await expect.poll(async () => (await native())?.bounds.width).toBe(nativeWidth);
     expect((await native())?.visible).toBe(true);
     expect((await native())?.id).toBe(pageBeforeResize);
     await page.mouse.move(grip.x - 40, grip.y + 100);
-    await expect.poll(async () => (await native())?.bounds.width).toBeGreaterThan(box.width);
+    await expect.poll(async () => (await native())?.bounds.width).toBe(nativeWidth);
     expect((await native())?.visible).toBe(true);
     await page.mouse.move(grip.x + 85, grip.y + 100);
     await page.mouse.up();
-    await expect.poll(async () => (await browser.boundingBox())!.width).toBeLessThan(box.width - 40);
+    await expect.poll(async () => (await details.boundingBox())!.width).toBe(400);
     const resizedWidth = (await browser.boundingBox())!.width;
     await expect.poll(async () => (await native())?.visible).toBe(true);
     // An unrelated overlay outside the browser must not blank its viewport.
@@ -997,6 +1001,33 @@ test('task-details browser supports tabs, address navigation, resizing, and view
     await expect.poll(async () => (await native())?.visible).toBe(true);
     const state = await orkas.invoke<{ state: { conversation_id: string; assistant_controlled: boolean } }>('webAssist.state', {});
     expect(state.state).toMatchObject({ conversation_id: cid, assistant_controlled: true });
+    // The host display can be narrower than the emulated viewport. Exercise
+    // wide layout on Files so the native browser is never placed off screen.
+    await page.evaluate(() => (window as any).ConversationInfo.openAndSetTab('files'));
+    await page.setViewportSize({ width: 1800, height: 900 });
+    await expect(handle).toHaveAttribute('aria-valuemax', '540');
+    await handle.press('ArrowLeft');
+    await expect.poll(async () => (await details.boundingBox())!.width).toBe(424);
+    const wideGrip = (await handle.boundingBox())!;
+    await page.mouse.move(wideGrip.x + wideGrip.width / 2, wideGrip.y + 100);
+    await page.mouse.down();
+    await page.mouse.move(wideGrip.x - 800, wideGrip.y + 100);
+    await expect.poll(async () => (await details.boundingBox())!.width).toBe(540);
+    await page.mouse.move(wideGrip.x + 300, wideGrip.y + 100);
+    await expect.poll(async () => (await details.boundingBox())!.width).toBe(400);
+    await page.mouse.up();
+    await handle.press('ArrowRight');
+    await expect.poll(async () => (await details.boundingBox())!.width).toBe(400);
+    for (let step = 0; step < 10; step++) await handle.press('ArrowLeft');
+    await expect.poll(async () => (await details.boundingBox())!.width).toBe(540);
+    await page.setViewportSize({ width: 1500, height: 900 });
+    await expect.poll(async () => (await details.boundingBox())!.width).toBe(450);
+    await expect(handle).toHaveAttribute('aria-valuemax', '450');
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await expect.poll(async () => (await details.boundingBox())!.width).toBe(400);
+    await expect(handle).toHaveAttribute('aria-valuemax', '400');
+    await page.evaluate(() => (window as any).ConversationInfo.openAndSetTab('browser'));
+    await expect.poll(async () => (await native())?.visible).toBe(true);
     await page.screenshot({ path: testInfo.outputPath('conversation-browser-panel.png') });
     await orkas.invoke('webAssist.close', {});
   } finally {
