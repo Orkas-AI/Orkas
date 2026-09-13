@@ -5111,8 +5111,8 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   position: relative;
   flex: 0 0 400px;
   width: 400px;
-  min-width: 320px;
-  max-width: none;
+  min-width: 400px;
+  max-width: max(400px, 30vw);
   display: flex;
   flex-direction: column;
   min-height: 0;
