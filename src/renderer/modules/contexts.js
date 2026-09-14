@@ -1182,20 +1182,7 @@ async function _commitInlineRename(rel, nextBase) {
   }
   trackResult('success');
   try {
-    if (_ctxActive && _ctxActive.id === rel) _ctxActive.id = dst;
-    // Re-key any drafts (file rename: one entry; dir rename: every entry
-    // under the old prefix) so the draft survives the rename. Iterate a
-    // snapshot since we're mutating the map.
-    for (const [key, val] of Array.from(_ctxDrafts.entries())) {
-      if (key === rel) {
-        _ctxDrafts.set(dst, val);
-        _ctxDrafts.delete(rel);
-      } else if (key.startsWith(rel + '/')) {
-        _ctxDrafts.set(dst + key.slice(rel.length), val);
-        _ctxDrafts.delete(key);
-      }
-    }
-    _retargetCtxViewerAfterRename(rel, dst);
+    _applyCtxPathChange(rel, dst);
     await loadContexts();
   } catch (err) {
     _contextsLog.warn('refresh after library entry rename failed', err);
@@ -1926,7 +1913,11 @@ function _ctxClearDraft(path) {
 function _showCtxTextViewer(rel, content) {
   const els = _prepCtxViewerShell(rel);
   if (!els) return;
-  _ctxMveController = mountMdViewEdit({
+  const drafts = _ctxDrafts;
+  // Capture this mount, so late callbacks never read a later file's source.
+  let controller = null;
+  const currentRel = () => controller?.getSource?.()?.rel || rel;
+  controller = mountMdViewEdit({
     bodyEl: els.bodyEl,
     actionsEl: els.actionsEl,
     source: { kind: 'context', rel },
@@ -1934,19 +1925,20 @@ function _showCtxTextViewer(rel, content) {
     initialContent: content,
     // Restore in-progress edits if the user was previously typing in this
     // file. mountMdViewEdit forces edit mode when `initialDraft` is present.
-    initialDraft: _ctxDrafts.get(rel) || null,
+    initialDraft: drafts.get(rel) || null,
     callbacks: {
       // Mirror draft state into the per-file Map so it survives switching
       // to another file in the tree and back.
       onDraftChange: (draft) => {
-        if (draft === null) _ctxDrafts.delete(rel);
-        else _ctxDrafts.set(rel, draft);
+        if (draft === null) drafts.delete(currentRel());
+        else drafts.set(currentRel(), draft);
       },
-      onReveal: () => revealCtxFile(rel),
+      onReveal: () => revealCtxFile(currentRel()),
       onDelete: () => _deleteCtxFromViewer(),
       onSaved:  async () => { await loadContexts(); },
     },
   });
+  _ctxMveController = controller;
   els.bodyEl.scrollTop = 0;
 }
 

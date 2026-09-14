@@ -104,6 +104,47 @@ function dropEvent(dataTransfer: any, closestEntry: any = null) {
 }
 
 describe('Library external file drag-and-drop', () => {
+  it.each(['rename-file', 'rename-dir', 'move'])(
+    'keeps save, draft and reveal paths current after %s', async (action) => {
+      const context = loadContextsScript();
+      vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/md-view-edit.js'), 'utf8'), context);
+      vm.runInContext('_ctxActive = { id: "notes/draft.md" };', context);
+      context._prepCtxViewerShell = () => ({ bodyEl: {}, actionsEl: {} });
+      context.loadContexts = vi.fn();
+      context.revealCtxFile = vi.fn();
+      context.apiFetch = vi.fn(async () => ({ json: async () => ({ ok: true }) }));
+      context.window.orkas = { invoke: vi.fn(async () => ({ ok: true })) };
+      // Only the editor DOM is replaced. Save uses its real source dispatcher.
+      let controller: any;
+      let callbacks: any;
+      context.mountMdViewEdit = (options: any) => {
+        let source = options.source;
+        callbacks = options.callbacks;
+        controller = {
+          getSource: () => source,
+          setSource: (next: any) => { source = next; },
+          save: (content: string) => context._mveWriteSource(source, content),
+        };
+        return controller;
+      };
+      context._showCtxTextViewer('notes/draft.md', 'Original');
+      callbacks.onDraftChange({ content: 'Before rename', dirty: true });
+      const next = action === 'rename-file' ? 'notes/final.md'
+        : action === 'rename-dir' ? 'archive/draft.md' : 'archive/notes/draft.md';
+      if (action === 'move') context._applyCtxPathChange('notes', 'archive/notes', 'archive');
+      else await context._commitInlineRename(action === 'rename-dir' ? 'notes' : 'notes/draft.md', action === 'rename-dir' ? 'archive' : 'final.md');
+      expect(vm.runInContext('_ctxActive.id', context)).toBe(next);
+      callbacks.onDraftChange({ content: 'After rename', dirty: false });
+      expect([...vm.runInContext('_ctxDrafts.entries()', context)]).toEqual([[next, { content: 'After rename', dirty: false }]]);
+      callbacks.onReveal();
+      expect(context.revealCtxFile).toHaveBeenCalledWith(next);
+      expect(await controller.save('After rename')).toEqual({ ok: true });
+      expect(context.apiFetch).toHaveBeenCalledWith('/api/contexts/update', expect.objectContaining({ body: JSON.stringify({ path: next, content: 'After rename' }) }));
+      callbacks.onDraftChange(null);
+      expect(vm.runInContext('_ctxDrafts.size', context)).toBe(0);
+    },
+  );
+
   it('accepts the successful KB status snapshot returned by the IPC handler', () => {
     const context = loadContextsScript();
 
