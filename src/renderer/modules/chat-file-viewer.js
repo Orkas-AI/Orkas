@@ -1248,7 +1248,7 @@ async function _renderAudioBody(absPath, displayName, cid, projectId) {
     <div class="chat-file-viewer-audio-card">
       <span class="chat-file-viewer-audio-icon">${icon}</span>
       <span class="chat-file-viewer-audio-name">${escapeHtml(displayName || '')}</span>
-      <audio class="chat-file-viewer-audio" controls controlslist="nodownload noremoteplayback" preload="metadata"></audio>
+      <audio class="chat-file-viewer-audio" controls controlslist="nodownload noplaybackrate noremoteplayback" preload="metadata"></audio>
     </div>
   `;
   const audio = wrap.querySelector('.chat-file-viewer-audio');
