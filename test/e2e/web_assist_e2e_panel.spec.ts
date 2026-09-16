@@ -728,6 +728,13 @@ test('task-details browser supports tabs, address navigation, resizing, and view
       await (window as any).loadConversations();
       (window as any).setView('conversation', taskId);
     }, cid);
+    await page.evaluate(() => (window as any).ConversationInfo.openAndSetTab('files'));
+    await page.setViewportSize({ width: 1800, height: 900 });
+    await expect.poll(async () => (await page.locator('#conversation-info-panel').boundingBox())!.width).toBe(540);
+    await page.setViewportSize({ width: 1500, height: 900 });
+    await expect.poll(async () => (await page.locator('#conversation-info-panel').boundingBox())!.width).toBe(450);
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await expect.poll(async () => (await page.locator('#conversation-info-panel').boundingBox())!.width).toBe(400);
     const opened = await orkas.electronApp!.evaluate(async ({ BrowserWindow }, input) => {
       const owner = BrowserWindow.getAllWindows()[0];
       const web = (process as any).mainModule.require(input.modulePath);
@@ -852,7 +859,7 @@ test('task-details browser supports tabs, address navigation, resizing, and view
     expect((await native())!.bounds.x).toBeGreaterThanOrEqual(Math.floor(box.x));
     const handle = page.locator('#conversation-info-resize');
     await expect(handle).toHaveAttribute('aria-valuemin', '400');
-    await expect(handle).toHaveAttribute('aria-valuemax', '400');
+    expect(Number(await handle.getAttribute('aria-valuemax'))).toBeGreaterThan(400);
     await expect.poll(async () => (await details.boundingBox())!.width).toBe(400);
     const nativeWidth = (await native())!.bounds.width;
     const grip = (await handle.boundingBox())!;
@@ -869,7 +876,7 @@ test('task-details browser supports tabs, address navigation, resizing, and view
     expect((await native())?.visible).toBe(true);
     expect((await native())?.id).toBe(pageBeforeResize);
     await page.mouse.move(grip.x - 40, grip.y + 100);
-    await expect.poll(async () => (await native())?.bounds.width).toBe(nativeWidth);
+    await expect.poll(async () => (await native())?.bounds.width).toBeGreaterThan(nativeWidth);
     expect((await native())?.visible).toBe(true);
     await page.mouse.move(grip.x + 85, grip.y + 100);
     await page.mouse.up();
@@ -1005,27 +1012,28 @@ test('task-details browser supports tabs, address navigation, resizing, and view
     // wide layout on Files so the native browser is never placed off screen.
     await page.evaluate(() => (window as any).ConversationInfo.openAndSetTab('files'));
     await page.setViewportSize({ width: 1800, height: 900 });
-    await expect(handle).toHaveAttribute('aria-valuemax', '540');
+    expect(Number(await handle.getAttribute('aria-valuemax'))).toBeGreaterThan(540);
     await handle.press('ArrowLeft');
     await expect.poll(async () => (await details.boundingBox())!.width).toBe(424);
     const wideGrip = (await handle.boundingBox())!;
     await page.mouse.move(wideGrip.x + wideGrip.width / 2, wideGrip.y + 100);
     await page.mouse.down();
-    await page.mouse.move(wideGrip.x - 800, wideGrip.y + 100);
-    await expect.poll(async () => (await details.boundingBox())!.width).toBe(540);
+    await page.mouse.move(0, wideGrip.y + 100);
+    await expect.poll(async () => (await details.boundingBox())!.width).toBeGreaterThan(540);
+    await expect.poll(async () => (await page.locator('#panel-conversation .chat-main-pane').boundingBox())!.width).toBeCloseTo(420, 0);
     await page.mouse.move(wideGrip.x + 300, wideGrip.y + 100);
     await expect.poll(async () => (await details.boundingBox())!.width).toBe(400);
     await page.mouse.up();
     await handle.press('ArrowRight');
     await expect.poll(async () => (await details.boundingBox())!.width).toBe(400);
     for (let step = 0; step < 10; step++) await handle.press('ArrowLeft');
-    await expect.poll(async () => (await details.boundingBox())!.width).toBe(540);
+    await expect.poll(async () => (await details.boundingBox())!.width).toBe(640);
     await page.setViewportSize({ width: 1500, height: 900 });
-    await expect.poll(async () => (await details.boundingBox())!.width).toBe(450);
-    await expect(handle).toHaveAttribute('aria-valuemax', '450');
+    await expect.poll(async () => (await details.boundingBox())!.width).toBe(640);
     await page.setViewportSize({ width: 1280, height: 800 });
-    await expect.poll(async () => (await details.boundingBox())!.width).toBe(400);
-    await expect(handle).toHaveAttribute('aria-valuemax', '400');
+    await expect.poll(async () => (await details.boundingBox())!.width).toBeLessThan(640);
+    expect((await details.boundingBox())!.width).toBeGreaterThan(400);
+    await expect.poll(async () => (await page.locator('#panel-conversation .chat-main-pane').boundingBox())!.width).toBeCloseTo(420, 0);
     await page.evaluate(() => (window as any).ConversationInfo.openAndSetTab('browser'));
     await expect.poll(async () => (await native())?.visible).toBe(true);
     await page.screenshot({ path: testInfo.outputPath('conversation-browser-panel.png') });

@@ -17,7 +17,7 @@ const ConversationInfo = (() => {
   let _cid = null;
   let _open = false;
   let _activeTab = 'files';
-  let _panelWidth = 400;
+  let _panelWidth = null;
   let _resizing = false;
   let _seq = 0;
   let _fileSeq = 0;
@@ -1293,15 +1293,16 @@ const ConversationInfo = (() => {
     const available = container.getBoundingClientRect().width;
     if (available <= 0) return;
     const minimum = Math.min(400, available);
-    const maximum = Math.max(minimum, Math.floor(window.innerWidth * 0.3));
-    _panelWidth = Math.round(Math.max(minimum, Math.min(_panelWidth, maximum)));
-    panel.style.width = `${_panelWidth}px`;
-    panel.style.flexBasis = `${_panelWidth}px`;
+    const maximum = Math.max(minimum, available - Math.min(420, available * 0.5));
+    const width = Math.round(Math.max(minimum, Math.min(_panelWidth ?? window.innerWidth * 0.3, maximum)));
+    if (_panelWidth !== null) _panelWidth = width;
+    panel.style.width = `${width}px`;
+    panel.style.flexBasis = `${width}px`;
     const handle = document.getElementById('conversation-info-resize');
     if (handle) {
       handle.setAttribute('aria-valuemin', String(Math.round(minimum)));
       handle.setAttribute('aria-valuemax', String(Math.round(maximum)));
-      handle.setAttribute('aria-valuenow', String(_panelWidth));
+      handle.setAttribute('aria-valuenow', String(width));
     }
   }
 
@@ -1323,6 +1324,7 @@ const ConversationInfo = (() => {
     handle.addEventListener('pointerdown', (event) => {
       if (event.button !== 0) return;
       event.preventDefault();
+      _panelWidth = panel.getBoundingClientRect().width;
       _resizing = true;
       handle.setPointerCapture(event.pointerId);
       document.body.classList.add('is-conversation-info-resizing');
@@ -1341,7 +1343,7 @@ const ConversationInfo = (() => {
       if (event.isComposing || event.keyCode === 229) return;
       if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
       event.preventDefault();
-      _panelWidth += event.key === 'ArrowLeft' ? 24 : -24;
+      _panelWidth = panel.getBoundingClientRect().width + (event.key === 'ArrowLeft' ? 24 : -24);
       _applyPanelWidth();
       try { localStorage.setItem('orkas.conversationInfo.width', String(_panelWidth)); } catch (_) {}
     });
