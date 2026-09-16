@@ -5109,10 +5109,10 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
    modules/conversation-info.js for this design pass. ── */
 .conversation-info-panel {
   position: relative;
-  flex: 0 0 400px;
-  width: 400px;
-  min-width: 400px;
-  max-width: max(400px, 30vw);
+  flex: 0 0 max(400px, 30vw);
+  width: max(400px, 30vw);
+  min-width: min(400px, 100%);
+  max-width: 100%;
   display: flex;
   flex-direction: column;
   min-height: 0;
