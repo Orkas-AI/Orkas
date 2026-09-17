@@ -1,4 +1,6 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+afterEach(() => vi.unstubAllGlobals());
 
 type Dataset = Record<string, string>;
 
@@ -66,6 +68,9 @@ class FakeElement {
   addEventListener() {}
 
   contains(target: FakeElement): boolean {
+    if (target != null && !(target instanceof FakeElement)) {
+      throw new TypeError('Node.contains requires a Node');
+    }
     if (target === this) return true;
     return this.childNodes.some((child) => child.contains(target));
   }
@@ -120,6 +125,8 @@ function loadUserWorkspace() {
   const placement = require('../../src/renderer/modules/dropdown-placement.js');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (globalThis as any)._dropdownVerticalPlacement = placement._dropdownVerticalPlacement;
+  // Match the browser's Node boundary, including its non-Node rejection.
+  vi.stubGlobal('Node', FakeElement);
   const body = new FakeElement('body');
   const windowListeners = new Map<string, Array<() => void>>();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -330,6 +337,34 @@ describe('user workspace menu placement', () => {
       maxHeight: 258,
       openAbove: false,
     });
+  });
+
+  it.each(['resize', 'scroll'])('repositions on window %s without passing Window to contains', (type) => {
+    const { _showWorkspaceDropdown } = loadUserWorkspace();
+    const anchor = new FakeElement('button');
+    anchor.rect = { top: 500, bottom: 530, left: 24, width: 120, height: 30 };
+    _showWorkspaceDropdown(anchor, 'new-chat');
+    const menu = (globalThis as any).document.body.querySelector('.workspace-menu') as FakeElement;
+    const listeners = (globalThis as any).__workspaceWindowListeners;
+    anchor.rect.left = 120;
+    for (const listener of listeners.get(type) || []) {
+      expect(() => listener({ target: (globalThis as any).window })).not.toThrow();
+    }
+    expect(menu.style.left).toBe('120px');
+  });
+
+  it('skips menu descendant scroll but repositions for outside DOM scroll', () => {
+    const { _showWorkspaceDropdown } = loadUserWorkspace();
+    const anchor = new FakeElement('button');
+    anchor.rect = { top: 500, bottom: 530, left: 24, width: 120, height: 30 };
+    _showWorkspaceDropdown(anchor, 'new-chat');
+    const menu = (globalThis as any).document.body.querySelector('.workspace-menu') as FakeElement;
+    const listeners = (globalThis as any).__workspaceWindowListeners.get('scroll');
+    anchor.rect.left = 120;
+    for (const listener of listeners) listener({ target: menu.childNodes[0] });
+    expect(menu.style.left).toBe('24px');
+    for (const listener of listeners) listener({ target: anchor });
+    expect(menu.style.left).toBe('120px');
   });
 
   it('shows default first and omits section headers when recent workspaces exist', () => {
