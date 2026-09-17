@@ -429,7 +429,8 @@ function _showWorkspaceDropdown(anchor, target) {
   const _onViewportChange = (event) => {
     // Scrolling the constrained menu should not trigger a redundant
     // measurement on every wheel/touchpad frame.
-    if (event && menu.contains(event.target)) return;
+    // Window resize/scroll targets are EventTargets, not DOM Nodes.
+    if (event?.target instanceof Node && menu.contains(event.target)) return;
     _positionWorkspaceMenu(menu, anchor);
   };
 
