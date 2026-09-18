@@ -15212,17 +15212,6 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     // event is delivered once. A re-delivered one could no longer recreate a
     // consumed Commander bubble anyway — rows are addressed by render key, and
     // a settled row is never reopened as a streaming target.
-    // A renderer can attach after the actor's initial `state_changed(running)`
-    // event has already passed (refresh, tab switch, scheduled/remote run).
-    // Process events are proof that work is still active, so recover the
-    // composer state here instead of leaving the button in blue "send" mode
-    // while a live placeholder is visibly thinking.
-    if (!isGroupConversationBusy(cid)) {
-      setGroupConversationBusy(cid, true);
-      _updateConvSidebarBadge(cid, true);
-      startPolling(cid);
-      if (cid === currentCid) _updateConvSendUI(cid);
-    }
     // Once Commander has flushed a segment it is inside a dispatch loop, and
     // its remaining tool progress is orchestration bookkeeping while a delegated
     // agent works. Opening a row for that would put an empty "thinking"
@@ -15234,11 +15223,14 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
       && data.type !== 'delta'
       && !visiblePlanEvent
       && !_findRenderNode(cid, _segmentRenderKey(turnId, evData.seg));
-    if (orchestrationIdle) return;
-    const target = _ensureActorPlaceholder(
+    const target = orchestrationIdle ? null : _ensureActorPlaceholder(
       cid, actor, streamingMsg, turnId, undefined, undefined, evData.seg,
     );
-    if (!target) {
+    // A settled turn can receive events for another (or missing) segment.
+    // Reject those before recovering the busy UI. Live targets were already
+    // checked by _ensureActorPlaceholder; avoid another scan on every token.
+    if (!target && turnId && _turnHasEndedRow(cid, turnId)) return;
+    if (!target && !orchestrationIdle) {
       // Terminal content is authoritative. A process event buffered by a
       // redundant stream can arrive after that row is finalized; dropping it
       // preserves the final text and makes terminal-late delivery idempotent.
@@ -15252,6 +15244,18 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
       });
       return;
     }
+    // A renderer can attach after the actor's initial `state_changed(running)`
+    // event has already passed (refresh, tab switch, scheduled/remote run).
+    // Process events are proof that work is still active, so recover the
+    // composer state here instead of leaving the button in blue "send" mode
+    // while a live placeholder is visibly thinking.
+    if (!isGroupConversationBusy(cid)) {
+      setGroupConversationBusy(cid, true);
+      _updateConvSidebarBadge(cid, true);
+      startPolling(cid);
+      if (cid === currentCid) _updateConvSendUI(cid);
+    }
+    if (orchestrationIdle) return;
     // Diagnostic — count how many deltas reach the renderer per actor.
     // If this number is much smaller than the bus emit count from the
     // turn-end log, the bottleneck is upstream (IPC batching). If it's
