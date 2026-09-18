@@ -747,6 +747,77 @@ describe('keyed rendering › terminal hand-off with an end-of-turn record', () 
     expect(container.rows.filter((row) => row.dataset.fromActor === 'agent-a')).toHaveLength(1);
   });
 
+  it.each([
+    ['earlier delta', 0, { type: 'delta', text: 'Late text' }],
+    ['same-segment delta', 1, { type: 'delta', text: 'Late text' }],
+    ['missing-segment tool event', undefined, { type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 't1', name: 'hand_off_to' } } }],
+    ['later orchestration event', 2, { type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 't1', name: 'hand_off_to' } } }],
+  ])('ignores %s after the turn ends without restarting idle UI', (_label, seg, data) => {
+    const { context, container } = loadRenderer(CID);
+    handoffPrelude(context);
+    context.setGroupConversationBusy(CID, false);
+    context.__warnings = [];
+    context.__pollStarts = 0;
+    context.__busyBadges = 0;
+    vm.runInContext(`
+      _convLog.warn = (...args) => __warnings.push(args);
+      startPolling = () => { __pollStarts += 1; };
+      _updateConvSidebarBadge = () => { __busyBadges += 1; };
+    `, context);
+    const rowsBefore = container.rows.slice();
+    const savedBefore = JSON.stringify(rowsBefore.map(row => ({ dataset: row.dataset, bodies: row.bodies })));
+
+    context._handleGroupBusEvent(CID, null, {
+      type: 'process', cid: CID, actor: 'commander', turn_id: TURN, seg, data,
+    });
+
+    expect(context.__warnings).toEqual([]);
+    expect(context.isGroupConversationBusy(CID)).toBe(false);
+    expect(context.__pollStarts).toBe(0);
+    expect(context.__busyBadges).toBe(0);
+    expect(container.rows).toEqual(rowsBefore);
+    expect(JSON.stringify(container.rows.map(row => ({ dataset: row.dataset, bodies: row.bodies })))).toBe(savedBefore);
+
+    // The ended Commander must not block a distinct turn's real output.
+    context._handleGroupBusEvent(CID, null, {
+      type: 'process', cid: CID, actor: 'commander', turn_id: 'next-turn', seg: 0,
+      data: { type: 'delta', text: 'New answer' },
+    });
+    expect(context.isGroupConversationBusy(CID)).toBe(true);
+    expect(context.__pollStarts).toBe(1);
+    expect(container.rows.at(-1)?.bodies.final.textContent).toBe('New answer');
+    expect(context.__warnings).toEqual([]);
+  });
+
+  it('keeps a delegate live while dropping late Commander output', () => {
+    const { context, container } = loadRenderer(CID);
+    handoffPrelude(context);
+    context._handleGroupBusEvent(CID, null, {
+      ...delta(0, 'Delegate answer', 'agent-a'), turn_id: 'delegate-turn',
+    });
+    context.__warnings = [];
+    vm.runInContext('_convLog.warn = (...args) => __warnings.push(args);', context);
+    context._handleGroupBusEvent(CID, null, delta(0, 'Late Commander text'));
+    expect(context.__warnings).toEqual([]);
+    expect(context.isGroupConversationBusy(CID)).toBe(true);
+    expect(container.rows.filter(row => row.dataset.fromActor === 'agent-a'))
+      .toHaveLength(1);
+    expect(container.rows.at(-1)?.bodies.final.textContent).toBe('Delegate answer');
+    expect(commanderRows(container).map(row => row.dataset.msgId)).toEqual(['msg-end']);
+  });
+
+  it('still reports a genuinely missing live target', () => {
+    const { context } = loadRenderer(CID);
+    context.__warnings = [];
+    vm.runInContext(`
+      _ensureActorPlaceholder = () => null;
+      _convLog.warn = (...args) => __warnings.push(args);
+    `, context);
+    context._handleGroupBusEvent(CID, null, delta(0, 'Live answer'));
+    expect(context.__warnings.map((args: any[]) => args[0]))
+      .toEqual(['group process target missing']);
+  });
+
   it('still lets a later segment stream after a mid-turn segment record (negative control)', () => {
     const { context, container } = loadRenderer(CID);
     context._handleGroupBusEvent(CID, null, delta(0, 'Handing this over.'));
