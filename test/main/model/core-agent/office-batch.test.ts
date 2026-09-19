@@ -302,13 +302,26 @@ describe('buildPptxBatch', () => {
       },
       {
         command: 'add', parent: '/slide[1]', type: 'shape',
-        props: { text: 'Filled', fill: '#FFFFFF', opacity: '0', line: '#111827', lineOpacity: '25' },
+        props: { text: 'Filled', fill: '#FFFFFF', opacity: '0', line: '#111827', lineOpacity: '0.25' },
       },
       {
         command: 'add', parent: '/slide[1]', type: 'shape',
         props: { text: 'Gradient', gradient: '#111827-#334155-0', opacity: '80' },
       },
     ]);
+  });
+
+  it.each([
+    [0, '0'], [0.5, '0.005'], [1, '0.01'], [45, '0.45'],
+    [50, '0.5'], [55, '0.55'], [100, '1'],
+  ])('converts the declared %s percent outline opacity to the engine fraction', (percent, fraction) => {
+    const ops = buildPptxBatch([{ shapes: [{ line: '#112233', lineOpacity: percent }] }]);
+    expect(ops[1].props).toEqual({ line: '#112233', lineOpacity: fraction });
+  });
+
+  it.each([-1, 101, Number.POSITIVE_INFINITY, Number.NaN])('does not normalize invalid outline opacity %s into a valid value', (value) => {
+    const ops = buildPptxBatch([{ shapes: [{ line: '#112233', lineOpacity: value }] }]);
+    expect(ops[1].props.lineOpacity).toBe(String(value));
   });
 
   it('normalizes the legacy outer shadow preset to OfficeCLI default shadow', () => {
