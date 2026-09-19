@@ -486,6 +486,15 @@ export function buildPptxBatch(slides: readonly PptxSlideSpec[]): OfficeBatchOp[
         // The outline equivalent has the same carrier relationship.
         if ('lineOpacity' in shapeProps && !('line' in shapeProps)) {
           delete shapeProps.lineOpacity;
+        } else if (
+          typeof shape.lineOpacity === 'number'
+          && Number.isFinite(shape.lineOpacity)
+          && shape.lineOpacity >= 0 && shape.lineOpacity <= 100
+        ) {
+          // create_pptx declares percentages; OfficeCLI expects a 0..1
+          // fraction for outlines. Even 1 means 1%, not full opacity.
+          // Leave invalid inputs to engine validation, without clamping.
+          shapeProps.lineOpacity = String(shape.lineOpacity / 100);
         }
         if (!Object.keys(shapeProps).length) continue;
         ops.push({ command: 'add', parent: `/slide[${slideNo}]`, type: 'shape', props: shapeProps });
