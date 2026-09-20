@@ -554,7 +554,50 @@ describe('renderer task board › visibility (multi-task only, adjudicated 2026-
     expect(runVisibility([{ ...pending[0], admission_pending: false }])).toEqual({ visible: true });
     expect(runVisibility([{ ...pending[0], status: 'running' }])).toEqual({ visible: false });
     expect(runVisibility([{ ...pending[0], status: 'blocked' }])).toEqual({ visible: true });
-    expect(runVisibility([...pending, { task_id: 'other', status: 'running' }])).toEqual({ visible: true });
+    expect(runVisibility([...pending, { task_id: 'other', status: 'running' }])).toEqual({ visible: false });
+  });
+
+  it.each(['event', 'seed'])(
+    'does not flash when a fresh send overlaps the prior turn settlement through %s', async (settlement) => {
+      const { context, panel, list, board } = boardHarness();
+      const prior = { task_id: 'prior', assignee: 'commander', status: 'running' };
+      const next = { task_id: 'next', assignee: 'commander', status: 'queued', admission_pending: true };
+      board.onEvent('c1', { task: prior });
+      expect(panel.style.display).toBe('none');
+      // The prior terminal can arrive after the new task's creation. No
+      // scheduler has confirmed waiting or a second execution at this point.
+      board.onEvent('c1', { task: next });
+      expect(panel.style.display).toBe('none');
+      expect(list.innerHTML).toBe('');
+      const done = { ...prior, status: 'done' };
+      if (settlement === 'event') board.onEvent('c1', { task: done });
+      else {
+        context.apiFetch = async () => ({ json: async () => ({ ok: true, tasks: [done, next] }) });
+        await board.sync('c1');
+      }
+      expect(panel.style.display).toBe('none');
+      board.onEvent('c1', { task: { ...next, status: 'running', admission_pending: undefined } });
+      expect(panel.style.display).toBe('none');
+    },
+  );
+
+  it('waits for admission facts across multiple fresh sends but exposes real concurrency and recovery', () => {
+    const { panel, list, board } = boardHarness();
+    const first = { task_id: 'first', assignee: 'commander', status: 'queued', admission_pending: true };
+    const second = { ...first, task_id: 'second', assignee: 'other' };
+    board.onEvent('c1', { task: first });
+    board.onEvent('c1', { task: second });
+    expect(panel.style.display).toBe('none');
+    board.onEvent('c1', { task: { ...first, status: 'running', admission_pending: undefined } });
+    expect(panel.style.display).toBe('none');
+    board.onEvent('c1', { task: { ...second, status: 'running', admission_pending: undefined } });
+    expect(panel.style.display).toBe('');
+    expect(list.innerHTML.match(/chat.task_status_running/g)).toHaveLength(2);
+    board.onEvent('c1', { task: { ...second, status: 'done', admission_pending: undefined } });
+    expect(panel.style.display).toBe('none');
+    board.onEvent('c1', { task: { task_id: 'blocked', assignee: 'other', status: 'blocked' } });
+    expect(panel.style.display).toBe('');
+    expect(list.innerHTML).toContain('data-act="task-run-anyway"');
   });
 
   it.each(['event-first', 'seed-first'])(
@@ -591,8 +634,10 @@ describe('renderer task board › visibility (multi-task only, adjudicated 2026-
         // resurfaces, and its terminal rows cannot keep the panel visible.
         const other = { task_id: 'second', assignee: 'commander', status: 'queued', admission_pending: true };
         board.onEvent('c1', { type: 'task_created', task: other });
+        expect(panel.style.display).toBe('none');
+        board.onEvent('c1', { type: 'task_state', task: { ...other, admission_pending: undefined } });
         expect(panel.style.display).toBe('');
-        board.onEvent('c1', { type: 'task_state', task: { ...other, status: 'cancelled' } });
+        board.onEvent('c1', { type: 'task_state', task: { ...other, status: 'cancelled', admission_pending: undefined } });
         expect(panel.style.display).toBe('none');
         board.onEvent('c1', { type: 'task_state', task: { ...snapshot, status: 'done' } });
         expect(panel.style.display).toBe('none');
