@@ -170,7 +170,8 @@ describe('prompts › chat_shared_rules web-search invariants', () => {
     expect(body).toMatch(/first action[\s\S]{0,180}owning actor's first evidence or execution action/i);
     expect(body).toMatch(/actor that owns a time-sensitive factual answer must search before answering/i);
     expect(body).not.toMatch(/choose the owner first/i);
-    expect(commander).toMatch(/Route after intent, before drafting/i);
+    expect(commander).toMatch(/current intent[\s\S]{0,100}before choosing an owner/i);
+    expect(commander).toMatch(/Choose the best owner[\s\S]{0,100}before drafting/i);
     expect(commander).toMatch(/choose the best owner for each user-visible outcome/i);
   });
 
@@ -215,7 +216,7 @@ describe('prompts › Commander Skill ownership boundary', () => {
   it('chooses the execution owner before reading an ordinary Skill', () => {
     const commander = prompts.load('chat_commander', {});
     const route = commander.indexOf('Prefer a high-confidence enabled Agent match');
-    const skill = commander.indexOf('Otherwise Commander owns the outcome and may read a matching regular Skill');
+    const skill = commander.indexOf('Otherwise Commander owns the outcome');
 
     expect(route).toBeGreaterThanOrEqual(0);
     expect(skill).toBeGreaterThan(route);
@@ -234,9 +235,9 @@ describe('prompts › Commander Skill ownership boundary', () => {
 
   it('discovers Skills by availability without exposing storage tiers as routing policy', () => {
     const commander = prompts.load('chat_commander', {});
-    const listed = commander.indexOf('For a matching Skill already listed in `Available skills`');
-    const otherAvailable = commander.indexOf('use `skill_search` to find other available Skills');
-    const marketplace = commander.indexOf('Search the marketplace only when no available Skill is suitable');
+    const listed = commander.indexOf("For Commander-owned work, read a matching listed Skill's `SKILL.md` and follow it");
+    const otherAvailable = commander.indexOf('if none matches, use `skill_search`');
+    const marketplace = commander.indexOf('the marketplace only if no available Skill fits');
 
     expect(listed).toBeGreaterThanOrEqual(0);
     expect(otherAvailable).toBeGreaterThan(listed);

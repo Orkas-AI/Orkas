@@ -1458,6 +1458,7 @@ describe('skills › createFromDir', () => {
         'skills/bad-skill/scripts/run.js',
         Buffer.from('module.exports = async () => ({ ok: true });\n'),
       );
+      zip.addFile('skills/not-a-skill/SKILL.md', Buffer.from('A document renamed to SKILL.md.'));
       zip.writeZip(archive);
 
       const s = await loadSkills();
@@ -1481,6 +1482,8 @@ describe('skills › createFromDir', () => {
         'utf8',
       )).toBe('preserved reference\n');
       expect(fs.existsSync(path.join(customSkillsDir(), 'bad-skill'))).toBe(false);
+      expect(fs.existsSync(path.join(customSkillsDir(), 'not-a-skill'))).toBe(false);
+      expect(result.failures?.some((failure: any) => failure.sourceName === 'not-a-skill')).toBe(true);
     } finally {
       fs.rmSync(srcParent, { recursive: true, force: true });
     }
@@ -1540,6 +1543,57 @@ describe('skills › createFromDir', () => {
       expect(result.ok).toBe(false);
       expect(result.error).toMatch(/SKILL\.md/i);
       expect(fs.existsSync(path.join(customSkillsDir(), 'plain-notes'))).toBe(false);
+    } finally {
+      fs.rmSync(srcParent, { recursive: true, force: true });
+    }
+  });
+
+  it('retains native import compatibility with legacy sidecar descriptions', async () => {
+    const src = fs.mkdtempSync(path.join(process.cwd(), '.tmp-skill-package-legacy-'));
+    try {
+      fs.writeFileSync(path.join(src, 'SKILL.md'), '---\nname: legacy-package\n---\n# Instructions\nSummarize a document.');
+      fs.writeFileSync(path.join(src, '_meta.json'), JSON.stringify({
+        descriptions: { en: 'A legacy Skill package', zh: '旧版技能包' }, category: 'general',
+      }));
+      const s = await loadSkills();
+      const result = await s.importSkillPackageFromPath(src);
+      expect(result.ok).toBe(true);
+      expect(result.skills?.map((skill: any) => skill.id)).toEqual(['legacy-package']);
+    } finally {
+      fs.rmSync(src, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['plain-text', 'A document renamed to SKILL.md.'],
+    ['empty', ''],
+    ['missing-name', '---\ndescription: A description without Skill identity\n---\nInstructions'],
+    ['missing-description', '---\nname: incomplete-skill\n---\nInstructions'],
+    ['invalid-name', '---\nname: [invalid\ndescription: Malformed identity\n---\nInstructions'],
+    ['unterminated', '---\nname: incomplete-skill\ndescription: Missing closing fence'],
+  ])('rejects non-Skill source metadata before normalization: %s', async (_shape, content) => {
+    const srcParent = fs.mkdtempSync(path.join(process.cwd(), '.tmp-skill-package-format-'));
+    try {
+      const src = path.join(srcParent, 'incomplete-skill');
+      fs.mkdirSync(src);
+      fs.writeFileSync(path.join(src, 'SKILL.md'), content);
+      const s = await loadSkills();
+      for (const archive of [false, true]) {
+        const zipPath = path.join(srcParent, 'source.zip');
+        if (archive) {
+          const zip = new AdmZip();
+          zip.addFile('incomplete-skill/SKILL.md', Buffer.from(content));
+          zip.writeZip(zipPath);
+        }
+        const result = await s.importSkillPackageFromPath(archive ? zipPath : src);
+        expect(result.ok).toBe(false);
+        expect(result.skills || []).toHaveLength(0);
+        expect(result.failures).toEqual([expect.objectContaining({
+          sourceName: 'incomplete-skill', report: expect.objectContaining({ ok: false }),
+        })]);
+        expect(fs.existsSync(path.join(customSkillsDir(), 'incomplete-skill'))).toBe(false);
+        expect(fs.readFileSync(path.join(src, 'SKILL.md'), 'utf8')).toBe(content);
+      }
     } finally {
       fs.rmSync(srcParent, { recursive: true, force: true });
     }

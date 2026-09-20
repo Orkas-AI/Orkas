@@ -60,16 +60,25 @@ describe("Errors", () => {
   });
 
   describe("isRetryableError", () => {
-    it("returns true for RateLimitError", () => {
-      expect(isRetryableError(new RateLimitError("rate"))).toBe(true);
+    it("does not automatically retry RateLimitError", () => {
+      expect(isRetryableError(new RateLimitError("rate"))).toBe(false);
     });
 
     it("returns true for TimeoutError", () => {
       expect(isRetryableError(new TimeoutError("timeout"))).toBe(true);
     });
 
-    it("returns true for 429 ProviderError", () => {
-      expect(isRetryableError(new ProviderError("429", "test", 429))).toBe(true);
+    it("does not automatically retry 429 ProviderError", () => {
+      expect(isRetryableError(new ProviderError("429", "test", 429))).toBe(false);
+    });
+
+    it("keeps nested throttling terminal even when server policy clears all blacklists", () => {
+      const policy = { permanent_statuses: [], permanent_message_patterns: [], permanent_code_patterns: [] };
+      for (const cause of [{ status: 429, message: 'opaque' }, { code: 'RATE_LIMIT', message: 'opaque' }]) {
+        const error = Object.assign(new Error('fetch failed'), { cause });
+        expect(classifyRetryableErrorWithPolicy(error, policy)).toBeNull();
+      }
+      expect(classifyRetryableErrorWithPolicy(new ProviderError('unavailable', 'test', 503), policy)).toBe('service_unavailable');
     });
 
     it("returns false for 429 balance/quota-exhausted errors", () => {
@@ -297,6 +306,13 @@ describe("Errors", () => {
       }
     });
 
+    it("does not retry the task backstop even with empty runtime blacklists", () => {
+      expect(classifyRetryableErrorWithPolicy(
+        Object.assign(new Error("Task token limit reached"), { code: "TASK_TOKEN_LIMIT_REACHED" }),
+        { permanent_statuses: [], permanent_message_patterns: [], permanent_code_patterns: [] },
+      )).toBeNull();
+    });
+
     it("allows runtime retry policy to add permanent message patterns", () => {
       configureRetryErrorPolicy({
         permanent_message_patterns: ["custom_hard_stop"],
@@ -325,6 +341,11 @@ describe("Errors", () => {
       expect(err.code).toBe(RETRY_EXHAUSTED_CODE);
       expect(classifyRetryableError(err)).toBeNull();
       expect(isRetryableError(err)).toBe(false);
+    });
+
+    it("does not turn an exhausted save into a provider retry across module boundaries", () => {
+      const error = Object.assign(new Error("save failed"), { code: "SESSION_PERSISTENCE_FAILED" });
+      expect(classifyRetryableError(error)).toBeNull();
     });
 
     it("honors the RETRY_EXHAUSTED code structurally (no instanceof needed)", () => {

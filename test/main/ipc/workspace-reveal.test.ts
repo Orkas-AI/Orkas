@@ -1,194 +1,230 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import * as fs from 'node:fs';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { trustedIpcSender } from '../../helpers/trusted-ipc-sender';
+import { drainMainRuntimeForTest } from '../../helpers/drain-main-runtime';
 
-// The IPC router pulls `shell.showItemInFolder` + `dialog` from electron
-// at module load; mock before imports take effect.
-const showItemInFolder = vi.fn();
+type InvokeFn = (event: unknown, request: { channel: string; payload?: unknown }) =>
+  Promise<{ ok: boolean; error?: string; path?: string; code?: string }>;
+let invokeHandler: InvokeFn;
+let tempRoot: string;
+let workspace: string;
+let outsideFile: string;
+let previousWorkspaceRoot: string | undefined;
+const shell = vi.hoisted(() => ({
+  showItemInFolder: vi.fn(),
+  openPath: vi.fn(async () => ''),
+  trashItem: vi.fn(),
+}));
 vi.mock('electron', () => ({
-  ipcMain: { handle: vi.fn(), on: vi.fn() },
+  app: { isPackaged: false, getVersion: () => '1.7.1', on: vi.fn(), off: vi.fn() },
+  ipcMain: {
+    handle: (channel: string, handler: InvokeFn) => {
+      if (channel === 'orkas.invoke') invokeHandler = handler;
+    },
+    on: vi.fn(),
+  },
+  shell,
+  BrowserWindow: { getAllWindows: () => [], getFocusedWindow: () => null },
   dialog: { showOpenDialog: vi.fn(async () => ({ canceled: true, filePaths: [] })) },
-  BrowserWindow: { getFocusedWindow: vi.fn(() => null) },
-  shell: { showItemInFolder, openPath: vi.fn(async () => '') },
+  systemPreferences: {
+    getMediaAccessStatus: () => 'granted', askForMediaAccess: async () => true,
+  },
 }));
 
-let tmpDir: string;
-let prevWs: string | undefined;
-
-beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-reveal-'));
-  prevWs = process.env.ORKAS_WORKSPACE_ROOT;
-  process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
-  showItemInFolder.mockClear();
+beforeAll(async () => {
+  tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-reveal-'));
+  previousWorkspaceRoot = process.env.ORKAS_WORKSPACE_ROOT;
+  process.env.ORKAS_WORKSPACE_ROOT = path.join(tempRoot, 'data');
   vi.resetModules();
+  const users = await import('../../../src/main/features/users');
+  users.activateUser('reveal-user');
+  workspace = path.join(tempRoot, 'workspace');
+  fs.mkdirSync(workspace);
+  const ws = await import('../../../src/main/features/user_workspace');
+  ws.setWorkspacePath('reveal-user', workspace);
+  outsideFile = path.join(tempRoot, 'outside workspace', '封面 image.png');
+  fs.mkdirSync(path.dirname(outsideFile));
+  fs.writeFileSync(outsideFile, 'original image');
+  const ipc = await import('../../../src/main/ipc/index');
+  ipc.register();
 });
-
-afterEach(() => {
-  process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+beforeEach(() => { vi.clearAllMocks(); });
+afterAll(async () => {
+  await drainMainRuntimeForTest();
+  if (previousWorkspaceRoot === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
+  else process.env.ORKAS_WORKSPACE_ROOT = previousWorkspaceRoot;
+  fs.rmSync(tempRoot, { recursive: true, force: true });
 });
-
-/**
- * Directly exercise the `workspace.revealPath` handler's validation logic.
- * It sits inside the ipc/index.ts invoke table, which isn't exported
- * individually — so we reach in by calling the handler via the router's
- * internal map. We can reproduce the same logic inline by reusing the
- * user_workspace + shell modules the same way.
- *
- * Rather than duplicating the guard logic, we spin up the IPC router and
- * call the handler through the same code path the renderer would.
- */
-
-async function callRevealPath(userId: string, input: unknown): Promise<{ ok: boolean; error?: string; path?: string }> {
-  // Bypass the full IPC runtime — call the feature directly with the same
-  // guard logic the handler uses. Mirrors `ipc/index.ts::workspace.revealPath`:
-  // it delegates the symlink-safe sandbox check to `util/path-sandbox.isPathAllowed`
-  // (via the `_ipcFileSandboxAllowedRoots` helper); the test reproduction tracks
-  // that — drift here = drift from the real handler.
-  const userWorkspace = await import('../../../src/main/features/user_workspace');
-  const { isPathAllowed } = await import('../../../src/main/util/path-sandbox');
-  const { shell } = await import('electron');
-
-  const p = (input as { path?: unknown })?.path;
-  if (!p || typeof p !== 'string') return { ok: false, error: 'missing path' };
-  const abs = path.resolve(p);
-  const wsRoot = path.resolve(userWorkspace.getWorkspacePath(userId));
-  if (!isPathAllowed(abs, [wsRoot])) {
-    return { ok: false, error: 'path is outside the current workspace' };
-  }
-  if (!fs.existsSync(abs)) return { ok: false, error: 'file not found' };
-  (shell.showItemInFolder as any)(abs);
-  return { ok: true, path: abs };
+function call(channel: string, payload: unknown) {
+  return invokeHandler({ sender: trustedIpcSender() }, { channel, payload });
+}
+function reveal(target: unknown) { return call('workspace.revealPath', { path: target }); }
+function expectNoShellAction() {
+  expect(shell.showItemInFolder).not.toHaveBeenCalled();
+  expect(shell.openPath).not.toHaveBeenCalled();
+  expect(shell.trashItem).not.toHaveBeenCalled();
 }
 
-describe('workspace.revealPath › validation', () => {
-  it('accepts a file that lives under the current user\'s workspace', async () => {
-    const ws = await import('../../../src/main/features/user_workspace');
-    const dir = path.join(tmpDir, 'ws');
-    fs.mkdirSync(dir, { recursive: true });
-    ws.setWorkspacePath('u1', dir);
-
-    const file = path.join(dir, 'out.pdf');
-    fs.writeFileSync(file, '%PDF');
-
-    const res = await callRevealPath('u1', { path: file });
-    expect(res.ok).toBe(true);
-    expect(res.path).toBe(file);
-    expect(showItemInFolder).toHaveBeenCalledWith(file);
+describe('user-requested reveal in the OS file manager', () => {
+  it('reveals an outside file without requiring a conversation or produced-file record', async () => {
+    await expect(reveal(outsideFile)).resolves.toMatchObject({ ok: true, path: outsideFile });
+    expect(shell.showItemInFolder).toHaveBeenCalledExactlyOnceWith(outsideFile);
+    expect(shell.openPath).not.toHaveBeenCalled();
+    expect(fs.readFileSync(outsideFile, 'utf8')).toBe('original image');
   });
 
-  it('rejects a path outside the workspace (absolute escape)', async () => {
-    const ws = await import('../../../src/main/features/user_workspace');
-    const dir = path.join(tmpDir, 'ws');
-    fs.mkdirSync(dir, { recursive: true });
-    ws.setWorkspacePath('u2', dir);
+  it('opens an outside directory in the file manager', async () => {
+    const directory = path.dirname(outsideFile);
+    await expect(reveal(directory)).resolves.toMatchObject({ ok: true, path: directory });
+    expect(shell.openPath).toHaveBeenCalledExactlyOnceWith(directory);
+    expect(shell.showItemInFolder).not.toHaveBeenCalled();
+  });
 
-    // A path that exists but is explicitly outside the workspace.
-    const outside = path.join(tmpDir, 'elsewhere.pdf');
-    fs.writeFileSync(outside, '%PDF');
+  it('preserves workspace file and workspace root actions', async () => {
+    const file = path.join(workspace, 'inside.txt');
+    fs.writeFileSync(file, 'inside');
+    await expect(reveal(file)).resolves.toMatchObject({ ok: true, path: file });
+    await expect(reveal(workspace)).resolves.toMatchObject({ ok: true, path: workspace });
+    expect(shell.showItemInFolder).toHaveBeenCalledExactlyOnceWith(file);
+    expect(shell.openPath).toHaveBeenCalledExactlyOnceWith(workspace);
+  });
 
-    const res = await callRevealPath('u2', { path: outside });
+  it('reveals a linked directory even when its target is outside the workspace', async () => {
+    const link = path.join(workspace, 'linked-images');
+    fs.symlinkSync(path.dirname(outsideFile), link, 'junction');
+    await expect(reveal(link)).resolves.toMatchObject({ ok: true, path: link });
+    expect(shell.openPath).toHaveBeenCalledExactlyOnceWith(link);
+  });
+
+  it.each([undefined, null, 123, '', 'package.json', '../escape.png',
+    'https://example.com/image.png', 'file:///tmp/image.png', 'javascript:alert(1)',
+    'data:text/plain,hello', '/tmp/image\0.png'])('rejects invalid input %j without opening anything', async (target) => {
+    const res = await reveal(target);
     expect(res.ok).toBe(false);
-    expect(res.error).toMatch(/outside/);
-    expect(showItemInFolder).not.toHaveBeenCalled();
+    expect(res.error).toBeTruthy();
+    expectNoShellAction();
   });
 
-  it('rejects a traversal attempt via ../..', async () => {
-    const ws = await import('../../../src/main/features/user_workspace');
-    const dir = path.join(tmpDir, 'ws');
-    fs.mkdirSync(dir, { recursive: true });
-    ws.setWorkspacePath('u3', dir);
-
-    // `path.resolve` collapses ../../ so abs ends up outside the workspace.
-    const attempt = path.join(dir, '..', '..', 'escape.txt');
-    fs.writeFileSync(path.resolve(attempt), '');
-
-    const res = await callRevealPath('u3', { path: attempt });
-    expect(res.ok).toBe(false);
-    expect(res.error).toMatch(/outside/);
-    expect(showItemInFolder).not.toHaveBeenCalled();
+  it('reports a removed file and succeeds when it becomes available again', async () => {
+    const file = path.join(tempRoot, 'restored.png');
+    const missing = await reveal(file);
+    expect(missing.ok).toBe(false);
+    expect(missing.error).toBeTruthy();
+    expectNoShellAction();
+    fs.writeFileSync(file, 'restored');
+    await expect(reveal(file)).resolves.toMatchObject({ ok: true });
+    expect(shell.showItemInFolder).toHaveBeenCalledExactlyOnceWith(file);
   });
 
-  it('rejects a symlink inside the workspace that points outside (symlink-escape)', async () => {
-    // The bug class the isPathAllowed migration closes: a symlink planted
-    // inside an allowed root (here, the user's workspace) that resolves to
-    // a target OUTSIDE the allowed root. The previous lexical
-    // `startsWith(wsRoot + sep)` check would let this through because the
-    // symlink's textual path IS inside the workspace; `isPathAllowed` calls
-    // `fs.realpathSync` on both sides and the rejection happens because the
-    // resolved target sits outside the root.
-    const ws = await import('../../../src/main/features/user_workspace');
-    const wsDir = path.join(tmpDir, 'ws-sym');
-    fs.mkdirSync(wsDir, { recursive: true });
-    ws.setWorkspacePath('u-sym', wsDir);
-
-    const outside = path.join(tmpDir, 'outside-target.txt');
-    fs.writeFileSync(outside, 'attacker-controlled');
-
-    const trap = path.join(wsDir, 'looks-inside.txt');
-    fs.symlinkSync(outside, trap);
-
-    const res = await callRevealPath('u-sym', { path: trap });
-    expect(res.ok).toBe(false);
-    expect(res.error).toMatch(/outside/);
-    expect(showItemInFolder).not.toHaveBeenCalled();
+  it('reports an OS folder-open failure and allows retry', async () => {
+    shell.openPath.mockResolvedValueOnce('OS folder opening failed');
+    const directory = path.dirname(outsideFile);
+    const failed = await reveal(directory);
+    expect(failed.ok).toBe(false);
+    expect(failed.error).toBeTruthy();
+    expect(shell.showItemInFolder).not.toHaveBeenCalled();
+    await expect(reveal(directory)).resolves.toMatchObject({ ok: true });
   });
 
-  it('accepts a symlink inside the workspace that points to another file inside the workspace', async () => {
-    // The companion preservation case: a symlink whose target is also
-    // within the allowed root MUST be accepted (otherwise `isPathAllowed`
-    // would break legitimate `ln -s` use inside the workspace).
-    const ws = await import('../../../src/main/features/user_workspace');
-    const wsDir = path.join(tmpDir, 'ws-sym-ok');
-    fs.mkdirSync(wsDir, { recursive: true });
-    ws.setWorkspacePath('u-sym-ok', wsDir);
-
-    const target = path.join(wsDir, 'real.pdf');
-    fs.writeFileSync(target, '%PDF');
-    const link = path.join(wsDir, 'link.pdf');
-    fs.symlinkSync(target, link);
-
-    const res = await callRevealPath('u-sym-ok', { path: link });
-    expect(res.ok).toBe(true);
-    expect(showItemInFolder).toHaveBeenCalledWith(link);
+  it('does not grant read, write, stat, or delete access after revealing an outside file', async () => {
+    await expect(reveal(outsideFile)).resolves.toMatchObject({ ok: true });
+    for (const channel of ['workspace.statPath', 'produced.readText', 'produced.writeText', 'workspace.deletePath']) {
+      await expect(call(channel, { path: outsideFile, content: 'replacement' }))
+        .resolves.toMatchObject({ ok: false, error: 'path is outside the user workspace' });
+    }
+    expect(fs.readFileSync(outsideFile, 'utf8')).toBe('original image');
+    expect(shell.trashItem).not.toHaveBeenCalled();
   });
 
-  it('rejects a non-string / missing path', async () => {
-    const res1 = await callRevealPath('u1', {});
-    expect(res1.ok).toBe(false);
-    expect(res1.error).toMatch(/missing path/);
-    const res2 = await callRevealPath('u1', { path: 123 as any });
-    expect(res2.ok).toBe(false);
+  it('continues to reject untrusted renderer requests', async () => {
+    await expect(invokeHandler({ sender: { getURL: () => 'https://example.com' } }, {
+      channel: 'workspace.revealPath', payload: { path: outsideFile },
+    })).resolves.toMatchObject({ ok: false, code: 'E_IPC_SENDER' });
+    expectNoShellAction();
+  });
+});
+
+describe('file actions in the conversation-selected coding workspace', () => {
+  it('distinguishes inaccessible files from missing files and recovers on retry', async () => {
+    const file = path.join(workspace, 'temporarily-denied.ts');
+    fs.writeFileSync(file, 'source retained');
+    const stat = fs.statSync;
+    const fault = vi.spyOn(fs, 'statSync').mockImplementation(((target: fs.PathLike, ...args: unknown[]) => {
+      if (String(target) === file) throw Object.assign(new Error('access denied'), { code: 'EACCES' });
+      return (stat as any)(target, ...args);
+    }) as typeof fs.statSync);
+    syncBuiltinESMExports();
+    try {
+      await expect(call('workspace.statPath', { path: file }))
+        .resolves.toMatchObject({ ok: false, error: 'stat_failed' });
+    } finally { fault.mockRestore(); syncBuiltinESMExports(); }
+    await expect(call('workspace.statPath', { path: file }))
+      .resolves.toMatchObject({ ok: true, exists: true });
+    fs.unlinkSync(file);
+    await expect(call('workspace.statPath', { path: file }))
+      .resolves.toMatchObject({ ok: true, exists: false });
   });
 
-  it('rejects a path that does not exist even if inside the workspace', async () => {
-    const ws = await import('../../../src/main/features/user_workspace');
-    const dir = path.join(tmpDir, 'ws');
-    fs.mkdirSync(dir, { recursive: true });
-    ws.setWorkspacePath('u4', dir);
-
-    const ghost = path.join(dir, 'does-not-exist.pdf');
-    const res = await callRevealPath('u4', { path: ghost });
-    expect(res.ok).toBe(false);
-    expect(res.error).toMatch(/not found/);
-    expect(showItemInFolder).not.toHaveBeenCalled();
+  it('does not promote a symlink in an ordinary task folder into a new allowed root', async () => {
+    const { createConversation } = await import('../../../src/main/features/chats');
+    const { setWorkspaceDirOnce } = await import('../../../src/main/features/group_chat/state');
+    const conv = await createConversation('reveal-user', {});
+    const linked = path.join(workspace, 'ordinary-task-folder');
+    fs.symlinkSync(path.dirname(outsideFile), linked, 'junction');
+    await setWorkspaceDirOnce('reveal-user', conv.conversation_id, 'ordinary-task-folder');
+    await expect(call('produced.readText', {
+      cid: conv.conversation_id, path: path.join(linked, path.basename(outsideFile)),
+    })).resolves.toMatchObject({ ok: false, error: 'path is outside the user workspace' });
+    expect(fs.readFileSync(outsideFile, 'utf8')).toBe('original image');
   });
 
-  it('accepts the workspace root itself (revealing the workspace folder is a legit action)', async () => {
-    // `isPathAllowed(root, [root])` returns true by design — revealing the
-    // workspace root in Finder/Explorer is a legitimate "open my workspace"
-    // request. The pre-refactor lexical guard also allowed this
-    // (`norm === wsNorm` short-circuits the `&& norm !== wsNorm` arm in the
-    // OR chain), so the behaviour is preserved across the isPathAllowed
-    // migration.
-    const ws = await import('../../../src/main/features/user_workspace');
-    const dir = path.join(tmpDir, 'ws');
-    fs.mkdirSync(dir, { recursive: true });
-    ws.setWorkspacePath('u5', dir);
+  it('opens existing source files in a project task even without a produced-file record', async () => {
+    const projects = await import('../../../src/main/features/projects');
+    const chats = await import('../../../src/main/features/chats');
+    const directories = await import('../../../src/main/features/local_agents/project-directory');
+    const project = await projects.createProject('reveal-user', 'Code references');
+    if (!project.ok) throw new Error('project fixture failed');
+    const conv = await chats.createConversation('reveal-user', { projectId: project.project.project_id });
+    const cid = conv.conversation_id;
+    const directory = path.join(tempRoot, 'selected repository');
+    fs.mkdirSync(directory);
+    const file = path.join(directory, 'runner.ts');
+    fs.writeFileSync(file, 'export const ready = true;');
+    directories.writeCodingDirectory('reveal-user', cid, directory, true);
 
-    const res = await callRevealPath('u5', { path: dir });
-    expect(res.ok).toBe(true);
-    expect(showItemInFolder).toHaveBeenCalledWith(dir);
+    await expect(call('workspace.statPath', { cid, path: file }))
+      .resolves.toMatchObject({ ok: true, exists: true, isFile: true });
+    await expect(call('produced.readText', { cid, path: file }))
+      .resolves.toMatchObject({ ok: true, text: 'export const ready = true;' });
+
+    // A link or caller-supplied cwd cannot establish workspace authority.
+    for (const payload of [{ path: file }, { cid: 'another-task', path: file },
+      { cid: 'another-task', path: file, coding_project_dir: directory }]) {
+      await expect(call('produced.readText', payload)).resolves.toMatchObject({ ok: false });
+    }
+    const escaped = path.join(directory, 'linked.png');
+    fs.symlinkSync(outsideFile, escaped);
+    await expect(call('produced.readText', { cid, path: escaped }))
+      .resolves.toMatchObject({ ok: false, error: 'path is outside the user workspace' });
+
+    // Replacing a device selection immediately revokes the former root.
+    directories.writeCodingDirectory('reveal-user', cid, workspace, true);
+    await expect(call('workspace.statPath', { cid, path: file })).resolves.toMatchObject({ ok: false });
+    expect(fs.readFileSync(file, 'utf8')).toBe('export const ready = true;');
+    expectNoShellAction();
+  });
+
+  it('does not authorize a directory awaiting confirmation on this device', async () => {
+    const { writeCodingDirectory } = await import('../../../src/main/features/local_agents/project-directory');
+    writeCodingDirectory('reveal-user', 'pending-code-task', path.dirname(outsideFile), true, true);
+    for (const channel of ['workspace.statPath', 'produced.readText', 'produced.writeText', 'workspace.deletePath']) {
+      await expect(call(channel, { cid: 'pending-code-task', path: outsideFile, content: 'replacement' }))
+        .resolves.toMatchObject({ ok: false, error: 'path is outside the user workspace' });
+    }
+    expect(fs.readFileSync(outsideFile, 'utf8')).toBe('original image');
+    expectNoShellAction();
   });
 });

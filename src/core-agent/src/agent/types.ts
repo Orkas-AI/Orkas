@@ -96,20 +96,6 @@ export type AgentRunParams = {
     | AgentRunSteerInput[]
     | undefined
     | Promise<AgentRunSteerInput[] | undefined>;
-  /**
-   * Host-side terminal-response guard. Called when the model produces a final
-   * answer with no tool calls. Return a correction instruction to REJECT that
-   * answer: the runner folds it in as a request control and re-prompts, so the
-   * model repairs the response inside the SAME turn instead of shipping a
-   * broken one to the user. Return null/undefined to accept.
-   *
-   * Runs on every terminal answer but REJECTS at most once per run: a guard
-   * that keeps failing cannot spin the turn, and the second offence ships
-   * (logged) with the user still able to act. Domain rules belong in the host —
-   * the runner owns only the reject-and-re-prompt mechanism, the same shape as
-   * the premature-completion nudge.
-   */
-  terminalTextGuard?: (text: string) => string | null | undefined;
 };
 
 /** Result of a single agent run. */
@@ -146,6 +132,7 @@ export type AgentRunConvergenceSignal =
   | "discovery_stall_nudge"
   | "tool_loop_limit"
   | "repetitive_tool_calls"
+  /** Historical metadata only; current runs do not fingerprint tool failures. */
   | "repeated_tool_failure_nudge"
   | "repeated_tool_failure_block"
   | "no_progress_stop"
@@ -164,6 +151,9 @@ export type AgentRunTermination = {
 } | {
   status: "waiting_input";
   reason: "user_action_required";
+} | {
+  status: "handed_off";
+  reason: "tool_handoff";
 };
 
 /** Metadata about an agent run. */
@@ -186,13 +176,13 @@ export type AgentRunMeta = {
   timings?: AgentRunTimings;
   /** Bounded, low-cardinality runner convergence interventions. */
   convergenceSignals?: AgentRunConvergenceSignal[];
-  /** Present only when the host stopped the run before normal completion. */
+  /** Host stop, input wait, or ownership transfer; not proof of task completion. */
   termination?: AgentRunTermination;
   /** Whether the run was aborted. */
   aborted?: boolean;
   /** Error info if the run failed. */
   error?: {
-    kind: "auth" | "rate_limit" | "context_overflow" | "timeout" | "provider_error";
+    kind: "auth" | "rate_limit" | "context_overflow" | "timeout" | "provider_error" | "storage";
     message: string;
     /** Machine-readable provider/runtime code. Host adapters must map this to
      * a bounded telemetry taxonomy before reporting it externally. */
@@ -232,6 +222,8 @@ export type AgentRunEvent =
       name: string;
       id: string;
       input: unknown;
+      /** Lifecycle announcement for an operation withheld before execution. */
+      skipped?: boolean;
       /** Internal watchdog routing. Omitted means the core-agent runner owns
        * the deadline; "executor" means the tool's bounded child runtime does. */
       executionTimeoutOwner?: "executor";
@@ -242,6 +234,8 @@ export type AgentRunEvent =
       name: string;
       id: string;
       result: string;
+      /** This receipt closes a proposal without entering its executor. */
+      skipped?: boolean;
       displayName?: string;
       persistedOutput?: { path: string; size: number; ref: string };
       isError?: boolean;

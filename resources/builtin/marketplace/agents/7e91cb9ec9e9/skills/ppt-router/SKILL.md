@@ -96,9 +96,9 @@ next_skills: []
 
 Populate `next_skills` progressively:
 
-- `CREATE`: `ppt-planner`, then `ppt-craft`, then `ppt-review` only after validation/render evidence. When a PPTX is a visual or template source, read the shared `office-ppt` Skill and inspect that deck before `ppt-planner` locks its visual interpretation.
-- `EDIT`: shared `office-ppt`, then `ppt-craft`, then `ppt-review` only after validation/render evidence.
-- `REVIEW`: shared `office-ppt`, then `ppt-review` after validation/render evidence; omit craft unless the user later authorizes repair.
+- `CREATE`: `ppt-planner`, then `ppt-craft`, then `ppt-review` before the first output quality review. When a PPTX is a visual or template source, read the shared `office-ppt` Skill and inspect that deck before `ppt-planner` locks its visual interpretation.
+- `EDIT`: shared `office-ppt`, then `ppt-craft`, then `ppt-review` before the first output quality review.
+- `REVIEW`: shared `office-ppt`, then `ppt-review` before the first deck quality review; omit craft unless the user later authorizes repair.
 - `OUTLINE`: `ppt-planner` only.
 
 `next_skills` is execution order, not permission to preload them in one batch.

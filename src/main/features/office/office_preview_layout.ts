@@ -237,6 +237,8 @@ export async function officeFileToPreviewHtml(
 ): Promise<OfficePreviewResult> {
   const resolved = path.resolve(file);
   const buf = knownBuffer || fs.readFileSync(resolved);
+  // Legacy XLS is a data preview; OfficeCLI only renders modern workbooks.
+  if (path.extname(resolved).toLowerCase() === '.xls') return officeBufferToPreviewHtml(kind, title, buf);
 
   let stat: fs.Stats;
   try { stat = fs.statSync(resolved); }

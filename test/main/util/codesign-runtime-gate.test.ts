@@ -33,6 +33,7 @@ async function removeFixtureTree(root: string): Promise<void> {
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-afterpack-'));
+  fs.cpSync(path.join(process.cwd(), 'resources/xls-reader'), path.join(tmpDir, 'resources/xls-reader'), { recursive: true });
 });
 
 afterEach(async () => {
@@ -356,6 +357,7 @@ describe('codesign-adhoc runtime gate', () => {
     expect(marker.verified).toContain('runtime:vc-app-local:win32-x64');
     expect(marker.verified).toContain('runtime:vc-import-closure:win32-x64');
     expect(marker.verified).toContain('resource:embedding-model:fast-bge-small-zh-v1.5');
+    expect(marker.verified).toContain('resource:xls-reader:2.0.2');
     expect(marker.verified).toContain('resource:builtin:manifest-v1');
     expect(marker.verified).toContain('entrypoint:bin/run-skill.cjs');
     expect(marker.verified).toContain('loader:tsx');

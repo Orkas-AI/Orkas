@@ -104,6 +104,23 @@ function makeFakeFfmpegEnv(tmp: string) {
 }
 
 describe('video media skill scripts', () => {
+  it('grounds screen narration in current-model frame evidence without a recognition installation', () => {
+    const reference = fs.readFileSync(path.join(skillDir('stage-edit'), 'references', 'transcript-and-screen-grounded-editing.md'), 'utf8');
+    for (const body of [reference,
+      fs.readFileSync(path.join(skillDir('stage-edit'), 'SKILL.md'), 'utf8'),
+      fs.readFileSync(path.join(skillDir('stage-plan'), 'SKILL.md'), 'utf8'),
+    ]) {
+      expect(body).not.toMatch(/ocr_file|--op ocr|OCR is mandatory|OCR runtime/);
+      expect(body).toContain('extract_frame');
+    }
+    expect(reference).toContain('current model');
+    expect(reference).toContain('extraction time');
+    expect(reference).toContain('not an\n   exact transition boundary');
+    expect(reference).toContain('readable text with timing');
+    expect(reference).toContain('install a local\n   recognition engine');
+    expect(reference).toContain('separate paid vision model');
+  });
+
   it('keeps VideoStudio media logic local to skill scripts', () => {
     const files = [
       path.join(skillDir('stage-edit'), 'scripts', 'analyze_media.js'),
@@ -121,6 +138,7 @@ describe('video media skill scripts', () => {
       /electron-log/,
       /node_modules\/electron/,
       /require\(["']electron["']\)/,
+      /rapidocr|pypdfium2|ocr_runtime|ocrImagesText|ocrImageText/,
     ];
     for (const file of files) {
       const text = fs.readFileSync(file, 'utf8');
@@ -145,8 +163,17 @@ describe('video media skill scripts', () => {
     const out = parseJson(res.stdout);
     expect(out.ok).toBe(true);
     expect(out.ops).not.toContain('transcribe');
+    expect(out.ops).not.toContain('ocr');
     expect(out.ops).toContain('quality');
     expect(out.usage).toContain('speech.transcribe');
+  });
+
+  it('rejects retired OCR commands before loading a backend or touching input', () => {
+    const res = runSkill('stage-edit', 'analyze_media', ['--op', 'ocr', '--input', 'missing.mp4']);
+    expect(res.status).toBe(1);
+    expect(res.stdout).toBe('');
+    expect(parseJson(res.stderr)).toMatchObject({ code: 'E_ARGS' });
+    expect(parseJson(res.stderr).message).toBe('op must be one of: silence, scenes, quality');
   });
 
   it('exposes edit_video through the stage-edit skill runner', () => {
@@ -157,6 +184,44 @@ describe('video media skill scripts', () => {
     expect(out.ops).toContain('trim');
     expect(out.ops).toContain('mix');
     expect(out.ops).toContain('normalize_loudness');
+  });
+
+  it('extracts a real video frame without a Python or uv recognition runtime', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-frame-reading-'));
+    try {
+      const binDir = path.join(pcDir(), 'resources', 'runtime', 'ffmpeg', `${process.platform}-${process.arch}`);
+      const extension = process.platform === 'win32' ? '.exe' : '';
+      const ffmpeg = path.join(binDir, `ffmpeg${extension}`);
+      const input = path.join(tmp, 'source.mp4');
+      const frame = path.join(tmp, 'frame.png');
+      const generated = spawnSync(ffmpeg, [
+        '-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi',
+        '-i', 'color=c=red:s=64x64:r=5:d=2', '-an', '-c:v', 'libx264', input,
+      ], { encoding: 'utf8', timeout: 20_000 });
+      expect(generated.status, generated.stderr || String(generated.error || '')).toBe(0);
+      expect(generated.stderr).toBe('');
+      const res = runSkill('stage-edit', 'edit_video', [
+        '--op', 'extract_frame', '--input', input, '--start', '1', '--output', frame,
+      ], {
+        ORKAS_BUNDLED_FFMPEG: ffmpeg,
+        ORKAS_BUNDLED_FFPROBE: path.join(binDir, `ffprobe${extension}`),
+        ORKAS_PYTHON: path.join(tmp, 'missing-python'),
+        ORKAS_UV: path.join(tmp, 'missing-uv'),
+      });
+      expect(res.status, res.stderr).toBe(0);
+      expect(parseJson(res.stdout)).toMatchObject({ ok: true, op: 'extract_frame' });
+      const progress = res.stderr.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+      for (const item of progress) expect(item).toMatchObject({ type: 'progress', source: 'video_edit' });
+      const { Jimp } = await import('jimp');
+      const image = await Jimp.read(frame);
+      expect([image.width, image.height]).toEqual([64, 64]);
+      const rgba = image.getPixelColor(32, 32);
+      expect((rgba >>> 24) & 255).toBeGreaterThan(240);
+      expect((rgba >>> 16) & 255).toBeLessThan(10);
+      expect((rgba >>> 8) & 255).toBeLessThan(10);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   it('keeps edit_video stdout parseable while streaming progress JSONL on stderr', () => {

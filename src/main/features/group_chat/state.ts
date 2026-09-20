@@ -651,6 +651,27 @@ export async function setStatus(uid: string, cid: string, status: GroupStatus): 
   });
 }
 
+/** Recheck both state owners under the existing writer lock. A status query
+ * may have read `running` before normal finalization or a user cancellation;
+ * it must not overwrite either, or a newly admitted turn, from that snapshot. */
+export async function recoverOrphanRunningState(
+  uid: string, cid: string, isRuntimeIdle: () => boolean,
+): Promise<{ recovered: boolean; state: StateFile }> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    if ((s.status !== 'running' && !s.in_flight.some(Boolean)) || !isRuntimeIdle()) {
+      return { recovered: false, state: s };
+    }
+    const current = s.status;
+    // Cancellation is sticky even if an orphan roster also needs clearing.
+    s.status = current === 'aborted' ? 'aborted' : 'idle';
+    s.in_flight = [];
+    s.last_active_at = nowIso();
+    await _writeStatusTransition(uid, cid, current, s.status, s);
+    return { recovered: true, state: s };
+  });
+}
+
 /** Atomic read-decide-write status transition. The `decide` callback runs
  *  with the lock held and the current status passed in; return the new
  *  status or `null` to leave it unchanged. Callers needing "set X only if

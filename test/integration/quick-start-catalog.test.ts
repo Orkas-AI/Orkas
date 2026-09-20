@@ -41,7 +41,7 @@ describe("Commander quick-start cross-layer catalog", () => {
   });
 
   it("ships a non-empty localized product prompt for every supported UI language", () => {
-    for (const language of ["en", "zh", "ja", "pt"]) {
+    for (const language of ["en", "zh", "ja", "pt", "es", "fr", "ko", "de", "ru", "it"]) {
       const messages = locale(language);
       for (const item of COMMANDER_QUICK_START_CASES) {
         expect(messages[item.localeKey]?.trim().length, `${language}/${item.key}`).toBeGreaterThan(10);

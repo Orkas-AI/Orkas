@@ -1,0 +1,619 @@
+{
+  "sdkVersion": 1,
+  "methods": [
+    {
+      "name": "capabilities.list",
+      "capability": null,
+      "description": "Discover supported methods, current availability and authorization requirements.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{sdkVersion, methods, unsupported}",
+      "example": {}
+    },
+    {
+      "name": "capabilities.describe",
+      "capability": null,
+      "description": "Read one method schema, result contract and example.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "method": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "required": [
+          "method"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "Method documentation.",
+      "example": {
+        "method": "ai.generate"
+      }
+    },
+    {
+      "name": "host.getContext",
+      "capability": null,
+      "description": "Read the current application language and SDK version.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{language, sdkVersion}",
+      "example": {}
+    },
+    {
+      "name": "permissions.revoke",
+      "capability": null,
+      "description": "Revoke this instance grants and cancel pending work. Reopening starts fresh.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{revoked:true}",
+      "example": {}
+    },
+    {
+      "name": "storage.get",
+      "capability": "storage",
+      "description": "Read app-private JSON; scope defaults to local for compatibility. cloud participates in account sync.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "local",
+              "cloud"
+            ],
+            "default": "local"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{value}; null when missing.",
+      "example": {
+        "key": "draft"
+      }
+    },
+    {
+      "name": "storage.set",
+      "capability": "storage",
+      "description": "Atomically save an app-private JSON value; total store limit 1 MiB.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "local",
+              "cloud"
+            ],
+            "default": "local"
+          },
+          "value": {}
+        },
+        "required": [
+          "key",
+          "value"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{saved:true}",
+      "example": {
+        "key": "draft",
+        "value": "Hello"
+      }
+    },
+    {
+      "name": "storage.remove",
+      "capability": "storage",
+      "description": "Remove one app-private value.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "local",
+              "cloud"
+            ],
+            "default": "local"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{removed:true}",
+      "example": {
+        "key": "draft"
+      }
+    },
+    {
+      "name": "storage.keys",
+      "capability": "storage",
+      "description": "List up to 256 keys in the selected app store.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "scope": {
+            "type": "string",
+            "enum": [
+              "local",
+              "cloud"
+            ],
+            "default": "local"
+          }
+        },
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{keys:string[]}",
+      "example": {}
+    },
+    {
+      "name": "appFiles.list",
+      "capability": "appFiles",
+      "description": "List sandbox files recursively. cloud (default) syncs with the account; local is for caches. At most 256 files and 16 MiB per scope.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "scope": {
+            "type": "string",
+            "enum": [
+              "local",
+              "cloud"
+            ],
+            "default": "cloud"
+          }
+        },
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{files:[{path,size}]}",
+      "example": {
+        "scope": "cloud"
+      }
+    },
+    {
+      "name": "appFiles.readText",
+      "capability": "appFiles",
+      "description": "Read a sandbox UTF-8 file up to 512 KiB; missing files return null.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240,
+            "description": "Relative path, at most 8 segments. No atomic temporary filenames, hidden/traversal segments, backslashes, Windows reserved names, trailing dots/spaces, visibility, Thumbs.db or desktop.ini."
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "local",
+              "cloud"
+            ],
+            "default": "cloud"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{text} or null.",
+      "example": {
+        "path": "notes/today.txt"
+      }
+    },
+    {
+      "name": "appFiles.readBase64",
+      "capability": "appFiles",
+      "description": "Read a sandbox binary file up to 512 KiB; missing files return null.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240,
+            "description": "Relative path, at most 8 segments. No atomic temporary filenames, hidden/traversal segments, backslashes, Windows reserved names, trailing dots/spaces, visibility, Thumbs.db or desktop.ini."
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "local",
+              "cloud"
+            ],
+            "default": "cloud"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{base64} or null.",
+      "example": {
+        "path": "images/icon.png"
+      }
+    },
+    {
+      "name": "appFiles.writeText",
+      "capability": "appFiles",
+      "description": "Atomically replace an app-owned UTF-8 file (512 KiB). Creates parent directories. Saved means local persistence, not completed upload.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240,
+            "description": "Relative path, at most 8 segments. No atomic temporary filenames, hidden/traversal segments, backslashes, Windows reserved names, trailing dots/spaces, visibility, Thumbs.db or desktop.ini."
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "local",
+              "cloud"
+            ],
+            "default": "cloud"
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 524288
+          }
+        },
+        "required": [
+          "path",
+          "text"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{saved:true}",
+      "example": {
+        "path": "notes/today.txt",
+        "text": "Hello"
+      }
+    },
+    {
+      "name": "appFiles.writeBase64",
+      "capability": "appFiles",
+      "description": "Atomically replace an app-owned binary file (512 KiB). Requires canonical base64.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240,
+            "description": "Relative path, at most 8 segments. No atomic temporary filenames, hidden/traversal segments, backslashes, Windows reserved names, trailing dots/spaces, visibility, Thumbs.db or desktop.ini."
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "local",
+              "cloud"
+            ],
+            "default": "cloud"
+          },
+          "base64": {
+            "type": "string",
+            "maxLength": 700000
+          }
+        },
+        "required": [
+          "path",
+          "base64"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{saved:true}",
+      "example": {
+        "path": "images/icon.bin",
+        "base64": "AAE="
+      }
+    },
+    {
+      "name": "appFiles.remove",
+      "capability": "appFiles",
+      "description": "Remove one sandbox file; missing files are a successful no-op. Directories are not recursively deleted.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240,
+            "description": "Relative path, at most 8 segments. No atomic temporary filenames, hidden/traversal segments, backslashes, Windows reserved names, trailing dots/spaces, visibility, Thumbs.db or desktop.ini."
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "local",
+              "cloud"
+            ],
+            "default": "cloud"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{removed:true}",
+      "example": {
+        "path": "notes/today.txt"
+      }
+    },
+    {
+      "name": "files.pick",
+      "capability": "files",
+      "description": "Choose a local file using the host dialog; grants read access only.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{handle,name,size} or null on cancellation.",
+      "example": {}
+    },
+    {
+      "name": "files.readText",
+      "capability": "files",
+      "description": "Read a selected UTF-8 file, at most 512 KiB.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "handle": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{32}$"
+          }
+        },
+        "required": [
+          "handle"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{text}",
+      "example": {
+        "handle": "0123456789abcdef0123456789abcdef"
+      }
+    },
+    {
+      "name": "files.readBase64",
+      "capability": "files",
+      "description": "Read a selected file as base64, at most 512 KiB.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "handle": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{32}$"
+          }
+        },
+        "required": [
+          "handle"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{base64}",
+      "example": {
+        "handle": "0123456789abcdef0123456789abcdef"
+      }
+    },
+    {
+      "name": "files.saveAs",
+      "capability": "files",
+      "description": "Export UTF-8 text using the host Save dialog. Create-only: choose a new destination; existing files are not overwritten.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120,
+            "pattern": "^[^/\\\\\\x00-\\x1f]+$"
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 524288
+          }
+        },
+        "required": [
+          "name",
+          "text"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{saved:true,name} or null on cancellation.",
+      "example": {
+        "name": "summary.txt",
+        "text": "Summary"
+      }
+    },
+    {
+      "name": "files.release",
+      "capability": "files",
+      "description": "Release a file handle before closing the app.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "handle": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{32}$"
+          }
+        },
+        "required": [
+          "handle"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{released:true}",
+      "example": {
+        "handle": "0123456789abcdef0123456789abcdef"
+      }
+    },
+    {
+      "name": "ai.generate",
+      "capability": "ai",
+      "description": "Generate text with the configured model without tools, skills or conversation history. Optional progress receives text deltas. Uses the configured model without an extra application permission dialog.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32000
+          },
+          "maxTokens": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4096,
+            "default": 1024
+          }
+        },
+        "required": [
+          "prompt"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{text,usage,stopReason}; token-limited output has stopReason=max_tokens. Cancel with AbortSignal.",
+      "example": {
+        "prompt": "Write a short greeting.",
+        "maxTokens": 128
+      }
+    },
+    {
+      "name": "tools.list",
+      "capability": null,
+      "description": "Discover eligible existing Orkas tools and their original schemas. Does not grant execution.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{tools:[{name,capability,description,inputSchema}]}",
+      "example": {}
+    },
+    {
+      "name": "tools.call",
+      "capability": null,
+      "description": "Execute an eligible existing tool under its original operation permissions. Sensitive actions use host approval; Trusted mode skips confirmation. Unknown tools fail closed.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "arguments": {
+            "type": "object",
+            "additionalProperties": {}
+          }
+        },
+        "required": [
+          "name",
+          "arguments"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{content,isError?}; inspect isError. Oversized results fail without replay.",
+      "example": {
+        "name": "library",
+        "arguments": {
+          "action": "list",
+          "scope": "global",
+          "limit": 10
+        }
+      }
+    }
+  ],
+  "unsupported": [
+    {
+      "capability": "files.writeInPlace",
+      "reason": "Deferred: needs shared revision/lock/indexer integration; export through files.saveAs."
+    },
+    {
+      "capability": "projects",
+      "reason": "Deferred: apps have no user-selected project binding; source conversation is not authority."
+    },
+    {
+      "capability": "memory",
+      "reason": "Deferred: needs a user-selected scope; Agent-private and global memories are not app state."
+    },
+    {
+      "capability": "history",
+      "reason": "Deferred: needs an explicit conversation grant and bounded history projection."
+    },
+    {
+      "capability": "agents.tasks",
+      "reason": "Deferred: needs a host-owned task lifetime, permissions and billing association."
+    },
+    {
+      "capability": "skills",
+      "reason": "Host-only: Skill script execution needs an explicitly scoped application sandbox and execution contract."
+    },
+    {
+      "capability": "shell",
+      "reason": "Host-only: arbitrary execution would escape the application capability boundary."
+    },
+    {
+      "capability": "media.generate",
+      "reason": "Deferred: owning studio plan, output and spending gates must be adapted first."
+    },
+    {
+      "capability": "network",
+      "reason": "Deferred: private app data must not reach arbitrary remote endpoints; bundled resources only."
+    }
+  ]
+}

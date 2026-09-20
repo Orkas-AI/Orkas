@@ -111,16 +111,16 @@ describe('reflection-transcript › estimateTokens', () => {
     expect(mod.estimateTokens('hello world')).toBe(3);
   });
 
-  it('uses ~0.7 token/char for CJK text', async () => {
+  it('uses the conservative 1.5 token/char capacity unit', async () => {
     const mod = await loadModule();
-    // "你好世界" 4 chars * 0.7 = 2.8 → 3
-    expect(mod.estimateTokens('你好世界')).toBe(3);
+    // Four CJK characters consume six estimated capacity tokens.
+    expect(mod.estimateTokens('你好世界')).toBe(6);
   });
 
   it('handles mixed Chinese / English correctly', async () => {
     const mod = await loadModule();
-    // "hello 世界" = 6 ASCII chars / 4 + 2 CJK * 0.7 = 1.5 + 1.4 = 2.9 → 3
-    expect(mod.estimateTokens('hello 世界')).toBe(3);
+    // Six ASCII characters / 4 + two CJK characters * 1.5 = 4.5 → 5.
+    expect(mod.estimateTokens('hello 世界')).toBe(5);
   });
 
   it('returns 0 for empty string', async () => {
@@ -136,14 +136,11 @@ describe('reflection-transcript › estimateTokens', () => {
     expect(mod.estimateTokens('。、「」')).toBe(mod.estimateTokens('你好世界'));
   });
 
-  it('stays below the conservative context-budget estimate for the same text', async () => {
+  it('uses the same unit as the context budget', async () => {
     const mod = await loadModule();
     const { estimateToolResultTokens } = await import('../../../src/main/util/tool-result-cap');
     const chinese = '这是一段用于反思的中文记录。';
-    // Two weights on one classifier, by design: the context budget guesses
-    // high because guessing low ends a run, while the transcript cap wants
-    // accuracy because guessing high halves the reflection evidence.
-    expect(mod.estimateTokens(chinese)).toBeLessThan(estimateToolResultTokens(chinese));
+    expect(mod.estimateTokens(chinese)).toBe(estimateToolResultTokens(chinese));
   });
 });
 
@@ -221,15 +218,14 @@ describe('reflection-transcript › extractAgentEntries', () => {
     expect(entries[0].text).toBe('the actual reply');
   });
 
-  it('truncates agent reply to MAX_AGENT_REPLY_CHARS', async () => {
+  it('preserves complete agent replies beyond 800 characters', async () => {
     const mod = await loadModule();
     const long = 'X'.repeat(2000);
     const entries = mod._internals.extractAgentEntries([
       { role: 'assistant', ts: 100, content: [{ type: 'text', text: long }] },
     ]);
     expect(entries.length).toBe(1);
-    expect(entries[0].text.length).toBeLessThanOrEqual(mod.MAX_AGENT_REPLY_CHARS + 20);
-    expect(entries[0].text).toContain('truncated');
+    expect(entries[0].text).toBe(long);
   });
 
   it('skips messages with only tool_use / thinking (no text)', async () => {
@@ -504,5 +500,133 @@ describe('reflection-transcript › listAgentGmemberFiles', () => {
   it('returns empty for empty agentId (defensive)', async () => {
     const mod = await loadModule();
     expect(mod.listAgentGmemberFiles(TEST_UID, '')).toEqual([]);
+  });
+});
+
+
+describe('reflection evidence budget and complete conversation', () => {
+  const section = (id: string, created: number, messages: Array<[number, string]>) => ({
+    conv: { conversation_id: id, title: id, created_at: new Date(created).toISOString() } as any,
+    entries: messages.map(([ts, text]) => ({ ts, text, kind: 'user' as const })),
+  });
+
+  it('removes oldest messages from the oldest task, even if its last activity is newest', async () => {
+    const { _internals, estimateTokens } = await loadModule();
+    const result = _internals.fitTranscript([
+      section('new-task', 200, [[210, 'new task message']]),
+      section('old-task', 100, [[110, 'FIRST ' + 'x'.repeat(1000)], [900, 'old task latest message']]),
+    ], 2, 'agent-x', 0, 180);
+    expect(result.text).not.toContain('FIRST');
+    expect(result.text).toContain('old task latest message');
+    expect(result.text).toContain('new task message');
+    expect(result.text.indexOf('old task latest')).toBeLessThan(result.text.indexOf('new task message'));
+    expect(result.text).toContain('Earlier messages omitted');
+    expect(estimateTokens(result.text)).toBeLessThanOrEqual(180);
+    expect(result.stats.convsIncluded).toBe(2);
+  });
+
+  it('continues to the next task only after exhausting messages in the oldest task', async () => {
+    const { _internals } = await loadModule();
+    const result = _internals.fitTranscript([
+      section('old', 100, [[101, 'old ' + 'x'.repeat(1000)], [102, 'old tail ' + 'x'.repeat(1000)]]),
+      section('new', 200, [[201, 'new first ' + 'x'.repeat(1000)], [202, 'new tail']]),
+    ], 2, '_default', 0, 150);
+    expect(result.text).not.toContain('old tail');
+    expect(result.text).not.toContain('new first');
+    expect(result.text).toContain('new tail');
+    expect(result.stats.convsIncluded).toBe(1);
+  });
+
+  it('preserves a whole answer even when its question was removed; no protected first interaction', async () => {
+    const { _internals } = await loadModule();
+    const task = section('task', 100, [[101, 'question ' + 'x'.repeat(2000)], [102, 'answer']]);
+    task.entries[1].kind = 'agent' as any;
+    const result = _internals.fitTranscript([task], 1, '_default', 0, 160);
+    expect(result.text).not.toContain('question');
+    expect(result.text).toContain('answer');
+  });
+
+  it.each([0, 100, Number.NaN])('does not emit an oversized last message with budget %s', async (budget) => {
+    const { _internals } = await loadModule();
+    const result = _internals.fitTranscript([section('task', 100, [[101, 'x'.repeat(10000)]])], 1, '_default', 0, budget);
+    expect(result.text).toBe('');
+    expect(result.capacityExceeded).toBe(true);
+    expect(result.stats.convsConsidered).toBe(1);
+  });
+
+  it('enforces the fixed 150K ceiling across all tasks, including CJK and annotation costs', async () => {
+    const { _internals, estimateTokens } = await loadModule();
+    const sections = Array.from({ length: 5 }, (_, i) => section(`task-${i}`, 100 + i,
+      [[200 + i * 2, `FIRST-${i} ` + '中'.repeat(21000)], [201 + i * 2, `LAST-${i} ` + 'x'.repeat(12000)]]));
+    const result = _internals.fitTranscript(sections, 5, '_default', 0, 999999);
+    expect(result.text).not.toContain('FIRST-0');
+    expect(result.text).toContain('LAST-0');
+    expect(result.text).toContain('FIRST-1');
+    expect(result.text).toContain('LAST-4');
+    expect(estimateTokens(result.text)).toBeLessThanOrEqual(150000);
+    expect(result.stats.convsIncluded).toBe(5);
+  });
+
+  it('keeps every complete message and omits no content when exactly within budget', async () => {
+    const { _internals, estimateTokens } = await loadModule();
+    const make = () => [section('task', 100, [[101, 'full answer ' + 'x'.repeat(4000)]])];
+    const first = _internals.fitTranscript(make(), 1, '_default', 0, 10000);
+    const exact = _internals.fitTranscript(make(), 1, '_default', 0, estimateTokens(first.text));
+    expect(exact.text).toBe(first.text);
+    expect(exact.text).not.toContain('omitted');
+  });
+
+  it('includes all legacy actors and pre-window messages without truncating their replies', async () => {
+    const { sessionId, gmemberSessionId } = writeConv(TEST_UID, { cid: 'legacy-all', agentId: 'agent-x' });
+    writeSessionJsonl(TEST_UID, sessionId, [userMsg('initial requirement', 100), agentMsg('commander reply', 200)]);
+    writeSessionJsonl(TEST_UID, gmemberSessionId, [agentMsg('agent x reply', 400)]);
+    writeSessionJsonl(TEST_UID, 'gmember-legacy-all-agent-y', [agentMsg('Y'.repeat(2000), 300)]);
+    const result = await (await loadModule()).buildTranscript(TEST_UID, 'agent-x', 350);
+    expect(result.text).toContain('initial requirement');
+    expect(result.text).toContain('commander reply');
+    expect(result.text).toContain('agent-y]');
+    expect(result.text).toContain('Y'.repeat(2000));
+    expect(result.text).toContain('agent x reply');
+  });
+
+  it('does not revive deleted canonical dialogue from an old member session', async () => {
+    const { gmemberSessionId } = writeConv(TEST_UID, { cid: 'deleted', agentId: 'agent-x' });
+    writeSessionJsonl(TEST_UID, gmemberSessionId, [agentMsg('MUST STAY DELETED', 300)]);
+    const { conversationMessageReadFile } = await import('../../../src/main/util/project-layout');
+    const file = conversationMessageReadFile(TEST_UID, 'deleted');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ id: 'gone', ts: new Date(300).toISOString(), from: 'agent-x', to: ['user'],
+      text: '', deleted_at: new Date(400).toISOString() }) + '\n');
+    const result = await (await loadModule()).buildTranscript(TEST_UID, 'agent-x', 200);
+    expect(result.text).toBe('');
+    expect(result.capacityExceeded).toBeUndefined();
+  });
+
+  it('reads full canonical dialogue before the activity window, including every actor, without private process', async () => {
+    const { gmemberSessionId } = writeConv(TEST_UID, { cid: 'full', agentId: 'agent-x' });
+    writeSessionJsonl(TEST_UID, gmemberSessionId, [agentMsg('STALE PRIVATE COPY', 300)]);
+    const { conversationMessageReadFile } = await import('../../../src/main/util/project-layout');
+    const file = conversationMessageReadFile(TEST_UID, 'full');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const records = [
+      { id: 'a', ts: new Date(100).toISOString(), from: 'user', to: ['commander'], text: 'original request' },
+      { id: 'b', ts: new Date(200).toISOString(), from: 'agent-y', to: ['user'], text: 'other agent ' + 'Y'.repeat(2000),
+        process: [{ type: 'event', event: { stream: 'thinking', data: { text: 'PRIVATE THOUGHT' } } }] },
+      { id: 'c', ts: new Date(300).toISOString(), from: 'agent-x', to: ['user'], text: 'current reply' },
+      { id: 'd', ts: new Date(400).toISOString(), from: 'user', to: ['commander'], text: 'DELETED', deleted_at: new Date().toISOString() },
+    ];
+    fs.writeFileSync(file, records.map((row) => JSON.stringify(row)).join('\n') + '\n');
+    const mod = await loadModule();
+    const result = await mod.buildTranscript(TEST_UID, 'agent-x', 250);
+    expect(result.text).toContain('original request');
+    expect(result.text).toContain('agent-y]');
+    expect(result.text).toContain('Y'.repeat(2000));
+    expect(result.text).toContain('agent-x]');
+    expect(result.text).not.toMatch(/PRIVATE|DELETED/);
+    expect(fs.readFileSync(file, 'utf8')).toContain('DELETED');
+    const trimmed = await mod.buildTranscript(TEST_UID, 'agent-x', 250, 180);
+    expect(trimmed.text).not.toContain('original request');
+    expect(trimmed.text).not.toContain('other agent');
+    expect(trimmed.text).toContain('current reply');
   });
 });

@@ -172,14 +172,16 @@ describe('conversation failed assistant retry actions', () => {
     await Promise.all([first, second]);
   });
 
-  it('classifies localized model-call failure text as retryable failure content', () => {
+  it('does not infer retryable failure from prose and preserves legacy host markup', () => {
     const isFailed = loadFailedClassifier();
 
-    expect(isFailed('⚠️ 模型调用失败：503 系统繁忙，请稍后重试')).toBe(true);
-    expect(isFailed('Model call failed: 503 service unavailable')).toBe(true);
-    expect(isFailed('Model response failed: aborted')).toBe(true);
+    expect(isFailed('⚠️ 模型调用失败：503 系统繁忙，请稍后重试')).toBe(false);
+    expect(isFailed('Model call failed: 503 service unavailable')).toBe(false);
+    expect(isFailed('Model response failed: aborted')).toBe(false);
     expect(isFailed('<span style="color:var(--danger)">⚠️ 模型调用失败：503</span>')).toBe(true);
     expect(isFailed('普通回复，没有失败状态')).toBe(false);
+    expect(isFailed('Explain what Model call failed means.', { failed: false })).toBe(false);
+    expect(isFailed('A normal response', { failed: true })).toBe(true);
   });
 
   it('classifies persisted stop and startup-recovery records without matching ordinary prose', () => {
@@ -212,7 +214,6 @@ describe('conversation failed assistant retry actions', () => {
     );
     expect(styleSource).toContain('.chat-message:hover .chat-bubble-actions');
     expect(styleSource).toContain('.chat-message:focus-within .chat-bubble-actions');
-    expect(styleSource).toContain('.chat-bubble-actions:has(.bubble-more-btn[aria-expanded="true"])');
     expect(styleSource).toMatch(
       /\.chat-message:hover \.chat-bubble-actions,[^{]+\{[^}]*opacity:\s*1;[^}]*pointer-events:\s*auto;/s,
     );
@@ -238,7 +239,8 @@ describe('conversation failed assistant retry actions', () => {
     expect(failedActionsBody).toContain('retry: true');
     expect(failedActionsBody).not.toContain('report: true');
     expect(source).toContain("const mode = compact\n    ? 'failure-only'\n    : includeRetry");
-    expect(source).toContain('class="chat-bubble-more-wrap"');
+    expect(source).not.toContain('class="chat-bubble-more-wrap"');
+    expect(source).toContain('class="bubble-action-btn bubble-copy-btn"');
     expect(source).toContain('_attachBubbleRetryBtn(directActions, msgDiv)');
 
     const interruptedActionsBody = extractFunction('_attachInterruptedAssistantActions');

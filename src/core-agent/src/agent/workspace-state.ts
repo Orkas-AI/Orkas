@@ -272,71 +272,115 @@ export function reconcileWorkspaceObservations(
 }
 
 export type WorkspaceReadRepetition = {
-  /** File reads recorded after the boundary. */
   readsAfter: number;
-  /** Of those, reads of a path that had already been read before it. */
+  /** Reads of a path present in the retained pre-boundary observations. */
   repeatedPaths: number;
-  /** Of those, reads whose content hash also matches the earlier read — the
-   *  file had not changed, so the re-read recovered nothing new. */
+  /** Non-empty source range fully covered in the same version; not a waste verdict. */
   repeatedIdenticalContent: number;
+  repeatedPartialContent: number;
+  newRangeReads: number;
+  unknownRangeReads: number;
+  emptyReads: number;
 };
 
-/**
- * How much of what was read after a boundary had already been read before it.
- *
- * Compaction trades context size against re-reading: whatever the checkpoint
- * fails to carry, the model fetches again. That trade is measurable rather than
- * arguable, and this is the measurement — the thresholds and ceilings in
- * `context-budget.ts` were chosen conservatively and are meant to be calibrated
- * against it rather than by argument.
- *
- * `repeatedIdenticalContent` is the sharper number: the same path AND the same
- * content hash means the second read returned exactly what the first one did.
- *
- * Bounded by the observation history that survives (`WORKSPACE_COMPACTED_MAX_READS`
- * entries), so on a very long run this under-counts rather than over-counts.
- */
+type ReadRange = { unit: "chars" | "lines"; start: number; end: number };
+type ReadCoverage = { chars: Array<[number, number]>; lines: Array<[number, number]>; unknown: boolean };
+
+function observedReadRange(read: FileReadObservation): ReadRange | undefined {
+  // Character offsets are half-open and more precise than line labels on a
+  // partial-line excerpt. Never fall back to those labels when offsets exist.
+  const unit = read.charRange ? "chars" : "lines";
+  const range = read.charRange ?? read.lineRange;
+  if (!range || range.length !== 2 || !range.every(Number.isSafeInteger)) return undefined;
+  const [start, last] = range;
+  if (start < (unit === "chars" ? 0 : 1) || last < start) return undefined;
+  const end = unit === "chars" ? last : last + 1;
+  return Number.isSafeInteger(end) ? { unit, start, end } : undefined;
+}
+
+function mergeReadRanges(ranges: Array<[number, number]>): Array<[number, number]> {
+  const merged: Array<[number, number]> = [];
+  for (const [start, end] of ranges.sort((a, b) => a[0] - b[0])) {
+    const last = merged.at(-1);
+    if (last && start <= last[1]) last[1] = Math.max(last[1], end);
+    else merged.push([start, end]);
+  }
+  return merged;
+}
+
+/** Compare source coverage in retained observations, not model usefulness or
+ * monetary waste. Older evicted reads are unavailable. Missing versions/ranges
+ * and incomparable coordinates remain unknown rather than identical.
+ * Index/merge once, then binary-search each read: O(n log n), bounded by the
+ * observation ledger, with no file I/O or source content in diagnostics. */
 export function workspaceReadRepetition(
   state: WorkspaceObservationState | undefined,
   boundarySequence: number,
 ): WorkspaceReadRepetition {
-  const empty: WorkspaceReadRepetition = {
-    readsAfter: 0,
-    repeatedPaths: 0,
-    repeatedIdenticalContent: 0,
+  const result: WorkspaceReadRepetition = {
+    readsAfter: 0, repeatedPaths: 0, repeatedIdenticalContent: 0,
+    repeatedPartialContent: 0, newRangeReads: 0, unknownRangeReads: 0, emptyReads: 0,
   };
-  if (!state) return empty;
-
-  const before = new Map<string, Set<string>>();
+  if (!state) return result;
+  const before = new Map<string, { versions: Map<string, ReadCoverage>; unknownVersion: boolean }>();
   const after: FileReadObservation[] = [];
   const consider = (sequence: number, read: FileReadObservation): void => {
     if (!read?.path) return;
-    // `boundarySequence` is the cursor value taken at the compaction point,
-    // i.e. the next sequence to be assigned — so anything below it happened
-    // before, and the cursor value itself belongs to the first read after.
-    if (sequence < boundarySequence) {
-      const hashes = before.get(read.path) ?? new Set<string>();
-      if (read.hash) hashes.add(read.hash);
-      before.set(read.path, hashes);
+    if (sequence >= boundarySequence) {
+      after.push(read);
       return;
     }
-    after.push(read);
+    let file = before.get(read.path);
+    if (!file) {
+      file = { versions: new Map(), unknownVersion: false };
+      before.set(read.path, file);
+    }
+    if (!read.hash) { file.unknownVersion = true; return; }
+    let coverage = file.versions.get(read.hash);
+    if (!coverage) {
+      coverage = { chars: [], lines: [], unknown: false };
+      file.versions.set(read.hash, coverage);
+    }
+    const range = observedReadRange(read);
+    if (!range) coverage.unknown = true;
+    else if (range.end > range.start) coverage[range.unit].push([range.start, range.end]);
   };
-
   for (const item of state.compacted?.latestReads ?? []) consider(item.sequence, item.read);
   for (const entry of state.entries) {
     for (const read of entry.fileReads ?? []) consider(entry.sequence, read);
   }
-
-  let repeatedPaths = 0;
-  let repeatedIdenticalContent = 0;
-  for (const read of after) {
-    const hashes = before.get(read.path);
-    if (!hashes) continue;
-    repeatedPaths++;
-    if (read.hash && hashes.has(read.hash)) repeatedIdenticalContent++;
+  for (const file of before.values()) for (const coverage of file.versions.values()) {
+    coverage.chars = mergeReadRanges(coverage.chars);
+    coverage.lines = mergeReadRanges(coverage.lines);
   }
-  return { readsAfter: after.length, repeatedPaths, repeatedIdenticalContent };
+  result.readsAfter = after.length;
+  for (const read of after) {
+    const file = before.get(read.path);
+    if (file) result.repeatedPaths++;
+    const range = observedReadRange(read);
+    if (!range) { result.unknownRangeReads++; continue; }
+    if (range.end === range.start) { result.emptyReads++; continue; }
+    if (!read.hash) { result.unknownRangeReads++; continue; }
+    if (!file) { result.newRangeReads++; continue; }
+    const coverage = file.versions.get(read.hash);
+    if (!coverage) { result.unknownRangeReads++; continue; }
+    const ranges = coverage[range.unit];
+    let lo = 0;
+    let hi = ranges.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (ranges[mid][0] <= range.start) lo = mid + 1;
+      else hi = mid;
+    }
+    const prior = ranges[lo - 1];
+    if (prior && prior[1] >= range.end) { result.repeatedIdenticalContent++; continue; }
+    if (file.unknownVersion || coverage.unknown || coverage[range.unit === "chars" ? "lines" : "chars"].length) {
+      result.unknownRangeReads++;
+    } else if ((prior && prior[1] > range.start) || (ranges[lo] && ranges[lo][0] < range.end)) {
+      result.repeatedPartialContent++;
+    } else result.newRangeReads++;
+  }
+  return result;
 }
 
 export function projectWorkspaceContext(

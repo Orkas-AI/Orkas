@@ -14,7 +14,9 @@ import * as path from 'node:path';
 
 const h = vi.hoisted(() => ({
   makeStream: null as null | (() => AsyncGenerator),
+  buildError: null as Error | null,
   lastBuildRunnerParams: null as null | Record<string, unknown>,
+  lastRunStreamParams: null as null | Record<string, unknown>,
   runStreamCalls: 0,
   sessionStoreCalls: [] as string[],
   logEntries: [] as Array<{ level: string; message: string; data?: Record<string, unknown> }>,
@@ -38,7 +40,9 @@ vi.mock('electron', () => ({
 // The runner's "provider stream" is whatever the current test installs in
 // `h.makeStream` — read at runStream() call time, so no module reset is needed.
 vi.mock('../../../../src/main/model/core-agent/runner', () => ({
-  buildRunner: async (params: Record<string, unknown>) => ({
+  buildRunner: async (params: Record<string, unknown>) => {
+    if (h.buildError) throw h.buildError;
+    return ({
     runner: { runStream: (runParams: Record<string, unknown>) => {
       h.runStreamCalls += 1;
       h.lastBuildRunnerParams = params;
@@ -63,7 +67,7 @@ vi.mock('../../../../src/main/model/core-agent/runner', () => ({
     }),
     skillDisplayNameById: new Map(),
     agentDisplayNameById: new Map(),
-  }),
+  }); },
 }));
 
 vi.mock('../../../../src/main/model/core-agent/session-store', () => ({
@@ -111,12 +115,12 @@ beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-client-stall-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
+  h.buildError = null;
   h.runStreamCalls = 0;
   h.sessionStoreCalls = [];
   h.lastRunStreamParams = null;
   h.logEntries = [];
 });
-
 afterEach(() => {
   vi.clearAllTimers();
   vi.useRealTimers();
@@ -151,6 +155,215 @@ async function drain(opts: Record<string, unknown>): Promise<{ events: DrainedEv
 }
 
 describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
+  it('does not charge the provider usage again when the enclosing run finishes', async () => {
+    const meter = await import('../../../../src/main/util/conversation-cost-meter');
+    const cid = 'client-budget-count-once';
+    meter.resetTaskTokens(cid);
+    h.makeStream = async function* () {
+      meter.recordUsageTokens(cid, { inputTokens: 1, outputTokens: 1 });
+      yield completedEvent('done');
+    };
+    try {
+      const { events } = await drain({ cid });
+      expect(events.find(event => event.type === 'final')).toMatchObject({ text: 'done' });
+      expect(meter.taskTokens(cid)).toBe(2);
+    } finally { meter.resetTaskTokens(cid); }
+  });
+
+  it('localizes a directly thrown task backstop without suggesting a model retry', async () => {
+    h.makeStream = async function* () { throw Object.assign(new Error('Task token limit reached'), { code: 'TASK_TOKEN_LIMIT_REACHED' }); };
+    const { t } = await import('../../../../src/main/i18n');
+    const { events } = await drain({});
+    expect(events.find(event => event.type === 'error')).toMatchObject({
+      text: t('chat.cost_limit_reached'), failureKind: 'model', failureCode: 'task_token_limit_reached', retryExhausted: true,
+    });
+    expect(h.runStreamCalls).toBe(1);
+    expect(events.filter(event => event.type === 'done')).toHaveLength(1);
+    expect(h.logEntries.filter(entry => entry.level === 'error').map(entry => entry.message)).toEqual(['model turn stream error']);
+  });
+
+  it('surfaces a failed save during resume preflight without invoking a model', async () => {
+    h.buildError = Object.assign(new Error('private storage path'), { code: 'SESSION_PERSISTENCE_FAILED' });
+    const { t } = await import('../../../../src/main/i18n');
+    const result = await drain({ sessionId: 'gconv-save-recovery' });
+    expect(h.runStreamCalls).toBe(0);
+    expect(result.events.filter(e => e.type === 'error')).toEqual([expect.objectContaining({
+      text: t('errors.session_save_failed'), failureKind: 'config',
+      failureCode: 'session_persistence_failed', retryExhausted: true,
+    })]);
+    expect(result.events.filter(e => e.type === 'done')).toHaveLength(1);
+    expect(h.logEntries.filter(e => e.level === 'error')).toEqual([expect.objectContaining({ message: 'model turn stream error' })]);
+    expect(JSON.stringify(result.events)).not.toContain('private storage path');
+  });
+
+  it.each(['session', 'global'] as const)(
+    'cancels a turn waiting for the %s gate without disturbing the holder or a later waiter',
+    async (gate) => {
+      const { sessionLock, globalSlots } = await import('../../../../src/main/util/locks');
+      const sessionId = `gconv-cancel-wait-${gate}`;
+      const held: Array<() => void> = [];
+      if (gate === 'session') held.push(await sessionLock(`u1\0${sessionId}`).acquire());
+      else for (let index = 0; index < 10; index++) held.push((await globalSlots.acquire())[1]);
+      h.makeStream = () => (async function* () { yield completedEvent('survivor completed'); })();
+      const controller = new AbortController();
+      const cancelled = drain({ sessionId, abortSignal: controller.signal, idleTimeout: 0.01 });
+      await vi.waitFor(() => expect(h.logEntries.some((entry) => entry.message === 'model turn queued')).toBe(true));
+      // Waiting for admission is not idle model/tool execution.
+      await delay(30);
+      expect(h.logEntries.filter((entry) => entry.level === 'warn' || entry.level === 'error')).toEqual([]);
+      controller.abort();
+      let survivor: ReturnType<typeof drain> | undefined;
+      let cancelledBeforeRelease = false;
+      let holderStillOwnsGate = false;
+      let cancelledStoreCalls: string[] = [];
+      try {
+        cancelledBeforeRelease = await Promise.race([cancelled.then(() => true), delay(100).then(() => false)]);
+        holderStillOwnsGate = gate === 'session'
+          ? sessionLock(`u1\0${sessionId}`).isLocked()
+          : globalSlots.getValue() === 0;
+        cancelledStoreCalls = [...h.sessionStoreCalls];
+        survivor = drain({ sessionId });
+        await delay(10);
+        expect(h.runStreamCalls).toBe(0);
+      } finally {
+        held.forEach((release) => release());
+      }
+      const [cancelledResult, survivorResult] = await Promise.all([cancelled, survivor!]);
+      expect(cancelledBeforeRelease).toBe(true);
+      expect(holderStillOwnsGate).toBe(true);
+      expect(cancelledStoreCalls).toEqual([]);
+      expect(cancelledResult.events.filter((event) => event.type === 'done')).toHaveLength(1);
+      expect(cancelledResult.events.find((event) => event.type === 'error')).toMatchObject({ text: 'aborted' });
+      expect(survivorResult.events.find((event) => event.type === 'final')).toMatchObject({ text: 'survivor completed' });
+      expect(h.runStreamCalls).toBe(1);
+      expect(globalSlots.getValue()).toBe(10);
+      expect(sessionLock(`u1\0${sessionId}`).isLocked()).toBe(false);
+      expect(h.logEntries.filter((entry) => entry.level === 'warn' || entry.level === 'error')).toEqual([]);
+    },
+  );
+
+  it('honors direct session cancellation while global admission is pending', async () => {
+    const { globalSlots, sessionLock } = await import('../../../../src/main/util/locks');
+    const client = await import('../../../../src/main/model/core-agent/client');
+    const held: Array<() => void> = [];
+    for (let index = 0; index < 10; index++) held.push((await globalSlots.acquire())[1]);
+    const sessionId = 'gconv-direct-queued-abort';
+    h.makeStream = () => (async function* () { yield completedEvent('must not start'); })();
+    const pending = drain({ sessionId });
+    await vi.waitFor(() => expect(sessionLock(`u1\0${sessionId}`).isLocked()).toBe(true));
+    const count = client.abortActiveSession(sessionId, 'u1');
+    let settledBeforeRelease = false;
+    try {
+      settledBeforeRelease = await Promise.race([pending.then(() => true), delay(100).then(() => false)]);
+      expect(globalSlots.getValue()).toBe(0);
+    } finally {
+      held.forEach((release) => release());
+    }
+    const result = await pending;
+    expect(count).toBe(1);
+    expect(settledBeforeRelease).toBe(true);
+    expect(h.runStreamCalls).toBe(0);
+    expect(h.sessionStoreCalls).toEqual([]);
+    expect(result.events.filter((event) => event.type === 'done')).toHaveLength(1);
+    // The cancelled semaphore waiter returns its eventual lease in a promise
+    // continuation after the last holder releases; it must not leak capacity.
+    await vi.waitFor(() => expect(globalSlots.getValue()).toBe(10));
+    expect(h.logEntries.filter((entry) => entry.level === 'warn' || entry.level === 'error')).toEqual([]);
+  });
+
+  it.each(['session', 'global'] as const)('returns a %s lease when grant and cancellation race', async (gate) => {
+    const { globalSlots, sessionLock } = await import('../../../../src/main/util/locks');
+    const sessionId = `gconv-grant-abort-${gate}`;
+    const held: Array<() => void> = [];
+    if (gate === 'session') held.push(await sessionLock(`u1\0${sessionId}`).acquire());
+    else for (let index = 0; index < 10; index++) held.push((await globalSlots.acquire())[1]);
+    h.makeStream = () => (async function* () { yield completedEvent('must not start'); })();
+    const controller = new AbortController();
+    const pending = drain({ sessionId, abortSignal: controller.signal });
+    await vi.waitFor(() => expect(h.logEntries.some((entry) => entry.message === 'model turn queued')).toBe(true));
+    held.forEach((release) => release());
+    controller.abort();
+    const result = await pending;
+    await vi.waitFor(() => expect(globalSlots.getValue()).toBe(10));
+    expect(sessionLock(`u1\0${sessionId}`).isLocked()).toBe(false);
+    expect(h.runStreamCalls).toBe(0);
+    expect(h.sessionStoreCalls).toEqual([]);
+    expect(result.events.filter((event) => event.type === 'done')).toHaveLength(1);
+    expect(result.events.find((event) => event.type === 'error')).toMatchObject({ text: 'aborted' });
+    expect(h.logEntries.filter((entry) => entry.level === 'warn' || entry.level === 'error')).toEqual([]);
+  });
+
+  it('does not acquire gates or build a runner for an already cancelled turn', async () => {
+    const { globalSlots, sessionLock } = await import('../../../../src/main/util/locks');
+    const controller = new AbortController();
+    controller.abort();
+    const result = await drain({ sessionId: 'gconv-pre-aborted', abortSignal: controller.signal });
+    expect(globalSlots.getValue()).toBe(10);
+    expect(sessionLock('u1\0gconv-pre-aborted').isLocked()).toBe(false);
+    expect(h.runStreamCalls).toBe(0);
+    expect(h.sessionStoreCalls).toEqual([]);
+    expect(result.events.filter((event) => event.type === 'done')).toHaveLength(1);
+    expect(result.events.find((event) => event.type === 'error')).toMatchObject({ text: 'aborted' });
+    expect(h.logEntries.filter((entry) => entry.level === 'warn' || entry.level === 'error')).toEqual([]);
+  });
+
+  it('keeps nested dispatch independent of a full global gate', async () => {
+    const { globalSlots } = await import('../../../../src/main/util/locks');
+    const held: Array<() => void> = [];
+    for (let index = 0; index < 10; index++) held.push((await globalSlots.acquire())[1]);
+    h.makeStream = () => (async function* () { yield completedEvent('nested completed'); })();
+    const pending = drain({ sessionId: 'gworker-full-global', nested: true });
+    let completedBeforeRelease = false;
+    try {
+      completedBeforeRelease = await Promise.race([pending.then(() => true), delay(100).then(() => false)]);
+      expect(globalSlots.getValue()).toBe(0);
+    } finally {
+      held.forEach((release) => release());
+    }
+    const result = await pending;
+    expect(completedBeforeRelease).toBe(true);
+    expect(result.events.find((event) => event.type === 'final')).toMatchObject({ text: 'nested completed' });
+    expect(h.runStreamCalls).toBe(1);
+    expect(globalSlots.getValue()).toBe(10);
+    expect(h.logEntries.filter((entry) => entry.level === 'warn' || entry.level === 'error')).toEqual([]);
+  });
+
+  it('finishes a real textless terminal-tool run without empty-response errors or another model call', async () => {
+    const { AgentRunner, ProviderRegistry, createConfig, defineTool } = await import('#core-agent');
+    const provider: import('#core-agent').LLMProvider = {
+      id: 'mock', name: 'Mock',
+      async validateAuth() { return true; },
+      async complete() { throw new Error('Unexpected synthesis'); },
+      async *stream() {
+        yield { type: 'message_start' };
+        yield { type: 'message_end',
+          content: [{ type: 'tool_use', id: 'h1', name: 'handoff_fixture', input: {} }],
+          stopReason: 'tool_use', model: 'mock-model',
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        };
+      },
+    };
+    const streamSpy = vi.spyOn(provider, 'stream');
+    const registry = new ProviderRegistry();
+    registry.registerFactory('mock', () => provider);
+    const execute = vi.fn(async () => ({ content: 'Admitted', endTurn: true, endTurnReason: 'handed_off' as const }));
+    const runner = new AgentRunner({
+      config: createConfig({ agent: { defaultProvider: 'mock', defaultModel: 'mock-model' } }),
+      providers: registry,
+      tools: [defineTool({ name: 'handoff_fixture', description: 'Transfer ownership', inputSchema: { type: 'object' }, execute })],
+    });
+    h.makeStream = () => runner.runStream({ message: 'Delegate this work' });
+    const { events } = await drain({});
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(streamSpy).toHaveBeenCalledTimes(1);
+    expect(events.filter((event) => event.type === 'error' || event.type === 'final')).toEqual([]);
+    expect(events.filter((event) => event.type === 'done')).toHaveLength(1);
+    // This metric describes the completed model invocation, not the downstream task.
+    expect(events.find((event) => event.event?.stream === 'agent_run_result')?.event?.data)
+      .toMatchObject({ result: 'success', terminal_status: 'completed' });
+    expect(h.logEntries.filter((entry) => entry.level === 'error' || entry.level === 'warn')).toEqual([]);
+  });
+
   it.each(['provider', 'text'] as const)('uses the shared 30-minute default for a stalled %s stream', async (phase) => {
     await import('../../../../src/main/model/core-agent/client');
     vi.useFakeTimers();

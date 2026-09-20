@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
   appendPhasedText,
-  commentaryForTerminalReplacement,
   createPhasedTextState,
   resolvedPhasedText,
   resolvedUnsuccessfulPhasedText,
@@ -54,22 +53,4 @@ describe('local_agents/text-phase', () => {
     expect(resolvedPhasedText(state, 'canonical')).toBe('canonical');
   });
 
-  it('preserves the complete streamed body before a canonical terminal replacement', () => {
-    const state = createPhasedTextState();
-    appendPhasedText(state, 'Working note. ', undefined);
-    appendPhasedText(state, 'Final answer.', undefined);
-
-    expect(commentaryForTerminalReplacement(state, 'Final answer.')).toBe(
-      'Working note. Final answer.',
-    );
-  });
-
-  it('does not finalize an empty body or a missing terminal result', () => {
-    const empty = createPhasedTextState();
-    expect(commentaryForTerminalReplacement(empty, 'Final answer.')).toBe('');
-
-    const partial = createPhasedTextState();
-    appendPhasedText(partial, 'Partial body', undefined);
-    expect(commentaryForTerminalReplacement(partial, '')).toBe('');
-  });
 });

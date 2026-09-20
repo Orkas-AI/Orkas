@@ -345,6 +345,20 @@ describe('contexts › uploadContextFile', () => {
     expect(fs.existsSync(path.join(ctxRoot(), 'doc.pdf'))).toBe(true);
   });
 
+  it('imports and previews a legacy XLS without changing the workbook', async () => {
+    const c = await loadContexts();
+    const bytes = fs.readFileSync(path.join(__dirname, '../../fixtures/xls/inventory.xls'));
+    expect(c.uploadContextFile('inventory.xls', bytes).ok).toBe(true);
+    const preview = await c.readContextOfficeHtml('inventory.xls');
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) throw new Error('missing preview');
+    expect(preview.html).toContain('冷却泵');
+    expect(preview.html).toContain('Inventory sentinel 8384');
+    expect(preview.html).not.toContain('<script>');
+    expect(preview.allowScripts).not.toBe(true);
+    expect(fs.readFileSync(path.join(ctxRoot(), 'inventory.xls'))).toEqual(bytes);
+  });
+
   it('accepts modern Office bytes', async () => {
     const c = await loadContexts();
     const sheet = c.uploadContextFile('scores.xlsx', makeMinimalXlsx());
@@ -575,6 +589,16 @@ describe('contexts › listContextsTree', () => {
     expect(top).toEqual(['sub', 'a.md'].sort());
     const sub = tree.find((n) => n.name === 'sub')!;
     expect((sub.children || []).map((n) => n.name)).toEqual(['b.pdf']);
+  });
+
+  // The renderer orders the Library newest-first, so folders need an mtime of
+  // their own — without it every folder ties at the bottom of its group.
+  it('stamps an mtime on folders as well as files', async () => {
+    writeFile('sub/b.pdf', 'PDF');
+    const c = await loadContexts();
+    const tree = c.listContextsTree();
+    const sub = tree.find((n) => n.name === 'sub')!;
+    expect(sub.mtime).toBeGreaterThan(0);
   });
 });
 

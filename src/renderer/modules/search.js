@@ -17,6 +17,7 @@ let _searchTab = 'all';             // 'all' | 'chat' | 'agent' | 'skill' | 'con
 let _searchResults = [];
 let _searchActiveIdx = -1;
 let _searchLastQuery = '';
+let _searchChatIndexComplete = true;
 const _SEARCH_FAILURE_DEDUPE_MS = 60 * 1000;
 const _SEARCH_FAILURE_MAX_KEYS = 16;
 const _SEARCH_FAILURE_STAGES = new Set(['request', 'response', 'partial']);
@@ -138,6 +139,7 @@ function openGlobalSearch(entryPoint = 'unknown') {
     _searchResults = [];
     _searchActiveIdx = -1;
     _searchLastQuery = '';
+    _searchChatIndexComplete = true;
     _searchSeq++;    // invalidate any in-flight query from a previous session
     _setSearchTab('all');           // reset to default tab each open
     _setSearchTabsVisible(false);   // hide tabs while empty/history state is shown
@@ -197,6 +199,7 @@ async function _runSearchNow(queryArg) {
     _searchVisibleResults = [];
     _searchActiveIdx = -1;
     _searchLastQuery = '';
+    _searchChatIndexComplete = true;
     _setSearchTabsVisible(false);
     _renderSearchEmptyState();
     return;
@@ -238,6 +241,7 @@ async function _runSearchNow(queryArg) {
         code: _searchDegradationErrorCode(data.degradation_code),
       }, 'search_degraded');
     }
+    _searchChatIndexComplete = data.chat_index_complete !== false;
     _searchResults = data.results || [];
     _searchLastQuery = query;
     _setSearchTabsVisible(true);
@@ -273,7 +277,9 @@ async function _runSearchNow(queryArg) {
 }
 
 // Split results into 4 buckets per the tab-grouping spec:
-//   - chats:    main-conversation messages, sorted by time DESC (recency)
+//   - chats:    main-conversation messages, sorted by relevance
+//               (query coverage, then score) — see _sectionRows for why the
+//               displayed rows are then re-ordered by recency
 //   - agents:   agent body matches, sorted by score DESC then name
 //   - skills:   skill body matches, sorted by score DESC then name
 //   - contexts: Library filename/body matches, sorted by relevance then path
@@ -283,7 +289,9 @@ function _partitionSearchResults(results) {
   const chats = results
     .filter((r) => r.kind === 'chat')
     .slice()
-    .sort((a, b) => String(b.time || '').localeCompare(String(a.time || '')));
+    .sort((a, b) => ((Number(b.term_coverage) || 0) - (Number(a.term_coverage) || 0))
+      || ((b.score || 0) - (a.score || 0))
+      || String(b.time || '').localeCompare(String(a.time || '')));
   const agents = results
     .filter((r) => r.kind === 'agent')
     .slice()
@@ -415,17 +423,41 @@ function _renderSearchRow(r, dataIdx, query) {
 // `_searchVisibleResults` as "what the user sees".
 let _searchVisibleResults = [];
 
+// Which rows a section shows, and in what order.
+//
+// Chats are *picked* by relevance and *shown* newest-first. The "all" tab has
+// room for _SEARCH_ALL_PER_SECTION rows only, so picking them by recency
+// buries the actual answer under whatever the user happened to discuss last —
+// the backend already ranked the bucket, and the cut has to respect that
+// ranking. Reading a chat list by time is still what the user expects, so the
+// rows that survive the cut are re-ordered by recency for display.
+function _sectionRows(section, tab) {
+  const rows = tab === 'all'
+    ? section.bucket.slice(0, _SEARCH_ALL_PER_SECTION)
+    : section.bucket.slice();
+  if (section.tab === 'chat') {
+    rows.sort((a, b) => String(b.time || '').localeCompare(String(a.time || '')));
+  }
+  return rows;
+}
+
 function _renderSearchResults(query) {
   const body = document.getElementById('search-body');
   if (!body) return;
   body.classList.remove('is-start-state');
+  const indexing = !_searchChatIndexComplete && (_searchTab === 'all' || _searchTab === 'chat');
+  const notice = indexing
+    ? `<div class="search-section-label is-status" role="status">${escapeHtml(t('search.history_indexing'))}</div>`
+    : '';
   if (!_searchResults.length) {
     _searchVisibleResults = [];
-    body.innerHTML = `<div class="search-empty">${escapeHtml(t('search.no_results', { query }))}</div>`;
+    body.innerHTML = indexing
+      ? `<div class="search-empty" role="status">${escapeHtml(t('search.history_indexing'))}</div>`
+      : `<div class="search-empty">${escapeHtml(t('search.no_results', { query }))}</div>`;
     return;
   }
   const { chats, agents, skills, contexts } = _partitionSearchResults(_searchResults);
-  const parts = [];
+  const parts = [notice];
   const visible = [];
 
   // "All" tab order: chats → agents → skills → Library; each
@@ -441,7 +473,7 @@ function _renderSearchResults(query) {
   ];
   for (const s of sections) {
     if (_searchTab !== 'all' && _searchTab !== s.tab) continue;
-    const slice = _searchTab === 'all' ? s.bucket.slice(0, _SEARCH_ALL_PER_SECTION) : s.bucket;
+    const slice = _sectionRows(s, _searchTab);
     if (!slice.length) continue;
     parts.push(`<div class="search-section-label">${escapeHtml(t(s.labelKey))}</div>`);
     for (const r of slice) { parts.push(_renderSearchRow(r, visible.length, query)); visible.push(r); }
@@ -452,7 +484,9 @@ function _renderSearchResults(query) {
 
   _searchVisibleResults = visible;
   if (!visible.length) {
-    body.innerHTML = `<div class="search-empty">${escapeHtml(t('search.no_results', { query }))}</div>`;
+    body.innerHTML = indexing
+      ? `<div class="search-empty" role="status">${escapeHtml(t('search.history_indexing'))}</div>`
+      : `<div class="search-empty">${escapeHtml(t('search.no_results', { query }))}</div>`;
     _searchActiveIdx = -1;
     return;
   }
@@ -532,6 +566,7 @@ async function _gotoSearchResult(r) {
     setView('contexts');
     const loader = typeof loadRendererFeature === 'function' ? loadRendererFeature : window.loadRendererFeature;
     if (typeof loader === 'function') await loader('contexts');
+    if (typeof switchCtxProject === 'function' && await switchCtxProject('') === false) return;
     if (typeof loadContexts === 'function') await loadContexts();
     if (typeof openCtxFile === 'function') openCtxFile(r.path);
   } else if (r.kind === 'chat') {
@@ -604,3 +639,12 @@ function _saveSearchHistoryEntry(query) {
   cur.unshift(q);
   _saveSearchHistory(cur.slice(0, _SEARCH_HISTORY_MAX));
 }
+
+// Search results are cached across tab switches; refresh their status copy
+// with the active locale as well.
+document.addEventListener('i18n-change', () => {
+  const overlay = document.getElementById('search-overlay');
+  if (overlay && overlay.style.display !== 'none' && _searchLastQuery) {
+    _renderSearchResults(_searchLastQuery);
+  }
+});

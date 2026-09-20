@@ -373,3 +373,75 @@ describe('connectors/action_confirm', () => {
     }
   });
 });
+
+describe('application usage grants', () => {
+  it('isolates owners, instances and sensitive classes, then expires the grant on close', async () => {
+    const confirm = await import('../../../../src/main/features/connectors/action_confirm');
+    const pushes: Array<{ channel: string; info: any; owner?: number }> = [];
+    confirm._setBroadcastForTest((channel, info, owner) => { pushes.push({ channel, info, owner }); });
+    const opts = { userId: 'action-confirm-user', appUsage: { id: 'app-open-1', owner: 21 },
+      connectorId: 'gmail', displayName: 'Gmail', accountKey: 'account-a', toolName: 'GMAIL_SEND_EMAIL',
+      risk: 'H' as const, sensitiveOperation: 'send', args: {} };
+    const first = confirm.requestActionConfirm(opts);
+    const queued = confirm.requestActionConfirm(opts);
+    expect(pushes[0]).toMatchObject({ owner: 21, info: { usage_scope: true, can_allow_run: true, cid: '' } });
+    const requestId = pushes[0].info.request_id;
+    expect(confirm.respond(requestId, true, 'usage', 22)).toBe(false);
+    expect(confirm.respond(requestId, true, 'task', 21)).toBe(false);
+    expect(confirm.respond(requestId, true, 'usage', 21)).toBe(true);
+    await expect(first).resolves.toBe(true); await expect(queued).resolves.toBe(true);
+    const count = pushes.length;
+    await expect(confirm.requestActionConfirm(opts)).resolves.toBe(true);
+    expect(pushes).toHaveLength(count);
+    for (const change of [
+      { appUsage: { id: 'app-open-2', owner: 21 } }, { appUsage: { id: 'app-open-1', owner: 22 } },
+      { accountKey: 'account-b' }, { risk: 'D' as const }, { sensitiveOperation: 'money' },
+      { appUsage: undefined, cid: 'app-open-1' },
+    ]) {
+      const next = confirm.requestActionConfirm({ ...opts, ...change });
+      const prompt = pushes.at(-1)!;
+      expect(prompt.channel).toBe('connectors:action-confirm');
+      expect(confirm.respond(prompt.info.request_id, false, 'once', prompt.owner)).toBe(true);
+      await expect(next).resolves.toBe(false);
+    }
+    confirm.cancelForApp(opts.userId, opts.appUsage);
+    const reopened = confirm.requestActionConfirm(opts);
+    expect(confirm.respond(pushes.at(-1)!.info.request_id, false, 'once', 21)).toBe(true);
+    await expect(reopened).resolves.toBe(false);
+  });
+
+  it.each(['close', 'connector', 'account'] as const)('withdraws pending app approval on %s and rejects a late response', async reason => {
+    const confirm = await import('../../../../src/main/features/connectors/action_confirm');
+    const pushes: Array<{ channel: string; info: any; owner?: number }> = [];
+    confirm._setBroadcastForTest((channel, info, owner) => { pushes.push({ channel, info, owner }); });
+    const appUsage = { id: 'pending-app', owner: 31 };
+    const pending = confirm.requestActionConfirm({ userId: 'action-confirm-user', appUsage,
+      connectorId: 'gmail', displayName: 'Gmail', toolName: 'send', risk: 'H', args: {} });
+    const requestId = pushes[0].info.request_id;
+    if (reason === 'close') confirm.cancelForApp('action-confirm-user', appUsage);
+    else if (reason === 'connector') confirm.cancelForConnector('action-confirm-user', 'gmail');
+    else (await import('../../../../src/main/features/users')).activateUser('another-user');
+    await expect(pending).resolves.toBe(false);
+    expect(pushes.at(-1)).toMatchObject({ channel: 'connectors:action-confirm-cancelled', owner: 31, info: { request_ids: [requestId] } });
+    expect(confirm.respond(requestId, true, 'usage', 31)).toBe(false);
+  });
+
+  it('uses Trusted without creating a grant that survives switching back to approval', async () => {
+    const confirm = await import('../../../../src/main/features/connectors/action_confirm');
+    const permissions = await import('../../../../src/main/features/permissions');
+    const broadcast = vi.fn(); confirm._setBroadcastForTest(broadcast);
+    const opts = { appUsage: { id: 'trusted-app', owner: 41 }, connectorId: 'gmail', displayName: 'Gmail', toolName: 'send', risk: 'H' as const, args: {} };
+    permissions.setLocalExecMode('all_files_auto');
+    await expect(confirm.requestActionConfirm(opts)).resolves.toBe(true);
+    expect(broadcast).not.toHaveBeenCalled();
+    permissions.setLocalExecMode('workspace_approval');
+    const pending = confirm.requestActionConfirm(opts);
+    const info = broadcast.mock.calls[0][1];
+    expect(confirm.respond(info.request_id, true, 'once', 41)).toBe(true);
+    await expect(pending).resolves.toBe(true);
+    const repeat = confirm.requestActionConfirm(opts);
+    expect(broadcast).toHaveBeenCalledTimes(2);
+    confirm.respond(broadcast.mock.calls[1][1].request_id, false, 'once', 41);
+    await expect(repeat).resolves.toBe(false);
+  });
+});

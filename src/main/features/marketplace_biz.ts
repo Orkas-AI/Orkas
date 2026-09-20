@@ -18,6 +18,7 @@ import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 
+import { SUPPORTED_LANGS, type Lang } from '../i18n';
 import { marketplaceBizFile, userLocalBizDir } from '../paths';
 import { getActiveUserId } from './users';
 import { withCommonHeaders } from './api_common';
@@ -31,12 +32,10 @@ const TTL_MS = 24 * 60 * 60 * 1000;  // 24 hours
 const MARKETPLACE_CATEGORIES_TIMEOUT_MS = 60_000;
 export const DEFAULT_MARKETPLACE_CATEGORY_CODE = 'general';
 
-export interface MarketplaceCategory {
+export interface MarketplaceCategory extends Partial<Record<`name_${Lang}`, string>> {
   code: string;
   name_zh: string;
   name_en: string;
-  name_ja?: string;
-  name_pt?: string;
   /** Display order — lower first. Kept on the wire purely for client-side rendering. */
   sort_order: number;
 }
@@ -58,13 +57,13 @@ export function normalizeMarketplaceCategoryCode(
  *  on a cold start. Mirrors the server category registry so the UI behaves identically when
  *  the network blip clears. Keep in sync with `Server/biz/marketplace/marketplace_mgr.py`. */
 const FALLBACK_CATEGORIES: readonly MarketplaceCategory[] = [
-  { code: 'education', name_zh: '教育', name_en: 'Education',  name_ja: '教育',        name_pt: 'Educação',    sort_order: 10 },
-  { code: 'ecommerce', name_zh: '电商', name_en: 'E-commerce', name_ja: 'EC',          name_pt: 'E-commerce',  sort_order: 20 },
-  { code: 'rnd',       name_zh: '产研', name_en: 'R&D',        name_ja: '研究開発',    name_pt: 'P&D',         sort_order: 30 },
-  { code: 'creation',  name_zh: '创作', name_en: 'Creation',   name_ja: '創作',        name_pt: 'Criação',     sort_order: 40 },
-  { code: 'data',      name_zh: '数据', name_en: 'Data',       name_ja: 'データ',      name_pt: 'Dados',       sort_order: 50 },
-  { code: 'office',    name_zh: '办公', name_en: 'Office',     name_ja: 'オフィス',    name_pt: 'Escritório',  sort_order: 60 },
-  { code: 'general',   name_zh: '通用', name_en: 'General',    name_ja: '汎用',        name_pt: 'Geral',       sort_order: 70 },
+  { code: 'education', name_zh: '教育', name_en: 'Education',  name_ja: '教育',        name_pt: 'Educação',    sort_order: 10, name_es: "Educación", name_fr: "Éducation", name_ko: "교육", name_de: "Bildung", name_ru: "Образование", name_it: "Istruzione" },
+  { code: 'ecommerce', name_zh: '电商', name_en: 'E-commerce', name_ja: 'EC',          name_pt: 'E-commerce',  sort_order: 20, name_es: "Comercio electrónico", name_fr: "Commerce en ligne", name_ko: "전자상거래", name_de: "E-Commerce", name_ru: "Электронная торговля", name_it: "E-commerce" },
+  { code: 'rnd',       name_zh: '产研', name_en: 'R&D',        name_ja: '研究開発',    name_pt: 'P&D',         sort_order: 30, name_es: "I+D", name_fr: "R&D", name_ko: "연구 개발", name_de: "Forschung und Entwicklung", name_ru: "Исследования и разработка", name_it: "Ricerca e sviluppo" },
+  { code: 'creation',  name_zh: '创作', name_en: 'Creation',   name_ja: '創作',        name_pt: 'Criação',     sort_order: 40, name_es: "Creación", name_fr: "Création", name_ko: "창작", name_de: "Kreation", name_ru: "Творчество", name_it: "Creazione" },
+  { code: 'data',      name_zh: '数据', name_en: 'Data',       name_ja: 'データ',      name_pt: 'Dados',       sort_order: 50, name_es: "Datos", name_fr: "Données", name_ko: "데이터", name_de: "Daten", name_ru: "Данные", name_it: "Dati" },
+  { code: 'office',    name_zh: '办公', name_en: 'Office',     name_ja: 'オフィス',    name_pt: 'Escritório',  sort_order: 60, name_es: "Oficina", name_fr: "Bureautique", name_ko: "사무", name_de: "Büro", name_ru: "Офис", name_it: "Ufficio" },
+  { code: 'general',   name_zh: '通用', name_en: 'General',    name_ja: '汎用',        name_pt: 'Geral',       sort_order: 70, name_es: "General", name_fr: "Général", name_ko: "일반", name_de: "Allgemein", name_ru: "Общее", name_it: "Generale" },
 ];
 
 interface PersistedBiz {
@@ -100,8 +99,8 @@ function _normalizeCategoryList(value: unknown): MarketplaceCategory[] {
       code,
       name_zh: String(row.name_zh || '').trim() || code,
       name_en: String(row.name_en || '').trim() || code,
-      name_ja: String(row.name_ja || '').trim(),
-      name_pt: String(row.name_pt || '').trim(),
+      ...Object.fromEntries(SUPPORTED_LANGS.filter(lang => lang !== 'zh' && lang !== 'en')
+        .map(lang => [`name_${lang}`, String(row[`name_${lang}`] || '').trim()])),
       sort_order: sortOrder,
     });
   }

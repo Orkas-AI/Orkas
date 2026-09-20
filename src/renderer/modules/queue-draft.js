@@ -18,6 +18,7 @@ const _sentComposerSnapshots = new Map();
 function _forgetConvLocal(cid) {
   if (!cid) return;
   _sentComposerSnapshots.delete(cid);
+  try { localStorage.removeItem(_queueComposerEditKey(cid)); } catch (_) {}
   _cancelDraftSave(cid);
   try {
     // `queue_<cid>` is the retired pre-board local queue's storage key —
@@ -138,6 +139,7 @@ function _writeDraftData(cid, text, references) {
 // when the destination textarea is still empty.
 function _persistQuoteDraft(cid) {
   if (!cid) return;
+  _persistQueueComposerEditState(cid);
   const previous = _readDraftData(cid);
   const input = cid === currentCid ? document.getElementById('chat-input') : null;
   const text = input ? input.value : (typeof previous.text === 'string' ? previous.text : '');
@@ -153,6 +155,7 @@ function _saveDraft(cid) {
   const input = document.getElementById('chat-input');
   const text = input ? input.value : '';
   const references = typeof _getQuotes === 'function' ? _getQuotes(cid) : [];
+  _persistQueueComposerEditState(cid);
   _cancelDraftSave(cid);
   const timer = setTimeout(() => {
     if (_draftSaveTimers.get(cid) !== timer) return;
@@ -171,6 +174,7 @@ function _clearDraft(cid) {
 function _restoreDraft(cid) {
   const input = document.getElementById('chat-input');
   if (!input) return;
+  if (_restoreQueueItemEdit(cid)) return;
   const data = _readDraftData(cid);
   const text = (data && typeof data.text === 'string') ? data.text : '';
   const use = data && data.use
@@ -241,7 +245,7 @@ function _clearSentComposerSnapshot(cid) {
  *  must never overwrite it — losing what the user just typed is worse than not
  *  restoring the interrupted message. */
 function _composerHoldsUnsentInput(cid) {
-  if (!cid) return true;
+  if (!cid || _isQueueItemEditing(cid)) return true;
   if (cid !== currentCid) {
     const draft = _readDraftData(cid);
     return !!(String(draft.text || '').trim()
@@ -295,3 +299,141 @@ function _restoreSentComposerSnapshot(cid) {
   try { input.setSelectionRange(input.value.length, input.value.length); } catch (_) {}
   return true;
 }
+
+// Queued-message edits use the ordinary composer. The backend retains its
+// queue slot and holds admission; this marker owns only the displaced draft.
+const _queueComposerRestoring = new Set();
+const _queueComposerSaving = new Set();
+const _queueComposerStarting = new Set();
+const _queueComposerEditKey = (cid) => `${_DRAFT_KEY(cid)}:queue-edit`;
+function _queueComposerEditFor(cid) {
+  try { return JSON.parse(localStorage.getItem(_queueComposerEditKey(cid)) || 'null'); }
+  catch (_) { return null; }
+}
+function _isQueueItemEditing(cid) { return !!_queueComposerEditFor(cid); }
+function _queueComposerContext(cid) {
+  return {
+    text: document.getElementById('chat-input')?.value || '',
+    references: typeof _getQuotes === 'function' ? _getQuotes(cid).slice() : [],
+    attachments: typeof _chatAttachList === 'function' ? _composerSafeAttachmentItems(_chatAttachList(cid)) : [],
+    recipient: typeof getChatRecipient === 'function' ? getChatRecipient('conversation') : null,
+  };
+}
+function _persistQueueComposerEditState(cid) {
+  if (!cid || cid !== currentCid || _queueComposerRestoring.has(cid)) return;
+  const edit = _queueComposerEditFor(cid);
+  if (!edit) return;
+  edit.draft = _queueComposerContext(cid);
+  localStorage.setItem(_queueComposerEditKey(cid), JSON.stringify(edit));
+}
+function _applyQueueComposerContext(cid, draft) {
+  _queueComposerRestoring.add(cid);
+  try {
+    _cancelDraftSave(cid);
+    _writeDraftData(cid, draft.text, draft.references);
+    if (typeof _chatAttachSet === 'function') {
+      _chatAttachSet(cid, _composerStoredAttachmentItems(cid, draft.attachments || []));
+    }
+    if (cid !== currentCid) return;
+    const input = document.getElementById('chat-input');
+    if (!input) return;
+    if (!_isQueueItemEditing(cid) && draft.recipient && typeof setChatRecipient === 'function') {
+      setChatRecipient('conversation', draft.recipient);
+    }
+    input.value = draft.text || '';
+    if (typeof _quotesByCid !== 'undefined') _quotesByCid.set(cid, draft.references || []);
+    if (typeof _renderQuotePreview === 'function') _renderQuotePreview(cid);
+    autoGrow(input, 200);
+    if (typeof syncChatRichComposerFromTextarea === 'function') syncChatRichComposerFromTextarea(input);
+    if (typeof _renderRecipientChip === 'function') _renderRecipientChip('conversation');
+  } finally { _queueComposerRestoring.delete(cid); }
+}
+function _restoreQueueItemEdit(cid) {
+  const edit = _queueComposerEditFor(cid);
+  if (!edit) return false;
+  _applyQueueComposerContext(cid, edit.draft);
+  return true;
+}
+async function _queueEditRequest(cid, action, body) {
+  const response = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/tasks/${action}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  return response.json();
+}
+function _queueEditError(error) {
+  return t(error === 'edit_conflict' ? 'chat.queue_edit_conflict'
+    : error === 'not_queued' || error === 'not_editable' ? 'chat.queue_edit_unavailable' : 'chat.queue_edit_failed');
+}
+async function _startQueueItemEdit(cid, taskId) {
+  if (cid !== currentCid || _isQueueItemEditing(cid) || _queueComposerStarting.has(cid)) return;
+  _queueComposerStarting.add(cid);
+  try {
+    const data = await _queueEditRequest(cid, 'begin-edit', { task_id: taskId });
+    if (!data?.ok) { await uiAlert(_queueEditError(data?.error)); return; }
+    if (cid !== currentCid) {
+      await _queueEditRequest(cid, 'cancel-edit', { task_id: taskId });
+      return;
+    }
+    const message = data.message;
+    let text = message.text || '';
+    if (typeof _chatUseTokenFor === 'function') {
+      const present = typeof _chatUseSelectionsFromText === 'function' ? _chatUseSelectionsFromText(text) : [];
+      const missing = (message.use_selections || []).filter((selection) => !present.some((p) => p.kind === selection.kind && p.id === selection.id));
+      text = [...missing.map((selection) => _chatUseTokenFor(selection)), text].filter(Boolean).join(' ');
+    }
+    const edit = { taskId, original: message.text || '', recipient: data.recipient,
+      previous: _queueComposerContext(cid),
+      draft: { text, references: (message.references || []).map(_composerQuoteFromReference).filter(Boolean),
+        attachments: (message.attachments || []).map((name) => ({ name, reused: true, status: 'ready' })) } };
+    localStorage.setItem(_queueComposerEditKey(cid), JSON.stringify(edit));
+    _applyQueueComposerContext(cid, edit.draft);
+    _updateConvSendUI(cid);
+    const input = document.getElementById('chat-input');
+    if (typeof focusChatRichComposer !== 'function' || !focusChatRichComposer(input)) input?.focus();
+  } catch (_) {
+    // Failure to persist the local edit marker must not strand the backend
+    // queue in a hold that no composer can subsequently release.
+    if (!_isQueueItemEditing(cid)) {
+      try { await _queueEditRequest(cid, 'cancel-edit', { task_id: taskId }); } catch (_) {}
+    }
+    await uiAlert(t('chat.queue_edit_failed'));
+  }
+  finally { _queueComposerStarting.delete(cid); }
+}
+async function _finishQueueItemEdit(cid, action = 'edit') {
+  const edit = _queueComposerEditFor(cid);
+  if (!edit || _queueComposerSaving.has(cid)) return false;
+  _persistQueueComposerEditState(cid);
+  const draft = _queueComposerEditFor(cid).draft;
+  const selections = typeof getChatUseSelections === 'function' ? getChatUseSelections('conversation') : [];
+  if (action === 'edit' && !draft.text.trim()) { await uiAlert(t('chat.queue_edit_empty')); return false; }
+  _queueComposerSaving.add(cid);
+  _updateConvSendUI(cid);
+  let releaseAttachments;
+  try {
+    let resources;
+    if (action === 'edit') {
+      releaseAttachments = _chatAttachTryBeginSend(cid);
+      if (!releaseAttachments) { await uiAlert(t('chat.attach_still_uploading')); return false; }
+      const snapshot = await _chatAttachSnapshotForSend(cid, { onlySelected: true });
+      if (!snapshot.ok) { await uiAlert(t('chat.attach_sync_failed')); return false; }
+      resources = { attachments: snapshot.names,
+        references: _referenceSnapshotsForQuotes(draft.references),
+        use_selections: selections };
+    }
+    const data = await _queueEditRequest(cid, action, { task_id: edit.taskId,
+      ...(action === 'edit' ? { instruction: transformWithChatUse(draft.text), expected_instruction: edit.original, resources } : {}) });
+    if (!data?.ok) { await uiAlert(_queueEditError(data?.error)); return false; }
+    localStorage.removeItem(_queueComposerEditKey(cid));
+    _applyQueueComposerContext(cid, edit.previous);
+    if (window.TaskBoard) window.TaskBoard.resync(cid);
+    return true;
+  } catch (_) { await uiAlert(t('chat.queue_edit_failed')); return false; }
+  finally {
+    releaseAttachments?.();
+    _queueComposerSaving.delete(cid);
+    _updateConvSendUI(cid);
+  }
+}
+function _cancelQueueItemEdit(cid) { return _finishQueueItemEdit(cid, 'cancel-edit'); }
+function _deleteQueueItemEdit(cid) { return _finishQueueItemEdit(cid, 'cancel'); }

@@ -1,3 +1,4 @@
+import { estimateTextTokens } from '../../../../src/core-agent/src/shared/token-estimate';
 import { spawnSync } from 'node:child_process';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
@@ -8,8 +9,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import sharp from 'sharp';
 
 import {
-  SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS,
-  TOOL_DESCRIPTION_SOFT_BUDGET_CHARS,
+  SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS,
+  TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS,
 } from '../../../../src/core-agent/src/tools';
 import { bundledFfmpegPaths } from '../../../../src/main/util/bundled-runtime';
 import { chatMediaLocalPathFromUrl } from '../../../../src/main/util/chat-media-url';
@@ -60,7 +61,6 @@ vi.mock('node:fs/promises', async (importOriginal) => {
   ));
   return { ...actual, readFile: fsPromiseMocks.readFile };
 });
-
 vi.mock('../../../../src/main/util/media_probe', () => ({
   probeMediaDurationSec: mediaProbeMock.duration,
 }));
@@ -553,15 +553,15 @@ describe('VideoStudio production-state tool protocol', () => {
       }
       const object = value as Record<string, unknown>;
       if (typeof object.description === 'string'
-        && object.description.replace(/\s+/g, ' ').trim().length > SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS) {
+        && estimateTextTokens(object.description.replace(/\s+/g, ' ').trim()) > SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS) {
         overBudget.push(`${pointer}/description`);
       }
       for (const [key, child] of Object.entries(object)) {
         if (key !== 'description') walk(child, `${pointer}/${key}`);
       }
     };
-    expect(tool.description.replace(/\s+/g, ' ').trim().length)
-      .toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_CHARS);
+    expect(estimateTextTokens(tool.description.replace(/\s+/g, ' ').trim()))
+      .toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
     walk(tool.inputSchema, 'inputSchema');
     expect(overBudget).toEqual([]);
   });
@@ -2801,7 +2801,16 @@ describe('VideoStudio production-state tool protocol', () => {
     });
   });
 
-  it('opens preview review directly from a passing snapshot and keeps design review advisory', async () => {
+  it.each(['none', 'available', 'missing'])('opens preview review with reference evidence=%s and keeps design review advisory', async (referenceState) => {
+    const withReference = referenceState !== 'none';
+    const sourceMissing = referenceState === 'missing';
+    // This case exercises real reference bytes. Other protocol tests stub the
+    // media executable, so restore only the decoder dependency for this case.
+    if (withReference) {
+      const runtime = await import('../../../../src/main/util/bundled-runtime');
+      const actual = await vi.importActual<typeof runtime>('../../../../src/main/util/bundled-runtime');
+      vi.spyOn(runtime, 'bundledFfmpegPaths').mockImplementation(actual.bundledFfmpegPaths);
+    }
     makePlanVisualOnly();
     const videoStudio = await import('../../../../src/main/features/video_studio');
     const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
@@ -2844,6 +2853,11 @@ describe('VideoStudio production-state tool protocol', () => {
       preflight: { status: 'passed', blocking_error_count: 0 },
       contact_sheet: contactSheet,
       frame_paths: framePaths,
+      ...(withReference ? {
+        design_review_inputs: { references: [{ id: 'look', path: sourceMissing ? 'missing-reference.png' : path.basename(contactSheet), media_type: 'image',
+          target_scene_ids: ['s1'], preserve: ['palette'], may_change: ['brand'] }] },
+        frame_evidence: { samples: [{ label: 'mid', expected_scene_id: 's1', path: framePaths[1], time_seconds: 2 }] },
+      } : {}),
     } as any);
     const snapshot = await tool.execute({
       op: 'composition.snapshot',
@@ -2851,7 +2865,20 @@ describe('VideoStudio production-state tool protocol', () => {
       output_path: 'project/composition/preview-contact-sheet.png',
     }, ctx);
     expect(snapshot.isError).toBe(false);
-    expect(snapshot.images).toHaveLength(1);
+    expect(snapshot.images).toHaveLength(withReference && !sourceMissing ? 2 : 1);
+    if (sourceMissing) {
+      expect(parseResult(snapshot.content).reference_comparison).toMatchObject({
+        status: 'unavailable', attached: false, pairs: [], issues: [{ reason: 'source_missing' }],
+      });
+    } else if (withReference) {
+      const comparison = parseResult(snapshot.content).reference_comparison;
+      expect(comparison).toMatchObject({ status: 'available', attached: true, pairs: [
+        { reference_id: 'look', preserve: ['palette'], may_change: ['brand'], target_scene_id: 's1' },
+      ] });
+      const expected = await sharp(comparison.contact_sheet).raw().toBuffer();
+      const actual = await sharp(Buffer.from(snapshot.images![1].data, 'base64')).raw().toBuffer();
+      expect(actual).toEqual(expected);
+    } else expect(parseResult(snapshot.content).reference_comparison).toBeUndefined();
     const contactSheetPixels = await sharp(fs.readFileSync(contactSheet)).ensureAlpha().raw().toBuffer();
     const attachedPixels = await sharp(Buffer.from(snapshot.images![0].data, 'base64'))
       .ensureAlpha().raw().toBuffer();
@@ -4388,6 +4415,7 @@ describe('VideoStudio production-state tool protocol', () => {
     }, ctx)).content);
     expect(offered.delivery_check.status).toBe('not_run');
     expect(offered.delivery_check.reason).toContain('delivered_video_path');
+    expect(offered.production_control.is_generation).toBe(false);
 
     // A path that names nothing is a refusal, not a silent skip.
     const missing = await tool.execute({
@@ -4424,6 +4452,91 @@ describe('VideoStudio production-state tool protocol', () => {
       delivered_video_path: 'project/render/video.mp4',
     }, ctx)).content);
     expect(projectRelative.delivery_check.video_path).toBe(renderPath);
+  });
+
+  it('reports direct generation at the native status boundary and replaces it when local output work is added', async () => {
+    const mod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const ctx = { workingDir: workspace, state: {} } as any;
+    const modelPath = writeCutFile(path.join('project', 'assets', 'model.mp4'), 'invalid returned media');
+    const planPath = path.join(workspace, 'project', 'plan.json');
+    const plan = {
+      aspect: '9:16', total_target_sec: 5, language: 'en', tracks: {} as Record<string, unknown>,
+      _runtime: { is_generation: false }, cost_estimate: { billable_generations: 1 },
+      segments: [{ id: 'model', order: 1, role: 'body', source: 'generate', layer: 'primary',
+        target_sec: 5, status: 'done', produced_path: modelPath,
+        spec: { media_kind: 'video', prompt: 'Product in a studio' } }],
+    };
+    fs.writeFileSync(planPath, JSON.stringify(plan));
+    const tool = mod.createVideoStudioTool({ userId: UID, cid: 'cid-mode', turnId: 'turn-mode',
+      agentId: VIDEO_STUDIO_AGENT_ID, agentName: 'VideoStudio' });
+    const direct = parseResult((await tool.execute({ op: 'production.status', plan_path: planPath }, ctx)).content);
+    expect(direct.production_control.is_generation).toBe(true);
+    expect(direct.production_review).toBeUndefined();
+    expect(direct.delivery_check.reason).toMatch(/readable video stream/);
+    for (const phase of ['lint', 'inspect', 'snapshot']) {
+      const qa = parseResult((await tool.execute({ op: 'production.segment_qa', plan_path: planPath, phase }, ctx)).content);
+      expect(qa).toMatchObject({ ok: true, is_generation: true, nothing_to_check: true, checked_segment_ids: [] });
+      expect(qa.production_contact_sheet).toBeUndefined();
+      expect(qa.production_review).toBeUndefined();
+    }
+    const unbound = parseResult((await tool.execute({ op: 'production.status', plan_path: planPath, delivered_video_path: modelPath }, ctx)).content);
+    expect(unbound.delivery_check).toMatchObject({ ok: false, is_generation: null, errorCode: 'E_VIDEO_PRODUCTION_DELIVERY_UNBOUND' });
+    // A provider receipt proves origin, not readability. The original broken
+    // media scenario still reaches the lightweight decoder after registration.
+    const control = await import('../../../../src/main/features/video_production_control');
+    const statePath = control.videoProductionControlStatePath({ userId: UID, planPath });
+    await control.approveVideoProductionPlan({ statePath, planPath, turnId: 'plan' });
+    const receipt = await control.readVideoProductionControlState(statePath, planPath);
+    receipt.transactions['video:model'] = { transaction_id: 'fixture', approval_id: 'fixture', segment_id: 'model', kind: 'video', request_signature: 'fixture', output_path: modelPath, output_sha256: crypto.createHash('sha256').update(fs.readFileSync(modelPath)).digest('hex'), status: 'completed', started_at: 'now', updated_at: 'now' };
+    fs.writeFileSync(statePath, JSON.stringify(receipt));
+    const broken = parseResult((await tool.execute({ op: 'production.status', plan_path: planPath, delivered_video_path: modelPath }, ctx)).content);
+    expect(broken.delivery_check).toMatchObject({ ok: false, is_generation: true });
+    expect(broken.delivery_check.issues[0].code).toBe('DELIVERY_VIDEO_UNREADABLE');
+    fs.appendFileSync(modelPath, 'changed after checking');
+    const staleFile = parseResult((await tool.execute({ op: 'production.status', plan_path: planPath }, ctx)).content);
+    expect(staleFile.delivery_check).toMatchObject({ ok: false, status: 'stale' });
+    const unregisteredEdit = parseResult((await tool.execute({ op: 'production.status', plan_path: planPath, delivered_video_path: modelPath }, ctx)).content);
+    expect(unregisteredEdit.delivery_check).toMatchObject({ ok: false, is_generation: null, errorCode: 'E_VIDEO_PRODUCTION_DELIVERY_UNBOUND' });
+
+
+    plan._runtime.is_generation = true;
+    plan.tracks.captions = { lines: [{ text: '$19.99', start_sec: 0, target_sec: 5 }] };
+    fs.writeFileSync(planPath, JSON.stringify(plan));
+    const edited = parseResult((await tool.execute({ op: 'production.status', plan_path: planPath }, ctx)).content);
+    expect(edited.production_control.is_generation).toBe(false);
+    expect(edited.production_review).toBeDefined();
+    expect(edited.production_control.plan_signature).not.toBe(direct.production_control.plan_signature);
+    expect(edited.delivery_check).toMatchObject({ ok: false, status: 'stale' });
+  });
+
+  it('uses host-observed EDL change for a quoted caption revision without a redundant model flag', async () => {
+    const mod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const ctx = { workingDir: workspace, state: {} } as any;
+    const planPath = path.join(workspace, 'project', 'plan.json');
+    const plan = { aspect: '9:16', total_target_sec: 4, language: 'en', tracks: {} as Record<string, unknown>,
+      cost_estimate: { billable_generations: 1 },
+      segments: [{ id: 'model', order: 1, role: 'body', source: 'generate', layer: 'primary',
+        target_sec: 4, spec: { media_kind: 'video', prompt: 'Product in a studio' } }],
+    };
+    fs.writeFileSync(planPath, JSON.stringify(plan));
+    const call = (message: string, decision: 'approve' | 'revise', quote = message) => mod.createVideoStudioTool({
+      userId: UID, turnId: 'caption-amendment', agentId: VIDEO_STUDIO_AGENT_ID, userMessage: message,
+    }).execute({ op: 'production.approve_plan', plan_path: planPath,
+      decision_evidence: decisionEvidence('plan', decision, quote) }, ctx);
+    expect((await call('把价格改成 ¥89', 'revise')).isError).toBe(true);
+    expect((await call('批准计划', 'approve')).isError).toBe(false);
+    expect((await call('把价格改成 ¥89', 'revise')).isError).toBe(true);
+    plan.tracks.captions = { lines: [{ text: 'LUMA 500 · ¥89', start_sec: 0, target_sec: 4 }] };
+    fs.writeFileSync(planPath, JSON.stringify(plan));
+    const changed = await call('把价格改成 ¥89', 'revise');
+    expect(changed.isError, String(changed.content)).toBe(false);
+    expect(parseResult(changed.content)).toMatchObject({ ok: true, plan_authorization: 'user_instruction',
+      production_control: { is_generation: false, plan_approval_current: true } });
+    plan.tracks.captions = { lines: [{ text: 'LUMA 500 · ¥79', start_sec: 0, target_sec: 4 }] };
+    fs.writeFileSync(planPath, JSON.stringify(plan));
+    const invented = await call('其他都不变', 'revise', '把价格改成 ¥79');
+    expect(invented.isError).toBe(true);
+    expect(String(invented.content)).toContain('E_DECISION_EVIDENCE_NOT_FROM_USER');
   });
 
   it('publishes one contact sheet for the whole production when the last segment is captured', async () => {

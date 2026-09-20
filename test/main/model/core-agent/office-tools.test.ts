@@ -47,6 +47,7 @@ vi.mock('../../../../src/main/util/log-redact', () => ({
 }));
 
 import { createOfficeTools } from '../../../../src/main/model/core-agent/office-tools';
+import { unassessedTextCollision } from '../../../../src/main/features/office/pptx_text_collision';
 
 describe('Office built-in tools', () => {
   let tmpDir = '';
@@ -1264,7 +1265,7 @@ describe('Office built-in tools', () => {
         code: 0,
         stdout: JSON.stringify({
           success: true,
-          data: {
+          data: { matches: 1, results: [{
             path: '/',
             type: 'presentation',
             format: { 'theme.color.dk1': '#000000', 'theme.color.lt1': '#FFFFFF' },
@@ -1283,7 +1284,7 @@ describe('Office built-in tools', () => {
                 }],
               }],
             }],
-          },
+          }] },
         }),
         stderr: '',
       });
@@ -1575,10 +1576,45 @@ describe('Office built-in tools', () => {
     expect(zero).toMatchObject({ isError: true });
     expect(worksheetName).toMatchObject({ isError: true });
     expect(worksheetName.content).toContain('worksheet order, not a name or range');
-    expect(h.renderOfficePageToPng).toHaveBeenCalledWith(file, path.dirname(file), '2', undefined);
+    expect(h.renderOfficePageToPng).toHaveBeenCalledWith(file, path.dirname(file), '2', undefined, {
+      onTextCollisionAudit: expect.any(Function),
+    });
     expect(h.renderOfficePageToPng).toHaveBeenCalledTimes(1);
     expect(h.runOfficeCli).not.toHaveBeenCalled();
     expect(h.closeOfficeFile).toHaveBeenCalledWith(file, path.dirname(file));
+  });
+
+  it('binds nonfatal collision evidence to each reviewed PPT page and preserves other render modes', async () => {
+    const file = path.join(h.workspace, 'collisions.pptx');
+    fs.writeFileSync(file, 'unchanged');
+    h.renderOfficePageToPng.mockImplementation(async (_file, _cwd, page, _signal, options) => {
+      const audit = unassessedTextCollision(`page_${page}_not_assessed`);
+      if (page === '1') {
+        audit.status = 'checked'; audit.skipped = {}; audit.assessed_text_elements = 2;
+        audit.warnings = [{ type: 'text_collision_candidate', severity: 'warning',
+          paths: ['/slide[1]/shape[1]', '/slide[1]/shape[2]'], bounds: { x: 100, y: 100, width: 10, height: 20 } }];
+      }
+      options?.onTextCollisionAudit(audit);
+      return Buffer.from(`image-${page}`);
+    });
+    const reviewed = await getTool('office_review').execute({ action: 'render', path: file,
+      pages: ['1', '2'], analysis_mode: 'quality_review' }, ctx());
+    expect(reviewed.isError).toBeUndefined();
+    expect(reviewed.images).toHaveLength(2);
+    const blocks = reviewed.content.split('<office-render page=').slice(1);
+    expect(blocks[0]).toContain('text_collision_candidate');
+    expect(blocks[0]).toContain('/slide[1]/shape[1]');
+    expect(blocks[0]).not.toContain('page_2_not_assessed');
+    expect(blocks[1]).toContain('page_2_not_assessed');
+    expect(fs.readFileSync(file, 'utf8')).toBe('unchanged');
+    for (const [ext, mode] of [['pptx', 'understand'], ['docx', 'quality_review'], ['xlsx', 'quality_review']]) {
+      const other = path.join(h.workspace, `other.${ext}`);
+      fs.writeFileSync(other, 'unchanged');
+      const result = await getTool('office_review').execute({ action: 'render', path: other,
+        pages: ['1'], analysis_mode: mode }, ctx());
+      expect(result.content).not.toContain('office-text-collision');
+      expect(h.renderOfficePageToPng).toHaveBeenLastCalledWith(other, path.dirname(other), '1', undefined);
+    }
   });
 
   it('rejects render-only fields on the check action', async () => {

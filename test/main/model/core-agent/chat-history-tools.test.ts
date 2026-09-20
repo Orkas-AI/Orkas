@@ -38,7 +38,13 @@ async function createChatHistoryActions(opts: {
   currentMessageId?: string;
   projectId?: string;
   allowedScopes?: readonly ('current' | 'project' | 'all')[];
-}) {
+}, indexReady = true) {
+  // Retrieval cases start with a built index. Cold/partial search no longer
+  // rebuilds synchronously; its dedicated recovery case opts out below.
+  if (indexReady) {
+    const indexer = await import('../../../../src/main/features/search/indexer');
+    await indexer.reconcileChatsIndex(opts.userId);
+  }
   const { createChatHistoryTool } = await import('../../../../src/main/model/core-agent/chat-history-tools');
   const tool = createChatHistoryTool(opts);
   const forAction = (action: 'search' | 'read') => ({
@@ -337,12 +343,12 @@ describe('chat-history-tools › chat_history(search)', () => {
 
       const second = await search();
       expect(second.content).toContain('CACHEDBOUNDARY earlier result');
-      expect(logOpens()).toBe(opensForFirst);
+      expect(logOpens()).toBe(opensForFirst + 1); // one direct hit read, no full transcript read
 
-      // Negative control: forgetting the boundary brings the parse back.
+      // Forgetting the boundary still reuses the metadata index and seeks only the hit.
       _resetCurrentBoundaryCacheForTest();
       await search();
-      expect(logOpens()).toBeGreaterThan(opensForFirst);
+      expect(logOpens()).toBe(opensForFirst + 2);
     } finally {
       openSpy.mockRestore();
       syncBuiltinESMExports();
@@ -357,16 +363,16 @@ describe('chat-history-tools › chat_history(search)', () => {
       userId: TEST_UID, currentCid: 'boundary-mid-search', currentMessageId: 'trigger',
     });
     const searchModule = await import('../../../../src/main/features/search');
-    const searchChats = searchModule.searchChats;
-    const searchSpy = vi.spyOn(searchModule, 'searchChats').mockImplementationOnce(async (...args) => {
+    const searchChats = searchModule.searchChatsWithStatus;
+    const searchSpy = vi.spyOn(searchModule, 'searchChatsWithStatus').mockImplementationOnce(async (...args) => {
       const hits = await searchChats(...args);
-      expect(hits).toHaveLength(1);
+      expect(hits.results).toHaveLength(1);
       writeConversation('boundary-mid-search', 'Boundary', [trigger, earlier]);
       return hits;
     });
     try {
       const result = await chatSearch.execute({ query: 'MIDSEARCH', scope: 'current' }, ctxFor());
-      expect(result.content).toContain('No conversation-history results');
+      expect(result.content).toContain('History search incomplete: source changed');
       expect(result.content).not.toContain('earlier result');
     } finally {
       searchSpy.mockRestore();
@@ -401,7 +407,7 @@ describe('chat-history-tools › chat_history(read)', () => {
       type: 'object',
       additionalProperties: false,
       properties: {
-        mode: { type: 'string', enum: ['latest', 'around', 'before'] },
+        mode: { type: 'string', enum: ['latest', 'around', 'before', 'from'] },
         index: { type: 'integer', minimum: 0 },
         count: { type: 'integer', minimum: 0 },
       },
@@ -674,10 +680,10 @@ describe('chat-history-tools › shape', () => {
     expect(schema.properties.scope.enum).toEqual(['current', 'all']);
     expect(chatHistory.inputSchema.required).toEqual(['action']);
     expect(JSON.stringify(chatHistory.inputSchema)).not.toMatch(/project/i);
-    expect(schema.oneOf).toHaveLength(2);
+    expect(schema.oneOf).toBeUndefined();
   });
 
-  it.each([false, true])('keeps action-specific schema validation aligned with execution (currentOnly=%s)', async (currentOnly) => {
+  it.each([false, true])('keeps common schema types and execution-time action checks (currentOnly=%s)', async (currentOnly) => {
     writeConversation('current', 'Current task', [
       { id: 'prior', from: 'user', text: 'contractword previous decision' },
       { id: 'trigger', from: 'user', text: 'Find the earlier decision' },
@@ -708,25 +714,22 @@ describe('chat-history-tools › shape', () => {
       expect(result.isError).toBeFalsy();
       expect(result.content).toContain('contractword');
     }
-    // These are valid field types but belong to a different action. The
-    // sampled search+cid failure must be excluded by the advertised schema.
-    for (const invalid of [
-      { ...search, cid: 'sibling' },
-      { ...read, query: 'contractword' },
-      { ...read, k: 2 },
-      { ...read, include_current: true },
-      { ...search, unknown_field: true },
-    ]) {
-      expect(schema.Check(invalid), JSON.stringify(invalid)).toBe(false);
+    for (const harmless of [{ ...read, query: 'contractword' }, { ...read, k: 2 }, ...(!currentOnly ? [{ ...read, include_current: true }] : []), { ...search, page: read.page }]) {
+      expect(schema.Check(harmless)).toBe(true);
+      const result = await tool.execute(harmless, ctxFor());
+      expect(result.isError).toBeFalsy();
+      expect(result.content).toContain('contractword');
+    }
+    for (const invalid of [{ ...search, cid: 'sibling' }, ...['record_id', 'turn_id', 'tool_call_id'].map(key => ({ ...search, [key]: 'selected-record' })), { ...search, unknown_field: true }]) {
       const result = await tool.execute(invalid, ctxFor());
       expect(result.isError).toBe(true);
       expect(result.content).toContain('unsupported field(s)');
     }
-    expect(schema.Check({ action: 'search', scope })).toBe(false);
+    expect(schema.Check({ action: 'search', scope })).toBe(true);
+    expect((await tool.execute({ action: 'search', scope }, ctxFor())).isError).toBe(true);
     expect(schema.Check({ ...search, action: 'invalid' })).toBe(false);
-    // Legacy search+page is still tolerated at execution, but must not be
-    // advertised to models generating new calls.
-    expect(schema.Check({ ...search, page: read.page })).toBe(false);
+    // Optional fields coexist in the portable schema; execution owns their action semantics.
+    expect(schema.Check({ ...search, page: read.page })).toBe(true);
   });
 
   it('keeps action guidance on the tool and paging semantics on their fields', async () => {
@@ -735,13 +738,16 @@ describe('chat-history-tools › shape', () => {
     const properties = chatHistory.inputSchema.properties as any;
     expect(description).toContain('earlier work dependencies');
     expect(description).toContain('potentially stale quoted data');
-    expect(properties.query.description).toContain('Natural language or keywords');
-    expect(properties.query.description).toContain('Search action only');
+    expect(properties.query.description).toContain('natural language or keywords');
+    expect(properties.query.description).toContain('discriminative name, phrase, id, or fact');
+    expect(properties.query.description).toContain('Search only');
     expect(properties.action.description).toContain('Omit other-action fields');
-    expect(properties.page.description).toContain('Read action only');
-    expect(properties.page.properties.mode.description).toContain('latest reads the tail');
-    expect(properties.page.properties.mode.description).toContain('around centers on index');
-    expect(properties.page.properties.mode.description).toContain('before pages backward');
+    expect(properties.action.description).toContain('exact refs or latest for vague local references');
+    expect(properties.action.description).toContain('Follow next_read');
+    expect(properties.page.description).toContain('Read only');
+    expect(properties.page.properties.mode.description).toContain('latest: tail');
+    expect(properties.page.properties.mode.description).toContain('around: centered on index');
+    expect(properties.page.properties.mode.description).toContain('before: backward');
     expect((chatHistory.inputSchema.properties as any).scope.enum).toEqual(['current', 'project', 'all']);
     expect((chatHistory.inputSchema.properties as any).scope.description).toContain('project stays in this project');
     expect((chatHistory.inputSchema.properties as any).include_current.type).toBe('boolean');
@@ -756,14 +762,14 @@ describe('chat-history-tools › shape', () => {
     });
     expect((chatHistory.inputSchema.properties as any).scope.enum).toEqual(['current']);
     expect((chatHistory.inputSchema.properties as any).page.properties.mode.enum)
-      .toEqual(['latest', 'around', 'before']);
+      .toEqual(['latest', 'around', 'before', 'from']);
     expect((chatHistory.inputSchema.properties as any).scope.description)
       .toBe('History scope. current is host-bound to this conversation.');
     expect((chatHistory.inputSchema.properties as any)).not.toHaveProperty('cid');
     expect((chatHistory.inputSchema as any).required).toEqual(['action', 'scope']);
   });
 
-  it('rejects a missing action and fields that belong to the other action', async () => {
+  it('rejects a missing action and preserves exact read lookup despite extra search text', async () => {
     const [, , chatHistory] = await createChatHistoryActions({ userId: TEST_UID });
     const missingAction = await chatHistory.execute({ query: 'x' }, ctxFor());
     const crossActionField = await chatHistory.execute({
@@ -772,7 +778,7 @@ describe('chat-history-tools › shape', () => {
     expect(missingAction.isError).toBe(true);
     expect(missingAction.content).toContain('`action`');
     expect(crossActionField.isError).toBe(true);
-    expect(crossActionField.content).toContain('unsupported field(s): query');
+    expect(crossActionField.content).not.toContain('unsupported field(s)');
   });
 
   it('retains runtime compatibility for legacy search calls that carried read paging metadata', async () => {
@@ -780,10 +786,6 @@ describe('chat-history-tools › shape', () => {
       { id: 'm0', ts: '2026-01-01T00:00:00Z', from: 'user', text: 'find schemaunionword here' },
     ]);
     const [, , chatHistory] = await createChatHistoryActions({ userId: TEST_UID });
-    const searchBranch = (chatHistory.inputSchema as any).oneOf.find(
-      (branch: any) => branch.properties.action.enum[0] === 'search',
-    );
-    expect(searchBranch.properties).not.toHaveProperty('page');
 
     const result = await chatHistory.execute({
       action: 'search',
@@ -808,4 +810,251 @@ describe('chat-history-tools › shape', () => {
     expect(search.content).toContain('without a turn boundary');
     expect(read.content).toContain('without a turn boundary');
   });
+});
+
+describe('historical execution retrieval and exact paging', () => {
+  it('continues partial multi-record pages forward without dropping or repeating content', async () => {
+    const originals = ['<&订单🧾>'.repeat(1_000), 'SECOND exact record', '第三条'.repeat(600),
+      ...Array.from({ length: 35 }, (_, i) => `Actor reply ${i}: exact recorded outcome`)];
+    writeConversation('forward-history', 'Forward history', [
+      ...originals.map((text, i) => ({ id: `old-${i}`, from: i ? 'commander' : 'user', text })),
+      { id: 'now', from: 'user', text: 'Recall' },
+    ]);
+    const [, read] = await createChatHistoryActions({ userId: TEST_UID, currentCid: 'forward-history', currentMessageId: 'now', allowedScopes: ['current'] });
+    const decode = (value: string) => value.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+    const recovered = new Map<string, string>();
+    let input: Record<string, unknown> = { turn_id: 'old-0' };
+    for (let page = 0; page < 40; page++) {
+      const result = await read.execute({ ...input, scope: 'current', max_tokens: 1_000 }, ctxFor());
+      expect(result.isError).toBeFalsy();
+      for (const match of result.content.matchAll(/<msg[^>]*id="([^"]+)"[^>]*covered="(\d+)-(\d+)"[^>]*>\n([\s\S]*?)\n<\/msg>/g)) {
+        const prior = recovered.get(match[1]) || '';
+        expect(Number(match[2])).toBe(prior.length);
+        recovered.set(match[1], prior + decode(match[4]));
+      }
+      const next = decode(/<next_read>([\s\S]*?)<\/next_read>/.exec(result.content)![1]);
+      if (next === 'done') break;
+      input = JSON.parse(next);
+    }
+    expect([...recovered.values()]).toEqual(originals);
+  });
+
+  it('isolates genuine programmatic child reads but does not trust a caller-supplied state flag', async () => {
+    writeConversation('child-history', 'Child history', [
+      { id: 'old', from: 'user', text: 'ORIGINAL_CHILD_INPUT' }, { id: 'now', from: 'user', text: 'Recall' },
+    ]);
+    const { createChatHistoryTool } = await import('../../../../src/main/model/core-agent/chat-history-tools');
+    const opts = { userId: TEST_UID, currentCid: 'child-history', currentMessageId: 'now', allowedScopes: ['current'] as const };
+    const ledger = { remainingTokens: 0, perResultTokens: 10_000 };
+    const ctx = ctxFor({ toolResultInlineLedger: ledger, isProgrammaticToolCall: true });
+    const input = { action: 'read', scope: 'current', record_id: 'old' };
+    const child = createChatHistoryTool({ ...opts, isProgrammaticToolCallContext: () => true });
+    expect((await child.execute(input, ctx)).content).toContain('ORIGINAL_CHILD_INPUT');
+    expect(ledger.remainingTokens).toBe(0);
+    const model = createChatHistoryTool({ ...opts, isProgrammaticToolCallContext: () => false });
+    const denied = await model.execute(input, ctx);
+    expect(denied.isError).toBe(true);
+    expect(denied.content).not.toContain('ORIGINAL_CHILD_INPUT');
+  });
+
+  it('searches stored tool input/output and reads by stable call/turn/message IDs without private reasoning', async () => {
+    writeConversation('execution-history', 'Execution history', [
+      { id: 'user-old', from: 'user', text: 'Perform a lookup', ts: '2026-09-01' },
+      { id: 'answer-old', from: 'commander', text: 'Lookup finished', turn_id: 'execution-1', source_message_id: 'user-old', process: [
+        { type: 'event', event: { stream: 'tool', data: { phase: 'start', id: 'call-lookup', name: 'lookup', input: { key: 'INPUT_NEEDLE_42' } } } },
+        { type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 'call-lookup', name: 'lookup', output: 'OUTPUT_NEEDLE_42 exact result', isError: false } } },
+        { type: 'event', event: { stream: 'thinking', data: { type: 'done', id: 'private-id', text: 'PRIVATE_REASONING' } } },
+      ] },
+      { id: 'now', from: 'user', text: 'Recall it' },
+      { id: 'future', from: 'commander', text: 'FUTURE_NEEDLE_42' },
+    ]);
+    const [search, read] = await createChatHistoryActions({ userId: TEST_UID, currentCid: 'execution-history', currentMessageId: 'now', allowedScopes: ['current'] });
+    const hit = await search.execute({ query: 'OUTPUT_NEEDLE_42', scope: 'current' }, ctxFor());
+    expect(hit.content).toContain('OUTPUT_NEEDLE_42');
+    expect(hit.content).toContain('record_id="answer-old"');
+    const record = await read.execute({ scope: 'current', record_id: 'answer-old', tool_call_id: 'call-lookup' }, ctxFor());
+    expect(record.content).toContain('INPUT_NEEDLE_42');
+    expect(record.content).toContain('OUTPUT_NEEDLE_42');
+    expect(record.content).not.toContain('PRIVATE_REASONING');
+    const turn = await read.execute({ scope: 'current', turn_id: 'user-old' }, ctxFor());
+    expect(turn.content).toContain('Perform a lookup');
+    expect(turn.content).toContain('Lookup finished');
+    const future = await read.execute({ scope: 'current', record_id: 'future' }, ctxFor());
+    expect(future.isError).toBe(true);
+    expect(future.content).not.toContain('FUTURE_NEEDLE_42');
+  });
+
+  it('pages an oversized historical input exactly without generating spill references', async () => {
+    const original = '订单🧾状态完整\n'.repeat(2_000);
+    writeConversation('exact-history', 'Exact history', [
+      { id: 'old', from: 'user', text: original }, { id: 'now', from: 'user', text: 'Recall' },
+    ]);
+    const [, read] = await createChatHistoryActions({ userId: TEST_UID, currentCid: 'exact-history', currentMessageId: 'now', allowedScopes: ['current'] });
+    const { capToolResult, estimateToolResultTokens } = await import('../../../../src/main/util/tool-result-cap');
+    let cursor = 0, recovered = '';
+    for (let step = 0; step < 30; step++) {
+      const ctx = ctxFor({ toolResultInlineLedger: { remainingTokens: 10_000, perResultTokens: 10_000 } });
+      const result = await read.execute({ scope: 'current', record_id: 'old', cursor, max_tokens: 3_000 }, ctx);
+      expect(result.isError).toBeFalsy();
+      expect(estimateToolResultTokens(result.content)).toBeLessThanOrEqual(3_000);
+      const match = /covered="(\d+)-(\d+)" next_cursor="(\d+|done)">\n([\s\S]*?)\n<\/msg>/.exec(result.content)!;
+      expect(Number(match[1])).toBe(cursor);
+      recovered += match[4];
+      const capped = capToolResult('chat_history', result, ctx, { maxInlineTokens: 10_000, toolResultsDir: path.join(tmpDir, 'unexpected-spill') });
+      expect(capped.persistedOutput).toBeUndefined();
+      if (match[3] === 'done') break;
+      cursor = Number(match[3]);
+    }
+    expect(recovered).toBe(original);
+    expect(fs.existsSync(path.join(tmpDir, 'unexpected-spill'))).toBe(false);
+  });
+
+  it('reads a retained full tool output under its owning conversation and rejects foreign sources', async () => {
+    const { cloudSessionToolResultsDirFor } = await import('../../../../src/main/util/project-layout');
+    const { persistToolResult } = await import('../../../../src/main/util/tool-result-cap');
+    const cid = 'retained-history';
+    const directory = cloudSessionToolResultsDirFor(TEST_UID, `gconv-${cid}`);
+    const file = persistToolResult(directory, 'lookup', 'RETAINED_SOURCE ' + '界'.repeat(12_000));
+    const oldDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1_000);
+    fs.utimesSync(file, oldDate, oldDate);
+    writeConversation(cid, 'Retained output', [
+      { id: 'old', from: 'commander', text: 'Finished', process: [
+        { type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 'call-old', name: 'lookup', result_path: 'C:\\synced-device\\' + path.basename(file), result_preview: 'preview only' } } },
+      ] }, { id: 'now', from: 'user', text: 'Recall output' },
+    ]);
+    const [, read] = await createChatHistoryActions({ userId: TEST_UID, currentCid: cid, currentMessageId: 'now', allowedScopes: ['current'] });
+    const result = await read.execute({ scope: 'current', record_id: 'old', tool_call_id: 'call-old', output_cursor: 0, max_tokens: 5_000 }, ctxFor());
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toContain('RETAINED_SOURCE');
+    expect(result.content).toMatch(/next_cursor="\d+"/);
+    writeConversation('foreign-history', 'Foreign', [
+      { id: 'old', from: 'commander', text: 'Forged source path', process: [
+        { type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 'call-old', result_path: file } } },
+      ] }, { id: 'now', from: 'user', text: 'Recall' },
+    ]);
+    const [, foreign] = await createChatHistoryActions({ userId: TEST_UID, currentCid: 'foreign-history', currentMessageId: 'now', allowedScopes: ['current'] });
+    const denied = await foreign.execute({ scope: 'current', record_id: 'old', tool_call_id: 'call-old', output_cursor: 0 }, ctxFor());
+    expect(denied.isError).toBe(true);
+    expect(denied.content).not.toContain('RETAINED_SOURCE');
+    expect(fs.existsSync(file)).toBe(true);
+  });
+});
+
+
+describe('chat history discovery and evidence recovery', () => {
+  it('searches and pages media-bearing history as text without returning image/video bytes', async () => {
+    const original = {
+      id: 'media-result', from: 'commander', text: 'Cedar poster ![chart](data:image/png;base64,' + 'AAAA'.repeat(40000) + ')',
+      produced: ['/work/chart.png', '/work/clip.mp4'],
+      process: [{ type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 'media-call', name: 'preview', output: {
+        status: 'Cedar export completed', content: [{ type: 'image', mimeType: 'image/png', data: 'IMAGE_PAYLOAD' },
+          { mimeType: 'video/mp4', data: 'VIDEO_PAYLOAD' }],
+      } } } }],
+    };
+    writeConversation('media-history', 'Media task', [original, { id: 'now', from: 'user', text: 'Continue' }]);
+    const [, , tool] = await createChatHistoryActions({ userId: TEST_UID, currentCid: 'media-history', currentMessageId: 'now', allowedScopes: ['current'] });
+    const search = await tool.execute({ action: 'search', scope: 'current', query: 'Cedar export' }, ctxFor());
+    const locator = JSON.parse(/^    read: (.+)$/m.exec(search.content)![1]);
+    const read = await tool.execute(locator, ctxFor());
+    expect(read.isError).toBeFalsy();
+    expect(read.content).toContain('Cedar export completed');
+    expect(read.content).toContain('/work/chart.png');
+    expect(read.content).toContain('/work/clip.mp4');
+    expect(search.content + read.content).not.toMatch(/AAAA|IMAGE_PAYLOAD|VIDEO_PAYLOAD/);
+    expect(read.content).toContain('data omitted from history');
+    expect(read.content).not.toContain('tool_result');
+    const { historyMessages } = await import('../../../../src/main/features/chat-history-records');
+    expect(await historyMessages(TEST_UID, 'media-history', [0])).toEqual([original]);
+  });
+
+  const facts = 'Cedar 导出验收：通过7项，失败2项。';
+  const query = 'Cedar 导出验收 执行结果 通过 失败 项数';
+  const decode = (text: string) => text.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+  const answer = () => ({ id: 'answer', from: 'commander', text: 'Cedar 导出验收的执行结果已检查。', process: [
+    { type: 'event', event: { stream: 'tool', data: { phase: 'start', id: 'cedar-test-report', name: 'read_files', arguments: { paths: [{ path: 'cedar-test-report.txt' }] } } } },
+    { type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 'cedar-test-report', name: 'read_files', output: facts } } },
+    { type: 'event', event: { stream: 'thinking', data: { text: 'PRIVATE_CEDAR_REASONING' } } },
+  ] });
+
+  it('recovers a process result using only locators returned for a natural query', async () => {
+    writeConversation('discovery', 'Export check', [answer(), { id: 'now', from: 'user', text: 'Write the status' }]);
+    const [, , tool] = await createChatHistoryActions({ userId: TEST_UID, currentCid: 'discovery', currentMessageId: 'now', allowedScopes: ['current'] });
+    const search = await tool.execute({ action: 'search', scope: 'current', query }, ctxFor());
+    expect(search.content).toContain(facts);
+    expect(search.content).toContain('process_match:');
+    const locator = JSON.parse(/^    read: (.+)$/m.exec(search.content)![1]);
+    const read = await tool.execute(locator, ctxFor());
+    expect(read.isError).toBeFalsy();
+    expect(read.content).toContain(facts);
+    expect(search.content + read.content).not.toContain('PRIVATE_CEDAR_REASONING');
+  });
+
+  it.each(['project', 'all'] as const)('keeps %s hit locators in their authorized conversation', async scope => {
+    writeConversation('other', 'Other export', [answer()], scope === 'project' ? 'p1' : 'p2');
+    writeConversation('current', 'Current task', [{ id: 'now', from: 'user', text: 'Status' }], 'p1');
+    const [, , tool] = await createChatHistoryActions({ userId: TEST_UID, currentCid: 'current', currentMessageId: 'now', projectId: 'p1' });
+    const result = await tool.execute({ action: 'search', scope, query }, ctxFor());
+    const locator = JSON.parse(/^    read: (.+)$/m.exec(result.content)![1]);
+    expect(locator).toMatchObject({ cid: 'other', scope });
+    const read = await tool.execute(locator, ctxFor());
+    expect(read.isError).toBeFalsy();
+    expect(read.content).toContain(facts);
+  });
+
+  it('offers an exact process read after a dialogue-only read without exposing private-only records', async () => {
+    writeConversation('discovery', 'Export check', [answer(),
+      { id: 'private', from: 'commander', text: 'No public execution', process: [{ type: 'event', event: { stream: 'reasoning', data: { text: 'PRIVATE_ONLY' } } }] },
+      { id: 'now', from: 'user', text: 'Status' }]);
+    const [, , tool] = await createChatHistoryActions({ userId: TEST_UID, currentCid: 'discovery', currentMessageId: 'now', allowedScopes: ['current'] });
+    const text = await tool.execute({ action: 'read', scope: 'current', record_id: 'answer' }, ctxFor());
+    expect(text.content).not.toContain(facts);
+    expect(text.content).toContain('include_process="false"');
+    const locator = JSON.parse(decode(/<process_read>(.*?)<\/process_read>/.exec(text.content)![1]));
+    expect((await tool.execute(locator, ctxFor())).content).toContain(facts);
+    const privateOnly = await tool.execute({ action: 'read', scope: 'current', record_id: 'private' }, ctxFor());
+    expect(privateOnly.content).not.toContain('<process_read>');
+    expect(privateOnly.content).not.toContain('PRIVATE_ONLY');
+  });
+
+  it('labels incomplete-index misses and recovers through the returned read without waiting for repair', async () => {
+    const trigger = { id: 'now', from: 'user', text: query };
+    writeConversation('partial', 'Partial index', [answer(), trigger]);
+    const indexer = await import('../../../../src/main/features/search/indexer');
+    const search = await import('../../../../src/main/features/search');
+    await indexer.indexChatMessage(TEST_UID, 'partial', 1, trigger);
+    const [, , tool] = await createChatHistoryActions({ userId: TEST_UID, currentCid: 'partial', currentMessageId: 'now', allowedScopes: ['current'] }, false);
+    try {
+      const result = await tool.execute({ action: 'search', scope: 'current', query }, ctxFor());
+      expect(result.content).toContain('index_complete=false');
+      expect(result.content).not.toContain('No conversation-history results');
+      const locator = JSON.parse(/^Read recent records: (.+)$/m.exec(result.content)![1]);
+      expect((await tool.execute(locator, ctxFor())).content).toContain(facts);
+    } finally { search.__searchTestHooks.cancelChatRepair(TEST_UID); }
+    await indexer.reconcileChatsIndex(TEST_UID);
+    const result = await tool.execute({ action: 'search', scope: 'current', query: 'absentuniqueterm' }, ctxFor());
+    expect(result.content).toContain('index_complete=true');
+    expect(result.content).toContain('No conversation-history results');
+  });
+
+  it('budgets process locators together with paged contents without recursive persistence', async () => {
+    const record = answer();
+    record.text = 'long original dialogue '.repeat(800);
+    writeConversation('bounded', 'Long record', [record, { id: 'now', from: 'user', text: 'Status' }]);
+    const [, , tool] = await createChatHistoryActions({ userId: TEST_UID, currentCid: 'bounded', currentMessageId: 'now', allowedScopes: ['current'] });
+    const { estimateToolResultTokens } = await import('../../../../src/main/util/tool-result-cap');
+    let input: any = { action: 'read', scope: 'current', record_id: 'answer', max_tokens: 1000 };
+    let body = '';
+    for (let i = 0; i < 20; i++) {
+      const result = await tool.execute(input, ctxFor());
+      expect(estimateToolResultTokens(result.content)).toBeLessThanOrEqual(1000);
+      expect(result.content).not.toContain('tool_result');
+      expect(result.content).toContain('<process_read>');
+      body += decode(/<msg [^>]*>\n([\s\S]*?)\n<process_read>/.exec(result.content)![1]);
+      const next = decode(/<next_read>([\s\S]*?)<\/next_read>/.exec(result.content)![1]);
+      if (next === 'done') break;
+      input = { action: 'read', scope: 'current', ...JSON.parse(next), max_tokens: 1000 };
+    }
+    expect(body).toBe(record.text);
+  });
+
 });

@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>词间 · 单词卡片</title>
+  <style>
+    :root { --ink:#172033; --muted:#697386; --line:#e3e8ef; --paper:#fffdf9; --bg:#f4f6fa; --blue:#2855d9; --blue-soft:#eaf0ff; --amber:#ed9b20; --green:#1e9d6d; --red:#d35050; --shadow:0 18px 45px rgba(28,42,72,.10); }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:var(--bg); font:15px/1.5 ui-rounded, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; }
+    button,input,textarea { font:inherit; }
+    button { cursor:pointer; }
+    .app { max-width:1180px; margin:0 auto; padding:34px 24px 56px; }
+    header { display:flex; align-items:center; justify-content:space-between; gap:18px; margin-bottom:30px; }
+    .brand { display:flex; align-items:center; gap:12px; font-weight:800; font-size:20px; letter-spacing:-.4px; }
+    .brand-mark { display:grid; place-items:center; width:38px; height:38px; border-radius:13px; background:var(--blue); color:white; box-shadow:0 7px 16px rgba(40,85,217,.28); font-size:19px; }
+    .today { color:var(--muted); font-size:13px; }
+    .layout { display:grid; grid-template-columns:330px 1fr; gap:28px; align-items:start; }
+    .panel, .card-shell { background:var(--paper); border:1px solid var(--line); border-radius:22px; box-shadow:var(--shadow); }
+    .panel { padding:22px; }
+    h1,h2,p { margin:0; }
+    h1 { font-size:clamp(25px,4vw,38px); line-height:1.15; letter-spacing:-1.2px; }
+    h2 { font-size:15px; }
+    .eyebrow { margin-bottom:8px; color:var(--blue); font-size:12px; font-weight:800; letter-spacing:.1em; text-transform:uppercase; }
+    .intro { color:var(--muted); margin-top:11px; }
+    .stat-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:22px 0; }
+    .stat { padding:12px 8px; text-align:center; border-radius:14px; background:#f7f8fc; }
+    .stat strong { display:block; font-size:20px; line-height:1.1; }
+    .stat span { color:var(--muted); font-size:11px; }
+    .rule { height:1px; background:var(--line); margin:21px 0; }
+    label { display:block; margin:13px 0 6px; color:#445068; font-size:13px; font-weight:700; }
+    input,textarea { width:100%; border:1px solid #d8deea; border-radius:11px; padding:10px 11px; outline:none; background:#fff; transition:border .16s,box-shadow .16s; }
+    textarea { min-height:72px; resize:vertical; }
+    input:focus,textarea:focus { border-color:var(--blue); box-shadow:0 0 0 3px rgba(40,85,217,.13); }
+    .primary,.secondary,.choice { border:0; border-radius:11px; padding:10px 14px; font-weight:750; transition:transform .16s, background .16s, box-shadow .16s; }
+    .primary { width:100%; margin-top:16px; color:white; background:var(--blue); box-shadow:0 6px 15px rgba(40,85,217,.24); }
+    .primary:hover { background:#1d46c3; transform:translateY(-1px); }
+    .content { min-width:0; }
+    .topline { display:flex; align-items:flex-end; justify-content:space-between; gap:16px; }
+    .queue { color:var(--muted); font-size:13px; text-align:right; }
+    .queue strong { color:var(--ink); font-size:20px; }
+    .filters { display:flex; gap:8px; flex-wrap:wrap; margin:24px 0 15px; }
+    .choice { color:#58647a; background:#edf0f5; padding:8px 12px; font-size:13px; }
+    .choice[aria-pressed="true"] { color:#1742ba; background:var(--blue-soft); }
+    .progress { height:6px; margin-bottom:15px; overflow:hidden; border-radius:99px; background:#e8ecf3; }
+    .progress > span { display:block; height:100%; width:0; border-radius:inherit; background:linear-gradient(90deg,#5379eb,#2855d9); transition:width .25s; }
+    .card-shell { min-height:390px; padding:clamp(24px,5vw,52px); position:relative; overflow:hidden; display:flex; flex-direction:column; justify-content:space-between; }
+    .card-shell::after { content:""; position:absolute; width:210px; height:210px; border-radius:50%; background:#eef2ff; top:-90px; right:-65px; z-index:0; }
+    .card-main,.card-actions { position:relative; z-index:1; }
+    .card-meta { display:flex; justify-content:space-between; align-items:center; color:var(--muted); font-size:13px; }
+    .pill { border-radius:999px; padding:5px 9px; font-weight:800; font-size:12px; }
+    .pill.learning { color:#97600a; background:#fff2d9; } .pill.mastered { color:#13704c; background:#ddf6e9; }
+    .word { margin:42px 0 14px; font-family:Georgia,serif; font-size:clamp(43px,7vw,72px); letter-spacing:-2px; line-height:1; word-break:break-word; }
+    .hint { color:var(--muted); }
+    .answer { margin-top:24px; padding-top:23px; border-top:1px solid var(--line); animation:reveal .2s ease-out; }
+    .answer h2 { color:var(--blue); margin-bottom:8px; }
+    .example { margin-top:15px; padding-left:14px; border-left:3px solid #b7c7fb; color:#465168; font-style:italic; }
+    @keyframes reveal { from {opacity:0; transform:translateY(6px)} to {opacity:1; transform:none} }
+    .card-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:30px; }
+    .secondary { color:#33415b; background:#eef1f6; } .secondary:hover { background:#e3e8f0; }
+    .master { color:white; background:var(--green); } .master:hover { background:#16835a; }
+    .unmaster { color:#9d3030; background:#fff0f0; } .unmaster:hover { background:#ffe4e4; }
+    .empty { padding:54px 24px; text-align:center; color:var(--muted); }
+    .empty b { display:block; color:var(--ink); font-size:18px; margin-bottom:7px; }
+    .toast { min-height:22px; margin-top:14px; color:var(--green); font-size:13px; font-weight:700; }
+    .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+    button:focus-visible { outline:3px solid rgba(40,85,217,.45); outline-offset:3px; }
+    @media (max-width:780px) { .app { padding:22px 16px 40px; } header { margin-bottom:22px; } .layout { grid-template-columns:1fr; gap:18px; } .panel { order:2; } .card-shell { min-height:370px; } }
+    @media (prefers-reduced-motion:reduce) { *,*::before,*::after { animation-duration:.01ms !important; transition-duration:.01ms !important; scroll-behavior:auto !important; } }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header><div class="brand"><span class="brand-mark" aria-hidden="true">卡</span>词间</div><div class="today" id="today"></div></header>
+    <div class="layout">
+      <aside class="panel" aria-label="添加单词">
+        <p class="eyebrow">你的词库</p><h2>添加一张新卡片</h2>
+        <div class="stat-grid" aria-label="学习统计"><div class="stat"><strong id="totalCount">0</strong><span>全部</span></div><div class="stat"><strong id="learningCount">0</strong><span>待掌握</span></div><div class="stat"><strong id="masteredCount">0</strong><span>已掌握</span></div></div>
+        <div class="rule"></div>
+        <form id="wordForm">
+          <label for="wordInput">单词 <span aria-hidden="true">*</span></label><input id="wordInput" required maxlength="80" placeholder="例如：serendipity" autocomplete="off" />
+          <label for="definitionInput">释义 <span aria-hidden="true">*</span></label><textarea id="definitionInput" required maxlength="300" placeholder="意外发现美好事物的能力或经历"></textarea>
+          <label for="exampleInput">例句（可选）</label><textarea id="exampleInput" maxlength="400" placeholder="It was pure serendipity that we met."></textarea>
+          <button class="primary" type="submit">添加到词库</button>
+        </form>
+        <div class="toast" id="toast" role="status" aria-live="polite"></div>
+      </aside>
+      <section class="content" aria-label="复习卡片">
+        <div class="topline"><div><p class="eyebrow">复习模式</p><h1>先攻克还不会的词</h1><p class="intro">未掌握的卡片会优先出现，翻卡后再给自己一个判断。</p></div><div class="queue"><strong id="queueCount">0</strong><br>张待复习</div></div>
+        <div class="filters" role="group" aria-label="筛选卡片"><button class="choice" data-filter="review" aria-pressed="true">优先复习</button><button class="choice" data-filter="all" aria-pressed="false">全部词汇</button><button class="choice" data-filter="mastered" aria-pressed="false">已掌握</button></div>
+        <div class="progress" aria-label="掌握进度"><span id="progressBar"></span></div>
+        <article class="card-shell" id="card" aria-live="polite"></article>
+      </section>
+    </div>
+  </main>
+  <script>
+    const KEY='word-card-app-v1';
+    const starter=[
+      {id:1,word:'serendipity',definition:'意外发现美好事物的能力或经历。',example:'It was pure serendipity that we met.',mastered:false},
+      {id:2,word:'resilient',definition:'有韧性的；能从困难中迅速恢复的。',example:'Children can be remarkably resilient.',mastered:false},
+      {id:3,word:'eloquent',definition:'雄辩的；表达流利且有说服力的。',example:'Her eloquent speech moved the audience.',mastered:true}
+    ];
+    let words=[]; let filter='review'; let index=0; let flipped=false;
+    const $=id=>document.getElementById(id);
+    function load(){ try { words=JSON.parse(localStorage.getItem(KEY)) || starter; } catch { words=starter; } }
+    function save(){ localStorage.setItem(KEY,JSON.stringify(words)); }
+    function selected(){ const unmastered=words.filter(w=>!w.mastered); if(filter==='review') return [...unmastered, ...words.filter(w=>w.mastered)]; if(filter==='mastered') return words.filter(w=>w.mastered); return words; }
+    function current(){ const list=selected(); if(index>=list.length) index=0; return list[index]; }
+    function escapeText(text){ const el=document.createElement('span'); el.textContent=text; return el.innerHTML; }
+    function render(){ const list=selected(), item=current(), learned=words.filter(w=>w.mastered).length, pending=words.length-learned;
+      $('totalCount').textContent=words.length; $('learningCount').textContent=pending; $('masteredCount').textContent=learned; $('queueCount').textContent=pending;
+      $('progressBar').style.width=(words.length?learned/words.length*100:0)+'%';
+      document.querySelectorAll('[data-filter]').forEach(b=>b.setAttribute('aria-pressed',b.dataset.filter===filter));
+      if(!item){ $('card').innerHTML='<div class="empty"><b>这里暂时没有卡片</b>添加一个单词，开始今天的复习。</div>'; return; }
+      const state=item.mastered?'mastered':'learning', label=item.mastered?'已掌握':'待掌握';
+      $('card').innerHTML=`<div class="card-main"><div class="card-meta"><span>第 ${index+1} / ${list.length} 张</span><span class="pill ${state}">${label}</span></div><div class="word">${escapeText(item.word)}</div>${flipped?`<div class="answer"><h2>释义</h2><p>${escapeText(item.definition)}</p>${item.example?`<p class="example">“${escapeText(item.example)}”</p>`:''}</div>`:'<p class="hint">试着先回想释义，再翻开卡片查看答案。</p>'}</div><div class="card-actions"><button class="secondary" id="flipButton">${flipped?'收起答案':'翻开答案'}</button><button class="secondary" id="nextButton">下一张 →</button>${flipped?`<button class="${item.mastered?'unmaster':'master'} secondary" id="masterButton">${item.mastered?'标记为未掌握':'我已掌握 ✓'}</button>`:''}</div>`;
+      $('flipButton').onclick=()=>{flipped=!flipped;render()}; $('nextButton').onclick=next; const m=$('masterButton'); if(m) m.onclick=toggleMastery;
+    }
+    function next(){ const list=selected(); if(list.length) index=(index+1)%list.length; flipped=false; render(); }
+    function toggleMastery(){ const item=current(); item.mastered=!item.mastered; save(); index=0; flipped=false; $('toast').textContent=item.mastered?`已将 “${item.word}” 标记为掌握。`:`“${item.word}” 已回到优先复习队列。`; render(); }
+    $('wordForm').addEventListener('submit',e=>{ e.preventDefault(); const word=$('wordInput').value.trim(), definition=$('definitionInput').value.trim(), example=$('exampleInput').value.trim(); if(!word||!definition)return; words.unshift({id:Date.now(),word,definition,example,mastered:false}); save(); filter='review'; index=0; flipped=false; e.target.reset(); $('toast').textContent=`“${word}” 已添加，排在复习队列前面。`; render(); $('wordInput').focus(); });
+    document.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{ const unchanged=filter===b.dataset.filter; filter=b.dataset.filter; index=0; flipped=false; $('toast').textContent=unchanged?'当前已显示此筛选结果。':`已切换到${b.textContent}。`; render();});
+    $('today').textContent=new Intl.DateTimeFormat('zh-CN',{month:'long',day:'numeric',weekday:'short'}).format(new Date());
+    load(); render();
+  </script>
+</body>
+</html>

@@ -594,3 +594,352 @@ describe('Library external file drag-and-drop', () => {
     expect(context.uiAlert).not.toHaveBeenCalled();
   });
 });
+
+
+describe('Library project switching', () => {
+  it('keeps the latest selection when an earlier Library load finishes late', async () => {
+    const context = loadContextsScript();
+    let finishGlobal: (value: any) => void = () => {};
+    context.apiFetch = vi.fn(async (url: string) => ({ json: async () => url.endsWith('/tree')
+      ? await new Promise((resolve) => { finishGlobal = resolve; }) : { ok: true, files: [] } }));
+    context.apiLibraryFetch = vi.fn(async () => ({ json: async () => ({
+      ok: true, tree: [{ type: 'file', name: 'project.md', path: 'project.md' }],
+      files: [{ path: 'project.md', status: 'ready' }],
+    }) }));
+    context._ensureKbEventSubscription = vi.fn();
+    const pending = context.loadContexts();
+    await Promise.resolve();
+    await Promise.resolve();
+    await context.switchCtxProject('p1');
+    finishGlobal({ ok: true, tree: [{ type: 'file', name: 'global.md', path: 'global.md' }] });
+    await pending;
+    expect(vm.runInContext('_ctxTree.map(file => file.name)', context)).toEqual(['project.md']);
+    context._applyKbEvent({ relPath: 'project.md', status: 'failed' });
+    expect(vm.runInContext('_kbStatusByPath["project.md"].status', context)).toBe('ready');
+  });
+
+  it('isolates same-named drafts and discards late previews across projects', async () => {
+    const context = loadContextsScript();
+    context.loadContexts = vi.fn();
+    context._showCtxTextViewer = vi.fn();
+    let finishRead: (value: any) => void = () => {};
+    context.apiFetch = vi.fn(async () => ({ json: () => new Promise((resolve) => { finishRead = resolve; }) }));
+    vm.runInContext('_ctxDrafts.set("same.md", { content: "Global draft", dirty: false })', context);
+    const read = context.openCtxFile('same.md');
+    await Promise.resolve();
+    await context.switchCtxProject('p1');
+    expect(vm.runInContext('_ctxDrafts.size', context)).toBe(0);
+    vm.runInContext('_ctxDrafts.set("same.md", { content: "Project draft", dirty: false })', context);
+    finishRead({ ok: true, content: 'Global content' });
+    await read;
+    expect(context._showCtxTextViewer).not.toHaveBeenCalled();
+    await context.switchCtxProject('');
+    expect(vm.runInContext('_ctxDrafts.get("same.md").content', context)).toBe('Global draft');
+    await context.switchCtxProject('p1');
+    expect(vm.runInContext('_ctxDrafts.get("same.md").content', context)).toBe('Project draft');
+  });
+
+  it('keeps a confirmed deletion in its original scope until it finishes', async () => {
+    const context = loadContextsScript();
+    context.loadContexts = vi.fn();
+    let confirm: (value: boolean) => void = () => {};
+    context.uiConfirm = () => new Promise((resolve) => { confirm = resolve; });
+    context.apiFetch = vi.fn(async () => ({ json: async () => ({ ok: true }) }));
+    const deletion = context.deleteCtxEntry('same.md', 'file');
+    expect(await context.switchCtxProject('p1')).toBe(false);
+    confirm(true);
+    await deletion;
+    expect(context.apiFetch).toHaveBeenCalledWith('/api/contexts/delete?path=same.md', { method: 'DELETE' });
+    await context.switchCtxProject('p1');
+    expect(vm.runInContext('_ctxProjectId', context)).toBe('p1');
+  });
+});
+
+
+describe('Library unsaved changes before switching projects', () => {
+  function setup(save: boolean, saveResult = true) {
+    const context = loadContextsScript();
+    context.loadContexts = vi.fn();
+    context.uiConfirm = vi.fn(async () => save);
+    context.uiAlert = vi.fn();
+    context.__controller = {
+      isDirty: () => true,
+      save: vi.fn(async () => saveResult),
+      destroy: vi.fn(),
+    };
+    vm.runInContext(`
+      _ctxActive = { id: 'same.md' };
+      _ctxMveController = __controller;
+      _ctxDrafts.set('same.md', { content: 'Unsaved text', dirty: true });
+    `, context);
+    return context;
+  }
+
+  // Model only the shared editor's persistence boundary. Use the real Library
+  // viewer callbacks, file reopening, and switch orchestration under test.
+  function setupMultipleDrafts() {
+    const context = loadContextsScript();
+    const persisted = new Map<string, string>();
+    const failedWrites = new Set<string>();
+    context.loadContexts = vi.fn();
+    context.uiConfirm = vi.fn(async () => true);
+    context.uiAlert = vi.fn();
+    context.apiFetch = vi.fn(async () => ({ json: async () => ({ ok: true, content: 'Original' }) }));
+    context._prepCtxViewerShell = (rel: string) => {
+      context.__rel = rel;
+      vm.runInContext('_ctxActive = { id: __rel }', context);
+      return { bodyEl: {}, actionsEl: {} };
+    };
+    const write = vi.fn(async (rel: string, content: string) => {
+      if (failedWrites.has(rel)) return false;
+      persisted.set(rel, content);
+      return true;
+    });
+    context.mountMdViewEdit = ({ source, initialDraft, callbacks }: any) => {
+      let dirty = !!initialDraft;
+      return {
+        isDirty: () => dirty,
+        destroy: vi.fn(),
+        save: async () => {
+          if (!await write(source.rel, initialDraft.content)) return false;
+          dirty = false;
+          callbacks.onDraftChange(null);
+          callbacks.onDirtyChange(false);
+          return true;
+        },
+      };
+    };
+    vm.runInContext(`
+      _ctxDrafts.set('first.md', { content: 'First edit', dirty: true });
+      _ctxDrafts.set('second.md', { content: 'Second edit', dirty: true });
+      _ctxDrafts.set('third.md', { content: 'Third edit', dirty: true });
+    `, context);
+    context._showCtxTextViewer('first.md', 'Original');
+    return { context, persisted, failedWrites, write };
+  }
+
+  it('switches directly when the editor and retained draft have no changes', async () => {
+    const context = setup(true);
+    context.__controller.isDirty = () => false;
+    vm.runInContext('_ctxDrafts.get("same.md").dirty = false', context);
+    expect(await context.switchCtxProject('p1')).toBe(true);
+    expect(vm.runInContext('_ctxProjectId', context)).toBe('p1');
+    expect(context.uiConfirm).not.toHaveBeenCalled();
+    expect(context.__controller.save).not.toHaveBeenCalled();
+  });
+
+  it('does not prompt, save, or reload when selecting the current project', async () => {
+    const context = setup(true);
+    expect(await context.switchCtxProject('')).toBe(true);
+    expect(context.uiConfirm).not.toHaveBeenCalled();
+    expect(context.__controller.save).not.toHaveBeenCalled();
+    expect(context.loadContexts).not.toHaveBeenCalled();
+    expect(vm.runInContext('_ctxDrafts.get("same.md").content', context)).toBe('Unsaved text');
+  });
+
+  it('discards edits without writing and does not restore them on return', async () => {
+    const context = setup(false);
+    expect(await context.switchCtxProject('p1')).toBe(true);
+    expect(context.__controller.save).not.toHaveBeenCalled();
+    await context.switchCtxProject('');
+    expect(vm.runInContext('_ctxDrafts.size', context)).toBe(0);
+  });
+
+  it('waits for saving to finish and rejects a second switch while saving', async () => {
+    const context = setup(true);
+    let finish: (value: boolean) => void = () => {};
+    context.__controller.save = vi.fn(() => new Promise((resolve) => { finish = resolve; }));
+    const pending = context.switchCtxProject('p1');
+    await vi.waitFor(() => expect(context.__controller.save).toHaveBeenCalledOnce());
+    expect(vm.runInContext('_ctxProjectId', context)).toBe('');
+    expect(await context.switchCtxProject('p2')).toBe(false);
+    finish(true);
+    expect(await pending).toBe(true);
+    expect(vm.runInContext('_ctxProjectId', context)).toBe('p1');
+  });
+
+  it('keeps the project and draft when saving fails, then permits retry', async () => {
+    const context = setup(true, false);
+    expect(await context.switchCtxProject('p1')).toBe(false);
+    expect(vm.runInContext('_ctxProjectId', context)).toBe('');
+    expect(vm.runInContext('_ctxDrafts.get("same.md").content', context)).toBe('Unsaved text');
+    expect(context.__controller.destroy).not.toHaveBeenCalled();
+    context.__controller.save.mockResolvedValue(true);
+    expect(await context.switchCtxProject('p1')).toBe(true);
+  });
+
+  it('also persists the contents of files that are no longer open before switching', async () => {
+    const { context, persisted } = setupMultipleDrafts();
+    expect(await context.switchCtxProject('p1')).toBe(true);
+    expect(context.uiConfirm.mock.calls[0][0].message).toContain('"count":3');
+    expect(Object.fromEntries(persisted)).toEqual({
+      'first.md': 'First edit', 'second.md': 'Second edit', 'third.md': 'Third edit',
+    });
+    await context.switchCtxProject('');
+    expect(vm.runInContext('_ctxDrafts.size', context)).toBe(0);
+  });
+
+  it('retains remaining drafts after a partial save and retries only unsaved files', async () => {
+    const { context, persisted, failedWrites, write } = setupMultipleDrafts();
+    failedWrites.add('second.md');
+    expect(await context.switchCtxProject('p1')).toBe(false);
+    expect(vm.runInContext('_ctxProjectId', context)).toBe('');
+    expect(Object.fromEntries(persisted)).toEqual({ 'first.md': 'First edit' });
+    expect(vm.runInContext('Array.from(_ctxDrafts.keys())', context)).toEqual(['second.md', 'third.md']);
+    expect(write.mock.calls).toEqual([['first.md', 'First edit'], ['second.md', 'Second edit']]);
+
+    failedWrites.clear();
+    expect(await context.switchCtxProject('p1')).toBe(true);
+    expect(context.uiConfirm.mock.calls[1][0].message).toContain('"count":2');
+    expect(write.mock.calls).toEqual([
+      ['first.md', 'First edit'], ['second.md', 'Second edit'],
+      ['second.md', 'Second edit'], ['third.md', 'Third edit'],
+    ]);
+    expect(Object.fromEntries(persisted)).toEqual({
+      'first.md': 'First edit', 'second.md': 'Second edit', 'third.md': 'Third edit',
+    });
+    expect(vm.runInContext('_ctxProjectId', context)).toBe('p1');
+  });
+
+  it('keeps hidden drafts and the current scope when reopening a file fails', async () => {
+    const { context, persisted, write } = setupMultipleDrafts();
+    context.apiFetch.mockResolvedValueOnce({ json: async () => ({ ok: false }) });
+    expect(await context.switchCtxProject('p1')).toBe(false);
+    expect(context.uiAlert).toHaveBeenCalledWith('contexts.read_failed:{}');
+    expect(vm.runInContext('_ctxProjectId', context)).toBe('');
+    expect(vm.runInContext('_ctxDrafts.get("second.md").content', context)).toBe('Second edit');
+    expect(write.mock.calls).toEqual([['first.md', 'First edit']]);
+
+    expect(await context.switchCtxProject('p1')).toBe(true);
+    expect(Object.fromEntries(persisted)).toEqual({
+      'first.md': 'First edit', 'second.md': 'Second edit', 'third.md': 'Third edit',
+    });
+  });
+});
+
+
+describe('Library drafts before moving or copying', () => {
+  function setup(projectId = '') {
+    const context = loadContextsScript();
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/library-transfer.js'), 'utf8'), context);
+    const writes = new Map<string, string>();
+    const failed = new Set<string>();
+    context.__pid = projectId;
+    vm.runInContext('_ctxProjectId = __pid', context);
+    context.uiConfirm = vi.fn(async () => true);
+    context.uiAlert = vi.fn();
+    context.loadContexts = vi.fn();
+    context.window.LibraryTransfer = { ...context.window.LibraryTransfer, open: vi.fn(async () => ({})) };
+    context.apiFetch = context.apiLibraryFetch = vi.fn(async () => ({ json: async () => ({ ok: true, content: 'Original' }) }));
+    context._prepCtxViewerShell = (rel: string) => {
+      context.__rel = rel;
+      vm.runInContext('_ctxActive = { id: __rel }', context);
+      return { bodyEl: {}, actionsEl: {} };
+    };
+    context.mountMdViewEdit = ({ source, initialDraft, callbacks }: any) => {
+      let dirty = initialDraft?.dirty === true;
+      return {
+        isDirty: () => dirty, destroy: vi.fn(), getSource: () => source,
+        save: vi.fn(async () => {
+          const rel = source.name || source.rel;
+          if (failed.has(rel)) return false;
+          writes.set(rel, initialDraft.content);
+          dirty = false;
+          callbacks.onDraftChange(null);
+          return true;
+        }),
+      };
+    };
+    vm.runInContext(`
+      _ctxDrafts.set('notes/one.md', { content: 'First edit', dirty: true });
+      _ctxDrafts.set('notes/two.md', { content: 'Second edit', dirty: true });
+      _ctxDrafts.set('notes-extra.md', { content: 'Unrelated edit', dirty: true });
+    `, context);
+    context._showCtxTextViewer('notes/one.md', 'Original');
+    return { context, writes, failed };
+  }
+
+  it.each(['', 'project-a'])('saves selected folder drafts before opening transfer in scope "%s"', async (pid) => {
+    const { context, writes } = setup(pid);
+    context.window.LibraryTransfer.open.mockImplementation(async () => {
+      expect(Object.fromEntries(writes)).toEqual({ 'notes/one.md': 'First edit', 'notes/two.md': 'Second edit' });
+    });
+    await context._openCtxTransfer(['notes', 'notes/one.md'], 'batch');
+    expect(context.uiConfirm).toHaveBeenCalledOnce();
+    expect(context.uiConfirm.mock.calls[0][0]).toMatchObject({
+      message: 'contexts.transfer.save_changes:{}', okLabel: 'contexts.switch_save:{}', cancelLabel: 'contexts.switch_discard:{}',
+    });
+    expect(context.window.LibraryTransfer.open).toHaveBeenCalledOnce();
+    expect(vm.runInContext('Array.from(_ctxDrafts.keys())', context)).toEqual(['notes-extra.md']);
+  });
+
+  it.each(['move', 'copy'])('retains drafts until a successful %s after choosing not to save', async (mode) => {
+    const { context, writes } = setup();
+    context.uiConfirm.mockResolvedValue(false);
+    await context._openCtxTransfer(['notes'], 'menu');
+    expect(context.uiConfirm).toHaveBeenCalledOnce();
+    expect(writes.size).toBe(0);
+    expect(vm.runInContext('_ctxDrafts.size', context)).toBe(3);
+    const options = context.window.LibraryTransfer.open.mock.calls[0][0];
+    await options.onComplete({ mode, destination: { scope: 'project', projectId: 'p2' }, results: [{ source: 'notes', destination: 'notes', ok: true }] });
+    expect(vm.runInContext('Array.from(_ctxDrafts.keys())', context)).toEqual(mode === 'copy'
+      ? ['notes/one.md', 'notes/two.md', 'notes-extra.md'] : ['notes-extra.md']);
+  });
+
+  it('does not ask about or save unrelated drafts', async () => {
+    const { context, writes } = setup();
+    await context._openCtxTransfer(['clean.md'], 'menu');
+    expect(context.uiConfirm).not.toHaveBeenCalled();
+    expect(writes.size).toBe(0);
+    expect(context.window.LibraryTransfer.open).toHaveBeenCalledOnce();
+  });
+
+  it('stops transfer after a failed save and retains the remaining drafts for retry', async () => {
+    const { context, writes, failed } = setup();
+    failed.add('notes/two.md');
+    await context._openCtxTransfer(['notes'], 'batch');
+    expect(context.window.LibraryTransfer.open).not.toHaveBeenCalled();
+    expect(Object.fromEntries(writes)).toEqual({ 'notes/one.md': 'First edit' });
+    expect(vm.runInContext('Array.from(_ctxDrafts.keys())', context)).toEqual(['notes/two.md', 'notes-extra.md']);
+    failed.clear();
+    await context._openCtxTransfer(['notes'], 'batch');
+    expect(context.window.LibraryTransfer.open).toHaveBeenCalledOnce();
+    expect(writes.get('notes/two.md')).toBe('Second edit');
+  });
+
+  it('stops transfer when a hidden draft cannot be reopened', async () => {
+    const { context, writes } = setup();
+    context.apiFetch.mockResolvedValue({ json: async () => ({ ok: false }) });
+    await context._openCtxTransfer(['notes'], 'batch');
+    expect(context.window.LibraryTransfer.open).not.toHaveBeenCalled();
+    expect(writes.get('notes/one.md')).toBe('First edit');
+    expect(vm.runInContext('_ctxDrafts.get("notes/two.md").content', context)).toBe('Second edit');
+    expect(context.uiAlert).toHaveBeenCalledWith('contexts.read_failed:{}');
+  });
+
+  it('blocks a duplicate transfer and project switch while the save choice is pending', async () => {
+    const { context } = setup();
+    let resolve: (value: boolean) => void = () => {};
+    context.uiConfirm.mockImplementation(() => new Promise<boolean>((done) => { resolve = done; }));
+    const pending = context._openCtxTransfer(['notes'], 'menu');
+    await vi.waitFor(() => expect(context.uiConfirm).toHaveBeenCalledOnce());
+    await context._openCtxTransfer(['notes'], 'batch');
+    expect(await context.switchCtxProject('p2')).toBe(false);
+    expect(context.window.LibraryTransfer.open).not.toHaveBeenCalled();
+    resolve(true);
+    await pending;
+    expect(context.window.LibraryTransfer.open).toHaveBeenCalledOnce();
+    expect(context.uiConfirm).toHaveBeenCalledOnce();
+  });
+
+  it('does not continue after the source scope changes while confirming', async () => {
+    const { context, writes } = setup();
+    context.uiConfirm.mockImplementation(async () => {
+      vm.runInContext('_ctxScopeGeneration++', context);
+      return true;
+    });
+    await context._openCtxTransfer(['notes'], 'menu');
+    expect(writes.size).toBe(0);
+    expect(context.window.LibraryTransfer.open).not.toHaveBeenCalled();
+  });
+});

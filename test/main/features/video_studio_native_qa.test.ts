@@ -4,9 +4,12 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import sharp from 'sharp';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+
 
 import {
   acquireCompositionRenderSlot,
@@ -48,6 +51,7 @@ import {
   videoCoverArtifactPath,
   videoStudioReferencedVisualAssetSignature,
   withVideoStudioTimeout,
+  writeReferenceComparison,
 } from '../../../src/main/features/video_studio';
 import {
   authoredAbsoluteTimelinePositions,
@@ -4268,6 +4272,132 @@ describe('native VideoStudio draft QA parity', () => {
     });
   });
 
+  it('pairs colored reference frames at source anchors with the corresponding target scenes', async () => {
+    const p = tmpProject('reference-evidence');
+    const source = path.join(p.compositionDir, 'source.mp4');
+    const target = path.join(p.compositionDir, 'target.png');
+    await sharp({ create: { width: 160, height: 90, channels: 3, background: '#00ff00' } }).png().toFile(target);
+    const bins = bundledFfmpegPaths();
+    expect(bins.ffmpeg).toBeTruthy();
+    const generated = await runVideoProcessForTest(bins.ffmpeg!, [
+      '-y', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=blue:s=160x90:d=1',
+      '-f', 'lavfi', '-i', 'color=c=red:s=160x90:d=1',
+      '-filter_complex', '[0:v][1:v]concat=n=2:v=1:a=0[v]', '-map', '[v]', '-c:v', 'libx264', source,
+    ]);
+    expect(generated.code).toBe(0);
+    const ref = { id: 'ad', path: 'source.mp4', media_type: 'video', intent: 'guide',
+      preserve: ['palette', 'layout'], may_change: ['product'], temporal_anchors: [
+        { source_start_sec: 0, source_end_sec: 1, target_scene_id: 's1' },
+        { source_start_sec: 1, source_end_sec: 2, target_scene_id: 's2' },
+      ] };
+    const args = { compositionDirAbs: p.compositionDir, reviewInputs: { references: [ref] },
+      frameEvidence: { samples: [
+        { label: 'scene-mid', expected_scene_id: 's2', path: target, time_seconds: 17 },
+        { label: 'scene-mid', expected_scene_id: 's1', path: target, time_seconds: 7 },
+      ] } };
+    const out = await writeReferenceComparison(args);
+    expect(out).toMatchObject({ status: 'available', attached: false, pairs: [
+      { source_time_sec: 0.5, target_scene_id: 's1', target_time_sec: 7, preserve: ['palette', 'layout'] },
+      { source_time_sec: 1.5, target_scene_id: 's2', target_time_sec: 17, may_change: ['product'] },
+    ] });
+    const pairs = out!.pairs as Array<{ source_frame: string }>;
+    const blue = await sharp(pairs[0].source_frame).stats();
+    const red = await sharp(pairs[1].source_frame).stats();
+    expect(blue.channels[2].mean - blue.channels[0].mean).toBeGreaterThan(180);
+    expect(red.channels[0].mean - red.channels[2].mean).toBeGreaterThan(180);
+    // The actual attachment sheet must contain both source colors and target
+    // green; metadata alone cannot certify that the images reached the model.
+    const sheet = await sharp(String(out!.contact_sheet)).raw().toBuffer({ resolveWithObject: true });
+    for (const channel of [0, 1, 2]) {
+      let count = 0;
+      for (let i = 0; i < sheet.data.length; i += sheet.info.channels) {
+        if (sheet.data[i + channel] > 180 && sheet.data[i + (channel + 1) % 3] < 70
+          && sheet.data[i + (channel + 2) % 3] < 70) count++;
+      }
+      expect(count).toBeGreaterThan(1_000);
+    }
+    // Draft frames normally live beside the rendered video, outside the
+    // composition directory but inside the active workspace's allowed roots.
+    fs.mkdirSync(p.renderDir, { recursive: true });
+    const draftFrame = path.join(p.renderDir, 'draft-frame.png');
+    fs.copyFileSync(target, draftFrame);
+    const draftArgs = { ...args, frameEvidence: { samples: [
+      { label: 'mid', expected_scene_id: 's1', path: draftFrame, time_seconds: 7 },
+    ] }, reviewInputs: { references: [{ ...ref, temporal_anchors: [ref.temporal_anchors[0]] }] } };
+    expect(await writeReferenceComparison(draftArgs)).toMatchObject({ status: 'unavailable', issues: [{ reason: 'target_frame_unavailable' }] });
+    expect(await writeReferenceComparison({ ...draftArgs, evidenceRoots: [p.root] }))
+      .toMatchObject({ status: 'available', pairs: [{ target_frame: draftFrame }] });
+    // A playlist disguised as a supported extension must not resolve another
+    // local file through FFmpeg's format auto-detection.
+    fs.writeFileSync(path.join(p.compositionDir, 'playlist.mp4'), `ffconcat version 1.0\nfile '${source.replaceAll("'", "'\\''")}'\n`);
+    expect(await writeReferenceComparison({ ...args, reviewInputs: { references: [{ ...ref, path: 'playlist.mp4' }] } }))
+      .toMatchObject({ status: 'unavailable', pairs: [], issues: [
+        { reason: 'source_frame_unavailable' }, { reason: 'source_frame_unavailable' },
+      ] });
+    // Past EOF and missing targets must not reuse the prior successful sheet.
+    const unavailable = await writeReferenceComparison({ ...args, reviewInputs: { references: [
+      { ...ref, temporal_anchors: [{ source_start_sec: 20, source_end_sec: 22, target_scene_id: 's1' },
+        { source_start_sec: 0, source_end_sec: 1, target_scene_id: 'absent' }] },
+    ] } });
+    expect(unavailable).toMatchObject({ status: 'unavailable', contact_sheet: '', pairs: [], issues: [
+      { reason: 'source_frame_unavailable' }, { reason: 'target_frame_unavailable' },
+    ] });
+  });
+
+  it('reports inaccessible reference evidence without claiming a comparison or imposing a verdict', async () => {
+    const p = tmpProject('reference-missing');
+    const outside = path.join(p.root, 'outside.png');
+    fs.writeFileSync(outside, 'not image data');
+    fs.symlinkSync(outside, path.join(p.compositionDir, 'escape.png'));
+    const out = await writeReferenceComparison({ compositionDirAbs: p.compositionDir, frameEvidence: {},
+      reviewInputs: { references: [
+        { id: 'missing', path: 'missing.png' }, { id: 'escape', path: 'escape.png' },
+        { id: 'absolute', path: outside }, { id: 'traversal', path: '../outside.png' },
+      ] } });
+    expect(out).toMatchObject({ status: 'unavailable', attached: false, pairs: [], issues: [
+      { reference_id: 'missing', reason: 'source_missing' },
+      { reference_id: 'escape', reason: 'source_out_of_scope' },
+      { reference_id: 'absolute', reason: 'source_out_of_scope' },
+      { reference_id: 'traversal', reason: 'source_out_of_scope' },
+    ] });
+    expect(out).not.toHaveProperty('passed');
+    expect(await writeReferenceComparison({ compositionDirAbs: p.compositionDir, reviewInputs: {}, frameEvidence: {} })).toBeNull();
+  });
+
+  it('bounds reference sampling, validates anchors and preserves cancellation evidence', async () => {
+    const p = tmpProject('reference-bounds');
+    const target = path.join(p.compositionDir, 'target.png');
+    await sharp({ create: { width: 8, height: 8, channels: 3, background: '#a020f0' } }).png().toFile(target);
+    const args = { compositionDirAbs: p.compositionDir,
+      reviewInputs: { references: [{ id: 'r', path: 'target.png', media_type: 'image', target_scene_ids: Array(9).fill('s1') }] },
+      frameEvidence: { samples: [{ label: 'mid', expected_scene_id: 's1', path: target, time_seconds: 4 }] } };
+    const bounded = await writeReferenceComparison(args);
+    expect(bounded).toMatchObject({ status: 'partial', omitted: 3 });
+    expect(bounded!.pairs).toHaveLength(6);
+    const aborted = new AbortController(); aborted.abort();
+    expect(await writeReferenceComparison({ ...args, signal: aborted.signal }))
+      .toMatchObject({ status: 'unavailable', pairs: [], issues: [{ reason: 'cancelled' }] });
+    expect(await writeReferenceComparison({ ...args, reviewInputs: { references: [
+      { id: 'r', path: 'target.png', media_type: 'video', temporal_anchors: [
+        { source_start_sec: -1, source_end_sec: 2, target_scene_id: 's1' },
+      ] }, { id: 'r2', path: 'target.png', media_type: 'video' },
+    ] } })).toMatchObject({ status: 'unavailable', issues: [{ reason: 'anchor_invalid' }, { reason: 'anchors_missing' }] });
+  });
+
+  it('carries the actual reference contract into model design review', () => {
+    const references = [{ id: 'ad', path: 'assets/ad.mp4', media_type: 'video',
+      preserve: ['purple palette', 'product UI hierarchy'], may_change: ['brand name'],
+      temporal_anchors: [{ source_start_sec: 4, source_end_sec: 8, target_scene_id: 's1' }] }];
+    const fidelity = { mode: 'adapt', layout_anchors: [{ target_scene_id: 's1' }] };
+    const summary = buildDesignReviewInputs({
+      contractLoad: { path: '/tmp/composition-manifest.json', exists: true,
+        value: { style_source: 'reference', references, reference_fidelity: fidelity } },
+      sceneMapLoad: { path: '', exists: false, value: null },
+    });
+    expect(summary).toMatchObject({ style_source: 'reference', references, reference_fidelity: fidelity });
+    expect(summary).not.toHaveProperty('passed');
+  });
+
   it('S3 summarizes design-review evidence without reopening the repair loop', () => {
     const summary = buildDesignReviewInputs({
       contractLoad: {
@@ -5586,6 +5716,9 @@ describe('P3c R0 video track reuse', () => {
 
   it('changes the reuse key on every dimension that changes rendered frames', () => {
     const base = buildRenderReuseKey(BASE_KEY_INPUT);
+    // Captured before the offscreen compositor repair: old video tracks may
+    // contain stale scene pixels and must be regenerated even for unchanged HTML.
+    expect(base).not.toBe('3b6e162ae4c072f138f13061a9fe9bcf319e1f32f755b8cbcecd09ac697b12ec');
     expect(buildRenderReuseKey({ ...BASE_KEY_INPUT, windows: BASE_KEY_INPUT.windows.map((w) => ({ ...w })) })).toBe(base);
     const variants = [
       buildRenderReuseKey({ ...BASE_KEY_INPUT, visualSignature: 'b'.repeat(64) }),
@@ -5709,6 +5842,32 @@ describe('P3c R0 video track reuse', () => {
   });
 
   const ffmpegBins = bundledFfmpegPaths();
+  it.skipIf(!ffmpegBins.ffmpeg || !ffmpegBins.ffprobe)('cleans up the real encoder before returning a failed render', async () => {
+    const p = tmpProject('failed-render-cleanup');
+    writeHtml(p.compositionDir, 'Cleanup', { width: 320, height: 180, duration: 2 });
+    fs.mkdirSync(p.renderDir, { recursive: true });
+    const children: ReturnType<typeof childProcess.spawn>[] = [];
+    const originalSpawn = childProcess.spawn;
+    const spawn = vi.spyOn(childProcess, 'spawn').mockImplementation(((bin: string, args: string[], opts: any) => {
+      const child = originalSpawn(bin, args, opts);
+      if (args.includes('rawvideo')) children.push(child);
+      return child;
+    }) as any);
+    syncBuiltinESMExports();
+    const warnings = vi.spyOn(console, 'warn');
+    try {
+      // The unit host cannot open the capture window; FFmpeg has already started.
+      const result = await renderComposition({ compositionDirAbs: p.compositionDir, outputAbsPath: p.outputPath, fps: 30 });
+      expect(result.ok).toBe(false);
+      expect(children).toHaveLength(1);
+      expect(children.every(child => child.exitCode !== null || child.signalCode !== null)).toBe(true);
+      expect(warnings.mock.calls.some(call => call[1] === 'Shell process tree termination failed')).toBe(false);
+    } finally {
+      spawn.mockRestore();
+      syncBuiltinESMExports();
+      warnings.mockRestore();
+    }
+  });
   it.skipIf(!ffmpegBins.ffmpeg || !ffmpegBins.ffprobe)(
     'renderComposition reuses an identical prior video track without opening a window, and only for the exact key',
     async () => {
@@ -6234,6 +6393,8 @@ describe('P3c R2 scene segment assembly', () => {
       format: 'mp4' as string | undefined,
     };
     const key = buildSceneSegmentKey(base);
+    // The same compatibility boundary applies to cached individual segments.
+    expect(key).not.toBe('41328eeb9543f26021ed344a969486353283c1e8356e7444f4ff52e9f26dd4ca');
     expect(buildSceneSegmentKey({ ...base })).toBe(key);
     const variants = [
       buildSceneSegmentKey({ ...base, subtreeSha256: 'x'.repeat(64) }),

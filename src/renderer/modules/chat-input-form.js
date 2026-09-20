@@ -74,8 +74,9 @@
       ctrlWrap.appendChild(input);
       read = () => {
         if (field.type === 'number') {
+          if (!input.value.trim()) return null;
           const n = Number(input.value);
-          return Number.isFinite(n) ? n : (typeof field.default === 'number' ? field.default : 0);
+          return n;
         }
         return input.value;
       };
@@ -91,7 +92,7 @@
       });
       ctrlWrap.appendChild(ta);
       read = () => ta.value;
-    } else if (field.type === 'select') {
+    } else if (field.type === 'select' || (field.type === 'boolean' && typeof field.default !== 'boolean')) {
       // Use the shared `_aiSelectMount` widget instead of native <select>.
       // Native chrome looks dated next to the rest of the app, and the
       // settings/agent-edit pages already standardised on AiSelect.
@@ -103,12 +104,17 @@
       const aiSel = _aiSelectMount(sel, {
         placeholder: field.placeholder || undefined,
       });
-      const options = (field.options || []).map((o) => ({
+      const booleanQuestion = field.type === 'boolean';
+      const options = (booleanQuestion ? [
+        { value: 'true', label: t('chat.form.boolean_yes') },
+        { value: 'false', label: t('chat.form.boolean_no') },
+      ] : (field.options || [])).map((o) => ({
         value: o.value,
         label: o.label || o.value,
       }));
       aiSel.setOptions(options, {
-        value: typeof initial === 'string' ? initial : '',
+        value: booleanQuestion ? (typeof initial === 'boolean' ? String(initial) : '')
+          : typeof initial === 'string' ? initial : '',
       });
       if (disabled) {
         const trigger = sel.querySelector('.ai-select-trigger');
@@ -117,7 +123,10 @@
       aiSel.onChange(() => {
         if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
       });
-      read = () => aiSel.getValue();
+      read = () => {
+        const value = aiSel.getValue();
+        return booleanQuestion ? (value === '' ? null : value === 'true') : value;
+      };
     } else if (field.type === 'multiselect') {
       // Checkbox group — clearer than <select multiple>, also better on mobile.
       const wrap = document.createElement('div');
@@ -465,6 +474,14 @@
   }
 
   function _validate(field, value) {
+    const empty = value === undefined || value === null || value === '';
+    if (field.type === 'number') {
+      if (empty) return field.required ? t('chat.form.required_text') : null;
+      if (typeof value !== 'number' || !Number.isFinite(value)) return t('chat.form.invalid_number');
+    }
+    if (field.type === 'boolean' && field.required && typeof value !== 'boolean') {
+      return t('chat.form.required_select');
+    }
     if (field.required) {
       if (field.type === 'text' || field.type === 'textarea') {
         if (!String(value || '').trim()) return t('chat.form.required_text');
@@ -490,7 +507,7 @@
 
   function _formatSummaryLine(field, value) {
     const fallback = '';
-    if (value === undefined || value === null) return fallback;
+    if (value === undefined || value === null || value === '') return fallback;
     if (field.type === 'boolean') return value === true ? 'yes' : 'no';
     if (field.type === 'select') {
       const opt = (field.options || []).find((o) => o.value === value);

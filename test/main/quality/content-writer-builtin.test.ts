@@ -38,11 +38,7 @@ describe('ContentWriter builtin contract', () => {
     expect(spec.name).toBe('ContentWriter');
     expect(spec.min_app_version).toBeUndefined();
     expect(spec.skill_list).toEqual(['9dfbd4e00c0d']);
-    // The soft delivery guard is spec-selected since 2026-08-12 (it replaced
-    // the host's identity-keyed selector). The declaration and its resolution
-    // are both pinned: a renamed or deleted registry check must fail here, not
-    // silently strip ContentWriter of its guard.
-    expect(spec.delivery_checks).toEqual(['content-delivery']);
+    expect(spec).not.toHaveProperty('delivery_checks');
     expect(spec.interactive).toBe(false);
     expect(spec.inputs.find((input: any) => input.id === 'task')?.required).toBe(true);
     expect(spec.inputs.find((input: any) => input.id === 'files')?.multiple).toBe(true);
@@ -58,6 +54,7 @@ describe('ContentWriter builtin contract', () => {
     expect(spec.workflow).toContain('Never ask which publishing platform to use');
     expect(spec.workflow).toContain('apply named platform constraints or use a neutral default');
 
+    expect(spec.workflow).not.toContain('instead of persisting or publishing');
     expect(spec.workflow.length).toBeLessThan(1_500);
     for (const marker of [
       'Read `content-writer` as the governing Skill',
@@ -70,7 +67,7 @@ describe('ContentWriter builtin contract', () => {
       'deterministic gates',
       'Return the requested artifact in the current turn',
       'publishing and platform operation remain out of scope',
-      'qualified-review requirement',
+      'Audit material claims, citations, disclosures, and the requested format',
     ]) {
       expect(spec.workflow, marker).toContain(marker);
     }
@@ -205,7 +202,9 @@ describe('ContentWriter builtin contract', () => {
     expect(skill).not.toContain('`fetch_attempts`');
     expect(skill).not.toMatch(/exact labels `salary`|fetch exactly 3|batches of 2 then 1/i);
     expect(skill).not.toContain('before any fourth fetch, prose, or extra analysis');
-    expect(skill).toContain('do not persist the blocked input as `ARTICLE.md`');
+    // HOLD is a publication decision; it must not disable the preflight file/runner route.
+    expect(skill).toContain('Require qualified review for high-stakes');
+    expect(bundle).not.toMatch(/do not persist the blocked\s+input|Skip that runner input|input file would itself be an unsafe/);
     expect(skill).toContain('vague rhetorical question');
     expect(skill).toContain('For an unlisted format');
     expect(skill).toContain('unfamiliar channel');

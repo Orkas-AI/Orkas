@@ -15,14 +15,13 @@ function quickStartOrder(source: string, declaration: string) {
 }
 
 describe('new chat home surface', () => {
-  it('keeps the commercial external-agent entry fixed above Settings in the sidebar footer', () => {
+  it('keeps the external-agent entry fixed above Settings in the sidebar footer', () => {
     const html = read('src/renderer/index.html');
     const sidebarFooter = html.slice(
       html.indexOf('<div class="sidebar-footer-actions">'),
       html.indexOf('<div class="sidebar-resize-handle"'),
     );
     const landing = html.slice(html.indexOf('<section class="panel active" id="panel-new-chat">'), html.indexOf('<!-- Conversation Detail -->'));
-
     expect(sidebarFooter).toContain('class="sb-connect" id="new-chat-external-agent-btn"');
     expect(sidebarFooter).toContain('data-i18n="sidebar.connect_agent"');
     expect(sidebarFooter).toContain('data-i18n="sidebar.connect_agent_sub"');
@@ -38,19 +37,17 @@ describe('new chat home surface', () => {
     expect(html).not.toContain('data-ui-icon="mic"');
   });
 
-  it('uses the commercial sidebar external-agent handler contract', () => {
+  it('uses the open-source sidebar external-agent handler contract', () => {
     const state = read('src/renderer/modules/state.js');
     const agents = read('src/renderer/modules/agents.js');
     const handler = state.slice(
       state.indexOf("document.getElementById('new-chat-external-agent-btn')"),
       state.indexOf("document.getElementById('create-agent-btn')"),
     );
-
     expect(handler).toContain("initialTab: 'external'");
     expect(handler).toContain('externalOnly: true');
     expect(handler).toContain("returnFocusId: 'new-chat-input'");
     expect(handler).toContain("entryPoint: 'new_chat_external_agent'");
-    expect(handler).toContain("_trackAgentCreateOpen('new_chat_external_agent', { agent_type: 'cli' })");
     expect(handler).not.toContain("setView('agents'");
     expect(agents).toContain('if (tabBar) tabBar.hidden = externalOnly;');
     expect(agents).toContain('closeAgentModal({ restoreFocus: true });');

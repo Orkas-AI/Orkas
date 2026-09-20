@@ -18,7 +18,7 @@ const log = createLogger("skill-manage");
  */
 export function createSkillManageTool(
   store: SkillStore,
-  onCreated?: (id: string) => void,
+  onCreated?: (id: string) => void | Promise<void>,
 ): AgentTool {
   type SkillManageAction = "create" | "read" | "patch" | "list" | "delete";
   const actionFields: Readonly<Record<SkillManageAction, ReadonlySet<string>>> = {
@@ -127,7 +127,7 @@ export function createSkillManageTool(
             if (!id) return { content: "Error: 'id' is required for read action.", isError: true };
             const skill = await store.read(id);
             if (!skill) return { content: `Skill not found: ${id}`, isError: true };
-            store.touch(id).catch(() => {});
+            await store.touch(id).catch(() => {});
             return {
               content: [
                 `# ${skill.frontmatter.name}`,
@@ -158,7 +158,7 @@ export function createSkillManageTool(
 
             const skill = await store.create({ id, name, description, body, tags });
             if (onCreated) {
-              try { onCreated(skill.id); }
+              try { await onCreated(skill.id); }
               catch (err) { log.warn(`onCreated callback threw for skill "${skill.id}": ${(err as Error).message}`); }
             }
             return {

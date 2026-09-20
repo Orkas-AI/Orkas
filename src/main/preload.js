@@ -112,6 +112,11 @@ function logRecord(record) {
 // the lifecycle (unlike `stream` which the renderer starts). Channel names are restricted to
 // a known prefix list so the renderer can't tap into arbitrary internal IPC traffic.
 const PUSH_EVENT_CHANNELS = new Set([
+  'preview-windows:owner-request',
+  'preview-windows:report',
+  'preview-windows:close-request',
+  'preview-windows:replace-request',
+  'preview-windows:gallery-refresh',
   'conversation:media_materialized',
   'conversation:task_terminal',
   'local-agent:permission',

@@ -141,6 +141,7 @@ describe('kb_indexer › enqueue + processJob', () => {
 
   it('extracts and stores searchable chunks for PDF and Office formats', async () => {
     const fixtures: Array<[string, Buffer, string]> = [
+      ['inventory.xls', fs.readFileSync(path.join(__dirname, '../../fixtures/xls/inventory.xls')), 'Inventory sentinel 8384'],
       ['report.pdf', makeMinimalPdf(['PDF orbit marker 741']), 'PDF orbit marker 741'],
       [
         'notes.docx',

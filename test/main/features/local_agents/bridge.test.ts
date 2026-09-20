@@ -139,6 +139,8 @@ afterEach(async () => {
 async function startTestBridge(opts: {
   projectId?: string;
   workingDir?: string;
+  onOutputsPublished?: (paths: string[]) => string[];
+  signal?: AbortSignal;
   runId?: string;
   conversationTitle?: string;
   onPermissionWaitStart?: () => () => void;
@@ -158,6 +160,8 @@ async function startTestBridge(opts: {
     currentMessageId: 'current-message',
     ...(opts.projectId ? { projectId: opts.projectId } : {}),
     workingDir: opts.workingDir,
+    onOutputsPublished: opts.onOutputsPublished,
+    signal: opts.signal,
     runId: opts.runId || `t${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`,
     configDir: path.join(tmpDir, 'rundir'),
     sandboxEnv: {
@@ -228,6 +232,253 @@ async function seedCurrentConversation(): Promise<void> {
 }
 
 describe('local_agents/bridge › auth + skills', () => {
+  it('requires an exact id for same-name private Skills and never falls back after the selected source disappears', async () => {
+    const privateRoot = path.join(tmpDir, TEST_UID, 'cloud', 'agents', 'a1', 'private_skills');
+    writeSkill(privateRoot, 'helper-a', 'Same helper', 'ONLY_A');
+    writeSkill(privateRoot, 'helper-b', 'Same helper', 'ONLY_B');
+    const bridge = await startTestBridge();
+    const call = async (method: string, id: string) => (await rpcOnce(bridge.socketPath, { id: 1, token: bridge.token, method, params: { id } })).reply as any;
+    try {
+      for (const method of ['skills.read', 'skills.run_info']) {
+        expect(await call(method, 'Same helper')).toMatchObject({ ok: false, error: expect.stringMatching(/ambiguous/) });
+        expect((await call(method, 'helper-a')).ok).toBe(true);
+      }
+      expect((await call('skills.read', 'helper-a')).result.skill_md).toContain('ONLY_A');
+      const selected = path.join(privateRoot, 'helper-a');
+      fs.renameSync(selected, `${selected}-removed`);
+      for (const method of ['skills.read', 'skills.run_info']) expect((await call(method, 'helper-a')).ok).toBe(false);
+      expect((await call('skills.read', 'helper-b')).result.skill_md).toContain('ONLY_B');
+      fs.renameSync(`${selected}-removed`, selected);
+      expect((await call('skills.read', 'helper-a')).result.skill_md).toContain('ONLY_A');
+      const enabled = await import('../../../../src/main/features/component_enabled');
+      enabled.setSkillEnabled(TEST_UID, 'helper-a', false);
+      for (const method of ['skills.read', 'skills.run_info']) expect((await call(method, 'helper-a')).ok).toBe(false);
+      enabled.setSkillEnabled(TEST_UID, 'helper-a', true);
+      expect((await call('skills.read', 'helper-a')).result.skill_md).toContain('ONLY_A');
+    } finally { await bridge.close(); }
+  });
+
+  it('rejects a listed Skill redirected to another source and recovers after its original directory is restored', async () => {
+    writeSkill(customSkillsDir(), 'selected', 'Selected', 'ORIGINAL');
+    writeSkill(path.join(tmpDir, 'foreign'), 'selected', 'Selected', 'FOREIGN');
+    const bridge = await startTestBridge();
+    const call = async (method: string) => (await rpcOnce(bridge.socketPath, { id: 1, token: bridge.token, method, params: { id: 'selected' } })).reply as any;
+    const root = path.join(customSkillsDir(), 'selected');
+    try {
+      expect((await call('skills.read')).result.skill_md).toContain('ORIGINAL');
+      fs.renameSync(root, `${root}-original`);
+      fs.symlinkSync(path.join(tmpDir, 'foreign', 'selected'), root, 'dir');
+      for (const method of ['skills.read', 'skills.run_info']) {
+        const result = await call(method);
+        expect(result.ok).toBe(false);
+        expect(JSON.stringify(result)).not.toContain('FOREIGN');
+      }
+      fs.unlinkSync(root);
+      fs.renameSync(`${root}-original`, root);
+      expect((await call('skills.read')).result.skill_md).toContain('ORIGINAL');
+    } finally { await bridge.close(); }
+  });
+
+  it('reads exact reference and binary template pages while rejecting traversal, symlinks and disabled resources', async () => {
+    writeSkill(customSkillsDir(), 'bundle', 'bundle');
+    const root = path.join(customSkillsDir(), 'bundle');
+    fs.mkdirSync(path.join(root, 'references'));
+    const body = '\uFEFF参考🙂'.repeat(15);
+    fs.writeFileSync(path.join(root, 'references', 'guide.md'), body);
+    const template = Buffer.from([0, 255, 12, 128, 42, 23, 87]);
+    fs.writeFileSync(path.join(root, 'template.bin'), template);
+    fs.writeFileSync(path.join(tmpDir, 'secret.txt'), 'FOREIGN');
+    fs.symlinkSync(path.join(tmpDir, 'secret.txt'), path.join(root, 'outside.txt'));
+    const bridge = await startTestBridge();
+    const read = async (params: Record<string, unknown>) => (await rpcOnce(bridge.socketPath, {
+      id: 1, token: bridge.token, method: 'skills.read', params: { id: 'bundle', ...params },
+    })).reply as any;
+    try {
+      let offset: number | null = 0;
+      let joined = '';
+      for (let i = 0; offset !== null && i < 100; i++) {
+        const reply = await read({ path: 'references/guide.md', offset, limit: 7 });
+        expect(reply.ok).toBe(true);
+        joined += reply.result.content;
+        if (reply.result.next_offset !== null) expect(reply.result.next_offset).toBeGreaterThan(offset);
+        offset = reply.result.next_offset;
+      }
+      expect(offset).toBeNull();
+      expect(joined).toBe(body);
+      const binary = await read({ path: 'template.bin', encoding: 'base64' });
+      expect(Buffer.from(binary.result.content, 'base64')).toEqual(template);
+      for (const resource of ['../secret.txt', 'outside.txt', '/etc/passwd', 'C:\\secret.txt', 'references/../../secret.txt']) {
+        expect((await read({ path: resource })).ok).toBe(false);
+      }
+      expect((await read({ path: 'references' })).ok).toBe(false);
+      const missing = await read({ path: 'references/missing.md' });
+      expect(missing.ok).toBe(false);
+      expect(missing.error).not.toContain(tmpDir);
+      expect((await read({ offset: -1 })).ok).toBe(false);
+      const enabled = await import('../../../../src/main/features/component_enabled');
+      enabled.setSkillEnabled(TEST_UID, 'bundle', false);
+      expect((await read({})).ok).toBe(false);
+      const run = await rpcOnce(bridge.socketPath, { id: 2, token: bridge.token, method: 'skills.run_info', params: { id: 'bundle' } });
+      expect((run.reply as any).ok).toBe(false);
+    } finally { await bridge.close(); }
+  });
+
+  it('retrieves the complete connector output exactly once and isolates retained references by run and account', async () => {
+    const visible = [{ instance: { id: 'service', display_name: 'Service' }, tools: [{ name: 'list', input_schema: {} }] }];
+    bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue(visible as any);
+    const body = '记录🙂'.repeat(25_000);
+    bridgeConnectorMock.callTool.mockResolvedValue({ content: [{ type: 'text', text: body }] });
+    const bridge = await startTestBridge();
+    const call = async (params: Record<string, unknown>) => (await rpcOnce(bridge.socketPath, {
+      id: 1, token: bridge.token, method: 'connectors.call', params,
+    })).reply as any;
+    let ref: string;
+    try {
+      const first = await call({ connector_id: 'service', tool_name: 'list' });
+      expect(first.ok).toBe(true);
+      ref = first.result.output_ref;
+      expect(ref).toMatch(/^[a-f0-9]{32}$/);
+      expect(JSON.stringify(first.result)).not.toContain(tmpDir);
+      let joined = first.result.text;
+      let offset = first.result.next_offset;
+      for (let i = 0; offset !== null && i < 20; i++) {
+        const next = await call({ action: 'read', output_ref: ref, offset });
+        expect(next.ok).toBe(true);
+        joined += next.result.text;
+        if (next.result.next_offset !== null) expect(next.result.next_offset).toBeGreaterThan(offset);
+        offset = next.result.next_offset;
+      }
+      expect(offset).toBeNull();
+      const connectors = await import('../../../../src/main/features/connectors');
+      expect(joined).toBe(connectors.stringifyMcpResult({ content: [{ type: 'text', text: body }] }));
+      expect(bridgeConnectorMock.callTool).toHaveBeenCalledTimes(1);
+      expect((await call({ action: 'read', output_ref: ref, offset: -1 })).ok).toBe(false);
+      expect((await call({ action: 'read', output_ref: '../secret' })).ok).toBe(false);
+      expect((await call({ action: 'read', output_ref: ref, tool_name: 'delete' })).ok).toBe(false);
+      bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue([]);
+      expect((await call({ action: 'read', output_ref: ref })).ok).toBe(false);
+      bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue([{ ...visible[0], instance: { ...visible[0].instance, created_at: 'replacement-account' } }] as any);
+      expect((await call({ action: 'read', output_ref: ref })).ok).toBe(false);
+      bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue(visible as any);
+      const users = await import('../../../../src/main/features/users');
+      users.activateUser('other');
+      expect((await call({ action: 'read', output_ref: ref })).ok).toBe(false);
+      users.activateUser(TEST_UID);
+    } finally { await bridge.close(); }
+    expect(fs.existsSync(path.join(tmpDir, 'rundir', '.orkas-bridge-results'))).toBe(false);
+    const next = await startTestBridge();
+    try {
+      const stale = await rpcOnce(next.socketPath, { id: 1, token: next.token, method: 'connectors.call', params: { action: 'read', output_ref: ref! } });
+      expect((stale.reply as any).ok).toBe(false);
+      expect(bridgeConnectorMock.callTool).toHaveBeenCalledTimes(1);
+    } finally { await next.close(); }
+  });
+
+  it('reports that the connector completed when result retention fails without replaying it', async () => {
+    bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue([{
+      instance: { id: 'service', display_name: 'Service' }, tools: [{ name: 'list', input_schema: {} }],
+    }] as any);
+    bridgeConnectorMock.callTool.mockResolvedValue({ content: [{ type: 'text', text: 'large result'.repeat(12_000) }] });
+    const bridge = await startTestBridge();
+    // A non-directory at the private spool location makes persistence fail.
+    fs.writeFileSync(path.join(tmpDir, 'rundir', '.orkas-bridge-results'), 'unavailable');
+    try {
+      const reply = (await rpcOnce(bridge.socketPath, { id: 1, token: bridge.token, method: 'connectors.call', params: { connector_id: 'service', tool_name: 'list' } })).reply as any;
+      expect(reply).toMatchObject({ ok: true, result: { execution_completed: true, result_unavailable: true } });
+      expect(reply.result.error).toContain('Do not repeat');
+      expect(reply.result.error).not.toContain(tmpDir);
+      expect(bridgeConnectorMock.callTool).toHaveBeenCalledTimes(1);
+    } finally { await bridge.close(); }
+  });
+
+  it('reads and retries pages of an approved sensitive action without repeating approval or its side effect', async () => {
+    bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue([{
+      instance: { id: 'gmail', display_name: 'Gmail' }, tools: [{ name: 'GMAIL_SEND_EMAIL', input_schema: {} }],
+    }] as any);
+    const receipt = 'Sent once.🙂'.repeat(12_000);
+    const sent: unknown[] = [];
+    bridgeConnectorMock.callTool.mockImplementation(async (...args: unknown[]) => {
+      sent.push(args);
+      return { content: [{ type: 'text', text: receipt }] };
+    });
+    const permissions = await import('../../../../src/main/features/permissions');
+    permissions.setLocalExecMode('workspace_approval');
+    const bridge = await startTestBridge();
+    const call = async (params: Record<string, unknown>) => (await rpcOnce(bridge.socketPath, { id: 1, token: bridge.token, method: 'connectors.call', params })).reply as any;
+    try {
+      const first = await call({ connector_id: 'gmail', tool_name: 'GMAIL_SEND_EMAIL', args: { recipient_email: 'fixture@example.test', body: 'Fixture only' } });
+      expect(first.ok).toBe(true);
+      const ref = first.result.output_ref;
+      const read = { action: 'read', output_ref: ref, offset: first.result.next_offset };
+      const second = await call(read);
+      expect(second.ok).toBe(true);
+      expect((await call(read)).result).toEqual(second.result);
+      expect((await call({ ...read, offset: Number.MAX_SAFE_INTEGER })).ok).toBe(false);
+      let joined = first.result.text + second.result.text;
+      let offset = second.result.next_offset;
+      for (let i = 0; offset !== null && i < 20; i++) {
+        const page = await call({ action: 'read', output_ref: ref, offset });
+        expect(page.ok).toBe(true);
+        joined += page.result.text;
+        offset = page.result.next_offset;
+      }
+      expect(offset).toBeNull();
+      expect(joined).toBe(receipt);
+      expect(sent).toHaveLength(1);
+      expect(bridgeActionConfirmMock.request).toHaveBeenCalledTimes(1);
+    } finally { await bridge.close(); }
+  });
+
+  it.each(['account-switch', 'stopped-run'] as const)('rejects memory reads and writes after %s without changing either account', async (change) => {
+    const memory = await import('../../../../src/main/features/memory');
+    const users = await import('../../../../src/main/features/users');
+    memory.addEntry(TEST_UID, 'user', 'Original preference');
+    memory.addEntry('other-account', 'user', 'Other preference');
+    memory.addAgentEntry(TEST_UID, 'a1', 'Original lesson');
+    const controller = new AbortController();
+    const bridge = await startTestBridge({ signal: controller.signal });
+    const call = async (params: Record<string, unknown>) => (await rpcOnce(bridge.socketPath, { id: 1, token: bridge.token, method: 'memory.agent', params })).reply as any;
+    try {
+      expect((await call({ action: 'list', target: 'user' })).result.entries).toEqual(['Original preference']);
+      if (change === 'account-switch') users.activateUser('other-account');
+      else controller.abort();
+      for (const params of [{ action: 'list', target: 'user' }, { action: 'list', target: 'shared' }, { action: 'add', target: 'agent', content: 'late write' }]) {
+        const reply = await call(params);
+        expect(reply.ok).toBe(false);
+        expect(JSON.stringify(reply)).not.toContain('preference');
+      }
+      expect(memory.listEntries(TEST_UID, 'user').entries).toEqual(['Original preference']);
+      expect(memory.listEntries('other-account', 'user').entries).toEqual(['Other preference']);
+      expect(memory.listAgentEntries(TEST_UID, 'a1').entries).toEqual(['Original lesson']);
+      expect(memory.listAgentEntries('other-account', 'a1').entries).toEqual([]);
+    } finally { users.activateUser(TEST_UID); await bridge.close(); }
+  });
+
+  it('uses the host publication selector and rejects foreign paths and stopped runs without changing selection', async () => {
+    const workspace = path.join(tmpDir, 'work');
+    fs.mkdirSync(workspace);
+    const output = path.join(workspace, 'report.txt');
+    fs.writeFileSync(output, 'report');
+    const selected: string[][] = [];
+    const controller = new AbortController();
+    const bridge = await startTestBridge({ workingDir: workspace, signal: controller.signal, onOutputsPublished: (paths) => {
+      const accepted = paths.filter((p) => p === output);
+      selected.push(accepted);
+      return accepted;
+    } });
+    const publish = async (paths: string[]) => (await rpcOnce(bridge.socketPath, {
+      id: 1, token: bridge.token, method: 'publish_outputs', params: { paths },
+    })).reply as any;
+    try {
+      expect((await publish(['report.txt', 'unknown.txt'])).result).toEqual({ published: 1, requested: 2 });
+      expect((await publish(['../secret'])).ok).toBe(false);
+      expect((await publish([])).result).toEqual({ published: 0, requested: 0 });
+      controller.abort();
+      expect((await publish(['report.txt'])).ok).toBe(false);
+      expect(selected).toEqual([[output], []]);
+      expect(fs.readFileSync(output, 'utf8')).toBe('report');
+    } finally { await bridge.close(); }
+  });
   it('reads live tasks and persists executor status updates while rejecting scope overrides and invalid writes', async () => {
     const projects = await import('../../../../src/main/features/projects');
     const tasks = await import('../../../../src/main/features/project_tasks');
@@ -235,10 +486,10 @@ describe('local_agents/bridge › auth + skills', () => {
     const other = await projects.createProject(TEST_UID, 'Other');
     if (!project.ok || !other.ok) throw new Error('project fixture failed');
     const pid = project.project.project_id;
-    const foreign = await tasks.createTask(TEST_UID, other.project.project_id, { title: 'foreign task' });
+    const foreign = await tasks.createTask(TEST_UID, other.project.project_id, { content: 'foreign task' });
     const foreignAccount = await projects.createProject('other-account', 'Private');
     if (!foreign.ok || !foreignAccount.ok) throw new Error('foreign fixture failed');
-    const privateTask = await tasks.createTask('other-account', foreignAccount.project.project_id, { title: 'private' });
+    const privateTask = await tasks.createTask('other-account', foreignAccount.project.project_id, { content: 'private' });
     if (!privateTask.ok) throw new Error('private task fixture failed');
     const bridge = await startTestBridge({ projectId: pid });
     let id = 0;
@@ -248,14 +499,15 @@ describe('local_agents/bridge › auth + skills', () => {
     try {
       expect(bridge.capabilities).toEqual(expect.arrayContaining(['tasks.read', 'tasks.write']));
       expect((await read({ action: 'list' })).result).toMatchObject({ tasks: [], next_offset: null });
-      const creation = await read({ action: 'create', title: 'first', detail: 'full detail' });
+      const creation = await read({ action: 'create', content: 'first\nfull detail' });
       expect(creation.ok).toBe(true);
       const created = creation.result;
-      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ title: 'first', origin_cid: 'c1' });
-      const duplicate = await read({ action: 'create', title: 'first', detail: 'do not replace' });
-      expect(duplicate.result).toMatchObject({ alreadyExists: true, task: { id: created.task.id, detail: 'full detail' } });
+      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ content: 'first\nfull detail' });
+      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).not.toHaveProperty('origin_cid');
+      const duplicate = await read({ action: 'create', content: 'first\nfull detail' });
+      expect(duplicate.result).toMatchObject({ alreadyExists: true, task: { id: created.task.id, content: 'first\nfull detail' } });
       if (!created.ok) throw new Error('task fixture failed');
-      await tasks.createTask(TEST_UID, pid, { title: 'second', depends_on: [created.task.id] });
+      await tasks.createTask(TEST_UID, pid, { content: 'second', depends_on: [created.task.id] });
       const first = await read({ action: 'list', limit: 1 });
       expect(first.ok).toBe(true);
       expect(first.result.tasks).toHaveLength(1);
@@ -264,25 +516,25 @@ describe('local_agents/bridge › auth + skills', () => {
       expect(second.result.next_offset).toBeNull();
       const all = [...first.result.tasks, ...second.result.tasks];
       expect(all).toEqual(expect.arrayContaining([
-        expect.objectContaining({ title: 'first' }),
-        expect.objectContaining({ title: 'second', depends_on: [created.task.id] }),
+        expect.objectContaining({ content: 'first\nfull detail' }),
+        expect.objectContaining({ content: 'second', depends_on: [created.task.id] }),
       ]));
       expect((await read({ action: 'update', task_id: created.task.id, status: 'review', result_ref: 'artifact-1' })).ok).toBe(true);
       expect((await read({ action: 'list' })).result.tasks).toContainEqual(expect.objectContaining({ id: created.task.id, status: 'review' }));
       const filtered = (await read({ action: 'list', status: 'review', limit: 1 })).result;
       expect(filtered).toMatchObject({ total: 1, next_offset: null, tasks: [{ id: created.task.id }], progress: { total: 2 } });
       expect(filtered.tasks[0]).not.toHaveProperty('detail');
-      expect((await read({ action: 'get', task_id: created.task.id })).result.task).toMatchObject({ detail: 'full detail', result_ref: 'artifact-1' });
+      expect((await read({ action: 'get', task_id: created.task.id })).result.task).toMatchObject({ content: 'first\nfull detail', result_ref: 'artifact-1' });
       for (const params of [
-        { action: 'create', title: 'forbidden', project: other.project.project_id },
-        { action: 'create', title: 'forbidden', userId: 'other-account' },
-        { action: 'create', title: 'forbidden', project: '__global__' },
-        { action: 'update', task_id: created.task.id, status: 'done', title: '' },
+        { action: 'create', content: 'forbidden', project: other.project.project_id },
+        { action: 'create', content: 'forbidden', userId: 'other-account' },
+        { action: 'create', content: 'forbidden', project: '__global__' },
+        { action: 'update', task_id: created.task.id, status: 'done', content: '' },
         { action: 'update', task_id: created.task.id, owner: 'another-agent' },
         { action: 'update', task_id: created.task.id, status: 'invalid' },
         ...['blocked', 'cancelled', 'in_progress', 'in_review'].flatMap(status => [
           { action: 'update', task_id: created.task.id, status },
-          { action: 'create', title: 'Removed state', status },
+          { action: 'create', content: 'Removed state', status },
         ]),
         { action: 'complete', task_id: created.task.id, project: other.project.project_id },
         { action: 'complete', task_id: created.task.id, userId: 'other-account' },
@@ -296,13 +548,15 @@ describe('local_agents/bridge › auth + skills', () => {
         { action: 'list', offset: -1 },
         { action: 'list', limit: 51 },
       ]) expect((await read(params)).ok).toBe(false);
-      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ status: 'review', title: 'first', result_ref: 'artifact-1' });
+      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ status: 'review', content: 'first\nfull detail', result_ref: 'artifact-1' });
       expect((await tasks.getTask(TEST_UID, other.project.project_id, foreign.task.id))?.status).toBe('todo');
       expect((await tasks.getTask('other-account', foreignAccount.project.project_id, privateTask.task.id))?.status).toBe('todo');
       expect((await read({ action: 'complete', task_id: created.task.id, result_ref: 'verified-1' })).ok).toBe(true);
-      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ status: 'done', result_ref: 'verified-1', origin_cid: 'c1' });
-      expect((await read({ action: 'update', task_id: created.task.id, title: 'Edited in CLI', detail: 'Updated detail', owner: '' })).ok).toBe(true);
-      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ title: 'Edited in CLI', detail: 'Updated detail', origin_cid: 'c1', status: 'done' });
+      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ status: 'done', result_ref: 'verified-1' });
+      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).not.toHaveProperty('origin_cid');
+      expect((await read({ action: 'update', task_id: created.task.id, content: 'Edited in CLI\nUpdated detail', owner: '' })).ok).toBe(true);
+      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ content: 'Edited in CLI\nUpdated detail', status: 'done' });
+      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).not.toHaveProperty('origin_cid');
       expect(await tasks.listTasks(TEST_UID, '')).toEqual([]);
       await projects.deleteProject(TEST_UID, pid);
       expect((await read({ action: 'list' })).ok).toBe(false);
@@ -310,11 +564,11 @@ describe('local_agents/bridge › auth + skills', () => {
     } finally { await bridge.close(); }
     const unbound = await startTestBridge();
     try {
-      expect(unbound.capabilities).not.toContain('tasks.read');
+      expect(unbound.capabilities).toContain('tasks.read');
       const denied = await rpcOnce(unbound.socketPath, {
         id: 1, token: unbound.token, method: 'todo_tasks', params: { action: 'list' },
       });
-      expect((denied.reply as any).ok).toBe(false);
+      expect((denied.reply as any)).toMatchObject({ ok: true, result: { tasks: [] } });
     } finally { await unbound.close(); }
   });
 
@@ -327,8 +581,8 @@ describe('local_agents/bridge › auth + skills', () => {
     const project = await projects.createProject(TEST_UID, 'Execution visibility');
     if (!project.ok) throw new Error('project fixture failed');
     const pid = project.project.project_id;
-    const first = await tasks.createTask(TEST_UID, pid, { title: 'Active item', status: 'progress', origin_cid: 'c1' });
-    const other = await tasks.createTask(TEST_UID, pid, { title: 'Unlinked item', status: 'progress', origin_cid: 'c1' });
+    const first = await tasks.createTask(TEST_UID, pid, { content: 'Active item', status: 'progress', origin_cid: 'c1' });
+    const other = await tasks.createTask(TEST_UID, pid, { content: 'Unlinked item', status: 'progress', origin_cid: 'c1' });
     if (!first.ok || !other.ok) throw new Error('task fixture failed');
     const native = createProjectTasksHandler(TEST_UID, pid, 'c1', new Map(), { actorId: 'a1' });
     const bridge = await startTestBridge({ projectId: pid });
@@ -379,12 +633,13 @@ describe('local_agents/bridge › auth + skills', () => {
       id: ++id, token: bridge.token, method: 'todo_tasks', params,
     })).reply as any;
     try {
-      const created = await call({ action: 'create', title: 'Assigned work', owner: 'backenddev' });
+      const created = await call({ action: 'create', content: 'Assigned work', owner: 'backenddev' });
       expect(created.ok).toBe(true);
       const tid = created.result.task.id;
-      expect(await tasks.getTask(TEST_UID, pid, tid)).toMatchObject({ owner_agent: 'Backend Dev', owner_agent_id: 'aaa111bbb222', origin_cid: 'c1' });
-      expect((await call({ action: 'update', task_id: tid, owner: 'Reviewer', title: 'Must not apply' })).ok).toBe(false);
-      expect((await tasks.getTask(TEST_UID, pid, tid))?.title).toBe('Assigned work');
+      expect(await tasks.getTask(TEST_UID, pid, tid)).toMatchObject({ owner_agent: 'Backend Dev', owner_agent_id: 'aaa111bbb222' });
+      expect(await tasks.getTask(TEST_UID, pid, tid)).not.toHaveProperty('origin_cid');
+      expect((await call({ action: 'update', task_id: tid, owner: 'Reviewer', content: 'Must not apply' })).ok).toBe(false);
+      expect((await tasks.getTask(TEST_UID, pid, tid))?.content).toBe('Assigned work');
       expect((await call({ action: 'update', task_id: tid, owner: '' })).ok).toBe(true);
       expect(await tasks.getTask(TEST_UID, pid, tid)).not.toHaveProperty('owner_agent_id');
       users.activateUser('other-account');
@@ -401,7 +656,7 @@ describe('local_agents/bridge › auth + skills', () => {
     const pid = project.project.project_id;
     const detail = '待办内容'.repeat(500);
     for (let index = 0; index < 55; index++) {
-      expect((await tasks.createTask(TEST_UID, pid, { title: `task ${index}-${'长'.repeat(180)}`, detail, status: index % 2 ? 'todo' : 'done' })).ok).toBe(true);
+      expect((await tasks.createTask(TEST_UID, pid, { content: `task ${index}-${'长'.repeat(180)}\n${detail}`, status: index % 2 ? 'todo' : 'done' })).ok).toBe(true);
     }
     const bridge = await startTestBridge({ projectId: pid });
     try {
@@ -420,6 +675,7 @@ describe('local_agents/bridge › auth + skills', () => {
         expect(page.tasks.length).toBeGreaterThan(0);
         for (const task of page.tasks) {
           expect(task).not.toHaveProperty('detail');
+          expect(task.content).toContain(detail);
           expect(task).not.toHaveProperty('owner_agent_id');
         }
         received.push(...page.tasks);
@@ -430,46 +686,24 @@ describe('local_agents/bridge › auth + skills', () => {
       expect(pages).toBeGreaterThan(1);
       const { createProjectTasksHandler } = await import('../../../../src/main/features/project_tasks_tool_handler');
       const native = createProjectTasksHandler(TEST_UID, pid, 'c1', new Map());
-      expect(await native.list()).toMatchObject({ total: 55, next_offset: 20 });
-      expect((await native.list()).tasks).toHaveLength(20);
+      const firstNativePage = await native.list();
+      expect(firstNativePage.total).toBe(55);
+      expect(firstNativePage.next_offset).toBe(firstNativePage.tasks.length);
+      expect(firstNativePage.tasks.length).toBeGreaterThan(0);
+      expect(firstNativePage.tasks.length).toBeLessThanOrEqual(20);
       expect(await native.list({ status: 'review' })).toMatchObject({ tasks: [], total: 0, next_offset: null, progress: { total: 55 } });
       expect(await native.list({ status: 'done', offset: 28 })).toMatchObject({ tasks: [], total: 28, next_offset: null });
       expect(await native.list({ offset: 999 })).toMatchObject({ tasks: [], total: 55, next_offset: null });
       const nativePage = await native.list({ offset: 50, limit: 50 });
-      expect(nativePage.tasks.map(task => task.id)).toEqual(received.slice(50).map(task => task.id));
+      expect(nativePage.tasks.map(task => task.id)).toEqual(received.slice(50, 50 + nativePage.tasks.length).map(task => task.id));
       const full = await rpcOnce(bridge.socketPath, {
         id: 100, token: bridge.token, method: 'todo_tasks', params: { action: 'get', task_id: received[0].id },
       });
-      expect((full.reply as any).result.task.detail).toBe(detail);
+      expect((full.reply as any).result.task.content).toBe(received[0].content);
       expect((full.reply as any).result).toEqual(await native.get(received[0].id));
       expect(received).toHaveLength(55);
       expect(new Set(received.map((task) => task.id)).size).toBe(55);
     } finally { await bridge.close(); }
-  });
-
-  it.each([
-    ['claude', true],
-    ['codex', true],
-    ['openclaw', false],
-    ['opencode', false],
-    ['hermes', false],
-  ] as const)('grants Agent memory according to the %s capability', async (cli, supported) => {
-    const bridge = await startTestBridge({ cli });
-    try {
-      expect(bridge.capabilities.includes('memory.agent')).toBe(supported);
-      if (!supported) {
-        const result = await rpcOnce(bridge.socketPath, {
-          id: 1,
-          token: bridge.token,
-          method: 'memory.agent',
-          params: { action: 'add', content: 'must not persist' },
-        });
-        expect((result.reply as any).ok).toBe(false);
-        expect((result.reply as any).error).toContain('unknown method');
-      }
-    } finally {
-      await bridge.close();
-    }
   });
 
   it('rejects a wrong token by destroying the connection (no error oracle)', async () => {
@@ -602,7 +836,7 @@ describe('local_agents/bridge › auth + skills', () => {
     }
   });
 
-  it.each(['claude', 'codex'] as const)('lets %s persist current-project context and files without changing other scopes', async (cli) => {
+  it.each(['claude', 'codex', 'opencode', 'hermes', 'openclaw'] as const)('lets %s persist current-project context and files without changing other scopes', async (cli) => {
     const projects = await import('../../../../src/main/features/projects');
     const files = await import('../../../../src/main/features/project_files');
     const memory = await import('../../../../src/main/features/memory');
@@ -649,21 +883,22 @@ describe('local_agents/bridge › auth + skills', () => {
       expect((await call('library_save', { action: 'checkout', name: 'report.md', source_path: 'escape/copy.md' })).ok).toBe(false);
       expect(fs.existsSync(path.join(outside, 'copy.md'))).toBe(false);
       expect((await call('library_save', { source_path: 'report.md', projectId: 'other' })).ok).toBe(false);
-      const createdTask = await call('todo_tasks', { action: 'create', title: 'Current project work' });
+      const createdTask = await call('todo_tasks', { action: 'create', content: 'Current project work' });
       expect(createdTask.ok).toBe(true);
       const tasks = await import('../../../../src/main/features/project_tasks');
-      expect(await tasks.getTask(TEST_UID, pid, createdTask.result.task.id)).toMatchObject({ title: 'Current project work', origin_cid: 'c1' });
-      expect((await call('todo_tasks', { action: 'create', title: 'Wrong scope', project: 'other' })).ok).toBe(false);
+      expect(await tasks.getTask(TEST_UID, pid, createdTask.result.task.id)).toMatchObject({ content: 'Current project work' });
+      expect(await tasks.getTask(TEST_UID, pid, createdTask.result.task.id)).not.toHaveProperty('origin_cid');
+      expect((await call('todo_tasks', { action: 'create', content: 'Wrong scope', project: 'other' })).ok).toBe(false);
       expect((await call('memory.agent', { action: 'remove', target: 'project', old_text: 'Corrected decision.' })).result.ok).toBe(true);
       expect(memory.listEntries(TEST_UID, { project: pid }).entries).toEqual([]);
     } finally { await bridge.close(); }
   });
 
-  it.each(['openclaw', 'opencode', 'hermes'] as const)('does not grant project writes to an unsupported %s runtime', async (cli) => {
+  it.each(['claude', 'codex', 'opencode', 'hermes', 'openclaw'] as const)('does not grant project writes to a global %s conversation', async (cli) => {
     const projects = await import('../../../../src/main/features/projects');
     const created = await projects.createProject(TEST_UID, 'Read-only runtime');
     if (!created.ok) throw new Error('fixture failed');
-    const bridge = await startTestBridge({ cli, projectId: created.project.project_id });
+    const bridge = await startTestBridge({ cli });
     try {
       expect(bridge.capabilities).not.toContain('project.context.write');
       for (const method of ['project_instructions', 'library_save']) {
@@ -695,7 +930,7 @@ describe('local_agents/bridge › auth + skills', () => {
         params: { action: 'add', target: 'user', content: 'must not persist' },
       });
       expect((broader.reply as any).ok).toBe(false);
-      expect((broader.reply as any).error).toContain('target must be "agent"');
+      expect((broader.reply as any).error).toContain('read-only');
 
       const forged = await rpcOnce(bridge.socketPath, {
         id: 403,
@@ -1058,6 +1293,61 @@ describe('local_agents/bridge › auth + skills', () => {
     },
   );
 
+  it('blocks a managed ordinary-update action when its sharing change is declined', async () => {
+    bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue([{
+      instance: { id: 'box', display_name: 'Box', origin: 'catalog', composio_grant: {
+        connection_id: 'box-account', toolkit: 'box', auth_config_id: 'config',
+      } },
+      tools: [{ name: 'BOX_UPDATE_FOLDER', description: 'Update a folder', input_schema: {},
+        orkas_action_policy: { risk: 'W', confirmation: 'none', max_batch_size: 25 } }],
+    }] as any);
+    bridgeActionConfirmMock.request.mockResolvedValue(false);
+    const bridge = await startTestBridge({ permissionPolicy: 'full_access' });
+    try {
+      const renamed = await rpcOnce(bridge.socketPath, { id: 461, token: bridge.token, method: 'connectors.call',
+        params: { connector_id: 'box', tool_name: 'BOX_UPDATE_FOLDER', args: { folder_id: 'folder-1', name: 'Renamed' } } });
+      expect(renamed.reply).toMatchObject({ ok: true });
+      expect(bridgeActionConfirmMock.request).not.toHaveBeenCalled();
+      bridgeConnectorMock.callTool.mockClear();
+      const args = { folder_id: 'folder-1', shared_link: { access: 'open' } };
+      const denied = await rpcOnce(bridge.socketPath, { id: 462, token: bridge.token, method: 'connectors.call',
+        params: { connector_id: 'box', tool_name: 'BOX_UPDATE_FOLDER', args } });
+      expect(denied.reply).toMatchObject({ ok: false, error: expect.stringContaining('E_CONNECTOR_CONFIRMATION_DENIED') });
+      expect(bridgeActionConfirmMock.request).toHaveBeenCalledWith(expect.objectContaining({ risk: 'H', args }));
+      expect(bridgeConnectorMock.callTool).not.toHaveBeenCalled();
+    } finally { await bridge.close(); }
+  });
+
+  it.each(['FATHOM_GET_RECORDING_SUMMARY', 'FATHOM_GET_RECORDING_TRANSCRIPT'])(
+    'blocks external delivery by %s when confirmation is declined', async (name) => {
+      bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue([{
+        instance: { id: 'fathom', display_name: 'Fathom', origin: 'catalog', composio_grant: {
+          connection_id: 'account', toolkit: 'fathom', auth_config_id: 'config',
+        } },
+        tools: [{ name, description: 'Get meeting content', input_schema: {},
+          orkas_action_policy: { risk: 'R', confirmation: 'none', max_batch_size: 25 } }],
+      }] as any);
+      bridgeActionConfirmMock.request.mockResolvedValue(false);
+      const bridge = await startTestBridge({ permissionPolicy: 'full_access' });
+      try {
+        const read = await rpcOnce(bridge.socketPath, { id: 463, token: bridge.token, method: 'connectors.call',
+          params: { connector_id: 'fathom', tool_name: name, args: { recording_id: 42 } } });
+        expect(read.reply).toMatchObject({ ok: true });
+        expect(bridgeConnectorMock.callTool).toHaveBeenCalledTimes(1);
+        expect(bridgeActionConfirmMock.request).not.toHaveBeenCalled();
+        bridgeConnectorMock.callTool.mockClear();
+        const args = { recording_id: 42, destination_url: 'https://example.com/meeting' };
+        const denied = await rpcOnce(bridge.socketPath, { id: 464, token: bridge.token, method: 'connectors.call',
+          params: { connector_id: 'fathom', tool_name: name, args } });
+        expect(denied.reply).toMatchObject({ ok: false, error: expect.stringContaining('E_CONNECTOR_CONFIRMATION_DENIED') });
+        expect(bridgeActionConfirmMock.request).toHaveBeenCalledWith(expect.objectContaining({
+          risk: 'H', sensitiveOperation: 'external_communication', args,
+        }));
+        expect(bridgeConnectorMock.callTool).not.toHaveBeenCalled();
+      } finally { await bridge.close(); }
+    },
+  );
+
   it('keeps sensitive action confirmation independent from full CLI execution access', async () => {
     bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue([{
       instance: {
@@ -1380,10 +1670,32 @@ describe('local_agents/bridge › current conversation history', () => {
 });
 
 
+describe('uniform CLI bridge permissions', () => {
+  it.each(['claude', 'codex', 'opencode', 'hermes', 'openclaw'] as const)('grants %s the same context-bound tools', async (cli) => {
+    const projects = await import('../../../../src/main/features/projects');
+    const created = await projects.createProject(TEST_UID, 'Uniform bridge');
+    if (!created.ok) throw new Error('fixture failed');
+    const bridge = await startTestBridge({ cli, projectId: created.project.project_id });
+    try {
+      expect([...bridge.capabilities].sort()).toEqual([
+        'automation', 'chat.read', 'commander.handoff', 'kb.read', 'memory.agent',
+        'project.context.write', 'skills.read', 'skills.run', 'tasks.read', 'tasks.write',
+      ]);
+      const added = await rpcOnce(bridge.socketPath, { id: 1, token: bridge.token, method: 'memory.agent',
+        params: { action: 'add', content: 'Shared bridge contract' } });
+      expect((added.reply as any).ok).toBe(true);
+      const memory = await import('../../../../src/main/features/memory');
+      expect(memory.listAgentEntries(TEST_UID, 'a1').entries).toEqual(['Shared bridge contract']);
+      const rejected = await rpcOnce(bridge.socketPath, { id: 2, token: bridge.token, method: 'memory.agent',
+        params: { action: 'add', content: 'Forbidden', agentId: 'another-agent' } });
+      expect((rejected.reply as any).ok).toBe(false);
+      expect(memory.listAgentEntries(TEST_UID, 'another-agent').entries).toEqual([]);
+    } finally { await bridge.close(); }
+  });
+});
+
 describe('CLI browser lifetime and isolation', () => {
-  it.each(['openclaw', 'hermes'] as const)('does not grant browser to unsupported %s transport even in a task', async (cli) => {
-    const life = await import('../../../../src/main/features/web_assist_lifecycle');
-    life.beginBrowserTaskRun(TEST_UID, 'c1', 'browser-denied');
+  it.each(['claude', 'codex', 'opencode', 'hermes', 'openclaw'] as const)('does not grant browser to %s without an active browser task', async (cli) => {
     const bridge = await startTestBridge({ cli });
     try {
       expect(bridge.capabilities).not.toContain('browser');
@@ -1391,7 +1703,6 @@ describe('CLI browser lifetime and isolation', () => {
       expect(result.reply).toMatchObject({ ok: false, error: 'unknown method: browser' });
     } finally {
       await bridge.close();
-      life.finishBrowserTaskRun(TEST_UID, 'c1', 'browser-denied');
     }
   });
 
@@ -1457,4 +1768,27 @@ describe('CLI browser lifetime and isolation', () => {
       life.finishBrowserTaskRun(TEST_UID, 'c1', 'browser-queue');
     }
   });
+});
+
+
+it('rejects invalid or unapproved CLI invocations without dispatching them', async () => {
+  bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue([{
+    instance: { id: 'gmail', display_name: 'Gmail' },
+    tools: [{ name: 'GMAIL_SEND_EMAIL', description: 'Send email', input_schema: {} }],
+  }] as any);
+  bridgeActionConfirmMock.request.mockResolvedValue(false);
+  const bridge = await startTestBridge({ runId: 'connector-telemetry' });
+  try {
+    const replies: unknown[] = [];
+    for (const params of [
+      { connector_id: 'private-canary', tool_name: 'private-canary' },
+      { connector_id: 'gmail', tool_name: 'GMAIL_SEND_EMAIL', args: { to: 'private-canary' } },
+    ]) {
+      const reply = (await rpcOnce(bridge.socketPath, { id: 1, token: bridge.token, method: 'connectors.call', params })).reply;
+      expect(reply).toMatchObject({ ok: false });
+      replies.push(reply);
+    }
+    expect(bridgeConnectorMock.callTool).not.toHaveBeenCalled();
+    expect(replies).toHaveLength(2);
+  } finally { await bridge.close(); }
 });

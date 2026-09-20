@@ -506,7 +506,7 @@ export async function writeProjectInstructions(
     const cur = await _readProject(uid, projectId);
     if (!cur) return { ok: false, error: 'not_found' };
     writeTextAtomicSync(projectInstructionsFile(uid, projectId), content);
-    log.info(`instructions saved user=${uid} pid=${projectId} chars=${content.length}`);
+    log.info('instructions saved', { uid: maskId(uid), pid: projectId, chars: content.length });
     return { ok: true };
   });
 }
@@ -539,14 +539,14 @@ export async function writeProjectInstructionsIfUnchanged(
       currentContent = await fsp.readFile(projectInstructionsFile(uid, projectId), 'utf8');
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-        log.warn(`instructions compare read failed user=${uid} pid=${projectId}: ${(err as Error).message}`);
+        log.warn('instructions compare read failed', { uid: maskId(uid), pid: projectId, error: logErrorSummary(err) });
         return { ok: false, error: 'read_failed' };
       }
     }
     if (currentContent !== expectedContent) return { ok: false, error: 'conflict' };
 
     writeTextAtomicSync(projectInstructionsFile(uid, projectId), content);
-    log.info(`instructions conditionally saved user=${uid} pid=${projectId} chars=${content.length}`);
+    log.info('instructions conditionally saved', { uid: maskId(uid), pid: projectId, chars: content.length });
     return { ok: true };
   });
 }

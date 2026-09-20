@@ -1126,6 +1126,10 @@ function _dbPie(data) {
     const large = (v / total) > 0.5 ? 1 : 0;
     const x1 = cx + r * Math.cos(startAngle), y1 = cy + r * Math.sin(startAngle);
     const x2 = cx + r * Math.cos(endAngle),   y2 = cy + r * Math.sin(endAngle);
+    // A full turn has coincident endpoints; SVG needs two arcs to paint it.
+    if (items.length === 1) {
+      return `<path d="M${cx},${cy - r} A${r},${r} 0 1 1 ${cx},${cy + r} A${r},${r} 0 1 1 ${cx},${cy - r} Z" class="db-chart-slice" data-idx="0"></path>`;
+    }
     return `<path d="M${cx},${cy} L${x1.toFixed(2)},${y1.toFixed(2)} A${r},${r} 0 ${large} 1 ${x2.toFixed(2)},${y2.toFixed(2)} Z" class="db-chart-slice" data-idx="${i % 6}"></path>`;
   }).join('');
   const legend = items.map((d, i) =>
@@ -1142,12 +1146,17 @@ function _dbXyChart(kind, data) {
   const points = data.map(d => ({ x: String((d && d.x) ?? ''), y: Number((d && d.y) ?? 0) }))
     .filter(p => Number.isFinite(p.y));
   if (!points.length) return '<div class="db-chart-empty"></div>';
-  const W = 320, H = 140, padL = 32, padR = 8, padT = 8, padB = 22;
+  const W = 320, H = 140, padL = 32, padR = 16, padT = 8, padB = 22;
   const innerW = W - padL - padR, innerH = H - padT - padB;
   const maxY = Math.max(...points.map(p => p.y), 0);
   const minY = Math.min(...points.map(p => p.y), 0);
   const span = (maxY - minY) || 1;
-  const xOf = (i) => padL + (points.length === 1 ? innerW / 2 : (i / (points.length - 1)) * innerW);
+  // Bars occupy bands, while line/area points span the plot endpoints. Center
+  // each bar inside its band so the first/last bar cannot cover the axis or
+  // extend outside the SVG. Values and the y scale are unchanged.
+  const xOf = (i) => padL + (kind === 'bar'
+    ? ((i + 0.5) / points.length) * innerW
+    : (points.length === 1 ? innerW / 2 : (i / (points.length - 1)) * innerW));
   const yOf = (y) => padT + innerH - ((y - minY) / span) * innerH;
   const yTicks = [0, 0.5, 1].map((ratio) => {
     const y = padT + innerH - ratio * innerH;
@@ -1339,14 +1348,85 @@ function _markdownAudioIconHtml(label) {
   return '<svg class="chat-file-kind-icon is-audio" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18V6l9-2v12"></path><circle cx="6.5" cy="18" r="2.5"></circle><circle cx="15.5" cy="16" r="2.5"></circle></svg>';
 }
 
+function _markdownAudioLocalPath(src) {
+  const localPath = _chatMediaLocalPathFromUrl(src);
+  if (!localPath || /[\u0000-\u001f\u007f]/.test(localPath)) return '';
+  try {
+    const url = new URL(src);
+    return url.username || url.password || url.port ? '' : localPath;
+  } catch (_) { return ''; }
+}
+
 function _markdownAudioHtml(src, label, title) {
-  const t = title ? ` title="${escapeHtml(title)}"` : '';
+  const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
   const name = _markdownMediaLabel(src, label, 'audio');
-  return `<span class="chat-md-audio-card"${t} role="group" aria-label="${escapeHtml(name)}">
+  const menuLabel = typeof t === 'function' ? t('contexts.menu.more_actions') : 'More actions';
+  const menuIcon = typeof window !== 'undefined' && typeof window.uiIconHtml === 'function'
+    ? window.uiIconHtml('more-horizontal') : '';
+  const menuButton = _markdownAudioLocalPath(src)
+    ? `<button type="button" class="chat-msg-produced-menu-btn" data-chat-md-audio-menu="1" data-audio-src="${escapeHtml(src)}" data-i18n-title="contexts.menu.more_actions" data-i18n-aria-label="contexts.menu.more_actions" title="${escapeHtml(menuLabel)}" aria-label="${escapeHtml(menuLabel)}" aria-haspopup="menu" aria-expanded="false">${menuIcon}</button>`
+    : '';
+  return `<span class="chat-md-audio-card"${titleAttr} role="group" aria-label="${escapeHtml(name)}">
     <span class="chat-md-audio-icon">${_markdownAudioIconHtml(name)}</span>
-    <span class="chat-md-audio-name">${escapeHtml(name)}</span>
-    <audio class="chat-md-audio" controls controlslist="nodownload noremoteplayback" preload="metadata" src="${escapeHtml(src)}" aria-label="${escapeHtml(name)}" data-monitor-resource="chat-markdown-audio"></audio>
+    <span class="chat-md-audio-header"><span class="chat-md-audio-name">${escapeHtml(name)}</span>${menuButton}</span>
+    <audio class="chat-md-audio" controls controlslist="nodownload noplaybackrate noremoteplayback" preload="metadata" src="${escapeHtml(src)}" aria-label="${escapeHtml(name)}" data-monitor-resource="chat-markdown-audio"></audio>
   </span>`;
+}
+
+async function _openMarkdownAudioMenu(button) {
+  if (button.disabled) return;
+  const localPath = _markdownAudioLocalPath(button.getAttribute('data-audio-src') || '');
+  if (!localPath || typeof window.ConversationInfo?.openFileMenu !== 'function') return;
+  const card = button.closest('.chat-md-audio-card');
+  const name = localPath.split(/[\\/]/).pop() || localPath;
+  button.disabled = true;
+  try {
+    await window.ConversationInfo.openFileMenu(button, localPath, name, {
+      cid: typeof currentCid !== 'undefined' ? currentCid || '' : '',
+      onDeleted: () => {
+        const audio = card?.querySelector('audio');
+        if (audio) {
+          audio.pause();
+          audio.removeAttribute('src');
+          audio.load();
+        }
+        if (!audio || !_dropFailedProducedPreview(audio)) card?.remove();
+      },
+    });
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function _markdownFileReferencePath(rawSrc) {
+  // Source locations are Markdown reference metadata, not filename bytes.
+  // Strip before URL decoding so an encoded literal colon/hash stays a filename.
+  // Keep this suffix grammar aligned with chat-media-url.ts document links.
+  return String(rawSrc || '').trim().replace(/(?::[1-9]\d*(?::[1-9]\d*)?|#L[1-9]\d*(?:C[1-9]\d*)?(?:-L[1-9]\d*(?:C[1-9]\d*)?)?)$/, '');
+}
+
+// Local file links are preview actions, never top-level navigation or evidence
+// of a produced file. Main's existing viewer IPC owns existence and scope checks.
+function _markdownFileLinkHtml(rawSrc, label, title) {
+  const raw = _markdownFileReferencePath(rawSrc);
+  if (!raw || /[\u0000-\u001f\u007f]/.test(raw) || raw.startsWith('//')) return '';
+  if (/^file:/i.test(raw)) {
+    try {
+      const url = new URL(raw);
+      if (url.hostname) return '';
+    } catch (_) { return ''; }
+  }
+  const src = _normalizeLocalMediaSrc(raw);
+  const absPath = _chatMediaLocalPathFromUrl(src);
+  if (!absPath || /[\u0000-\u001f\u007f]/.test(absPath)) return '';
+  try {
+    const url = new URL(src);
+    if (url.username || url.password || url.port) return '';
+  } catch (_) { return ''; }
+  const name = absPath.split(/[\\/]/).pop() || absPath;
+  const icon = typeof window !== 'undefined' && typeof window.fileKindIconHtml === 'function'
+    ? window.fileKindIconHtml(name) : '';
+  return `<button type="button" class="chat-attach-chip is-inline chat-attach-preview" data-chat-md-file-open="1" data-file-src="${escapeHtml(src)}" title="${escapeHtml(title || _markdownHtmlPreviewLabel())}"><span class="chat-attach-icon">${icon}</span><span class="chat-attach-label">${escapeHtml(label || name)}</span></button>`;
 }
 
 function _markdownHtmlPreviewLabel() {
@@ -1856,6 +1936,25 @@ function _toggleChatVideoFromSurface(e, surface) {
 
 if (typeof document !== 'undefined') document.addEventListener('click', (e) => {
   const target = e.target;
+  const audioMenu = target && target.closest ? target.closest('[data-chat-md-audio-menu="1"]') : null;
+  if (audioMenu) {
+    e.preventDefault();
+    e.stopPropagation();
+    return _openMarkdownAudioMenu(audioMenu);
+  }
+  const file = target && target.closest ? target.closest('[data-chat-md-file-open="1"]') : null;
+  if (file) {
+    e.preventDefault();
+    e.stopPropagation();
+    const absPath = _chatMediaLocalPathFromUrl(file.getAttribute('data-file-src') || '');
+    if (!absPath || /[\u0000-\u001f\u007f]/.test(absPath) || typeof openChatFileViewer !== 'function') return;
+    const name = absPath.split(/[\\/]/).pop() || absPath;
+    openChatFileViewer(absPath, name, {
+      cid: typeof currentCid !== 'undefined' ? currentCid || null : null,
+      sourceElement: file,
+    });
+    return;
+  }
   const retry = target && target.closest ? target.closest('[data-chat-md-video-retry="1"]') : null;
   if (retry) {
     e.preventDefault();
@@ -1964,8 +2063,8 @@ let _mdEmbeddedMediaKeys = null;
 
 function _collectEmbeddedMediaKeys(md) {
   const keys = new Set();
-  String(md || '').replace(/!\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_, rawSrc) => {
-    const src = _normalizeLocalMediaSrc(rawSrc);
+  String(md || '').replace(/!\[[^\]]*\]\((<[^<>\r\n]+>|[^)\s]+)(?:\s+"[^"]*")?\)/g, (_, rawSrc) => {
+    const src = _normalizeLocalMediaSrc(rawSrc.startsWith('<') ? rawSrc.slice(1, -1) : rawSrc);
     if (_isImageSrc(src) || _isVideoSrc(src) || _isAudioSrc(src)) {
       const key = _mediaDedupKey(src);
       if (key) keys.add(key);
@@ -1980,9 +2079,9 @@ function inlineFormat(text) {
   const phase1 = text
     // Media: ![alt](src) — dispatch to <video> when src looks like a video
     // file, else <img>. Must run before link syntax.
-    .replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,
+    .replace(/!\[([^\]]*)\]\((<[^<>\r\n]+>|[^)\s]+)(?:\s+"([^"]*)")?\)/g,
       (_, alt, rawSrc, title) => {
-        const src = _normalizeLocalMediaSrc(rawSrc);
+        const src = _normalizeLocalMediaSrc(rawSrc.startsWith('<') ? rawSrc.slice(1, -1) : rawSrc);
         const mediaMeta = _parseOrkasMediaTitle(title);
         if (_isHtmlSrc(src)) return _markdownHtmlEmbedHtml(src, alt, title);
         if (mediaMeta ? mediaMeta.kind === 'video' : _isVideoSrc(src)) {
@@ -1994,8 +2093,9 @@ function inlineFormat(text) {
         return _markdownImageHtml(src, alt, title);
       })
     // Markdown links: [text](url "title")
-    .replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,
+    .replace(/\[([^\]]+)\]\((<[^<>\r\n]+>|[^)\s]+)(?:\s+"([^"]*)")?\)/g,
       (_, txt, rawUrl, title) => {
+        if (rawUrl.startsWith('<')) rawUrl = rawUrl.slice(1, -1);
         // Media links get the same rewrite as `![](…)`: an agent delivering a
         // finished file writes `[视频成片](<path>)` as often as an embed.
         const url = _isImageSrc(rawUrl) || _isVideoSrc(rawUrl) || _isAudioSrc(rawUrl)
@@ -2016,11 +2116,21 @@ function inlineFormat(text) {
         if (_isImageSrc(url)) return _markdownImageHtml(url, txt, title);
         if (_isVideoSrc(url)) return _markdownVideoHtml(url, txt, title);
         if (_isAudioSrc(url)) return _markdownAudioHtml(url, txt, title);
+        const fileLink = _markdownFileLinkHtml(url, txt, title);
+        if (fileLink) return fileLink;
         // href: scheme-checked + escaped (blocks javascript:/data: and quote
         // breakout). text stays raw so nested image/emphasis still render;
         // DOMPurify scrubs any raw HTML in the text at the output layer.
         const href = _safeHref(url);
-        if (!href) return txt;
+        if (!href) {
+          // Main promotes only existing workspace-relative document links.
+          // Unresolved relative references remain filenames, without an action.
+          if (!/^(?:[a-z][a-z0-9+.-]*:|[\\/#?])/i.test(_markdownFileReferencePath(url))) {
+            const name = url.split(/[\\/]/).pop() || '';
+            if (/\.[^./\\\s]+/.test(name)) return escapeHtml(name);
+          }
+          return txt;
+        }
         const target = href.charAt(0) === '#' ? '' : ' target="_blank" rel="noopener"';
         return `<a href="${escapeHtml(href)}"${target}${title ? ` title="${escapeHtml(title)}"` : ''}>${txt}</a>`;
       })

@@ -1,10 +1,26 @@
 # HTML generation playbook
 
-Use this during the initial COMPOSE generation, after the brief/storyboard is approved and before writing `index.html`. This is an internal authorship pass, not a user gate and not a new required project file.
+Use this when mapping reference frames into `art_direction` and before writing `index.html`. This is an internal authorship pass, not a user gate and not a new required project file.
 
 ## Private pre-code art direction
 
-For the whole piece, decide five things before coding:
+Use the path selected in `frontend-design`. Keep the result in the existing manifest; this pass implements its scene plan.
+
+### Reference-led composition
+
+For each scene about to be planned or implemented, open its saved source frame as an image with `read_files` (`metadata_only: false`) immediately before authoring. Earlier inspection receipts and plan prose do not keep the pixels visible in a later turn. Use the visible frame and mapped source time to fill the existing fields below, then write that scene description or HTML while the frame is in context:
+
+1. **Elements and substitutions** — identify the source elements and their roles. Replace their content with confirmed target copy and explicit user changes, retaining the visual relationships.
+2. **Recurring carrier** — retain the element and connections that continue between the mapped source scenes.
+3. **Type hierarchy** — derive relative title/body/label scale, placement and contrast from the source while preserving approved casing.
+4. **Spatial arrangement** — put named regions, relative positions and sizes, grouping and connections in `art_direction.scenes[].composition`. Record the source frame/time with this description. For example: a main card centered above three equal child cards, joined by branching lines; replace the card copy inside that arrangement. This describes a particular frame, not a theme such as "modular cards".
+5. **Observed motion** — fill opening/resolved states and motion verbs from the observed changes and holds, using the declared temporal anchors. Unseen movement remains unknown under `reference-recreation`.
+
+Build the static HTML/CSS/SVG from those mapped regions, then apply the content substitutions before adding motion. Keep the source scene sequence and layout changes within the user's preserve/may-change scope. Implementation primitives fit these regions; a new visual metaphor is an original-design decision.
+
+### Original composition
+
+Without a concrete reference, decide five things before coding:
 
 1. **Material world** — list the real artifacts, surfaces, marks, diagrams, interfaces, documents, objects, or physical behaviors that belong to the topic. Prefer those over generic circles and lines.
 2. **Recurring carrier** — choose one visual object that can move through the story: signal, rule, token stream, document strip, route, waveform, product surface, cursor, scale, or data mark.
@@ -26,28 +42,27 @@ Put compact answers in the existing design contract scene fields when they help 
 
 Before coding the first scene, resolve the dedicated cover contract separately: approved headline, dominant hero, at least two concrete signals of the video's real content, and a composition that still communicates at thumbnail size. Frame 0 is the exported cover, so it cannot be a generic title treatment or an incomplete tween state.
 
-When reference media exists, place each copied image or sampled video anchor beside its planned target frame. Convert declared layout anchors into explicit HTML/CSS/SVG regions and map video temporal anchors to their target scene/timeline positions before styling details. If safe owned layers or assets happen to be available, they may help execute the same contract, but they do not change the reproduce/edit/guide intent. Write motion around preserved geometry and timing; do not let animation become an excuse for drift.
+## Original composition preferences
 
-## Compose a frame, not a page
-
-A good video frame remains intentional when paused:
+Without a concrete reference, compose intentional video frames:
 
 - Use asymmetric tension, scale contrast, edge anchoring, cropping, overlap, or a strong full-field structure. Do not center every object inside generous web-page whitespace.
 - Let meaningful material occupy the canvas. Empty space is useful only when it creates direction, suspense, scale, or emphasis.
 - Use three semantic depth layers. Background structure should belong to the subject; midground carries the main message; foreground annotations, ticks, fragments, or masks create scale and finish.
 - Build one dominant focal point and one supporting focal point. Tiny labels scattered around a small diagram do not create hierarchy.
 - Prefer a few large shapes and readable annotations over many small cards. At phone size, labels must remain legible and the hero graphic must still read as a silhouette.
-- Treat exact words, dates, numbers, and CTA copy as real HTML. Use SVG for geometry, relationships, paths, masks, charts, and spatial systems.
 
 ## Opening, explanation, resolved
 
-Every scene needs three authored states:
+For both paths, keep exact words, dates, numbers, and CTA copy as real HTML. Use SVG for geometry, relationships, paths, masks, charts, and spatial systems.
+
+Reference-led scenes take their states from the observed source. For original work, design three states:
 
 1. **Opening** — the premise and visual identity are already visible. The first scene must never be a blank canvas waiting for a fade.
 2. **Explanation** — structure, comparison, connection, or causality becomes visible in a controlled sequence.
 3. **Resolved** — the completed idea holds long enough to read and should be visibly different from the opening state.
 
-Author the resolved state first in HTML/CSS/SVG, then decide which parts begin muted, clipped, offset, or incomplete. Avoid building a scene whose only change is container opacity.
+For both paths, author the resolved state first in HTML/CSS/SVG, then implement the planned opening and explanation states. For original work, choose which parts begin muted, clipped, offset, or incomplete; avoid using only container opacity.
 
 For the first scene:
 
@@ -65,9 +80,9 @@ tl.set('#s01', { opacity: 1 }, 0)
 
 For later scenes, a hard cut, wipe, carried object, or short crossfade may reveal the next scene at its start. Do not spend the first second of every scene fading an empty layout into view.
 
-## Scene variation without random style changes
+## Original scene variation
 
-Keep typography, palette, stroke character, corner treatment, and the recurring carrier consistent. Vary two or more of these per scene:
+Without a concrete reference, keep typography, palette, stroke character, corner treatment, and the recurring carrier consistent. Vary two or more of these per scene:
 
 - dominant mass position;
 - full-field versus split composition;
@@ -78,9 +93,9 @@ Keep typography, palette, stroke character, corner treatment, and the recurring 
 
 Variation is structural, not a new palette or unrelated visual style every few seconds.
 
-## Generation-time anti-patterns
+## Original generation-time anti-patterns
 
-Replace these before coding:
+In original work, replace these before coding:
 
 - `top-left headline + small diagram below` repeated across the sequence;
 - a pure-color background with only one thin SVG group;
@@ -98,11 +113,11 @@ Before saving `index.html`, verify from the source itself:
 - frame 0 contains the promise and a subject-specific visual signal;
 - frame 0 satisfies every `art_direction.cover.content_signals` item and reads as the actual video's cover;
 - reference images and videos satisfy their reproduce/edit/guide intent, protected axes, allowed changes, and layout/temporal anchors;
-- every scene has background, midground, and foreground intent;
+- scene layering follows the source, or the planned background/midground/foreground for original work;
 - each scene has a large, recognizable hero visual;
-- the spatial sequence varies without losing the shared visual system;
-- opening and resolved states differ meaningfully;
-- one carrier or motif creates continuity across the piece;
+- the spatial sequence follows the mapped source, or varies within the original visual system;
+- opening/resolved states follow the observed changes and holds, or reveal new information in original work;
+- continuity follows the source carrier, or the chosen original motif;
 - typography roles differ beyond font size;
 - SVG structure encodes real content rather than generic decoration;
 - no remote runtime dependency is required;

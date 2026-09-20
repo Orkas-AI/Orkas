@@ -40,6 +40,12 @@ const _LOCALES = [
   { code: 'en', label: 'English', htmlLang: 'en', intlLocale: 'en-US', fallback: null },
   { code: 'ja', label: '日本語', htmlLang: 'ja', intlLocale: 'ja-JP', fallback: 'en' },
   { code: 'pt', label: 'Português (Brasil)', htmlLang: 'pt-BR', intlLocale: 'pt-BR', fallback: 'en' },
+  { code: 'es', label: 'Español', htmlLang: 'es', intlLocale: 'es-ES', fallback: 'en' },
+  { code: 'fr', label: 'Français', htmlLang: 'fr', intlLocale: 'fr-FR', fallback: 'en' },
+  { code: 'ko', label: '한국어', htmlLang: 'ko', intlLocale: 'ko-KR', fallback: 'en' },
+  { code: 'de', label: 'Deutsch', htmlLang: 'de', intlLocale: 'de-DE', fallback: 'en' },
+  { code: 'ru', label: 'Русский', htmlLang: 'ru', intlLocale: 'ru-RU', fallback: 'en' },
+  { code: 'it', label: 'Italiano', htmlLang: 'it', intlLocale: 'it-IT', fallback: 'en' },
 ];
 const _LOCALE_BY_CODE = _LOCALES.reduce((acc, meta) => {
   acc[meta.code] = meta;

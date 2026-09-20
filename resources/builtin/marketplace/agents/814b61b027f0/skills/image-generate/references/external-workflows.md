@@ -78,4 +78,4 @@ The mask uses white for the edited area. Use an empty prompt for a host erase mo
 1. Call `workflow.capabilities` and select only an `executable:true` engine.
 2. Keep one stable `image_request_id` per generation intent.
 3. Call `workflow.run` once. `pending_uncertain` means the request may be running; never retry blindly.
-4. Inspect the returned raster, score current evidence, and repair only from concrete findings within the manifest budget.
+4. Follow [the generation review loop](../SKILL.md#review-loop): validate the returned raster with `project.inspect`, then export it with `project.export`.

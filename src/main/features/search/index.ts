@@ -1,3 +1,4 @@
+import { hasHistoryProcess, historyMessagesAtFile, historyProcessTexts } from '../chat-history-records';
 /**
  * Global search query API.
  *
@@ -25,7 +26,6 @@
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
-import * as readline from 'node:readline';
 import { Semaphore } from 'async-mutex';
 
 import {
@@ -37,16 +37,13 @@ import { conversationMessageReadFile } from '../../util/project-layout';
 import { getActiveUserId } from '../users';
 import { createLogger } from '../../logger';
 import { t } from '../../i18n';
-import {
-  scheduleBootBackground,
-  type ScheduledBootBackgroundTask,
-} from '../../util/boot_init';
 
 const log = createLogger('search');
 
 import { tokenize, isCJK } from './tokenize';
-import type { Index, Doc } from './storage';
+import { SCHEMA_VERSION, type Index, type Doc } from './storage';
 import * as indexer from './indexer';
+import * as chatStore from './chat_store';
 import {
   isRelevantLibraryContentHit,
   libraryContentDisplayScore,
@@ -224,79 +221,21 @@ interface ChatSourceMessage {
   id?: unknown;
   content?: unknown;
   text?: unknown;
+  process?: unknown;
   deleted_at?: unknown;
   dispatch?: unknown;
 }
 
-// Search reads only the bounded result window requested by the caller. Group
-// hits by conversation and cap the number of simultaneously-open JSONLs so a
-// broad query cannot turn into a disk burst. readline's async iterator yields
-// between chunks instead of synchronously reading/splitting an entire long
-// history on Electron's main event loop.
+// Bound concurrent exact source reads, including cold index construction.
 const _chatSnippetIo = new Semaphore(4);
-
-async function _readJsonlMessagesAt(
-  file: string,
-  indexes: ReadonlySet<number>,
-): Promise<Map<number, ChatSourceMessage>> {
-  const found = new Map<number, ChatSourceMessage>();
-  if (!indexes.size) return found;
-  const maxIndex = Math.max(...indexes);
-  return _chatSnippetIo.runExclusive(async () => {
-    const input = fs.createReadStream(file, { encoding: 'utf8' });
-    const lines = readline.createInterface({ input, crlfDelay: Infinity });
-    let parsedIndex = 0;
-    try {
-      for await (const line of lines) {
-        if (!line.trim()) continue;
-        let msg: ChatSourceMessage;
-        try { msg = JSON.parse(line) as ChatSourceMessage; }
-        catch { continue; }
-        if (indexes.has(parsedIndex)) found.set(parsedIndex, msg);
-        if (parsedIndex >= maxIndex || found.size >= indexes.size) break;
-        parsedIndex += 1;
-      }
-    } catch {
-      // Missing/replaced source files are repaired by the index reconciler.
-    } finally {
-      lines.close();
-      input.destroy();
-    }
-    return found;
-  });
-}
-
-const _chatRepairTasks = new Map<string, ScheduledBootBackgroundTask>();
-
-function _scheduleChatIndexRepair(userId: string): void {
-  if (_chatRepairTasks.has(userId)) return;
-  const task = scheduleBootBackground(
-    `search:chat-query-repair:${userId}`,
-    (signal) => indexer.reconcileChatsIndex(userId, signal),
-    250,
-    { resourceClass: 'disk', preferIdle: true, maxSliceMs: 15_000 },
-  );
-  _chatRepairTasks.set(userId, task);
-  void task.promise.finally(() => {
-    if (_chatRepairTasks.get(userId) === task) _chatRepairTasks.delete(userId);
-  });
-}
 
 export function invalidateChatsIndex(userId: string): void {
   indexer.invalidateChatsIndex(userId);
-  const pending = _chatRepairTasks.get(userId);
-  if (pending) {
-    pending.cancel();
-    _chatRepairTasks.delete(userId);
-  }
 }
 
 export const __searchTestHooks = {
-  hasPendingChatRepair: (userId: string): boolean => _chatRepairTasks.has(userId),
-  cancelChatRepair: (userId: string): void => {
-    _chatRepairTasks.get(userId)?.cancel();
-    _chatRepairTasks.delete(userId);
-  },
+  hasPendingChatRepair: indexer.hasPendingChatRepair,
+  cancelChatRepair: indexer.cancelChatIndexRepair,
   setLibraryContentSearchProvider: (provider: LibraryContentSearchProvider | null): void => {
     _libraryContentSearchProviderForTests = provider;
     _libraryQueryEmbeddingCache.clear();
@@ -345,11 +284,36 @@ function _avgDocLen(idx: RuntimeIndex): number {
   return idx._avgdl;
 }
 
-function _scoreIndex(idx: RuntimeIndex, queryTokens: string[]): Map<string, number> {
-  const docCount = Object.keys(idx.docs).length;
-  const scores = new Map<string, number>();
+/** BM25 relevance plus how much of the query the doc actually covers.
+ * `coverage` counts distinct query tokens present in the doc; repeating a
+ * token in the query still weights the score but cannot inflate coverage. */
+interface ScoredDoc { score: number; coverage: number }
+
+/** One posting as the scorer needs it, whatever storage produced it. */
+interface PostingRow<K> { key: K; tf: number; len: number }
+
+/**
+ * BM25 with the CJK bigram anchor, over any postings source.
+ *
+ * Kept generic so the in-memory context/agent/skill indexes and the SQLite
+ * chat store run the *same* arithmetic: two copies would drift, and ranking
+ * drift is invisible until someone notices their search got worse.
+ */
+function _scorePostings<K>(
+  docCount: number,
+  avgdl: number,
+  queryTokens: string[],
+  readPostings: (term: string) => PostingRow<K>[],
+): Map<K, ScoredDoc> {
+  const scores = new Map<K, ScoredDoc>();
   if (!docCount) return scores;
-  const avgdl = _avgDocLen(idx);
+  // A bigram is read for the anchor and again for scoring; one lookup each.
+  const cache = new Map<string, PostingRow<K>[]>();
+  const postings = (term: string): PostingRow<K>[] => {
+    let rows = cache.get(term);
+    if (!rows) { rows = readPostings(term); cache.set(term, rows); }
+    return rows;
+  };
 
   // CJK bigram anchor filter — tokenize emits both unigrams (`苏`) and
   // bigrams (`苏格`) per CJK char. Single CJK chars match millions of
@@ -364,14 +328,10 @@ function _scoreIndex(idx: RuntimeIndex, queryTokens: string[]): Map<string, numb
   const cjkBigrams = queryTokens.filter(
     (t) => t.length === 2 && isCJK(t[0]) && isCJK(t[1]),
   );
-  let anchored: Set<string> | null = null;
+  let anchored: Set<K> | null = null;
   if (cjkBigrams.length) {
-    anchored = new Set<string>();
-    for (const t of cjkBigrams) {
-      const post = idx.postings[t];
-      if (!post) continue;
-      for (const [docId] of post) anchored.add(docId);
-    }
+    anchored = new Set<K>();
+    for (const t of cjkBigrams) for (const row of postings(t)) anchored.add(row.key);
     // No anchor bigram hit any doc — the query's full CJK shape doesn't
     // appear in this index. Returning empty here keeps the noise-doc list
     // from showing up; without it, the single-char unigram contributions
@@ -379,35 +339,65 @@ function _scoreIndex(idx: RuntimeIndex, queryTokens: string[]): Map<string, numb
     if (anchored.size === 0) return scores;
   }
 
+  const counted = new Set<string>();
   for (const t of queryTokens) {
-    const post = idx.postings[t];
-    if (!post) continue;
-    const df = post.length;
+    const rows = postings(t);
+    if (!rows.length) continue;
+    const df = rows.length;
     const idf = Math.log(1 + (docCount - df + 0.5) / (df + 0.5));
-    for (const [docId, tf] of post) {
-      if (anchored && !anchored.has(docId)) continue;
-      const doc = idx.docs[docId];
-      const dl = (doc && typeof doc.len === 'number') ? doc.len : avgdl;
+    const firstSighting = !counted.has(t);
+    counted.add(t);
+    for (const row of rows) {
+      if (anchored && !anchored.has(row.key)) continue;
+      const dl = typeof row.len === 'number' ? row.len : avgdl;
       const norm = 1 - BM25_B + BM25_B * (dl / avgdl);
-      const contribution = idf * (tf * (BM25_K1 + 1)) / (tf + BM25_K1 * norm);
-      scores.set(docId, (scores.get(docId) || 0) + contribution);
+      const contribution = idf * (row.tf * (BM25_K1 + 1)) / (row.tf + BM25_K1 * norm);
+      const scored = scores.get(row.key);
+      if (scored) {
+        scored.score += contribution;
+        if (firstSighting) scored.coverage += 1;
+      } else {
+        scores.set(row.key, { score: contribution, coverage: firstSighting ? 1 : 0 });
+      }
     }
   }
   return scores;
 }
 
-function _topN<R extends { score: number }>(
-  scores: Map<string, number>,
+/** Score an in-memory index (contexts, agents, skills, and the legacy chat
+ *  snapshot) through the shared arithmetic above. */
+function _scoreIndex(idx: RuntimeIndex, queryTokens: string[]): Map<string, ScoredDoc> {
+  const avgdl = _avgDocLen(idx);
+  return _scorePostings<string>(
+    Object.keys(idx.docs).length,
+    avgdl,
+    queryTokens,
+    (term) => (idx.postings[term] || []).map(([docId, tf]) => ({
+      key: docId,
+      tf,
+      len: typeof idx.docs[docId]?.len === 'number' ? (idx.docs[docId].len as number) : avgdl,
+    })),
+  );
+}
+
+function _topN<R extends { score: number }, K = string>(
+  scores: Map<K, ScoredDoc>,
   n: number,
-  mapDoc: (docId: string, score: number) => R | null,
+  mapDoc: (docId: K, scored: ScoredDoc) => R | null,
+  // Rank docs that carry more of the query above docs that carry less, and
+  // only then by BM25. A pure OR sum lets one common-but-strong term outrank
+  // a doc that actually contains every word the user typed, which is how a
+  // two-word search returns pages of half-matches and never the real hit.
+  // CJK queries already get the bigram anchor above; this is the general form.
+  tierByCoverage = false,
 ): R[] {
-  const arr: R[] = [];
-  for (const [docId, score] of scores) {
-    const r = mapDoc(docId, score);
-    if (r) arr.push(r);
+  const arr: Array<{ row: R; coverage: number }> = [];
+  for (const [docId, scored] of scores) {
+    const r = mapDoc(docId, scored);
+    if (r) arr.push({ row: r, coverage: scored.coverage });
   }
-  arr.sort((a, b) => b.score - a.score);
-  return arr.slice(0, n);
+  arr.sort((a, b) => (tierByCoverage ? b.coverage - a.coverage : 0) || (b.row.score - a.row.score));
+  return arr.slice(0, n).map((entry) => entry.row);
 }
 
 // ── Per-kind queries ─────────────────────────────────────────────────────
@@ -429,13 +419,13 @@ export async function searchContexts(
   const entry = await indexer.getEntry(userContextsIndexPath(uid), 'context');
   const tokens = tokenize(q);
   const scores = _scoreIndex(entry.idx as RuntimeIndex, tokens);
-  return _topN<SearchResult>(scores, _boundedSearchLimit(limit), (docId, score) => {
+  return _topN<SearchResult>(scores, _boundedSearchLimit(limit), (docId, scored) => {
     const doc = entry.idx.docs[docId] as Doc & { path?: string; title?: string };
     if (!doc) return null;
     const rel = String(doc.path || '');
     const relLower = rel.toLowerCase();
     const qLower = q.toLowerCase();
-    let rankedScore = score;
+    let rankedScore = scored.score;
     if (relLower === qLower) rankedScore = Math.max(rankedScore, 95);
     else if (relLower.startsWith(qLower)) rankedScore = Math.max(rankedScore, 60);
     else if (relLower.includes(qLower)) rankedScore = Math.max(rankedScore, 35);
@@ -641,21 +631,38 @@ export async function searchChats(
   query: string,
   options: SearchChatsOptions = {},
 ): Promise<SearchResult[]> {
+  return (await searchChatsWithStatus(userId, query, options)).results;
+}
+
+/** Query-local index status: a scheduled repair must not turn a partial miss
+ * into proof that history contains no matches. Existing UI callers keep arrays. */
+export async function searchChatsWithStatus(
+  userId: string,
+  query: string,
+  options: SearchChatsOptions = {},
+): Promise<{ results: SearchResult[]; indexComplete: boolean }> {
   const q = (query || '').trim();
-  if (!q) return [];
-  const entry = await indexer.getEntry(userChatsIndexPath(userId), 'chat');
-  // A usable persisted snapshot is preferable to making the first query wait
-  // for a history-wide repair. Normal writes patch the index incrementally;
-  // this stale-snapshot path primarily covers sync/manual edits and repairs in
-  // the same idle, serialized disk queue used by startup maintenance. An empty
-  // or corrupt snapshot still reconciles synchronously because it cannot
-  // return any useful result.
-  if (!indexer.isChatsIndexTrusted(userId) && !await indexer.isChatsIndexCurrent(userId)) {
-    if (Object.keys(entry.idx.docs).length > 0) _scheduleChatIndexRepair(userId);
-    else await indexer.reconcileChatsIndex(userId);
-  }
+  if (!q) return { results: [], indexComplete: true };
+  // Appends hand their upsert to a deferred chain so a send is not held up by
+  // the index; a reader pays that cost instead, and only when it searches.
+  await indexer.drainDeferredChatWrites(userId);
+
+  // Cold and partial indexes use the same background path. Searching must
+  // never inherit a history-wide rebuild, including during first migration.
+  let indexComplete = indexer.isChatsIndexTrusted(userId) || await indexer.isChatsIndexCurrent(userId);
+  if (!indexComplete) indexer.scheduleChatIndexRepair(userId);
   const tokens = tokenize(q);
-  const scores = _scoreIndex(entry.idx as RuntimeIndex, tokens);
+  // Normalize BM25 against the currently available corpus, including a
+  // partially rebuilt index.
+  const docCount = chatStore.docCount(userId);
+  const avgLen = chatStore.avgDocLen(userId);
+  const scores = _scorePostings<number>(docCount, avgLen, tokens, (term) => (
+    chatStore.postingsWithLen(userId, term)
+      .map((row) => ({ key: row.doc, tf: row.tf, len: row.len }))
+  ));
+  // Resolve every surviving candidate in one statement. Reading metadata from
+  // inside the ranking callback would be one query per scored document.
+  const docsById = chatStore.docsByIds(userId, [...scores.keys()]);
 
   const displayCatalog = await _getChatDisplayCatalog(userId);
 
@@ -663,14 +670,14 @@ export async function searchChats(
     sourceFile: string;
     sourceIndex: number;
   }
-  const candidates = _topN<ChatCandidate>(
+  const candidates = _topN<ChatCandidate, number>(
     scores,
     _boundedSearchLimit(options.limit),
-    (docId, score) => {
-      const doc = entry.idx.docs[docId] as Doc & { cid?: string; msg_index?: number; role?: string; time?: string };
+    (docKey, scored) => {
+      const doc = docsById.get(docKey);
       if (!doc) return null;
-      const cid = String(doc.cid);
-      const msgIndex = Number(doc.msg_index);
+      const cid = doc.cid;
+      const msgIndex = doc.msgIndex;
       if (!cid || !Number.isInteger(msgIndex) || msgIndex < 0) return null;
       const pid = displayCatalog.cidToPid.get(cid) || '';
       if (options.conversationId && cid !== options.conversationId) return null;
@@ -684,12 +691,16 @@ export async function searchChats(
       const result: ChatCandidate = {
         kind: 'chat',
         cid: doc.cid,
-        msg_index: doc.msg_index,
+        msg_index: doc.msgIndex,
         conv_title: displayCatalog.titles.get(cid) || t('chat.default_title'),
         role: doc.role,
         time: doc.time,
         snippet: '',
-        score,
+        score: scored.score,
+        // Carried to the caller so the merge quota and the renderer keep
+        // ranking full-query matches first; the row list they cut down to is
+        // otherwise re-sorted by raw score and loses the tier.
+        term_coverage: scored.coverage,
         sourceFile: file,
         sourceIndex: msgIndex,
       };
@@ -700,6 +711,7 @@ export async function searchChats(
       }
       return result;
     },
+    true,
   );
 
   const byFile = new Map<string, Set<number>>();
@@ -710,10 +722,14 @@ export async function searchChats(
   }
   const sourceRows = new Map<string, Map<number, ChatSourceMessage>>();
   await Promise.all(Array.from(byFile, async ([file, indexes]) => {
-    sourceRows.set(file, await _readJsonlMessagesAt(file, indexes));
+    sourceRows.set(file, await _chatSnippetIo.runExclusive(async () => {
+      try { return await historyMessagesAtFile(file, indexes); }
+      catch { return new Map(); } // Source changes/missing files are repaired by reconciliation.
+    }));
   }));
-  return candidates.flatMap(({ sourceFile, sourceIndex, ...result }) => {
+  const results = candidates.flatMap(({ sourceFile, sourceIndex, ...result }) => {
     const msg = sourceRows.get(sourceFile)?.get(sourceIndex);
+    if (!msg) indexComplete = false;
     if (
       options.userVisibleOnly
       && (
@@ -726,9 +742,23 @@ export async function searchChats(
       return [];
     }
     result.snippet = _makeSnippet(indexer.readMsgText(msg), q);
+    if (msg && hasHistoryProcess(msg)) {
+      result.has_process = true;
+      // Compare public execution entries separately so a leading dialogue
+      // acknowledgement or call input cannot hide a more relevant result.
+      let best = '', coverage = 0;
+      const terms = [...new Set(tokens)];
+      for (const text of historyProcessTexts(msg, true)) {
+        const lower = text.toLowerCase();
+        const matched = terms.reduce((count, term) => count + Number(lower.includes(term)), 0);
+        if (matched > coverage) { best = text; coverage = matched; }
+      }
+      if (best) result.process_snippet = _makeSnippet(best, q);
+    }
     if (typeof msg?.id === 'string' && msg.id) result.msg_id = msg.id;
     return [result];
   });
+  return { results, indexComplete };
 }
 
 // ── Agent / skill body search (in-memory, no persistent index) ──────────
@@ -854,6 +884,7 @@ async function _hasPersistedIndex(file: string): Promise<boolean> {
   }
 }
 
+
 async function _reconcileUser(
   uid: string,
   reusePersisted: boolean,
@@ -863,7 +894,6 @@ async function _reconcileUser(
   let reused = 0;
   let cancelled = 0;
   const contextIndex = userContextsIndexPath(uid);
-  const chatIndex = userChatsIndexPath(uid);
   // Context path indexes are comparatively small and used by interactive
   // typeahead. Reconcile them in the idle startup cohort so the first query
   // never inherits a full directory walk.
@@ -872,12 +902,26 @@ async function _reconcileUser(
     const result = await indexer.reconcileContextsIndex(uid, signal);
     if (result.cancelled) cancelled += 1;
   });
-  if (reusePersisted && await _hasPersistedIndex(chatIndex)) reused++;
+  // The chat index is `chat_store`, not the retired `chats.idx.json` snapshot.
+  // Every existing profile still has that file on disk, so asking the file
+  // system whether it exists would report a usable index while the store is
+  // empty — chat search would then return nothing until some later reconcile.
+  // A source stamp is what "this index was completed at least once" means.
+  if (reusePersisted && chatStore.readSourceStamp(uid)) reused++;
   else operations.push(async () => {
-    const result = await indexer.reconcileChatsIndex(uid, signal);
-    if (result.cancelled) cancelled += 1;
+    try {
+      const result = await indexer.reconcileChatsIndex(uid, signal, !!signal);
+      if (!result.complete) {
+        cancelled += 1;
+        indexer.scheduleChatIndexRepair(uid, 1_000);
+      }
+    } catch (err) {
+      indexer.scheduleChatIndexRepair(uid, 30_000);
+      throw err;
+    }
   });
   operations.push(() => _unlinkLegacyIndexes(uid));
+  operations.push(() => indexer.cleanupLegacyChatIndex(uid));
   let failed = 0;
   // Keep context and chat scans serial inside the shared disk resource slot.
   // Missing both indexes must not create a second internal disk storm.
@@ -918,8 +962,12 @@ export async function reconcileAll(): Promise<void> {
   log.info(`reconcileAll done in ${Date.now() - t0}ms (${tasks.length} users, ${failed} failed)`);
 }
 
+/** Retired non-chat indexes are independent of the SQLite migration.
+ * Chat snapshots are cleaned by the indexer only after its durable ready marker. */
 async function _unlinkLegacyIndexes(uid: string): Promise<void> {
-  for (const name of ['skill_chats.idx.json', 'agent_chats.idx.json']) {
+  for (const name of [
+    'skill_chats.idx.json', 'agent_chats.idx.json',
+  ]) {
     const p = path.join(userSearchDir(uid), name);
     try { await fsp.unlink(p); }
     catch (err) {
@@ -953,6 +1001,15 @@ function _dedupeSearchResults(results: SearchResult[]): SearchResult[] {
   return out;
 }
 
+function _chatCoverage(row: SearchResult): number {
+  const value = (row as { term_coverage?: unknown }).term_coverage;
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function _byChatRank(a: SearchResult, b: SearchResult): number {
+  return (_chatCoverage(b) - _chatCoverage(a)) || (b.score - a.score);
+}
+
 function _limitSearchResults(
   results: SearchResult[],
   limit: number,
@@ -970,7 +1027,13 @@ function _limitSearchResults(
   const out: SearchResult[] = [];
   if (quota > 0) {
     for (const kind of kinds) {
-      for (const result of ranked.filter((row) => row.kind === kind).slice(0, quota)) {
+      // Chat rows carry query coverage, so their quota keeps full-query
+      // matches ahead of higher-scoring half-matches; every other kind is
+      // ordered by score exactly as before.
+      const contenders = kind === 'chat'
+        ? results.filter((row) => row.kind === 'chat').sort(_byChatRank)
+        : ranked.filter((row) => row.kind === kind);
+      for (const result of contenders.slice(0, quota)) {
         selected.add(result);
         out.push(result);
       }
@@ -991,12 +1054,14 @@ export async function searchAll(
   results: SearchResult[];
   total?: number;
   degradation_code?: SearchDegradationCode | 'multiple';
+  chat_index_complete?: boolean;
 }> {
   const q = (query || '').trim();
   if (!q) return { results: [] };
   const requestedLimit = _boundedSearchLimit(limit);
   const buckets: SearchResult[] = [];
   const degradations = new Set<SearchDegradationCode>();
+  let chatIndexComplete: boolean | undefined;
   const tasks: Array<Promise<void>> = [];
   if (scope === 'all' || scope === 'context') {
     tasks.push(searchContexts(q, userId, requestedLimit).then((r) => { buckets.push(...r); }));
@@ -1012,7 +1077,10 @@ export async function searchAll(
     }).then((r) => { buckets.push(...r); }));
   }
   if (scope === 'all' || scope === 'chat') {
-    tasks.push(searchChats(userId, q, { limit: requestedLimit }).then((r) => { buckets.push(...r); }));
+    tasks.push(searchChatsWithStatus(userId, q, { limit: requestedLimit }).then((page) => {
+      buckets.push(...page.results);
+      chatIndexComplete = page.indexComplete;
+    }));
   }
   if (scope === 'all' || scope === 'agent') {
     tasks.push(searchAgents(userId, q, requestedLimit).then((r) => { buckets.push(...r); }));
@@ -1028,6 +1096,7 @@ export async function searchAll(
   return {
     results: _limitSearchResults(merged, requestedLimit, scope),
     total: merged.length,
+    ...(chatIndexComplete !== undefined ? { chat_index_complete: chatIndexComplete } : {}),
     ...(degradationCode ? { degradation_code: degradationCode } : {}),
   };
 }

@@ -16,6 +16,7 @@ function harness(invoke: ReturnType<typeof vi.fn>) {
   const host = { innerHTML: '', style: { display: '' }, querySelectorAll: () => [] };
   const apiFetch = vi.fn(async () => ({ json: async () => ({ ok: true }) }));
   const uiAlert = vi.fn();
+  const warn = vi.fn(), event = vi.fn(), error = vi.fn(), focus = vi.fn(), consume = vi.fn();
   const context: any = vm.createContext({
     window: { orkas: { invoke } },
     document: { getElementById: () => host },
@@ -26,9 +27,13 @@ function harness(invoke: ReturnType<typeof vi.fn>) {
     _chatAttachmentRevisions: new Map(),
     _chatAttachHostIdFor: () => 'chips',
     _chatFileIconHtml: () => '',
-    _convLog: { warn: vi.fn() },
+    _convLog: { warn },
+    _targetFromPickerAnchor: () => 'conversation', _resolveActiveProjectId: () => '',
+    _libraryPickerDraftCidFor: () => 'main_chat', _libraryPickerInputIdForTarget: () => 'input',
+    _agentsTrackEvent: event, _agentsTrackError: error,
+    _consumeAtKeyChar: consume, _focusInput: focus,
     escapeHtml: (value: string) => value,
-    t: (key: string) => key,
+    t: (key: string, data?: { reason?: string }) => data?.reason || key,
     URL,
     apiFetch,
     uiAlert,
@@ -43,6 +48,11 @@ function harness(invoke: ReturnType<typeof vi.fn>) {
   }
   functions.push(declaration('window.attachKbFileToDraft ='));
   vm.runInContext(functions.join('\n'), context);
+  const picker = readFileSync(path.join(__dirname, '../../src/renderer/modules/agents.js'), 'utf8');
+  const pickerStart = picker.indexOf('async function _triggerLibraryFile(');
+  const pickerEnd = picker.indexOf('\n}', pickerStart);
+  if (pickerStart < 0 || pickerEnd < 0) throw new Error('Missing Library picker');
+  vm.runInContext(picker.slice(pickerStart, pickerEnd + 2), context);
   return {
     attach: (cid = 'main_chat', afterNavigate = vi.fn()) => context.window.attachKbFileToDraft(
       'contexts.attachToDraft', { relPath: 'folder/note.md' }, cid, afterNavigate,
@@ -53,6 +63,10 @@ function harness(invoke: ReturnType<typeof vi.fn>) {
     beginSend: () => context._chatAttachTryBeginSend('main_chat'),
     apiFetch,
     uiAlert,
+    warn, event, error, focus, consume,
+    select: (scope: string) => context._triggerLibraryFile({
+      libraryRel: 'PRIVATE_FILE_PATH', libraryScope: scope, projectId: scope === 'project' ? 'project-test' : '',
+    }, 'picker'),
   };
 }
 
@@ -100,6 +114,65 @@ describe('Library attachment draft lifecycle', () => {
     finishSend();
     await fixture.attach();
     expect(fixture.names()).toEqual(['note.md']);
+  });
+
+  it.each([
+    ['ipc_request', () => { throw new Error('private-file-marker'); }, false],
+    ['source_resolve', async () => ({ ok: false, error: 'private-file-marker', failure_stage: 'source_resolve', failure_kind: 'permission_denied' }), false],
+    ['navigation', async () => imported, true],
+  ])('retains the safe %s stage and releases the draft for retry', async (stage, operation, navigationFails) => {
+    const invoke = vi.fn(operation as any);
+    const fixture = harness(invoke);
+    const navigate = navigationFails ? () => { throw new Error('private-file-marker'); } : vi.fn();
+    await expect(fixture.attach('main_chat', navigate)).rejects.toMatchObject({ failure_stage: stage });
+    expect(fixture.names()).toEqual([]);
+    const release = fixture.beginSend();
+    expect(release).toBeTypeOf('function');
+    release();
+    invoke.mockResolvedValue(imported);
+    await fixture.attach();
+    expect(fixture.names()).toEqual(['note.md']);
+  });
+
+  it.each([
+    ['global', 'source_resolve', 'not_found', 'source_resolve', 'not_found'],
+    ['project', 'source_resolve', 'permission_denied', 'source_resolve', 'permission_denied'],
+    ['global', 'attachment_import', 'disk_full', 'attachment_import', 'disk_full'],
+    ['project', 'attachment_import', 'operation_failed', 'attachment_import', 'operation_failed'],
+    ['global', 'PRIVATE_STAGE', 'PRIVATE_KIND', 'ipc_request', 'operation_failed'],
+  ])('preserves %s/%s/%s through IPC, local logging and picker events before recovery', async (scope, stage, kind, expectedStage, expectedKind) => {
+    const invoke = vi.fn().mockResolvedValueOnce({
+      ok: false, error: 'PRIVATE_ERROR_TEXT', failure_stage: stage, failure_kind: kind,
+    }).mockResolvedValue(imported);
+    const fixture = harness(invoke);
+    await fixture.select(scope);
+    expect(invoke).toHaveBeenCalledWith(scope === 'project' ? 'projects.files.attachToDraft' : 'contexts.attachToDraft', expect.objectContaining({ cid: 'main_chat' }));
+    expect(fixture.names()).toEqual([]);
+    expect(fixture.readyChips()).toBe(0);
+    expect(fixture.focus).not.toHaveBeenCalled();
+    expect(fixture.consume).not.toHaveBeenCalled();
+    expect(fixture.uiAlert).toHaveBeenCalledExactlyOnceWith('PRIVATE_ERROR_TEXT');
+    const diagnosis = { failure_stage: expectedStage, failure_kind: expectedKind };
+    expect(fixture.warn).toHaveBeenCalledExactlyOnceWith('library attachment failed', diagnosis);
+    expect(fixture.event).toHaveBeenCalledExactlyOnceWith('chat_library_attach_result', expect.objectContaining({
+      ...diagnosis, result: 'failure', scope, telemetry_version: 3,
+    }));
+    expect(fixture.error).toHaveBeenCalledExactlyOnceWith('chat_library_attach', expect.objectContaining({
+      ...diagnosis, error_type: 'operation', error_message: 'library_attach_failed', telemetry_version: 3,
+    }));
+    expect(JSON.stringify([fixture.warn.mock.calls, fixture.event.mock.calls, fixture.error.mock.calls])).not.toContain('PRIVATE_');
+    const release = fixture.beginSend();
+    expect(release).toBeTypeOf('function');
+    release();
+    await fixture.select(scope);
+    expect(fixture.names()).toEqual(['note.md']);
+    expect(fixture.readyChips()).toBe(1);
+    expect(fixture.event).toHaveBeenLastCalledWith('chat_library_attach_result', expect.objectContaining({ result: 'success', scope }));
+    expect(fixture.event).toHaveBeenCalledTimes(2);
+    expect(fixture.error).toHaveBeenCalledTimes(1);
+    expect(fixture.warn).toHaveBeenCalledTimes(1);
+    expect(fixture.focus).toHaveBeenCalledOnce();
+    expect(fixture.consume).toHaveBeenCalledOnce();
   });
 
   it('blocks send until import completes and prevents an import during an active send', async () => {

@@ -1,3 +1,4 @@
+import { estimateTextTokens } from "../shared/token-estimate.js";
 import type { FileFailureDiagnostic } from "./file-diagnostics.js";
 import type { ToolDefinition } from "../providers/base.js";
 import { createLogger } from "../shared/logger.js";
@@ -92,6 +93,11 @@ export type CommandExecutionObservation = {
 };
 
 export type ToolObservations = {
+  /** Complete durable-state mutation receipt from its owning executor. Scope
+   * and version are opaque host-only identities, never model text or logs.
+   * changed=false certifies the entire operation had no state effect; version
+   * must also cover all returned information. Omit for unmeasured extra work. */
+  stateMutation?: { scope: string; version: string; changed: boolean };
   /** Diagnostic-only validator facts. Never affect routing or provider content. */
   fileFailure?: FileFailureDiagnostic;
   /** Host-only outcomes from Result Store retrieval, including failures hidden
@@ -143,23 +149,6 @@ export type ToolObservations = {
   };
 };
 
-/** Host-only identity for a complete deterministic validation snapshot.
- * Validators opt in only when one execution reports every blocker currently
- * discoverable in `content`. The stable scope lets loop guards keep changing
- * blocker codes in one convergence episode without conflating unrelated
- * projects or ordinary/transient tool failures. */
-export type ToolFailureContext = {
-  kind: "deterministic_validation";
-  /** Stable non-sensitive identity for the validated artifact or project. */
-  scope: string;
-  /** Must be true only when content contains the complete current blocker set. */
-  complete: boolean;
-  /** Total current blocker count before this bounded host-only code summary. */
-  issueCount?: number;
-  /** Bounded diagnostic labels for logs/tests; raw messages stay in content. */
-  issueCodes?: string[];
-};
-
 /** Result returned from a tool execution. */
 export type ToolResult = {
   content: string;
@@ -171,9 +160,6 @@ export type ToolResult = {
    * them with the real tool-call/turn identity; providers never receive this
    * object directly. */
   observations?: ToolObservations;
-  /** Host-only failure grouping used by run-scoped convergence guards. It is
-   * never serialized into provider tool_result content. */
-  failureContext?: ToolFailureContext;
   /** Host-only handoff for process output that was streamed to a session temp
    * file instead of being truncated at the in-memory capture threshold. The
    * final host result transformer must content-address/adopt this file before
@@ -191,6 +177,9 @@ export type ToolResult = {
    *  immediately following the tool_result message (works across providers
    *  even when the provider's tool_result channel doesn't accept images). */
   images?: ToolResultImage[];
+  /** Host-selected authoring input; latest set (at most six images) survives
+   * active-turn elision/checkpoints. Empty replaces/clears the prior set. */
+  imageRetention?: "active_turn";
   /** This result is a document the model was instructed to read whole — a
    *  skill body or its reference. File-tool hosts and core-agent's learned
    *  skill reader set the same semantic hint, so the host result policy can
@@ -206,7 +195,7 @@ export type ToolResult = {
   endTurn?: boolean;
   /** Host-observed reason for an immediate terminal tool boundary. Only
    * honored with endTurn; never inferred from model text or tool content. */
-  endTurnReason?: "waiting_input";
+  endTurnReason?: "waiting_input" | "handed_off";
   /** Used with `endTurn` when a terminal bookkeeping tool expects the model to
    * write the user-facing reply in the same response. If that response has no
    * text, the runner permits exactly one tool-free synthesis instead of
@@ -223,6 +212,16 @@ export type ToolResult = {
   synthesizeAndEndTurn?: boolean;
 };
 
+/** Trusted, ephemeral state for repeat detection on a read continuation. */
+export type ToolReadContinuation = {
+  /** Opaque revision of the requested result range and its lifecycle state.
+   * Unrelated output, timestamps and model arguments must not manufacture a
+   * new revision. Host-only; never persisted, logged or sent to a provider. */
+  version: string;
+  /** True only for an authorized, bounded wait at the live output tail. */
+  waiting: boolean;
+};
+
 /** A tool that can be called by the agent during an LLM interaction. */
 export interface AgentTool {
   /** Tool name (must be unique within an agent run). */
@@ -231,6 +230,7 @@ export interface AgentTool {
   readonly description: string;
   /** JSON Schema for the tool's input parameters. */
   readonly inputSchema: Record<string, unknown>;
+  readonly constrainedSampling?: ToolDefinition["constrainedSampling"];
 
   /** Re-read the model-facing description whenever provider definitions are
    * built. Use only when Host state changes the advertised capability during
@@ -241,9 +241,17 @@ export interface AgentTool {
    *  calls in one tool-use batch. Defaults to "sequential". Only
    *  side-effect-free, `ctx.state`-non-mutating tools (read / list / grep /
    *  search / web / library reads …) should opt into "parallel"; write / edit /
-   *  delete / bash / pdf / generate / connector-call / skill tools stay
-   *  sequential. Engine-internal — never sent to the model. */
+   *  delete / pdf / generate / connector-call / skill tools stay sequential,
+   *  and `bash` is admitted per call through `parallelWhen`.
+   *  Engine-internal — never sent to the model. */
   readonly executionMode?: "sequential" | "parallel";
+
+  /** Per-call refinement of `executionMode: "parallel"`: the call joins a
+   *  concurrent batch only when this returns true for its input; otherwise it
+   *  is a barrier, exactly like an undeclared tool. Pure, synchronous and
+   *  bounded — it runs on model-authored input before authorization, and a
+   *  throw counts as false. Engine-internal — never sent to the model. */
+  readonly parallelWhen?: (input: Record<string, unknown>) => boolean;
 
   /** Selects who owns the execution deadline. The default is the core-agent
    * runner. Set to "executor" only for delegation tools whose child runtime
@@ -251,12 +259,18 @@ export interface AgentTool {
    * never sent to the model. */
   readonly executionTimeoutOwner?: "executor";
 
+  /** Inspect an owned read continuation before repeat detection. Pure,
+   * synchronous and bounded; no execution, I/O or authorization side effects.
+   * Return undefined for other actions, invalid inputs and inaccessible state.
+   * Execution still performs its normal validation and authorization. */
+  inspectReadContinuation?(input: Record<string, unknown>, ctx: ToolContext): ToolReadContinuation | undefined;
+
   /** Execute the tool with the given input. */
   execute(input: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult>;
 }
 
-export const TOOL_DESCRIPTION_SOFT_BUDGET_CHARS = 480;
-export const SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS = 220;
+export const TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS = 150;
+export const SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS = 80;
 
 type CachedToolDefinition = {
   definition: ToolDefinition;
@@ -275,13 +289,14 @@ export function toToolDefinition(tool: AgentTool): ToolDefinition {
     `tool:${tool.name}:description`,
     tool.name,
     "tool description",
-    description.length,
-    TOOL_DESCRIPTION_SOFT_BUDGET_CHARS,
+    estimateTextTokens(description),
+    TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS,
   );
   const definition = {
     name: tool.name,
     description,
     inputSchema: compactSchema(tool.inputSchema, tool.name),
+    ...(tool.constrainedSampling ? { constrainedSampling: tool.constrainedSampling } : {}),
   };
   toolDefinitionCache.set(tool, { definition, description });
   return definition;
@@ -317,8 +332,8 @@ function compactSchemaValue(value: unknown, toolName: string, pointer: string): 
         `schema:${toolName}:${pointer}/description`,
         toolName,
         `schema description at ${pointer}`,
-        description.length,
-        SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS,
+        estimateTextTokens(description),
+        SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS,
       );
       out[key] = description;
     } else {
@@ -336,16 +351,16 @@ function warnLongDescriptionOnce(
   key: string,
   toolName: string,
   field: string,
-  chars: number,
-  softBudget: number,
+  estimatedTokens: number,
+  softBudgetTokens: number,
 ): void {
-  if (chars <= softBudget || warnedLongDescriptions.has(key)) return;
+  if (estimatedTokens <= softBudgetTokens || warnedLongDescriptions.has(key)) return;
   warnedLongDescriptions.add(key);
   log.warn("tool definition description exceeds soft budget; sent untruncated", {
     tool: toolName,
     field,
-    chars,
-    softBudget,
+    estimatedTokens,
+    softBudgetTokens,
   });
 }
 
@@ -362,16 +377,38 @@ export function defineTool(opts: {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  constrainedSampling?: ToolDefinition["constrainedSampling"];
   executionMode?: "sequential" | "parallel";
+  parallelWhen?: AgentTool["parallelWhen"];
   executionTimeoutOwner?: "executor";
+  inspectReadContinuation?: AgentTool["inspectReadContinuation"];
   execute: (input: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
 }): AgentTool {
   return {
     name: opts.name,
     description: opts.description,
     inputSchema: opts.inputSchema,
+    ...(opts.constrainedSampling ? { constrainedSampling: opts.constrainedSampling } : {}),
     ...(opts.executionMode ? { executionMode: opts.executionMode } : {}),
+    ...(opts.parallelWhen ? { parallelWhen: opts.parallelWhen } : {}),
     ...(opts.executionTimeoutOwner ? { executionTimeoutOwner: opts.executionTimeoutOwner } : {}),
+    ...(opts.inspectReadContinuation ? { inspectReadContinuation: opts.inspectReadContinuation } : {}),
     execute: opts.execute,
   };
+}
+
+/** Scheduling decision for one call. A call is concurrent only when its tool
+ *  declared `executionMode: "parallel"` and, if the tool refines that per
+ *  call, `parallelWhen` admits this input; every other call is a barrier. */
+export function toolCallIsParallel(
+  tool: Pick<AgentTool, "executionMode" | "parallelWhen"> | undefined,
+  input: unknown,
+): boolean {
+  if (tool?.executionMode !== "parallel") return false;
+  if (!tool.parallelWhen) return true;
+  const record = input && typeof input === "object" && !Array.isArray(input)
+    ? input as Record<string, unknown>
+    : {};
+  try { return tool.parallelWhen(record) === true; }
+  catch { return false; }
 }

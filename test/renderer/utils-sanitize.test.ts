@@ -106,9 +106,10 @@ describe('inlineFormat — markdown link XSS hardening', () => {
     expect(out).toContain('&quot;');
   });
 
-  it('renders a non-media app protocol reference as inert text', () => {
+  it('renders a non-media app protocol reference as a safe preview chip', () => {
     const out = inlineFormat('[clip](chat-media://local/Users/test/notes.txt)');
-    expect(out).toBe('clip');
+    expect(out).toContain('data-chat-md-file-open="1"');
+    expect(out).not.toContain('<a ');
   });
 
   it('keeps anchors in-page and external schemes in a separate browsing context', () => {

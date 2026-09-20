@@ -8,6 +8,7 @@ import {
   beginImageStudioGeneration,
   finishImageStudioGeneration,
   imageGenerationControlStatePath,
+  imageStudioGenerationOutputs,
   latestCompletedImageStudioGenerationOutput,
   readImageGenerationControlState,
   summarizeImageGenerationBudget,
@@ -27,7 +28,7 @@ import {
 } from '../../features/image_assets';
 import {
   exportImageStudioProject,
-  imageStudioEvidenceReviewRequired,
+  imageStudioEvidenceIsGeneration,
   inspectImageStudioProject,
   readImageStudioEvidenceState,
   recordRasterEvidence,
@@ -134,40 +135,6 @@ type ProjectInspection = Awaited<ReturnType<typeof inspectImageStudioProject>>;
 function inspectionForModel(inspection: ProjectInspection): Omit<ProjectInspection, 'manifest'> {
   const { manifest: _manifest, ...rest } = inspection;
   return rest;
-}
-
-const IMAGE_STUDIO_FAILURE_CONTEXT_MAX_CODES = 64;
-
-function jsonValidationResult(
-  value: Record<string, unknown>,
-  validationScope: string,
-  renameNote = '',
-): ToolResult {
-  const result = jsonResult(value, renameNote);
-  const inspection = value.inspection;
-  if (
-    value.ok !== false
-    || !inspection
-    || typeof inspection !== 'object'
-    || Array.isArray(inspection)
-  ) return result;
-  const blockers = (inspection as Record<string, unknown>).blockers;
-  if (!Array.isArray(blockers) || blockers.length === 0) return result;
-  const issueCodes = [...new Set(blockers.flatMap((blocker) => {
-    if (!blocker || typeof blocker !== 'object' || Array.isArray(blocker)) return [];
-    const code = (blocker as Record<string, unknown>).code;
-    return typeof code === 'string' && code.trim() ? [code.trim()] : [];
-  }))].slice(0, IMAGE_STUDIO_FAILURE_CONTEXT_MAX_CODES);
-  return {
-    ...result,
-    failureContext: {
-      kind: 'deterministic_validation',
-      scope: validationScope,
-      complete: true,
-      issueCount: blockers.length,
-      issueCodes,
-    },
-  };
 }
 
 async function jsonResultWithVisualEvidence(
@@ -280,7 +247,7 @@ function nextImageStudioRecoveryOperation(input: {
 }): string {
   if (!input.inspection.ok) return 'repair_project_then_project.inspect';
   if (!input.evidenceAvailable || !input.evidenceCurrent) {
-    return input.inspection.route === 'compose' || input.inspection.route === 'hybrid'
+    return input.inspection.source_kind === 'html'
       ? 'project.snapshot'
       : 'project.inspect';
   }
@@ -290,6 +257,21 @@ function nextImageStudioRecoveryOperation(input: {
   }
   if (!input.reviewRequired) return 'project.export';
   return 'project.submit_design_review';
+}
+
+/** The authored final binding outranks provider history; only an unbound
+ * raster project may recover its prior candidate or latest completed output. */
+async function inspectCurrentImageStudioProject(
+  projectDirAbs: string,
+  state: Awaited<ReturnType<typeof readImageStudioEvidenceState>>,
+  generation: Awaited<ReturnType<typeof readImageGenerationControlState>>,
+  turnId: string,
+  explicitInput?: string,
+): Promise<ProjectInspection> {
+  const inspection = await inspectImageStudioProject(projectDirAbs, explicitInput);
+  if (explicitInput || !inspection.blockers.some(item => item.code === 'E_RASTER_SOURCE_REQUIRED')) return inspection;
+  const fallback = state?.source_path || latestCompletedImageStudioGenerationOutput(generation, turnId);
+  return fallback ? inspectImageStudioProject(projectDirAbs, fallback) : inspection;
 }
 
 async function buildImageStudioRecoveryHandoff(input: {
@@ -304,10 +286,8 @@ async function buildImageStudioRecoveryHandoff(input: {
   const generation = input.generation === undefined
     ? await readImageGenerationControlState(input.generationStateAbsPath)
     : input.generation;
-  const resumeSource = latestCompletedImageStudioGenerationOutput(generation, input.turnId)
-    || state?.source_path;
   const inspection = input.inspection
-    || await inspectImageStudioProject(input.projectDirAbs, resumeSource);
+    || await inspectCurrentImageStudioProject(input.projectDirAbs, state, generation, input.turnId);
   const maxCalls = generation?.max_calls ?? inspection.manifest?.generation_budget.max_calls ?? null;
   const usage = summarizeImageGenerationBudget(generation, maxCalls ?? 0, input.turnId);
   const evidenceAvailable = await existingFile(state?.evidence_path);
@@ -315,7 +295,7 @@ async function buildImageStudioRecoveryHandoff(input: {
     && !!state
     && !!inspection.signature
     && state.signature === inspection.signature;
-  const reviewRequired = imageStudioEvidenceReviewRequired(state);
+  const reviewRequired = !imageStudioEvidenceIsGeneration(state);
   const reviewCurrent = reviewRequired
     && evidenceCurrent
     && !!state?.review
@@ -335,7 +315,7 @@ async function buildImageStudioRecoveryHandoff(input: {
     current_signature: inspection.signature || null,
     evidence_current: evidenceCurrent,
     review_current: reviewCurrent,
-    review_required: reviewRequired,
+    is_generation: imageStudioEvidenceIsGeneration(state),
     review_verdict: reviewRequired ? state.review?.verdict || null : null,
     review_scores: reviewRequired ? state.review?.quality_scorecard || null : null,
     review_findings: reviewRequired ? state.review?.findings || [] : [],
@@ -349,7 +329,7 @@ async function buildImageStudioRecoveryHandoff(input: {
       evidence_available: evidenceAvailable,
       evidence_current: evidenceCurrent,
       review_current: reviewCurrent,
-      review_required: reviewRequired,
+      is_generation: imageStudioEvidenceIsGeneration(state),
       review_verdict: reviewVerdict,
       generation: {
         ...usage,
@@ -400,7 +380,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
           description: 'Project QA/export or host-configured external workflow operation.',
         },
         project_dir: { type: 'string', description: 'Image project directory containing image-manifest.json and local assets.' },
-        input_path: { type: 'string', description: 'Optional generated or edited project-local raster for project.inspect. When omitted, the latest completed output from the current turn is adopted before manifest raster_source.' },
+        input_path: { type: 'string', description: 'Optional current project-local raster for project.inspect. Otherwise uses manifest raster_source, then prior evidence or the current turn completed generation. Use manifest entry for HTML.' },
         output_path: { type: 'string', description: 'Snapshot, external workflow, or final export path.' },
         format: { type: 'string', enum: ['png', 'jpeg'], description: 'Final project.export format. Defaults from output_path, otherwise PNG.' },
         evidence_path: { type: 'string', description: 'Required for project.submit_design_review: exact current evidence path returned by project.inspect or project.snapshot.' },
@@ -465,7 +445,6 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
       if (dirError) return { content: dirError, isError: true } as ToolResult;
       const stateAbsPath = imageStudioStatePath(opts, projectDirAbs);
       const generationStateAbsPath = imageGenerationControlStatePath(opts.userId, projectDirAbs);
-      const validationScope = `image_studio.project:${stateKey(opts, projectDirAbs)}`;
 
       try {
         if (op === 'workflow.capabilities') {
@@ -598,7 +577,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
               turnId: currentTurnId,
               inspection: inspectionForModel(inspection),
             });
-            return jsonValidationResult({ ok: false, op, inspection, ...handoff }, validationScope);
+            return jsonResult({ ok: false, op, inspection, ...handoff });
           }
           const generation = await readImageGenerationControlState(
             generationStateAbsPath,
@@ -660,9 +639,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             readImageStudioEvidenceState(stateAbsPath),
             readImageGenerationControlState(generationStateAbsPath),
           ]);
-          const resumeSource = latestCompletedImageStudioGenerationOutput(generation, currentTurnId)
-            || state?.source_path;
-          const inspection = await inspectImageStudioProject(projectDirAbs, resumeSource);
+          const inspection = await inspectCurrentImageStudioProject(projectDirAbs, state, generation, currentTurnId);
           const maxCalls = generation?.max_calls ?? inspection.manifest?.generation_budget.max_calls ?? null;
           const usage = summarizeImageGenerationBudget(generation, maxCalls ?? 0, currentTurnId);
           let creditQuote: Record<string, unknown> | undefined;
@@ -692,7 +669,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             inspection: inspectionForModel(inspection),
             generation,
           });
-          return jsonValidationResult({
+          return jsonResult({
             ok: inspection.ok,
             op,
             current_signature: inspection.signature || null,
@@ -713,7 +690,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             } : {}),
             inspection: inspectionForModel(inspection),
             ...handoff,
-          }, validationScope);
+          });
         }
 
         if (op === 'project.inspect') {
@@ -722,11 +699,10 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             return { content: `E_PATH_OUT_OF_SCOPE: input_path is outside scope: ${explicitInputAbs}`, isError: true } as ToolResult;
           }
           const generation = await readImageGenerationControlState(generationStateAbsPath);
-          const inputAbs = explicitInputAbs
-            || latestCompletedImageStudioGenerationOutput(generation, currentTurnId);
-          const preliminary = await inspectImageStudioProject(projectDirAbs, inputAbs);
-          const inspection = preliminary.route === 'generate' || preliminary.route === 'edit'
-            ? await recordRasterEvidence({ projectDirAbs, rasterAbsPath: inputAbs, stateAbsPath })
+          const state = await readImageStudioEvidenceState(stateAbsPath);
+          const preliminary = await inspectCurrentImageStudioProject(projectDirAbs, state, generation, currentTurnId, explicitInputAbs);
+          const inspection = preliminary.source_kind === 'raster'
+            ? await recordRasterEvidence({ projectDirAbs, rasterAbsPath: preliminary.source_path, stateAbsPath, generationOutputs: imageStudioGenerationOutputs(generation) })
             : preliminary;
           const handoff = await buildImageStudioRecoveryHandoff({
             projectDirAbs,
@@ -737,7 +713,10 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             generation,
           });
           const result = { ok: inspection.ok, op, inspection: inspectionForModel(inspection), ...handoff };
-          return jsonValidationResult(result, validationScope);
+          if (inspection.ok && inspection.evidence_path && inspection.is_generation === false) {
+            return jsonResultWithVisualEvidence(result, imageStudioVisualEvidence(projectDirAbs, inspection));
+          }
+          return jsonResult(result);
         }
 
         if (op === 'project.snapshot') {
@@ -771,9 +750,8 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
               unique.renamed ? renderRenameSignal(requested, unique.finalPath) : '',
             );
           }
-          return jsonValidationResult(
+          return jsonResult(
             result,
-            validationScope,
             unique.renamed ? renderRenameSignal(requested, unique.finalPath) : '',
           );
         }

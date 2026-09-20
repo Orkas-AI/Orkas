@@ -59,7 +59,7 @@ describe('ipc/connectors renderer DTO', () => {
     confirm._setBroadcastForTest((_channel, payload) => { info = payload; });
     const opts = { cid: 'ipc-task', connectorId: 'feishu', displayName: 'Feishu', toolName: 'send', risk: 'H' as const, args: {} };
     const once = confirm.requestActionConfirm(opts);
-    const answer = invokeHandlers['connectors.action_confirm_response'];
+    const answer = (payload: any) => invokeHandlers['connectors.action_confirm_response'](payload, { sender: { id: 42 } });
     await expect(answer({ request_id: info.request_id, approved: true, scope: 'forever' })).rejects.toThrow('invalid approval scope');
     await expect(answer({ request_id: info.request_id, approved: true })).resolves.toEqual({ handled: true });
     await expect(once).resolves.toBe(true);
@@ -68,6 +68,14 @@ describe('ipc/connectors renderer DTO', () => {
     await expect(task).resolves.toBe(true);
     await expect(confirm.requestActionConfirm({ ...opts, toolName: 'delete', risk: 'D' })).resolves.toBe(true);
     confirm.cancelForCid(opts.cid);
+    const appUsage = { id: 'ipc-app', owner: 42 };
+    const appRequest = confirm.requestActionConfirm({ ...opts, cid: undefined, appUsage });
+    const appId = info.request_id;
+    await expect(invokeHandlers['connectors.action_confirm_response']({ request_id: appId, approved: true, scope: 'usage' }, { sender: { id: 43 } })).resolves.toEqual({ handled: false });
+    await expect(answer({ request_id: appId, approved: true, scope: 'task' })).resolves.toEqual({ handled: false });
+    await expect(answer({ request_id: appId, approved: true, scope: 'usage' })).resolves.toEqual({ handled: true });
+    await expect(appRequest).resolves.toBe(true);
+    confirm.cancelForApp('approval-ipc', appUsage);
     confirm._setBroadcastForTest(null);
   });
 

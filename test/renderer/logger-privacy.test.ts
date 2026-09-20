@@ -9,6 +9,22 @@ const loggerSource = readFileSync(
 );
 
 describe('renderer logger privacy boundary', () => {
+  it.each(['ResizeObserver loop completed with undelivered notifications.', 'ResizeObserver loop limit exceeded'])(
+    'retains %s without reporting it as an uncaught exception', (message) => {
+    const forwarded = vi.fn();
+    const listeners: Record<string, (event: any) => void> = {};
+    const sandbox = { console: { warn: vi.fn(), error: vi.fn() }, window: {
+      orkas: { log: forwarded }, addEventListener: (type: string, handler: any) => { listeners[type] = handler; },
+    } };
+    vm.runInNewContext(loggerSource, sandbox);
+    listeners.error({ message, error: null });
+    expect(forwarded).toHaveBeenLastCalledWith(expect.objectContaining({ level: 'warn', message: 'browser resize notification' }));
+    listeners.error({ message, error: new Error(message) });
+    expect(forwarded).toHaveBeenLastCalledWith(expect.objectContaining({ level: 'error', message: 'uncaught error' }));
+    listeners.error({ message: 'ResizeObserver callback failed', error: null });
+    expect(forwarded).toHaveBeenLastCalledWith(expect.objectContaining({ level: 'error', message: 'uncaught error' }));
+  });
+
   it('sanitizes messages and structured data before forwarding either log stream', () => {
     const forwarded = vi.fn();
     const consoleCalls: unknown[][] = [];

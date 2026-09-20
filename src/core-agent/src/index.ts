@@ -25,6 +25,7 @@ export {
   OutputLimitError,
   ProviderError,
   StorageFullError,
+  SessionPersistenceError,
   TimeoutError,
   DEFAULT_RETRY_ERROR_POLICY,
   configureRetryErrorPolicy,
@@ -41,6 +42,8 @@ export type { RetryableErrorKind, RetryErrorPolicyConfig } from "./shared/errors
 export { createLogger } from "./shared/logger.js";
 export type { Logger, LogLevel } from "./shared/logger.js";
 
+export type { ProviderRequestFailure } from "./providers/request-diagnostics.js";
+
 // Providers (backed by @earendil-works/pi-ai)
 export type { LLMProvider, CompletionParams, CompletionResult, ToolDefinition } from "./providers/index.js";
 export { createAnthropicProvider, createOpenAIProvider, createPiProvider } from "./providers/index.js";
@@ -51,6 +54,7 @@ export { ProviderRegistry } from "./providers/index.js";
 export { AgentRunner } from "./agent/index.js";
 export type {
   ReflectionModelCallEvent,
+  ReflectionFailure,
 } from "./agent/index.js";
 export { Session } from "./agent/index.js";
 export { PersistentSession } from "./agent/index.js";
@@ -94,7 +98,6 @@ export type {
   ToolResult,
   ToolResultImage,
   ToolObservations,
-  ToolFailureContext,
   FileReadObservation,
   FileChangeObservation,
   CommandExecutionObservation,
@@ -189,7 +192,6 @@ export {
 export { SkillStore, createSkillManageTool } from "./evolution/index.js";
 export type { Skill, SkillSummary, SkillFrontmatter } from "./evolution/index.js";
 export {
-  detectUserCorrection,
   buildReviewPrompt,
   REFLECTION_SYSTEM_PROMPT,
 } from "./evolution/index.js";

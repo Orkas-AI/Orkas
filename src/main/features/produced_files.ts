@@ -29,6 +29,7 @@ const PROCESS_EXTS = new Set([
 
 const PROCESS_EXACT_NAMES = new Set([
   '.ds_store',
+  '.orkas-output-types.json',
   'debug.log',
   'manifest.json',
   'metadata.json',

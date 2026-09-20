@@ -69,6 +69,31 @@ test.describe('settings persistence', () => {
     await expect(relaunchedPage.locator('#settings-task-notifications-toggle')).not.toBeChecked();
   });
 
+  for (const [code, label] of [
+    ['es', 'Español'], ['fr', 'Français'], ['ko', '한국어'],
+    ['de', 'Deutsch'], ['ru', 'Русский'], ['it', 'Italiano'],
+  ]) {
+    test(`selects ${code} from the language menu and restores it on first paint`, async ({ orkas }, testInfo) => {
+      const page = orkas.page!;
+      await openGeneralSettings(page);
+      const select = page.locator('#settings-language-select');
+      await select.locator('.ai-select-trigger').click();
+      const option = page.locator('body > .ai-select-popover:not([hidden]) .ai-select-item').filter({ hasText: label });
+      await option.click();
+      await expect(page.locator('html')).toHaveAttribute('lang', code);
+      await expect(select).toHaveAttribute('data-value', code);
+      await page.locator('[data-settings-pane="general"]').screenshot({ path: testInfo.outputPath('settings-' + code + '.png') });
+      const overflow = await page.locator('[data-settings-pane="general"]').evaluate((element) => {
+        return element.scrollWidth > element.clientWidth + 1;
+      });
+      expect(overflow).toBe(false);
+      const reopened = await orkas.relaunch();
+      await expect(reopened.locator('html')).toHaveAttribute('lang', code);
+      await openGeneralSettings(reopened);
+      await expect(reopened.locator('#settings-language-select')).toHaveAttribute('data-value', code);
+    });
+  }
+
   test('changes all local execution modes in the UI and persists the selected mode', async ({ orkas }) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     await openGeneralSettings(orkas.page);

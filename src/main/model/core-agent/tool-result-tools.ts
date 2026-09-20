@@ -5,7 +5,7 @@
  * path. Search locates text, query computes deterministic aggregates over
  * recognized records, read returns an exact cursor range, and materialize
  * creates an isolated working copy for bash/Node processing. Every operation
- * accepts a bounded batch. Model-facing reads use a runner-provided 4K round
+ * accepts a bounded batch. Model-facing reads use a runner-provided shared inline
  * ledger with duplicate suppression; reads retained inside run_program use
  * that runtime's stricter call/result/wall-clock limits instead.
  */
@@ -19,7 +19,7 @@ import type { AgentTool, ToolContext, ToolResult } from '#core-agent';
 import { createLogger } from '../../logger';
 import { fileEditLock } from '../../util/locks';
 import { sha256OfFileStream } from '../../util/sha256';
-import { CLOUD_TOOL_RESULT_MAX_AGE_DAYS, estimateToolResultTokens } from '../../util/tool-result-cap';
+import { DEFAULT_INLINE_RESULT_TOKENS, withRetrievalBudget, estimateToolResultTokens } from '../../util/tool-result-cap';
 import {
   TOOL_RESULT_QUERY_MAX_INPUT_BYTES,
   TOOL_RESULT_QUERY_TOO_LARGE_MESSAGE,
@@ -29,10 +29,11 @@ import {
   type ToolResultQueryFilter,
 } from '../../util/tool-result-data';
 
-export const TOOL_RESULT_CHUNK_DEFAULT_TOKENS = 1_000;
-export const TOOL_RESULT_CHUNK_MAX_TOKENS = 2_000;
-export const TOOL_RESULT_SEARCH_MAX_TOKENS = 2_000;
-export const TOOL_RESULT_ROUND_MAX_TOKENS = 4_000;
+// Compatibility exports all use the ordinary per-result ceiling; none adds a step quota.
+export const TOOL_RESULT_CHUNK_DEFAULT_TOKENS = DEFAULT_INLINE_RESULT_TOKENS;
+export const TOOL_RESULT_CHUNK_MAX_TOKENS = DEFAULT_INLINE_RESULT_TOKENS;
+export const TOOL_RESULT_SEARCH_MAX_TOKENS = DEFAULT_INLINE_RESULT_TOKENS;
+export const TOOL_RESULT_ROUND_MAX_TOKENS = DEFAULT_INLINE_RESULT_TOKENS;
 export const TOOL_RESULT_BATCH_MAX_ITEMS = 8;
 export const TOOL_RESULT_REF_SCHEMA_PATTERN = '^[a-zA-Z0-9_-]{1,48}\\.(?:[a-f0-9]{16}|[a-f0-9]{64})$';
 const TOOL_RESULT_REF_RE = new RegExp(TOOL_RESULT_REF_SCHEMA_PATTERN);
@@ -215,7 +216,10 @@ class PersistedToolResultQueryWorker {
 }
 
 export function createToolResultTools(opts: ToolResultToolsOpts): AgentTool[] {
-  return [createToolResultTool(opts)];
+  const tool = createToolResultTool(opts);
+  return [{ ...tool, execute: (input, ctx) => opts.isProgrammaticToolCallContext(ctx)
+    ? tool.execute(input, ctx)
+    : withRetrievalBudget(ctx, (child) => tool.execute(input, child)) }];
 }
 
 type ToolResultAction = 'search' | 'query' | 'read' | 'materialize';
@@ -239,7 +243,8 @@ function toolResultActionRequestError(
   for (let index = 0; index < requests.length; index++) {
     const item = requests[index];
     if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
-    const unexpected = Object.keys(item).filter((key) => !allowed.has(key)).sort();
+    const ignored = action === 'read' ? ['query'] : ['cursor', 'max_tokens'];
+    const unexpected = Object.keys(item).filter((key) => !allowed.has(key) && !ignored.includes(key)).sort();
     if (!unexpected.length) continue;
     return error(
       'E_BAD_INPUT',
@@ -257,7 +262,6 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
   const refProperty = () => ({
     type: 'string',
     pattern: TOOL_RESULT_REF_SCHEMA_PATTERN,
-    description: TOOL_RESULT_REF_DESCRIPTION,
   });
   const searchRequest = {
     type: 'object',
@@ -354,12 +358,12 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
     additionalProperties: false,
     properties: {
       ref: refProperty(),
-      cursor: { type: 'integer', minimum: 0, description: 'Exact non-negative character cursor.' },
+      cursor: { type: 'integer', minimum: 0, description: 'Exact non-negative character cursor. Do not prefetch sequential chunks.' },
       max_tokens: {
         type: 'integer',
         minimum: 256,
         maximum: TOOL_RESULT_CHUNK_MAX_TOKENS,
-        description: 'Requested slice size; default 1000, maximum 2000.',
+        description: 'Slice budget including framing; defaults to 10000.',
       },
     },
     required: ['ref', 'cursor'],
@@ -373,22 +377,12 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
   const actionProperty = {
     type: 'string',
     enum: ['search', 'query', 'read', 'materialize'],
-    description: 'Choose exactly one operation and use only that action\'s request fields.',
+    description: 'search: narrow text lookup; query: deterministic aggregates; read: exact source excerpts; materialize: session-scoped UTF-8 copies for calculations query cannot express. Use one operation per call.',
   };
-  // The request shapes are advertised once, as the union of `requests.items`;
-  // the action branches below only bind `action` to its purpose. Pairing each
-  // action with its request shape is enforced at runtime
-  // (`toolResultActionRequestError`), so repeating the full item schema per
-  // branch bought no enforcement and cost ~1,100 tokens on every model request.
-  const actionBranch = (action: ToolResultAction, description: string) => ({
-    properties: {
-      action: { type: 'string', enum: [action], description },
-    },
-  });
   return {
     name: 'tool_result',
     description:
-      'Inspect one oversized result referenced by a prior <persisted-output ref="..."> marker. Make at most one tool_result call per model step and batch up to eight currently needed same-action requests. Use only the selected action branch; never use a tool-call ID such as call_....',
+      'Inspect oversized results using the literal opaque tool.hash ref from a prior <persisted-output ref="..."> marker, not read_files. Make at most one tool_result call per model step and batch up to eight currently needed same-action requests. Use only the selected action; never use a tool-call ID such as call_....',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -398,17 +392,11 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
           type: 'array',
           minItems: 1,
           maxItems: TOOL_RESULT_BATCH_MAX_ITEMS,
-          description: 'One to eight same-action requests using only that action\'s fields (search: ref+query; query: ref+operation…; read: ref+cursor; materialize: ref). Retrieval actions share one 4K-token model-step budget.',
+          description: 'One to eight same-action requests. The whole batch shares 10000 tokens and remaining model-step capacity; earlier items use space first.',
           items: { oneOf: [searchRequest, structuredRequest, textCountRequest, readRequest, materializeRequest] },
         },
       },
       required: ['action', 'requests'],
-      oneOf: [
-        actionBranch('search', 'Search 1-8 narrow text expressions; do not include cursor or aggregate fields.'),
-        actionBranch('query', 'Run 1-8 deterministic aggregates matching the marker data type.'),
-        actionBranch('read', 'Read 1-8 exact source excerpts by cursor for inspection; do not prefetch sequential chunks.'),
-        actionBranch('materialize', 'Create 1-8 session-scoped UTF-8 working copies for full-data calculations that query cannot express; process them with an available local runtime.'),
-      ],
     },
     async execute(input, ctx) {
       const action = String(input.action ?? '') as ToolResultAction;
@@ -602,7 +590,7 @@ function createReadChunkTool(opts: ToolResultToolsOpts): AgentTool {
           type: 'array',
           minItems: 1,
           maxItems: TOOL_RESULT_BATCH_MAX_ITEMS,
-          description: 'One to eight exact reads sharing a 4K-token round budget. Each item contains ref, cursor, and optional maxTokens capped at 2K.',
+          description: 'One to eight exact reads sharing the ordinary result and model-step budgets. Each item contains ref, cursor, and optional maxTokens.',
           items: {
             type: 'object',
             additionalProperties: false,
@@ -681,18 +669,12 @@ async function executeBatch(
     TOOL_RESULT_ROUND_MAX_TOKENS,
     ledger?.remainingTokens ?? TOOL_RESULT_ROUND_MAX_TOKENS,
   );
+  remainingOutputTokens = Math.max(0, remainingOutputTokens - estimateToolResultTokens(`\n<retrieval-batch next_request="done"/>`));
   for (let index = 0; index < items.length; index++) {
     const item = items[index];
     const separatorTokens = outputs.length ? estimateToolResultTokens('\n') : 0;
-    const remainingItems = items.length - index;
-    // Divide what remains across every pending request. Without this, the
-    // first two 2K chunks can consume the entire 4K allowance and silently
-    // drop the tail of an otherwise valid batch.
-    const itemBudget = Math.max(
-      0,
-      Math.floor((remainingOutputTokens - separatorTokens) / remainingItems),
-    );
-    if (itemBudget < 1) break;
+    const itemBudget = Math.max(0, remainingOutputTokens - separatorTokens);
+    if (itemBudget < 128) break;
     const result = await executeItem(item, itemBudget);
     // Inspect the owning item's status before rendering/truncation. Source
     // excerpts may themselves quote tool-error text; those are not failures.
@@ -713,7 +695,7 @@ async function executeBatch(
   } };
   if (!outputs.length) return { ...budgetError(), observations };
   return {
-    content: outputs.join('\n'),
+    content: outputs.join('\n') + `\n<retrieval-batch next_request="${outputs.length < items.length ? outputs.length : 'done'}"/>`,
     observations,
     ...(successes === 0 ? { isError: true as const } : {}),
   };
@@ -768,7 +750,7 @@ async function executeQueryItem(
     log.warn('persisted-result query failed', { phase: 'read_or_worker' });
     return error(
       'E_RESULT_QUERY_READ',
-      'The persisted result could not be read for querying. Re-run the original tool or use a different retained result ref.',
+      'The persisted result could not be read for querying. Use a different retained result ref; retrieval does not rerun the original tool.',
     );
   }
   commitRead(ledger, key, estimateToolResultTokens(content));
@@ -865,6 +847,13 @@ function executeSearchItem(
   return { content: output };
 }
 
+/** Shared exact reader for authorized historical execution records. The
+ * caller owns admission; this returns a source range, never another spill. */
+export function readToolResultExcerpt(toolResultsDir: string, ref: string, cursor: number, budget: number, ctx: ToolContext): ToolResult {
+  const opts = { toolResultsDir, materializeDir: toolResultsDir, isProgrammaticToolCallContext: () => false };
+  return executeReadChunkItem(opts, { ref, cursor, maxTokens: budget }, readLedger(ctx, opts), budget);
+}
+
 function executeReadChunkItem(
   opts: ToolResultToolsOpts,
   input: Record<string, unknown>,
@@ -889,16 +878,9 @@ function executeReadChunkItem(
   const budget = availableBudget(ledger, Math.min(perCall, maxOutputTokens));
   if (budget < 128) return budgetError();
 
-  let candidate = '';
-  let candidateFull = false;
-  const totalChars = scanUtf8File(resolved.path, (text, chunkStart) => {
-    if (candidateFull || chunkStart + text.length <= cursor) return;
-    const localStart = Math.max(0, cursor - chunkStart);
-    const combined = candidate + text.slice(localStart);
-    const bounded = prefixWithinTokenBudget(combined, budget);
-    candidate = bounded;
-    candidateFull = bounded.length < combined.length;
-  });
+  const source = resultCharacterIndex(resolved.path);
+  const totalChars = source.totalChars;
+  const candidate = readIndexedCharacterRange(resolved.path, source, cursor, cursor + budget * 4);
   if (cursor > totalChars) {
     return error('E_RESULT_CURSOR_RANGE', `cursor ${cursor} exceeds total_chars ${totalChars}.`);
   }
@@ -910,7 +892,7 @@ function executeReadChunkItem(
   // The cursor/end attributes grow with the selected payload, so reserving
   // an envelope built with `covered="cursor-cursor"` can be one or two
   // tokens short once real offsets are inserted. Bound the FINAL envelope,
-  // not only its text payload, so the documented 2K per-read ceiling is a
+  // not only its text payload, so the ordinary per-result ceiling is a
   // strict invariant rather than an approximate one.
   const payloadCandidate = prefixWithinTokenBudget(candidate, payloadBudget);
   const render = (text: string): string => {
@@ -929,6 +911,7 @@ function executeReadChunkItem(
     if (estimateToolResultTokens(render(payloadCandidate.slice(0, mid))) <= budget) lo = mid;
     else hi = mid - 1;
   }
+  if (lo > 0 && /[\uD800-\uDBFF]/.test(payloadCandidate[lo - 1])) lo--;
   const output = render(payloadCandidate.slice(0, lo));
   commitRead(ledger, key, estimateToolResultTokens(output));
   return { content: output };
@@ -974,7 +957,7 @@ export function resolveToolResultRef(
     return {
       ok: false,
       code: 'E_RESULT_REF_MISSING',
-      message: `Tool result no longer exists — persisted results are retained up to ${CLOUD_TOOL_RESULT_MAX_AGE_DAYS} days. Re-run the original tool to regenerate the data.`,
+      message: 'The retained result is unavailable (missing, expired under an older retention policy, or never captured). Retrieval does not rerun the original tool.',
     };
   }
 }
@@ -1047,6 +1030,45 @@ function searchResultFile(filePath: string, ref: string, query: string, budget: 
  * total use JavaScript UTF-16 character cursors, matching String#slice and the
  * public cursor contract, while resident memory stays bounded by one 64KB
  * byte buffer plus whatever the callback deliberately retains. */
+type ResultCharacterIndex = { stamp: string; totalChars: number; points: Array<{ char: number; byte: number }> };
+const resultCharacterIndexes = new Map<string, ResultCharacterIndex>();
+function resultStamp(file: string): string {
+  const stat = fs.statSync(file);
+  return [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].join(':');
+}
+function resultCharacterIndex(file: string): ResultCharacterIndex {
+  const existing = resultCharacterIndexes.get(file);
+  if (existing?.stamp === resultStamp(file)) return existing;
+  scanUtf8File(file, () => {});
+  return resultCharacterIndexes.get(file)!;
+}
+function readIndexedCharacterRange(file: string, index: ResultCharacterIndex, start: number, end: number): string {
+  if (start >= index.totalChars) return '';
+  let low = 0, high = index.points.length - 1;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (index.points[mid].char <= start) low = mid; else high = mid - 1;
+  }
+  const point = index.points[low];
+  const fd = fs.openSync(file, 'r');
+  const decoder = new StringDecoder('utf8');
+  const bytes = Buffer.allocUnsafe(TOOL_RESULT_FILE_SCAN_BYTES);
+  let byte = point.byte, char = point.char;
+  const pieces: string[] = [];
+  try {
+    while (char < end) {
+      const count = fs.readSync(fd, bytes, 0, bytes.length, byte);
+      if (!count) break;
+      byte += count;
+      const text = decoder.write(bytes.subarray(0, count));
+      if (char + text.length > start) pieces.push(text.slice(Math.max(0, start - char), Math.max(0, end - char)));
+      char += text.length;
+    }
+    if (resultStamp(file) !== index.stamp) throw new Error('Stored result changed during retrieval; retry the original ref.');
+    return pieces.join('');
+  } finally { fs.closeSync(fd); }
+}
+
 function scanUtf8File(
   filePath: string,
   onText: (text: string, chunkStart: number) => void,
@@ -1055,9 +1077,14 @@ function scanUtf8File(
   const decoder = new StringDecoder('utf8');
   const bytes = Buffer.allocUnsafe(TOOL_RESULT_FILE_SCAN_BYTES);
   let chars = 0;
+  let byte = 0;
+  const stamp = resultStamp(filePath);
+  const points: ResultCharacterIndex['points'] = [];
   const emit = (text: string) => {
     if (!text) return;
     const start = chars;
+    points.push({ char: start, byte });
+    byte += Buffer.byteLength(text);
     chars += text.length;
     onText(text, start);
   };
@@ -1071,6 +1098,9 @@ function scanUtf8File(
   } finally {
     fs.closeSync(fd);
   }
+  if (resultStamp(filePath) !== stamp) throw new Error('Stored result changed during retrieval; retry the original ref.');
+  if (resultCharacterIndexes.size >= 32) resultCharacterIndexes.delete(resultCharacterIndexes.keys().next().value!);
+  resultCharacterIndexes.set(filePath, { stamp, totalChars: chars, points: points.length ? points : [{ char: 0, byte: 0 }] });
   return chars;
 }
 
@@ -1078,24 +1108,15 @@ function readUtf8CharacterRanges(
   filePath: string,
   ranges: ReadonlyArray<{ start: number; end: number }>,
 ): string[] {
-  const pieces = ranges.map(() => [] as string[]);
-  scanUtf8File(filePath, (text, chunkStart) => {
-    const chunkEnd = chunkStart + text.length;
-    for (let i = 0; i < ranges.length; i++) {
-      const range = ranges[i];
-      if (range.start >= chunkEnd || range.end <= chunkStart) continue;
-      const start = Math.max(0, range.start - chunkStart);
-      const end = Math.min(text.length, range.end - chunkStart);
-      pieces[i].push(text.slice(start, end));
-    }
-  });
-  return pieces.map((parts) => parts.join(''));
+  const index = resultCharacterIndex(filePath);
+  return ranges.map((range) => readIndexedCharacterRange(filePath, index, range.start, range.end));
+
 }
 
 function readLedger(ctx: ToolContext, opts: ToolResultToolsOpts): ToolResultReadLedger | null {
   // Program child results stay inside the isolated runtime and are governed
   // by run_program's call/result/wall-clock limits. Do not charge those bytes
-  // to the model-facing 4K retrieval ledger; only run_program's final compact
+  // to the model-facing shared inline ledger; only run_program's final compact
   // output crosses into conversation context.
   if (opts.isProgrammaticToolCallContext(ctx)) return null;
   const value = ctx.state.toolResultReadLedger;
@@ -1126,7 +1147,7 @@ function commitRead(ledger: ToolResultReadLedger | null, key: string, usedTokens
 function budgetError(): ReturnType<typeof error> {
   return error(
     'E_RESULT_READ_BUDGET',
-    'The shared 4K-token query/search/read observation budget for this model step is exhausted. Reuse prior observations. For full-data calculations, materialize the same ref and process its working copy with an available local runtime.',
+    'The available tool-result budget is exhausted. No source data was read. Retry the same source cursor when budget is available.',
   );
 }
 

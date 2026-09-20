@@ -25,6 +25,7 @@ import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 
 import { createLogger } from '../logger';
+import { t } from '../i18n';
 import { fileToChunks, type ChunkableKind } from '../util/file_to_chunks';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import {
@@ -126,7 +127,7 @@ export function libraryKindFor(name: string): ChunkableKind | null {
   const ext = path.extname(name).toLowerCase();
   if (ext === '.pdf') return 'pdf';
   if (ext === '.docx' || ext === '.docm') return 'docx';
-  if (ext === '.xlsx' || ext === '.xlsm') return 'spreadsheet';
+  if (ext === '.xlsx' || ext === '.xlsm' || ext === '.xls') return 'spreadsheet';
   if (ext === '.pptx' || ext === '.pptm') return 'presentation';
   if (IMAGE_EXTS.has(ext)) return 'image';
   if (TEXT_EXTS.has(ext)) return 'text';
@@ -178,6 +179,8 @@ export interface CorpusSpec {
   imageSessionPrefix: string;
   /** Status sink. Callers map this to their own event shape. */
   emit(event: CorpusStatusEvent): void;
+  /** Whole-text indexing admission, independent from source storage. */
+  maxTextBytes?: number;
   /** Extra exclusion beyond dot-entries and unsupported kinds. */
   skipRelPath?(relPath: string): boolean;
   /** Monotonic generation. A job stamped with an older value is dropped —
@@ -458,6 +461,20 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
       return null;
     }
 
+    if (kind === 'text' && spec.maxTextBytes != null && stat.size > spec.maxTextBytes) {
+      if (!jobIsCurrent(job)) return null;
+      const error = t('errors.text_index_too_large', { mb: Math.round(spec.maxTextBytes / 1024 / 1024) });
+      // Remove stale search chunks if a formerly small file grew past the work limit.
+      await store().deleteFile(relPath);
+      if (!jobIsCurrent(job)) return null;
+      await store().setFileStatus(relPath, 'failed', {
+        kind, bytes: stat.size, mtime: stat.mtimeMs / 1000, sha1: '', error,
+      });
+      if (!jobIsCurrent(job)) return null;
+      spec.emit({ relPath, status: 'failed', kind, error, stage: 'extract', errorCode: 'E_LIBRARY_FILE_TOO_LARGE' });
+      return null;
+    }
+
     const buf = await fsp.readFile(abs);
     if (!jobIsCurrent(job)) return null;
     const sha1 = crypto.createHash('sha1').update(buf).digest('hex');
@@ -702,6 +719,14 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
       const existing = snapshotExisting?.status === 'processing'
         ? store().getFile(relPath)
         : snapshotExisting;
+      // An unchanged size exclusion cannot recover by retrying. A smaller replacement
+      // re-enters normal hashing/indexing; manual admission still reports the limit.
+      if (meta.kind === 'text' && spec.maxTextBytes != null && meta.bytes > spec.maxTextBytes
+        && existing?.status === 'failed' && existing.bytes === meta.bytes
+        && Math.abs(existing.mtime - meta.mtime) < 0.001 && existing.sha1 === '') {
+        unchanged += 1;
+        continue;
+      }
       const ownedByQueue = queue.activePaths.has(relPath)
         || queue.queuedKeys.has(`upsert\u0000${relPath}`)
         || queue.queuedKeys.has(`delete\u0000${relPath}`);
@@ -769,6 +794,9 @@ function createCorpus(spec: CorpusSpec): LibraryCorpus {
       if (!st.isFile()) return { meta: null, reliable: true, reusedHash: false };
       if (signal?.aborted) return { meta: null, reliable: false, reusedHash: false };
       const mtime = st.mtimeMs / 1000;
+      if (kind === 'text' && spec.maxTextBytes != null && st.size > spec.maxTextBytes) {
+        return { meta: { kind, sha1: '', bytes: st.size, mtime }, reliable: true, reusedHash: false };
+      }
       if (existing?.sha1 && existing.bytes === st.size && Math.abs(existing.mtime - mtime) < 0.001) {
         return { meta: { kind, sha1: existing.sha1, bytes: st.size, mtime }, reliable: true, reusedHash: true };
       }

@@ -58,23 +58,12 @@ export function createMetacognitionTool(
         },
       },
       required: ['action', 'target'],
-      oneOf: [
-        { properties: { action: { const: 'read' } } },
-        { properties: { action: { const: 'write' } }, required: ['content'] },
-      ],
     },
 
     async execute(input: Record<string, unknown>, _ctx: ToolContext): Promise<ToolResult> {
       const action = input.action as string;
       const target = input.target as 'competence' | 'strategies';
-      const content = (input.content as string) || '';
-
-      if (action === 'read' && Object.hasOwn(input, 'content')) {
-        return {
-          content: JSON.stringify({ ok: false, error: 'content is not allowed for read' }),
-          isError: true,
-        };
-      }
+      const content = typeof input.content === 'string' ? input.content : '';
 
       if (target !== 'competence' && target !== 'strategies') {
         return {

@@ -15,6 +15,8 @@ import { TextDecoder } from "node:util";
 import { createHash } from "node:crypto";
 import { createLogger } from "../shared/logger.js";
 import { errorCodeForLog } from "../shared/errors.js";
+import { blockedCommand } from "./command-policy.js";
+import { windowsTreeCleanupCommand } from "./windows-process-tree.js";
 import {
   ProcessOutputCapture,
   type StreamedToolOutput,
@@ -36,7 +38,7 @@ export interface SandboxConfig {
   maxSpoolBytes?: number;
   /** Allowed directories the sandbox can access (default: [workingDir]). */
   allowedDirs?: string[];
-  /** Commands that are explicitly blocked. */
+  /** Additional literal substring patterns blocked in every command. */
   blockedCommands?: string[];
   /** Whether to allow network access (default: true). */
   allowNetwork?: boolean;
@@ -68,12 +70,20 @@ export interface SandboxResult {
   /** Host-only temp files for streams larger than the in-memory threshold. */
   stdoutStreamedOutput?: StreamedToolOutput;
   stderrStreamedOutput?: StreamedToolOutput;
+  /** Explicit cancellation, distinct from command failure or timeout. */
+  aborted?: boolean;
   /** Execution duration in milliseconds. */
   durationMs: number;
 }
 
+/** Optional managed continuation; ordinary execute callers retain closed stdin. */
+export interface SandboxContinuation {
+  onStart(control: { write(chars: string): void; stop(): void }): void;
+  onOutput(bytes: Buffer, stream: "stdout" | "stderr", env: NodeJS.ProcessEnv): void;
+}
+
 type ShellKind = "posix" | "cmd" | "powershell";
-type KillableChild = Pick<ChildProcess, "kill" | "pid">;
+type KillableChild = Pick<ChildProcess, "kill" | "pid"> & Partial<Pick<ChildProcess, "exitCode" | "signalCode">>;
 type ProcessKiller = typeof process.kill;
 type SpawnFn = typeof spawn;
 
@@ -113,32 +123,68 @@ export function killProcessTree(
     platform?: NodeJS.Platform;
     processKill?: ProcessKiller;
     spawnFn?: SpawnFn;
+    onComplete?: () => void;
   } = {},
 ): void {
   const platform = opts.platform ?? process.platform;
   if (platform === "win32" && child.pid) {
-    try {
-      const killer = (opts.spawnFn ?? spawn)(windowsSystem32Tool("taskkill.exe"), ["/pid", String(child.pid), "/t", "/f"], {
-        stdio: "ignore",
-        windowsHide: true,
-      });
-      const fallback = () => {
-        try { child.kill(signal); } catch { /* Process may already be dead. */ }
-      };
-      killer.once("error", fallback);
-      killer.once("exit", (code) => {
-        if (code !== 0) fallback();
-      });
-      if (typeof killer.unref === "function") killer.unref();
+    // Windows cannot traverse an exited root. A delayed retry must not target
+    // a different process that has since acquired the same numeric PID.
+    if (child.exitCode != null || child.signalCode != null) {
+      opts.onComplete?.();
       return;
-    } catch {
-      // Fall back to killing the direct child below.
     }
+    let completed = false;
+    const complete = (failed: boolean) => {
+      if (completed) return;
+      completed = true;
+      if (failed) {
+        log.warn("Shell process tree termination failed", {
+          platform: "win32", fallback: "direct_child_only",
+        });
+        if (child.exitCode == null && child.signalCode == null) {
+          try { child.kill(signal); } catch { /* Process may already be dead. */ }
+        }
+      }
+      opts.onComplete?.();
+    };
+    try {
+      const killer = (opts.spawnFn ?? spawn)(windowsSystem32Tool("WindowsPowerShell\\v1.0\\powershell.exe"), [
+        "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", windowsTreeCleanupCommand(child.pid),
+      ], {
+        stdio: ["pipe", "pipe", "ignore"],
+        windowsHide: true,
+        timeout: KILL_GRACE_MS,
+      });
+      // The helper pins the PID first. Only authorize it while the original
+      // ChildProcess is still live; a late helper must not target a reused PID.
+      let readiness = "";
+      let acknowledged = false;
+      let authorized = false;
+      killer.stdin?.on("error", () => undefined);
+      killer.stdout?.on("data", (data: Buffer) => {
+        if (acknowledged) return;
+        readiness = (readiness + data.toString("utf8")).slice(0, 16);
+        if (!readiness.includes("\n")) return;
+        acknowledged = true;
+        const owned = readiness.trim() === "ready" && child.exitCode == null && child.signalCode == null;
+        authorized = owned;
+        killer.stdin?.end(owned ? "go\n" : "cancel\n");
+      });
+      killer.once("error", () => complete(true));
+      killer.once("exit", (code) => complete(code !== 0 &&
+        (authorized || (child.exitCode == null && child.signalCode == null))));
+      if (typeof killer.unref === "function") killer.unref();
+    } catch {
+      complete(true);
+    }
+    return;
   }
 
   try {
     if (platform !== "win32" && child.pid) {
       (opts.processKill ?? process.kill)(-child.pid, signal);
+      opts.onComplete?.();
       return;
     }
   } catch {
@@ -149,6 +195,7 @@ export function killProcessTree(
   } catch {
     // Process may already be dead.
   }
+  opts.onComplete?.();
 }
 
 type OutputEncodingEnv = {
@@ -157,22 +204,6 @@ type OutputEncodingEnv = {
   ORKAS_UI_LANG?: string;
   [key: string]: string | undefined;
 };
-
-/** Default blocked commands — destructive or dangerous operations. */
-const DEFAULT_BLOCKED_COMMANDS = [
-  "rm -rf /",
-  "rm -rf /*",
-  "mkfs",
-  "dd if=",
-  ":(){ :|:& };:",
-  "chmod -R 777 /",
-  "> /dev/sda",
-  "shutdown",
-  "reboot",
-  "halt",
-  "init 0",
-  "init 6",
-];
 
 function shellBaseName(shell: string): string {
   return (shell.split(/[\\/]/).pop() || shell).toLowerCase();
@@ -554,10 +585,7 @@ export class SandboxExecutor {
       ...config,
       workingDir: path.resolve(config.workingDir),
       allowedDirs: uniqueSandboxDirs(config.allowedDirs),
-      blockedCommands: [
-        ...DEFAULT_BLOCKED_COMMANDS,
-        ...(config.blockedCommands ?? []),
-      ],
+      blockedCommands: [...(config.blockedCommands ?? [])],
     };
   }
 
@@ -570,7 +598,7 @@ export class SandboxExecutor {
    * - Blocked command check
    * - Working directory restriction
    */
-  async execute(command: string): Promise<SandboxResult> {
+  async execute(command: string, continuation?: SandboxContinuation): Promise<SandboxResult> {
     const startTime = Date.now();
     const logStartFailure = (error: unknown) => log.warn("Shell process failed to start", {
       phase: "spawn",
@@ -579,6 +607,11 @@ export class SandboxExecutor {
       command_hash: createHash("sha256").update(command).digest("hex").slice(0, 12),
     });
 
+    if (this.config.signal?.aborted) {
+      return { stdout: "", stderr: "Command cancelled before execution.", exitCode: null,
+        startFailed: false, timedOut: false, aborted: true, outputLimitExceeded: false,
+        stdoutBytes: 0, stderrBytes: 0, durationMs: 0 };
+    }
     // Check for blocked commands
     const violation = this.checkBlockedCommand(command);
     if (violation) {
@@ -607,9 +640,12 @@ export class SandboxExecutor {
       let timedOut = false;
       let outputLimitExceeded = false;
       let killed = false;
+      let aborted = false;
       let stdoutTruncated = false;
       let stderrTruncated = false;
       let settled = false;
+      let treeCleanupPending = false;
+      let pendingFinish: { code: number | null; startFailed: boolean } | undefined;
       let forceSettleTimer: NodeJS.Timeout | null = null;
       let abortListener: (() => void) | null = null;
 
@@ -674,18 +710,12 @@ export class SandboxExecutor {
       }
 
       const abortSignal = this.config.signal;
-      if (abortSignal) {
-        abortListener = () => killChild();
-        if (abortSignal.aborted) abortListener();
-        else abortSignal.addEventListener("abort", abortListener, { once: true });
-      }
-
-      // Close stdin immediately — no interactive input
-      child.stdin.end();
+      child.stdin.on("error", () => undefined);
 
       // Collect stdout with size limit
       child.stdout.on("data", (data: Buffer) => {
-        if (outputLimitExceeded) return;
+        if (settled || outputLimitExceeded) return;
+        continuation?.onOutput(data, "stdout", env);
         if (stdoutCapture) {
           if (!stdoutCapture.append(data)) {
             outputLimitExceeded = true;
@@ -708,7 +738,8 @@ export class SandboxExecutor {
 
       // Collect stderr with size limit
       child.stderr.on("data", (data: Buffer) => {
-        if (outputLimitExceeded) return;
+        if (settled || outputLimitExceeded) return;
+        continuation?.onOutput(data, "stderr", env);
         if (stderrCapture) {
           if (!stderrCapture.append(data)) {
             outputLimitExceeded = true;
@@ -737,6 +768,10 @@ export class SandboxExecutor {
 
       const finish = (code: number | null, startFailed = false) => {
         if (settled) return;
+        if (treeCleanupPending) {
+          pendingFinish = { code, startFailed };
+          return;
+        }
         settled = true;
         clearTimeout(timeoutId);
         if (forceSettleTimer) clearTimeout(forceSettleTimer);
@@ -772,6 +807,7 @@ export class SandboxExecutor {
           stderr,
           exitCode: code,
           startFailed,
+          ...(aborted ? { aborted: true } : {}),
           timedOut,
           outputLimitExceeded,
           stdoutBytes,
@@ -783,13 +819,30 @@ export class SandboxExecutor {
       };
 
       function killChild() {
-        if (killed) return;
+        if (killed || settled) return;
         killed = true;
-        killProcessTree(child, "SIGTERM");
-        // Escalate to SIGKILL after 5 seconds
-        const killTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), KILL_GRACE_MS);
-        if (typeof killTimer.unref === "function") killTimer.unref();
-        forceSettleTimer = setTimeout(() => finish(null), KILL_SETTLE_GRACE_MS);
+        treeCleanupPending = process.platform === "win32";
+        killProcessTree(child, "SIGTERM", { onComplete: () => {
+          treeCleanupPending = false;
+          if (pendingFinish) finish(pendingFinish.code, pendingFinish.startFailed);
+        } });
+        // Windows already uses forceful tree cleanup with a bounded lifetime.
+        // POSIX still needs group escalation if a descendant ignores TERM,
+        // including when the shell's close has already settled the result.
+        if (process.platform !== "win32") {
+          const killTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), KILL_GRACE_MS);
+          if (typeof killTimer.unref === "function") killTimer.unref();
+        }
+        if (settled) return;
+        forceSettleTimer = setTimeout(() => {
+          if (settled) return;
+          // Bounded return is not proof that descendants released their pipes.
+          log.warn("Shell process cleanup was not confirmed", {
+            platform: process.platform, phase: "cleanup_deadline",
+          });
+          treeCleanupPending = false;
+          finish(pendingFinish?.code ?? null, pendingFinish?.startFailed ?? false);
+        }, KILL_SETTLE_GRACE_MS);
         if (typeof forceSettleTimer.unref === "function") forceSettleTimer.unref();
       }
 
@@ -808,6 +861,23 @@ export class SandboxExecutor {
         }
         finish(null, true);
       });
+      // Install cancellation only after finish/timers exist: a pre-aborted
+      // signal must never enter killChild's temporal dead zone.
+      if (abortSignal) {
+        abortListener = () => { aborted = true; killChild(); };
+        if (abortSignal.aborted) abortListener();
+        else abortSignal.addEventListener("abort", abortListener, { once: true });
+      }
+      if (continuation) {
+        continuation.onStart({
+          write: (chars) => {
+            if (settled || killed || child.stdin.destroyed) throw new Error("Process is not running");
+            child.stdin.write(chars, "utf8");
+          },
+          stop: () => { aborted = true; killChild(); },
+        });
+      } else child.stdin.end();
+
     });
   }
 
@@ -863,13 +933,7 @@ export class SandboxExecutor {
 
   /** Check if a command matches the blocklist. */
   private checkBlockedCommand(command: string): string | null {
-    const normalized = command.trim().toLowerCase();
-    for (const blocked of this.config.blockedCommands ?? []) {
-      if (normalized.includes(blocked.toLowerCase())) {
-        return blocked;
-      }
-    }
-    return null;
+    return blockedCommand(command, this.config.blockedCommands);
   }
 }
 

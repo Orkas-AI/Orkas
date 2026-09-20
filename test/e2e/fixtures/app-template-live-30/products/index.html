@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>库存管理</title>
+  <script src="/__orkas/sdk.js"></script>
+  <style>
+    :root { --ink:#14202e; --muted:#64748b; --line:#dce4ec; --paper:#fff; --canvas:#f5f8fb; --blue:#0f5fbc; --blue-dark:#0a4a94; --red:#b42318; --amber:#a65f00; --green:#18794e; --radius:14px; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--canvas); color:var(--ink); font:15px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif; }
+    button,input { font:inherit; }
+    button { cursor:pointer; }
+    button:focus-visible,input:focus-visible { outline:3px solid #90c2ff; outline-offset:2px; }
+    .app { max-width:1100px; margin:0 auto; padding:46px 30px 64px; }
+    header { display:flex; align-items:flex-end; justify-content:space-between; gap:24px; margin-bottom:28px; }
+    h1 { margin:0; font-size:30px; letter-spacing:-.03em; }
+    .eyebrow { margin:0 0 5px; color:var(--blue); font-size:12px; font-weight:800; letter-spacing:.1em; }
+    .sub { margin:5px 0 0; color:var(--muted); }
+    .status { min-height:22px; margin:0; color:var(--muted); font-size:13px; text-align:right; }
+    .layout { display:grid; grid-template-columns:330px minmax(0,1fr); gap:24px; align-items:start; }
+    .panel { background:var(--paper); border:1px solid var(--line); border-radius:var(--radius); box-shadow:0 8px 24px rgba(33,52,73,.05); }
+    .form-panel { padding:24px; position:sticky; top:20px; }
+    h2 { margin:0; font-size:18px; }
+    .form-intro { color:var(--muted); margin:6px 0 22px; font-size:14px; }
+    form { display:grid; gap:16px; }
+    label { display:grid; gap:7px; font-weight:700; font-size:14px; }
+    input { width:100%; border:1px solid #bcc9d6; border-radius:9px; padding:10px 11px; color:var(--ink); background:#fff; }
+    input::placeholder { color:#94a3b8; }
+    .form-actions { display:flex; gap:9px; padding-top:4px; }
+    .primary,.secondary,.danger { border:0; border-radius:9px; padding:10px 14px; font-weight:750; }
+    .primary { background:var(--blue); color:#fff; }
+    .primary:hover { background:var(--blue-dark); }
+    .secondary { background:#eaf1f8; color:#25405d; }
+    .danger { background:#fff0ef; color:var(--red); }
+    .inventory { overflow:hidden; }
+    .inventory-head { padding:22px 24px 18px; border-bottom:1px solid var(--line); display:flex; align-items:center; justify-content:space-between; gap:16px; }
+    .count { color:var(--muted); font-size:14px; white-space:nowrap; }
+    .table-wrap { overflow-x:auto; }
+    table { width:100%; border-collapse:collapse; min-width:600px; }
+    th,td { text-align:left; padding:15px 24px; border-bottom:1px solid #e8eef4; }
+    th { color:var(--muted); font-size:12px; letter-spacing:.06em; text-transform:uppercase; }
+    td { font-size:14px; }
+    tbody tr:last-child td { border-bottom:0; }
+    .product-name { font-weight:750; }
+    .price { font-variant-numeric:tabular-nums; }
+    .stock { display:inline-flex; align-items:center; min-width:50px; justify-content:center; padding:3px 8px; border-radius:999px; background:#eaf7ef; color:var(--green); font-weight:750; font-size:13px; font-variant-numeric:tabular-nums; }
+    .stock.low { background:#fff4e5; color:var(--amber); }
+    .stock.none { background:#fff0ef; color:var(--red); }
+    .row-actions { display:flex; justify-content:flex-end; gap:6px; }
+    .text-button { border:0; border-radius:7px; background:transparent; color:var(--blue); padding:6px 8px; font-weight:700; }
+    .text-button:hover { background:#edf5ff; }
+    .text-button.delete { color:var(--red); }
+    .text-button.delete:hover { background:#fff0ef; }
+    .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+    .empty { padding:62px 28px; color:var(--muted); text-align:center; }
+    .empty strong { display:block; color:var(--ink); font-size:16px; margin-bottom:5px; }
+    dialog { border:0; border-radius:14px; box-shadow:0 24px 70px rgba(15,32,50,.28); padding:0; max-width:410px; width:calc(100% - 32px); color:var(--ink); }
+    dialog::backdrop { background:rgba(15,32,50,.42); }
+    .dialog-content { padding:24px; }
+    .dialog-content p { color:var(--muted); margin:8px 0 22px; }
+    .dialog-actions { display:flex; justify-content:flex-end; gap:9px; }
+    @media (max-width:760px) { .app { padding:28px 16px 44px; } header,.layout { display:block; } .status { text-align:left; margin-top:10px; } .form-panel { position:static; margin-bottom:18px; } .inventory-head { padding:18px; } th,td { padding:13px 16px; } }
+    @media (prefers-reduced-motion:reduce) { *,*::before,*::after { scroll-behavior:auto!important; transition:none!important; animation:none!important; } }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header>
+      <div><p class="eyebrow">PRODUCT INVENTORY</p><h1>库存管理</h1><p class="sub">集中维护商品售价与可用库存。</p></div>
+      <p id="status" class="status" role="status" aria-live="polite">正在加载库存…</p>
+    </header>
+    <div class="layout">
+      <section class="panel form-panel" aria-labelledby="form-title">
+        <h2 id="form-title">添加商品</h2>
+        <p id="form-intro" class="form-intro">填写商品信息后保存到库存。</p>
+        <form id="product-form">
+          <input id="product-id" type="hidden">
+          <label for="name">商品名称<input id="name" name="name" type="text" maxlength="80" required autocomplete="off" placeholder="例如：无线键盘"></label>
+          <label for="price">售价（元）<input id="price" name="price" type="number" min="0" step="0.01" required inputmode="decimal" placeholder="0.00"></label>
+          <label for="quantity">库存数量<input id="quantity" name="quantity" type="number" min="0" step="1" required inputmode="numeric" placeholder="0"></label>
+          <div class="form-actions"><button id="save" class="primary" type="submit">添加商品</button><button id="cancel" class="secondary" type="button" hidden>取消编辑</button></div>
+        </form>
+      </section>
+      <section class="panel inventory" aria-labelledby="inventory-title">
+        <div class="inventory-head"><h2 id="inventory-title">商品库存</h2><span id="count" class="count">0 件商品</span></div>
+        <div class="table-wrap"><table id="table" hidden><thead><tr><th scope="col">商品</th><th scope="col">售价</th><th scope="col">库存</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead><tbody id="products"></tbody></table></div>
+        <div id="empty" class="empty"><strong>还没有商品</strong>从左侧添加第一件商品。</div>
+      </section>
+    </div>
+  </main>
+  <dialog id="delete-dialog" aria-labelledby="delete-title">
+    <div class="dialog-content"><h2 id="delete-title">删除商品？</h2><p id="delete-copy"></p><div class="dialog-actions"><button id="delete-cancel" class="secondary" type="button">取消</button><button id="delete-confirm" class="danger" type="button">删除</button></div></div>
+  </dialog>
+  <script>
+    (() => {
+      const KEY = 'inventory-products-v1';
+      const $ = (id) => document.getElementById(id);
+      const form = $('product-form'), list = $('products'), table = $('table'), empty = $('empty');
+      const status = $('status'), count = $('count'), dialog = $('delete-dialog');
+      let products = [], pendingDelete = null, usingHostStorage = false;
+      const money = new Intl.NumberFormat('zh-CN', {style:'currency', currency:'CNY'});
+      const escapeHtml = (value) => String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+      const setStatus = (text) => { status.textContent = text; };
+      async function initStorage() {
+        const api = window.orkasApp;
+        if (api?.capabilities && api?.storage) {
+          try {
+            const caps = await api.capabilities.list();
+            const storage = caps.methods?.find(m => m.name === 'storage.get');
+            if (storage?.available && !storage?.isError) {
+              const result = await api.storage.get({key:KEY, scope:'cloud'});
+              products = Array.isArray(result?.value) ? result.value : [];
+              usingHostStorage = true;
+              setStatus('库存已保存到 Orkas 云端。');
+              return;
+            }
+          } catch (_) { /* Preview or an unavailable host falls back to browser storage. */ }
+        }
+        try { products = JSON.parse(localStorage.getItem(KEY) || '[]'); } catch (_) { products = []; }
+        setStatus('库存已保存在此浏览器中。');
+      }
+      async function persist() {
+        try {
+          if (usingHostStorage) await window.orkasApp.storage.set({key:KEY, value:products, scope:'cloud'});
+          else localStorage.setItem(KEY, JSON.stringify(products));
+          setStatus('更改已保存。');
+        } catch (_) { setStatus('保存失败，请重试。'); throw _; }
+      }
+      function render() {
+        products.sort((a,b) => a.name.localeCompare(b.name, 'zh-CN'));
+        count.textContent = `${products.length} 件商品`;
+        table.hidden = products.length === 0; empty.hidden = products.length !== 0;
+        list.innerHTML = products.map(p => {
+          const cls = p.quantity === 0 ? 'none' : p.quantity <= 5 ? 'low' : '';
+          return `<tr><td class="product-name">${escapeHtml(p.name)}</td><td class="price">${money.format(p.price)}</td><td><span class="stock ${cls}">${p.quantity}</span></td><td><div class="row-actions"><button class="text-button" data-action="edit" data-id="${p.id}" type="button">编辑</button><button class="text-button delete" data-action="delete" data-id="${p.id}" type="button">删除</button></div></td></tr>`;
+        }).join('');
+      }
+      function resetForm() { form.reset(); $('product-id').value=''; $('form-title').textContent='添加商品'; $('form-intro').textContent='填写商品信息后保存到库存。'; $('save').textContent='添加商品'; $('cancel').hidden=true; }
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const name = $('name').value.trim(), price = Number($('price').value), quantity = Number($('quantity').value), id = $('product-id').value;
+        if (!name || !Number.isFinite(price) || price < 0 || !Number.isInteger(quantity) || quantity < 0) { setStatus('请填写有效的名称、非负售价和整数库存数量。'); return; }
+        const newId = (window.crypto && typeof window.crypto.randomUUID === 'function') ? window.crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        const item = {id: id || newId, name, price, quantity};
+        if (id) products = products.map(p => p.id === id ? item : p); else products.push(item);
+        try { await persist(); render(); resetForm(); } catch (_) { /* status already updated */ }
+      });
+      list.addEventListener('click', (event) => {
+        const button = event.target.closest('button[data-id]'); if (!button) return;
+        const item = products.find(p => p.id === button.dataset.id); if (!item) return;
+        if (button.dataset.action === 'edit') { $('product-id').value=item.id; $('name').value=item.name; $('price').value=item.price; $('quantity').value=item.quantity; $('form-title').textContent='编辑商品'; $('form-intro').textContent=`正在编辑“${item.name}”。`; $('save').textContent='保存更改'; $('cancel').hidden=false; $('name').focus(); }
+        else { pendingDelete=item; $('delete-copy').textContent=`“${item.name}”将从库存中移除，此操作无法撤销。`; dialog.showModal(); $('delete-cancel').focus(); }
+      });
+      $('cancel').addEventListener('click', resetForm);
+      $('delete-cancel').addEventListener('click', () => dialog.close());
+      $('delete-confirm').addEventListener('click', async () => { if (!pendingDelete) return; products=products.filter(p => p.id !== pendingDelete.id); try { await persist(); render(); if ($('product-id').value === pendingDelete.id) resetForm(); dialog.close(); } catch (_) {} finally { pendingDelete=null; } });
+      initStorage().then(render);
+    })();
+  </script>
+</body>
+</html>

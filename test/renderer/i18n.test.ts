@@ -11,7 +11,7 @@ const i18nSource = fs.readFileSync(
   path.join(rendererRoot, 'modules', 'i18n.js'),
   'utf8',
 );
-const LANGS = ['en', 'zh', 'ja', 'pt'] as const;
+const LANGS = ['en', 'zh', 'ja', 'pt', 'es', 'fr', 'ko', 'de', 'ru', 'it'] as const;
 
 type Deferred<T> = {
   promise: Promise<T>;
@@ -171,6 +171,23 @@ function sourceFiles(root: string): string[] {
 }
 
 describe('renderer i18n runtime', () => {
+  it.each([
+    ['es', 'Cancelar'], ['fr', 'Annuler'], ['ko', '취소'],
+    ['de', 'Abbrechen'], ['ru', 'Отмена'], ['it', 'Annulla'],
+  ] as const)('renders %s before first paint and preserves the selected language on change', async (language, cancel) => {
+    const text = domElement({ 'data-i18n': 'common.cancel' }, 'Cancel');
+    const tables = localeTables('renderer');
+    const first = loadI18n({ boot: { lang: language, tables }, textElements: [text] });
+    expect(text.textContent).toBe(cancel);
+    expect(first.htmlAttributes.lang).toBe(language);
+    const persist = vi.fn(async (lang: string) => ({ ok: true, language: lang }));
+    const second = loadI18n({ boot: { lang: 'en', tables }, textElements: [text], setLanguage: persist });
+    await expect(second.sandbox.setLang(language)).resolves.toBe(language);
+    expect(persist).toHaveBeenCalledWith(language);
+    expect(text.textContent).toBe(cancel);
+    expect(second.htmlAttributes.lang).toBe(language);
+    expect(second.events).toEqual([{ type: 'i18n-change', detail: { lang: language } }]);
+  });
   it('uses English fallback and raw-key fallback without blanking content', () => {
     const text = domElement({ 'data-i18n': 'only.english' }, 'default');
     const { sandbox, htmlAttributes } = loadI18n({
@@ -455,7 +472,7 @@ describe('locale resource contract', () => {
       pt: /\benviar\b/i,
     } as const;
 
-    for (const lang of LANGS) {
+    for (const lang of ['en', 'zh', 'ja', 'pt'] as const) {
       expect(tables[lang]['chat.menu.scratch_edit'], `${lang}: edit selected copy`)
         .toBe(editCopyLabels[lang]);
       expect(tables[lang]['chat.md_drawer.scratch_title'], `${lang}: edited copy title`)
@@ -468,6 +485,8 @@ describe('locale resource contract', () => {
         .not.toContain('read_file');
       expect(tables[lang]['chat.archive_btn'], `${lang}: Library action`)
         .toBe(tables[lang]['chat.archive_btn_title']);
+      expect(tables[lang]['chat.archive_btn'], `${lang}: compact Library label`)
+        .toBe(tables[lang]['sidebar.contexts']);
       expect(tables[lang]['kb_picker.title_global'].toLocaleLowerCase(), `${lang}: Global Library picker`)
         .toContain(tables[lang]['contexts.transfer.global_library'].toLocaleLowerCase());
       expect(tables[lang]['kb_picker.title_project'].toLocaleLowerCase(), `${lang}: Project Library picker`)

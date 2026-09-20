@@ -247,7 +247,7 @@ async function loadOssCatalog(forceOrOpts) {
 
 function _ossLang() { return (typeof getLang === 'function' ? getLang() : 'en'); }
 function ossTaskFor(p) { return (_ossLang() === 'zh' ? p.task_zh : p.task_en) || p.task_en || p.task_zh || ''; }
-function ossDescFor(p) { return (_ossLang() === 'zh' ? p.description_zh : p.description_en) || p.description_en || p.description_zh || ''; }
+function ossDescFor(p) { return p['description_' + _ossLang()] || p.description_en || p.description_zh || ''; }
 function ossCatLabel(cat, categories) {
   const c = (categories || []).find((x) => x.code === cat);
   if (!c) return cat || '';

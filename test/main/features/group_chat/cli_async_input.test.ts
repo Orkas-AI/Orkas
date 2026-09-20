@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { answerCliAsyncInput, closeCliAsyncInputs, finishCliAsyncInputs, registerCliAsyncInput } from '../../../../src/main/features/group_chat/cli_async_input';
+import { answerCliAsyncInput, cancelCliAsyncInput, closeCliAsyncInputs, finishCliAsyncInputs, registerCliAsyncInput } from '../../../../src/main/features/group_chat/cli_async_input';
 
 const uid = 'question-user';
 const cid = 'question-chat';
@@ -9,12 +9,56 @@ function setup() {
   const submit = vi.fn(async () => ({ mode: 'steered' as const }));
   const message = { id: 'reply', ts: '2026-09-09T10:00:00Z', from: 'user', to: ['agent'], text: 'Which folder?\nCurrent' };
   const save = vi.fn(async () => message);
+  const cancelled = { id: 'question', ts: message.ts, from: 'agent', to: ['user'], text: 'Which folder?', cli_question: { questions: [{ title: 'Which folder?' }], cancelled: true } };
+  const saveCancelled = vi.fn(async () => cancelled);
   let active = true;
-  registerCliAsyncInput({ uid, cid, turnId: 'turn', messageId: 'question', inputId: 'reply', questions: [{ title: 'Which folder?' }], ingress: () => active ? { submit } : null, save });
-  return { submit, save, message, finish: () => { active = false; closeCliAsyncInputs(uid, cid, 'turn'); } };
+  registerCliAsyncInput({ uid, cid, turnId: 'turn', messageId: 'question', inputId: 'reply', questions: [{ title: 'Which folder?' }], ingress: () => active ? { submit } : null, save, saveCancelled });
+  return { submit, save, message, cancelled, saveCancelled, finish: () => { active = false; closeCliAsyncInputs(uid, cid, 'turn'); } };
 }
 
 describe('native async question replies', () => {
+  it('persists concurrent cancellation once without delivering an answer and rejects later answers', async () => {
+    const h = setup();
+    expect(await cancelCliAsyncInput('other', cid, 'question')).toEqual({ ok: false, error: 'expired' });
+    const results = await Promise.all([cancelCliAsyncInput(uid, cid, 'question'), cancelCliAsyncInput(uid, cid, 'question'), answerCliAsyncInput(uid, cid, 'question', ['Current'])]);
+    expect(results).toEqual([{ ok: true, message: h.cancelled }, { ok: true, message: h.cancelled }, { ok: false, error: 'cancelled' }]);
+    expect(await cancelCliAsyncInput(uid, cid, 'question')).toEqual(results[0]);
+    expect(h.saveCancelled).toHaveBeenCalledOnce();
+    expect(h.submit).not.toHaveBeenCalled();
+    expect(h.save).not.toHaveBeenCalled();
+  });
+
+  it('keeps failed cancellation retryable and waits for its durable write before closing the turn', async () => {
+    const h = setup();
+    h.saveCancelled.mockRejectedValueOnce(new Error('injected write failure'));
+    expect(await cancelCliAsyncInput(uid, cid, 'question')).toEqual({ ok: false, error: 'save_failed' });
+    let saved!: (message: typeof h.cancelled) => void;
+    h.saveCancelled.mockImplementationOnce(() => new Promise(resolve => { saved = resolve; }));
+    const cancel = cancelCliAsyncInput(uid, cid, 'question');
+    let finished = false;
+    const finish = finishCliAsyncInputs(uid, cid, 'turn').then(() => { finished = true; });
+    await Promise.resolve();
+    expect(finished).toBe(false);
+    saved(h.cancelled);
+    expect(await cancel).toEqual({ ok: true, message: h.cancelled });
+    await finish;
+    expect(h.saveCancelled).toHaveBeenCalledTimes(2);
+    expect(h.submit).not.toHaveBeenCalled();
+  });
+
+  it('does not cancel an answer that won the race or whose history save needs retrying', async () => {
+    const h = setup();
+    h.save.mockRejectedValueOnce(new Error('injected write failure'));
+    const answer = answerCliAsyncInput(uid, cid, 'question', ['Current']);
+    const cancel = cancelCliAsyncInput(uid, cid, 'question');
+    expect(await answer).toEqual({ ok: false, error: 'save_failed' });
+    expect(await cancel).toEqual({ ok: false, error: 'already_answered' });
+    expect(await answerCliAsyncInput(uid, cid, 'question', ['Current'])).toEqual({ ok: true, message: h.message });
+    expect(await cancelCliAsyncInput(uid, cid, 'question')).toEqual({ ok: true, message: h.message });
+    expect(h.saveCancelled).not.toHaveBeenCalled();
+    expect(h.submit).toHaveBeenCalledOnce();
+  });
+
   it('keeps an unanswered question available beyond ten minutes while its CLI turn accepts input', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1000);

@@ -66,7 +66,7 @@ export function enumerateAllInjectedTools(): AgentTool[] {
     onArtifactCreated: () => {},
     onOutputsPublished: (paths) => paths,
   }));
-  tools.push(...createFileTools({ userId, cid, includeOcrFile: true }));
+  tools.push(...createFileTools({ userId, cid }));
   tools.push(createLibraryTool({ userId }));
   tools.push(createChatHistoryTool({ userId }));
   tools.push(createImageGenTool({ userId, cid }));

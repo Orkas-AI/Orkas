@@ -299,12 +299,12 @@ test.describe('library and global search', () => {
     const primaryResult = allResults.filter({
       has: page.locator('.search-result-project', { hasText: projectName }),
     });
-    await primaryResult.click();
+    const preview = await orkas.openPreview(() => primaryResult.click());
 
     await expect(overlay).toBeHidden();
     await expect(page.locator('#panel-project')).toHaveClass(/\bactive\b/);
-    await expect(page.locator('.chat-file-viewer')).toBeVisible();
-    await expect(page.locator('.chat-file-viewer')).toContainText(marker);
+    await expect(preview.locator('.chat-file-viewer')).toBeVisible();
+    await expect(preview.locator('.chat-file-viewer')).toContainText(marker);
 
     await page.keyboard.press(searchShortcut);
     await expect(overlay).toBeVisible();
@@ -317,6 +317,112 @@ test.describe('library and global search', () => {
     await expect(scopedResults.locator('.search-result-project', { hasText: projectName })).toHaveCount(1);
     await expect(scopedResults.locator('.search-result-project', { hasText: otherProjectName })).toHaveCount(0);
     await expect(scopedResults.locator('.search-result-project')).toHaveCount(1);
+  });
+
+  test('resolves unsaved Library edits before switching projects', async ({ orkas }) => {
+    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+    const page = orkas.page;
+    await page.evaluate(async () => { await (window as any).setLang('zh'); });
+    await orkas.invoke('projects.create', { name: 'Review Project' });
+    for (const name of ['first.md', 'second.md']) {
+      await orkas.invoke('contexts.write', { path: name, content: `Original ${name}` });
+    }
+    await page.locator('#contexts-btn').click();
+    const selector = page.locator('#contexts-project-select-trigger');
+    const menu = page.locator('#contexts-project-select-listbox');
+    const editor = page.locator('#contexts-viewer-body textarea');
+    const dialog = page.locator('.ui-dialog-overlay:visible');
+    for (const name of ['first.md', 'second.md']) {
+      await page.locator(`#contexts-tree [data-path="${name}"] > .skill-tree-node`).click();
+      await page.locator('[data-mve-action="edit"]').click();
+      await editor.fill(`Edited ${name}`);
+    }
+    await selector.click();
+    await menu.getByRole('option', { name: 'Review Project', exact: true }).click();
+    await expect(dialog).toContainText('是否保存 2 个文件的修改');
+    await expect(selector).toContainText('全局');
+    await expect(dialog.getByRole('button')).toHaveText(['不保存', '保存']);
+    await dialog.getByRole('button', { name: '保存', exact: true }).click();
+    await expect(selector).toContainText('Review Project');
+    for (const name of ['first.md', 'second.md']) {
+      expect((await orkas.invoke<any>('contexts.read', { path: name })).content).toBe(`Edited ${name}`);
+    }
+    await selector.click();
+    await menu.getByRole('option', { name: '全局', exact: true }).click();
+    await page.locator('#contexts-tree [data-path="first.md"] > .skill-tree-node').click();
+    await page.locator('[data-mve-action="edit"]').click();
+    await editor.fill('Discard this change');
+    await selector.click();
+    await menu.getByRole('option', { name: 'Review Project', exact: true }).click();
+    await dialog.getByRole('button', { name: '不保存', exact: true }).click();
+    await expect(selector).toContainText('Review Project');
+    await selector.click();
+    await menu.getByRole('option', { name: '全局', exact: true }).click();
+    await page.locator('#contexts-tree [data-path="first.md"] > .skill-tree-node').click();
+    await expect(editor).toHaveCount(0);
+    await expect(page.locator('#contexts-viewer-body')).toContainText('Edited first.md');
+    expect((await orkas.invoke<any>('contexts.read', { path: 'first.md' })).content).toBe('Edited first.md');
+  });
+
+  test('switches between Global and every project without mixing same-named files', async ({ orkas }, testInfo) => {
+    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+    const page = orkas.page;
+    const fileName = 'same.md';
+    const alpha = await orkas.invoke<any>('projects.create', { name: 'Alpha Library' });
+    const beta = await orkas.invoke<any>('projects.create', { name: 'Beta Library' });
+    expect(alpha.ok && beta.ok).toBe(true);
+    await orkas.invoke('contexts.write', { path: fileName, content: 'Global original' });
+    await orkas.invoke('projects.files.upload', {
+      projectId: alpha.project.project_id, name: fileName, data: Buffer.from('Alpha original').toString('base64'),
+    });
+    await page.locator('#contexts-btn').click();
+    const selector = page.locator('#contexts-project-select-trigger');
+    await expect(selector).toContainText('Global');
+    await page.locator(`#contexts-tree [data-path="${fileName}"] > .skill-tree-node`).click();
+    await expect(page.locator('#contexts-viewer-body')).toContainText('Global original');
+    await selector.click();
+    const menu = page.locator('#contexts-project-select-listbox');
+    await expect(menu.locator('[role="option"]')).toHaveCount(3);
+    await expect(menu).toContainText('Global');
+    await page.screenshot({ path: testInfo.outputPath('library-project-menu.png') });
+    await menu.getByRole('option', { name: 'Alpha Library', exact: true }).click();
+    await expect(selector).toContainText('Alpha Library');
+    await expect(page.locator('#panel-contexts')).toHaveClass(/\bactive\b/);
+    await expect(page.locator('#contexts-viewer-wrap')).toBeHidden();
+    const row = page.locator(`#contexts-tree [data-path="${fileName}"]`);
+    await row.locator(':scope > .skill-tree-node').click();
+    await expect(page.locator('#contexts-viewer-body')).toContainText('Alpha original');
+    await page.locator('[data-mve-action="edit"]').click();
+    await page.locator('#contexts-viewer-body textarea').fill('Alpha edited');
+    await page.locator('[data-mve-action="save"]').click();
+    await expect(page.locator('#contexts-viewer-body')).toContainText('Alpha edited');
+    const saved = await orkas.invoke<any>('projects.files.readText', { projectId: alpha.project.project_id, name: fileName });
+    expect(saved.content).toBe('Alpha edited');
+    expect((await orkas.invoke<any>('contexts.read', { path: fileName })).content).toBe('Global original');
+
+    await selector.click();
+    await menu.getByRole('option', { name: 'Beta Library', exact: true }).click();
+    await expect(page.locator('#contexts-tree .empty')).toBeVisible();
+    const upload = orkas.createFixtureFile('beta-only.md', 'Beta upload');
+    await orkas.selectFilesOnNextDialog([upload]);
+    await page.locator('#ctx-root-menu-btn').click();
+    await page.locator('#ctx-row-menu [data-action="upload"]').click();
+    await expect(page.locator('#contexts-tree [data-path="beta-only.md"]')).toBeVisible();
+    expect((await orkas.invoke<any>('projects.files.readText', { projectId: beta.project.project_id, name: 'beta-only.md' })).content).toBe('Beta upload');
+    expect((await orkas.invoke<any>('contexts.tree')).tree.map((file: any) => file.name)).toEqual([fileName]);
+
+    await selector.click();
+    await menu.getByRole('option', { name: 'Alpha Library', exact: true }).click();
+    await row.hover();
+    await row.locator('[data-menu]').click();
+    await page.locator('#ctx-row-menu [data-action="delete"]').click();
+    await page.locator('.ui-dialog-overlay:visible [data-act="ok"]').click();
+    await expect(row).toHaveCount(0);
+    await selector.click();
+    await menu.getByRole('option', { name: 'Global', exact: true }).click();
+    await expect(row).toBeVisible();
+    await row.locator(':scope > .skill-tree-node').click();
+    await expect(page.locator('#contexts-viewer-body')).toContainText('Global original');
   });
 
   test('uploads, previews, renames, persists, and deletes a Library file', async ({ orkas }) => {
@@ -362,9 +468,12 @@ test.describe('library and global search', () => {
     await expect(relaunchedPage.locator('#contexts-tree .empty')).toBeVisible();
   });
 
-  test('moves a Library file into a project and persists exactly one destination', async ({ orkas }) => {
+  for (const mode of ['move', 'copy'] as const) for (const save of [true, false]) {
+  test(`${mode} a Library file after save=${save} and preserves the chosen bytes`, async ({ orkas }) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     let page = orkas.page;
+    await page.evaluate(async () => { await (window as any).setLang('zh'); });
+    const edited = 'Unsaved transfer edits';
     const fileName = 'E2E transfer source.md';
     const projectName = 'E2E Transfer Destination';
     const created = await orkas.invoke<{
@@ -380,12 +489,21 @@ test.describe('library and global search', () => {
     await page.locator('#contexts-btn').click();
     let sourceRow = page.locator(`.ctx-tree-wrap[data-path="${fileName}"]`);
     await expect(sourceRow).toBeVisible();
+    await sourceRow.locator(':scope > .skill-tree-node').click();
+    await page.locator('[data-mve-action="edit"]').click();
+    await page.locator('#contexts-viewer-body textarea').fill(edited);
     await sourceRow.hover();
     await sourceRow.locator('[data-menu]').click();
     await page.locator('#ctx-row-menu .ctx-row-menu-item[data-action="organize"]').click();
 
+    const saveDialog = page.locator('.ui-dialog-overlay:visible');
+    await expect(saveDialog.locator('.ui-dialog-message')).toHaveText('是否保存修改？');
+    await expect(saveDialog.getByRole('button')).toHaveText(['不保存', '保存']);
+    await saveDialog.getByRole('button', { name: save ? '保存' : '不保存', exact: true }).click();
+
     const dialog = page.locator('#library-transfer-overlay');
     await expect(dialog).toBeVisible();
+    await dialog.locator(`label:has([data-transfer-mode="${mode}"])`).click();
     await dialog.locator('[data-transfer-library] .ai-select-trigger').click();
     const popover = page.locator('body > .ai-select-popover:not([hidden])');
     await popover.locator('.ai-select-item', { hasText: projectName }).click();
@@ -395,7 +513,13 @@ test.describe('library and global search', () => {
 
     await expect(dialog).toHaveCount(0);
     sourceRow = page.locator(`.ctx-tree-wrap[data-path="${fileName}"]`);
-    await expect(sourceRow).toHaveCount(0);
+    await expect(sourceRow).toHaveCount(mode === 'move' ? 0 : 1);
+    const transferred = await orkas.invoke<any>('projects.files.readText', { projectId: created.project.project_id, name: fileName });
+    expect(transferred.content).toBe(save ? edited : '# Transfer proof\n\nThis file must have one durable owner.');
+    if (mode === 'copy') {
+      expect((await orkas.invoke<any>('contexts.read', { path: fileName })).content).toBe(transferred.content);
+      if (!save) await expect(page.locator('#contexts-viewer-body textarea')).toHaveValue(edited);
+    }
     let destination = await orkas.invoke<{
       tree: Array<{ name: string }>;
     }>('projects.files.tree', { projectId: created.project.project_id });
@@ -403,12 +527,13 @@ test.describe('library and global search', () => {
 
     page = await orkas.relaunch();
     await page.locator('#contexts-btn').click();
-    await expect(page.locator(`.ctx-tree-wrap[data-path="${fileName}"]`)).toHaveCount(0);
+    await expect(page.locator(`.ctx-tree-wrap[data-path="${fileName}"]`)).toHaveCount(mode === 'move' ? 0 : 1);
     destination = await orkas.invoke<{
       tree: Array<{ name: string }>;
     }>('projects.files.tree', { projectId: created.project.project_id });
     expect(destination.tree.filter((entry) => entry.name === fileName)).toHaveLength(1);
   });
+  }
 
   test('searches a real agent and navigates to its detail page', async ({ orkas }) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');

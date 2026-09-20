@@ -14,8 +14,9 @@
  * advisory so existing skills stay importable.
  */
 
+import { estimateBudgetTokens } from '../../util/token-estimate';
 import { Violation } from '../types';
-import { SKILL_DESCRIPTION_ROSTER_MAX_CHARS } from '../../util/skill-description-policy';
+import { SKILL_DESCRIPTION_ROSTER_MAX_TOKENS } from '../../util/skill-description-policy';
 
 // Skill name pattern: starts with a letter, then word chars / dashes.
 // Spaces are not allowed. Mirrors `skills.ts::SKILL_NAME_RE`.
@@ -205,13 +206,13 @@ export function validateSkillFrontmatter(
       ['description_zh', zh], ['description_en', en], ['description', generic],
       ['_meta.descriptions.zh', metaDescriptions.zh], ['_meta.descriptions.en', metaDescriptions.en],
     ] as const) {
-      if (value.length > SKILL_DESCRIPTION_ROSTER_MAX_CHARS) {
+      if (estimateBudgetTokens(value) > SKILL_DESCRIPTION_ROSTER_MAX_TOKENS) {
         out.push({
           level: 'MEDIUM',
           rule: 'frontmatter_description_too_long',
           field: `frontmatter:${field}`,
           snippet: `${value.slice(0, 80)}…`,
-          suggested_fix: `Keep ${field} at or below ${SKILL_DESCRIPTION_ROSTER_MAX_CHARS} characters — longer runtime roster text is shortened with an ellipsis, so put routing-critical signal first.`,
+          suggested_fix: `Keep ${field} at or below ${SKILL_DESCRIPTION_ROSTER_MAX_TOKENS} estimated tokens — longer runtime roster text is shortened with an ellipsis, so put routing-critical signal first.`,
         });
       }
     }

@@ -67,7 +67,14 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 function normalizeField(field: CatalogConnectionField, raw: unknown): string {
   if (typeof raw !== 'string' || !raw.trim()) throw new Error(`connector parameter required: ${field.key}`);
   const value = raw.trim();
+  if (field.format === 'yahoo_public_key') {
+    return require(path.join(pcDirForChild(), 'bin/yahoo-shopping-api.cjs')).normalizePublicKey(value);
+  }
   if (/[\u0000-\u001f\u007f]/.test(value) || value.length > 4096) throw new Error(`invalid connector parameter: ${field.key}`);
+  if (field.format === 'yahoo_seller_id' || field.format === 'yahoo_key_version') {
+    if (!(field.format === 'yahoo_seller_id' ? /^[a-z0-9_-]{1,128}$/ : /^[1-9][0-9]{0,5}$/).test(value)) throw new Error('Invalid Yahoo! Shopping seller or key version');
+    return value;
+  }
   if (field.format === 'client_id' || field.format === 'app_key') {
     if (value.length < 3 || value.length > 512) throw new Error(`invalid connector ${field.format === 'app_key' ? 'app key' : 'client ID'}: ${field.key}`);
     return value;
@@ -91,6 +98,9 @@ function normalizeField(field: CatalogConnectionField, raw: unknown): string {
   }
   if (field.format === 'magento_store_url') {
     return require(path.join(pcDirForChild(), 'bin/magento-admin-api.cjs')).normalizeBinding(value);
+  }
+  if (field.format === 'futureshop_api_origin') {
+    return require(path.join(pcDirForChild(), 'bin/futureshop-api.cjs')).normalizeBinding(value);
   }
   if (field.format === 'shopify_shop_domain') {
     let host = value.toLowerCase();

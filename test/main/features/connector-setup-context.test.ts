@@ -83,7 +83,8 @@ describe('connector setup assistance context', () => {
     expect(fs.readFileSync(path.join(chatRoot, `${conv.conversation_id}.jsonl`), 'utf8')).toBe('');
     expect(fs.readFileSync(path.join(chatRoot, '_index.json'), 'utf8')).not.toContain(setup.connectorSetupGuidance());
     const fetched = await chats.getConversation('u1', conv.conversation_id);
-    fetched!.assistance!.connector_id = 'notion';
+    if (fetched?.assistance?.kind !== 'connector_setup') throw new Error('Missing connector association');
+    fetched.assistance.connector_id = 'notion';
     expect(await setup.formatConnectorSetupForTurn('u1', conv.conversation_id)).toBe(first);
 
     vi.resetModules();
@@ -115,7 +116,9 @@ describe('connector setup assistance context', () => {
       assistance: { kind: 'connector_setup', connector_id: 'removed-provider' },
     });
     expect(await setup.formatConnectorSetupForTurn('u1', conv.conversation_id)).toBe('');
-    expect((await chats.getConversation('u1', conv.conversation_id))?.assistance?.connector_id).toBe('removed-provider');
+    expect((await chats.getConversation('u1', conv.conversation_id))?.assistance).toEqual({
+      kind: 'connector_setup', connector_id: 'removed-provider',
+    });
     await chats.updateConversation('u1', conv.conversation_id, { assistance: {
       kind: 'connector_setup', connector_id: 'notion', secret: 'must-not-persist',
     } as any });

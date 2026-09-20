@@ -92,10 +92,10 @@ describe('external CLI Agent detail layout', () => {
 
   it('ships concise runtime labels and the permission control', () => {
     const labels = {
-      en: { section: 'Runtime settings', defaultOption: 'Default', aliasLatest: 'latest', permissionPath: 'AI Team >' },
-      zh: { section: '运行设置', defaultOption: '默认', aliasLatest: '最新版', permissionPath: 'AI 团队 >' },
-      ja: { section: '実行設定', defaultOption: 'デフォルト', aliasLatest: '最新版', permissionPath: 'AI チーム >' },
-      pt: { section: 'Configurações de execução', defaultOption: 'Padrão', aliasLatest: 'mais recente', permissionPath: 'Equipe de IA >' },
+      en: { section: 'Runtime settings', defaultOption: 'Default', permissionPath: 'AI Team >' },
+      zh: { section: '运行设置', defaultOption: '默认', permissionPath: 'AI 团队 >' },
+      ja: { section: '実行設定', defaultOption: 'デフォルト', permissionPath: 'AI チーム >' },
+      pt: { section: 'Configurações de execução', defaultOption: 'Padrão', permissionPath: 'Equipe de IA >' },
     };
 
     for (const [locale, copy] of Object.entries(labels)) {
@@ -104,7 +104,10 @@ describe('external CLI Agent detail layout', () => {
       );
       expect(table['agents.label_cli_settings']).toBe(copy.section);
       expect(table['agents.cli_default']).toBe(copy.defaultOption);
-      expect(table['agents.cli_model_alias_latest']).toBe(copy.aliasLatest);
+      // An alias row names the concrete model it runs today, so no locale
+      // keeps a "latest" placeholder the user cannot act on. The hint alone
+      // still says the alias follows later Claude Code updates.
+      expect(table['agents.cli_model_alias_latest']).toBeUndefined();
       expect(table['agents.cli_model_alias_hint']).toBeTruthy();
       expect(table['agents.cli_model_recent']).toContain('{model}');
       expect(table['agents.cli_current_default']).toBeUndefined();
@@ -137,6 +140,22 @@ describe('external CLI Agent detail layout', () => {
     // CLI reports it, instead of a bare "Default" the user cannot act on.
     expect(settings).toContain("const resolvedDefault = String(info.default_model_resolved || '').trim()");
     expect(settings).toContain("? `${t('agents.cli_default')} · ${resolvedDefault}`");
+    // An alias label states the version the CLI reports for it now; the model
+    // observed on the last run is the fallback for a CLI that reports none,
+    // and a resolution that is unknown appends nothing rather than a placeholder.
+    expect(settings).toContain("String(model?.resolved_model || '').trim()");
+    expect(settings).toContain("|| (id === currentModel ? observedModelForCurrentSelection : '')");
+    expect(settings).toContain(
+      'label: resolvedModel && resolvedModel !== label ? `${label} · ${resolvedModel}` : label,',
+    );
+    expect(settings).not.toContain('cli_model_alias_latest');
+    // The picker states the resolution of every listed row, so the separate
+    // "recently used" note is left for a saved override the catalog omits.
+    expect(settings).toContain(
+      "const selectedModelIsListed = models.some(model => String(model?.id || '') === currentModel)",
+    );
+    expect(settings).toContain('&& !selectedModelIsListed');
+    expect(settings).not.toContain('selectedModelIsAlias');
     expect(settings).toContain("if (!thinkingOptions.some(option => option.value === ''))");
     expect(settings).toContain("thinkingOptions.unshift({ value: '', label: t('agents.cli_default') })");
     expect(settings).toContain('data-role="permission"');
@@ -155,5 +174,104 @@ describe('external CLI Agent detail layout', () => {
     expect(settings).toContain('(!info.can_select_thinking || thinkingUnsupported) && !currentThinking');
     expect(settings).toContain('_mergeAgentIntoCache(saved.agent)');
     expect(settings).not.toContain('_agentsCache = null');
+  });
+});
+
+// The picker is what a user reads before pinning an Agent to a model, so the
+// rows must name the model each choice runs rather than a placeholder that
+// cannot be checked against a release note or a support thread. The option
+// loop is run here directly so the assertions are the visible strings.
+describe('external CLI Agent model picker labels', () => {
+  const source = fs.readFileSync(path.join(rendererRoot, 'modules/agents.js'), 'utf8');
+
+  function buildModelOptions(input: {
+    models: Array<Record<string, unknown>>;
+    defaultModelId?: string;
+    currentModel?: string;
+    observed?: string;
+  }): Array<{ value: string; label: string; hint: string }> {
+    const start = source.indexOf('  for (const model of models) {');
+    expect(start).toBeGreaterThan(-1);
+    const end = source.indexOf('\n  }\n', start);
+    expect(end).toBeGreaterThan(start);
+    const loop = source.slice(start, end + 4);
+    const context = vm.createContext({
+      models: input.models,
+      defaultModelId: input.defaultModelId || '',
+      currentModel: input.currentModel || '',
+      observedModelForCurrentSelection: input.observed || '',
+      modelOptions: [] as Array<Record<string, string>>,
+      seenModelIds: new Set<string>(),
+      t: (key: string) => (key === 'agents.cli_default' ? 'Default' : key),
+    });
+    vm.runInContext(loop, context);
+    return (context as any).modelOptions;
+  }
+
+  it('names the model version every row runs, alias or pinned', () => {
+    const options = buildModelOptions({
+      models: [
+        { id: 'opus[1m]', label: 'Opus (1M context)', is_alias: true, resolved_model: 'claude-opus-5[1m]' },
+        { id: 'sonnet', label: 'Sonnet', is_alias: true, resolved_model: 'claude-sonnet-5' },
+        // A pinned id whose display name carries no version: "Fable" alone
+        // leaves the user unable to tell which release it is.
+        { id: 'claude-fable-5-1[1m]', label: 'Fable', resolved_model: 'claude-fable-5-1' },
+        // A label that already is the model id must not repeat it.
+        { id: 'gpt-x', label: 'gpt-x', resolved_model: 'gpt-x' },
+      ],
+    });
+    expect(options.map(option => option.label)).toEqual([
+      'Opus (1M context) · claude-opus-5[1m]',
+      'Sonnet · claude-sonnet-5',
+      'Fable · claude-fable-5-1',
+      'gpt-x',
+    ]);
+    // The hint keeps saying the alias follows later Claude Code updates, so the
+    // named version reads as "today's", not as a pin. A pinned row gets no
+    // such hint even though it now names a version too.
+    expect(options[0].hint).toBe('agents.cli_model_alias_hint');
+    expect(options[2].hint).toBe('');
+  });
+
+  it('falls back to the model observed on the last run, and appends nothing when neither is known', () => {
+    const [selected, other] = buildModelOptions({
+      // A CLI build that answers no catalog resolution: only the run that
+      // actually happened can name a version.
+      models: [
+        { id: 'opus', label: 'Opus', is_alias: true },
+        { id: 'sonnet', label: 'Sonnet', is_alias: true },
+      ],
+      currentModel: 'opus',
+      observed: 'claude-opus-5',
+    });
+    expect(selected.label).toBe('Opus · claude-opus-5');
+    // The observation covers only what actually ran; another alias must not
+    // borrow it, and no locale placeholder stands in for the unknown version.
+    expect(other.label).toBe('Sonnet');
+  });
+
+  it('prefers the catalog resolution over a stale observation of the same alias', () => {
+    const [option] = buildModelOptions({
+      models: [{ id: 'opus', label: 'Opus', is_alias: true, resolved_model: 'claude-opus-5-2' }],
+      currentModel: 'opus',
+      observed: 'claude-opus-5',
+    });
+    expect(option.label).toBe('Opus · claude-opus-5-2');
+  });
+
+  it('keeps the default row naming the model that choice runs', () => {
+    // The default doubles as "inherit the CLI default" and persists as an empty
+    // override, so its own row must still say which model that is.
+    const options = buildModelOptions({
+      models: [
+        { id: 'opus[1m]', label: 'Opus (1M context)', is_alias: true, resolved_model: 'claude-opus-5[1m]' },
+      ],
+      defaultModelId: 'opus[1m]',
+    });
+    expect(options).toEqual([{
+      value: '',
+      label: 'Opus (1M context) · claude-opus-5[1m]',
+      hint: 'Default · agents.cli_model_alias_hint',
+    }]);
   });
 });

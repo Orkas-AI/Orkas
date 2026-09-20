@@ -166,6 +166,49 @@ describe("SandboxExecutor", () => {
     expect(result.stderr).toContain("blocked");
   });
 
+  it.each([
+    "printf '%s\\n' shutdown", "echo reboot", "rg shutdown README.md",
+    "redis-cli -p 6379 shutdown nosave", "cat docs/shutdown.md",
+    "printf '%s\\n' 'rm -rf /'", "echo init 0", "echo mkfs.ext4",
+    "echo shutdown | cat", "cat < /dev/sda",
+  ])("does not mistake literal arguments for blocked execution: %s", (command) => {
+    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
+    // Check admission without executing service mutations or destructive commands.
+    expect((sandbox as any).checkBlockedCommand(command)).toBeNull();
+  });
+
+  it.each([
+    "shutdown -h now", "/sbin/reboot", "halt", "mkfs.ext4 /dev/example",
+    "rm -rf /", "rm -rf /*", "dd if=/dev/zero of=/dev/example",
+    "chmod -R 777 /", "init 0", "init 6", "echo test > /dev/sda",
+    "echo ready; shutdown -h now", "echo ready && reboot", "echo ready | halt",
+    '"shut""down" -h now', "sudo shutdown -h now", "env X=1 reboot",
+    "sh -c 'shutdown -h now'", 'echo "$(shutdown -h now)"',
+    "python -c 'import os; os.system(\"shutdown -h now\")'",
+    ":(){ :|:& };:", "! reboot", "su -c shutdown", "ssh host shutdown",
+    "X=1 /sbin/shutdown", '"C:\\Windows\\System32\\shutdown.exe" /s',
+  ])("retains dangerous and opaque command denial: %s", (command) => {
+    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
+    expect((sandbox as any).checkBlockedCommand(command)).not.toBeNull();
+  });
+
+  it("prints a blocked command name as data in foreground and detached execution", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-literal-"));
+    const sandbox = new SandboxExecutor({ workingDir: dir });
+    const command = "echo shutdown";
+    try {
+      const foreground = await sandbox.execute(command);
+      expect(foreground.exitCode).toBe(0);
+      expect(foreground.stdout.trim()).toBe("shutdown");
+      const logPath = path.join(dir, "output.log");
+      const background = sandbox.executeBackground(command, logPath);
+      expect(background.error).toBeUndefined();
+      expect(background.pid).toBeGreaterThan(0);
+      await expect.poll(async () => (await fs.readFile(logPath, "utf8")).trim()).toBe("shutdown");
+      await waitForProcessExit(background.pid!);
+    } finally { await removeTree(dir); }
+  }, NATIVE_SHELL_TEST_TIMEOUT_MS);
+
   it("blocks custom commands", async () => {
     const sandbox = new SandboxExecutor({
       workingDir: os.tmpdir(),
@@ -299,7 +342,7 @@ describe("SandboxExecutor", () => {
 });
 
 describe("killProcessTree", () => {
-  it("uses taskkill to terminate Windows child process trees", () => {
+  it("uses bounded native Windows tree cleanup and reports fallback failure", () => {
     const callbacks = new Map<string, (...args: any[]) => void>();
     const killer = {
       once: vi.fn((event: string, cb: (...args: any[]) => void) => {
@@ -316,16 +359,23 @@ describe("killProcessTree", () => {
       spawnFn: spawnFn as any,
     });
 
-    expect(String(spawnFn.mock.calls[0][0]).toLowerCase()).toMatch(/taskkill\.exe$/);
-    expect(spawnFn).toHaveBeenCalledWith(expect.any(String), ["/pid", "1234", "/t", "/f"], {
-      stdio: "ignore",
+    expect(String(spawnFn.mock.calls[0][0]).toLowerCase()).toMatch(/powershell\.exe$/);
+    expect(spawnFn).toHaveBeenCalledWith(expect.any(String), expect.arrayContaining(["-NoProfile", "-EncodedCommand"]), {
+      stdio: ["pipe", "pipe", "ignore"],
       windowsHide: true,
+      timeout: 5_000,
     });
     expect(killer.unref).toHaveBeenCalled();
     expect(child.kill).not.toHaveBeenCalled();
 
-    callbacks.get("exit")?.(1);
-    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      callbacks.get("exit")?.(1);
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+      expect(warning).toHaveBeenCalledWith("[sandbox]", "Shell process tree termination failed", {
+        platform: "win32", fallback: "direct_child_only",
+      });
+    } finally { warning.mockRestore(); }
   });
 
   it("kills POSIX process groups when a pid is available", () => {

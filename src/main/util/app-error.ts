@@ -66,3 +66,16 @@ export function normalizeAppError(err: unknown): NormalizedAppError {
 
   return { code: AppErrorCode.UNKNOWN, error: raw };
 }
+
+/** Closed filesystem diagnosis carried across internal Result/Error boundaries.
+ * Never classify caller-visible text: callers may deliberately mask paths/errors. */
+export type FileFailureKind = 'not_found' | 'permission_denied' | 'disk_full' | 'operation_failed';
+export function fileFailureKind(error: unknown): FileFailureKind {
+  const value = error as { code?: unknown; failure_kind?: unknown } | null;
+  const carried = value?.failure_kind;
+  if (carried === 'not_found' || carried === 'permission_denied' || carried === 'disk_full' || carried === 'operation_failed') return carried;
+  const code = value?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR' ? 'not_found'
+    : code === 'EACCES' || code === 'EPERM' ? 'permission_denied'
+      : code === 'ENOSPC' ? 'disk_full' : 'operation_failed';
+}

@@ -156,7 +156,7 @@ describe('features/config › initLanguage', () => {
   it('falls back to en for unsupported locales on first boot', async () => {
     const paths = await import('../../../src/main/paths');
     const prefPath = paths.userPreferencesFile(TEST_UID);
-    for (const locale of ['en-US', 'fr-FR', '']) {
+    for (const locale of ['en-US', 'ar-SA', '']) {
       fs.rmSync(prefPath, { force: true });
       vi.resetModules();
       const users = await import('../../../src/main/features/users');
@@ -170,7 +170,7 @@ describe('features/config › initLanguage', () => {
 
   it('overwrites corrupt language value with detected default', async () => {
     const { appConfig } = await load();
-    appConfig.writeConfig({ language: 'fr' as unknown as 'en' });
+    appConfig.writeConfig({ language: 'ar' as unknown as 'en' });
     expect(appConfig.initLanguage('zh-HK')).toBe('zh');
     expect(appConfig.readConfig().language).toBe('zh');
   });
@@ -186,7 +186,7 @@ describe('features/config › setLanguage', () => {
 
   it('rejects unsupported languages', async () => {
     const { appConfig } = await load();
-    expect(() => appConfig.setLanguage('fr' as unknown as 'en')).toThrow();
+    expect(() => appConfig.setLanguage('ar' as unknown as 'en')).toThrow();
   });
 
   it('refreshes in-memory current lang from synced preferences without rewriting', async () => {

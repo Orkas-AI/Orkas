@@ -8,6 +8,7 @@
  *   - Abort group + drop on conv delete
  */
 
+import { projectConversationHistoryRecords } from '../conversation_history_cache';
 import { inspectCodingDirectory } from '../local_agents/project-directory';
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
@@ -26,15 +27,18 @@ import { fileEditLock } from '../../util/locks';
 
 import {
   COMMANDER_ID, USER_ID, readMembers, readState, seedReservedActors, purgeGroupDir,
-  setCodingProjectDir, setStatus, actorSessionId, setActiveRecipients, type Actor,
+  setCodingProjectDir, setStatus, recoverOrphanRunningState, actorSessionId, setActiveRecipients, type Actor,
 } from './state';
 import { isPlaceholderTitle } from './conv_title';
 import type { CommanderMentionDisplay } from './message-display';
 import {
-  abort as busAbort, dropConv as busDropConv, enqueue, subscribe, isQuiescent, runtimeSnapshot,
+  abort as busAbort, dropConv as busDropConv, enqueue, subscribe, isQuiescent, runtimeSnapshot, liveDisplaySnapshot,
   type GroupEvent,
   cancelConversationTask as busCancelConversationTask,
   sendConversationTaskNow as busSendConversationTaskNow,
+  editConversationTask as busEditConversationTask,
+  beginConversationTaskEdit as busBeginConversationTaskEdit,
+  cancelConversationTaskEdit as busCancelConversationTaskEdit,
   listConversationTasks as busListConversationTasks,
   setConversationTaskAfter as busSetConversationTaskAfter,
   resumeBlockedTask as busResumeBlockedTask,
@@ -48,6 +52,19 @@ import {
  *  authoritative source. */
 export const busIsQuiescent = isQuiescent;
 
+/** Reuse history's lazy tool-output projection for an active public turn. */
+export function displaySnapshot(userId: string, cid: string, projectIdHint?: string | null) {
+  const snapshot = liveDisplaySnapshot(userId, cid);
+  const source = conversationMessageReadFile(userId, cid, projectIdHint);
+  return {
+    ...snapshot,
+    turns: snapshot.turns.map((turn) => ({
+      ...turn,
+      records: projectConversationHistoryRecords(userId, source, turn.records),
+    })),
+  };
+}
+
 export async function runtimeStatus(
   userId: string,
   cid: string,
@@ -55,21 +72,23 @@ export async function runtimeStatus(
 ): Promise<{ processing: boolean; processing_since: string | null; in_flight: string[]; active_turns: Array<{ actor: string; turn_id: string; msg_id?: string; steerable: boolean; started_at_ms: number }>; active_recipient?: string; active_recipients?: string[]; active_recipient_revision?: number }> {
   if (!safeId(cid)) return { processing: false, processing_since: null, in_flight: [], active_turns: [] };
   try {
-    const state = await readState(userId, cid, projectIdHint);
-    const runtime = runtimeSnapshot(userId, cid);
-    const diskInFlight = Array.isArray(state.in_flight)
-      ? state.in_flight.filter(Boolean)
-      : [];
+    let state = await readState(userId, cid, projectIdHint);
+    let runtime = runtimeSnapshot(userId, cid);
+    if ((state.status === 'running' || state.in_flight.some(Boolean)) && !runtime.processing) {
+      const result = await recoverOrphanRunningState(userId, cid, () => !runtimeSnapshot(userId, cid).processing);
+      state = result.state;
+      // Admission can also start during the asynchronous recovery write.
+      runtime = runtimeSnapshot(userId, cid);
+      if (result.recovered) {
+        log.warn('healed orphan running state', { user_id: maskId(userId), cid: maskId(cid) });
+      }
+    }
+    const diskInFlight = state.in_flight.filter(Boolean);
     // The conversation floor — included so a renderer reload / recovery poll
     // restores the composer target (the agent the commander handed off to)
     // instead of dropping back to the commander until the next state_changed.
     const floor = { active_recipient_revision: state.active_recipient_revision || 0,
       ...(state.active_recipient ? { active_recipient: state.active_recipient } : {}) };
-    if ((state.status === 'running' || diskInFlight.length > 0) && !runtime.processing) {
-      log.warn(`healing orphan running state user=${userId} cid=${cid} status=${state.status} in_flight=${diskInFlight.join(',')}`);
-      await setStatus(userId, cid, 'idle');
-      return { processing: false, processing_since: null, in_flight: [], active_turns: [], ...floor };
-    }
     const inFlight = Array.from(new Set([
       ...diskInFlight,
       ...runtime.inFlight,
@@ -96,7 +115,7 @@ export { submitCliAsyncInput } from './bus';
 
 import type { ChatUseSelection, ChatMessageReference, GroupMessage } from './visibility';
 import {
-  type ChatFormPayload, encodeSubmission, buildMention,
+  type ChatFormPayload, encodeSubmission, buildMention, validateFormAnswers,
 } from './router';
 import type { MarketplaceInstallRequest } from './visibility';
 import * as marketplace from '../marketplace';
@@ -795,6 +814,36 @@ export async function sendTaskNow(userId: string, cid: string, taskId: string) {
   return busSendConversationTaskNow(userId, cid, taskId);
 }
 
+export function beginTaskEdit(userId: string, cid: string, taskId: string) {
+  if (!safeId(cid) || !safeId(taskId)) return { ok: false, error: 'invalid arguments' };
+  return busBeginConversationTaskEdit(userId, cid, taskId);
+}
+
+export function cancelTaskEdit(userId: string, cid: string, taskId: string) {
+  if (!safeId(cid) || !safeId(taskId)) return { ok: false, error: 'invalid arguments' };
+  return busCancelConversationTaskEdit(userId, cid, taskId);
+}
+
+export async function editTask(
+  userId: string, cid: string, taskId: string, instruction: string, expectedInstruction: string,
+  resources?: Pick<SendInput, 'attachments' | 'references' | 'use_selections'>,
+) {
+  if (!safeId(cid) || !safeId(taskId) || typeof instruction !== 'string'
+    || !instruction.trim() || typeof expectedInstruction !== 'string') {
+    return { ok: false as const, error: 'invalid arguments' };
+  }
+  if (resources && (!Array.isArray(resources.attachments)
+    || resources.attachments.some((name) => typeof name !== 'string' || !name || /[/\\\0]/.test(name) || name === '.' || name === '..')
+    || !Array.isArray(resources.references) || !Array.isArray(resources.use_selections))) {
+    return { ok: false, error: 'invalid arguments' };
+  }
+  const resolved = resources ? { attachments: resources.attachments,
+    use_selections: resources.use_selections,
+    references: await _resolveMessageReferences(userId, resources.references),
+  } : undefined;
+  return busEditConversationTask(userId, cid, taskId, instruction, expectedInstruction, resolved);
+}
+
 export async function setTaskAfter(
   userId: string,
   cid: string,
@@ -1131,6 +1180,9 @@ export async function markFormSubmittedAndDispatch(
       values,
     );
     if (!projectDirPreparation.ok) return projectDirPreparation;
+    if (!validateFormAnswers(target.form.fields, values)) {
+      return { ok: false, error: t('errors.form_input_invalid') };
+    }
 
     const agentId = target.form.agent_id;
 
@@ -1505,7 +1557,7 @@ export async function deleteMessages(
       if (actor.kind !== 'commander' && actor.kind !== 'agent') continue;
       const sid = actorSessionId(cid, actor);
       sessions.evictSession(sid);
-      sessions.deleteSessionFileForUser(userId, sid);
+      sessions.deleteSessionFileForUser(userId, sid, { preserveToolResults: true });
     }
   } catch (err) {
     log.warn('message delete session reset failed', { userId, cid, error: logErrorRef(err) });

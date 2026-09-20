@@ -1,10 +1,199 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { makeAcpBackend } from '../../../../src/main/features/local_agents/backends/_acp';
+import { killProcessTree } from '../../../../src/main/features/local_agents/backends/base';
 
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 
+function isAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
+}
+
 describe('local_agents/backends/_acp process lifecycle', () => {
+  it.each([
+    { mode: 'success', status: 'completed', output: 'ACP result' },
+    { mode: 'empty', status: 'completed', output: '' },
+    { mode: 'rpc-error', status: 'failed', output: 'ACP result', error: 'Synthetic prompt failure' },
+    { mode: 'stop-reason', status: 'failed', output: 'ACP result', error: 'max_tokens' },
+    { mode: 'session-error', status: 'failed', output: '', error: 'Synthetic session failure' },
+    { mode: 'cancel', status: 'cancelled', output: 'ACP result' },
+    { mode: 'no-terminal', status: 'timeout', output: 'ACP result', timeoutKind: 'idle' },
+    { mode: 'tool-stall', status: 'timeout', output: 'ACP result', timeoutKind: 'idle' },
+    { mode: 'approval-stall', status: 'timeout', output: 'ACP result', timeoutKind: 'idle' },
+  ])('settles $mode independently of a persistent ACP process and reaps its descendants', async ({ mode, ...expected }) => {
+    // A valid terminal owns the turn outcome even while the CLI and an
+    // inherited stdout pipe remain alive. Without a terminal, silence must
+    // still time out; cancellation already requested by the user must win.
+    const fixture = String.raw`
+      const mode = ${JSON.stringify(mode)};
+      const { spawn } = require('node:child_process');
+      const descendant = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'inherit' });
+      const send = m => process.stdout.write(JSON.stringify(m) + '\n');
+      process.stdout.write('descendant:' + descendant.pid + '\n');
+      setInterval(() => {}, 1000);
+      require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+        const m = JSON.parse(line);
+        if (m.method === 'initialize') send({ id: m.id, result: { protocolVersion: 1 } });
+        if (m.method === 'session/new') {
+          send(mode === 'session-error'
+            ? { id: m.id, error: { code: -32603, message: 'Synthetic session failure' } }
+            : { id: m.id, result: { sessionId: 'persistent-acp' } });
+        }
+        if (m.method === 'session/prompt') {
+          if (mode !== 'empty') send({ method: 'session/update', params: { update: {
+            sessionUpdate: 'agent_message_chunk', content: { text: 'ACP result' }
+          } } });
+          if (mode === 'no-terminal') return;
+          if (mode === 'tool-stall' || mode === 'approval-stall') {
+            send({ method: 'session/update', params: { update: {
+              sessionUpdate: 'tool_call', toolCallId: 'private-tool', title: 'private-command', status: 'pending'
+            } } });
+            send({ method: 'session/update', params: { update: {
+              sessionUpdate: 'tool_call_update', toolCallId: 'private-tool', status: 'in_progress'
+            } } });
+            if (mode === 'approval-stall') send({ id: 77, method: 'session/request_permission', params: { options: [] } });
+            return;
+          }
+          const terminal = mode === 'rpc-error'
+            ? { id: m.id, error: { code: -32603, message: 'Synthetic prompt failure' } }
+            : { id: m.id, result: { stopReason: mode === 'stop-reason' ? 'max_tokens' : 'end_turn' } };
+          // Coalesced late traffic must not mutate an already settled turn or
+          // open a new permission dialog, including a repeated terminal.
+          process.stdout.write([terminal, terminal,
+            { method: 'session/update', params: { update: {
+              sessionUpdate: 'agent_message_chunk', content: { text: 'late text' }
+            } } },
+            { id: 99, method: 'session/request_permission', params: { options: [] } }
+          ].map(JSON.stringify).join('\n') + '\n');
+        }
+      });
+    `;
+    const events: any[] = [];
+    const controller = new AbortController();
+    const requestPermission = vi.fn(() => mode === 'approval-stall'
+      ? new Promise<'deny'>(() => {}) : Promise.resolve('deny' as const));
+    let lastActivity = Date.now();
+    let pid = 0;
+    let descendantPid = 0;
+    try {
+      await makeAcpBackend({ logName: 'local-agents:test-acp', argv: ['-e', fixture], clientName: 'orkas-test' }).run({
+        binPath: TEST_NODE, cwd: process.cwd(), prompt: 'Return a result',
+        signal: controller.signal, requestPermission, permissionPolicy: 'ask',
+        timeoutMs: 5_000, idleKillMs: 500, lastEventAt: () => lastActivity,
+        onEvent: event => {
+          events.push(event);
+          lastActivity = Date.now();
+          if (event.type === 'process-info') pid = Number(event.pid);
+          if (event.type === 'raw-line') descendantPid = Number(String(event.line).split(':')[1]);
+          if (mode === 'cancel' && event.type === 'text-delta') controller.abort();
+        },
+      });
+      expect(events.filter(event => event.type === 'done')).toHaveLength(1);
+      const summaries = events.filter(event => event.source === 'acp-diagnostics');
+      expect(summaries).toHaveLength(1);
+      const summary = JSON.parse(summaries[0].message.slice(4));
+      expect(summary).toMatchObject({
+        status: expected.status, stage: mode === 'session-error' ? 'session_new' : 'prompt',
+        initAck: true,
+        end: expected.status === 'timeout' ? 'close' : mode === 'cancel' ? expect.any(String) : 'protocol',
+        pending: mode.endsWith('-stall') ? 1 : 0,
+        permissions: mode === 'approval-stall' ? 1 : 0,
+      });
+      expect(summaries[0].synthetic).toBe(true);
+      expect(summaries[0].message.length).toBeLessThanOrEqual(500);
+      expect(summaries[0].message).not.toContain('ACP result');
+      expect(summaries[0].message).not.toContain('persistent-acp');
+      expect(summaries[0].message).not.toContain('private-');
+      expect(events.at(-1)).toMatchObject({ type: 'done', ...expected });
+      expect(events.filter(event => event.type === 'stderr-line')).toEqual([]);
+      expect(events.some(event => event.text === 'late text')).toBe(false);
+      expect(requestPermission).toHaveBeenCalledTimes(mode === 'approval-stall' ? 1 : 0);
+      expect(pid).toBeGreaterThan(0);
+      expect(descendantPid).toBeGreaterThan(0);
+      const settledCount = events.length;
+      await vi.waitFor(() => {
+        expect(isAlive(pid)).toBe(false);
+        expect(isAlive(descendantPid)).toBe(false);
+      }, { timeout: 3_000, interval: 25 });
+      expect(events).toHaveLength(settledCount);
+    } finally {
+      if (pid && isAlive(pid)) killProcessTree({ pid, kill: signal => process.kill(pid, signal) }, 'SIGKILL');
+      if (descendantPid && isAlive(descendantPid)) process.kill(descendantPid, 'SIGKILL');
+    }
+  });
+
+  it.each(['missing-terminal', 'upstream-error'] as const)('preserves failure evidence for %s', async mode => {
+    const events: any[] = [];
+    let diagnosticReceived!: () => void;
+    const diagnostic = new Promise<void>(resolve => { diagnosticReceived = resolve; });
+    const fixture = String.raw`
+      const mode = ${JSON.stringify(mode)};
+      const send = m => process.stdout.write(JSON.stringify(m) + '\n');
+      let promptId;
+      require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+        const m = JSON.parse(line);
+        if (m.method === 'initialize') send({ id: m.id, result: { protocolVersion: 1 } });
+        if (m.method === 'session/new') send({ id: m.id, result: { sessionId: 'failure-acp' } });
+        if (m.method === 'session/prompt') {
+          if (mode === 'missing-terminal') return process.exit(0);
+          promptId = m.id;
+          process.stderr.write('HTTP 400: synthetic upstream failure\n');
+          // The permission exchange provides a deterministic barrier across
+          // stdout/stderr: the terminal follows collected diagnostic evidence.
+          send({ id: 77, method: 'session/request_permission', params: { options: [] } });
+        }
+        if (m.id === 77) send({ id: promptId, result: { stopReason: 'end_turn' } });
+      });
+    `;
+    await makeAcpBackend({ logName: 'local-agents:test-acp', argv: ['-e', fixture], clientName: 'orkas-test' }).run({
+      binPath: TEST_NODE, cwd: process.cwd(), prompt: 'Return a result',
+      signal: new AbortController().signal, permissionPolicy: 'ask', timeoutMs: 2_000,
+      requestPermission: async () => { await diagnostic; return 'deny'; },
+      onEvent: event => {
+        events.push(event);
+        if (event.type === 'stderr-line') diagnosticReceived();
+      },
+    });
+    expect(events.at(-1)).toMatchObject({
+      status: 'failed', output: '',
+      error: mode === 'missing-terminal'
+        ? 'cli closed without prompt result'
+        : expect.stringContaining('HTTP 400: synthetic upstream failure'),
+    });
+    expect(events.filter(event => event.type === 'stderr-line').map(event => event.line)).toEqual(
+      mode === 'upstream-error' ? ['HTTP 400: synthetic upstream failure'] : [],
+    );
+  });
+
+  it.each([false, true])('passes only the current run MCP server on ACP session start (resume=%s)', async (resume) => {
+    const server = { command: 'test-node', args: ['bridge.cjs'], env: { ORKAS_BRIDGE_ENV_FILE: 'run-local.json' } };
+    const probe = `
+      const assert = require('node:assert/strict');
+      const lines = require('node:readline').createInterface({input: process.stdin});
+      const send = m => process.stdout.write(JSON.stringify(m) + '\\n');
+      lines.on('line', line => {
+        const m = JSON.parse(line);
+        if (m.method === 'initialize') send({id:m.id,result:{protocolVersion:1}});
+        else if (m.method === 'session/new' || m.method === 'session/resume') {
+          assert.equal(m.method, ${JSON.stringify(resume ? 'session/resume' : 'session/new')});
+          assert.deepEqual(m.params.mcpServers, [{name:'orkas',command:'test-node',args:['bridge.cjs'],env:[{name:'ORKAS_BRIDGE_ENV_FILE',value:'run-local.json'}]}]);
+          send({id:m.id,result:{sessionId:'test-session'}});
+        } else if (m.method === 'session/prompt') {
+          send({method:'session/update',params:{update:{sessionUpdate:'agent_message_chunk',content:{text:'Scoped MCP registered'}}}});
+          send({id:m.id,result:{stopReason:'end_turn'}});
+        }
+      });
+    `;
+    const backend = makeAcpBackend({ logName: 'local-agents:test-acp', argv: ['-e', probe], clientName: 'orkas-test', resume });
+    const events: any[] = [];
+    await backend.run({ binPath: TEST_NODE, prompt: 'Use the current scope', cwd: process.cwd(),
+      bridge: { server, mcpConfigPath: 'run-config.json' }, resumeSessionId: resume ? 'test-session' : undefined,
+      signal: new AbortController().signal, timeoutMs: 2000, onEvent: event => events.push(event) });
+    expect(events.filter(event => event.type === 'stderr-line')).toEqual([]);
+    expect(events.at(-1)).toMatchObject({ status: 'completed', output: 'Scoped MCP registered' });
+  });
+
   it('starts the ACP session immediately after initialize acknowledgement and completes one prompt', async () => {
     const fakeAcpServer = String.raw`
       let buffer = '';

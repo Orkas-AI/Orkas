@@ -29,6 +29,7 @@ export type RendererChannelDeps = {
 export type RendererChannelOptions = {
   /** Rows kept while delivery is impossible; older rows are dropped first. */
   maxPending: number;
+  onDrop?: (reason: 'buffer_full' | 'owner_changed', count: number) => void;
   /** Rows belong to an account: dropped at emission and at flush unless that
    *  account is the active one. */
   ownerScoped?: boolean;
@@ -57,12 +58,19 @@ export function createRendererChannel(
   const ownerScoped = options.ownerScoped === true;
   const waitForRenderer = ownerScoped || options.requireRendererReady === true;
   const pending: PendingRow[] = [];
+  const drops = { buffer_full: 0, owner_changed: 0 };
+  const recordDrop = (reason: 'buffer_full' | 'owner_changed'): void => {
+    const dropped = ++drops[reason];
+    if (dropped === 1 || dropped % 100 === 0) {
+      try { options.onDrop?.(reason, dropped); } catch { /* Diagnostics cannot break delivery. */ }
+    }
+  };
 
   const emit = (payload: unknown, ownerUserId = ''): void => {
-    if (ownerScoped && (!ownerUserId || deps.activeUserId() !== ownerUserId)) return;
+    if (ownerScoped && (!ownerUserId || deps.activeUserId() !== ownerUserId)) { recordDrop('owner_changed'); return; }
     if ((waitForRenderer && !deps.rendererReady()) || !deps.broadcast(channel, payload)) {
       pending.push({ ownerUserId, payload });
-      if (pending.length > options.maxPending) pending.shift();
+      if (pending.length > options.maxPending) { pending.shift(); recordDrop('buffer_full'); }
     }
   };
 
@@ -74,6 +82,7 @@ export function createRendererChannel(
       if (ownerScoped && row.ownerUserId !== activeUserId) {
         // Never attach an old account's buffered rows to the new account.
         pending.shift();
+        recordDrop('owner_changed');
         continue;
       }
       if (!deps.broadcast(channel, row.payload)) return;

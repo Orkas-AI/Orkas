@@ -64,6 +64,26 @@ function loadProjectDetailScript() {
 }
 
 describe('Project Library indexing recovery', () => {
+  it('explains oversized saved text after an event and a status refresh without offering a futile retry', () => {
+    const { context } = loadProjectDetailScript();
+    const status = {
+      name: 'large.txt', kind: 'text', status: 'failed',
+      errorCode: 'E_LIBRARY_FILE_TOO_LARGE',
+      error: 'File saved. Text files over 5 MB are not indexed for search.',
+    };
+    context._applyProjectKbEvent({ ...status, projectId: 'project-1' });
+    const eventChip = context._projectKbStatusChipHtml('large.txt');
+    expect(eventChip).toContain(status.error);
+    expect(eventChip).not.toContain('project-file-reprocess');
+    context.snapshot = context._buildProjectKbStatusMap([], [status]);
+    vm.runInContext('_projectKbStatusByName = snapshot', context);
+    expect(context._projectKbStatusChipHtml('large.txt')).toBe(eventChip);
+
+    context._applyProjectKbEvent({ ...status, errorCode: 'E_LIBRARY_EMBED_FAILED', error: 'Internal failure', projectId: 'project-1' });
+    expect(context._projectKbStatusChipHtml('large.txt')).toContain('project-file-reprocess');
+    expect(context._projectKbStatusChipHtml('large.txt')).not.toContain('Internal failure');
+  });
+
   it('reconciles a processing row left behind by a previous app process', async () => {
     const { context, invoke } = loadProjectDetailScript();
 

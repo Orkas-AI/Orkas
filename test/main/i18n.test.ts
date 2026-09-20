@@ -11,6 +11,16 @@ beforeEach(() => {
 });
 
 describe('i18n › detectSystemLang', () => {
+  it.each([
+    ['es-MX', 'es'], ['fr-CA', 'fr'], ['ko-KR', 'ko'],
+    ['de-AT', 'de'], ['ru-RU', 'ru'], ['it-CH', 'it'],
+  ] as const)('recognizes %s and negotiates the selected language', (tag, language) => {
+    expect(detectSystemLang(tag)).toBe(language);
+    expect(isLang(language)).toBe(true);
+    expect(fallbackChain(language)).toEqual([language, 'en']);
+    expect(acceptLanguageHeader(language).split(',')[0].split('-')[0]).toBe(language);
+    expect(Object.keys(getRendererBootTables(language)).sort()).toEqual(['en', language].sort());
+  });
   it('maps zh* locales to zh', () => {
     for (const v of ['zh', 'zh-CN', 'zh-TW', 'zh-HK', 'ZH-Hans']) {
       expect(detectSystemLang(v)).toBe('zh');
@@ -30,7 +40,7 @@ describe('i18n › detectSystemLang', () => {
   });
 
   it('falls back to en for non-supported / malformed / empty', () => {
-    for (const v of ['en-US', 'fr', '', null, undefined, 42]) {
+    for (const v of ['en-US', 'ar', '', null, undefined, 42]) {
       expect(detectSystemLang(v)).toBe('en');
     }
   });
@@ -43,7 +53,7 @@ describe('i18n › isLang', () => {
     expect(isLang('ja')).toBe(true);
     expect(isLang('pt')).toBe(true);
     expect(isLang('ZH')).toBe(false);
-    expect(isLang('fr')).toBe(false);
+    expect(isLang('ar')).toBe(false);
     expect(isLang('')).toBe(false);
     expect(isLang(null)).toBe(false);
   });

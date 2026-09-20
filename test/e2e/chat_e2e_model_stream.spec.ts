@@ -3,6 +3,8 @@ import path from 'node:path';
 
 import { expect, test } from './fixtures/orkas';
 
+const accountTest = test;
+
 async function sendNewChat(
   app: import('./fixtures/orkas').OrkasTestApp,
   prompt: string,
@@ -133,14 +135,30 @@ test.describe('real chat pipeline with a local model', () => {
     const orders = '[{"amount":60},{"amount":70}]\n';
     const configPath = modelOrkas.createWorkspaceFile('commentary/config.json', config);
     const ordersPath = modelOrkas.createWorkspaceFile('commentary/orders.json', orders);
-    const first = '我先读取**限额配置**。\n\n确认后核对订单。';
-    const second = '限额已确认。\n\n继续核对**订单数据**。';
+    // Identical prose in distinct model rounds is intentional: the UI must
+    // preserve both messages while consuming each transport event only once.
+    const first = '我先读取**本轮数据**。\n\n读取后继续核对。';
+    const second = first;
     const final = '订单总额为 130，超过限额 100，超出 30。';
     await modelOrkas.setChatCommentaryScenario({
       reads: [{ path: configPath, commentary: first }, { path: ordersPath, commentary: second }],
       finalText: final,
     });
-    let page = await sendNewChat(modelOrkas, '读取 commentary 目录中的配置和订单数据，核对订单总额是否超过配置中的限额。');
+    let page = modelOrkas.page!;
+    const created = await modelOrkas.invoke<{ conversation: { conversation_id: string } }>(
+      'conversations.create', { title: 'Recovered commentary' },
+    );
+    const recoveredCid = created.conversation.conversation_id;
+    await page.evaluate(async () => (window as any).loadConversations());
+    await page.locator(`#conversation-list .conv-item[data-cid="${recoveredCid}"]`).click();
+    await expect(page.locator('#chat-header-title')).toHaveText('Recovered commentary');
+    // Exercise the production recovery entry before the real UI send. Only
+    // event ordering is controlled; text, tools, IPC, and DOM remain real.
+    expect(await page.evaluate(cid => !!(window as any).ConversationRuntime.observePlanRecoveryRun(
+      cid, { allowWithController: true },
+    ), recoveredCid)).toBe(true);
+    await page.locator('#chat-input').fill('读取 commentary 目录中的配置和订单数据，核对订单总额是否超过配置中的限额。');
+    await page.locator('#chat-send-btn').click();
     const prose = () => page.locator('#chat-history .stream-process-commentary');
     const tool = (index: number) => page.locator(
       `#chat-history .stream-process-line[data-process-call-id="tool:call-e2e-commentary-${index}"]`,
@@ -154,13 +172,10 @@ test.describe('real chat pipeline with a local model', () => {
     };
     const assertProse = async (count: number) => {
       await expect(prose()).toHaveCount(count);
-      await expect(prose().nth(0)).toBeVisible();
-      await expect(prose().nth(0).locator('p')).toHaveText(['我先读取限额配置。', '确认后核对订单。']);
-      await expect(prose().nth(0).locator('strong')).toHaveText('限额配置');
-      if (count === 2) {
-        await expect(prose().nth(1)).toBeVisible();
-        await expect(prose().nth(1).locator('p')).toHaveText(['限额已确认。', '继续核对订单数据。']);
-        await expect(prose().nth(1).locator('strong')).toHaveText('订单数据');
+      for (let index = 0; index < count; index += 1) {
+        await expect(prose().nth(index)).toBeVisible();
+        await expect(prose().nth(index).locator('p')).toHaveText(['我先读取本轮数据。', '读取后继续核对。']);
+        await expect(prose().nth(index).locator('strong')).toHaveText('本轮数据');
       }
     };
     const assertOrder = async () => {
@@ -178,15 +193,33 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(tool(1)).toBeVisible();
     await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
     await expect(page.locator('#chat-history [data-role="final"]:visible')).toHaveCount(0);
+    const other = await modelOrkas.invoke<{ conversation: { conversation_id: string } }>(
+      'conversations.create', { title: 'Other task during commentary' },
+    );
+    await page.evaluate(async () => (window as any).loadConversations());
+    const otherCid = other.conversation.conversation_id;
+    await page.locator(`#conversation-list .conv-item[data-cid="${otherCid}"]`).click();
+    await expect(page.locator('#chat-header-title')).toHaveText('Other task during commentary');
     modelOrkas.releaseCommentaryStage();
 
     await expect.poll(() => modelOrkas.commentaryStage).toBe(2);
+    await expect(prose()).toHaveCount(0);
+    await page.locator(`#conversation-list .conv-item[data-cid="${recoveredCid}"]`).click();
+    await expect(page.locator('#chat-header-title')).toHaveText('Recovered commentary');
     await assertProse(2);
     await expect(tool(2)).toHaveCount(1);
     await openOperations();
     await expect(tool(1)).toContainText('Done');
     await expect(tool(2)).toBeVisible();
     await assertOrder();
+    // Repeated switches without new model output must keep the same text and
+    // operation identities, including the round that streamed off-screen.
+    await page.locator(`#conversation-list .conv-item[data-cid="${otherCid}"]`).click();
+    await expect(page.locator('#chat-header-title')).toHaveText('Other task during commentary');
+    await page.locator(`#conversation-list .conv-item[data-cid="${recoveredCid}"]`).click();
+    await assertProse(2);
+    await assertOrder();
+    await openOperations();
     await expect(page.locator('#chat-history [data-role="final"]:visible')).toHaveCount(0);
     await testInfo.attach('commentary-before-completion', {
       body: await page.screenshot({ path: testInfo.outputPath('commentary-before-completion.png') }),
@@ -209,9 +242,15 @@ test.describe('real chat pipeline with a local model', () => {
       const messages = requests[index].messages as Array<{ role: string; content: unknown }>;
       expect(messages.filter((message) => message.role === 'tool').some((message) => String(message.content).includes(expected))).toBe(true);
     }
+    await page.locator(`#conversation-list .conv-item[data-cid="${otherCid}"]`).click();
     modelOrkas.releaseCommentaryStage();
+    await expect.poll(async () => (await modelOrkas.invoke<{ processing: boolean }>(
+      'groupChat.runtimeStatus', { cid: recoveredCid },
+    )).processing).toBe(false);
+    await page.locator(`#conversation-list .conv-item[data-cid="${recoveredCid}"]`).click();
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
-    await expect(page.locator('#chat-history [data-role="final"]')).toHaveText(final);
+    await expect(page.locator('#chat-history .chat-message.assistant')).toHaveCount(1);
+    await expect(page.locator('#chat-history .chat-message.assistant .markdown-body').filter({ hasText: final })).toHaveText(final);
     expect(readFileSync(configPath, 'utf8')).toBe(config);
     expect(readFileSync(ordersPath, 'utf8')).toBe(orders);
     const cid = await page.locator('#conversation-list .conv-item.active').getAttribute('data-cid');

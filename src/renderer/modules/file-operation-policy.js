@@ -17,7 +17,7 @@
   const imageExts = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
   const videoExts = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
   const audioExts = new Set(['.mp3', '.wav', '.ogg', '.opus', '.m4a', '.aac', '.flac']);
-  const officeExts = new Set(['.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm']);
+  const officeExts = new Set(['.docx', '.docm', '.xlsx', '.xlsm', '.xls', '.pptx', '.pptm']);
   const libraryExts = new Set([...textExts, ...imageExts, ...officeExts, '.pdf']);
   const chatExts = new Set([
     ...chatTextExts, ...imageExts, ...videoExts, ...audioExts, ...officeExts, '.pdf', '.zip',

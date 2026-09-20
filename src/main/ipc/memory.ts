@@ -16,6 +16,7 @@
  * `ctx.userId`). This is a VIEW over `features/memory.ts` — it never
  * re-implements limits/separator/scanner/dedup. See PC/CLAUDE.md §3.
  */
+import { addEntryWithMaintenance, replaceEntryWithMaintenance } from '../features/memory-maintenance';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { shell } from 'electron';
@@ -115,11 +116,11 @@ export const invokeHandlers = {
   },
 
   'memory.add': async (payload: any, ctx: any) => {
-    return memory.addEntry(ctx.userId, await resolveScope(ctx.userId, payload), String(payload?.content || ''));
+    return addEntryWithMaintenance(ctx.userId, await resolveScope(ctx.userId, payload), String(payload?.content || ''));
   },
 
   'memory.replace': async (payload: any, ctx: any) => {
-    return memory.replaceEntry(
+    return replaceEntryWithMaintenance(
       ctx.userId,
       await resolveScope(ctx.userId, payload),
       String(payload?.oldText || ''),

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 vi.mock('electron', () => ({
   app: { isPackaged: false },
@@ -590,11 +591,11 @@ describe('core-agent client skill sandbox env', () => {
     }, 1030);
     client.recordModelRawEventForLog(stats, {
       type: 'context_status', phase: 'active_process_compaction_start',
-      data: { groups: 1, readsSinceLastCompaction: 5, rereadPaths: 3, rereadIdenticalContent: 2 },
+      data: { groups: 1, readsSinceLastCompaction: 5, rereadPaths: 3, rereadIdenticalContent: 2, rereadPartialContent: 1, rereadNewRange: 1, rereadUnknownRange: 1, rereadEmpty: 0 },
     }, 1040);
     client.recordModelRawEventForLog(stats, {
       type: 'context_status', phase: 'history_summary_start',
-      data: { turns: 4, readsSinceLastCompaction: 4, rereadPaths: 1, rereadIdenticalContent: 0 },
+      data: { turns: 4, readsSinceLastCompaction: 4, rereadPaths: 1, rereadIdenticalContent: 0, rereadPartialContent: 0, rereadNewRange: 1, rereadUnknownRange: 2, rereadEmpty: 1 },
     }, 1050);
 
     expect(client.summarizeModelRunForLog(stats, 1060)).toMatchObject({
@@ -604,6 +605,10 @@ describe('core-agent client skill sandbox env', () => {
       rereadReads: 9,
       rereadPaths: 4,
       rereadIdentical: 2,
+      rereadPartial: 1,
+      rereadNewRange: 2,
+      rereadUnknown: 3,
+      rereadEmpty: 1,
     });
   });
 

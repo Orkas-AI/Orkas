@@ -2,20 +2,14 @@ import { describe, it, expect } from "vitest";
 import {
   Session,
   ACTIVE_CHECKPOINT_EXACT_FACTS_HEADING,
-  ACTIVE_CHECKPOINT_BODY_MAX_CHARS,
-  ACTIVE_CHECKPOINT_META_MAX_CHARS,
-  ACTIVE_PROCESS_TRIGGER_TOKENS,
-  ACTIVE_RETAIN_TOKEN_BUDGET,
   ARCHIVED_TOOL_RESULT_MARKER,
   COMPLETED_WORK_MAX_ENTRIES,
-  COMPLETED_WORK_MODEL_MAX_CHARS,
+  COMPLETED_WORK_MODEL_MAX_TOKENS,
   COMPLETED_WORK_MODEL_MAX_ENTRIES,
   EXECUTION_PLAN_AUDIT_MAX_ENTRIES,
   HISTORY_EXACT_FACTS_HEADING,
   HISTORY_EXACT_FACTS_MAX_TOKENS,
   estimateTextTokens,
-  HISTORY_RAW_RETAIN_TOKEN_BUDGET,
-  HISTORY_SUMMARY_MAX_TOKENS,
   IMAGE_BLOCK_ESTIMATE_TOKENS,
   DEFAULT_CONTEXT_BUDGET,
   CONTEXT_COMPACTION_SUMMARY_HARD_TOKENS,
@@ -25,6 +19,36 @@ import {
 } from "../src/agent/session.js";
 
 describe("Session", () => {
+  it("keeps transport identity through active work but not completion, reset or persistence reload", () => {
+    const session = new Session();
+    expect(session.getProviderTurnContext()).toBeUndefined();
+    session.beginUserTurn([{ type: "text", text: "Process the report" }]);
+    const first = session.getProviderTurnContext();
+    expect(first).toBeDefined();
+    session.addAssistantMessage([{ type: "tool_use", id: "read", name: "read_files", input: {} }]);
+    session.addToolResult("read", "source report");
+    session.applyActiveCheckpointSummary("Source report inspected", session.length - 1);
+    expect(session.getProviderTurnContext()).toBe(first);
+    const serialized = session.getSerializedContextState();
+    expect(JSON.stringify(serialized)).not.toContain("providerTurnContext");
+    const restored = new Session();
+    for (const message of session.getMessages()) restored.addMessage(message.role, message.content, message.turnId);
+    // PersistentSession loads messages before the sidecar. False means the
+    // supplied context was valid and needed no reconstruction, not a failure.
+    expect(restored.restoreContextState(serialized)).toBe(false);
+    expect(restored.getProviderTurnContext()).toBeDefined();
+    expect(restored.getProviderTurnContext()).not.toBe(first);
+    session.completeActiveTurn("Report ready");
+    expect(session.getProviderTurnContext()).toBeUndefined();
+    session.beginUserTurn([{ type: "text", text: "Process another report" }]);
+    expect(session.getProviderTurnContext()).not.toBe(first);
+    const second = session.getProviderTurnContext();
+    session.clear();
+    session.beginUserTurn([{ type: "text", text: "Restart" }]);
+    expect(session.getProviderTurnContext()).not.toBe(second);
+    expect(session.getProviderTurnContext()).not.toBe(first);
+  });
+
   it("keeps a read/write turn append-only without manufacturing a new user boundary", () => {
     const session = new Session();
     session.beginUserTurn([{ type: "text", text: "Update the file and check the result" }]);
@@ -245,6 +269,38 @@ describe("Session", () => {
     expect(changed[0].content[0]).toMatchObject({ type: "tool_result", toolUseId: "shot-2" });
   });
 
+  it("keeps only the latest authoring references through intervening tools and checkpoints, then releases them", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Build from this reference" }]);
+    const capture = (id: string, retention?: "active_turn", count = 1) => {
+      session.addAssistantMessage([{ type: "tool_use", id, name: "fixture", input: {} }]);
+      session.addToolResult(id, id, Array.from({ length: count }, (_, i) => ({ data: `${id}-pixel-${i}`, mediaType: "image/png" })), false, undefined, retention);
+    };
+    const images = () => session.getMessagesForModel().flatMap(m => m.content).flatMap(c =>
+      c.type === "tool_result" ? c.images ?? [] : c.type === "image" ? [c] : []);
+    capture("reference", "active_turn");
+    capture("ordinary");
+    for (const id of ["read", "list", "write"]) {
+      session.addAssistantMessage([{ type: "tool_use", id, name: "fixture", input: {} }]);
+      session.addToolResult(id, "Read source metadata. ".repeat(500));
+    }
+    expect(images().map(i => i.data)).toEqual(["reference-pixel-0"]);
+    const tokens = session.estimateModelTokens();
+    session.applyActiveCheckpointSummary("Ready to author", 8);
+    expect(images().map(i => i.data)).toEqual(["reference-pixel-0"]);
+    expect(session.estimateModelTokens()).toBeGreaterThan(IMAGE_BLOCK_ESTIMATE_TOKENS);
+    expect(session.estimateModelTokens()).toBeLessThan(tokens);
+    expect(session.estimateActiveProcessTokens()).toBeGreaterThan(IMAGE_BLOCK_ESTIMATE_TOKENS);
+    capture("replacement", "active_turn", 8);
+    expect(images().map(i => i.data)).toEqual(Array.from({ length: 6 }, (_, i) => `replacement-pixel-${i}`));
+    capture("clear", "active_turn", 0);
+    expect(images()).toEqual([]);
+    capture("last-reference", "active_turn");
+    session.completeActiveTurn();
+    session.beginUserTurn([{ type: "text", text: "New task" }]);
+    expect(images()).toEqual([]);
+  });
+
   it("marks elided JSON receipts structurally and keeps tagged user images as input", () => {
     const session = new Session();
     session.beginUserTurn([{ type: "text", text: "Compare viewports" }]);
@@ -381,39 +437,13 @@ describe("Session", () => {
     const view = session.getMessagesForModel();
     const flat = view.flatMap((m) => m.content);
 
-    expect(view.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    expect(JSON.stringify(view[0])).toContain("not a full execution transcript");
+    expect(view.slice(1).map((m) => m.role)).toEqual(["user", "assistant", "user"]);
     expect(flat.some((c) => c.type === "tool_use")).toBe(false);
     expect(flat.some((c) => c.type === "tool_result")).toBe(false);
     expect(JSON.stringify(view)).toContain("First task");
     expect(JSON.stringify(view)).toContain("First final answer");
     expect(JSON.stringify(view)).toContain("Second task");
-  });
-
-  it("history archive candidate triggers by structured size and retains the newest two raw turns", () => {
-    const session = new Session();
-    for (let i = 0; i < 15; i++) {
-      session.beginUserTurn([{ type: "text", text: `User ${i} ${"large ".repeat(400)}` }]);
-      session.addAssistantMessage([{ type: "text", text: `Answer ${i} ${"body ".repeat(400)}` }]);
-      session.completeActiveTurn();
-    }
-
-    const candidate = session.getPendingHistoryArchive();
-    expect(candidate).toBeTruthy();
-    expect(candidate?.turnIds).toHaveLength(13);
-    session.applyHistorySummary("Summary through turn 12", candidate!.turnIds);
-
-    session.beginUserTurn([{ type: "text", text: "Fresh task" }]);
-    const serialized = JSON.stringify(session.getMessagesForModel());
-    expect(serialized).toContain("Older completed conversation turns have been summarized and omitted");
-    expect(serialized).toContain("re-read the relevant path/range with tools");
-    expect(serialized).toContain("Summary through turn 12");
-    expect(serialized).not.toContain("User 0");
-    expect(serialized).not.toContain("Answer 0");
-    expect(serialized).toContain("User 13");
-    expect(serialized).toContain("Answer 13");
-    expect(serialized).toContain("User 14");
-    expect(serialized).toContain("Answer 14");
-    expect(serialized).toContain("Fresh task");
   });
 
   it("does not use completed-turn count as a history compaction trigger", () => {
@@ -425,46 +455,6 @@ describe("Session", () => {
     }
 
     expect(session.getPendingHistoryArchive()).toBeNull();
-  });
-
-  it("includes the existing rolling summary in the 12K history high-water mark", () => {
-    const session = new Session();
-    for (let i = 0; i < 15; i++) {
-      session.beginUserTurn([{ type: "text", text: `Seed ${i} ${"large ".repeat(400)}` }]);
-      session.addAssistantMessage([{ type: "text", text: `Seed answer ${i} ${"body ".repeat(400)}` }]);
-      session.completeActiveTurn();
-    }
-    const initial = session.getPendingHistoryArchive()!;
-    session.applyHistorySummary("s".repeat(8_000), initial.turnIds);
-
-    let next = session.getPendingHistoryArchive();
-    for (let i = 0; !next && i < 30; i++) {
-      session.beginUserTurn([{ type: "text", text: `New ${i} ${"request ".repeat(200)}` }]);
-      session.addAssistantMessage([{ type: "text", text: `New answer ${i} ${"response ".repeat(200)}` }]);
-      session.completeActiveTurn();
-      next = session.getPendingHistoryArchive();
-    }
-
-    expect(next).toBeTruthy();
-    expect(next!.summaryTokens).toBeGreaterThan(0);
-    expect(next!.rawTokens).toBeLessThan(12_000);
-    expect(next!.rawTokens + next!.summaryTokens).toBeGreaterThanOrEqual(12_000);
-  });
-
-  it("previews a history summary without mutating turn state", () => {
-    const session = new Session();
-    for (let i = 0; i < 15; i++) {
-      session.beginUserTurn([{ type: "text", text: `User ${i} ${"large ".repeat(400)}` }]);
-      session.addAssistantMessage([{ type: "text", text: `Answer ${i} ${"body ".repeat(400)}` }]);
-      session.completeActiveTurn();
-    }
-    const candidate = session.getPendingHistoryArchive()!;
-    const before = JSON.stringify(session.getSerializedContextState());
-    const projected = session.previewHistorySummaryTokens("Projected summary", candidate.turnIds);
-
-    expect(projected).toBeLessThan(session.estimateModelTokens());
-    expect(JSON.stringify(session.getSerializedContextState())).toBe(before);
-    expect(session.getPendingHistoryArchive()?.turnIds).toEqual(candidate.turnIds);
   });
 
   it("accumulates exact history facts outside probabilistic rolling summaries", () => {
@@ -493,10 +483,10 @@ describe("Session", () => {
     restored.restoreContextState(state);
     restored.beginUserTurn([{ type: "text", text: "What next?" }]);
     const view = JSON.stringify(restored.getMessagesForModel());
-    expect(view).toContain("History retained facts");
-    expect(view).toContain("Private runtime context for task continuation only.");
-    expect(view).toContain("release_id=rel-123");
-    expect(view).toContain("checksum=sha256:abc");
+    expect(view).not.toContain("History retained facts");
+    expect(view).not.toContain("Private runtime context for task continuation only.");
+    expect(view).not.toContain("release_id=rel-123");
+    expect(view).not.toContain("checksum=sha256:abc");
   });
 
   it("replaces stale keyed exact facts while retaining cumulative audit facts", () => {
@@ -528,11 +518,7 @@ describe("Session", () => {
       [1],
     );
 
-    expect(session.getSerializedContextState()!.historyExactFacts).toEqual([
-      "provider charged request req-1",
-      "provider charged request req-2",
-      "text_sha256=history-new",
-    ]);
+    expect(session.getSerializedContextState()!.historyExactFacts).toEqual(["text_sha256=history-new"]);
   });
 
   it("retains the newest facts when the token budget is full", () => {
@@ -562,7 +548,7 @@ describe("Session", () => {
     expect(facts).not.toContain(factOf(0));
     expect(facts.at(-1)).toBe("newest-fact");
     const view = JSON.stringify(session.getMessagesForModel());
-    expect(view).toContain("host-persisted model extraction");
+    expect(view).not.toContain("host-persisted model extraction");
     expect(view).not.toContain("deterministic host state, not a summary");
   });
 
@@ -615,7 +601,7 @@ describe("Session", () => {
     expect(migrated.historyExactFacts).toEqual(["legacy_id=legacy-456"]);
   });
 
-  it("promotes active-checkpoint exact facts into cross-turn host state", () => {
+  it("does not promote active checkpoint facts into default history", () => {
     const session = new Session();
     session.beginUserTurn([{ type: "text", text: "Run the build" }]);
     session.applyActiveCheckpointSummary(
@@ -627,8 +613,8 @@ describe("Session", () => {
     session.beginUserTurn([{ type: "text", text: "Continue" }]);
 
     const view = JSON.stringify(session.getMessagesForModel());
-    expect(view).toContain("History retained facts");
-    expect(view).toContain("build_id=build-789");
+    expect(view).not.toContain("History retained facts");
+    expect(view).not.toContain("build_id=build-789");
   });
 
   it("active checkpoint candidate archives older complete tool step groups and keeps the recent tail", () => {
@@ -657,6 +643,55 @@ describe("Session", () => {
     expect(serialized).toContain("result-3");
     expect(serialized).toContain("call-4");
     expect(serialized).toContain("result-4");
+  });
+
+  it.each([
+    { shape: "oversized latest result", sizes: [100_000, 80, 168_000] },
+    { shape: "oversized result before a small tail", sizes: [100_000, 80, 168_000, 800] },
+    { shape: "combined tail exceeds retention budget", sizes: [100_000, 80, 24_000, 24_000, 24_000] },
+  ])("accounts for every tool result across compaction: $shape", ({ sizes }) => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Use the inspected evidence to finish the repair" }]);
+    const receipts: Array<{ id: string; marker: string }> = [];
+    sizes.forEach((size, group) => {
+      // The small middle group includes parallel success/error receipts. Losing
+      // either can hide a prerequisite or failed verification from the next step.
+      const calls = Array.from({ length: group === 1 ? 2 : 1 }, (_, part) => ({
+        id: `read-${group}-${part}`, marker: `EVIDENCE_${group}_${part}`,
+      }));
+      receipts.push(...calls);
+      session.addAssistantMessage(calls.map(({ id }) => ({
+        type: "tool_use" as const, id, name: "read_files", input: {},
+      })));
+      for (const { id, marker } of calls) {
+        session.addToolResult(id, `${marker}\n${"x".repeat(size)}`, undefined, id.endsWith("-1"));
+      }
+    });
+
+    // A budget whose active trigger is ~37K and retention ~16.7K: the three
+    // 6K-token tail results of the last shape together exceed retention, which
+    // is the accounting case under test. Room is 2 × trigger by derivation.
+    const candidate = session.getPendingActiveCheckpoint(contextBudget({
+      usableInputTokens: 141_952, requestCeilingTokens: 74_200 + 18_286, fixedOverheadTokens: 18_286,
+    }));
+    expect(candidate).not.toBeNull();
+    const summaryInput = JSON.stringify(candidate!.messages);
+    session.applyActiveCheckpointSummary("Earlier observations summarized", candidate!.checkpointThroughMessageIndex);
+    const parts = session.getMessagesForModel().flatMap((message) => message.content);
+    const results = parts.filter((part) => part.type === "tool_result");
+    const uses = parts.filter((part) => part.type === "tool_use");
+
+    // Independent coverage oracle: each unique source fact has exactly one
+    // route forward, regardless of which groups the selection algorithm chose.
+    for (const { id, marker } of receipts) {
+      const raw = results.find((part) => part.toolUseId === id);
+      const routes = Number(summaryInput.includes(marker)) + Number(raw?.content.includes(marker) ?? false);
+      expect(routes, `${marker} must be summarized or retained, never lost or duplicated`).toBe(1);
+    }
+    expect(results.map((part) => part.toolUseId).sort()).toEqual(uses.map((part) => part.id).sort());
+    if (sizes.at(-1)! <= 24_000) {
+      expect(results.some((part) => part.toolUseId === `read-${sizes.length - 1}-0`)).toBe(true);
+    }
   });
 
   it("preserves a mid-turn interrupt steer that an active checkpoint archives past", () => {
@@ -693,20 +728,74 @@ describe("Session", () => {
       .toHaveLength(1);
   });
 
-  it("builds active checkpoint input from bounded projections without mutating raw tool data", () => {
+  // A round of parallel tool calls is one tool step group. The single-step
+  // retention cap used to apply to the whole group, so a batch of ten
+  // ordinary reads — each small enough for the admission ceiling to inline —
+  // could never be kept verbatim: the checkpoint archived all of them and the
+  // model continued from a summary alone (seen on every probe run with a
+  // model that batches reads). The cap is per result, like admission.
+  it("retains a parallel tool round whose results each fit the single-step cap", () => {
+    const budget = {
+      ...DEFAULT_CONTEXT_BUDGET,
+      activeProcessTrigger: 50_000,
+      activeRetainTokens: 45_000,
+      activeSingleStepMaxTokens: 8_000,
+    };
+    const build = (largestParallelResultChars: number) => {
+      const session = new Session();
+      session.beginUserTurn([{ type: "text", text: "survey the service documents" }]);
+      // An older, oversized single result: never retainable, always archived.
+      session.addAssistantMessage([{ type: "tool_use", id: "old", name: "read_doc", input: { name: "old" } }]);
+      session.addToolResult("old", `OLD ${"o".repeat(80_000)}`, undefined, false);
+      // A parallel round of ten reads, ~4K tokens each, ~40K as a group.
+      const ids = Array.from({ length: 10 }, (_, i) => `par-${i}`);
+      session.addAssistantMessage(ids.map((id) => ({ type: "tool_use" as const, id, name: "read_doc", input: { name: id } })));
+      ids.forEach((id, i) => session.addToolResult(id, `${id} ${"p".repeat(i === 0 ? largestParallelResultChars : 16_000)}`, undefined, false));
+      return session;
+    };
+
+    const parallel = build(16_000);
+    const candidate = parallel.getPendingActiveCheckpoint(budget);
+    expect(candidate).not.toBeNull();
+    // Only the oversized old step is archived; the round survives verbatim.
+    expect(candidate!.groups).toHaveLength(1);
+    expect(candidate!.groups[0].largestResultTokens).toBeGreaterThan(budget.activeSingleStepMaxTokens);
+    parallel.applyActiveCheckpointSummary("old result summarized", candidate!.checkpointThroughMessageIndex);
+    const view = JSON.stringify(parallel.getMessagesForModel());
+    for (let i = 0; i < 10; i++) expect(view).toContain(`par-${i} pppp`);
+    expect(view).not.toContain("OLD oooo");
+
+    // The newest round stays raw even when a sibling exceeds the cap. Once a
+    // later round exists, ordinary size-based selection may archive it whole.
+    const oversized = build(48_000);
+    expect(oversized.getPendingActiveCheckpoint(budget)!.groups).toHaveLength(1);
+    oversized.addAssistantMessage([{ type: "tool_use", id: "next", name: "read_doc", input: {} }]);
+    oversized.addToolResult("next", "latest observation");
+    const both = oversized.getPendingActiveCheckpoint(budget);
+    expect(both).not.toBeNull();
+    expect(both!.groups).toHaveLength(2);
+  });
+
+  it("keeps middle facts in complete checkpoint groups without mutating raw tool data", () => {
     const session = new Session();
-    session.beginUserTurn([{ type: "text", text: "Current projection task" }]);
+    session.beginUserTurn([{ type: "text", text: "Implement the requirements from the inspected files" }]);
     for (let i = 0; i < 5; i++) {
       session.addAssistantMessage([{
         type: "tool_use",
         id: `projection-${i}`,
-        name: "large_tool",
-        input: { command: `INPUT_HEAD_${i}${"i".repeat(6_000)}INPUT_TAIL_${i}` },
+        name: "read_files",
+        input: { paths: [`/workspace/source-${i}.txt`], note: `INPUT_${"i".repeat(6_000)}_${i}` },
       }]);
       const isError = i === 1;
       session.addToolResult(
         `projection-${i}`,
-        `${isError ? "ERROR" : "RESULT"}_HEAD_${i}${isError ? "e".repeat(15_000) : "r".repeat(15_000)}${isError ? "ERROR" : "RESULT"}_TAIL_${i}`,
+        [
+          `${isError ? "ERROR" : "RESULT"}_HEAD_${i}`,
+          (isError ? "e" : "r").repeat(7_000),
+          `REQUIRED_MIDDLE_FACT_${i}=present`,
+          (isError ? "e" : "r").repeat(7_000),
+          `${isError ? "ERROR" : "RESULT"}_TAIL_${i}`,
+        ].join("\n"),
         undefined,
         isError,
       );
@@ -715,23 +804,186 @@ describe("Session", () => {
     const rawBefore = JSON.stringify(session.getMessages());
     const candidate = session.getPendingActiveCheckpoint();
     expect(candidate?.groups.length).toBeGreaterThanOrEqual(3);
-    const projection = JSON.stringify(candidate?.messages || []);
+    const checkpointInput = JSON.stringify(candidate?.messages || []);
 
-    expect(projection).toContain("INPUT_HEAD_0");
-    expect(projection).toContain("INPUT_TAIL_0");
-    expect(projection).toContain("RESULT_HEAD_0");
-    expect(projection).toContain("RESULT_TAIL_0");
-    expect(projection).toContain("ERROR_HEAD_1");
-    expect(projection).toContain("ERROR_TAIL_1");
-    expect(projection).toContain("chars omitted]");
-    // Tool input and error output are metadata-shaped and cut at the shorter
-    // cap; successful tool output keeps the body cap.
-    expect(projection).not.toContain("i".repeat(ACTIVE_CHECKPOINT_META_MAX_CHARS + 1));
-    expect(projection).not.toContain("r".repeat(ACTIVE_CHECKPOINT_BODY_MAX_CHARS + 1));
-    expect(projection).not.toContain("e".repeat(ACTIVE_CHECKPOINT_META_MAX_CHARS + 1));
+    expect(checkpointInput).toContain("/workspace/source-0.txt");
+    expect(checkpointInput).toContain("i".repeat(5_000));
+    expect(checkpointInput).toContain("RESULT_HEAD_0");
+    expect(checkpointInput).toContain("REQUIRED_MIDDLE_FACT_0=present");
+    expect(checkpointInput).toContain("RESULT_TAIL_0");
+    expect(checkpointInput).toContain("ERROR_HEAD_1");
+    expect(checkpointInput).toContain("REQUIRED_MIDDLE_FACT_1=present");
+    expect(checkpointInput).toContain("ERROR_TAIL_1");
+    expect(checkpointInput).not.toContain("chars omitted]");
     expect(rawBefore).toContain("i".repeat(5_000));
-    expect(rawBefore).toContain("r".repeat(10_000));
-    expect(rawBefore).toContain("e".repeat(10_000));
+    expect(rawBefore).toContain("r".repeat(6_000));
+    expect(rawBefore).toContain("e".repeat(6_000));
+    expect(JSON.stringify(session.getMessages())).toBe(rawBefore);
+  });
+
+  it("fits the largest oldest prefix of complete groups within checkpoint input capacity", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Use every complete observation" }]);
+    for (let i = 0; i < 6; i++) {
+      session.addAssistantMessage([{
+        type: "tool_use",
+        id: `capacity-${i}`,
+        name: "read_files",
+        input: { paths: [`/workspace/capacity-${i}.txt`] },
+      }]);
+      session.addToolResult(
+        `capacity-${i}`,
+        `HEAD_${i}\n${"x".repeat(20_000)}\nMIDDLE_${i}=kept\n${"y".repeat(20_000)}\nTAIL_${i}`,
+      );
+    }
+
+    const unbounded = session.getPendingActiveCheckpoint()!;
+    expect(unbounded.groups).toHaveLength(5);
+    expect(JSON.stringify(unbounded.messages)).not.toContain("MIDDLE_5=kept");
+    const selection = session.selectPendingActiveCheckpoint(undefined, 22_000);
+    const bounded = selection.candidate!;
+    const input = JSON.stringify(bounded.messages);
+
+    expect(selection.capacityIssue).toBeUndefined();
+    expect(bounded.capacityLimited).toBe(true);
+    expect(bounded.inputTokenBudget).toBe(22_000);
+    expect(bounded.inputTokens).toBeLessThanOrEqual(22_000);
+    expect(bounded.groups).toHaveLength(2);
+    for (const i of [0, 1]) {
+      expect(input).toContain(`HEAD_${i}`);
+      expect(input).toContain(`MIDDLE_${i}=kept`);
+      expect(input).toContain(`TAIL_${i}`);
+    }
+    expect(input).not.toContain("MIDDLE_2=kept");
+
+    session.applyActiveCheckpointSummary("First two groups summarized", bounded.checkpointThroughMessageIndex);
+    const retained = JSON.stringify(session.getMessagesForModel());
+    expect(retained).toContain("MIDDLE_2=kept");
+    expect(retained).not.toContain("MIDDLE_0=kept");
+  });
+
+  it("admits complete bounded checkpoint groups after the trigger without a minimum savings gate", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Preserve every source decision" }]);
+    const usable = 1_048_576 - 8_192;
+    const budget = contextBudget({ usableInputTokens: usable, requestCeilingTokens: Math.floor(usable * 0.82), fixedOverheadTokens: 30_000, historyOccupancyTokens: 0 });
+    const addGroup = (i: number) => {
+      session.addAssistantMessage([{ type: "tool_use", id: `bounded-${i}`, name: "read_files", input: {} }]);
+      session.addToolResult(`bounded-${i}`, `FACT_${i}=kept\n${"x".repeat(180_000)}`);
+    };
+    for (let i = 0; i < 10; i++) addGroup(i);
+    expect(session.selectPendingActiveCheckpoint(budget, 150_000).candidate).toBeNull();
+    for (let i = 10; i < 18; i++) addGroup(i);
+    const selection = session.selectPendingActiveCheckpoint(budget, 150_000);
+    expect(selection.capacityIssue).toBeUndefined();
+    expect(selection.candidate).not.toBeNull();
+    const candidate = selection.candidate!;
+    expect(candidate.capacityLimited).toBe(true);
+    expect(candidate.groups).toHaveLength(3);
+    expect(candidate.inputTokens).toBeLessThanOrEqual(150_000);
+    expect(candidate.tokensBefore - candidate.estimatedTokensAfter).toBeLessThan(135_000);
+    session.applyActiveCheckpointSummary("FACT_0=kept\nFACT_1=kept\nFACT_2=kept", candidate.checkpointThroughMessageIndex);
+    const view = JSON.stringify(session.getMessagesForModel());
+    for (let i = 0; i < 18; i++) expect(view).toContain(`FACT_${i}=kept`);
+    expect(view).toContain("x".repeat(10_000));
+  });
+
+  it("clips only an oversized first group's summary input without mutating raw data", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Preserve the complete source" }]);
+    for (let i = 0; i < 3; i++) {
+      session.addAssistantMessage([{
+        type: "tool_use", id: `blocked-${i}`, name: "read_files", input: { paths: [`source-${i}`] },
+      }]);
+      session.addToolResult(
+        `blocked-${i}`,
+        `HEAD_${i}\n${"x".repeat(30_000)}\nMIDDLE_${i}=required\n${"y".repeat(30_000)}\nTAIL_${i}`,
+      );
+    }
+    const rawBefore = JSON.stringify(session.getMessages());
+    const selection = session.selectPendingActiveCheckpoint(undefined, 1_000);
+
+    expect(selection.capacityIssue).toBeUndefined();
+    const candidate = selection.candidate!;
+    expect(candidate.groups).toHaveLength(1);
+    expect(candidate.capacityLimited).toBe(true);
+    expect(candidate.inputTokens).toBeLessThanOrEqual(1_000);
+    const text = JSON.stringify(candidate.messages);
+    expect(text).toContain("HEAD_0");
+    expect(text).toContain("TAIL_0");
+    expect(text).toContain("chars omitted");
+    expect(text).not.toContain("MIDDLE_0=required");
+    expect(JSON.stringify(session.getMessages())).toBe(rawBefore);
+    expect(JSON.stringify(session.getMessagesForModel())).toContain("MIDDLE_0=required");
+
+    // Even identifiers, status and omission markers cannot fit: fail closed.
+    const impossible = session.selectPendingActiveCheckpoint(undefined, 1);
+    expect(impossible.candidate).toBeNull();
+    expect(impossible.capacityIssue).toMatchObject({
+      reason: "no_complete_group_fits",
+      inputTokenBudget: 1,
+      eligibleGroups: 2,
+      selectedGroups: 0,
+    });
+    expect(impossible.capacityIssue!.firstGroupInputTokens).toBeGreaterThan(1_000);
+    expect(JSON.stringify(session.getMessages())).toBe(rawBefore);
+    expect(JSON.stringify(session.getMessagesForModel())).toContain("MIDDLE_0=required");
+  });
+
+  it.each(["ascii", "cjk", "digits"])("fits a 200K parallel group with its prior checkpoint (%s)", (shape) => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Compare all parallel observations" }]);
+    session.applyActiveCheckpointSummary("PRIOR_DECISION\n" + "p".repeat(40_000), 0);
+    const ids = Array.from({ length: 8 }, (_, i) => `parallel-${i}`);
+    session.addAssistantMessage(ids.map((id) => ({ type: "tool_use" as const, id,
+      name: "read_files", input: { path: `/workspace/${id}.md` } })));
+    const body = shape === "cjk" ? "中".repeat(16_666)
+      : shape === "digits" ? "123456789".repeat(8_333) : "x".repeat(100_000);
+    for (const id of ids) session.addToolResult(id, `HEAD_${id}\n${body}\nTAIL_${id}`, undefined, id === ids[3]);
+    // A newer group is outside this checkpoint and must remain raw.
+    session.addAssistantMessage([{ type: "tool_use", id: "newer", name: "read_files", input: {} }]);
+    session.addToolResult("newer", "NEWER_RAW");
+    const rawBefore = JSON.stringify(session.getMessages());
+    const candidate = session.selectPendingActiveCheckpoint(undefined, 150_000).candidate!;
+    expect(candidate.groups).toHaveLength(1);
+    expect(candidate.capacityLimited).toBe(true);
+    const text = candidate.messages.flatMap(m => m.content).map(c => c.type === "text" ? c.text : "").join("");
+    expect(estimateTextTokens(text)).toBeLessThanOrEqual(150_000);
+    expect(text).toContain("PRIOR_DECISION\n" + "p".repeat(40_000));
+    for (const id of ids) {
+      expect(text).toContain(`tool_use read_files id=${id}`);
+      expect(text).toContain(`/workspace/${id}.md`);
+      expect(text).toContain(`HEAD_${id}`);
+      expect(text).toContain(`TAIL_${id}`);
+    }
+    expect(text).toContain("tool_result id=parallel-3 error=true");
+    expect(text).toContain("chars omitted");
+    expect(JSON.stringify(session.getMessages())).toBe(rawBefore);
+    session.applyActiveCheckpointSummary("CHECKPOINT_OK", candidate.checkpointThroughMessageIndex);
+    const view = JSON.stringify(session.getMessagesForModel());
+    expect(view).toContain("CHECKPOINT_OK");
+    expect(view).toContain("NEWER_RAW");
+    expect(view).not.toContain("HEAD_parallel-");
+  });
+
+  it("preserves small sibling results and host result refs when giant arguments also need clipping", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Continue every inspected operation" }]);
+    session.addAssistantMessage([
+      { type: "tool_use", id: "giant", name: "transform", input: { source: "ARG_HEAD" + "a".repeat(800_000) + "ARG_TAIL" } },
+      { type: "tool_use", id: "small", name: "inspect", input: { path: "/workspace/small" } },
+    ]);
+    session.addToolResult("giant", "RESULT_HEAD" + "x".repeat(800_000) + "RESULT_TAIL");
+    session.addToolResult("small", "SMALL_COMPLETE: exact failure", undefined, true);
+    session.recordCompletedWork({ toolCallId: "giant", tool: "transform", inputDigest: "digest", inputSummary: "large source",
+      status: "succeeded", resultRef: "result-trusted-ref" });
+    session.addAssistantMessage([{ type: "tool_use", id: "next", name: "inspect", input: {} }]);
+    session.addToolResult("next", "LATEST_RAW");
+    const rawBefore = JSON.stringify(session.getMessages());
+    const candidate = session.selectPendingActiveCheckpoint(undefined, 150_000).candidate!;
+    const text = candidate.messages.flatMap(m => m.content).map(c => c.type === "text" ? c.text : "").join("");
+    expect(estimateTextTokens(text)).toBeLessThanOrEqual(150_000);
+    for (const fact of ["ARG_HEAD", "ARG_TAIL", "RESULT_HEAD", "RESULT_TAIL", "SMALL_COMPLETE: exact failure", "/workspace/small", "tool_result id=small error=true", "Full content is stored under result ref result-trusted-ref"]) expect(text).toContain(fact);
     expect(JSON.stringify(session.getMessages())).toBe(rawBefore);
   });
 
@@ -868,31 +1120,13 @@ describe("Session", () => {
     // Well past the old fixed cap of 2, and bounded by the token budget: each
     // step is ~STEP_CHARS/4 tokens, so the budget cannot hold more than this.
     expect(retainedSteps).toBeGreaterThan(2);
-    expect(retainedSteps).toBeLessThanOrEqual(Math.ceil(ACTIVE_RETAIN_TOKEN_BUDGET / (STEP_CHARS / 4)));
+    expect(retainedSteps).toBeLessThanOrEqual(Math.ceil(DEFAULT_CONTEXT_BUDGET.activeRetainTokens / (STEP_CHARS / 4)));
 
     // The budget bound still holds where it matters: applying the checkpoint
     // must drop the live tail below the trigger so it cannot immediately refire.
     session.applyActiveCheckpointSummary("Older small steps summarized", candidate!.checkpointThroughMessageIndex);
-    expect(session.estimateActiveProcessTokens()).toBeLessThan(ACTIVE_PROCESS_TRIGGER_TOKENS);
+    expect(session.estimateActiveProcessTokens()).toBeLessThan(DEFAULT_CONTEXT_BUDGET.activeProcessTrigger);
     expect(session.getPendingActiveCheckpoint()).toBeNull();
-  });
-
-  it("keeps recent completed turns up to the token budget rather than a fixed count", () => {
-    const session = new Session();
-    const REPLY_CHARS = 2_000;
-    const TOTAL_TURNS = 30;
-    for (let turn = 0; turn < TOTAL_TURNS; turn++) {
-      session.beginUserTurn([{ type: "text", text: `question ${turn}` }]);
-      session.addAssistantMessage([{ type: "text", text: `answer ${turn}\n${"y".repeat(REPLY_CHARS)}` }]);
-      session.completeActiveTurn();
-    }
-
-    const candidate = session.getPendingHistoryArchive();
-    expect(candidate).toBeTruthy();
-    const retainedTurns = TOTAL_TURNS - candidate!.turnIds.length;
-
-    expect(retainedTurns).toBeGreaterThan(2);
-    expect(retainedTurns).toBeLessThanOrEqual(Math.ceil(HISTORY_RAW_RETAIN_TOKEN_BUDGET / (REPLY_CHARS / 4)));
   });
 
   // The parameterized path must not change anything for callers that have no
@@ -918,14 +1152,22 @@ describe("Session", () => {
       }
       return session;
     };
-    const overhead = { fixedOverheadTokens: 30_000 };
-    const wide = contextBudget({ usableInputTokens: 1_000_000, ...overhead });
-    const narrow = contextBudget({ usableInputTokens: 21_760, ...overhead });
+    const at = (usableInputTokens: number) => contextBudget({
+      usableInputTokens, requestCeilingTokens: Math.floor(usableInputTokens * 0.82), fixedOverheadTokens: 30_000,
+    });
+    const wide = at(1_000_000);
+    const narrow = at(60_000);
+    const tooSmall = at(21_760);
 
     // ~20K tokens of live tool traffic: past the narrow window's trigger, well
     // inside the wide one's.
     expect(build().getPendingActiveCheckpoint(wide)).toBeNull();
     expect(build().getPendingActiveCheckpoint(narrow)).toBeTruthy();
+    // A window with no room for a layered budget behind a 30K prompt does not
+    // fire a summarization call it cannot benefit from; the emergency layer
+    // owns that window.
+    expect(tooSmall.windowTooSmall).toBe(true);
+    expect(build().getPendingActiveCheckpoint(tooSmall)).toBeNull();
   });
 
   // 2026-08-16 latency review P1-5: the estimator weighs CJK at 1.5 tok/char
@@ -933,6 +1175,20 @@ describe("Session", () => {
   // segment triggers 1.5-2.5x early — each early fire is one extra 29-105s
   // summarization call. Anchored calls observe the real/estimated ratio of the
   // previous request; the trigger comparisons scale by it.
+  it("reports history occupancy in the units the history trigger is compared in", () => {
+    const session = new Session();
+    for (let i = 0; i < 4; i++) {
+      session.beginUserTurn([{ type: "text", text: `question ${i} ${"detail ".repeat(200)}` }]);
+      session.addAssistantMessage([{ type: "text", text: `answer ${i} ${"detail ".repeat(200)}` }]);
+      session.completeActiveTurn();
+    }
+    const raw = session.estimateHistoryTokens();
+    expect(raw).toBeGreaterThan(0);
+    expect(session.estimateCalibratedHistoryTokens()).toBe(raw);
+    session.setEstimatorCalibration(1_000, 2_000);
+    expect(session.estimateCalibratedHistoryTokens()).toBe(raw * 0.5);
+  });
+
   it("anchored calibration defers the active-checkpoint trigger, and heavier traffic still fires it", () => {
     const build = (steps: number) => {
       const session = new Session();
@@ -960,28 +1216,6 @@ describe("Session", () => {
     expect(heavier.getPendingActiveCheckpoint()).toBeTruthy();
   });
 
-  it("anchored calibration defers the history-archive trigger the same way", () => {
-    const build = (turns: number) => {
-      const session = new Session();
-      for (let t = 0; t < turns; t++) {
-        session.beginUserTurn([{ type: "text", text: `question ${t}` }]);
-        session.addAssistantMessage([{ type: "text", text: `answer ${t}\n${"y".repeat(2_000)}` }]);
-        session.completeActiveTurn();
-      }
-      return session;
-    };
-
-    expect(build(30).getPendingHistoryArchive()).toBeTruthy();
-
-    const calibrated = build(30);
-    calibrated.setEstimatorCalibration(1, 2);
-    expect(calibrated.getPendingHistoryArchive()).toBeNull();
-
-    const heavier = build(70);
-    heavier.setEstimatorCalibration(1, 2);
-    expect(heavier.getPendingHistoryArchive()).toBeTruthy();
-  });
-
   it("clamps calibration to [0.5, 1], ignores unusable observations, and resets on clear", () => {
     const session = new Session();
     expect(session.getEstimatorCalibration()).toBe(1);
@@ -1007,9 +1241,43 @@ describe("Session", () => {
     expect(session.getEstimatorCalibration()).toBe(1);
   });
 
+  it.each(["checkpoint", "emergency"] as const)("protects the latest parallel tool round during %s reduction regardless of size", (mode) => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Inspect all returned evidence before proceeding" }]);
+    const newest = ["fresh-success", "fresh-error"];
+    session.addAssistantMessage(newest.map(id => ({ type: "tool_use" as const, id, name: "inspect", input: {} })));
+    newest.forEach((id, i) => session.addToolResult(id, `${id}\n${"x".repeat(16_000)}`, undefined, i === 1));
+    const budget = { ...DEFAULT_CONTEXT_BUDGET, activeProcessTrigger: 1_000,
+      activeRetainTokens: 1_000, activeSingleStepMaxTokens: 1_000 };
+    const select = () => mode === "checkpoint"
+      ? session.getPendingActiveCheckpoint(budget) : session.getFoldableActiveProcess();
+    // Neither a repeated preparation nor a later assistant text proves another
+    // tool round exists. A single returned batch must never be reduced.
+    expect(select()).toBeNull();
+    session.addAssistantMessage([{ type: "text", text: "Inspecting the returned batch" }]);
+    expect(select()).toBeNull();
+    const protectedResults = session.getMessagesForModel().flatMap(m => m.content).filter(c => c.type === "tool_result");
+    expect(protectedResults.map(c => c.toolUseId)).toEqual(newest);
+
+    // A subsequent round makes the older batch eligible while protecting the
+    // new oversized result even though it exceeds the entire retain budget.
+    session.addAssistantMessage([{ type: "tool_use", id: "newest", name: "inspect", input: {} }]);
+    session.addToolResult("newest", `LATEST_EXACT\n${"y".repeat(20_000)}`);
+    const candidate = select()!;
+    expect(candidate).not.toBeNull();
+    if (mode === "checkpoint") expect(JSON.stringify(session.getPendingActiveCheckpoint(budget)!.messages)).not.toContain("LATEST_EXACT");
+    session.applyEmergencyActiveFold("Earlier evidence reduced", candidate.checkpointThroughMessageIndex);
+    const visible = session.getMessagesForModel().flatMap(m => m.content);
+    expect(visible.filter(c => c.type === "tool_use").map(c => c.id)).toEqual(["newest"]);
+    expect(visible.filter(c => c.type === "tool_result")).toEqual([
+      expect.objectContaining({ toolUseId: "newest", content: `LATEST_EXACT\n${"y".repeat(20_000)}` }),
+    ]);
+    expect(select()).toBeNull();
+  });
+
   // Used by the emergency path, which runs when summarization is unavailable
-  // and space matters more than the verbatim tail.
-  it("offers every foldable tool step, retaining none, on group boundaries", () => {
+  // while the latest round still needs its first delivery to the main model.
+  it("offers older tool steps for emergency folding while protecting the latest whole round", () => {
     const session = new Session();
     session.beginUserTurn([{ type: "text", text: "Emergency task" }]);
     expect(session.getFoldableActiveProcess()).toBeNull();
@@ -1020,8 +1288,8 @@ describe("Session", () => {
     }
 
     const foldable = session.getFoldableActiveProcess()!;
-    // Nothing is held back, unlike the normal checkpoint which keeps a tail.
-    expect(foldable.groups).toHaveLength(5);
+    // Older rounds can be dropped; the latest round remains protected.
+    expect(foldable.groups).toHaveLength(4);
     const normal = session.getPendingActiveCheckpoint();
     expect(foldable.groups.length).toBeGreaterThan(normal?.groups.length ?? 0);
 
@@ -1041,12 +1309,14 @@ describe("Session", () => {
     expect([...resultIds].every((id) => useIds.has(id))).toBe(true);
     expect([...useIds].every((id) => resultIds.has(id))).toBe(true);
 
-    // Raw payloads are gone and the notice took their place.
+    // Older payloads are gone; the latest result stays raw beside the notice.
     const serialized = JSON.stringify(view);
-    expect(serialized).not.toContain("y".repeat(500));
+    for (let i = 0; i < 4; i++) expect(serialized).not.toContain(`out-${i}`);
+    expect(serialized).toContain("out-4");
+    expect(serialized).toContain("y".repeat(3_000));
     expect(serialized).toContain("reduced without summarization");
 
-    // Everything foldable is folded, so a second pass has nothing to offer.
+    // Repeated pressure cannot remove the protected round either.
     expect(session.getFoldableActiveProcess()).toBeNull();
   });
 
@@ -1115,51 +1385,6 @@ describe("Session", () => {
     expect(afterRecovery).toContain("deploy_token=tok_9f2a");
   });
 
-  it("emergency history fold keeps the prior rolling summary verbatim", () => {
-    const session = new Session();
-    for (let turn = 0; turn < 3; turn++) {
-      session.beginUserTurn([{ type: "text", text: `question ${turn}` }]);
-      session.addAssistantMessage([{ type: "text", text: `answer ${turn}` }]);
-      session.completeActiveTurn();
-    }
-    session.applyHistorySummary(
-      "User is migrating the billing stack; prefers Stripe test-mode fixtures.",
-      session.getArchivableHistoryTurns(),
-    );
-    for (let turn = 3; turn < 5; turn++) {
-      session.beginUserTurn([{ type: "text", text: `question ${turn}` }]);
-      session.addAssistantMessage([{ type: "text", text: `answer ${turn}` }]);
-      session.completeActiveTurn();
-    }
-
-    session.applyEmergencyHistoryFold(
-      "[Earlier turns dropped without summarization]",
-      session.getArchivableHistoryTurns(),
-    );
-
-    const view = JSON.stringify(session.getMessagesForModel());
-    expect(view).toContain("Earlier turns dropped without summarization");
-    expect(view).toContain("Prior history summary retained verbatim");
-    expect(view).toContain("prefers Stripe test-mode fixtures");
-  });
-
-  it("offers every unarchived completed turn for emergency archiving", () => {
-    const session = new Session();
-    expect(session.getArchivableHistoryTurns()).toEqual([]);
-
-    for (let turn = 0; turn < 3; turn++) {
-      session.beginUserTurn([{ type: "text", text: `question ${turn}` }]);
-      session.addAssistantMessage([{ type: "text", text: `answer ${turn}` }]);
-      session.completeActiveTurn();
-    }
-
-    const archivable = session.getArchivableHistoryTurns();
-    expect(archivable).toHaveLength(3);
-
-    session.applyHistorySummary("[earlier turns dropped]", archivable);
-    expect(session.getArchivableHistoryTurns()).toEqual([]);
-  });
-
   it("active checkpoint trigger tracks only the live tail, not cumulative raw", () => {
     const session = new Session();
     session.beginUserTurn([{ type: "text", text: "Current large task" }]);
@@ -1169,7 +1394,7 @@ describe("Session", () => {
     }
     // Before any checkpoint the whole raw process is counted → trigger is hot.
     const rawBefore = session.estimateActiveProcessTokens();
-    expect(rawBefore).toBeGreaterThan(ACTIVE_PROCESS_TRIGGER_TOKENS);
+    expect(rawBefore).toBeGreaterThan(DEFAULT_CONTEXT_BUDGET.activeProcessTrigger);
 
     const candidate = session.getPendingActiveCheckpoint();
     expect(candidate).toBeTruthy();
@@ -1181,7 +1406,7 @@ describe("Session", () => {
     // estimate stayed at the cumulative raw size and kept the trigger hot).
     const liveAfter = session.estimateActiveProcessTokens();
     expect(liveAfter).toBeLessThan(rawBefore);
-    expect(liveAfter).toBeLessThan(ACTIVE_PROCESS_TRIGGER_TOKENS);
+    expect(liveAfter).toBeLessThan(DEFAULT_CONTEXT_BUDGET.activeProcessTrigger);
     expect(session.getPendingActiveCheckpoint()).toBeNull();
   });
 
@@ -1371,48 +1596,6 @@ describe("Session", () => {
     });
   });
 
-  it("does not drop completed turns still awaiting rolling-summary archival", () => {
-    // The trim must not silently lose a completed turn's raw I/O before the
-    // history summary has folded it in — those unarchived turns are the model
-    // view's raw buffer.
-    const session = new Session({ maxHistoryTurns: 3 }); // trims past 6 messages
-    for (let i = 0; i < 8; i++) {
-      session.beginUserTurn([{ type: "text", text: `Q${i}` }]);
-      session.addAssistantMessage([{ type: "text", text: `A${i}` }]);
-      session.completeActiveTurn();
-    }
-    const view = session.getMessagesForModel();
-    for (let i = 0; i < 8; i++) {
-      expect(view.some((m) => m.role === "user" && m.content.some((c) => (c as { text?: string }).text === `Q${i}`))).toBe(true);
-      expect(view.some((m) => m.role === "assistant" && m.content.some((c) => (c as { text?: string }).text === `A${i}`))).toBe(true);
-    }
-  });
-
-  it("still trims archived turns (no unbounded in-memory growth once summarized)", () => {
-    // Once a completed turn is archived into the rolling summary, its raw
-    // messages are no longer model-facing and remain eligible for the trim.
-    const session = new Session({ maxHistoryTurns: 2 });
-    const archived: number[] = [];
-    for (let i = 0; i < 6; i++) {
-      const id = session.beginUserTurn([{ type: "text", text: `Q${i}` }]);
-      session.addAssistantMessage([{ type: "text", text: `A${i}` }]);
-      session.completeActiveTurn();
-      archived.push(id);
-    }
-    // Archive the four oldest turns into the summary.
-    session.applyHistorySummary("summary of Q0..Q3", archived.slice(0, 4));
-    // Adding another turn triggers trimHistory; archived turns' raw messages
-    // are now droppable, so in-memory length is bounded well below 12.
-    session.beginUserTurn([{ type: "text", text: "Q6" }]);
-    session.addAssistantMessage([{ type: "text", text: "A6" }]);
-    session.completeActiveTurn();
-    expect(session.length).toBeLessThan(12);
-    // The summary + the newest (non-archived) turns still project to the model.
-    const view = session.getMessagesForModel();
-    expect(view.some((m) => m.content.some((c) => (c as { text?: string }).text?.includes("summary of Q0..Q3")))).toBe(true);
-    expect(view.some((m) => m.content.some((c) => (c as { text?: string }).text === "Q6"))).toBe(true);
-  });
-
   // Image blocks cost real tokens (provider caps sit around 1,600 per image)
   // but the estimator priced them at zero, so image-heavy turns — frame
   // screenshots from browser/video tools — were invisible to every derived
@@ -1443,9 +1626,15 @@ describe("Session", () => {
     for (let i = 0; i < 14; i++) {
       session.addToolResult(`frame-${i}`, `frame ${i} captured`, [{ data: "aW1n", mediaType: "image/png" }]);
     }
+    expect(session.estimateActiveProcessTokens()).toBeGreaterThan(DEFAULT_CONTEXT_BUDGET.activeProcessTrigger);
+    expect(session.getPendingActiveCheckpoint()).toBeNull();
+    // The image batch contributes pressure immediately but becomes eligible
+    // only when a subsequent tool round exists, before image aging elides it.
+    session.addAssistantMessage([{ type: "tool_use", id: "next", name: "inspect", input: {} }]);
+    session.addToolResult("next", "LATEST_RAW");
     const candidate = session.getPendingActiveCheckpoint();
     expect(candidate).not.toBeNull();
-    expect(candidate!.tokensBefore).toBeGreaterThan(ACTIVE_PROCESS_TRIGGER_TOKENS);
+    expect(candidate!.tokensBefore).toBeGreaterThan(DEFAULT_CONTEXT_BUDGET.activeProcessTrigger);
   });
 
   it("does not let elided captures from earlier rounds inflate the checkpoint trigger", () => {
@@ -1465,36 +1654,8 @@ describe("Session", () => {
   // the projection no compaction layer can reduce. REPLACE semantics are the
   // point — a merge would keep every prior fact and re-grow what the shrink
   // removed.
-  it("persistent-block shrink replaces the facts pool instead of merging into it", () => {
-    const session = new Session();
-    session.beginUserTurn([{ type: "text", text: "long project" }]);
-    session.addAssistantMessage([{ type: "text", text: "ack" }]);
-    session.completeActiveTurn();
-    const staleFacts = Array.from({ length: 40 }, (_, i) => `- stale_fact_${i}: value ${"v".repeat(200)}`);
-    session.applyHistorySummary(
-      `Long-running summary prose. ${"p".repeat(9_000)}\n${HISTORY_EXACT_FACTS_HEADING}\n${staleFacts.join("\n")}`,
-      [1],
-    );
-
-    const candidate = session.getPersistentBlockShrinkCandidate();
-    expect(candidate).not.toBeNull();
-    expect(candidate!.estimatedTokens).toBeGreaterThan(HISTORY_SUMMARY_MAX_TOKENS * 2);
-
-    const epochBefore = session.contentEpoch();
-    session.applyPersistentBlockShrink(
-      `Shrunk prose.\n${HISTORY_EXACT_FACTS_HEADING}\n- kept_fact_1: run id RX-7`,
-    );
-    // Rewrite is a content rewrite: the request-token anchor must fall back.
-    expect(session.contentEpoch()).toBeGreaterThan(epochBefore);
-
-    const state = session.getSerializedContextState();
-    expect(state?.historySummary).toContain("Shrunk prose");
-    expect(state?.historySummary).not.toContain("Long-running summary");
-    const facts = JSON.stringify(state?.historyExactFacts ?? []);
-    expect(facts).toContain("kept_fact_1");
-    // The stale facts must be GONE — merge semantics would have kept them.
-    expect(facts).not.toContain("stale_fact_0");
-  });
+  // A hot history trigger admits eligible turns even when the retained tail
+  // leaves only one small turn to archive.
 
   it("persistent-block shrink declines small blocks and empty rewrites", () => {
     const session = new Session();
@@ -1827,18 +1988,9 @@ describe("Session execution plan anchor", () => {
     expect(plan.objective).toBe("Implement the long-running import safely");
 
     expect(JSON.stringify(session.getMessages())).not.toContain("Execution plan anchor");
-    // The plan must not leak into the history summarizer's input either — the
-    // L1 archive candidate carries the real summarizer-facing messages (a
-    // floor-low trigger materializes the candidate for this small fixture).
-    session.completeActiveTurn();
-    const candidate = session.getPendingHistoryArchive({
-      ...DEFAULT_CONTEXT_BUDGET,
-      historyTrigger: 1,
-      historyRetainTokens: 0,
-      historySingleTurnMaxTokens: 0,
-    });
-    expect(candidate).not.toBeNull();
-    expect(JSON.stringify(candidate!.messages)).not.toContain("Execution plan anchor");
+    // History projection never invokes a separate summarizer.
+    expect(session.getPendingHistoryArchive(DEFAULT_CONTEXT_BUDGET)).toBeNull();
+
   });
 
   it("survives an active checkpoint even when the checkpoint omits the goal", () => {
@@ -2572,7 +2724,6 @@ describe("Session execution plan anchor", () => {
     expect(modelView[workspaceIndex].role).toBe("developer");
   });
 
-
   it("retains an unattributed command summary that cannot be safely matched to a raw result", () => {
     const session = new Session();
     session.beginUserTurn([{ type: "text", text: "Preserve legacy command evidence" }]);
@@ -2636,8 +2787,8 @@ describe("Session execution plan anchor", () => {
       .find((content) => content.type === "text" && content.text.includes("[Completed work ledger"));
     expect(ledgerText?.type).toBe("text");
     if (ledgerText?.type !== "text") throw new Error("missing completed-work projection");
-    expect(ledgerText.text.slice(ledgerText.text.indexOf("[Completed work ledger")).length)
-      .toBeLessThanOrEqual(COMPLETED_WORK_MODEL_MAX_CHARS);
+    expect(estimateTextTokens(ledgerText.text))
+      .toBeLessThanOrEqual(COMPLETED_WORK_MODEL_MAX_TOKENS);
     expect(ledgerText.text.match(/^#\d+ /gm)?.length ?? 0)
       .toBeLessThanOrEqual(COMPLETED_WORK_MODEL_MAX_ENTRIES);
     expect(ledgerText.text).toContain(`#${COMPLETED_WORK_MAX_ENTRIES + 14}`);
@@ -2694,5 +2845,52 @@ describe("Session execution plan anchor", () => {
       ],
     });
     expect(plan.steps.map((step) => step.status)).toEqual(["in_progress", "pending"]);
+  });
+});
+
+describe('token budgets for deterministic continuation state', () => {
+  it.each(['界', 'a', '123,', '😀界'])('bounds plan excerpts for %s while retaining the durable plan', (unit) => {
+    const session = new Session();
+    const objective = 'START ' + unit.repeat(3_000) + ' END';
+    const step = 'FIRST ' + unit.repeat(100) + ' LAST';
+    session.beginUserTurn([{ type: 'text', text: objective }]);
+    session.updateExecutionPlan({ steps: [{ step, status: 'in_progress' }] });
+    const stored = session.getExecutionPlan();
+    session.applyActiveCheckpointSummary('Made progress.', session.length - 1);
+    const projected = session.getMessagesForModel().flatMap(m => m.content)
+      .filter(c => c.type === 'text').map(c => c.text).join('\n');
+    const anchor = projected.slice(projected.indexOf('[Execution plan anchor'));
+    const objectiveText = anchor.slice(anchor.indexOf(':\n') + 2, anchor.indexOf('\nRevision:'));
+    expect(estimateTextTokens(objectiveText)).toBeLessThanOrEqual(600);
+    expect(objectiveText).toContain('START');
+    expect(objectiveText).toContain('END');
+    expect(objectiveText).toContain('chars omitted');
+    const stepText = anchor.slice(anchor.indexOf('[in_progress] ') + '[in_progress] '.length);
+    expect(estimateTextTokens(stepText)).toBeLessThanOrEqual(100);
+    expect(stepText).toContain('FIRST');
+    expect(stepText).toContain('LAST');
+    expect(stepText.isWellFormed()).toBe(true);
+    expect(session.getExecutionPlan()).toEqual(stored);
+    expect(session.getExecutionPlan()?.steps[0].step).toBe(step);
+  });
+
+  it('bounds dense completed records as whole entries, including runtime framing', () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: 'text', text: 'Inspect all results' }]);
+    for (let i = 1; i <= 24; i++) session.recordCompletedWork({
+      tool: 'probe', inputDigest: `entry-${i}`, inputSummary: '界'.repeat(70),
+      status: 'succeeded', resultSummary: '界'.repeat(180), resultRef: `result-${i}`,
+    });
+    session.applyActiveCheckpointSummary('Progress.', session.length - 1);
+    const projected = session.getMessagesForModel().flatMap(m => m.content)
+      .filter(c => c.type === 'text').map(c => c.text).find(t => t.includes('[Completed work ledger'))!;
+    const ledgerText = projected.slice(projected.indexOf('[Completed work ledger'));
+    const privacyNotice = projected.split('\n').find(line => line.startsWith('Private runtime context'))!;
+    expect(estimateTextTokens(privacyNotice + '\n' + ledgerText)).toBeLessThanOrEqual(3_000);
+    expect(projected).toContain('result-24');
+    expect(projected).not.toContain('ref=result-1;');
+    expect(projected).toContain('Private runtime context');
+    expect(session.getCompletedWorkLedger()).toHaveLength(24);
+    expect(session.getCompletedWorkLedger()[0].resultSummary).toBe('界'.repeat(180));
   });
 });

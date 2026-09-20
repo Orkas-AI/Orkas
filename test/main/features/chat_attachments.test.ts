@@ -57,6 +57,26 @@ async function makePng(color = 0xAACCEEFF): Promise<Buffer> {
   return await img.getBuffer('image/png');
 }
 
+describe('chat_attachments › legacy spreadsheet input', () => {
+  it('uploads XLS unchanged, exposes it to the model, and lazily reads both sheets', async () => {
+    const bytes = fs.readFileSync(path.join(__dirname, '../../fixtures/xls/inventory.xls'));
+    const m = await loadMod();
+    expect(await m.uploadAttachment(UID, CID, 'inventory.XLS', bytes)).toMatchObject({ ok: true, info: { kind: 'spreadsheet' } });
+    const manifest = await m.buildAttachmentManifest(UID, CID, ['inventory.XLS']);
+    expect(manifest.manifest).toContain('kind="spreadsheet"');
+    expect(manifest.manifest).not.toContain('model_readable="false"');
+    const indexer = await import('../../../src/main/features/file_indexer');
+    const file = path.join(attDir(), 'inventory.XLS');
+    expect(indexer.getCachedMeta(UID, file)).toBeNull();
+    await indexer.statFile(UID, file);
+    const result = await indexer.readRange(UID, file);
+    expect(result.content).toContain('冷却泵');
+    expect(result.content).toContain('Inventory sentinel 8384');
+    expect(fs.readFileSync(file)).toEqual(bytes);
+    expect((await indexer.readRange(UID, file)).content).toBe(result.content);
+  });
+});
+
 describe('chat_attachments › diagnostic privacy', () => {
   async function captureDiagnostics(): Promise<unknown[][]> {
     const logger = await import('../../../src/main/logger');
@@ -242,17 +262,14 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(fs.existsSync(path.join(attDir(), 'oversized-skills.zip'))).toBe(false);
   });
 
-  it('rejects legacy Office binary formats before they enter the attachment pool', async () => {
+  it('rejects legacy Word and PowerPoint before they enter the attachment pool', async () => {
     const m = await loadMod();
     const doc = await m.uploadAttachment(UID, CID, 'old.doc', Buffer.from('legacy'));
-    const xls = await m.uploadAttachment(UID, CID, 'old.xls', Buffer.from('legacy'));
     const ppt = await m.uploadAttachment(UID, CID, 'old.ppt', Buffer.from('legacy'));
 
     expect(doc.ok).toBe(false);
-    expect(xls.ok).toBe(false);
     expect(ppt.ok).toBe(false);
     expect(fs.existsSync(path.join(attDir(), 'old.doc'))).toBe(false);
-    expect(fs.existsSync(path.join(attDir(), 'old.xls'))).toBe(false);
     expect(fs.existsSync(path.join(attDir(), 'old.ppt'))).toBe(false);
   });
 
@@ -1346,12 +1363,12 @@ describe('chat_attachments › buildAttachmentManifest', () => {
   it('skips legacy Office names if a stale caller tries to build a manifest for them', async () => {
     const m = await loadMod();
 
-    const r = await m.buildAttachmentManifest(UID, CID, ['old.xls']);
+    const r = await m.buildAttachmentManifest(UID, CID, ['old.doc']);
 
     expect(r.manifest).toBe('');
     expect(r.images).toEqual([]);
     expect(r.skipped).toHaveLength(1);
-    expect(r.skipped[0].name).toBe('old.xls');
+    expect(r.skipped[0].name).toBe('old.doc');
     expect(r.skipped[0].reason).toMatch(/unsupported|不支持|未対応/i);
   });
 

@@ -53,6 +53,9 @@ import {
 } from '../util/project-layout';
 import { readJson, writeJson, nowIso, safeId } from '../storage';
 import { createLogger } from '../logger';
+import { logErrorSummary, maskId } from '../util/log-redact';
+import { replaceDirectoryAtomically } from '../util/atomic-directory-replace';
+import { sha256OfFileStream } from '../util/sha256';
 import { t as translate } from '../i18n';
 import {
   getCurrentDevice as getLegacyDeviceFingerprint,
@@ -60,7 +63,6 @@ import {
   type DeviceFingerprint,
 } from '../util/device';
 import { limitNameDisplayText } from '../util/name-limit';
-import { findOuterTagRanges } from '../util/markdown-prose-code';
 import { getDeviceId as getPersistentDeviceId } from './machine_device_id';
 import { getActiveUserId, hasActiveUser } from './users';
 import { registerUserSwitchHook } from './user-switch-hooks';
@@ -343,8 +345,10 @@ function _runExclusive<T>(uid: string, fn: () => Promise<T>): Promise<T> {
   return next;
 }
 
-async function _readOne(uid: string, taskId: string): Promise<AutoTask | null> {
-  const loc = findAutoTaskLocation(uid, taskId);
+async function _readOne(
+  uid: string, taskId: string,
+  loc = findAutoTaskLocation(uid, taskId),
+): Promise<AutoTask | null> {
   const cfg = loc?.configFile || globalAutoTaskLocation(uid, taskId).configFile;
   if (!fs.existsSync(cfg)) return null;
   try {
@@ -354,8 +358,33 @@ async function _readOne(uid: string, taskId: string): Promise<AutoTask | null> {
     if (loc?.projectId && !raw.project_id) raw.project_id = loc.projectId;
     return raw;
   } catch (err) {
-    log.warn(`read failed uid=${uid} id=${taskId}: ${(err as Error).message}`);
+    log.warn(`read failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err));
     return null;
+  }
+}
+
+// Merge into an unpublished directory. A different-byte collision must not
+// choose a winner: both originals remain intact until the caller resolves it.
+async function _copyTaskEntry(source: string, target: string): Promise<void> {
+  const sourceStat = fs.lstatSync(source);
+  const targetStat = fs.existsSync(target) ? fs.lstatSync(target) : null;
+  if (sourceStat.isDirectory()) {
+    if (targetStat && !targetStat.isDirectory()) throw new Error('Task file conflict');
+    fs.mkdirSync(target, { recursive: true });
+    for (const name of fs.readdirSync(source)) {
+      await _copyTaskEntry(path.join(source, name), path.join(target, name));
+    }
+  } else if (sourceStat.isFile()) {
+    if (targetStat) {
+      if (!targetStat.isFile() || sourceStat.size !== targetStat.size
+        || await sha256OfFileStream(source) !== await sha256OfFileStream(target)) {
+        throw new Error('Task file conflict');
+      }
+    } else {
+      fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL);
+    }
+  } else {
+    throw new Error('Unsupported task file type');
   }
 }
 
@@ -375,29 +404,25 @@ async function _writeOne(uid: string, task: AutoTask): Promise<void> {
   );
   if (prev && prev.dir !== loc.dir && fs.existsSync(prev.dir)) {
     const prevRelPaths = _relFilesUnder(uid, prev.dir, prev.configRelPath);
-    fs.mkdirSync(path.dirname(loc.dir), { recursive: true });
-    if (!fs.existsSync(loc.dir)) {
-      try { fs.renameSync(prev.dir, loc.dir); }
-      catch {
-        fs.cpSync(prev.dir, loc.dir, { recursive: true });
-        fs.rmSync(prev.dir, { recursive: true, force: true });
+    const retired = path.join(path.dirname(prev.dir), `.${task.id}.moved-${crypto.randomUUID()}`);
+    await replaceDirectoryAtomically(loc.dir, async (staged) => {
+      if (fs.existsSync(loc.dir)) fs.cpSync(loc.dir, staged, { recursive: true });
+      for (const name of fs.readdirSync(prev.dir)) {
+        if (name !== 'config.json') await _copyTaskEntry(path.join(prev.dir, name), path.join(staged, name));
       }
-    } else {
-      const srcAtt = prev.attachmentsDir;
-      const dstAtt = loc.attachmentsDir;
-      if (fs.existsSync(srcAtt)) {
-        fs.mkdirSync(dstAtt, { recursive: true });
-        for (const name of fs.readdirSync(srcAtt)) {
-          const src = path.join(srcAtt, name);
-          const dst = path.join(dstAtt, name);
-          if (fs.existsSync(dst)) continue;
-          try { fs.renameSync(src, dst); }
-          catch { try { fs.copyFileSync(src, dst); fs.unlinkSync(src); } catch { /* best effort */ } }
-        }
-      }
-      fs.rmSync(prev.dir, { recursive: true, force: true });
-    }
+      await writeJson(path.join(staged, 'config.json'), task);
+    }, async () => {
+      // Same-parent rename removes the old runnable config in one operation.
+      // If it fails, the directory replacement restores the original target.
+      fs.renameSync(prev.dir, retired);
+    }, {
+      onCleanupError: (err) => log.warn('task migration backup cleanup failed', logErrorSummary(err)),
+    });
+    try { fs.rmSync(retired, { recursive: true, force: true }); }
+    catch (err) { log.warn('task migration source cleanup failed', logErrorSummary(err)); }
     for (const relPath of prevRelPaths) _notifyDeleted(relPath);
+    _notifyDirty(loc.configRelPath);
+    return;
   }
   fs.mkdirSync(loc.dir, { recursive: true });
   await writeJson(loc.configFile, task);
@@ -504,7 +529,9 @@ async function _readAll(uid: string): Promise<AutoTask[]> {
   const out: AutoTask[] = [];
   for (const loc of listAutoTaskLocations(uid)) {
     if (!_isValidTaskId(loc.taskId)) continue;
-    const task = await _readOne(uid, loc.taskId);
+    // Discovery already resolved scope and duplicate precedence. Re-scanning
+    // all directories per item makes a list quadratic in filesystem work.
+    const task = await _readOne(uid, loc.taskId, loc);
     if (task) out.push(task);
   }
   // Newest-first by created_at — a brand-new task lands at the top so the
@@ -631,7 +658,7 @@ async function _validateProjectScope(
   const recipient = fields.recipient;
   if (!projectId) return null;
   // A syntactically safe id is not proof that the project exists. In
-  // particular, Commander-generated containers can contain a hallucinated
+  // particular, a model-supplied mutation can name a hallucinated
   // but path-safe id. Reject it before _writeOne creates a project-shaped
   // orphan directory that no real Project view can surface.
   if (!fs.existsSync(projectMetaFile(uid, projectId))) return 'invalid_project';
@@ -676,11 +703,11 @@ export async function createTask(
   return _runExclusive(uid, async () => {
     const all = await _readAll(uid);
     if (all.length >= MAX_TASKS_PER_USER) {
-      log.warn(`task create rejected uid=${uid} reason=too_many_tasks count=${all.length} cap=${MAX_TASKS_PER_USER}`);
+      log.warn(`task create rejected uid=${maskId(uid)} reason=too_many_tasks count=${all.length} cap=${MAX_TASKS_PER_USER}`);
       return { ok: false as const, error: 'too_many_tasks' as const };
     }
     if (all.some((t) => t.id === desiredId)) {
-      log.warn(`task create id collision uid=${uid} id=${desiredId}`);
+      log.warn(`task create id collision uid=${maskId(uid)} id=${desiredId}`);
       return { ok: false as const, error: 'too_many_tasks' as const };
     }
     const scopeError = await _validateProjectScope(uid, norm.fields);
@@ -697,7 +724,7 @@ export async function createTask(
       updated_at: now,
     };
     await _writeOne(uid, task);
-    log.info(`task created uid=${uid} id=${task.id} type=${task.schedule.type} project=${task.project_id || '-'} attachments=${(task.attachments || []).length} device=${device.name}`);
+    log.info(`task created uid=${maskId(uid)} id=${task.id} type=${task.schedule.type} project=${task.project_id || '-'} attachments=${(task.attachments || []).length}`);
     _scheduleTask(uid, task);
     return { ok: true as const, task };
   });
@@ -705,13 +732,13 @@ export async function createTask(
 
 export async function updateTask(
   uid: string, taskId: string, patch: TaskUpdatePatch,
-  expectedProjectId?: string,
+  expectedProjectId?: string | null,
 ): Promise<{ ok: true; task: AutoTask } | { ok: false; error: TaskError }> {
   if (!_isValidTaskId(taskId)) return { ok: false, error: 'invalid_id' };
   return _runExclusive(uid, async () => {
     const stored = await _readOne(uid, taskId);
     if (!stored) return { ok: false as const, error: 'not_found' as const };
-    if (expectedProjectId && (stored.project_id !== expectedProjectId || (patch.project_id !== undefined && patch.project_id !== expectedProjectId))) return { ok: false as const, error: 'not_found' as const };
+    if (expectedProjectId !== undefined && ((stored.project_id ?? null) !== expectedProjectId || (patch.project_id !== undefined && patch.project_id !== expectedProjectId))) return { ok: false as const, error: 'not_found' as const };
     const cur = await _migrateLegacyDeviceBindingIfOwned(uid, stored);
     const priorDueAtMs = _timers.get(taskId)?.dueAtMs;
     const legacyMessageChanged = patch.content !== undefined
@@ -773,7 +800,7 @@ export async function updateTask(
         next.device_id = device.id;
         next.device_name = device.name;
       } else {
-        log.warn(`task device rebind skipped uid=${uid} id=${taskId} reason=missing_device_id`);
+        log.warn(`task device rebind skipped uid=${maskId(uid)} id=${taskId} reason=missing_device_id`);
       }
     }
     // Strip optional fields when they normalised away.
@@ -786,7 +813,7 @@ export async function updateTask(
     if (!norm.fields.attachments) delete next.attachments;
     if (!norm.fields.end_condition) delete next.end_condition;
     await _writeOne(uid, next);
-    log.info(`task updated uid=${uid} id=${taskId}`);
+    log.info(`task updated uid=${maskId(uid)} id=${taskId}`);
     // A changed schedule starts at its next valid boundary. Preserve an
     // immediate occurrence only when the unchanged schedule already had that
     // boundary armed; all other edits reuse the restore/sync no-backfill rule.
@@ -804,10 +831,10 @@ export async function updateTask(
   });
 }
 
-export async function deleteTask(uid: string, taskId: string, expectedProjectId?: string): Promise<{ ok: boolean }> {
+export async function deleteTask(uid: string, taskId: string, expectedProjectId?: string | null): Promise<{ ok: boolean }> {
   if (!_isValidTaskId(taskId)) return { ok: false };
   return _runExclusive(uid, async () => {
-    if (expectedProjectId && (await _readOne(uid, taskId))?.project_id !== expectedProjectId) return { ok: false };
+    if (expectedProjectId !== undefined && ((await _readOne(uid, taskId))?.project_id ?? null) !== expectedProjectId) return { ok: false };
     const loc = findAutoTaskLocation(uid, taskId);
     if (!loc || !fs.existsSync(loc.dir)) return { ok: false };
     const relPaths = _relFilesUnder(uid, loc.dir, loc.configRelPath);
@@ -815,11 +842,11 @@ export async function deleteTask(uid: string, taskId: string, expectedProjectId?
       fs.rmSync(loc.dir, { recursive: true, force: true });
       for (const relPath of relPaths) _notifyDeleted(relPath);
       _removeFireBoundaryClaimDir(uid, taskId);
-      log.info(`task deleted uid=${uid} id=${taskId}`);
+      log.info(`task deleted uid=${maskId(uid)} id=${taskId}`);
       _onTaskMutated(uid, null, taskId);
       return { ok: true };
     } catch (err) {
-      log.warn(`task delete failed uid=${uid} id=${taskId}: ${(err as Error).message}`);
+      log.warn(`task delete failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err));
       return { ok: false };
     }
   });
@@ -827,12 +854,12 @@ export async function deleteTask(uid: string, taskId: string, expectedProjectId?
 
 export async function setTaskEnabled(
   uid: string, taskId: string, enabled: boolean,
-  expectedProjectId?: string,
+  expectedProjectId?: string | null,
 ): Promise<{ ok: true; task: AutoTask } | { ok: false; error: TaskError }> {
   if (!_isValidTaskId(taskId)) return { ok: false, error: 'invalid_id' };
   return _runExclusive(uid, async () => {
     const cur = await _readOne(uid, taskId);
-    if (expectedProjectId && cur?.project_id !== expectedProjectId) return { ok: false as const, error: 'not_found' as const };
+    if (expectedProjectId !== undefined && (cur?.project_id ?? null) !== expectedProjectId) return { ok: false as const, error: 'not_found' as const };
     if (!cur) return { ok: false as const, error: 'not_found' as const };
     const next: AutoTask = { ...cur, enabled: !!enabled, updated_at: nowIso() };
     await _writeOne(uid, next);
@@ -841,26 +868,28 @@ export async function setTaskEnabled(
   });
 }
 
-// ── Commander `<auto-task>` container ────────────────────────────────────
+// ── Automation mutations ─────────────────────────────────────────────────
 //
-// Mutations requested by the commander use a structural block, parallel to
-// `<agent>` / `<skill>`. The model never writes `config.json` directly; it
-// emits this container and the bus applies it through the same CRUD functions
-// used by the renderer.
+// One applier for every writer: the `auto_tasks` tool and the renderer share
+// these CRUD functions, so validation, project scoping and attachment staging
+// cannot drift between them. The model never writes `config.json`.
+//
+// Retired 2026-09-13 (review P3-2): the commander used to emit an
+// `<auto-task>` structural block that the bus parsed out of its final reply.
+// The tool owns automations now — `chat_commander.md` may not even mention the
+// old protocol and the automation benchmark scores an emitted container as a
+// wrong answer — so the parser is gone rather than left as a write path that
+// fires on markup the model could quote from an untrusted page.
 
-const AUTO_TASK_OPEN_TAG = '<auto-task>';
-const AUTO_TASK_CLOSE_TAG = '</auto-task>';
-const AUTO_TASK_CHILD_RE = (tag: string) => new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`);
+export type AutoTaskMutationAction = 'create' | 'update' | 'delete' | 'enable' | 'disable';
 
-export type AutoTaskContainerAction = 'create' | 'update' | 'delete' | 'enable' | 'disable';
-
-export interface AutoTaskContainerExtracted {
-  action?: AutoTaskContainerAction;
+export interface AutoTaskMutation {
+  action?: AutoTaskMutationAction;
   taskId?: string;
   updates: Partial<TaskDraft>;
 }
 
-export interface AutoTaskContainerResult {
+export interface AutoTaskMutationResult {
   ok: boolean;
   kind?: 'created' | 'updated' | 'deleted' | 'enabled' | 'disabled';
   task?: AutoTask;
@@ -869,118 +898,12 @@ export interface AutoTaskContainerResult {
   error?: string;
 }
 
-export interface AutoTaskContainerApplyOptions {
-  /** Conversation whose current message attachments should be copied into
-   *  the task's attachment directory when `<attachments>` is present. */
+export interface AutoTaskMutationOptions {
+  /** Conversation whose current message attachments should be copied into the
+   *  task's attachment directory when the mutation names attachments. */
   sourceAttachmentCid?: string;
-  /** Host-bound project; supplied by project conversations, never by the model. */
-  projectId?: string;
-}
-
-function _childText(inner: string, tag: string): string | undefined {
-  const m = inner.match(AUTO_TASK_CHILD_RE(tag));
-  return m ? m[1].trim() : undefined;
-}
-
-function _parseJsonChild<T>(inner: string, tag: string): T | undefined {
-  const raw = _childText(inner, tag);
-  if (raw === undefined || raw === '') return undefined;
-  try {
-    return JSON.parse(raw) as T;
-  } catch (err) {
-    log.warn(`<auto-task><${tag}> JSON parse failed: ${(err as Error).message}`);
-    return undefined;
-  }
-}
-
-function _parseMaybeClearableRef<T>(inner: string, tag: string): T | null | undefined {
-  const raw = _childText(inner, tag);
-  if (raw === undefined) return undefined;
-  if (raw === '') return null;
-  try {
-    return JSON.parse(raw) as T;
-  } catch (err) {
-    log.warn(`<auto-task><${tag}> JSON parse failed: ${(err as Error).message}`);
-    return undefined;
-  }
-}
-
-function _parseAutoTaskAction(raw: string | undefined): AutoTaskContainerAction | undefined {
-  const v = String(raw || '').trim().toLowerCase().replace(/_/g, '-');
-  if (v === 'create') return 'create';
-  if (v === 'update' || v === 'edit') return 'update';
-  if (v === 'delete' || v === 'remove') return 'delete';
-  if (v === 'enable') return 'enable';
-  if (v === 'disable') return 'disable';
-  return undefined;
-}
-
-function _parseAutoTaskBool(raw: string | undefined): boolean | undefined {
-  if (raw === undefined) return undefined;
-  const v = raw.trim().toLowerCase();
-  if (v === 'true') return true;
-  if (v === 'false') return false;
-  return undefined;
-}
-
-function _parseAutoTaskContainer(inner: string): AutoTaskContainerExtracted {
-  const updates: Partial<TaskDraft> = {};
-  const action = _parseAutoTaskAction(_childText(inner, 'action'));
-  const taskId = _childText(inner, 'task_id');
-  const title = _childText(inner, 'title');
-  const content = _childText(inner, 'content');
-  const projectId = _childText(inner, 'project_id');
-  const enabled = _parseAutoTaskBool(_childText(inner, 'enabled'));
-  const schedule = _parseJsonChild<Schedule>(inner, 'schedule');
-  const endCondition = _parseMaybeClearableRef<TaskEndCondition>(inner, 'end_condition');
-  const recipient = _parseJsonChild<TaskRecipient>(inner, 'recipient');
-  const skill = _parseMaybeClearableRef<TaskSkillRef>(inner, 'skill');
-  const connector = _parseMaybeClearableRef<TaskConnectorRef>(inner, 'connector');
-  const attachments = _parseJsonChild<string[]>(inner, 'attachments');
-
-  if (title !== undefined) updates.title = title;
-  if (content !== undefined) updates.content = content;
-  if (enabled !== undefined) updates.enabled = enabled;
-  if (schedule !== undefined) updates.schedule = schedule;
-  if (endCondition !== undefined) updates.end_condition = endCondition;
-  if (recipient !== undefined) updates.recipient = recipient;
-  if (skill !== undefined) updates.skill = skill as any;
-  if (connector !== undefined) updates.connector = connector as any;
-  if (projectId !== undefined) updates.project_id = projectId || null;
-  if (Array.isArray(attachments)) {
-    updates.attachments = attachments
-      .map((name) => _sanitiseFilename(String(name || '')))
-      .filter((name) => !!name);
-  }
-
-  return {
-    ...(action ? { action } : {}),
-    ...(taskId && _isValidTaskId(taskId) ? { taskId } : {}),
-    updates,
-  };
-}
-
-export function extractAutoTaskContainers(
-  text: string,
-): { cleanText: string; containers: AutoTaskContainerExtracted[] } {
-  if (!text || text.indexOf(AUTO_TASK_OPEN_TAG) < 0) return { cleanText: text, containers: [] };
-  const ranges = findOuterTagRanges(text, 'auto-task');
-  if (!ranges.length) return { cleanText: text, containers: [] };
-  const containers: AutoTaskContainerExtracted[] = [];
-  let cleaned = '';
-  let cursor = 0;
-  for (const [s, e] of ranges) {
-    cleaned += text.slice(cursor, s);
-    const block = text.slice(s, e);
-    if (block.startsWith(AUTO_TASK_OPEN_TAG) && block.endsWith(AUTO_TASK_CLOSE_TAG)) {
-      const inner = block.slice(AUTO_TASK_OPEN_TAG.length, block.length - AUTO_TASK_CLOSE_TAG.length);
-      containers.push(_parseAutoTaskContainer(inner));
-    }
-    cursor = e;
-  }
-  cleaned += text.slice(cursor);
-  cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
-  return { cleanText: cleaned, containers };
+  /** Host-bound scope: null is global, undefined preserves Commander selection. */
+  projectId?: string | null;
 }
 
 function _autoTaskResultTitle(task: AutoTask | null | undefined, fallbackId: string): string {
@@ -991,22 +914,22 @@ function _autoTaskResultTitle(task: AutoTask | null | undefined, fallbackId: str
   return fallbackId;
 }
 
-export async function applyAutoTaskContainerFromCommander(
+export async function applyAutoTaskMutation(
   uid: string,
-  container: AutoTaskContainerExtracted,
-  opts: AutoTaskContainerApplyOptions = {},
-): Promise<AutoTaskContainerResult> {
-  const action = container.action || (container.taskId ? 'update' : 'create');
-  const taskId = container.taskId || '';
+  mutation: AutoTaskMutation,
+  opts: AutoTaskMutationOptions = {},
+): Promise<AutoTaskMutationResult> {
+  const action = mutation.action || (mutation.taskId ? 'update' : 'create');
+  const taskId = mutation.taskId || '';
   try {
-    if (opts.projectId) {
-      if (container.updates.project_id !== undefined && container.updates.project_id !== opts.projectId) return { ok: false, error: 'project_scope_mismatch' };
-      if (taskId && (await getTask(uid, taskId))?.project_id !== opts.projectId) return { ok: false, error: 'not_found' };
+    if (opts.projectId !== undefined) {
+      if (mutation.updates.project_id !== undefined && mutation.updates.project_id !== opts.projectId) return { ok: false, error: 'project_scope_mismatch' };
+      if (taskId && ((await getTask(uid, taskId))?.project_id ?? null) !== opts.projectId) return { ok: false, error: 'not_found' };
     }
     if (action === 'create') {
-      const result = await createTask(uid, { ...container.updates, ...(opts.projectId ? { project_id: opts.projectId } : {}) } as TaskDraft);
+      const result = await createTask(uid, { ...mutation.updates, ...(opts.projectId ? { project_id: opts.projectId } : {}) } as TaskDraft);
       if (!result.ok) return { ok: false, error: (result as { error: string }).error };
-      await _stageContainerAttachments(uid, result.task.id, container, opts);
+      await _stageMutationAttachments(uid, result.task.id, mutation, opts);
       return {
         ok: true,
         kind: 'created',
@@ -1038,10 +961,10 @@ export async function applyAutoTaskContainerFromCommander(
         title: _autoTaskResultTitle(result.task, taskId),
       };
     }
-    if (!Object.keys(container.updates).length) return { ok: false, error: 'empty_update' };
-    const result = await updateTask(uid, taskId, container.updates, opts.projectId);
+    if (!Object.keys(mutation.updates).length) return { ok: false, error: 'empty_update' };
+    const result = await updateTask(uid, taskId, mutation.updates, opts.projectId);
     if (!result.ok) return { ok: false, error: (result as { error: string }).error };
-    await _stageContainerAttachments(uid, taskId, container, opts);
+    await _stageMutationAttachments(uid, taskId, mutation, opts);
     return {
       ok: true,
       kind: 'updated',
@@ -1054,15 +977,15 @@ export async function applyAutoTaskContainerFromCommander(
   }
 }
 
-async function _stageContainerAttachments(
+async function _stageMutationAttachments(
   uid: string,
   taskId: string,
-  container: AutoTaskContainerExtracted,
-  opts: AutoTaskContainerApplyOptions,
+  mutation: AutoTaskMutation,
+  opts: AutoTaskMutationOptions,
 ): Promise<void> {
   if (!_isValidTaskId(taskId)) return;
-  const names = Array.isArray(container.updates.attachments)
-    ? container.updates.attachments.map((name) => _sanitiseFilename(name)).filter((name) => !!name)
+  const names = Array.isArray(mutation.updates.attachments)
+    ? mutation.updates.attachments.map((name) => _sanitiseFilename(name)).filter((name) => !!name)
     : [];
   if (!names.length || !opts.sourceAttachmentCid) return;
   const srcDir = chatAttachmentDirForConversation(uid, opts.sourceAttachmentCid);
@@ -1077,7 +1000,7 @@ async function _stageContainerAttachments(
       fs.copyFileSync(src, path.join(destDir, name));
       _notifyDirty(`${loc.attachmentsRelBase}/${name}`);
     } catch (err) {
-      log.warn(`container attachment stage failed uid=${uid} id=${taskId} name=${name}: ${(err as Error).message}`);
+      log.warn(`attachment stage failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err));
     }
   }
 }
@@ -1129,10 +1052,10 @@ export async function uploadAttachment(
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, safe), buf);
     _notifyDirty(`${loc.attachmentsRelBase}/${safe}`);
-    log.info(`attachment uploaded uid=${uid} id=${taskId} name=${safe} bytes=${buf.length}`);
+    log.info(`attachment uploaded uid=${maskId(uid)} id=${taskId} bytes=${buf.length}`);
     return { ok: true, name: safe };
   } catch (err) {
-    log.warn(`attachment upload failed uid=${uid} id=${taskId} name=${safe}: ${(err as Error).message}`);
+    log.warn(`attachment upload failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err));
     return { ok: false, error: (err as Error).message };
   }
 }
@@ -1148,7 +1071,7 @@ export async function deleteAttachment(uid: string, taskId: string, name: string
     _notifyDeleted(`${loc.attachmentsRelBase}/${safe}`);
     return { ok: true };
   } catch (err) {
-    log.warn(`attachment delete failed uid=${uid} id=${taskId} name=${safe}: ${(err as Error).message}`);
+    log.warn(`attachment delete failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err));
     return { ok: false };
   }
 }
@@ -1275,7 +1198,7 @@ function _tryClaimFireBoundary(uid: string, task: AutoTask, boundary: Date, now:
     // If the local claim directory is temporarily unavailable, keep the task
     // available rather than silently dropping the scheduled run. Normal data
     // roots are writable; this branch is defensive for odd filesystem states.
-    log.warn(`fire claim unavailable uid=${uid} id=${task.id}: ${(err as Error).message}`);
+    log.warn(`fire claim unavailable uid=${maskId(uid)} id=${task.id}`, logErrorSummary(err));
     return true;
   }
 }
@@ -1287,7 +1210,7 @@ function _releaseFireBoundaryClaim(uid: string, task: AutoTask, boundary: Date):
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'ENOENT') return;
-    log.warn(`fire claim release failed uid=${uid} id=${task.id}: ${(err as Error).message}`);
+    log.warn(`fire claim release failed uid=${maskId(uid)} id=${task.id}`, logErrorSummary(err));
   }
 }
 
@@ -1328,7 +1251,7 @@ function _pruneFireBoundaryClaims(uid: string): void {
 
 function _removeFireBoundaryClaimDir(uid: string, taskId: string): void {
   try { fs.rmSync(path.join(userLocalRoot(uid), AUTO_TASK_CLAIMS_DIR, taskId), { recursive: true, force: true }); }
-  catch (err) { log.warn(`claim dir cleanup failed uid=${uid} id=${taskId}: ${(err as Error).message}`); }
+  catch (err) { log.warn(`claim dir cleanup failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err)); }
 }
 
 /** Test seam (same convention as armedDueAtForTest). */
@@ -1402,6 +1325,23 @@ export function _buildSeedTextForTest(task: AutoTask): string {
   return _buildSeedText(task);
 }
 
+/** Hand the fired conversation a window so its task browser has an owner.
+ *
+ *  Imported lazily for the same reason the browser tool does it: `web_assist`
+ *  pulls in window machinery that a headless automation run should not load
+ *  until something actually needs it. A failure here is not fatal — the fire
+ *  still runs, it just cannot drive a page. */
+async function _bindTaskBrowserWindow(uid: string, cid: string, taskId: string): Promise<void> {
+  try {
+    const webAssist = await import('./web_assist');
+    if (!webAssist.bindHostStartedWebAssistConversation(uid, cid)) {
+      log.info(`fire browser unbound (no window) uid=${maskId(uid)} id=${taskId} cid=${maskId(cid)}`);
+    }
+  } catch (e) {
+    log.warn(`fire browser bind failed uid=${maskId(uid)} id=${taskId} cid=${maskId(cid)}`, logErrorSummary(e));
+  }
+}
+
 async function _buildFireSeedText(task: AutoTask): Promise<string> {
   const recipient = task.recipient;
   if (!recipient || recipient.kind !== 'agent') return _buildSeedText(task);
@@ -1415,7 +1355,7 @@ async function _buildFireSeedText(task: AutoTask): Promise<string> {
       });
     }
   } catch (err) {
-    log.warn(`fire recipient lookup failed id=${task.id} agent=${recipient.id}: ${(err as Error).message}`);
+    log.warn(`fire recipient lookup failed id=${task.id} agent=${recipient.id}`, logErrorSummary(err));
   }
   return _buildSeedText(task);
 }
@@ -1470,7 +1410,7 @@ async function _fireTask(
     });
     cid = conv.conversation_id;
   } catch (err) {
-    log.error(`fire conv-create failed uid=${uid} id=${task.id}: ${(err as Error).message}`);
+    log.error(`fire conv-create failed uid=${maskId(uid)} id=${task.id}`, logErrorSummary(err));
     emitFailure('conv_create_failed');
     return { ok: false, error: 'conv_create_failed' };
   }
@@ -1481,20 +1421,25 @@ async function _fireTask(
   const text = await _buildFireSeedText(task);
   const rollbackEmptyConv = async (reason: string): Promise<void> => {
     try { await chats.deleteConversation(uid, cid, task.project_id || null); }
-    catch (e) { log.warn(`fire rollback failed uid=${uid} id=${task.id} cid=${cid} reason=${reason}: ${(e as Error).message}`); }
+    catch (e) { log.warn(`fire rollback failed uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)} reason=${reason}`, logErrorSummary(e)); }
   };
+  // The conversation was just created here, so no renderer send has bound it to
+  // a window. Without that binding every task-browser call fails, so an
+  // automation that reads a page has no way to run at all. Binding stays out of
+  // the foreground: the tab this fire opens must not take over the view.
+  await _bindTaskBrowserWindow(uid, cid, task.id);
   try {
     const res = await groupChat.send({
       userId: uid, cid, text,
       ...(attachmentNames.length ? { attachments: attachmentNames } : {}),
     });
     if (!res.ok) {
-      log.warn(`fire send failed uid=${uid} id=${task.id} cid=${cid}: ${res.error || 'unknown'}`);
+      log.warn(`fire send failed uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)}`, logErrorSummary(res.error || 'unknown'));
       await rollbackEmptyConv('send_not_ok');
       emitFailure('send_not_ok');
       return { ok: false, error: 'send_not_ok' };
     }
-    log.info(`fired uid=${uid} id=${task.id} cid=${cid} project=${task.project_id || '-'} attachments=${attachmentNames.length}`);
+    log.info(`fired uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)} project=${task.project_id || '-'} attachments=${attachmentNames.length}`);
     _emitFire({
       type: 'conv_created',
       source,
@@ -1505,7 +1450,7 @@ async function _fireTask(
     });
     return { ok: true, cid };
   } catch (err) {
-    log.error(`fire send threw uid=${uid} id=${task.id} cid=${cid}: ${(err as Error).message}`);
+    log.error(`fire send threw uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)}`, logErrorSummary(err));
     await rollbackEmptyConv('send_threw');
     emitFailure('send_threw');
     return { ok: false, error: 'send_threw' };
@@ -1560,7 +1505,7 @@ async function _copyAttachmentsForFire(uid: string, task: AutoTask, cid: string)
       fs.copyFileSync(src, path.join(destDir, safe));
       copied.push(safe);
     } catch (err) {
-      log.warn(`attachment copy failed uid=${uid} id=${task.id} cid=${cid} name=${safe}: ${(err as Error).message}`);
+      log.warn(`attachment copy failed uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)}`, logErrorSummary(err));
     }
   }
   return copied;
@@ -1604,7 +1549,7 @@ export function subscribeFiresForUser(uid: string, fn: FireListener): () => void
 function _emitFire(ev: AutoFireEvent): void {
   for (const fn of _fireListeners) {
     try { fn(ev); }
-    catch (err) { log.warn(`fire listener threw: ${(err as Error).message}`); }
+    catch (err) { log.warn(`fire listener threw`, logErrorSummary(err)); }
   }
 }
 
@@ -1820,7 +1765,7 @@ function _armTimerAt(
     // already queued. Only the currently armed handle may advance the task.
     if (_timers.get(taskId)?.handle !== handle) return;
     _onTimerFire(uid, taskId, dueAtMs, scheduleStateKey, schedulerEpoch)
-      .catch((err) => log.warn(`timer fire threw id=${taskId}: ${(err as Error).message}`));
+      .catch((err) => log.warn(`timer fire threw id=${taskId}`, logErrorSummary(err)));
   }, delay);
   if (typeof (handle as any).unref === 'function') (handle as any).unref();
   _timers.set(taskId, { handle, dueAtMs, scheduleStateKey });
@@ -1877,7 +1822,7 @@ async function _onTimerFire(
     if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
     if (!_tryClaimFireBoundary(uid, task, dueBoundary, now)) {
       claimedElsewhereBoundary = dueBoundary;
-      log.info(`fire skipped duplicate uid=${uid} id=${taskId} boundary=${dueBoundary.toISOString()}`);
+      log.info(`fire skipped duplicate uid=${maskId(uid)} id=${taskId} boundary=${dueBoundary.toISOString()}`);
     } else {
       const markStartedAt = Date.now();
       try {
@@ -1887,7 +1832,7 @@ async function _onTimerFire(
         if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
       } catch (err) {
         _releaseFireBoundaryClaim(uid, task, dueBoundary);
-        log.warn(`fire mark failed id=${taskId}: ${(err as Error).message}`);
+        log.warn(`fire mark failed id=${taskId}`, logErrorSummary(err));
         _emitFire({
           type: 'fire_failed',
           source: 'scheduled',
@@ -1903,7 +1848,7 @@ async function _onTimerFire(
       try {
         await _fireTask(uid, task, 'scheduled');
       } catch (err) {
-        log.warn(`fire failed id=${taskId}: ${(err as Error).message}`);
+        log.warn(`fire failed id=${taskId}`, logErrorSummary(err));
       }
     }
   }
@@ -2021,7 +1966,7 @@ const _onSystemResume = (): void => {
     return;
   }
   _resumeScheduler(getActiveUserId())
-    .catch((err) => log.warn(`resume failed: ${(err as Error).message}`));
+    .catch((err) => log.warn(`resume failed`, logErrorSummary(err)));
 };
 
 async function _attachSchedulerPowerMonitor(): Promise<void> {
@@ -2035,7 +1980,7 @@ async function _attachSchedulerPowerMonitor(): Promise<void> {
     _schedulerPowerMonitor.on('suspend', _onSystemSuspend);
     _schedulerPowerMonitor.on('resume', _onSystemResume);
   } catch (err) {
-    log.warn(`power monitor registration failed: ${(err as Error).message}`);
+    log.warn(`power monitor registration failed`, logErrorSummary(err));
   }
 }
 
@@ -2069,7 +2014,7 @@ export function startScheduler(): void {
   _pruneFireBoundaryClaims(uid);
   const schedulerEpoch = _schedulerEpoch;
   _rescheduleAll(uid, 'restore', schedulerEpoch)
-    .catch((err) => log.warn(`bootstrap failed uid=${uid}: ${(err as Error).message}`));
+    .catch((err) => log.warn(`bootstrap failed uid=${maskId(uid)}`, logErrorSummary(err)));
 }
 
 /** Re-read task configs after sync writes directly into cloud/auto_tasks.
@@ -2102,6 +2047,6 @@ registerUserSwitchHook('auto-tasks-scheduler', (_previousUid, nextUid) => {
   queueMicrotask(() => {
     if (!_started || !schedulerEpochIsCurrent(switchEpoch) || !isActiveUser(nextUid)) return;
     _rescheduleAll(nextUid, 'restore', switchEpoch)
-      .catch((err) => log.warn(`account-switch reschedule failed uid=${nextUid}: ${(err as Error).message}`));
+      .catch((err) => log.warn(`account-switch reschedule failed uid=${maskId(nextUid)}`, logErrorSummary(err)));
   });
 });

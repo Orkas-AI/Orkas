@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#203a2b" />
+  <title>记忆翻页 · 单词卡片</title>
+  <style>
+    :root {
+      --ink: #20302a;
+      --muted: #66746d;
+      --paper: #f7f3e9;
+      --card: #fffdf7;
+      --line: #d9d7c9;
+      --green: #256746;
+      --green-dark: #174831;
+      --mint: #dcebdc;
+      --yellow: #f6d777;
+      --shadow: 0 18px 44px rgba(35, 54, 43, .12);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; background: radial-gradient(circle at 84% 3%, #e5f0df 0, transparent 27rem), var(--paper); color: var(--ink); font: 16px/1.5 ui-rounded, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; }
+    button, input, textarea { font: inherit; }
+    button { cursor: pointer; }
+    .app { width: min(1120px, calc(100% - 32px)); margin: 0 auto; padding: 42px 0 56px; }
+    header { display: flex; justify-content: space-between; gap: 22px; align-items: flex-start; margin-bottom: 30px; }
+    .eyebrow { margin: 0 0 7px; color: var(--green); font-size: .78rem; font-weight: 800; letter-spacing: .13em; }
+    h1 { margin: 0; font-family: Georgia, "Songti SC", serif; font-size: clamp(2rem, 5vw, 3.5rem); letter-spacing: -.055em; line-height: 1.05; }
+    .subtitle { margin: 12px 0 0; color: var(--muted); max-width: 38rem; }
+    .progress { min-width: 180px; padding: 13px 15px; border: 1px solid var(--line); border-radius: 15px; background: rgba(255,255,255,.52); }
+    .progress strong { display: block; font-size: 1.25rem; color: var(--green-dark); }
+    .progress span { color: var(--muted); font-size: .85rem; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(280px, .8fr); gap: 25px; align-items: start; }
+    .study, .panel { border: 1px solid var(--line); border-radius: 22px; background: rgba(255,253,247,.8); box-shadow: var(--shadow); }
+    .study { overflow: hidden; }
+    .study-head { display: flex; justify-content: space-between; align-items: center; padding: 17px 21px; border-bottom: 1px solid var(--line); }
+    .study-head p { margin: 0; color: var(--muted); font-size: .9rem; }
+    .badge { border-radius: 999px; padding: 4px 10px; background: var(--mint); color: var(--green-dark); font-size: .78rem; font-weight: 700; }
+    .card-wrap { padding: 24px; }
+    .flashcard { width: 100%; min-height: 345px; border: 0; border-radius: 18px; color: inherit; text-align: left; perspective: 1000px; background: transparent; padding: 0; }
+    .flashcard:focus-visible { outline: 3px solid #397b58; outline-offset: 4px; }
+    .card-inner { display: block; position: relative; width: 100%; min-height: 345px; transform-style: preserve-3d; transition: transform .55s ease; }
+    .flashcard.flipped .card-inner { transform: rotateY(180deg); }
+    .face { position: absolute; inset: 0; padding: clamp(25px, 7%, 48px); display: flex; flex-direction: column; justify-content: center; border: 1px solid #c8d2c5; border-radius: 18px; backface-visibility: hidden; background: linear-gradient(145deg, #fffefb, #eef5e9); box-shadow: inset 0 1px 0 white; }
+    .back { background: linear-gradient(145deg, #e1eddd, #fafff6); transform: rotateY(180deg); }
+    .face-label { margin: 0 0 12px; font-size: .76rem; font-weight: 800; letter-spacing: .14em; color: var(--green); }
+    .word { margin: 0; font-family: Georgia, "Songti SC", serif; font-size: clamp(2.4rem, 8vw, 5rem); line-height: 1.02; overflow-wrap: anywhere; }
+    .hint { margin-top: 20px; color: var(--muted); font-size: .92rem; }
+    .meaning { margin: 0 0 19px; font-size: clamp(1.35rem, 3vw, 2rem); font-weight: 750; line-height: 1.35; }
+    .example { margin: 0; padding-left: 16px; border-left: 3px solid #86ad87; color: #43564a; font-style: italic; }
+    .controls { display: grid; grid-template-columns: 1fr 1fr 1.25fr; gap: 10px; padding: 0 24px 24px; }
+    .btn { min-height: 48px; border: 1px solid var(--line); border-radius: 12px; padding: 9px 13px; background: #fffdf7; color: var(--ink); font-weight: 700; transition: transform .15s, background .15s, box-shadow .15s; }
+    .btn:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(34,55,43,.12); }
+    .btn:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px solid #89b596; outline-offset: 2px; }
+    .btn.mastered { background: var(--green); color: #fff; border-color: var(--green); }
+    .btn.mastered[aria-pressed="true"] { background: var(--green-dark); }
+    .panel { padding: 22px; }
+    .panel h2 { margin: 0 0 4px; font-size: 1.1rem; }
+    .panel > p { margin: 0 0 16px; color: var(--muted); font-size: .9rem; }
+    form { display: grid; gap: 12px; }
+    label { display: grid; gap: 5px; font-size: .88rem; font-weight: 700; }
+    input, textarea { width: 100%; border: 1px solid #c8cdc4; border-radius: 10px; padding: 10px 11px; background: #fffefa; color: var(--ink); }
+    textarea { min-height: 76px; resize: vertical; }
+    .add { margin-top: 4px; border: 0; background: var(--green-dark); color: #fff; }
+    .add:hover { background: var(--green); }
+    .list-header { display:flex; align-items:center; justify-content:space-between; margin-top: 25px; }
+    .list-header h2 { margin: 0; font-size: 1rem; }
+    .list { margin: 10px 0 0; padding: 0; list-style: none; max-height: 265px; overflow: auto; }
+    .item { display: flex; align-items: center; gap: 9px; padding: 10px 0; border-top: 1px solid #e6e2d8; }
+    .item button:first-child { flex: 1; min-width: 0; border: 0; padding: 0; background: transparent; color: var(--ink); text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .item small { color: var(--muted); white-space: nowrap; }
+    .delete { width: 30px; height: 30px; border: 0; border-radius: 8px; background: transparent; color: #8d4d47; font-size: 1.15rem; }
+    .delete:hover { background: #f8e3de; }
+    .empty { padding: 22px 0; color: var(--muted); text-align: center; font-size: .93rem; }
+    .toast { min-height: 22px; margin: 15px 24px 0; color: var(--green-dark); font-size: .9rem; font-weight: 650; }
+    @media (max-width: 780px) { header { display: block; } .progress { display: inline-block; margin-top: 20px; } .layout { grid-template-columns: 1fr; } }
+    @media (max-width: 440px) { .app { width: min(100% - 22px, 1120px); padding-top: 25px; } .card-wrap { padding: 15px; } .controls { padding: 0 15px 15px; grid-template-columns: 1fr 1fr; } .controls .mastered { grid-column: 1 / -1; } .flashcard, .card-inner { min-height: 300px; } }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition-duration: .01ms !important; animation-duration: .01ms !important; } }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header>
+      <div>
+        <p class="eyebrow">FLASHCARD PRACTICE</p>
+        <h1>记忆翻页</h1>
+        <p class="subtitle">先复习还不熟悉的单词。点击卡片翻面，再记录这一轮的掌握程度。</p>
+      </div>
+      <div class="progress" aria-live="polite"><strong id="progressText">0 / 0</strong><span>已掌握</span></div>
+    </header>
+    <div class="layout">
+      <section class="study" aria-labelledby="studyTitle">
+        <div class="study-head"><p id="studyTitle">当前优先复习未掌握的单词</p><span class="badge" id="queueBadge">准备开始</span></div>
+        <div class="toast" id="toast" role="status" aria-live="polite"></div>
+        <div class="card-wrap">
+          <button class="flashcard" id="flashcard" type="button" aria-label="翻转单词卡片，查看释义和例句">
+            <span class="card-inner">
+              <span class="face front"><span class="face-label">WORD</span><strong class="word" id="cardWord">添加你的第一个单词</strong><span class="hint">点击卡片或按空格键翻面</span></span>
+              <span class="face back"><span class="face-label">MEANING & EXAMPLE</span><strong class="meaning" id="cardMeaning">释义会显示在这里</strong><em class="example" id="cardExample">例句会显示在这里</em></span>
+            </span>
+          </button>
+        </div>
+        <div class="controls">
+          <button class="btn" id="prevBtn" type="button">← 上一张</button>
+          <button class="btn" id="nextBtn" type="button">下一张 →</button>
+          <button class="btn mastered" id="masterBtn" type="button" aria-pressed="false">✓ 标记为已掌握</button>
+        </div>
+      </section>
+      <aside class="panel" aria-labelledby="addTitle">
+        <h2 id="addTitle">添加单词</h2><p>所有内容仅保存在当前浏览器中。</p>
+        <form id="wordForm">
+          <label>单词<input id="wordInput" name="word" required maxlength="80" placeholder="例如: serendipity" autocomplete="off" /></label>
+          <label>释义<input id="meaningInput" name="meaning" required maxlength="160" placeholder="例如: 意外发现美好事物" /></label>
+          <label>例句<textarea id="exampleInput" name="example" required maxlength="300" placeholder="例如: Finding that book was pure serendipity."></textarea></label>
+          <button class="btn add" type="submit">添加到卡片组</button>
+        </form>
+        <div class="list-header"><h2>我的单词 <span id="countText">(0)</span></h2><small>未掌握优先</small></div>
+        <ul class="list" id="wordList" aria-label="单词列表"></ul>
+      </aside>
+    </div>
+  </main>
+  <script>
+    (() => {
+      const KEY = 'memory-flip-words-v1';
+      let cards = [];
+      let index = 0;
+      let flipped = false;
+      const $ = (id) => document.getElementById(id);
+      const els = { card: $('flashcard'), word: $('cardWord'), meaning: $('cardMeaning'), example: $('cardExample'), progress: $('progressText'), queue: $('queueBadge'), toast: $('toast'), master: $('masterBtn'), prev: $('prevBtn'), next: $('nextBtn'), list: $('wordList'), count: $('countText'), form: $('wordForm') };
+      const escapeText = (value) => String(value || '').trim();
+      function load() {
+        try { cards = JSON.parse(localStorage.getItem(KEY)) || []; } catch { cards = []; }
+        if (!cards.length) {
+          const now = Date.now();
+          cards = [
+            { id: 'sample-1', word: 'serendipity', meaning: '意外发现美好事物的幸运', example: 'Finding that book was pure serendipity.', mastered: false, updatedAt: now },
+            { id: 'sample-2', word: 'resilient', meaning: '有韧性的；能迅速恢复的', example: 'She remained resilient after the setback.', mastered: false, updatedAt: now - 1 }
+          ];
+          save();
+        }
+      }
+      function save() { localStorage.setItem(KEY, JSON.stringify(cards)); }
+      function ordered() { return [...cards].sort((a, b) => Number(a.mastered) - Number(b.mastered) || b.updatedAt - a.updatedAt); }
+      function current() { const queue = ordered(); if (!queue.length) return null; index = Math.max(0, Math.min(index, queue.length - 1)); return queue[index]; }
+      function announce(text) { els.toast.textContent = text; }
+      function render() {
+        const card = current(), mastered = cards.filter(c => c.mastered).length;
+        els.progress.textContent = `${mastered} / ${cards.length}`;
+        els.count.textContent = `(${cards.length})`;
+        els.prev.disabled = cards.length < 2;
+        els.next.disabled = cards.length < 2;
+        els.card.disabled = !card;
+        els.card.classList.remove('flipped'); flipped = false;
+        if (!card) {
+          els.word.textContent = '添加你的第一个单词'; els.meaning.textContent = '释义会显示在这里'; els.example.textContent = '例句会显示在这里';
+          els.queue.textContent = '卡片组为空'; els.master.disabled = true; els.master.setAttribute('aria-pressed', 'false');
+        } else {
+          els.word.textContent = card.word; els.meaning.textContent = card.meaning; els.example.textContent = card.example;
+          els.queue.textContent = card.mastered ? `已掌握 · ${index + 1}/${cards.length}` : `待复习 · ${index + 1}/${cards.length}`;
+          els.master.disabled = false; els.master.textContent = card.mastered ? '↺ 标记为未掌握' : '✓ 标记为已掌握'; els.master.setAttribute('aria-pressed', String(card.mastered));
+        }
+        els.list.innerHTML = '';
+        if (!cards.length) { els.list.innerHTML = '<li class="empty">还没有单词，从上方添加一张卡片吧。</li>'; return; }
+        ordered().forEach((item) => {
+          const li = document.createElement('li'); li.className = 'item';
+          const open = document.createElement('button'); open.type = 'button'; open.textContent = item.word; open.title = `学习 ${item.word}`; open.onclick = () => { index = ordered().findIndex(c => c.id === item.id); render(); announce(`已切换到 ${item.word}`); };
+          const state = document.createElement('small'); state.textContent = item.mastered ? '已掌握' : '待复习';
+          const del = document.createElement('button'); del.type = 'button'; del.className = 'delete'; del.setAttribute('aria-label', `删除 ${item.word}`); del.textContent = '×'; del.onclick = () => { cards = cards.filter(c => c.id !== item.id); index = 0; save(); render(); announce(`已删除 ${item.word}`); };
+          li.append(open, state, del); els.list.append(li);
+        });
+      }
+      function flip() { if (!current()) return; flipped = !flipped; els.card.classList.toggle('flipped', flipped); els.card.setAttribute('aria-label', flipped ? '卡片背面，点击翻回单词' : '卡片正面，点击查看释义和例句'); }
+      els.card.addEventListener('click', flip);
+      els.card.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); flip(); } });
+      $('prevBtn').onclick = () => { if (cards.length) { index = (index - 1 + cards.length) % cards.length; render(); } };
+      $('nextBtn').onclick = () => { if (cards.length) { index = (index + 1) % cards.length; render(); } };
+      els.master.onclick = () => { const item = current(); if (!item) return; const source = cards.find(c => c.id === item.id); source.mastered = !source.mastered; source.updatedAt = Date.now(); save(); index = 0; render(); announce(source.mastered ? `已将 ${source.word} 标记为掌握` : `已将 ${source.word} 放回优先复习队列`); };
+      els.form.addEventListener('submit', (e) => { e.preventDefault(); const data = new FormData(els.form); const word = escapeText(data.get('word')), meaning = escapeText(data.get('meaning')), example = escapeText(data.get('example')); if (!word || !meaning || !example) return; cards.push({ id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()), word, meaning, example, mastered: false, updatedAt: Date.now() }); save(); els.form.reset(); index = 0; render(); announce(`已添加 ${word}，它会优先出现在复习队列中。`); $('wordInput').focus(); });
+      load(); render();
+    })();
+  </script>
+</body>
+</html>

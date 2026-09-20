@@ -14,7 +14,8 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { userMemoryFile, userProfileFile, agentMemoryFile, userAgentMemoryFile, projectMemoryFile } from '../paths';
+import { createHash } from 'node:crypto';
+import { userMemoryFile, userProfileFile, agentMemoryFile, userAgentMemoryFile, projectMemoryFile, userLocalConfigDir } from '../paths';
 import { writeTextAtomicSync } from '../storage';
 import { createLogger } from '../logger';
 
@@ -56,6 +57,8 @@ function isProjectScope(target: MemoryScope): target is { project: string } {
 
 export interface MemoryOpResult {
   ok: boolean;
+  /** Present for conditional writes, measured against the committed store. */
+  changed?: boolean;
   error?: string;
   entries: string[];
   usage: { current: number; limit: number; entries_current?: number; entries_limit?: number };
@@ -435,6 +438,7 @@ export function removeEntry(userId: string, target: MemoryScope, oldText: string
   const match = resolveMemoryEntryMatch(entries.map(e => e.text), oldText);
   if (match.ok === false) return buildResult(userId, target, false, match.error);
 
+  clearMemoryBackup(userId, target);
   entries.splice(match.index, 1);
   const report = saveEntries(filePath, entries, limit, entryLimitForTarget(target));
   notifyMemoryDirty(target);
@@ -447,6 +451,7 @@ export function removeAgentEntry(userId: string, agentId: string, oldText: strin
   const canonicalEntries = loadEntries(canonicalPath);
   const match = resolveMemoryEntryMatch(canonicalEntries.map(e => e.text), oldText);
   if (match.ok === false) return buildAgentResult(userId, agentId, false, match.error);
+  clearMemoryBackup(userId, { agent: agentId });
   canonicalEntries.splice(match.index, 1);
   const report = saveEntries(canonicalPath, canonicalEntries, AGENT_CHAR_LIMIT, AGENT_ENTRY_LIMIT);
   notifyMemoryDirty({ agent: agentId });
@@ -461,9 +466,98 @@ export function listAgentEntries(userId: string, agentId: string): MemoryOpResul
   return buildAgentResult(userId, agentId, true);
 }
 
+/** Feature-owned conditional writes keep asynchronous consolidation outside
+ * the synchronous storage primitives used by migration and recovery. */
+export interface MemorySnapshot {
+  revision: string;
+  entries: string[];
+  charLimit: number;
+  entryLimit: number;
+}
+
+export function memoryScopeKey(target: MemoryScope): string {
+  return createHash('sha256').update(syncRelForTarget(target)).digest('hex');
+}
+
+function memoryBackupFile(userId: string, target: MemoryScope): string {
+  return path.join(userLocalConfigDir(userId), 'memory-backups', `${memoryScopeKey(target)}.json`);
+}
+
+export function snapshotMemory(userId: string, target: MemoryScope): MemorySnapshot {
+  if (isAgentScope(target)) migrateLegacyAgentMemoryOnce(userId, target.agent);
+  const filePath = fileForTarget(userId, target);
+  let raw = '';
+  try { raw = fs.readFileSync(filePath, 'utf8'); }
+  catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err; }
+  return {
+    revision: createHash('sha256').update(raw).digest('hex'),
+    entries: raw.split(/\n?§\n?/).map(text => text.trim()).filter(Boolean),
+    charLimit: limitForTarget(target),
+    entryLimit: entryLimitForTarget(target),
+  };
+}
+
+/** Check and commit synchronously: no await can admit another host writer
+ * between the revision check and the existing atomic write/sync notification. */
+export function saveMemorySnapshot(
+  userId: string, target: MemoryScope, snapshot: MemorySnapshot,
+  entries: string[], recoveryEntries?: string[],
+): MemoryOpResult | null {
+  if (snapshotMemory(userId, target).revision !== snapshot.revision) return null;
+  // Preserve ordering/eviction semantics: only the exact candidate bytes are
+  // eligible. A repeated older entry may legitimately move to the newest slot.
+  const candidateRevision = createHash('sha256').update(entries.join(ENTRY_SEPARATOR)).digest('hex');
+  if (!recoveryEntries && candidateRevision === snapshot.revision) {
+    return { ...buildResult(userId, target, true), changed: false };
+  }
+  if (recoveryEntries) {
+    // One bounded, local-only recovery snapshot per store. Explicit removal
+    // clears it so maintenance cannot retain user-deleted records.
+    writeTextAtomicSync(memoryBackupFile(userId, target), JSON.stringify({
+      version: 1, savedAt: Date.now(), entries: recoveryEntries,
+    }));
+  }
+  const report = saveEntries(fileForTarget(userId, target), entries.map(text => ({ text })),
+    limitForTarget(target), entryLimitForTarget(target));
+  notifyMemoryDirty(target);
+  const result = buildResult(userId, target, true, undefined, report);
+  const committedRevision = createHash('sha256').update(result.entries.join(ENTRY_SEPARATOR)).digest('hex');
+  return { ...result, changed: committedRevision !== snapshot.revision };
+}
+
+function clearMemoryBackup(userId: string, target: MemoryScope): void {
+  fs.rmSync(memoryBackupFile(userId, target), { force: true });
+}
+
+/** Expire local recovery copies after seven days. Walk only
+ * our flat backup directory, never user workspaces or conversation history. */
+export async function pruneMemoryBackups(
+  userId: string, now: number, canContinue: () => boolean,
+): Promise<void> {
+  const root = path.join(userLocalConfigDir(userId), 'memory-backups');
+  let dir: fs.Dir;
+  try { dir = await fs.promises.opendir(root); }
+  catch (err) { if ((err as NodeJS.ErrnoException).code === 'ENOENT') return; throw err; }
+  for await (const entry of dir) {
+    if (!canContinue()) return;
+    if (!entry.isFile() || !/^[a-f0-9]{64}\.json$/.test(entry.name)) continue;
+    const file = path.join(root, entry.name);
+    let stat: fs.Stats;
+    // Keep the expiry check and removal in one synchronous host critical
+    // section so a new recovery copy cannot replace the file between them.
+    try { stat = fs.statSync(file); }
+    catch (err) { if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue; throw err; }
+    if (!canContinue()) return;
+    if (now - stat.mtimeMs > 7 * 24 * 60 * 60 * 1000) {
+      fs.rmSync(file, { force: true });
+    }
+  }
+}
+
 export function clearMemory(userId: string, target: MemoryScope): void {
   const filePath = fileForTarget(userId, target);
   try {
+    clearMemoryBackup(userId, target);
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     writeTextAtomicSync(filePath, '');
     notifyMemoryDirty(target);

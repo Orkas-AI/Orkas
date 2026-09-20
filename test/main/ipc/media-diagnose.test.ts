@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import * as fs from 'node:fs';
+import fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { trustedIpcSender } from '../../helpers/trusted-ipc-sender';
@@ -45,6 +45,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -82,4 +83,45 @@ describe('media.diagnose', () => {
     expect(res).toEqual({ ok: true, diagnosis: 'not_found' });
     expect(JSON.stringify(res)).not.toContain(missingPath);
   });
+  it('diagnoses a telemetry-only SVG by asynchronous metadata without reading its contents', async () => {
+    const file = path.join(tmpDir, 'private-source.svg');
+    fs.writeFileSync(file, '<svg><script>private-marker</script></svg>');
+    const { chatMediaLocalUrl } = await import('../../../src/main/util/chat-media-url');
+    // Import the IPC graph before spying so module loading is not counted as diagnosis.
+    await invoke({ url: 'not a url' });
+    const syncStat = vi.spyOn(fs, 'statSync');
+    const read = vi.spyOn(fs, 'readFileSync');
+    const asyncStat = vi.spyOn(fs.promises, 'stat');
+    const result = await invoke({ url: chatMediaLocalUrl(file), diagnosticOnly: true });
+    expect(result).toEqual({ ok: true, diagnosis: 'stat_available', media_kind: 'image' });
+    expect(asyncStat).toHaveBeenCalledOnce();
+    expect(syncStat).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toContain('private');
+  });
+
+  it.each([['ENOENT', 'not_found'], ['ENOTDIR', 'not_found'], ['EACCES', 'permission_denied'],
+    ['EPERM', 'permission_denied'], ['EIO', 'io_error']])(
+    'distinguishes %s without leaking filesystem messages', async (code, diagnosis) => {
+      await invoke({ url: 'not a url' });
+      const stat = vi.spyOn(fs.promises, 'stat').mockRejectedValue(Object.assign(new Error('private-source-marker'), { code }));
+      const result = await invoke({ url: 'chat-media://local/private/source.mp4', diagnosticOnly: true });
+      expect(result).toEqual({ ok: true, diagnosis, media_kind: 'video' });
+      expect(stat).toHaveBeenCalledOnce();
+      expect(JSON.stringify(result)).not.toContain('private');
+    },
+  );
+
+  it('rejects non-files and leaves cold attachment layouts unknown without scanning indexes', async () => {
+    const dir = path.join(tmpDir, 'folder.mp4');
+    fs.mkdirSync(dir);
+    const { chatMediaLocalUrl } = await import('../../../src/main/util/chat-media-url');
+    expect(await invoke({ url: chatMediaLocalUrl(dir), diagnosticOnly: true }))
+      .toMatchObject({ diagnosis: 'not_file' });
+    const read = vi.spyOn(fs, 'readFileSync');
+    expect(await invoke({ url: 'chat-media://cid/unknown-conversation/clip.mp4', diagnosticOnly: true }))
+      .toMatchObject({ diagnosis: 'unavailable' });
+    expect(read).not.toHaveBeenCalled();
+  });
+
 });

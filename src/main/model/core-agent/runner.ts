@@ -19,6 +19,7 @@
 
 import type { AgentTool, HistoryResource, LLMProvider, Message, ToolContext, ToolResult } from '#core-agent';
 import type { Api, Model } from '@earendil-works/pi-ai';
+import { customModelImageSupport } from './custom-model-image-support';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
@@ -33,6 +34,8 @@ import {
 import {
   getSystemPromptBlock,
   getSystemSkillsPromptBlock,
+  getAgentSkillDependenciesPromptBlock,
+  APP_AUTHORING_SYSTEM_SKILLS,
   type SkillSelectionInput,
   type SkillRuntimeBinding,
 } from './skill-registry';
@@ -46,13 +49,12 @@ import {
   toolResultsDirForSession,
 } from './session-store';
 import {
-  addEntry,
-  replaceEntry,
   removeEntry,
   listEntries,
   formatForSystemPrompt as formatMemoryForSystemPrompt,
   type MemoryScope,
 } from '../../features/memory';
+import { addEntryWithMaintenance, replaceEntryWithMaintenance } from '../../features/memory-maintenance';
 import {
   formatProjectContextPolicyForSystemPrompt,
   formatProjectInstructionsForSystemPrompt,
@@ -89,7 +91,6 @@ import {
 } from './tool-catalog';
 import { createToolLoadTool, createToolSurfaceController } from './tool-surface';
 import { createProgrammaticToolPolicy } from './programmatic-tool-policy';
-import { shouldExposeOcrFileTool } from './ocr-tool-policy';
 import { createWebSearchOverrideTool } from './search-tools';
 import { renderWebFetchPage } from './web-fetch-render';
 import {
@@ -100,7 +101,7 @@ import {
 } from '../../paths';
 import { artifactDirForConversation, chatAttachmentDirForConversation } from '../../util/project-layout';
 import {
-  capToolResult,
+  capToolResultWithRetry,
   DEFAULT_INLINE_RESULT_TOKENS,
 } from '../../util/tool-result-cap';
 import { createToolResultTools } from './tool-result-tools';
@@ -115,7 +116,9 @@ import {
   createDoubaoProvider,
   buildCustomOpenAICompatibleModel,
   createCustomOpenAICompatibleProvider,
+  omitReservedOutputLimitForProvider,
 } from './external-providers';
+import { withTaskBudget } from './task-budget-provider';
 import { createRotatingProvider, type RotatingCandidate } from './rotating-provider';
 import { clearCooldown } from './profile-cooldown';
 import {
@@ -126,7 +129,7 @@ import {
 import { readDisabledSets } from '../../features/component_enabled';
 import type { OrkasApiUsageContext } from '../../features/orkas_api';
 import {
-  nativeSearchToolForApi,
+  nativeSearchToolForModel,
   nativeSearchToolName,
   routeSearchPayloadTools,
 } from './native-search-tools';
@@ -187,10 +190,18 @@ function modelCatalogEntryFromModel(
   if (typeof model.contextWindow === 'number' && model.contextWindow > 0) {
     entry.contextWindow = model.contextWindow;
   }
-  if (typeof model.maxTokens === 'number' && model.maxTokens > 0) {
+  if (typeof model.maxTokens === 'number' && model.maxTokens > 0 && !modelOutputLimitExceedsWindow(model)) {
     entry.maxOutputTokens = model.maxTokens;
   }
   return Object.keys(entry).length ? entry : null;
+}
+
+function modelOutputLimitExceedsWindow(
+  model: { contextWindow?: number; maxTokens?: number } | null | undefined,
+): boolean {
+  if (!model) return false;
+  return typeof model.contextWindow === 'number' && model.contextWindow > 0
+    && typeof model.maxTokens === 'number' && model.maxTokens >= model.contextWindow;
 }
 
 type CA = typeof import('#core-agent');
@@ -232,6 +243,7 @@ async function ca(): Promise<CA> {
 
 export interface BuildRunnerParams {
   sessionId: string;
+  persistenceSignal?: AbortSignal;
   systemPrompt?: string;
   userId?: string;
   /** Host-authoritative completed dialogue. Replaces the execution session's
@@ -346,6 +358,8 @@ export interface BuildRunnerParams {
   onFileWritten?: (absPath: string) => void | Promise<void>;
   /** Turn owner resource-display filter for the `publish_outputs` tool. */
   onOutputsPublished?: (absPaths: string[]) => string[] | Promise<string[]>;
+  /** A saved automation, so the host can offer the user a route to it. */
+  onAutoTaskSaved?: (taskId: string) => void;
   /** Caller-supplied predicate consumed by write-style tools' uniquify
    *  logic. See `model/client.ts` `ChatOptions.hasProducedPath`. */
   hasProducedPath?: (absPath: string) => boolean;
@@ -501,6 +515,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
 
   const sessionKind = sessionKindOf(params.sessionId);
   const isReflectionSession = sessionKind === 'reflect';
+  const isAgentEditSession = sessionKind === 'agent';
+  const isAgentToolAuthoringSession = isAgentEditSession
+    && params.agentToolDependencyAuthoring === true;
 
   // Per-user disabled-skill set; passed into getSystemPromptBlock so the
   // rendered `## Available skills` block excludes user-disabled skills regardless
@@ -560,7 +577,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         ? await getSystemSkillsPromptBlock(
             earlyUid || undefined,
             skillRuntimeBindings,
-            params.systemSkillList,
+            /^gmember-/.test(params.sessionId)
+              ? APP_AUTHORING_SYSTEM_SKILLS.filter(id => params.systemSkillList === undefined || params.systemSkillList.includes(id))
+              : params.systemSkillList,
           )
         : '';
       const regularBlock = await getSystemPromptBlock({
@@ -574,9 +593,15 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         displayNameById: skillDisplayNameById,
         runtimeBindings: skillRuntimeBindings,
         ...(skillSearchVisible ? { includeSkillSearchHint: true } : {}),
-        ...(params.forceOpenSkillRefs?.length ? { forceOpenSkillRefs: [...params.forceOpenSkillRefs] } : {}),
+        ...(!isAgentEditSession && params.forceOpenSkillRefs?.length
+          ? { forceOpenSkillRefs: [...params.forceOpenSkillRefs] } : {}),
       });
-      return [systemBlock, regularBlock];
+      // The editor already has a trusted candidate roster; rename its host
+      // heading rather than adding a duplicate inventory to the prompt.
+      return [systemBlock, isAgentToolAuthoringSession
+        ? regularBlock.replace('## Available skills (skills)', '## Agent Skill dependencies')
+          || getAgentSkillDependenciesPromptBlock(skillRuntimeBindings)
+        : regularBlock];
     })();
   const [mod, session, [systemSkillsBlock, skillsBlock]] = await Promise.all([
     ca(),
@@ -593,6 +618,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const providerId = primary?.provider || 'anthropic';
   const modelId    = primary?.model    || 'claude-opus-4-8';
 
+  // A failed prior save must be repaired before canonical history can replace it.
+  await session.flushPending(params.persistenceSignal);
   const sessionHadHistoryBeforeSync = session.length > 0;
   const preservingActiveTurn = !!params.resumeActiveTurn
     && !!session.getSerializedContextState()?.activeTurn;
@@ -678,8 +705,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       : tier === 'project' ? { project: projectScopeId }
       : tier === 'shared' ? 'memory' : 'user';
     const memoryHandler: MemoryToolHandler = {
-      add: (tier, content) => addEntry(uid, toScope(tier), content),
-      replace: (tier, oldText, content) => replaceEntry(uid, toScope(tier), oldText, content),
+      add: (tier, content, signal) => addEntryWithMaintenance(uid, toScope(tier), content, { signal }),
+      replace: (tier, oldText, content, signal) => replaceEntryWithMaintenance(uid, toScope(tier), oldText, content, { signal }),
       remove: (tier, oldText) => removeEntry(uid, toScope(tier), oldText),
       list: (tier) => listEntries(uid, toScope(tier)),
     };
@@ -688,12 +715,18 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     injectedTools.push(createCrossSessionMemoryTool(memoryHandler, {
       includeProjectTier: !!projectScopeId,
       projectTierReadOnly: !!projectScopeId && !isCommander && !isGroupAgent,
+      globalTiersReadOnly: !isCommander,
     }));
   }
 
-  if (uid && (isCommander || (isGroupAgent && params.projectId))) {
+  if (uid && (isCommander || isGroupAgent)) {
     const { createAutoTasksTool } = await import('../../features/auto_tasks_tool');
-    injectedTools.push(createAutoTasksTool({ userId: uid, cid: params.cid, projectId: params.projectId }));
+    injectedTools.push(createAutoTasksTool({
+      userId: uid,
+      cid: params.cid,
+      projectId: params.projectId || (isGroupAgent ? null : undefined),
+      ...(params.onAutoTaskSaved ? { onSaved: params.onAutoTaskSaved } : {}),
+    }));
   }
 
   // Project sessions keep their bound backlog. A non-project Commander may
@@ -702,13 +735,14 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // VALIDATES an already-resolved id (project_tasks.ts: "name→id resolution
   // lives with the caller"), so this handler resolves name → bound agent id
   // before persisting — unknown owners fail closed with the valid set.
-  if (uid && memoryAgentScope && (params.projectId || isCommander)) {
+  if (uid && memoryAgentScope && (params.projectId || isCommander || isGroupAgent)) {
     const cid = params.cid || '';
     const { createProjectTasksHandler: createBoundHandler } = await import('../../features/project_tasks_tool_handler');
     const createProjectTasksHandler = (pid: string) => createBoundHandler(uid, pid, cid, agentDisplayNameById, { actorId: isCommander ? 'commander' : memoryAgentScope });
     const { createProjectTasksTool } = await import('../../../core-agent/src/tools/project-tasks-tool');
-    if (params.projectId) {
-      injectedTools.push(createProjectTasksTool(createProjectTasksHandler(params.projectId), {
+    if (params.projectId || isGroupAgent) {
+      injectedTools.push(createProjectTasksTool(createProjectTasksHandler(params.projectId || ''), {
+        globalScope: !params.projectId,
         readOnly: !isCommander && !isGroupAgent,
       }));
     } else {
@@ -829,16 +863,6 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const deepResearchIsAvailable = (): boolean => Array.from(
     skillRuntimeBindings.values(),
   ).some((binding) => binding.id === DEEP_RESEARCH_SKILL_ID);
-  const visionFallbackAvailable = inputImageLimitForChoice(mod, primary) > 0;
-  const includeOcrFile = !!uid && (
-    params.richSteerEnabled === true
-    || shouldExposeOcrFileTool({
-      userMessage: params.userMessage,
-      attachmentTypes: params.attachmentMetadata?.attachmentTypes,
-      conversationAttachmentNames: conversationAttachmentNames(uid, params.cid, params.projectId),
-      visionAvailable: visionFallbackAvailable,
-    })
-  );
   const localReadOnlyDenyRoots = [
     ...fileReadOnlyExtraRoots,
     ...(toolResultsDir ? [toolResultsDir] : []),
@@ -874,8 +898,6 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const fileToolOptions = uid
     ? {
         userId: uid,
-        includeOcrFile,
-        visionFallbackAvailable,
         ...(params.cid ? { cid: params.cid } : {}),
         ...(params.conversationTitle ? { conversationTitle: params.conversationTitle } : {}),
         ...(params.conversationTitleUpdatedAt ? { conversationTitleUpdatedAt: params.conversationTitleUpdatedAt } : {}),
@@ -922,12 +944,13 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   })] : [];
 
   // Conversation-history tool (search/read actions). Group Agents get
-  // only a host-bound current-conversation scope; they never receive automatic
-  // canonical-history replay and cannot browse sibling conversations.
+  // only a host-bound current-conversation scope alongside bounded canonical
+  // dialogue replay, and cannot browse sibling conversations.
   // Commander additionally retains all scope, plus project only when this
   // conversation is actually bound to a project.
   const chatHistoryTools = uid && (isCommander || isGroupAgent) ? [createChatHistoryTool({
     userId: uid,
+    isProgrammaticToolCallContext: mod.isProgrammaticToolCallContext,
     ...(params.cid ? { currentCid: params.cid } : {}),
     ...(params.historyBoundaryMessageId
       ? { currentMessageId: params.historyBoundaryMessageId }
@@ -998,6 +1021,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         ...(agentName ? { agentName } : {}),
         ...(params.projectId ? { projectId: params.projectId } : {}),
         ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
+        ...(params.readOnlyExtraRoots?.length ? { readOnlyExtraRoots: params.readOnlyExtraRoots } : {}),
+        ...(params.runtimeReadOnlyRoots ? { runtimeReadOnlyRoots: params.runtimeReadOnlyRoots } : {}),
         ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
         ...(params.onOutputsPublished ? { onOutputsPublished: params.onOutputsPublished } : {}),
         ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
@@ -1157,9 +1182,6 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // permanently inactive.
   const visibleTools = allTools.filter((tool) => isToolVisibleToAgent(tool.name, agentId));
   const evolutionToolNames = agentId && earlyUid ? ['skill_manage'] : [];
-  const isAgentEditSession = sessionKind === 'agent';
-  const isAgentToolAuthoringSession = isAgentEditSession
-    && params.agentToolDependencyAuthoring === true;
   const isNamedAgentRuntime = sessionKind === 'gmember';
   const programmaticToolPolicy = programmaticExecutionExposureFromSessionId(params.sessionId)
     ? createProgrammaticToolPolicy({ ...(uid ? { userId: uid } : {}) })
@@ -1193,6 +1215,17 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     : availableToolNames.filter((name) => (
         name !== 'list_connector_tools' && name !== 'call_connector_tool'
       ));
+  // Describe the target Agent, not the editor's read-only Connector surface.
+  // A retained rich-steer executor without a visible connection is not usable.
+  const agentAuthoringToolNames = [...dynamicLoadableToolNames];
+  if (connectorSurface.promptBlock
+    && agentAuthoringToolNames.includes('list_connector_tools')
+    && !agentAuthoringToolNames.includes('call_connector_tool')) {
+    agentAuthoringToolNames.push('call_connector_tool');
+  }
+  const agentSkillDependencies = isCommander
+    ? getAgentSkillDependenciesPromptBlock(skillRuntimeBindings)
+    : '';
   // Agent creation is an infrequent Commander route, so its exact
   // group-to-tool directory belongs in the progressive-disclosure read rather
   // than every Commander system prompt. The binding is run-scoped and the file
@@ -1200,12 +1233,12 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // bytes, hashes, ranges, and referenced files remain unchanged.
   if (isCommander) {
     const dependencyDirectory = getLoadableToolGroupsSystemPromptBlock({
-      availableToolNames,
+      availableToolNames: agentAuthoringToolNames,
       purpose: 'agent-authoring',
     });
     for (const binding of new Set(skillRuntimeBindings.values())) {
       if (binding.source === 'system' && binding.id === 'agent-creator') {
-        binding.entryReadPrelude = [binding.entryReadPrelude, dependencyDirectory]
+        binding.entryReadPrelude = [binding.entryReadPrelude, dependencyDirectory, agentSkillDependencies]
           .filter(Boolean)
           .join('\n\n');
       }
@@ -1226,7 +1259,10 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       ? AGENT_DEPENDENCY_TOOL_GROUP_IDS
       : [];
   const hostPreloadGroups = sessionKind === 'gworker'
-    ? ['workspace', 'web', 'library']
+    // Ordinary run_worker calls omit toolList and retain the fixed generic
+    // profile. Host-owned internal workers may provide a narrower explicit
+    // profile, which must not be broadened back to workspace/web/library.
+    ? (params.toolList === undefined ? ['workspace', 'web', 'library'] : [])
     : isCommander
       ? ['workspace.read', 'workspace.execute.command', 'web']
     : isAgentEditSession
@@ -1234,6 +1270,10 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       // authoring dependencies, but discover mode still withholds calls.
       ? ['workspace.read', 'connectors']
       : [];
+  // Resolve trusted entry context once for both initial tools and turn guidance.
+  const conversationAssistance = (uid && params.cid && isCommander)
+    ? await (await import('../../features/conversation_assistance_context')).resolveConversationAssistanceForTurn(uid, params.cid)
+    : { kind: undefined, guidance: '' };
   const toolSurface = createToolSurfaceController({
     availableToolNames: surfaceAvailableToolNames,
     dynamicLoadableToolNames: isReflectionSession
@@ -1249,6 +1289,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       : [
           'read_files',
           'tool_result',
+          ...(conversationAssistance.kind === 'app_creation' ? ['create_artifact'] : []),
           ...(programmaticToolPolicy ? ['run_program'] : []),
           // Skill discovery is a small read-only catalog surface for task
           // runtimes. Package import and other management mutations remain
@@ -1296,16 +1337,15 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   );
 
   // Apply the inline-result policy at AgentRunner's FINAL result boundary.
-  // The per-result cap is budget-derived (the round ledger's perResultTokens,
-  // from the resolved model window); DEFAULT_INLINE_RESULT_TOKENS is only the
-  // fallback when no window resolves. Keeping this as a result transformer
+  // The runner supplies fixed ordinary/Skill per-result ceilings in its ledger;
+  // DEFAULT_INLINE_RESULT_TOKENS is the standalone fallback. This transformer
   // (instead of pre-wrapping the current tool list) also covers core builtins
   // and tools AgentRunner adds later, notably skill_manage. AgentRunner
   // supplies the shared per-model-step inline ledger through ctx.state and
   // shrinks it when context headroom is low. `uid` can be empty in ad-hoc
   // tests; without a session Result Store we leave outputs untouched.
   const transformToolResult = uid
-    ? (toolName: string, result: ToolResult, ctx: ToolContext): ToolResult => {
+    ? (toolName: string, result: ToolResult, ctx: ToolContext): Promise<ToolResult> => {
         if (
           deepResearchSnapshotFile
           && toolName === 'web_fetch'
@@ -1321,7 +1361,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
             });
           }
         }
-        return capToolResult(toolName, result, ctx, {
+        return capToolResultWithRetry(toolName, result, ctx, {
           maxInlineTokens: DEFAULT_INLINE_RESULT_TOKENS,
           toolResultsDir,
         });
@@ -1367,7 +1407,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // A dedicated Agent editor sees them without widening its fixed surface.
   const toolGroupsBlock = isAgentToolAuthoringSession || toolSurface.dynamicLoading
     ? getLoadableToolGroupsSystemPromptBlock({
-        availableToolNames: isAgentToolAuthoringSession ? availableToolNames : dynamicLoadableToolNames,
+        availableToolNames: isAgentToolAuthoringSession ? agentAuthoringToolNames : dynamicLoadableToolNames,
         initialActiveToolNames: toolSurface.activeToolNames(),
         ...(isAgentToolAuthoringSession ? {} : { allowedGroupIds: toolSurface.loadableGroups() }),
         purpose: isAgentToolAuthoringSession ? 'agent-authoring' : isCommander ? 'runtime' : 'agent-runtime',
@@ -1433,16 +1473,13 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const conversationBoardBlock = (uid && params.cid && sessionKind === 'gconv')
     ? await conversationTaskBoard.formatConversationBoardForTurn(uid, params.cid).catch(() => '')
     : '';
-  // Feature-owned historical target and on-demand guidance; no tool grant,
-  // dialogue write, or configuration status is inferred from this association.
-  const connectorSetupBlock = (uid && params.cid && sessionKind === 'gconv')
-    ? await (await import('../../features/connector_setup_context')).formatConnectorSetupForTurn(uid, params.cid)
-    : '';
+  // Entry guidance stays on the current turn, outside the stable system prefix.
+  const conversationAssistanceBlock = conversationAssistance.guidance;
   const turnEphemeral = [
     orchestrationBlock,
     volatileTail,
     conversationBoardBlock,
-    connectorSetupBlock,
+    conversationAssistanceBlock,
   ]
     .filter((b) => b && b.trim())
     .join('\n\n');
@@ -1484,6 +1521,17 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     const model = EXTERNAL_API_PROVIDERS.includes(choice.provider)
       ? buildExternalProviderModel(choice.provider, choice.model, choice.customConfig)
       : resolveConfiguredPiModel(mod, choice.provider, choice.model)?.model;
+    if (modelOutputLimitExceedsWindow(model)) {
+      // A catalog row, not user data: the ids are ours. The limit is dropped
+      // so the budget and the request both fall back to the default output
+      // allowance instead of a window with no room for input.
+      log.error('model catalog output limit is not smaller than its context window; ignoring the limit', {
+        provider: choice.provider,
+        model: choice.model,
+        contextWindow: model?.contextWindow,
+        maxTokens: model?.maxTokens,
+      });
+    }
     const entry = modelCatalogEntryFromModel(model);
     if (entry) modelCatalog[choice.model] = { provider: choice.provider, model: choice.model, ...entry };
   }
@@ -1524,10 +1572,13 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       params.onCandidateChosen,
       params.onCandidatesObserved,
       params.providerFirstEventTimeoutMs,
+      uid || undefined,
+      undefined,
       {
         conversationId: params.cid,
         turnId: params.turnId,
       },
+      params.cid,
     );
     // Inject the rotating provider into BOTH the factory slot AND the
     // pre-built instance cache. ProviderRegistry.get() short-circuits on
@@ -1546,7 +1597,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // the agent has no explicit dependency list.
   const onSkillCreated = agentId
     ? (skillId: string) => {
-        appendAgentSkill(agentId, skillId)
+        return appendAgentSkill(agentId, skillId)
+          .then(() => undefined)
           .catch((err) => log.warn('skill_list sync failed', {
             agent_id: maskId(agentId),
             skill_id: maskId(skillId),
@@ -1649,7 +1701,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       loadedUnusedGroupCount: stats.newlyLoadedGroups.filter((group) => (
         !toolNamesForGroups([group]).some((name) => used.has(name))
       )).length,
-      webToolUsed: used.has('web_search') || used.has('web_fetch') || used.has('browser'),
+      webToolUsed: used.has('web_search') || used.has('web_fetch') || used.has('inner_browser'),
     };
   };
 
@@ -1715,11 +1767,10 @@ export function programmaticExecutionExposureFromSessionId(sessionId: string): b
   return /^(gconv|gmember|gworker)-/.test(sessionId);
 }
 
-/** System skills are authoring/orchestration affordances, not worker context.
- *  Keep them visible to the group-chat commander, agent editor, and skill editor only; ordinary
- *  agent workers receive the normal user skill surface, not authoring protocols. */
+/** Named tasks get only APP_AUTHORING_SYSTEM_SKILLS, filtered at composition.
+ * Anonymous/internal workers never inherit product authoring protocols. */
 export function systemSkillsExposureFromSessionId(sessionId: string): boolean {
-  return /^gconv-/.test(sessionId) || /^agent-/.test(sessionId) || /^skill-/.test(sessionId);
+  return /^(gconv|gmember|agent|skill)-/.test(sessionId);
 }
 
 /** Task runtimes can discover shared non-System, non-private Skills lazily.
@@ -1787,7 +1838,10 @@ async function buildRotatingProvider(
   onCandidateChosen?: (info: { profileId: string; providerId: string; modelId: string }) => void,
   onCandidatesObserved?: (info: { candidateCount: number; availableCandidateCount: number }) => void,
   firstEventTimeoutMs?: number,
+  userId?: string,
+  retryLimits?: { networkRetryAttempts: number; normalEmptyRetryAttempts: number },
   usageContext?: OrkasApiUsageContext,
+  cid?: string,
 ): Promise<LLMProvider> {
   const candidates: RotatingCandidate[] = group.map((choice) => {
     const candProviderId = choice.provider;
@@ -1808,6 +1862,10 @@ async function buildRotatingProvider(
       providerId: candProviderId,
       modelId: candModelId,
       maxInputImages,
+      ...(candProviderId === 'custom' && userId && choice.customConfig
+        ? { imageSupport: customModelImageSupport({ userId, profileId: choice.profileId,
+            modelId: candModelId, apiKey: choice.apiKey, config: choice.customConfig }) }
+        : {}),
       ...(typeof candidateMaxTokens === 'number'
         && Number.isFinite(candidateMaxTokens)
         && candidateMaxTokens > 0
@@ -1815,7 +1873,7 @@ async function buildRotatingProvider(
         : {}),
       build: async () => {
         if (isExternal) {
-          return buildExternalProvider(choice, usageContext);
+          return withTaskBudget(await buildExternalProvider(choice, usageContext), cid);
         }
         if (resolvedModel?.isConfiguredFallback) {
           log.info('using configured model fallback', {
@@ -1825,12 +1883,16 @@ async function buildRotatingProvider(
             templateModel: resolvedModel.templateModelId,
           });
         }
-        return mod.createPiProvider({
+        return withTaskBudget(mod.createPiProvider({
           provider: candProviderId,
           ...(resolvedModel?.needsCustomModel ? { customModel: resolvedModel.model } : { model: candModelId }),
           apiKey: currentApiKey,
-          onPayload: buildNativeSearchOnPayload(candProviderId, candModelId, onNativeSearchInjected),
-        });
+          onPayload: omitReservedOutputLimitForProvider(
+            candProviderId,
+            buildNativeSearchOnPayload(candProviderId, candModelId, onNativeSearchInjected),
+          ),
+          googleNativeSearch: shouldUseGoogleNativeSearch,
+        }), cid);
       },
     };
   });
@@ -1838,6 +1900,7 @@ async function buildRotatingProvider(
   return createRotatingProvider({
     providerId,
     candidates,
+    ...retryLimits,
     ...(process.env.ORKAS_MODEL_EVAL_PINNED_ROUTE === '1'
       && providerId === 'custom'
       && candidates.length === 1
@@ -1865,6 +1928,89 @@ async function buildRotatingProvider(
   });
 }
 
+/** Pure app inference: reuse provider construction, with one configured candidate
+ * and no automatic generation retries. No Agent session or prompt assembly. */
+export async function generateWebAppText(
+  uid: string,
+  input: { prompt: string; maxTokens: number },
+  signal: AbortSignal,
+  progress: (event: { type: 'delta'; text: string }) => void,
+): Promise<{ text: string; usage: Record<string, number>; stopReason: string }> {
+  const { getActiveUserId } = await import('../../features/users');
+  const check = () => {
+    if (signal.aborted || getActiveUserId() !== uid) throw new Error('app generation cancelled');
+  };
+  check();
+  if (!input.prompt || input.prompt.length > 32000 || !Number.isInteger(input.maxTokens)
+    || input.maxTokens < 1 || input.maxTokens > 4096) throw new Error('invalid app model input');
+  const group = (await pickChatEntryGroup()).slice(0, 1);
+  check();
+  if (!group.length) throw new Error('app model unavailable');
+  const mod = await ca();
+  const primary = group[0];
+  const provider = await buildRotatingProvider(mod, primary.provider, group, undefined, undefined, undefined,
+    45_000, uid, { networkRetryAttempts: 0, normalEmptyRetryAttempts: 0 });
+  check();
+  let text = '';
+  let stopReason = '';
+  const usage: Record<string, number> = {};
+  for await (const event of provider.stream({ model: primary.model,
+    messages: [{ role: 'user', content: [{ type: 'text', text: input.prompt }] }],
+    tools: [], maxTokens: input.maxTokens, reasoning: 'off', signal })) {
+    check();
+    if (event.type === 'error') throw event.error;
+    if (event.type === 'tool_use_start' || event.type === 'tool_use_delta' || event.type === 'tool_use_end') {
+      throw new Error('unexpected app model tool request');
+    }
+    if (event.type === 'text_delta') {
+      text += event.text;
+      if (text.length > 256 * 1024) throw new Error('app model output limit');
+      // Provider chunks can exceed the bridge event budget; split deterministically.
+      for (let at = 0; at < event.text.length; at += 4000) progress({ type: 'delta', text: event.text.slice(at, at + 4000) });
+    }
+    if (event.type === 'message_start' || event.type === 'message_end') {
+      for (const key of ['inputTokens', 'outputTokens', 'totalTokens', 'cacheReadTokens', 'cacheWriteTokens']) {
+        const value = event.usage?.[key];
+        if (typeof value === 'number' && Number.isFinite(value) && value >= 0) usage[key] = value;
+      }
+    }
+    if (event.type === 'message_end') {
+      if (event.stopReason === 'tool_use' || event.content?.some(part => part.type === 'tool_use')) throw new Error('unexpected app model tool request');
+      stopReason = event.stopReason;
+    }
+  }
+  check();
+  if (!stopReason) throw new Error('incomplete app model response');
+  return { text, usage, stopReason };
+}
+
+/** A feature-owned memory transformation, using the same auth/candidate and
+ * rotating-provider construction as task runs. No Agent session, tools,
+ * repository instructions, skills, or other memory scopes enter this call. */
+export async function completeMemoryConsolidation(uid: string, message: string, signal: AbortSignal): Promise<string> {
+  const { getActiveUserId } = await import('../../features/users');
+  if (signal.aborted || getActiveUserId() !== uid) throw new Error('memory maintenance cancelled');
+  const group = await pickChatEntryGroup();
+  if (signal.aborted || getActiveUserId() !== uid || !group.length) throw new Error('memory model unavailable');
+  const mod = await ca();
+  const primary = group[0];
+  const provider = await buildRotatingProvider(mod, primary.provider, group, undefined, undefined, undefined, 45_000, uid);
+  if (signal.aborted || getActiveUserId() !== uid) throw new Error('memory maintenance cancelled');
+  const result = await provider.complete({
+    model: primary.model,
+    messages: [{ role: 'user', content: [{ type: 'text', text: message }] }],
+    tools: [],
+    maxTokens: 4096,
+    reasoning: 'off',
+    signal,
+  });
+  if (signal.aborted || getActiveUserId() !== uid || result.stopReason === 'max_tokens'
+    || result.content.some(item => item.type === 'tool_use')) {
+    throw new Error('memory maintenance incomplete');
+  }
+  return result.content.filter(item => item.type === 'text').map(item => (item as { text: string }).text).join('').trim();
+}
+
 /** Check if metacognition feature is enabled.
  *
  *  Single source of truth lives in `features/metacognition.isFeatureEnabled`
@@ -1876,30 +2022,44 @@ export function isMetacognitionEnabled(): boolean {
   return metacognition.isFeatureEnabled();
 }
 
+/** Select the transport with the same actual-model and active-tool gates as the payload hook. */
+export function shouldUseGoogleNativeSearch(
+  model: { api?: string; id?: string; provider?: string },
+  tools: readonly { name: string }[],
+): boolean {
+  return model.api === 'google-generative-ai'
+    && !!nativeSearchToolForModel(model, {})
+    && isNativeSearchEnabled() && !hasAnySearchProfile()
+    && tools.some(tool => tool.name === 'web_search');
+}
+
 /**
  * Builds a pi-ai `onPayload` callback: pi-ai invokes it after handing us
- * the result of `buildParams` and before sending the request. When both
- * "the debug toggle is on" and "model.api is in the supported list" hold,
- * we replace the function-style Orkas search schema with the model's native
- * search schema, write an info log, and bubble the "injected" event up through
- * the caller-supplied callback to client.ts's archive recorder. Paid search
- * profiles and unsupported APIs retain the Orkas function instead.
+ * the result of `buildParams` and before sending the request. An activated
+ * search definition (initial or deferred) uses the native schema only when
+ * the toggle and actual model/API permit it and no search profile takes
+ * precedence. Native injection is reported to client.ts's archive recorder.
+ * Unsupported and unknown candidates retain the executable Orkas function.
  *
  * On a miss we return params unchanged (pi-ai treats an undefined return
  * as no-op, so a no-op return is also legal).
  */
-function buildNativeSearchOnPayload(
+export function buildNativeSearchOnPayload(
   providerId: string,
   modelId: string,
   onNativeSearchInjected?: (info: NativeSearchInjectedInfo) => void,
-): (params: unknown, model: { api?: string }) => unknown {
+): (params: unknown, model: { api?: string; id?: string; provider?: string }) => unknown {
   return (params, model) => {
     const repaired = repairOpenAIToolMessageOrder(params);
-    const cur = repaired as { tools?: unknown[]; messages?: unknown[]; input?: unknown[] } & Record<string, unknown>;
+    const cur = repaired as { tools?: unknown[]; messages?: unknown[]; input?: unknown[]; reasoning?: { effort?: unknown } } & Record<string, unknown>;
     const api = model?.api;
-    const tool = nativeSearchToolForApi(api);
+    const tool = nativeSearchToolForModel(model, cur);
+    const google = api === 'google-generative-ai' || api === 'google-vertex';
+    const googleConfig = google && cur.config && typeof cur.config === 'object'
+      ? cur.config as { tools?: unknown[]; toolConfig?: Record<string, unknown> } : undefined;
     const route = routeSearchPayloadTools({
-      tools: cur.tools,
+      tools: google ? googleConfig?.tools : cur.tools,
+      input: cur.input,
       nativeEnabled: isNativeSearchEnabled(),
       paidSearchConfigured: hasAnySearchProfile(),
       nativeTool: tool,
@@ -1913,8 +2073,9 @@ function buildNativeSearchOnPayload(
     try { approxBodyBytes = JSON.stringify(repaired).length; } catch { /* circular — give up */ }
     const msgCount = Array.isArray(cur.messages)
       ? cur.messages.length
-      : (Array.isArray(cur.input) ? cur.input.length : -1);
-    const toolsBefore = Array.isArray(cur.tools) ? cur.tools.length : 0;
+      : (Array.isArray(cur.input) ? cur.input.length : (Array.isArray(cur.contents) ? cur.contents.length : -1));
+    const requestTools = google ? googleConfig?.tools : cur.tools;
+    const toolsBefore = Array.isArray(requestTools) ? requestTools.length : 0;
     const toolsAfter = Array.isArray(route.tools) ? route.tools.length : 0;
     runnerLog.info('native web search selected', {
       provider: providerId, model: modelId, api, tool: toolName,
@@ -1926,6 +2087,11 @@ function buildNativeSearchOnPayload(
     } catch (err) {
       runnerLog.warn(`onNativeSearchInjected callback failed: ${(err as Error).message}`);
     }
-    return { ...cur, tools: route.tools };
+    if (google) {
+      return { ...cur, config: { ...googleConfig, tools: route.tools,
+        toolConfig: { ...googleConfig?.toolConfig, includeServerSideToolInvocations: true,
+          functionCallingConfig: { ...(googleConfig?.toolConfig?.functionCallingConfig as object), mode: 'VALIDATED' } } } };
+    }
+    return { ...cur, tools: route.tools, ...(route.input !== undefined ? { input: route.input } : {}) };
   };
 }

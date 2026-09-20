@@ -36,6 +36,8 @@
  * it stays unit-testable without Electron and cheap to call per command.
  */
 
+import { tokenize } from '../../../core-agent/src/sandbox/shell-words';
+
 import {
   classifyExternalMutationCommand,
   classifyExternalMutationScript,
@@ -71,86 +73,6 @@ export interface RiskResult {
   reasons: RiskCategory[];
   externalMutations: ExternalMutationFinding[];
   irreversible: IrreversibleAction[];
-}
-
-// ── Tokenizer ──────────────────────────────────────────────────────────────
-
-type Tok = { type: 'word'; value: string } | { type: 'op'; value: string };
-
-const TWO_CHAR_OPS = new Set(['&&', '||', '>>', '|&', '2>']);
-const ONE_CHAR_OPS = new Set(['|', '&', ';', '>', '<', '(', ')', '\n']);
-
-/** Best-effort shell tokenizer. Quote-strips single/double quotes, honors
- *  backslash escapes, and emits control/redirection operators as separate
- *  tokens. Command substitution `$(...)` / backticks are NOT expanded — they
- *  remain literal inside word tokens, which is what the matchers want. */
-function tokenize(input: string): Tok[] {
-  const toks: Tok[] = [];
-  let cur = '';
-  let hasCur = false;
-  const flush = () => { if (hasCur) { toks.push({ type: 'word', value: cur }); cur = ''; hasCur = false; } };
-
-  let i = 0;
-  const n = input.length;
-  while (i < n) {
-    const c = input[i];
-
-    if (c === "'") {
-      const end = input.indexOf("'", i + 1);
-      if (end === -1) { cur += input.slice(i + 1); hasCur = true; i = n; break; }
-      cur += input.slice(i + 1, end); hasCur = true; i = end + 1; continue;
-    }
-    if (c === '"') {
-      let j = i + 1; let buf = '';
-      while (j < n && input[j] !== '"') {
-        if (input[j] === '\\' && j + 1 < n) {
-          const next = input[j + 1];
-          if (next === '"' || next === '\\' || next === '$' || next === '`') {
-            buf += next;
-            j += 2;
-            continue;
-          }
-          // In double-quoted POSIX shell text, backslash before an ordinary
-          // letter stays literal. Preserving it is also essential for
-          // Windows paths such as "C:\Users\test\.ssh\id_rsa".
-          buf += '\\';
-          j++;
-          continue;
-        }
-        buf += input[j]; j++;
-      }
-      cur += buf; hasCur = true; i = (j < n ? j + 1 : n); continue;
-    }
-    if (c === '\\') {
-      if (i + 1 < n) {
-        const next = input[i + 1];
-        if (next === ' ' || next === '\t' || next === '\r' || next === '\n'
-          || next === '"' || next === "'" || next === '\\' || ONE_CHAR_OPS.has(next)) {
-          cur += next;
-          hasCur = true;
-          i += 2;
-        } else {
-          cur += '\\';
-          hasCur = true;
-          i++;
-        }
-      } else {
-        cur += '\\';
-        hasCur = true;
-        i++;
-      }
-      continue;
-    }
-    if (c === ' ' || c === '\t' || c === '\r') { flush(); i++; continue; }
-
-    const two = input.slice(i, i + 2);
-    if (TWO_CHAR_OPS.has(two)) { flush(); toks.push({ type: 'op', value: two }); i += 2; continue; }
-    if (ONE_CHAR_OPS.has(c)) { flush(); toks.push({ type: 'op', value: c === '\n' ? ';' : c }); i++; continue; }
-
-    cur += c; hasCur = true; i++;
-  }
-  flush();
-  return toks;
 }
 
 const SEGMENT_SEPS = new Set([';', '&&', '||', '&']);
@@ -477,6 +399,10 @@ function matchPipeToShell(seg: Segment): boolean {
 }
 
 const RAW_DEVICE_RE = /^\/dev\/(sd|hd|nvme|disk|rdisk|mapper)/i;
+
+export function hasDestructiveBashRedirection(targets: readonly string[]): boolean {
+  return targets.some((target) => RAW_DEVICE_RE.test(target));
+}
 const POSIX_PROCESS_TERMINATORS = new Set(['kill', 'pkill', 'killall']);
 const POWERSHELL_STOP_PROCESS_CMDS = new Set(['stop-process', 'spps']);
 const SIGNAL_NAME_RE = /^-(?:sig)?(?:abrt|alrm|bus|chld|cld|cont|emt|fpe|hup|ill|info|int|io|iot|kill|lost|pipe|poll|prof|pwr|quit|segv|stkflt|stop|sys|term|trap|tstp|ttin|ttou|urg|usr1|usr2|vtalrm|winch|xcpu|xfsz)$/i;
@@ -611,7 +537,7 @@ function matchDestructive(cmd: string, args: string[], seg: Segment): boolean {
     }
   }
   // redirect / dd into a raw device
-  if (seg.redirectTargets.some((t) => RAW_DEVICE_RE.test(t))) return true;
+  if (hasDestructiveBashRedirection(seg.redirectTargets)) return true;
   if (cmd === 'tee' && args.some((t) => RAW_DEVICE_RE.test(t))) return true;
   return false;
 }
@@ -1113,7 +1039,10 @@ function classifyBashCommandInternal(command: string, depth: number): RiskResult
       }
       const inlineSource = inlineProgramSource(c, args);
       if (inlineSource) {
-        const inlineMutations = classifyExternalMutationScript(inlineSource);
+        const inlineMutations = classifyExternalMutationScript(inlineSource, {
+          language: /^(?:python(?:3(?:\.\d+)?)?|py)(?:\.exe)?$/i.test(c)
+            && !/[$`]/.test(inlineSource) ? 'python' : undefined,
+        });
         if (inlineMutations.length) reasons.add('external_mutation');
         externalMutations.push(...inlineMutations);
       }

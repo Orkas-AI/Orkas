@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>词卡 · 专注复习</title>
+  <script src="/__orkas/sdk.js"></script>
+  <style>
+    :root { --ink:#18233c; --muted:#66728c; --paper:#f6f7fb; --card:#fff; --line:#e5e8f0; --violet:#6657e8; --violet-dark:#4e40c8; --mint:#dff6e8; --mint-ink:#177346; --amber:#fff2c5; --amber-ink:#8d6400; --red:#b7364f; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:radial-gradient(circle at 88% 5%,#e7e3ff 0,transparent 24rem),var(--paper); font:16px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
+    button,input,textarea { font:inherit; }
+    button { cursor:pointer; border:0; border-radius:12px; font-weight:700; transition:transform .16s ease,box-shadow .16s ease,background .16s ease; }
+    button:focus-visible,input:focus-visible,textarea:focus-visible { outline:3px solid #9c94ff; outline-offset:3px; }
+    button:hover { transform:translateY(-1px); }
+    .shell { width:min(1100px,calc(100% - 32px)); margin:0 auto; padding:42px 0 64px; }
+    header { display:flex; justify-content:space-between; gap:24px; align-items:flex-start; margin-bottom:30px; }
+    .eyebrow { margin:0 0 8px; font-size:13px; font-weight:800; letter-spacing:.11em; color:var(--violet); }
+    h1 { margin:0; font-size:clamp(32px,5vw,48px); line-height:1.1; letter-spacing:-.045em; }
+    .sub { color:var(--muted); margin:12px 0 0; }
+    .progress { min-width:205px; padding:14px 16px; background:#fff; border:1px solid var(--line); border-radius:16px; box-shadow:0 8px 28px #1e275113; }
+    .progress strong { display:block; font-size:22px; }
+    .progress span { font-size:13px; color:var(--muted); }
+    .bar { height:7px; background:#e7e9f2; border-radius:99px; margin-top:10px; overflow:hidden; } .bar i { display:block; height:100%; width:0; border-radius:inherit; background:var(--violet); transition:width .3s ease; }
+    main { display:grid; grid-template-columns:minmax(0,1.35fr) minmax(290px,.65fr); gap:24px; }
+    .panel { background:var(--card); border:1px solid var(--line); border-radius:22px; box-shadow:0 12px 34px #20274a0c; }
+    .study { min-height:500px; display:flex; flex-direction:column; padding:24px; }
+    .study-head { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+    .badge { padding:6px 10px; background:#f0efff; border-radius:99px; font-size:13px; color:var(--violet-dark); font-weight:800; }
+    .count { color:var(--muted); font-size:14px; }
+    .flashcard { flex:1; min-height:320px; margin:22px 0; perspective:1100px; background:transparent; border:0; padding:0; text-align:left; border-radius:18px; }
+    .flashcard:hover { transform:none; }
+    .flashcard[disabled] { cursor:default; }
+    .inner { position:relative; width:100%; height:100%; min-height:320px; transition:transform .55s cubic-bezier(.2,.75,.25,1); transform-style:preserve-3d; }
+    .flashcard.is-flipped .inner { transform:rotateY(180deg); }
+    .face { position:absolute; inset:0; display:flex; flex-direction:column; justify-content:center; align-items:center; padding:32px; border:1px solid #dadff0; border-radius:18px; backface-visibility:hidden; background:linear-gradient(145deg,#fff,#f8f8ff); box-shadow:inset 0 1px #fff; }
+    .back { transform:rotateY(180deg); background:linear-gradient(145deg,#faf9ff,#f0efff); align-items:flex-start; }
+    .hint { margin:0 0 16px; color:var(--muted); font-size:14px; font-weight:700; }.word { display:block; align-self:stretch; margin:0; font-size:clamp(35px,6vw,62px); letter-spacing:-.04em; text-align:center; word-break:normal; overflow-wrap:anywhere; }.meaning { margin:0 0 22px; font-size:clamp(24px,3vw,32px); font-weight:800; line-height:1.25; }.example { margin:0; padding:16px; width:100%; border-left:4px solid #a399fb; border-radius:0 10px 10px 0; background:#fff; color:#3e4860; }.tap { position:absolute; bottom:20px; color:var(--violet); font-size:13px; font-weight:800; }
+    .actions { display:flex; gap:12px; }.actions button { flex:1; padding:13px 14px; }.again { background:var(--amber); color:var(--amber-ink); }.mastered { background:var(--mint); color:var(--mint-ink); }.disabled { background:#f1f2f6; color:#a0a7b7; }
+    aside { padding:22px; }.section-title { margin:0 0 4px; font-size:19px; }.section-copy { margin:0 0 18px; color:var(--muted); font-size:14px; }
+    label { display:block; margin:14px 0 6px; font-size:13px; font-weight:800; } input,textarea { width:100%; padding:11px 12px; color:var(--ink); background:#fff; border:1px solid #dce0ea; border-radius:10px; } textarea { min-height:80px; resize:vertical; }.add { width:100%; margin-top:16px; padding:12px; color:#fff; background:var(--violet); }.add:hover { background:var(--violet-dark); }
+    .list-wrap { margin-top:24px; padding-top:20px; border-top:1px solid var(--line); }.list-heading { display:flex; align-items:center; justify-content:space-between; }.list-heading h2 { margin:0; font-size:17px; }.card-list { list-style:none; padding:0; margin:12px 0 0; max-height:270px; overflow:auto; }.card-list li { display:flex; gap:10px; align-items:center; padding:10px 2px; border-bottom:1px solid #f0f1f5; }.card-list li:last-child { border:0; }.card-name { flex:1; min-width:0; font-weight:750; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }.state { font-size:12px; font-weight:800; padding:3px 7px; border-radius:99px; }.state.learning { background:var(--amber); color:var(--amber-ink); }.state.done { background:var(--mint); color:var(--mint-ink); }.delete { flex:0; padding:5px 7px; color:var(--red); background:transparent; font-size:13px; }.empty { padding:20px 0; color:var(--muted); font-size:14px; }.notice { min-height:21px; margin:14px 0 0; color:var(--muted); font-size:13px; }
+    @media (max-width:760px) { .shell { width:min(100% - 24px,600px); padding-top:26px; } header,main { display:block; }.progress { margin-top:20px; }.study { min-height:460px; margin-bottom:18px; }.inner,.face { min-height:280px; }.actions { flex-direction:column; } }
+    @media (prefers-reduced-motion:reduce) { *,*::before,*::after { scroll-behavior:auto!important; transition:none!important; animation:none!important; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header><div><p class="eyebrow">WORD DECK</p><h1>把陌生单词，变成你的词汇。</h1><p class="sub">优先复习未掌握的卡片；点击卡片翻面查看释义和例句。</p></div><div class="progress" aria-label="掌握进度"><strong id="progressText">0 / 0</strong><span>已掌握</span><div class="bar"><i id="progressBar"></i></div></div></header>
+    <main>
+      <section class="panel study" aria-labelledby="studyTitle"><div class="study-head"><span class="badge" id="studyTitle">优先复习</span><span class="count" id="queueCount"></span></div><button class="flashcard" id="flashcard" type="button" aria-label="翻转单词卡片"><span class="inner"><span class="face front"><span class="hint">单词</span><span class="word" id="word">添加你的第一张卡片</span><span class="tap">点击翻卡</span></span><span class="face back"><span class="hint">释义</span><span class="meaning" id="meaning">从右侧填写单词、释义和例句。</span><span class="example" id="example">例句会显示在这里。</span><span class="tap">点击返回单词</span></span></span></button><div class="actions"><button class="again" id="again" type="button">还不熟悉</button><button class="mastered" id="mastered" type="button">我已掌握</button></div><p class="notice" id="notice" role="status" aria-live="polite"></p></section>
+      <aside class="panel" aria-labelledby="addTitle"><h2 class="section-title" id="addTitle">添加新卡片</h2><p class="section-copy">所有内容会自动保存到当前应用。</p><form id="cardForm"><label for="newWord">单词 *</label><input id="newWord" required maxlength="80" placeholder="例如：resilient" autocomplete="off"><label for="newMeaning">释义 *</label><textarea id="newMeaning" required maxlength="300" placeholder="例如：有韧性的；能够快速恢复的"></textarea><label for="newExample">例句</label><textarea id="newExample" maxlength="400" placeholder="例如：She remained resilient after the setback."></textarea><button class="add" type="submit">添加到词卡</button></form><div class="list-wrap"><div class="list-heading"><h2>我的词卡</h2><span class="count" id="totalCount"></span></div><ul class="card-list" id="cardList"></ul></div></aside>
+    </main>
+  </div>
+  <script>
+    const KEY='word-deck-cards-v1';
+    const fallbackKey='word-deck-cards-v1';
+    const api=window.orkasApp;
+    let cards=[], currentId=null, isFlipped=false, saveTimer;
+    const $=s=>document.querySelector(s);
+    const els={flashcard:$('#flashcard'),word:$('#word'),meaning:$('#meaning'),example:$('#example'),again:$('#again'),mastered:$('#mastered'),queue:$('#queueCount'),progress:$('#progressText'),bar:$('#progressBar'),total:$('#totalCount'),list:$('#cardList'),notice:$('#notice'),form:$('#cardForm')};
+    const uid=()=>`${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    function notify(text){ els.notice.textContent=text; }
+    async function load(){
+      try { if(api?.storage?.get){ const r=await api.storage.get({key:KEY,scope:'cloud'}); if(r?.value) cards=Array.isArray(r.value)?r.value:[]; } else cards=JSON.parse(localStorage.getItem(fallbackKey)||'[]'); }
+      catch(e){ try{cards=JSON.parse(localStorage.getItem(fallbackKey)||'[]')}catch(_){cards=[]} notify('云端暂不可用，当前内容会保存在此浏览器。'); }
+      render();
+    }
+    function persist(){ clearTimeout(saveTimer); saveTimer=setTimeout(async()=>{ try { localStorage.setItem(fallbackKey,JSON.stringify(cards)); if(api?.storage?.set) await api.storage.set({key:KEY,value:cards,scope:'cloud'}); } catch(e){ notify('保存暂时失败；请稍后继续编辑。'); } },180); }
+    function queue(){ const unmastered=cards.filter(c=>!c.mastered); return unmastered.length?unmastered:cards; }
+    function getCurrent(){ return cards.find(c=>c.id===currentId); }
+    function nextCard(){ const q=queue(); if(!q.length){currentId=null;return;} const index=q.findIndex(c=>c.id===currentId); currentId=q[(index+1+q.length)%q.length].id; }
+    function render(){ const current=getCurrent(); if(!current && cards.length){ currentId=queue()[0].id; return render(); } isFlipped=false; els.flashcard.classList.remove('is-flipped'); const has=!!current; els.word.textContent=has?current.word:'添加你的第一张卡片'; els.meaning.textContent=has?current.meaning:'从右侧填写单词、释义和例句。'; els.example.textContent=has?(current.example||'还没有例句。'):'例句会显示在这里。'; els.flashcard.disabled=!has; els.again.disabled=!has; els.mastered.disabled=!has; els.again.classList.toggle('disabled',!has); els.mastered.classList.toggle('disabled',!has); const mastered=cards.filter(c=>c.mastered).length; const pending=cards.length-mastered; els.progress.textContent=`${mastered} / ${cards.length}`; els.bar.style.width=cards.length?`${mastered/cards.length*100}%`:'0%'; els.queue.textContent=cards.length?`${pending?`待复习 ${pending} 张`:'全部已掌握，可继续巩固'}`:'暂无词卡'; els.total.textContent=`${cards.length} 张`; els.list.innerHTML=''; if(!cards.length){const li=document.createElement('li');li.className='empty';li.textContent='还没有词卡，添加一张开始复习吧。';els.list.append(li);return;} [...cards].sort((a,b)=>Number(a.mastered)-Number(b.mastered)).forEach(c=>{const li=document.createElement('li');const name=document.createElement('span');name.className='card-name';name.textContent=c.word;const state=document.createElement('span');state.className=`state ${c.mastered?'done':'learning'}`;state.textContent=c.mastered?'已掌握':'待复习';const del=document.createElement('button');del.className='delete';del.type='button';del.textContent='删除';del.setAttribute('aria-label',`删除 ${c.word}`);del.onclick=()=>{cards=cards.filter(x=>x.id!==c.id);if(currentId===c.id)currentId=null;persist();render();notify('词卡已删除。');};li.append(name,state,del);els.list.append(li);}); }
+    els.flashcard.addEventListener('click',()=>{isFlipped=!isFlipped;els.flashcard.classList.toggle('is-flipped',isFlipped);});
+    els.form.addEventListener('submit',e=>{e.preventDefault();const word=$('#newWord').value.trim(),meaning=$('#newMeaning').value.trim(),example=$('#newExample').value.trim();if(!word||!meaning)return;const card={id:uid(),word,meaning,example,mastered:false};cards.unshift(card);currentId=card.id;persist();els.form.reset();render();notify(`已添加「${word}」，现在开始复习吧。`);$('#newWord').focus();});
+    els.again.addEventListener('click',()=>{const c=getCurrent();if(!c)return;c.mastered=false;persist();nextCard();render();notify('已保留在优先复习队列。');});
+    els.mastered.addEventListener('click',()=>{const c=getCurrent();if(!c)return;c.mastered=true;persist();nextCard();render();notify(`已标记「${c.word}」为已掌握。`);});
+    load();
+  </script>
+</body>
+</html>

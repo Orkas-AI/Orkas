@@ -1,11 +1,12 @@
+import { estimateTextTokens } from '../../../../src/core-agent/src/shared/token-estimate';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
-  SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS,
-  TOOL_DESCRIPTION_SOFT_BUDGET_CHARS,
+  SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS,
+  TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS,
 } from '../../../../src/core-agent/src/tools';
 
 vi.mock('../../../../src/main/logger', () => ({
@@ -229,7 +230,7 @@ function installLongRunningSkill(skillName: string): string {
   return pidFile;
 }
 
-async function startLifecycleBridge(label: string, projectId?: string, cli: 'claude' | 'codex' | 'opencode' = 'codex') {
+async function startLifecycleBridge(label: string, projectId?: string, cli: 'claude' | 'codex' | 'opencode' | 'hermes' | 'openclaw' = 'codex') {
   const { startBridge } = await import('../../../../src/main/features/local_agents/bridge');
   return startBridge({
     uid: TEST_UID,
@@ -304,7 +305,7 @@ function bridgeDescriptionBudgetProblems(tools: any[]): string[] {
     }
     const object = value as Record<string, unknown>;
     if (typeof object.description === 'string'
-      && object.description.replace(/\s+/g, ' ').trim().length > SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS) {
+      && estimateTextTokens(object.description.replace(/\s+/g, ' ').trim()) > SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS) {
       problems.push(`${toolName}:${pointer}/description`);
     }
     for (const [key, child] of Object.entries(object)) {
@@ -313,7 +314,7 @@ function bridgeDescriptionBudgetProblems(tools: any[]): string[] {
   };
   for (const tool of tools) {
     const description = String(tool.description || '').replace(/\s+/g, ' ').trim();
-    if (description.length > TOOL_DESCRIPTION_SOFT_BUDGET_CHARS) {
+    if (estimateTextTokens(description) > TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS) {
       problems.push(`${tool.name}:description`);
     }
     walk(String(tool.name), tool.inputSchema, 'inputSchema');
@@ -322,7 +323,119 @@ function bridgeDescriptionBudgetProblems(tools: any[]): string[] {
 }
 
 describe('orkas-bridge.cjs › MCP stdio e2e', () => {
-  it.each(['claude', 'codex', 'opencode'] as const)('lets %s use the task browser over MCP with the native contract and recovery receipts', async (cli) => {
+  it.each(['claude', 'codex', 'opencode', 'hermes', 'openclaw'] as const)('supports complete Skill resources, retained output and file publication over %s MCP', async (cli) => {
+    const { startBridge } = await import('../../../../src/main/features/local_agents/bridge');
+    const owner = `owner-${cli}`;
+    const skillRoot = path.join(tmpDir, TEST_UID, 'cloud', 'agents', owner, 'private_skills', 'private-helper');
+    fs.mkdirSync(path.join(skillRoot, 'scripts'), { recursive: true });
+    fs.mkdirSync(path.join(skillRoot, 'references'));
+    const skillEntry = '---\nname: private-helper\ndescription: scoped helper\n---\nRead references/guide.md\n' + '完整步骤🙂\n'.repeat(5000);
+    fs.writeFileSync(path.join(skillRoot, 'SKILL.md'), skillEntry);
+    const template = Buffer.from(Array.from({ length: 256 }, (_, i) => i));
+    fs.writeFileSync(path.join(skillRoot, 'template.bin'), template);
+    fs.writeFileSync(path.join(skillRoot, 'references', 'guide.md'), 'Exact private reference');
+    fs.writeFileSync(path.join(skillRoot, 'scripts', 'check.js'), "module.exports = async () => 'PRIVATE_EXECUTION_OK';");
+    const workspace = path.join(tmpDir, 'work');
+    fs.mkdirSync(workspace);
+    const output = path.join(workspace, 'report.txt');
+    fs.writeFileSync(output, 'FINAL_REPORT');
+    let published: string[] = [];
+    const content = 'Record🙂'.repeat(20_000);
+    bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue([{
+      instance: { id: 'gmail', display_name: 'Gmail' }, tools: [{ name: 'GMAIL_FETCH_EMAILS', description: 'Read mail', input_schema: {} }],
+    }] as any);
+    bridgeConnectorMock.callTool.mockResolvedValue({ content: [{ type: 'text', text: content }] });
+    const bridge = await startBridge({ uid: TEST_UID, cid: 'c-parity', agentId: owner, agentName: 'Owner', cli,
+      permissionPolicy: 'ask', currentMessageId: 'current', workingDir: workspace,
+      onOutputsPublished: (paths) => { published = paths.filter((p) => p === output); return published; },
+      runId: `parity-${cli}-${Date.now().toString(36)}`, configDir: path.join(tmpDir, 'parity-run'),
+      sandboxEnv: { ORKAS_NODE: TEST_NODE, ORKAS_BUNDLED_NODE: TEST_NODE, ORKAS_PC_DIR: process.cwd(), ORKAS_WORKSPACE_ROOT: tmpDir, ELECTRON_RUN_AS_NODE: '1' },
+    });
+    const client = new McpStdioClient(bridge.serverEnv);
+    let requestId = 2;
+    const call = (name: string, args: Record<string, unknown>) => client.request(requestId++, 'tools/call', { name, arguments: args });
+    try {
+      await client.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'parity', version: '0' } });
+      client.notify('notifications/initialized');
+      const tools = await client.request(requestId++, 'tools/list', {});
+      expect(bridgeDescriptionBudgetProblems(tools.result.tools)).toEqual([]);
+      expect(tools.result.tools.map((t: any) => t.name)).toContain('publish_outputs');
+      const memoryDefinition = tools.result.tools.find((t: any) => t.name === 'cross_session_memory');
+      expect(memoryDefinition.description).toContain('intended scope, not write access');
+      expect(memoryDefinition.description).toContain('User/shared writes belong to Commander');
+      expect(memoryDefinition.description).toContain('hand back those changes without substituting or duplicating them in another store');
+      expect(memoryDefinition.inputSchema.properties.target.description).toContain('Agent-only reusable lessons');
+      const memory = await import('../../../../src/main/features/memory');
+      for (const target of ['user', 'shared'] as const) {
+        const scope = target === 'shared' ? 'memory' : 'user';
+        memory.addEntry(TEST_UID, scope, `Durable ${target} fact`);
+        const global = await call('cross_session_memory', { action: 'list', target });
+        expect(global.result.isError).not.toBe(true);
+        expect(JSON.parse(global.result.content[0].text).entries).toEqual([`Durable ${target} fact`]);
+        for (const input of [
+          { action: 'add', content: 'new' },
+          { action: 'replace', old_text: `Durable ${target} fact`, content: 'new' },
+          { action: 'remove', old_text: `Durable ${target} fact` },
+        ]) {
+          const denied = await call('cross_session_memory', { ...input, target });
+          expect(denied.result.isError).toBe(true);
+          expect(denied.result.content[0].text).toContain('read-only');
+        }
+        expect(memory.listEntries(TEST_UID, scope).entries).toEqual([`Durable ${target} fact`]);
+      }
+      const listed = await call('orkas_list_skills', {});
+      expect(JSON.parse(listed.result.content[0].text)).toContainEqual(expect.objectContaining({ id: 'private-helper', source: 'agent' }));
+      for (const resource of [{ encoding: 'utf8', expected: Buffer.from(skillEntry) }, { path: 'template.bin', encoding: 'base64', expected: template }]) {
+        const pages: Buffer[] = [];
+        let offset: number | null = 0;
+        for (let i = 0; offset !== null && i < 20; i++) {
+          const reply = await call('orkas_read_skill', { id: 'private-helper', path: resource.path, encoding: resource.encoding, ...(offset ? { offset } : {}), ...(resource.path ? { limit: 73 } : {}) });
+          expect(reply.result.isError).not.toBe(true);
+          const page = JSON.parse(reply.result.content[0].text);
+          pages.push(Buffer.from(page.content, resource.encoding as BufferEncoding));
+          if (page.next_offset !== null) expect(page.next_offset).toBeGreaterThan(offset);
+          offset = page.next_offset;
+        }
+        expect(offset).toBeNull();
+        expect(Buffer.concat(pages)).toEqual(resource.expected);
+      }
+      const resource = await call('orkas_read_skill', { id: 'private-helper', path: 'references/guide.md' });
+      expect(JSON.parse(resource.result.content[0].text).content).toBe('Exact private reference');
+      const ran = await call('orkas_run_skill', { skill: 'private-helper', script: 'check' });
+      expect(ran.result.isError).not.toBe(true);
+      expect(JSON.parse(ran.result.content[0].text).stdout).toContain('PRIVATE_EXECUTION_OK');
+      const first = await call('orkas_call_connector_tool', { connector_id: 'gmail', tool_name: 'GMAIL_FETCH_EMAILS' });
+      expect(first.result.isError, first.result.content[0].text.slice(0, 200)).not.toBe(true);
+      let page = JSON.parse(first.result.content[0].text);
+      let joined = page.text;
+      const ref = page.output_ref;
+      for (let i = 0; page.next_offset !== null && i < 20; i++) {
+        const previousOffset = page.next_offset;
+        const next = await call('orkas_call_connector_tool', { action: 'read', output_ref: ref, offset: page.next_offset });
+        page = JSON.parse(next.result.content[0].text);
+        if (page.next_offset !== null) expect(page.next_offset).toBeGreaterThan(previousOffset);
+        joined += page.text;
+      }
+      expect(page.next_offset).toBeNull();
+      const connectors = await import('../../../../src/main/features/connectors');
+      expect(joined).toBe(connectors.stringifyMcpResult({ content: [{ type: 'text', text: content }] }));
+      expect(bridgeConnectorMock.callTool).toHaveBeenCalledTimes(1);
+      expect(JSON.parse((await call('publish_outputs', { paths: ['report.txt'] })).result.content[0].text)).toEqual({ requested: 1, published: 1 });
+      expect(published).toEqual([output]);
+      await call('publish_outputs', { paths: [] });
+      expect(published).toEqual([]);
+      expect((await call('orkas_read_skill', { id: 'private-helper', path: '../outside' })).result.isError).toBe(true);
+      expect((await call('publish_outputs', { paths: ['../outside'] })).result.isError).toBe(true);
+      expect(fs.readFileSync(output, 'utf8')).toBe('FINAL_REPORT');
+    } finally {
+      client.kill();
+      await client.waitForExit();
+      await bridge.close();
+    }
+    client.assertCleanOutput();
+    expect(fs.existsSync(path.join(tmpDir, 'parity-run', '.orkas-bridge-results'))).toBe(false);
+  }, 20000);
+  it.each(['claude', 'codex', 'opencode', 'hermes', 'openclaw'] as const)('lets %s use the task browser over MCP with the native contract and recovery receipts', async (cli) => {
     const life = await import('../../../../src/main/features/web_assist_lifecycle');
     const label = `browser-${cli}`;
     const cid = `c-${label}`;
@@ -336,7 +449,7 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
       await client.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'vitest', version: '0' } });
       client.notify('notifications/initialized');
       const listed = await client.request(2, 'tools/list', {});
-      const definition = listed.result.tools.find((tool: any) => tool.name === 'browser');
+      const definition = listed.result.tools.find((tool: any) => tool.name === 'inner_browser');
       expect(definition).toBeTruthy();
       const { buildConversationBrowserTool } = await import('../../../../src/main/features/group_chat/browser_tool');
       const native = buildConversationBrowserTool(TEST_UID, cid);
@@ -344,9 +457,13 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
       expect(definition.inputSchema.properties).toEqual(native.inputSchema.properties);
       expect(definition.inputSchema.additionalProperties).toBe(false);
       expect(bridgeDescriptionBudgetProblems([definition])).toEqual([]);
-      if (cli === 'opencode') expect(listed.result.tools.map((tool: any) => tool.name)).toEqual(['browser']);
+      expect(listed.result.tools.map((tool: any) => tool.name)).toEqual(expect.arrayContaining(['inner_browser', 'auto_tasks', 'todo_tasks', 'orkas_list_skills', 'cross_session_memory']));
       let id = 3;
-      const call = async (args: Record<string, unknown>) => (await client.request(id++, 'tools/call', { name: 'browser', arguments: args })).result;
+      expect(listed.result.tools.some((tool: any) => tool.name === 'browser')).toBe(false);
+      const retired = await client.request(id++, 'tools/call', { name: 'browser', arguments: { operation: 'open', url: 'https://example.com/retired' } });
+      expect(retired.result.isError).toBe(true);
+      expect(browserHost.openModelWebAssist).not.toHaveBeenCalled();
+      const call = async (args: Record<string, unknown>) => (await client.request(id++, 'tools/call', { name: 'inner_browser', arguments: args })).result;
       const opened = await call({ operation: 'open', url: 'https://example.com/settings' });
       expect(JSON.parse(opened.content[0].text)).toEqual({ ok: true, active_tab_id: '0123456789ab' });
       expect(browserHost.openModelWebAssist).toHaveBeenCalledWith(TEST_UID, cid, { url: 'https://example.com/settings' });
@@ -386,7 +503,7 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
     const project = await projects.createProject(TEST_UID, 'OpenCode MCP');
     if (!project.ok) throw new Error('project fixture failed');
     const pid = project.project.project_id;
-    const task = await tasks.createTask(TEST_UID, pid, { title: 'Only visible through the tool' });
+    const task = await tasks.createTask(TEST_UID, pid, { content: 'Only visible through the tool' });
     if (!task.ok) throw new Error('task fixture failed');
     const bridge = await startLifecycleBridge('opencode-mcp', pid, 'opencode');
     const config = JSON.parse(fs.readFileSync(bridge.mcpConfigPath, 'utf8'));
@@ -399,6 +516,9 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
       const { StdioClientTransport } = require(${JSON.stringify(path.join(sdkRoot, 'stdio.js'))});
       (async () => {
         assert(!process.argv.join(' ').includes('Only visible through the tool'));
+        const input = [];
+        for await (const chunk of process.stdin) input.push(chunk);
+        assert.equal(Buffer.concat(input).toString('utf8'), 'Read the current backlog');
         const server = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT).mcp.orkas;
         const client = new Client({ name: 'fake-opencode', version: '1' });
         const transport = new StdioClientTransport({
@@ -408,11 +528,11 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         transport.stderr?.on('data', chunk => process.stderr.write(chunk));
         try {
           await client.connect(transport);
-          assert.deepEqual((await client.listTools()).tools.map(t => t.name).sort(), ['auto_tasks', 'todo_tasks']);
+          assert.deepEqual((await client.listTools()).tools.map(t => t.name).sort(), ['auto_tasks', 'chat_history', 'cross_session_memory', 'library', 'library_save', 'orkas_handoff_to_commander', 'orkas_list_skills', 'orkas_read_skill', 'orkas_run_skill', 'project_instructions', 'todo_tasks']);
           const result = await client.callTool({ name: 'todo_tasks', arguments: { action: 'list' } });
           assert(!result.isError);
           const tasks = JSON.parse(result.content[0].text).tasks;
-          assert.equal(tasks[0].title, 'Only visible through the tool');
+          assert.equal(tasks[0].content, 'Only visible through the tool');
           process.stdout.write(JSON.stringify({ type: 'text', part: { text: tasks[0].status } }) + '\\n');
           process.stdout.write(JSON.stringify({ type: 'step_finish', sessionID: 'opencode-test-session', part: { reason: 'stop' } }) + '\\n');
         } finally { await client.close(); }
@@ -436,46 +556,106 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
     expect(fs.existsSync(bridge.serverEnv.ORKAS_BRIDGE_ENV_FILE)).toBe(false);
   });
 
-  it.each(['claude', 'codex', 'opencode'] as const)('exposes scoped task lifecycle operations over the %s MCP bridge', async (cli) => {
+  it('lets the OpenClaw backend use live global tasks through its per-run config on new and resumed sessions', async () => {
+    const tasks = await import('../../../../src/main/features/project_tasks');
+    const { openclawBackend } = await import('../../../../src/main/features/local_agents/backends/openclaw');
+    const task = await tasks.createTask(TEST_UID, '', { content: 'Global task fetched on demand' });
+    if (!task.ok) throw new Error('task fixture failed');
+    const bridge = await startLifecycleBridge('openclaw-mcp', undefined, 'openclaw');
+    const config = JSON.parse(fs.readFileSync(bridge.mcpConfigPath, 'utf8'));
+    const sdkRoot = path.join(process.cwd(), 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'cjs', 'client');
+    const source = path.join(tmpDir, 'openclaw.json');
+    const original = JSON.stringify({ agents: { defaults: { workspace: tmpDir } } });
+    fs.writeFileSync(source, original);
+    fs.writeFileSync(path.join(tmpDir, 'config'), `process.stdout.write(${JSON.stringify(source)});`);
+    // No model: the native adapter launches a consumer which reads the exact
+    // runtime config and calls the real MCP server and host-bound task store.
+    fs.writeFileSync(path.join(tmpDir, 'agent'), `
+      const assert = require('node:assert/strict');
+      const fs = require('node:fs');
+      const { Client } = require(${JSON.stringify(path.join(sdkRoot, 'index.js'))});
+      const { StdioClientTransport } = require(${JSON.stringify(path.join(sdkRoot, 'stdio.js'))});
+      (async () => {
+        assert(!process.argv.join(' ').includes('Global task fetched on demand'));
+        const server = JSON.parse(fs.readFileSync(process.env.OPENCLAW_CONFIG_PATH, 'utf8')).mcp.servers.orkas;
+        const client = new Client({ name: 'fake-openclaw', version: '1' });
+        const transport = new StdioClientTransport({ command: server.command, args: server.args,
+          env: { ...process.env, ...server.env }, stderr: 'pipe' });
+        transport.stderr?.on('data', chunk => process.stdout.write(chunk));
+        try {
+          await client.connect(transport);
+          const names = (await client.listTools()).tools.map(t => t.name);
+          assert(names.includes('todo_tasks') && names.includes('auto_tasks') && names.includes('cross_session_memory'));
+          assert(!names.includes('project_instructions') && !names.includes('library_save'));
+          const result = await client.callTool({ name: 'todo_tasks', arguments: { action: 'list' } });
+          assert(!result.isError);
+          const task = JSON.parse(result.content[0].text).tasks[0];
+          assert.equal(task.content, 'Global task fetched on demand');
+          const forbidden = await client.callTool({ name: 'todo_tasks', arguments: { action: 'create', content: 'must not persist', project_id: 'foreign-project' } });
+          assert.equal(forbidden.isError, true);
+          process.stderr.write(JSON.stringify({ payloads: [{ text: task.status }], meta: { agentMeta: { sessionId: 'openclaw-test-session' } } }));
+        } finally { await client.close(); }
+      })().catch(error => { process.stderr.write('OpenClaw MCP contract probe failed: ' + error.message); process.exitCode = 1; });
+    `);
+    try {
+      for (const [status, resumeSessionId] of [['todo', undefined], ['review', 'openclaw-test-session']] as const) {
+        await tasks.updateTask(TEST_UID, '', task.task.id, { status });
+        const events: any[] = [];
+        await openclawBackend.run({ binPath: TEST_NODE, prompt: 'Read my tasks', cwd: tmpDir,
+          resumeSessionId, signal: new AbortController().signal, timeoutMs: 10_000,
+          bridge: { mcpConfigPath: bridge.mcpConfigPath, server: config.mcpServers.orkas },
+          onEvent: event => events.push(event) });
+        expect(events.find(event => event.type === 'done')).toMatchObject({ status: 'completed', output: status, sessionId: 'openclaw-test-session' });
+        expect(events.filter(event => event.type === 'text-delta').map(event => event.text)).toEqual([status]);
+        const diagnostics = events.filter(event => event.type === 'stderr-line').map(event => event.line);
+        expect(diagnostics).toHaveLength(1);
+        expect(JSON.parse(diagnostics[0]).payloads).toEqual([{ text: status }]);
+        expect(fs.readFileSync(source, 'utf8')).toBe(original);
+        expect(fs.readdirSync(tmpDir).filter(name => name.startsWith('.orkas-run-'))).toEqual([]);
+      }
+      expect((await tasks.listTasks(TEST_UID, '')).map(item => item.content)).toEqual(['Global task fetched on demand']);
+    } finally { await bridge.close(); }
+    expect(fs.existsSync(bridge.serverEnv.ORKAS_BRIDGE_ENV_FILE)).toBe(false);
+  });
+
+  it.each(['claude', 'codex', 'opencode', 'hermes', 'openclaw'] as const)('exposes scoped task lifecycle operations over the %s MCP bridge', async (cli) => {
     const projects = await import('../../../../src/main/features/projects');
     const tasks = await import('../../../../src/main/features/project_tasks');
     const created = await projects.createProject(TEST_UID, 'CLI backlog');
     if (!created.ok) throw new Error('project fixture failed');
     const pid = created.project.project_id;
     for (const bound of [false, true]) {
+      const scope = bound ? pid : '';
       const bridge = await startLifecycleBridge(`tasks-${bound}`, bound ? pid : undefined, cli);
       const client = new McpStdioClient(bridge.serverEnv);
       try {
         await client.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'vitest', version: '0' } });
         client.notify('notifications/initialized');
         const listed = await client.request(2, 'tools/list', {});
-        if (!bound && cli === 'opencode') {
-          // With no granted category MCP advertises no tools capability.
-          expect(listed.error?.code).toBe(-32601);
-          continue;
-        }
         const tool = listed.result.tools.find((t: any) => t.name === 'todo_tasks');
         expect(listed.result.tools.map((t: any) => t.name)).not.toContain('project_tasks');
-        expect(!!tool).toBe(bound);
-        if (!bound) continue;
-        const stale = await client.request(22, 'tools/call', { name: 'project_tasks', arguments: { action: 'create', title: 'Stale tool must not write' } });
+        expect(!!tool).toBe(true);
+        expect(tool.inputSchema.properties).not.toHaveProperty('title');
+        expect(tool.inputSchema.properties).not.toHaveProperty('detail');
+        const stale = await client.request(22, 'tools/call', { name: 'project_tasks', arguments: { action: 'create', content: 'Stale tool must not write' } });
         expect(stale.result?.isError || stale.error).toBeTruthy();
         expect(bridgeDescriptionBudgetProblems([tool])).toEqual([]);
         expect(tool.inputSchema.properties).not.toHaveProperty('project');
         expect(tool.inputSchema.properties.status.enum).toEqual(['todo', 'progress', 'review', 'done']);
         const { createProjectTasksTool } = await import('../../../../src/core-agent/src/tools/project-tasks-tool');
         const { createProjectTasksHandler } = await import('../../../../src/main/features/project_tasks_tool_handler');
-        const native = createProjectTasksTool(createProjectTasksHandler(TEST_UID, pid, 'c-tasks-true', new Map()));
-        for (const field of ['offset', 'limit', 'status', 'task_id']) {
+        const native = createProjectTasksTool(createProjectTasksHandler(TEST_UID, scope, 'c-tasks-true', new Map()));
+        for (const field of ['offset', 'limit', 'status', 'task_id', 'content']) {
           expect(tool.inputSchema.properties[field]).toEqual((native.inputSchema as any).properties[field]);
         }
         const autoTasks = await import('../../../../src/main/features/auto_tasks');
         const automation = await client.request(20, 'tools/call', { name: 'auto_tasks', arguments: { action: 'create', content: 'Daily report', schedule: { type: 'daily', hour: 9, minute: 0 }, enabled: false } });
         expect(automation.result.isError).toBeFalsy();
         const automationId = JSON.parse(automation.result.content[0].text).taskId;
-        expect(await autoTasks.getTask(TEST_UID, automationId)).toMatchObject({ project_id: pid, enabled: false });
+        expect(await autoTasks.getTask(TEST_UID, automationId)).toMatchObject({ ...(bound ? { project_id: pid } : {}), enabled: false });
+        if (!bound) expect(await autoTasks.getTask(TEST_UID, automationId)).not.toHaveProperty('project_id');
         const { createAutoTasksTool } = await import('../../../../src/main/features/auto_tasks_tool');
-        const nativeAuto = createAutoTasksTool({ userId: TEST_UID, projectId: pid });
+        const nativeAuto = createAutoTasksTool({ userId: TEST_UID, projectId: scope || null });
         const queryAuto = { action: 'list', enabled: false, offset: 0, limit: 1 };
         const autoPage = await client.request(90, 'tools/call', { name: 'auto_tasks', arguments: queryAuto });
         const nativeAutoPage = JSON.parse((await nativeAuto.execute(queryAuto, { state: {} })).content);
@@ -489,8 +669,8 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         expect((await autoTasks.getTask(TEST_UID, automationId))?.enabled).toBe(true);
         const editSchedule = await client.request(23, 'tools/call', { name: 'auto_tasks', arguments: { action: 'update', task_id: automationId, schedule: { type: 'daily', hour: 10, minute: 15 } } });
         expect(editSchedule.result.isError).toBeFalsy();
-        expect(await autoTasks.getTask(TEST_UID, automationId)).toMatchObject({ content: 'Daily report', project_id: pid, enabled: true, schedule: { type: 'daily', hour: 10, minute: 15 } });
-        const global = await autoTasks.createTask(TEST_UID, { content: 'Foreign schedule', enabled: false, schedule: { type: 'daily', hour: 8, minute: 0 } });
+        expect(await autoTasks.getTask(TEST_UID, automationId)).toMatchObject({ content: 'Daily report', ...(bound ? { project_id: pid } : {}), enabled: true, schedule: { type: 'daily', hour: 10, minute: 15 } });
+        const global = await autoTasks.createTask(TEST_UID, { content: 'Foreign schedule', ...(bound ? {} : { project_id: pid }), enabled: false, schedule: { type: 'daily', hour: 8, minute: 0 } });
         if (!global.ok) throw new Error('global fixture failed');
         const forbidden = await client.request(24, 'tools/call', { name: 'auto_tasks', arguments: { action: 'enable', task_id: global.task.id } });
         expect(forbidden.result?.isError || forbidden.error).toBeTruthy();
@@ -501,42 +681,56 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         expect(override.result?.isError || override.error).toBeTruthy();
         const disabled = await client.request(26, 'tools/call', { name: 'auto_tasks', arguments: { action: 'disable', task_id: automationId } });
         expect(disabled.result.isError).toBeFalsy();
-        expect(await autoTasks.getTask(TEST_UID, automationId)).toMatchObject({ enabled: false, project_id: pid });
+        expect(await autoTasks.getTask(TEST_UID, automationId)).toMatchObject({ enabled: false, ...(bound ? { project_id: pid } : {}) });
         expect(await autoTasks.getTask(TEST_UID, automationId)).not.toHaveProperty('last_run_at');
         const removed = await client.request(27, 'tools/call', { name: 'auto_tasks', arguments: { action: 'delete', task_id: automationId } });
         expect(removed.result.isError).toBeFalsy();
         expect(await autoTasks.getTask(TEST_UID, automationId)).toBeNull();
 
+        await autoTasks.deleteTask(TEST_UID, global.task.id);
         const empty = await client.request(3, 'tools/call', { name: 'todo_tasks', arguments: { action: 'list' } });
         expect(JSON.parse(empty.result.content[0].text)).toMatchObject({ ok: true, tasks: [], next_offset: null });
-        const creation = await client.request(8, 'tools/call', { name: 'todo_tasks', arguments: { action: 'create', title: 'Read only when requested' } });
+        const foreignScope = bound ? '' : pid;
+        const foreignTodo = await tasks.createTask(TEST_UID, foreignScope, { content: 'Foreign scope todo' });
+        if (!foreignTodo.ok) throw new Error('foreign todo fixture failed');
+        for (const action of ['get', 'update', 'complete']) {
+          const rejected = await client.request(99, 'tools/call', { name: 'todo_tasks', arguments: {
+            action, task_id: foreignTodo.task.id, ...(action === 'update' ? { status: 'done' } : {}),
+          } });
+          expect(rejected.result?.isError || rejected.error).toBeTruthy();
+          expect(await tasks.getTask(TEST_UID, foreignScope, foreignTodo.task.id)).toEqual(foreignTodo.task);
+        }
+        await tasks.deleteTask(TEST_UID, foreignScope, foreignTodo.task.id);
+        const creation = await client.request(8, 'tools/call', { name: 'todo_tasks', arguments: { action: 'create', content: 'Read only when requested' } });
         expect(creation.result.isError).toBeFalsy();
         const fresh = await client.request(4, 'tools/call', { name: 'todo_tasks', arguments: { action: 'list' } });
-        expect(JSON.parse(fresh.result.content[0].text).tasks).toContainEqual(expect.objectContaining({ title: 'Read only when requested' }));
+        expect(JSON.parse(fresh.result.content[0].text).tasks).toContainEqual(expect.objectContaining({ content: 'Read only when requested' }));
         const denied = await client.request(5, 'tools/call', { name: 'todo_tasks', arguments: { action: 'complete', task_id: 'forged' } });
         expect(denied.result?.isError || denied.error).toBeTruthy();
-        const task = (await tasks.listTasks(TEST_UID, pid))[0];
+        const task = (await tasks.listTasks(TEST_UID, scope))[0];
         expect(task.status).toBe('todo');
-        expect(task.origin_cid).toBe('c-tasks-true');
+        expect(task.origin_cid).toBeUndefined();
         let invalidStatusId = 29;
         for (const status of ['blocked', 'cancelled', 'in_progress', 'in_review']) {
           for (const args of [
-            { action: 'create', title: 'Removed state', status },
+            { action: 'create', content: 'Removed state', status },
             { action: 'update', task_id: task.id, status },
           ]) {
             const rejected = await client.request(invalidStatusId++, 'tools/call', { name: 'todo_tasks', arguments: args });
             expect(rejected.result?.isError || rejected.error).toBeTruthy();
-            expect(await tasks.listTasks(TEST_UID, pid)).toEqual([task]);
+            expect(await tasks.listTasks(TEST_UID, scope)).toEqual([task]);
           }
         }
-        const update = await client.request(6, 'tools/call', { name: 'todo_tasks', arguments: { action: 'update', task_id: task.id, status: 'review', result_ref: 'artifact-1', title: 'Edited through MCP', detail: 'Retained requirement' } });
+        const update = await client.request(6, 'tools/call', { name: 'todo_tasks', arguments: { action: 'update', task_id: task.id, status: 'review', result_ref: 'artifact-1', content: 'Edited through MCP\nRetained requirement' } });
         expect(update.result.isError).toBeFalsy();
-        expect(await tasks.getTask(TEST_UID, pid, task.id)).toMatchObject({ status: 'review', result_ref: 'artifact-1', title: 'Edited through MCP', detail: 'Retained requirement' });
+        expect(await tasks.getTask(TEST_UID, scope, task.id)).toMatchObject({ status: 'review', result_ref: 'artifact-1', content: 'Edited through MCP\nRetained requirement' });
         const complete = await client.request(7, 'tools/call', { name: 'todo_tasks', arguments: { action: 'complete', task_id: task.id, result_ref: 'verified-1' } });
         expect(complete.result.isError).toBeFalsy();
-        expect(await tasks.getTask(TEST_UID, pid, task.id)).toMatchObject({ status: 'done', result_ref: 'verified-1', origin_cid: 'c-tasks-true' });
-        const reopened = await createProjectTasksHandler(TEST_UID, pid, 'new-native-chat', new Map()).update(task.id, { status: 'todo' });
-        expect(reopened.task).toMatchObject({ status: 'todo', origin_cid: 'c-tasks-true', result_ref: 'verified-1' });
+        expect(await tasks.getTask(TEST_UID, scope, task.id)).toMatchObject({ status: 'done', result_ref: 'verified-1' });
+        expect(await tasks.getTask(TEST_UID, scope, task.id)).not.toHaveProperty('origin_cid');
+        const reopened = await createProjectTasksHandler(TEST_UID, scope, 'new-native-chat', new Map()).update(task.id, { status: 'todo' });
+        expect(reopened.task).toMatchObject({ status: 'todo', result_ref: 'verified-1' });
+        expect(reopened.task).not.toHaveProperty('origin_cid');
         const reread = await client.request(28, 'tools/call', { name: 'todo_tasks', arguments: { action: 'list' } });
         expect(JSON.parse(reread.result.content[0].text).tasks).toContainEqual(expect.objectContaining({ id: task.id, status: 'todo' }));
         const queryTodo = { action: 'list', offset: 0, limit: 50, status: 'todo' };
@@ -544,7 +738,20 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         expect(JSON.parse(page.result.content[0].text)).toEqual(JSON.parse((await native.execute(queryTodo, { state: {} })).content));
         expect(JSON.parse(page.result.content[0].text).tasks[0]).not.toHaveProperty('detail');
         const detail = await client.request(94, 'tools/call', { name: 'todo_tasks', arguments: { action: 'get', task_id: task.id } });
-        expect(JSON.parse(detail.result.content[0].text).task).toMatchObject({ detail: 'Retained requirement', result_ref: 'verified-1' });
+        expect(JSON.parse(detail.result.content[0].text).task).toMatchObject({ content: 'Edited through MCP\nRetained requirement', result_ref: 'verified-1' });
+        const legacy = await client.request(95, 'tools/call', { name: 'todo_tasks', arguments: {
+          action: 'create', title: 'Old client', detail: 'Keep this requirement',
+        } });
+        expect(legacy.result.isError).toBeFalsy();
+        const migrated = JSON.parse(legacy.result.content[0].text).task;
+        expect(migrated.content).toBe('Old client\nKeep this requirement');
+        expect(migrated).not.toHaveProperty('title');
+        expect(migrated).not.toHaveProperty('detail');
+        const rejectedScope = await client.request(96, 'tools/call', { name: 'todo_tasks', arguments: {
+          action: 'create', content: 'Must not write', project: 'foreign',
+        } });
+        expect(rejectedScope.result.isError).toBe(true);
+        expect((await tasks.listTasks(TEST_UID, scope)).some(item => item.content === 'Must not write')).toBe(false);
       } finally {
         client.kill();
         await client.waitForExit();
@@ -606,7 +813,7 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         'orkas_kb_list', 'orkas_kb_search', 'orkas_kb_read',
         'chat_search', 'chat_read',
       ]));
-      expect(names).not.toContain('browser');
+      expect(names).not.toContain('inner_browser');
       expect(names).not.toContain('orkas_list_connector_tools');
       expect(names).not.toContain('orkas_call_connector_tool');
       expect(bridgeDescriptionBudgetProblems(tools.result.tools)).toEqual([]);
@@ -620,12 +827,16 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
       expect(library.inputSchema.properties.action.enum).toEqual(['list', 'search', 'read']);
       expect(chatHistory.inputSchema.properties.action.enum).toEqual(['search', 'read']);
       expect(chatHistory.inputSchema.properties.page.properties.mode.enum)
-        .toEqual(['latest', 'around', 'before']);
-      expect(readSkill.description).toContain('return one available Orkas Skill');
+        .toEqual(['latest', 'around', 'before', 'from']);
+      expect(readSkill.description).toContain('available Orkas Skill');
+      expect(readSkill.inputSchema.properties.path.description).toContain('Relative file path');
+      expect(readSkill.inputSchema.properties.encoding.enum).toEqual(['utf8', 'base64']);
       expect(readSkill.description).not.toContain('Follow');
       expect(runSkill.inputSchema.properties.action.enum).toEqual(['run', 'read']);
       expect(runSkill.description).toContain('page oversized stdout or stderr');
       expect(commanderHandoff.description).not.toContain('then stop this turn');
+      expect(commanderHandoff.description).toContain('changes through Orkas app resource management');
+      expect(commanderHandoff.description).toContain('Workspace source-file edits are not app resource mutations.');
 
       const call = await client.request(3, 'tools/call', { name: 'orkas_list_skills', arguments: {} });
       const text = call.result.content[0].text as string;
@@ -714,7 +925,7 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
     expect(fs.existsSync(path.join(tmpDir, 'rundir', '.orkas-bridge-skill-output'))).toBe(false);
   }, 20000);
 
-  it.each(['claude', 'codex'] as const)('exposes scoped project writes over the %s MCP bridge', async (cli) => {
+  it.each(['claude', 'codex', 'opencode', 'hermes', 'openclaw'] as const)('exposes scoped project writes over the %s MCP bridge', async (cli) => {
     const projects = await import('../../../../src/main/features/projects');
     const workspace = await import('../../../../src/main/features/user_workspace');
     const files = await import('../../../../src/main/features/project_files');
@@ -732,7 +943,7 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
       const listed = await client.request(2, 'tools/list', {});
       expect(listed.result.tools.map((tool: any) => tool.name)).toEqual(expect.arrayContaining(['project_instructions', 'library_save']));
       expect(listed.result.tools.find((tool: any) => tool.name === 'cross_session_memory').inputSchema.properties.target.enum)
-        .toEqual(['agent', 'project']);
+        .toEqual(['agent', 'project', 'shared', 'user']);
       expect(bridgeDescriptionBudgetProblems(listed.result.tools)).toEqual([]);
       let id = 2;
       const call = async (name: string, args: Record<string, unknown>) => {
@@ -761,7 +972,7 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
     client.assertCleanOutput();
   });
 
-  it.each(['claude', 'codex'] as const)('lets %s edit a native Agent deliverable and makes the changes visible to a fresh native turn', async (cli) => {
+  it.each(['claude', 'codex', 'opencode', 'hermes', 'openclaw'] as const)('lets %s edit a native Agent deliverable and makes the changes visible to a fresh native turn', async (cli) => {
     // Exercise real MCP, role gates and disk IO without starting a model-backed
     // indexer. Independently verify each committed version requests an upsert.
     const indexUpdates: unknown[][] = [];
@@ -879,11 +1090,10 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         (tool: any) => tool.name === 'cross_session_memory',
       );
       expect(memoryTool).toBeTruthy();
-      expect(memoryTool.description).toContain('Decide from meaning, not trigger words');
-      expect(memoryTool.description).toContain('stable, reusable information');
+      expect(memoryTool.description).toContain('Decide from meaning, never trigger words');
+      expect(memoryTool.description).toContain('stable facts, corrections or invalidations');
       expect(memoryTool.description).toContain('future conversations');
-      expect(memoryTool.description).toContain('replace a correction');
-      expect(memoryTool.description).toContain('Do not store current-task progress');
+      expect(memoryTool.description).toContain('exclude task progress and temporary state');
       expect(memoryTool.inputSchema.properties.target.enum).toContain('agent');
       expect(memoryTool.inputSchema.properties).not.toHaveProperty('agent_id');
 
@@ -959,6 +1169,47 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
       client.kill();
       await client.waitForExit();
       await bridge.close();
+    }
+    client.assertCleanOutput();
+  }, 20000);
+
+  it('reads the reconciled SDK package through MCP, rejects creator and traversal reads, then recovers', async () => {
+    const { reconcileAllForUser } = await import('../../../../src/main/features/system_skills');
+    const results = await reconcileAllForUser(TEST_UID);
+    expect(results).toContainEqual({id:'web-app-sdk',action:'created'});
+    const bridge = await startLifecycleBridge('sdk-guidance');
+    const client = new McpStdioClient(bridge.serverEnv);
+    try {
+      await client.request(1, 'initialize', {protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'vitest',version:'0'}});
+      client.notify('notifications/initialized');
+      let id = 2;
+      const call = (name: string, args: Record<string, unknown>) => client.request(id++, 'tools/call', {name,arguments:args});
+      const listing = await call('orkas_list_skills', {});
+      expect(listing.result.isError).not.toBe(true);
+      const rows = JSON.parse(listing.result.content[0].text);
+      expect(rows).toContainEqual(expect.objectContaining({id:'web-app-sdk',source:'system'}));
+      expect(rows.some((row: any) => ['skill-creator','orkas-guide','agent-creator'].includes(row.id))).toBe(false);
+      expect(JSON.stringify(rows)).not.toContain(tmpDir);
+      const body = await call('orkas_read_skill', {id:'web-app-sdk'});
+      expect(body.result.isError).not.toBe(true);
+      expect(body.result.content[0].text).toContain('references/api.json');
+      for (const args of [{id:'skill-creator'}, {id:'web-app-sdk',path:'../orkas-guide/SKILL.md'}]) {
+        const denied = await call('orkas_read_skill', args);
+        expect(denied.result.isError).toBe(true);
+      }
+      const schema = await call('orkas_read_skill', {id:'web-app-sdk',path:'references/api.json'});
+      expect(schema.result.isError).not.toBe(true);
+      const document = JSON.parse(JSON.parse(schema.result.content[0].text).content);
+      expect(document.methods.some((method: any) => method.name === 'ai.generate')).toBe(true);
+      const starter = await call('orkas_read_skill', {id:'web-app-sdk',path:'assets/starter/index.html'});
+      expect(starter.result.isError).not.toBe(true);
+      expect(JSON.parse(starter.result.content[0].text).content).toContain('Text notebook');
+      const { activateUser } = await import('../../../../src/main/features/users');
+      activateUser('sdk-other-account');
+      const switched = await call('orkas_read_skill', {id:'web-app-sdk'});
+      expect(switched.result.isError).toBe(true);
+    } finally {
+      client.kill(); await client.waitForExit(); await bridge.close();
     }
     client.assertCleanOutput();
   }, 20000);
@@ -1218,4 +1469,66 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
       forceStopProcessTree(processTree);
     }
   }, 20000);
+});
+
+
+describe('CLI history process discovery', () => {
+  it('follows returned process locators and continuation over real MCP without changing scope', async () => {
+    const { createConversation } = await import('../../../../src/main/features/chats');
+    const { conversationMessageFile } = await import('../../../../src/main/util/project-layout');
+    const { appendJsonlAtomic } = await import('../../../../src/main/storage');
+    const { indexChatMessage } = await import('../../../../src/main/features/search/indexer');
+    await createConversation(TEST_UID, { conversationId: 'history', title: 'Cedar export' });
+    for (const row of [
+      { id: 'earlier', from: 'commander', text: 'Cedar check finished. ' + 'detail '.repeat(900), process: [
+        { type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 'report', name: 'read_files', output: 'Cedar 通过7项，失败2项。' } } },
+        { type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 'preview', name: 'preview', output: { mimeType: 'video/mp4', data: 'PRIVATE_VIDEO_BYTES' } } } },
+        { type: 'event', event: { stream: 'thinking', data: { text: 'PRIVATE_REASONING' } } },
+      ] },
+      ...Array.from({ length: 6 }, (_, i) => [
+        { id: `intervening-u${i}`, from: 'user', text: `Unrelated request ${i}` },
+        { id: `intervening-a${i}`, from: 'commander', text: `Unrelated response ${i}` },
+      ]).flat(),
+      { id: 'current', from: 'user', text: 'CURRENT_TRIGGER' },
+      { id: 'later', from: 'commander', text: 'LATER_CONCURRENT' },
+    ]) {
+      const { msgIndex } = await appendJsonlAtomic(conversationMessageFile(TEST_UID, 'history'), row);
+      await indexChatMessage(TEST_UID, 'history', msgIndex, row);
+    }
+    const { startBridge } = await import('../../../../src/main/features/local_agents/bridge');
+    const bridge = await startBridge({ uid: TEST_UID, cid: 'history', agentId: 'a1', agentName: 'Agent', cli: 'codex', permissionPolicy: 'ask',
+      currentMessageId: 'current', runId: 'history-recovery', configDir: path.join(tmpDir, 'rundir'),
+      sandboxEnv: { ORKAS_NODE: TEST_NODE, ORKAS_BUNDLED_NODE: TEST_NODE, ORKAS_PC_DIR: process.cwd(), ORKAS_WORKSPACE_ROOT: tmpDir, ELECTRON_RUN_AS_NODE: '1' },
+    });
+    const client = new McpStdioClient(bridge.serverEnv);
+    const decode = (s: string) => s.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+    try {
+      await client.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'history-test', version: '0' } });
+      client.notify('notifications/initialized');
+      const search = await client.request(2, 'tools/call', { name: 'chat_history', arguments: { action: 'search', scope: 'current', query: 'Cedar 通过 失败' } });
+      const locator = JSON.parse(/^    read: (.+)$/m.exec(search.result.content[0].text)![1]);
+      let args = { ...locator, max_tokens: 800 };
+      let recovered = '', continued = false;
+      for (let i = 0; i < 10; i++) {
+        const read = await client.request(3 + i, 'tools/call', { name: 'chat_history', arguments: args });
+        expect(read.result.isError).not.toBe(true);
+        const text = read.result.content[0].text;
+        expect(estimateTextTokens(text)).toBeLessThanOrEqual(800);
+        recovered += text;
+        const next = decode(/<next_read>([\s\S]*?)<\/next_read>/.exec(text)![1]);
+        if (next === 'done') break;
+        continued = true;
+        args = { ...JSON.parse(next), action: 'read', scope: 'current', max_tokens: 800 };
+      }
+      expect(continued).toBe(true);
+      expect(recovered).toContain('Cedar 通过7项，失败2项。');
+      expect(recovered).not.toMatch(/PRIVATE_REASONING|PRIVATE_VIDEO_BYTES|CURRENT_TRIGGER|LATER_CONCURRENT/);
+      const denied = await client.request(20, 'tools/call', { name: 'chat_history', arguments: { ...locator, scope: 'all' } });
+      expect(denied.result.isError).toBe(true);
+    } finally {
+      client.kill(); await client.waitForExit(); await bridge.close(); client.assertCleanOutput();
+      const { flushAll } = await import('../../../../src/main/features/search/indexer');
+      await flushAll();
+    }
+  });
 });

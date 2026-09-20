@@ -9,6 +9,14 @@ const productionCredits = vi.hoisted(() => ({
   estimate: vi.fn(),
 }));
 
+const imageProvider = vi.hoisted(() => ({ generate: vi.fn() }));
+vi.mock('../../../../src/main/features/image_gen', () => ({
+  generateImage: (...args: unknown[]) => imageProvider.generate(...args),
+}));
+vi.mock('../../../../src/main/features/user_workspace', () => ({
+  getWorkspacePath: () => root,
+}));
+
 const electronImage = vi.hoisted(() => {
   const makeImage = (bitmap: Buffer, png: Buffer) => ({
     getSize: () => ({ width: 128, height: 128 }),
@@ -58,6 +66,7 @@ vi.mock('electron', () => ({
   },
   nativeImage: {
     createFromPath: () => electronImage.image,
+    createFromBuffer: () => electronImage.image,
   },
 }));
 
@@ -69,6 +78,7 @@ import {
   createImageStudioTool,
   imageStudioStatePath,
 } from '../../../../src/main/model/core-agent/image-studio-tool';
+import { createImageGenTool } from '../../../../src/main/model/core-agent/image-gen-tool';
 import {
   beginImageStudioGeneration,
   finishImageStudioGeneration,
@@ -86,6 +96,13 @@ beforeEach(() => {
   electronImage.requiredCopyLayouts = [];
   previousComfyBaseUrl = process.env.ORKAS_COMFYUI_BASE_URL;
   delete process.env.ORKAS_COMFYUI_BASE_URL;
+  vi.stubGlobal('fetch', vi.fn(() => { throw new Error('Unexpected network call in ImageStudio integration test'); }));
+  imageProvider.generate.mockReset().mockImplementation(async (request) => {
+    const bytes = electronImage.image.toPNG();
+    fs.mkdirSync(path.dirname(request.outputAbsPath), { recursive: true });
+    fs.writeFileSync(request.outputAbsPath, bytes);
+    return { ok: true, path: request.outputAbsPath, width: 128, height: 128, bytes: bytes.length, provider: 'fixture', model: 'fixture' };
+  });
   productionCredits.estimate.mockReset();
   productionCredits.estimate.mockResolvedValue({
     expected_credits_milli: 22_000,
@@ -136,6 +153,19 @@ afterEach(() => {
     fs.rmSync(path.join(process.env.ORKAS_WORKSPACE_ROOT, USER_ID, 'local', 'image_studio'), { recursive: true, force: true });
   }
 });
+
+async function generateProviderOutput(outputPath: string, extra: Record<string, unknown> = {}): Promise<void> {
+  // Mock only the external generation/quote boundaries; the tools must persist
+  // provenance themselves before inspection can grant an export exemption.
+  const tool = createImageGenTool({ userId: USER_ID, agentId: IMAGE_STUDIO_AGENT_ID, hasProducedPath: () => true });
+  const result = await tool.execute!({
+    prompt: 'An editorial cover', output_path: outputPath,
+    image_project_path: projectDir, image_request_id: 'provider-output', ...extra,
+  }, { workingDir: root } as any);
+  expect(result.isError, String(result.content)).not.toBe(true);
+  expect(imageProvider.generate).toHaveBeenCalledOnce();
+  expect(fs.existsSync(outputPath)).toBe(true);
+}
 
 describe('image_studio tool', () => {
   it('directly executes structural project inspection for its owner', async () => {
@@ -211,6 +241,7 @@ describe('image_studio tool', () => {
 
     expect(result.isError).not.toBe(true);
     expect(result.images).toHaveLength(2);
+    expect(await sharp(snapshotPath).metadata()).toMatchObject({ width: 1080, height: 1080 });
     expect(result.images).toEqual([
       expect.objectContaining({ analysisMode: 'quality_review' }),
       expect.objectContaining({ analysisMode: 'understand' }),
@@ -223,7 +254,7 @@ describe('image_studio tool', () => {
         images: [
           {
             order: 1, role: 'candidate', analysis_mode: 'quality_review',
-            path: snapshotPath, width: 2, height: 2,
+            path: snapshotPath, width: 1080, height: 1080,
           },
           {
             order: 2, role: 'reference:style-anchor', analysis_mode: 'understand',
@@ -238,8 +269,8 @@ describe('image_studio tool', () => {
     const referencePixels = await sharp(referencePng).ensureAlpha().raw().toBuffer();
     const attachedReferencePixels = await sharp(Buffer.from(result.images![1].data, 'base64'))
       .ensureAlpha().raw().toBuffer();
-    expect(attachedCandidatePixels).toEqual(candidatePixels);
-    expect(attachedReferencePixels).toEqual(referencePixels);
+    expect(attachedCandidatePixels.equals(candidatePixels)).toBe(true);
+    expect(attachedReferencePixels.equals(referencePixels)).toBe(true);
   });
 
   it('fails closed when invoked by a non-owner', async () => {
@@ -325,7 +356,7 @@ describe('image_studio tool', () => {
     });
   });
 
-  it('returns every current manifest blocker and declares one complete validation scope', async () => {
+  it('returns every current manifest blocker without failure-grouping metadata', async () => {
     const manifestPath = path.join(projectDir, 'image-manifest.json');
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     manifest.references = [{
@@ -364,16 +395,7 @@ describe('image_studio tool', () => {
       expect.objectContaining({ code: 'E_MANIFEST_REFERENCE_PATH' }),
       expect.objectContaining({ code: 'E_MANIFEST_REPRODUCE_REFERENCE_REQUIRED' }),
     ]));
-    expect(result.failureContext).toMatchObject({
-      kind: 'deterministic_validation',
-      scope: expect.stringMatching(/^image_studio\.project:[0-9a-f]{32}$/),
-      complete: true,
-      issueCount: parsed.inspection.blockers.length,
-      issueCodes: expect.arrayContaining([
-        'E_MANIFEST_REFERENCE_PATH',
-        'E_MANIFEST_REPRODUCE_REFERENCE_REQUIRED',
-      ]),
-    });
+    expect(result).not.toHaveProperty("failureContext");
   });
 
   it('requires an exact generated-raster canvas before export without visual review', async () => {
@@ -413,6 +435,7 @@ describe('image_studio tool', () => {
 
     manifest.canvas = { width: 128, height: 128 };
     fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+    await generateProviderOutput(generatedPath);
     const inspected = await tool.execute({
       op: 'project.inspect',
       project_dir: projectDir,
@@ -426,10 +449,10 @@ describe('image_studio tool', () => {
       current_candidate: {
         status: 'validated',
         path: generatedPath,
-        review_required: false,
+        is_generation: true,
       },
       recovery_context: {
-        review_required: false,
+        is_generation: true,
         next_operation: 'project.export',
       },
     });
@@ -640,7 +663,7 @@ describe('image_studio tool', () => {
         minimum_score: 85,
       },
     },
-  ])('keeps $name provider-owned without ImageStudio visual review', async ({
+  ])('delivers low-contrast $name without aesthetic advice or ImageStudio visual review', async ({
     route,
     reference,
     referenceIntent,
@@ -648,7 +671,21 @@ describe('image_studio tool', () => {
     const generatedPath = path.join(projectDir, 'provider-result.png');
     const referencePath = path.join(projectDir, reference.path);
     fs.mkdirSync(path.dirname(referencePath), { recursive: true });
-    fs.writeFileSync(generatedPath, electronImage.baseImage.toPNG());
+    // A deliberately uniform provider result is valid, not a request to
+    // improve contrast. Use a full-sized bitmap so image analysis is real.
+    const providerBytes = await sharp({
+      create: { width: 128, height: 128, channels: 4, background: '#808080' },
+    }).png().toBuffer();
+    const bitmap = Buffer.alloc(128 * 128 * 4);
+    for (let offset = 0; offset < bitmap.length; offset += 4) {
+      bitmap.set([128, 128, 128, 255], offset);
+    }
+    electronImage.image = {
+      ...electronImage.baseImage,
+      toBitmap: () => bitmap,
+      toPNG: () => providerBytes,
+      toJPEG: () => providerBytes,
+    };
     fs.writeFileSync(referencePath, electronImage.changedImage.toPNG());
     const manifestPath = path.join(projectDir, 'image-manifest.json');
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
@@ -659,6 +696,21 @@ describe('image_studio tool', () => {
     manifest.references = [reference];
     manifest.reference_intent = referenceIntent;
     fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+    const binding = {
+      index: 0, role: reference.role, strength: reference.strength,
+      preserve: reference.preserve, may_change: reference.may_change,
+    };
+    await generateProviderOutput(generatedPath, {
+      prompt: referenceIntent.instructions[0], reference_images: [referencePath], reference_bindings: [binding],
+    });
+    expect(imageProvider.generate).toHaveBeenCalledWith(expect.objectContaining({
+      referenceImagePaths: [referencePath],
+      referenceBindings: [{
+        index: 0, role: reference.role, strength: reference.strength,
+        preserve: reference.preserve, mayChange: reference.may_change,
+      }],
+      prompt: expect.stringContaining(referenceIntent.instructions[0]),
+    }));
     const tool = createImageStudioTool({
       userId: USER_ID,
       agentId: IMAGE_STUDIO_AGENT_ID,
@@ -680,15 +732,15 @@ describe('image_studio tool', () => {
     // derived facts (route, counts, budget) — see K-3.
     expect(inspectedPayload.inspection.manifest).toBeUndefined();
     expect(inspectedPayload).toMatchObject({
-      inspection: { route },
-      recovery_context: { reference_count: 1 },
+      inspection: { route, advisories: [], image: { contrast: 0 } },
       current_candidate: {
         status: 'validated',
         path: generatedPath,
-        review_required: false,
+        is_generation: true,
       },
       recovery_context: {
-        review_required: false,
+        inspection_advisories: [],
+        is_generation: true,
         next_operation: 'project.export',
       },
     });
@@ -720,9 +772,115 @@ describe('image_studio tool', () => {
       output_path: path.join(root, 'final', `${route}-provider-result.png`),
     }, ctx);
     expect(exported.isError).not.toBe(true);
+    expect(fs.readFileSync(path.join(root, 'final', `${route}-provider-result.png`))).toEqual(providerBytes);
+    expect(fs.readFileSync(generatedPath)).toEqual(providerBytes);
   });
 
-  it('ignores a legacy rejected review when resuming generated raster evidence', async () => {
+  it('reuses a generated request after tool recreation and retains its export exemption in a later turn', async () => {
+    const manifestPath = path.join(projectDir, 'image-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    Object.assign(manifest, { route: 'generate', canvas: { width: 128, height: 128 }, generation_budget: { max_calls: 1 } });
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const outputPath = path.join(projectDir, 'generated.png');
+    const request = {
+      prompt: 'An editorial cover', output_path: outputPath,
+      image_project_path: projectDir, image_request_id: 'cover',
+    };
+    const opts = { userId: USER_ID, agentId: IMAGE_STUDIO_AGENT_ID, turnId: 'generation-turn' };
+    const ctx = { workingDir: root } as any;
+    expect((await createImageGenTool(opts).execute!(request, ctx)).isError).not.toBe(true);
+    const original = fs.readFileSync(outputPath);
+    const reused = await createImageGenTool(opts).execute!(request, ctx);
+    expect(reused.isError).not.toBe(true);
+    expect(String(reused.content)).toContain('reused completed generation');
+    expect(imageProvider.generate).toHaveBeenCalledOnce();
+    expect(productionCredits.estimate).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(outputPath)).toEqual(original);
+    expect(fs.existsSync(path.join(projectDir, 'generated-2.png'))).toBe(false);
+
+    const tool = createImageStudioTool({ ...opts, extraRoots: [root] });
+    const inspected = await tool.execute({ op: 'project.inspect', project_dir: projectDir }, ctx);
+    expect(inspected.isError).not.toBe(true);
+    expect(inspected.images).toBeUndefined();
+    expect(JSON.parse(inspected.content).current_candidate).toMatchObject({ path: outputPath, is_generation: true });
+
+    const nextTurn = createImageStudioTool({ ...opts, turnId: 'delivery-turn', extraRoots: [root] });
+    const status = await nextTurn.execute({ op: 'project.status', project_dir: projectDir }, ctx);
+    expect(JSON.parse(status.content)).toMatchObject({
+      generation: { calls_started: 0, calls_remaining: 1 },
+      current_candidate: { path: outputPath, is_generation: true },
+      recovery_context: { next_operation: 'project.export' },
+    });
+    const finalPath = path.join(root, 'delivered.png');
+    const exported = await nextTurn.execute({ op: 'project.export', project_dir: projectDir, output_path: finalPath }, ctx);
+    expect(exported.isError).not.toBe(true);
+    expect(JSON.parse(exported.content).is_generation).toBe(true);
+    expect(fs.readFileSync(finalPath)).toEqual(original);
+    expect(imageProvider.generate).toHaveBeenCalledOnce();
+  });
+
+  it.each(['failed', 'pending'] as const)('does not exempt a partial provider file or redispatch a %s generation', async (status) => {
+    const manifestPath = path.join(projectDir, 'image-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const referencePath = path.join(projectDir, 'source.png');
+    fs.writeFileSync(referencePath, electronImage.changedImage.toPNG());
+    Object.assign(manifest, {
+      route: 'edit', canvas: { width: 128, height: 128 },
+      raster_source: 'partial.png', generation_budget: { max_calls: 1 },
+      references: [{ id: 'source', path: 'source.png', role: 'edit_source', required: true, strength: 1, preserve: ['subject'], may_change: ['background'], region_ids: [] }],
+      reference_intent: { mode: 'edit', basis: 'user', instructions: ['Replace the background.'], minimum_score: 80 },
+    });
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const outputPath = path.join(projectDir, 'partial.png');
+    imageProvider.generate.mockImplementationOnce(async (request) => {
+      fs.writeFileSync(request.outputAbsPath, electronImage.baseImage.toPNG());
+      if (status === 'pending') throw new Error('Synthetic interrupted delivery');
+      return { ok: false, errorCode: 'PROVIDER_API_ERROR', message: 'Synthetic terminal failure' };
+    });
+    const onFileWritten = vi.fn();
+    const opts = { userId: USER_ID, agentId: IMAGE_STUDIO_AGENT_ID, turnId: 'fault-turn', onFileWritten };
+    const request = {
+      prompt: 'Replace the background.', output_path: outputPath,
+      image_project_path: projectDir, image_request_id: 'cover', reference_images: [referencePath],
+      reference_bindings: [{ index: 0, role: 'edit_source', preserve: ['subject'], may_change: ['background'] }],
+    };
+    const ctx = { workingDir: root } as any;
+    const result = await createImageGenTool(opts).execute!(request, ctx);
+    expect(result.isError).toBe(true);
+    expect(String(result.content)).toContain(status === 'pending' ? 'E_IMAGE_GENERATION_UNCERTAIN' : 'PROVIDER_API_ERROR');
+    const state = JSON.parse(fs.readFileSync(imageGenerationControlStatePath(USER_ID, projectDir), 'utf8'));
+    expect(state.transactions).toHaveLength(1);
+    expect(state.transactions[0].status).toBe(status);
+    expect(state.transactions[0]).not.toHaveProperty('output_sha256');
+    expect(state.transactions[0]).not.toHaveProperty('output_path');
+    expect(onFileWritten).not.toHaveBeenCalled();
+
+    const duplicate = await createImageGenTool(opts).execute!(request, ctx);
+    expect(duplicate.isError).toBe(true);
+    expect(String(duplicate.content)).toContain('E_IMAGE_GENERATION_REQUEST_ALREADY_USED');
+    const exhausted = await createImageGenTool(opts).execute!({ ...request, image_request_id: 'another-cover' }, ctx);
+    expect(exhausted.isError).toBe(true);
+    expect(String(exhausted.content)).toContain('E_IMAGE_GENERATION_BUDGET_EXHAUSTED');
+    expect(imageProvider.generate).toHaveBeenCalledOnce();
+    expect(onFileWritten).not.toHaveBeenCalled();
+
+    const studio = createImageStudioTool({ ...opts, extraRoots: [root] });
+    const inspected = await studio.execute({ op: 'project.inspect', project_dir: projectDir }, ctx);
+    expect(inspected.isError).not.toBe(true);
+    expect(inspected.images).toHaveLength(2);
+    expect(JSON.parse(inspected.content)).toMatchObject({
+      current_candidate: { is_generation: false, status: 'current_unapproved' },
+      recovery_context: { next_operation: 'project.submit_design_review' },
+    });
+    const finalPath = path.join(root, 'blocked.png');
+    const exported = await studio.execute({ op: 'project.export', project_dir: projectDir, output_path: finalPath }, ctx);
+    expect(exported.isError).toBe(true);
+    expect(JSON.parse(exported.content).error_code).toBe('E_IMAGE_REVIEW_PASS_REQUIRED');
+    expect(fs.existsSync(finalPath)).toBe(false);
+    expect(onFileWritten).not.toHaveBeenCalled();
+  });
+
+  it('requires reinspection of legacy evidence and only clears its review after provider proof', async () => {
     const generatedPath = path.join(projectDir, 'legacy.png');
     fs.writeFileSync(generatedPath, electronImage.baseImage.toPNG());
     const manifestPath = path.join(projectDir, 'image-manifest.json');
@@ -747,7 +905,9 @@ describe('image_studio tool', () => {
 
     const statePath = imageStudioStatePath(toolOpts, projectDir);
     const legacyState = JSON.parse(fs.readFileSync(statePath, 'utf8'));
-    delete legacyState.review_required;
+    delete legacyState.is_generation;
+    delete legacyState.source_kind;
+    legacyState.review_required = false;
     legacyState.review = {
       verdict: 'repair',
       scope: 'Legacy automatic visual review.',
@@ -759,6 +919,9 @@ describe('image_studio tool', () => {
     };
     fs.writeFileSync(statePath, JSON.stringify(legacyState, null, 2));
 
+    expect((await tool.execute({ op: 'project.export', project_dir: projectDir, output_path: path.join(root, 'unverified.png') }, ctx)).isError).toBe(true);
+    await generateProviderOutput(generatedPath);
+    await tool.execute({ op: 'project.inspect', project_dir: projectDir }, ctx);
     const status = await tool.execute({
       op: 'project.status',
       project_dir: projectDir,
@@ -766,13 +929,13 @@ describe('image_studio tool', () => {
     expect(JSON.parse(status.content)).toMatchObject({
       current_candidate: {
         status: 'validated',
-        review_required: false,
+        is_generation: true,
         review_current: false,
         review_verdict: null,
         review_findings: [],
       },
       recovery_context: {
-        review_required: false,
+        is_generation: true,
         review_current: false,
         review_verdict: null,
         next_operation: 'project.export',
@@ -785,6 +948,76 @@ describe('image_studio tool', () => {
       output_path: path.join(root, 'final', 'legacy.png'),
     }, ctx);
     expect(exported.isError).not.toBe(true);
+  });
+
+  it.each(['html', 'raster'] as const)('reviews a non-generated EDIT %s and preserves its current candidate on resume', async (kind) => {
+    const manifestPath = path.join(projectDir, 'image-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const providerPath = path.join(projectDir, 'provider.png');
+    const candidatePath = path.join(projectDir, 'composed.png');
+    fs.writeFileSync(providerPath, electronImage.baseImage.toPNG());
+    fs.writeFileSync(candidatePath, electronImage.changedImage.toPNG());
+    manifest.route = 'edit';
+    manifest.canvas = { width: 128, height: 128 };
+    manifest.generation_budget.max_calls = 1;
+    manifest.references = [{ id: 'source', path: 'provider.png', role: 'edit_source', strength: 1, required: true, preserve: ['product'], may_change: ['headline'], region_ids: [] }];
+    manifest.reference_intent = { mode: 'edit', basis: 'user', instructions: ['Replace the headline'], minimum_score: 80 };
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    await generateProviderOutput(providerPath);
+    if (kind === 'html') manifest.entry = 'index.html';
+    else manifest.raster_source = 'composed.png';
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    electronImage.image = electronImage.changedImage;
+    const opts = { userId: USER_ID, agentId: IMAGE_STUDIO_AGENT_ID, extraRoots: [root] };
+    const tool = createImageStudioTool(opts);
+    const ctx = { workingDir: root } as any;
+    const execute = (op: string, extra = {}) => tool.execute({ op, project_dir: projectDir, ...extra }, ctx);
+    expect((await execute('project.inspect')).isError).not.toBe(true);
+    const evidence = kind === 'html'
+      ? await execute('project.snapshot', { output_path: path.join(projectDir, 'snapshot.png') })
+      : await execute('project.inspect');
+    expect(evidence.isError).not.toBe(true);
+    expect(evidence.images).toHaveLength(2);
+    const payload = JSON.parse(evidence.content);
+    const evidencePath = payload.current_candidate.path;
+    expect(payload.current_candidate).toMatchObject({ is_generation: false, status: 'current_unapproved' });
+    expect(payload.recovery_context.next_operation).toBe('project.submit_design_review');
+    expect(payload.current_candidate).not.toHaveProperty('review_required');
+    expect((await execute('project.export', { output_path: path.join(root, 'blocked.png') })).isError).toBe(true);
+    expect(fs.existsSync(path.join(root, 'blocked.png'))).toBe(false);
+    const status = JSON.parse((await execute('project.status')).content);
+    expect(status.current_candidate.path).toBe(evidencePath);
+    expect(status.current_candidate.is_generation).toBe(false);
+    const review = await execute('project.submit_design_review', {
+      evidence_path: evidencePath, review_verdict: 'passed', review_scope: 'Current composition and protected source compared.', review_findings: [],
+      quality_scores: { intent_alignment: 90, composition: 90, craft: 90, text_legibility: 90, defect_freedom: 90, specificity: 90, reference_fidelity: 90 },
+    });
+    expect(review.isError).not.toBe(true);
+    // Reading the same authored raster again must not erase its passing review.
+    if (kind === 'raster') expect(JSON.parse((await execute('project.inspect')).content).current_candidate.status).toBe('approved');
+    expect((await execute('project.export', { output_path: path.join(root, 'final.png') })).isError).not.toBe(true);
+    expect(fs.readFileSync(providerPath)).toEqual(electronImage.baseImage.toPNG());
+    expect(JSON.parse(fs.readFileSync(imageStudioStatePath(opts, projectDir), 'utf8'))).not.toHaveProperty('review_required');
+  });
+
+  it('revokes a provider artifact exemption after the same path is overwritten', async () => {
+    const manifestPath = path.join(projectDir, 'image-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const providerPath = path.join(projectDir, 'provider.png');
+    fs.writeFileSync(providerPath, electronImage.baseImage.toPNG());
+    Object.assign(manifest, { route: 'generate', canvas: { width: 128, height: 128 }, raster_source: 'provider.png', generation_budget: { max_calls: 1 }, is_generation: true });
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    await generateProviderOutput(providerPath);
+    const tool = createImageStudioTool({ userId: USER_ID, agentId: IMAGE_STUDIO_AGENT_ID, extraRoots: [root] });
+    const call = (op: string, extra = {}) => tool.execute({ op, project_dir: projectDir, ...extra }, { workingDir: root } as any);
+    expect(JSON.parse((await call('project.inspect')).content).current_candidate.is_generation).toBe(true);
+    fs.writeFileSync(providerPath, electronImage.changedImage.toPNG());
+    electronImage.image = electronImage.changedImage;
+    expect((await call('project.export', { output_path: path.join(root, 'stale.png') })).isError).toBe(true);
+    const refreshed = await call('project.inspect');
+    expect(refreshed.images).toHaveLength(1);
+    expect(JSON.parse(refreshed.content).current_candidate.is_generation).toBe(false);
+    expect((await call('project.export', { output_path: path.join(root, 'unreviewed.png') })).isError).toBe(true);
   });
 
   it('runs the COMPOSE snapshot, scored review, and export gate through the production tool path', async () => {
@@ -820,8 +1053,8 @@ describe('image_studio tool', () => {
       attached: true,
       role: 'candidate',
       path: snapshotPath,
-      width: 2,
-      height: 2,
+      width: 1080,
+      height: 1080,
       policy: 'attached_only_after_deterministic_inspection_passed',
       review_gate: {
         scope: 'candidate_only',
@@ -842,7 +1075,7 @@ describe('image_studio tool', () => {
     );
     const evidencePixels = await sharp(fs.readFileSync(snapshotPath)).ensureAlpha().raw().toBuffer();
     const modelPixels = await sharp(Buffer.from(snapshot.images![0].data, 'base64')).ensureAlpha().raw().toBuffer();
-    expect(modelPixels).toEqual(evidencePixels);
+    expect(modelPixels.equals(evidencePixels)).toBe(true);
 
     const review = await tool.execute({
       op: 'project.submit_design_review',
@@ -1349,7 +1582,7 @@ describe('image_studio tool', () => {
       current_candidate: {
         status: 'validated',
         path: generatedPath,
-        review_required: false,
+        is_generation: true,
       },
       recovery_context: {
         next_operation: 'project.export',

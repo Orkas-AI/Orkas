@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { resolveCatalogConnection } from '../../../../src/main/features/connectors/connection-parameters';
+import { findCatalogEntry } from '../../../../src/main/features/connectors/catalog';
 import type { CatalogEntry } from '../../../../src/main/features/connectors/types';
 
 function netSuiteEntry(): CatalogEntry {
@@ -29,6 +30,22 @@ function netSuiteEntry(): CatalogEntry {
 }
 
 describe('catalog connector connection parameters', () => {
+  it('preserves a prerequisite-only Color Me connection on first use and restart without accepting arbitrary fields', () => {
+    const entry = findCatalogEntry('colorme-shop')!;
+    expect(entry.connection_setup?.requirement).toBe('provider_application');
+    for (const input of [undefined, null, {}]) {
+      const resolved = resolveCatalogConnection(entry, input);
+      expect(resolved.parameters).toBeUndefined();
+      expect(resolved.entry.transport_template).toMatchObject({ url: 'https://agent.colorme.app/api/mcp' });
+    }
+    for (const input of [{ url: 'https://private.example/mcp' }, { token: 'private' }, [], 'private']) {
+      expect(() => resolveCatalogConnection(entry, input)).toThrow('does not accept connection parameters');
+    }
+    for (const url of ['https://{{account_id}}.example/mcp', 'https://secret@example.com/mcp', 'http://example.com/mcp']) {
+      expect(() => resolveCatalogConnection({ ...entry, transport_template: { kind: 'streamable-http', url } }, {})).toThrow();
+    }
+  });
+
   it('binds a NetSuite sandbox account to its normalized Oracle account domain', () => {
     const source = netSuiteEntry();
     const resolved = resolveCatalogConnection(source, { account_id: ' 123456_SB1 ' });

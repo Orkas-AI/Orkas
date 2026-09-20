@@ -20,7 +20,7 @@ const PROJECT_LIBRARY_ALLOWED_EXTS = [
   '.sh', '.bash', '.zsh', '.ps1', '.cmd', '.bat', '.rb', '.go', '.rs', '.java', '.kt',
   '.c', '.cpp', '.cc', '.h', '.hpp', '.css', '.scss', '.less',
   '.sql', '.graphql', '.gql',
-  '.pdf', '.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm',
+  '.pdf', '.docx', '.docm', '.xlsx', '.xlsm', '.xls', '.pptx', '.pptm',
   '.png', '.jpg', '.jpeg', '.webp', '.gif',
   '.mp4', '.webm', '.mov', '.m4v', '.ogv',
 ];
@@ -1149,12 +1149,12 @@ function _renderTodoCard(task, context) {
   statusSel.innerHTML = '<span class="project-todo-status-dot"></span>'
     + `<span class="project-todo-status-label">${escapeHtml(t('project.todo.status_' + status))}</span>`
     + (typeof uiIconHtml === 'function' ? uiIconHtml('chevron-down', 'project-todo-status-caret') : '');
-  const titleEl = document.createElement('button');
-  titleEl.type = 'button';
-  titleEl.dataset.action = 'todo-edit';
-  titleEl.className = 'project-todo-title';
-  titleEl.textContent = task.title || '';
-  row.appendChild(titleEl);
+  const content = document.createElement('button');
+  content.type = 'button';
+  content.dataset.action = 'todo-edit';
+  content.className = 'project-todo-title';
+  content.textContent = task.content || '';
+  row.appendChild(content);
   const menuBtn = document.createElement('button');
   menuBtn.type = 'button';
   menuBtn.className = 'project-todo-menu';
@@ -1166,12 +1166,6 @@ function _renderTodoCard(task, context) {
     ? uiIconHtml('more-horizontal', 'project-todo-menu-icon')
     : '…';
   row.appendChild(menuBtn);
-  if (task.detail) {
-    const detail = document.createElement('p');
-    detail.className = 'todo-card-detail';
-    detail.textContent = task.detail;
-    row.appendChild(detail);
-  }
   row.dataset.pid = context.pid || '';
   row.dataset.todoScope = context.global ? 'global' : 'project';
   const metaRow = context.showProject ? document.createElement('div') : null;
@@ -1204,8 +1198,7 @@ function _renderTodoCard(task, context) {
     appendMeta(att);
   }
 
-  // A task keeps the first conversation that created/worked it. Expose that
-  // durable back-link directly on every board that renders the task.
+  // Open the latest successfully dispatched execution on every todo board.
   const conversationId = typeof task.origin_cid === 'string' ? task.origin_cid.trim() : '';
   if (conversationId) {
     const conversation = document.createElement('button');
@@ -1279,7 +1272,7 @@ function _updateProjectTodoEditor() {
   if (!input) return;
   if (counter) counter.textContent = `${input.value.length}/${input.maxLength}`;
   const busy = _projectTodoMutating || _todoEditorAttachments.some((a) => a.status === 'uploading');
-  if (save) save.disabled = busy || !input.value.trim();
+  if (save) save.disabled = busy || !input.value.trim() || input.value.length > input.maxLength;
   const cancel = document.getElementById('project-todo-cancel');
   if (cancel) cancel.disabled = busy;
   const project = document.getElementById('project-todo-project');
@@ -1469,7 +1462,7 @@ async function _removeTodoEditorAttachment(name) {
 }
 
 // The shared dialog doubles as the create and edit surface. A task
-// argument switches it to edit mode (pre-filled title, Save updates that task);
+// argument switches it to edit mode (pre-filled content, Save updates that task);
 // no argument is create mode. _todoEditorTaskId is the current edit target.
 function _openProjectTodoEditor(task, context = _projectTodoContext(), status = 'todo') {
   const editor = document.getElementById('project-todo-add');
@@ -1488,7 +1481,7 @@ function _openProjectTodoEditor(task, context = _projectTodoContext(), status = 
   _ensureTodoEditorSelects();
   _todoEditorOwnerChanged = false;
   void _loadTodoEditorAgents(task);
-  input.value = _todoEditorTaskId && task ? (task.title || '') : '';
+  input.value = _todoEditorTaskId && task ? (task.content || '') : '';
   const existing = (_todoEditorTaskId && task && Array.isArray(task.attachments)) ? task.attachments : [];
   _setTodoEditorAttachments(existing.map((name) => ({ name, displayName: name, kind: _todoAttachKind(name), status: 'ready' })));
   if (_todoEditorStatusSelect) {
@@ -1527,7 +1520,7 @@ function _openProjectTodoEditor(task, context = _projectTodoContext(), status = 
   _updateProjectTodoEditor();
   setTimeout(() => {
     input.focus();
-    // Edit: select the whole title for quick replace. Create: caret at end.
+    // Edit: select the whole content for quick replace. Create: caret at end.
     if (_todoEditorTaskId) input.setSelectionRange(0, input.value.length);
     else { const end = input.value.length; input.setSelectionRange(end, end); }
   }, 0);
@@ -1599,8 +1592,8 @@ async function _todoMutate(fn, pid = _projectDetailPid) {
 
 async function _saveProjectTodoEditor() {
   const input = document.getElementById('project-todo-input');
-  const title = String(input?.value || '').trim();
-  if (!title || _todoEditorPid === null || _projectTodoMutating || _todoEditorAttachments.some((a) => a.status === 'uploading')) return;
+  const content = String(input?.value || '').trim();
+  if (!content || _todoEditorPid === null || _projectTodoMutating || _todoEditorAttachments.some((a) => a.status === 'uploading')) return;
   const pid = _todoEditorPid;
   const generation = _todoEditorGeneration;
   const status = _todoEditorStatusSelect?.getValue?.() || 'todo';
@@ -1618,13 +1611,13 @@ async function _saveProjectTodoEditor() {
     ? window.orkas.invoke('projects.tasks.update', {
       projectId: pid,
       taskId,
-      title,
+      content,
       ...(status !== _todoEditorInitial?.status ? { status } : {}),
       ...owner,
     })
     : window.orkas.invoke('projects.tasks.create', {
       projectId: pid,
-      title,
+      content,
       status,
       ...owner,
       ...(_todoEditorTid ? { taskId: _todoEditorTid } : {}),
@@ -2251,11 +2244,25 @@ function _projectLibraryEntryPaths(nodes, out = []) {
   return out;
 }
 
+// Comparable timestamp for ordering. Same seconds-or-milliseconds tolerance as
+// `_projectFormatMtime`; entries without a usable mtime rank last within their group.
+function _projectMtimeRank(mtime) {
+  const n = Number(mtime);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return n > 100000000000 ? n : n * 1000;
+}
+
+// Recency-first, matching the global Library tree: a deliverable saved or
+// replaced just now sits at the top instead of sinking to wherever its name
+// sorts. Folders still lead, ordered by their own mtime; name breaks ties.
 function _sortProjectLibraryNodes(nodes) {
   return (nodes || []).slice().sort((a, b) => {
     const at = a?.type === 'dir';
     const bt = b?.type === 'dir';
     if (at !== bt) return at ? -1 : 1;
+    const aTime = _projectMtimeRank(a?.mtime);
+    const bTime = _projectMtimeRank(b?.mtime);
+    if (aTime !== bTime) return bTime - aTime;
     const an = a?.name || _projectBasename(_projectLibraryRel(a));
     const bn = b?.name || _projectBasename(_projectLibraryRel(b));
     return an.localeCompare(bn, undefined, { sensitivity: 'base', numeric: true });
@@ -2271,6 +2278,7 @@ function _buildProjectKbStatusMap(files, statusRows) {
       status: row.status,
       chunks: row.chunks,
       error: row.error,
+      errorCode: row.errorCode,
       kind: row.kind,
     };
   }
@@ -2354,6 +2362,9 @@ function _projectKbStatusChipHtml(name) {
     return `<span class="ctx-kb-chip is-processing" title="${escapeHtml(label)}"><span class="ctx-kb-spinner"></span></span>`;
   }
   if (st.status === 'failed') {
+    if (st.errorCode === 'E_LIBRARY_FILE_TOO_LARGE' && st.error) {
+      return `<span class="ctx-kb-chip is-failed" title="${escapeHtml(st.error)}">!</span>`;
+    }
     return `<span class="ctx-kb-chip is-failed" data-action="project-file-reprocess" title="${escapeHtml(t('contexts.kb.failed'))}">!</span>`;
   }
   return '';
@@ -3371,6 +3382,19 @@ async function _runProjectLibraryRootAction(action) {
 async function _openProjectLibraryTransfer(paths, entryPoint) {
   if (!_projectDetailPid || !window.LibraryTransfer?.open || !paths?.length) return;
   const sourceProjectId = _projectDetailPid;
+  const owner = typeof currentUserId === 'string' ? currentUserId : '';
+  if (!await window.LibraryTransfer.confirmUnsaved({
+    paths,
+    drafts: _projectLibraryDrafts,
+    getActivePath: () => _projectLibraryActiveName,
+    getController: () => _projectLibraryMveController,
+    openFile: async (name) => {
+      _projectLibraryActiveName = name;
+      await _showProjectTextViewer(name);
+    },
+    isCurrent: () => _projectDetailPid === sourceProjectId
+      && (typeof currentUserId === 'string' ? currentUserId : '') === owner,
+  })) return;
   await window.LibraryTransfer.open({
     source: { scope: 'project', projectId: sourceProjectId },
     paths,
@@ -3707,6 +3731,7 @@ function _applyProjectKbEvent(ev) {
       status: ev.status,
       ...(ev.chunks != null ? { chunks: ev.chunks } : {}),
       ...(ev.error ? { error: ev.error } : {}),
+      ...(ev.errorCode ? { errorCode: ev.errorCode } : {}),
       ...(ev.kind ? { kind: ev.kind } : {}),
     };
   }

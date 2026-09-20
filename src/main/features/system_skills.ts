@@ -8,7 +8,10 @@
  */
 
 import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
+
+import { replaceDirectoryAtomically } from '../util/atomic-directory-replace';
 
 import {
   packagedSystemSkillsManifestFile,
@@ -19,6 +22,7 @@ import {
 } from '../paths';
 import { createLogger } from '../logger';
 import { safeId } from '../storage';
+import { logErrorSummary } from '../util/log-redact';
 import { getActiveUserId, hasActiveUser } from './users';
 
 const log = createLogger('system-skills');
@@ -66,6 +70,18 @@ function _readManifest(file: string, opts: { requireNonEmpty?: boolean } = {}): 
   } catch (err) {
     return { ok: false, entries: [], error: `unable to read manifest: ${(err as Error).message}` };
   }
+  return _parseManifest(raw, opts);
+}
+
+async function _readManifestAsync(file: string, opts: { requireNonEmpty?: boolean } = {}): Promise<SystemSkillManifestRead> {
+  try {
+    return _parseManifest(JSON.parse(await fsp.readFile(file, 'utf8')), opts);
+  } catch (err) {
+    return { ok: false, entries: [], error: `unable to read manifest: ${(err as Error).message}` };
+  }
+}
+
+function _parseManifest(raw: unknown, opts: { requireNonEmpty?: boolean }): SystemSkillManifestRead {
   const wrapped = raw && typeof raw === 'object' && !Array.isArray(raw)
     ? raw as { skills?: unknown }
     : null;
@@ -96,117 +112,114 @@ function _sameEntry(a: SystemSkillManifestEntry | null | undefined, b: SystemSki
   return !!a && !!b && String(a.update_at) === String(b.update_at);
 }
 
-function _writeManifestEntries(file: string, entries: SystemSkillManifestEntry[]): void {
+async function _writeManifestEntries(file: string, entries: SystemSkillManifestEntry[]): Promise<void> {
   const compact = entries
     .filter((entry) => safeId(entry.id))
     .sort((a, b) => a.id.localeCompare(b.id))
     .map((entry) => ({ id: entry.id, update_at: entry.update_at }));
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `${JSON.stringify(compact, null, 2)}\n`);
+  await fsp.mkdir(path.dirname(file), { recursive: true });
+  await fsp.writeFile(file, `${JSON.stringify(compact, null, 2)}\n`);
 }
 
-function _copyDir(src: string, dest: string): void {
-  fs.mkdirSync(dest, { recursive: true });
-  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
-    if (entry.name === '.' || entry.name === '..') continue;
-    const from = path.join(src, entry.name);
-    const to = path.join(dest, entry.name);
-    if (entry.isDirectory()) {
-      _copyDir(from, to);
-    } else if (entry.isFile()) {
-      fs.copyFileSync(from, to);
-    }
+function _assertContinue(shouldContinue?: () => boolean): void {
+  if (shouldContinue && !shouldContinue()) {
+    throw Object.assign(new Error('System Skill publication cancelled'), { name: 'AbortError' });
   }
 }
 
-function _replaceDir(src: string, dest: string): void {
-  const parent = path.dirname(dest);
-  const tmp = path.join(parent, `.${path.basename(dest)}.tmp-${Date.now()}-${Math.random().toString(16).slice(2)}`);
-  const bak = path.join(parent, `.${path.basename(dest)}.bak-${Date.now()}-${Math.random().toString(16).slice(2)}`);
-  fs.rmSync(tmp, { recursive: true, force: true });
-  fs.rmSync(bak, { recursive: true, force: true });
-  _copyDir(src, tmp);
-  if (fs.existsSync(dest)) fs.renameSync(dest, bak);
-  fs.renameSync(tmp, dest);
-  fs.rmSync(bak, { recursive: true, force: true });
+async function _copyDir(src: string, dest: string, shouldContinue?: () => boolean): Promise<void> {
+  _assertContinue(shouldContinue);
+  await fsp.mkdir(dest, { recursive: true });
+  for (const entry of await fsp.readdir(src, { withFileTypes: true })) {
+    _assertContinue(shouldContinue);
+    const from = path.join(src, entry.name);
+    const to = path.join(dest, entry.name);
+    if (entry.isDirectory()) await _copyDir(from, to, shouldContinue);
+    else if (entry.isFile()) await fsp.copyFile(from, to);
+  }
 }
 
-function _removeLegacyPerSkillManifest(uid: string, id: string): void {
+async function _removeLegacyPerSkillManifest(uid: string, id: string): Promise<void> {
   try {
-    fs.rmSync(path.join(userSystemSkillDir(uid, id), '_system.json'), { force: true });
+    await fsp.rm(path.join(userSystemSkillDir(uid, id), '_system.json'), { force: true });
   } catch { /* best-effort legacy cleanup */ }
 }
 
 export function listPackagedSystemSkillIds(): string[] {
   const manifest = _readManifest(packagedSystemSkillsManifestFile(), { requireNonEmpty: true });
   if (manifest.ok === false) {
-    log.warn(`packaged system skill manifest invalid: ${manifest.error}`);
+    log.warn('packaged system skill manifest invalid', { error: logErrorSummary(manifest.error) });
     return [];
   }
   return manifest.entries.map((entry) => entry.id).sort();
 }
 
-export function reconcileSystemSkill(uid: string, id: string): SystemSkillReconcileResult {
+export async function reconcileSystemSkill(uid: string, id: string): Promise<SystemSkillReconcileResult> {
   if (!safeId(uid) || !safeId(id)) return { id: String(id || ''), action: 'invalid_manifest', error: 'invalid id' };
-  const sourceManifest = _readManifest(packagedSystemSkillsManifestFile(), { requireNonEmpty: true });
+  const sourceManifest = await _readManifestAsync(packagedSystemSkillsManifestFile(), { requireNonEmpty: true });
   if (sourceManifest.ok === false) return { id, action: 'invalid_manifest', error: sourceManifest.error };
-  const localManifest = _readManifest(userSystemSkillsManifestFile(uid));
+  const localManifest = await _readManifestAsync(userSystemSkillsManifestFile(uid));
   const sourceEntries = _manifestMap(sourceManifest.entries);
   const localEntries = _manifestMap(localManifest.ok ? localManifest.entries : []);
-  const result = _reconcileSystemSkill(uid, id, sourceEntries.get(id), localEntries.get(id));
+  const result = await _reconcileSystemSkill(uid, id, sourceEntries.get(id), localEntries.get(id));
   if (result.action === 'created' || result.action === 'updated') {
     localEntries.set(id, sourceEntries.get(id)!);
-    _writeManifestEntries(userSystemSkillsManifestFile(uid), Array.from(localEntries.values()));
+    await _writeManifestEntries(userSystemSkillsManifestFile(uid), Array.from(localEntries.values()));
   }
   return result;
 }
 
-function _reconcileSystemSkill(
+async function _reconcileSystemSkill(
   uid: string,
   id: string,
   srcManifest: SystemSkillManifestEntry | null | undefined,
   destManifest: SystemSkillManifestEntry | null | undefined,
-): SystemSkillReconcileResult {
+  shouldContinue?: () => boolean,
+): Promise<SystemSkillReconcileResult> {
   const src = _sourceSkillDir(id);
   if (!fs.existsSync(path.join(src, 'SKILL.md'))) return { id, action: 'missing_source' };
   if (!srcManifest || srcManifest.id !== id) return { id, action: 'invalid_manifest' };
   const dest = userSystemSkillDir(uid, id);
   if (fs.existsSync(path.join(dest, 'SKILL.md')) && _sameEntry(srcManifest, destManifest)) {
-    _removeLegacyPerSkillManifest(uid, id);
+    await _removeLegacyPerSkillManifest(uid, id);
     return { id, action: 'skipped' };
   }
   try {
     const existed = fs.existsSync(dest);
-    fs.mkdirSync(userSystemSkillsDir(uid), { recursive: true });
-    _replaceDir(src, dest);
-    _removeLegacyPerSkillManifest(uid, id);
+    await replaceDirectoryAtomically(dest, (staged) => _copyDir(src, staged, shouldContinue), undefined, {
+      assertReady: () => _assertContinue(shouldContinue),
+    });
+    await _removeLegacyPerSkillManifest(uid, id);
     return { id, action: existed ? 'updated' : 'created' };
   } catch (err) {
+    if ((err as Error).name === 'AbortError') return { id, action: 'skipped' };
     return { id, action: 'failed', error: (err as Error).message };
   }
 }
 
-export async function reconcileAllForUser(uid: string): Promise<SystemSkillReconcileResult[]> {
+export async function reconcileAllForUser(uid: string, shouldContinue?: () => boolean): Promise<SystemSkillReconcileResult[]> {
   if (!safeId(uid)) return [];
-  const sourceManifest = _readManifest(packagedSystemSkillsManifestFile(), { requireNonEmpty: true });
+  const sourceManifest = await _readManifestAsync(packagedSystemSkillsManifestFile(), { requireNonEmpty: true });
   if (sourceManifest.ok === false) {
     const failure: SystemSkillReconcileResult = {
       id: '*',
       action: 'invalid_manifest',
       error: sourceManifest.error,
     };
-    log.warn(`system skill reconcile invalid_manifest id=* error=${sourceManifest.error}`);
+    log.warn('system skill reconcile invalid_manifest id=*', { error: logErrorSummary(sourceManifest.error) });
     return [failure];
   }
-  const localManifest = _readManifest(userSystemSkillsManifestFile(uid));
+  const localManifest = await _readManifestAsync(userSystemSkillsManifestFile(uid));
   if (localManifest.ok === false && fs.existsSync(userSystemSkillsManifestFile(uid))) {
-    log.warn(`local system skill manifest invalid; rebuilding from packaged source: ${localManifest.error}`);
+    log.warn('local system skill manifest invalid; rebuilding from packaged source', { error: logErrorSummary(localManifest.error) });
   }
   const sourceEntries = _manifestMap(sourceManifest.entries);
   const localEntries = _manifestMap(localManifest.ok ? localManifest.entries : []);
-  const results: SystemSkillReconcileResult[] = Array.from(sourceEntries.keys())
-    .sort()
-    .map((id) => _reconcileSystemSkill(uid, id, sourceEntries.get(id), localEntries.get(id)));
+  const results: SystemSkillReconcileResult[] = [];
+  for (const id of Array.from(sourceEntries.keys()).sort()) {
+    if (shouldContinue && !shouldContinue()) break;
+    results.push(await _reconcileSystemSkill(uid, id, sourceEntries.get(id), localEntries.get(id), shouldContinue));
+  }
   let manifestChanged = false;
   for (const r of results) {
     if (r.action === 'created' || r.action === 'updated') {
@@ -220,15 +233,16 @@ export async function reconcileAllForUser(uid: string): Promise<SystemSkillRecon
   const localRoot = userSystemSkillsDir(uid);
   const diskIds = new Set<string>();
   try {
-    for (const entry of fs.readdirSync(localRoot, { withFileTypes: true })) {
+    for (const entry of await fsp.readdir(localRoot, { withFileTypes: true })) {
       if (entry.isDirectory() || entry.isSymbolicLink()) diskIds.add(entry.name);
     }
   } catch { /* no local mirror yet */ }
   const cleanupIds = new Set([...localEntries.keys(), ...diskIds]);
   for (const id of Array.from(cleanupIds).sort()) {
+    if (shouldContinue && !shouldContinue()) break;
     if (sourceEntries.has(id)) continue;
     try {
-      fs.rmSync(path.join(localRoot, id), { recursive: true, force: true });
+      await fsp.rm(path.join(localRoot, id), { recursive: true, force: true });
       localEntries.delete(id);
       manifestChanged = true;
       results.push({ id, action: 'deleted' });
@@ -237,21 +251,21 @@ export async function reconcileAllForUser(uid: string): Promise<SystemSkillRecon
     }
   }
   if (manifestChanged) {
-    _writeManifestEntries(userSystemSkillsManifestFile(uid), Array.from(localEntries.values()));
+    await _writeManifestEntries(userSystemSkillsManifestFile(uid), Array.from(localEntries.values()));
   }
   if (results.some((r) => r.action === 'created' || r.action === 'updated' || r.action === 'deleted')) {
     try {
       const registry = await import('../model/core-agent/skill-registry');
       await registry.invalidateSkills();
     } catch (err) {
-      log.warn(`system skill registry invalidation failed: ${(err as Error).message}`);
+      log.warn('system skill registry invalidation failed', { error: logErrorSummary(err) });
     }
   }
   for (const r of results) {
     if (r.action === 'created' || r.action === 'updated' || r.action === 'deleted') {
       log.info(`system skill ${r.action} id=${r.id}`);
     } else if (r.action === 'failed' || r.action === 'invalid_manifest' || r.action === 'missing_source') {
-      log.warn(`system skill reconcile ${r.action} id=${r.id}${r.error ? ` error=${r.error}` : ''}`);
+      log.warn(`system skill reconcile ${r.action} id=${r.id}`, r.error ? { error: logErrorSummary(r.error) } : undefined);
     }
   }
   return results;
@@ -281,7 +295,7 @@ export async function reconcileAllForUserWithRetry(
   while (true) {
     if (opts.shouldContinue && !opts.shouldContinue()) return last;
     try {
-      last = await reconcileAllForUser(uid);
+      last = await reconcileAllForUser(uid, opts.shouldContinue);
     } catch (err) {
       last = [{ id: '*', action: 'failed', error: (err as Error).message || String(err) }];
     }

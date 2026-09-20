@@ -21,7 +21,7 @@
  */
 
 import {
-  sessionLock, globalSlots,
+  sessionLock, globalSlots, acquireWithAbort,
   type Releaser,
 } from '../../util/locks';
 import type {
@@ -33,7 +33,6 @@ import type {
 import { createLogger } from '../../logger';
 import { AGENT_EXECUTION_IDLE_MS, agentExecutionDeadline } from '../../util/agent-execution-budget';
 import { logErrorRef, logErrorSummary, logPathRef, maskId } from '../../util/log-redact';
-import { recordUsageTokens } from '../../util/conversation-cost-meter';
 
 const log = createLogger('model');
 import { genConversationId } from '../../storage';
@@ -72,6 +71,13 @@ function startRecording(_input: unknown): NoopRecorder {
     setActiveCandidate() {},
     finish() {},
   };
+}
+
+function modelPreflightFailureCode(err: unknown): string {
+  const code = err && typeof err === 'object' ? (err as { code?: unknown }).code : undefined;
+  return typeof code === 'string'
+    && ['provider_auth', 'provider_permission', 'provider_rate_limit', 'provider_balance'].includes(code)
+    ? code : '';
 }
 
 export async function* stopStreamOnAbort<T>(
@@ -516,11 +522,17 @@ export interface ModelRunLogDiagnostics {
   emergencyNoDropCount: number;
   /** Re-read accounting summed over measured compaction spans (the runner
    * reports it from a run's second compaction on): reads seen, re-reads of an
-   * already-read path, and byte-identical re-reads. Fleet calibration input
+   * already-read path, and fully covered same-version source ranges. Local
+   * diagnostics also separate partial/new/unknown/empty ranges. None of these
+   * counters establishes that a read was unnecessary. Fleet calibration input
    * for the derived context-budget ceilings. */
   rereadReads: number;
   rereadPaths: number;
   rereadIdentical: number;
+  rereadPartial: number;
+  rereadNewRange: number;
+  rereadUnknown: number;
+  rereadEmpty: number;
   providerCallCount: number;
   providerCallMaxMs: number;
   providerSlowCallCount: number;
@@ -692,6 +704,10 @@ export function createModelRunLogDiagnostics(nowMs = Date.now()): ModelRunLogDia
     rereadReads: 0,
     rereadPaths: 0,
     rereadIdentical: 0,
+    rereadPartial: 0,
+    rereadNewRange: 0,
+    rereadUnknown: 0,
+    rereadEmpty: 0,
     providerCallCount: 0,
     providerCallMaxMs: 0,
     providerSlowCallCount: 0,
@@ -1171,6 +1187,10 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
         stats.rereadReads += Math.max(0, Math.round(finiteNumber(statusData.readsSinceLastCompaction) ?? 0));
         stats.rereadPaths += Math.max(0, Math.round(finiteNumber(statusData.rereadPaths) ?? 0));
         stats.rereadIdentical += Math.max(0, Math.round(finiteNumber(statusData.rereadIdenticalContent) ?? 0));
+        stats.rereadPartial += Math.max(0, Math.round(finiteNumber(statusData.rereadPartialContent) ?? 0));
+        stats.rereadNewRange += Math.max(0, Math.round(finiteNumber(statusData.rereadNewRange) ?? 0));
+        stats.rereadUnknown += Math.max(0, Math.round(finiteNumber(statusData.rereadUnknownRange) ?? 0));
+        stats.rereadEmpty += Math.max(0, Math.round(finiteNumber(statusData.rereadEmpty) ?? 0));
       }
       noteRunTimelineForLog(
         stats,
@@ -1287,6 +1307,10 @@ export function summarizeModelRunForLog(stats: ModelRunLogDiagnostics, nowMs = D
     rereadReads: stats.rereadReads,
     rereadPaths: stats.rereadPaths,
     rereadIdentical: stats.rereadIdentical,
+    rereadPartial: stats.rereadPartial,
+    rereadNewRange: stats.rereadNewRange,
+    rereadUnknown: stats.rereadUnknown,
+    rereadEmpty: stats.rereadEmpty,
     providerCallCount: stats.providerCallCount,
     providerCallMaxMs: stats.providerCallMaxMs,
     providerSlowCallCount: stats.providerSlowCallCount,
@@ -1450,6 +1474,7 @@ function agentRunResultEventForTelemetry(input: {
     : (input.failureCode || (input.status === 'empty' ? 'empty_response' : input.status));
   const data: Record<string, unknown> = {
     result,
+    terminal_status: input.status,
     provider: providerCategoryForTelemetry(input.providerId),
     model: modelFamilyForTelemetry(input.modelId, input.providerId),
     duration_ms: Math.max(0, Math.round(input.durationMs)),
@@ -1631,13 +1656,13 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     hasProducedPath,
     onArtifactCreated,
     onCustomConnectorAdded,
+    onAutoTaskSaved,
     onSkillAdvertised,
     onSkillInvoked,
     cacheRetention,
     thinkingLevel,
     nested = false,
     drainSteer,
-    terminalTextGuard,
   } = opts;
 
   const diagnostics = createModelRunLogDiagnostics();
@@ -1692,42 +1717,17 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   let runnerBuildMs = 0;
 
   const releaseSessionOnce = (reason: string): void => {
-    if (sessionReleased) return;
+    if (sessionReleased || !_releaseSession) return;
     sessionReleased = true;
     if (reason !== 'finally') log.info('release session-lock', { session_id: maskedSessionId, reason });
     try { _releaseSession?.(); } catch (err) { log.warn('release session-lock failed', { error: logErrorRef(err) }); }
   };
   const releaseSlotOnce = (reason: string): void => {
-    if (slotReleased) return;
+    if (slotReleased || !_slotRelease) return;
     slotReleased = true;
     if (reason !== 'finally') log.info('release global-slot', { session_id: maskedSessionId, reason });
     try { _slotRelease?.(); } catch (err) { log.warn('release global-slot failed', { error: logErrorRef(err) }); }
   };
-
-  log.info('model turn queued', turnLogContext);
-  const sessionLockWaitStartedAt = Date.now();
-  _releaseSession = await sessionLock(`${userId}\0${sessionId}`).acquire();
-  sessionLockWaitMs = Math.max(0, Date.now() - sessionLockWaitStartedAt);
-  if (nested) {
-    // G8d nested sub-run: do NOT take a global slot — the parent turn already
-    // holds one, and acquiring another here would deadlock when the slot pool
-    // is exhausted (parent holds a slot, blocks on the child's slot, no slot
-    // ever frees). Bounded by the caller's dispatch cap instead. Mark the slot
-    // released so every slot-release path (abort / idle / finally) is a no-op.
-    slotReleased = true;
-  } else {
-    const globalSlotWaitStartedAt = Date.now();
-    const [, slotRelease] = await globalSlots.acquire();
-    globalSlotWaitMs = Math.max(0, Date.now() - globalSlotWaitStartedAt);
-    _slotRelease = slotRelease;
-  }
-  log.info('model turn locks acquired', {
-    ...turnLogContext,
-    lock_wait_ms: sessionLockWaitMs + globalSlotWaitMs,
-    session_lock_wait_ms: sessionLockWaitMs,
-    global_slot_wait_ms: globalSlotWaitMs,
-    global_slot_acquired: !nested,
-  });
 
   // Build an AbortController that fires when the active phase's idle window
   // expires or the caller's external abortSignal fires.
@@ -1833,15 +1833,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       releaseSessionOnce('idle-watchdog');
     }, delayMs);
   };
-  resetIdle();
-  const wallTimer = setTimeout(() => {
-    if (controller.signal.aborted) return;
-    wallHit = true;
-    controller.abort();
-    releaseSlotOnce('wall-watchdog');
-    releaseSessionOnce('wall-watchdog');
-  }, Math.max(0, executionDeadlineAt - Date.now()));
-  wallTimer.unref?.();
+  let wallTimer: NodeJS.Timeout | null = null;
 
   const onExternalAbort = () => {
     externalAbort = true;
@@ -1867,10 +1859,51 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   // This is the taxonomy boundary between setup/config failures and failures
   // produced by an attempted model run; do not replace it with text matching.
   let modelRunStarted = false;
+  let runnerBuildStarted = false;
   let activeProviderId = '';
   let activeModelId = '';
   let activeToolCount = 0;
   try {
+    log.info('model turn queued', turnLogContext);
+    const sessionLockWaitStartedAt = Date.now();
+    try {
+      _releaseSession = await acquireWithAbort(
+        () => sessionLock(`${userId}\0${sessionId}`).acquire(), controller.signal,
+      );
+    } finally {
+      sessionLockWaitMs = Math.max(0, Date.now() - sessionLockWaitStartedAt);
+    }
+    if (nested) {
+      // The parent already holds a global slot. Nested dispatches retain
+      // their caller-owned bound instead of deadlocking on this semaphore.
+      slotReleased = true;
+    } else {
+      const globalSlotWaitStartedAt = Date.now();
+      try {
+        _slotRelease = await acquireWithAbort(async () => (await globalSlots.acquire())[1], controller.signal);
+      } finally {
+        globalSlotWaitMs = Math.max(0, Date.now() - globalSlotWaitStartedAt);
+      }
+    }
+    controller.signal.throwIfAborted();
+    log.info('model turn locks acquired', {
+      ...turnLogContext,
+      lock_wait_ms: sessionLockWaitMs + globalSlotWaitMs,
+      session_lock_wait_ms: sessionLockWaitMs,
+      global_slot_wait_ms: globalSlotWaitMs,
+      global_slot_acquired: !nested,
+    });
+    // Lock waiting is not provider/tool idleness. Arm the existing watchdogs
+    // only after admission; cancellation remains active throughout the wait.
+    resetIdle();
+    wallTimer = setTimeout(() => {
+      if (controller.signal.aborted) return;
+      wallHit = true;
+      controller.abort();
+      releaseSlotOnce('wall-watchdog');
+      releaseSessionOnce('wall-watchdog');
+    }, Math.max(0, executionDeadlineAt - Date.now()));
+    wallTimer.unref?.();
 
     // Called back when pi-ai's onPayload hook injects the native web
     // search tool — write the event straight into the recorder so the
@@ -1880,9 +1913,11 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     // runner.runStream, by which time the recorder is ready, so the
     // closure can simply read the outer `let` variable.
     const buildStartedAt = Date.now();
+    runnerBuildStarted = true;
     log.info('model turn build start', turnLogContext);
     const built = await buildRunner({
       sessionId,
+      persistenceSignal: controller.signal,
       systemPrompt,
       userId,
       agentId,
@@ -1922,6 +1957,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(hasProducedPath ? { hasProducedPath } : {}),
       ...(onArtifactCreated ? { onArtifactCreated } : {}),
       ...(onCustomConnectorAdded ? { onCustomConnectorAdded } : {}),
+      ...(onAutoTaskSaved ? { onAutoTaskSaved } : {}),
       ...(onSkillAdvertised ? { onSkillAdvertised } : {}),
       ...(onSkillInvoked ? { onSkillInvoked } : {}),
       onNativeSearchInjected: (info) => {
@@ -2076,7 +2112,6 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(cacheRetention ? { cacheRetention } : {}),
       ...(thinkingLevel ? { thinkingLevel } : {}),
       ...(drainSteer ? { drainSteer } : {}),
-      ...(terminalTextGuard ? { terminalTextGuard } : {}),
     });
 
     // Wrap raw events to capture the AgentRunResult for post-run reflection.
@@ -2273,8 +2308,18 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       recorder.record(abortEvent as any);
       yield abortEvent;
     } else {
-      errText = (err as Error).message || String(err);
-      terminalFailureCode = modelRunStarted ? 'model_stream_error' : 'model_preflight';
+      const taskLimitHit = (err as { code?: unknown })?.code === 'TASK_TOKEN_LIMIT_REACHED';
+      const toolSaveFailed = (err as { code?: unknown })?.code === 'TOOL_RESULT_PERSISTENCE_FAILED';
+      const saveFailed = toolSaveFailed || (err as { code?: unknown })?.code === 'SESSION_PERSISTENCE_FAILED';
+      errText = taskLimitHit ? t('chat.cost_limit_reached')
+        : toolSaveFailed ? t('errors.tool_result_save_failed')
+          : saveFailed ? t('errors.session_save_failed')
+            : (err as Error).message || String(err);
+      terminalFailureCode = (taskLimitHit ? 'task_token_limit_reached' : '')
+        || (toolSaveFailed ? 'tool_result_persistence_failed' : '')
+        || (saveFailed ? 'session_persistence_failed' : '')
+        || (!modelRunStarted ? modelPreflightFailureCode(err) : '')
+        || (modelRunStarted ? 'model_stream_error' : 'model_preflight');
       terminalFailurePhase = modelRunStarted ? 'provider_wait' : 'preflight';
       log.error('model turn stream error', { ...turnLogContext, error: logErrorSummary(err) });
       const errorEvent: StreamEvent = {
@@ -2283,6 +2328,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
         failureKind: modelRunStarted ? 'model' : 'config',
         failureCode: terminalFailureCode,
         failurePhase: terminalFailurePhase,
+        ...(saveFailed || taskLimitHit ? { retryExhausted: true } : {}),
       };
       recordModelStreamEventForLog(diagnostics, errorEvent);
       recorder.record(errorEvent as any);
@@ -2291,7 +2337,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   } finally {
     removeActiveSessionAbort(userId, sessionId, activeAbortEntry);
     if (idleTimer) clearTimeout(idleTimer);
-    clearTimeout(wallTimer);
+    if (wallTimer) clearTimeout(wallTimer);
     if (abortSignal) abortSignal.removeEventListener?.('abort', onExternalAbort);
     // Heal orphan tool_use in the cached session before releasing the
     // per-session lock. The PersistentSession instance is cached per
@@ -2300,10 +2346,11 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     // mid-tool-execution. Without this, the next turn would reuse a
     // memory-resident session whose last assistant message has an
     // unmatched tool_use — provider APIs silently hang on that shape,
-    // which surfaces as a "thinking" state that never ends. Heal is idempotent and
-    // a no-op on healthy sessions, so running it unconditionally every
-    // turn is safe.
-    try {
+    // which surfaces as a "thinking" state that never ends. Heal is idempotent
+    // and a no-op on healthy sessions after an admitted turn.
+    // A cancelled admission has never touched the session and may still be
+    // queued behind its actual owner. It must not heal or evict that state.
+    if (runnerBuildStarted) try {
       const cached = await _getCachedSessionForUser(userId, sessionId);
       if (cached && typeof (cached as { healAndPersist?: () => boolean }).healAndPersist === 'function') {
         if (cached.healAndPersist()) {
@@ -2329,7 +2376,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     // (which re-caches via getSession) and before the lock release, so no
     // concurrent turn can be holding the evicted instance. Conversation-backed
     // kinds are a no-op inside evictEphemeralSession.
-    try { evictEphemeralSession(userId, sessionId); }
+    if (runnerBuildStarted) try { evictEphemeralSession(userId, sessionId); }
     catch (err) { log.warn('ephemeral session evict failed', { session_id: maskedSessionId, error: logErrorRef(err) }); }
     releaseSlotOnce('finally');
     releaseSessionOnce('finally');
@@ -2343,7 +2390,9 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
               ? 'waiting_input'
               : (agentRunResult?.meta.termination?.status === 'stopped'
                   ? 'stopped'
-                  : (finalText ? 'completed' : 'empty'))));
+                  // A handed-off model invocation completed normally; task
+                  // completion remains owned by the host's queued Agent run.
+                  : (finalText || agentRunResult?.meta.termination?.status === 'handed_off' ? 'completed' : 'empty'))));
     const telemetryIds = modelRunIdsForTelemetry(
       activeProviderId,
       activeModelId,
@@ -2382,7 +2431,6 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       timings: timingSummary,
       diagnostics: summarizeModelRunForLog(diagnostics),
     });
-    recordUsageTokens(cid, { inputTokens: diagnostics.usage?.inputTokens ?? 0, outputTokens: diagnostics.usage?.outputTokens ?? 0 });
     try { recorder.finish({ text: finalText, aborted: abortedFlag, error: errText }); }
     catch (err) { log.warn('archive finish failed', { error: logErrorRef(err) }); }
     yield doneEvent;

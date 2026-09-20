@@ -1,8 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { getEventListeners } from 'node:events';
 import { Mutex, Semaphore, type SemaphoreInterface } from 'async-mutex';
 import {
   sessionLock, fileEditLock, globalSlots,
-  acquireWithTimeout, acquireSemWithTimeout,
+  acquireWithAbort, acquireWithTimeout, acquireSemWithTimeout,
   _keyedLockCountsForTest,
 } from '../../../src/main/util/locks';
 
@@ -93,6 +94,76 @@ describe('locks › globalSlots', () => {
   });
 });
 
+describe('locks › acquireWithAbort', () => {
+  it('does not queue an acquisition when already cancelled', async () => {
+    const ac = new AbortController();
+    const reason = new Error('cancel before admission');
+    ac.abort(reason);
+    const acquire = vi.fn();
+    await expect(acquireWithAbort(acquire, ac.signal)).rejects.toBe(reason);
+    expect(acquire).not.toHaveBeenCalled();
+    expect(getEventListeners(ac.signal, 'abort')).toHaveLength(0);
+  });
+
+  it('settles cancellation while the holder remains active and returns the late lease before live FIFO waiters run', async () => {
+    const sem = new Semaphore(1);
+    const [, holder] = await sem.acquire();
+    const ac = new AbortController();
+    const reason = new Error('cancel queued admission');
+    const cancelled = acquireWithAbort(async () => (await sem.acquire())[1], ac.signal);
+    const rejection = expect(cancelled).rejects.toBe(reason);
+    const order: string[] = [];
+    const first = sem.runExclusive(() => { order.push('first'); });
+    const second = sem.runExclusive(() => { order.push('second'); });
+    try {
+      ac.abort(reason);
+      await rejection;
+      expect(sem.getValue()).toBe(0);
+      expect(order).toEqual([]);
+      expect(getEventListeners(ac.signal, 'abort')).toHaveLength(0);
+    } finally {
+      holder();
+    }
+    await Promise.all([first, second]);
+    expect(order).toEqual(['first', 'second']);
+    expect(sem.getValue()).toBe(1);
+  });
+
+  it('lets the caller clean up a grant that wins the cancellation race without entering work', async () => {
+    const ac = new AbortController();
+    const release = vi.fn();
+    const pending = acquireWithAbort(() => Promise.resolve(release), ac.signal);
+    ac.abort();
+    const acquired = await pending;
+    const work = vi.fn();
+    try {
+      expect(() => {
+        ac.signal.throwIfAborted();
+        work();
+      }).toThrow();
+    } finally {
+      acquired();
+    }
+    expect(work).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(getEventListeners(ac.signal, 'abort')).toHaveLength(0);
+  });
+
+  it('leaves an admitted lease under its caller ownership when cancellation arrives later', async () => {
+    const sem = new Semaphore(1);
+    const ac = new AbortController();
+    const release = await acquireWithAbort(async () => (await sem.acquire())[1], ac.signal);
+    try {
+      expect(getEventListeners(ac.signal, 'abort')).toHaveLength(0);
+      ac.abort();
+      expect(sem.getValue()).toBe(0);
+    } finally {
+      release();
+    }
+    expect(sem.getValue()).toBe(1);
+  });
+});
+
 describe('locks › acquireWithTimeout', () => {
   it('resolves to a release function on success', async () => {
     const m = new Mutex();
@@ -158,4 +229,3 @@ describe('locks › acquireSemWithTimeout', () => {
     release();
   });
 });
-

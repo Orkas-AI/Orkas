@@ -577,4 +577,18 @@ describe('oss.js', () => {
     const { context } = loadOss();
     expect(context.ossIconFor('slides')).toBe('presentation');
   });
+
+  it('localizes descriptions while retaining existing task prompt language and legacy fallbacks', () => {
+    const descriptions = { es: 'Descripción', fr: 'Description française', ko: '한국어 설명', de: 'Beschreibung', ru: 'Описание', it: 'Descrizione' };
+    for (const [lang, description] of Object.entries(descriptions)) {
+      const { context } = loadOss({ lang });
+      const p = { task_zh: '中文任务', task_en: 'English task', description_zh: '中文描述', description_en: 'English description', ['description_' + lang]: description };
+      expect(context.ossDescFor(p)).toBe(description);
+      expect(context.ossTaskFor(p)).toBe('English task');
+      delete p['description_' + lang];
+      expect(context.ossDescFor(p)).toBe('English description');
+      expect(context.ossDescFor({ description_zh: '中文描述' })).toBe('中文描述');
+      expect(context.ossDescFor({})).toBe('');
+    }
+  });
 });

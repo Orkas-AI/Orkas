@@ -471,6 +471,23 @@ def merge_audits(primary: dict, adds: list) -> dict:
             geo_score = ad.get("geo_score")
             geo_dimensions = ad.get("geo_dimensions") or geo_dimensions
 
+    # No findings is not evidence that an optional audit ran. Preserve declared
+    # coverage and the existing producers' score fields, including clean audits.
+    assessed = set()
+    for audit in [pdata] + [data_of(a) for a in adds]:
+        assessed.update(audit.get("assessed_dimensions") or [])
+        assessed.update(d for d, score in (audit.get("dimension_scores") or {}).items()
+                        if score is not None)
+        for dimension in ("content", "schema", "performance"):
+            if isinstance(audit.get(dimension + "_score"), (int, float)):
+                assessed.add(dimension)
+    assessed.update(f.get("dimension", "indexability") for f in findings)
+    blind = {e.get("dimension") for e in not_assessed}
+    for dimension in _CANON_DIMS:
+        if dimension not in assessed and dimension not in blind:
+            not_assessed.append({"dimension": dimension, "check": "audit_coverage",
+                                 "reason": "no assessment evidence in supplied audit results"})
+
     counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
     dim_pen = {d: 0 for d in _CANON_DIMS}
     total_pen = 0

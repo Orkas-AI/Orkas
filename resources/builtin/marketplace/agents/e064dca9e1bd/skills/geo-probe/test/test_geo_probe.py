@@ -162,6 +162,48 @@ class ModeTierTest(unittest.TestCase):
 
 
 class DomainCitationBoundaryTest(unittest.TestCase):
+    def assert_citation(self, domain, text, expected):
+        score = score_answers({"brand": "Globex", "domain": domain,
+                               "answers": [{"text": text, "mode": "retrieval"}]})
+        self.assertEqual(score["per_answer"][0]["domain_cited"], expected)
+        self.assertEqual(score["citation_rate"], float(expected))
+        for ref in (text, {"url": text}, {"text": text}, {"snippet": text}, {"title": text}):
+            refs = disambiguate_references({"brand": "Globex", "domain": domain,
+                                            "references": [ref]})
+            self.assertEqual(refs["references"][0]["domain_present"], expected)
+            self.assertEqual(refs["verdict_counts"]["cited"], int(expected))
+
+    def test_host_and_bare_domain_citations_are_generic(self):
+        for domain in ("orkas.ai", "example.com"):
+            for text in (f"https://{domain}/", f"https://docs.{domain}/guide",
+                         f"https://{domain.upper()}.:443/docs", f"//docs.{domain}/",
+                         domain, f"See {domain}.", f"({domain})", f"docs.{domain}/guide",
+                         f"{domain}.:443/guide",
+                         f"[website](https://{domain}/)",
+                         f"https://evil.test/{domain} and the real site {domain}"):
+                with self.subTest(domain=domain, text=text):
+                    self.assert_citation(domain, text, True)
+
+    def test_url_disguises_do_not_cite_the_target(self):
+        for domain in ("orkas.ai", "example.com"):
+            for token in (f"{domain}.evil.test", f"evil.test/{domain}",
+                          f"{domain}@evil.test", f"evil.test/?next={domain}",
+                          f"evil.test/#{domain}", f"not-{domain}",
+                          f"evil.test./?next={domain}", f"evil.test:bad/?next={domain}"):
+                for prefix in ("", "https://", "//"):
+                    with self.subTest(domain=domain, text=prefix + token):
+                        self.assert_citation(domain, prefix + token, False)
+            for text in (f"https:///{domain}", f"https://[invalid]/{domain}"):
+                with self.subTest(domain=domain, text=text):
+                    self.assert_citation(domain, text, False)
+
+    def test_missing_target_cannot_cite_and_brand_matching_is_unchanged(self):
+        self.assert_citation("", "https://example.com/", False)
+        score = score_answers({"brand": "Globex", "domain": "example.com",
+                               "answers": [{"text": "Globex https://evil.test/example.com"}]})
+        self.assertTrue(score["per_answer"][0]["brand_token_present"])
+        self.assertEqual(score["per_answer"][0]["result"], "mentioned")
+
     def test_domain_substring_is_not_a_citation(self):
         # A domain that merely prefixes a longer host must NOT count as cited.
         # Brand "Globex" is absent so this isolates the domain-citation rule.
@@ -280,10 +322,6 @@ class DisambiguateTest(unittest.TestCase):
         self.assertEqual(d["references"][0]["verdict"], "corroborated")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class BrandedControlSplitTest(unittest.TestCase):
     """The bias this change exists to remove.
 
@@ -358,3 +396,7 @@ class FilterTest(unittest.TestCase):
         res = filter_candidates(
             ["best Generative Engine Optimization services for startups"], "Orkas", "orkas.ai")
         self.assertEqual(len(res["kept"]), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

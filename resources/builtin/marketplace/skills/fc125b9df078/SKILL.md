@@ -1,7 +1,7 @@
 ---
 name: product-ui
-description_zh: "根据 PRD、产品目标、用户流程、设计来源或现有应用上下文设计并实现产品 UI，覆盖响应式行为、可访问性、视觉方向与渲染验证；用于页面、落地页、仪表盘、组件、设计系统和 UI 打磨。"
-description_en: "Design and implement product UI from a PRD, product goal, user flow, design source, or existing app context, with responsive behavior, accessibility, visual direction, and rendered verification. Use for screens, landing pages, dashboards, components, design systems, and UI polish."
+description_zh: "依据产品需求、用户流程或设计来源设计并实现页面、组件、落地页、仪表盘或设计系统，覆盖响应式、可访问性、UI 打磨与渲染验证。"
+description_en: "Design and implement screens, components, landing pages, dashboards or design systems from product needs, flows or design sources, with responsive behavior, accessibility, UI polish and rendered checks."
 ---
 
 # Product UI

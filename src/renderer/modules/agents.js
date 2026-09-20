@@ -470,9 +470,7 @@ function _generalCategoryLabel(lang) {
   });
   const label = c ? pickLocalizedName(c, lang) : '';
   if (label) return label;
-  if (lang === 'zh') return '通用';
-  if (lang === 'ja') return '汎用';
-  return 'General';
+  return t('marketplace.category_general');
 }
 
 function _knownCategoryCodes(cats) {
@@ -2265,9 +2263,11 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
     seenModelIds.add(id);
     const isDefault = id === defaultModelId;
     const isAlias = model?.is_alias === true;
-    const aliasResolvedModel = isAlias && id === currentModel
-      ? observedModelForCurrentSelection
-      : '';
+    // The catalog states what this row runs right now; a model observed on the
+    // last run only covers the current selection and can be older, so it is the
+    // fallback for CLIs whose catalog omits the resolution.
+    const resolvedModel = String(model?.resolved_model || '').trim()
+      || (id === currentModel ? observedModelForCurrentSelection : '');
     const label = String(model.label || id);
     const hints = [];
     if (isDefault) hints.push(t('agents.cli_default'));
@@ -2276,9 +2276,10 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
       // The real default model doubles as the "inherit CLI default" action.
       // Keep its empty persisted value without adding a synthetic first row.
       value: isDefault ? '' : id,
-      label: isAlias
-        ? `${label} · ${aliasResolvedModel || t('agents.cli_model_alias_latest')}`
-        : label,
+      // Name the model this row runs; for an alias the hint adds that the
+      // choice follows later CLI updates. A label that already is the model id,
+      // or a row with no known resolution, appends nothing.
+      label: resolvedModel && resolvedModel !== label ? `${label} · ${resolvedModel}` : label,
       hint: hints.join(' · '),
     });
   }
@@ -2390,11 +2391,11 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
         ? t('agents.cli_settings_partial')
         : t('agents.cli_settings_unavailable'),
     )}</div>`;
-  const selectedModelIsAlias = models.some(
-    model => model?.is_alias === true && String(model.id || '') === currentModel,
-  );
+  // A listed row already names its resolution in the picker, so the note is
+  // left for a saved override the catalog does not list at all.
+  const selectedModelIsListed = models.some(model => String(model?.id || '') === currentModel);
   const observedModelNote = observedModelForCurrentSelection
-    && !selectedModelIsAlias
+    && !selectedModelIsListed
     && observedModelForCurrentSelection !== currentModel
     ? `<div class="agents-detail-cli-note agents-detail-cli-model-observed">${escapeHtml(
       t('agents.cli_model_recent', { model: observedModelForCurrentSelection }),
@@ -3133,6 +3134,15 @@ function openAgentModal(options = {}) {
   const msgEl = document.getElementById('agent-form-msg');
   msgEl.textContent = '';
   msgEl.className = 'form-msg';
+
+  // The external-only entry binds a CLI that already exists, so "New agent"
+  // misdescribes it. Swap the key rather than the rendered string, so a later
+  // language change re-renders the title this dialog is actually showing.
+  const titleEl = document.getElementById('agent-modal-title');
+  if (titleEl?.dataset) {
+    titleEl.dataset.i18n = externalOnly ? 'agent_modal.title_connect' : 'agent_modal.title';
+    titleEl.textContent = t(titleEl.dataset.i18n);
+  }
 
   // Reset both panels' inputs.
   const nameInput = document.getElementById('agent-name-input');
@@ -3875,6 +3885,16 @@ function _agentPickerAllowsLibrary(anchorId) {
     || anchorId === 'auto-recipient-chip';
 }
 
+/** Composer anchors that may offer the coding-CLI entry. The automation
+ *  dialog is excluded on purpose: it is a `.ui-dialog-overlay` (z-index 13000)
+ *  and `openAgentModal` opens a plain `.modal-overlay` (z-index 100), so the
+ *  create dialog would open behind the task the user is still filling in. */
+function _agentPickerAllowsCliEntry(anchorId) {
+  return anchorId === 'chat-recipient-chip'
+    || anchorId === 'new-chat-recipient-chip'
+    || anchorId === 'project-chat-recipient-chip';
+}
+
 function _agentPickerVisibleTabs(anchorId) {
   // Skills and connectors use the same visible picker surface for commander
   // and agent recipients; runtime capability gates live in the main process.
@@ -3904,6 +3924,14 @@ function _updateAgentPickerChrome() {
   if (tabsEl) tabsEl.style.gridTemplateColumns = `repeat(${Math.max(1, visibleTabs.size)}, minmax(0, 1fr))`;
   const search = document.getElementById('agent-picker-search');
   if (search) search.placeholder = _agentPickerSearchPlaceholder();
+  // Picking an agent and connecting a new CLI are different jobs, so the entry
+  // sits below the roster instead of in it, and only where it applies: the
+  // Agents tab of a composer picker.
+  const cliFooter = document.getElementById('agent-picker-cli-footer');
+  if (cliFooter) {
+    cliFooter.hidden = _agentPickerTab !== 'agents'
+      || !_agentPickerAllowsCliEntry(picker.dataset.anchorId || '');
+  }
 }
 
 function _setAgentPickerTab(tab, opts = {}) {
@@ -4122,7 +4150,23 @@ function _closeAgentPicker({ preserveAtKey = false } = {}) {
   if (!preserveAtKey) _atKeyMark = null;
 }
 
+/** Re-anchor the open picker to its current content height. The popover is
+ *  placed from a measurement, so any later list repaint — tab switch, search,
+ *  async project/tab data — must re-run it or the box keeps a `top` computed
+ *  for the previous height and grows past its placement. */
+function _repositionAgentPicker() {
+  const picker = document.getElementById('agent-picker');
+  if (!picker || picker.style.display === 'none') return;
+  const anchor = document.getElementById(picker.dataset.anchorId || '');
+  if (anchor) _positionPopoverAboveOrBelow(picker, anchor);
+}
+
 function _renderAgentPickerList(filterText) {
+  _renderAgentPickerListRows(filterText);
+  _repositionAgentPicker();
+}
+
+function _renderAgentPickerListRows(filterText) {
   const listEl = document.getElementById('agent-picker-list');
   const picker = document.getElementById('agent-picker');
   if (!listEl) return;
@@ -4330,6 +4374,14 @@ function _agentPickerBasename(rel) {
   return i >= 0 ? s.slice(i + 1) : s;
 }
 
+// Comparable timestamp for ordering; same seconds-or-milliseconds tolerance as
+// `_agentPickerFormatMtime`. Rows without a usable mtime rank last.
+function _agentPickerMtimeRank(mtime) {
+  const n = Number(mtime);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return n > 100000000000 ? n : n * 1000;
+}
+
 function _agentPickerFormatMtime(mtime) {
   const n = Number(mtime);
   if (!Number.isFinite(n) || n <= 0) return '';
@@ -4402,6 +4454,11 @@ async function _loadLibraryPickerRows(projectId) {
   if (globalData && globalData.ok !== false) {
     rows.push(..._flattenLibraryPickerTree(globalData.tree || [], 'global', ''));
   }
+  // Recency-first, like both Library trees — the file you just saved is the one
+  // you are most likely to @-mention. Scope grouping is re-applied at render, so
+  // sorting across scopes here is safe, and the search path's sort is stable so
+  // equally-scored matches keep this order.
+  rows.sort((a, b) => _agentPickerMtimeRank(b?.mtime) - _agentPickerMtimeRank(a?.mtime));
   return rows;
 }
 
@@ -4551,8 +4608,7 @@ function _renderAgentPickerSelectionHeader(picker, selected) {
     (header.children[Math.min(focusedIndex, header.children.length - 1)]
       || document.getElementById('agent-picker-search'))?.focus();
   }
-  const anchor = document.getElementById(picker.dataset.anchorId);
-  if (anchor && picker.style.display !== 'none') _positionPopoverAboveOrBelow(picker, anchor);
+  _repositionAgentPicker();
 }
 
 function _refreshAgentPickerSelection() {
@@ -4583,23 +4639,19 @@ function _refreshAgentPickerSelection() {
       el.dataset.recipientKeyboardWired = '1';
       el.addEventListener('keydown', (event) => {
         if (event.isComposing || event.keyCode === 229) return;
-        if (event.key === ' ') {
+        if (event.key === ' ' || event.key === 'Enter') {
           event.preventDefault();
           el.dataset.pickerSourceType = 'keyboard';
           el.click();
+          return;
         }
         if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
           event.preventDefault();
           _moveAgentPickerActive(event.key === 'ArrowDown' ? 1 : -1);
           list.querySelector('.skill-picker-item.active')?.focus();
         }
-        if (event.key === 'Enter' || event.key === 'Escape') {
+        if (event.key === 'Escape') {
           event.preventDefault();
-          if (event.key === 'Enter' && _atKeyMark) {
-            el.dataset.pickerSourceType = 'keyboard';
-            el.click();
-            return;
-          }
           _closeAgentPicker();
           _focusInput(_composerRecipientInput(_targetFromPickerAnchor(picker.dataset.anchorId)));
         }
@@ -4741,11 +4793,17 @@ async function _triggerLibraryFile(dataset, anchorId) {
     _focusInput(document.getElementById(inputId));
   } catch (err) {
     const reason = String((err && err.message) || err || 'failed');
-    _agentsTrackEvent('chat_library_attach_result', { ...telemetry, result: 'failure' });
+    const failure_stage = ['draft_lock', 'ipc_request', 'input_validation', 'source_resolve', 'attachment_import', 'navigation', 'draft_render'].includes(err && err.failure_stage)
+      ? err.failure_stage : 'picker_finalize';
+    const failure_kind = ['not_found', 'permission_denied', 'disk_full'].includes(err && err.failure_kind)
+      ? err.failure_kind : 'operation_failed';
+    const diagnostic = { failure_stage, failure_kind, telemetry_version: 3 };
+    _agentsTrackEvent('chat_library_attach_result', { ...telemetry, ...diagnostic, result: 'failure' });
     _agentsTrackError('chat_library_attach', {
       ...telemetry,
       error_type: 'operation',
       error_message: 'library_attach_failed',
+      ...diagnostic,
     });
     if (typeof uiAlert === 'function') await uiAlert(t('agent_picker.library_attach_failed', { reason }));
   }
@@ -4939,6 +4997,33 @@ function bindAgentPickers() {
       _setAgentPickerTab(btn.dataset.agentPickerTab || 'agents');
     });
   });
+  // Coding-CLI entry. It leaves the picker rather than selecting from it, so it
+  // closes first and hands off to the external-only dialog the AI Team header
+  // and the old sidebar card both open -- no tab bar, just the CLI flow, so
+  // every entry to it shows one page. Only `entry_point` differs, which keeps
+  // the funnels separable. The modal returns focus to the chip on cancel.
+  const cliEntry = document.getElementById('agent-picker-connect-cli');
+  if (cliEntry && cliEntry.dataset.bound !== '1') {
+    cliEntry.dataset.bound = '1';
+    cliEntry.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const anchorId = document.getElementById('agent-picker')?.dataset.anchorId || '';
+      _closeAgentPicker();
+      _agentsTrackClick('agent_create_open', {
+        entry_point: 'agent_picker_connect_cli',
+        source_view: typeof currentView === 'string' ? currentView : '',
+        agent_type: 'cli',
+      });
+      if (typeof openAgentModal !== 'function') return;
+      openAgentModal({
+        initialTab: 'external',
+        externalOnly: true,
+        entryPoint: 'agent_picker_connect_cli',
+        sourceView: typeof currentView === 'string' ? currentView : '',
+        returnFocusId: anchorId,
+      });
+    });
+  }
   const searchInput = document.getElementById('agent-picker-search');
   searchInput?.addEventListener('input', () => {
     _renderAgentPickerList(searchInput.value);
@@ -4966,13 +5051,6 @@ function bindAgentPickers() {
       return;
     }
     if (e.key === 'Enter') {
-      const picker = document.getElementById('agent-picker');
-      if (_agentPickerTab === 'agents' && _isMultiRecipientPicker(picker?.dataset.anchorId) && !_atKeyMark) {
-        e.preventDefault();
-        _closeAgentPicker();
-        _focusInput(_composerRecipientInput(_targetFromPickerAnchor(picker.dataset.anchorId)));
-        return;
-      }
       const listEl = document.getElementById('agent-picker-list');
       const active = listEl?.querySelector('.skill-picker-item.active[data-id]')
         || listEl?.querySelector('.skill-picker-item[data-id]');

@@ -221,6 +221,35 @@ describe('Shopify 2026-07 official query and error contracts', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it.each(['success', 'lost-response'])('sends a valid refund request once and preserves the high-impact lane: %s', async outcome => {
+    // Required since 2026-04, including the pinned 2026-07 API:
+    // https://shopify.dev/docs/api/admin-graphql/2026-07/mutations/refundCreate
+    const { adapter, env } = setup('shopify');
+    const fetchMock = shopifyFetch({ data: { refundCreate: { refund: { id: 'refund-1' }, userErrors: [] } } });
+    if (outcome === 'lost-response') fetchMock.mockRejectedValue(new TypeError(privateMarker));
+    const input = { orderId: 'gid://shopify/Order/1', transactions: [{
+      orderId: 'gid://shopify/Order/1', parentId: 'gid://shopify/OrderTransaction/2',
+      kind: 'REFUND', gateway: 'fixture', amount: '12.00',
+    }] };
+    const args = { action: 'refunds.create', parameters: { input } };
+    await expect(adapter.callTool('execute_write', args, env)).rejects.toThrow(/risk mismatch/);
+    expect(fetchMock).not.toHaveBeenCalled();
+    const result = await adapter.callToolResult('execute_high_impact', args, env);
+    expect(fetchMock).toHaveBeenCalledTimes(2); // One token request, one refund; no automatic replay.
+    const request = JSON.parse(fetchMock.mock.calls[1][1].body);
+    expect(request.query).toContain('$idempotencyKey:String!');
+    expect(request.query).toContain('refundCreate(input:$input) @idempotent(key:$idempotencyKey)');
+    expect(request.variables.input).toEqual(input);
+    expect(request.variables.idempotencyKey).toMatch(/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/);
+    if (outcome === 'success') {
+      expect(result.isError).toBeUndefined();
+      expect(JSON.parse(result.content[0].text)).toMatchObject({ risk: 'H', result: { refundCreate: { refund: { id: 'refund-1' } } } });
+    } else {
+      expect(result._meta.orkas.errorCode).toBe('E_TOOL_CALL_NETWORK');
+      expect(JSON.stringify(result)).not.toContain(privateMarker);
+    }
+  });
+
   it('rejects an overlong cancellation note before dispatch, while accepting the official 255-character boundary', async () => {
     const { adapter, env } = setup('shopify');
     const fetchMock = shopifyFetch({ data: { orderCancel: { job: { id: 'job', done: false }, userErrors: [] } } });

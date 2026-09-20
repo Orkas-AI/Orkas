@@ -17,6 +17,7 @@
 
 import { createLogger } from '../../../logger.js';
 import { logErrorSummary } from '../../../util/log-redact.js';
+import { AcpDiagnostics } from './acp-diagnostics.js';
 import {
   type LocalBackend,
   type BackendRunOptions,
@@ -24,8 +25,8 @@ import {
   spawnCli,
   bindAbort,
   armKillWatchdog,
+  reapCliAfterProtocolTerminal,
   LineSplitter,
-  levelOrInfo,
 } from './base.js';
 
 export interface AcpBackendDef {
@@ -53,8 +54,12 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       const detachAbort = bindAbort(child, opts.signal);
       const tail = new StderrTail();
       const startedAt = Date.now();
+      const diagnostics = new AcpDiagnostics();
+      let processState: 'open' | 'exit' | 'close' = 'open';
+      child.once('exit', () => { processState = 'exit'; });
 
       let exited = false;
+      let finishProtocol!: () => void;
       let sessionId: string | undefined;
       let resultText = '';
       let resultStatus: 'completed' | 'failed' | undefined;
@@ -86,6 +91,9 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       });
 
       const send = (msg: object) => {
+        if (exited) return;
+        const method = (msg as { method?: string }).method;
+        if (method) diagnostics.sent(method);
         try { child.stdin.write(JSON.stringify(msg) + '\n'); }
         catch (err) { log.warn('acp stdin write failed', { error: logErrorSummary(err) }); }
       };
@@ -103,9 +111,13 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       // Include the model on session/new for ACP implementations that accept
       // it there. session/set_model below covers implementations that require
       // the explicit setter. Missing means the CLI/account default.
+      const mcpServers = opts.bridge ? [{
+        name: 'orkas', command: opts.bridge.server.command, args: opts.bridge.server.args,
+        env: Object.entries(opts.bridge.server.env).map(([name, value]) => ({ name, value })),
+      }] : [];
       const sessionNewParams: Record<string, unknown> = {
         cwd: opts.cwd,
-        mcpServers: [],
+        mcpServers,
       };
       if (opts.modelOverride) sessionNewParams.model = opts.modelOverride;
       const requestedResumeId = def.resume ? String(opts.resumeSessionId || '') : '';
@@ -119,7 +131,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           id: 2,
           method: requestedResumeId ? 'session/resume' : 'session/new',
           params: requestedResumeId
-            ? { sessionId: requestedResumeId, cwd: opts.cwd, mcpServers: [] }
+            ? { sessionId: requestedResumeId, cwd: opts.cwd, mcpServers }
             : sessionNewParams,
         });
       };
@@ -157,12 +169,16 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       };
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', chunk => {
+        if (exited) return;
+        diagnostics.bytes('stdout');
         splitter.push(chunk, line => {
+          if (exited) return;
           const trimmed = line.trim();
           if (!trimmed) return;
           let env: any;
           try { env = JSON.parse(trimmed); }
           catch {
+            diagnostics.malformed();
             // ACP wire is NDJSON; a non-JSON line means the CLI logged
             // something straight to stdout (hermes occasionally does
             // this on startup). Surface as raw-line so it appears in
@@ -170,6 +186,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             opts.onEvent({ type: 'raw-line', line: trimmed });
             return;
           }
+          diagnostics.received(env);
           if (env?.method === 'session/request_permission' && env.id !== undefined) {
             const params = env.params && typeof env.params === 'object' ? env.params : {};
             const toolCall = params.toolCall && typeof params.toolCall === 'object'
@@ -197,6 +214,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
               });
               return bounded ? String(bounded.optionId || bounded.option_id || '') : '';
             };
+            diagnostics.permissionStarted();
             void (async () => {
               const fullAccess = opts.permissionPolicy === 'full_access';
               const decision = fullAccess
@@ -209,6 +227,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
                     : typeof toolCall.title === 'string' ? toolCall.title : undefined,
                   command: typeof rawInput.command === 'string' ? rawInput.command : undefined,
                 }) ?? Promise.resolve('deny'));
+              if (exited) return;
               const selected = decision === 'deny' ? '' : optionId();
               send({
                 jsonrpc: '2.0',
@@ -228,13 +247,14 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
                   : { decision: selected ? 'allow' : 'deny', reason: 'user' }),
               });
             })().catch((err) => {
+              if (exited) return;
               log.warn('acp permission response failed', { error: logErrorSummary(err) });
               send({
                 jsonrpc: '2.0',
                 id: env.id,
                 result: { outcome: { outcome: 'cancelled' } },
               });
-            });
+            }).finally(() => diagnostics.permissionEnded());
             return;
           }
           if (Number(env.id) === 1 && !env.error) sendSessionStart();
@@ -244,7 +264,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             resultError = typeof env.error.message === 'string'
               ? env.error.message
               : 'ACP session could not be started';
-            try { child.stdin.end(); } catch { /* */ }
+            finishProtocol();
             return;
           }
           if (Number(env.id) === 2 && requestedResumeId && !env.error) {
@@ -279,14 +299,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
               resultStatus = r.ok ? 'completed' : 'failed';
               if (r.ok && r.text) resultText = r.text;
               if (!r.ok) resultError = r.error;
-              // ACP servers (hermes / kimi / kiro) keep stdin open
-              // ready for the next prompt — they're long-running.
-              // We're a one-shot dispatcher; closing stdin signals
-              // them to shut down so the close handler below fires
-              // and the outer Promise resolves. Without this we hang
-              // forever waiting on a child that's perfectly happy to
-              // sit idle.
-              try { child.stdin.end(); } catch { /* */ }
+              finishProtocol();
             },
             onUnknown: raw => {
               // Previously surfaced as a fake `tool:'acp'` tool-event,
@@ -314,6 +327,8 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
 
       child.stderr.setEncoding('utf8');
       child.stderr.on('data', chunk => {
+        if (exited) return;
+        diagnostics.bytes('stderr');
         tail.push(chunk);
         for (const line of chunk.split(/\r?\n/)) {
           if (line) opts.onEvent({ type: 'stderr-line', line });
@@ -331,6 +346,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       });
 
       return new Promise<void>(resolve => {
+        let endReason: 'protocol' | 'close' | 'spawn_error' = 'close';
         const finish = (status: 'completed' | 'failed' | 'cancelled' | 'timeout', extra: Record<string, unknown> = {}) => {
           if (exited) return;
           exited = true;
@@ -338,6 +354,14 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           clearTimeout(initTimer);
           if (modelSetTimer) clearTimeout(modelSetTimer);
           detachAbort();
+          // One content-free summary survives both local archives and sampled
+          // conversations. It must not count as fresh CLI progress.
+          const summary = diagnostics.snapshot(status, endReason, processState, child.exitCode);
+          log.info('ACP run diagnostics', summary);
+          opts.onEvent({
+            type: 'log', level: 'info', source: 'acp-diagnostics', synthetic: true,
+            message: `ACP ${JSON.stringify(summary)}`,
+          });
           opts.onEvent({
             type: 'done',
             status,
@@ -347,7 +371,35 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           });
           resolve();
         };
+        finishProtocol = () => {
+          if (exited) return;
+          endReason = 'protocol';
+          try {
+            if (opts.signal.aborted) return finish('cancelled', { output: resultText });
+            if (watchdog.fired()) return finish('timeout', {
+              timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`,
+              output: resultText, stderrTail: tail.toString(),
+            });
+            if (resultStatus === 'failed') return finish('failed', {
+              error: resultError, output: resultText, stderrTail: tail.toString(),
+            });
+            // Preserve the existing Hermes silent-provider-failure handling
+            // for diagnostic evidence received before the protocol terminal.
+            if (!resultText && stderrErrorHint) return finish('failed', {
+              error: `${def.logName.replace('local-agents:', '')} reported success but produced no text — upstream: ${stderrErrorHint}`,
+              output: '', stderrTail: tail.toString(),
+            });
+            finish('completed', { output: resultText });
+          } finally {
+            // The protocol response ends this one-shot dispatch. Cleanup owns
+            // its own bounded lifetime; inherited pipes or a persistent server
+            // must not keep the turn open or replace its outcome with timeout.
+            reapCliAfterProtocolTerminal(child);
+          }
+        };
         child.on('error', err => {
+          if (exited) return;
+          endReason = 'spawn_error';
           log.warn('acp spawn error', { error: logErrorSummary(err) });
           finish('failed', {
             error: (err as Error).message,
@@ -357,24 +409,10 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           });
         });
         child.on('close', code => {
+          if (exited) return;
+          processState = 'close';
           if (opts.signal.aborted) return finish('cancelled', { output: resultText });
-if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`, output: resultText, stderrTail: tail.toString() });
-          if (code === 0 && resultStatus === 'completed') {
-            // Demote silent failure: server claimed success via
-            // stopReason=end_turn but never streamed any text AND
-            // stderr contained an upstream-provider error. Hermes
-            // does this on auth/model misconfig (HTTP 400). Surface
-            // the captured error so the chat shows a real reason
-            // instead of an empty bubble.
-            if (!resultText && stderrErrorHint) {
-              return finish('failed', {
-                error: `${def.logName.replace('local-agents:', '')} reported success but produced no text — upstream: ${stderrErrorHint}`,
-                output: '',
-                stderrTail: tail.toString(),
-              });
-            }
-            return finish('completed', { output: resultText });
-          }
+          if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`, output: resultText, stderrTail: tail.toString() });
           const err = resultError || (code !== 0 ? `cli exited with code ${code}` : 'cli closed without prompt result');
           finish('failed', { error: err, output: resultText, stderrTail: tail.toString() });
         });

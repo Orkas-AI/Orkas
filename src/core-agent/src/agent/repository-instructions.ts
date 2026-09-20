@@ -1,26 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import type { Stats } from "node:fs";
+import type { Session } from "./session.js";
 
 export const REPOSITORY_INSTRUCTION_MAX_FILE_BYTES = 32 * 1024;
 export const REPOSITORY_INSTRUCTION_MAX_TOTAL_BYTES = 64 * 1024;
 export const REPOSITORY_INSTRUCTION_MAX_FILES = 16;
-const REPOSITORY_INSTRUCTION_MAX_SCANNED_DIRECTORIES = 4_096;
-const REPOSITORY_INSTRUCTION_EXCLUDED_DIRECTORIES = new Set([
-  ".git",
-  "node_modules",
-  "vendor",
-  "dist",
-  "build",
-  "out",
-  "coverage",
-  ".next",
-  ".nuxt",
-  ".cache",
-  "target",
-  "__pycache__",
-  ".venv",
-]);
-
 export type RepositoryInstructionFile = {
   path: string;
   directory: string;
@@ -36,12 +21,21 @@ export type RepositoryInstructions = {
   discoveryTruncated?: boolean;
 };
 
-/** Discover repository facts and scoped AGENTS.md files without invoking Git
- * or changing the workspace. Ancestor instructions are ordered root-to-cwd,
- * followed by bounded descendant scopes in shallow-to-deep order. */
+type InstructionSnapshot = { signature: string; context: RepositoryInstructions };
+// Runners are rebuilt each turn; Session identity survives until eviction/reload.
+// One bounded snapshot per live Session, never shared across accounts or persisted.
+const snapshots = new WeakMap<Session, InstructionSnapshot>();
+
+/** Read only the root-to-cwd instruction chain. Revalidate candidate metadata
+ * each run (including absent files); reuse bodies while that chain is unchanged.
+ * Descendant scopes are read by the model on demand through existing file tools. */
 export async function discoverRepositoryInstructions(
   workingDir: string | undefined,
+  session?: Session,
 ): Promise<RepositoryInstructions | undefined> {
+  const cached = session ? snapshots.get(session) : undefined;
+  // A failed/partial refresh must not leave an old snapshot available to reuse.
+  if (session) snapshots.delete(session);
   if (!workingDir) return undefined;
   const cwd = path.resolve(workingDir);
   try {
@@ -52,49 +46,60 @@ export async function discoverRepositoryInstructions(
 
   const repositoryRoot = await findRepositoryRoot(cwd) ?? cwd;
   const directories = repositoryDirectories(repositoryRoot, cwd);
+  let cacheable = true;
+  const candidates = await Promise.all(directories.map(async (directory) => {
+    const filePath = path.join(directory, "AGENTS.md");
+    let stat: Stats | undefined;
+    try {
+      stat = await fs.stat(filePath);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") cacheable = false;
+    }
+    return { directory, filePath, stat };
+  }));
+  const signature = JSON.stringify([cwd, repositoryRoot, candidates.map(({ filePath, stat }) => [
+    filePath,
+    stat ? [stat.dev, stat.ino, stat.mode, stat.uid, stat.gid, stat.size, stat.mtimeMs, stat.ctimeMs] : null,
+  ])]);
+  if (cacheable && cached?.signature === signature) {
+    if (session) snapshots.set(session, cached);
+    return copyContext(cached.context);
+  }
 
   const files: RepositoryInstructionFile[] = [];
   let remaining = REPOSITORY_INSTRUCTION_MAX_TOTAL_BYTES;
-  let discoveryTruncated = false;
-  for (const directory of directories) {
+  let discoveryTruncated = !cacheable;
+  for (const { directory, filePath, stat } of candidates) {
     if (files.length >= REPOSITORY_INSTRUCTION_MAX_FILES || remaining <= 0) {
       discoveryTruncated = true;
       break;
     }
-    const filePath = path.join(directory, "AGENTS.md");
-    const instruction = await readBoundedInstruction(filePath, directory, remaining);
-    if (!instruction) continue;
-    files.push(instruction);
-    remaining -= Buffer.byteLength(instruction.content, "utf8");
-    if (instruction.truncated) discoveryTruncated = true;
-  }
-
-  if (files.length < REPOSITORY_INSTRUCTION_MAX_FILES && remaining > 0) {
-    const descendants = await discoverDescendantInstructions(
-      cwd,
-      REPOSITORY_INSTRUCTION_MAX_FILES - files.length,
-    );
-    discoveryTruncated ||= descendants.truncated;
-    for (const filePath of descendants.paths) {
-      if (files.length >= REPOSITORY_INSTRUCTION_MAX_FILES || remaining <= 0) {
-        discoveryTruncated = true;
-        break;
-      }
-      const directory = path.dirname(filePath);
-      const instruction = await readBoundedInstruction(filePath, directory, remaining);
+    if (!stat?.isFile() || stat.size <= 0) continue;
+    try {
+      const instruction = await readBoundedInstruction(filePath, directory, remaining, stat);
       if (!instruction) continue;
       files.push(instruction);
       remaining -= Buffer.byteLength(instruction.content, "utf8");
       if (instruction.truncated) discoveryTruncated = true;
+    } catch {
+      cacheable = false;
+      discoveryTruncated = true;
     }
   }
-  return {
+  const context: RepositoryInstructions = {
     version: 1,
     workingDir: cwd,
     repositoryRoot,
     files,
     ...(discoveryTruncated ? { discoveryTruncated: true } : {}),
   };
+  if (session && cacheable) snapshots.set(session, { signature, context: copyContext(context) });
+  return context;
+}
+
+function copyContext(context: RepositoryInstructions): RepositoryInstructions {
+  return { ...context, files: context.files.map((file) => ({ ...file })) };
 }
 
 export function repositoryInstructionsText(
@@ -105,11 +110,11 @@ export function repositoryInstructionsText(
     "[Repository context — host-discovered facts]",
     `Working directory: ${context.workingDir}`,
     `Repository root: ${context.repositoryRoot}`,
+    "Only root-to-working-directory AGENTS.md files are preloaded below; subdirectories are not scanned. Do not reread these files solely to reload unchanged instructions.",
+    "Before modifying files in a deeper or other authorized directory, check the target's ancestor directories for applicable AGENTS.md files not loaded here and read them with existing file tools. Reuse rules already read in this turn unless they change.",
+    "AGENTS.md files are ordered shallow-to-deep. Each file applies only to files inside its directory subtree; a deeper applicable file takes precedence.",
   ];
   if (context.files.length) {
-    lines.push(
-      "AGENTS.md files are ordered shallow-to-deep. Each file applies only to files inside its directory subtree; a deeper applicable file takes precedence.",
-    );
     for (const file of context.files) {
       lines.push(
         `\n--- ${file.path} (scope: ${file.directory}) ---\n`
@@ -119,58 +124,10 @@ export function repositoryInstructionsText(
   }
   if (context.discoveryTruncated) {
     lines.push(
-      "Repository instruction discovery was bounded. Before editing a deeper target, check for a nearer AGENTS.md if its scope is not listed above.",
+      "Some repository instructions could not be fully loaded. Read missing or truncated applicable instructions before modifying files.",
     );
   }
   return lines.join("\n");
-}
-
-async function discoverDescendantInstructions(
-  cwd: string,
-  maxFiles: number,
-): Promise<{ paths: string[]; truncated: boolean }> {
-  if (maxFiles <= 0) return { paths: [], truncated: true };
-  const queue = [cwd];
-  const found: string[] = [];
-  let scannedDirectories = 0;
-  let truncated = false;
-  while (queue.length) {
-    const directory = queue.shift()!;
-    scannedDirectories++;
-    if (scannedDirectories > REPOSITORY_INSTRUCTION_MAX_SCANNED_DIRECTORIES) {
-      truncated = true;
-      break;
-    }
-    let entries;
-    try {
-      entries = await fs.readdir(directory, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    entries.sort((a, b) => a.name.localeCompare(b.name));
-    for (const entry of entries) {
-      if (entry.isSymbolicLink()) continue;
-      if (entry.isFile() && entry.name === "AGENTS.md" && directory !== cwd) {
-        found.push(path.join(directory, entry.name));
-        if (found.length >= maxFiles) {
-          truncated = queue.length > 0 || entries.some((candidate) => (
-            candidate !== entry
-            && candidate.name === "AGENTS.md"
-            && candidate.isFile()
-          ));
-          return { paths: found, truncated };
-        }
-        continue;
-      }
-      if (
-        entry.isDirectory()
-        && !REPOSITORY_INSTRUCTION_EXCLUDED_DIRECTORIES.has(entry.name)
-      ) {
-        queue.push(path.join(directory, entry.name));
-      }
-    }
-  }
-  return { paths: found, truncated };
 }
 
 async function findRepositoryRoot(start: string): Promise<string | undefined> {
@@ -202,10 +159,8 @@ async function readBoundedInstruction(
   filePath: string,
   directory: string,
   remainingBytes: number,
+  stat: Stats,
 ): Promise<RepositoryInstructionFile | undefined> {
-  let stat;
-  try { stat = await fs.stat(filePath); } catch { return undefined; }
-  if (!stat.isFile() || stat.size <= 0) return undefined;
   const maxBytes = Math.min(
     REPOSITORY_INSTRUCTION_MAX_FILE_BYTES,
     remainingBytes,
@@ -226,8 +181,6 @@ async function readBoundedInstruction(
       content,
       truncated: stat.size > bytesRead,
     };
-  } catch {
-    return undefined;
   } finally {
     await handle?.close().catch(() => undefined);
   }

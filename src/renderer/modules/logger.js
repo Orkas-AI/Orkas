@@ -126,6 +126,13 @@ const createLogger = (function () {
 
   window.addEventListener('error', (ev) => {
     try {
+      // Chromium delivers these notifications without an application exception.
+      // Keep them visible, while retaining real callback exceptions as errors.
+      if (!ev.error && (ev.message === 'ResizeObserver loop completed with undelivered notifications.'
+        || ev.message === 'ResizeObserver loop limit exceeded')) {
+        rootLog.warn('browser resize notification', { message: ev.message });
+        return;
+      }
       rootLog.error('uncaught error', {
         message: ev.message,
         source: ev.filename,

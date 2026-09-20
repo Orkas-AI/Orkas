@@ -10,6 +10,7 @@ import path from 'node:path';
 import type { Page } from '@playwright/test';
 
 import { expect, test, type OrkasTestApp } from './fixtures/orkas';
+import { estimateBudgetTokens } from '../../src/main/util/token-estimate';
 
 async function createCliAgent(
   app: OrkasTestApp,
@@ -256,6 +257,10 @@ test.describe('CLI Agent runtime settings', () => {
     await expect(page.locator('#agents-detail-cli-settings [data-role="model"]'))
       .toHaveAttribute('data-value', 'gpt-e2e-deep');
 
+    // The model value is optimistic. Its dependent effort menu is ready only
+    // after the saved runtime remounts the model-specific default.
+    await expect(thinking.locator('.ai-select-trigger')).toHaveText('high');
+
     await selectAiOption(page, '#agents-detail-cli-settings [data-role="thinking"]', 'low');
     await expect(page.locator('#agents-detail-cli-settings [data-role="thinking"]'))
       .toHaveAttribute('data-value', 'low');
@@ -277,6 +282,7 @@ test.describe('CLI Agent runtime settings', () => {
     await selectAiOption(page, '#agents-detail-cli-settings [data-role="model"]', 'gpt-e2e-deep');
     await expect(page.locator('#agents-detail-cli-settings [data-role="model"]'))
       .toHaveAttribute('data-value', 'gpt-e2e-deep');
+    await expect(thinking.locator('.ai-select-trigger')).toHaveText('high');
     await selectAiOption(page, '#agents-detail-cli-settings [data-role="thinking"]', 'low');
     await expect(page.locator('#agents-detail-cli-settings [data-role="thinking"]'))
       .toHaveAttribute('data-value', 'low');
@@ -381,7 +387,7 @@ test.describe('CLI Agent runtime settings', () => {
     await page.locator(`.agent-card[data-id="${agentId}"]`).click();
     const model = page.locator('#agents-detail-cli-settings [data-role="model"]');
     await expect(model.locator('.ai-select-trigger'))
-      .toContainText('Sonnet · latest', { timeout: 30_000 });
+      .toContainText('Sonnet · claude-sonnet-4-6', { timeout: 30_000 });
     await model.locator('.ai-select-trigger').click();
     const sonnet = page.locator(
       '.ai-select-popover:visible .ai-select-item[data-value="sonnet"]',
@@ -415,7 +421,7 @@ test.describe('CLI Agent runtime settings', () => {
       'opus',
     );
     await expect(relaunchedModel).toHaveAttribute('data-value', 'opus');
-    await expect(relaunchedModel.locator('.ai-select-trigger')).toContainText('Opus · latest');
+    await expect(relaunchedModel.locator('.ai-select-trigger')).toContainText('Opus · claude-opus-4-6');
     await expect(relaunchedModel.locator('.ai-select-trigger')).not.toContainText('claude-sonnet-4-6');
   });
 });
@@ -577,10 +583,11 @@ test.describe('CLI failed-turn recovery', () => {
     expect(historyStart).toBeGreaterThanOrEqual(0);
     expect(taskStart).toBeGreaterThan(historyStart);
     const historyBlock = prompt.slice(historyStart, taskStart).trim();
-    expect(Buffer.byteLength(historyBlock, 'utf8')).toBeLessThanOrEqual(16 * 1024);
-    expect((historyBlock.match(/^### Turn /gm) || []).length).toBeLessThanOrEqual(20);
+    expect(estimateBudgetTokens(historyBlock)).toBeLessThanOrEqual(30_000);
+    expect((historyBlock.match(/^### Turn /gm) || []).length).toBeLessThanOrEqual(5);
     expect(historyBlock).toContain('E2E_HISTORY_NEWEST_FACT=violet-orbit');
-    expect(historyBlock).toContain('message truncated by Orkas');
+    // The newest message fits the token window and must survive intact.
+    expect(historyBlock).toContain('界'.repeat(6_000));
     expect(historyBlock).toMatch(/older turns? omitted/);
     expect(historyBlock).not.toContain('E2E_HISTORY_OLD_01');
     expect(prompt).toContain('E2E_HERMES_LIMITS_CURRENT_TASK');
@@ -681,6 +688,40 @@ test.describe('CLI failed-turn recovery', () => {
     expect(codexRuns).toHaveLength(1);
     expect(codexRuns[0].steers).toHaveLength(1);
     expect(codexRuns[0].steers?.[0].text).toContain('E2E_CODEX_SEND_NOW_UPDATE');
+  });
+
+  test('cancels a live Codex question without an answer and keeps it dismissed after switching and reload', async ({ cliOrkas }) => {
+    const { page } = await createCliAgent(cliOrkas, 'CancelQuestionCodex', 'codex');
+    const cid = await sendNewChat(page, '@CancelQuestionCodex E2E_CODEX_SEND_NOW_ACTIVE E2E_CODEX_ASYNC_QUESTION');
+    try {
+      const card = page.locator('#chat-cli-questions');
+      await expect(card.getByRole('button', { name: 'Send answer', exact: true })).toBeDisabled();
+      await card.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await expect(card).toBeHidden();
+      await expect.poll(async () => {
+        const result = await cliOrkas.invoke<{ history: Array<{ cli_question?: { cancelled?: boolean } }> }>('conversations.history', { cid, limit: 20 });
+        return result.history.some(row => row.cli_question?.cancelled === true);
+      }).toBe(true);
+      await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
+      await page.locator('#new-chat-btn').click();
+      await page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
+      await expect(card).toBeHidden();
+      await Promise.all([
+        page.waitForEvent('domcontentloaded'),
+        cliOrkas.electronApp!.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.reload()),
+      ]);
+      await page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
+      await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
+      await expect(card).toBeHidden();
+      const history = await cliOrkas.invoke<{ history: Array<{ from: string; cli_answer?: unknown }> }>('conversations.history', { cid, limit: 20 });
+      expect(history.history.filter(row => row.from === 'user')).toHaveLength(1);
+      expect(history.history.some(row => row.cli_answer)).toBe(false);
+      const runs = cliOrkas.readCliState().invocations.filter(item => item.cli === 'codex');
+      expect(runs).toHaveLength(1);
+      expect(runs[0].steers).toHaveLength(0);
+    } finally {
+      await cliOrkas.invoke('groupChat.abort', { cid });
+    }
   });
 
   test('offers no steer for an unsupported one-shot CLI and runs the busy send as the next native turn', async ({ cliOrkas }) => {

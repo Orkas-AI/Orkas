@@ -6,7 +6,7 @@ import sharp from 'sharp';
 const require = createRequire(import.meta.url);
 
 describe('connector catalog', () => {
-  it('ships complete four-locale copy for every built-in card and setup surface', async () => {
+  it('ships complete ten-locale copy for every built-in card and setup surface', async () => {
     const { CONNECTOR_CATALOG } = await import('../../../../src/main/features/connectors/catalog');
     const missingCopy = (items: unknown[]) => {
       const missing: string[] = [];
@@ -14,7 +14,7 @@ describe('connector catalog', () => {
         if (!node || typeof node !== 'object') return;
         for (const [key, value] of Object.entries(node)) {
           if (/^(description|label|help|instructions|callback_help|guide_label)_en$/.test(key) && value) {
-            for (const lang of ['zh', 'ja', 'pt']) {
+            for (const lang of ['zh', 'ja', 'pt', 'es', 'fr', 'ko', 'de', 'ru', 'it']) {
               const sibling = key.replace(/_en$/, `_${lang}`);
               if (typeof node[sibling] !== 'string' || !node[sibling].trim()) missing.push(`${location}.${sibling}`);
             }
@@ -28,7 +28,7 @@ describe('connector catalog', () => {
     expect(CONNECTOR_CATALOG.length).toBeGreaterThan(100);
     expect(missingCopy(CONNECTOR_CATALOG)).toEqual([]);
     // Negative control: a single omitted form label must be detected, even if English exists.
-    const broken = [{ id: 'canary', connection_setup: { fields: [{ label_en: 'Shop ID', label_zh: '店铺 ID', label_pt: 'ID da loja' }] } }];
+    const broken = [{ id: 'canary', connection_setup: { fields: [{ label_en: 'Shop ID', label_zh: '店铺 ID', label_pt: 'ID da loja', label_es: 'ID de la tienda', label_fr: 'ID de la boutique', label_ko: '상점 ID', label_de: 'Shop-ID', label_ru: 'ID магазина', label_it: 'ID del negozio' }] } }];
     expect(missingCopy(broken)).toEqual(['canary.connection_setup.fields.0.label_ja']);
   });
 
@@ -39,7 +39,7 @@ describe('connector catalog', () => {
     expect(setupEntries.flatMap((entry) => {
       const setup = entry.connection_setup;
       if (!setup?.guide_url?.match(/^https:\/\//)) return [`${entry.id}.guide_url`];
-      return ['zh', 'en', 'ja', 'pt']
+      return ['zh', 'en', 'ja', 'pt', 'es', 'fr', 'ko', 'de', 'ru', 'it']
         .filter((lang) => !String(setup[`guide_label_${lang}` as keyof typeof setup] || '').trim())
         .map((lang) => `${entry.id}.guide_label_${lang}`);
     })).toEqual([]);
@@ -215,15 +215,17 @@ describe('connector catalog', () => {
     const domestic = await import('../../../../src/main/features/connectors/catalog-domestic');
     const localCommerce = await import('../../../../src/main/features/connectors/catalog-local-commerce');
     const remote = await import('../../../../src/main/features/connectors/catalog-remote-commerce');
+    const japan = await import('../../../../src/main/features/connectors/catalog-japan-commerce');
     const auditedEntries = [
       ...commerce.COMPOSIO_COMMERCE_ENTRIES,
       ...direct.DIRECT_COMMERCE_ENTRIES,
       ...domestic.DOMESTIC_COLLABORATION_ENTRIES,
       ...localCommerce.LOCAL_COMMERCE_ENTRIES,
       ...remote.REMOTE_COMMERCE_ENTRIES,
+      ...japan.JAPAN_COMMERCE_ENTRIES,
     ];
 
-    expect(auditedEntries).toHaveLength(96);
+    expect(auditedEntries).toHaveLength(102);
     expect(auditedEntries.map((entry) => entry.id)).toEqual(expect.arrayContaining(['shopee', 'tiktok-shop']));
     const idsByIconHash = new Map<string, string[]>();
     for (const entry of auditedEntries) {
@@ -361,6 +363,7 @@ describe('connector catalog', () => {
       'tiktok-shop',
       'bigcommerce', 'shopline', 'shoplazza',
       'magento', 'temu-seller', 'lazada-seller', 'shein-seller', 'alibaba-com-seller', 'aliexpress-seller',
+      'rakuten-rms', 'base-shop', 'qoo10-japan', 'futureshop', 'yahoo-shopping',
       'commerce-layer',
       'shopify-admin',
       'constant-contact',

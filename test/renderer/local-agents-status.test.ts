@@ -25,6 +25,9 @@ function loadStatusHint() {
   return {
     hint: windowObject.getLocalCliUnavailableHint as (entry: Record<string, unknown> | undefined) => string,
     isCodingAgent: windowObject.cliIsCodingAgent as (cli: string) => boolean,
+    defaults: windowObject.getCliDefaults as (cli: string) => {
+      name: string; description_en: string; description_zh: string;
+    } | null,
     calls,
   };
 }
@@ -192,6 +195,24 @@ describe('external-agent unavailable status copy', () => {
     expect(isCodingAgent('openclaw')).toBe(false);
     expect(isCodingAgent('opencode')).toBe(true);
     expect(isCodingAgent('hermes')).toBe(false);
+  });
+
+  it('offers concise bilingual routing seeds without repeated examples or protocol details', () => {
+    const { defaults } = loadStatusHint();
+    for (const cli of ['claude', 'codex', 'openclaw', 'opencode', 'hermes']) {
+      const seed = defaults(cli)!;
+      expect(seed).not.toBeNull();
+      // Source-only regression ceilings, not limits on user-authored descriptions.
+      expect(seed.description_en.length).toBeLessThanOrEqual(250);
+      expect(seed.description_zh.length).toBeLessThanOrEqual(100);
+      expect(seed.description_en).toMatch(/[a-z]/i);
+      expect(seed.description_zh).toMatch(/[\u4e00-\u9fff]/);
+      for (const description of [seed.description_en, seed.description_zh]) {
+        expect(description).not.toMatch(/For:|Triggers:|触发词|ACP|session-scoped/);
+      }
+    }
+    expect(defaults('unknown')).toBeNull();
+    expect(defaults('toString')).toBeNull();
   });
 
   it('ships recovery and detection messages in every renderer locale', () => {

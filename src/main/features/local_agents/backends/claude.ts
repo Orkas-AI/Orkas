@@ -27,7 +27,6 @@ import {
   StderrTail,
   spawnCli,
   reapCliAfterProtocolTerminal,
-  killProcessTree,
   armKillWatchdog,
   LineSplitter,
   levelOrInfo,
@@ -255,10 +254,7 @@ export const claudeBackend: LocalBackend = {
         if (terminated) return;
         terminated = true;
         if (interruptGrace) clearTimeout(interruptGrace);
-        try { child.stdin.end(); } catch { /* already closed */ }
-        killProcessTree(child, 'SIGTERM');
-        const hardKill = setTimeout(() => killProcessTree(child, 'SIGKILL'), 10_000);
-        if (typeof hardKill.unref === 'function') hardKill.unref();
+        reapCliAfterProtocolTerminal(child);
       };
       // Let the small protocol interrupt reach Claude first so it can persist a
       // resumable session, but never let stdin backpressure delay Stop beyond a
@@ -600,6 +596,7 @@ export const claudeBackend: LocalBackend = {
           const combinedOutput = completedTurnTexts.join('\n\n');
           const terminalExtra = {
             output: combinedOutput,
+            finalMessageText: resultText,
             ...(resultError ? { error: resultError, stderrTail: tail.toString() } : {}),
             ...(resultUsage || accUsage ? { usage: resultUsage || accUsage } : {}),
           };
@@ -607,6 +604,7 @@ export const claudeBackend: LocalBackend = {
           // stream-json process. A later self-woken turn may fall back to full
           // assistant blocks even when the previous turn streamed deltas.
           partialState.sawTextStreamEvent = false;
+          partialState.messageId = undefined;
           // Tool calls never span turns; drop any callId whose result
           // never arrived so the map stays turn-scoped.
           partialState.toolNamesByCallId?.clear();
@@ -721,12 +719,12 @@ export const claudeBackend: LocalBackend = {
         }
         const combinedOutput = completedTurnTexts.join('\n\n');
         if ((code === 0 || closingForTerminal) && resultStatus === 'completed') {
-          return finish('completed', { output: combinedOutput, usage: resultUsage });
+          return finish('completed', { output: combinedOutput, finalMessageText: resultText, usage: resultUsage });
         }
         // Non-zero exit OR result subtype indicated error — surface tail.
         const err = resultError
           || (code !== 0 ? `claude exited with code ${code}` : 'claude reported error in result');
-        finish('failed', { error: err, output: combinedOutput, stderrTail: tail.toString(), usage: resultUsage });
+        finish('failed', { error: err, output: combinedOutput, finalMessageText: resultText, stderrTail: tail.toString(), usage: resultUsage });
       });
     });
   },
@@ -809,12 +807,30 @@ export function buildClaudePermissionArgs(
  */
 export type ClaudeParseState = {
   sawTextStreamEvent: boolean;
+  /** Native assistant message identity, shared by partial and full records. */
+  messageId?: string;
+  messageHasNativeId?: boolean;
+  messageSequence?: number;
+  lastFullMessageId?: string;
+  /** Whether text for `lastFullMessageId` has already been emitted (streamed
+   *  partials or an earlier full record of the same message). */
+  lastFullMessageEmittedText?: boolean;
   /** callId -> tool name, captured from the assistant `tool_use` block so the
    *  `tool_result` branch can tell agent-produced media apart from a file the
    *  agent merely read. Optional: callers that only care about text (and the
    *  parser tests) may pass a bare `{ sawTextStreamEvent }`. */
   toolNamesByCallId?: Map<string, string>;
 };
+
+/** Older full-record transports may omit ids. Their record boundary still
+ * supplies message identity; never derive a boundary from the body. */
+function startClaudeMessage(state: ClaudeParseState, nativeId?: unknown): string {
+  state.messageSequence = (state.messageSequence || 0) + 1;
+  state.messageHasNativeId = typeof nativeId === 'string' && !!nativeId;
+  state.messageId = state.messageHasNativeId
+    ? nativeId as string : `claude-message:${state.messageSequence}`;
+  return state.messageId;
+}
 
 export function mapClaudeEvent(
   obj: any,
@@ -1021,11 +1037,17 @@ export function mapClaudeEvent(
     const inner = obj.event;
     if (!inner || typeof inner !== 'object') return undefined;
     const innerType = inner.type;
+    if (innerType === 'message_start') {
+      startClaudeMessage(partialState, inner.message?.id);
+      partialState.sawTextStreamEvent = false;
+      return undefined;
+    }
     if (innerType === 'content_block_delta') {
       const d = inner.delta;
       if (d?.type === 'text_delta' && typeof d.text === 'string' && d.text.length) {
+        if (!partialState.messageId) startClaudeMessage(partialState);
         partialState.sawTextStreamEvent = true;
-        return { event: { type: 'text-delta', text: d.text } };
+        return { event: { type: 'text-delta', text: d.text, itemId: partialState.messageId } };
       }
       if (d?.type === 'thinking_delta' && typeof d.thinking === 'string' && d.thinking.length) {
         return { event: { type: 'thinking', text: d.thinking } };
@@ -1053,6 +1075,20 @@ export function mapClaudeEvent(
   if (type === 'assistant') {
     const content = Array.isArray(obj?.message?.content) ? obj.message.content : [];
     const events: LocalEvent[] = [];
+    const messageId = typeof obj.message?.id === 'string' ? obj.message.id : undefined;
+    const streamedThisMessage = partialState.sawTextStreamEvent
+      && (!messageId || !partialState.messageHasNativeId || messageId === partialState.messageId);
+    // Claude Code writes one `assistant` record per content block, and every
+    // record of a message shares its id. A record is therefore a replay of this
+    // message's text only when that text has actually left the parser already
+    // — streamed as partials, or emitted from an earlier record of the same
+    // message. A thinking record that merely precedes the text record must not
+    // make the text look like a duplicate: with no partials on the wire (the
+    // CLI does not always stream text deltas), that dropped the whole body.
+    const sameMessageAsLastRecord = !!messageId && messageId === partialState.lastFullMessageId;
+    const alreadyStreamed = streamedThisMessage
+      || (sameMessageAsLastRecord && partialState.lastFullMessageEmittedText === true);
+    const itemId = messageId || partialState.messageId || startClaudeMessage(partialState);
     for (const part of content) {
       if (part?.type === 'text' && typeof part.text === 'string') {
         // Already streamed via stream_event partials → skip to avoid
@@ -1060,13 +1096,13 @@ export function mapClaudeEvent(
         // flag (older versions), no stream_event with text fired and
         // we fall back to emitting it here so the user still sees the
         // reply.
-        if (!partialState.sawTextStreamEvent) {
-          events.push({ type: 'text-delta', text: part.text });
+        if (!alreadyStreamed) {
+          events.push({ type: 'text-delta', text: part.text, itemId });
         }
         continue;
       }
       if (part?.type === 'thinking') {
-        if (!partialState.sawTextStreamEvent && typeof part.thinking === 'string') {
+        if (!alreadyStreamed && typeof part.thinking === 'string') {
           events.push({ type: 'thinking', text: part.thinking });
         }
         continue;
@@ -1088,6 +1124,11 @@ export function mapClaudeEvent(
         });
       }
     }
+    partialState.lastFullMessageEmittedText = alreadyStreamed
+      || content.some((part: any) => part?.type === 'text' && typeof part.text === 'string');
+    partialState.lastFullMessageId = messageId;
+    partialState.messageId = undefined;
+    partialState.sawTextStreamEvent = false;
     return packClaudeEvents(events);
   }
   if (type === 'user') {
@@ -1129,15 +1170,17 @@ export function mapClaudeEvent(
     return packClaudeEvents(events);
   }
   if (type === 'result') {
-    const ok = obj.subtype === 'success';
+    // A success-shaped SDK result can still report an execution error.
+    const ok = obj.subtype === 'success' && obj.is_error !== true;
     const text = typeof obj.result === 'string' ? obj.result : '';
     const error = !ok
       ? (
-          typeof obj.error === 'string'
-            ? obj.error
-            : (Array.isArray(obj.errors)
+          (typeof obj.error === 'string' ? obj.error : '')
+            || (Array.isArray(obj.errors)
                 ? obj.errors.map((entry: unknown) => String(entry || '')).filter(Boolean).join('\n')
-                : undefined)
+                : '')
+            || text
+            || undefined
         )
       : undefined;
     // Extract usage in the same shape multica daemon does

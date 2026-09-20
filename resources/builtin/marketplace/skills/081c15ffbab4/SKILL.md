@@ -1,7 +1,7 @@
 ---
 name: office-excel
-description_zh: "创建、读取、编辑和检查 Excel/XLSX 工作簿，并保护公式、日期、数据类型、格式、验证规则、模板、图表和打印设置；用于报表制作、CSV 转 XLSX、公式模型、工作簿清理和保格式修改。"
-description_en: "Create, read, edit, and check Excel/XLSX workbooks while protecting formulas, dates, data types, formatting, validations, templates, charts, and print settings. Use for spreadsheet deliverables, workbook cleanup, CSV conversion, formula models, and Excel reporting."
+description_zh: "创建、读取、编辑和检查 Excel/XLSX 报表、公式模型和模板，支持 CSV 转换、数据清理、图表与保格式修改。"
+description_en: "Create, read, edit and check Excel/XLSX reports, formula models and templates, including CSV conversion, data cleanup, charts and format-preserving changes."
 ---
 
 # Office Excel

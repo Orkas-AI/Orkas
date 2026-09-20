@@ -75,6 +75,20 @@ function _bashTrackCancelledPermission(info, currentMode, errorCode = 'request_c
 }
 
 function _bashTrackPermissionResult(info, properties) {
+  if (info._permission_kind === 'web-assist') {
+    // Page origin and control label are user content: report the handback
+    // reason and the verdict, which is what tells us whether this gate is
+    // catching real intent or only adding clicks.
+    _bashPermissionTelemetry('web_assist_action_confirmation_result', {
+      reason: String(info.reason || ''),
+      control_kind: String(info.control_kind || ''),
+      decision: properties.effective_decision === 'deny' ? 'denied' : 'approved',
+      ...(properties.decision ? { requested_decision: properties.decision } : {}),
+      result: properties.result,
+      duration_ms: properties.duration_ms,
+    });
+    return;
+  }
   if (info._permission_kind === 'connector') {
     // Custom MCP ids derive from a user-authored display name and their tool
     // names are server-defined free text: report the stable `custom` bucket and
@@ -254,6 +268,7 @@ function _showBashPermissionModeDialog({
   requestId,
   onPresented,
   allowRun = true,
+  allowRunLabel = t('bash.permission.allow_run'),
   showModeControl = true,
   modes = _bashPermissionModeOptions(),
   modeValidator = _bashIsMode,
@@ -294,7 +309,7 @@ function _showBashPermissionModeDialog({
               </button>
             </div>` : '';
     const allowRunHtml = allowRun
-      ? `<button class="btn" data-act="choice" data-id="allow_run">${_bashEscapeHtml(t('bash.permission.allow_run'))}</button>`
+      ? `<button class="btn" data-act="choice" data-id="allow_run">${_bashEscapeHtml(allowRunLabel)}</button>`
       : '';
 
     overlay.innerHTML = `
@@ -433,6 +448,30 @@ function _showBashPermissionModeDialog({
   });
 }
 
+function _webAssistDecision(decision) {
+  if (decision === 'allow_run') return 'run';
+  return decision === 'allow_once' ? 'once' : 'deny';
+}
+
+function _webAssistActionMessage(info) {
+  const site = String(info.page_origin || '').trim();
+  const title = String(info.page_title || '').trim();
+  const control = String(info.control_label || '').trim();
+  return [
+    _bashT(info.reason === 'high_impact_action'
+      ? 'web_assist.action_confirm.high_impact_message'
+      : 'web_assist.action_confirm.submission_message',
+    'The Agent wants to activate a control on the page you can see.'),
+    '',
+    ...(title ? [`${_bashT('web_assist.action_confirm.page', 'Page')}: ${title}`] : []),
+    `${_bashT('web_assist.action_confirm.site', 'Site')}: ${site || _bashT('web_assist.action_confirm.site_unknown', 'Unknown site')}`,
+    `${_bashT('web_assist.action_confirm.control', 'Control')}: ${control}`,
+    '',
+    _bashT('web_assist.action_confirm.note',
+      'Approving covers this control on this site in this browser tab. A different page, control or label asks again.'),
+  ].join('\n');
+}
+
 async function _showBashPermissionDialog(info) {
   const startedAt = Date.now();
   const requestId = String(info.request_id || '');
@@ -441,6 +480,7 @@ async function _showBashPermissionDialog(info) {
     return;
   }
   const isConnector = info._permission_kind === 'connector';
+  const isWebAssist = info._permission_kind === 'web-assist';
   const agent = _bashAgentLabel(info);
   const reasonsText = [
     _bashReasonText(info.reasons),
@@ -449,8 +489,8 @@ async function _showBashPermissionDialog(info) {
   const command = String(info.command || '');
   const operation = String(info.operation || '').trim();
   const subject = String(info.subject || '').trim();
-  const isAction = isConnector || !!(operation || subject);
-  const baseMessage = isConnector ? _connectorActionMessage(info) : isAction
+  const isAction = isConnector || isWebAssist || !!(operation || subject);
+  const baseMessage = isWebAssist ? _webAssistActionMessage(info) : isConnector ? _connectorActionMessage(info) : isAction
     ? t('bash.permission.action_message', {
       agent,
       operation: operation || t('bash.permission.action_fallback'),
@@ -472,10 +512,14 @@ async function _showBashPermissionDialog(info) {
     externalMutationText,
   ].filter(Boolean).join('\n\n');
   let presented = false;
-  const isSensitiveApproval = isConnector || (Array.isArray(info.reasons)
+  const isSensitiveApproval = isConnector || isWebAssist || (Array.isArray(info.reasons)
     && info.reasons.some((reason) => _BASH_PERMISSION_RISK_CATEGORIES.includes(reason)));
-  const canAllowRun = isConnector ? info.can_allow_run === true
-    : info.unresolved_paths !== true && (!isSensitiveApproval || info.can_allow_run === true);
+  // A page grant is safe to offer: the host binds it to this tab, origin and
+  // control, so repeating the same approved step is the case it exists for.
+  // A connector grant stays on the host's own terms.
+  const canAllowRun = isWebAssist ? true
+    : isConnector ? info.can_allow_run === true
+      : info.unresolved_paths !== true && (!isSensitiveApproval || info.can_allow_run === true);
   // An earlier queued permission can switch the account to Trusted while this
   // connector waits. Its host gate already checked availability/prohibitions.
   let result;
@@ -484,7 +528,8 @@ async function _showBashPermissionDialog(info) {
     result = isConnector && currentMode === 'all_files_auto'
       ? { choice: 'allow_once', mode: currentMode }
       : await _showBashPermissionModeDialog({
-        title: t(isAction ? 'bash.permission.action_title' : 'bash.permission.title'),
+        title: t(isWebAssist ? 'web_assist.action_confirm.title'
+          : isAction ? 'bash.permission.action_title' : 'bash.permission.title'),
         message,
         ...(isConnector ? {
           details: _connectorActionDetails(info),
@@ -493,6 +538,7 @@ async function _showBashPermissionDialog(info) {
         currentMode,
         requestId,
         allowRun: canAllowRun,
+        ...(isConnector && info.usage_scope === true ? { allowRunLabel: t('bash.permission.allow_usage') } : {}),
         showModeControl: true,
         onPresented: () => {
           if (isConnector) return;
@@ -559,10 +605,13 @@ async function _showBashPermissionDialog(info) {
   };
   try {
     const response = await window.orkas.invoke(
-      isConnector ? 'connectors.action_confirm_response' : 'bash.permission_response',
-      isConnector
-        ? { request_id: info.request_id, approved: decision !== 'deny', ...(decision === 'allow_run' ? { scope: 'task' } : {}) }
-        : { request_id: info.request_id, decision },
+      isWebAssist ? 'webAssist.actionConfirmResponse'
+        : isConnector ? 'connectors.action_confirm_response' : 'bash.permission_response',
+      isWebAssist
+        ? { request_id: info.request_id, decision: _webAssistDecision(decision) }
+        : isConnector
+          ? { request_id: info.request_id, approved: decision !== 'deny', ...(decision === 'allow_run' ? { scope: info.usage_scope === true ? 'usage' : 'task' } : {}) }
+          : { request_id: info.request_id, decision },
     );
     const failed = !response || response.ok === false;
     const stale = !failed && response.handled === false;
@@ -741,37 +790,41 @@ function _cancelBashPermissionRequests(payload, kind) {
 
 if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
   try {
-    window.orkas.onPushEvent('bash:permission', (info) => {
-      if (!info || typeof info.request_id !== 'string') return;
-      const queuedInfo = {
-        ...info,
-        _renderer_received_at_ms: Date.now(),
-      };
-      _bashPermissionTelemetry('bash_risk_prompt_requested', {
-        categories: _bashPermissionCategories(info),
-        ...(_bashPermissionIrreversible(info) ? { irreversible: _bashPermissionIrreversible(info) } : {}),
-        visibility_state: _bashPermissionVisibilityState(),
+    const appWindow = window.location?.pathname?.endsWith('/preview.html') === true;
+    if (!appWindow) {
+      window.orkas.onPushEvent('bash:permission', (info) => {
+        if (!info || typeof info.request_id !== 'string') return;
+        const queuedInfo = {
+          ...info,
+          _renderer_received_at_ms: Date.now(),
+        };
+        _bashPermissionTelemetry('bash_risk_prompt_requested', {
+          categories: _bashPermissionCategories(info),
+          ...(_bashPermissionIrreversible(info) ? { irreversible: _bashPermissionIrreversible(info) } : {}),
+          visibility_state: _bashPermissionVisibilityState(),
+        });
+        _bashPermQueue.push(queuedInfo);
+        _drainBashPermissionQueue();
       });
-      _bashPermQueue.push(queuedInfo);
-      _drainBashPermissionQueue();
-    });
-    window.orkas.onPushEvent('bash:permission_cancelled', (payload) => {
-      _cancelBashPermissionRequests(payload, undefined);
-    });
-    window.orkas.onPushEvent('local-agent:permission', (info) => {
-      if (!info || typeof info.request_id !== 'string') return;
-      _bashPermQueue.push({
-        ...info,
-        _permission_kind: 'local-agent',
-        _renderer_received_at_ms: Date.now(),
+      window.orkas.onPushEvent('bash:permission_cancelled', (payload) => {
+        _cancelBashPermissionRequests(payload, undefined);
       });
-      _drainBashPermissionQueue();
-    });
-    window.orkas.onPushEvent('local-agent:permission_cancelled', (payload) => {
-      _cancelBashPermissionRequests(payload, 'local-agent');
-    });
+      window.orkas.onPushEvent('local-agent:permission', (info) => {
+        if (!info || typeof info.request_id !== 'string') return;
+        _bashPermQueue.push({
+          ...info,
+          _permission_kind: 'local-agent',
+          _renderer_received_at_ms: Date.now(),
+        });
+        _drainBashPermissionQueue();
+      });
+      window.orkas.onPushEvent('local-agent:permission_cancelled', (payload) => {
+        _cancelBashPermissionRequests(payload, 'local-agent');
+      });
+    }
     window.orkas.onPushEvent('connectors:action-confirm', (info) => {
       if (!info || typeof info.request_id !== 'string') return;
+      if (appWindow && info.usage_scope !== true) return;
       _bashPermQueue.push({
         ...info,
         _permission_kind: 'connector',
@@ -780,7 +833,22 @@ if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
       _drainBashPermissionQueue();
     });
     window.orkas.onPushEvent('connectors:action-confirm-cancelled', (payload) => {
+      if (appWindow && payload?.usage_scope !== true) return;
       _cancelBashPermissionRequests(payload, 'connector');
     });
+    if (!appWindow) {
+      window.orkas.onPushEvent('web-assist:action-confirm', (info) => {
+        if (!info || typeof info.request_id !== 'string') return;
+        _bashPermQueue.push({
+          ...info,
+          _permission_kind: 'web-assist',
+          _renderer_received_at_ms: Date.now(),
+        });
+        _drainBashPermissionQueue();
+      });
+      window.orkas.onPushEvent('web-assist:action-confirm-cancelled', (payload) => {
+        _cancelBashPermissionRequests(payload, 'web-assist');
+      });
+    }
   } catch (_err) { /* push channel unavailable; bash calls deny on timeout */ }
 }

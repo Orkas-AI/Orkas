@@ -1,7 +1,7 @@
 ---
 name: pdf-editing
-description_zh: "读取、OCR、创建和编辑 PDF，包括合并、提取、删除、重排和旋转页面，添加中文水印、文字或图片覆盖层，填写表单并渲染检查；用于 PDF 页面操作、表单、OCR 和交付前检查。"
-description_en: "Read, OCR, create, and edit PDFs: merge, extract, delete, reorder, or rotate pages; add CJK watermarks, text, or image overlays; fill forms; and render changed pages for review. Use for PDF page operations, forms, OCR, and delivery QA."
+description_zh: "读取、创建和编辑 PDF，包括扫描页读取、页面整理、水印与文字/图片覆盖、表单填写及交付前版式检查。"
+description_en: "Read, create and edit PDFs, including scanned-page reading, page organization, watermarks, text/image overlays, form filling and layout checks."
 ---
 
 # PDF Editing
@@ -11,7 +11,7 @@ description_en: "Read, OCR, create, and edit PDFs: merge, extract, delete, reord
 Use the bundled tools; do not install `nano-pdf`, pypdf, qpdf, Poppler, or another PDF package during a task.
 
 - Call `read_files` with one `paths` item for a normal PDF; extraction is prepared in the same call.
-- Use `ocr_file` only for scanned or image-only pages whose text cannot be extracted.
+- For scanned or image-only pages, call `pdf_render` only on needed pages and read the returned images with the current model. If it cannot read images, ask for readable text or a vision-capable model; do not install a recognition engine. Mark unreadable fields instead of guessing.
 - Use `create_pdf` with `source_type:"markdown"` for a text-first new PDF or `source_type:"html"` for tables and custom layout.
 - Use `edit_pdf` for deterministic edits to an existing PDF: merge, extract, delete, reorder, rotate, watermark, visible text/image overlay, and form filling.
 - Use `pdf_render` on every changed page and representative unchanged pages before delivery.
@@ -31,7 +31,7 @@ Use the bundled tools; do not install `nano-pdf`, pypdf, qpdf, Poppler, or anoth
 ## Delivery Check
 
 Check page count and order, rotations, changed-page renders, clipping,
-watermark placement, form values, extracted/OCR text, output path, and source
+watermark placement, form values, extracted or visually read text, output path, and source
 preservation. For a watermark or overlay, explicitly confirm from the rendered
 pages that it is legible, positioned as intended, and not clipped. Return the
 final PDF path, untouched source path, actions performed, pages affected, and

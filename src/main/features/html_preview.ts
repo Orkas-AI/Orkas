@@ -6,6 +6,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import type { BrowserWindow as ElectronBrowserWindow, Session } from 'electron';
 
+import { createPreviewSdk, previewBundle, previewPreload, type PreviewSdkEvidence } from './web_apps/preview';
+import type { Bundle } from './web_apps/runtime';
 import { ARTIFACT_FRAME } from './chat_artifacts';
 import { isPathAllowed } from '../util/path-sandbox';
 import { hardenedWebPreferences } from '../util/window-security';
@@ -13,7 +15,7 @@ import { hardenedWebPreferences } from '../util/window-security';
 const HTML_PREVIEW_TIMEOUT_MS = 20_000;
 const HTML_PREVIEW_MAX_BLOCKED_RESOURCE_SAMPLES = 8;
 const HTML_PREVIEW_MAX_DIAGNOSTICS = 12;
-const HTML_PREVIEW_MAX_INTERACTION_FAILURE_SAMPLES = 10;
+const HTML_PREVIEW_MAX_INTERACTION_SAMPLES = 10;
 const HTML_PREVIEW_MAX_DIAGNOSTIC_CHARS = 400;
 
 export type HtmlPreviewViewportName = 'desktop' | 'mobile' | 'embed';
@@ -50,6 +52,7 @@ export interface HtmlPreviewViewportEvidence {
   missingAltCount: number;
   failedImageCount: number;
   layoutIssues: HtmlPreviewLayoutIssue[];
+  ineffectiveTransforms?: string[];
   consoleErrors: string[];
 }
 
@@ -88,9 +91,13 @@ export interface HtmlPreviewInteractionEvidence {
   keyboard: HtmlPreviewKeyboardEvidence;
   failureCount: number;
   failures: string[];
+  /** Missing observable effects are inconclusive, not functional failures. */
+  warningCount?: number;
+  warnings?: string[];
 }
 
 export interface HtmlPreviewEvidence {
+  sdk?: PreviewSdkEvidence;
   ok: boolean;
   entryPath: string;
   blockedResourceCount: number;
@@ -157,6 +164,8 @@ function emptyPageInteractionEvidence(): PageInteractionEvidence {
     mailtoLinksChecked: 0,
     failureCount: 0,
     failures: [],
+    warningCount: 0,
+    warnings: [],
   };
 }
 
@@ -171,7 +180,33 @@ const READY_SCRIPT = `(async () => {
   return true;
 })()`;
 
+// CSS Transforms excludes non-replaced inline boxes. Check computed state,
+// including states reached by interactions, without interpreting app text.
+// https://www.w3.org/TR/css-transforms-1/#transformable-element
+const INEFFECTIVE_TRANSFORMS_SCRIPT = `
+  const ineffectiveTransforms = () => {
+    const issues = [];
+    for (const element of document.body?.querySelectorAll('*') || []) {
+      if (!(element instanceof HTMLElement)) continue;
+      const style = getComputedStyle(element);
+      if (style.display !== 'inline' || style.transform === 'none'
+        || style.visibility === 'hidden' || Number(style.opacity) === 0
+        || !element.getClientRects().length) continue;
+      // Replaced content and native controls can have transformable boxes.
+      if (element.matches('img,video,audio,canvas,iframe,embed,object,input,textarea,select,button')
+        || !['normal', 'none'].includes(style.content)) continue;
+      if (new DOMMatrixReadOnly(style.transform).isIdentity) continue;
+      const selector = element.id ? '#' + CSS.escape(element.id)
+        : element.tagName.toLowerCase() + Array.from(element.classList).slice(0, 2).map(c => '.' + CSS.escape(c)).join('');
+      issues.push(selector.slice(0, ${HTML_PREVIEW_MAX_DIAGNOSTIC_CHARS}));
+      if (issues.length >= ${HTML_PREVIEW_MAX_DIAGNOSTICS}) break;
+    }
+    return issues;
+  };
+`;
+
 const EVIDENCE_SCRIPT = `(() => {
+  ${INEFFECTIVE_TRANSFORMS_SCRIPT}
   const viewportWidth = Math.max(1, document.documentElement.clientWidth || window.innerWidth || 1);
   const viewportHeight = Math.max(1, document.documentElement.clientHeight || window.innerHeight || 1);
   const visible = (element) => {
@@ -242,11 +277,13 @@ const EVIDENCE_SCRIPT = `(() => {
     headingCount: document.querySelectorAll('h1,h2,h3,h4,h5,h6').length,
     missingAltCount: images.filter((img) => !img.hasAttribute('alt')).length,
     failedImageCount: images.filter((img) => img.complete && img.naturalWidth === 0).length,
-    layoutIssues: issues
+    layoutIssues: issues,
+    ineffectiveTransforms: ineffectiveTransforms()
   };
 })()`;
 
 const INTERACTION_SCRIPT = `(async () => {
+  ${INEFFECTIVE_TRANSFORMS_SCRIPT}
   const visible = (element) => {
     const style = getComputedStyle(element);
     const rect = element.getBoundingClientRect();
@@ -262,6 +299,15 @@ const INTERACTION_SCRIPT = `(async () => {
     || 'control'
   ).replace(/\\s+/g, ' ').trim().slice(0, 120);
   const failures = [];
+  const warnings = [];
+  const reportedTransforms = new Set();
+  const auditTransforms = () => {
+    for (const selector of ineffectiveTransforms()) {
+      if (reportedTransforms.has(selector) || reportedTransforms.size >= ${HTML_PREVIEW_MAX_DIAGNOSTICS}) continue;
+      reportedTransforms.add(selector);
+      failures.push('CSS transform does not apply to non-replaced inline box: ' + selector);
+    }
+  };
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const maxGenericControls = 5;
   const maxStateControls = 8;
@@ -279,7 +325,8 @@ const INTERACTION_SCRIPT = `(async () => {
   const visibleState = () => JSON.stringify(
     Array.from(document.body?.querySelectorAll('*') || [])
       .filter((element) => visible(element) && !element.matches('textarea,select,option'))
-      .slice(0, 240)
+      // A dense graphic can precede the panel a control changes. Compare the
+      // whole visible state; only returned diagnostics should be truncated.
       .map((element) => [
         String(element.tagName || '').toLowerCase(),
         String(element.id || ''),
@@ -385,7 +432,8 @@ const INTERACTION_SCRIPT = `(async () => {
       if (formsFound >= maxFormStates) break;
       const hasPendingLocalControl = Array.from(form.querySelectorAll('button,[role="button"],[role="tab"]'))
         .some((control) => {
-          const type = String(control.getAttribute?.('type') || 'button').toLowerCase();
+          const type = control instanceof HTMLButtonElement ? control.type
+            : String(control.getAttribute?.('type') || 'button').toLowerCase();
           return visible(control)
             && !control.disabled
             && control.getAttribute?.('aria-disabled') !== 'true'
@@ -400,7 +448,7 @@ const INTERACTION_SCRIPT = `(async () => {
       formsFound += 1;
       try {
         for (const field of Array.from(form.elements || [])) {
-          if (!visible(field) || field.disabled) continue;
+          if (!visible(field) || field.disabled || field.readOnly) continue;
           const type = String(field.type || '').toLowerCase();
           if (type === 'checkbox' || type === 'radio') {
             if (field.required) field.checked = true;
@@ -432,8 +480,9 @@ const INTERACTION_SCRIPT = `(async () => {
         formsSubmitted += 1;
         controlsExercised += 1;
         const after = await settleVisibleState(before, 1100, true);
+        auditTransforms();
         if (after !== before || artifactMessagesObserved > messagesBefore) stateChangesObserved += 1;
-        else failures.push('form submit produced no observable outcome: ' + label(form));
+        else warnings.push('form submit produced no observable outcome: ' + label(form));
       } catch (error) {
         failures.push('form submit failed for ' + label(form) + ': ' + String(error?.message || error));
       }
@@ -450,7 +499,8 @@ const INTERACTION_SCRIPT = `(async () => {
         && control.getAttribute?.('aria-disabled') !== 'true'
         && !(
           control.closest('form')
-          && ['submit', 'reset'].includes(String(control.getAttribute?.('type') || 'submit').toLowerCase())
+          && ['submit', 'reset'].includes(control instanceof HTMLButtonElement ? control.type
+            : String(control.getAttribute?.('type') || 'button').toLowerCase())
         )
         && !downloadControls.includes(control)
       ))
@@ -465,6 +515,7 @@ const INTERACTION_SCRIPT = `(async () => {
 
   enqueueVisibleStateControls();
   await exerciseVisibleForms();
+  enqueueVisibleStateControls();
   for (let index = 0; index < stateControlQueue.length && index < maxStateControls; index += 1) {
     const control = stateControlQueue[index];
     if (!visible(control) || control.disabled || control.getAttribute?.('aria-disabled') === 'true') continue;
@@ -481,21 +532,23 @@ const INTERACTION_SCRIPT = `(async () => {
       controlsExercised += 1;
       stateControlsExercised += 1;
       const after = await settleVisibleState(before, 600);
+      auditTransforms();
       if (after !== before || artifactMessagesObserved > messagesBefore) {
         stateChangesObserved += 1;
         stateTransitionsObserved += 1;
       } else if (!alreadySelected) {
-        failures.push('enabled control produced no observable outcome: ' + label(control));
+        warnings.push('enabled control produced no observable outcome: ' + label(control));
       }
       enqueueVisibleStateControls();
       await exerciseVisibleForms();
+      enqueueVisibleStateControls();
     } catch (error) {
       failures.push('control interaction failed for ' + label(control) + ': ' + String(error?.message || error));
     }
   }
 
   const fields = Array.from(document.querySelectorAll('input,textarea,select'))
-    .filter((field) => visible(field) && !field.disabled && !field.closest('form'))
+    .filter((field) => visible(field) && !field.disabled && !field.readOnly && !field.closest('form'))
     .slice(0, maxGenericControls);
   for (const field of fields) {
     try {
@@ -522,8 +575,9 @@ const INTERACTION_SCRIPT = `(async () => {
       field.dispatchEvent(new Event('change', { bubbles: true }));
       controlsExercised += 1;
       const after = await settleVisibleState(before, 500);
+      auditTransforms();
       if (after !== before) stateChangesObserved += 1;
-      else failures.push('standalone field produced no observable outcome: ' + label(field));
+      else warnings.push('standalone field produced no observable outcome: ' + label(field));
     } catch (error) {
       failures.push('control interaction failed for ' + label(field) + ': ' + String(error?.message || error));
     }
@@ -544,8 +598,12 @@ const INTERACTION_SCRIPT = `(async () => {
     mailtoLinksChecked,
     failureCount: failures.length,
     failures: failures
-      .slice(0, ${HTML_PREVIEW_MAX_INTERACTION_FAILURE_SAMPLES})
-      .map((failure) => String(failure || '').replace(/\\s+/g, ' ').trim().slice(0, ${HTML_PREVIEW_MAX_DIAGNOSTIC_CHARS}))
+      .slice(0, ${HTML_PREVIEW_MAX_INTERACTION_SAMPLES})
+      .map((failure) => String(failure || '').replace(/\\s+/g, ' ').trim().slice(0, ${HTML_PREVIEW_MAX_DIAGNOSTIC_CHARS})),
+    warningCount: warnings.length,
+    warnings: warnings
+      .slice(0, ${HTML_PREVIEW_MAX_INTERACTION_SAMPLES})
+      .map((warning) => String(warning || '').replace(/\\s+/g, ' ').trim().slice(0, ${HTML_PREVIEW_MAX_DIAGNOSTIC_CHARS}))
   };
 })()`;
 
@@ -598,7 +656,7 @@ const KEYBOARD_ACTIVE_SCRIPT = `(() => {
 })()`;
 
 async function auditKeyboardTraversal(
-  webContents: ElectronBrowserWindow['webContents'],
+  webContents: Pick<ElectronBrowserWindow['webContents'], 'executeJavaScript' | 'focus' | 'sendInputEvent'>,
   focusableFound: number,
 ): Promise<HtmlPreviewKeyboardEvidence> {
   const failures: string[] = [];
@@ -703,10 +761,13 @@ function registerNetworkIsolation(
   ses: Session,
   entryRootReal: string,
   blocked: { count: number; samples: string[] },
+  sdkOrigin: { current?: string },
 ): void {
   ses.webRequest.onBeforeRequest((details, callback) => {
     const raw = String(details.url || '');
-    const allowed = allowedPreviewRequest(raw, entryRootReal);
+    const allowed = sdkOrigin.current
+      ? /^(?:data|blob|about):/i.test(raw) || raw.startsWith(sdkOrigin.current + '/')
+      : allowedPreviewRequest(raw, entryRootReal);
     if (!allowed) {
       blocked.count += 1;
       const label = blockedResourceLabel(raw);
@@ -749,15 +810,20 @@ async function clearPreviewSession(ses: Session): Promise<void> {
   ]);
 }
 
-function consoleErrorListener(target: string[]) {
-  return (_event: unknown, levelOrDetails: unknown, message?: unknown) => {
-    const details = levelOrDetails && typeof levelOrDetails === 'object'
-      ? levelOrDetails as { level?: unknown; message?: unknown }
+function consoleErrorListener(errors: string[], warnings: string[]) {
+  return (...args: [unknown, unknown?, unknown?]) => {
+    const [event, levelOrDetails, message] = args;
+    // Modern Electron carries named levels on the event; the legacy numeric
+    // arguments use 2 for warning and 3 for error.
+    const candidate = event && typeof event === 'object' && 'level' in event ? event : levelOrDetails;
+    const details = candidate && typeof candidate === 'object'
+      ? candidate as { level?: unknown; message?: unknown }
       : null;
     const level = details?.level ?? levelOrDetails;
     const value = details?.message ?? message;
-    const isError = level === 'error' || (typeof level === 'number' && level >= 2);
-    if (!isError || target.length >= HTML_PREVIEW_MAX_DIAGNOSTICS) return;
+    const target = level === 'error' || level === 3 ? errors
+      : level === 'warning' || level === 2 ? warnings : null;
+    if (!target || target.length >= HTML_PREVIEW_MAX_DIAGNOSTICS) return;
     const text = boundedDiagnostic(value);
     if (text && !target.includes(text)) target.push(text);
   };
@@ -770,12 +836,17 @@ async function renderViewport(
   viewport: HtmlPreviewViewport,
   auditKeyboard: boolean,
   exerciseInteractions: boolean,
+  bundle: Bundle | null,
+  sdkOrigin: { current?: string },
 ): Promise<{
   evidence: HtmlPreviewViewportEvidence;
   screenshot: Buffer;
+  consoleWarnings: string[];
+  sdk?: PreviewSdkEvidence;
   interactions?: RenderInteractionEvidence;
 }> {
   const consoleErrors: string[] = [];
+  const consoleWarnings: string[] = [];
   const win = new BrowserWindow({
     show: false,
     width: viewport.width,
@@ -785,6 +856,7 @@ async function renderViewport(
     webPreferences: hardenedWebPreferences({
       session: ses,
       backgroundThrottling: false,
+      ...(bundle ? { preload: previewPreload } : {}),
     }),
   });
   const webContents = win.webContents;
@@ -792,19 +864,22 @@ async function renderViewport(
   webContents.on('will-navigate', (event: { preventDefault(): void }, targetUrl: string) => {
     if (targetUrl !== entryUrl) event.preventDefault();
   });
-  webContents.on('console-message', consoleErrorListener(consoleErrors));
+  webContents.on('console-message', consoleErrorListener(consoleErrors, consoleWarnings));
 
+  let sdk: Awaited<ReturnType<typeof createPreviewSdk>> | undefined;
   try {
+    if (bundle) { sdk = await createPreviewSdk(ses, webContents, bundle); sdkOrigin.current = sdk.origin; }
     await withTimeout(
-      win.loadURL(entryUrl),
+      win.loadURL(sdk?.shellUrl ?? entryUrl),
       `E_HTML_PREVIEW_LOAD_TIMEOUT: ${viewport.name} HTML did not finish loading`,
     );
+    const inspected = sdk ? await withTimeout(sdk.attach(), 'E_HTML_PREVIEW_SDK_TIMEOUT: SDK frame did not load') : webContents;
     await withTimeout(
-      webContents.executeJavaScript(READY_SCRIPT, true),
+      inspected.executeJavaScript(READY_SCRIPT, true),
       `E_HTML_PREVIEW_READY_TIMEOUT: ${viewport.name} fonts or images did not settle`,
     );
     const page = await withTimeout(
-      webContents.executeJavaScript(EVIDENCE_SCRIPT, true) as Promise<PageEvidence>,
+      inspected.executeJavaScript(EVIDENCE_SCRIPT, true) as Promise<PageEvidence>,
       `E_HTML_PREVIEW_INSPECT_TIMEOUT: ${viewport.name} layout inspection timed out`,
     );
     const image = await withTimeout(
@@ -814,7 +889,11 @@ async function renderViewport(
     const interactions = auditKeyboard
       ? await withTimeout(
         (async () => {
-          const keyboard = await auditKeyboardTraversal(webContents, page.focusableCount);
+          const keyboard = await auditKeyboardTraversal({
+            executeJavaScript: (script, gesture) => inspected.executeJavaScript(script, gesture),
+            focus: () => webContents.focus(),
+            sendInputEvent: event => webContents.sendInputEvent(event),
+          }, page.focusableCount);
           if (!exerciseInteractions) {
             return {
               performed: false,
@@ -822,7 +901,7 @@ async function renderViewport(
               keyboard,
             };
           }
-          const safeInteractions = await webContents.executeJavaScript(
+          const safeInteractions = await inspected.executeJavaScript(
             INTERACTION_SCRIPT,
             true,
           ) as PageInteractionEvidence;
@@ -843,10 +922,14 @@ async function renderViewport(
         consoleErrors,
       },
       screenshot: image.toPNG(),
+      consoleWarnings,
+      ...(sdk ? { sdk: sdk.evidence } : {}),
       ...(interactions ? { interactions } : {}),
     };
   } finally {
     try { win.destroy(); } catch { /* best effort */ }
+    await sdk?.dispose();
+    sdkOrigin.current = undefined;
   }
 }
 
@@ -872,12 +955,14 @@ export async function renderResponsiveHtmlPreview(
     throw new Error('E_HTML_PREVIEW_BROWSER_UNAVAILABLE: Electron BrowserWindow is unavailable');
   }
 
+  const bundle = previewBundle(entryReal);
+  const sdkOrigin: { current?: string } = {};
   const blocked = { count: 0, samples: [] as string[] };
   const partition = `html-preview-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
   const ses = electronSession.fromPartition(partition);
   registerPermissionIsolation(ses);
   try {
-    registerNetworkIsolation(ses, entryRootReal, blocked);
+    registerNetworkIsolation(ses, entryRootReal, blocked, sdkOrigin);
     const downloads: HtmlPreviewDownloadEvidence[] = [];
     ses.on('will-download', (event, item) => {
       const rawUrl = String(item.getURL?.() || '');
@@ -902,6 +987,8 @@ export async function renderResponsiveHtmlPreview(
     const rendered: Array<{
       evidence: HtmlPreviewViewportEvidence;
       screenshot: Buffer;
+      consoleWarnings: string[];
+      sdk?: PreviewSdkEvidence;
       interactions?: RenderInteractionEvidence;
     }> = [];
     const exerciseInteractions = options.interactions !== false;
@@ -913,6 +1000,8 @@ export async function renderResponsiveHtmlPreview(
         viewport,
         index === 0,
         index === 0 && exerciseInteractions,
+        bundle,
+        sdkOrigin,
       ));
     }
 
@@ -920,6 +1009,7 @@ export async function renderResponsiveHtmlPreview(
     const warnings: string[] = [];
     for (const item of rendered) {
       const view = item.evidence;
+      warnings.push(...item.consoleWarnings.map(message => `${view.name}: ${message}`));
       if (view.horizontalOverflowPx > 1) {
         blockers.push(
           `${view.name}: horizontal overflow is ${view.horizontalOverflowPx}px `
@@ -928,6 +1018,9 @@ export async function renderResponsiveHtmlPreview(
       }
       if (view.consoleErrors.length) {
         blockers.push(`${view.name}: ${view.consoleErrors.length} console/runtime error(s)`);
+      }
+      for (const selector of view.ineffectiveTransforms || []) {
+        blockers.push(`${view.name}: CSS transform does not apply to non-replaced inline box: ${selector}`);
       }
       if (view.failedImageCount) {
         blockers.push(`${view.name}: ${view.failedImageCount} image(s) failed to load`);
@@ -959,7 +1052,7 @@ export async function renderResponsiveHtmlPreview(
       blockers.push(`${pageInteractions.keyboard.failures.length} keyboard traversal check(s) failed`);
     }
     const interactionFailureSamples = pageInteractions.failures
-      .slice(0, HTML_PREVIEW_MAX_INTERACTION_FAILURE_SAMPLES)
+      .slice(0, HTML_PREVIEW_MAX_INTERACTION_SAMPLES)
       .map(boundedDiagnostic)
       .filter(Boolean);
     const interactionFailureCount = Math.max(
@@ -968,6 +1061,16 @@ export async function renderResponsiveHtmlPreview(
         : 0,
       pageInteractions.failures.length,
     );
+    const interactionWarningSamples = (pageInteractions.warnings ?? [])
+      .slice(0, HTML_PREVIEW_MAX_INTERACTION_SAMPLES).map(boundedDiagnostic).filter(Boolean);
+    const interactionWarningCount = Math.max(
+      Number.isFinite(pageInteractions.warningCount) ? Math.max(0, Math.floor(pageInteractions.warningCount!)) : 0,
+      (pageInteractions.warnings ?? []).length,
+    );
+    if (pageInteractions.performed && interactionWarningCount) {
+      warnings.unshift(`${interactionWarningCount} interaction check(s) were inconclusive: no observable change. `
+        + 'This does not establish a functional failure; details are in interactions.warnings.');
+    }
     if (pageInteractions.performed && interactionFailureCount) {
       const omittedFailureCount = Math.max(
         0,
@@ -1005,6 +1108,7 @@ export async function renderResponsiveHtmlPreview(
       evidence: {
         ok: blockers.length === 0,
         entryPath: entryAbs,
+        ...(rendered[0]?.sdk ? { sdk: rendered[0].sdk } : {}),
         blockedResourceCount: blocked.count,
         blockedResourceSamples: blocked.samples,
         blockers,
@@ -1022,6 +1126,8 @@ export async function renderResponsiveHtmlPreview(
           ...pageInteractions,
           failureCount: interactionFailureCount,
           failures: interactionFailureSamples,
+          warningCount: interactionWarningCount,
+          warnings: interactionWarningSamples,
           downloads,
         },
       },
@@ -1046,9 +1152,9 @@ const ARTIFACT_SMOKE_VIEWPORTS = [
 /** A few pixels of unreachable content is rounding, not a hidden control. */
 const ARTIFACT_EMBED_CLIP_TOLERANCE_PX = 8;
 
-/** Render an interactive chat artifact and require one observable behavior.
- *  The ordinary HTML preview remains valid for static documents; this stricter
- *  wrapper is only used by create_artifact before its card is exposed. */
+/** Render an interactive chat artifact and require an operable control.
+ *  Bounded playback may not observe its effect; retain that uncertainty as a
+ *  warning. This wrapper runs before create_artifact exposes its card. */
 export async function renderInteractiveHtmlSmoke(
   entryPath: string,
   deps: HtmlPreviewRuntimeDeps = {},
@@ -1104,7 +1210,7 @@ export async function renderInteractiveHtmlSmoke(
     && (interactions.artifactMessagesObserved ?? 0) <= 0
     && interactions.downloads.length <= 0
   ) {
-    blockers.push('interactive artifact smoke observed no visible state change, artifact submission, or download');
+    warnings.unshift('interactive artifact smoke observed no visible state change, artifact submission, or download; functional behavior remains unverified');
   }
   return {
     ...rendered,

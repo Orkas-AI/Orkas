@@ -1,24 +1,26 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: stage-generate
-description_zh: AI 生成视频线的知识——口播/数字人、电影感/AI b-roll：用形象图 + 图生视频保镜头内一致、按分镜逐镜生成再组装成片；「生成为主」产线的核心。
-description_en: Knowledge for the AI-generated-footage line — talking-head / avatar and cinematic / AI b-roll: a character still + image-to-video for in-shot consistency, generate per shot, then assemble; core of the generation-primary line.
+description_zh: AI 视频生成与受约束的语义编辑——使用真实参考输入制作口播、数字人、电影感镜头或直接成片，按需要选择单次生成或多镜头装配。
+description_en: Generate AI video or execute bounded semantic edits using real reference inputs; choose a direct model deliverable or assembled shots for talking heads, avatars and cinematic footage.
 ---
 
 # stage-generate
 
 How to produce AI-generated footage and how to execute a **bounded semantic video edit** already planned by the EDIT/AUTO workflow. Designed HTML remains composition work; deterministic cutting remains stage-edit work. In Orkas use `generate_image`, `generate_video`, and `generate_speech`, then assemble through `stage-edit`. Every billable call belongs to a signed `project/plan.json` generate segment and carries `production_plan_path` plus `production_segment_id`.
 
+Before reference analysis or delivery checks, apply [production-method.md](../video-router/references/production-method.md). Direct model output and a locally assembled montage have different checks even on the same route.
+
 ## Pattern A — talking-head / spokesperson (口播 / 数字人)
 
-1. **Character still:** generate one image of the presenter / avatar with the intended look. **Keep this reference image** and reuse it for every shot of the same character.
+1. **Character reference:** reuse a suitable supplied or completed image/video. Generate a new still only when identity control actually needs one and its distinct paid segment is approved; do not require a new portrait for direct reference-video generation.
 2. **Bring it to life:** generate a video *from* that image (image-to-video). When the provider returns speech + **built-in audio**, that audio is the deliverable voice — it is **lip-synced to the mouth in the clip** — so keep it and do NOT synthesize a separate narration. Only when the clip comes back **silent** do you synthesize the narration (`generate_speech`) and add it as the audio track. Synthesizing a fresh TTS track over a clip that already speaks is the #1 talking-head defect: the new audio has different wording/timing/length, so the voice no longer matches the lips.
-3. **Polish:** add captions / a lower-third / a hook by authoring a small composition (composition skill) and overlaying it onto the clip — **visual-only**. Preserve the clip's own (lip-synced) audio through assembly; a captions composition must not carry a narration `<audio>` track that would replace the clip's voice.
+3. **Optional local polish (`is_generation:false`):** only when requested/planned, add captions / a lower-third / a hook by authoring a small composition (composition skill) and overlaying it onto the clip — **visual-only**. Preserve the clip's own (lip-synced) audio through assembly; a captions composition must not carry a narration `<audio>` track that would replace the clip's voice.
 
 ## Pattern B — cinematic / AI b-roll montage
 
 1. **Storyboard** the shots (each: prompt, camera motion, duration).
-2. **Generate each shot** (one generate-video call per shot; reuse a shared reference image / consistent style prompt for visual continuity).
+2. **Choose the necessary requests:** one model clip can contain multiple shots. Split into separate calls only when duration or independent control requires it; reuse actual reference inputs for continuity. A locally joined montage is `is_generation:false`.
 3. **Assemble:** concatenate the shots in order, add transitions, and overlay a title / captions from a composition.
 
 ## Consistency (basic — deep consistency is a later capability)
@@ -33,8 +35,8 @@ Craft calls specific to AI-generated footage, on top of the shared craft referen
 
 **Talking-head / spokesperson**
 - Understand what's said before placing overlays; time graphics to the spoken words.
-- **3–6 overlays/min**, varied types; keep them in speaker-safe zones — never over the face.
-- Cut silences and filler; for vertical, keep subtitles low so they don't cover the face.
+- For planned local overlays, **3–6 overlays/min**, varied types; keep them in speaker-safe zones — never over the face.
+- For planned local editing, cut silences and filler; for vertical, keep subtitles low so they do not cover the face. Do not introduce local editing as mandatory polish for a direct model deliverable.
 
 **Cinematic / AI b-roll**
 - Open on a hero frame; keep a small transition palette (cut / fade-to-black / slow dissolve / restrained push-in).

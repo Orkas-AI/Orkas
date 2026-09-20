@@ -114,6 +114,88 @@ describe('connector_setup', () => {
     expect(stageConfigure).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['es', ['pedidos', 'facturas', 'inventario', 'informes']],
+    ['fr', ['commandes', 'factures', 'stocks', 'rapports']],
+    ['ko', ['주문', '청구서', '재고', '보고서']],
+    ['de', ['Bestellungen', 'Rechnungen', 'Lagerbestand', 'Berichte']],
+    ['ru', ['заказы', 'счета', 'запасы', 'отчёты']],
+    ['it', ['ordini', 'fatture', 'scorte', 'rapporti']],
+  ] as const)('discovers connector families from authored %s descriptions and variant copy without starting setup', async (language, queries) => {
+    const stageConfigure = vi.fn(() => ({ ok: true as const }));
+    const catalog = [
+      entry({ id: 'direct', [`description_${language}`]: queries[0] }),
+      entry({ id: 'related-parent' }),
+      entry({ id: 'related-child', catalog_parent_id: 'related-parent', [`description_${language}`]: queries[1] }),
+      entry({ id: 'variant-parent', connection_variants: [{
+        catalog_id: 'variant-child', label_zh: '子连接', label_en: 'Child connection',
+        [`label_${language}`]: queries[2], [`description_${language}`]: queries[3],
+      }] }),
+    ];
+    const tool = buildConnectorSetupTool({
+      uid: 'u1', language, stageConfigure,
+      dependencies: { catalog: () => catalog, instances: () => [], enabledSnapshot: () => ({ connectors: {} }) },
+    });
+    for (const [query, expectedId] of [
+      [queries[0], 'direct'], [queries[1], 'related-parent'],
+      [queries[2], 'variant-parent'], [queries[3], 'variant-parent'],
+    ]) {
+      const output = await run(tool, { operation: 'search', query });
+      expect(output.result.results.map((item: { connector_id: string }) => item.connector_id)).toEqual([expectedId]);
+    }
+    expect(stageConfigure).not.toHaveBeenCalled();
+  });
+
+  it('keeps existing related-description search ordering when new translations have different lengths', async () => {
+    const parent = (id: string, descriptionFr: string) => entry({
+      id, display_name: 'Catalog', description_fr: descriptionFr,
+    });
+    const child = (prefix: string) => entry({
+      id: `${prefix}-child`, catalog_parent_id: `${prefix}-parent`, description_en: 'Ledger',
+    });
+    const tool = buildConnectorSetupTool({
+      uid: 'u1', language: 'en', stageConfigure: vi.fn(() => ({ ok: true as const })),
+      dependencies: {
+        catalog: () => [parent('bb-parent', 'Court'), child('bb'), parent('aa-parent', 'Une description française beaucoup plus longue'), child('aa')],
+        instances: () => [], enabledSnapshot: () => ({ connectors: {} }),
+      },
+    });
+    const output = await run(tool, { operation: 'search', query: 'Ledger' });
+    expect(output.result.results.map((item: { connector_id: string }) => item.connector_id)).toEqual(['aa-parent', 'bb-parent']);
+  });
+
+  it.each(['rakuten-rms', 'colorme-shop', 'base-shop', 'qoo10-japan', 'futureshop', 'yahoo-shopping'])(
+    'provides the exact %s setup guide and Commander handoff before authorization', async id => {
+      const candidate = CONNECTOR_CATALOG.find(row => row.id === id)!;
+      const bindAssistance = vi.fn(async () => {});
+      const stageConfigure = vi.fn(() => ({ ok: true as const }));
+      const openGuide = vi.fn(async () => ({ ok: true }));
+      const tool = buildConnectorSetupTool({ uid: 'u1', language: 'en', bindAssistance, stageConfigure, openGuide,
+        dependencies: { catalog: () => CONNECTOR_CATALOG, instances: () => [], enabledSnapshot: () => ({ connectors: {} }) } });
+      const inspected = await run(tool, { operation: 'inspect', connector_id: id });
+      expect(inspected.result).toMatchObject({ ok: true, guidance: connectorSetupGuidance(), connector: {
+        connector_id: id, requires_extra_configuration: true, setup_guide: { available: true, id },
+        connection: { configured: false, status: 'not_configured' },
+      } });
+      expect(openGuide).not.toHaveBeenCalled();
+      expect(bindAssistance).not.toHaveBeenCalled();
+      if (id === 'colorme-shop') {
+        expect(inspected.result.connector.protected_fields).toEqual([]);
+        expect(inspected.result.connector.setup_guide.content).toContain('must be installed');
+      } else {
+        expect(inspected.result.connector.protected_fields.every(field => field.help)).toBe(true);
+      }
+      const started = await run(tool, { operation: 'start', connector_id: id });
+      expect(started.result).toMatchObject({ status: 'setup_card_staged', web_assist: { opened: true }, connector: {
+        connection: { configured: false, status: 'not_configured' },
+      } });
+      expect(bindAssistance).toHaveBeenCalledExactlyOnceWith(id);
+      expect(stageConfigure).toHaveBeenCalledExactlyOnceWith(id);
+      expect(openGuide).toHaveBeenCalledExactlyOnceWith({ connectorId: id,
+        url: candidate.connection_setup!.guide_url, label: candidate.display_name });
+    },
+  );
+
   it.each(['not_configured', 'disconnected', 'connected'] as const)(
     'offers only the connection entry for simple OAuth (%s), without complex setup or false verification', async state => {
       const candidate = CONNECTOR_CATALOG.find(item => item.id === 'notion')!;
@@ -656,4 +738,18 @@ describe('connector_setup', () => {
       wait_condition: 'text', text: longText,
     }));
   });
+});
+
+
+it('keeps model configuration inspection and status results free of private fields', async () => {
+  const candidate = CONNECTOR_CATALOG.find(item => item.id === 'notion')!;
+  const tool = buildConnectorSetupTool({ uid: 'u1', language: 'en', dependencies: {
+    catalog: () => [candidate], instances: () => [], enabledSnapshot: () => ({ connectors: {} }),
+  } });
+  const inspected = await run(tool, { operation: 'inspect', connector_id: 'notion' });
+  const status = await run(tool, { operation: 'status', connector_id: 'notion' });
+  expect(inspected.isError).toBeFalsy();
+  expect(status.isError).toBeFalsy();
+  const output = JSON.stringify([inspected.result, status.result]);
+  expect(output).not.toMatch(/entry_point|telemetry|account|credit/i);
 });

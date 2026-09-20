@@ -182,6 +182,27 @@ describe('session-store.evictEphemeralSession (post-run cache eviction)', () => 
     expect(store._cacheHas('gconv-evict001')).toBe(true);
   });
 
+  it('keeps failed saves through cleanup and account switching, then releases the saved instance', async () => {
+    const store = await import('../../../src/main/model/core-agent/session-store');
+    const users = await import('../../../src/main/features/users');
+    const id = 'anon-unsaved';
+    const session = await store.getSession(id);
+    const file = session.getSessionFile();
+    fs.mkdirSync(file);
+    session.addUserMessage('retained pending request');
+    store.evictEphemeralSession(uid, id);
+    expect(store._cacheHas(id)).toBe(true);
+    users.activateUser('different-save-owner');
+    expect(await store.getSession(id)).not.toBe(session);
+    users.activateUser(uid);
+    expect(await store.getSession(id)).toBe(session);
+    fs.rmdirSync(file);
+    await session.flushPending();
+    store.evictEphemeralSession(uid, id);
+    expect(store._cacheHas(id)).toBe(false);
+    expect((await store.getSession(id)).getMessages()).toEqual(session.getMessages());
+  });
+
   it('covers every ephemeral kind and tolerates non-cached ids', async () => {
     const store = await import('../../../src/main/model/core-agent/session-store');
     for (const id of [

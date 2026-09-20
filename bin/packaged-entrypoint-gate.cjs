@@ -128,6 +128,11 @@ const PACKAGED_BIN_HELPERS = Object.freeze([
   'marketplace-seller-api.cjs',
   'storefront-admin-api.cjs',
   'merchant-platform-api.cjs',
+  'rakuten-rms-api.cjs',
+  'base-shop-api.cjs',
+  'qoo10-japan-api.cjs',
+  'futureshop-api.cjs',
+  'yahoo-shopping-api.cjs',
   'magento-admin-api.cjs',
   'temu-seller-api.cjs',
   'lazada-seller-api.cjs',
@@ -177,6 +182,12 @@ const PACKAGED_MCP_RUNTIME_UNPACK_GLOBS = Object.freeze([
   'node_modules/fast-uri/**/*',
   'node_modules/json-schema-traverse/**/*',
   'node_modules/undici/**/*',
+  'node_modules/fast-xml-parser/**/*',
+  'node_modules/fast-xml-builder/**/*',
+  'node_modules/@nodable/entities/**/*',
+  'node_modules/path-expression-matcher/**/*',
+  'node_modules/strnum/**/*',
+  'node_modules/xml-naming/**/*',
 ]);
 
 const PACKAGED_MCP_RUNTIME_FILES = Object.freeze([
@@ -215,6 +226,16 @@ const PACKAGED_MCP_RUNTIME_FILES = Object.freeze([
     entries: ['index.js'],
   },
   { lockPath: 'node_modules/undici', packageName: 'undici', entries: ['index.js'] },
+  { lockPath: 'node_modules/fast-xml-parser', packageName: 'fast-xml-parser', entries: ['lib/fxp.cjs'] },
+  { lockPath: 'node_modules/fast-xml-builder', packageName: 'fast-xml-builder', entries: ['lib/fxb.cjs'] },
+  // fast-xml-parser's shipped lib/fxp.cjs bundles its ESM-only dependencies
+  // (@nodable/entities, strnum, xml-naming), so they never load at runtime, but
+  // the packaged files must still parse as the modules their package.json
+  // declares; the verifier reads that `type` instead of assuming CommonJS.
+  { lockPath: 'node_modules/@nodable/entities', packageName: '@nodable/entities', entries: ['src/index.js'] },
+  { lockPath: 'node_modules/path-expression-matcher', packageName: 'path-expression-matcher', entries: ['lib/pem.cjs'] },
+  { lockPath: 'node_modules/strnum', packageName: 'strnum', entries: ['strnum.js'] },
+  { lockPath: 'node_modules/xml-naming', packageName: 'xml-naming', entries: ['src/index.js'] },
 ]);
 
 function slash(value) {
@@ -246,6 +267,46 @@ function assertCommonJsSyntax(label, file) {
     new vm.Script(Module.wrap(source), { filename: file });
   } catch (err) {
     throw new Error(`[packaged-entrypoint-gate] invalid ${label} syntax: ${file}: ${err.message}`);
+  }
+}
+
+// Module format the way Node resolves it: the extension wins, then the nearest
+// package.json `type` between the entry and the package root (a `dist/cjs`
+// scope inside a `type: module` package stays CommonJS). Defaults to CommonJS.
+function packagedModuleFormat(packageDir, entry) {
+  if (entry.endsWith('.mjs')) return 'esm';
+  if (entry.endsWith('.cjs')) return 'cjs';
+  let dir = path.dirname(entry);
+  const root = path.resolve(packageDir);
+  while (true) {
+    const manifest = path.join(dir, 'package.json');
+    if (fs.existsSync(manifest)) {
+      try {
+        const type = JSON.parse(fs.readFileSync(manifest, 'utf8')).type;
+        if (type === 'module') return 'esm';
+        if (type === 'commonjs') return 'cjs';
+      } catch {
+        return 'cjs';
+      }
+    }
+    if (path.resolve(dir) === root) return 'cjs';
+    const parent = path.dirname(dir);
+    if (parent === dir) return 'cjs';
+    dir = parent;
+  }
+}
+
+// An ES module cannot be wrapped as CommonJS (`export` is a syntax error there).
+// `node --check` resolves the module format from the package's own
+// `package.json`, which the packaged payload ships beside the entry.
+function assertEsModuleSyntax(label, file) {
+  const result = spawnSync(process.execPath, ['--check', file], {
+    encoding: 'utf8',
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+  });
+  if (result.error || result.status !== 0) {
+    const detail = result.error ? result.error.message : String(result.stderr || '').trim().split('\n').slice(-1)[0];
+    throw new Error(`[packaged-entrypoint-gate] invalid ${label} syntax: ${file}: ${detail}`);
   }
 }
 
@@ -395,6 +456,7 @@ function verifySourceEntrypointContract(projectRoot) {
   verifyBuildFilesConfig(packageJson.build);
   verifyRuntimeConsumerReferences(projectRoot);
   const packageLock = readJson('package-lock.json', path.join(projectRoot, 'package-lock.json'));
+  require('./packaged-dependency-gate.cjs').verifyNodeRuntimeBuildConfig(packageJson, packageLock);
   for (const spec of PACKAGED_JS_LOADER_FILES) packageLockVersion(packageLock, spec.packageName);
   for (const spec of PACKAGED_MCP_RUNTIME_FILES) packageLockPathVersion(packageLock, spec.lockPath);
   return expected;
@@ -569,7 +631,9 @@ function verifyPackagedEntrypointPayload(pcRoot, options = {}) {
     for (const relativeEntry of spec.entries) {
       const entry = path.join(packageDir, ...relativeEntry.split('/'));
       requiredFile(`${spec.packageName} runtime ${relativeEntry}`, entry);
-      assertCommonJsSyntax(`${spec.packageName} runtime ${relativeEntry}`, entry);
+      const format = spec.format || packagedModuleFormat(packageDir, entry);
+      if (format === 'esm') assertEsModuleSyntax(`${spec.packageName} runtime ${relativeEntry}`, entry);
+      else assertCommonJsSyntax(`${spec.packageName} runtime ${relativeEntry}`, entry);
     }
     verified.push(`mcp-runtime:${spec.lockPath}`);
   }

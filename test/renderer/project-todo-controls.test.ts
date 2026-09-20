@@ -356,14 +356,14 @@ describe('project to-do controls', () => {
     });
   });
 
-  it('edits a title through the shared editor and still creates through it', async () => {
+  it('edits full content through the shared editor and still creates through it', async () => {
     const invocations: Array<{ channel: string; payload: Record<string, any> }> = [];
     const listeners: Record<string, (event: any) => Promise<void>> = {};
     let currentTask: Record<string, unknown> = {
-      id: 't_edit123abcd', title: 'Old title', detail: 'Legacy detail stays intact', status: 'todo',
+      id: 't_edit123abcd', content: 'Old content\nFull requirements', status: 'todo',
     };
     const editor = { hidden: true };
-    const input = { value: '', maxLength: 200, dataset: {}, focus() {}, setSelectionRange() {}, addEventListener() {} };
+    const input = { value: '', maxLength: 4000, dataset: {}, focus() {}, setSelectionRange() {}, addEventListener() {} };
     const elements: Record<string, any> = {
       'project-todo-list': {
         dataset: {},
@@ -403,8 +403,8 @@ describe('project to-do controls', () => {
           async invoke(channel: string, payload: Record<string, any>) {
             invocations.push({ channel, payload });
             if (channel === 'projects.tasks.list') return { ok: true, tasks: [{ ...currentTask }] };
-            if (channel === 'projects.tasks.update' && typeof payload.title === 'string') {
-              currentTask = { ...currentTask, title: payload.title, ...(payload.status ? { status: payload.status } : {}) };
+            if (channel === 'projects.tasks.update' && typeof payload.content === 'string') {
+              currentTask = { ...currentTask, content: payload.content, ...(payload.status ? { status: payload.status } : {}) };
             }
             return { ok: true };
           },
@@ -431,23 +431,23 @@ describe('project to-do controls', () => {
       },
     };
 
-    // Clicking the card title opens the shared editor directly; the restored
+    // Clicking the card content opens the shared editor directly; the restored
     // overflow menu remains a separate explicit target.
     await listeners.click({ target: editTarget });
     expect(editor.hidden).toBe(false);
-    expect(input.value).toBe('Old title');
+    expect(input.value).toBe('Old content\nFull requirements');
 
-    // A background run advances while the title editor is open. Saving the
-    // title must preserve that newer status when the status field was untouched.
+    // A background run advances while the content editor is open. Saving the
+    // content must preserve that newer status when the status field was untouched.
     currentTask = { ...currentTask, status: 'progress' };
-    input.value = 'New title';
+    input.value = 'New content\nFull requirements';
     await context._saveProjectTodoEditor();
     const updates = invocations.filter((call) => call.channel === 'projects.tasks.update');
     expect(updates).toHaveLength(1);
-    expect(updates[0].payload).toMatchObject({ projectId: 'p_test', taskId: 't_edit123abcd', title: 'New title' });
+    expect(updates[0].payload).toMatchObject({ projectId: 'p_test', taskId: 't_edit123abcd', content: 'New content\nFull requirements' });
     expect(updates[0].payload.detail).toBeUndefined();
     expect(editor.hidden).toBe(true);
-    expect(currentTask).toMatchObject({ title: 'New title', detail: 'Legacy detail stays intact', status: 'progress' });
+    expect(currentTask).toMatchObject({ content: 'New content\nFull requirements', status: 'progress' });
 
     // Opening with no task is still create mode — Save creates, not updates.
     context._openProjectTodoEditor();
@@ -455,7 +455,7 @@ describe('project to-do controls', () => {
     await context._saveProjectTodoEditor();
     const creates = invocations.filter((call) => call.channel === 'projects.tasks.create');
     expect(creates).toHaveLength(1);
-    expect(creates[0].payload).toMatchObject({ projectId: 'p_test', title: 'Fresh task' });
+    expect(creates[0].payload).toMatchObject({ projectId: 'p_test', content: 'Fresh task' });
     expect(invocations.filter((call) => call.channel === 'projects.tasks.update')).toHaveLength(1);
   });
 
@@ -517,7 +517,7 @@ describe('project to-do controls', () => {
     await context._saveProjectTodoEditor();
     const creates = invocations.filter((c) => c.channel === 'projects.tasks.create');
     expect(creates).toHaveLength(1);
-    expect(creates[0].payload).toMatchObject({ projectId: 'p_test', title: 'Task with file', taskId: draftTid });
+    expect(creates[0].payload).toMatchObject({ projectId: 'p_test', content: 'Task with file', taskId: draftTid });
   });
 
   it('uploads a picked file through the input change handler (survives the value reset)', async () => {

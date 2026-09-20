@@ -94,6 +94,7 @@ class FakeElement {
 
 function loadFormModule() {
   const context: any = {
+    selects: [],
     console,
     Date,
     JSON,
@@ -125,13 +126,18 @@ function loadFormModule() {
       const trigger = new FakeElement('button');
       trigger.className = 'ai-select-trigger';
       host.appendChild(trigger);
-      return {
-        setOptions: (options: Array<{ value: string }>, state: { value?: string } = {}) => {
-          value = state.value || options[0]?.value || '';
+      const api = {
+        options: [] as Array<{ value: string; label?: string }>,
+        setOptions: (options: Array<{ value: string; label?: string }>, state: { value?: string } = {}) => {
+          api.options = options;
+          value = typeof state.value === 'string' ? state.value : '';
         },
+        setValue: (next: string) => { value = next; },
         getValue: () => value,
         onChange: () => {},
       };
+      context.selects.push(api);
+      return api;
     },
     window: {},
   };
@@ -153,6 +159,83 @@ const baseMessage = {
 };
 
 describe('chat input form widget', () => {
+  describe('PC unanswered values', () => {
+    it('requires actual answers for missing typed values and preserves zero and false', async () => {
+      const context = loadFormModule();
+      const container = new FakeElement('div');
+      const submissions: any[] = [];
+      const form = { form_id: 'typed1234', agent_id: 'writer', fields: [
+        { id: 'count', label: 'Count', type: 'number', required: true, min: 0 },
+        { id: 'confirmed', label: 'Confirmed', type: 'boolean', required: true },
+        { id: 'choice', label: 'Choice', type: 'select', required: true, options: [{ value: 'a', label: 'A' }] },
+      ] };
+      context.window.renderChatInputForm(container, { form }, {
+        cid: 'typed', onSubmit: (_text: string, values: unknown) => submissions.push(values),
+      });
+      const submit = container.querySelectorAll('button').find(b => b.textContent === 'Submit')!;
+      await submit.dispatch('click');
+      expect(submissions).toEqual([]);
+      expect(container.querySelectorAll('input')[0].value).toBe('');
+      expect(context.selects).toHaveLength(2);
+      container.querySelectorAll('input')[0].value = '0';
+      context.selects[1].setValue('a');
+      await submit.dispatch('click');
+      expect(submissions).toEqual([]);
+      context.selects[0].setValue('false');
+      // A normal edit saves all current answers. Rerendering must retain an
+      // explicit false, rather than treating it as an unanswered question.
+      await container.querySelectorAll('input')[0].dispatch('input');
+      const rerendered = new FakeElement('div');
+      context.window.renderChatInputForm(rerendered, { form }, {
+        cid: 'typed', onSubmit: (_text: string, values: unknown) => submissions.push(values),
+      });
+      expect(rerendered.querySelectorAll('input')[0].value).toBe('0');
+      expect(context.selects[2].getValue()).toBe('false');
+      await rerendered.querySelectorAll('button').find(b => b.textContent === 'Submit')!.dispatch('click');
+      expect(submissions).toEqual([{ count: 0, confirmed: false, choice: 'a' }]);
+    });
+
+    it('does not restore a cleared numeric default or convert an optional blank to zero', async () => {
+      const context = loadFormModule();
+      const container = new FakeElement('div');
+      const submissions: any[] = [];
+      const form = { form_id: 'number1234', agent_id: 'writer', fields: [
+        { id: 'count', label: 'Count', type: 'number', required: true, default: 4, min: 0 },
+        { id: 'optional', label: 'Optional', type: 'number' },
+      ] };
+      context.window.renderChatInputForm(container, { form }, {
+        cid: 'numbers', onSubmit: (_text: string, values: unknown) => submissions.push(values),
+      });
+      const number = container.querySelectorAll('input')[0];
+      const submit = container.querySelectorAll('button').find(b => b.textContent === 'Submit')!;
+      for (const value of ['', 'Infinity', '-1']) {
+        number.value = value;
+        await submit.dispatch('click');
+        expect(submissions).toEqual([]);
+      }
+      number.value = '0';
+      await submit.dispatch('click');
+      expect(submissions).toEqual([{ count: 0, optional: null }]);
+    });
+
+    it('preserves declared defaults while leaving an optional boolean unanswered', async () => {
+      const context = loadFormModule();
+      const container = new FakeElement('div');
+      const submissions: any[] = [];
+      context.window.renderChatInputForm(container, { form: {
+        form_id: 'defaults1234', agent_id: 'writer', fields: [
+          { id: 'count', label: 'Count', type: 'number', required: true, default: 0 },
+          { id: 'confirmed', label: 'Confirmed', type: 'boolean', required: true, default: false },
+          { id: 'choice', label: 'Choice', type: 'select', default: 'b', options: [{ value: 'a' }, { value: 'b' }] },
+          { id: 'unknown', label: 'Unknown', type: 'boolean' },
+        ],
+      } }, { cid: 'defaults', onSubmit: (_text: string, values: unknown) => submissions.push(values) });
+      await container.querySelectorAll('button').find(b => b.textContent === 'Submit')!.dispatch('click');
+      expect(submissions).toEqual([{ count: 0, confirmed: false, choice: 'b', unknown: null }]);
+    });
+
+  });
+
   it('blocks required empty text fields before submit', () => {
     const context = loadFormModule();
     const container = new FakeElement('div');

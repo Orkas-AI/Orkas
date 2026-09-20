@@ -1,3 +1,6 @@
+import { fitHistoryTextSuffix } from '../../util/history-text-window';
+import { projectHistoryMediaText } from '../../util/history-media';
+import { estimateBudgetTokenQuarters } from '../../util/token-estimate';
 /** Group-chat message schema and canonical model-history projection. */
 
 import type { Message } from '#core-agent';
@@ -8,7 +11,7 @@ import { COMMANDER_ID, USER_ID } from './state';
  * the serialized dialogue shape changes so persisted session tails and shared
  * summaries rebuild from the canonical JSONL instead of retaining an older
  * prompt-visible format. */
-export const GROUP_HISTORY_SOURCE_VERSION = 5;
+export const GROUP_HISTORY_SOURCE_VERSION = 8;
 
 export function groupConversationHistorySource(cid: string, actorId = COMMANDER_ID): string {
   const source = `group-main-v${GROUP_HISTORY_SOURCE_VERSION}:${cid}`;
@@ -76,6 +79,9 @@ export interface GroupMessage {
   id: string;
   /** ISO timestamp. */
   ts: string;
+  /** Host receipt time for user-supplied local import sources. Optional for
+   * legacy records; unlike the display timestamp, retains milliseconds. */
+  received_at_ms?: number;
   /** Sender actor id. */
   from: string;
   /** Recipient actor ids (resolved by router). */
@@ -141,7 +147,7 @@ export interface GroupMessage {
    * a fenced agent-input-form block. */
   form?: import('./router').ChatFormPayload;
   /** CLI-native non-blocking questions, independent of the terminal reply. */
-  cli_question?: { questions: import('../local_agents/backends/base').LocalCliAsyncQuestion[] };
+  cli_question?: { questions: import('../local_agents/backends/base').LocalCliAsyncQuestion[]; cancelled?: boolean };
   /** Exact question-message identity and user-authored answers. */
   cli_answer?: { message_id: string; answers: string[] };
   /** Quick-created / quick-edited agent meta — populated when the commander's
@@ -460,11 +466,11 @@ function commanderHistoryRecordText(
   // already in the user role. Actor replies carry no attribution line here;
   // the host routing record in the turn's user message owns that. The caller
   // also keeps other actors' bodies and dispatch briefs in that data block.
-  return [
+  return projectHistoryMediaText([
     ...(record.actor_id === USER_ID ? commanderHistoryAttribution(record) : []),
     body,
     ...details,
-  ].filter(Boolean).join('\n');
+  ].filter(Boolean).join('\n'));
 }
 
 /**
@@ -600,23 +606,21 @@ export function buildGroupConversationHistoryTail(
 export const buildCommanderConversationHistoryTail = buildGroupConversationHistoryTail;
 
 /** Full canonical rebuilds replay at most this many completed user turns
- * verbatim. A named actor first dispatched late in a long conversation used to
+ * before token fitting. A named actor first dispatched late in a long conversation used to
  * have the whole log replayed into its fresh session — first-round input grew
  * linearly with conversation length and was paid again by every late-joining
  * actor (2026-08-21 task-execution review TX-3). The omitted prefix becomes
  * one deterministic note pair; global user-turn ordinals are preserved, so the
  * checkpoint tail boundary and the incremental path are unaffected. */
-export const FULL_REBASE_MAX_PRIOR_TURNS = 40;
+export const FULL_REBASE_MAX_PRIOR_TURNS = 5;
 
-/** Hard pre-compaction ceiling for a canonical full rebuild. The ordinary
- * Session token budgets still summarize below/after this boundary; this byte
- * cap prevents a few unusually large completed turns from reaching session
- * replacement, persistence, or the summarizer as an unbounded prefix. It
- * excludes the current triggering message, which the runner adds separately. */
-export const FULL_REBASE_MAX_BYTES = 200 * 1024;
+/** Fixed estimated-token ceiling including message framing and omission note.
+ * Mirrors Session's recent-history policy without importing the ESM runtime
+ * before SDK initialization. The owning contract test pins both defaults. */
+export const FULL_REBASE_MAX_TOKENS = 30_000;
 
-function fullRebaseSerializedBytes(messages: readonly Message[]): number {
-  return Buffer.byteLength(JSON.stringify(messages), 'utf8');
+function fullRebaseEstimatedTokens(messages: readonly Message[]): number {
+  return Math.ceil(estimateBudgetTokenQuarters(JSON.stringify(messages)) / 4);
 }
 
 function fullRebaseTurnGroups(messages: readonly Message[]): Message[][] {
@@ -648,7 +652,7 @@ function fullRebaseOmissionNote(
         type: 'text',
         text: `${HOST_CONTEXT_NOTE_PREFIX} ${omittedRows.length} earlier messages`
           + ` across ${omittedTurns} earlier user turns${span} are not replayed`
-          + ' here. The dispatch brief and referenced files carry the task'
+          + ` here (last omitted message_id=${omittedRows.at(-1)?.id || 'unavailable'}). The dispatch brief and referenced files carry the task`
           + ' inputs. If an omitted detail is required, read it with the'
           + ' chat_history tool when available, or ask for it; do not guess'
           + ' omitted content.',
@@ -666,9 +670,9 @@ function fullRebaseOmissionNote(
 }
 
 /** Project a full canonical rebuild through two independent pre-compaction
- * limits: at most 40 recent completed user turns, then at most 200 KiB of
- * serialized provider history. The byte pass removes only complete oldest
- * turns and includes its one omission note in the ceiling. The current user
+ * limits: at most 5 recent completed user turns, then at most 30,000 estimated tokens of
+ * serialized provider history. The token pass crops oldest text, retaining a
+ * partial boundary message and counting omission markers inside the ceiling. The current user
  * message is outside this projection, while retained global turn ids keep the
  * Session checkpoint and later token compaction semantics unchanged. */
 export function projectFullRebaseMessages(
@@ -683,7 +687,7 @@ export function projectFullRebaseMessages(
   // Deleted user rows still count: the projector advances its user ordinal on
   // every prior `from === user` row, so the cut must count the same way.
   const priorUserRows = priorRows.filter((message) => message.from === USER_ID);
-  let omittedTurns = Math.max(0, priorUserRows.length - FULL_REBASE_MAX_PRIOR_TURNS);
+  const omittedTurns = Math.max(0, priorUserRows.length - FULL_REBASE_MAX_PRIOR_TURNS);
   const keptStart = omittedTurns > 0 ? rows.indexOf(priorUserRows[omittedTurns]) : 0;
   const projected = omittedTurns > 0
     ? buildGroupConversationHistoryTail(
@@ -697,19 +701,26 @@ export function projectFullRebaseMessages(
     : buildGroupConversationHistory(rows, currentMsgId, actorNames, formatReferences, actorId);
   const groups = fullRebaseTurnGroups(projected);
 
-  let result = omittedTurns > 0
-    ? [...fullRebaseOmissionNote(priorRows, priorUserRows, omittedTurns), ...projected]
-    : projected;
-  while (groups.length > 0 && fullRebaseSerializedBytes(result) > FULL_REBASE_MAX_BYTES) {
-    const removed = groups.shift()!;
-    omittedTurns = Math.max(
-      omittedTurns,
-      ...removed.map((message) => message.turnId ?? 0),
-    );
-    result = [
-      ...fullRebaseOmissionNote(priorRows, priorUserRows, omittedTurns),
-      ...groups.flat(),
-    ];
-  }
-  return result;
+  const entries = groups.flatMap((messages, group) => messages.flatMap((message, row) =>
+    message.content.flatMap((block, column) => block.type === 'text'
+      ? [{ group, row, column, text: block.text }] : [])));
+  return fitHistoryTextSuffix<Message[]>(entries.map(entry => entry.text), FULL_REBASE_MAX_TOKENS, (first, boundaryText) => {
+    const boundary = entries[first];
+    const keptGroups = boundary ? groups.slice(boundary.group) : [];
+    const droppedTurns = boundary
+      ? Math.max(omittedTurns, (keptGroups[0][0].turnId ?? 1) - 1)
+      : priorUserRows.length;
+    const prefix = droppedTurns > 0 ? fullRebaseOmissionNote(priorRows, priorUserRows, droppedTurns) : [];
+    const messages = keptGroups.flatMap((rows, groupOffset) => rows.map((message, row) => {
+      if (groupOffset !== 0 || !boundary || row > boundary.row) return message;
+      // Keep the user/assistant envelopes and global turn id for Session's
+      // canonical rebuild, even when only the reply survives the text cut.
+      const content = row < boundary.row
+        ? (message.role === 'user' ? [{ type: 'text' as const, text: '[Earlier history text omitted]' }] : [])
+        : message.content.slice(boundary.column).map((block, index) =>
+        index === 0 && block.type === 'text' && boundaryText !== undefined ? { ...block, text: boundaryText } : block);
+      return { ...message, content };
+    }));
+    return [...prefix, ...messages];
+  }, fullRebaseEstimatedTokens, []);
 }

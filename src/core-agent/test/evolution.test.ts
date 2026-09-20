@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -559,6 +559,40 @@ describe("Evolution: skill_manage tool", () => {
     }, ctx);
 
     expect(created).toEqual(["hooked"]);
+  });
+
+  it("read waits for its metadata write before releasing the tool", async () => {
+    await store.create({ id: "read-drain", name: "Read", description: "Test", body: "body" });
+    let release!: () => void;
+    let started!: () => void;
+    const ready = new Promise<void>((resolve) => { started = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const touch = vi.spyOn(store, "touch").mockImplementation(async () => { started(); await gate; });
+    let returned = false;
+    const read = tool.execute({ action: "read", id: "read-drain" }, ctx).then((value) => { returned = true; return value; });
+    try {
+      await ready;
+      await Promise.resolve();
+      expect(returned).toBe(false);
+    } finally { release(); touch.mockRestore(); }
+    expect((await read).content).toContain("body");
+  });
+
+  it("create waits for asynchronous agent membership updates", async () => {
+    let release!: () => void;
+    let started!: () => void;
+    const ready = new Promise<void>((resolve) => { started = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const toolWithCb = createSkillManageTool(store, async () => { started(); await gate; });
+    let returned = false;
+    const create = toolWithCb.execute({ action: "create", id: "create-drain", name: "Create", description: "Test", body: "body" }, ctx)
+      .then((value) => { returned = true; return value; });
+    try {
+      await ready;
+      await Promise.resolve();
+      expect(returned).toBe(false);
+    } finally { release(); }
+    expect((await create).content).toContain("Skill created");
   });
 
   it("does not fire onCreated callback when create fails validation", async () => {

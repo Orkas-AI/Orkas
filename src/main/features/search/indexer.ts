@@ -1,5 +1,6 @@
+import { historyRecordText } from '../chat-history-records';
 /**
- * In-memory inverted index manager.
+ * Context snapshot and restartable SQLite chat index manager.
  *
  * Lifecycle per idx file:
  *   1. lazy load on first touch (cached in `_cache`)
@@ -9,15 +10,16 @@
  *      re-tokenized, missing files have their docs dropped
  *   4. `flushAll()` is called from app quit
  *
- * Concurrency: per-idx Mutex serializes write paths so two appends to the
- * same conversation can't race the line-count read. Reconciliation also
- * holds the lock so it doesn't see a half-applied upsert.
+ * Chat rebuilds yield between bounded transactions. Live messages remain in
+ * their durable JSONL until catch-up; source revisions guard the ready handoff.
  */
 
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import { Mutex } from 'async-mutex';
+
+import * as chatStore from './chat_store';
 
 import {
   userContextsDir, userChatsDir, projectChatsDir,
@@ -27,6 +29,7 @@ import { conversationMessageReadFile, listProjectIds } from '../../util/project-
 import { getActiveUserId } from '../users';
 import { createLogger } from '../../logger';
 import { logErrorSummary, logPathRef } from '../../util/log-redact';
+import { isBootAdmissionIdle, scheduleBootBackground, type ScheduledBootBackgroundTask } from '../../util/boot_init';
 
 const log = createLogger('search');
 
@@ -91,6 +94,76 @@ const _flushTimers = new Map<string, NodeJS.Timeout>();
 const _locks = new Map<string, Mutex>();
 const _currentContextIndexes = new Set<string>();
 const _currentChatIndexes = new Set<string>();
+const _chatReconcileRuns = new Map<string, Promise<SearchReconcileResult>>();
+const _chatRepairTasks = new Map<string, ScheduledBootBackgroundTask>();
+const _chatRevisions = new Map<string, number>();
+const _dirtyChats = new Map<string, Set<string>>();
+const _migratingChats = new Set<string>();
+const _migrationChecked = new Set<string>();
+let _closing = false;
+
+function _noteChatChange(uid: string, cid?: string): void {
+  _chatRevisions.set(uid, (_chatRevisions.get(uid) || 0) + 1);
+  if (cid) {
+    let dirty = _dirtyChats.get(uid);
+    if (!dirty) { dirty = new Set(); _dirtyChats.set(uid, dirty); }
+    dirty.add(cid);
+  }
+}
+
+function _isMigrating(uid: string): boolean {
+  if (!_migrationChecked.has(uid)) {
+    if (!chatStore.hasCompletedRebuild(uid) && fs.existsSync(userChatsIndexPath(uid))) {
+      _migratingChats.add(uid);
+    }
+    _migrationChecked.add(uid);
+  }
+  return _migratingChats.has(uid);
+}
+
+export function cancelChatIndexRepair(uid: string): void {
+  const task = _chatRepairTasks.get(uid);
+  _chatRepairTasks.delete(uid);
+  task?.cancel();
+}
+
+export function hasPendingChatRepair(uid: string): boolean { return _chatRepairTasks.has(uid); }
+
+/** One idle disk job per account. A partial pass releases its slot before
+ * scheduling the next slice; failures back off instead of spinning. */
+export function scheduleChatIndexRepair(uid: string, delayMs = 250): void {
+  if (_closing || _chatRepairTasks.has(uid)) return;
+  let retry = false;
+  let retryDelay = 1_000;
+  const task = scheduleBootBackground('search:chat-repair', async (signal) => {
+    try {
+      const result = await reconcileChatsIndex(uid, signal, true);
+      retry = !result.complete;
+    } catch (err) {
+      retry = true;
+      retryDelay = 30_000;
+      log.warn('chat repair failed', { error: logErrorSummary(err) });
+    }
+  }, delayMs, { resourceClass: 'disk', preferIdle: true, maxSliceMs: 15_000 });
+  _chatRepairTasks.set(uid, task);
+  void task.promise.finally(() => {
+    if (_chatRepairTasks.get(uid) !== task) return;
+    _chatRepairTasks.delete(uid);
+    if (retry) scheduleChatIndexRepair(uid, retryDelay);
+  });
+}
+
+export async function cleanupLegacyChatIndex(uid: string): Promise<void> {
+  if (!chatStore.hasCompletedRebuild(uid)) return;
+  for (const file of [userChatsIndexPath(uid), `${userChatsIndexPath(uid)}.tmp`]) {
+    try { await fsp.unlink(file); }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        log.warn('legacy chat index cleanup failed', { error: logErrorSummary(err) });
+      }
+    }
+  }
+}
 
 function _getLock(idxPath: string): Mutex {
   let m = _locks.get(idxPath);
@@ -153,9 +226,70 @@ export async function flushOne(idxPath: string): Promise<void> {
 }
 
 export async function flushAll(): Promise<void> {
+  _closing = true;
+  for (const uid of _chatRepairTasks.keys()) cancelChatIndexRepair(uid);
+  await Promise.allSettled([..._chatReconcileRuns.values()]);
+  await drainDeferredChatWrites();
   await Promise.all(Array.from(_cache.keys()).map((p) => flushOne(p).catch((err) => {
     log.warn('flushAll entry failed', { error: logErrorSummary(err) });
   })));
+  // The chat index is a SQLite file now. Its handle has to be released here
+  // too: Windows refuses to unlink an open database, which blocks both a
+  // per-test workspace teardown and an in-place repair.
+  chatStore.closeAllChatStores();
+  _closing = false;
+}
+
+/** Deferred chat upserts, chained per user so the watermark check keeps
+ *  seeing appends in order. The stat + lock inside an upsert means two
+ *  concurrently started writes can reach the index out of order, and a
+ *  non-contiguous index hands the whole file back to the reconciler. */
+const _deferredChatWrites = new Map<string, Promise<void>>();
+
+/**
+ * Index one appended message without holding up its caller.
+ *
+ * The conversation record is durable before this runs, and the index is
+ * derived state that already fails soft and is repaired by
+ * `reconcileChatsIndex`. Awaiting it put a whole-index load (a 241MB
+ * snapshot measured ~950ms to parse on a real profile) in front of the
+ * user's own chat bubble, which is not painted until the append returns.
+ * Outside migration, readers drain the incremental writes queued before them.
+ * During migration the JSONL remains authoritative and search reports partial coverage.
+ */
+export function indexChatMessageDeferred(
+  userId: string,
+  cid: string,
+  msgIndex: number,
+  msg: ChatMessage,
+): void {
+  if (_chatReconcileRuns.has(userId) || _migratingChats.has(userId)) {
+    _noteChatChange(userId, cid);
+    _currentChatIndexes.delete(userId);
+    scheduleChatIndexRepair(userId, 1_000);
+    return;
+  }
+  const key = _chatIdxPath(userId);
+  const previous = _deferredChatWrites.get(key) ?? Promise.resolve();
+  // `indexChatMessage` already absorbs its own failures, so the chain cannot
+  // reject and one bad append cannot strand later ones.
+  const next = previous.then(() => indexChatMessage(userId, cid, msgIndex, msg));
+  _deferredChatWrites.set(key, next);
+  void next.finally(() => {
+    if (_deferredChatWrites.get(key) === next) _deferredChatWrites.delete(key);
+  });
+}
+
+/** Readers settle their account's existing live writes; shutdown drains all.
+ * Migration changes are represented by source files, never waiting promises. */
+export async function drainDeferredChatWrites(userId?: string): Promise<void> {
+  if (userId) {
+    await _deferredChatWrites.get(_chatIdxPath(userId));
+    return;
+  }
+  while (_deferredChatWrites.size) {
+    await Promise.allSettled(Array.from(_deferredChatWrites.values()));
+  }
 }
 
 // ── Index ops (callers must hold the per-idx lock) ───────────────────────
@@ -222,12 +356,7 @@ async function _readJsonl(file: string, signal?: AbortSignal): Promise<ChatMessa
 }
 
 function _msgText(msg: ChatMessage | null | undefined): string {
-  if (!msg) return '';
-  // Group-chat shape (current) wins when present; legacy `content` is the
-  // fallback for older jsonl that predates the bus refactor.
-  if (typeof msg.text === 'string') return msg.text;
-  if (typeof msg.content === 'string') return msg.content;
-  return '';
+  return msg ? historyRecordText(msg, true) : '';
 }
 
 function _msgRole(msg: ChatMessage | null | undefined): string {
@@ -314,6 +443,7 @@ export interface SearchReconcileResult {
   updated: number;
   deleted: number;
   cancelled?: boolean;
+  complete?: boolean;
 }
 
 export async function reconcileContextsIndex(
@@ -511,6 +641,9 @@ export const __searchIndexerTestHooks = {
   contextStatConcurrency: CONTEXT_STAT_CONCURRENCY,
 };
 
+/** Lock key for the chat index. The chat index is `chat_store` now, not a
+ *  file; this only has to be a stable per-user string, and reusing the retired
+ *  path keeps every chat critical section on the one lock it always used. */
 function _chatIdxPath(uid: string): string { return userChatsIndexPath(uid); }
 function _chatJsonlFile(uid: string, cid: string): string {
   return conversationMessageReadFile(uid, cid);
@@ -521,109 +654,125 @@ function _docId(kind: IndexKind, fileKey: string, msgIndex: number): string {
 }
 
 async function _reindexChatFile(
-  idx: RuntimeIndex, fileKey: string, file: string, mtimeMs: number, size: number,
-  signal?: AbortSignal,
+  userId: string, f: ChatFileInfo, shouldStop: () => boolean,
 ): Promise<boolean> {
-  const msgs = await _readJsonl(file, signal);
-  if (!msgs || signal?.aborted) return false;
-  _dropDocsByFileKey(idx, fileKey);
-  for (let i = 0; i < msgs.length; i++) {
-    const m = msgs[i];
-    const text = _msgText(m);
-    if (!text) continue;
-    const doc: Doc = {
-      fileKey, kind: 'chat', msg_index: i, cid: fileKey,
-      role: _msgRole(m), time: _msgTime(m), len: text.length,
-    };
-    _putDoc(idx, _docId('chat', fileKey, i), doc, text);
-    if (i > 0 && i % CPU_YIELD_EVERY === 0) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
+  const revision = _chatRevisions.get(userId) || 0;
+  const msgs = await _readJsonl(f.file);
+  if (!msgs || shouldStop()) return false;
+  // A sync pull or append during the read cannot certify this source snapshot.
+  const stat = await fsp.stat(f.file).catch(() => undefined);
+  if (!stat || stat.mtimeMs !== f.mtime || stat.size !== f.size
+      || revision !== (_chatRevisions.get(userId) || 0)) return false;
+  const cursor = chatStore.readRebuildCursor(userId, f.fileKey);
+  const resume = cursor && cursor.mtime === f.mtime && cursor.size === f.size;
+  let next = resume ? cursor.next : 0;
+  let reset = !resume;
+  do {
+    if (shouldStop() || revision !== (_chatRevisions.get(userId) || 0)) return false;
+    const end = Math.min(next + 16, msgs.length);
+    const docs: chatStore.ChatDocInput[] = [];
+    for (let i = next; i < end; i++) {
+      const m = msgs[i];
+      const text = _msgText(m);
+      if (text) docs.push({ cid: f.fileKey, msgIndex: i, role: _msgRole(m), time: _msgTime(m), text });
     }
+    chatStore.writeRebuildBatch(userId, f.fileKey, docs,
+      { mtime: f.mtime, size: f.size, next: end }, reset, end === msgs.length);
+    reset = false;
+    next = end;
+    // Yield after the actual tokenization/SQLite work, not just after building
+    // an input array. The persisted cursor survives a slice or process exit.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  } while (next < msgs.length);
+  // Sync can replace the file before its completion callback invalidates the
+  // index. Recheck the source after the final yielded batch as well as before it.
+  const finalStat = await fsp.stat(f.file).catch(() => undefined);
+  if (!finalStat || finalStat.mtimeMs !== f.mtime || finalStat.size !== f.size
+      || revision !== (_chatRevisions.get(userId) || 0)) {
+    chatStore.dropFileWatermark(userId, f.fileKey);
+    return false;
   }
-  idx.files[fileKey] = { mtime: mtimeMs, size };
+  _dirtyChats.get(userId)?.delete(f.fileKey);
   return true;
 }
 
-export async function reconcileChatsIndex(
-  userId: string,
-  signal?: AbortSignal,
+/** Coalesce boot, query and sync repairs. Interactive writes never wait on
+ * this promise: while it runs their durable JSONL is the catch-up queue. */
+export function reconcileChatsIndex(
+  userId: string, signal?: AbortSignal, preferIdle = false,
+): Promise<SearchReconcileResult> {
+  const existing = _chatReconcileRuns.get(userId);
+  if (existing) return existing;
+  const run = _reconcileChatsPass(userId, signal, preferIdle);
+  _chatReconcileRuns.set(userId, run);
+  void run.finally(() => {
+    if (_chatReconcileRuns.get(userId) === run) _chatReconcileRuns.delete(userId);
+  }).catch(() => undefined);
+  return run;
+}
+
+async function _reconcileChatsPass(
+  userId: string, signal?: AbortSignal, preferIdle = false,
 ): Promise<SearchReconcileResult> {
   const startedAt = Date.now();
-  const idxPath = _chatIdxPath(userId);
+  const shouldStop = (): boolean => _closing || !!signal?.aborted || (preferIdle && !isBootAdmissionIdle());
+  if (shouldStop()) return { scanned: 0, updated: 0, deleted: 0, cancelled: true, complete: false };
+  if (!chatStore.hasCompletedRebuild(userId)) _migratingChats.add(userId);
+  _currentChatIndexes.delete(userId);
+  // Persist invalidation before any partial batches; a restart must not trust
+  // an old catalog stamp left by an interrupted repair.
+  chatStore.writeSourceStamp(userId, undefined);
+  const revision = _chatRevisions.get(userId) || 0;
   const [sourceStampBefore, scan] = await Promise.all([
-    _chatSourceStamp(userId),
-    _listUserChats(userId, fsp.stat, signal),
+    _chatSourceStamp(userId), _listUserChats(userId, fsp.stat, signal),
   ]);
-  if (!scan.complete || signal?.aborted) {
-    log.info(`chat reconcile cancelled scanned=${scan.files.length} ms=${Date.now() - startedAt}`);
-    return { scanned: scan.files.length, updated: 0, deleted: 0, cancelled: true };
+  if (!scan.complete || shouldStop()) {
+    return { scanned: scan.files.length, updated: 0, deleted: 0, cancelled: true, complete: false };
   }
   let updated = 0;
   let deleted = 0;
   let cancelled = false;
-  let completed = false;
-  await _getLock(idxPath).runExclusive(async () => {
-    if (signal?.aborted) { cancelled = true; return; }
-    const entry = await _getEntry(idxPath, 'chat');
-    const seen = new Set<string>();
-    let dirty = false;
-    const toUpdate: ChatFileInfo[] = [];
-    for (const f of scan.files) {
-      seen.add(f.fileKey);
-      const known = entry.idx.files[f.fileKey];
-      if (known && known.mtime === f.mtime && known.size === f.size) continue;
-      toUpdate.push(f);
+  const seen = new Set(scan.files.map(f => f.fileKey));
+  for (const f of scan.files) {
+    if (shouldStop()) { cancelled = true; break; }
+    const known = chatStore.readFileWatermark(userId, f.fileKey);
+    if (!_dirtyChats.get(userId)?.has(f.fileKey)
+        && known && known.mtime === f.mtime && known.size === f.size) continue;
+    if (!await _reindexChatFile(userId, f, shouldStop)) { cancelled = true; break; }
+    updated++;
+  }
+  const sourceStampAfter = cancelled ? undefined : await _chatSourceStamp(userId);
+  const complete = !cancelled && !shouldStop()
+    && revision === (_chatRevisions.get(userId) || 0) && sourceStampBefore === sourceStampAfter;
+  if (complete) {
+    // Deletion and the ready marker share a synchronous boundary. No new
+    // append/invalidation can interleave between the final check and handoff.
+    for (const cid of chatStore.indexedConversationIds(userId)) {
+      if (!seen.has(cid)) { chatStore.deleteConversation(userId, cid); deleted++; }
     }
-    for (const f of toUpdate) {
-      if (signal?.aborted) { cancelled = true; break; }
-      if (!await _reindexChatFile(entry.idx, f.fileKey, f.file, f.mtime, f.size, signal)) {
-        cancelled = true;
-        break;
-      }
-      updated += 1;
-      dirty = true;
-    }
-    if (!cancelled) {
-      for (const fk of Object.keys(entry.idx.files)) {
-        if (!seen.has(fk)) {
-          _dropDocsByFileKey(entry.idx, fk);
-          deleted += 1;
-          dirty = true;
-        }
-      }
-    }
-    // If the catalog moved while the potentially long JSONL pass was
-    // running, do not bless a mixed snapshot. The next search will retry.
-    const sourceStampAfter = cancelled ? undefined : await _chatSourceStamp(userId);
-    const completedSourceStamp = !cancelled && sourceStampBefore === sourceStampAfter ? sourceStampAfter : undefined;
-    completed = Boolean(completedSourceStamp);
-    if (entry.idx.sourceStamp !== completedSourceStamp) {
-      entry.idx.sourceStamp = completedSourceStamp;
-      dirty = true;
-    }
-    if (dirty) { entry.dirty = true; _markDirty(idxPath); }
-  });
-  const result = {
-    scanned: scan.files.length,
-    updated,
-    deleted,
-    ...(cancelled ? { cancelled: true } : {}),
-  };
-  if (completed) _currentChatIndexes.add(userId);
-  log.info(`chat reconcile ${cancelled ? 'cancelled' : 'complete'} scanned=${result.scanned} updated=${updated} deleted=${deleted} ms=${Date.now() - startedAt}`);
-  return result;
+    _dirtyChats.delete(userId);
+    chatStore.markRebuildComplete(userId, sourceStampAfter!);
+    _migratingChats.delete(userId);
+    _currentChatIndexes.add(userId);
+    _chatReconcileRuns.delete(userId);
+    cancelChatIndexRepair(userId);
+    await cleanupLegacyChatIndex(userId);
+  }
+  log.info(`chat reconcile complete=${complete} scanned=${scan.files.length} updated=${updated} deleted=${deleted} ms=${Date.now() - startedAt}`);
+  return { scanned: scan.files.length, updated, deleted, complete, ...(!complete ? { cancelled: true } : {}) };
 }
 
 /** Return true when the persisted/in-memory chat index agrees with the small
  * conversation catalog. A true result intentionally avoids a full history
  * directory walk on the query path. */
 export async function isChatsIndexCurrent(userId: string): Promise<boolean> {
-  const entry = await _getEntry(_chatIdxPath(userId), 'chat');
-  if (!entry.idx.sourceStamp) {
+  if (_chatReconcileRuns.has(userId) || _isMigrating(userId)) return false;
+  const stamp = chatStore.readSourceStamp(userId);
+  if (!stamp) {
     _currentChatIndexes.delete(userId);
     return false;
   }
-  const current = entry.idx.sourceStamp === await _chatSourceStamp(userId);
+  const current = stamp === await _chatSourceStamp(userId);
   if (current) _currentChatIndexes.add(userId);
   else _currentChatIndexes.delete(userId);
   return current;
@@ -641,7 +790,10 @@ export function isChatsIndexTrusted(userId: string): boolean {
  * verified process snapshot current through indexChatMessage/dropChatConversation
  * and must not trigger a redundant history scan on the next query. */
 export function invalidateChatsIndex(userId: string): void {
+  _noteChatChange(userId);
   _currentChatIndexes.delete(userId);
+  chatStore.writeSourceStamp(userId, undefined);
+  scheduleChatIndexRepair(userId, 1_000);
 }
 
 /**
@@ -655,46 +807,75 @@ async function _upsertChatMessageDoc(
   userId: string, fileKey: string, msgIndex: number, msg: ChatMessage,
 ): Promise<void> {
   const text = _msgText(msg);
-  if (!text) return;
   const idxPath = _chatIdxPath(userId);
   const file = _chatJsonlFile(userId, fileKey);
   let st: fs.Stats | undefined;
   try { st = await fsp.stat(file); } catch { /* file may have been deleted */ }
   await _getLock(idxPath).runExclusive(async () => {
-    const entry = await _getEntry(idxPath, 'chat');
-    const doc: Doc = {
-      fileKey, kind: 'chat', msg_index: msgIndex, cid: fileKey,
-      role: _msgRole(msg), time: _msgTime(msg), len: text.length,
-    };
-    _putDoc(entry.idx, _docId('chat', fileKey, msgIndex), doc, text);
-    if (st) entry.idx.files[fileKey] = { mtime: st.mtimeMs, size: st.size };
-    entry.dirty = true;
+    // A repair may have started while stat was in flight.
+    if (_chatReconcileRuns.has(userId) || _isMigrating(userId)) {
+      _noteChatChange(userId, fileKey);
+      _currentChatIndexes.delete(userId);
+      scheduleChatIndexRepair(userId);
+      return;
+    }
+    const known = chatStore.readFileWatermark(userId, fileKey);
+    // One appended message only proves the index is complete for the whole
+    // file when it lands exactly on the watermark. Re-stamping mtime+size
+    // without that proof certifies history this index never read, and
+    // `reconcileChatsIndex` then skips the file for good — the conversation
+    // keeps only its indexed tail and the rest silently stops being
+    // searchable. A fresh file legitimately starts at position 0.
+    const contiguous = (known ? known.next : 0) === msgIndex;
+    if (text) {
+      chatStore.upsertDoc(userId, {
+        cid: fileKey, msgIndex, role: _msgRole(msg), time: _msgTime(msg), text,
+      });
+    }
+    if (contiguous && st) {
+      // A body-less row still advances the watermark: it produces no doc, so
+      // the next real message is still a contiguous continuation.
+      chatStore.setFileWatermark(userId, fileKey, {
+        mtime: st.mtimeMs, size: st.size, next: msgIndex + 1,
+      });
+    } else {
+      _releaseChatFileToReconciler(userId, fileKey);
+    }
   });
-  _markDirty(idxPath);
+}
+
+/** Hand one conversation file back to the reconciler. Dropping the entry is
+ * what makes the next reconcile re-read it; clearing the snapshot fingerprint
+ * and the trusted flag is what makes that reconcile actually happen, because
+ * appending to an existing JSONL leaves the chat-root stat unchanged. */
+function _releaseChatFileToReconciler(userId: string, fileKey: string): void {
+  chatStore.dropFileWatermark(userId, fileKey);
+  chatStore.writeSourceStamp(userId, undefined);
+  _currentChatIndexes.delete(userId);
 }
 
 export function indexChatMessage(
-  userId: string,
-  cid: string,
-  msgIndex: number,
-  msg: ChatMessage,
+  userId: string, cid: string, msgIndex: number, msg: ChatMessage,
 ): Promise<void> {
-  return _upsertChatMessageDoc(userId, cid, msgIndex, msg)
-    .catch((err) => {
+  return (async () => {
+    if (_chatReconcileRuns.has(userId) || _isMigrating(userId)) {
+      _noteChatChange(userId, cid);
       _currentChatIndexes.delete(userId);
-      log.warn(`index chat msg failed: ${err.message}`);
-    });
+      scheduleChatIndexRepair(userId, 1_000);
+      return;
+    }
+    await _upsertChatMessageDoc(userId, cid, msgIndex, msg);
+  })().catch((err) => {
+    _currentChatIndexes.delete(userId);
+    log.warn('index chat message failed', { error: logErrorSummary(err) });
+  });
 }
 
 async function _dropChatFile(userId: string, fileKey: string): Promise<void> {
-  const idxPath = _chatIdxPath(userId);
-  await _getLock(idxPath).runExclusive(async () => {
-    const entry = await _getEntry(idxPath, 'chat');
-    if (!entry.idx.files[fileKey]) return;
-    _dropDocsByFileKey(entry.idx, fileKey);
-    entry.dirty = true;
+  _noteChatChange(userId, fileKey);
+  await _getLock(_chatIdxPath(userId)).runExclusive(async () => {
+    chatStore.deleteConversation(userId, fileKey);
   });
-  _markDirty(idxPath);
 }
 
 export function dropChatConversation(userId: string, cid: string): Promise<void> {

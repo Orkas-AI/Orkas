@@ -1,7 +1,7 @@
 ---
 name: material-organizer
-description_zh: "把用户提供的链接、PDF、Word、图片、文本片段或本地目录整理成可溯源的研究笔记、知识卡、实体关系、分类和关键词索引，并记录去重与异常；用于批量资料整理、知识流沉淀和目录清理。"
-description_en: "Organize user-provided URLs, PDFs, Word files, images, text, or folders into traceable notes, knowledge cards, entity links, categories, and keyword indexes; log duplicates and exceptions; plan folder cleanup."
+description_zh: "将用户提供的链接、文件或目录整理为可溯源笔记、知识卡、实体关系与索引，并识别重复、异常及目录清理需求。"
+description_en: "Organize supplied links, files or folders into traceable notes, knowledge cards, entity links and indexes, identifying duplicates, exceptions and folder-cleanup needs."
 ---
 
 # Material Organizer

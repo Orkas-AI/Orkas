@@ -128,6 +128,40 @@ afterEach(() => {
 });
 
 describe('features/connectors/oauth-dcr', () => {
+  it.each(['complete', 'omitted', 'reduced'])('Color Me Shop requests pinned scopes and handles a %s grant before storage', async mode => {
+    const { findCatalogEntry } = await import('../../../../src/main/features/connectors/catalog');
+    const entry = findCatalogEntry('colorme-shop')!;
+    const scope = entry.required_oauth_scopes!.join(' ');
+    const fetchMock = vi.fn(async (raw: string, init?: RequestInit) => {
+      const url = new URL(raw);
+      if (url.pathname.includes('oauth-protected-resource')) return jsonResponse({ authorization_servers: ['https://agent.colorme.app'], resource: 'https://agent.colorme.app/api/mcp' });
+      if (url.pathname.includes('oauth-authorization-server')) return jsonResponse({ authorization_endpoint: 'https://agent.colorme.app/api/auth/oauth2/authorize', token_endpoint: 'https://agent.colorme.app/api/auth/oauth2/token', registration_endpoint: 'https://agent.colorme.app/api/auth/oauth2/register', token_endpoint_auth_methods_supported: ['client_secret_post'] });
+      if (url.pathname.endsWith('/register')) return jsonResponse({ client_id: 'fixture-client', client_secret: 'fixture-secret' });
+      if (url.pathname.endsWith('/dcr-exchange')) return jsonResponse({ code: 0, oauth_code: 'one-use-code', oauth_state: new URL(String(electronMock.openExternal.mock.calls.at(-1)![0])).searchParams.get('state') });
+      if (url.pathname.endsWith('/token')) return jsonResponse({ access_token: 'fixture-token', refresh_token: 'fixture-refresh', expires_in: 3600,
+        ...(mode !== 'omitted' ? { scope: mode === 'complete' ? scope : 'openid read_products' } : {}) });
+      if (url.pathname.endsWith('/dcr-store')) {
+        expect(JSON.parse(init?.body as string)).toMatchObject({ provider: 'colorme-shop', scope,
+          dcr_client: { token_endpoint: 'https://agent.colorme.app/api/auth/oauth2/token', resource: 'https://agent.colorme.app/api/mcp' } });
+        return jsonResponse({ code: 0, access_token: 'fixture-token', grant_id: 'fixture-grant', server_managed: true, expires_in: 3600 });
+      }
+      throw new Error('Unexpected request');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const flow = oauth.startMcpDcrOAuth('uid-1', entry);
+    const outcome = mode === 'reduced' ? expect(flow).rejects.toMatchObject({ code: 'missing_required_scopes' })
+      : expect(flow).resolves.toMatchObject({ grant: { scopes: entry.required_oauth_scopes } });
+    await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledTimes(1));
+    const auth = new URL(String(electronMock.openExternal.mock.calls[0][0]));
+    expect(auth.searchParams.get('scope')).toBe(scope);
+    expect(auth.searchParams.get('code_challenge_method')).toBe('S256');
+    expect(auth.searchParams.get('resource')).toBe('https://agent.colorme.app/api/mcp');
+    await oauth.handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?exchange_code=receipt');
+    await outcome;
+    expect(fetchMock.mock.calls.filter(([url]) => url.endsWith('/dcr-store'))).toHaveLength(0);
+  });
+
   it.each(['zh', 'en', 'ja', 'pt'])('carries %s in fresh opaque states without changing registered callback URLs', async (lang) => {
     localeMock.lang = lang;
     const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');

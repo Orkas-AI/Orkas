@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -185,8 +186,12 @@ async function processAsset(root, request) {
   if (layers.length > MAX_LAYERS) fail('E_IMAGE_ASSET_LIMIT', `at most ${MAX_LAYERS} composite layers are allowed`);
   const quality = request.quality === undefined ? 92 : integer(request.quality, 'quality', 1, 100);
   const sharp = await sharpFactory();
+  const normalized = operations.map(normalizeOperation);
+  const canNormalize = input !== output && !layers.length && normalized.length <= 1
+    && normalized.every(op => op.type === 'resize' && (!op.kernel || op.kernel === 'lanczos3') && !op.without_enlargement);
+  const inputHash = canNormalize ? crypto.createHash('sha256').update(fs.readFileSync(input)).digest('hex') : '';
   let pipeline = sharp(input, { failOn: 'error', limitInputPixels: MAX_AREA });
-  operations.map(normalizeOperation).forEach((operation) => { pipeline = applyOperation(pipeline, operation); });
+  normalized.forEach((operation) => { pipeline = applyOperation(pipeline, operation); });
   if (layers.length) {
     pipeline = pipeline.composite(layers.map((layer, index) => {
       if (!record(layer)) fail('E_IMAGE_ASSET_ARGUMENT', `composite_layers[${index}] must be an object`);
@@ -203,13 +208,29 @@ async function processAsset(root, request) {
   const temporary = `${output}.${process.pid}.${Date.now()}.tmp${extension}`;
   try {
     await pipeline.toFile(temporary);
-    if (request.overwrite === true && fs.existsSync(output)) fs.unlinkSync(output);
+    const info = await inspectImage(temporary);
+    // Replace directly: deleting the destination first loses it if rename fails.
     fs.renameSync(temporary, output);
+    const receiptPath = projectPath(root, `${output}.image-normalization.json`, 'normalization receipt');
+    // The host replays this hint against a recorded provider ancestor. It is
+    // never an authority to mark a composite or arbitrary output as generated.
+    fs.rmSync(receiptPath, { force: true });
+    const format = extension === '.jpg' || extension === '.jpeg' ? 'jpeg' : extension.slice(1);
+    if (canNormalize && ['png', 'jpeg', 'webp'].includes(format)) {
+      const before = await inspectImage(input);
+      if (before.width * info.height === before.height * info.width) {
+        fs.writeFileSync(receiptPath, JSON.stringify({
+          schema_version: 1, input_path: path.relative(root, input), input_sha256: inputHash,
+          output_sha256: crypto.createHash('sha256').update(fs.readFileSync(output)).digest('hex'),
+          format, quality, resize: normalized.length === 1,
+        }));
+      }
+    }
+    return { ok: true, op: 'process', output_path: output, ...info, engine: 'image-compose-skill-sharp', model_calls: 0 };
   } catch (error) {
     try { fs.unlinkSync(temporary); } catch { /* ignore */ }
     throw error;
   }
-  return { ok: true, op: 'process', output_path: output, ...(await inspectImage(output)), engine: 'image-compose-skill-sharp', model_calls: 0 };
 }
 
 function runCommand(command, args, timeoutMs) {
@@ -254,10 +275,15 @@ async function externalTransform(root, request, kind) {
     try { fs.unlinkSync(temporary); } catch { /* ignore */ }
     fail(kind === 'remove_background' ? 'E_REMBG_UNAVAILABLE' : 'E_REALESRGAN_UNAVAILABLE', result.detail || `${engine} did not write output`);
   }
-  await inspectImage(temporary);
-  if (request.overwrite === true && fs.existsSync(output)) fs.unlinkSync(output);
-  fs.renameSync(temporary, output);
-  return { ok: true, op: kind, output_path: output, ...(await inspectImage(output)), engine, model_calls: 0 };
+  try {
+    const info = await inspectImage(temporary);
+    // Keep the existing file intact when permissions or file locks deny replacement.
+    fs.renameSync(temporary, output);
+    return { ok: true, op: kind, output_path: output, ...info, engine, model_calls: 0 };
+  } catch (error) {
+    try { fs.unlinkSync(temporary); } catch { /* ignore */ }
+    throw error;
+  }
 }
 
 async function capabilities() {

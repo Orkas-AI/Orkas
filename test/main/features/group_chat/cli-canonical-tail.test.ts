@@ -29,14 +29,14 @@ function writeLog(rows: number): string {
 }
 
 describe('_readCliCanonicalTail', () => {
-  it('reads a bounded tail that still contains the boundary and 40 prior user turns', async () => {
+  it('reads a bounded tail that still contains the boundary and five prior user turns', async () => {
     const { _readCliCanonicalTailForTest } = await import('../../../../src/main/features/group_chat/bus');
     const file = writeLog(2000);
     const rows = await _readCliCanonicalTailForTest(file, { boundaryId: 'm1998' });
     expect(rows.at(-1)?.id).toBe('m1999');
     expect(rows.some((r) => r.id === 'm1998')).toBe(true);
     const boundaryAt = rows.findIndex((r) => r.id === 'm1998');
-    expect(rows.slice(0, boundaryAt).filter((r) => r.from === 'user').length).toBeGreaterThanOrEqual(40);
+    expect(rows.slice(0, boundaryAt).filter((r) => r.from === 'user').length).toBeGreaterThanOrEqual(5);
     expect(rows.length).toBeLessThan(2000 / 2);
     // Chronological, contiguous tail.
     expect(rows.map((r) => Number(r.id.slice(1)))).toEqual(

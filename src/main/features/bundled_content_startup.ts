@@ -1,5 +1,5 @@
 import { createLogger } from '../logger';
-import { maskId } from '../util/log-redact';
+import { logErrorSummary, maskId } from '../util/log-redact';
 import * as systemSkills from './system_skills';
 import * as builtinMarketplaceStartup from './builtin_marketplace_startup';
 import { registerUserSwitchHook } from './user-switch-hooks';
@@ -58,7 +58,7 @@ function _canContinue(opts: SyncBundledContentOptions): boolean {
   } catch (err) {
     log.warn('bundled content context check failed', {
       reason: opts.reason,
-      error: (err as Error).message,
+      error: logErrorSummary(err),
     });
     return false;
   }
@@ -76,6 +76,7 @@ async function _syncBundledContentForUser(
   };
 
   if (!_canContinue(opts)) return result;
+  const systemStartedAt = Date.now();
   try {
     // This startup boundary is fail-open. Retrying a local filesystem error
     // here would extend first-window latency; later account/startup triggers
@@ -97,11 +98,13 @@ async function _syncBundledContentForUser(
     log.warn('bundled System Skill sync failed', {
       reason: opts.reason,
       uid: maskId(uid),
-      error: (err as Error).message,
+      error: logErrorSummary(err),
     });
   }
 
+  const systemMs = Date.now() - systemStartedAt;
   if (!_canContinue(opts)) return result;
+  const marketplaceStartedAt = Date.now();
   try {
     result.marketplace = await builtinMarketplaceStartup.seedBuiltinMarketplaceForUser(uid, {
       reason: opts.reason,
@@ -112,7 +115,7 @@ async function _syncBundledContentForUser(
     log.warn('bundled Marketplace content sync failed', {
       reason: opts.reason,
       uid: maskId(uid),
-      error: (err as Error).message,
+      error: logErrorSummary(err),
     });
   }
 
@@ -127,6 +130,8 @@ async function _syncBundledContentForUser(
     uid: maskId(uid),
     complete,
     ms: Date.now() - startedAt,
+    system_ms: systemMs,
+    marketplace_ms: Date.now() - marketplaceStartedAt,
     system_skill_changes: result.system_skills.filter((row) => (
       row.action === 'created' || row.action === 'updated' || row.action === 'deleted'
     )).length,
@@ -170,7 +175,7 @@ export async function syncBundledContentForUser(
       log.warn('bundled Marketplace change notification failed', {
         reason: opts.reason,
         uid: maskId(uid),
-        error: (err as Error).message,
+        error: logErrorSummary(err),
       });
     }
   }

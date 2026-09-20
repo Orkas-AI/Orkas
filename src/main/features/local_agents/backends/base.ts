@@ -17,11 +17,13 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import * as path from 'node:path';
+import { createLogger } from '../../../logger.js';
 import { buildCliSpawnEnv, resolveCliCommand } from '../spawn-command.js';
 import type { LocalCliPermissionPolicy } from '../registry.js';
 
 type KillableChild = Pick<ChildProcessWithoutNullStreams, 'kill' | 'pid'>;
 type SpawnFn = typeof spawn;
+const log = createLogger('local-agents:process');
 
 /** All event types a backend can emit. The runner removes private fields,
  *  persists the normalized event to `events.jsonl`, and forwards that same
@@ -93,6 +95,7 @@ export interface LocalEvent {
    *                        // silent spinner.
    *    done:               { status: 'completed'|'failed'|'cancelled'|'timeout'|
    *                                  'missing_cli', error?, durationMs?, sessionId?, usage?,
+   *                                  finalMessageText?: string (Claude's last native result),
    *                                  timeoutPhase?: 'foreground'|'background',
    *                                  failureKind?: 'cli_spawn'|'cli_protocol', retrySafe?: boolean }
    */
@@ -340,6 +343,13 @@ export function spawnCli(
   // Swallow EPIPE during cancel; the OS will close the pipe when the
   // child dies before we finish writing the prompt.
   child.stdin.on('error', () => { /* noop */ });
+  // A CLI can exit without a protocol terminal, with descendants still holding
+  // its pipes open. POSIX retains our process group while any member survives;
+  // reap it at exit, before close waits for inherited pipes. Windows taskkill
+  // needs a live parent and remains owned by the terminal/cancel path.
+  if (process.platform !== 'win32') {
+    child.once('exit', () => killProcessTree(child, 'SIGKILL'));
+  }
   return child;
 }
 
@@ -358,7 +368,7 @@ function windowsSystem32Tool(name: string): string {
 export function killProcessTree(
   child: KillableChild,
   signal: NodeJS.Signals,
-  opts: { platform?: NodeJS.Platform; spawnFn?: SpawnFn } = {},
+  opts: { platform?: NodeJS.Platform; spawnFn?: SpawnFn; onComplete?: () => void } = {},
 ): void {
   const pid = child.pid;
   const platform = opts.platform ?? process.platform;
@@ -367,59 +377,85 @@ export function killProcessTree(
       const killer = (opts.spawnFn ?? spawn)(
         windowsSystem32Tool('taskkill.exe'),
         ['/pid', String(pid), '/t', '/f'],
-        { stdio: 'ignore', windowsHide: true },
+        { stdio: 'ignore', windowsHide: true, timeout: 10_000 },
       );
-      const fallback = () => {
-        try { child.kill(signal); } catch { /* already gone */ }
+      let settled = false;
+      const complete = (failed: boolean) => {
+        if (settled) return;
+        settled = true;
+        if (failed) {
+          // A direct-child fallback is not proof that the process tree stopped.
+          // Omit PIDs, commands, paths and raw stderr from this bounded warning.
+          log.warn('CLI process tree termination failed', {
+            platform: 'win32', failure: 'tree_command_failed', fallback: 'direct_child_only',
+          });
+          try { child.kill(signal); } catch { /* already gone */ }
+        }
+        opts.onComplete?.();
       };
-      killer.once('error', fallback);
-      killer.once('exit', (code) => {
-        if (code !== 0) fallback();
-      });
+      killer.once('error', () => complete(true));
+      killer.once('exit', (code) => complete(code !== 0));
       if (typeof killer.unref === 'function') killer.unref();
       return;
     } catch {
+      log.warn('CLI process tree termination failed', {
+        platform: 'win32', failure: 'tree_command_unavailable', fallback: 'direct_child_only',
+      });
       // Fall through to a best-effort direct child kill.
     }
   }
   if (pid && platform !== 'win32') {
     try {
       process.kill(-pid, signal);
+      opts.onComplete?.();
       return;
     } catch (err) {
       // ESRCH: the group is already gone — nothing left to signal.
-      if ((err as NodeJS.ErrnoException).code === 'ESRCH') return;
+      if ((err as NodeJS.ErrnoException).code === 'ESRCH') { opts.onComplete?.(); return; }
       // Any other error (e.g. the child never became a group leader):
       // fall through to a best-effort direct kill.
     }
   }
   try { child.kill(signal); } catch { /* already gone */ }
+  opts.onComplete?.();
 }
 
-/**
- * A one-shot CLI's protocol terminal event is authoritative for the UI. Close
- * stdin and signal the whole process tree immediately, while the direct CLI
- * pid still identifies its descendants on Windows. Waiting for the CLI to exit
- * before signaling lets a detached child escape `taskkill /t`; cancelling that
- * delayed signal on `close` caused completed local-Agent runs to leave GUI and
- * test processes behind. The hard-kill fallback remains bounded and does not
- * hold the backend promise (and therefore the conversation loading state) open.
+/** Begin bounded tree cleanup independently of a backend's abort listener.
+ * Parent close does not prove descendants exited. On POSIX, force the remaining
+ * group immediately at close before cancelling the timer; do not retain a PID
+ * for a delayed signal after its original group may have disappeared. Windows
+ * tree termination is already forceful and must start while the parent is live.
+ */
+function terminateCliTree(child: ChildProcessWithoutNullStreams, graceMs: number, onComplete?: () => void): void {
+  let hardKill: NodeJS.Timeout | undefined;
+  let closed = false;
+  child.once?.('close', () => {
+    closed = true;
+    if (process.platform !== 'win32' && child.pid) killProcessTree(child, 'SIGKILL');
+    if (hardKill) clearTimeout(hardKill);
+  });
+  killProcessTree(child, 'SIGTERM', { onComplete });
+  if (!closed) {
+    hardKill = setTimeout(() => {
+      hardKill = undefined;
+      killProcessTree(child, 'SIGKILL');
+    }, Math.max(0, graceMs));
+    hardKill.unref?.();
+  }
+}
+
+/** A protocol terminal settles the turn without waiting on inherited pipes.
+ * Start tree termination before EOF can cause the parent to exit, then close
+ * input. Cleanup retains its own lifetime after the backend has settled.
  */
 export function reapCliAfterProtocolTerminal(
   child: ChildProcessWithoutNullStreams,
   hardKillGraceMs = 10_000,
 ): void {
-  try { child.stdin.end(); } catch { /* already closed */ }
-
-  killProcessTree(child, 'SIGTERM');
-  const hardKill = setTimeout(
-    () => killProcessTree(child, 'SIGKILL'),
-    Math.max(0, hardKillGraceMs),
-  );
-  if (typeof hardKill.unref === 'function') hardKill.unref();
-
-  child.once('close', () => {
-    clearTimeout(hardKill);
+  // On Windows, spawning taskkill is not completion: keep stdin open until
+  // it has traversed the tree, so EOF cannot make the parent disappear first.
+  terminateCliTree(child, hardKillGraceMs, () => {
+    try { child.stdin.end(); } catch { /* already closed */ }
   });
 }
 
@@ -502,9 +538,7 @@ export function armKillWatchdog(
   let firedIdleMs = 0;
 
   const kill = () => {
-    killProcessTree(child, 'SIGTERM');
-    const hardKill = setTimeout(() => killProcessTree(child, 'SIGKILL'), 10_000);
-    if (typeof hardKill.unref === 'function') hardKill.unref();
+    terminateCliTree(child, 10_000);
   };
 
   // Poll instead of one-shot timers so the idle window slides with
@@ -546,18 +580,10 @@ export function armKillWatchdog(
  * caller must invoke after the child exits to detach listeners.
  */
 export function bindAbort(child: ChildProcessWithoutNullStreams, signal: AbortSignal, graceMs = 10_000): () => void {
-  let killTimer: NodeJS.Timeout | null = null;
-  const onAbort = () => {
-    killProcessTree(child, 'SIGTERM');
-    killTimer = setTimeout(() => {
-      killProcessTree(child, 'SIGKILL');
-    }, graceMs);
-    if (typeof killTimer.unref === 'function') killTimer.unref();
-  };
+  const onAbort = () => terminateCliTree(child, graceMs);
   if (signal.aborted) onAbort();
   else signal.addEventListener('abort', onAbort, { once: true });
-  return () => {
-    signal.removeEventListener('abort', onAbort);
-    if (killTimer) { clearTimeout(killTimer); killTimer = null; }
-  };
+  // Detach future aborts only. Once cancellation starts, backend settlement
+  // must not withdraw the cleanup of its still-running descendants.
+  return () => signal.removeEventListener('abort', onAbort);
 }

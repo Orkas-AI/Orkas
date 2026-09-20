@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import type { FileReadObservation } from "../src/tools/base.js";
 import { Session } from "../src/agent/session.js";
 import { getBuiltinTools } from "../src/tools/builtin.js";
 import {
@@ -348,18 +349,15 @@ describe("workspace_diff", () => {
 describe("read repetition after a compaction boundary", () => {
   const hash = (body: string) => `sha256:${createHash("sha256").update(body).digest("hex")}`;
 
-  // Compaction trades context size against re-reading: whatever the checkpoint
-  // fails to carry, the model fetches again. The budget ratios and ceilings in
-  // context-budget.ts were set conservatively and are meant to be calibrated
-  // against this number rather than by argument, so it has to separate a
-  // genuine re-read from a first read and from a read of changed content.
+  // Source coverage helps investigate compaction costs, but does not establish
+  // causation or whether a verification read was necessary.
   const read = (session: Session, callId: string, filePath: string, content: string) => {
     session.addAssistantMessage([{ type: "tool_use", id: callId, name: "read_file", input: { path: filePath } }]);
     session.addToolResult(callId, content, undefined, false);
     session.recordToolObservations({
       toolCallId: callId,
       tool: "read_file",
-      observations: { fileReads: [{ path: filePath, hash: hash(content) }] },
+      observations: { fileReads: [{ path: filePath, hash: hash(content), charRange: [0, content.length] }] },
     });
   };
 
@@ -371,10 +369,9 @@ describe("read repetition after a compaction boundary", () => {
     read(session, "r2", "/w/b.ts", "beta");
     const cursor = session.workspaceObservationCursor();
 
-    // Same path, same content — the re-read recovered nothing.
+    // Same source range and version. This measures coverage, not whether the read was useful.
     read(session, "r3", "/w/a.ts", "alpha");
-    // Same path, different content — the file genuinely changed, so re-reading
-    // it was necessary, not waste.
+    // Changed versions do not establish which source ranges still overlap.
     read(session, "r4", "/w/b.ts", "beta-v2");
     // A path never seen before the boundary is not a re-read at all.
     read(session, "r5", "/w/c.ts", "gamma");
@@ -383,6 +380,71 @@ describe("read repetition after a compaction boundary", () => {
     expect(repetition.readsAfter).toBe(3);
     expect(repetition.repeatedPaths).toBe(2);
     expect(repetition.repeatedIdenticalContent).toBe(1);
+    expect(repetition.newRangeReads).toBe(1);
+    expect(repetition.unknownRangeReads).toBe(1);
+  });
+
+  // Full-file hashes are deliberately identical across different excerpts.
+  // Expected classifications describe source coverage, independently of selection logic.
+  type ReadShape = Omit<FileReadObservation, "path">;
+  const chars = (start: number, end: number): ReadShape => ({ hash: "v1", charRange: [start, end] });
+  const lines = (start: number, end: number): ReadShape => ({ hash: "v1", lineRange: [start, end] });
+  it.each<{ name: string; before: ReadShape[]; after: ReadShape; category: string }>([
+    { name: "same excerpt", before: [chars(0, 100)], after: chars(0, 100), category: "repeatedIdenticalContent" },
+    { name: "subset", before: [chars(0, 100)], after: chars(20, 40), category: "repeatedIdenticalContent" },
+    { name: "adjacent prior excerpts cover the request", before: [chars(50, 100), chars(0, 50)], after: chars(0, 100), category: "repeatedIdenticalContent" },
+    { name: "overlapping excerpts with a gap", before: [chars(0, 40), chars(20, 50), chars(60, 100)], after: chars(0, 100), category: "repeatedPartialContent" },
+    { name: "extended range", before: [chars(0, 100)], after: chars(50, 150), category: "repeatedPartialContent" },
+    { name: "adjacent character ranges do not overlap", before: [chars(0, 100)], after: chars(100, 200), category: "newRangeReads" },
+    { name: "disjoint lines", before: [lines(1, 100)], after: lines(101, 200), category: "newRangeReads" },
+    { name: "line endpoints are inclusive", before: [lines(1, 100)], after: lines(100, 200), category: "repeatedPartialContent" },
+    { name: "single line", before: [lines(1, 100)], after: lines(100, 100), category: "repeatedIdenticalContent" },
+    { name: "changed version", before: [chars(0, 100)], after: { ...chars(0, 100), hash: "v2" }, category: "unknownRangeReads" },
+    { name: "missing version", before: [chars(0, 100)], after: { charRange: [0, 100] }, category: "unknownRangeReads" },
+    { name: "legacy prior read lacks range", before: [{ hash: "v1" }], after: chars(0, 100), category: "unknownRangeReads" },
+    { name: "current read lacks range", before: [chars(0, 100)], after: { hash: "v1" }, category: "unknownRangeReads" },
+    { name: "incomparable coordinates", before: [lines(1, 100)], after: chars(0, 100), category: "unknownRangeReads" },
+    { name: "character coverage overrides coarse line metadata", before: [{ ...chars(0, 10), lineRange: [1, 1] }], after: { ...chars(10, 20), lineRange: [1, 1] }, category: "newRangeReads" },
+    { name: "empty result", before: [chars(0, 100)], after: chars(100, 100), category: "emptyReads" },
+    { name: "reversed range", before: [chars(0, 100)], after: chars(100, 0), category: "unknownRangeReads" },
+    { name: "fractional range", before: [chars(0, 100)], after: chars(0.5, 10), category: "unknownRangeReads" },
+    { name: "known coverage despite an unknown prior range", before: [{ hash: "v1" }, chars(0, 100)], after: chars(0, 100), category: "repeatedIdenticalContent" },
+    { name: "unknown prior range prevents a claim of new content", before: [{ hash: "v1" }, chars(0, 10)], after: chars(20, 30), category: "unknownRangeReads" },
+  ])("classifies $name without equating a file version with an excerpt", ({ before, after, category }) => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Inspect the relevant code" }]);
+    const observe = (read: ReadShape) => session.recordToolObservations({
+      tool: "read_files", observations: { fileReads: [{ path: "/w/source.ts", ...read }] },
+    });
+    before.forEach(observe);
+    const boundary = session.workspaceObservationCursor();
+    observe(after);
+    const expected = {
+      readsAfter: 1, repeatedPaths: 1, repeatedIdenticalContent: 0,
+      repeatedPartialContent: 0, newRangeReads: 0, unknownRangeReads: 0, emptyReads: 0,
+      [category]: 1,
+    };
+    const actual = session.readRepetitionSince(boundary);
+    expect(actual.repeatedIdenticalContent).toBe(category === "repeatedIdenticalContent" ? 1 : 0);
+    expect(actual).toEqual(expected);
+  });
+
+  it("keeps range classifications across session state restoration", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Inspect code" }]);
+    session.recordToolObservations({ tool: "read_files", observations: {
+      fileReads: [{ path: "/w/a.ts", hash: "v1", charRange: [0, 100] }],
+    } });
+    const cursor = session.workspaceObservationCursor();
+    session.recordToolObservations({ tool: "read_files", observations: {
+      fileReads: [{ path: "/w/a.ts", hash: "v1", charRange: [100, 200] }],
+    } });
+    const restored = new Session();
+    for (const message of session.getMessages()) restored.addMessage(message.role, message.content, message.turnId);
+    restored.restoreContextState(session.getSerializedContextState());
+    expect(restored.readRepetitionSince(cursor)).toMatchObject({
+      readsAfter: 1, repeatedPaths: 1, repeatedIdenticalContent: 0, newRangeReads: 1,
+    });
   });
 
   it("reports nothing before any boundary has been recorded", () => {
@@ -394,6 +456,10 @@ describe("read repetition after a compaction boundary", () => {
       readsAfter: 0,
       repeatedPaths: 0,
       repeatedIdenticalContent: 0,
+      repeatedPartialContent: 0,
+      newRangeReads: 0,
+      unknownRangeReads: 0,
+      emptyReads: 0,
     });
   });
 });

@@ -45,17 +45,26 @@ const DRIVER_TICK_MS = 60 * 1000;
 // enqueue/rollback finishes; a later explicit retry remains allowed.
 const _dispatchingTasks = new Set<string>();
 
-async function _selectGlobalTaskOwner(uid: string, pid: string, task: ProjectTask, cid: string): Promise<boolean> {
-  if (pid || !task.owner_agent_id) return true;
+async function _selectTaskOwner(uid: string, pid: string, task: ProjectTask, cid: string): Promise<boolean> {
+  const ownerName = String(task.owner_agent || '').trim();
+  if (!task.owner_agent_id && !ownerName) return true;
   if (getActiveUserId() !== uid) return false;
   try {
-    const agent = (await agents.listAgentSummaries()).find((a) => a.agent_id === task.owner_agent_id && a.enabled !== false);
+    const bindings = pid ? await projects.getBindings(uid, pid) : null;
+    const candidates = (await agents.listAgentSummaries()).filter((a) => (
+      a.enabled !== false
+      && (!bindings || bindings.agents.includes(a.agent_id))
+      && (task.owner_agent_id ? a.agent_id === task.owner_agent_id : !!pid && a.name === ownerName)
+    ));
+    // Legacy project tasks may have only a display name. Resolve it only when
+    // exactly one available project member matches; never choose a substitute.
+    const agent = candidates.length === 1 ? candidates[0] : undefined;
     if (!agent || getActiveUserId() !== uid) return false;
     return (await groupChat.setFloor(uid, cid, agent.agent_id)).ok;
   } catch {
     // Selection precedes the status write. A lookup failure must not roll back
     // a status transition made by another caller while this lookup was pending.
-    log.warn('global task owner selection failed');
+    log.warn('task owner selection failed');
     return false;
   }
 }
@@ -103,31 +112,54 @@ async function _associateTaskConversation(uid: string, pid: string, tid: string,
     // associate this same cid when it writes the next status.
     log.error('task conversation association failed', { uid: maskId(uid), pid: maskId(pid), tid: maskId(tid), error: logErrorSummary(err) });
   }
+  await projectTasks.recordTaskExecution(uid, pid, tid, cid);
 }
 
-// Seed for one auto-advance, sent to the project COMMANDER (no @mention, so
-// default routing reaches it). Task-specific — names the exact task the loop
-// just marked progress so the commander advances THAT one, not a re-picked
-// todo. The commander orchestrates: dispatch to the owning agent, oversee, judge
-// the result, then reconcile the task status. Named Agents may also write status;
-// entering through Commander preserves the auto-advance orchestration contract.
-// Localized (project language) with the title interpolated; detail appended.
+// An assigned task is advanced by its owner, which executes rather than relays:
+// it holds todo_tasks itself, so it reconciles the status and hears that in the
+// project's language. An unassigned project task keeps Commander orchestration;
+// a global task has no Commander at all.
 function _advanceSeedText(task: ProjectTask, pid: string): string {
-  if (!pid) {
-    return _runSeedText(task, '')
+  const owned = !!task.owner_agent_id || !!String(task.owner_agent || '').trim();
+  if (!pid || owned) {
+    const ownerKey = 'project.driver.advance_seed_owner';
+    const ownerNote = translate(ownerKey);
+    return _runSeedText(task, pid)
+      + (owned
+        ? ' ' + (ownerNote === ownerKey
+          ? "You are this task's assigned owner: do the work yourself rather than handing it off, and verify the result."
+          : ownerNote)
+        : '')
       + ' This run was started by auto-advance; after updating the status, stop so the next backlog item can be selected.';
   }
   const key = 'project.driver.advance_seed';
-  const fallback = `Auto-advance: advance the project task "${task.title}" now — it is already marked `
+  const fallback = `Auto-advance: advance the project task "${task.content}" now — it is already marked `
     + 'progress. Dispatch it to its owner agent (or the right agent if unassigned), oversee the work, '
     + 'and verify the result. If and only if the work is fully complete and verified, update this exact '
     + 'task to review with todo_tasks. If the work is incomplete, interrupted, or fails, do not '
     + 'change its status; it must remain progress. During this run, never set it to blocked or done. '
     + 'Then stop; the auto-advance loop continues with the next task on its own.';
-  const localized = translate(key, { title: task.title });
-  let text = localized === key ? fallback : localized;
-  if (task.detail) text += `\n\nTask details:\n${task.detail}`;
-  return text;
+  const localized = translate(key, { title: task.content });
+  return localized === key ? fallback : localized;
+}
+
+/** Hand the advanced conversation a window so its task browser has an owner.
+ *
+ *  `advance` and `runTaskNow` both create the conversation they are about to
+ *  run, so no renderer send has bound it. Without a binding every task-browser
+ *  call fails and a backlog task that needs to read a page cannot run at all.
+ *  The bind deliberately does not claim foreground — a driven task must not
+ *  take the view away from whatever the user is doing. Best-effort: a run with
+ *  no window still proceeds, it just has no browser. */
+async function _bindTaskBrowserWindow(uid: string, cid: string, taskId: string, phase: string): Promise<void> {
+  try {
+    const webAssist = await import('./web_assist');
+    if (!webAssist.bindHostStartedWebAssistConversation(uid, cid)) {
+      log.info(`${phase} browser unbound (no window) uid=${maskId(uid)} cid=${maskId(cid)} task=${maskId(taskId)}`);
+    }
+  } catch (e) {
+    log.warn(`${phase} browser bind failed uid=${maskId(uid)} cid=${maskId(cid)} task=${maskId(taskId)}`, { error: logErrorSummary(e) });
+  }
 }
 
 /** Copy a task's attachments into the new conversation's chat_attachments dir
@@ -169,7 +201,7 @@ export async function advance(uid: string, pid: string, task: ProjectTask): Prom
   try {
     const conv = await chats.createConversation(uid, {
       kind: 'normal',
-      title: task.title,
+      title: task.content,
       ...(pid ? { projectId: pid } : {}),
     });
     cid = conv.conversation_id;
@@ -188,7 +220,7 @@ export async function advance(uid: string, pid: string, task: ProjectTask): Prom
     return { ok: false };
   }
   try {
-    if (!(await _selectGlobalTaskOwner(uid, pid, task, cid))) {
+    if (!(await _selectTaskOwner(uid, pid, task, cid))) {
       await rollback();
       return { ok: false };
     }
@@ -198,11 +230,12 @@ export async function advance(uid: string, pid: string, task: ProjectTask): Prom
       return { ok: false };
     }
     const attachments = _copyTaskAttachments(uid, pid, task, cid);
+    await _bindTaskBrowserWindow(uid, cid, task.id, 'advance');
     const res = await groupChat.send({
       userId: uid,
       cid,
-      text: task.title,
-      title_text: task.title,
+      text: task.content,
+      title_text: task.content,
       model_text: _advanceSeedText(task, pid),
       ...(attachments.length ? { attachments } : {}),
     });
@@ -225,13 +258,12 @@ export async function advance(uid: string, pid: string, task: ProjectTask): Prom
   }
 }
 
-/** Seed for a user-triggered single-task run. Project tasks always enter through
- *  the Commander, which dispatches and verifies the work. Named Agents may
- *  also update the bound task status. A global task runs in the default assistant and
+/** Seed for a single-task run. The selected Agent executes and verifies assigned
+ *  work; unassigned project work uses Commander orchestration. Global work
  *  uses the synthetic global selector exposed by the unbound todo_tasks tool.
- *  This is private model text; the visible chat bubble remains just the title. */
+ *  This is private model text; the visible chat bubble contains the complete task content. */
 function _runSeedText(task: ProjectTask, pid: string): string {
-  const owner = String(task.owner_agent || '').trim();
+  const assigned = !!task.owner_agent_id || !!String(task.owner_agent || '').trim();
   const review = task.status === 'review';
   const target = review ? 'done' : 'review';
   const start = review
@@ -242,27 +274,27 @@ function _runSeedText(task: ProjectTask, pid: string): string {
     ? 'During this run, never set it to blocked. Then stop.'
     : 'During this run, never set it to blocked or done. '
       + 'Only a later explicit user instruction or manual action may set it to done. Then stop.';
-  let text = pid
-    ? `Execute project task ${task.id} now: "${task.title}". ${start}`
-      + `Act as the project Commander: ${owner ? `dispatch the work to @${owner}` : 'choose and dispatch the right Agent'}, `
-      + 'wait for its result, and verify the deliverable. If and only if the work is fully complete and verified, '
+  const text = pid
+    ? `Execute project task ${task.id} now: "${task.content}". ${start}`
+      + (assigned ? 'Complete and verify the work. '
+        : 'Act as the project Commander: choose and dispatch the right Agent, wait for its result, and verify the deliverable. ')
+      + 'If and only if the work is fully complete and verified, '
       + `update this exact task to ${target} with todo_tasks. If the work is incomplete, interrupted, or fails, `
       + 'do not change its status; it must remain progress. ' + finish
-    : `Execute account-global todo ${task.id} now: "${task.title}". ${start}`
+    : `Execute account-global todo ${task.id} now: "${task.content}". ${start}`
       + 'Complete and verify the work. If and only if it is fully complete and verified, update this exact todo '
       + `to ${target} with todo_tasks using project "__global__". If the work is incomplete, interrupted, or fails, `
       + 'do not change its status; it must remain progress. ' + finish;
-  if (task.detail) text += `\n\nTask details:\n${task.detail}`;
   return text;
 }
 
-/** User-triggered "run this task now": open a fresh conversation, route project
- *  work through its Commander (which delegates to the assigned owner), or route
- *  a global task to its selected Agent (or the default assistant). Review-stage transitions belong to
+/** User-triggered "run this task now": open a fresh conversation and route
+ *  assigned work directly to its owner, otherwise use the default assistant.
+ *  Review-stage transitions belong to
  *  the executor; other runnable tasks are marked progress at startup. Mirrors
  *  advance()'s create→send→rollback shape and — like auto_tasks.runTaskNow — is
  *  NOT gated by the driver's cooldown/daily-cap/lease; a manual run is explicit.
- *  The Commander advances the status further via todo_tasks as work finishes. */
+ *  The executor advances the status further via todo_tasks as work finishes. */
 export async function runTaskNow(
   uid: string, pid: string, tid: string,
 ): Promise<{ ok: boolean; cid?: string; conversation?: unknown; error?: string }> {
@@ -280,7 +312,7 @@ export async function runTaskNow(
   try {
     const conv = await chats.createConversation(uid, {
       kind: 'normal',
-      title: task.title,
+      title: task.content,
       ...(pid ? { projectId: pid } : {}),
     });
     cid = conv.conversation_id;
@@ -299,7 +331,7 @@ export async function runTaskNow(
     return { ok: false, error: 'status_update_failed' };
   }
   try {
-    if (!(await _selectGlobalTaskOwner(uid, pid, task, cid))) {
+    if (!(await _selectTaskOwner(uid, pid, task, cid))) {
       await rollback();
       return { ok: false, error: 'owner_not_bound' };
     }
@@ -309,15 +341,14 @@ export async function runTaskNow(
       return { ok: false, error: 'status_update_failed' };
     }
     const attachments = _copyTaskAttachments(uid, pid, task, cid);
-    // Keep the conversation readable: the bubble shows the task itself while
-    // the model receives the workflow instruction through the private model_text
-    // channel. Do not @-route project work directly to its owner here: only the
-    // Commander can verify the result and write the next durable task status.
+    await _bindTaskBrowserWindow(uid, cid, tid, 'runTaskNow');
+    // The selected owner holds the conversation floor. Keep the complete task
+    // visible while carrying its execution/status contract in model_text.
     const res = await groupChat.send({
       userId: uid,
       cid,
-      text: task.title,
-      title_text: task.title,
+      text: task.content,
+      title_text: task.content,
       model_text: _runSeedText(task, pid),
       ...(attachments.length ? { attachments } : {}),
     });

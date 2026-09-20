@@ -157,7 +157,7 @@ export async function checkLocalCliPermissions(
       const proxyEnv = await buildChildProxyEnvironment();
       // The user may disconnect while proxy setup is pending. Do not recreate its runtime.
       if (state.abort.signal.aborted || !localCliInstallStatus(uid, entry).installed) return;
-      await runner({
+      const result = await runner({
         command: resolveBackgroundNodeRuntime().executable,
         args: [path.join(pcDirForChild(), 'bin/local-cli-auth.cjs')],
         cwd: localCliRuntimeDir(uid, entry.id),
@@ -165,7 +165,17 @@ export async function checkLocalCliPermissions(
         timeoutMs: 60_000,
         signal: state.abort.signal,
       });
-    } catch { /* Keep the last known permission state when verification is unavailable. */ }
+      if (!state.abort.signal.aborted && (result.timedOut || result.exitCode !== 0)) {
+        log.warn('permission_check_unavailable', {
+          catalog_id: entry.id, status: result.timedOut ? 'timeout' : 'exit', exit_code: result.exitCode,
+        });
+      }
+    } catch {
+      // Preserve the last known permission state; provider output may contain credentials.
+      if (!state.abort.signal.aborted) log.warn('permission_check_unavailable', {
+        catalog_id: entry.id, status: 'exception',
+      });
+    }
   })();
   state.running = run;
   permissionChecks.set(key, state);

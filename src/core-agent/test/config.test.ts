@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { createConfig, loadConfig, CoreAgentConfigSchema } from "../src/config/index.js";
+import { ModelConfigSchema } from "../src/config/schema.js";
 
 describe("Config", () => {
   describe("createConfig", () => {
@@ -70,5 +71,35 @@ describe("Config", () => {
       const config = await loadConfig("/tmp/nonexistent-config-12345.json");
       expect(config.agent.defaultModel).toBe("claude-opus-4-8");
     });
+  });
+});
+
+// Input and output share the context window on every provider this runtime
+// talks to. A catalog row whose output limit fills the window cannot be run
+// against — the derived budgets collapse to a few tokens and every request
+// trips the emergency layer — so the library refuses it at its boundary
+// rather than computing on it.
+describe("ModelConfigSchema window consistency", () => {
+  it("rejects an output limit that is not smaller than the context window", () => {
+    expect(ModelConfigSchema.safeParse({
+      provider: "p", model: "m", contextWindow: 256_000, maxOutputTokens: 256_000,
+    }).success).toBe(false);
+    expect(ModelConfigSchema.safeParse({
+      provider: "p", model: "m", contextWindow: 256_000, maxOutputTokens: 300_000,
+    }).success).toBe(false);
+  });
+
+  it("accepts a limit inside the window and rows that declare only one side", () => {
+    expect(ModelConfigSchema.safeParse({
+      provider: "p", model: "m", contextWindow: 256_000, maxOutputTokens: 32_000,
+    }).success).toBe(true);
+    expect(ModelConfigSchema.safeParse({ provider: "p", model: "m", contextWindow: 256_000 }).success).toBe(true);
+    expect(ModelConfigSchema.safeParse({ provider: "p", model: "m", maxOutputTokens: 256_000 }).success).toBe(true);
+  });
+
+  it("surfaces the rejection through createConfig instead of running on it", () => {
+    expect(() => createConfig({
+      models: { catalog: { m: { provider: "p", model: "m", contextWindow: 8_000, maxOutputTokens: 8_000 } } },
+    } as never)).toThrow(/maxOutputTokens must be smaller than contextWindow/);
   });
 });

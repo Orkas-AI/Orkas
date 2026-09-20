@@ -73,14 +73,3 @@ export function resolvedUnsuccessfulPhasedText(
   if (state.commentaryText) return '';
   return terminalText || state.allText;
 }
-
-/** Some CLIs (currently Claude Code) expose a canonical terminal result but no
- * token-level final-answer phase. When that result is about to replace the live
- * body, preserve the complete body the user already watched as process history.
- * No content matching is intentional: terminal replacement is the boundary. */
-export function commentaryForTerminalReplacement(
-  state: PhasedTextState,
-  terminalText: string,
-): string {
-  return terminalText && state.allText ? state.allText : '';
-}

@@ -121,8 +121,6 @@ describe('prompts ↔ code contract', () => {
     expect(shared).toMatch(/current request permits file writes/i);
     expect(shared).toMatch(/explicit read-only or no-new-files constraint overrides this default/i);
     expect(shared).toMatch(/do not use mutating file or shell tools/i);
-    expect(shared).toContain('Prefer supplied current history and explicit references');
-    expect(shared).toMatch(/use history tools only when required context is absent/i);
     expect(shared).not.toContain('Finish it in one turn.');
     const composed = composeChatPrompt({
       main: 'ROLE\n\n## Runtime injection\nRUNTIME',
@@ -151,6 +149,30 @@ describe('prompts ↔ code contract', () => {
     expect(agentPrompt).not.toMatch(/Even when the built-in PDF tools error, do not fall back/i);
     expect(agentPrompt).toContain('canonical group record');
     expect(agentPrompt).not.toContain('does not inject the conversation transcript');
+  });
+
+  it('shares dependency-safe multi-tool batching without duplicating it in actor prompts', () => {
+    const shared = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_shared_rules.md'), 'utf-8');
+    const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
+    const agentPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_agent_in_group.md'), 'utf-8');
+
+    // Coding and research work should not pay another model round for tool
+    // calls whose inputs are already known. The dependency/side-effect branch
+    // prevents the cost rule from turning ordered work into unsafe fan-out.
+    expect(shared).toMatch(/tool calls are already known and independent[\s\S]{0,80}together in one response/i);
+    expect(shared).toMatch(/keep calls sequential[\s\S]{0,100}depends on an earlier result[\s\S]{0,100}ordered side effects matter/i);
+    expect(commanderPrompt).not.toMatch(/tool calls are already known and independent/i);
+    expect(agentPrompt).not.toMatch(/tool calls are already known and independent/i);
+
+    const composed = composeChatPrompt({
+      main: 'ROLE\n\n## Runtime injection\nRUNTIME',
+      stableFragments: [shared],
+      languageDirective: 'LANGUAGE',
+      runtimeDatetimeBlock: 'DATE',
+    });
+    expect(composed).toMatch(/tool calls are already known and independent/i);
+    expect(composed.indexOf('tool calls are already known and independent'))
+      .toBeLessThan(composed.indexOf('## Runtime injection'));
   });
 
   it('shares the intent core with every execution runtime while keeping input UI rules in-process', () => {
@@ -255,15 +277,16 @@ describe('prompts ↔ code contract', () => {
     const bus = readFile('src/main/features/group_chat/bus.ts');
 
     expect(agentPrompt).toMatch(/primary requested outcome cannot be completed/i);
-    expect(agentPrompt).toMatch(/declared workflow and available skills\/tools/i);
+    expect(agentPrompt).toMatch(/declared workflow, available skills\/tools, or granted permissions/i);
+    expect(agentPrompt).toMatch(/hand it back to the commander with the exact boundary, preserved progress, and facts needed to continue/i);
     expect(agentPrompt).toMatch(/direct user calls/i);
     expect(agentPrompt).toMatch(/Do not hand back for missing input, a recoverable failure, task difficulty/i);
     // The 2026-08-06 mis-handback: a runtime-blocked VideoStudio handed a
     // direct user task to the commander, who could only restate it. The
     // boundary line is what tells an agent that an in-domain blocker is
     // report-and-stop, not a reassignment.
-    expect(agentPrompt).toMatch(/the KIND of work is outside your domain/i);
-    expect(agentPrompt).toMatch(/runtime fault, tool defect, or unmet dependency is NOT a capability boundary/i);
+    expect(agentPrompt).toMatch(/work outside your domain or an operation reserved for another actor/i);
+    expect(agentPrompt).toMatch(/runtime fault, tool defect, or unmet dependency that handing off cannot resolve is NOT a capability boundary/i);
     expect(agentPrompt).toMatch(/stop without a handback marker/i);
     expect(agentPrompt).toMatch(/merely because another agent may be better/i);
     expect(agentPrompt).toMatch(/Do not choose a replacement agent/i);
@@ -341,16 +364,15 @@ describe('prompts ↔ code contract', () => {
     expect(memoryTool).toContain('Use todo_tasks for task progress');
 
 
-    // Requester decision 2026-09-08: the tool contract is the single owner of
-    // "when to write"; the resident prompt keeps destinations and hand-off only.
-    expect(agentPrompt).toMatch(/tool contract decides when durable state is worth writing/i);
+    // The tool owns storage choices and permissions; the role preserves the
+    // requested scope and uses its generic capability/permission handback rule.
+    expect(agentPrompt).toMatch(/tool contract owns durability, destination, and write permissions/i);
     expect(agentPrompt).not.toMatch(/Decide from meaning/i);
     expect(agentPrompt).not.toMatch(/Never store current task progress/i);
     expect(memoryTool).toContain('Decide from meaning, never trigger words');
     expect(memoryTool).toContain('Do not store current-task progress');
-    expect(agentPrompt).toMatch(/Use `agent` for a convention limited to this Agent/i);
-    expect(agentPrompt).toMatch(/use `user` for a preference meant across Agents/i);
-    expect(agentPrompt).toMatch(/choose other destinations from the tool contract/i);
+    expect(agentPrompt).toMatch(/Preserve the intended scope/i);
+    expect(agentPrompt).not.toMatch(/use `(?:agent|user|shared)`/i);
     expect(agentPrompt).toMatch(/Project memory\/instructions are preloaded/i);
     expect(agentPrompt).toMatch(/use their mutation tools for authorized changes within the current project/i);
     expect(agentPrompt).not.toMatch(/Project memory\/instructions are read-only/i);
@@ -434,7 +456,10 @@ describe('prompts ↔ code contract', () => {
 
     expect(commanderPrompt).toMatch(/Agent, Skill, and external-package mutations/i);
     expect(commanderPrompt).not.toContain('agent-creator');
-    expect(agentCreatorEntry).toMatch(/create an Agent, crystallize a conversation into one, or change its workflow/i);
+    const description = agentCreatorEntry.match(/^description_en:\s*(.+)$/m)?.[1] || '';
+    expect(description).toMatch(/create (?:an Agent|or revise explicitly requested custom Agents)/i);
+    expect(description).toMatch(/crystallize a conversation|conversation crystallization/i);
+    expect(description).toMatch(/workflow/i);
     expect(agentCreator).toMatch(/concrete target before the current request/i);
     expect(agentCreator).toMatch(/not from the meta act of creating an Agent/i);
     expect(agentCreator).toMatch(/ask one concise clarification and emit no container/i);
@@ -466,6 +491,18 @@ describe('prompts ↔ code contract', () => {
     expect(authoring).toMatch(/explicit Markdown link[^\n]+same sentence[^\n]+read condition/i);
     expect(authoring).toMatch(/bare or backticked path is not a link/i);
     expect(authoring).toMatch(/common path is executable from the root without loading optional material/i);
+  });
+
+  it('skill authoring keeps necessary outcome explanations in the visible reply channel', () => {
+    const creator = readFile('resources/builtin/system/skills/skill-creator/SKILL.md');
+    const editor = readFile('src/main/prompts/chat_skill_setup.md');
+    expect(creator).toMatch(/requirement remains unmet|changes the required usage conditions/i);
+    expect(creator).toMatch(/session's user-visible reply channel, outside mutation and file blocks/i);
+    expect(creator).toMatch(/Writing it inside the Skill does not inform the user/i);
+    expect(creator).toMatch(/omit redundant completion prose when the host result suffices/i);
+    expect(creator).not.toContain('optional user-visible prose');
+    expect(creator).not.toContain('Emit only the minimal metadata');
+    expect(editor).toContain('<skill-reply>...</skill-reply>');
   });
 
   it('keeps the resident resource-change router compact and flexible', () => {
@@ -585,7 +622,7 @@ describe('prompts ↔ code contract', () => {
     expect(intentRules).toMatch(/Request new approval only for a materially different action, target, or condition/i);
     expect(commanderPrompt).toMatch(/Quality, correctness, and completion come first/i);
     expect(commanderPrompt).toMatch(/light outcome/i);
-    expect(commanderPrompt).toMatch(/Complete it directly/i);
+    expect(commanderPrompt).toMatch(/Complete a \*\*light outcome\*\* directly: one low-stakes deliverable/i);
     expect(commanderPrompt).toMatch(/is never light/i);
     expect(commanderPrompt).toMatch(/cost and latency break ties between comparable routes/i);
     expect(commanderPrompt).toMatch(/best owner for each user-visible outcome/i);
@@ -607,7 +644,7 @@ describe('prompts ↔ code contract', () => {
     expect(commanderPrompt).toMatch(/Do not collapse distinct user-visible materials into one task/i);
     expect(commanderPrompt).toMatch(/independent outcomes with different named owners as parallel `dispatch_to` calls/i);
     expect(commanderPrompt).toMatch(/in one response, then synthesize/i);
-    expect(commanderPrompt).toMatch(/multiple Agents for genuinely different outcomes, not merely because a task is large/i);
+    expect(commanderPrompt).toMatch(/Task size alone does not justify multiple Agents/i);
     expect(commanderPrompt).toMatch(/never dispatch merely to look busy/i);
   });
 
@@ -670,7 +707,7 @@ describe('prompts ↔ code contract', () => {
     // Commander to do now. Capability routing is a second decision.
     expect(commanderPrompt).toMatch(/current intent from the latest request and visible history before choosing an owner/i);
     const intentDecision = commanderPrompt.indexOf('Resolve the current intent');
-    const routingDecision = commanderPrompt.indexOf('2. **Route after intent, before drafting.**');
+    const routingDecision = commanderPrompt.indexOf('Choose the best owner for each user-visible outcome');
     expect(intentDecision).toBeGreaterThanOrEqual(0);
     expect(routingDecision).toBeGreaterThan(intentDecision);
     expect(commanderPrompt).toMatch(/Honor an explicit agent \/ skill \/ connector pick/i);
@@ -734,7 +771,7 @@ describe('prompts ↔ code contract', () => {
     const composer = readFile('src/main/prompts/chat_prompt_composer.ts');
 
     expect(agentPrompt).toMatch(/at most 2-3 focused fields or questions/i);
-    expect(agentPrompt).toMatch(/repeat this same decision/i);
+    expect(agentPrompt).toMatch(/retain resolved values and recheck only remaining blockers/i);
     expect(composer).not.toMatch(/at most 2-3 focused missing (?:fields|questions)/i);
     expect(composer).not.toMatch(/repeat the input decision/i);
     expect(composer).toMatch(/prefer one plain question/i);
@@ -749,10 +786,15 @@ describe('prompts ↔ code contract', () => {
     expect(agentPrompt).not.toMatch(/### Handling `inputs_schema`/i);
     expect(agentPrompt).toMatch(/Resolve inputs before dependent work on every inbound task/i);
     expect(agentPrompt).toMatch(/If `inputs_schema`[\s\S]+scan the inbound/i);
-    expect(agentPrompt).toMatch(/missing user-specific context, constraints, examples\/files, goals, or decisions/i);
-    expect(agentPrompt).toMatch(/do not fill the gap with a generic assumption/i);
-    expect(agentPrompt).toMatch(/does not depend on Commander naming the gap/i);
-    expect(agentPrompt).toMatch(/quick assumption-based answer/i);
+    // Evidence retrieval is a prerequisite to asking, with detailed triggers
+    // still owned by shared rules rather than copied into this role.
+    expect(agentPrompt).toMatch(/2\. Before treating a blocking fact as missing user input, apply the shared history and source-retrieval rules[\s\S]+4\. Otherwise request/);
+    expect(agentPrompt).toContain('carry resolved values and declared schema defaults into field defaults; leave unresolved values empty');
+    expect(agentPrompt).not.toContain('neither the inbound message nor the schema supplies a value');
+    expect(agentPrompt).toMatch(/Do not invent user facts, evidence, action targets, or authority/i);
+    expect(agentPrompt).toMatch(/execute the supported portion with explicit limits/i);
+    expect(agentPrompt).toMatch(/marking unavailable facts as unknown/i);
+    expect(agentPrompt).not.toMatch(/would materially change the result|quick assumption-based answer/i);
     expect(agentPrompt).toMatch(/at most 2-3 focused fields or questions/i);
     expect(agentPrompt).toContain('$input_channel_protocol');
     expect(agentPrompt).toContain('$plan_interaction_hint');
@@ -771,6 +813,23 @@ describe('prompts ↔ code contract', () => {
     expect(creatorSkill).toMatch(/one required task \/ material field/i);
     expect(cliSetupPrompt).toMatch(/zero\/few inputs/i);
     expect(cliSetupPrompt).toMatch(/one task field plus one optional context field/i);
+  });
+
+  it('owns concise descriptions in the creator root shared by LLM and CLI authoring', () => {
+    const root = readFile('resources/builtin/system/skills/agent-creator/SKILL.md');
+    const bundle = readSystemSkillBundle('agent-creator');
+    const cli = readFile('src/main/prompts/chat_agent_setup_cli.md');
+
+    expect(root).toMatch(/usually need one or two concise sentences/i);
+    expect(root).toMatch(/action, work object, deliverable/);
+    expect(root).toMatch(/any boundary needed to distinguish adjacent roles/);
+    expect(root).toMatch(/add an example only to resolve ambiguity/);
+    expect(root).toMatch(/not a repeated keyword list/);
+    expect(root).toMatch(/Do not shorten supplied or existing descriptions during unrelated edits or source-preserving imports/);
+    expect(bundle).not.toMatch(/Write three compact parts|quoted real user phrasings|5–8 natural keywords/);
+    expect(cli).not.toMatch(/Descriptions must be detailed|creator`'s formula/);
+    expect(cli).toContain('routing-description contract');
+    expect(cli).toContain('CLI-agnostic');
   });
 
   it('keeps agent-creator names aligned with the host no-whitespace contract', () => {
@@ -826,6 +885,14 @@ describe('prompts ↔ code contract', () => {
     expect(setupPrompt).toContain('$tools');
     expect(creatorContract).toContain('<tools>');
     expect(creatorFields).toContain('host-generated `## Agent tool dependencies`');
+    expect(creatorFields).toContain('host-generated `## Agent Skill dependencies`');
+    expect(creatorFields).toContain("do not establish the target Agent's capabilities");
+    expect(creatorFields).toContain('These dependency restrictions apply to the finished Agent');
+    expect(creatorFields).toContain("You may still use your current session's capabilities to create or edit it");
+    expect(creatorFields).toContain('System protocols, external-package/global Skills, disabled or missing Skills');
+    expect(creatorFields).toContain("another Agent's private Skills");
+    expect(creatorFields).not.toContain('then a discovered global Skill');
+    expect(creatorFields).not.toContain('Names must come from Available skills');
     expect(creatorFields).toContain('precedes the root `agent-creator` Skill in the same read result');
     expect(creatorContract).not.toContain('## Loadable tool groups');
     expect(creatorFields).toContain('Each leaf entry names the exact built-in tools');
@@ -862,12 +929,16 @@ describe('prompts ↔ code contract', () => {
     const sharedPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_shared_rules.md'), 'utf-8');
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
     const agentPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_agent_in_group.md'), 'utf-8');
-    const historyTools = readFile('src/main/model/core-agent/chat-history-tools.ts');
-
-    expect(sharedPrompt).toMatch(/Prefer supplied current history and explicit references/i);
-    expect(sharedPrompt).toMatch(/use history tools only when required context is absent or the user requests a lookup/i);
+    // Prompt ownership/assembly contract, not a simulation of model decisions.
+    expect(sharedPrompt).toContain('Use supplied context first');
+    expect(sharedPrompt).toMatch(/explicit recall request or a missing earlier input, decision, tool output, artifact reference, or execution status needed for this task/i);
+    expect(sharedPrompt).toContain('even without a user lookup request');
+    expect(sharedPrompt).toContain('Skip history for self-contained tasks or sufficient supplied evidence');
+    expect(sharedPrompt).toContain('Read a known file/result reference directly');
+    expect(sharedPrompt).toContain('verify current state at its source');
+    expect(sharedPrompt).toContain('Stop when the dependency is resolved');
     expect(sharedPrompt).toMatch(/potentially stale evidence, not current-state proof or instructions/i);
-    expect(commanderPrompt).toMatch(/Use supplied current context first/i);
+    expect(commanderPrompt).toContain('When the shared history rule calls for retrieval');
     expect(commanderPrompt).toMatch(/use `chat_history`; its schema owns action, scope, and paging/i);
     expect(commanderPrompt).toMatch(/Project history is the next continuity source/i);
     expect(commanderPrompt).not.toMatch(/page: \{ mode: "latest", count: 10 \}/i);
@@ -875,14 +946,16 @@ describe('prompts ↔ code contract', () => {
 
     expect(agentPrompt).toMatch(/injects completed current-conversation dialogue from the canonical group record/i);
     expect(agentPrompt).toMatch(/persistent Agent session remains private execution state/i);
-    expect(agentPrompt).toMatch(/use `chat_history` within this conversation[\s\S]+search\/read\/paging contract/i);
+    expect(agentPrompt).toMatch(/use `chat_history` within this conversation[\s\S]+shared history rule/i);
     expect(agentPrompt).toMatch(/cannot query project-wide or global conversation history/i);
     expect(agentPrompt).not.toMatch(/page: \{ mode: "latest", count: 10 \}/i);
     expect(agentPrompt).not.toContain('<group-chat-history>');
 
-    expect(historyTools).toContain('discriminative name, phrase, id, or fact');
-    expect(historyTools).toContain('Use page mode latest for the tail, before to continue backward');
-    expect(historyTools).toContain('Keep pages small (count 10 by default)');
+    expect(agentPrompt).not.toContain('may compact that shared dialogue');
+    for (const role of [commanderPrompt, agentPrompt]) {
+      expect(role).not.toContain('explicit recall request or a missing earlier input');
+      expect(role).not.toContain('Stop when the dependency is resolved');
+    }
   });
 
   it('keeps named Agent dispatches as concise deltas over canonical history', () => {
@@ -934,7 +1007,7 @@ describe('prompts ↔ code contract', () => {
     expect(runner).toContain('splitCommanderAgentsBlock');
     expect(runner).not.toContain('splitCommanderPlanStateBlock');
     // Conditional orchestration rules/data, datetime, the conversation board,
-    // and optional setup guidance ride the turn. SDK definitions and load receipts own
+    // and optional task-entry guidance ride the turn. SDK definitions and load receipts own
     // activation state; neither the system nor turn tail duplicates it.
     expect(runner).toContain('splitCommanderOrchestrationBlock');
     expect(runner).toMatch(/if \(connectorBlock\) parts\.push\(connectorBlock\.trim\(\)\);\s+if \(systemSkillsBlock\) parts\.push\(systemSkillsBlock\.trim\(\)\);\s+if \(skillsBlock\) parts\.push\(skillsBlock\.trim\(\)\);\s+if \(agentsBlock\) parts\.push\(agentsBlock\);/);
@@ -950,12 +1023,12 @@ describe('prompts ↔ code contract', () => {
     // Match the array structurally so formatting-only line wrapping does not
     // break the contract, while additions/removals/reordering still do.
     expect(runner).toMatch(
-      /const turnEphemeral = \[\s*orchestrationBlock,\s*volatileTail,\s*conversationBoardBlock,\s*connectorSetupBlock,\s*\]/,
+      /const turnEphemeral = \[\s*orchestrationBlock,\s*volatileTail,\s*conversationBoardBlock,\s*conversationAssistanceBlock,\s*\]/,
     );
     // Backlog state is read on demand, not injected into the prompt.
     expect(runner).not.toContain('formatProjectStatusForTurn');
     expect(runner).not.toMatch(/parts\.push\(projectStatusBlock\)/);
-    expect(runner).not.toMatch(/parts\.push\(connectorSetupBlock\)/);
+    expect(runner).not.toMatch(/parts\.push\(conversationAssistanceBlock\)/);
     expect(runner).not.toMatch(/parts\.push\(orchestrationBlock\)/);
     expect(runner).not.toMatch(/parts\.push\(volatileTail\)/);
     expect(runner).not.toMatch(/parts\.push\(activeToolGroupsBlock\)/);

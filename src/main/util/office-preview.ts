@@ -1,5 +1,6 @@
 import { docxBufferToHtml } from './extract-docx';
 import { pptxBufferToHtml, xlsxBufferToHtml } from './extract-office';
+import { isZipSpreadsheet, xlsBufferToHtml } from './extract-xls';
 
 export type OfficePreviewKind = 'word' | 'spreadsheet' | 'presentation';
 
@@ -27,7 +28,7 @@ function escapePreviewHtml(s: string): string {
 export function officePreviewKindForExt(ext: string): OfficePreviewKind | null {
   const e = String(ext || '').toLowerCase();
   if (e === '.docx' || e === '.docm') return 'word';
-  if (e === '.xlsx' || e === '.xlsm') return 'spreadsheet';
+  if (e === '.xlsx' || e === '.xlsm' || e === '.xls') return 'spreadsheet';
   if (e === '.pptx' || e === '.pptm') return 'presentation';
   return null;
 }
@@ -226,7 +227,7 @@ export async function officeBufferToPreviewHtml(
   if (kind === 'word') {
     fragment = await docxBufferToHtml(buf);
   } else if (kind === 'spreadsheet') {
-    fragment = xlsxBufferToHtml(buf);
+    fragment = isZipSpreadsheet(buf) ? xlsxBufferToHtml(buf) : await xlsBufferToHtml(buf);
   } else {
     fragment = pptxBufferToHtml(buf);
   }

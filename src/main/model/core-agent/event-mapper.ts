@@ -48,6 +48,7 @@ import {
   isStorageFullError,
 } from '../../../core-agent/src/shared/errors';
 import { classifyKeyFailure, type KeyFailureKind } from './auth-error';
+import { providerCredentialFailure } from '../../../core-agent/src/shared/provider-error-facts';
 import { sanitizeLogTextForUpload } from '../../util/log-sanitize';
 import { redactPaths } from '../../util/redact';
 
@@ -137,7 +138,7 @@ interface ConnectorEventMetadata {
 }
 
 type AgentErrorMeta = {
-  kind: 'auth' | 'rate_limit' | 'context_overflow' | 'timeout' | 'provider_error';
+  kind: 'auth' | 'rate_limit' | 'context_overflow' | 'timeout' | 'provider_error' | 'storage';
   message: string;
   code?: string;
   statusCode?: number;
@@ -147,10 +148,26 @@ function modelFailureDetails(
   error: AgentErrorMeta,
   hasVisibleText: boolean,
   providerId?: string,
-): Pick<StreamEvent, 'failureKind' | 'failureCode' | 'failurePhase' | 'failureRawCode'> {
+): Pick<StreamEvent, 'failureKind' | 'failureCode' | 'failurePhase' | 'failureRawCode' | 'retryExhausted'> {
+  if (error.code === 'TASK_TOKEN_LIMIT_REACHED') {
+    return { failureKind: 'model', failureCode: 'task_token_limit_reached', retryExhausted: true };
+  }
+  if (error.code === 'TOOL_RESULT_PERSISTENCE_FAILED') {
+    return { failureKind: 'model', failureCode: 'tool_result_persistence_failed', retryExhausted: true };
+  }
+  if (error.code === 'SESSION_PERSISTENCE_FAILED') {
+    return { failureKind: 'model', failureCode: 'session_persistence_failed', retryExhausted: true };
+  }
   const rawCode = String(error.code || '').trim();
   const code = rawCode.toUpperCase();
+  // These terminal codes are emitted after the owning retry policy finishes.
+  // Progress events, transient error kinds and error prose do not prove that
+  // budget was exhausted. Keep classification independent for UI/telemetry.
+  const retryExhausted = code === 'PROVIDER_NETWORK_EXHAUSTED'
+    || code === 'PROVIDER_RETRIES_EXHAUSTED'
+    || code === 'RETRY_EXHAUSTED';
   const statusCode = typeof error.statusCode === 'number' ? error.statusCode : 0;
+  const credentialKind = providerCredentialFailure(error);
   const transientKind = classifyTransientNetworkError(error);
   let failureCode = 'provider_error';
   let failurePhase: NonNullable<StreamEvent['failurePhase']> = hasVisibleText ? 'model_text' : 'provider_wait';
@@ -165,18 +182,17 @@ function modelFailureDetails(
   else if (code === 'PROVIDER_EMPTY_TRANSPORT') failureCode = 'provider_network';
   else if (code === 'PROVIDER_EMPTY_RESPONSE') failureCode = 'empty_response_unknown';
   else if (code === 'PROVIDER_NETWORK_EXHAUSTED') failureCode = 'provider_network';
+  else if (credentialKind) failureCode = `provider_${credentialKind}`;
   else if (transientKind === 'timeout') failureCode = 'provider_timeout';
   else if (transientKind === 'connection_dropped' || transientKind === 'network') failureCode = 'provider_network';
   else if (/^(ECONN|ENET|EAI_|ETIMEDOUT|UND_ERR_)/.test(code)) failureCode = 'provider_network';
   else if (code === 'NO_PROVIDER') failureCode = 'provider_not_configured';
-  else if (error.kind === 'auth' || code === 'PROVIDER_AUTH_EXHAUSTED') failureCode = 'provider_auth';
-  else if (error.kind === 'rate_limit' || code === 'PROVIDER_RATE_LIMIT_EXHAUSTED') failureCode = 'provider_rate_limit';
+  else if (error.kind === 'auth') failureCode = 'provider_auth';
+  else if (error.kind === 'rate_limit') failureCode = 'provider_rate_limit';
   else if (error.kind === 'context_overflow') {
     failureCode = 'context_overflow';
     failurePhase = 'compaction';
   } else if (error.kind === 'timeout') failureCode = 'provider_timeout';
-  else if (/BALANCE|QUOTA|CREDIT|FUNDS|PAYMENT/.test(code)) failureCode = 'provider_balance';
-  else if (/PERMISSION|FORBIDDEN|PLAN_REQUIRED|SUBSCRIPTION/.test(code)) failureCode = 'provider_permission';
   else if (/INVALID_REQUEST|INVALID_ARGUMENT|INVALID_SCHEMA|MODEL_NOT_FOUND|UNSUPPORTED_MODEL/.test(code)) failureCode = 'provider_request';
   // An endpoint-level HTTP client rejection (custom/BYOK endpoint gone, bad
   // request without a body, …). The status is syntax-bounded into the code so
@@ -194,6 +210,7 @@ function modelFailureDetails(
     failureCode,
     failurePhase,
     ...(failureRawCode ? { failureRawCode } : {}),
+    ...(retryExhausted ? { retryExhausted: true } : {}),
   };
 }
 
@@ -237,12 +254,11 @@ export function extractPersistedOutputPath(result: string): { path: string; size
  * user-facing so we map the common families here. The actual user-visible
  * string is resolved via i18n (`t()`).
  *
- * Unknown reasons fall back to a generic "network error" — the full
- * message is still in `data/logs/` for debugging.
+ * Preserve unknown diagnostics rather than inventing a network/account cause.
  */
 export function friendlyRetryReason(reason: string): string {
   const r = (reason || '').toLowerCase();
-  if (!r) return t('errors.network');
+  if (!r) return reason || '';
   // 5xx gateway/upstream failures first — "504 Gateway Timeout" contains
   // the word "timeout" but is really an upstream problem, not our client.
   if (/\b(502|503|504)\b|bad gateway|service unavailable|gateway timeout/.test(r)) {
@@ -254,15 +270,18 @@ export function friendlyRetryReason(reason: string): string {
   if (/\bterminated\b|stream ended without finish_reason|missing finish_reason|without finish_reason|missing final (chunk|event)|without final (chunk|event)|socket (hang up|closed|close)|fetch failed|websocket (error|closed|close)|\bws (error|closed|close)\b|connection (closed|close|reset|dropped|terminated)|stream (closed|close|interrupted|disconnected|reset|terminated)|premature close|err_stream_premature_close|econnreset|epipe|und_err_socket/.test(r)) {
     return t('errors.network.connection_dropped');
   }
-  if (/rate.?limit|429|too many requests/.test(r)) return t('errors.network.rate_limited');
+  if (providerCredentialFailure(reason) === 'rate_limit') return t('errors.network.rate_limited');
   if (/\b500\b|internal server error/.test(r)) return t('errors.network.server_error');
   if (/\b529\b|overloaded/.test(r)) return t('errors.network.overloaded');
   if (/econnrefused/.test(r)) return t('errors.network.refused');
   if (/enetunreach|enetdown|eai_again/.test(r)) return t('errors.network.unreachable');
-  return t('errors.network');
+  return reason;
 }
 
 function localizeKnownRunnerText(text: string, code?: string): string {
+  if (code === 'TASK_TOKEN_LIMIT_REACHED') return t('chat.cost_limit_reached');
+  if (code === 'TOOL_RESULT_PERSISTENCE_FAILED') return t('errors.tool_result_save_failed');
+  if (code === 'SESSION_PERSISTENCE_FAILED') return t('errors.session_save_failed');
   const trimmed = String(text || '').trim();
   if (isStorageFullError({ message: trimmed, code })) return t('errors.storage_full');
   if (/^PROVIDER_EMPTY_(?:RESPONSE|NORMAL|SAFETY|UNKNOWN|TRANSPORT)$/.test(String(code || '').trim().toUpperCase())) {
@@ -315,6 +334,9 @@ const CUSTOM_ENDPOINT_FAILURE_THRESHOLD = 2;
 const NO_BODY_HTTP_RE = /\b(4\d\d)\s+status code\s*\(\s*no body\s*\)/i;
 
 function isEndpointLevelFailure(error: AgentErrorMeta, failureCode: string): boolean {
+  // Account failures already have authoritative status/code diagnostics. A
+  // no-body SDK message must not overwrite them with endpoint suspicion.
+  if (providerCredentialFailure(error)) return false;
   return /^provider_http_4\d\d$/.test(failureCode)
     || NO_BODY_HTTP_RE.test(String(error.message || ''));
 }
@@ -381,7 +403,7 @@ function localizeKnownRunnerError(error: AgentErrorMeta, providerId?: string): s
           ? 'balance'
           : code === 'PROVIDER_NETWORK_EXHAUSTED'
             ? 'network'
-            : classifyKeyFailure({ message: raw, code: error.code });
+            : classifyKeyFailure({ message: raw, code: error.code, statusCode: error.statusCode });
   if (explicitKind === 'auth') return t('errors.model_auth_unavailable');
   if (explicitKind === 'permission') return t('errors.model_permission_unavailable');
   if (explicitKind === 'rate_limit') return t('errors.model_rate_limited');
@@ -626,7 +648,7 @@ export async function* mapCoreAgentEvents(
 ): AsyncGenerator<StreamEvent, { finalText: string; error: string | null }, unknown> {
   let finalText = '';
   let error: string | null = null;
-  let failureDetails: Pick<StreamEvent, 'failureKind' | 'failureCode' | 'failurePhase'> | null = null;
+  let failureDetails: ReturnType<typeof modelFailureDetails> | null = null;
   const skillReadByToolId = new Map<string, SkillReadEventMetadata>();
   const agentReadByToolId = new Map<string, AgentReadEventMetadata>();
   const delegationByToolId = new Map<string, { agent_id: string; agent_name: string }>();
@@ -646,7 +668,7 @@ export async function* mapCoreAgentEvents(
   let thinkingProgressEmitted = false;
   let lastThinkingProgressMs = 0;
   let pendingUnphasedText: string[] = [];
-  let waitingForInput = false;
+  let allowsEmptyFinal = false;
   let hasAssistantText = finalText.length > 0;
 
   type AssistantTextPhase = 'commentary' | 'final_answer';
@@ -884,6 +906,7 @@ export async function* mapCoreAgentEvents(
             stream: 'tool',
             data: {
               phase: 'start',
+              execution_state: 'proposed',
               id,
               name,
             },
@@ -925,6 +948,7 @@ export async function* mapCoreAgentEvents(
               // milestone. The execution boundary only enriches that same
               // lifecycle row with complete, validated input.
               phase: wasAnnounced ? 'progress' : 'start',
+              execution_state: ev.skipped ? 'skipped' : 'running',
               id: ev.id,
               name: ev.name,
               arguments: ev.input,
@@ -1006,6 +1030,7 @@ export async function* mapCoreAgentEvents(
           : extractPersistedOutputPath(rawResult);
         const data: Record<string, unknown> = {
           phase: 'end',
+          execution_state: ev.skipped ? 'skipped' : 'completed',
           id: ev.id,
           name: ev.name,
           isError: !!ev.isError,
@@ -1052,7 +1077,7 @@ export async function* mapCoreAgentEvents(
         const prefix = ev.attempt <= 1 ? t('model.retrying') : t('model.retrying_n', { attempt: ev.attempt });
         yield {
           type: 'progress',
-          text: `${prefix}·${friendly}`,
+          text: friendly ? `${prefix}·${friendly}` : prefix,
           event: {
             stream: 'runtime',
             data: {
@@ -1144,7 +1169,12 @@ export async function* mapCoreAgentEvents(
 
       case 'done': {
         const result = ev.result;
-        waitingForInput = !result.meta.error && result.meta.termination?.status === 'waiting_input';
+        // Only a successful host boundary permits a textless result. A tool
+        // call or provider tool_use stop alone does not establish a handoff.
+        allowsEmptyFinal = !result.meta.error && (
+          result.meta.termination?.status === 'waiting_input'
+          || result.meta.termination?.status === 'handed_off'
+        );
         // Some custom/test providers omit provider_call. The run result is the
         // final structured fallback: failures cannot promote partial prose to
         // a final answer; successful no-tool completion can.
@@ -1232,7 +1262,7 @@ export async function* mapCoreAgentEvents(
     yield { type: 'error', text: error, ...failureDetails };
   } else if (finalText) {
     yield { type: 'final', text: finalText };
-  } else if (!waitingForInput) {
+  } else if (!allowsEmptyFinal) {
     yield {
       type: 'error',
       text: localizeKnownRunnerText('empty response'),

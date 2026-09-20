@@ -7,6 +7,8 @@ export type RepositoryFileList = {
   files: string[];
   backend: 'rg' | 'walk';
   capped: boolean;
+  interrupted?: boolean;
+  error?: string;
 };
 
 export type RepositoryGrepHit = {
@@ -24,7 +26,28 @@ export type RepositoryGrepResult = {
   scannedBackend: 'rg' | 'fallback';
   capped: boolean;
   error?: string;
+  interrupted?: boolean;
 };
+
+/** One deadline shared by all roots and search phases of a tool call. */
+export function createRepositorySearchBudget(signal?: AbortSignal, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref();
+  return {
+    signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
+    reason(): 'cancelled' | 'time_budget' | undefined {
+      if (signal?.aborted) return 'cancelled';
+      if (controller.signal.aborted || Date.now() >= deadline) {
+        controller.abort();
+        return 'time_budget';
+      }
+      return undefined;
+    },
+    dispose: () => clearTimeout(timer),
+  };
+}
 
 const COMMAND_OUTPUT_MAX_BYTES = 24 * 1024 * 1024;
 const DEFAULT_FALLBACK_EXCLUDES = [
@@ -50,6 +73,7 @@ type CommandResult = {
   stderr: string;
   unavailable: boolean;
   capped: boolean;
+  interrupted?: boolean;
 };
 
 export async function listRepositoryFiles(
@@ -57,6 +81,20 @@ export async function listRepositoryFiles(
   maxFiles: number,
   opts: { includeIgnored?: boolean; signal?: AbortSignal } = {},
 ): Promise<RepositoryFileList> {
+  const files: string[] = [];
+  const result = await visitRepositoryFiles(root, (file) => {
+    files.push(file);
+    return files.length > maxFiles;
+  }, opts);
+  return { ...result, files: files.slice(0, maxFiles) };
+}
+
+/** Backpressured filename stream. The visitor returns true to stop early. */
+export async function visitRepositoryFiles(
+  root: string,
+  visit: (file: string) => boolean | Promise<boolean>,
+  opts: { includeIgnored?: boolean; signal?: AbortSignal } = {},
+): Promise<Omit<RepositoryFileList, 'files'>> {
   const args = [
     '--files',
     '--hidden',
@@ -67,26 +105,22 @@ export async function listRepositoryFiles(
   ];
   for (const dir of DEFAULT_FALLBACK_EXCLUDES) args.push('--glob', `!${dir}/**`);
   for (const glob of DEFAULT_FALLBACK_FILE_GLOBS) args.push('--glob', `!${glob}`);
-  const relative: string[] = [];
   const result = await runStreamingRecords(
     'rg',
     args,
     root,
     '\0',
-    (record) => {
-      if (record) relative.push(record);
-      return relative.length > maxFiles;
-    },
+    (record) => record ? visit(path.resolve(root, record)) : false,
     opts.signal,
   );
-  if (result.ok) {
-    return {
-      files: relative.slice(0, maxFiles).map((file) => path.resolve(root, file)),
-      backend: 'rg',
-      capped: result.capped || relative.length > maxFiles,
-    };
-  }
-  return { files: [], backend: 'walk', capped: false };
+  return {
+    backend: result.unavailable ? 'walk' : 'rg',
+    capped: result.capped,
+    ...(result.interrupted ? { interrupted: true } : {}),
+    ...(!result.ok && !result.unavailable && !result.interrupted && result.code !== 1
+      ? { error: result.stderr.trim() || `rg exited with code ${result.code ?? 'null'}` }
+      : {}),
+  };
 }
 
 export async function grepRepository(
@@ -96,6 +130,7 @@ export async function grepRepository(
     regex: boolean;
     caseSensitive: boolean;
     contextLines: number;
+    filesOnly?: boolean;
     maxResults: number;
     includeGlobs: string[];
     excludeGlobs: string[];
@@ -114,6 +149,7 @@ export async function grepRepository(
     '!.git/**',
     ...(input.regex ? [] : ['--fixed-strings']),
     ...(input.caseSensitive ? [] : ['--ignore-case']),
+    ...(input.filesOnly ? ['--max-count', '1'] : []),
     ...(input.contextLines > 0 ? ['--context', String(input.contextLines)] : []),
     ...(input.includeIgnored ? ['--no-ignore'] : []),
   ];
@@ -162,7 +198,7 @@ export async function grepRepository(
   if (result.unavailable) {
     return { available: false, hits: [], scannedBackend: 'fallback', capped: false };
   }
-  if (!result.ok && result.code !== 1) {
+  if (!result.ok && result.code !== 1 && !result.interrupted) {
     return {
       available: true,
       hits: [],
@@ -178,6 +214,7 @@ export async function grepRepository(
     available: true,
     scannedBackend: 'rg',
     capped,
+    ...(result.interrupted ? { interrupted: true } : {}),
     hits: selected.map((match) => {
       const context = contextByPath.get(match.path);
       const before: Array<{ line: number; text: string }> = [];
@@ -210,96 +247,80 @@ async function runStreamingRecords(
   args: string[],
   cwd: string,
   delimiter: '\0' | '\n',
-  onRecord: (record: string) => boolean,
+  onRecord: (record: string) => boolean | Promise<boolean>,
   signal?: AbortSignal,
 ): Promise<CommandResult> {
-  return new Promise((resolve) => {
-    const decoder = new StringDecoder('utf8');
-    let pending = '';
-    let stderr: Buffer = Buffer.alloc(0);
-    let settled = false;
-    let outputExceeded = false;
-    let intentionallyStopped = false;
-    const finish = (value: CommandResult) => {
-      if (settled) return;
-      settled = true;
-      resolve(value);
-    };
-    let child;
-    try {
-      child = spawn(command, args, {
-        cwd,
-        shell: false,
-        windowsHide: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        ...(signal ? { signal } : {}),
-      });
-    } catch (error) {
-      finish({
-        ok: false,
-        code: null,
-        stderr: (error as Error).message,
-        unavailable: true,
-        capped: false,
-      });
-      return;
-    }
-    const stop = () => {
-      intentionallyStopped = true;
-      try { child.kill('SIGTERM'); } catch { /* best effort */ }
-    };
-    const consumeStdout = (data: Buffer) => {
-      if (intentionallyStopped || outputExceeded) return;
-      pending += decoder.write(data);
-      if (pending.length > COMMAND_OUTPUT_MAX_BYTES) {
-        outputExceeded = true;
-        try { child.kill('SIGTERM'); } catch { /* best effort */ }
-        return;
-      }
-      let boundary = pending.indexOf(delimiter);
-      while (boundary >= 0) {
-        const record = pending.slice(0, boundary).replace(/\r$/, '');
-        pending = pending.slice(boundary + delimiter.length);
-        if (onRecord(record)) {
-          stop();
-          return;
-        }
-        boundary = pending.indexOf(delimiter);
-      }
-    };
-    child.stdout.on('data', consumeStdout);
-    child.stderr.on('data', (data: Buffer) => {
-      if (stderr.length >= COMMAND_OUTPUT_MAX_BYTES) return;
-      stderr = Buffer.concat([
-        stderr,
-        data.subarray(0, COMMAND_OUTPUT_MAX_BYTES - stderr.length),
-      ]);
-    });
-    child.on('error', (error: NodeJS.ErrnoException) => {
-      finish({
-        ok: false,
-        code: null,
-        stderr: error.message,
-        unavailable: error.code === 'ENOENT',
-        capped: intentionallyStopped,
-      });
-    });
-    child.on('close', (code) => {
-      if (!intentionallyStopped && !outputExceeded) {
-        pending += decoder.end();
-        if (pending && !onRecord(pending.replace(/\r$/, ''))) pending = '';
-      }
-      finish({
-        ok: (code === 0 || intentionallyStopped) && !outputExceeded,
-        code,
-        stderr: outputExceeded
-          ? 'repository search output exceeded its bounded capture'
-          : stderr.toString('utf8'),
-        unavailable: false,
-        capped: intentionallyStopped,
-      });
-    });
+  if (signal?.aborted) return { ok: false, code: null, stderr: '', unavailable: false, capped: false, interrupted: true };
+  const child = spawn(command, args, { cwd, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  let spawnError: NodeJS.ErrnoException | undefined;
+  const closed = new Promise<number | null>((resolve) => {
+    child.on('error', (error: NodeJS.ErrnoException) => { spawnError = error; });
+    child.once('close', resolve);
   });
+  let stopped = false;
+  let outputExceeded = false;
+  let callbackError = false;
+  let stderrBytes = 0;
+  const stderrChunks: Buffer[] = [];
+  child.stderr.on('data', (data: Buffer) => {
+    const chunk = data.subarray(0, Math.max(0, COMMAND_OUTPUT_MAX_BYTES - stderrBytes));
+    if (chunk.length) { stderrChunks.push(chunk); stderrBytes += chunk.length; }
+  });
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const stop = () => {
+    try { child.kill('SIGTERM'); } catch { /* close owns terminal state */ }
+    if (!killTimer) {
+      killTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* exited */ } }, 250);
+      killTimer.unref();
+    }
+  };
+  signal?.addEventListener('abort', stop, { once: true });
+  const decoder = new StringDecoder('utf8');
+  let pending = '';
+  const consume = async (): Promise<void> => {
+    let boundary = pending.indexOf(delimiter);
+    let offset = 0;
+    while (boundary >= 0 && !signal?.aborted) {
+      const record = pending.slice(offset, boundary).replace(/\r$/, '');
+      offset = boundary + delimiter.length;
+      const decision = onRecord(record);
+      if (typeof decision === 'boolean' ? decision : await decision) { stopped = true; break; }
+      boundary = pending.indexOf(delimiter, offset);
+    }
+    pending = pending.slice(offset);
+  };
+  try {
+    for await (const data of child.stdout) {
+      if (signal?.aborted) break;
+      pending += decoder.write(data as Buffer);
+      if (pending.length > COMMAND_OUTPUT_MAX_BYTES) { outputExceeded = true; break; }
+      await consume();
+      if (stopped || signal?.aborted) break;
+      // Let cancellation/deadline timers run even on a hot local pipe.
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    if (!stopped && !outputExceeded && !signal?.aborted) {
+      pending += decoder.end();
+      if (pending) stopped = await onRecord(pending.replace(/\r$/, ''));
+    }
+  } catch {
+    callbackError = !signal?.aborted && !spawnError;
+  } finally {
+    if (stopped || outputExceeded || callbackError || signal?.aborted) stop();
+  }
+  const code = await closed;
+  if (killTimer) clearTimeout(killTimer);
+  signal?.removeEventListener('abort', stop);
+  return {
+    ok: (code === 0 || stopped) && !outputExceeded && !callbackError && !signal?.aborted && !spawnError,
+    code,
+    stderr: outputExceeded ? 'repository search output exceeded its bounded capture'
+      : callbackError ? 'repository search visitor failed'
+      : spawnError?.message ?? Buffer.concat(stderrChunks).toString('utf8'),
+    unavailable: spawnError?.code === 'ENOENT',
+    capped: stopped,
+    ...(signal?.aborted ? { interrupted: true } : {}),
+  };
 }
 
 // ── Ignore-file support for the walk fallback ────────────────────────────

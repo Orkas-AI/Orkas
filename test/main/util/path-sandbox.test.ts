@@ -34,6 +34,26 @@ afterAll(() => {
 });
 
 describe('path-sandbox › isPathAllowed', () => {
+  it('distinguishes deleting a directory entry from accessing its target', () => {
+    const link = path.join(workspace, 'entry-link');
+    fs.symlinkSync(path.dirname(outsideFile), link, process.platform === 'win32' ? 'junction' : 'dir');
+    try {
+      expect(isPathAllowed(link, [workspace])).toBe(false);
+      expect(isPathAllowed(link, [workspace], { followFinalSymlink: false })).toBe(true);
+      expect(isPathAllowed(path.join(link, 'secret.md'), [workspace], { followFinalSymlink: false })).toBe(false);
+      expect(isPathAllowed(link + path.sep, [workspace], { followFinalSymlink: false })).toBe(false);
+    } finally { fs.unlinkSync(link); }
+  });
+
+  it('does not authorize deleting an outside entry just because its target is inside', () => {
+    const link = path.join(path.dirname(outsideFile), 'entry-back');
+    fs.symlinkSync(workspace, link, process.platform === 'win32' ? 'junction' : 'dir');
+    try {
+      expect(isPathAllowed(link, [workspace])).toBe(true);
+      expect(isPathAllowed(link, [workspace], { followFinalSymlink: false })).toBe(false);
+    } finally { fs.unlinkSync(link); }
+  });
+
   it('accepts files inside a root', () => {
     expect(isPathAllowed(workspaceFile, [workspace, attachments])).toBe(true);
     expect(isPathAllowed(attachmentFile, [workspace, attachments])).toBe(true);

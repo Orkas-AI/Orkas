@@ -131,7 +131,7 @@ const AUTO_ATTACH_ACCEPT = (typeof CHAT_ATTACH_ACCEPT !== 'undefined' && Array.i
   ? CHAT_ATTACH_ACCEPT
   : [
       '.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log',
-      '.pdf', '.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm',
+      '.pdf', '.docx', '.docm', '.xlsx', '.xlsm', '.xls', '.pptx', '.pptm',
       '.png', '.jpg', '.jpeg', '.webp', '.gif',
       '.mp4', '.webm', '.mov', '.m4v', '.ogv',
       '.mp3', '.wav', '.ogg', '.opus', '.m4a', '.aac', '.flac',
@@ -155,7 +155,7 @@ function _autoAttachKindFromExt(ext) {
   if (['.mp3', '.wav', '.ogg', '.opus', '.m4a', '.aac', '.flac'].includes(ext)) return 'audio';
   if (ext === '.pdf') return 'pdf';
   if (ext === '.docx' || ext === '.docm') return 'docx';
-  if (ext === '.xlsx' || ext === '.xlsm') return 'spreadsheet';
+  if (ext === '.xlsx' || ext === '.xlsm' || ext === '.xls') return 'spreadsheet';
   if (ext === '.pptx' || ext === '.pptm') return 'presentation';
   return 'text';
 }

@@ -1730,6 +1730,7 @@ async function _installSourceSkillRoots(
     force?: boolean;
     continueOnError?: boolean;
     rejectExisting?: boolean;
+    requireSkillMd?: boolean;
   } = {},
 ): Promise<ImportResult> {
   const reserved = new Set<string>();
@@ -1775,6 +1776,27 @@ async function _installSourceSkillRoots(
       : _sourceSkillImportDescription(sourceSkillMd, t('skills.import.default_desc_dir'));
     let created: CustomSkill | null = null;
     try {
+      if (opts.requireSkillMd) {
+        // Check the source before normalization can fill a missing name or
+        // description. Native import accepts an existing Skill, not a draft.
+        const report = validateSkillFile({ relpath: 'SKILL.md', content: fs.readFileSync(sourceSkillMd, 'utf8') });
+        const invalidIdentity = report.violations.some((violation) =>
+          violation.rule === 'frontmatter_name_invalid'
+          || (violation.rule === 'frontmatter_description_missing'
+            && !_sourceSkillImportDescription(sourceSkillMd, '')));
+        if (!report.ok || invalidIdentity) {
+          report.ok = false;
+          const failure: ImportFailure = {
+            sourceName, skillId: effectiveName, error: t('skills.errors.validation_blocked'), report,
+          };
+          failures.push(failure);
+          if (!opts.continueOnError) {
+            await rollbackCreated();
+            return { ok: false, error: failure.error, report, failures };
+          }
+          continue;
+        }
+      }
       created = await createCustomSkill(effectiveName, effectiveDesc);
       if (!created) throw new Error(t('skills.errors.create_failed'));
 
@@ -2056,6 +2078,7 @@ export async function createFromDir(
         force: opts.force,
         continueOnError: opts.continueOnError,
         rejectExisting: opts.rejectExisting,
+        requireSkillMd: opts.requireSkillMd,
       },
     );
   }

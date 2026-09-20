@@ -20,7 +20,7 @@ import {
   type ToolSurfaceState,
 } from "./session.js";
 import type { WorkspaceObservationEntry } from "./workspace-state.js";
-import { errorCodeForLog } from "../shared/errors.js";
+import { SessionPersistenceError, errorCodeForLog } from "../shared/errors.js";
 
 const log = createLogger("persistent-session");
 
@@ -78,6 +78,72 @@ export class PersistentSession extends Session {
    * instead of rewriting every retained turn. */
   private messageStartOffsets: number[] = [];
   private sessionFileSize = 0;
+  // Capture ordered disk operations, not the trimmed model/history window.
+  // Runtime barriers stop new work while this queue cannot be drained.
+  private pendingWrites: Array<() => void> = [];
+  private persistenceFailure: string | undefined;
+  private pendingFlush: Promise<void> | undefined;
+
+  override hasPendingPersistence(): boolean {
+    return this.pendingWrites.length > 0 || this.contextWriteDirty;
+  }
+
+  override async flushPending(signal?: AbortSignal): Promise<void> {
+    if (!this.hasPendingPersistence()) return;
+    if (this.pendingFlush) return this.pendingFlush;
+    const flush = async () => {
+      for (const waitMs of [200, 1_000, 3_000]) {
+        await new Promise<void>((resolve, reject) => {
+          const abort = () => {
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", abort);
+            reject(Object.assign(new Error("Run aborted"), { code: "ABORT_ERR" }));
+          };
+          const timer = setTimeout(() => {
+            signal?.removeEventListener("abort", abort);
+            resolve();
+          }, waitMs);
+          signal?.addEventListener("abort", abort, { once: true });
+          if (signal?.aborted) abort();
+        });
+        this.persistenceFailure = undefined;
+        this.attemptPersistence();
+        if (!this.hasPendingPersistence()) return;
+      }
+      throw new SessionPersistenceError(this.persistenceFailure);
+    };
+    this.pendingFlush = flush();
+    try { await this.pendingFlush; }
+    finally { this.pendingFlush = undefined; }
+  }
+
+  private enqueueWrite(write: () => void): void {
+    this.pendingWrites.push(write);
+    this.attemptPersistence();
+  }
+
+  private attemptPersistence(): void {
+    // Mutations during a failure retain data without restarting the retry budget.
+    if (this.persistenceFailure) return;
+    try {
+      let written = 0;
+      try {
+        while (written < this.pendingWrites.length) {
+          this.pendingWrites[written]();
+          written++;
+        }
+      } finally {
+        if (written) this.pendingWrites.splice(0, written);
+      }
+      if (this.contextWriteDirty && this.contextMutationDepth === 0) {
+        this.persistContext();
+        this.contextWriteDirty = false;
+      }
+    } catch (err) {
+      this.persistenceFailure = errorCodeForLog(err);
+      log.warn("session save pending", { code: this.persistenceFailure });
+    }
+  }
 
   constructor(opts: {
     /** Absolute path to the jsonl file that backs this session. */
@@ -110,6 +176,7 @@ export class PersistentSession extends Session {
    * constructor; exposed so callers can force a reload (rare — mostly tests).
    */
   loadFromDisk(): void {
+    if (this.hasPendingPersistence()) throw new SessionPersistenceError(this.persistenceFailure);
     super.clear();
     this.messageStartOffsets = [];
     this.sessionFileSize = 0;
@@ -475,6 +542,12 @@ export class PersistentSession extends Session {
     this.requestContextWrite();
   }
 
+  override configureHistoryBudget(usableInputTokens: number, requestCeilingTokens: number, fixedOverheadTokens: number): boolean {
+    const changed = super.configureHistoryBudget(usableInputTokens, requestCeilingTokens, fixedOverheadTokens);
+    if (changed) this.requestContextWrite();
+    return changed;
+  }
+
   override addHistoryResource(resource: HistoryResource): void {
     super.addHistoryResource(resource);
     this.requestContextWrite();
@@ -533,6 +606,11 @@ export class PersistentSession extends Session {
     this.requestContextWrite();
   }
 
+  override applyEmergencyHistoryFold(notice: string, turnIds: readonly number[]): void {
+    super.applyEmergencyHistoryFold(notice, turnIds);
+    this.requestContextWrite();
+  }
+
   override applyActiveCheckpointSummary(
     summary: string,
     checkpointThroughMessageIndex: number,
@@ -557,53 +635,41 @@ export class PersistentSession extends Session {
     } finally {
       this.contextMutationDepth--;
       if (this.contextMutationDepth === 0 && this.contextWriteDirty) {
-        this.contextWriteDirty = false;
-        this.writeContextToDisk();
+        this.attemptPersistence();
       }
     }
   }
 
-  /** Truncate the on-disk history to match an empty in-memory session. */
+  /** Persist an explicit reset in order, including after a failed append. */
   override clear(): void {
     super.clear();
-    this.messageStartOffsets = [];
-    this.sessionFileSize = 0;
-    this.contextWriteDirty = false;
-    try {
-      if (fs.existsSync(this.sessionFile)) fs.truncateSync(this.sessionFile, 0);
-      if (fs.existsSync(this.contextFile)) fs.unlinkSync(this.contextFile);
-    } catch (err) {
-      log.warn("session truncate failed", { code: errorCodeForLog(err) });
-    }
+    this.flushToDisk();
+    this.requestContextWrite();
   }
-
-  // ── Disk writes ────────────────────────────────────────────────────────
 
   private requestContextWrite(): void {
-    if (this.contextMutationDepth > 0) {
-      this.contextWriteDirty = true;
-      return;
-    }
-    this.writeContextToDisk();
+    this.contextWriteDirty = true;
+    if (this.contextMutationDepth === 0) this.attemptPersistence();
   }
 
-  /**
-   * Append a single record to the jsonl file. `fs.appendFileSync` with
-   * `{ flag: "a" }` is atomic for writes up to PIPE_BUF (~4K) on POSIX; for
-   * larger payloads we fall back to a write+fsync on a tmp file + rename,
-   * but in practice a single message is well under that limit.
-   */
+  /** Capture the expected byte offset so partial appends can be retried without
+   * duplicating a complete row or joining a new row onto a torn write. */
   private appendToDisk(record: Message): void {
-    this.ensureDir();
     const line = JSON.stringify({ ...record, ts: Date.now() }) + "\n";
-    try {
-      const start = this.sessionFileSize;
+    const start = this.sessionFileSize;
+    this.messageStartOffsets.push(start);
+    this.sessionFileSize += Buffer.byteLength(line, "utf-8");
+    let attempted = false;
+    this.enqueueWrite(() => {
+      this.ensureDir();
+      if (attempted) {
+        const size = fs.existsSync(this.sessionFile) ? fs.statSync(this.sessionFile).size : 0;
+        if (size < start) throw Object.assign(new Error("Session prefix changed"), { code: "EIO" });
+        if (size > start) fs.truncateSync(this.sessionFile, start);
+      }
+      attempted = true;
       fs.appendFileSync(this.sessionFile, line, "utf-8");
-      this.messageStartOffsets.push(start);
-      this.sessionFileSize += Buffer.byteLength(line, "utf-8");
-    } catch (err) {
-      log.warn("session append failed", { code: errorCodeForLog(err) });
-    }
+    });
   }
 
   /** Account for Session's legacy in-memory head trim before recording the
@@ -614,98 +680,64 @@ export class PersistentSession extends Session {
     if (dropped) this.messageStartOffsets.splice(0, dropped);
   }
 
-  /** Replace only the changed suffix. Canonical group history is recoverable
-   * from the main conversation log, so an interrupted suffix write is repaired
-   * by the next full/incremental rebase; fsync still closes the normal crash
-   * window before the new active turn starts. */
+  /** Capture only the changed suffix, retaining the historical disk prefix. */
   private rewriteTailToDisk(changedFrom: number): void {
-    let onDiskSize = -1;
-    try {
-      onDiskSize = fs.existsSync(this.sessionFile)
-        ? fs.statSync(this.sessionFile).size
-        : -1;
-    } catch { /* full rewrite below */ }
-    if (
-      changedFrom <= 0
-      || changedFrom > this.messageStartOffsets.length
-      || onDiskSize !== this.sessionFileSize
-    ) {
+    let diskMatches = true;
+    if (!this.pendingWrites.length) {
+      try { diskMatches = fs.statSync(this.sessionFile).size === this.sessionFileSize; }
+      catch { diskMatches = false; }
+    }
+    if (changedFrom <= 0 || changedFrom > this.messageStartOffsets.length || !diskMatches) {
       this.flushToDisk();
       return;
     }
-
-    const oldLength = this.messageStartOffsets.length;
-    const offset = changedFrom < oldLength
-      ? this.messageStartOffsets[changedFrom]
-      : this.sessionFileSize;
-    const tail = this.getMessages().slice(changedFrom);
-    const lines = tail.map((message) => JSON.stringify({
-      role: message.role,
-      content: message.content,
-      ...(message.turnId ? { turnId: message.turnId } : {}),
-      ts: Date.now(),
-    }) + "\n");
+    const offset = this.messageStartOffsets[changedFrom] ?? this.sessionFileSize;
+    const lines = this.serializedMessages(changedFrom);
     const payload = Buffer.from(lines.join(""), "utf-8");
-
-    this.ensureDir();
-    let fd: number | undefined;
-    try {
-      fd = fs.openSync(this.sessionFile, "r+");
-      fs.ftruncateSync(fd, offset);
-      if (payload.length) fs.writeSync(fd, payload, 0, payload.length, offset);
-      fs.fsyncSync(fd);
-
-      const nextOffsets = this.messageStartOffsets.slice(0, changedFrom);
-      let position = offset;
-      for (const line of lines) {
-        nextOffsets.push(position);
-        position += Buffer.byteLength(line, "utf-8");
-      }
-      this.messageStartOffsets = nextOffsets;
-      this.sessionFileSize = position;
-    } catch (err) {
-      log.warn("session tail rewrite failed", { code: errorCodeForLog(err) });
-      if (fd !== undefined) {
-        try { fs.closeSync(fd); } catch { /* ignore */ }
-        fd = undefined;
-      }
-      this.flushToDisk();
-    } finally {
-      if (fd !== undefined) {
-        try { fs.closeSync(fd); } catch { /* ignore */ }
-      }
-    }
+    this.updateOffsets(lines, changedFrom, offset);
+    this.enqueueWrite(() => {
+      this.ensureDir();
+      const fd = fs.openSync(this.sessionFile, "r+");
+      try {
+        fs.ftruncateSync(fd, offset);
+        let written = 0;
+        while (written < payload.length) {
+          const count = fs.writeSync(fd, payload, written, payload.length - written, offset + written);
+          if (!count) throw Object.assign(new Error("Incomplete session write"), { code: "EIO" });
+          written += count;
+        }
+        fs.fsyncSync(fd);
+      } finally { fs.closeSync(fd); }
+    });
   }
 
-  /**
-   * Rewrite the entire file from current in-memory state — used by compact()
-   * so the on-disk view drops old content along with memory.
-   */
-  private flushToDisk(): void {
-    this.ensureDir();
-    const tmp = `${this.sessionFile}.tmp`;
-    try {
-      const records = this.getMessages()
-        .map((m) => JSON.stringify({
-          role: m.role,
-          content: m.content,
-          ...(m.turnId ? { turnId: m.turnId } : {}),
-          ts: Date.now(),
-        }) + "\n");
-      const lines = records.join("");
-      fs.writeFileSync(tmp, lines, "utf-8");
-      fs.renameSync(tmp, this.sessionFile);
-      this.messageStartOffsets = [];
-      let position = 0;
-      for (const record of records) {
-        this.messageStartOffsets.push(position);
-        position += Buffer.byteLength(record, "utf-8");
-      }
-      this.sessionFileSize = position;
-    } catch (err) {
-      log.warn("session flush failed", { code: errorCodeForLog(err) });
-      try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+  private serializedMessages(from = 0): string[] {
+    return this.getMessages().slice(from).map((m) => JSON.stringify({
+      role: m.role, content: m.content,
+      ...(m.turnId ? { turnId: m.turnId } : {}), ts: Date.now(),
+    }) + "\n");
+  }
+
+  private updateOffsets(lines: string[], from: number, offset: number): void {
+    this.messageStartOffsets = this.messageStartOffsets.slice(0, from);
+    for (const line of lines) {
+      this.messageStartOffsets.push(offset);
+      offset += Buffer.byteLength(line, "utf-8");
     }
+    this.sessionFileSize = offset;
+  }
+
+  /** Explicit full replacement (rebase/reset/heal), never an append retry. */
+  private flushToDisk(): void {
+    const records = this.serializedMessages();
+    const payload = records.join("");
+    this.updateOffsets(records, 0, 0);
+    this.enqueueWrite(() => {
+      this.ensureDir();
+      const tmp = `${this.sessionFile}.tmp`;
+      fs.writeFileSync(tmp, payload, "utf-8");
+      fs.renameSync(tmp, this.sessionFile);
+    });
   }
 
   private loadContextFromDisk(): void {
@@ -736,19 +768,19 @@ export class PersistentSession extends Session {
   }
 
   private writeContextToDisk(): void {
+    this.requestContextWrite();
+  }
+
+  private persistContext(): void {
     const state = this.getSerializedContextState();
-    try {
-      if (!state) {
-        if (fs.existsSync(this.contextFile)) fs.unlinkSync(this.contextFile);
-        return;
-      }
-      this.ensureDir();
-      const tmp = `${this.contextFile}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(state) + "\n", "utf-8");
-      fs.renameSync(tmp, this.contextFile);
-    } catch (err) {
-      log.warn("session context write failed", { code: errorCodeForLog(err) });
+    if (!state) {
+      if (fs.existsSync(this.contextFile)) fs.unlinkSync(this.contextFile);
+      return;
     }
+    this.ensureDir();
+    const tmp = `${this.contextFile}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(state) + "\n", "utf-8");
+    fs.renameSync(tmp, this.contextFile);
   }
 
   private ensureDir(): void {

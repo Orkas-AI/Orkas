@@ -33,16 +33,15 @@
 //     renderer origin, so SOP already blocks parent.* access; the sandbox
 //     flags pre-empt top-window navigation and new-window pop.
 //   - The reveal-in-folder header button goes through workspace.revealPath,
-//     which the main process re-validates against the workspace + attachment
-//     scope.
+//     which validates an existing absolute path without granting read access.
 //
 // Usage:
 //   openChatFileViewer(absPath, displayName?, opts?)
 //     opts.cid — pass through when the file is a per-conv attachment, so
-//                main can include the cid's attachment dir in the reveal /
-//                read scope. Workspace-only paths can omit it.
+//                main can include the cid's attachment dir in the read scope.
+//                Workspace-only paths can omit it.
 //     opts.projectId — pass through when the file belongs to a project file
-//                pool so reveal / text preview can include that scope.
+//                pool so text preview can include that scope.
 
 let _viewerEl = null;
 let _viewerBody = null;
@@ -340,7 +339,7 @@ const _IMAGE_EXTS = new Set([
 ]);
 const _VIDEO_EXTS = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
 const _AUDIO_EXTS = new Set(['.mp3', '.wav', '.ogg', '.oga', '.opus', '.weba', '.m4a', '.aac', '.flac']);
-const _OFFICE_EXTS = new Set(['.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm']);
+const _OFFICE_EXTS = new Set(['.docx', '.docm', '.xlsx', '.xlsm', '.xls', '.pptx', '.pptm']);
 const _MARKDOWN_EXTS = new Set(['.md', '.markdown']);
 // Text exts: the source-as-text bucket. Keep code-ish exts here too so the
 // user can peek at a generated script without leaving the app. No syntax
@@ -503,6 +502,7 @@ function _viewerCanAddToLibrary(name, options = {}) {
 }
 
 function _viewerConversationIsProjectScoped(cid) {
+  if (window.OrkasPreviewHost?.projectScopedFor) return window.OrkasPreviewHost.projectScopedFor(cid);
   if (!cid || typeof conversations === 'undefined' || !Array.isArray(conversations)) return false;
   const conversation = conversations.find((item) => item && item.conversation_id === cid);
   return !!(conversation && conversation.project_id);
@@ -606,6 +606,7 @@ function _teardownViewerContent(reason = 'replaced') {
   }
   _viewerEditController = null;
   _viewerDirty = false;
+  window.OrkasPreviewHost?.setDirty(false);
   _viewerLibraryProjectScoped = false;
   if (_viewerHtmlCanvasResizeHandler && typeof window !== 'undefined') {
     window.removeEventListener('resize', _viewerHtmlCanvasResizeHandler);
@@ -711,6 +712,7 @@ async function _onAddLibraryClick() {
   }
 
   const scope = res.scope === 'project' ? 'project' : (res.scope === 'global' ? 'global' : 'unknown');
+  window.OrkasPreviewHost?.filesChanged();
   _viewerTrackEvent('file_preview_add_library_result', {
     result: 'success',
     kind: _kindOf(p),
@@ -776,7 +778,7 @@ async function _onSaveAppClick() {
     return;
   }
   const label = _viewerLabel('apps.save_from_file_action', 'Save as app');
-  const doneLabel = _viewerLabel('apps.saved_toast', 'Saved to My Apps');
+  const doneLabel = _viewerLabel('apps.saved_toast', 'Saved to Apps');
   const original = _viewerSaveAppButtonHtml(label);
   try { _setSaveAppVisible(false); } catch (_) {
     _viewerLogFailure('file_preview_save_app_presentation', {
@@ -826,6 +828,7 @@ async function _onSaveAppClick() {
     kind: _kindOf(p),
     duration_ms: _viewerDurationSince(startedAt),
   });
+  window.OrkasPreviewHost?.filesChanged();
   try {
     _viewerSaveAppBtn.innerHTML = _viewerSaveAppButtonHtml(doneLabel, 'check');
     if (typeof uiToast === 'function') uiToast(doneLabel, { variant: 'success' });
@@ -904,6 +907,7 @@ async function closeChatFileViewer(opts) {
     document.removeEventListener('keydown', _viewerKeyHandler);
     _viewerKeyHandler = null;
   }
+  if (!force) window.OrkasPreviewHost?.close();
   return true;
 }
 
@@ -1206,6 +1210,7 @@ async function _renderVideoBody(absPath, displayName, cid, projectId, playbackOp
 async function openChatVideoUrlViewer(src, displayName, opts) {
   const url = String(src || '').trim();
   if (!url) return;
+  if (window.OrkasPreviewWindows) return window.OrkasPreviewWindows.open({ kind: 'video', src: url, title: displayName || '', options: window.OrkasPreviewWindows.options(opts) });
   const absPath = (opts && opts.absPath) || _viewerAbsPathFromChatMediaLocalUrl(url);
   const cid = (opts && opts.cid) || null;
   const projectId = (opts && opts.projectId) || null;
@@ -1288,7 +1293,7 @@ async function _renderMarkdownBody(absPath, displayName, cid, projectId) {
     initialContent: text,
     actionIconOnly: true,
     callbacks: {
-      onDirtyChange: (dirty) => { _viewerDirty = !!dirty; },
+      onDirtyChange: (dirty) => { _viewerDirty = !!dirty; window.OrkasPreviewHost?.setDirty(_viewerDirty); },
       onSaved: () => _typesetViewerMarkdown(),
     },
   });
@@ -1322,7 +1327,7 @@ async function _renderTextBody(absPath, displayName, cid, projectId) {
     initialContent: text,
     actionIconOnly: true,
     callbacks: {
-      onDirtyChange: (dirty) => { _viewerDirty = !!dirty; },
+      onDirtyChange: (dirty) => { _viewerDirty = !!dirty; window.OrkasPreviewHost?.setDirty(_viewerDirty); },
     },
   });
 }
@@ -1424,6 +1429,14 @@ async function _ensureViewerFileExists(absPath, cid, projectId) {
     if (res && res.ok && res.exists && res.isFile !== false) return true;
     if (res && res.ok && res.exists && res.isFile === false) return true;
     const name = String(absPath || '').split(/[\\/]/).pop() || String(absPath || '');
+    if (!res || !res.ok) {
+      await _showUnsupportedDialog(absPath, cid, projectId, {
+        messageKey: 'chat.preview_read_failed_message',
+        vars: { name },
+        fallback: 'Could not read this file. Open the containing folder?',
+      });
+      return false;
+    }
     const message = _viewerLabelVars(
       'chat.file_missing_toast',
       'The file no longer exists.',
@@ -1442,6 +1455,11 @@ async function _ensureViewerFileExists(absPath, cid, projectId) {
 
 async function openChatFileViewer(absPath, displayName, opts) {
   if (!absPath) return;
+  if (window.OrkasPreviewWindows) {
+    if (!(await _ensureViewerFileExists(absPath, opts?.cid, opts?.projectId))) return;
+    if (_kindOf(displayName || absPath) === 'image') return window.OrkasPreviewWindows.image(_chatMediaLocalUrl(absPath), displayName || absPath.split(/[\\/]/).pop(), { ...opts, absPath });
+    return window.OrkasPreviewWindows.open({ kind: 'file', path: absPath, title: displayName || absPath.split(/[\\/]/).pop(), options: window.OrkasPreviewWindows.options(opts) });
+  }
   const cid = (opts && opts.cid) || null;
   const projectId = (opts && opts.projectId) || null;
   const name = displayName || (absPath.split(/[\\/]/).pop() || absPath);
@@ -1454,7 +1472,7 @@ async function openChatFileViewer(absPath, displayName, opts) {
     // need the chat-media:// URL since openChatImageLightbox expects an
     // <img>-loadable src, not an abs path.
     if (typeof openChatImageLightbox === 'function') {
-      openChatImageLightbox(_chatMediaLocalUrl(absPath), name, { absPath, cid, projectId });
+      openChatImageLightbox(_chatMediaLocalUrl(absPath), name, { absPath, cid, projectId, sourceElement: opts?.sourceElement });
     }
     return;
   }

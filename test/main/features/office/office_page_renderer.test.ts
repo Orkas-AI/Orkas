@@ -13,6 +13,7 @@ vi.mock('../../../../src/main/features/office/office_engine', () => ({
 }));
 
 import { renderOfficePageToPng } from '../../../../src/main/features/office/office_page_renderer';
+import { PPTX_TEXT_COLLISION_SCRIPT, unassessedTextCollision } from '../../../../src/main/features/office/pptx_text_collision';
 
 class FakeWebContents extends EventEmitter {
   setWindowOpenHandler = vi.fn();
@@ -61,6 +62,38 @@ describe('embedded Office page renderer', () => {
   beforeEach(() => {
     mocks.runOfficeCli.mockReset();
     FakeBrowserWindow.instances = [];
+  });
+
+  it.each([false, true])('keeps the image and reports audit coverage when collection fails=%s', async (fails) => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-office-audit-'));
+    const audit = { ...unassessedTextCollision('unsupported_text_container'), status: 'partial' };
+    const onTextCollisionAudit = vi.fn();
+    const ses = fakeSession();
+    mocks.runOfficeCli.mockImplementation(async (args: string[]) => {
+      fs.writeFileSync(args[args.indexOf('-o') + 1], '<html></html>');
+      return { code: 0, stdout: '', stderr: '' };
+    });
+    class AuditWindow extends FakeBrowserWindow {
+      constructor(options: Record<string, unknown>) {
+        super(options);
+        const ordinary = this.webContents.executeJavaScript.getMockImplementation()!;
+        this.webContents.executeJavaScript.mockImplementation(async script => {
+          if (script !== PPTX_TEXT_COLLISION_SCRIPT) return ordinary(script);
+          if (fails) throw new Error('test collection failure');
+          return audit as any;
+        });
+      }
+    }
+    try {
+      const png = await renderOfficePageToPng(path.join(cwd, 'deck.pptx'), cwd, '1', undefined, {
+        loadElectron: async () => ({ BrowserWindow: AuditWindow as any, session: { fromPartition: () => ses as any } }),
+        onTextCollisionAudit,
+      });
+      expect(png).toEqual(Buffer.from('electron-png'));
+      expect(onTextCollisionAudit).toHaveBeenCalledWith(fails ? unassessedTextCollision('collection_failed') : audit);
+      expect(FakeBrowserWindow.instances[0].destroy).toHaveBeenCalled();
+      expect(ses.clearStorageData).toHaveBeenCalled();
+    } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
   });
 
   it('renders OfficeCLI HTML in embedded Electron without invoking its screenshot backend', async () => {

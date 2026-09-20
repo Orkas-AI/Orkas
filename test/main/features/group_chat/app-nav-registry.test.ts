@@ -1,3 +1,4 @@
+import { estimateTextTokens } from '../../../../src/core-agent/src/shared/token-estimate';
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -10,7 +11,7 @@ import {
   findAppNavSurface,
   validateAppNavRequest,
 } from '../../../../src/main/features/group_chat/app_nav';
-import { SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS } from '../../../../src/core-agent/src/tools';
+import { SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS } from '../../../../src/core-agent/src/tools';
 
 const RENDERER_CONVERSATION = path.join(
   __dirname, '..', '..', '..', '..', 'src', 'renderer', 'modules', 'conversation.js',
@@ -244,7 +245,7 @@ describe('group_chat app_nav registry', () => {
     expect(findAppNavSurface('settings.models')?.id).toBe('settings.models');
     expect(findAppNavSurface('not-a-surface')).toBeNull();
     const schemaDescription = appNavSurfaceDescription();
-    expect(schemaDescription.length).toBeLessThanOrEqual(SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS);
+    expect(estimateTextTokens(schemaDescription)).toBeLessThanOrEqual(SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS);
     for (const surface of APP_NAV_SURFACES) expect(schemaDescription).toContain(surface.id);
   });
 

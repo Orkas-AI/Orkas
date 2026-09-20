@@ -68,7 +68,7 @@ class PipelineCompose(unittest.TestCase):
             {"text": "On-device inference protects privacy.",
              "citations": [{"source": rec["id"], "quote": QUOTE, "doi": rec["doi"]}]}]})
         self.assertFalse(ver["abstain"])
-        self.assertTrue(ver["claims"][0]["supported"])
+        self.assertEqual(ver["summary"]["verified"], 1)
         c = ver["claims"][0]["citations"][0]
         self.assertEqual(c["quote_status"], "verified")
         self.assertEqual(c["doi_status"], "verified")
@@ -96,7 +96,7 @@ class PipelineCompose(unittest.TestCase):
         src = {"id": "s1", "url": "https://a", "title": "A", "text": SOURCE_TEXT}
         ver = citations.verify({"sources": [src], "claims": [
             {"text": "bogus", "citations": [{"source": "s1", "quote": "the model achieves sentience by 2027"}]}]})
-        self.assertFalse(ver["claims"][0]["supported"])
+        self.assertEqual(ver["summary"]["verified"], 0)
         self.assertEqual(ver["flags"][0]["issue"], "quote_not_found_in_source")
 
     def test_caps_bounds_plan_then_account_stops_at_ceiling(self):

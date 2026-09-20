@@ -6,7 +6,8 @@ import { AgentRunner, partitionToolBatches } from "../src/agent/runner.js";
 import { PersistentSession } from "../src/agent/persistent-session.js";
 import { createConfig } from "../src/config/loader.js";
 import { ProviderRegistry } from "../src/providers/registry.js";
-import { defineTool } from "../src/tools/base.js";
+import { defineTool, toolCallIsParallel } from "../src/tools/base.js";
+import { bashTool } from "../src/tools/builtin.js";
 import type { LLMProvider, CompletionParams, CompletionResult } from "../src/providers/base.js";
 
 // ── partitionToolBatches (pure) ────────────────────────────────────────────
@@ -131,9 +132,9 @@ function tracker() {
   return { tool, log, get max() { return max; } };
 }
 
-function toolUseResponse(blocks: Array<{ id: string; name: string }>): CompletionResult {
+function toolUseResponse(blocks: Array<{ id: string; name: string; input?: Record<string, unknown> }>): CompletionResult {
   return {
-    content: blocks.map((b) => ({ type: "tool_use" as const, id: b.id, name: b.name, input: {} })),
+    content: blocks.map((b) => ({ type: "tool_use" as const, id: b.id, name: b.name, input: b.input ?? {} })),
     stopReason: "tool_use",
     usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
     model: "mock-model",
@@ -163,6 +164,159 @@ async function runCollect(
 }
 
 describe("AgentRunner — parallel tool execution (G4)", () => {
+  it("keeps queued calls proposed until an execution slot is available", async () => {
+    vi.stubEnv("ORKAS_MAX_TOOL_CONCURRENCY", "1");
+    try {
+      const t = tracker();
+      const { provider } = recordingProvider([
+        toolUseResponse([{ id: "a", name: "first" }, { id: "b", name: "second" }]), finalResponse,
+      ]);
+      const events = await runCollect([t.tool("first", "parallel"), t.tool("second", "parallel")], provider);
+      expect(events.filter(e => e.type === "tool_start" || e.type === "tool_end")
+        .map(e => `${e.type}:${e.id}`)).toEqual(["tool_start:a", "tool_end:a", "tool_start:b", "tool_end:b"]);
+      expect(t.max).toBe(1);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  // The two rendezvous commands below can only both succeed when they run at
+  // the same time. The scheduler side is exercised with a tool that admits
+  // every call; whether a real command is admitted (provably read-only) is
+  // the host's decision, pinned in test/main/model/local-tools.test.ts.
+  it.each([false, true])("overlaps independent real shell commands the tool admits (programmatic=%s)", async (programmatic) => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "shell-overlap-"));
+    const quote = (s: string) => "'" + s.replace(/'/g, process.platform === "win32" ? "''" : "'\\''") + "'";
+    const inputs = [0, 1].map((id) => {
+      // Neither command can succeed unless the other starts before it finishes.
+      const script = `const fs=require('fs'); fs.writeFileSync('${id}.ready','');
+        const deadline=Date.now()+2500; const timer=setInterval(()=>{
+          if(fs.existsSync('${1 - id}.ready')) {clearInterval(timer); console.log('shell-${id}-ok');}
+          else if(Date.now()>deadline) {clearInterval(timer); process.exitCode=1;}
+        },10);`;
+      return { command: `${process.platform === "win32" ? "& " : ""}${quote(process.env.ORKAS_TEST_NODE || process.execPath)} -e ${quote(script)}`, timeoutMs: 5000 };
+    });
+    const { provider, calls } = recordingProvider([
+      toolUseResponse(programmatic
+        ? [{ id: "program", name: "run_program", input: { code: `const results=await Promise.all(${JSON.stringify(inputs)}.map(input=>tools.bash(input))); results.forEach(text);` } }]
+        : inputs.map((input, id) => ({ id: `shell-${id}`, name: "bash", input }))),
+      finalResponse,
+    ]);
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const runner = new AgentRunner({
+      config: createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } }),
+      providers: registry, tools: [{ ...bashTool, executionMode: "parallel", parallelWhen: () => true }],
+      ...(programmatic ? { programmaticToolPolicy: {
+        isEligible: () => true, authorize: () => ({ allowed: true as const }),
+      } } : {}),
+    });
+    try {
+      for await (const _event of runner.runStream({ message: "go", workingDir: cwd })) { /* drain */ }
+      const results = calls[1].messages.flatMap(m => m.content)
+        .filter(c => c.type === "tool_result");
+      expect(results.every(r => !r.isError)).toBe(true);
+      const content = results.map(r => r.content).join("\n");
+      expect(content).toContain("shell-0-ok");
+      expect(content).toContain("shell-1-ok");
+      if (!programmatic) expect(results.map(r => r.toolUseId)).toEqual(["shell-0", "shell-1"]);
+    } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it("serializes shell calls the tool cannot prove read-only", async () => {
+    // Same rendezvous pair, but the core bash tool carries no read-only proof,
+    // so the second call must not start before the first finishes: the first
+    // waits out its deadline alone, the second then finds the ready file.
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "shell-serial-"));
+    const quote = (s: string) => "'" + s.replace(/'/g, process.platform === "win32" ? "''" : "'\\''") + "'";
+    const inputs = [0, 1].map((id) => {
+      const script = `const fs=require('fs'); fs.writeFileSync('${id}.ready','');
+        const deadline=Date.now()+1200; const timer=setInterval(()=>{
+          if(fs.existsSync('${1 - id}.ready')) {clearInterval(timer); console.log('shell-${id}-ok');}
+          else if(Date.now()>deadline) {clearInterval(timer); console.log('shell-${id}-alone'); process.exitCode=1;}
+        },10);`;
+      return { command: `${process.platform === "win32" ? "& " : ""}${quote(process.env.ORKAS_TEST_NODE || process.execPath)} -e ${quote(script)}`, timeoutMs: 5000 };
+    });
+    const { provider, calls } = recordingProvider([
+      toolUseResponse(inputs.map((input, id) => ({ id: `shell-${id}`, name: "bash", input }))),
+      finalResponse,
+    ]);
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const runner = new AgentRunner({
+      config: createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } }),
+      providers: registry, tools: [bashTool],
+    });
+    try {
+      for await (const _event of runner.runStream({ message: "go", workingDir: cwd })) { /* drain */ }
+      const results = calls[1].messages.flatMap(m => m.content).filter(c => c.type === "tool_result");
+      expect(results.map(r => r.toolUseId)).toEqual(["shell-0", "shell-1"]);
+      expect(results[0].content).toContain("shell-0-alone");
+      expect(results[0].content).not.toContain("shell-0-ok");
+      expect(results[1].content).toContain("shell-1-ok");
+    } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it("admits per call: refined parallel tools overlap only for admitted inputs", async () => {
+    // [ro, ro, write, ro]: the two leading read-only calls overlap, the write
+    // is a barrier on its own, the trailing read-only call runs after it.
+    let active = 0;
+    let max = 0;
+    const order: string[] = [];
+    const tool = defineTool({
+      name: "shell_like",
+      description: "fixture",
+      inputSchema: { type: "object", properties: {} },
+      executionMode: "parallel",
+      parallelWhen: (input) => input.ro === true,
+      async execute(input) {
+        active++; max = Math.max(max, active); order.push(String(input.id));
+        await new Promise(r => setTimeout(r, 25));
+        active--;
+        return { content: `${String(input.id)}-ok` };
+      },
+    });
+    const { provider, calls } = recordingProvider([
+      toolUseResponse([
+        { id: "a", name: "shell_like", input: { id: "a", ro: true } },
+        { id: "b", name: "shell_like", input: { id: "b", ro: true } },
+        { id: "c", name: "shell_like", input: { id: "c", ro: false } },
+        { id: "d", name: "shell_like", input: { id: "d", ro: true } },
+      ]),
+      finalResponse,
+    ]);
+    await runCollect([tool], provider);
+    expect(max).toBe(2);
+    expect(order).toEqual(["a", "b", "c", "d"]);
+    const msgs = JSON.stringify(calls[1].messages);
+    for (const [first, second] of [["a-ok", "b-ok"], ["b-ok", "c-ok"], ["c-ok", "d-ok"]]) {
+      expect(msgs.indexOf(first)).toBeLessThan(msgs.indexOf(second));
+    }
+  });
+
+  it("bounds an opted-in shell batch and never executes queued calls after cancellation", async () => {
+    vi.stubEnv("ORKAS_MAX_TOOL_CONCURRENCY", "2");
+    const abort = new AbortController();
+    const started: number[] = [];
+    const { provider } = recordingProvider([
+      toolUseResponse([0, 1, 2, 3].map(id => ({ id: String(id), name: "bash", input: { id } }))), finalResponse,
+    ]);
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const runner = new AgentRunner({
+      config: createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } }), providers: registry,
+      tools: [{ ...bashTool, executionMode: "parallel", async execute(input, ctx) {
+        started.push(Number(input.id));
+        return new Promise(resolve => ctx.signal!.addEventListener("abort", () => resolve({ content: "cancelled", isError: true }), { once: true }));
+      } }],
+    });
+    const run = (async () => { for await (const _event of runner.runStream({ message: "go", signal: abort.signal })) { /* drain */ } })();
+    try {
+      await expect.poll(() => started.length).toBe(2);
+      abort.abort();
+      await run;
+      expect(started).toEqual([0, 1]);
+    } finally { abort.abort(); await run; vi.unstubAllEnvs(); }
+  });
+
   it("runs an adjacent parallel batch concurrently and commits results in declared order", async () => {
     const { provider, calls } = recordingProvider([
       toolUseResponse([
@@ -328,5 +482,27 @@ describe("AgentRunner — parallel tool execution (G4)", () => {
     expect(at("start:write_x")).toBeGreaterThan(at("end:read_b"));
     // read_c starts only after write_x finished.
     expect(at("start:read_c")).toBeGreaterThan(at("end:write_x"));
+  });
+});
+
+describe("toolCallIsParallel", () => {
+  const base = { name: "t", description: "d", inputSchema: {}, async execute() { return { content: "" }; } };
+  it("treats undeclared and sequential tools as barriers", () => {
+    expect(toolCallIsParallel(undefined, {})).toBe(false);
+    expect(toolCallIsParallel(base, {})).toBe(false);
+    expect(toolCallIsParallel({ ...base, executionMode: "sequential" }, {})).toBe(false);
+  });
+  it("admits an unrefined parallel tool for every input", () => {
+    expect(toolCallIsParallel({ ...base, executionMode: "parallel" }, { any: 1 })).toBe(true);
+  });
+  it("lets the refinement decide per input and fails closed on a throw or non-object input", () => {
+    const tool = { ...base, executionMode: "parallel" as const, parallelWhen: (i: Record<string, unknown>) => i.ro === true };
+    expect(toolCallIsParallel(tool, { ro: true })).toBe(true);
+    expect(toolCallIsParallel(tool, { ro: false })).toBe(false);
+    expect(toolCallIsParallel(tool, undefined)).toBe(false);
+    expect(toolCallIsParallel(tool, ["ro"])).toBe(false);
+    expect(toolCallIsParallel({ ...tool, parallelWhen: () => { throw new Error("boom"); } }, { ro: true })).toBe(false);
+    // Only a literal true admits; a truthy non-boolean is not a proof.
+    expect(toolCallIsParallel({ ...tool, parallelWhen: (() => "yes") as unknown as (i: Record<string, unknown>) => boolean }, { ro: true })).toBe(false);
   });
 });

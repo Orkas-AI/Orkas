@@ -252,12 +252,12 @@ describe('connectorExposureFromSessionId', () => {
 });
 
 describe('systemSkillsExposureFromSessionId', () => {
-  it('exposes system skills to authoring sessions only', async () => {
+  it('admits authoring and named tasks while excluding anonymous/internal sessions', async () => {
     const { systemSkillsExposureFromSessionId } = await import('../../../../src/main/model/core-agent/runner');
     expect(systemSkillsExposureFromSessionId('gconv-ac5559863d42')).toBe(true);
     expect(systemSkillsExposureFromSessionId('agent-agt-7')).toBe(true);
     expect(systemSkillsExposureFromSessionId('skill-sk1')).toBe(true);
-    expect(systemSkillsExposureFromSessionId('gmember-cv1-agt-42')).toBe(false);
+    expect(systemSkillsExposureFromSessionId('gmember-cv1-agt-42')).toBe(true);
     expect(systemSkillsExposureFromSessionId('extract-img-deadbeef')).toBe(false);
     expect(systemSkillsExposureFromSessionId('cli-claude-run-1')).toBe(false);
     expect(systemSkillsExposureFromSessionId('reflect-x')).toBe(false);

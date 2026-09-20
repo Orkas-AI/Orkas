@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { expect, OrkasTestApp, test } from './fixtures/orkas';
@@ -376,7 +377,18 @@ test('task browser opens ordinary pages as tabs while preserving web navigation 
       const parent = BrowserWindow.getAllWindows().find(win => !win.getParentWindow())!.contentView.children
         .find(view => view instanceof WebContentsView && view.webContents.getURL() === args.url) as InstanceType<typeof WebContentsView>;
       if (args.middle) {
-        const point = await parent.webContents.executeJavaScript(`(() => { const r = document.querySelector(${JSON.stringify(args.selector)}).getBoundingClientRect(); return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }; })()`);
+        // Native input requires a focused owner; the shared E2E window starts
+        // hidden and unfocusable. DOM .click() above does not have that prerequisite.
+        const owner = BrowserWindow.getAllWindows().find(win => !win.getParentWindow())!;
+        owner.setFocusable(true);
+        owner.show();
+        owner.focus();
+        parent.webContents.focus();
+        const geometry = await parent.webContents.executeJavaScript(`(() => { const r = document.querySelector(${JSON.stringify(args.selector)}).getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2, width: innerWidth }; })()`);
+        // Desktop emulation scales CSS coordinates into the narrow native view.
+        // Sending the unscaled point clicks empty space instead of the anchor.
+        const scale = parent.getBounds().width / geometry.width;
+        const point = { x: Math.round(geometry.x * scale), y: Math.round(geometry.y * scale) };
         parent.webContents.sendInputEvent({ type: 'mouseDown', ...point, button: 'middle', clickCount: 1 });
         parent.webContents.sendInputEvent({ type: 'mouseUp', ...point, button: 'middle', clickCount: 1 });
       } else {
@@ -525,7 +537,7 @@ test('task completion only closes explicitly temporary native tabs and resumes a
   }
 });
 
-test('task browser caps its visible strip at ten while keeping user and connector handoff pages', async ({ orkas }) => {
+test('task browser caps its visible strip at thirty while keeping user and connector handoff pages', async ({ orkas }) => {
   const server = createServer((_req, res) => {
     res.setHeader('Content-Type', 'text/html');
     res.end('<title>Capacity fixture</title><h1>Ready</h1>');
@@ -549,7 +561,7 @@ test('task browser caps its visible strip at ten while keeping user and connecto
       });
       await web.waitForControlledWebAssist('account-e2e', args.cid, 'fixture-shop', { condition: 'loaded' });
       const results: any[] = [];
-      for (let index = 0; index < 9; index++) {
+      for (let index = 0; index < 29; index++) {
         const opened = await web.openModelWebAssist('account-e2e', args.cid, { url: args.url + index });
         if (!opened.ok) throw new Error(JSON.stringify(opened));
         const loaded = await web.waitForModelWebAssist('account-e2e', args.cid, { tabId: opened.active_tab_id, condition: 'loaded' });
@@ -563,11 +575,11 @@ test('task browser caps its visible strip at ten while keeping user and connecto
       };
     }, { cid, url: `http://127.0.0.1:${port}/`, webPath: path.resolve(__dirname, '../../src/main/features/web_assist.ts') });
     expect(result.login.ok).toBe(true);
-    expect(result.tabs.tab_limit).toBe(10);
-    expect(result.tabs.tabs).toHaveLength(10);
-    expect(result.results[8].closed_tab_ids).toEqual([result.results[0].active_tab_id]);
-    expect(result.paths).toEqual(['/1', '/2', '/3', '/4', '/5', '/6', '/7', '/8', '/login', '/user']);
-    await expect(orkas.page!.locator('.web-assist-tab')).toHaveCount(10);
+    expect(result.tabs.tab_limit).toBe(30);
+    expect(result.tabs.tabs).toHaveLength(30);
+    expect(result.results[28].closed_tab_ids).toEqual([result.results[0].active_tab_id]);
+    expect(result.paths).toEqual([...Array.from({ length: 28 }, (_, index) => `/${index + 1}`), '/login', '/user'].sort());
+    await expect(orkas.page!.locator('.web-assist-tab')).toHaveCount(30);
   } finally {
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
@@ -646,6 +658,12 @@ test('task browser keeps an authorization popup separate and reconnects it to it
       return created;
     });
     expect(requestedPopupSize).toEqual([480, 620]);
+    if (process.env.PWDEBUG !== '1' && process.env.ORKAS_E2E_SHOW_WINDOW !== '1') {
+      expect(await orkas.electronApp!.evaluate(({ BrowserWindow }) => {
+        const popup = BrowserWindow.getAllWindows().find(win => !!win.getParentWindow())!;
+        return { visible: popup.isVisible(), focused: popup.isFocused(), focusable: popup.isFocusable() };
+      })).toEqual({ visible: false, focused: false, focusable: false });
+    }
     await expect.poll(async () => orkas.electronApp!.evaluate(({ BrowserWindow, WebContentsView, screen }) => {
       const owner = BrowserWindow.getAllWindows().find(win => !win.getParentWindow())!;
       const popup = BrowserWindow.getAllWindows().find(win => win.getParentWindow()?.id === owner.id);
@@ -767,8 +785,27 @@ test('task-details browser supports tabs, address navigation, resizing, and view
     await expect(details).toBeVisible();
     await expect(details.locator('[data-info-tab="browser"]')).toHaveClass(/is-active/);
     await expect(browser).toBeVisible();
-    await expect(browser.locator('.web-assist-status')).toHaveCSS('font-size', '13px');
-    await expect(browser.locator('.web-assist-status')).toHaveCSS('text-align', 'center');
+    await expect(browser.locator('.web-assist-status')).toHaveCSS('font-size', '12px');
+    // Task-wide history stays beside Add Tab, independently of the page status.
+    const statusLayout = () => browser.evaluate(el => {
+      const box = el.getBoundingClientRect();
+      const status = el.querySelector('.web-assist-status')!.getBoundingClientRect();
+      const button = el.querySelector('.web-assist-activity-btn')!.getBoundingClientRect();
+      const add = el.querySelector('.web-assist-add-tab')!.getBoundingClientRect();
+      return { centerOffset: status.x + status.width / 2 - (box.x + box.width / 2),
+        gap: button.x - add.right, sameRow: Math.abs(button.y - add.y),
+        buttonInset: box.right - button.right };
+    });
+    // Allow only DOMRect floating-point noise, not visible spacing regressions.
+    const geometryEpsilon = 0.0001;
+    for (const width of [1500, 400]) {
+      await page.setViewportSize({ width, height: 900 });
+      await expect.poll(async () => Math.abs((await statusLayout()).centerOffset)).toBeLessThan(1);
+      expect((await statusLayout()).gap + geometryEpsilon).toBeGreaterThanOrEqual(4);
+      expect((await statusLayout()).sameRow).toBeLessThan(2);
+      expect((await statusLayout()).buttonInset + geometryEpsilon).toBeGreaterThanOrEqual(7);
+    }
+    await page.setViewportSize({ width: 1280, height: 800 });
     await expect.poll(async () => (await native())?.visible).toBe(true);
     // Use the actual close/tab controls: ongoing model operations must not
     // undo the user's view choice, and the native page remains usable hidden.
@@ -917,8 +954,8 @@ test('task-details browser supports tabs, address navigation, resizing, and view
     await page.locator('.web-assist-address-input').fill(`http://127.0.0.1:${address.port}/second`);
     await page.locator('.web-assist-address-input').press('Enter');
     await expect.poll(async () => {
-      const result = await orkas.invoke<{ state: { display_url: string } }>('webAssist.state', {});
-      return result.state.display_url;
+      const result = await orkas.invoke<{ state: { display_url: string; loading: boolean } }>('webAssist.state', {});
+      return result.state.loading ? '' : result.state.display_url;
     }).toContain('/second');
     const activeState = await orkas.invoke<{ state: { active_tab_id: string } }>('webAssist.state', {});
     const modelObservation = await orkas.electronApp!.evaluate(async (_electron, input) => {
@@ -939,7 +976,12 @@ test('task-details browser supports tabs, address navigation, resizing, and view
       requires_user_action: boolean;
     }>).find(element => element.label === 'Purchase now');
     expect(purchase).toMatchObject({ requires_user_action: true });
-    const blockedAction = await orkas.electronApp!.evaluate(async (_electron, input) => {
+    const permissionMode = await orkas.invoke<{ ok: boolean; mode: string }>(
+      'permissions.setLocalExecMode',
+      { mode: 'all_files_approval' },
+    );
+    expect(permissionMode).toMatchObject({ ok: true, mode: 'all_files_approval' });
+    const clickPurchase = () => orkas.electronApp!.evaluate(async (_electron, input) => {
       const web = (process as any).mainModule.require(input.modulePath);
       return web.actOnModelWebAssist('account-e2e', input.cid, {
         tabId: input.tabId,
@@ -954,9 +996,17 @@ test('task-details browser supports tabs, address navigation, resizing, and view
       elementRef: purchase!.ref,
       modulePath: path.resolve(__dirname, '../../src/main/features/web_assist.ts'),
     });
-    expect(blockedAction).toMatchObject({
+
+    // The controller still refuses on its own; what the user now gets is a way
+    // to answer. Declining leaves the model with the same handback as before.
+    const declined = clickPurchase();
+    const permissionDialog = page.locator('.bash-permission-dialog');
+    await expect(permissionDialog).toContainText('Purchase now', { timeout: 20_000 });
+    await permissionDialog.locator('[data-act="cancel"]').click();
+    expect(await declined).toMatchObject({
       ok: false, code: 'user_action_required', reason: 'high_impact_action',
     });
+
     const modelAction = await orkas.electronApp!.evaluate(async (_electron, input) => {
       const web = (process as any).mainModule.require(input.modulePath);
       return web.actOnModelWebAssist('account-e2e', input.cid, {
@@ -974,6 +1024,40 @@ test('task-details browser supports tabs, address navigation, resizing, and view
       modulePath: path.resolve(__dirname, '../../src/main/features/web_assist.ts'),
     });
     expect(modelAction).toMatchObject({ ok: true, outcome: 'acted' });
+
+    // Approving runs the same control the controller refused. A successful
+    // action invalidates the snapshot, so this needs its own observation.
+    const approvedObservation = await orkas.electronApp!.evaluate(async (_electron, input) => {
+      const web = (process as any).mainModule.require(input.modulePath);
+      return web.observeModelWebAssist('account-e2e', input.cid, input.tabId);
+    }, {
+      cid,
+      tabId: activeState.state.active_tab_id,
+      modulePath: path.resolve(__dirname, '../../src/main/features/web_assist.ts'),
+    });
+    const repeatPurchase = (approvedObservation.elements as Array<{ ref: string; label: string }>)
+      .find(element => element.label === 'Purchase now');
+    expect(repeatPurchase).toBeTruthy();
+    const approved = orkas.electronApp!.evaluate(async (_electron, input) => {
+      const web = (process as any).mainModule.require(input.modulePath);
+      return web.actOnModelWebAssist('account-e2e', input.cid, {
+        tabId: input.tabId,
+        pageId: input.pageId,
+        elementRef: input.elementRef,
+        action: 'click',
+      });
+    }, {
+      cid,
+      tabId: activeState.state.active_tab_id,
+      pageId: approvedObservation.page_id,
+      elementRef: repeatPurchase!.ref,
+      modulePath: path.resolve(__dirname, '../../src/main/features/web_assist.ts'),
+    });
+    await expect(permissionDialog).toContainText('Purchase now', { timeout: 20_000 });
+    await permissionDialog.locator('[data-id="allow_once"]').click();
+    expect(await approved).toMatchObject({ ok: true, outcome: 'acted', action: 'click' });
+    await expect(permissionDialog).toHaveCount(0);
+
     await page.locator('.web-assist-tab-close').last().click();
     await expect(page.locator('.web-assist-tab')).toHaveCount(1);
 
@@ -1037,7 +1121,6 @@ test('task-details browser supports tabs, address navigation, resizing, and view
     await page.evaluate(() => (window as any).ConversationInfo.openAndSetTab('browser'));
     await expect.poll(async () => (await native())?.visible).toBe(true);
     await page.screenshot({ path: testInfo.outputPath('conversation-browser-panel.png') });
-    await orkas.invoke('webAssist.close', {});
   } finally {
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));

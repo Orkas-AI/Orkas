@@ -194,7 +194,7 @@ test.describe('connectors', () => {
     await expect(categories.locator('[data-connectors-cat="office"]')).toBeVisible();
   });
 
-  test('shows all remaining merchant forms in four languages with production-only setup and callback ownership', async ({ appPage, orkas }, testInfo) => {
+  test('shows all remaining merchant forms in ten languages with production-only setup and callback ownership', async ({ appPage, orkas }, testInfo) => {
     const logs: string[] = [];
     const child = orkas.electronApp?.process();
     const stdout = (data: Buffer) => logs.push(`[main:stdout] ${String(data).trimEnd()}`);
@@ -220,7 +220,7 @@ test.describe('connectors', () => {
         await expect(setup.locator('[data-act="copy-setup-callback"]')).toHaveCount(callback ? 1 : 0);
         await setup.locator('input[type="password"]').first().fill('merchant-ui-private-canary');
         let englishInstructions = '';
-        for (const lang of ['en', 'zh', 'ja', 'pt']) {
+        for (const lang of ['en', 'zh', 'ja', 'pt', 'es', 'fr', 'ko', 'de', 'ru', 'it']) {
           await appPage.evaluate(async locale => { await (window as any).setLang(locale); }, lang);
           const instructions = await setup.locator('.connectors-setup-instructions').innerText();
           expect(instructions.trim()).not.toBe('');
@@ -230,6 +230,8 @@ test.describe('connectors', () => {
           await expect(setup).not.toContainText('connectors.setup.');
           await expect(setup.locator('option[value="sandbox"]')).toHaveCount(0);
           if (callback) await expect(setup.locator('input[readonly]')).toHaveValue('https://orkas.ai/api/connectors/oauth/dcr-callback');
+          expect(await setup.evaluate(el => el.scrollWidth <= el.clientWidth + 1), `${id}/${lang}`).toBe(true);
+          if (id === 'temu-seller') await setup.screenshot({ path: testInfo.outputPath(`${id}-${lang}-setup.png`) });
         }
         await appPage.evaluate(async () => { await (window as any).setLang('zh'); });
         await setup.screenshot({ path: testInfo.outputPath(`${id}-setup.png`) });
@@ -299,7 +301,7 @@ test.describe('connectors', () => {
     expect(logs.filter(line => line.startsWith('[renderer:error]'))).toEqual([]);
   });
 
-  test('switches four locales in open connector forms without losing credentials or selected region', async ({ appPage }) => {
+  test('switches ten locales in open connector forms without losing credentials or selected region', async ({ appPage }) => {
     await appPage.locator('#connectors-btn').click();
     const shopee = appPage.locator('.connector-card[data-id="shopee"]');
     await shopee.locator('[data-act="connect"]').click();
@@ -315,7 +317,7 @@ test.describe('connectors', () => {
     } }));
     await setup.locator('[data-act="copy-setup-callback"]').click();
     expect(await appPage.evaluate(() => (window as any).__copiedCallback)).toBe('https://orkas.ai/api/connectors/oauth/dcr-callback');
-    for (const [lang, label, copied] of [['ja', 'ショップ ID', 'コピーしました'], ['pt', 'ID da loja', 'Copiado'], ['zh', '店铺 ID', '已复制'], ['en', 'Shop ID', 'Copied']]) {
+    for (const [lang, label, copied] of [['ja', 'ショップ ID', 'コピーしました'], ['pt', 'ID da loja', 'Copiado'], ['zh', '店铺 ID', '已复制'], ['en', 'Shop ID', 'Copied'], ['es', 'ID de la tienda', 'Copiado'], ['fr', 'ID de la boutique', 'Copié'], ['ko', 'Shop ID', '복사됨'], ['de', 'Shop-ID', 'Kopiert'], ['ru', 'Shop ID', 'Скопировано'], ['it', 'Shop ID', 'Copiato']]) {
       await appPage.evaluate(async locale => { await (window as any).setLang(locale); }, lang);
       await expect(setup.locator('label[for="connector-setup-field-1"]')).toContainText(label);
       await expect(setup.locator('[data-act="callback-copy-status"]')).toHaveText(copied);
@@ -335,7 +337,7 @@ test.describe('connectors', () => {
     await custom.locator('[data-f="kind"]').selectOption('stdio');
     await custom.locator('[data-f="command"]').fill('node');
     await custom.locator('[data-f="env"]').fill('TEST_SECRET=test-only-secret');
-    for (const [lang, nameLabel] of [['ja', '名前'], ['pt', 'Nome'], ['zh', '名称'], ['en', 'Name']]) {
+    for (const [lang, nameLabel] of [['ja', '名前'], ['pt', 'Nome'], ['zh', '名称'], ['en', 'Name'], ['es', 'Nombre'], ['fr', 'Nom'], ['ko', '이름'], ['de', 'Name'], ['ru', 'Название'], ['it', 'Nome']]) {
       await appPage.evaluate(async locale => { await (window as any).setLang(locale); }, lang);
       await expect(custom.locator('.form-row').first().locator('label')).toHaveText(nameLabel);
       await expect(custom.locator('[data-f="name"]')).toHaveValue('我的 MCP');

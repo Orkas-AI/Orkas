@@ -158,7 +158,6 @@ describe('DeepResearch bundled Skill scripts through run-skill.cjs', () => {
     expect(output.ok).toBe(true);
     expect(output.data.summary).toMatchObject({
       claims: 1,
-      supported: 1,
       verified: 1,
       flagged: 0,
     });
@@ -167,7 +166,7 @@ describe('DeepResearch bundled Skill scripts through run-skill.cjs', () => {
         evidence_id: 'E1',
         source_id: 'official',
         quote: exactQuote,
-        verification: 'verified',
+        quote_status: 'verified',
       }),
     ]);
     expect(output.data.evidence_markdown).toContain('E1');
@@ -175,34 +174,15 @@ describe('DeepResearch bundled Skill scripts through run-skill.cjs', () => {
     expect(output.data.comparison_coverage).toEqual([
       expect.objectContaining({
         candidate: 'Example product',
-        status: 'under_evidenced',
-        recommendation_ready: false,
-        missing_decision_groups: [
-          'platform_and_setup',
-          'model_capabilities',
-          'privacy_or_offline',
-          'pricing',
-          'limitations',
-        ],
+        fields_with_citations: ['os'],
       }),
     ]);
-    expect(output.data.recommendation_markdown).toContain(
-      'Conditional path — **Managed desktop deployment: Example product**',
-    );
-    expect(output.data.recommendation_markdown).toContain('verify before choosing:');
-    for (const gap of [
-      'platform and setup',
-      'model capabilities',
-      'privacy or offline',
-      'pricing',
-      'limitations',
-    ]) {
-      expect(output.data.recommendation_markdown).toContain(gap);
-    }
+    expect(output.data).not.toHaveProperty('recommendation_markdown');
+    expect(output.data.claims[0]).not.toHaveProperty('supported');
     const stdout = JSON.parse(result.stdout);
     expect(stdout.comparison_coverage_details[0]).toMatchObject({
       candidate: 'Example product',
-      status: 'under_evidenced',
+      fields_with_citations: ['os'],
     });
   });
 
@@ -248,6 +228,7 @@ describe('DeepResearch bundled Skill scripts through run-skill.cjs', () => {
       compact_landscape: {
         title: 'Example desktop-app comparison',
         boundary: 'Official evidence accessed on 2026-08-20.',
+        analysis_markdown: '## Recommendations\n\nChoose local use only with sufficient memory [E6].',
         candidates: [{
           candidate: 'Example desktop app',
           best_for: 'Everyday private use',
@@ -275,9 +256,11 @@ describe('DeepResearch bundled Skill scripts through run-skill.cjs', () => {
     expect(stdout).not.toHaveProperty('comparison_markdown');
     expect(stdout).not.toHaveProperty('evidence_markdown');
 
-    const report = fs.readFileSync(path.join(tmpDir, 'RESEARCH-REPORT.md'), 'utf8');
+    // Python text output uses native newlines; the contract is Markdown content.
+    const report = fs.readFileSync(path.join(tmpDir, 'RESEARCH-REPORT.md'), 'utf8').replace(/\r\n/g, '\n');
     expect(report).toContain('# Example desktop-app comparison');
-    expect(report).toContain('## Recommendations');
+    expect(report).toContain('## Recommendations\n\nChoose local use only with sufficient memory [E6].');
+    expect(report).not.toContain('material limitation:');
     expect(report).toContain('| Candidate | Best for |');
     expect(report).toContain('## Evidence used');
   });

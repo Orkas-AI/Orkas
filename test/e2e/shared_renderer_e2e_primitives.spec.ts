@@ -1,6 +1,106 @@
 import { expect, test } from './fixtures/orkas';
 
 test.describe('shared Renderer primitives', () => {
+  test('fills dashboard table frames inside chat bubbles at wide and narrow widths', async ({ appPage }) => {
+    const layouts = await appPage.evaluate(() => {
+      const host = document.createElement('div');
+      host.style.position = 'absolute';
+      document.body.appendChild(host);
+      const table = {
+        type: 'Table',
+        props: {
+          columns: [{ key: 'label', label: '指标' }, { key: 'value', label: '数值', numeric: true }],
+          rows: [{ label: '已完成', value: '128' }, { label: '待处理', value: '24' }],
+        },
+      };
+      const results = [];
+      try {
+        for (const width of [1000, 600, 360, 240]) {
+          host.style.width = `${width}px`;
+          for (const style of ['minimal', 'card']) {
+            const spec = {
+              schema_version: 1,
+              theme: { style },
+              root: {
+                type: 'Grid', props: { columns: 2 },
+                children: [table, { type: 'Card', props: { title: '项目' }, children: [table] }],
+              },
+            };
+            host.innerHTML = `<div class="chat-history"><div class="chat-message assistant"><div class="chat-bubble"><div class="markdown-body">${
+              (window as any).renderMarkdownFull(`:::dashboard\n${JSON.stringify(spec)}\n:::`)
+            }</div></div></div></div>`;
+            const bubble = host.querySelector<HTMLElement>('.chat-bubble')!;
+            results.push({
+              width, style, bubbleOverflow: bubble.scrollWidth - bubble.clientWidth,
+              tables: Array.from(host.querySelectorAll<HTMLTableElement>('.db-table')).map((node) => ({
+                frameWidth: node.parentElement!.clientWidth,
+                tableWidth: node.getBoundingClientRect().width,
+                rowWidths: Array.from(node.rows).map((row) => row.getBoundingClientRect().width),
+                values: Array.from(node.querySelectorAll('td[data-numeric]')).map((cell) => cell.textContent),
+                alignment: getComputedStyle(node.querySelector('td[data-numeric]')!).textAlign,
+              })),
+            });
+          }
+        }
+        return results;
+      } finally {
+        host.remove();
+      }
+    });
+    for (const layout of layouts) {
+      expect(layout.bubbleOverflow, JSON.stringify(layout)).toBeLessThanOrEqual(1);
+      expect(layout.tables).toHaveLength(2);
+      for (const table of layout.tables) {
+        expect(table.frameWidth, JSON.stringify(layout)).toBeGreaterThan(0);
+        expect(table.values).toEqual(['128', '24']);
+        expect(table.alignment).toBe('right');
+        expect(table.rowWidths).toHaveLength(3);
+        for (const rowWidth of table.rowWidths) {
+          expect(rowWidth, JSON.stringify(layout)).toBeGreaterThanOrEqual(table.frameWidth - 1);
+          expect(Math.abs(rowWidth - table.tableWidth)).toBeLessThanOrEqual(1);
+        }
+      }
+    }
+  });
+
+  test('keeps wide dashboard and ordinary Markdown tables scrollable within chat bubbles', async ({ appPage }) => {
+    const result = await appPage.evaluate(() => {
+      const host = document.createElement('div');
+      host.style.position = 'absolute';
+      host.style.width = '320px';
+      const columns = Array.from({ length: 10 }, (_, index) => ({ key: `c${index}`, label: `Column ${index}`, numeric: true }));
+      const values = columns.map((_, index) => `${index}123456789.00`);
+      const spec = { root: { type: 'Table', props: { columns, rows: [Object.fromEntries(columns.map((column, index) => [column.key, values[index]]))] } } };
+      const markdown = `:::dashboard\n${JSON.stringify(spec)}\n:::\n\n|${columns.map((column) => column.label).join('|')}|\n|${columns.map(() => '---').join('|')}|\n|${values.join('|')}|`;
+      host.innerHTML = `<div class="chat-history"><div class="chat-message assistant"><div class="chat-bubble"><div class="markdown-body">${(window as any).renderMarkdownFull(markdown)}</div></div></div></div>`;
+      document.body.appendChild(host);
+      try {
+        const bubble = host.querySelector<HTMLElement>('.chat-bubble')!;
+        return {
+          bubbleOverflow: bubble.scrollWidth - bubble.clientWidth,
+          tables: ['.db-table-wrap', 'table:not(.db-table)'].map((selector) => {
+            const scroller = host.querySelector<HTMLElement>(selector)!;
+            scroller.scrollLeft = 100;
+            return {
+              overflow: scroller.scrollWidth - scroller.clientWidth,
+              scrollLeft: scroller.scrollLeft,
+              values: Array.from(scroller.querySelectorAll('td')).map((cell) => cell.textContent),
+            };
+          }),
+          values,
+        };
+      } finally {
+        host.remove();
+      }
+    });
+    expect(result.bubbleOverflow).toBeLessThanOrEqual(1);
+    for (const table of result.tables) {
+      expect(table.overflow).toBeGreaterThan(0);
+      expect(table.scrollLeft).toBeGreaterThan(0);
+      expect(table.values).toEqual(result.values);
+    }
+  });
+
   test('hydrates the icon catalog, contains sanitizer loss, and loads offline math on demand', async ({
     appPage,
   }) => {

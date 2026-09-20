@@ -150,6 +150,28 @@ function fakeTurnNavDocument(userTurns: any[]) {
 }
 
 describe('conversation turn navigation', () => {
+  it.each([
+    { name: 'true top wins when all turns fit', tops: [20, 120, 220], metrics: { atStart: true, atEnd: true, scrollTop: 0, lastTop: 260, lastBottom: 340 }, expected: 0 },
+    { name: 'final reply is visible before reaching bottom', tops: [-1200, -300, 230], metrics: { atEnd: true, lastTop: 380, lastBottom: 520, distanceToBottom: 400 }, expected: 2 },
+    { name: 'bottom with a trailing spacer', tops: [-2000, -1000, -700], metrics: { atEnd: true, lastTop: -300, lastBottom: -100, distanceToBottom: 0 }, expected: 2 },
+    { name: 'long reply keeps its owning turn', tops: [-1200, -300, 500], metrics: {}, expected: 1 },
+    { name: 'the next question below the reading line does not steal focus', tops: [-700, -100, 200], metrics: {}, expected: 1 },
+    { name: 'partial history top is not the conversation start', tops: [-100, 100, 500], metrics: { scrollTop: 0, atStart: false }, expected: 1 },
+    { name: 'partial history bottom is not the conversation end', tops: [-700, -100, 350], metrics: { atEnd: false, lastTop: 450, lastBottom: 550, distanceToBottom: 0 }, expected: 1 },
+    { name: 'last message outside the viewport does not steal focus', tops: [-700, -100, 500], metrics: { atEnd: true, lastTop: 600, lastBottom: 800, distanceToBottom: 400 }, expected: 1 },
+  ])('$name', ({ tops, metrics, expected }) => {
+    expect(turnNav.viewportTurnIndex(tops, {
+      height: 600, scrollTop: 100, distanceToBottom: 1000,
+      atStart: false, atEnd: false, lastTop: 900, lastBottom: 1000,
+      ...metrics,
+    })).toBe(expected);
+  });
+
+  it('does not choose a turn for an empty or hidden transcript', () => {
+    expect(turnNav.viewportTurnIndex([], { height: 600 })).toBe(-1);
+    expect(turnNav.viewportTurnIndex([0], { height: 0 })).toBe(-1);
+  });
+
   it('appears at five indexed user turns, not four', () => {
     expect(turnNav.shouldShowTurnNav(4)).toBe(false);
     expect(turnNav.shouldShowTurnNav(5)).toBe(true);

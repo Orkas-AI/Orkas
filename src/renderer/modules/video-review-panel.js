@@ -242,6 +242,8 @@
     ? createLogger('video-review-panel')
     : { debug() {}, info() {}, warn() {}, error() {} };
   let _cid = '';
+  let _openRequest = 0;
+  let _panelResize = null;
   let _panelData = null;
   // Explicit user toggles only, so a refresh keeps whatever the user opened
   // or closed by hand while everything else follows the fresh payload.
@@ -693,8 +695,14 @@
     const panel = _el('video-review-panel');
     const toggle = _el('video-review-toggle');
     if (!panel) return;
+    if (open) global.ConversationInfo?.close();
+    else _panelResize?.finish();
     panel.hidden = !open;
-    if (toggle) toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (open) _panelResize?.apply();
+    if (toggle) {
+      toggle.classList.toggle('is-active', open);
+      toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
   }
 
   async function refresh() {
@@ -707,15 +715,17 @@
   }
 
   async function open(cid) {
+    const request = ++_openRequest;
     _cid = cid;
     // Fetch BEFORE revealing. `_setOpen(true)` only unhides the panel; the body
     // still holds whatever was rendered last, so showing first flashed the
     // previous conversation's productions until the round trip landed.
     await refresh();
-    _setOpen(true);
+    if (request === _openRequest && _cid === cid) _setOpen(true);
   }
 
   function close() {
+    _openRequest += 1;
     _setOpen(false);
   }
 
@@ -762,6 +772,7 @@
   }
 
   function _bind() {
+    _panelResize = global.TaskSidePanel?.bind('video-review-panel', 'video-review-resize');
     const toggle = _el('video-review-toggle');
     if (toggle) {
       toggle.addEventListener('click', () => {

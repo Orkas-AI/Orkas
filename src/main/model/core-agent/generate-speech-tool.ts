@@ -17,7 +17,7 @@ import {
   estimateNarrationDuration,
   measureNarrationUnits,
 } from '../../features/tts';
-import { getTtsAvailabilityDetails } from '../../features/tts_capabilities';
+import { getTtsAvailabilityDetails, listTtsCapabilities, publicTtsCapabilities, listableTtsVoices } from '../../features/tts_capabilities';
 import { isPathAllowed } from '../../util/path-sandbox';
 import { uniquifyPath, renderRenameSignal } from '../../util/uniquify-path';
 import { getWorkspacePath } from '../../features/user_workspace';
@@ -186,15 +186,17 @@ export function createGenerateSpeechTool(opts: GenerateSpeechToolOpts): AgentToo
   return {
     name: 'generate_speech',
     description:
-      'Synthesize narration audio to a local file. For VideoStudio COMPOSE narration, use video_studio composition.materialize_narration.',
+      'List configured speech voices or synthesize audio to a local file. For VideoStudio COMPOSE narration, use video_studio composition.materialize_narration.',
     inputSchema: {
       type: 'object',
       properties: {
+        action: { type: 'string', enum: ['generate', 'capabilities'], description: 'Defaults to generate, which requires text and output_path. capabilities lists configured routes and voices without synthesis.' },
         text: { type: 'string', description: 'The text to speak.' },
         output_path: { type: 'string', description: 'Where to write audio. `project/...` resolves under the workspace; other relative paths prefer chat attachments. Extension optional. Each requested path may be used once per turn.' },
-        route_ref: { type: 'string', description: 'Configured TTS route returned by video_studio speech.capabilities.' },
-        voice_ref: { type: 'string', description: 'Route-bound voice returned by video_studio speech.capabilities. VideoStudio plans must use this instead of inventing provider ids.' },
-        language: { type: 'string', description: 'BCP-47 narration language supported by the selected voice and signed during production plan confirmation, such as zh-CN or en-US.' },
+        route_ref: { type: 'string', description: 'Configured TTS route returned by capabilities; optionally filters capability listings.' },
+        voice_ref: { type: 'string', description: 'Route-bound voice returned by capabilities. VideoStudio plans must use this instead of inventing provider ids.' },
+        offset: { type: 'integer', minimum: 0, description: 'Zero-based voice offset per route for capabilities; defaults to 0. Returns up to 20 eligible voices per route.' },
+        language: { type: 'string', description: 'BCP-47 speech language, such as zh-CN or en-US; filters capabilities. VideoStudio generation must match its confirmed plan language.' },
         voice: { type: 'string', description: 'Legacy provider voice id. New VideoStudio plans use route_ref + voice_ref.' },
         speed: { type: 'number', description: 'Speech speed multiplier (1.0 = normal). Optional.' },
         format: { type: 'string', description: 'Audio format: mp3 (default) / wav / opus. Optional.' },
@@ -202,9 +204,32 @@ export function createGenerateSpeechTool(opts: GenerateSpeechToolOpts): AgentToo
         production_plan_path: { type: 'string', description: 'For VideoStudio EDL narration, the confirmed project/plan.json that owns this synthesis selection and line.' },
         narration_segment_index: { type: 'number', description: 'Zero-based tracks.narration.segments index in production_plan_path. Required with route_ref/voice_ref for VideoStudio.' },
       },
-      required: ['text', 'output_path'],
     },
     async execute(input, ctx) {
+      const action = input.action ?? 'generate';
+      if (action !== 'generate' && action !== 'capabilities') {
+        return { content: 'action must be generate or capabilities', isError: true } as ToolResult;
+      }
+      if (action === 'capabilities') {
+        const offset = input.offset ?? 0;
+        if (!Number.isSafeInteger(offset) || Number(offset) < 0) {
+          return { content: 'offset must be a non-negative integer', isError: true } as ToolResult;
+        }
+        const availability = getTtsAvailabilityDetails();
+        if (!availability.available) return { content: JSON.stringify(availability), isError: true } as ToolResult;
+        const routes = publicTtsCapabilities(await listTtsCapabilities(ctx.signal))
+          .filter(route => !input.route_ref || route.routeRef === input.route_ref)
+          .map(route => {
+            const eligible = listableTtsVoices(route.voices, {
+              language: typeof input.language === 'string' ? input.language : undefined,
+              limit: Infinity,
+            });
+            const voices = eligible.voices.slice(Number(offset), Number(offset) + 20);
+            return { ...route, voices, total_voices: eligible.eligible,
+              next_offset: Number(offset) + voices.length < eligible.eligible ? Number(offset) + voices.length : null };
+          });
+        return { content: JSON.stringify({ routes }) } as ToolResult;
+      }
       const text = String(input.text ?? '').trim();
       const outputPathRaw = String(input.output_path ?? '').trim();
       if (!text) return { content: 'text is required', isError: true } as ToolResult;

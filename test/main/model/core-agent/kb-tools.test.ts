@@ -467,30 +467,24 @@ describe('kb-tools › shape', () => {
     expect(library.inputSchema.required).toEqual(['action']);
   });
 
-  it('advertises action-discriminated schemas while enforcing action-specific fields', async () => {
+  it('uses a portable schema and ignores search text on exact reads', async () => {
     const library = await createLibrary();
     const schema = library.inputSchema as any;
-    const branches = Object.fromEntries(schema.oneOf.map((branch: any) => [
-      branch.properties.action.enum[0], branch,
-    ]));
     expect(schema.properties).toHaveProperty('scope');
     expect(schema.properties).toHaveProperty('query');
     expect(schema.properties).toHaveProperty('path');
     expect(schema.additionalProperties).toBe(false);
-    expect(schema.oneOf).toHaveLength(3);
-    expect(Object.keys(branches.list.properties)).toEqual(['action']);
-    expect(Object.keys(branches.search.properties)).toEqual(['action']);
-    expect(Object.keys(branches.read.properties)).toEqual(['action']);
-    expect(branches.search.required).toEqual(['action', 'query']);
-    expect(branches.read.required).toEqual(['action', 'path']);
+    expect(schema.oneOf).toBeUndefined();
 
     const missingAction = await library.execute({ query: 'alpha' }, ctxFor());
+    await seedFiles();
     const crossActionField = await library.execute({
       action: 'read', path: 'notes/a.md', query: 'alpha',
     }, ctxFor());
     expect(missingAction.isError).toBe(true);
     expect(missingAction.content).toContain('`action`');
-    expect(crossActionField.isError).toBe(true);
-    expect(crossActionField.content).toContain('unsupported field(s): query');
+    expect(crossActionField.isError).toBeFalsy();
+    expect(crossActionField.content).toContain('alpha content');
+    expect(crossActionField.content).toContain('second chunk body');
   });
 });

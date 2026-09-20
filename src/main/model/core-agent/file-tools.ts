@@ -31,19 +31,18 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import type { AgentTool, ProgramSourceLoader, ToolContext, ToolObservations } from '#core-agent';
+import type { AgentTool, ProgramSourceLoader, ToolContext, ToolObservations, ToolResult } from '#core-agent';
 import { createLogger } from '../../logger';
 import {
   statFile,
   readRange,
-  readImageAsGrayJpeg,
+  readImageAsJpeg,
   getExtractedText,
   getCachedMeta,
   kindOf,
   NoTextError,
   UnsupportedFileKindError,
 } from '../../features/file_indexer';
-import { ocrFile } from '../../features/ocr_runtime';
 import { userMarketplaceSkillsDir, userSkillsDir } from '../../paths';
 import { chatAttachmentDirForConversation } from '../../util/project-layout';
 import { getWorkspacePath } from '../../features/user_workspace';
@@ -56,6 +55,8 @@ import { parseSkillPath } from '../../features/expert_signals/skill_path';
 import { isSkillEnabled } from '../../features/component_enabled';
 import { recordRead } from './read-tracker';
 import { issueFileRevision } from './file-revision';
+import { formatSearchFileResults, type SearchFileHit } from './search-file-result';
+import { formatGrepFileResults, type GrepHit } from './grep-file-result';
 import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
 import {
   DEFAULT_INLINE_RESULT_TOKENS,
@@ -72,7 +73,8 @@ import {
   fallbackDirectoryExcluded,
   fallbackFileExcluded,
   grepRepository,
-  listRepositoryFiles,
+  visitRepositoryFiles,
+  createRepositorySearchBudget,
   readIgnoreScope,
   isIgnoredByScopes,
   type IgnoreScope,
@@ -82,9 +84,8 @@ const log = createLogger('file-tools');
 
 // ── Tunables ──────────────────────────────────────────────────────────────
 
-/** Hard ceiling for `search_files` / `grep_files` directory walks — protects
- *  against accidentally pointing at a huge workspace tree. */
-const MAX_SCAN_FILES = 2000;
+/** Expensive document extraction has a separate bound from repository text searches. */
+const MAX_EXTRACT_FILES = 2000;
 
 /** Max results returned by search_files per call. */
 const MAX_SEARCH_RESULTS = 200;
@@ -100,17 +101,22 @@ const GREP_YIELD_EVERY = 64;
 /** Concurrent extract workers in grep_files. Rich-document cache miss path. */
 const GREP_EXTRACT_CONCURRENCY = 4;
 
+/** On-demand invocation facts; paths stay in the host's existing sandbox env. */
+export function renderSkillExecutionReadPrelude(ref: string, platform: NodeJS.Platform = process.platform): string {
+  const windows = platform === 'win32';
+  const quotedRef = `'${ref.replace(/'/g, windows ? "''" : "'\"'\"'")}'`;
+  const command = windows
+    ? `& "$env:ORKAS_NODE" "$env:ORKAS_PC_DIR/bin/run-skill.cjs" ${quotedRef}`
+    : `"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" ${quotedRef}`;
+  const attributeRef = ref.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return `<skill-runtime execution_ref="${attributeRef}">The host has already bound it to this Skill for the current run. Invoke a packaged script with this command template:\n`
+    + `\`\`\`${windows ? 'powershell' : 'sh'}\n${command} <script-basename> -- <args...>\n\`\`\`\n</skill-runtime>`;
+}
+
 // ── Opts + scope ─────────────────────────────────────────────────────────
 
 export interface FileToolsOpts {
   userId: string;
-  /** Local OCR is a specialized capability and is omitted by default.
-   * Runner policy enables it for scanned-PDF / explicit OCR workflows or
-   * when the selected model cannot receive attached images. */
-  includeOcrFile?: boolean;
-  /** The selected model can consume image blocks. Used only to provide a
-   * controlled visual fallback after the local OCR runtime fails. */
-  visionFallbackAvailable?: boolean;
   /** Maximum exact UTF-8 body size returned by one raw_text call. The normal
    * final-result boundary separately keeps direct calls out of model context
    * when the returned JSON exceeds the inline budget. */
@@ -584,9 +590,10 @@ function parseReadAddress(input: Record<string, unknown>): ReadAddressResult {
     const numericEnd = end as number;
     const minimumStart = unit === 'line' ? 1 : 0;
     if (numericStart < minimumStart || numericEnd < numericStart) {
-      return invalid(unit === 'line'
+      return invalid((unit === 'line'
           ? '`range` line positions must satisfy 1 <= start <= end'
-          : '`range` character positions must satisfy 0 <= start <= end',
+          : '`range` character positions must satisfy 0 <= start <= end')
+          + ` (start=${numericStart}, end=${numericEnd})`,
         'range_order', { ...rangeFacts, start_in_bounds: numericStart >= minimumStart, ordered: numericEnd >= numericStart });
     }
     return unit === 'line'
@@ -611,10 +618,20 @@ function parseReadAddress(input: Record<string, unknown>): ReadAddressResult {
 
 // ── read_files item executor ──────────────────────────────────────────────
 
+/** Internal preparation only; page callbacks never escape read_files. */
+type PreparedFileRead = ToolResult & {
+  textPage?: {
+    minimumTokens: number;
+    render: (maxTokens: number) => ToolResult;
+  };
+};
+
 function createReadFileTool(
   opts: FileToolsOpts,
   behavior: { defaultCharLimit?: number } = {},
-): AgentTool {
+): Omit<AgentTool, 'execute'> & {
+  execute: (input: Record<string, unknown>, ctx: ToolContext) => Promise<PreparedFileRead>;
+} {
   return {
     // Internal-only executor. The host exposes the aggregate read_files tool,
     // not this compatibility-shaped single-item implementation.
@@ -810,8 +827,8 @@ function createReadFileTool(
         }
 
         if (kind === 'image') {
-          const img = await readImageAsGrayJpeg(opts.userId, abs);
-          const header = `<file path="${displayPath}" kind="image" bytes="${img.bytes}" compressed="${img.width}x${img.height} gray JPEG q=70"/>`;
+          const img = await readImageAsJpeg(opts.userId, abs);
+          const header = `<file path="${displayPath}" kind="image" bytes="${img.bytes}" compressed="${img.width}x${img.height} color JPEG q=70"/>`;
           log.info('read_files image loaded', {
             user_id: maskId(opts.userId),
             path: logPathRef(abs),
@@ -819,7 +836,7 @@ function createReadFileTool(
             bytes: img.bytes,
           });
           return {
-            content: `${header}\nImage loaded — the compressed grayscale JPEG follows as a user-turn image.`,
+            content: `${header}\nImage loaded — the compressed color JPEG follows as a user-turn image.`,
             images: [{ data: img.base64, mediaType: img.mediaType }],
           };
         }
@@ -835,7 +852,10 @@ function createReadFileTool(
         if (kind !== 'text') {
           await withReadFilesExtractionSlot(() => statFile(opts.userId, abs));
         }
-        let result = await readRange(opts.userId, abs, {
+        const result = await readRange(opts.userId, abs, {
+          // The shared estimator charges at least one token per four UTF-16
+          // units. No larger body can fit, even before headers and preludes.
+          maxContentChars: readFilesInlineTokenBudget(ctx, portableSkillDocument) * 4,
           ...(hasLineRange
             ? {
               ...(address.lineStart !== undefined ? { lineStart: address.lineStart } : {}),
@@ -851,65 +871,15 @@ function createReadFileTool(
             }),
         });
 
-        const maxContentTokens = Number(input.maxContentTokens);
-        if (
-          !portableSkillDocument
-          && Number.isFinite(maxContentTokens)
-          && maxContentTokens > 0
-          && estimateToolResultTokens(addLineNumbers(result.content, result.startLine).text) > maxContentTokens
-        ) {
-          let low = 0;
-          let high = result.content.length;
-          while (low < high) {
-            const mid = Math.ceil((low + high) / 2);
-            const candidate = addLineNumbers(result.content.slice(0, mid), result.startLine).text;
-            if (estimateToolResultTokens(candidate) <= maxContentTokens) low = mid;
-            else high = mid - 1;
-          }
-          result = {
-            ...result,
-            content: result.content.slice(0, low),
-            range: {
-              charStart: result.range.charStart,
-              charEnd: result.range.charStart + low,
-            },
-          };
-        }
-
+        // Capture the requested/default page after EOF clamping but before
+        // budget clipping. File pagination alone cannot describe completeness
+        // of an explicitly selected range (including a single long line).
+        const requestedPageEnd = result.requestedCharEnd ?? result.range.charEnd;
         const total = result.meta.totalChars ?? 0;
         const cs = result.range.charStart;
-        const ce = result.range.charEnd;
         const revision = kind === 'text' && result.sourceHash
           ? issueFileRevision(ctx, abs, sourceStat.size, result.sourceHash)
           : '';
-        // Number the lines for display (the model thinks in lines for code);
-        // char offsets remain the addressing/paging unit.
-        const { text: numberedContent, lastLine } = addLineNumbers(result.content, result.startLine);
-        const attrs = [
-          `path="${displayPath}"`,
-          `kind="${kind}"`,
-          `total_chars="${total}"`,
-          `covered="${cs}-${ce}"`,
-          `lines="${result.startLine}-${lastLine}"`,
-          ...(ce < total ? [
-            'has_more="true"',
-            `next_range="char:${ce}-${Math.min(total, ce + READ_FILES_DEFAULT_SLICE_CHARS)}"`,
-          ] : ['has_more="false"']),
-          ...(result.sourceHash ? [`file_hash="${result.sourceHash}"`] : []),
-          ...(revision ? [`revision="${revision}"`] : []),
-          ...(result.meta.extractionEmpty ? ['extraction="empty_pages"'] : []),
-        ];
-        const header = `<file ${attrs.join(' ')}>`;
-        log.info('read_files loaded', {
-          user_id: maskId(opts.userId),
-          path: logPathRef(abs),
-          kind,
-          covered_start: cs,
-          covered_end: ce,
-          total_chars: total,
-          start_line: result.startLine,
-          end_line: lastLine,
-        });
         const runtimeBinding = resolvedPath.skillRef
           ? opts.skillRuntimeBindings?.get(resolvedPath.skillRef)
           : undefined;
@@ -928,59 +898,145 @@ function createReadFileTool(
             try { return fs.statSync(path.join(runtimeBinding!.root, 'scripts')).isDirectory(); }
             catch { return false; }
           })()
-          ? `<skill-runtime execution_ref="${resolvedPath.skillRef}">For run-skill.cjs commands, use this exact ref; the host has already bound it to this Skill for the current run.</skill-runtime>`
+          ? renderSkillExecutionReadPrelude(resolvedPath.skillRef)
           : '';
         const entryPrelude = [
           entryReadPrelude,
           runtimeRequirementsPrelude,
           executionReadPrelude,
         ].filter(Boolean).join('\n\n');
-        // skill_invoked attribution: when the LLM reads a SKILL.md body through
-        // read_files, the body is the progressive-disclosure "use this skill"
-        // signal (per Claude Code conventions). Emit AFTER the successful
-        // text read — image / rich-document SKILL.md is not a real shape.
-        if (opts.onSkillInvoked) {
-          const runtimeParsed = isRuntimeSkillEntry
-            ? {
-              skill_id: runtimeBinding!.id,
-              system: runtimeBinding.source === 'custom'
-                ? 'A.custom' as const
-                : runtimeBinding.source === 'builtin' || runtimeBinding.source === 'platform'
-                  ? 'A.platform' as const
-                  : 'B' as const,
+        const renderPage = (body: string, includePrelude = true) => {
+          const ce = cs + body.length;
+          // Resume a clipped Skill request within the same requested range;
+          // its next result will be bounded by the then-current allowance.
+          const nextEnd = portableSkillDocument && ce < requestedPageEnd
+            ? requestedPageEnd : Math.min(total, ce + READ_FILES_DEFAULT_SLICE_CHARS);
+          // Number the lines for display (the model thinks in lines for code);
+          // char offsets remain the addressing/paging unit.
+          const { text: numberedContent, lastLine } = addLineNumbers(body, result.startLine);
+          const attrs = [
+            `path="${displayPath}"`,
+            `kind="${kind}"`,
+            `total_chars="${total}"`,
+            `covered="${cs}-${ce}"`,
+            `lines="${result.startLine}-${lastLine}"`,
+            `request_complete="${ce === requestedPageEnd}"`,
+            ...(ce < requestedPageEnd
+              ? [`remaining_request_range="char:${ce}-${requestedPageEnd}"`]
+              : []),
+            ...(ce < total ? [
+              'has_more="true"',
+              `next_range="char:${ce}-${nextEnd}"`,
+            ] : ['has_more="false"']),
+            ...(result.sourceHash ? [`file_hash="${result.sourceHash}"`] : []),
+            ...(revision ? [`revision="${revision}"`] : []),
+            ...(result.meta.extractionEmpty ? ['extraction="empty_pages"'] : []),
+          ];
+          const header = `<file ${attrs.join(' ')}>`;
+          const fileBlock = `${header}\n${numberedContent}\n</file>`;
+          return {
+            content: includePrelude && entryPrelude ? `${entryPrelude}\n\n${fileBlock}` : fileBlock,
+            lastLine,
+          };
+        };
+        const completePage = renderPage(result.content);
+        const documentFlag = portableSkillDocument ? { verbatimDocument: true } : {};
+        // An unread receipt carries a continuation but neither entry instructions
+        // nor read/OCC evidence. Reserve it before allocating body space.
+        const minimum: ToolResult = {
+          content: renderPage('', false).content,
+          ...documentFlag,
+        };
+        const completeTokens = estimateToolResultTokens(completePage.content);
+        const receiptTokens = estimateToolResultTokens(minimum.content);
+        const finishPage = (body: string, page: ReturnType<typeof renderPage>): ToolResult => {
+          const ce = cs + body.length;
+          const { lastLine } = page;
+          log.info('read_files loaded', {
+            user_id: maskId(opts.userId),
+            path: logPathRef(abs),
+            kind,
+            covered_start: cs,
+            covered_end: ce,
+            total_chars: total,
+            start_line: result.startLine,
+            end_line: lastLine,
+          });
+          // skill_invoked attribution: when the LLM reads a SKILL.md body through
+          // read_files, the body is the progressive-disclosure "use this skill"
+          // signal (per Claude Code conventions). Emit AFTER the successful
+          // text read — image / rich-document SKILL.md is not a real shape.
+          if (opts.onSkillInvoked) {
+            const runtimeParsed = isRuntimeSkillEntry
+              ? {
+                skill_id: runtimeBinding!.id,
+                system: runtimeBinding.source === 'custom'
+                  ? 'A.custom' as const
+                  : runtimeBinding.source === 'builtin' || runtimeBinding.source === 'platform'
+                    ? 'A.platform' as const
+                    : 'B' as const,
+              }
+              : null;
+            const parsed = runtimeParsed || parseSkillPath(abs, opts.userId);
+            if (parsed) {
+              try { opts.onSkillInvoked(parsed.skill_id, parsed.system, 'read_file'); }
+              catch (err) { log.warn('onSkillInvoked callback failed', { error: logErrorRef(err) }); }
             }
-            : null;
-          const parsed = runtimeParsed || parseSkillPath(abs, opts.userId);
-          if (parsed) {
-            try { opts.onSkillInvoked(parsed.skill_id, parsed.system, 'read_file'); }
-            catch (err) { log.warn('onSkillInvoked callback failed', { error: logErrorRef(err) }); }
           }
-        }
-        // Stamp the read-state baseline so a later edit_file accepts an edit
-        // built on these bytes (read-before-edit) and rejects it if the file
-        // changed since (OCC). See read-tracker.ts.
-        recordRead(ctx, abs, undefined, result.sourceHash);
-        const fileBlock = `${header}\n${numberedContent}\n</file>`;
+          // Stamp the read-state baseline so a later edit_file accepts an edit
+          // built on these bytes (read-before-edit) and rejects it if the file
+          // changed since (OCC). See read-tracker.ts.
+          recordRead(ctx, abs, undefined, result.sourceHash);
+          return {
+            content: page.content,
+            // Skill pages retain the shared policy's wider inline ceiling.
+            ...documentFlag,
+            observations: {
+              fileReads: [{
+                path: abs,
+                ...(result.sourceHash ? { hash: result.sourceHash } : {}),
+                charRange: [cs, ce],
+                lineRange: [result.startLine, lastLine],
+              }],
+            },
+          };
+        };
         return {
-          content: entryPrelude ? `${entryPrelude}\n\n${fileBlock}` : fileBlock,
-          // A skill body or its reference is a document the model was told to
-          // read whole. Spilled, it comes back as a stub the model keyword-
-          // searches, and whatever the search misses goes unread — so the
-          // result policy gives it a wider (still bounded) inline ceiling.
-          ...(portableSkillDocument ? { verbatimDocument: true } : {}),
-          observations: {
-            fileReads: [{
-              path: abs,
-              ...(result.sourceHash ? { hash: result.sourceHash } : {}),
-              charRange: [cs, ce],
-              lineRange: [result.startLine, lastLine],
-            }],
+          content: completePage.content,
+          ...documentFlag,
+          textPage: {
+            minimumTokens: Math.min(completeTokens, receiptTokens),
+            render: (maxTokens) => {
+              if (completeTokens <= maxTokens) {
+                return finishPage(result.content, completePage);
+              }
+              // Search only a budget-bounded prefix of the already-read text.
+              let low = 0;
+              let high = Math.min(result.content.length, Math.max(0, Math.floor(maxTokens * 4)));
+              while (low < high) {
+                const mid = Math.ceil((low + high) / 2);
+                if (estimateToolResultTokens(renderPage(result.content.slice(0, mid)).content) <= maxTokens) low = mid;
+                else high = mid - 1;
+              }
+              if (low > 0 && low < result.content.length
+                && result.content.charCodeAt(low - 1) >= 0xD800 && result.content.charCodeAt(low - 1) <= 0xDBFF
+                && result.content.charCodeAt(low) >= 0xDC00 && result.content.charCodeAt(low) <= 0xDFFF) low--;
+              if (low === 0) {
+                if (receiptTokens <= maxTokens) return minimum;
+                return {
+                  content: errText('E_READ_BUDGET', 'Insufficient inline space for a file receipt. Retry in a later call or read fewer files.'),
+                  isError: true,
+                };
+              }
+              const body = result.content.slice(0, low);
+              return finishPage(body, renderPage(body));
+            },
           },
         };
       } catch (err) {
         if (err instanceof NoTextError) {
           log.warn('read_files no text', { user_id: maskId(opts.userId), path: logPathRef(abs) });
-          return { content: errText('E_NO_TEXT', `${displayPath}: image has no text representation`), isError: true };
+          return { content: errText('E_NO_TEXT', `${displayPath}: ${err.kind} has no text representation`), isError: true };
         }
         if (err instanceof UnsupportedFileKindError) {
           log.warn('read_files unsupported kind', { user_id: maskId(opts.userId), path: logPathRef(abs), kind: err.kind });
@@ -1021,13 +1077,15 @@ async function withReadFilesExtractionSlot<T>(work: () => Promise<T>): Promise<T
   }
 }
 
-function readFilesInlineTokenBudget(ctx: ToolContext): number {
+function readFilesInlineTokenBudget(ctx: ToolContext, verbatimDocument = false): number {
   const value = ctx.state?.[TOOL_RESULT_INLINE_LEDGER_STATE_KEY];
   const ledger = value && typeof value === 'object'
     ? value as Partial<ToolResultInlineLedger>
     : undefined;
-  const candidates = [DEFAULT_INLINE_RESULT_TOKENS];
-  if (Number.isFinite(ledger?.perResultTokens)) {
+  const skillLimit = ledger?.verbatimDocumentTokens;
+  const candidates = [verbatimDocument && Number.isFinite(skillLimit) && skillLimit! > 0
+    ? skillLimit! : DEFAULT_INLINE_RESULT_TOKENS];
+  if (!verbatimDocument && Number.isFinite(ledger?.perResultTokens)) {
     candidates.push(Math.max(0, ledger!.perResultTokens!));
   }
   if (Number.isFinite(ledger?.remainingTokens)) {
@@ -1041,15 +1099,14 @@ function readFilesInlineTokenBudget(ctx: ToolContext): number {
  * line-number rendering, skill attribution, and OCC stamps stay identical. */
 function createReadFilesTool(opts: FileToolsOpts): AgentTool {
   // Ordinary batch reads default to a bounded slice. Portable skill documents
-  // are the exception: the delegated item reader classifies them only after its
-  // normal access gate and reads them whole, so a skill never silently becomes
-  // a valid-looking prefix.
+  // use their wider shared allowance. The delegated reader classifies them
+  // after the access gate and reports explicit ranges when pagination is needed.
   const readFile = createReadFileTool(opts, { defaultCharLimit: READ_FILES_DEFAULT_SLICE_CHARS });
   return {
     name: 'read_files',
     executionMode: 'parallel',
     description:
-      'Read one or more visible files in one call. Use one paths item for a single file; add an exact range for paging. PDF and Office files are prepared automatically. Set metadata_only to inspect several files without returning bodies. Set raw_text for exact UTF-8 text in machine-readable JSON.',
+      'Read one or more visible files; use ranges to inspect structure or samples. PDF and Office files are prepared automatically. For text pages, request_complete means the requested/default page reached its end (clamped to EOF); remaining_request_range identifies budget-clipped content. has_more/next_range describe file pagination, not missing requested content. Use metadata_only for metadata; use raw_text when complete original text is needed.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1074,7 +1131,7 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
         },
         raw_text: {
           type: 'boolean',
-          description: 'Return exact UTF-8 text as JSON {files:[{requested_path,ok,path,content,total_chars,file_hash}|{requested_path,ok:false,error}]}. Cannot combine with ranges/metadata_only. Large direct results may be persisted.',
+          description: 'Return complete UTF-8 text as JSON {files:[{requested_path,ok,path,content,total_chars,file_hash}|{requested_path,ok:false,error}]}. Cannot combine with ranges/metadata_only. Large direct results may be persisted.',
         },
       },
       required: ['paths'],
@@ -1095,37 +1152,36 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
           : {}
       ));
       const rawText = input.raw_text === true;
-      if (rawText && (input.metadata_only === true || requests.some((entry) => entry.range !== undefined))) {
+      if (rawText && input.metadata_only === true) {
         return {
           content: errText(
             'E_BAD_INPUT',
-            'read_files raw_text cannot be combined with metadata_only or ranges.',
+            'read_files raw_text cannot be combined with metadata_only.',
           ),
           isError: true,
         };
       }
-      if (requests.some((entry) => typeof entry.path !== 'string' || !entry.path)) {
-        return {
-          content: errText('E_BAD_INPUT', 'every read_files paths item requires a non-empty `path`'),
-          isError: true,
-        };
-      }
-      const parsedAddresses = requests.map((entry) => parseReadAddress(entry));
-      const invalidAddressIndex = parsedAddresses.findIndex((entry) => entry.error !== undefined);
-      if (invalidAddressIndex >= 0) {
-        const diagnostic = parsedAddresses[invalidAddressIndex].diagnostic;
-        return {
-          content: errText(
-            'E_BAD_INPUT',
-            `read_files item ${invalidAddressIndex + 1}: ${parsedAddresses[invalidAddressIndex].error}`,
-          ),
-          isError: true,
-          observations: diagnostic ? { fileFailure: { ...diagnostic, item_index: invalidAddressIndex } } : undefined,
-        };
-      }
-
+      // Validation failures use the same ordered per-item results as missing
+      // or unreadable files. Invalid items never reach the scoped reader.
+      const itemErrors: Array<ToolResult | undefined> = [];
       const normalized = requests.map((request, index) => {
-        const address = parsedAddresses[index].address!;
+        const invalid = (message: string, diagnostic?: FileFailureDiagnostic) => {
+          itemErrors[index] = {
+            content: errText('E_BAD_INPUT', `read_files item ${index + 1}: ${message}`),
+            isError: true,
+            ...(diagnostic ? { observations: { fileFailure: { ...diagnostic, item_index: index } } } : {}),
+          };
+          return { path: typeof request.path === 'string' ? request.path : '' };
+        };
+        if (typeof request.path !== 'string' || !request.path) {
+          return invalid('`path` must be a non-empty string');
+        }
+        if (rawText && request.range !== undefined) {
+          return invalid('raw_text cannot be combined with ranges');
+        }
+        const parsed = parseReadAddress(request);
+        if (parsed.error) return invalid(parsed.error, parsed.diagnostic);
+        const address = parsed.address!;
         const hasLineRange = address.lineStart !== undefined || address.lineEnd !== undefined;
         if (hasLineRange) {
           const lineStart = address.lineStart !== undefined && Number.isFinite(address.lineStart)
@@ -1150,19 +1206,24 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
           charEnd: explicitEnd ?? start + READ_FILES_DEFAULT_SLICE_CHARS,
         };
       });
+      const inputFailure = itemErrors.find((result) => result?.observations?.fileFailure)?.observations?.fileFailure;
       if (rawText) {
+        // Input-only refusals contain no source payload. Keep their actionable
+        // diagnostics, as before, even when the raw source quota is tiny; the
+        // ordinary result transformer still bounds their model-context size.
+        const validationOnly = normalized.every((_, index) => !!itemErrors[index]);
         const results = [];
         let resultBytes = 0;
         const maxBytes = Math.max(1, Math.trunc(
           opts.rawTextMaxBytes ?? 8 * 1024 * 1024,
         ));
-        for (const request of normalized) {
-          const result = await readFile.execute({
+        for (const [index, request] of normalized.entries()) {
+          const result = itemErrors[index] ?? await readFile.execute({
             ...request,
             rawText: true,
           }, ctx);
           resultBytes += Buffer.byteLength(result.content, 'utf8');
-          if (resultBytes > maxBytes) {
+          if (!validationOnly && resultBytes > maxBytes) {
             return {
               content: errText(
                 'E_RAW_TEXT_LIMIT',
@@ -1194,7 +1255,7 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
         });
         const errors = files.filter((file) => file.ok === false).length;
         const content = JSON.stringify({ files });
-        if (Buffer.byteLength(content, 'utf8') > maxBytes) {
+        if (!validationOnly && Buffer.byteLength(content, 'utf8') > maxBytes) {
           return {
             content: errText(
               'E_RAW_TEXT_LIMIT',
@@ -1207,6 +1268,7 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
           content,
           ...(errors === files.length ? { isError: true } : {}),
           observations: {
+            ...(inputFailure ? { fileFailure: inputFailure } : {}),
             fileReads: results.flatMap((result) => result.observations?.fileReads ?? []),
             fileReadBatch: fileReadBatchObservation(files.map((file) => (
               file.ok === false
@@ -1216,25 +1278,39 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
           },
         };
       }
-      const inlineBudget = readFilesInlineTokenBudget(ctx);
+      // Prepare authorized reads concurrently; allocate their formatted bodies
+      // in request order only after the actual sizes and document kinds are known.
+      const prepared: PreparedFileRead[] = await Promise.all(normalized.map((request, index) => (
+        itemErrors[index] ?? readFile.execute({
+          ...request,
+          metadataOnly: input.metadata_only === true,
+        }, ctx)
+      )));
+      const hasSkill = prepared.some(result => !result.isError && result.verbatimDocument);
+      const inlineBudget = readFilesInlineTokenBudget(ctx, hasSkill);
       const emptyEnvelope =
-        `<read-files count="${normalized.length}" errors="0">\n`
+        `<read-files count="${normalized.length}" errors="0" metadata_only="${input.metadata_only === true}">\n`
         + normalized.map((request, index) => (
           `<read-result index="${index}" ok="true">\nrequested_path=${String(request.path)}\n\n</read-result>`
         )).join('\n')
         + '\n</read-files>';
       const envelopeTokens = estimateToolResultTokens(emptyEnvelope) + 64;
-      const bodyTokensPerItem = Math.max(
-        8,
-        Math.floor(Math.max(0, inlineBudget - envelopeTokens) * 0.8 / normalized.length),
-      );
-      const results = await Promise.all(normalized.map((request) => (
-        readFile.execute({
-          ...request,
-          metadataOnly: input.metadata_only === true,
-          maxContentTokens: bodyTokensPerItem,
-        }, ctx)
-      )));
+      const minimumTokens = prepared.map(result => (
+        result.textPage?.minimumTokens ?? estimateToolResultTokens(result.content)
+      ));
+      let reservedTokens = minimumTokens.reduce((sum, tokens) => sum + tokens, 0);
+      let remainingTokens = Math.max(0, inlineBudget - envelopeTokens);
+      const ordinaryBudget = readFilesInlineTokenBudget(ctx);
+      const results = prepared.map((result, index): ToolResult => {
+        reservedTokens -= minimumTokens[index];
+        const available = Math.min(
+          result.verbatimDocument ? inlineBudget : ordinaryBudget,
+          Math.max(0, remainingTokens - reservedTokens),
+        );
+        const admitted = result.textPage ? result.textPage.render(available) : result;
+        remainingTokens = Math.max(0, remainingTokens - estimateToolResultTokens(admitted.content));
+        return admitted;
+      });
       const images = results.flatMap((result) => result.images || []);
       const includesVerbatimDocument = results.some((result) => !result.isError && result.verbatimDocument);
       const blocks = results.map((result, index) => {
@@ -1253,6 +1329,7 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
         ...(errors === results.length ? { isError: true } : {}),
         ...(includesVerbatimDocument ? { verbatimDocument: true } : {}),
         observations: {
+          ...(inputFailure ? { fileFailure: inputFailure } : {}),
           fileReads: results.flatMap((result) => result.observations?.fileReads ?? []),
           fileReadBatch: fileReadBatchObservation(results.map((result) => ({
             ok: !result.isError,
@@ -1264,207 +1341,80 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
   };
 }
 
-// ── ocr_file ─────────────────────────────────────────────────────────────
-
-function createOcrFileTool(opts: FileToolsOpts): AgentTool {
-  return {
-    name: 'ocr_file',
-    executionMode: 'sequential',
-    description:
-      'Run local OCR on scanned PDFs or images when exact text is needed and read_files returns empty extraction. For ordinary visual understanding use the image preview; read_files handles text-bearing PDF and Office files directly.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: 'Path relative to the working directory, a visible absolute path, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
-        pages: { type: 'string', description: 'Optional PDF pages, e.g. "1-3,5". Omit to OCR all pages.' },
-      },
-      required: ['path'],
-    },
-    async execute(input, ctx) {
-      const raw = String(input.path ?? '');
-      if (!raw) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
-      const resolvedPath = resolveRequestedPath(opts, ctx, raw);
-      if (resolvedPath.error) return { content: resolvedPath.error, isError: true };
-      const { abs, displayPath } = resolvedPath;
-
-      const scopeErr = await gatePathAccess(opts, abs, 'ocr_file', ctx);
-      if (scopeErr) {
-        log.warn('ocr_file scope reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
-        return { content: scopeErr, isError: true };
-      }
-      const disabledSkillErr = guardDisabledSkillAccess(opts, abs);
-      if (disabledSkillErr) {
-        log.warn('ocr_file disabled skill reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
-        return { content: disabledSkillErr, isError: true };
-      }
-      try { fs.statSync(abs); }
-      catch (err) {
-        log.warn('ocr_file not found', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
-        return { content: errText('E_NOT_FOUND', `${displayPath}: ${displayErrorMessage(err, abs, displayPath)}`), isError: true };
-      }
-
-      const kind = kindOf(abs);
-      if (kind !== 'pdf' && kind !== 'image') {
-        return {
-          content: errText(
-            'E_OCR_UNSUPPORTED_FILE',
-            `ocr_file currently supports PDF and image files only; got kind=${kind}. Use read_files for normal text or Office files.`,
-          ),
-          isError: true,
-        };
-      }
-
-      const pages = typeof input.pages === 'string' ? input.pages : undefined;
-      const result = await ocrFile({
-        userId: opts.userId,
-        absPath: abs,
-        ...(pages ? { pages } : {}),
-        ...(ctx.signal ? { signal: ctx.signal } : {}),
-        onProgress: (event) => ctx.emitProgress?.({
-          phase: event.phase,
-          message: event.message,
-          ...(event.data ? { data: event.data } : {}),
-        }),
-      });
-      if (result.ok === false) {
-        const processBlock = result.processLog?.length
-          ? `\n\n<ocr-process>\n${result.processLog.map((line) => `- ${line}`).join('\n')}\n</ocr-process>`
-          : '';
-        const repairHint = '\n\nDo not retry ocr_file or install/repair OCR dependencies with bash, pip, or uv.';
-        if (opts.visionFallbackAvailable && kind === 'image') {
-          try {
-            const image = await readImageAsGrayJpeg(opts.userId, abs);
-            return {
-              content:
-                `<ocr-vision-fallback path="${displayPath}" reason="${result.errorCode}" action="inspect_attached_image">\n`
-                + 'Local OCR is unavailable. Continue once from the attached model-visible image; do not call OCR or shell repair commands.\n'
-                + `</ocr-vision-fallback>${processBlock}`,
-              images: [{ data: image.base64, mediaType: image.mediaType }],
-            };
-          } catch (fallbackErr) {
-            log.warn('ocr_file image fallback failed', {
-              user_id: maskId(opts.userId),
-              path: logPathRef(abs),
-              error: logErrorRef(fallbackErr),
-            });
-          }
-        }
-        const visionFallback = opts.visionFallbackAvailable && kind === 'pdf'
-          ? '\n\n<ocr-vision-fallback action="pdf_render" retry_ocr="false">Render only the needed PDF pages, one page per call, and inspect the returned images. Do not use shell extraction or package installation.</ocr-vision-fallback>'
-          : '';
-        return {
-          content: errText(
-            result.errorCode,
-            displayErrorMessage(`${result.message}${processBlock}${visionFallback}${repairHint}`, abs, displayPath),
-          ),
-          isError: true,
-        };
-      }
-      log.info('ocr_file completed', {
-        user_id: maskId(opts.userId),
-        path: logPathRef(abs),
-        kind,
-        cached: !!result.cached,
-        text_chars: result.content.length,
-      });
-      return { content: displayErrorMessage(result.content, abs, displayPath) };
-    },
-  };
-}
-
 // ── search_files ─────────────────────────────────────────────────────────
 
-interface SearchHit {
-  path: string;
-  name: string;
-  size: number;
-  mtime: number;
-  ext: string;
-  source: 'attachment' | 'workspace' | 'extra';
-  /** Only present when a fresh cache entry is already on disk. Never
-   *  triggers extract just to populate this field. */
-  totalChars?: number;
-}
-
-function compileMatcher(query: string): (name: string) => boolean {
+function compileMatcher(query: string): (target: { abs: string; root: string }) => boolean {
   const q = query.trim();
   if (!q) return () => true;
+  // Path queries use the same root-relative rules as include/exclude globs.
+  // Bare queries retain their existing filename substring/glob behavior.
+  if (q.includes('/')) {
+    const [glob] = compileGrepGlobs(q);
+    return (target) => targetMatchesGrepGlob(target, glob);
+  }
   const hasGlob = /[*?[]/.test(q);
   if (hasGlob) {
     const re = new RegExp(
       '^' + q.replace(/[.+^${}()|\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$',
       'i',
     );
-    return (name) => re.test(name);
+    return (target) => re.test(path.basename(target.abs));
   }
   const lower = q.toLowerCase();
-  return (name) => name.toLowerCase().includes(lower);
+  return (target) => path.basename(target.abs).toLowerCase().includes(lower);
 }
 
-function walkFiles(
-  root: string,
-  max: number,
-  opts: { includeIgnored?: boolean } = {},
-): { files: string[]; skippedReason?: string } {
-  const out: string[] = [];
-  if (!root) return { files: out };
-  const protectedRoot = macosTccSensitivePath(path.resolve(root), { recursive: true });
-  if (protectedRoot) return { files: out, skippedReason: protectedRoot.reason };
-  let rootStat: fs.Stats;
-  try { rootStat = fs.statSync(root); }
-  catch { return { files: out }; }
-  if (!rootStat.isDirectory()) return { files: out };
+type SearchIncompleteReason = 'time_budget' | 'cancelled' | 'result_limit' | 'extraction_limit' | 'io_error' | 'protected_scope';
 
-  // Ignore files are honoured here too, not just by the `rg` backend: the tool
-  // promises repository scans respect them, and a machine without ripgrep must
-  // not start surfacing ignored build output and local config.
+function searchCompletion(reasons: Set<SearchIncompleteReason>): string {
+  return reasons.size
+    ? `complete=false reasons=${[...reasons].join(',')}. Results cover only the searched scope; narrow root or filters to continue.`
+    : 'complete=true';
+}
+
+/** Privacy is checked before either backend. No backend may reopen a skipped root. */
+async function visitFiles(
+  root: string,
+  visit: (file: string) => boolean | Promise<boolean>,
+  opts: { includeIgnored?: boolean; signal: AbortSignal },
+): Promise<{ backend: 'rg' | 'walk'; capped: boolean; skippedReason?: string; error?: string; interrupted?: boolean }> {
+  if (opts.signal.aborted) return { backend: 'walk', capped: false, interrupted: true };
+  const protectedRoot = macosTccSensitivePath(path.resolve(root), { recursive: true });
+  if (protectedRoot) return { backend: 'walk', capped: false, skippedReason: protectedRoot.reason };
+  try {
+    if (!(await fs.promises.stat(root)).isDirectory()) return { backend: 'walk', capped: false };
+  } catch (error) {
+    return { backend: 'walk', capped: false,
+      ...((error as NodeJS.ErrnoException).code === 'ENOENT' ? {} : { error: 'directory could not be inspected' }) };
+  }
+  const native = await visitRepositoryFiles(root, visit, opts);
+  if (native.backend === 'rg' || native.interrupted) return native;
   const honourIgnores = opts.includeIgnored !== true;
-  const rootScope = honourIgnores ? readIgnoreScope(root) : null;
-  const stack: Array<{ dir: string; scopes: readonly IgnoreScope[] }> = [
-    { dir: root, scopes: rootScope ? [rootScope] : [] },
-  ];
-  while (stack.length && out.length < max) {
-    const { dir, scopes } = stack.pop()!;
-    let entries: fs.Dirent[];
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
-    catch { continue; }
-    for (const e of entries) {
-      if (e.name === '.git') continue;
-      if (e.isDirectory() && fallbackDirectoryExcluded(e.name)) continue;
-      const p = path.join(dir, e.name);
-      if (honourIgnores && isIgnoredByScopes(p, e.isDirectory(), scopes)) continue;
-      if (e.isDirectory()) {
-        // A nested `.gitignore` governs its own subtree, as in git.
-        const nested = honourIgnores ? readIgnoreScope(p) : null;
-        stack.push({ dir: p, scopes: nested ? [...scopes, nested] : scopes });
-      } else if (e.isFile()) {
-        if (fallbackFileExcluded(e.name)) continue;
-        out.push(p);
-        if (out.length >= max) break;
+  let capped = false;
+  let failed = false;
+  let visited = 0;
+  const walk = async (dir: string, inherited: readonly IgnoreScope[]): Promise<void> => {
+    if (capped || opts.signal.aborted) return;
+    const local = honourIgnores ? readIgnoreScope(dir) : null;
+    const scopes = local ? [...inherited, local] : inherited;
+    try {
+      const entries = await fs.promises.opendir(dir);
+      for await (const entry of entries) {
+        if (capped || opts.signal.aborted) break;
+        if (++visited % GREP_YIELD_EVERY === 0) await new Promise<void>(resolve => setImmediate(resolve));
+        if (opts.signal.aborted) break;
+        if (entry.name === '.git' || (entry.isDirectory() && fallbackDirectoryExcluded(entry.name))) continue;
+        const file = path.join(dir, entry.name);
+        if (honourIgnores && isIgnoredByScopes(file, entry.isDirectory(), scopes)) continue;
+        if (entry.isDirectory()) await walk(file, scopes);
+        else if (entry.isFile() && !fallbackFileExcluded(entry.name)) capped = await visit(file);
       }
-    }
-  }
-  return { files: out };
-}
-
-async function enumerateFiles(
-  root: string,
-  max: number,
-  opts: { includeIgnored?: boolean; signal?: AbortSignal } = {},
-): Promise<{ files: string[]; backend: 'rg' | 'walk'; capped: boolean; skippedReason?: string }> {
-  const protectedRoot = macosTccSensitivePath(path.resolve(root), { recursive: true });
-  if (protectedRoot) {
-    return { files: [], backend: 'walk', capped: false, skippedReason: protectedRoot.reason };
-  }
-  const repository = await listRepositoryFiles(root, max, opts);
-  if (repository.backend === 'rg') return repository;
-  const fallback = walkFiles(root, max, opts);
-  return {
-    files: fallback.files,
-    backend: 'walk',
-    capped: fallback.files.length >= max,
-    ...(fallback.skippedReason ? { skippedReason: fallback.skippedReason } : {}),
+    } catch { failed = true; }
   };
+  await walk(root, []);
+  return { backend: 'walk', capped,
+    ...(opts.signal.aborted ? { interrupted: true } : {}),
+    ...(failed && !opts.signal.aborted ? { error: 'directory scan was incomplete' } : {}) };
 }
 
 function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
@@ -1476,7 +1426,7 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Substring or glob. Omit to list everything.' },
+        query: { type: 'string', description: 'Name substring or glob; patterns with / match root-relative paths. Omit to list everything.' },
         root: { type: 'string', description: 'Optional file or directory relative to the working directory, visible absolute path, or @skill/<read-ref>[/relative-path]; searches all visible roots when omitted.' },
         include_glob: { type: 'array', items: { type: 'string' }, maxItems: 16, description: 'Optional include globs matched against root-relative paths or basenames.' },
         exclude_glob: { type: 'array', items: { type: 'string' }, maxItems: 16, description: 'Optional exclude globs.' },
@@ -1551,98 +1501,74 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
         Math.min(MAX_SEARCH_RESULTS, Math.trunc(Number(input.max_results) || MAX_SEARCH_RESULTS)),
       );
 
-      const hits: SearchHit[] = [];
-      const skippedScans: string[] = [];
+      const hits: SearchFileHit[] = [];
+      const reasons = new Set<SearchIncompleteReason>();
       const backends = new Set<string>();
-      let budget = MAX_SCAN_FILES;
-      for (const { root, source } of rootKinds) {
-        if (budget <= 0) break;
-        const scan = await enumerateFiles(root, budget, { includeIgnored, signal: ctx.signal });
-        if (scan.skippedReason) {
-          skippedScans.push(`${source}:${scan.skippedReason}`);
-          continue;
+      const budget = createRepositorySearchBudget(ctx.signal);
+      let total = 0;
+      try {
+        for (const { root, source } of rootKinds) {
+          const stopReason = budget.reason();
+          if (stopReason) { reasons.add(stopReason); break; }
+          const scan = await visitFiles(root, async (abs) => {
+            const stopReason = budget.reason();
+            if (stopReason) { reasons.add(stopReason); return true; }
+            const name = path.basename(abs);
+            const target = { abs, root };
+            if (!matcher(target)) return false;
+            if (includeGlobs.length && !includeGlobs.some(glob => targetMatchesGrepGlob(target, glob))) return false;
+            if (excludeGlobs.some(glob => targetMatchesGrepGlob(target, glob))) return false;
+            let st: fs.Stats;
+            try { st = await fs.promises.stat(abs); }
+            catch { reasons.add('io_error'); return false; }
+            const hit: SearchFileHit = {
+              root: requestedRootResolution?.skillRef ? requestedRootDisplay : root,
+              path: requestedRootResolution?.skillRef ? displayDescendantPath(abs, requestedRoot, requestedRootDisplay) : abs,
+              name, size: st.size, mtime: Math.floor(st.mtimeMs), source,
+            };
+            total++;
+            // Stable newest-first top K, without retaining all matching paths.
+            let low = 0, high = hits.length;
+            while (low < high) {
+              const mid = (low + high) >>> 1;
+              if (hits[mid].mtime >= hit.mtime) low = mid + 1;
+              else high = mid;
+            }
+            if (low < maxResults) {
+              const cached = getCachedMeta(opts.userId, abs);
+              if (cached?.totalChars !== undefined) hit.totalChars = cached.totalChars;
+              hits.splice(low, 0, hit);
+              if (hits.length > maxResults) hits.pop();
+            }
+            return false;
+          }, { includeIgnored, signal: budget.signal });
+          backends.add(scan.backend);
+          if (scan.skippedReason) reasons.add('protected_scope');
+          if (scan.error) reasons.add('io_error');
+          const reason = budget.reason();
+          if (reason) { reasons.add(reason); break; }
         }
-        backends.add(scan.backend);
-        const files = scan.files;
-        budget -= files.length;
-        for (const abs of files) {
-          const name = path.basename(abs);
-          if (!matcher(name)) continue;
-          const target = { abs, root };
-          if (includeGlobs.length && !includeGlobs.some((glob) => targetMatchesGrepGlob(target, glob))) continue;
-          if (excludeGlobs.some((glob) => targetMatchesGrepGlob(target, glob))) continue;
-          let st: fs.Stats;
-          try { st = fs.statSync(abs); }
-          catch { continue; }
-          const ext = path.extname(name).toLowerCase();
-          const hit: SearchHit = {
-            path: requestedRootResolution?.skillRef
-              ? displayDescendantPath(abs, requestedRoot, requestedRootDisplay)
-              : abs,
-            name,
-            size: st.size,
-            mtime: Math.floor(st.mtimeMs),
-            ext,
-            source,
-          };
-          // Only include total_chars when a cache entry already exists — never
-          // trigger extract from a search. Model can call read_files with
-          // metadata_only when it needs prepared document metadata.
-          const cached = getCachedMeta(opts.userId, abs);
-          if (cached?.totalChars !== undefined) hit.totalChars = cached.totalChars;
-          hits.push(hit);
+        if (total > hits.length) reasons.add('result_limit');
+        const completion = searchCompletion(reasons);
+        if (!hits.length) {
+          if (reasons.has('protected_scope') && reasons.size === 1) {
+            return { content: `No files were scanned in the privacy-protected workspace. Use an exact path with read_files, or ask the user to attach the file.\n${completion}` };
+          }
+          return { content: reasons.size
+            ? `0 matches in searched scope.\n${completion}`
+            : `${query ? `No matches for "${query}".` : 'No files found.'}\n${completion}` };
         }
-      }
-
-      if (!hits.length) {
-        if (skippedScans.length) {
-          return {
-            content: 'No files were scanned in the privacy-protected workspace. Use an exact path with read_files, or ask the user to attach the file.',
-          };
-        }
-        return { content: query ? `No matches for "${query}".` : 'No files found.' };
-      }
-      // Newest-first, THEN cap — so the cap keeps the most recently modified
-      // files (previously the cap was applied during the walk, which dropped
-      // recent files that happened to be visited late in the traversal).
-      hits.sort((a, b) => b.mtime - a.mtime);
-      const total = hits.length;
-      const shown = total > maxResults ? hits.slice(0, maxResults) : hits;
-      const lines = shown.map((h) => {
-        const bits = [
-          `path=${h.path}`,
-          `size=${h.size}`,
-          `mtime=${new Date(h.mtime).toISOString()}`,
-          `source=${h.source}`,
-          ...(h.totalChars !== undefined ? [`total_chars=${h.totalChars}`] : []),
-        ];
-        return `- ${h.name}  (${bits.join(', ')})`;
-      });
-      log.info('search_files completed', {
-        user_id: maskId(opts.userId),
-        query_chars: query.length,
-        hits: total,
-        shown: shown.length,
-      });
-      const header = total > shown.length
-        ? `${total} match(es), showing ${maxResults}; backend=${[...backends].join('+') || 'walk'}:`
-        : `${total} match(es); backend=${[...backends].join('+') || 'walk'}:`;
-      return { content: `${header}\n${lines.join('\n')}` };
+        log.info('search_files completed', { user_id: maskId(opts.userId), query_chars: query.length, hits: total, shown: hits.length });
+        const header = total > hits.length
+          ? `${total} match(es), showing ${maxResults}; backend=${[...backends].join('+') || 'walk'}:`
+          : `${total} match(es); backend=${[...backends].join('+') || 'walk'}:`;
+        return { content: `${header}\n${completion}\n${formatSearchFileResults(hits)}` };
+      } finally { budget.dispose(); }
     },
   };
 }
 
 // ── grep_files ───────────────────────────────────────────────────────────
-
-interface GrepHit {
-  path: string;
-  line: number;
-  column: number;
-  snippet: string;
-  before: Array<{ line: number; text: string }>;
-  after: Array<{ line: number; text: string }>;
-  source: 'attachment' | 'workspace' | 'extra';
-}
 
 /** Minimal glob → RegExp for grep_files scoping. `*` = a run of non-slash
  *  chars, `**` = any directories, `?` = one non-slash char. A glob WITHOUT
@@ -1701,11 +1627,12 @@ function targetMatchesGrepGlob(
 }
 
 function grepHitFromLines(
-  target: { abs: string; source: 'attachment' | 'workspace' | 'extra' },
+  target: { abs: string },
   lines: readonly string[],
   index: number,
   matcher: RegExp,
   contextLines: number,
+  includeContent: boolean,
 ): GrepHit | null {
   const match = matcher.exec(lines[index]);
   if (!match) return null;
@@ -1715,7 +1642,7 @@ function grepHitFromLines(
     path: target.abs,
     line: index + 1,
     column: match.index + 1,
-    snippet: snippetFromLine(lines[index], matcher),
+    snippet: includeContent ? snippetFromLine(lines[index], match) : '',
     before: lines.slice(beforeStart, index).map((text, offset) => ({
       line: beforeStart + offset + 1,
       text: text.slice(0, 240),
@@ -1724,28 +1651,25 @@ function grepHitFromLines(
       line: index + offset + 2,
       text: text.slice(0, 240),
     })),
-    source: target.source,
   };
 }
 
-async function pMapLimit<T, U>(
+async function pMapLimit<T>(
   items: T[],
   limit: number,
-  fn: (item: T) => Promise<U>,
-): Promise<U[]> {
-  const out: U[] = new Array(items.length);
+  fn: (item: T) => Promise<void>,
+): Promise<void> {
   let cursor = 0;
   const worker = async () => {
     while (true) {
       const i = cursor++;
       if (i >= items.length) return;
-      out[i] = await fn(items[i]);
+      await fn(items[i]);
     }
   };
   const n = Math.min(Math.max(1, limit), items.length);
   const workers = Array.from({ length: n }, () => worker());
   await Promise.all(workers);
-  return out;
 }
 
 function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
@@ -1753,12 +1677,12 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
     name: 'grep_files',
     executionMode: 'parallel',
     description:
-      'Search text across visible files; PDF and modern Office content is extracted and cached, while images, legacy Office, and other binaries are skipped.',
+      'Search visible text, PDF and modern Office content; skips images and other binaries. Prefer shell `rg`/`rg --files` for repository text/file searches when available.',
     inputSchema: {
       type: 'object',
       properties: {
         pattern: { type: 'string', description: 'Pattern to search for.' },
-        root: { type: 'string', description: 'Optional directory relative to the working directory, visible absolute directory, or @skill/<read-ref>[/relative-path]; searches all visible roots when omitted.' },
+        root: { type: 'string', description: 'One file/directory relative to the working directory, visible absolute, or @skill/<read-ref>[/path]. No globs/path lists; omit for all visible roots.' },
         regex: { type: 'boolean', description: 'Default false — treat pattern as a case-insensitive substring.' },
         glob: { type: 'string', description: 'Optional file glob. No "/" matches basenames; with "/" matches relative paths, e.g. "src/**/*.ts".' },
         include_glob: { type: 'array', items: { type: 'string' }, maxItems: 16, description: 'Optional additional include globs. A file may match any include glob.' },
@@ -1802,18 +1726,21 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
       const mode: 'content' | 'files' | 'count' =
         input.output_mode === 'files' || input.output_mode === 'count' ? input.output_mode : 'content';
       const filesMode = mode === 'files';
-      const contextLines = Math.max(0, Math.min(3, Math.trunc(Number(input.context_lines) || 0)));
+      const includeContent = mode === 'content';
+      const contextLines = includeContent
+        ? Math.max(0, Math.min(3, Math.trunc(Number(input.context_lines) || 0)))
+        : 0;
       const maxResults = Math.max(
         1,
         Math.min(MAX_GREP_MATCHES, Math.trunc(Number(input.max_results) || MAX_GREP_MATCHES)),
       );
 
-      const rootKinds: Array<{ root: string; source: 'attachment' | 'workspace' | 'extra' }> = [];
-      try { rootKinds.push({ root: getWorkspacePath(opts.userId, opts.projectId), source: 'workspace' }); }
+      const roots: string[] = [];
+      try { roots.push(getWorkspacePath(opts.userId, opts.projectId)); }
       catch { /* workspace unavailable */ }
-      if (opts.cid) rootKinds.push({ root: chatAttachmentDirForConversation(opts.userId, opts.cid), source: 'attachment' });
+      if (opts.cid) roots.push(chatAttachmentDirForConversation(opts.userId, opts.cid));
       for (const root of [...(opts.extraRoots || []), ...(opts.readOnlyExtraRoots || [])]) {
-        if (root) rootKinds.push({ root, source: 'extra' });
+        if (root) roots.push(root);
       }
       const requestedRootInput = typeof input.root === 'string' ? input.root.trim() : '';
       const requestedRootResolution = requestedRootInput
@@ -1853,223 +1780,156 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
         // round trip every time. The path was gated just above, so answering
         // it reads nothing the caller could not already read; enumeration is
         // skipped rather than widened to the parent directory.
-        const source = rootKinds.find(({ root }) => isInsideRoot(root, requestedRoot))?.source ?? 'extra';
         if (st.isFile()) {
           singleFileTarget = requestedRoot;
-          rootKinds.splice(0, rootKinds.length, { root: path.dirname(requestedRoot), source });
+          roots.splice(0, roots.length, path.dirname(requestedRoot));
         } else {
-          rootKinds.splice(0, rootKinds.length, { root: requestedRoot, source });
+          roots.splice(0, roots.length, requestedRoot);
         }
       }
-      if (!rootKinds.length) {
+      if (!roots.length) {
         return { content: errText('E_NO_SCOPE', 'no visible roots for this conversation'), isError: true };
       }
 
-      const targets: Array<{ abs: string; source: 'attachment' | 'workspace' | 'extra'; root: string }> = [];
-      const skippedScans: string[] = [];
       const includeIgnored = input.include_ignored === true;
-      const enumerationBackends = new Set<string>();
-      let budget = MAX_SCAN_FILES;
-      for (const { root, source } of rootKinds) {
-        if (budget <= 0) break;
-        if (singleFileTarget) {
-          targets.push({ abs: singleFileTarget, source, root });
-          budget -= 1;
-          continue;
-        }
-        const scan = await enumerateFiles(root, budget, { includeIgnored, signal: ctx.signal });
-        if (scan.skippedReason) {
-          skippedScans.push(`${source}:${scan.skippedReason}`);
-          continue;
-        }
-        enumerationBackends.add(scan.backend);
-        const files = scan.files;
-        budget -= files.length;
-        for (const abs of files) targets.push({ abs, source, root });
-      }
-      if (!targets.length && skippedScans.length) {
-        return {
-          content: 'No files were scanned in the privacy-protected workspace. Use an exact path with read_files, or ask the user to attach the file.',
-        };
-      }
-
-      // Scope by glob (when given). No-slash globs match the basename at any
-      // depth; slash globs match the root-relative path (normalized to "/").
-      const scoped = targets.filter((target) => {
-        const included = includeGlobs.length === 0
-          || includeGlobs.some((glob) => targetMatchesGrepGlob(target, glob));
-        const excluded = excludeGlobs.some((glob) => targetMatchesGrepGlob(target, glob));
-        return included && !excluded;
-      });
-      if ((includeGlobs.length || excludeGlobs.length) && !scoped.length) {
-        const includeText = includeGlobs.map((glob) => glob.raw).join(', ') || '(all)';
-        const excludeText = excludeGlobs.map((glob) => glob.raw).join(', ') || '(none)';
-        return {
-          content:
-            `No files matched glob filters in the visible scope. `
-            + `include=${includeText} exclude=${excludeText}`,
-        };
-      }
-
-      let scanned = 0, skipped = 0, extracted = 0;
+      const reasons = new Set<SearchIncompleteReason>();
+      const budget = createRepositorySearchBudget(ctx.signal);
+      const backends = new Set<string>();
       const hits: GrepHit[] = [];
-      const rgHandledRoots = new Set<string>();
-      // The fast path operates on directories. When the caller named one
-      // file, running it on the file's parent would widen the authorized and
-      // requested scope to siblings; let the direct-file path below own it.
-      if (!singleFileTarget) {
-        for (const { root, source } of rootKinds) {
-          if (hits.length >= maxResults) break;
-          const repositoryResult = await grepRepository(root, {
-            pattern,
-            regex: useRegex,
-            caseSensitive,
-            contextLines,
-            maxResults: maxResults - hits.length,
-            includeGlobs: includeGlobs.map((glob) => glob.raw),
-            excludeGlobs: excludeGlobs.map((glob) => glob.raw),
-            includeIgnored,
-            signal: ctx.signal,
-          });
-          if (!repositoryResult.available) continue;
-          if (repositoryResult.error) {
-            return {
-              content: errText(
-                'E_GREP_FAILED',
-                requestedRootResolution?.skillRef
-                  ? displayErrorMessage(repositoryResult.error, requestedRoot, requestedRootDisplay)
-                  : repositoryResult.error,
-              ),
-              isError: true,
-            };
-          }
-          rgHandledRoots.add(path.resolve(root));
-          for (const hit of repositoryResult.hits) {
-            hits.push({
-              path: hit.path,
-              line: hit.line,
-              column: hit.column,
-              snippet: snippetFromLine(hit.text, matcher),
-              before: hit.before,
-              after: hit.after,
-              source,
-            });
-          }
-        }
-      }
-
-      // Split into text-direct vs extract-required buckets. Text bucket is
-      // fast (sync read + scan); extract bucket is bounded-concurrency async.
-      const allTextTargets = scoped.filter((t) => {
-        const k = kindOf(t.abs);
-        if (k === 'image') return false;
-        return k === 'text';
-      });
-      const textTargets = allTextTargets.filter((t) => !rgHandledRoots.has(path.resolve(t.root)));
-      const extractTargets = scoped.filter((t) => {
-        const k = kindOf(t.abs);
-        return isExtractableRichKind(k);
-      });
-      // Images + unknown → skipped
-      skipped += scoped.length - allTextTargets.length - extractTargets.length;
-
-      // Text bucket — async, non-blocking line scan: read each file off the
-      // event loop and yield every GREP_YIELD_EVERY files, so a large workspace
-      // can't stall the main process (was a synchronous readFileSync loop).
-      let sinceYield = 0;
-      for (const t of textTargets) {
-        if (hits.length >= maxResults) break;
-        scanned++;
-        if (++sinceYield >= GREP_YIELD_EVERY) { sinceYield = 0; await new Promise<void>((r) => setImmediate(r)); }
-        let body: string;
-        try { body = await fs.promises.readFile(t.abs, 'utf8'); }
-        catch { continue; }
+      const extractTargets: Array<{ abs: string }> = [];
+      let scanned = 0, skipped = 0, extracted = 0, candidates = 0;
+      const shouldStop = () => {
+        const reason = budget.reason();
+        if (reason) reasons.add(reason);
+        if (hits.length >= maxResults) reasons.add('result_limit');
+        return !!reason || hits.length >= maxResults;
+      };
+      const collectMatches = (target: { abs: string }, body: string) => {
         const lines = body.split('\n');
-        for (let i = 0; i < lines.length; i++) {
-          const hit = grepHitFromLines(t, lines, i, matcher, contextLines);
+        for (let i = 0; i < lines.length && hits.length < maxResults; i++) {
+          if (i % GREP_YIELD_EVERY === 0 && shouldStop()) break;
+          const hit = grepHitFromLines(target, lines, i, matcher, contextLines, includeContent);
           if (hit) {
             hits.push(hit);
-            if (filesMode) break;   // files/count: one snippet per file is enough for files-mode
-            if (hits.length >= maxResults) break;
+            if (filesMode) break;
           }
         }
-      }
-
-      // Extract bucket — parallel extract with cache, then line scan.
-      if (hits.length < maxResults && extractTargets.length) {
-        await pMapLimit(extractTargets, GREP_EXTRACT_CONCURRENCY, async (t) => {
-          if (hits.length >= maxResults) return;
-          scanned++;
-          let text: string;
-          try {
-            const { text: got } = await getExtractedText(opts.userId, t.abs);
-            text = got;
-            extracted++;
-          } catch (err) {
-            log.warn('grep_files extract failed', { user_id: maskId(opts.userId), path: logPathRef(t.abs), error: logErrorRef(err) });
-            return;
+      };
+      try {
+        for (const root of roots) {
+          if (shouldStop()) break;
+          // A single file never opens its parent. Directory privacy applies before rg.
+          if (!singleFileTarget && macosTccSensitivePath(path.resolve(root), { recursive: true })) {
+            reasons.add('protected_scope');
+            continue;
           }
-          const lines = text.split('\n');
-          for (let i = 0; i < lines.length; i++) {
-            if (hits.length >= maxResults) return;
-            const hit = grepHitFromLines(t, lines, i, matcher, contextLines);
-            if (hit) {
-              hits.push(hit);
-              if (filesMode) return;   // one hit per file is enough for files-mode
+          let nativeHandled = false;
+          if (!singleFileTarget) {
+            try {
+              if (!(await fs.promises.stat(root)).isDirectory()) continue;
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') reasons.add('io_error');
+              continue;
+            }
+            const result = await grepRepository(root, {
+              pattern, regex: useRegex, caseSensitive, contextLines, filesOnly: filesMode,
+              maxResults: maxResults - hits.length,
+              includeGlobs: includeGlobs.map(glob => glob.raw),
+              excludeGlobs: excludeGlobs.map(glob => glob.raw),
+              includeIgnored, signal: budget.signal,
+            });
+            if (result.available) {
+              if (result.error) {
+                return { content: errText('E_GREP_FAILED', requestedRootResolution?.skillRef
+                  ? displayErrorMessage(result.error, requestedRoot, requestedRootDisplay) : result.error), isError: true };
+              }
+              nativeHandled = true;
+              backends.add('rg');
+              if (result.capped) reasons.add('result_limit');
+              for (const hit of result.hits) {
+                hits.push({ path: hit.path, line: hit.line, column: hit.column,
+                  snippet: includeContent ? snippetFromLine(hit.text, matcher.exec(hit.text)) : '',
+                  before: hit.before, after: hit.after });
+              }
+              if (shouldStop()) break;
             }
           }
+          const visit = async (abs: string): Promise<boolean> => {
+            if (shouldStop()) return true;
+            const target = { abs, root };
+            if (includeGlobs.length && !includeGlobs.some(glob => targetMatchesGrepGlob(target, glob))) return false;
+            if (excludeGlobs.some(glob => targetMatchesGrepGlob(target, glob))) return false;
+            candidates++;
+            const kind = kindOf(abs);
+            if (isExtractableRichKind(kind)) {
+              if (extractTargets.length < MAX_EXTRACT_FILES) extractTargets.push(target);
+              else reasons.add('extraction_limit');
+            } else if (kind === 'text') {
+              if (!nativeHandled) {
+                scanned++;
+                try { collectMatches(target, await fs.promises.readFile(abs, { encoding: 'utf8', signal: budget.signal })); }
+                catch { if (!budget.reason()) reasons.add('io_error'); }
+              }
+            } else skipped++;
+            return shouldStop();
+          };
+          if (singleFileTarget) {
+            backends.add('walk');
+            await visit(singleFileTarget);
+          } else {
+            const scan = await visitFiles(root, visit, { includeIgnored, signal: budget.signal });
+            backends.add(scan.backend);
+            if (scan.error) reasons.add('io_error');
+            if (scan.skippedReason) reasons.add('protected_scope');
+          }
+        }
+        // The deadline prevents new extraction work. Already admitted extractors
+        // retain their existing completion/cleanup contract (no detached replay).
+        if (!shouldStop()) {
+          await pMapLimit(extractTargets, GREP_EXTRACT_CONCURRENCY, async (target) => {
+            if (shouldStop()) return;
+            scanned++;
+            try {
+              const { text } = await getExtractedText(opts.userId, target.abs);
+              extracted++;
+              if (!shouldStop()) collectMatches(target, text);
+            } catch (error) {
+              reasons.add('io_error');
+              log.warn('grep_files extract failed', { user_id: maskId(opts.userId), path: logPathRef(target.abs), error: logErrorRef(error) });
+            }
+          });
+        }
+        shouldStop();
+        log.info('grep_files completed', {
+          user_id: maskId(opts.userId), pattern_chars: pattern.length, use_regex: useRegex,
+          hits: hits.length, scanned, extracted, skipped, backend: [...backends].join('+'),
         });
-      }
-
-      log.info('grep_files completed', {
-        user_id: maskId(opts.userId),
-        pattern_chars: pattern.length,
-        use_regex: useRegex,
-        hits: hits.length,
-        scanned,
-        extracted,
-        skipped,
-        backend: rgHandledRoots.size ? 'rg' : [...enumerationBackends].join('+'),
-      });
-      if (!hits.length) {
-        return {
-          content:
-            `No matches for ${useRegex ? `/${pattern}/${caseSensitive ? '' : 'i'}` : `"${pattern}"`}.\n`
-            + `scanned=${scanned} extracted=${extracted} skipped=${skipped}`,
-        };
-      }
-      const tail =
-        `  scanned=${scanned} extracted=${extracted} skipped=${skipped} `
-        + `backend=${rgHandledRoots.size ? 'rg' : [...enumerationBackends].join('+') || 'walk'}`;
-      const visibleHits = requestedRootResolution?.skillRef
-        ? hits.map((hit) => ({
-          ...hit,
-          path: displayDescendantPath(hit.path, requestedRoot, requestedRootDisplay),
-        }))
-        : hits;
-      const capped = visibleHits.length >= maxResults;
-      if (mode === 'files') {
-        const files = [...new Set(visibleHits.map((h) => h.path))];
-        const header = `${files.length} file(s) with matches`
-          + (capped ? ` (capped — narrow with glob)` : '') + tail;
-        return { content: `${header}\n${files.map((f) => `  ${f}`).join('\n')}` };
-      }
-      if (mode === 'count') {
-        const counts = new Map<string, number>();
-        for (const h of visibleHits) counts.set(h.path, (counts.get(h.path) || 0) + 1);
-        const body = [...counts.entries()].map(([p, n]) => `  ${p}: ${n}`).join('\n');
-        const header = `${counts.size} file(s), ${hits.length} match(es)`
-          + (capped ? ` (capped at ${maxResults})` : '') + tail;
-        return { content: `${header}\n${body}` };
-      }
-      const lines = visibleHits.flatMap((h) => [
-        ...h.before.map((entry) => `  ${h.path}-${entry.line}-  ${entry.text}`),
-        `  ${h.path}:${h.line}:${h.column}  ${h.snippet}`,
-        ...h.after.map((entry) => `  ${h.path}+${entry.line}+  ${entry.text}`),
-      ]);
-      const header = `${hits.length} match(es)`
-        + (capped ? ` (capped at ${maxResults})` : '') + tail;
-      return { content: `${header}\n${lines.join('\n')}` };
+        const completion = searchCompletion(reasons);
+        if (!hits.length) {
+          if (reasons.has('protected_scope') && reasons.size === 1 && candidates === 0) {
+            return { content: `No files were scanned in the privacy-protected workspace. Use an exact path with read_files, or ask the user to attach the file.\n${completion}` };
+          }
+          if (reasons.size) return { content: `0 matches in searched scope.\n${completion}` };
+          if ((includeGlobs.length || excludeGlobs.length) && !candidates) {
+            return { content: `No files matched glob filters in the visible scope. include=${includeGlobs.map(glob => glob.raw).join(', ') || '(all)'} exclude=${excludeGlobs.map(glob => glob.raw).join(', ') || '(none)'}\n${completion}` };
+          }
+          return { content: `No matches for ${useRegex ? `/${pattern}/${caseSensitive ? '' : 'i'}` : `"${pattern}"`}.\nscanned=${scanned} extracted=${extracted} skipped=${skipped}\n${completion}` };
+        }
+        const tail = `  scanned=${scanned} extracted=${extracted} skipped=${skipped} backend=${[...backends].join('+') || 'walk'}`;
+        const visibleHits = requestedRootResolution?.skillRef
+          ? hits.map(hit => ({ ...hit, path: displayDescendantPath(hit.path, requestedRoot, requestedRootDisplay) })) : hits;
+        const capped = reasons.has('result_limit');
+        if (mode === 'files') {
+          const files = [...new Set(visibleHits.map(hit => hit.path))];
+          return { content: `${files.length} file(s) with matches${capped ? ' (capped — narrow with glob)' : ''}${tail}\n${completion}\n${files.map(file => `  ${file}`).join('\n')}` };
+        }
+        if (mode === 'count') {
+          const counts = new Map<string, number>();
+          for (const hit of visibleHits) counts.set(hit.path, (counts.get(hit.path) || 0) + 1);
+          return { content: `${counts.size} file(s), ${hits.length} match(es)${capped ? ` (capped at ${maxResults})` : ''}${tail}\n${completion}\n${[...counts.entries()].map(([file, count]) => `  ${file}: ${count}`).join('\n')}` };
+        }
+        return { content: `${hits.length} match(es)${capped ? ` (capped at ${maxResults})` : ''}${tail}\n${completion}\n${formatGrepFileResults(visibleHits)}` };
+      } finally { budget.dispose(); }
     },
   };
 }
@@ -2097,8 +1957,7 @@ function findUniquifySiblings(absPath: string): string[] {
   return matches.map((m) => m.basename);
 }
 
-function snippetFromLine(line: string, matcher: RegExp): string {
-  const m = matcher.exec(line);
+function snippetFromLine(line: string, m: RegExpExecArray | null): string {
   if (!m) return line.slice(0, 160);
   const mid = m.index;
   const lo = Math.max(0, mid - 40);
@@ -2173,7 +2032,6 @@ function createListFilesTool(opts: FileToolsOpts): AgentTool {
 export function createFileTools(opts: FileToolsOpts): AgentTool[] {
   return [
     createReadFilesTool(opts),
-    ...(opts.includeOcrFile ? [createOcrFileTool(opts)] : []),
     createSearchFilesTool(opts),
     createGrepFilesTool(opts),
     createListFilesTool(opts),

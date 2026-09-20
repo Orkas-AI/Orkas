@@ -10,8 +10,10 @@
 import type { AgentTool } from '#core-agent';
 import { z } from 'zod';
 import { zodToJsonSchema } from 'zod-to-json-schema';
+import { createLogger } from '../../logger';
 import { browserTaskRunId } from '../web_assist_lifecycle';
 
+const log = createLogger('browser-tool');
 const contract = require('../../../../bin/browser-tool-contract.cjs');
 const schema = z.object(contract.shape(z)).strict();
 const { $schema: _schemaVersion, ...inputSchema } = zodToJsonSchema(schema);
@@ -24,7 +26,11 @@ export interface BrowserToolCallbacks {
     action: 'goto' | 'back' | 'forward' | 'reload';
     url?: string;
   }) => Promise<Record<string, unknown>>;
-  observe: (tabId?: string) => Promise<Record<string, unknown>>;
+  observe: (
+    tabId?: string,
+    scope?: 'full' | 'meta',
+    window?: { textOffset?: number; elementOffset?: number },
+  ) => Promise<Record<string, unknown>>;
   act: (input: {
     tabId?: string;
     pageId: string;
@@ -32,7 +38,7 @@ export interface BrowserToolCallbacks {
     action: 'click' | 'fill' | 'select' | 'check' | 'uncheck' | 'scroll';
     text?: string;
     direction?: 'up' | 'down' | 'top' | 'bottom';
-  }) => Promise<Record<string, unknown>>;
+  }, signal?: AbortSignal) => Promise<Record<string, unknown>>;
   wait: (input: {
     tabId?: string;
     condition: 'loaded' | 'text';
@@ -62,13 +68,14 @@ const OPERATIONS = new Set(['tabs', 'open', 'navigate', 'observe', 'act', 'wait'
 const NAVIGATION_ACTIONS = new Set(['goto', 'back', 'forward', 'reload']);
 const PAGE_ACTIONS = new Set(['click', 'fill', 'select', 'check', 'uncheck', 'scroll']);
 const DIRECTIONS = new Set(['up', 'down', 'top', 'bottom']);
+const OBSERVE_SCOPES = new Set(['full', 'meta']);
 
 export function buildBrowserTool(callbacks: BrowserToolCallbacks): AgentTool {
   return {
-    name: 'browser',
+    name: 'inner_browser',
     description: contract.description,
     inputSchema: inputSchema as AgentTool['inputSchema'],
-    async execute(input) {
+    async execute(input, context) {
       const parsed = schema.safeParse(input);
       if (!parsed.success) return error(parsed.error.issues.map(issue => `${issue.path.join('.') || 'input'}: ${issue.message}`).join('; '));
       const operation = String(input.operation || '').trim();
@@ -97,7 +104,20 @@ export function buildBrowserTool(callbacks: BrowserToolCallbacks): AgentTool {
             ...(url ? { url } : {}),
           }));
         }
-        if (operation === 'observe') return output(await callbacks.observe(tabId));
+        if (operation === 'observe') {
+          const scope = optionalString(input.scope) || 'full';
+          if (!OBSERVE_SCOPES.has(scope)) return error('`scope` must be full or meta');
+          const offsets: { textOffset?: number; elementOffset?: number } = {};
+          for (const [key, field] of [['text_offset', 'textOffset'], ['element_offset', 'elementOffset']] as const) {
+            if (input[key] === undefined) continue;
+            const parsed = Number(input[key]);
+            if (!Number.isInteger(parsed) || parsed < 0) {
+              return error(`\`${key}\` must be a non-negative integer`);
+            }
+            offsets[field] = parsed;
+          }
+          return output(await callbacks.observe(tabId, scope as 'full' | 'meta', offsets));
+        }
         if (operation === 'act') {
           const pageId = optionalString(input.page_id);
           const pageAction = String(input.page_action || '').trim();
@@ -124,7 +144,7 @@ export function buildBrowserTool(callbacks: BrowserToolCallbacks): AgentTool {
             action: pageAction as 'click' | 'fill' | 'select' | 'check' | 'uncheck' | 'scroll',
             ...(typeof input.text === 'string' ? { text: input.text } : {}),
             ...(direction ? { direction: direction as 'up' | 'down' | 'top' | 'bottom' } : {}),
-          }));
+          }, context?.signal));
         }
         if (operation === 'wait') {
           const condition = String(input.wait_condition || 'loaded').trim();
@@ -152,6 +172,7 @@ export function buildBrowserTool(callbacks: BrowserToolCallbacks): AgentTool {
         }
         return output(await callbacks.close(tabId));
       } catch {
+        log.warn('browser operation failed', { operation });
         return error('The task browser operation failed');
       }
     },
@@ -160,10 +181,10 @@ export function buildBrowserTool(callbacks: BrowserToolCallbacks): AgentTool {
 
 export function buildConversationBrowserTool(uid: string, cid: string, isActive: () => boolean = () => true): AgentTool {
   const runId = browserTaskRunId(uid, cid);
+  const ended = () => !isActive() || !runId || browserTaskRunId(uid, cid) !== runId;
   async function withBrowser(
     run: (web: typeof import('../web_assist')) => Record<string, unknown> | Promise<Record<string, unknown>>,
   ): Promise<Record<string, unknown>> {
-    const ended = () => !isActive() || !runId || browserTaskRunId(uid, cid) !== runId;
     const endedResult = { ok: false, code: 'task_run_ended', error: 'This browser task turn has ended.' };
     if (ended()) return endedResult;
     const web = await import('../web_assist');
@@ -174,8 +195,10 @@ export function buildConversationBrowserTool(uid: string, cid: string, isActive:
     tabs: () => withBrowser(web => web.listModelWebAssistTabs(uid, cid)),
     open: input => withBrowser(web => web.openModelWebAssist(uid, cid, input)),
     navigate: input => withBrowser(web => web.navigateModelWebAssist(uid, cid, input)),
-    observe: tabId => withBrowser(web => web.observeModelWebAssist(uid, cid, tabId)),
-    act: input => withBrowser(web => web.actOnModelWebAssist(uid, cid, input)),
+    observe: (tabId, scope, window) => withBrowser(web => web.observeModelWebAssist(uid, cid, tabId, scope, window)),
+    act: (input, signal) => withBrowser(web => web.actOnModelWebAssist(uid, cid, input, {
+      signal, isActive: () => !ended(),
+    })),
     wait: input => withBrowser(web => web.waitForModelWebAssist(uid, cid, input)),
     close: tabId => withBrowser(web => web.closeModelWebAssistTab(uid, cid, tabId)),
     retain: (tabId, retention) => withBrowser(web => web.retainModelWebAssistTab(uid, cid, tabId, retention)),

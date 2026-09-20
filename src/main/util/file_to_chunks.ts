@@ -19,6 +19,7 @@
 import { pdfBufferToChunks } from './extract-pdf';
 import { docxBufferToChunks } from './extract-docx';
 import { pptxBufferToMarkdown, xlsxBufferToMarkdown } from './extract-office';
+import { isZipSpreadsheet, xlsBufferToMarkdown } from './extract-xls';
 
 export type ChunkableKind = 'text' | 'pdf' | 'docx' | 'spreadsheet' | 'presentation' | 'image';
 
@@ -70,7 +71,8 @@ export async function fileToChunks(opts: FileToChunksOptions): Promise<Extracted
     }));
   }
   if (opts.kind === 'spreadsheet') {
-    return chunkPlainText(xlsxBufferToMarkdown(opts.buf), budget, overlap);
+    const text = isZipSpreadsheet(opts.buf) ? xlsxBufferToMarkdown(opts.buf) : await xlsBufferToMarkdown(opts.buf);
+    return chunkPlainText(text, budget, overlap);
   }
   if (opts.kind === 'presentation') {
     return chunkPlainText(pptxBufferToMarkdown(opts.buf), budget, overlap);

@@ -79,6 +79,9 @@ const _IPC_ROUTES = [
   ['GET',    /^\/api\/conversations\/([^/]+)\/tasks$/,     'groupChat.tasks.list',       ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/tasks\/cancel$/, 'groupChat.tasks.cancel', ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/tasks\/send-now$/, 'groupChat.tasks.sendNow', ['cid']],
+  ['POST',   /^\/api\/conversations\/([^/]+)\/tasks\/edit$/, 'groupChat.tasks.edit', ['cid']],
+  ['POST',   /^\/api\/conversations\/([^/]+)\/tasks\/begin-edit$/, 'groupChat.tasks.beginEdit', ['cid']],
+  ['POST',   /^\/api\/conversations\/([^/]+)\/tasks\/cancel-edit$/, 'groupChat.tasks.cancelEdit', ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/tasks\/after$/,  'groupChat.tasks.setAfter', ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/tasks\/resume-blocked$/, 'groupChat.tasks.resumeBlocked', ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/tasks\/reorder$/,  'groupChat.tasks.reorder',  ['cid']],
@@ -385,4 +388,62 @@ function apiFetch(url, options) {
       _monitorIpcError('ipc_invoke', channel, _ipcFailureMeta(err));
       return _mockErrorResponse('ipc request failed', 500);
     });
+}
+
+// The Library page keeps one file workflow while each scope uses its owning IPC.
+async function apiLibraryFetch(projectId, url, options = {}) {
+  if (!projectId) return apiFetch(url, options);
+  const [pathname, query = ''] = url.split('?');
+  const body = typeof options.body === 'string' ? JSON.parse(options.body) : {};
+  const name = body.path || new URLSearchParams(query).get('path') || '';
+  const invoke = (method, payload = {}) => window.orkas.invoke(method, { projectId, ...payload });
+  let channel = '';
+  try {
+    if (pathname === '/api/kb/events/stream') {
+      return _streamResponse('project.kb.events', { projectId }, options.signal);
+    }
+    if (pathname === '/api/contexts/upload') {
+      return await _uploadBinary('projects.files.upload', options, { projectId });
+    }
+    if (pathname === '/api/contexts/write') {
+      return await _uploadBinary('projects.files.upload', {
+        headers: { 'X-Filename': encodeURIComponent(name) },
+        body: new TextEncoder().encode(body.content || '').buffer,
+      }, { projectId });
+    }
+    if (pathname === '/api/contexts/reveal') {
+      channel = 'projects.files.absPath';
+      const resolved = await invoke(channel, { name });
+      if (!resolved.ok) return _mockJsonResponse(resolved);
+      channel = 'workspace.revealPath';
+      return _mockJsonResponse(await invoke(channel, { path: resolved.path }));
+    }
+    const routes = {
+      '/api/contexts/tree': ['tree', {}],
+      '/api/contexts/read': ['readText', { name }],
+      '/api/contexts/image': ['image', { name }],
+      '/api/contexts/office': ['officeHtml', { name }],
+      '/api/contexts/mkdir': ['mkdir', { path: name }],
+      '/api/contexts/rename': ['rename', { oldName: body.src, name: body.dst }],
+      '/api/contexts/delete': ['delete', { name }],
+      '/api/kb/status': ['status', { skipReconcile: true }],
+      '/api/kb/reconcile': ['reconcile', {}],
+      '/api/kb/reprocess': ['reprocess', { name }],
+    };
+    const route = routes[pathname];
+    if (!route) return _mockErrorResponse('unknown Library route', 404);
+    channel = `projects.files.${route[0]}`;
+    const result = await invoke(channel, route[1]);
+    if (result.ok !== false && Array.isArray(result.tree)) {
+      const normalize = (nodes) => nodes.map((node) => ({
+        ...node, path: node.relPath,
+        ...(node.children ? { children: normalize(node.children) } : {}),
+      }));
+      return _mockJsonResponse({ ...result, tree: normalize(result.tree) });
+    }
+    return _mockJsonResponse(result);
+  } catch (err) {
+    _monitorIpcError('ipc_invoke', channel || 'projects.files.upload', _ipcFailureMeta(err));
+    return _mockErrorResponse('ipc request failed', 500);
+  }
 }

@@ -297,7 +297,7 @@ describe('renderer local Agent structured user input', () => {
       { id: 'option-1', label: 'Production' },
       { id: 'other', label: 'agents.cli_user_input_other' },
     ]);
-    expect(harness.uiPrompt).toHaveBeenCalledWith('Choose target', '', { signal: expect.any(AbortSignal) });
+    expect(harness.uiPrompt).toHaveBeenCalledWith('Choose target', '', { signal: expect.any(AbortSignal), secret: false });
     expect(harness.invoke).toHaveBeenCalledWith('localAgents.userInputResponse', {
       request_id: 'request-other',
       answers: { environment: ['Canary ring'] },
@@ -319,6 +319,25 @@ describe('renderer local Agent structured user input', () => {
     expect(harness.uiPrompt).toHaveBeenCalledWith('Paste the deploy token', '', { signal: expect.any(AbortSignal), secret: true });
     expect(harness.invoke).toHaveBeenCalledWith('localAgents.userInputResponse', {
       request_id: 'request-secret', answers: { token: ['hunter2'] }, cancelled: false,
+    });
+  });
+
+  it.each([false, true])('masks a secret custom option answer (multiple=%s)', async (multiple) => {
+    const harness = loadHarness();
+    harness.uiChoice.mockResolvedValue(multiple ? ['option-0', 'other'] : 'other');
+    harness.uiPrompt.mockResolvedValue('private-fixture-answer');
+    harness.push('local-agent:user-input', {
+      request_id: 'secret-option', cid: 'chat-1',
+      questions: [{ ...choiceQuestion, isOther: true, isSecret: true, multiSelect: multiple }],
+    });
+    await flush();
+    expect(harness.requests).toHaveLength(0);
+    expect(harness.uiPrompt).toHaveBeenCalledWith('Choose target', '', {
+      signal: expect.any(AbortSignal), secret: true,
+    });
+    expect(harness.invoke).toHaveBeenCalledExactlyOnceWith('localAgents.userInputResponse', {
+      request_id: 'secret-option', cancelled: false,
+      answers: { environment: multiple ? ['Staging', 'private-fixture-answer'] : ['private-fixture-answer'] },
     });
   });
 

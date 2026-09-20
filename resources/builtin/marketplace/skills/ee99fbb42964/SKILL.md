@@ -1,7 +1,7 @@
 ---
 name: deep-research
-description_zh: "深度研究的确定性工具组：规划抓取预算、检索学术来源、压缩证据、核验来源/原句/DOI，并生成可交付的对比表与证据清单。用于深度研究、文献综述、来源与引用核验。"
-description_en: "Deterministic deep-research tools for bounded planning, academic retrieval, evidence compression, source/quote/DOI verification, and delivery-ready comparison/evidence Markdown. Use for deep research, literature review, and citation verification."
+description_zh: "为深度研究、文献综述与引用核验提供抓取预算、学术检索、证据压缩及来源/原句/DOI 检查，输出对比表与证据清单。"
+description_en: "Support deep research, literature reviews and citation checks with retrieval budgets, academic search, evidence compression and source/quote/DOI verification, producing comparison and evidence tables."
 ---
 
 # deep-research
@@ -37,16 +37,16 @@ This Skill performs deterministic processing only; it never calls a model.
   necessary decision merely to batch. When a known input file only enables a
   deterministic command, write it and invoke that command in the same response.
   Never spend a standalone response creating empty ledgers.
-- A verified quote proves provenance, not semantic entailment. Deliver a major
-  claim only when the quote also supports its scope and meaning.
-- Never deliver a claim or comparison binding with `support_status=unproven`
-  or `alignment_status=unproven`. Use the verifier's supported, downgraded
-  subset and expose the gap. Correct and rerun only when a decision-changing
-  claim can be resolved from valid evidence; do not chase an empty warning list
-  by rewriting or rereading non-material intermediate data.
-- A comparison cell must align with a claim from that same candidate's
-  evidence sources. Missing, unproven, cross-candidate, or unrelated
-  `field_claims` bindings become Not verified.
+- The citation script checks source/quote/DOI attribution and explicit bindings,
+  not semantic support. Before final ledger and analysis submission, check every
+  factual part of each claim and comparison cell against cited context, preserving
+  negation, conditions, versions, and limitations. Add evidence, narrow, or remove
+  uncovered parts; leave unsupported fields `Not verified`. Keep supported facts
+  when another part is unknown. Exact quotes and field coverage alone never
+  establish a conclusion.
+- Bind each factual comparison cell to its own candidate's cited evidence.
+  Repair missing or invalid citation bindings only when valid evidence can
+  resolve a decision-changing gap; otherwise expose that gap.
 - With no usable sources, abstain from source-backed conclusions. For a low-risk
   landscape only, provide clearly labeled discovery seeds and verification gaps.
 
@@ -61,8 +61,9 @@ This Skill performs deterministic processing only; it never calls a model.
    the character budget, and persist the result.
 4. Build narrow claims only from the compact evidence ledger and run
    `citations --op verify`.
-5. Deliver from its supported, downgraded subset. Research and verify again only
-   when a resolvable gap could materially change the conclusion.
+5. Deliver claims you have checked for meaning and whose citations pass
+   verification. Research and verify again only when a resolvable gap could
+   materially change the conclusion.
 
 Use `{"url":"...","maxChars":12000}` as both the default and the maximum
 `web_fetch` size for ordinary research evidence on this path, and never refetch
@@ -120,8 +121,9 @@ canonical citations command with `--report-out RESEARCH-<topic>.md` as ordered
 calls in one model response. `<topic>` is a short slug of this research
 question; never reuse a report filename that already exists in the workspace,
 because a later research run is a new report, not a revision of an earlier one.
-The verifier builds the report from that compact state; do not transform
-ledgers, read its full audit, or assemble the report with shell code. Then
+The script assembles your analysis and citation tables from that compact state;
+do not transform ledgers, read its full audit, or assemble the report with shell
+code. Then
 emit the final plan update and publication together; add final caps
 accounting only when a user, cost, resume, or task budget applies.
 On other paths, keep the equivalent known writes and deterministic command
@@ -129,7 +131,7 @@ batched.
 
 After publishing a compact report, keep the user-visible handoff to its file
 link and evidence boundary. Do not restate candidate recommendations outside
-the verifier-authored report.
+the assembled report.
 
 ## Optional domain references
 

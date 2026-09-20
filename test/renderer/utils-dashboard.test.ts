@@ -166,12 +166,51 @@ describe('renderDashboard — component coverage (set A)', () => {
     expect(html).toMatch(/class="db-chart-line"/);
   });
 
+  it('Chart bar: keeps every signed bar inside the plot without changing its value', () => {
+    // Users must see the full first and last category, including negative
+    // values. The zero line is shared and equal magnitudes have equal heights.
+    const html = renderDashboard({ root: { type: 'Chart', props: { kind: 'bar', data: [
+      { x: 'Negative', y: -10 }, { x: 'Zero', y: 0 }, { x: 'Positive', y: 10 },
+    ] } } });
+    const bars = [...html.matchAll(/<rect x="([\d.-]+)" y="([\d.-]+)" width="([\d.-]+)" height="([\d.-]+)"/g)]
+      .map(m => ({ x: Number(m[1]), y: Number(m[2]), width: Number(m[3]), height: Number(m[4]) }));
+    const axis = html.match(/<line x1="([\d.-]+)" y1="[\d.-]+" x2="([\d.-]+)" y2="[\d.-]+" class="db-chart-axis"/)!;
+    expect(bars).toHaveLength(3);
+    expect(bars.every(bar => bar.x >= Number(axis[1]) && bar.x + bar.width <= Number(axis[2]))).toBe(true);
+    expect(bars[0].height).toBeGreaterThan(0);
+    expect(bars[0].height).toBeCloseTo(bars[2].height, 2);
+    expect(bars[1].height).toBe(0);
+    expect(bars[0].y).toBeCloseTo(bars[2].y + bars[2].height, 2);
+    for (const label of ['Negative', 'Zero', 'Positive']) expect(html).toContain(label);
+  });
+
   it('Chart pie: emits one slice per item and a legend', () => {
     const html = renderDashboard({ root: { type: 'Chart', props: { kind: 'pie', data: [
       { label: 'A', value: 1 }, { label: 'B', value: 2 }, { label: 'C', value: 3 },
     ] } } });
     expect((html.match(/db-chart-slice/g) || []).length).toBe(3);
     expect(html).toContain('class="db-chart-legend"');
+  });
+
+  it('Chart pie: a single category paints a complete disk and retains its legend', () => {
+    const html = renderDashboard({ root: { type: 'Chart', props: { kind: 'pie', data: [
+      { label: 'Complete', value: 100 },
+    ] } } });
+    const path = html.match(/<path d="([^"]+)" class="db-chart-slice"/)![1];
+    // One SVG arc with identical endpoints paints nothing. Opposing endpoints
+    // joined by two arcs cover the circle, without inventing another category.
+    const start = path.match(/^M([\d.-]+),([\d.-]+)/)!;
+    const arcs = [...path.matchAll(/A([\d.-]+),([\d.-]+) 0 1 1 ([\d.-]+),([\d.-]+)/g)];
+    expect(arcs).toHaveLength(2);
+    expect(Number(arcs[0][1])).toBeGreaterThan(0);
+    expect(Number(arcs[0][1])).toBe(Number(arcs[0][2]));
+    expect(Math.hypot(Number(arcs[0][3]) - Number(start[1]), Number(arcs[0][4]) - Number(start[2])))
+      .toBeCloseTo(2 * Number(arcs[0][1]), 2);
+    expect(arcs[1].slice(1, 3)).toEqual(arcs[0].slice(1, 3));
+    expect(arcs[1].slice(3)).toEqual(start.slice(1));
+    expect((html.match(/class="db-chart-slice"/g) || [])).toHaveLength(1);
+    expect(html).toContain('Complete');
+    expect(html).toContain('>100</span>');
   });
 
   it('nested tree: Stack → Grid → Metric × 3', () => {

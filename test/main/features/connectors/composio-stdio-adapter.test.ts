@@ -15,7 +15,8 @@ type Adapter = {
   callComposioTool: (
     name: string,
     value: Record<string, unknown>,
-    request?: (path: string, body: Record<string, unknown>, timeoutMs: number) => Promise<Record<string, unknown>>,
+    request?: (path: string, body: Record<string, unknown>, timeoutMs: number, signal?: AbortSignal) => Promise<Record<string, unknown>>,
+    signal?: AbortSignal,
   ) => Promise<Record<string, unknown>>;
   normalizeTool: (tool: Record<string, unknown>) => Record<string, unknown> | null;
 };
@@ -61,7 +62,7 @@ describe('Composio stdio proxy adapter', () => {
   it('keeps the Server execution deadline inside the adapter deadline', () => {
     const adapter = loadAdapter();
     expect(adapter.TOOLS_REQUEST_TIMEOUT_MS).toBe(25_000);
-    expect(adapter.EXECUTE_REQUEST_TIMEOUT_MS).toBe(100_000);
+    expect(adapter.EXECUTE_REQUEST_TIMEOUT_MS).toBe(590_000);
   });
 
   it('strips host credit context from third-party tool arguments and promotes bounded metadata', () => {

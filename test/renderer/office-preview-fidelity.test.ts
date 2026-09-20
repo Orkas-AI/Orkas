@@ -51,7 +51,7 @@ describe('Office preview fidelity contract', () => {
   it('shows an accessible loading state before every asynchronous Office preview request', () => {
     const cases = [
       ['chat-file-viewer.js', "window.orkas.invoke('produced.officePreviewHtml'"],
-      ['contexts.js', 'apiFetch(`/api/contexts/office?path='],
+      ['contexts.js', '_ctxFetch(`/api/contexts/office?path='],
       ['project-detail.js', "window.orkas.invoke('projects.files.officeHtml'"],
     ] as const;
 

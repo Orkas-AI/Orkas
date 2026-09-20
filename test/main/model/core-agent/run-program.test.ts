@@ -31,7 +31,6 @@ const context = (workingDir = '/tmp/workspace') => ({ workingDir, state: {} });
 const EXPECTED_PROGRAMMATIC_TOOL_NAMES = [
   'read_files',
   'list_files',
-  'ocr_file',
   'search_files',
   'grep_files',
   'write_file',
@@ -64,7 +63,6 @@ type ProgrammaticToolName = typeof EXPECTED_PROGRAMMATIC_TOOL_NAMES[number];
 const VALID_PROGRAMMATIC_INPUTS: Record<ProgrammaticToolName, Record<string, unknown>> = {
   read_files: {},
   list_files: {},
-  ocr_file: {},
   search_files: {},
   grep_files: {},
   write_file: {},

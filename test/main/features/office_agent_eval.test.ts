@@ -72,8 +72,12 @@ describe('OfficeWorker built-in agent evaluation', () => {
       skill_list: string[];
     };
 
-    expect(agent.description_zh).toContain('单个或多个');
-    expect(agent.description_en).toContain('one or more');
+    for (const description of [agent.description_zh, agent.description_en]) {
+      expect(description).toContain('Word/DOCX');
+      expect(description).toContain('Excel/XLSX');
+    }
+    expect(agent.description_zh).toContain('创建、读取、编辑、检查和批量处理');
+    expect(agent.description_en).toContain('Creates, reads, edits, checks and batch-processes');
     expect(agent.description_en).not.toContain('specialist agent for a single Word, Excel');
     expect(agent.workflow).toContain('Single or multiple supported Office files stay here');
     expect(agent.workflow).toContain('`office-word`');

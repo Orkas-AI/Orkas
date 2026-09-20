@@ -48,7 +48,7 @@ function presentationTree(background: string = '#0F172A') {
 }
 
 describe('PPTX deterministic contrast audit', () => {
-  it('catches inherited black placeholder text on a dark slide and removes the engine false positive', () => {
+  it.each(['bare', 'direct', 'query'] as const)('audits %s tree output, catching dark-slide text without retaining an engine false positive', (envelope) => {
     const rawIssues = {
       success: true,
       data: {
@@ -72,7 +72,11 @@ describe('PPTX deterministic contrast audit', () => {
       },
     };
 
-    const result = auditPptxContrast(rawIssues, presentationTree());
+    const tree = presentationTree();
+    const input = envelope === 'bare' ? tree.data
+      : envelope === 'query' ? { success: true, data: { matches: 1, results: [tree.data] } }
+        : tree;
+    const result = auditPptxContrast(rawIssues, input);
     const output = result.issues as any;
 
     expect(result).toMatchObject({ findingCount: 1, scannedTextCount: 2 });
@@ -142,6 +146,23 @@ describe('PPTX deterministic contrast audit', () => {
 
     expect(issue).toMatchObject({ severity: 'blocker', path: '/slide[1]/shape[1]' });
     expect(issue.message).not.toContain('theme default');
+  });
+
+  it.each([[], [null], [{ path: '/slide[1]', type: 'slide' }]].map(results => ({ results })))(
+    'preserves engine findings when query output has no presentation root: %j', ({ results }) => {
+      const rawIssues = { issues: [{ id: 'existing', subtype: 'low_contrast', path: '/slide[1]/shape[1]' }] };
+      const result = auditPptxContrast(rawIssues, { success: true, data: { matches: results.length, results } });
+      expect(result).toMatchObject({ findingCount: 0, scannedTextCount: 0 });
+      expect((result.issues as any).issues).toEqual(rawIssues.issues);
+    },
+  );
+
+  it('does not select an arbitrary presentation from ambiguous query results', () => {
+    const root = presentationTree().data;
+    const rawIssues = { issues: [{ id: 'existing' }] };
+    const result = auditPptxContrast(rawIssues, { success: true, data: { matches: 2, results: [root, root] } });
+    expect(result).toMatchObject({ findingCount: 0, scannedTextCount: 0 });
+    expect((result.issues as any).issues).toEqual(rawIssues.issues);
   });
 
   it('uses WCAG relative luminance rather than simple palette brightness', () => {

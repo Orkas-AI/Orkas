@@ -18,7 +18,7 @@ import * as fs from 'node:fs';
 import { SRC_ROOT } from './paths';
 import { buildLanguageDirectiveText } from './prompts/chat_prompt_composer';
 
-export type Lang = 'zh' | 'en' | 'ja' | 'pt';
+export type Lang = 'zh' | 'en' | 'ja' | 'pt' | 'es' | 'fr' | 'ko' | 'de' | 'ru' | 'it';
 
 export interface LocaleMeta {
   code: Lang;
@@ -62,6 +62,12 @@ export const LOCALES: readonly LocaleMeta[] = [
     llmName: 'Brazilian Portuguese (Português do Brasil)',
     fallback: 'en',
   },
+  { code: 'es', label: 'Español', htmlLang: 'es', intlLocale: 'es-ES', llmName: 'Spanish (Español)', fallback: 'en' },
+  { code: 'fr', label: 'Français', htmlLang: 'fr', intlLocale: 'fr-FR', llmName: 'French (Français)', fallback: 'en' },
+  { code: 'ko', label: '한국어', htmlLang: 'ko', intlLocale: 'ko-KR', llmName: 'Korean (한국어)', fallback: 'en' },
+  { code: 'de', label: 'Deutsch', htmlLang: 'de', intlLocale: 'de-DE', llmName: 'German (Deutsch)', fallback: 'en' },
+  { code: 'ru', label: 'Русский', htmlLang: 'ru', intlLocale: 'ru-RU', llmName: 'Russian (Русский)', fallback: 'en' },
+  { code: 'it', label: 'Italiano', htmlLang: 'it', intlLocale: 'it-IT', llmName: 'Italian (Italiano)', fallback: 'en' },
 ] as const;
 
 export const SUPPORTED_LANGS: readonly Lang[] = LOCALES.map((l) => l.code);

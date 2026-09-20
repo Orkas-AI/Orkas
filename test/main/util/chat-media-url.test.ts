@@ -1,9 +1,10 @@
-import * as fs from 'node:fs';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   chatMediaLocalPathFromUrl,
@@ -188,22 +189,62 @@ describe('util/chat-media-url', () => {
       expect(normalized).toMatch(/\?v=\d+-\d+-11/);
 
       // Nothing else becomes a local embed: a relative path that names no
-      // file, a non-media file, a remote URL, a fragment, and a traversal out
+      // file, a remote URL, a fragment, and a traversal out
       // of the workspace all keep their original text.
       const untouched = [
         '[gone](project/composition/preview/99-missing.png)',
-        '[notes](project/notes.txt)',
         '[remote](https://example.test/hero.png)',
         '[anchor](#section.png)',
         `[escape](../${path.basename(outside)})`,
       ].join('\n');
       expect(versionChatMediaLocalUrlsInText(untouched, ws)).toBe(untouched);
+      expect(versionChatMediaLocalUrlsInText('[notes](project/notes.txt)', ws))
+        .toBe(`[notes](${versionedChatMediaLocalUrl(notes)})`);
 
       // Without a base directory the relative destination is not guessed at.
       expect(versionChatMediaLocalUrlsInText('[first frame](project/composition/preview/01-first-frame.png)'))
         .toBe('[first frame](project/composition/preview/01-first-frame.png)');
     } finally {
       fs.rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it('makes only existing workspace document links previewable, with source locations separate from path bytes', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-document-links-'));
+    const ws = path.join(root, 'workspace');
+    fs.mkdirSync(ws);
+    const file = path.join(ws, '旧稿 (1).md');
+    const outside = path.join(root, 'outside', 'outside.md');
+    fs.mkdirSync(path.dirname(outside));
+    fs.writeFileSync(file, '# Existing document');
+    fs.writeFileSync(outside, 'Outside');
+    fs.symlinkSync(path.dirname(outside), path.join(ws, 'linked'), 'junction');
+    try {
+      for (const location of [':21', ':21:5', '#L21', '#L21C5', '#L21-L25']) {
+        const result = versionChatMediaLocalUrlsInText(`[source](<旧稿 (1).md${location}>)`, ws);
+        const destination = /\[source\]\(([^)]+)\)/.exec(result)![1];
+        expect(path.normalize(chatMediaLocalPathFromUrl(destination)!)).toBe(path.normalize(file));
+        expect(destination).toContain('#L21');
+        expect(result).toContain('[source]');
+      }
+      for (const target of ['../outside/outside.md', 'linked/outside.md', 'missing.md', 'https://example.test/notes.md', '#section']) {
+        const source = `[source](${target})`;
+        expect(versionChatMediaLocalUrlsInText(source, ws)).toBe(source);
+      }
+      const link = '[source](<旧稿 (1).md:21>)';
+      for (const example of [`\`${link}\``, `\`\` literal \` ${link} \`\``, `\`\`\`\`markdown\n${link}\n\`\`\`\``]) {
+        expect(versionChatMediaLocalUrlsInText(example, ws)).toBe(example);
+      }
+      expect(versionChatMediaLocalUrlsInText(link)).toBe(link);
+      expect(versionChatMediaLocalUrlsInText('旧稿 (1).md:21', ws)).toBe('旧稿 (1).md:21');
+      const literal = path.join(ws, 'literal.md:21');
+      if (process.platform !== 'win32') {
+        fs.writeFileSync(literal, 'Literal colon');
+        expect(versionChatMediaLocalUrlsInText('[literal](literal.md%3A21)', ws))
+          .toBe(`[literal](${versionedChatMediaLocalUrl(literal)})`);
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });

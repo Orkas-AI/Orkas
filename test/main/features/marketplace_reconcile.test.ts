@@ -103,6 +103,96 @@ describe('marketplace reconcile', () => {
     fs.writeFileSync(path.join(dir, 'installs.json'), JSON.stringify(data, null, 2), 'utf8');
   }
 
+  it.each(['agent', 'skill'] as const)('does not restore a %s uninstalled while the catalog request was pending', async (kind) => {
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    const add = kind === 'agent' ? installs.addAgentInstall : installs.addSkillInstall;
+    const remove = kind === 'agent' ? installs.removeAgentInstall : installs.removeSkillInstall;
+    await add('u1', { id: 'item', version: '1.0.0', published_at: 1,
+      installed_at: Date.now() - 1000, agent_json_url: 'https://example.test/a', bundle_url: 'https://example.test/s' });
+    postJsonMock.mockImplementation(async () => {
+      await remove('u1', 'item');
+      return { list: [{ id: 'item', version: '2.0.0', published_at: 1, updated_at: Date.now() + 1000 }], total: 1 };
+    });
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    expect(await reconcile.checkServerUpdatesForInstalls('u1')).toEqual({ updated_agents: 0, updated_skills: 0 });
+    const removed = await installs.readInstalls('u1');
+    expect(removed[kind === 'agent' ? 'agents' : 'skills']).toEqual([]);
+    expect(removed._deleted_at?.[kind === 'agent' ? 'agents' : 'skills']?.item).toEqual(expect.any(Number));
+  });
+
+  it.each(['agent', 'skill'] as const)('cancels a pending %s download when a remote uninstall arrives', async (kind) => {
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    const paths = await import('../../../src/main/paths');
+    const add = kind === 'agent' ? installs.addAgentInstall : installs.addSkillInstall;
+    const remove = kind === 'agent' ? installs.removeAgentInstall : installs.removeSkillInstall;
+    let received!: () => void;
+    const requested = new Promise<void>((resolve) => { received = resolve; });
+    let finish!: () => void;
+    const origin = await listen((_req, res) => {
+      finish = () => {
+        if (kind === 'agent') res.end(JSON.stringify({ agent_id: 'item', name: 'Item' }));
+        else { const zip = new AdmZip(); zip.addFile('SKILL.md', Buffer.from('---\nname: item\n---\n')); res.end(zip.toBuffer()); }
+      };
+      received();
+    });
+    await add('u1', { id: 'item', version: '1.0.0', published_at: 1, installed_at: Date.now() - 1000,
+      agent_json_url: origin + '/agent.json', bundle_url: origin + '/skill.zip' });
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const running = reconcile.reconcileInstalls('u1');
+    await requested;
+    // Remote sync changes the manifest without waiting for the per-item download lock.
+    await remove('u1', 'item');
+    finish();
+    const result = await running;
+    expect(result.failed).toEqual([]);
+    expect(result.pulled_agents + result.pulled_skills).toBe(0);
+    const manifest = await installs.readInstalls('u1');
+    expect(manifest[kind === 'agent' ? 'agents' : 'skills']).toEqual([]);
+    expect(fs.existsSync(kind === 'agent' ? paths.userMarketplaceAgentDir('u1', 'item') : paths.userMarketplaceSkillDir('u1', 'item'))).toBe(false);
+  });
+
+  it.each(['agent', 'skill'] as const)('drops a queued %s pull whose installation was removed before its lock was acquired', async (kind) => {
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    const add = kind === 'agent' ? installs.addAgentInstall : installs.addSkillInstall;
+    const remove = kind === 'agent' ? installs.removeAgentInstall : installs.removeSkillInstall;
+    let downloads = 0;
+    const origin = await listen((_req, res) => {
+      downloads++;
+      if (kind === 'agent') res.end(JSON.stringify({ agent_id: 'item', name: 'Item' }));
+      else { const zip = new AdmZip(); zip.addFile('SKILL.md', Buffer.from('---\nname: item\n---\n')); res.end(zip.toBuffer()); }
+    });
+    await add('u1', { id: 'item', version: '1.0.0', installed_at: Date.now() - 1000,
+      published_at: 1, agent_json_url: origin + '/a', bundle_url: origin + '/s' });
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const { withMarketplaceInstallLock } = await import('../../../src/main/features/marketplace_locks');
+    let captured!: () => void;
+    const scheduled = new Promise<void>((resolve) => { captured = resolve; });
+    const unsubscribe = reconcile.subscribeReconcileStatus((status) => { if (status.state === 'running') captured(); });
+    const deletion = withMarketplaceInstallLock('u1', kind, 'item', async () => {
+      await scheduled;
+      await remove('u1', 'item');
+    });
+    try {
+      const [result] = await Promise.all([reconcile.reconcileInstalls('u1'), deletion]);
+      expect(result).toMatchObject({ pulled_agents: 0, pulled_skills: 0, failed: [] });
+      expect(downloads).toBe(0);
+      expect((await installs.readInstalls('u1'))[kind === 'agent' ? 'agents' : 'skills']).toEqual([]);
+    } finally { unsubscribe(); }
+  });
+
+  it('prunes a local-only agent with newer content metadata after uninstall', async () => {
+    const deletedAt = Date.now() - 1000;
+    const dir = writeLocalAgent('item', { version: '2.0.0', installed_at: deletedAt - 1000,
+      published_at: 1, updated_at: deletedAt + 500, agent_json_url: 'https://example.test/a' });
+    writeManifest({ version: 1, agents: [], skills: [], _deleted_at: { agents: { item: deletedAt } } });
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const result = await reconcile.reconcileInstalls('u1');
+    expect(result).toMatchObject({ pruned_agents: 1, restored_agents: 0, pulled_agents: 0 });
+    expect(fs.existsSync(dir)).toBe(false);
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    expect((await installs.readInstalls('u1'))._deleted_at?.agents?.item).toBe(deletedAt);
+  });
+
   it('marks installed agents and skills stale only when the catalog version is higher', async () => {
     postJsonMock.mockImplementation(async (p: string) => {
       if (p === '/marketplace/agents/list') {

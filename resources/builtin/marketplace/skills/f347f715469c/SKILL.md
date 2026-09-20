@@ -1,7 +1,7 @@
 ---
 name: wps
-description_zh: "处理 WPS 兼容的 DOCX、XLSX、PPTX 和 PDF 交付，并检查中文字体、A4 版式、编号、打印设置和兼容风险；用于 WPS 文字、表格、演示、中文办公排版、打印和 PDF 导出。"
-description_en: "Prepare WPS-compatible DOCX, XLSX, PPTX, and PDF deliverables with checks for Chinese fonts, A4 layout, numbering, print settings, and compatibility risks. Use for WPS Writer, Spreadsheets, Presentation, Chinese-office formatting, printing, and PDF export."
+description_zh: "准备 WPS 兼容的 DOCX、XLSX、PPTX 与 PDF 交付，检查中文字体、A4 版式、编号、打印和导出兼容性。"
+description_en: "Prepare WPS-compatible DOCX, XLSX, PPTX and PDF deliverables, checking Chinese fonts, A4 layout, numbering, printing and export compatibility."
 ---
 
 # WPS Compatibility

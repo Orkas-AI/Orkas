@@ -27,8 +27,14 @@ const electronBin = require_('electron');
 const vitestBin = resolve(here, '..', 'node_modules', 'vitest', 'vitest.mjs');
 const testEnvironment = withWindowsGitOnPath(process.env);
 
-const child = spawn(electronBin, [vitestBin, ...process.argv.slice(2)], {
-  stdio: 'inherit',
+// npm appends arguments to the final shell command of a compound script.
+// Own the suite here so filters reach Vitest without first running every JS
+// test or being interpreted by npm/pytest. No arguments retains the full suite.
+const suiteMode = process.argv[2] === 'suite';
+const args = process.argv.slice(suiteMode ? 3 : 2);
+const commands = [{
+  executable: electronBin,
+  args: [vitestBin, ...(suiteMode ? ['run', ...args] : args)],
   env: {
     ...testEnvironment,
     ELECTRON_RUN_AS_NODE: '1',
@@ -38,8 +44,16 @@ const child = spawn(electronBin, [vitestBin, ...process.argv.slice(2)], {
     // outer npm/node executable as the explicit test-helper runtime.
     ORKAS_TEST_NODE: process.execPath,
   },
-});
+}];
+if (suiteMode && args.length === 0) {
+  commands.push({
+    executable: process.execPath,
+    args: [resolve(here, 'run-python-tests.mjs'), 'resources/builtin', 'resources/test', '-q'],
+    env: testEnvironment,
+  });
+}
 
+let child;
 let forwardedSignal = null;
 const signalHandlers = new Map();
 
@@ -54,24 +68,37 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']) {
   const handler = () => {
     if (forwardedSignal) return;
     forwardedSignal = signal;
-    if (!child.killed) child.kill(signal);
+    if (child && !child.killed) child.kill(signal);
   };
   signalHandlers.set(signal, handler);
   process.on(signal, handler);
 }
 
-child.once('error', (error) => {
-  removeSignalHandlers();
-  console.error(`[run-tests] failed to start Electron's Node runtime: ${error.message}`);
-  process.exitCode = 1;
-});
-
-child.once('exit', (code, signal) => {
-  removeSignalHandlers();
-  const terminalSignal = forwardedSignal || signal;
-  if (terminalSignal) {
-    process.kill(process.pid, terminalSignal);
+function runNext() {
+  const command = commands.shift();
+  if (!command) {
+    removeSignalHandlers();
     return;
   }
-  process.exit(code ?? 1);
-});
+  child = spawn(command.executable, command.args, { stdio: 'inherit', env: command.env });
+  child.once('error', (error) => {
+    removeSignalHandlers();
+    console.error(`[run-tests] failed to start test runtime: ${error.message}`);
+    process.exitCode = 1;
+  });
+  child.once('exit', (code, signal) => {
+    const terminalSignal = forwardedSignal || signal;
+    if (terminalSignal) {
+      removeSignalHandlers();
+      process.kill(process.pid, terminalSignal);
+      return;
+    }
+    if (code !== 0) {
+      removeSignalHandlers();
+      process.exit(code ?? 1);
+    }
+    runNext();
+  });
+}
+
+runNext();

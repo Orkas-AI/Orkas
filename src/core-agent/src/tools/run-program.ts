@@ -1,13 +1,8 @@
 import { createHash } from "node:crypto";
 import { basename, isAbsolute, relative, sep } from "node:path";
 
-import {
-  newQuickJSWASMModule,
-  type QuickJSContext,
-  type QuickJSDeferredPromise,
-  type QuickJSHandle,
-  type QuickJSRuntime,
-} from "quickjs-emscripten";
+import { programWorkerPool } from "./run-program-worker-pool.js";
+import type { ProgramChildResult, ProgramErrorDiagnostic } from "./run-program-protocol.js";
 
 import {
   type AgentTool,
@@ -74,10 +69,9 @@ export type ProgramSourceLoader = (
 export type RunProgramLimits = {
   maxSourceChars: number;
   maxWallMs: number;
-  /** Longest synchronous stretch (no awaited tool call) the program may run
-   *  on the host thread. QuickJS executes synchronously on the Electron main
-   *  process, so a hot loop freezes every window and IPC until this trips;
-   *  the wall-clock limit alone would let that last ten minutes. */
+  /** Longest synchronous guest stretch between awaited tool calls. QuickJS
+   *  runs in its own worker; this bounds CPU occupation independently of the
+   *  original wall deadline, which also includes admission and tool waits. */
   maxSyncSliceMs: number;
   maxMemoryBytes: number;
   maxStackBytes: number;
@@ -120,33 +114,11 @@ type ProgramFatal = {
   directCallAllowed?: boolean;
 };
 
-type ProgramErrorDiagnostic = {
-  line?: number;
-  column?: number;
-  frames?: Array<{ line: number; column: number }>;
-  sourceExcerpt?: Array<{ line: number; text: string }>;
-};
-
 type ProgramChildFailure = {
   tool: string;
   call: number;
   code?: string;
   message: string;
-};
-
-type ProgramArtifactIdentity = {
-  path: string;
-  operation: "create" | "update" | "delete" | "rename";
-  exists: boolean;
-  bytes?: number;
-  hash?: string;
-};
-
-type ProgramChildResult = {
-  ok: boolean;
-  content: string;
-  displayName?: string;
-  artifacts?: ProgramArtifactIdentity[];
 };
 
 type ProgramExecutionReceipt = {
@@ -235,13 +207,14 @@ export function createRunProgramTool(opts: CreateRunProgramToolOptions): AgentTo
     inputSchema: {
       type: "object",
       properties,
-      ...(supportsSourcePath
-        ? { oneOf: [{ required: ["code"] }, { required: ["path"] }] }
-        : { required: ["code"] }),
+      ...(!supportsSourcePath ? { required: ["code"] } : {}),
       additionalProperties: false,
     },
     executionTimeoutOwner: "executor",
     async execute(input, ctx) {
+      if ([input.code, input.path].some((value) => value != null && typeof value !== "string")) {
+        return incompleteResult("E_PROGRAM_BAD_INPUT", "`code` and `path` must be strings when supplied.", 0);
+      }
       const inlineCode = typeof input.code === "string" ? input.code : "";
       const requestedPath = typeof input.path === "string" ? input.path.trim() : "";
       if (Boolean(inlineCode.trim()) === Boolean(requestedPath)) {
@@ -310,10 +283,6 @@ async function runProgram(
   };
   const startedAt = Date.now();
   const deadline = startedAt + limits.maxWallMs;
-  // Reset every time control returns to the host (tool results, job pumps);
-  // read by the QuickJS interrupt handler on the same thread.
-  let syncSliceStartedAt = startedAt;
-  let syncSliceTripped = false;
   const programAbort = createLinkedAbortController(parentCtx.signal);
   const semaphore = new ProgramSemaphore(limits.maxConcurrentToolCalls);
   let fatal: ProgramFatal | null = null;
@@ -326,10 +295,6 @@ async function runProgram(
   let lastChildFailure: ProgramChildFailure | undefined;
   let aggregateToolResultBytes = 0;
   let disposed = false;
-  let runtime: QuickJSRuntime | null = null;
-  let vm: QuickJSContext | null = null;
-  let programPromiseHandle: QuickJSHandle | null = null;
-  const pendingDeferreds = new Set<QuickJSDeferredPromise>();
 
   const observeChildFailure = (name: string): void => {
     failedChildCalls += 1;
@@ -382,18 +347,7 @@ async function runProgram(
     return error;
   };
 
-  let rejectExternalWait: ((error: Error) => void) | null = null;
-  const abortPromise = new Promise<never>((_resolve, reject) => {
-    rejectExternalWait = reject;
-  });
-  // Mark the promise handled immediately: WASM initialization itself is
-  // asynchronous, so an external timeout must not become an unhandled
-  // rejection before the evaluation race is attached below.
-  void abortPromise.catch(() => {});
-  const rejectForExternalStop = (next: ProgramFatal) => {
-    const error = setFatal(next);
-    rejectExternalWait?.(error);
-  };
+  const rejectForExternalStop = (next: ProgramFatal) => { setFatal(next); };
   const deadlineTimer = setTimeout(() => {
     rejectForExternalStop({
       code: "E_PROGRAM_TIMEOUT",
@@ -410,143 +364,24 @@ async function runProgram(
   else parentCtx.signal?.addEventListener("abort", rejectForParentAbort, { once: true });
 
   try {
-    const module = await newQuickJSWASMModule();
-    if (programAbort.signal.aborted) throw Object.assign(new Error("Program execution was cancelled."), { code: "E_PROGRAM_ABORTED" });
-    runtime = module.newRuntime();
-    runtime.setMemoryLimit(limits.maxMemoryBytes);
-    runtime.setMaxStackSize(limits.maxStackBytes);
-    runtime.setInterruptHandler(() => {
-      const now = Date.now();
-      if (now >= deadline || programAbort.signal.aborted) return true;
-      if (now - syncSliceStartedAt >= limits.maxSyncSliceMs) {
-        syncSliceTripped = true;
-        return true;
-      }
-      return false;
+    const settled = await programWorkerPool.execute({
+      code,
+      toolNames: programmaticToolNames(opts.listToolNames),
+      limits,
+      deadline,
+      signal: programAbort.signal,
+      invoke: invokeFromProgram,
     });
-    vm = runtime.newContext();
-
-    const callToolHandle = vm.newFunction(
-      "__orkas_call_tool",
-      (nameHandle: QuickJSHandle, inputJsonHandle: QuickJSHandle) => {
-        const deferred = vm!.newPromise();
-        pendingDeferreds.add(deferred);
-        const name = vm!.getString(nameHandle);
-        const inputJson = vm!.getString(inputJsonHandle);
-        void invokeFromProgram(name, inputJson).then(
-          (payload) => {
-            if (disposed || !deferred.alive) return;
-            const value = vm!.newString(JSON.stringify(payload));
-            deferred.resolve(value);
-            value.dispose();
-          },
-          (error) => {
-            if (disposed || !deferred.alive) return;
-            const quickError = vm!.newError({
-              name: "ProgramToolError",
-              message: safeErrorMessage(error),
-            });
-            deferred.reject(quickError);
-            quickError.dispose();
-          },
-        );
-        void deferred.settled.finally(() => {
-          pendingDeferreds.delete(deferred);
-          if (!disposed && runtime?.alive) {
-            syncSliceStartedAt = Date.now();
-            const jobs = runtime.executePendingJobs();
-            if (jobs.error) jobs.error.dispose();
-          }
-          if (deferred.alive) deferred.dispose();
-        });
-        return deferred.handle;
-      },
-    );
-    callToolHandle.consume((handle) => vm!.setProp(vm!.global, "__orkas_call_tool", handle));
-
-    const toolNames = programmaticToolNames(opts.listToolNames);
-    const bootstrap = vm.evalCode(programBootstrap(toolNames), "run_program_bootstrap.js");
-    if (bootstrap.error) {
-      const diagnostic = quickJSError(vm, bootstrap.error);
-      bootstrap.error.dispose();
-      return incomplete("E_PROGRAM_RUNTIME_INIT", diagnostic.message);
-    }
-    successfulHandle(bootstrap).dispose();
-
-    syncSliceStartedAt = Date.now();
-    const evaluated = vm.evalCode(`(async () => {\n${code}\n})()`, "run_program.js");
-    if (evaluated.error) {
-      const diagnostic = quickJSError(vm, evaluated.error, code);
-      diagnostic.message = clarifyProgramApiError(diagnostic.message, code, toolNames);
-      evaluated.error.dispose();
-      if (parentCtx.signal?.aborted) {
-        return incomplete("E_PROGRAM_ABORTED", "Program execution was cancelled.");
-      }
-      if (syncSliceTripped) {
-        return incomplete("E_PROGRAM_CPU_SLICE", syncSliceMessage(limits), undefined, diagnostic.error);
-      }
-      return incomplete(
-        classifyProgramError(diagnostic.message),
-        diagnostic.message,
-        undefined,
-        diagnostic.error,
-      );
-    }
-
-    const promiseHandle = successfulHandle(evaluated);
-    programPromiseHandle = promiseHandle;
-    const resolvedPromise = vm.resolvePromise(promiseHandle);
-    const initialJobs = runtime.executePendingJobs();
-    if (initialJobs.error) initialJobs.error.dispose();
-    const settled = await Promise.race([resolvedPromise, abortPromise]);
-    promiseHandle.dispose();
-    programPromiseHandle = null;
     const fatalAfterSettlement = fatal as ProgramFatal | null;
     if (fatalAfterSettlement) {
-      settled.dispose();
-      return incomplete(
-        fatalAfterSettlement.code,
-        fatalAfterSettlement.reason,
-        fatalAfterSettlement.directCallAllowed,
-      );
+      return incomplete(fatalAfterSettlement.code, fatalAfterSettlement.reason, fatalAfterSettlement.directCallAllowed);
     }
-    if (settled.error) {
-      const diagnostic = quickJSError(vm, settled.error, code);
-      diagnostic.message = clarifyProgramApiError(diagnostic.message, code, toolNames);
-      settled.error.dispose();
-      if (parentCtx.signal?.aborted) {
-        return incomplete("E_PROGRAM_ABORTED", "Program execution was cancelled.");
-      }
-      if (syncSliceTripped) {
-        return incomplete("E_PROGRAM_CPU_SLICE", syncSliceMessage(limits), undefined, diagnostic.error);
-      }
-      return incomplete(
-        classifyProgramError(diagnostic.message),
-        diagnostic.message,
-        undefined,
-        diagnostic.error,
-      );
+    if (settled.status === "failed") {
+      return incomplete(settled.code, settled.message, undefined, settled.error);
     }
-
-    const settledValue = successfulHandle(settled);
-    const returnedValue = vm.dump(settledValue);
-    settledValue.dispose();
-    const outputResult = vm.evalCode("JSON.stringify(globalThis.__orkas_outputs)", "run_program_output.js");
-    if (outputResult.error) {
-      const diagnostic = quickJSError(vm, outputResult.error);
-      outputResult.error.dispose();
-      return incomplete("E_PROGRAM_OUTPUT", diagnostic.message);
-    }
-    const outputValue = successfulHandle(outputResult);
-    const outputJson = vm.getString(outputValue);
-    outputValue.dispose();
-    const outputs = parseOutputs(outputJson);
-    if (!outputs.length && returnedValue !== undefined) outputs.push(formatReturnedValue(returnedValue));
-    if (!outputs.length) {
+    if (settled.output === undefined) {
       if (completedToolCalls > 0 && failedToolCalls === 0) {
-        return observed({
-          content: completedProgramContent(completedToolCalls, executionReceipt(), undefined),
-        });
+        return observed({ content: completedProgramContent(completedToolCalls, executionReceipt(), undefined) });
       }
       return incomplete(
         "E_PROGRAM_NO_OUTPUT",
@@ -555,17 +390,7 @@ async function runProgram(
           : "Program completed without output or tool calls. Emit a result with text(value) or json(value).",
       );
     }
-    const output = outputs.join("\n");
-    const outputBytes = Buffer.byteLength(output, "utf8");
-    if (outputBytes > limits.maxOutputBytes) {
-      return incomplete(
-        "E_PROGRAM_OUTPUT_LIMIT",
-        `Program output exceeds the ${limits.maxOutputBytes}-byte limit. Return a smaller aggregate or summary.`,
-      );
-    }
-    return observed({
-      content: completedProgramContent(completedToolCalls, executionReceipt(), output),
-    });
+    return observed({ content: completedProgramContent(completedToolCalls, executionReceipt(), settled.output) });
   } catch (error) {
     const terminalFailure = fatal as ProgramFatal | null;
     if (terminalFailure) {
@@ -576,8 +401,7 @@ async function runProgram(
       return incomplete("E_PROGRAM_ABORTED", "Program execution was cancelled.");
     }
     const message = safeErrorMessage(error);
-    if (syncSliceTripped) return incomplete("E_PROGRAM_CPU_SLICE", syncSliceMessage(limits));
-    return incomplete(classifyProgramError(message), message);
+    return incomplete(code === "E_PROGRAM_CAPACITY" ? code : classifyProgramError(message), message);
   } finally {
     clearTimeout(deadlineTimer);
     disposed = true;
@@ -590,13 +414,7 @@ async function runProgram(
     }
     parentCtx.signal?.removeEventListener("abort", rejectForParentAbort);
     programAbort.cleanup();
-    if (programPromiseHandle?.alive) programPromiseHandle.dispose();
-    for (const deferred of pendingDeferreds) {
-      if (deferred.alive) deferred.dispose();
-    }
-    pendingDeferreds.clear();
-    if (vm?.alive) vm.dispose();
-    if (runtime?.alive) runtime.dispose();
+    semaphore.stop(Object.assign(new Error("Program execution finished."), { code: "E_PROGRAM_ABORTED" }));
   }
 
   async function invokeFromProgram(
@@ -656,6 +474,9 @@ async function runProgram(
 
     const release = await semaphore.acquire();
     try {
+      if (disposed || programAbort.signal.aborted) {
+        throw Object.assign(new Error("Program execution was cancelled."), { code: "E_PROGRAM_ABORTED" });
+      }
       const currentFatal = fatal as ProgramFatal | null;
       if (currentFatal) {
         throw Object.assign(new Error(currentFatal.reason), { code: currentFatal.code });
@@ -669,6 +490,9 @@ async function runProgram(
         ...parentCtx,
         signal: programAbort.signal,
       });
+      if (disposed) {
+        throw Object.assign(new Error("Program execution finished."), { code: "E_PROGRAM_ABORTED" });
+      }
       if (outcome.status === "denied") {
         failedToolCalls += 1;
         observeChildFailure(name);
@@ -757,32 +581,6 @@ async function runProgram(
   }
 }
 
-function programBootstrap(toolNames: string[]): string {
-  return `
-globalThis.__orkas_outputs = [];
-globalThis.text = (value) => {
-  if (typeof value === "string") globalThis.__orkas_outputs.push(value);
-  else if (value === undefined) globalThis.__orkas_outputs.push("undefined");
-  else {
-    try { globalThis.__orkas_outputs.push(JSON.stringify(value)); }
-    catch { globalThis.__orkas_outputs.push(String(value)); }
-  }
-};
-globalThis.json = (value) => globalThis.__orkas_outputs.push(JSON.stringify(value));
-const __orkas_tools = Object.create(null);
-for (const __name of ${JSON.stringify(toolNames)}) {
-  Object.defineProperty(__orkas_tools, __name, {
-    enumerable: true,
-    configurable: false,
-    writable: false,
-    value: async (args = {}) => JSON.parse(await globalThis.__orkas_call_tool(__name, JSON.stringify(args))),
-  });
-}
-globalThis.tools = Object.freeze(__orkas_tools);
-Object.freeze(globalThis.tools);
-`;
-}
-
 function programmaticToolNames(listToolNames: () => string[]): string[] {
   try {
     return [...new Set(listToolNames())]
@@ -797,60 +595,6 @@ function programmaticToolDescription(
   limits: RunProgramLimits,
 ): string {
   return `Bounded QuickJS for in-memory logic unavailable from a Host tool, or to combine/branch/batch/reduce Host-tool results (${limits.maxToolCalls} calls/${limits.maxConcurrentToolCalls} concurrent/${formatLimitDuration(limits.maxWallMs)}/${formatLimitBytes(limits.maxToolResultBytes)} each/${formatLimitBytes(limits.maxAggregateToolResultBytes)} total). Call one Host operation directly. Use bash for local files, shell/CLI, Python, Node, native dependencies/scripts. Eligible calls: tools.<exact_snake_case_name>(direct args); check {ok,content}. tool_load reveals schemas, not permission; child policy/concurrency apply. No Node/I/O. Emit a compact result.`;
-}
-
-function clarifyProgramApiError(message: string, source: string, toolNames: readonly string[]): string {
-  if (!/(?:not a function|not callable|undefined|cannot read propert)/i.test(message)) return message;
-
-  const outputHelper = /\b(text|json)\s*\.\s*([A-Za-z_$][\w$]*)/.exec(source);
-  if (outputHelper) {
-    const helper = outputHelper[1];
-    return `${message} ${helper}(value) is an output function; it has no .${outputHelper[2]} method.`.slice(0, 800);
-  }
-
-  const references = [
-    ...source.matchAll(/\btools\s*\.\s*([A-Za-z_$][\w$]*)/g),
-    ...source.matchAll(/\btools\s*\[\s*["']([^"']+)["']\s*\]/g),
-  ];
-  const unknown = references.map((match) => match[1]).find((name) => !toolNames.includes(name));
-  if (!unknown) return message;
-  const suggestion = nearestProgramToolName(unknown, toolNames);
-  const guidance = suggestion
-    ? `Unknown tools.${unknown}; use exact provider tool names. Did you mean tools.${suggestion}?`
-    : `Unknown tools.${unknown}; use an exact provider snake_case tool name.`;
-  return `${message} ${guidance}`.slice(0, 800);
-}
-
-function nearestProgramToolName(input: string, candidates: readonly string[]): string | undefined {
-  const normalized = input.replace(/[_-]/g, "").toLowerCase();
-  let best: { name: string; distance: number } | undefined;
-  for (const name of candidates) {
-    const candidate = name.replace(/[_-]/g, "").toLowerCase();
-    const distance = editDistance(normalized, candidate);
-    if (!best || distance < best.distance || (distance === best.distance && name < best.name)) {
-      best = { name, distance };
-    }
-  }
-  if (!best) return undefined;
-  return best.distance <= Math.max(2, Math.floor(Math.max(normalized.length, best.name.length) / 3))
-    ? best.name
-    : undefined;
-}
-
-function editDistance(left: string, right: string): number {
-  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
-  for (let i = 1; i <= left.length; i++) {
-    let diagonal = previous[0];
-    previous[0] = i;
-    for (let j = 1; j <= right.length; j++) {
-      const above = previous[j];
-      previous[j] = left[i - 1] === right[j - 1]
-        ? diagonal
-        : 1 + Math.min(diagonal, previous[j - 1], above);
-      diagonal = above;
-    }
-  }
-  return previous[right.length];
 }
 
 function formatLimitDuration(ms: number): string {
@@ -884,84 +628,6 @@ function createLinkedAbortController(parent: AbortSignal | undefined): AbortCont
   else parent?.addEventListener("abort", onAbort, { once: true });
   controller.cleanup = () => parent?.removeEventListener("abort", onAbort);
   return controller;
-}
-
-function parseOutputs(serialized: string): string[] {
-  try {
-    const parsed = JSON.parse(serialized);
-    return Array.isArray(parsed) ? parsed.map((value) => String(value)) : [];
-  } catch {
-    return [];
-  }
-}
-
-function formatReturnedValue(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (value === undefined) return "";
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}
-
-function quickJSError(
-  vm: QuickJSContext,
-  handle: QuickJSHandle,
-  source?: string,
-): { message: string; error?: ProgramErrorDiagnostic } {
-  const dumped = vm.dump(handle) as {
-    name?: unknown;
-    message?: unknown;
-    stack?: unknown;
-  } | string | undefined;
-  if (dumped && typeof dumped === "object") {
-    const name = typeof dumped.name === "string" ? dumped.name : "Error";
-    const message = typeof dumped.message === "string" ? dumped.message : "Program execution failed.";
-    const error = source && typeof dumped.stack === "string"
-      ? sourceErrorDiagnostic(dumped.stack, source)
-      : undefined;
-    return {
-      message: `${name}: ${message}`.slice(0, 800),
-      ...(error && Object.keys(error).length ? { error } : {}),
-    };
-  }
-  return { message: String(dumped || "Program execution failed.").slice(0, 800) };
-}
-
-function sourceErrorDiagnostic(stack: string, source: string): ProgramErrorDiagnostic | undefined {
-  const lines = source.split(/\r?\n/);
-  const frames: Array<{ line: number; column: number }> = [];
-  const framePattern = /run_program\.js:(\d+):(\d+)/g;
-  for (const match of stack.matchAll(framePattern)) {
-    // The user source is wrapped in one leading `(async () => {` line.
-    const line = Number(match[1]) - 1;
-    const column = Number(match[2]);
-    if (!Number.isSafeInteger(line) || !Number.isSafeInteger(column)) continue;
-    if (line < 1 || line > lines.length || column < 1) continue;
-    if (!frames.some((frame) => frame.line === line && frame.column === column)) {
-      frames.push({ line, column });
-    }
-    if (frames.length >= 4) break;
-  }
-  const primary = frames[0];
-  if (!primary) return undefined;
-  const start = Math.max(1, primary.line - 1);
-  const end = Math.min(lines.length, primary.line + 1);
-  const sourceExcerpt: Array<{ line: number; text: string }> = [];
-  for (let line = start; line <= end; line++) {
-    const text = lines[line - 1] ?? "";
-    sourceExcerpt.push({
-      line,
-      text: text.length > 180 ? `${text.slice(0, 177)}...` : text,
-    });
-  }
-  return {
-    line: primary.line,
-    column: primary.column,
-    frames,
-    sourceExcerpt,
-  };
 }
 
 function compactWorkspacePath(filePath: string, workingDir: string | undefined): string {
@@ -1063,17 +729,6 @@ function completedProgramContent(
   return output === undefined
     ? `${heading}\n${receiptLine}`
     : `${heading}\n${receiptLine}\n\n${output}`;
-}
-
-function successfulHandle(result: unknown): QuickJSHandle {
-  const value = (result as { value?: QuickJSHandle } | null)?.value;
-  if (!value) throw new Error("QuickJS result did not contain a value.");
-  return value;
-}
-
-function syncSliceMessage(limits: RunProgramLimits): string {
-  return `Program ran ${limits.maxSyncSliceMs}ms of synchronous code without awaiting a tool call. `
-    + "Break long loops into awaited tool calls or do the work in a direct bash/python job.";
 }
 
 function classifyProgramError(message: string): string {

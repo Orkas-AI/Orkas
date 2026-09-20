@@ -132,18 +132,22 @@ describe('ProductDeveloper builtin contract', () => {
     expect(github).toContain('batch independent preflight reads');
     for (const marker of [
       'Classify The Engineering Contract',
-      'repository instructions',
-      'current status',
-      'overlapping hunks',
-      'acceptance-to-evidence matrix',
-      'falsifiable hypotheses',
-      'Review-On-Submit',
-      'unverified path',
+      'Use `product-dev` for repository intake',
+      'selected Skill',
+      'completion criteria',
+      'Delivery standards',
       'do not fill it with a recommended MVP',
       'standalone greenfield UI uses `product-ui`',
     ]) {
       expect(spec.workflow, marker).toContain(marker);
     }
+    // Procedures stay in the Skill; resident standards describe valid evidence.
+    expect(spec.workflow).toContain('review or diagnosis-only');
+    expect(spec.workflow).toContain('without mutating files');
+    expect(spec.workflow).toContain('Do not patch generated trees');
+    expect(spec.workflow).not.toMatch(/Run the relevant checks|inspect their new output|falsifiable hypotheses|smallest coherent change/);
+    expect(spec.standards.join('\n')).toMatch(/evidence covers the final relevant state[\s\S]*failed, unavailable, or stale/);
+    expect(spec.standards.join('\n')).not.toMatch(/rerun|Run the relevant checks|Review-On-Submit/);
 
     expect(spec.description_zh).toMatch(/bug|重构|代码评审|性能|CI|测试修复/i);
     expect(spec.description_en).toMatch(/bug|refactor|code review|performance|CI|test repair/i);
@@ -183,6 +187,8 @@ describe('ProductDeveloper builtin contract', () => {
     expect(prompt).not.toContain('### Agent strengths');
     expect(prompt).toContain('### Delivery standards');
     expect(prompt).toContain('unsafe generated-tree patch');
+    expect(prompt.split(raw.standards[2])).toHaveLength(2);
+    expect(prompt).not.toContain('Run the relevant checks after the last related edit');
     expect(prompt).not.toContain('desktop window is visible');
     expect(prompt).not.toContain('node_modules');
     expect(prompt).toContain('## User intent and clarification');
@@ -219,6 +225,46 @@ describe('ProductDeveloper builtin contract', () => {
     expect(skill).not.toMatch(/Do not close issues.*without explicit user approval/i);
   });
 
+  it('keeps routine repairs self-contained without losing verification or risk escalation', () => {
+    const skill = fs.readFileSync(path.join(productDevDir, 'SKILL.md'), 'utf8');
+    const routine = skill.match(/## Routine development\n([\s\S]*?)(?=\n## |$)/)?.[1] ?? '';
+    // A scoped repair needs the core contract, not four phase-by-phase guide reads.
+    // This checks authored instructions, not whether a model will obey them.
+    expect(routine).toMatch(/repository instructions[\s\S]*worktree[\s\S]*relevant code\s+and tests/i);
+    expect(routine).toMatch(/baseline|reproduc/i);
+    expect(routine).toMatch(/red-green[\s\S]*expected defect/i);
+    expect(routine).toMatch(/smallest coherent change/i);
+    expect(routine).toMatch(/checks required for the affected\s+behavior and risk/i);
+    // Cross-component delivery needs evidence of the connection, not only green
+    // component checks. This protects the instruction; A06 observes adherence.
+    expect(routine).toMatch(/behavior spanning components[\s\S]*user entry point[\s\S]*changed boundary[\s\S]*observable result/i);
+    expect(routine).toMatch(/connected\s+path[\s\S]*smallest sufficient check[\s\S]*boundary condition[\s\S]*partial implementation/i);
+    expect(routine).toMatch(/Component tests\s+and builds alone do not verify that connection/i);
+    expect(routine).toMatch(/Broaden checks\s+only for new changes, failures, or unresolved risks/i);
+    expect(routine).toMatch(/passing verification covers the final code[\s\S]*test,[\s\S]*dependency, configuration, and environment/i);
+    expect(routine).toMatch(/Reuse results while those\s+inputs are unchanged; otherwise rerun affected checks[\s\S]*new\s+output/i);
+    expect(routine).toMatch(/required checks and review pass[\s\S]*without repeating/i);
+    expect(routine).not.toMatch(/After the final relevant edit, rerun/i);
+    expect(routine).toMatch(/final diff[\s\S]*acceptance/i);
+    expect(routine).toMatch(/failed[\s\S]*unverified/i);
+    const routineRefs = [...routine.matchAll(/\]\(references\/([^)]+\.md)\)/g)]
+      .map((match) => match[1]);
+    expect(routineRefs).toEqual(['change-safety.md']);
+    expect(routine).toMatch(/Before[\s\S]*dependency[\s\S]*migration[\s\S]*read[\s\S]*change-safety\.md/);
+
+    const specialized = skill.match(/## Specialized guidance\n([\s\S]*?)(?=\n## |$)/)?.[1] ?? '';
+    expect(specialized).toMatch(/only when[\s\S]*not prerequisites/i);
+    for (const [reference, trigger] of [
+      ['repository-intake.md', /unclear|unfamiliar/i],
+      ['implementation.md', /dependent|multi-module/i],
+      ['engineering-tests.md', /integration|contract|E2E/i],
+      ['review-and-finish.md', /dedicated review|high-risk/i],
+    ] as const) {
+      const row = specialized.split('\n').find((line) => line.includes(`references/${reference}`));
+      expect(row, reference).toMatch(trigger);
+    }
+  });
+
   it('keeps product engineering references and routing metadata complete', () => {
     const requiredReferences = [
       'repository-intake.md',
@@ -237,16 +283,14 @@ describe('ProductDeveloper builtin contract', () => {
     }
 
     const skillMd = fs.readFileSync(path.join(productDevDir, 'SKILL.md'), 'utf8');
-    expect(skillMd).toContain('## 边界先行');
-    expect(skillMd).toContain('不编造推荐 MVP、PRD、功能范围、架构或代码');
-    expect(skillMd).toContain('不生成实现工件');
-    expect(skillMd).toContain('可能影响该验收项的修改');
-    expect(skillMd).toContain('最后一次相关修改后必须重跑同一验证链并检查新输出');
-    const safetyPreflight = skillMd.indexOf('**风险分支前置**');
-    const implementation = skillMd.indexOf('**实现与快速反馈**');
+    expect(skillMd).toMatch(/do not invent an MVP, PRD, scope, architecture, or code/i);
+    expect(skillMd).toMatch(/disposable demo[\s\S]*do not produce implementation\s+artifacts/i);
+    expect(skillMd).toMatch(/do not present stale results[\s\S]*as verified behavior/i);
+    const safetyPreflight = skillMd.indexOf('Before the first dependency installation');
+    const implementation = skillMd.indexOf('Make the smallest coherent change');
     expect(safetyPreflight).toBeGreaterThanOrEqual(0);
     expect(implementation).toBeGreaterThan(safetyPreflight);
-    expect(skillMd).toMatch(/首次相关安装或编辑前读取[\s\S]*没有这些风险时跳过/);
+    expect(skillMd).toMatch(/Before the first dependency installation or edit[\s\S]*change-safety\.md[\s\S]*Skip that reference\s+when those risks are absent/i);
     const changeSafety = fs.readFileSync(
       path.join(productDevDir, 'references', 'change-safety.md'), 'utf8',
     );

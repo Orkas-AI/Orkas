@@ -17,8 +17,7 @@ const ConversationInfo = (() => {
   let _cid = null;
   let _open = false;
   let _activeTab = 'files';
-  let _panelWidth = null;
-  let _resizing = false;
+  let _panelResize = null;
   let _seq = 0;
   let _fileSeq = 0;
   let _attachmentSeq = 0;
@@ -55,7 +54,7 @@ const ConversationInfo = (() => {
   const _CI_VIDEO_EXTS = new Set(['mp4', 'webm', 'mov', 'm4v', 'ogv']);
   const _CI_AUDIO_EXTS = new Set(['mp3', 'wav', 'ogg', 'oga', 'opus', 'weba', 'm4a', 'aac', 'flac']);
   const _CI_OFFICE_WORD_EXTS = new Set(['docx', 'docm']);
-  const _CI_OFFICE_SHEET_EXTS = new Set(['xlsx', 'xlsm']);
+  const _CI_OFFICE_SHEET_EXTS = new Set(['xlsx', 'xlsm', 'xls']);
   const _CI_OFFICE_PRESENTATION_EXTS = new Set(['pptx', 'pptm']);
 
   function _label(key, fallback, vars) {
@@ -228,7 +227,7 @@ const ConversationInfo = (() => {
     if (_CI_OFFICE_WORD_EXTS.has(ext)) return 'docx';
     if (_CI_OFFICE_SHEET_EXTS.has(ext)) return 'spreadsheet';
     if (_CI_OFFICE_PRESENTATION_EXTS.has(ext)) return 'presentation';
-    if (['doc', 'xls', 'ppt'].includes(ext)) return 'legacy_office';
+    if (['doc', 'ppt'].includes(ext)) return 'legacy_office';
     if (_CI_TEXT_EXTS.has(ext)) return 'text';
     return 'unsupported';
   }
@@ -723,7 +722,7 @@ const ConversationInfo = (() => {
     const panel = document.getElementById('conversation-info-panel');
     const toggle = document.getElementById('conversation-info-toggle');
     if (panel) panel.hidden = !_open;
-    if (_open) _applyPanelWidth();
+    if (_open) _panelResize?.apply();
     if (toggle) {
       toggle.classList.toggle('is-active', _open);
       toggle.setAttribute('aria-expanded', _open ? 'true' : 'false');
@@ -761,6 +760,8 @@ const ConversationInfo = (() => {
   }
 
   function _setOpen(next) {
+    if (next) window.VideoReviewPanel?.close();
+    else _panelResize?.finish();
     _open = !!next;
     _syncChrome();
     if (_open && _activeTab !== 'browser') refresh(_cid);
@@ -1059,7 +1060,7 @@ const ConversationInfo = (() => {
       anchorBtn.setAttribute('aria-expanded', 'true');
     }
     _positionFileMenu(menu, anchorBtn);
-    _fileMenuScrollHost = anchorBtn.closest('.chat-msg-produced');
+    _fileMenuScrollHost = anchorBtn.closest('.chat-msg-produced, .chat-history, .skills-chat-messages, .agents-chat-messages');
     if (_fileMenuScrollHost && _fileMenuScrollHost.addEventListener) {
       _fileMenuScrollHost.addEventListener('scroll', _closeFileMenu, { passive: true });
     }
@@ -1200,7 +1201,7 @@ const ConversationInfo = (() => {
 
     _trackSavedAppSaveResult(startedAt, 'success', absPath, resourceKind);
     try {
-      const message = _label('apps.saved_toast', 'Saved to My Apps');
+      const message = _label('apps.saved_toast', 'Saved to Apps');
       if (typeof uiToast === 'function') uiToast(message, { variant: 'success' });
       else if (typeof uiAlert === 'function') await uiAlert(message);
       if (typeof loadSavedApps === 'function') loadSavedApps(true);
@@ -1279,75 +1280,9 @@ const ConversationInfo = (() => {
     }
   }
 
-  function _loadPanelWidth() {
-    try {
-      const value = Number(localStorage.getItem('orkas.conversationInfo.width'));
-      if (Number.isFinite(value) && value >= 320) _panelWidth = value;
-    } catch (_) { /* storage can be unavailable in isolated renderer tests */ }
-  }
-
-  function _applyPanelWidth() {
-    const panel = document.getElementById('conversation-info-panel');
-    const container = panel?.parentElement;
-    if (!panel || !container) return;
-    const available = container.getBoundingClientRect().width;
-    if (available <= 0) return;
-    const minimum = Math.min(400, available);
-    const maximum = Math.max(minimum, available - Math.min(420, available * 0.5));
-    const width = Math.round(Math.max(minimum, Math.min(_panelWidth ?? window.innerWidth * 0.3, maximum)));
-    if (_panelWidth !== null) _panelWidth = width;
-    panel.style.width = `${width}px`;
-    panel.style.flexBasis = `${width}px`;
-    const handle = document.getElementById('conversation-info-resize');
-    if (handle) {
-      handle.setAttribute('aria-valuemin', String(Math.round(minimum)));
-      handle.setAttribute('aria-valuemax', String(Math.round(maximum)));
-      handle.setAttribute('aria-valuenow', String(width));
-    }
-  }
-
-  function _finishPanelResize() {
-    if (!_resizing) return;
-    _resizing = false;
-    document.body.classList.remove('is-conversation-info-resizing');
-    window.WebAssist?.setResizing(false);
-    try { localStorage.setItem('orkas.conversationInfo.width', String(_panelWidth)); } catch (_) {}
-  }
-
   function _bindPanelResize() {
-    const handle = document.getElementById('conversation-info-resize');
-    const panel = document.getElementById('conversation-info-panel');
-    if (!handle || !panel || handle.dataset.bound === '1') return;
-    handle.dataset.bound = '1';
-    _loadPanelWidth();
-    _applyPanelWidth();
-    handle.addEventListener('pointerdown', (event) => {
-      if (event.button !== 0) return;
-      event.preventDefault();
-      _panelWidth = panel.getBoundingClientRect().width;
-      _resizing = true;
-      handle.setPointerCapture(event.pointerId);
-      document.body.classList.add('is-conversation-info-resizing');
-      window.WebAssist?.setResizing(true);
-    });
-    handle.addEventListener('pointermove', (event) => {
-      if (!_resizing) return;
-      const right = panel.parentElement.getBoundingClientRect().right;
-      _panelWidth = right - event.clientX;
-      _applyPanelWidth();
-    });
-    handle.addEventListener('pointerup', _finishPanelResize);
-    handle.addEventListener('pointercancel', _finishPanelResize);
-    handle.addEventListener('lostpointercapture', _finishPanelResize);
-    handle.addEventListener('keydown', (event) => {
-      if (event.isComposing || event.keyCode === 229) return;
-      if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
-      event.preventDefault();
-      _panelWidth = panel.getBoundingClientRect().width + (event.key === 'ArrowLeft' ? 24 : -24);
-      _applyPanelWidth();
-      try { localStorage.setItem('orkas.conversationInfo.width', String(_panelWidth)); } catch (_) {}
-    });
-    window.addEventListener('resize', _applyPanelWidth);
+    _panelResize = window.TaskSidePanel?.bind('conversation-info-panel', 'conversation-info-resize',
+      (resizing) => window.WebAssist?.setResizing(resizing));
   }
 
   function _bindDom() {
@@ -1459,11 +1394,17 @@ const ConversationInfo = (() => {
   function open()  { _setOpen(true); }
   function close() { _setOpen(false); }
   function toggle() { _setOpen(!_open); }
-  function openAndSetTab(tab) {
+  function openAndSetTab(tab, ownerCid) {
+    // Automatic reveals belong to their originating task, including while
+    // navigation and the details binding are temporarily out of sync.
+    if (ownerCid !== undefined && (!ownerCid || ownerCid !== _cid
+        || typeof currentView !== 'string' || currentView !== 'conversation'
+        || typeof currentCid !== 'string' || currentCid !== ownerCid)) return false;
     _activeTab = tab || 'files';
     _setOpen(true);
     _syncChrome();
     _renderBody();
+    return true;
   }
   function openFileMenu(anchorBtn, absPath, displayName, options = {}) {
     return _openFileMenu(anchorBtn, absPath, displayName, 'file', options);

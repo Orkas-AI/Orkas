@@ -7,10 +7,8 @@
  * with the vendor's server-side search schema. The model therefore sees one
  * search route, never two competing routes.
  *
- * Dispatch is keyed by pi-ai's Model.api field (the `model` argument
- * passed to onPayload by provider.stream()).
- * Single source of truth: adding new supported apis / bumping the vendor
- * tool schema version is a one-place change here.
+ * Dispatch checks the actual request model and API passed to onPayload.
+ * This module owns native-search capability facts and vendor schemas.
  */
 
 /**
@@ -58,20 +56,57 @@ export function nativeSearchToolForApi(api: string | undefined): Record<string, 
     // case 'anthropic-messages':
     //   return { type: 'web_search_20250305', name: 'web_search', max_uses: 5 };
 
-    // Google Gemini / Vertex — grounding with google search. No extra fields.
+    // Google SDK uses camelCase; the host supplies the tool-combination config.
     case 'google-generative-ai':
+      return { googleSearch: {} };
+    // The installed Google SDK rejects tool-context circulation on Vertex.
+    // Keep the executable function route rather than send an invalid mixture.
     case 'google-vertex':
-      return { google_search: {} };
+      return undefined;
 
     default:
       return undefined;
   }
 }
 
+// Capability facts, not model routing or a list of selectable models. Unknown
+// IDs keep the executable Orkas search route; API compatibility is insufficient.
+// Sources (checked 2026-09-12): OpenAI model pages and tools-web-search guide;
+// https://ai.google.dev/gemini-api/docs/generate-content/google-search
+const OPENAI_SEARCH_MODELS = new Set([
+  'gpt-4o', 'gpt-4o-mini', 'gpt-4.1', 'gpt-4.1-mini', 'o3', 'o4-mini',
+  'gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'gpt-5.1', 'gpt-5.2', 'gpt-5.3-codex',
+  'gpt-5.4', 'gpt-5.5', 'gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-6-astra',
+]);
+// Tool combinations are supported only by documented Gemini 3 models.
+// https://ai.google.dev/gemini-api/docs/generate-content/tool-combination
+const GOOGLE_SEARCH_MODELS = new Set([
+  'gemini-3-flash-preview', 'gemini-3.1-pro-preview',
+  'gemini-3.1-flash-lite-preview', 'gemini-3.1-flash-lite',
+  'gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.6-flash', 'gemini-3.7-flash', 'gemini-3.8-flash',
+]);
+
+/** Check the actual request candidate, including request-level restrictions. */
+export function nativeSearchToolForModel(
+  model: { api?: string; id?: string; provider?: string },
+  payload: { reasoning?: { effort?: unknown } },
+): Record<string, unknown> | undefined {
+  if (!model.id || !model.provider || providerApi(model.provider) !== model.api) return undefined;
+  const tool = nativeSearchToolForApi(model.api);
+  if (!tool) return undefined;
+  // Official dated snapshots retain the named model's capability. Deployment
+  // aliases and unreviewed variants must not inherit it from a similar name.
+  const id = model.id.replace(/-\d{4}-\d{2}-\d{2}$/, '');
+  if (tool.type === 'web_search') {
+    if (!OPENAI_SEARCH_MODELS.has(id)) return undefined;
+    if (['gpt-5', 'gpt-5-mini', 'gpt-5-nano'].includes(id) && payload.reasoning?.effort === 'minimal') return undefined;
+  } else if (!GOOGLE_SEARCH_MODELS.has(id)) return undefined;
+  return tool;
+}
+
 /**
- * Pre-flight "will we inject?" check for callers that only have a
- * providerId (no pi-ai Model object yet); used by client.ts to push a
- * synthetic archive event before the stream starts.
+ * Provider-only schema lookup retained for compatibility. This does not
+ * establish model support or activation; runtime uses nativeSearchToolForModel.
  * The mapping is provider → its most common api convention; a small
  * number of providers may differ (e.g. Azure OpenAI uses responses), but
  * those are not in the current catalog. Providers outside the catalog are
@@ -104,7 +139,7 @@ export function nativeSearchToolName(tool: Record<string, unknown> | undefined):
   if (!tool) return undefined;
   const t = tool['type'];
   if (typeof t === 'string') return t;
-  if ('google_search' in tool) return 'google_search';
+  if ('googleSearch' in tool) return 'google_search';
   return undefined;
 }
 
@@ -112,6 +147,7 @@ export type SearchPayloadRoute = 'absent' | 'orkas' | 'native';
 
 export type SearchPayloadRouteResult = {
   tools: unknown[] | undefined;
+  input?: unknown[];
   route: SearchPayloadRoute;
   replacedOrkasSearch: boolean;
 };
@@ -148,9 +184,20 @@ function removeOrkasWebSearchTool(candidate: unknown): unknown | undefined {
 
 function sameNativeTool(candidate: unknown, nativeTool: Record<string, unknown>): boolean {
   if (!candidate || typeof candidate !== 'object') return false;
-  if ('google_search' in nativeTool) return 'google_search' in candidate;
+  if ('googleSearch' in nativeTool) return 'googleSearch' in candidate;
   return nativeTool.type === 'web_search'
     && (candidate as { type?: unknown }).type === 'web_search';
+}
+
+function deferredToolReceipt(candidate: unknown): { tools: unknown[] } | undefined {
+  if (!candidate || typeof candidate !== 'object') return undefined;
+  const value = candidate as Record<string, unknown>;
+  if (!Array.isArray(value.tools)) return undefined;
+  if ((value.type === 'tool_search_output' && value.execution === 'client' && value.status === 'completed')
+    || (value.type === 'additional_tools' && value.role === 'developer')) {
+    return value as { tools: unknown[] };
+  }
+  return undefined;
 }
 
 /**
@@ -163,29 +210,40 @@ function sameNativeTool(candidate: unknown, nativeTool: Record<string, unknown>)
  */
 export function routeSearchPayloadTools(input: {
   tools: unknown[] | undefined;
+  input?: unknown[];
   nativeEnabled: boolean;
   paidSearchConfigured: boolean;
   nativeTool: Record<string, unknown> | undefined;
 }): SearchPayloadRouteResult {
   const { tools, nativeEnabled, paidSearchConfigured, nativeTool } = input;
-  if (!Array.isArray(tools)) {
-    return { tools, route: 'absent', replacedOrkasSearch: false };
-  }
-  const hasOrkasSearch = tools.some(isOrkasWebSearchTool);
+  const history = input.input;
+  const unchanged = { tools, ...(history !== undefined ? { input: history } : {}) };
+  const hasOrkasSearch = tools?.some(isOrkasWebSearchTool)
+    || history?.some(item => deferredToolReceipt(item)?.tools.some(isOrkasWebSearchTool));
   if (!hasOrkasSearch) {
-    return { tools, route: 'absent', replacedOrkasSearch: false };
+    return { ...unchanged, route: 'absent', replacedOrkasSearch: false };
   }
   if (!nativeEnabled || paidSearchConfigured || !nativeTool) {
-    return { tools, route: 'orkas', replacedOrkasSearch: false };
+    return { ...unchanged, route: 'orkas', replacedOrkasSearch: false };
   }
 
-  const withoutSearchDuplicates = tools.flatMap((candidate) => {
+  const withoutSearchDuplicates = (tools ?? []).flatMap((candidate) => {
     if (sameNativeTool(candidate, nativeTool)) return [];
     const stripped = removeOrkasWebSearchTool(candidate);
     return stripped === undefined ? [] : [stripped];
   });
   return {
     tools: [...withoutSearchDuplicates, nativeTool],
+    ...(history !== undefined ? { input: history.map(item => {
+      const receipt = deferredToolReceipt(item);
+      if (!receipt || !receipt.tools.some(isOrkasWebSearchTool)) return item;
+      // Keep the receipt/call pair, insertion position, and unrelated tools.
+      // Never mutate persisted history: retries and other models rebuild from it.
+      return { ...receipt, tools: receipt.tools.flatMap(candidate => {
+        const stripped = removeOrkasWebSearchTool(candidate);
+        return stripped === undefined ? [] : [stripped];
+      }) };
+    }) } : {}),
     route: 'native',
     replacedOrkasSearch: true,
   };

@@ -759,3 +759,65 @@ describe('renderer task board › latest-batch display while the multi-task boar
     expect(rows).toEqual(['primary']);
   });
 });
+
+
+describe('renderer task board › editing queued messages', () => {
+  it('keeps the editing message cancellable when it is the only queued item', async () => {
+    const { context, panel, list, board } = boardHarness();
+    context._queueComposerEditFor = () => ({ taskId: 'q' });
+    context._latestActiveTurns = new Map([['c1', [{ actor: 'commander', steerable: true }]]]);
+    board.onEvent('c1', { task: { task_id: 'q', status: 'queued', created_by: 'user', assignee: 'commander', instruction: 'original' } });
+    expect(panel.style.display).not.toBe('none');
+    expect(list.innerHTML).toContain('data-act="task-cancel"');
+    expect(list.innerHTML).not.toContain('data-act="task-send-now"');
+    context._deleteQueueItemEdit = vi.fn(async () => true);
+    context.apiFetch = vi.fn();
+    await context._taskBoardCancel('c1', 'q');
+    expect(context._deleteQueueItemEdit).toHaveBeenCalledWith('c1');
+    expect(context.apiFetch).not.toHaveBeenCalled();
+    expect(context._taskBoardMapFor('c1').get('q').status).toBe('cancelled');
+  });
+
+  it('leaves the editing message available when cancellation fails or a save is pending', async () => {
+    const { context, list, board } = boardHarness();
+    context._queueComposerEditFor = () => ({ taskId: 'q' });
+    board.onEvent('c1', { task: { task_id: 'q', status: 'queued', created_by: 'user', assignee: 'commander', instruction: 'original' } });
+    context._deleteQueueItemEdit = vi.fn(async () => false);
+    context.apiFetch = vi.fn();
+    await context._taskBoardCancel('c1', 'q');
+    expect(context.apiFetch).not.toHaveBeenCalled();
+    expect(context._taskBoardMapFor('c1').get('q').status).toBe('queued');
+    expect(list.innerHTML).toContain('data-act="task-cancel"');
+  });
+
+  it('orders the user controls Send now, Edit, Cancel and does not edit running or dispatched contracts', () => {
+    const { context, list, board } = boardHarness();
+    context._latestActiveTurns = new Map([['c1', [{ actor: 'commander', steerable: true }]]]);
+    board.onEvent('c1', { task: { task_id: 'q', status: 'queued', created_by: 'user', assignee: 'commander', instruction: 'draft' } });
+    expect([...list.innerHTML.matchAll(/data-act="([^"]+)"/g)].map((match: any) => match[1]))
+      .toEqual(['task-send-now', 'task-edit', 'task-cancel']);
+    expect(renderBoardRows([{ task_id: 'child', status: 'queued', created_by: 'commander', assignee: 'a' }]))
+      .not.toContain('task-edit');
+  });
+
+  it('opens the queued message in the shared composer', async () => {
+    const { context, board } = boardHarness();
+    board.onEvent('c1', { task: { task_id: 'q', status: 'queued', created_by: 'user', assignee: 'commander', instruction: 'original' } });
+    context._startQueueItemEdit = vi.fn(async () => {});
+    await context._taskBoardEdit('c1', 'q');
+    expect(context._startQueueItemEdit).toHaveBeenCalledWith('c1', 'q');
+  });
+
+  it('retains the revised text across delayed task events and resync', async () => {
+    const { context, board } = boardHarness();
+    const task = { task_id: 'q', status: 'queued', created_by: 'user', assignee: 'commander', instruction: 'original' };
+    board.onEvent('c1', { task });
+    context.apiFetch = vi.fn();
+    expect(context.apiFetch).not.toHaveBeenCalled();
+    board.onEvent('c1', { task: { ...task, instruction: 'saved', instruction_revision: 1 } });
+    board.onEvent('c1', { task });
+    expect(context._taskBoardMapFor('c1').get('q').instruction).toBe('saved');
+    context._taskBoardMergeSeedRows(context._taskBoardMapFor('c1'), [{ ...task, instruction: 'saved again', instruction_revision: 2 }]);
+    expect(context._taskBoardMapFor('c1').get('q').instruction).toBe('saved again');
+  });
+});

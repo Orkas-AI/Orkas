@@ -373,6 +373,57 @@ describe('parseAspectRatio', () => {
 describe('verifyProductionDelivery', () => {
   const bins = bundledFfmpegPaths();
 
+  it.skipIf(!bins.ffmpeg || !bins.ffprobe)('delivers direct generate and semantic-edit media despite spec drift, but verifies a later local caption version', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-direct-delivery-'));
+    try {
+      const video = path.join(dir, 'model.mp4');
+      const mk = spawnSync(bins.ffmpeg!, ['-y', '-f', 'lavfi', '-i', 'color=c=blue:s=320x180:r=15:d=1',
+        '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1', '-af', 'volume=0.01',
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', video], { encoding: 'utf8' });
+      expect(mk.status, mk.stderr).toBe(0);
+      const originalBytes = fs.readFileSync(video);
+      for (const operation of ['generate', 'edit']) {
+        const plan = { aspect: '9:16', total_target_sec: 5, tracks: {},
+          segments: [{ source: 'generate', layer: 'primary', spec: { media_kind: 'video', operation } }] };
+        const input = { planAbsPath: path.join(dir, 'project/plan.json'), plan, videoAbsPath: video, allowedRoots: [dir] };
+        const verdict = await verifyProductionDelivery(input);
+        expect(verdict).toMatchObject({ ok: true, is_generation: true, canvas: '320x180',
+          integrated_lufs: null, narration_lines_measured: 0 });
+        expect(verdict.issues.map((issue) => [issue.code, issue.severity])).toEqual([
+          ['DELIVERY_DURATION_DRIFT', 'warning'], ['DELIVERY_ASPECT_MISMATCH', 'warning'],
+        ]);
+        expect(fs.readFileSync(video)).toEqual(originalBytes);
+        // A forged annotation cannot hide local output work, including after
+        // the model source has already been delivered in a previous turn.
+        const edited = await verifyProductionDelivery({ ...input, plan: { ...plan,
+          _runtime: { is_generation: true }, tracks: { captions: { lines: [{ text: '$19.99' }] } } } });
+        expect(edited).toMatchObject({ ok: false, is_generation: false });
+        expect(edited.integrated_lufs).not.toBeNull();
+        expect(edited.issues.find((issue) => issue.code === 'DELIVERY_DURATION_DRIFT')?.severity).toBe('error');
+        expect(edited.issues.some((issue) => issue.code === 'DELIVERY_CAPTIONS_MISSING')).toBe(true);
+      }
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.skipIf(!bins.ffmpeg || !bins.ffprobe)('does not accept missing, corrupt or audio-only model output as a finished video', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-bad-generation-'));
+    try {
+      const audio = path.join(dir, 'audio.mp4');
+      const mk = spawnSync(bins.ffmpeg!, ['-y', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1', '-c:a', 'aac', audio], { encoding: 'utf8' });
+      expect(mk.status, mk.stderr).toBe(0);
+      fs.writeFileSync(path.join(dir, 'corrupt.mp4'), 'invalid provider payload');
+      for (const file of ['missing.mp4', 'corrupt.mp4', 'audio.mp4']) {
+        const verdict = await verifyProductionDelivery({
+          planAbsPath: path.join(dir, 'project/plan.json'),
+          plan: { segments: [{ source: 'generate', layer: 'primary', spec: { media_kind: 'video' } }] },
+          videoAbsPath: path.join(dir, file), allowedRoots: [dir],
+        });
+        expect(verdict).toMatchObject({ ok: false, is_generation: true, integrated_lufs: null });
+        expect(verdict.issues).toEqual([expect.objectContaining({ code: 'DELIVERY_VIDEO_UNREADABLE', severity: 'error' })]);
+      }
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it.skipIf(!bins.ffmpeg || !bins.ffprobe)('finds real collisions in a hand-assembled file', async () => {
     // End to end against real media, because the whole point is that the check
     // reads the artifact rather than trusting the route that made it. Two

@@ -6,6 +6,7 @@ import { userLocalRoot } from '../paths';
 import { fileEditLock } from '../util/locks';
 import { isPathAllowed } from '../util/path-sandbox';
 import { validateImageStudioManifest, type ImageStudioRoute } from './image_studio';
+import { imageStudioFileHash, type ImageStudioGenerationOutput } from './image_studio_provenance';
 
 export interface ImageGenerationTransaction {
   transaction_id: string;
@@ -25,6 +26,7 @@ export interface ImageGenerationTransaction {
   budget_effect?: 'counted' | 'not_counted';
   planned_output_path: string;
   output_path?: string;
+  output_sha256?: string;
   error_code?: string;
   started_at: string;
   finished_at?: string;
@@ -76,6 +78,15 @@ export function summarizeImageGenerationBudget(
     completed: counted.filter((item) => item.status === 'completed').length,
     failed: counted.filter((item) => item.status === 'failed').length,
   };
+}
+
+/** Completed provider facts remain valid across turns while their exact bytes exist. */
+export function imageStudioGenerationOutputs(state: ImageGenerationControlState | null): ImageStudioGenerationOutput[] {
+  return (state?.transactions || []).flatMap(transaction => (
+    transaction.status === 'completed' && transaction.output_path && transaction.output_sha256
+      ? [{ output_path: transaction.output_path, output_sha256: transaction.output_sha256 }]
+      : []
+  ));
 }
 
 /** Return the newest completed raster for the requested host turn. A named
@@ -247,7 +258,10 @@ export async function finishImageStudioGeneration(input: {
     if (transaction.status !== 'pending') return state;
     transaction.status = input.ok ? 'completed' : 'failed';
     transaction.finished_at = new Date().toISOString();
-    if (input.ok && input.outputPath) transaction.output_path = path.resolve(input.outputPath);
+    if (input.ok && input.outputPath) {
+      transaction.output_path = path.resolve(input.outputPath);
+      transaction.output_sha256 = await imageStudioFileHash(transaction.output_path);
+    }
     if (!input.ok && input.errorCode) transaction.error_code = input.errorCode;
     if (!input.ok && input.countsTowardBudget === false) transaction.budget_effect = 'not_counted';
     state.updated_at = transaction.finished_at;

@@ -149,6 +149,9 @@ export function buildNoProxy(env: NodeJS.ProcessEnv = process.env): string {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
+  // Undici recognizes the all-hosts bypass only as the entire value. It
+  // already includes loopback, so appending local entries would weaken it.
+  if (existing.includes('*')) return '*';
   return [...new Set([...existing, ...LOCAL_NO_PROXY])].join(',');
 }
 

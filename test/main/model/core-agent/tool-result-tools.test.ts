@@ -2,9 +2,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { toToolDefinition, type AgentTool, type ToolContext } from '#core-agent';
+import { Session, toToolDefinition, type AgentTool, type ToolContext } from '#core-agent';
 import {
   estimateToolResultTokens,
+  capToolResult,
   persistToolResult,
   toolResultRefForPath,
   wrapToolWithCap,
@@ -62,9 +63,54 @@ describe('persisted tool-result retrieval', () => {
         },
       },
     };
+    ctx.state.toolResultInlineLedger = ctx.state.toolResultReadLedger;
   });
 
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  it('reads beyond the retired 2K limit and finalizes without a second charge or spill', async () => {
+    const source = '界'.repeat(15_000);
+    const sourceRef = toolResultRefForPath(persistToolResult(dir, 'fixture', source));
+    const before = fs.readdirSync(dir);
+    const tool = getTool(tools, 'tool_result');
+    const result = await tool.execute({ action: 'read', requests: [{ ref: sourceRef, cursor: 0 }] }, ctx);
+    const tokens = estimateToolResultTokens(result.content);
+    expect(tokens).toBeGreaterThan(8_000);
+    expect(tokens).toBeLessThanOrEqual(10_000);
+    const remaining = (ctx.state.toolResultInlineLedger as { remainingTokens: number }).remainingTokens;
+    expect(remaining).toBe(10_000 - tokens);
+    const final = capToolResult('tool_result', result, ctx, { maxInlineTokens: 10_000, toolResultsDir: dir });
+    expect(final).toBe(result);
+    expect(final.persistedOutput).toBeUndefined();
+    expect((ctx.state.toolResultInlineLedger as { remainingTokens: number }).remainingTokens).toBe(remaining);
+    expect(fs.readdirSync(dir)).toEqual(before);
+  });
+
+  it('uses actual remaining budget for ordered batch items and preserves the original ref', async () => {
+    const smallRef = toolResultRefForPath(persistToolResult(dir, 'small', 'small complete record'));
+    const largeRef = toolResultRefForPath(persistToolResult(dir, 'large', '界'.repeat(15_000)));
+    const result = await getTool(tools, 'tool_result').execute({ action: 'read', requests: [
+      { ref: smallRef, cursor: 0 }, { ref: largeRef, cursor: 0 },
+    ] }, ctx);
+    expect(result.content).toContain('small complete record');
+    expect(result.content).toContain(`ref="${largeRef}"`);
+    expect(estimateToolResultTokens(result.content)).toBeGreaterThan(8_000);
+    expect(estimateToolResultTokens(result.content)).toBeLessThanOrEqual(10_000);
+    expect(result.observations?.resultRetrievalBatch?.succeeded).toBe(2);
+  });
+
+  it('queues competing retrievals safely and advances only delivered ranges', async () => {
+    const sourceRef = toolResultRefForPath(persistToolResult(dir, 'large', '界'.repeat(20_000)));
+    const tool = getTool(tools, 'tool_result');
+    const results = await Promise.all([0, 10_000, 15_000].map(cursor => tool.execute({ action: 'read', requests: [{ ref: sourceRef, cursor, max_tokens: 6_000 }] }, ctx)));
+    expect(results[0].isError).toBeFalsy();
+    expect(results[1].isError).toBeFalsy();
+    expect(results[2].isError).toBe(true);
+    expect(results.reduce((total, result) => total + estimateToolResultTokens(result.content), 0)).toBeLessThanOrEqual(10_000);
+    const keys = (ctx.state.toolResultReadLedger as { readKeys: Set<string> }).readKeys;
+    expect([...keys].some(key => key.endsWith(':15000'))).toBe(false);
+    for (const result of results) expect(capToolResult('tool_result', result, ctx, { maxInlineTokens: 10_000, toolResultsDir: dir }).persistedOutput).toBeUndefined();
+  });
 
   it('retains exact partial failures before truncation without confusing quoted source errors', async () => {
     const quoted = '<tool-error code="E_RESULT_READ_BUDGET">source quotation</tool-error>';
@@ -85,9 +131,7 @@ describe('persisted tool-result retrieval', () => {
       { ref, cursor: 0 }, { ref, cursor: 100 },
     ] }, ctx);
     expect(exhausted.isError).toBe(true);
-    expect(exhausted.observations?.resultRetrievalBatch).toMatchObject({
-      requested: 2, attempted: 0, succeeded: 0, failed: 0, skipped: 2,
-    });
+    expect(exhausted.content).toBe('');
   });
 
   it('exposes unvalidated source semantics before local arithmetic without coercing missing, null or zero', async () => {
@@ -136,7 +180,7 @@ describe('persisted tool-result retrieval', () => {
     expect(resolveToolResultRef(dir, 'web_fetch.0000000000000000')).toMatchObject({
       ok: false,
       code: 'E_RESULT_REF_MISSING',
-      message: expect.stringMatching(/retained up to 30 days[\s\S]*Re-run the original tool/),
+      message: expect.stringMatching(/unavailable[\s\S]*does not rerun the original tool/),
     });
   });
 
@@ -405,7 +449,49 @@ describe('persisted tool-result retrieval', () => {
     expect(result.content).not.toContain('E_RESULT_CHUNK_ALREADY_READ');
   });
 
-  it('grounds every model-facing ref field to persisted-output syntax after compaction', () => {
+  it('keeps retrieval guidance in the tool definition while spilled results survive compaction and reload', async () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: 'text', text: 'Compare two source results' }]);
+    const sources = ['first source', 'second source'].map((text) => `${text}\n${'detail\n'.repeat(500)}`);
+    const refs: string[] = [];
+    for (const [i, source] of sources.entries()) {
+      const id = `spill-${i}`;
+      const producer = wrapToolWithCap({
+        name: 'fixture', description: 'Produce a source result', inputSchema: { type: 'object' },
+        async execute() { return { content: source }; },
+      }, { toolResultsDir: dir, maxInlineTokens: 50 });
+      const result = await producer.execute({}, ctx);
+      refs.push(result.persistedOutput!.ref);
+      session.addAssistantMessage([{ type: 'tool_use', id, name: 'fixture', input: { i } }]);
+      session.addToolResult(id, result.content);
+      session.recordCompletedWork({
+        toolCallId: id, tool: 'fixture', inputDigest: id, inputSummary: id,
+        status: 'succeeded', resultRef: result.persistedOutput!.ref,
+      });
+    }
+    const checkRequest = (current: Session) => {
+      const request = JSON.stringify({ tools: tools.map(toToolDefinition), messages: current.getMessagesForModel() });
+      expect(request.match(/Make at most one tool_result call/g)).toHaveLength(1);
+      expect(request.match(/read_files/g)).toHaveLength(1);
+      for (const resultRef of refs) expect(request).toContain(resultRef);
+      expect(request).not.toContain(dir);
+    };
+    checkRequest(session);
+    session.applyActiveCheckpointSummary('Both sources are available for comparison.', session.length - 1);
+    checkRequest(session);
+    const restored = new Session();
+    for (const message of session.getMessages()) restored.addMessage(message.role, message.content, message.turnId);
+    // A valid sidecar restores without rebuilding its turn indexes.
+    expect(restored.restoreContextState(session.getSerializedContextState())).toBe(false);
+    checkRequest(restored);
+    const result = await getTool(tools, 'tool_result').execute({
+      action: 'read', requests: refs.map((ref) => ({ ref, cursor: 0, max_tokens: 2_000 })),
+    }, ctx);
+    expect(result.isError).toBeFalsy();
+    for (const source of sources) expect(result.content).toContain(source);
+  });
+
+  it('grounds all ref shapes with one shared provider-visible instruction after compaction', () => {
     type Schema = {
       description?: string;
       pattern?: string;
@@ -428,33 +514,28 @@ describe('persisted tool-result retrieval', () => {
     expect(refs).toHaveLength(5);
     for (const schema of refs) {
       expect(schema.pattern).toBe(TOOL_RESULT_REF_SCHEMA_PATTERN);
-      expect(schema.description).toMatch(/persisted-output/i);
-      expect(schema.description).toMatch(/never use.*call_/i);
+      expect(schema.description).toBeUndefined();
       expect(new RegExp(schema.pattern!).test('call_246')).toBe(false);
       expect(new RegExp(schema.pattern!).test('grep_files.0123456789abcdef')).toBe(true);
       expect(new RegExp(schema.pattern!).test('call_connector_tool.0123456789abcdef')).toBe(true);
     }
     for (const tool of definitions) {
+      expect(tool.description).toMatch(/literal opaque tool\.hash ref/);
+      expect(tool.description).toContain('<persisted-output ref="...">');
       expect(tool.description).toMatch(/call_\.\.\..*never|never.*call_\.\.\./i);
+      // All request variants receive the common guidance, including after
+      // history compaction, without paying for a copy on every ref leaf.
+      expect(JSON.stringify(tool).match(/persisted-output/g)).toHaveLength(1);
     }
   });
 
-  it('advertises one action-discriminated canonical batch request', async () => {
+  it('advertises a portable root with canonical nested batch shapes', async () => {
     expect(tools.map((tool) => tool.name)).toEqual(['tool_result']);
     const schema = getTool(tools, 'tool_result').inputSchema as any;
-    const branches = Object.fromEntries(schema.oneOf.map((branch: any) => [
-      branch.properties.action.enum[0], branch,
-    ]));
 
+    expect(schema.oneOf).toBeUndefined();
     expect(schema.required).toEqual(['action', 'requests']);
     expect(schema.properties.action.enum).toEqual(['search', 'query', 'read', 'materialize']);
-    // The action branches only bind `action`; the request shapes are advertised
-    // once as the `requests.items` union (the per-action pairing is enforced at
-    // runtime, see the rejected-shape case below).
-    expect(Object.keys(branches).sort()).toEqual(['materialize', 'query', 'read', 'search']);
-    for (const branch of Object.values(branches) as any[]) {
-      expect(Object.keys(branch.properties)).toEqual(['action']);
-    }
     const shapes = schema.properties.requests.items.oneOf as any[];
     expect(shapes).toHaveLength(5);
     const byKeys = (keys: string[]) => shapes.find(
@@ -474,10 +555,6 @@ describe('persisted tool-result retrieval', () => {
     expect(textCount.required).toEqual(['ref', 'operation', 'match', 'count_unit']);
     expect(textCount.properties).not.toHaveProperty('dataset');
     expect(getTool(tools, 'tool_result').description).toMatch(/at most one tool_result call per model step/i);
-    expect(branches.materialize.properties.action.description)
-      .toMatch(/full-data calculations.*query cannot express/);
-    expect(branches.read.properties.action.description).toMatch(/source excerpts/);
-    expect(branches.read.properties.action.description).not.toMatch(/query\/search cannot answer/);
 
     const invalid = await getTool(tools, 'tool_result').execute({
       action: 'unknown',
@@ -487,7 +564,7 @@ describe('persisted tool-result retrieval', () => {
     expect(invalid.content).toContain('E_BAD_INPUT');
   });
 
-  it('materializes exact session-scoped working copies without spending the retrieval budget', async () => {
+  it('materializes exact session-scoped copies and charges only the delivered receipt', async () => {
     const originalPath = resolveToolResultRef(dir, ref);
     if (!originalPath.ok) throw new Error(originalPath.message);
     const original = fs.readFileSync(originalPath.path, 'utf8');
@@ -513,7 +590,7 @@ describe('persisted tool-result retrieval', () => {
     });
     expect(path.dirname(payload.files[0].path)).toBe(fs.realpathSync(materializeDir));
     expect(fs.readFileSync(payload.files[0].path, 'utf8')).toBe(original);
-    expect(ledger.remainingTokens).toBe(TOOL_RESULT_ROUND_MAX_TOKENS);
+    expect(ledger.remainingTokens).toBe(TOOL_RESULT_ROUND_MAX_TOKENS - estimateToolResultTokens(result.content));
     expect(ledger.readKeys.size).toBe(0);
   });
 
@@ -642,7 +719,7 @@ describe('persisted tool-result retrieval', () => {
     expect((ctx.state.toolResultReadLedger as { readKeys: Set<string> }).readKeys.size).toBe(0);
   });
 
-  it('rejects fields from another action even when the selected request is otherwise complete', async () => {
+  it('ignores irrelevant paging and search fields without changing selected operations', async () => {
     const tool = getTool(tools, 'tool_result');
     const invalidSearch = await tool.execute({
       action: 'search',
@@ -658,10 +735,11 @@ describe('persisted tool-result retrieval', () => {
     }, ctx);
 
     for (const result of [invalidSearch, invalidRead, invalidMaterialize]) {
-      expect(result).toMatchObject({ isError: true });
-      expect(result.content).toContain('unsupported field(s)');
+      expect(result.isError).toBeFalsy();
     }
-    expect((ctx.state.toolResultReadLedger as { readKeys: Set<string> }).readKeys.size).toBe(0);
+    expect(invalidSearch.content).toContain('needle');
+    expect(invalidRead.content).toContain('tool-result-chunk');
+    expect(JSON.parse(invalidMaterialize.content).files).toHaveLength(1);
   });
 
   it('rejects an oversized batch before reading or partially disclosing any result', async () => {
@@ -680,7 +758,7 @@ describe('persisted tool-result retrieval', () => {
     const legacyRef = 'bash.1111111111111111';
     fs.writeFileSync(path.join(dir, `${legacyRef}.txt`), 'legacy result');
     expect(resolveToolResultRef(dir, legacyRef)).toMatchObject({ ok: true });
-    expect(TOOL_RESULT_SEARCH_MAX_TOKENS).toBe(2_000);
+    expect(TOOL_RESULT_SEARCH_MAX_TOKENS).toBe(10_000);
   });
 
   it('searches for narrow excerpts without returning the whole result', async () => {
@@ -978,7 +1056,7 @@ describe('persisted tool-result retrieval', () => {
 
     expect(result).toMatchObject({ isError: true });
     expect(result.content).toContain('E_RESULT_QUERY_READ');
-    expect(result.content).toMatch(/Re-run the original tool/);
+    expect(result.content).toMatch(/does not rerun the original tool/);
     expect(result.content).not.toContain('private worker detail');
     expect((ctx.state.toolResultReadLedger as { readKeys: Set<string> }).readKeys.size).toBe(0);
   });
@@ -986,7 +1064,7 @@ describe('persisted tool-result retrieval', () => {
   it('reads an exact bounded chunk and returns a continuation cursor', async () => {
     const result = await getTool(tools, 'tool_result').execute({
       action: 'read',
-      requests: [{ ref, cursor: 0, max_tokens: 9_000 }],
+      requests: [{ ref, cursor: 0, max_tokens: 1_000 }],
     }, ctx);
     expect(result.isError).toBeFalsy();
     expect(result.content).toContain('covered="0-');
@@ -1081,24 +1159,26 @@ describe('persisted tool-result retrieval', () => {
       results.push(await tool.execute({ action: 'read', requests: [request] }, ctx));
     }
     const successful = results.filter((result) => !result.isError);
-    expect(successful).toHaveLength(2);
+    expect(successful.length).toBeGreaterThan(2);
+    expect(successful.length).toBeLessThan(8);
     expect(successful.reduce((tokens, result) => tokens + estimateToolResultTokens(result.content), 0))
       .toBeLessThanOrEqual(TOOL_RESULT_ROUND_MAX_TOKENS);
-    for (const result of results.slice(2)) {
+    for (const result of results.filter((result) => result.isError)) {
       expect(result.isError).toBe(true);
-      expect(result.content).toContain('E_RESULT_READ_BUDGET');
+      expect(result.content === '' || result.content.includes('E_RESULT_READ_BUDGET')).toBe(true);
       expect(result.content).not.toContain('confirmed-');
     }
     const ledger = ctx.state.toolResultReadLedger as {
       epoch: number; remainingTokens: number; readKeys: Set<string>;
     };
-    expect(ledger.readKeys.size).toBe(2);
+    expect(ledger.readKeys.size).toBe(successful.length);
 
     // A fresh model step restores observation capacity, not read history.
     ctx.state.toolResultReadLedger = { ...ledger, remainingTokens: TOOL_RESULT_ROUND_MAX_TOKENS };
-    const recovered = await tool.execute({ action: 'read', requests: [requests[2]] }, ctx);
+      ctx.state.toolResultInlineLedger = ctx.state.toolResultReadLedger;
+    const recovered = await tool.execute({ action: 'read', requests: [requests[successful.length]] }, ctx);
     expect(recovered.isError).toBeFalsy();
-    expect(recovered.content).toContain('section-2: confirmed-2');
+    expect(recovered.content).toContain(`section-${successful.length}: confirmed-${successful.length}`);
     const duplicate = await tool.execute({ action: 'read', requests: [requests[0]] }, ctx);
     expect(duplicate.isError).toBe(true);
     expect(duplicate.content).toContain('E_RESULT_CHUNK_ALREADY_READ');
@@ -1112,7 +1192,7 @@ describe('persisted tool-result retrieval', () => {
     const result = await getTool(tools, 'tool_result').execute({
       action: 'read',
       requests: Array.from({ length: 8 }, (_, index) => ({
-        ref: sourceRef, cursor: source.indexOf(`section-${index}:`), max_tokens: 2_000,
+        ref: sourceRef, cursor: source.indexOf(`section-${index}:`), max_tokens: 1_000,
       })),
     }, ctx);
     expect(result.isError).toBeFalsy();
@@ -1135,6 +1215,7 @@ describe('persisted tool-result retrieval', () => {
     let recovered = '';
     for (let step = 0; step < 100; step++) {
       ctx.state.toolResultReadLedger = { ...ledger, remainingTokens: TOOL_RESULT_ROUND_MAX_TOKENS };
+      ctx.state.toolResultInlineLedger = ctx.state.toolResultReadLedger;
       const result = await tool.execute({
         action: 'read', requests: [{ ref: sourceRef, cursor, max_tokens: 2_000 }],
       }, ctx);
@@ -1150,6 +1231,7 @@ describe('persisted tool-result retrieval', () => {
     }
     expect(recovered).toBe(source);
     ctx.state.toolResultReadLedger = { ...ledger, epoch: 1, remainingTokens: TOOL_RESULT_ROUND_MAX_TOKENS };
+    ctx.state.toolResultInlineLedger = ctx.state.toolResultReadLedger;
     const afterCompaction = await tool.execute({
       action: 'read', requests: [{ ref: sourceRef, cursor: 0, max_tokens: 2_000 }],
     }, ctx);
@@ -1177,14 +1259,15 @@ describe('persisted tool-result retrieval', () => {
     const blocked = await tool.execute({ action: 'query', requests: [{ ref: sourceRef, operation: 'sum', field: 'amount' }] }, ctx);
     expect(blocked.isError).toBe(true);
     expect(blocked.content).toContain('E_RESULT_READ_BUDGET');
-    expect(blocked.content).toContain('materialize');
+    expect(blocked.content).toContain('No source data');
+    (ctx.state.toolResultInlineLedger as { remainingTokens: number }).remainingTokens = 10_000;
     const recovered = await tool.execute({ action: 'materialize', requests: [{ ref: sourceRef }] }, ctx);
     expect(recovered.isError).toBeFalsy();
     const copied = JSON.parse(recovered.content).files[0];
     const content = fs.readFileSync(copied.path, 'utf8');
     expect(content).toBe(source);
     expect(JSON.parse(content).reduce((sum: number, row: { amount: number }) => sum + row.amount, 0)).toBe(18);
-    expect(ledger.remainingTokens).toBe(100);
+    expect(ledger.remainingTokens).toBe(10_000 - estimateToolResultTokens(recovered.content));
     expect(ledger.readKeys.size).toBe(0);
   });
 
@@ -1213,6 +1296,6 @@ describe('persisted tool-result retrieval', () => {
 
     expect(result.isError).toBe(true);
     expect(result.content).toContain('E_RESULT_READ_BUDGET');
-    expect(ledger.remainingTokens).toBe(100);
+    expect(ledger.remainingTokens).toBe(100 - estimateToolResultTokens(result.content));
   });
 });

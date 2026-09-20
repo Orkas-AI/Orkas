@@ -109,14 +109,14 @@
           return Number.isInteger(index) && options[index] ? String(options[index].label || '') : '';
         }).filter(Boolean);
         if (selected.includes('other')) {
-          const other = await uiPrompt(question.question || '', '', { signal });
+          const other = await uiPrompt(question.question || '', '', { signal, secret: question.isSecret === true });
           if (other === null) return null;
           if (String(other).trim()) answers.push(String(other));
         }
         return answers;
       }
       if (selected === 'other') {
-        const other = await uiPrompt(question.question || '', '', { signal });
+        const other = await uiPrompt(question.question || '', '', { signal, secret: question.isSecret === true });
         return other === null ? null : [String(other)];
       }
       const index = Number(String(selected).replace('option-', ''));

@@ -33,7 +33,7 @@ function loadShim(
   vm.createContext(sandbox);
   const source = readFileSync(resolve(__dirname, '../../src/renderer/modules/ipc-shim.js'), 'utf8');
   vm.runInContext(source, sandbox, { filename: 'ipc-shim.js' });
-  return { apiFetch: sandbox.apiFetch as Function, monitorError, loggerWarn };
+  return { apiFetch: sandbox.apiFetch as Function, apiLibraryFetch: sandbox.apiLibraryFetch as Function, monitorError, loggerWarn };
 }
 
 describe('ipc-shim streams', () => {
@@ -92,6 +92,24 @@ describe('ipc-shim invoke results', () => {
       limit: '15',
       before: '20',
       project_id: 'p1',
+    });
+  });
+
+  it.each([['begin-edit', 'beginEdit'], ['cancel-edit', 'cancelEdit']])('routes composer %s with the queued task identity', async (path, channel) => {
+    const invoke = vi.fn(async () => ({ ok: true }));
+    const { apiFetch } = loadShim(idleStream, invoke);
+    await apiFetch(`/api/conversations/c1/tasks/${path}`, { method: 'POST', body: JSON.stringify({ task_id: 'q1' }) });
+    expect(invoke).toHaveBeenCalledWith(`groupChat.tasks.${channel}`, { cid: 'c1', task_id: 'q1' });
+  });
+
+  it('routes queued edits with their original content precondition', async () => {
+    const invoke = vi.fn(async () => ({ ok: true }));
+    const { apiFetch } = loadShim(idleStream, invoke);
+    await apiFetch('/api/conversations/c1/tasks/edit', {
+      method: 'POST', body: JSON.stringify({ task_id: 'q1', instruction: 'new\ntext', expected_instruction: 'old' }),
+    });
+    expect(invoke).toHaveBeenCalledWith('groupChat.tasks.edit', {
+      cid: 'c1', task_id: 'q1', instruction: 'new\ntext', expected_instruction: 'old',
     });
   });
 
@@ -241,5 +259,49 @@ describe('ipc-shim invoke results', () => {
       method: 'GET',
     });
     expect(diagnostics).not.toContain('private-conversation-id');
+  });
+});
+
+
+describe('scoped Library IPC', () => {
+  it('uses relative project paths in the tree and targets project file operations', async () => {
+    const invoke = vi.fn(async (channel) => channel === 'projects.files.tree' ? {
+      ok: true, tree: [{ name: 'Notes', relPath: 'Notes', path: '/private/project/Notes', type: 'dir', children: [
+        { name: 'same.md', relPath: 'Notes/same.md', path: '/private/project/Notes/same.md', type: 'file' },
+      ] }],
+    } : { ok: true });
+    const { apiLibraryFetch } = loadShim(vi.fn(), invoke);
+    const result = await (await apiLibraryFetch('p1', '/api/contexts/tree')).json();
+    expect(result.tree[0].path).toBe('Notes');
+    expect(result.tree[0].children[0].path).toBe('Notes/same.md');
+    await apiLibraryFetch('p1', '/api/contexts/rename', {
+      method: 'POST', body: JSON.stringify({ src: 'Notes/same.md', dst: 'Notes/renamed.md' }),
+    });
+    expect(invoke).toHaveBeenLastCalledWith('projects.files.rename', {
+      projectId: 'p1', oldName: 'Notes/same.md', name: 'Notes/renamed.md',
+    });
+    await apiLibraryFetch('p1', '/api/contexts/delete?path=Notes%2Frenamed.md', { method: 'DELETE' });
+    expect(invoke).toHaveBeenLastCalledWith('projects.files.delete', { projectId: 'p1', name: 'Notes/renamed.md' });
+  });
+
+  it('creates project text with its content and keeps global writes on their existing channel', async () => {
+    const invoke = vi.fn(async () => ({ ok: true }));
+    const { apiLibraryFetch } = loadShim(vi.fn(), invoke);
+    const options = { method: 'POST', body: JSON.stringify({ path: 'notes.md', content: 'Scoped note' }) };
+    await apiLibraryFetch('p1', '/api/contexts/write', options);
+    expect(invoke).toHaveBeenLastCalledWith('projects.files.upload', {
+      projectId: 'p1', name: 'notes.md', data: Buffer.from('Scoped note').toString('base64'),
+    });
+    await apiLibraryFetch('', '/api/contexts/write', options);
+    expect(invoke).toHaveBeenLastCalledWith('contexts.write', { path: 'notes.md', content: 'Scoped note' });
+  });
+
+  it('never falls back to the global Library after a project request fails', async () => {
+    const invoke = vi.fn(async () => { throw new Error('project unavailable'); });
+    const { apiLibraryFetch, monitorError } = loadShim(vi.fn(), invoke);
+    const result = await (await apiLibraryFetch('p1', '/api/contexts/read?path=same.md')).json();
+    expect(result).toMatchObject({ ok: false, error: 'ipc request failed' });
+    expect(invoke).toHaveBeenCalledExactlyOnceWith('projects.files.readText', { projectId: 'p1', name: 'same.md' });
+    expect(monitorError).not.toHaveBeenCalled();
   });
 });

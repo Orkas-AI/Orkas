@@ -1,6 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+
+const { cleanupWarning } = vi.hoisted(() => ({ cleanupWarning: vi.fn() }));
+vi.mock('../../../../src/main/logger', () => ({ createLogger: () => ({ warn: cleanupWarning }) }));
 
 import {
   bindAbort,
@@ -8,6 +12,7 @@ import {
   levelOrInfo,
   LineSplitter,
   reapCliAfterProtocolTerminal,
+  spawnCli,
   StderrTail,
   stripAnsi,
 } from '../../../../src/main/features/local_agents/backends/base';
@@ -130,25 +135,63 @@ describe('local_agents/backends/base', () => {
     expect(spawnFn).toHaveBeenCalledWith(
       expect.stringMatching(/taskkill\.exe$/i),
       ['/pid', '2468', '/t', '/f'],
-      { stdio: 'ignore', windowsHide: true },
+      { stdio: 'ignore', windowsHide: true, timeout: 10_000 },
     );
     expect(killer.unref).toHaveBeenCalledOnce();
     expect(child.kill).not.toHaveBeenCalled();
 
+    cleanupWarning.mockClear();
+    callbacks.get('error')?.(new Error('private diagnostic'));
     callbacks.get('exit')?.(1);
-    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(child.kill).toHaveBeenCalledExactlyOnceWith('SIGTERM');
+    expect(cleanupWarning).toHaveBeenCalledExactlyOnceWith('CLI process tree termination failed', {
+      platform: 'win32', failure: 'tree_command_failed', fallback: 'direct_child_only',
+    });
+  });
+
+  it('does not signal a closed child again after cancellation grace expires', () => {
+    vi.useFakeTimers();
+    const child = Object.assign(new EventEmitter(), { kill: vi.fn(() => true) });
+    const controller = new AbortController();
+    const detach = bindAbort(child as any, controller.signal, 50);
+    try {
+      controller.abort();
+      child.emit('close', 0);
+      detach();
+      vi.advanceTimersByTime(100);
+      expect(child.kill).toHaveBeenCalledExactlyOnceWith('SIGTERM');
+    } finally { detach(); vi.useRealTimers(); }
+  });
+
+  it('waits for the Windows tree command before releasing terminal input', () => {
+    const killer = Object.assign(new EventEmitter(), { unref: vi.fn() });
+    const complete = vi.fn();
+    const child = { pid: 2468, kill: vi.fn() };
+    cleanupWarning.mockClear();
+    killProcessTree(child, 'SIGTERM', {
+      platform: 'win32', spawnFn: (() => killer) as any, onComplete: complete,
+    });
+    expect(complete).not.toHaveBeenCalled();
+    killer.emit('exit', 0);
+    expect(complete).toHaveBeenCalledOnce();
+    expect(child.kill).not.toHaveBeenCalled();
+    expect(cleanupWarning).not.toHaveBeenCalled();
   });
 
   it('falls back to the direct Windows child when taskkill cannot start', () => {
     const child = { pid: 1357, kill: vi.fn() };
     const spawnFn = vi.fn(() => { throw new Error('spawn failed'); });
 
+    cleanupWarning.mockClear();
     killProcessTree(child as any, 'SIGKILL', {
       platform: 'win32',
       spawnFn: spawnFn as any,
     });
 
     expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+    expect(cleanupWarning).toHaveBeenCalledExactlyOnceWith('CLI process tree termination failed', {
+      platform: 'win32', failure: 'tree_command_unavailable', fallback: 'direct_child_only',
+    });
   });
 
   itPosix('signals the CLI tree before a fast parent exit can cancel cleanup', () => {
@@ -236,4 +279,60 @@ describe('local_agents/backends/base', () => {
       }
     }
   });
+  itPosix.each(['terminal', 'abort', 'parent-exit'] as const)(
+    'removes a resistant descendant after %s while preserving unrelated work', async mode => {
+      const node = process.env.ORKAS_TEST_NODE || process.execPath;
+      const resistant = "process.on('SIGTERM', () => {}); process.stdout.write('ready'); setInterval(() => {}, 1000);";
+      const source = [
+        "const { spawn } = require('node:child_process');",
+        `const child = spawn(process.execPath, ['-e', ${JSON.stringify(resistant)}], { stdio: ['ignore', 'pipe', 'ignore'] });`,
+        "child.stdout.once('data', () => process.stdout.write(String(child.pid) + '\\n'));",
+        "process.stdin.on('data', () => process.exit(7));",
+        "setInterval(() => {}, 1000);",
+      ].join('\n');
+      const parent = mode === 'parent-exit'
+        ? spawnCli(node, ['-e', source], process.cwd())
+        : spawn(node, ['-e', source], { detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
+      const unrelated = spawn(node, ['-e', "setInterval(() => {}, 1000)"], { stdio: 'ignore' });
+      let descendantPid = 0;
+      let detach = () => {};
+      try {
+        const data = await once(parent.stdout, 'data', { signal: AbortSignal.timeout(3_000) });
+        descendantPid = Number(String(data[0]).trim());
+        expect(descendantPid).toBeGreaterThan(0);
+        const closed = once(parent, 'close', { signal: AbortSignal.timeout(3_000) });
+        if (mode === 'terminal') reapCliAfterProtocolTerminal(parent, 100);
+        else if (mode === 'abort') {
+          const controller = new AbortController();
+          detach = bindAbort(parent, controller.signal, 100);
+          controller.abort();
+          detach(); // Settling the backend must not cancel already-started cleanup.
+        } else parent.stdin.write('exit');
+        await closed;
+        await waitForProcessExit(descendantPid, 1_000);
+        expect(processIsAlive(descendantPid)).toBe(false);
+        expect(processIsAlive(unrelated.pid!)).toBe(true);
+      } finally {
+        detach();
+        killProcessTree(parent, 'SIGKILL');
+        if (descendantPid && processIsAlive(descendantPid)) process.kill(descendantPid, 'SIGKILL');
+        unrelated.kill('SIGKILL');
+      }
+    },
+  );
+
+  it('starts terminal tree termination before closing stdin can release the parent', () => {
+    vi.useFakeTimers();
+    const actions: string[] = [];
+    const child = Object.assign(new EventEmitter(), {
+      stdin: { end: () => actions.push('stdin-closed') },
+      kill: () => { actions.push('terminate'); return true; },
+    });
+    try {
+      reapCliAfterProtocolTerminal(child as any, 50);
+      expect(actions.slice(0, 2)).toEqual(['terminate', 'stdin-closed']);
+      child.emit('close');
+    } finally { vi.useRealTimers(); }
+  });
+
 });

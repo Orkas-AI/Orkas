@@ -8,6 +8,13 @@ describe('produced file presentation', () => {
     expect(selectVisibleProducedFiles(['/workspace/tool.py'])).toEqual(['/workspace/tool.py']);
   });
 
+  it('keeps producer type declarations out of transcript delivery unless explicitly requested', () => {
+    const metadata = '/workspace/.orkas-output-types.json';
+    const transcript = '/workspace/customer-copy.txt';
+    expect(selectVisibleProducedFiles([metadata, transcript])).toEqual([transcript]);
+    expect(selectVisibleProducedFiles([metadata, transcript], [metadata])).toEqual([metadata]);
+  });
+
   it('shows document exports instead of their source and rendering assets', () => {
     expect(selectVisibleProducedFiles([
       '/workspace/report.md',

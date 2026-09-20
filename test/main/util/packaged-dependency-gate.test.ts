@@ -10,6 +10,7 @@ const asarCli = path.join(path.dirname(require.resolve('@electron/asar/package.j
 const gate = require('../../../bin/packaged-dependency-gate.cjs') as {
   comparePackagedDependencyInventories(left: any, right: any): string;
   packageRootFromManifestPath(manifestPath: string): string | null;
+  verifyNodeRuntimeBuildConfig(sourcePackage: Manifest, lock: Manifest): string[];
   verifyPackagedDependencyGraph(options: {
     appAsar: string;
     packageJsonFile: string;
@@ -101,7 +102,7 @@ function writeJson(file: string, value: unknown): void {
   fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-async function buildFixture(value: Fixture): Promise<{
+async function buildFixture(value: Fixture, unpack = ''): Promise<{
   appAsar: string;
   packageJsonFile: string;
   packageLockFile: string;
@@ -117,8 +118,9 @@ async function buildFixture(value: Fixture): Promise<{
   fs.writeFileSync(path.join(packedRoot, 'bootstrap.cjs'), 'module.exports = {};\n');
   for (const [packageRoot, manifest] of Object.entries(value.packages)) {
     writeJson(path.join(packedRoot, ...packageRoot.split('/'), 'package.json'), manifest);
+    fs.writeFileSync(path.join(packedRoot, ...packageRoot.split('/'), 'index.js'), 'module.exports = {};\n');
   }
-  execFileSync(process.execPath, [asarCli, 'pack', packedRoot, appAsar]);
+  execFileSync(process.execPath, [asarCli, 'pack', packedRoot, appAsar, ...(unpack ? ['--unpack', unpack] : [])]);
   return { appAsar, packageJsonFile, packageLockFile };
 }
 
@@ -132,6 +134,47 @@ async function verify(value: Fixture): Promise<any> {
 }
 
 describe('packaged-dependency-gate', () => {
+  // A valid archive graph is insufficient for the stock Node image process:
+  // every dependency it resolves must also exist outside the archive.
+  function imageFixture(): Fixture {
+    const value = fixture();
+    value.sourcePackage.dependencies.sharp = '1.0.0';
+    value.packedRoot = structuredClone(value.sourcePackage);
+    value.packages['node_modules/sharp'] = {
+      name: 'sharp', version: '1.0.0', dependencies: { 'detect-libc': '1.0.0' },
+    };
+    value.packages['node_modules/detect-libc'] = { name: 'detect-libc', version: '1.0.0' };
+    value.lock.packages['node_modules/sharp'] = { version: '1.0.0' };
+    value.lock.packages['node_modules/detect-libc'] = { version: '1.0.0' };
+    return value;
+  }
+
+  it.each(['darwin', 'win32'])('rejects archive-only image dependencies for %s', async (platform) => {
+    const value = imageFixture();
+    delete value.packages['node_modules/platform-addon'];
+    const paths = await buildFixture(value, '**/sharp/**');
+    expect(() => gate.verifyPackagedDependencyGraph({ ...paths, platform, arch: 'x64' }))
+      .toThrow(/stock Node.*detect-libc.*not unpacked/);
+  });
+
+  it('accepts complete Node dependencies while Electron-only packages remain archived', async () => {
+    const paths = await buildFixture(imageFixture(), '**/{sharp,detect-libc}/**');
+    const result = gate.verifyPackagedDependencyGraph({ ...paths, platform: 'darwin', arch: 'x64' });
+    expect(result.nodeRuntimeInventory).toEqual(['node_modules/detect-libc', 'node_modules/sharp']);
+    fs.rmSync(`${paths.appAsar}.unpacked/node_modules/detect-libc/index.js`);
+    expect(() => gate.verifyPackagedDependencyGraph({ ...paths, platform: 'darwin', arch: 'x64' }))
+      .toThrow(/stock Node.*detect-libc\/index.js.*missing/);
+  });
+
+  it('discovers a new transitive Node dependency before packaging without a manual leaf list', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8'));
+    const lock = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package-lock.json'), 'utf8'));
+    expect(gate.verifyNodeRuntimeBuildConfig(pkg, lock)).toContain('node_modules/detect-libc');
+    lock.packages['node_modules/sharp'].dependencies['future-image-codec'] = '^1.0.0';
+    lock.packages['node_modules/future-image-codec'] = { version: '1.0.0' };
+    expect(() => gate.verifyNodeRuntimeBuildConfig(pkg, lock)).toThrow(/future-image-codec/);
+  });
+
   it('validates the complete packaged graph, nested resolution, optional package, and root override', async () => {
     const result = await verify(fixture());
 

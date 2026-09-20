@@ -67,6 +67,7 @@ describe('builtin-resource-gate', () => {
       .toEqual([...gate.REQUIRED_BUILTIN_INVENTORY.marketplace_agents].sort());
     expect(manifest.inventory.marketplace_skills.map((row) => row.id).sort())
       .toEqual([...gate.REQUIRED_BUILTIN_INVENTORY.marketplace_skills].sort());
+    // Normal Resource development does not move an Agent into the PC bundle.
     expect(manifest.inventory.marketplace_agents)
       .not.toContainEqual(expect.objectContaining({ id: '1040b336306f' }));
     expect(manifest.inventory.marketplace_agents)
@@ -147,6 +148,7 @@ describe('builtin-resource-gate', () => {
       ['string number', (agent) => { agent.inputs[3].default = '60'; }, /finite number/],
       ['unknown select default', (agent) => { agent.inputs[1].default = 'portrait'; }, /default must match an option/],
       ['unknown locale default', (agent) => { agent.inputs[2].default_by_ui_language.zh = 'cn'; }, /invalid zh language default/],
+      ['unsupported UI locale', (agent) => { agent.inputs[2].default_by_ui_language.nl = 'en'; }, /invalid nl language default/],
       ['non-boolean required', (agent) => { agent.inputs[0].required = 1; }, /required must be boolean/],
       ['ignored textarea bound', (agent) => { agent.inputs[0].min = 1; }, /must not declare numeric bounds/],
     ];
@@ -159,6 +161,15 @@ describe('builtin-resource-gate', () => {
         label,
       ).toThrow(expected);
     }
+  });
+
+  it('allows valid select defaults for every newly supported UI language', () => {
+    const candidate = readBuiltinAgent('79df9cc89f5f');
+    const inputs = candidate.inputs as Array<Record<string, unknown>>;
+    inputs[2].default_by_ui_language = Object.fromEntries(
+      ['es', 'fr', 'ko', 'de', 'ru', 'it'].map((language) => [language, 'en']),
+    );
+    expect(gate.validateBuiltinAgentContract(candidate, '79df9cc89f5f')).toBe(true);
   });
 
   it('rejects missing primary files before a release can be signed', () => {

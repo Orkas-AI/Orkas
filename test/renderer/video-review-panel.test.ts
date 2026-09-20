@@ -10,7 +10,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 const panelSource = fs.readFileSync(
   path.join(__dirname, '../../src/renderer/modules/video-review-panel.js'),
@@ -102,6 +102,31 @@ async function renderPanelVideos(composition: Record<string, unknown>): Promise<
   await context.VideoReviewPanel.open('cid-video-review');
   return elements.get('video-review-panel-body')!.descendants('video');
 }
+
+it.each(['close', 'task-switch'])('does not reopen the video panel after a pending request is cancelled by %s', async action => {
+  const panel = new PanelTestElement('aside');
+  panel.hidden = true;
+  const toggle = new PanelTestElement('button');
+  let finish!: (value: unknown) => void;
+  const closeDetails = vi.fn();
+  const sandbox: any = {
+    document: { readyState: 'complete', getElementById: (id: string) => id === 'video-review-panel' ? panel
+      : id === 'video-review-toggle' ? toggle : null },
+    orkas: { invoke: vi.fn().mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }))
+      .mockResolvedValue({ ok: true, panel: null }) },
+    ConversationInfo: { close: closeDetails }, addEventListener() {},
+  };
+  sandbox.window = sandbox;
+  const context = vm.createContext(sandbox);
+  vm.runInContext(panelSource, context);
+  const opening = context.VideoReviewPanel.open('first-task');
+  if (action === 'close') context.VideoReviewPanel.close();
+  else await context.VideoReviewPanel.probe('second-task');
+  finish({ ok: true, panel: { compositions: [] } });
+  await opening;
+  expect(panel.hidden).toBe(true);
+  expect(closeDetails).not.toHaveBeenCalled();
+});
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const viewModel = require('../../src/renderer/modules/video-review-panel.js') as {

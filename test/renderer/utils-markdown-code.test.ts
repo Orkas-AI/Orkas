@@ -57,6 +57,16 @@ describe('inline code spans pair on backtick-run length', () => {
 });
 
 describe('fenced code blocks', () => {
+  it('keeps file-link examples inert while the actual reference remains previewable', () => {
+    const link = '[Report](</workspace/previous report.pdf>)';
+    const html = renderMarkdown(`Use \`${link}\` or:\n\n\`\`\`markdown\n${link}\n\`\`\`\n\n${link}`);
+    const escapedLink = '[Report](&lt;/workspace/previous report.pdf&gt;)';
+    expect(html).toContain(`<code>${escapedLink}</code>`);
+    expect(html).toContain(`<pre><code>${escapedLink}</code></pre>`);
+    expect(count(html, /data-chat-md-file-open="1"/g)).toBe(1);
+    expect(html).not.toContain('href=');
+  });
+
   it('renders an ordinary fence', () => {
     const html = renderMarkdown('```js\nconst a = 1;\n```');
     expect(html).toContain('<pre><code>const a = 1;</code></pre>');

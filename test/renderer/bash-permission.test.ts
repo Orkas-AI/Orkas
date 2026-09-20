@@ -219,6 +219,7 @@ type Choice = 'allow_once' | 'allow_run' | 'deny';
 type UserAction = 'pending' | Choice | { choice: Choice; mode?: string };
 
 interface HarnessOptions {
+  preview?: boolean;
   locale?: 'zh' | 'en' | 'ja' | 'pt';
   visibility?: { state: 'visible' | 'hidden'; focused?: boolean };
   // Dialogs whose `document.createElement` throws before elements work again
@@ -289,6 +290,13 @@ function loadHarness(
         'bash.permission.action_title': 'Allow this sensitive action?',
         'bash.permission.action_message': '{agent} wants {operation}, which {reasons}:',
         'bash.permission.action_fallback': 'local action',
+        'web_assist.action_confirm.title': 'Allow this action on the page?',
+        'web_assist.action_confirm.high_impact_message':
+          'The Agent wants to activate a control that sends, publishes or authorizes something.',
+        'web_assist.action_confirm.page': 'Page',
+        'web_assist.action_confirm.site': 'Site',
+        'web_assist.action_confirm.control': 'Control',
+        'web_assist.action_confirm.note': 'Approving covers this control on this site in this browser tab.',
         'bash.permission.mode_title': 'Permission level',
         'bash.permission.mode_hint': 'You can change this in Settings - General - Local operation permissions.',
         'bash.permission.allow_once': 'Allow once',
@@ -334,6 +342,7 @@ function loadHarness(
     },
     Monitor: { event: monitorEvent },
     window: {
+      location: { pathname: options.preview ? '/preview.html' : '/index.html' },
       addEventListener() {},
       Monitor: { event: monitorEvent },
       orkas: {
@@ -356,14 +365,14 @@ function loadHarness(
   };
   context.window.window = context.window;
   vm.createContext(context);
-  for (const module of ['dropdown-placement.js', 'connectors.js', 'bash_permission.js']) {
+  for (const module of ['dropdown-placement.js', ...(options.preview ? [] : ['connectors.js']), 'connector-action-dialog.js', 'bash_permission.js']) {
     vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules', module), 'utf8'), context, { filename: module });
   }
-  if (!pushHandler) throw new Error('bash:permission handler was not registered');
-  if (!cancelHandler) throw new Error('bash:permission_cancelled handler was not registered');
+  if (!options.preview && !pushHandler) throw new Error('bash:permission handler was not registered');
+  if (!options.preview && !cancelHandler) throw new Error('bash:permission_cancelled handler was not registered');
 
-  if (!localAgentPushHandler) throw new Error('local-agent:permission handler was not registered');
-  if (!localAgentCancelHandler) throw new Error('local-agent:permission_cancelled handler was not registered');
+  if (!options.preview && !localAgentPushHandler) throw new Error('local-agent:permission handler was not registered');
+  if (!options.preview && !localAgentCancelHandler) throw new Error('local-agent:permission_cancelled handler was not registered');
 
   return {
     context,
@@ -1426,4 +1435,105 @@ describe('renderer bash permission prompt', () => {
       channel: 'bash.permission_response', payload: { request_id: 'req-escape', decision: 'deny' },
     });
   });
+});
+
+describe('web assist page actions reuse the same permission dialog', () => {
+  const handback = {
+    request_id: 'web-assist-request',
+    cid: 'task-1',
+    tab_id: '0123456789ab',
+    page_title: 'ChatGPT',
+    page_origin: 'https://chatgpt.com',
+    control_label: 'Send prompt',
+    control_kind: 'button',
+    reason: 'high_impact_action',
+  };
+
+  it('offers a task grant and answers with the run decision', async () => {
+    const h = loadHarness('allow_run');
+    h.emitPush('web-assist:action-confirm', handback);
+    await flush();
+    expect(h.dialogs[0]).toMatchObject({
+      title: 'Allow this action on the page?',
+      currentMode: 'all_files_approval',
+      // The repeat is the case this gate exists for, so the grant is offered.
+      allowRun: true,
+      showModeControl: true,
+    });
+    for (const detail of ['ChatGPT', 'https://chatgpt.com', 'Send prompt']) {
+      expect(h.dialogs[0].message).toContain(detail);
+    }
+    expect(h.invokeCalls.at(-1)).toEqual({
+      channel: 'webAssist.actionConfirmResponse',
+      payload: { request_id: handback.request_id, decision: 'run' },
+    });
+  });
+
+  it('answers once without a grant and reports the verdict without page content', async () => {
+    const h = loadHarness('allow_once');
+    h.emitPush('web-assist:action-confirm', handback);
+    await flush();
+    expect(h.invokeCalls.at(-1)).toEqual({
+      channel: 'webAssist.actionConfirmResponse',
+      payload: { request_id: handback.request_id, decision: 'once' },
+    });
+    expect(h.monitorEvent).toHaveBeenCalledWith('web_assist_action_confirmation_result', expect.objectContaining({
+      result: 'success', decision: 'approved', reason: 'high_impact_action', control_kind: 'button',
+    }));
+    // Origin, title and control label are user content and stay out of analytics.
+    expect(JSON.stringify(h.monitorEvent.mock.calls)).not.toMatch(/chatgpt\.com|Send prompt|ChatGPT/);
+  });
+
+  it('declines with a deny decision the host can distinguish from an approval', async () => {
+    const h = loadHarness('deny');
+    h.emitPush('web-assist:action-confirm', handback);
+    await flush();
+    expect(h.invokeCalls.at(-1)).toEqual({
+      channel: 'webAssist.actionConfirmResponse',
+      payload: { request_id: handback.request_id, decision: 'deny' },
+    });
+    expect(h.monitorEvent).toHaveBeenCalledWith('web_assist_action_confirmation_result', expect.objectContaining({
+      decision: 'denied',
+    }));
+  });
+
+  it('drops a withdrawn request without answering it', async () => {
+    const h = loadHarness('pending');
+    h.emitPush('web-assist:action-confirm', handback);
+    h.emitPush('web-assist:action-confirm-cancelled', { request_ids: [handback.request_id], cid: 'task-1' });
+    await flush();
+    expect(h.invokeCalls.some(call => call.channel === 'webAssist.actionConfirmResponse')).toBe(false);
+  });
+});
+
+describe('Web application sensitive approval', () => {
+  it.each(['zh', 'en', 'ja', 'pt'] as const)('uses the shared dialog with a usage button and no additional explanation in %s', async locale => {
+    const table = JSON.parse(fs.readFileSync(path.join(__dirname, '../../src/renderer/locales', `${locale}.json`), 'utf8'));
+    const h = loadHarness('pending', undefined, { locale });
+    const action = { request_id: 'usage-request', connector_id: 'custom-app', display_name: 'App connector',
+      tool_name: 'send', risk: 'H', arguments_preview: '{}', can_allow_run: true, usage_scope: true };
+    h.emitPush('connectors:action-confirm', action);
+    await flush();
+    const overlay = h.document.body.children.find(child => typeof child !== 'string') as FakeElement;
+    expect(overlay.querySelector('[data-id="allow_run"]')?.textContent).toBe(table['bash.permission.allow_usage']);
+    expect(h.dialogs[0].message).toBe(`${table['connectors.action_confirm.connector']}: App connector\n${table['connectors.action_confirm.action']}: send${table['connectors.action_confirm.details']}{}`);
+    overlay.querySelector('[data-id="allow_run"]')!.click(); await flush();
+    expect(h.invokeCalls.at(-1)).toEqual({ channel: 'connectors.action_confirm_response',
+      payload: { request_id: action.request_id, approved: true, scope: 'usage' } });
+  });
+});
+
+it('application windows ignore task prompts and cancellations while showing their own pending approval', async () => {
+  const h = loadHarness('pending', undefined, { preview: true, locale: 'en' });
+  const app = { request_id: 'app-only', connector_id: 'custom-app', display_name: 'App', tool_name: 'record',
+    risk: 'H', arguments_preview: '{}', usage_scope: true, can_allow_run: true };
+  h.emitPush('connectors:action-confirm', { ...app, request_id: 'task-only', usage_scope: undefined, cid: 'task' });
+  h.emitPush('bash:permission', { request_id: 'bash-task', command: 'task' });
+  h.emitPush('connectors:action-confirm', app);
+  await flush(); expect(h.openDialogs()).toBe(1);
+  h.emitPush('connectors:action-confirm-cancelled', { request_ids: ['app-only'] });
+  await flush(); expect(h.openDialogs()).toBe(1);
+  h.emitPush('connectors:action-confirm-cancelled', { request_ids: ['app-only'], usage_scope: true });
+  await flush(); expect(h.openDialogs()).toBe(0);
+  expect(h.invokeCalls.some(call => call.channel === 'connectors.action_confirm_response')).toBe(false);
 });

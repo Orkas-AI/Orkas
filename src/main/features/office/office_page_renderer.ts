@@ -9,6 +9,7 @@ import type { BrowserWindow as ElectronBrowserWindow, Session } from 'electron';
 import { isPathAllowed } from '../../util/path-sandbox';
 import { hardenedWebPreferences } from '../../util/window-security';
 import { runOfficeCli } from './office_engine';
+import { PPTX_TEXT_COLLISION_SCRIPT, unassessedTextCollision, type TextCollisionAudit } from './pptx_text_collision';
 
 const OFFICE_RENDER_TIMEOUT_MS = 60_000;
 const DEFAULT_SCREENSHOT_WIDTH = 1600;
@@ -30,6 +31,7 @@ type ElectronRuntime = {
 
 export interface OfficePageRendererDeps {
   loadElectron?: () => Promise<ElectronRuntime>;
+  onTextCollisionAudit?: (audit: TextCollisionAudit) => void;
 }
 
 const READY_SCRIPT = `(async () => {
@@ -55,9 +57,9 @@ const CONTENT_SIZE_SCRIPT = `(() => {
   };
 })()`;
 
-function withTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
+function withTimeout<T>(promise: Promise<T>, message: string, timeoutMs = OFFICE_RENDER_TIMEOUT_MS): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), OFFICE_RENDER_TIMEOUT_MS);
+    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
     promise.then(
       (value) => { clearTimeout(timer); resolve(value); },
       (error) => { clearTimeout(timer); reject(error); },
@@ -194,6 +196,20 @@ export async function renderOfficePageToPng(
       'E_OFFICE_RENDER_RESIZE_TIMEOUT: resized preview did not settle',
     );
     assertNotAborted(signal);
+
+    if (deps.onTextCollisionAudit) {
+      let audit = unassessedTextCollision('collection_failed');
+      try {
+        const collected = await withTimeout(
+          win.webContents.executeJavaScript(PPTX_TEXT_COLLISION_SCRIPT, true),
+          'E_OFFICE_TEXT_AUDIT_TIMEOUT: text layout collection timed out',
+          2_000,
+        );
+        if (collected && ['checked', 'partial', 'not_assessed'].includes(collected.status)) audit = collected;
+      } catch { /* Preserve the image and report incomplete diagnostic coverage. */ }
+      assertNotAborted(signal);
+      deps.onTextCollisionAudit(audit);
+    }
 
     const image = await withTimeout(
       win.webContents.capturePage({ x: 0, y: 0, width: size.width, height: size.height }),

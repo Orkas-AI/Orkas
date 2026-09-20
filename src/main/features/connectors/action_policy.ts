@@ -92,7 +92,7 @@ for (const name of ['delete_event', 'delete_calendar', 'clear_sheet', 'delete_sh
  * server may describe its tools, but cannot grant itself read-only treatment.
  * Pinned policies and reviewed actions take precedence over provider hints.
  */
-export function connectorActionRisk(
+function baseConnectorActionRisk(
   instance: Pick<ConnectorInstance, 'id' | 'origin' | 'composio_grant'>,
   tool: ToolSchema,
 ): ConnectorActionRisk {
@@ -117,4 +117,35 @@ export function connectorActionRisk(
   if (entry && tool.annotations?.readOnlyHint === true && tool.annotations.destructiveHint !== true) return READ;
   if (entry && tool.annotations?.destructiveHint === true) return DELETE;
   return UNKNOWN;
+}
+
+// Exact provider fields, after argument normalization. These mixed-purpose
+// updates also rename resources, so action-wide W metadata is insufficient.
+// Presence matters: false/null can revoke access or remove an existing policy.
+const SENSITIVE_UPDATE_FIELDS: ReadonlyArray<readonly [string, string, readonly string[]]> = [
+  ['box', 'BOX_UPDATE_FOLDER', ['shared_link', 'folder_upload_email', 'can_non_owners_invite',
+    'can_non_owners_view_collaborators', 'is_collaboration_restricted_to_enterprise']],
+  ['box', 'BOX_UPDATE_FILE', ['permissions__can__download', 'disposition_at']],
+  ['miro', 'MIRO_UPDATE_BOARD', ['policy']],
+  ['wrike', 'WRIKE_MODIFY_FOLDER', ['addShareds', 'removeShareds', 'addAccessRoles', 'removeAccessRoles']],
+  ['youtube', 'YOUTUBE_UPDATE_PLAYLIST', ['status']],
+];
+
+export function connectorActionRisk(
+  instance: Pick<ConnectorInstance, 'id' | 'origin' | 'composio_grant'>,
+  tool: ToolSchema,
+  args: Record<string, unknown> = {},
+): ConnectorActionRisk {
+  const base = baseConnectorActionRisk(instance, tool);
+  // Never weaken a pinned destructive/sensitive policy or custom-tool distrust.
+  if (base.risk === 'H' || base.risk === 'D') return base;
+  // Fathom's GET actions can POST private meeting content to a caller's URL.
+  if (instance.id === 'fathom'
+    && ['FATHOM_GET_RECORDING_SUMMARY', 'FATHOM_GET_RECORDING_TRANSCRIPT'].includes(tool.name)
+    && Object.hasOwn(args, 'destination_url') && args.destination_url !== undefined) return SEND;
+  const fields = SENSITIVE_UPDATE_FIELDS.find(([id, name]) => id === instance.id && name === tool.name)?.[2];
+  if (fields?.some((key) => Object.hasOwn(args, key) && args[key] !== undefined)) {
+    return { risk: 'H', sensitive_operation: 'permissions' };
+  }
+  return base;
 }

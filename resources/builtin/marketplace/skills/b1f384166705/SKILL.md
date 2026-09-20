@@ -1,7 +1,7 @@
 ---
 name: swiftui-dev
-description_zh: "评审和重构 SwiftUI 架构、Observation/MV 状态边界、渲染、滚动与布局，或用 Instruments、xctrace 和 Time Profiler 证据分析 macOS/iOS 原生热点；用于 SwiftUI 设计与性能工作，不用于 Web 或服务端分析。"
-description_en: "Review and refactor SwiftUI architecture, Observation/MV state boundaries, rendering, scrolling, and layout, or analyze native macOS/iOS hotspots with Instruments, xctrace, and Time Profiler evidence. Use for SwiftUI design and performance work, not web or server profiling."
+description_zh: "评审和重构 SwiftUI 架构、状态边界、渲染、滚动与布局，或依据性能追踪诊断 macOS/iOS 原生热点；不用于 Web 或服务端性能分析。"
+description_en: "Review or refactor SwiftUI architecture, state, rendering, scrolling and layout, or diagnose native macOS/iOS hotspots from profiling evidence; not web or server profiling."
 ---
 
 # SwiftUI Dev

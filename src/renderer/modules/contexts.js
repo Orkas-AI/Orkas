@@ -1,6 +1,6 @@
 const _contextsLog = createLogger('contexts');
 // ─── Library (contexts) ───
-// Single user-owned directory tree at `<uid>/cloud/contexts/`.
+// Browse the global Library or one project Library through the same file controls.
 // Mutations (write / upload / mkdir / rename / delete) hit the backend directly;
 // the backend enqueues `kb_indexer` jobs that produce status transitions
 // broadcast back to the UI via `/api/kb/events/stream` (chips update live).
@@ -33,14 +33,138 @@ function _ctxUiIconHtml(name, className) {
   return '';
 }
 
+let _ctxProjectId = '';
+let _ctxLoadSeq = 0;
+let _ctxScopeGeneration = 0;
+let _ctxOpenSeq = 0;
+let _ctxScopeSelector = null;
+let _ctxOperations = 0;
+const _ctxScopeDrafts = new Map();
+
+function _ctxFetch(url, options) {
+  return _ctxProjectId ? apiLibraryFetch(_ctxProjectId, url, options) : apiFetch(url, options);
+}
+
+function _ctxSetOperation(delta) {
+  _ctxOperations += delta;
+  const trigger = document.getElementById('contexts-project-select-trigger');
+  if (trigger) trigger.disabled = _ctxOperations > 0;
+}
+
+function _renderCtxScopeSelector(projects) {
+  const host = document.getElementById('contexts-project-select');
+  if (!host || typeof _aiSelectMount !== 'function') return;
+  const options = [
+    { value: '', label: t('contexts.global'), iconName: 'folder' },
+    ...(projects || []).slice().sort((a, b) => a.name.localeCompare(b.name)).map((project) => ({
+      value: project.project_id, label: project.name, iconName: 'folder',
+    })),
+  ];
+  if (_ctxScopeSelector) {
+    _ctxScopeSelector.setOptions(options, { value: _ctxProjectId });
+    _ctxScopeSelector.setAriaLabel(t('contexts.switch_project'));
+  } else {
+    _ctxScopeSelector = _aiSelectMount(host, {
+      options, value: _ctxProjectId, ariaLabel: t('contexts.switch_project'),
+      onChange: (value) => switchCtxProject(value),
+    });
+    host.addEventListener('click', () => {
+      if (_ctxScopeSelector.state.open) _refreshCtxProjects();
+    });
+  }
+}
+
+async function _refreshCtxProjects() {
+  if (typeof loadProjects !== 'function') return;
+  const projects = await loadProjects(true);
+  _renderCtxScopeSelector(projects);
+  if (_ctxProjectId && !projects.some((project) => project.project_id === _ctxProjectId)) {
+    await switchCtxProject('');
+  }
+}
+
+async function _confirmCtxProjectSwitch() {
+  const pending = new Set(Array.from(_ctxDrafts.entries())
+    .filter(([, draft]) => draft.dirty !== false)
+    .map(([rel]) => rel));
+  if (_ctxMveController?.isDirty() && _ctxActive) pending.add(_ctxActive.id);
+  if (!pending.size) return true;
+  _ctxSetOperation(1);
+  // An earlier file read must not replace the editor while the choice is open.
+  _ctxOpenSeq++;
+  try {
+    const save = await uiConfirm({
+      message: t('contexts.switch_unsaved', { count: pending.size }),
+      okLabel: t('contexts.switch_save'),
+      cancelLabel: t('contexts.switch_discard'),
+    });
+    if (!save) {
+      _ctxDrafts.clear();
+      return true;
+    }
+    for (const rel of pending) {
+      if (_ctxActive?.id !== rel || !_ctxMveController) await openCtxFile(rel);
+      if (_ctxActive?.id !== rel || !_ctxMveController) return false;
+      if (!await _ctxMveController.save()) return false;
+    }
+    return true;
+  } catch (_) {
+    await uiAlert(t('contexts.save_failed'));
+    return false;
+  } finally {
+    _ctxSetOperation(-1);
+  }
+}
+
+async function switchCtxProject(projectId) {
+  projectId = projectId || '';
+  if (_ctxOperations || projectId === _ctxProjectId) {
+    _ctxScopeSelector?.setValue(_ctxProjectId);
+    return !_ctxOperations;
+  }
+  _closeCtxRowMenu();
+  _ctxScopeSelector?.close();
+  _ctxScopeSelector?.setValue(_ctxProjectId);
+  if (!await _confirmCtxProjectSwitch()) return false;
+  document.getElementById('ctx-new-modal')?.classList.remove('open');
+  _clearCtxViewer();
+  _ctxScopeDrafts.set(_ctxProjectId, _ctxDrafts);
+  _ctxProjectId = projectId;
+  _ctxDrafts = _ctxScopeDrafts.get(projectId) || new Map();
+  _ctxScopeGeneration++;
+  _ctxOpenSeq++;
+  _ctxTree = [];
+  _ctxExpanded.clear();
+  _ctxSelected.clear();
+  _ctxSelectionAnchor = null;
+  _ctxPendingRename = null;
+  _kbStatusByPath = {};
+  _kbUnavailableCode = '';
+  _kbUnavailableReportedCode = '';
+  _kbEventsAbort?.abort();
+  _kbEventsAbort = null;
+  clearTimeout(_kbStatusRefreshTimer);
+  _kbStatusRefreshTimer = null;
+  _kbReconcileInFlight = false;
+  _ctxScopeSelector?.setValue(projectId);
+  renderCtxTree();
+  await loadContexts();
+  return true;
+}
+
 async function loadContexts() {
+  const seq = ++_ctxLoadSeq;
+  const generation = _ctxScopeGeneration;
+  _renderCtxScopeSelector(typeof _projectsCache !== 'undefined' ? _projectsCache : []);
+  void _refreshCtxProjects();
   try {
     const [treeRes, kbRes] = await Promise.all([
-      apiFetch('/api/contexts/tree'),
-      apiFetch('/api/kb/status'),
+      _ctxFetch('/api/contexts/tree'),
+      _ctxFetch('/api/kb/status'),
     ]);
     const treeData = await treeRes.json();
     const kbData = await kbRes.json().catch(() => ({ ok: false }));
+    if (seq !== _ctxLoadSeq || generation !== _ctxScopeGeneration) return;
     if (treeData.ok !== false) _ctxTree = treeData.tree || [];
     if (_applyKbStatusResult(kbData)) _kbStatusByPath = _buildKbStatusMap(_ctxTree, kbData.files || []);
     renderCtxTree();
@@ -104,18 +228,22 @@ function _hasActiveKbStatuses() {
 function _kickKbReconcileIfNeeded() {
   if (_kbReconcileInFlight || !_hasActiveKbStatuses()) return;
   _kbReconcileInFlight = true;
-  apiFetch('/api/kb/reconcile', { method: 'POST' })
-    .then(() => _refreshKbStatusSnapshot())
+  const generation = _ctxScopeGeneration;
+  _ctxFetch('/api/kb/reconcile', { method: 'POST' })
+    .then(() => generation === _ctxScopeGeneration && _refreshKbStatusSnapshot())
     .catch((err) => _contextsLog.warn('kb reconcile failed', err))
     .finally(() => {
+      if (generation !== _ctxScopeGeneration) return;
       _kbReconcileInFlight = false;
       _scheduleKbStatusRefreshIfNeeded();
     });
 }
 
 async function _refreshKbStatusSnapshot() {
-  const res = await apiFetch('/api/kb/status');
+  const generation = _ctxScopeGeneration;
+  const res = await _ctxFetch('/api/kb/status');
   const data = await res.json().catch(() => ({ ok: false }));
+  if (generation !== _ctxScopeGeneration) return;
   if (!_applyKbStatusResult(data)) {
     renderCtxTree();
     return;
@@ -149,7 +277,7 @@ function _ensureKbEventSubscription() {
   _kbEventsAbort = controller;
   (async () => {
     try {
-      const res = await apiFetch('/api/kb/events/stream', {
+      const res = await _ctxFetch('/api/kb/events/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: '{}',
@@ -173,7 +301,7 @@ function _ensureKbEventSubscription() {
           if (!dataLines.length) continue;
           try {
             const msg = JSON.parse(dataLines.join('\n'));
-            if (msg && msg.type === 'event' && msg.event) _applyKbEvent(msg.event);
+            if (!controller.signal.aborted && msg && msg.type === 'event' && msg.event) _applyKbEvent(msg.event);
           } catch { /* malformed event — skip */ }
         }
       }
@@ -181,7 +309,7 @@ function _ensureKbEventSubscription() {
       if (!controller.signal.aborted) _contextsLog.warn('kb events stream dropped', err);
     } finally {
       const wasAborted = controller.signal.aborted;
-      _kbEventsAbort = null;
+      if (_kbEventsAbort === controller) _kbEventsAbort = null;
       if (!wasAborted) {
         setTimeout(() => {
           if (!_kbEventsAbort) loadContexts();
@@ -192,7 +320,8 @@ function _ensureKbEventSubscription() {
 }
 
 function _applyKbEvent(ev) {
-  const p = ev.relPath;
+  if ((ev.projectId || '') !== _ctxProjectId) return;
+  const p = ev.relPath || ev.name;
   if (!p) return;
   if (ev.status === 'deleted') {
     delete _kbStatusByPath[p];
@@ -290,11 +419,27 @@ function _ctxTotalFiles() {
   try { return _collectCtxFilePaths(_ctxTree).length; } catch (_) { return 0; }
 }
 
+// Comparable timestamp for ordering. Same seconds-or-milliseconds tolerance as
+// `_ctxFormatMtime`; entries without a usable mtime rank last within their group.
+function _ctxMtimeRank(mtime) {
+  const n = Number(mtime);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return n > 100000000000 ? n : n * 1000;
+}
+
+// Recency-first: the file you just added or edited belongs at the top, not
+// wherever its name happens to fall alphabetically. Folders still lead the
+// list (containers, not deliverables) and are ordered by their own mtime,
+// which moves when entries are added or removed directly inside them. Name is
+// the tie-break when two entries share a timestamp.
 function _sortCtxNodes(nodes) {
   return (nodes || []).slice().sort((a, b) => {
     const aDir = a?.type === 'dir';
     const bDir = b?.type === 'dir';
     if (aDir !== bDir) return aDir ? -1 : 1;
+    const aTime = _ctxMtimeRank(a?.mtime);
+    const bTime = _ctxMtimeRank(b?.mtime);
+    if (aTime !== bTime) return bTime - aTime;
     return String(a?.name || '').localeCompare(String(b?.name || ''), undefined, {
       sensitivity: 'base',
       numeric: true,
@@ -738,33 +883,38 @@ function _bindCtxTreeHandlers(container) {
 function _ctxCreateEntryActionTracker(action) { return () => {}; }
 
 async function reprocessCtxKbFile(rel) {
-  const trackResult = _ctxCreateEntryActionTracker('reprocess');
-  const failedStatus = { ...(_kbStatusByPath[rel] || {}), status: 'failed' };
-  const restoreFailedStatus = () => {
-    _kbStatusByPath[rel] = failedStatus;
-    _updateCtxKbChip(rel);
-  };
+  _ctxSetOperation(1);
   try {
-    _kbStatusByPath[rel] = { ...(_kbStatusByPath[rel] || {}), status: 'pending' };
-    _updateCtxKbChip(rel);
-    _scheduleKbStatusRefreshIfNeeded();
-    const res = await apiFetch('/api/kb/reprocess', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: rel }),
-    });
-    const data = await res.json();
-    if (!data.ok) {
+    const trackResult = _ctxCreateEntryActionTracker('reprocess');
+    const failedStatus = { ...(_kbStatusByPath[rel] || {}), status: 'failed' };
+    const restoreFailedStatus = () => {
+      _kbStatusByPath[rel] = failedStatus;
+      _updateCtxKbChip(rel);
+    };
+    try {
+      _kbStatusByPath[rel] = { ...(_kbStatusByPath[rel] || {}), status: 'pending' };
+      _updateCtxKbChip(rel);
+      _scheduleKbStatusRefreshIfNeeded();
+      const res = await _ctxFetch('/api/kb/reprocess', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: rel }),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        restoreFailedStatus();
+        trackResult('failure', 'reprocess_failed');
+        await uiAlert(t('contexts.kb.reprocess_failed'));
+        return;
+      }
+      trackResult('success');
+    } catch (_) {
       restoreFailedStatus();
-      trackResult('failure', 'reprocess_failed');
+      trackResult('failure', 'request_failed');
       await uiAlert(t('contexts.kb.reprocess_failed'));
-      return;
     }
-    trackResult('success');
-  } catch (_) {
-    restoreFailedStatus();
-    trackResult('failure', 'request_failed');
-    await uiAlert(t('contexts.kb.reprocess_failed'));
+  } finally {
+    _ctxSetOperation(-1);
   }
 }
 
@@ -783,43 +933,48 @@ function _updateCtxKbChip(rel) {
 }
 
 async function deleteCtxEntry(rel, kind) {
-  const name = String(rel || '').split('/').pop() || rel;
-  const prompt = kind === 'dir'
-    ? t('contexts.dir.del_confirm', { name })
-    : t('contexts.file.del_confirm', { name });
-  if (!(await uiConfirm(prompt))) return;
-  const trackResult = _ctxCreateEntryActionTracker('delete');
-  let data;
+  _ctxSetOperation(1);
   try {
-    const res = await apiFetch(`/api/contexts/delete?path=${encodeURIComponent(rel)}`, { method: 'DELETE' });
-    data = await res.json();
-  } catch (err) {
-    trackResult('failure', 'request_failed');
-    _contextsLog.warn('library entry delete failed', { error_code: 'request_failed' });
-    await uiAlert(t('contexts.delete_failed'));
-    return;
-  }
-  if (!data?.ok) {
-    trackResult('failure', 'delete_failed');
-    _contextsLog.warn('library entry delete failed', { error_code: 'delete_failed' });
-    await uiAlert(t('contexts.delete_failed'));
-    return;
-  }
-  trackResult('success');
-  try {
-    if (_ctxActive && (_ctxActive.id === rel || _ctxActive.id.startsWith(rel + '/'))) {
-      _clearCtxViewer();
+    const name = String(rel || '').split('/').pop() || rel;
+    const prompt = kind === 'dir'
+      ? t('contexts.dir.del_confirm', { name })
+      : t('contexts.file.del_confirm', { name });
+    if (!(await uiConfirm(prompt))) return;
+    const trackResult = _ctxCreateEntryActionTracker('delete');
+    let data;
+    try {
+      const res = await _ctxFetch(`/api/contexts/delete?path=${encodeURIComponent(rel)}`, { method: 'DELETE' });
+      data = await res.json();
+    } catch (err) {
+      trackResult('failure', 'request_failed');
+      _contextsLog.warn('library entry delete failed', { error_code: 'request_failed' });
+      await uiAlert(t('contexts.delete_failed'));
+      return;
     }
-    // Drop drafts under the deleted path (file or whole dir subtree); a
-    // stale draft pointing at a no-longer-existing file would silently
-    // re-create itself on the next click into a same-named freshly-made
-    // file.
-    for (const key of Array.from(_ctxDrafts.keys())) {
-      if (key === rel || key.startsWith(rel + '/')) _ctxDrafts.delete(key);
+    if (!data?.ok) {
+      trackResult('failure', 'delete_failed');
+      _contextsLog.warn('library entry delete failed', { error_code: 'delete_failed' });
+      await uiAlert(t('contexts.delete_failed'));
+      return;
     }
-    await loadContexts();
-  } catch (err) {
-    _contextsLog.warn('refresh after library entry delete failed', err);
+    trackResult('success');
+    try {
+      if (_ctxActive && (_ctxActive.id === rel || _ctxActive.id.startsWith(rel + '/'))) {
+        _clearCtxViewer();
+      }
+      // Drop drafts under the deleted path (file or whole dir subtree); a
+      // stale draft pointing at a no-longer-existing file would silently
+      // re-create itself on the next click into a same-named freshly-made
+      // file.
+      for (const key of Array.from(_ctxDrafts.keys())) {
+        if (key === rel || key.startsWith(rel + '/')) _ctxDrafts.delete(key);
+      }
+      await loadContexts();
+    } catch (err) {
+      _contextsLog.warn('refresh after library entry delete failed', err);
+    }
+  } finally {
+    _ctxSetOperation(-1);
   }
 }
 
@@ -963,32 +1118,50 @@ async function _runCtxMenuAction(action, kind, relPath) {
 }
 
 async function _openCtxTransfer(paths, entryPoint) {
-  if (!window.LibraryTransfer?.open || !paths?.length) return;
-  await window.LibraryTransfer.open({
-    source: { scope: 'global' },
-    paths,
-    entryPoint,
-    onComplete: async (result) => {
-      const successful = (result.results || []).filter((row) => row.ok);
-      if (result.mode === 'move') {
-        for (const row of successful) {
-          if (result.destination?.scope === 'global') {
-            _applyCtxPathChange(row.source, row.destination, result.destination.dir || '');
-          } else {
-            for (const key of Array.from(_ctxDrafts.keys())) {
-              if (key === row.source || key.startsWith(row.source + '/')) _ctxDrafts.delete(key);
-            }
-            if (_ctxActive && (_ctxActive.id === row.source || _ctxActive.id.startsWith(row.source + '/'))) {
-              _clearCtxViewer();
+  if (_ctxOperations || !window.LibraryTransfer?.open || !paths?.length) return;
+  _ctxSetOperation(1);
+  try {
+    const sourceProjectId = _ctxProjectId;
+    const generation = _ctxScopeGeneration;
+    const owner = typeof currentUserId === 'string' ? currentUserId : '';
+    _ctxOpenSeq++;
+    if (!await window.LibraryTransfer.confirmUnsaved({
+      paths,
+      drafts: _ctxDrafts,
+      getActivePath: () => _ctxActive?.id,
+      getController: () => _ctxMveController,
+      openFile: openCtxFile,
+      isCurrent: () => _ctxProjectId === sourceProjectId && _ctxScopeGeneration === generation
+        && (typeof currentUserId === 'string' ? currentUserId : '') === owner,
+    })) return;
+    await window.LibraryTransfer.open({
+      source: _ctxProjectId ? { scope: 'project', projectId: _ctxProjectId } : { scope: 'global' },
+      paths,
+      entryPoint,
+      onComplete: async (result) => {
+        const successful = (result.results || []).filter((row) => row.ok);
+        if (result.mode === 'move') {
+          for (const row of successful) {
+            if ((result.destination?.projectId || '') === _ctxProjectId) {
+              _applyCtxPathChange(row.source, row.destination, result.destination.dir || '');
+            } else {
+              for (const key of Array.from(_ctxDrafts.keys())) {
+                if (key === row.source || key.startsWith(row.source + '/')) _ctxDrafts.delete(key);
+              }
+              if (_ctxActive && (_ctxActive.id === row.source || _ctxActive.id.startsWith(row.source + '/'))) {
+                _clearCtxViewer();
+              }
             }
           }
         }
-      }
-      _ctxSelected.clear();
-      _ctxSelectionAnchor = null;
-      await loadContexts();
-    },
-  });
+        _ctxSelected.clear();
+        _ctxSelectionAnchor = null;
+        await loadContexts();
+      },
+    });
+  } finally {
+    _ctxSetOperation(-1);
+  }
 }
 
 // Open a fresh GLOBAL commander conversation with this KB file attached as a
@@ -1002,8 +1175,8 @@ async function askCommanderAboutCtxFile(relPath) {
     // Attach the file to the commander draft pool and go to the chat home; the
     // user then types their question (no new conversation is created here).
     await window.attachKbFileToDraft(
-      'contexts.attachToDraft',
-      { relPath },
+      _ctxProjectId ? 'projects.files.attachToDraft' : 'contexts.attachToDraft',
+      _ctxProjectId ? { projectId: _ctxProjectId, name: relPath } : { relPath },
       window.COMMANDER_DRAFT_CID,
       () => { if (typeof setView === 'function') setView('new-chat'); },
     );
@@ -1056,72 +1229,79 @@ function _applyCtxPathChange(srcRel, dst, targetDir = '') {
 }
 
 async function _handleCtxMove(srcRel, targetDir) {
-  if (!srcRel) return;
-  const base = srcRel.includes('/') ? srcRel.slice(srcRel.lastIndexOf('/') + 1) : srcRel;
-  const dst = targetDir ? `${targetDir}/${base}` : base;
-  if (dst === srcRel) return;
-  const sourceWrap = Array.from(document.querySelectorAll('.contexts-tree .ctx-tree-wrap[data-path]'))
-    .find((el) => el.dataset.path === srcRel);
-  const entryType = sourceWrap?.dataset?.type || 'file';
-  const startedAt = performance.now();
-  const trackResult = (result, errorCode, reportError = true) => {
-    const payload = {
-      result,
-      entry_type: entryType,
-      has_target_dir: !!targetDir,
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...(errorCode ? { error_code: errorCode } : {}),
-      ...(errorCode ? { error_type: _ctxFailureType(errorCode) } : {}),
+  _ctxSetOperation(1);
+  try {
+    if (!srcRel) return;
+    const base = srcRel.includes('/') ? srcRel.slice(srcRel.lastIndexOf('/') + 1) : srcRel;
+    const dst = targetDir ? `${targetDir}/${base}` : base;
+    if (dst === srcRel) return;
+    const sourceWrap = Array.from(document.querySelectorAll('.contexts-tree .ctx-tree-wrap[data-path]'))
+      .find((el) => el.dataset.path === srcRel);
+    const entryType = sourceWrap?.dataset?.type || 'file';
+    const startedAt = performance.now();
+    const trackResult = (result, errorCode, reportError = true) => {
+      const payload = {
+        result,
+        entry_type: entryType,
+        has_target_dir: !!targetDir,
+        duration_ms: Math.round(performance.now() - startedAt),
+        ...(errorCode ? { error_code: errorCode } : {}),
+        ...(errorCode ? { error_type: _ctxFailureType(errorCode) } : {}),
+      };
+      if (result === 'failure' && reportError) {
+        _contextsLog.warn('library file move failed', payload);
+      }
+      if (!window.Monitor) return;
+      try { Monitor.event('library_file_move_result', payload); } catch (_) {}
     };
-    if (result === 'failure' && reportError) {
-      _contextsLog.warn('library file move failed', payload);
+    // Reject moves into self or own subtree (only meaningful for dirs but the
+    // check is cheap and correct for files too).
+    if (targetDir === srcRel || targetDir.startsWith(srcRel + '/')) {
+      trackResult('failure', 'invalid_target', false);
+      await uiAlert(t('contexts.dnd.invalid_self'));
+      return;
     }
-  };
-  // Reject moves into self or own subtree (only meaningful for dirs but the
-  // check is cheap and correct for files too).
-  if (targetDir === srcRel || targetDir.startsWith(srcRel + '/')) {
-    trackResult('failure', 'invalid_target', false);
-    await uiAlert(t('contexts.dnd.invalid_self'));
-    return;
-  }
-  let data;
-  try {
-    const res = await apiFetch('/api/contexts/rename', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ src: srcRel, dst }),
-    });
-    data = await res.json();
-  } catch (err) {
-    trackResult('failure', 'move_failed');
-    await uiAlert(t('contexts.dnd.move_failed'));
-    return;
-  }
-  if (!data?.ok) {
-    const errorCode = data.error === 'destination already exists' ? 'target_exists' : 'move_failed';
-    trackResult('failure', errorCode);
-    const message = errorCode === 'target_exists'
-      ? t('contexts.dnd.target_exists', { name: base })
-      : t('contexts.dnd.move_failed');
-    await uiAlert(message);
-    return;
-  }
-  trackResult('success');
-  try {
-    _applyCtxPathChange(srcRel, dst, targetDir);
-    await loadContexts();
-    _ctxFlashMovedEntry(dst);
-    if (typeof uiToast === 'function') {
-      uiToast(t('contexts.dnd.moved_to', { target: _ctxMoveTargetLabel(targetDir) }), { variant: 'success' });
+    let data;
+    try {
+      const res = await _ctxFetch('/api/contexts/rename', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ src: srcRel, dst }),
+      });
+      data = await res.json();
+    } catch (err) {
+      trackResult('failure', 'move_failed');
+      await uiAlert(t('contexts.dnd.move_failed'));
+      return;
     }
-  } catch (err) {
-    _contextsLog.warn('refresh after library file move failed', err);
+    if (!data?.ok) {
+      const errorCode = data.error === 'destination already exists' ? 'target_exists' : 'move_failed';
+      trackResult('failure', errorCode);
+      const message = errorCode === 'target_exists'
+        ? t('contexts.dnd.target_exists', { name: base })
+        : t('contexts.dnd.move_failed');
+      await uiAlert(message);
+      return;
+    }
+    trackResult('success');
+    try {
+      _applyCtxPathChange(srcRel, dst, targetDir);
+      await loadContexts();
+      _ctxFlashMovedEntry(dst);
+      if (typeof uiToast === 'function') {
+        uiToast(t('contexts.dnd.moved_to', { target: _ctxMoveTargetLabel(targetDir) }), { variant: 'success' });
+      }
+    } catch (err) {
+      _contextsLog.warn('refresh after library file move failed', err);
+    }
+  } finally {
+    _ctxSetOperation(-1);
   }
 }
 
 /** If the right-pane md viewer is showing the renamed file (or any file
  *  nested under a renamed directory), update the controller's internal
- *  source.rel + the path label so the next save PUTs the correct path.
+ *  source path + the path label so the next save writes the correct file.
  *  Without this, an inline-rename or drag-drop move while the file is
  *  open in edit mode causes the next save to hit the backend with the
  *  stale path and the user gets `not found: <old path>`. The viewer is
@@ -1129,13 +1309,14 @@ async function _handleCtxMove(srcRel, targetDir) {
 function _retargetCtxViewerAfterRename(oldRel, newRel) {
   if (!_ctxMveController || typeof _ctxMveController.getSource !== 'function') return;
   const src = _ctxMveController.getSource();
-  if (!src || src.kind !== 'context' || typeof src.rel !== 'string') return;
+  const key = src?.kind === 'context' ? 'rel' : src?.kind === 'project-file' ? 'name' : null;
+  if (!key || typeof src[key] !== 'string') return;
   let nextRel = null;
-  if (src.rel === oldRel) nextRel = newRel;
-  else if (src.rel.startsWith(oldRel + '/')) nextRel = newRel + src.rel.slice(oldRel.length);
+  if (src[key] === oldRel) nextRel = newRel;
+  else if (src[key].startsWith(oldRel + '/')) nextRel = newRel + src[key].slice(oldRel.length);
   if (!nextRel) return;
   if (typeof _ctxMveController.setSource === 'function') {
-    _ctxMveController.setSource({ ...src, rel: nextRel });
+    _ctxMveController.setSource({ ...src, [key]: nextRel });
   }
   const pathEl = document.getElementById('contexts-editor-path');
   if (pathEl) pathEl.textContent = nextRel;
@@ -1145,47 +1326,52 @@ function _retargetCtxViewerAfterRename(oldRel, newRel) {
 // / blur). Same backend endpoint as `renameCtxEntry` but skips the uiPrompt
 // and renders no alerts on empty / unchanged — those cases cancel silently.
 async function _commitInlineRename(rel, nextBase) {
-  const cleaned = String(nextBase).trim();
-  if (!cleaned || cleaned.includes('/') || cleaned.includes('..') || cleaned.includes('\\')) {
-    await uiAlert(t('contexts.entry.rename_bad_name'));
-    await loadContexts();
-    return;
-  }
-  const dir = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
-  const dst = dir ? `${dir}/${cleaned}` : cleaned;
-  if (dst === rel) { renderCtxTree(); return; }
-  const trackResult = _ctxCreateEntryActionTracker('rename');
-  let data;
+  _ctxSetOperation(1);
   try {
-    const res = await apiFetch('/api/contexts/rename', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ src: rel, dst }),
-    });
-    data = await res.json();
-  } catch (err) {
-    trackResult('failure', 'request_failed');
-    _contextsLog.warn('library entry rename failed', { error_code: 'request_failed' });
-    await uiAlert(t('contexts.entry.rename_failed'));
-    try { await loadContexts(); } catch (refreshErr) { _contextsLog.warn('refresh after library entry rename failure failed', refreshErr); }
-    return;
-  }
-  if (!data?.ok) {
-    const errorCode = data.error === 'destination already exists' || data.error === 'target_exists'
-      ? 'target_exists'
-      : 'rename_failed';
-    trackResult('failure', errorCode);
-    _contextsLog.warn('library entry rename failed', { error_code: errorCode });
-    await uiAlert(_ctxRenameFailureMessage(data.error));
-    try { await loadContexts(); } catch (refreshErr) { _contextsLog.warn('refresh after library entry rename failure failed', refreshErr); }
-    return;
-  }
-  trackResult('success');
-  try {
-    _applyCtxPathChange(rel, dst);
-    await loadContexts();
-  } catch (err) {
-    _contextsLog.warn('refresh after library entry rename failed', err);
+    const cleaned = String(nextBase).trim();
+    if (!cleaned || cleaned.includes('/') || cleaned.includes('..') || cleaned.includes('\\')) {
+      await uiAlert(t('contexts.entry.rename_bad_name'));
+      await loadContexts();
+      return;
+    }
+    const dir = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
+    const dst = dir ? `${dir}/${cleaned}` : cleaned;
+    if (dst === rel) { renderCtxTree(); return; }
+    const trackResult = _ctxCreateEntryActionTracker('rename');
+    let data;
+    try {
+      const res = await _ctxFetch('/api/contexts/rename', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ src: rel, dst }),
+      });
+      data = await res.json();
+    } catch (err) {
+      trackResult('failure', 'request_failed');
+      _contextsLog.warn('library entry rename failed', { error_code: 'request_failed' });
+      await uiAlert(t('contexts.entry.rename_failed'));
+      try { await loadContexts(); } catch (refreshErr) { _contextsLog.warn('refresh after library entry rename failure failed', refreshErr); }
+      return;
+    }
+    if (!data?.ok) {
+      const errorCode = data.error === 'destination already exists' || data.error === 'target_exists'
+        ? 'target_exists'
+        : 'rename_failed';
+      trackResult('failure', errorCode);
+      _contextsLog.warn('library entry rename failed', { error_code: errorCode });
+      await uiAlert(_ctxRenameFailureMessage(data.error));
+      try { await loadContexts(); } catch (refreshErr) { _contextsLog.warn('refresh after library entry rename failure failed', refreshErr); }
+      return;
+    }
+    trackResult('success');
+    try {
+      _applyCtxPathChange(rel, dst);
+      await loadContexts();
+    } catch (err) {
+      _contextsLog.warn('refresh after library entry rename failed', err);
+    }
+  } finally {
+    _ctxSetOperation(-1);
   }
 }
 
@@ -1225,48 +1411,53 @@ window.closeCtxNewModal = closeCtxNewModal;
 // Directory-only "new entry" modal confirm. Text-file creation no longer
 // goes through the modal — see `createCtxNewTextFile`.
 async function saveCtxNew() {
-  const nameRaw = document.getElementById('ctx-new-name').value.trim();
-  const msg = document.getElementById('ctx-new-msg');
-  msg.className = 'form-msg';
-  if (!nameRaw) { msg.textContent = t('contexts.new.name_needed'); msg.className = 'form-msg err'; return; }
-  if (nameRaw.includes('/') || nameRaw.includes('..') || nameRaw.includes('\\')) {
-    msg.textContent = t('contexts.new.bad_chars'); msg.className = 'form-msg err'; return;
-  }
-  const joined = _ctxNewTargetDir ? `${_ctxNewTargetDir}/${nameRaw}` : nameRaw;
-  const trackResult = _ctxCreateEntryActionTracker('create_directory');
-  let data;
+  _ctxSetOperation(1);
   try {
-    const res = await apiFetch('/api/contexts/mkdir', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: joined }),
-    });
-    data = await res.json();
-  } catch (err) {
-    trackResult('failure', 'request_failed');
-    _contextsLog.warn('library directory create failed', { error_code: 'request_failed' });
-    msg.textContent = t('contexts.dir.create_failed');
-    msg.className = 'form-msg err';
-    return;
-  }
-  if (!data?.ok) {
-    msg.textContent = data.error === 'path exists and is not a directory'
-      ? t('contexts.entry.name_exists')
-      : t('contexts.dir.create_failed');
-    msg.className = 'form-msg err';
-    const errorCode = data.error === 'path exists and is not a directory' ? 'target_exists' : 'create_failed';
-    trackResult('failure', errorCode);
-    _contextsLog.warn('library directory create failed', { error_code: errorCode });
-    return;
-  }
-  trackResult('success');
-  try {
-    _ctxExpanded.add(joined);
-    closeCtxNewModal();
-    if (_ctxNewTargetDir) _ctxExpanded.add(_ctxNewTargetDir);
-    await loadContexts();
-  } catch (err) {
-    _contextsLog.warn('refresh after library directory create failed', err);
+    const nameRaw = document.getElementById('ctx-new-name').value.trim();
+    const msg = document.getElementById('ctx-new-msg');
+    msg.className = 'form-msg';
+    if (!nameRaw) { msg.textContent = t('contexts.new.name_needed'); msg.className = 'form-msg err'; return; }
+    if (nameRaw.includes('/') || nameRaw.includes('..') || nameRaw.includes('\\')) {
+      msg.textContent = t('contexts.new.bad_chars'); msg.className = 'form-msg err'; return;
+    }
+    const joined = _ctxNewTargetDir ? `${_ctxNewTargetDir}/${nameRaw}` : nameRaw;
+    const trackResult = _ctxCreateEntryActionTracker('create_directory');
+    let data;
+    try {
+      const res = await _ctxFetch('/api/contexts/mkdir', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: joined }),
+      });
+      data = await res.json();
+    } catch (err) {
+      trackResult('failure', 'request_failed');
+      _contextsLog.warn('library directory create failed', { error_code: 'request_failed' });
+      msg.textContent = t('contexts.dir.create_failed');
+      msg.className = 'form-msg err';
+      return;
+    }
+    if (!data?.ok) {
+      msg.textContent = data.error === 'path exists and is not a directory'
+        ? t('contexts.entry.name_exists')
+        : t('contexts.dir.create_failed');
+      msg.className = 'form-msg err';
+      const errorCode = data.error === 'path exists and is not a directory' ? 'target_exists' : 'create_failed';
+      trackResult('failure', errorCode);
+      _contextsLog.warn('library directory create failed', { error_code: errorCode });
+      return;
+    }
+    trackResult('success');
+    try {
+      _ctxExpanded.add(joined);
+      closeCtxNewModal();
+      if (_ctxNewTargetDir) _ctxExpanded.add(_ctxNewTargetDir);
+      await loadContexts();
+    } catch (err) {
+      _contextsLog.warn('refresh after library directory create failed', err);
+    }
+  } finally {
+    _ctxSetOperation(-1);
   }
 }
 window.saveCtxNew = saveCtxNew;
@@ -1276,47 +1467,52 @@ window.saveCtxNew = saveCtxNew;
 // for inline rename on the next tree render, and immediately drops the
 // viewer into edit mode so the user can start typing content.
 async function createCtxNewTextFile(parentDir = '') {
-  const stemBase = t('contexts.new.untitled_stem');
-  // Collect sibling file names so we can uniquify if a conflict exists.
-  const siblings = _ctxListChildren(parentDir).map(n => n.name);
-  let stem = stemBase;
-  let i = 2;
-  while (siblings.includes(`${stem}.md`)) { stem = `${stemBase} ${i++}`; }
-  const name = `${stem}.md`;
-  const fullPath = parentDir ? `${parentDir}/${name}` : name;
-  const trackResult = _ctxCreateEntryActionTracker('create_text');
-  let data;
+  _ctxSetOperation(1);
   try {
-    const res = await apiFetch('/api/contexts/write', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: fullPath, content: '' }),
-    });
-    data = await res.json();
-  } catch (err) {
-    trackResult('failure', 'request_failed');
-    _contextsLog.warn('library text create failed', { error_code: 'request_failed' });
-    await uiAlert(t('contexts.file.create_failed'));
-    return;
-  }
-  if (!data?.ok) {
-    trackResult('failure', 'create_failed');
-    _contextsLog.warn('library text create failed', { error_code: 'create_failed' });
-    await uiAlert(t('contexts.file.create_failed'));
-    return;
-  }
-  trackResult('success');
-  try {
-    if (parentDir) _ctxExpanded.add(parentDir);
-    _ctxPendingRename = { path: fullPath };
-    await loadContexts();
-    // Show the file in the right pane already in edit mode (empty textarea
-    // + Save/Cancel actions). `_ctxPendingRename` will be consumed by the
-    // next renderCtxTree() call.
-    _showCtxTextViewer(fullPath, '');
-    _enterCtxEdit();
-  } catch (err) {
-    _contextsLog.warn('open created library text failed', err);
+    const stemBase = t('contexts.new.untitled_stem');
+    // Collect sibling file names so we can uniquify if a conflict exists.
+    const siblings = _ctxListChildren(parentDir).map(n => n.name);
+    let stem = stemBase;
+    let i = 2;
+    while (siblings.includes(`${stem}.md`)) { stem = `${stemBase} ${i++}`; }
+    const name = `${stem}.md`;
+    const fullPath = parentDir ? `${parentDir}/${name}` : name;
+    const trackResult = _ctxCreateEntryActionTracker('create_text');
+    let data;
+    try {
+      const res = await _ctxFetch('/api/contexts/write', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: fullPath, content: '' }),
+      });
+      data = await res.json();
+    } catch (err) {
+      trackResult('failure', 'request_failed');
+      _contextsLog.warn('library text create failed', { error_code: 'request_failed' });
+      await uiAlert(t('contexts.file.create_failed'));
+      return;
+    }
+    if (!data?.ok) {
+      trackResult('failure', 'create_failed');
+      _contextsLog.warn('library text create failed', { error_code: 'create_failed' });
+      await uiAlert(t('contexts.file.create_failed'));
+      return;
+    }
+    trackResult('success');
+    try {
+      if (parentDir) _ctxExpanded.add(parentDir);
+      _ctxPendingRename = { path: fullPath };
+      await loadContexts();
+      // Show the file in the right pane already in edit mode (empty textarea
+      // + Save/Cancel actions). `_ctxPendingRename` will be consumed by the
+      // next renderCtxTree() call.
+      _showCtxTextViewer(fullPath, '');
+      _enterCtxEdit();
+    } catch (err) {
+      _contextsLog.warn('open created library text failed', err);
+    }
+  } finally {
+    _ctxSetOperation(-1);
   }
 }
 
@@ -1326,45 +1522,50 @@ async function createCtxNewTextFile(parentDir = '') {
 // behavior is layered on by the KB viewer; the file itself stays portable
 // and indexable like any other md note.
 async function createCtxNewTodoFile(parentDir = '') {
-  const stemBase = t('contexts.new.todo_stem');
-  const siblings = _ctxListChildren(parentDir).map(n => n.name);
-  let stem = stemBase;
-  let i = 2;
-  while (siblings.includes(`${stem}.md`)) { stem = `${stemBase} ${i++}`; }
-  const name = `${stem}.md`;
-  const fullPath = parentDir ? `${parentDir}/${name}` : name;
-  const heading = t('contexts.new.todo_template_heading');
-  const template = `# ${heading}\n\n- [ ] \n- [ ] \n- [ ] \n`;
-  const trackResult = _ctxCreateEntryActionTracker('create_todo');
-  let data;
+  _ctxSetOperation(1);
   try {
-    const res = await apiFetch('/api/contexts/write', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: fullPath, content: template }),
-    });
-    data = await res.json();
-  } catch (err) {
-    trackResult('failure', 'request_failed');
-    _contextsLog.warn('library todo create failed', { error_code: 'request_failed' });
-    await uiAlert(t('contexts.file.create_failed'));
-    return;
-  }
-  if (!data?.ok) {
-    trackResult('failure', 'create_failed');
-    _contextsLog.warn('library todo create failed', { error_code: 'create_failed' });
-    await uiAlert(t('contexts.file.create_failed'));
-    return;
-  }
-  trackResult('success');
-  try {
-    if (parentDir) _ctxExpanded.add(parentDir);
-    _ctxPendingRename = { path: fullPath };
-    await loadContexts();
-    _showCtxTextViewer(fullPath, template);
-    _enterCtxEdit();
-  } catch (err) {
-    _contextsLog.warn('open created library todo failed', err);
+    const stemBase = t('contexts.new.todo_stem');
+    const siblings = _ctxListChildren(parentDir).map(n => n.name);
+    let stem = stemBase;
+    let i = 2;
+    while (siblings.includes(`${stem}.md`)) { stem = `${stemBase} ${i++}`; }
+    const name = `${stem}.md`;
+    const fullPath = parentDir ? `${parentDir}/${name}` : name;
+    const heading = t('contexts.new.todo_template_heading');
+    const template = `# ${heading}\n\n- [ ] \n- [ ] \n- [ ] \n`;
+    const trackResult = _ctxCreateEntryActionTracker('create_todo');
+    let data;
+    try {
+      const res = await _ctxFetch('/api/contexts/write', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: fullPath, content: template }),
+      });
+      data = await res.json();
+    } catch (err) {
+      trackResult('failure', 'request_failed');
+      _contextsLog.warn('library todo create failed', { error_code: 'request_failed' });
+      await uiAlert(t('contexts.file.create_failed'));
+      return;
+    }
+    if (!data?.ok) {
+      trackResult('failure', 'create_failed');
+      _contextsLog.warn('library todo create failed', { error_code: 'create_failed' });
+      await uiAlert(t('contexts.file.create_failed'));
+      return;
+    }
+    trackResult('success');
+    try {
+      if (parentDir) _ctxExpanded.add(parentDir);
+      _ctxPendingRename = { path: fullPath };
+      await loadContexts();
+      _showCtxTextViewer(fullPath, template);
+      _enterCtxEdit();
+    } catch (err) {
+      _contextsLog.warn('open created library todo failed', err);
+    }
+  } finally {
+    _ctxSetOperation(-1);
   }
 }
 
@@ -1391,7 +1592,7 @@ const CTX_ALLOWED_EXTS = [
   '.sh', '.bash', '.zsh', '.ps1', '.cmd', '.bat', '.rb', '.go', '.rs', '.java', '.kt',
   '.c', '.cpp', '.cc', '.h', '.hpp', '.css', '.scss', '.less',
   '.sql', '.graphql', '.gql',
-  '.pdf', '.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm',
+  '.pdf', '.docx', '.docm', '.xlsx', '.xlsm', '.xls', '.pptx', '.pptm',
   '.png', '.jpg', '.jpeg', '.webp', '.gif',
 ];
 
@@ -1467,124 +1668,128 @@ async function _ctxAlertUploadFailures(rows) {
 }
 
 async function handleCtxUpload(fileList, targetDir = '') {
-  const files = Array.from(fileList || []);
-  _contextsLog.info('library upload started', { file_count: files.length, has_target_dir: !!targetDir });
-  if (!files.length) return;
-  if (targetDir) _ctxExpanded.add(targetDir);
-
-  // Visible progress banner above the tree — without it the user has no
-  // signal between "I clicked upload" and "the row appears" (which only
-  // happens after loadContexts() at the end of all jobs). Hidden in the
-  // finally block so a thrown exception still tears it down.
-  const statusEl = document.getElementById('ctx-upload-status');
-  const labelEl = document.getElementById('ctx-upload-status-label');
-  if (statusEl && labelEl) {
-    labelEl.textContent = t('contexts.upload.in_progress', { count: files.length });
-    statusEl.style.display = '';
-  }
-
-  // Bound filesystem imports to two at a time. The preload path uses
-  // webUtils.getPathForFile + async main-process copy, so large files never
-  // become ArrayBuffer/binary-string/base64 clones in renderer memory.
-  const jobs = _ctxUploadMap(files, async (file) => {
-    const ext = _ctxExtOf(file.name);
-    if (_ctxHasHiddenPathSegment(file.name)) {
-      return { ok: false, name: file.name, reason: 'hidden' };
-    }
-    if (!CTX_ALLOWED_EXTS.includes(ext)) {
-      return { ok: false, name: file.name, reason: 'ext' };
-    }
-    try {
-      const target = targetDir ? `${targetDir}/${file.name}` : file.name;
-      _kbStatusByPath[target] = { status: 'pending' };
-      let data = null;
-      if (window.orkas && typeof window.orkas.importLocalFiles === 'function') {
-        const imported = await window.orkas.importLocalFiles('contexts', [file], { targetDir });
-        if (imported && imported.ok === false) {
-          data = imported;
-        } else if (Array.isArray(imported && imported.files) && imported.files.length) {
-          data = imported.files[0];
-        }
-      }
-      // Synthetic File objects used by browser tests have no OS path. Keep a
-      // small compatibility fallback, but never allow a large payload back
-      // onto the base64 bridge.
-      if (!data) {
-        if (Number(file.size || 0) > 8 * 1024 * 1024) {
-          data = { ok: false, code: 'E_IMPORT_PATH', error: 'local file path unavailable' };
-        } else {
-          const buf = await file.arrayBuffer();
-          const res = await apiFetch('/api/contexts/upload', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/octet-stream',
-              'X-Filename': encodeURIComponent(target),
-            },
-            body: buf,
-          });
-          data = await res.json();
-        }
-      }
-      if (!data.ok) {
-        delete _kbStatusByPath[target];
-        return {
-          ok: false,
-          name: file.name,
-          reason: data.error || 'unknown',
-          code: data.code || '',
-          existingDir: typeof data.existingDir === 'string' ? data.existingDir : '',
-        };
-      }
-      return { ok: true, name: file.name };
-    } catch (e) {
-      return { ok: false, name: file.name, reason: e.message || String(e) };
-    }
-  }, 2);
-  let results;
+  _ctxSetOperation(1);
   try {
-    results = await jobs;
-  } finally {
-    if (statusEl) statusEl.style.display = 'none';
-  }
+    const files = Array.from(fileList || []);
+    _contextsLog.info('library upload started', { file_count: files.length });
+    if (!files.length) return;
+    if (targetDir) _ctxExpanded.add(targetDir);
 
-  const rejected = results.filter((r) => !r.ok);
-  const errorCodes = Array.from(new Set(rejected.map((r) => _ctxUploadErrorCode(r.code || r.reason))));
-  const errorCode = errorCodes.length === 1 ? errorCodes[0] : errorCodes.length > 1 ? 'multiple' : '';
-  const result = rejected.length === 0 ? 'success' : rejected.length < results.length ? 'partial_failure' : 'failure';
-  if (rejected.length) {
-    _contextsLog.warn('upload batch completed with failures', {
-      file_count: results.length,
-      failed_count: rejected.length,
-      error_codes: errorCodes,
-    });
-    _ctxLogUploadFailure({
-      source_type: 'dom',
-      file_count: results.length,
-      failed_count: rejected.length,
-      error_code: errorCode,
-      error_type: _ctxFailureType(errorCode || 'upload_failed'),
-    });
+    // Visible progress banner above the tree — without it the user has no
+    // signal between "I clicked upload" and "the row appears" (which only
+    // happens after loadContexts() at the end of all jobs). Hidden in the
+    // finally block so a thrown exception still tears it down.
+    const statusEl = document.getElementById('ctx-upload-status');
+    const labelEl = document.getElementById('ctx-upload-status-label');
+    if (statusEl && labelEl) {
+      labelEl.textContent = t('contexts.upload.in_progress', { count: files.length });
+      statusEl.style.display = '';
+    }
+
+    // Bound filesystem imports to two at a time. The preload path uses
+    // webUtils.getPathForFile + async main-process copy, so large files never
+    // become ArrayBuffer/binary-string/base64 clones in renderer memory.
+    const jobs = _ctxUploadMap(files, async (file) => {
+      const ext = _ctxExtOf(file.name);
+      if (_ctxHasHiddenPathSegment(file.name)) {
+        return { ok: false, name: file.name, reason: 'hidden' };
+      }
+      if (!CTX_ALLOWED_EXTS.includes(ext)) {
+        return { ok: false, name: file.name, reason: 'ext' };
+      }
+      try {
+        const target = targetDir ? `${targetDir}/${file.name}` : file.name;
+        _kbStatusByPath[target] = { status: 'pending' };
+        let data = null;
+        if (window.orkas && typeof window.orkas.importLocalFiles === 'function') {
+          const imported = await window.orkas.importLocalFiles(_ctxProjectId ? 'project' : 'contexts', [file], { targetDir, ...(_ctxProjectId ? { projectId: _ctxProjectId } : {}) });
+          if (imported && imported.ok === false) {
+            data = imported;
+          } else if (Array.isArray(imported && imported.files) && imported.files.length) {
+            data = imported.files[0];
+          }
+        }
+        // Synthetic File objects used by browser tests have no OS path. Keep a
+        // small compatibility fallback, but never allow a large payload back
+        // onto the base64 bridge.
+        if (!data) {
+          if (Number(file.size || 0) > 8 * 1024 * 1024) {
+            data = { ok: false, code: 'E_IMPORT_PATH', error: 'local file path unavailable' };
+          } else {
+            const buf = await file.arrayBuffer();
+            const res = await _ctxFetch('/api/contexts/upload', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/octet-stream',
+                'X-Filename': encodeURIComponent(target),
+              },
+              body: buf,
+            });
+            data = await res.json();
+          }
+        }
+        if (!data.ok) {
+          delete _kbStatusByPath[target];
+          return {
+            ok: false,
+            name: file.name,
+            reason: data.error || 'unknown',
+            code: data.code || '',
+            existingDir: typeof data.existingDir === 'string' ? data.existingDir : '',
+          };
+        }
+        return { ok: true, name: file.name };
+      } catch (e) {
+        return { ok: false, name: file.name, reason: e.message || String(e) };
+      }
+    }, 2);
+    let results;
+    try {
+      results = await jobs;
+    } finally {
+      if (statusEl) statusEl.style.display = 'none';
+    }
+
+    const rejected = results.filter((r) => !r.ok);
+    const errorCodes = Array.from(new Set(rejected.map((r) => _ctxUploadErrorCode(r.code || r.reason))));
+    const errorCode = errorCodes.length === 1 ? errorCodes[0] : errorCodes.length > 1 ? 'multiple' : '';
+    if (rejected.length) {
+      _contextsLog.warn('upload batch completed with failures', {
+        file_count: results.length,
+        failed_count: rejected.length,
+        error_codes: errorCodes,
+      });
+      _ctxLogUploadFailure({
+        source_type: 'dom',
+        file_count: results.length,
+        failed_count: rejected.length,
+        error_code: errorCode,
+        error_type: _ctxFailureType(errorCode || 'upload_failed'),
+      });
+    }
+    if (results.some((row) => row && row.ok)) {
+      try { await loadContexts(); }
+      catch (err) { _contextsLog.warn('refresh after library upload failed', err); }
+    }
+    const extRejected = rejected.filter((r) => r.reason === 'ext');
+    const hiddenRejected = rejected.filter((r) => r.reason === 'hidden');
+    const duplicateRejected = rejected.filter((r) => r.code === 'duplicate_content');
+    const failed = rejected.filter((r) => r.reason !== 'ext' && r.reason !== 'hidden' && r.code !== 'duplicate_content');
+    if (extRejected.length) {
+      await uiAlert(t('contexts.upload_rejected', {
+        list: extRejected.map((r) => r.name || '').join('\n'),
+      }));
+    }
+    if (hiddenRejected.length) {
+      await uiAlert(t('contexts.upload_hidden_rejected', {
+        list: hiddenRejected.map((r) => r.name || '').join('\n'),
+      }));
+    }
+    await _ctxAlertDuplicateUploads(duplicateRejected);
+    await _ctxAlertUploadFailures(failed);
+  } finally {
+    _ctxSetOperation(-1);
   }
-  if (results.some((row) => row && row.ok)) {
-    try { await loadContexts(); }
-    catch (err) { _contextsLog.warn('refresh after library upload failed', err); }
-  }
-  const extRejected = rejected.filter((r) => r.reason === 'ext');
-  const hiddenRejected = rejected.filter((r) => r.reason === 'hidden');
-  const duplicateRejected = rejected.filter((r) => r.code === 'duplicate_content');
-  const failed = rejected.filter((r) => r.reason !== 'ext' && r.reason !== 'hidden' && r.code !== 'duplicate_content');
-  if (extRejected.length) {
-    await uiAlert(t('contexts.upload_rejected', {
-      list: extRejected.map((r) => r.name || '').join('\n'),
-    }));
-  }
-  if (hiddenRejected.length) {
-    await uiAlert(t('contexts.upload_hidden_rejected', {
-      list: hiddenRejected.map((r) => r.name || '').join('\n'),
-    }));
-  }
-  await _ctxAlertDuplicateUploads(duplicateRejected);
-  await _ctxAlertUploadFailures(failed);
 }
 
 async function _ctxUploadMap(items, worker, concurrency) {
@@ -1709,7 +1914,7 @@ const CTX_TEXT_EXTS = new Set([
   '.sql', '.graphql', '.gql',
 ]);
 const CTX_IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
-const CTX_OFFICE_EXTS = new Set(['.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm']);
+const CTX_OFFICE_EXTS = new Set(['.docx', '.docm', '.xlsx', '.xlsm', '.xls', '.pptx', '.pptm']);
 
 function _kindOfPath(rel) {
   const ext = _ctxExtOf(rel);
@@ -1744,17 +1949,20 @@ function _ctxScrollActiveIntoView() {
 }
 
 async function openCtxFile(rel) {
+  const seq = ++_ctxOpenSeq;
   _ctxExpandAncestors(rel);
   const kind = _kindOfPath(rel);
   try {
     if (kind === 'text') {
-      const res = await apiFetch(`/api/contexts/read?path=${encodeURIComponent(rel)}`);
+      const res = await _ctxFetch(`/api/contexts/read?path=${encodeURIComponent(rel)}`);
       const data = await res.json();
+      if (seq !== _ctxOpenSeq) return;
       if (!data.ok) { await uiAlert(t('contexts.read_failed')); return; }
       _showCtxTextViewer(rel, data.content || '');
     } else if (kind === 'image') {
-      const res = await apiFetch(`/api/contexts/image?path=${encodeURIComponent(rel)}`);
+      const res = await _ctxFetch(`/api/contexts/image?path=${encodeURIComponent(rel)}`);
       const data = await res.json();
+      if (seq !== _ctxOpenSeq) return;
       if (!data.ok) { await uiAlert(t('contexts.read_failed')); return; }
       _showCtxImageViewer(rel, data.base64, data.mediaType, data.bytes);
     } else if (kind === 'pdf') {
@@ -1762,9 +1970,9 @@ async function openCtxFile(rel) {
       // protocol registered in main/index.ts. Encoding: path segments are
       // URL-encoded individually so CJK filenames survive but `/` boundaries
       // stay visible to the router.
-      _showCtxPdfViewer(rel);
+      await _showCtxPdfViewer(rel, seq);
     } else if (kind === 'office') {
-      await _showCtxOfficeViewer(rel);
+      await _showCtxOfficeViewer(rel, seq);
     } else {
       _showCtxBinaryViewer(rel, kind);
       revealCtxFile(rel);
@@ -1783,10 +1991,16 @@ function _encodeKbFileUrl(rel) {
   return 'kb-file://kb/' + rel.split('/').map(encodeURIComponent).join('/');
 }
 
-function _showCtxPdfViewer(rel) {
+async function _showCtxPdfViewer(rel, seq = _ctxOpenSeq) {
+  let src = _encodeKbFileUrl(rel);
+  if (_ctxProjectId) {
+    const result = await window.orkas.invoke('projects.files.absPath', { projectId: _ctxProjectId, name: rel });
+    if (seq !== _ctxOpenSeq) return;
+    if (!result.ok) throw new Error('read_failed');
+    src = _chatMediaLocalUrl(result.path);
+  }
   const els = _prepCtxViewerShell(rel);
   if (!els) return;
-  const src = _encodeKbFileUrl(rel);
   // #toolbar=1&navpanes=0 is the Chromium PDFium control hint — keep toolbar
   // (zoom, print, download) visible; hide the sidebar since the panel is
   // already narrow.
@@ -1822,15 +2036,16 @@ function _ctxOfficePreviewLoadingHtml() {
   </div>`;
 }
 
-async function _showCtxOfficeViewer(rel) {
+async function _showCtxOfficeViewer(rel, seq = _ctxOpenSeq) {
   const els = _prepCtxViewerShell(rel);
   if (!els) return;
   els.bodyEl.setAttribute('aria-busy', 'true');
   els.bodyEl.innerHTML = _ctxOfficePreviewLoadingHtml();
   els.actionsEl.innerHTML = '';
   try {
-    const res = await apiFetch(`/api/contexts/office?path=${encodeURIComponent(rel)}`);
+    const res = await _ctxFetch(`/api/contexts/office?path=${encodeURIComponent(rel)}`);
     const data = await res.json();
+    if (seq !== _ctxOpenSeq) return;
     if (!data.ok) throw new Error(data.error || 'read_failed');
     if (_ctxOfficeBlobUrl) {
       try { URL.revokeObjectURL(_ctxOfficeBlobUrl); } catch (_) { /* ignore */ }
@@ -1847,16 +2062,17 @@ async function _showCtxOfficeViewer(rel) {
     els.actionsEl.querySelector('#ctx-viewer-del').addEventListener('click', _deleteCtxFromViewer);
     els.bodyEl.scrollTop = 0;
   } catch (err) {
+    if (seq !== _ctxOpenSeq) return;
     els.bodyEl.innerHTML = `<div class="ctx-viewer-msg">${escapeHtml(t('contexts.read_failed'))}</div>`;
     throw err;
   } finally {
-    els.bodyEl.removeAttribute('aria-busy');
+    if (seq === _ctxOpenSeq) els.bodyEl.removeAttribute('aria-busy');
   }
 }
 
 async function revealCtxFile(rel) {
   try {
-    const res = await apiFetch('/api/contexts/reveal', {
+    const res = await _ctxFetch('/api/contexts/reveal', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: rel }),
@@ -1903,7 +2119,7 @@ function _prepCtxViewerShell(rel) {
 // Lifetime = renderer session (cleared on Save / Cancel / Delete; re-keyed
 // on Rename). Not persisted across app restarts. Fed via the
 // `onDraftChange` callback below.
-const _ctxDrafts = new Map();
+let _ctxDrafts = new Map();
 
 function _ctxClearDraft(path) {
   const key = path || (_ctxActive && _ctxActive.id);
@@ -1916,11 +2132,16 @@ function _showCtxTextViewer(rel, content) {
   const drafts = _ctxDrafts;
   // Capture this mount, so late callbacks never read a later file's source.
   let controller = null;
-  const currentRel = () => controller?.getSource?.()?.rel || rel;
+  const currentRel = () => {
+    const source = controller?.getSource?.();
+    return (source?.kind === 'project-file' ? source.name : source?.rel) || rel;
+  };
   controller = mountMdViewEdit({
     bodyEl: els.bodyEl,
     actionsEl: els.actionsEl,
-    source: { kind: 'context', rel },
+    source: _ctxProjectId
+      ? { kind: 'project-file', projectId: _ctxProjectId, name: rel }
+      : { kind: 'context', rel },
     // Skip the read round-trip — caller already has the bytes.
     initialContent: content,
     // Restore in-progress edits if the user was previously typing in this
@@ -1932,6 +2153,10 @@ function _showCtxTextViewer(rel, content) {
       onDraftChange: (draft) => {
         if (draft === null) drafts.delete(currentRel());
         else drafts.set(currentRel(), draft);
+      },
+      onDirtyChange: (dirty) => {
+        const draft = drafts.get(currentRel());
+        if (draft) draft.dirty = dirty;
       },
       onReveal: () => revealCtxFile(currentRel()),
       onDelete: () => _deleteCtxFromViewer(),
@@ -1992,25 +2217,34 @@ function _showCtxBinaryViewer(rel, kind) {
 }
 
 async function _deleteCtxFromViewer() {
-  if (!_ctxActive) return;
-  const rel = _ctxActive.id;
-  const name = String(rel || '').split('/').pop() || rel;
-  if (!(await uiConfirm(t('contexts.file.del_confirm', { name })))) return;
+  _ctxSetOperation(1);
   try {
-    const res = await apiFetch(`/api/contexts/delete?path=${encodeURIComponent(rel)}`, { method: 'DELETE' });
-    const data = await res.json();
-    if (!data.ok) { await uiAlert(t('contexts.delete_failed')); return; }
-    _ctxClearDraft(rel);
-    _clearCtxViewer();
-    await loadContexts();
-  } catch (_) {
-    await uiAlert(t('contexts.delete_failed'));
+    if (!_ctxActive) return;
+    const rel = _ctxActive.id;
+    const name = String(rel || '').split('/').pop() || rel;
+    if (!(await uiConfirm(t('contexts.file.del_confirm', { name })))) return;
+    try {
+      const res = await _ctxFetch(`/api/contexts/delete?path=${encodeURIComponent(rel)}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!data.ok) { await uiAlert(t('contexts.delete_failed')); return; }
+      _ctxClearDraft(rel);
+      _clearCtxViewer();
+      await loadContexts();
+    } catch (_) {
+      await uiAlert(t('contexts.delete_failed'));
+    }
+  } finally {
+    _ctxSetOperation(-1);
   }
 }
 
 function _clearCtxViewer() {
   if (_ctxMveController) { try { _ctxMveController.destroy(); } catch (_) {} _ctxMveController = null; }
   _ctxActive = null;
+  if (_ctxOfficeBlobUrl) {
+    URL.revokeObjectURL(_ctxOfficeBlobUrl);
+    _ctxOfficeBlobUrl = null;
+  }
   const empty = document.getElementById('contexts-editor-empty');
   const wrap = document.getElementById('contexts-viewer-wrap');
   if (empty) empty.style.display = 'flex';
@@ -2048,4 +2282,8 @@ function initCtxBindings() {
 initCtxBindings();
 
 // Re-run on i18n change to keep tree labels / empty state fresh.
-window.addEventListener('i18n-change', () => { _closeCtxRowMenu(); renderCtxTree(); });
+window.addEventListener('i18n-change', () => {
+  _closeCtxRowMenu();
+  _renderCtxScopeSelector(typeof _projectsCache !== 'undefined' ? _projectsCache : []);
+  renderCtxTree();
+});

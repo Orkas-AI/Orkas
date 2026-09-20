@@ -31,6 +31,7 @@ export type VideoReferenceIntent = 'reproduce' | 'edit' | 'guide';
 export type VideoReferenceIntentBasis = 'user' | 'inferred';
 export type VideoReferenceRole = 'content' | 'identity' | 'composition' | 'structure' | 'style' | 'motion' | 'timing' | 'audio';
 export type VideoEditMode = 'deterministic' | 'semantic' | 'mixed';
+// Keep historical evidence tags readable without re-running their retired producer.
 export type VideoEditDecisionSignal = 'timecode' | 'transcript' | 'ocr' | 'scene' | 'silence' | 'quality' | 'vision' | 'semantic_model';
 
 export const DELIVERY_PROMISE_TYPES: readonly DeliveryPromiseType[] = [

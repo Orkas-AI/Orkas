@@ -24,7 +24,7 @@ export async function bindConnectorSetupAssistance(userId: string, cid: string, 
   const assistance = validateConnectorSetupAssistance({ kind: 'connector_setup', connector_id: connectorId });
   const current = await chats.getConversationMetadata(userId, cid);
   if (!current) throw new Error('Open the conversation and try again.');
-  if (current.assistance?.connector_id === connectorId) return;
+  if (current.assistance?.kind === 'connector_setup' && current.assistance.connector_id === connectorId) return;
   if (!await chats.updateConversation(userId, cid, { assistance })) {
     throw new Error('Open the conversation and try again.');
   }
@@ -35,8 +35,11 @@ export async function bindConnectorSetupAssistance(userId: string, cid: string, 
  */
 export async function formatConnectorSetupForTurn(userId: string, cid: string): Promise<string> {
   const conversation = await chats.getConversationMetadata(userId, cid);
-  const assistance = conversation?.assistance;
-  if (!assistance) return '';
+  return formatConnectorSetupAssistance(conversation?.assistance);
+}
+
+export function formatConnectorSetupAssistance(assistance: chats.ConversationAssistance | undefined): string {
+  if (assistance?.kind !== 'connector_setup') return '';
   const entry = connectorCatalog().find(item => item.id === assistance.connector_id);
   // Old/synced metadata may refer to a connector absent from this edition.
   if (!entry) return '';

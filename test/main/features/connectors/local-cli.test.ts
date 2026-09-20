@@ -8,6 +8,12 @@ import { shell } from 'electron';
 
 import { describe, expect, it, vi } from 'vitest';
 
+const diagnostics = vi.hoisted(() => ({ warn: vi.fn() }));
+vi.mock('../../../../src/main/logger', async importOriginal => {
+  const actual = await importOriginal<typeof import('../../../../src/main/logger')>();
+  return { ...actual, createLogger: (scope: string) => ({ ...actual.createLogger(scope), warn: diagnostics.warn }) };
+});
+
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 
 const interactiveMocks = vi.hoisted(() => ({
@@ -97,6 +103,36 @@ describe('official local CLI connector runtime', () => {
       }));
       expect(localCliMissingPermissions(uid, 'dingtalk')).toEqual(['chat.message:send', 'mail:send']);
     } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
+  });
+
+  it.each(['nonzero', 'timeout', 'exception'])('diagnoses an unavailable permission check (%s) without exposing account or provider output', async mode => {
+    diagnostics.warn.mockClear();
+    const entry = findCatalogEntry('feishu')!;
+    const uid = `private-permission-account-${mode}`;
+    const directory = seedInstalled(uid, entry);
+    const file = path.join(directory, '.orkas-user-permissions.json');
+    const original = JSON.stringify({ profile: localCliProfileName(uid, entry.id), scopes: ['docx:document:readonly'], reauthorize: true });
+    fs.writeFileSync(file, original);
+    const runner = vi.fn(async () => {
+      if (mode === 'exception') throw new Error('private-provider-transcript');
+      return { exitCode: mode === 'nonzero' ? 1 : 0, timedOut: mode === 'timeout', stderr: 'private-provider-transcript' };
+    });
+    try {
+      await checkLocalCliPermissions(uid, entry, true, runner);
+      expect(diagnostics.warn).toHaveBeenCalledOnce();
+      const diagnostic = JSON.stringify(diagnostics.warn.mock.calls);
+      expect(diagnostic).toContain('permission_check_unavailable');
+      expect(diagnostic).not.toContain(uid);
+      expect(diagnostic).not.toContain(directory);
+      expect(diagnostic).not.toContain('private-provider-transcript');
+      expect(fs.readFileSync(file, 'utf8')).toBe(original);
+      await checkLocalCliPermissions(uid, entry, false, runner);
+      expect(runner).toHaveBeenCalledOnce();
+      const retry = vi.fn(async () => ({ exitCode: 0, stderr: '' }));
+      await checkLocalCliPermissions(uid, entry, true, retry);
+      expect(retry).toHaveBeenCalledOnce();
+      expect(diagnostics.warn).toHaveBeenCalledOnce();
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
   });
 
   it('does not start an old-account permission check after switching accounts during proxy setup', async () => {
@@ -191,6 +227,7 @@ describe('official local CLI connector runtime', () => {
 
   it.each(['disconnect', 'account-switch'])('aborts a running permission check and queued refresh on %s', async mode => {
     const entry = findCatalogEntry('feishu')!;
+    diagnostics.warn.mockClear();
     const uid = `permission-running-${mode}`;
     const directory = seedInstalled(uid, entry);
     let signal!: AbortSignal;
@@ -207,6 +244,7 @@ describe('official local CLI connector runtime', () => {
       else (await import('../../../../src/main/features/user-switch-hooks')).notifyUserSwitch(uid, 'next-account');
       await Promise.all([checking, queued]);
       expect(signal.aborted).toBe(true);
+      expect(diagnostics.warn).not.toHaveBeenCalled();
       expect(runner).toHaveBeenCalledOnce();
       if (mode === 'disconnect') expect(fs.existsSync(directory)).toBe(false);
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }

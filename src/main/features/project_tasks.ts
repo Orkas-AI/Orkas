@@ -54,14 +54,12 @@ const STATUSES: readonly TaskStatus[] = ['todo', 'progress', 'review', 'done'];
 // Review is unfinished work awaiting confirmation, so it counts as open.
 const OPEN_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>(['todo', 'progress', 'review']);
 
-export const TASK_TITLE_MAX = 200;
-export const TASK_DETAIL_MAX = 2000;
+export const TASK_CONTENT_MAX = 4000;
 export const TASK_RESULT_REF_MAX = 400;
 
 export interface ProjectTask {
   id: string;
-  title: string;
-  detail?: string;
+  content: string;
   status: TaskStatus;
   /** Agent display NAME (user/LLM-facing). */
   owner_agent?: string;
@@ -72,7 +70,7 @@ export interface ProjectTask {
   depends_on?: string[];
   /** Pointer to the delivering conversation cid / artifact / file. */
   result_ref?: string;
-  /** First conversation that created/worked the task; immutable once linked. */
+  /** Latest successfully dispatched execution conversation; legacy field name. */
   origin_cid?: string;
   /** Filenames under `task_attachments/<id>/`, copied into the conversation the
    *  task starts (manual Run or the auto-advance driver), like the composer's. */
@@ -85,9 +83,10 @@ export interface ProjectTask {
 export type TaskError =
   | 'project_not_found'
   | 'task_not_found'
-  | 'title_empty'
-  | 'title_too_long'
-  | 'detail_too_long'
+  | 'content_empty'
+  | 'content_too_long'
+  | 'content_invalid'
+  | 'content_required_for_update'
   | 'bad_status'
   | 'status_conflict'
   | 'owner_not_bound'
@@ -129,8 +128,8 @@ function clampStr(v: unknown, max: number): string | undefined {
   return s.length > max ? s.slice(0, max) : s;
 }
 
-function canonicalOpenTaskTitle(title: string): string {
-  let normalized = title.normalize('NFKC').trim();
+function canonicalOpenTaskContent(content: string): string {
+  let normalized = content.normalize('NFKC').trim();
   const wrappingQuotes: ReadonlyArray<readonly [string, string]> = [
     ['"', '"'], ["'", "'"], ['`', '`'], ['“', '”'], ['‘', '’'], ['「', '」'], ['『', '』'],
   ];
@@ -141,6 +140,28 @@ function canonicalOpenTaskTitle(title: string): string {
     }
   }
   return normalized.replace(/\s+/g, ' ').toLowerCase();
+}
+
+/** Legacy fields are read-only aliases; canonical content always wins. */
+function taskContent(input: { content?: unknown; title?: unknown; detail?: unknown }): string | undefined {
+  if (input.content !== undefined) return typeof input.content === 'string' ? input.content.trim() : undefined;
+  return [input.title, input.detail].filter((value): value is string => typeof value === 'string')
+    .map((value) => value.trim()).filter(Boolean).join('\n');
+}
+
+/** Input-only compatibility for older clients; never persisted or returned. */
+export interface TaskContentInput {
+  content?: string;
+  title?: string;
+  detail?: string;
+}
+
+function validateTaskContent(input: TaskContentInput): TaskError | null {
+  const fields = input.content !== undefined ? [input.content] : [input.title, input.detail];
+  if (fields.some((value) => value !== undefined && typeof value !== 'string')) return 'content_invalid';
+  const content = taskContent(input);
+  if (!content) return 'content_empty';
+  return content.length > TASK_CONTENT_MAX ? 'content_too_long' : null;
 }
 
 async function withCreateLock<T>(uid: string, pid: string, fn: () => Promise<T>): Promise<T> {
@@ -171,8 +192,8 @@ function _normaliseTask(raw: any): ProjectTask | null {
   if (!raw || typeof raw !== 'object') return null;
   const id = typeof raw.id === 'string' ? raw.id : '';
   if (!TASK_ID_RE.test(id)) return null;
-  const title = clampStr(raw.title, TASK_TITLE_MAX);
-  if (!title) return null;
+  const content = taskContent(raw);
+  if (!content) return null;
   // Older names retain their stage; retired blocked/cancelled tasks reopen as
   // todo. Reads preserve the source file; an ordinary edit persists the mapping.
   const storedStatus = raw.status === 'in_progress' ? 'progress'
@@ -181,14 +202,12 @@ function _normaliseTask(raw: any): ProjectTask | null {
   const now = nowIso();
   const t: ProjectTask = {
     id,
-    title,
+    content,
     status,
     created_by: typeof raw.created_by === 'string' && raw.created_by ? raw.created_by : 'user',
     created_at: typeof raw.created_at === 'string' ? raw.created_at : now,
     updated_at: typeof raw.updated_at === 'string' ? raw.updated_at : now,
   };
-  const detail = clampStr(raw.detail, TASK_DETAIL_MAX);
-  if (detail) t.detail = detail;
   const owner = clampStr(raw.owner_agent, 200);
   if (owner) t.owner_agent = owner;
   if (typeof raw.owner_agent_id === 'string' && raw.owner_agent_id) t.owner_agent_id = raw.owner_agent_id;
@@ -360,8 +379,7 @@ export function computeProgress(tasks: readonly ProjectTask[]): TaskProgress {
  *  backlogs retrieved on demand. */
 export interface ProjectTaskView {
   id: string;
-  title: string;
-  detail?: string;
+  content: string;
   status: TaskStatus;
   owner_agent?: string;
   depends_on?: string[];
@@ -375,8 +393,7 @@ export interface ProjectTaskView {
 export function taskView(t: ProjectTask): ProjectTaskView {
   return {
     id: t.id,
-    title: t.title,
-    ...(t.detail ? { detail: t.detail } : {}),
+    content: t.content,
     status: t.status,
     ...(t.owner_agent ? { owner_agent: t.owner_agent } : {}),
     ...(t.depends_on?.length ? { depends_on: [...t.depends_on] } : {}),
@@ -389,9 +406,7 @@ export function taskView(t: ProjectTask): ProjectTaskView {
   };
 }
 
-export interface CreateTaskInput {
-  title: string;
-  detail?: string;
+export interface CreateTaskInput extends TaskContentInput {
   status?: TaskStatus;
   owner_agent?: string;
   owner_agent_id?: string;
@@ -409,12 +424,10 @@ export async function createTask(
   uid: string, pid: string, input: CreateTaskInput,
 ): Promise<{ ok: true; task: ProjectTask; alreadyExists: boolean } | { ok: false; error: TaskError }> {
   if (!(await _scopeExists(uid, pid))) return { ok: false, error: 'project_not_found' };
-  const title = clampStr(input.title, TASK_TITLE_MAX + 1);
-  if (!title) return { ok: false, error: 'title_empty' };
-  if (title.length > TASK_TITLE_MAX) return { ok: false, error: 'title_too_long' };
+  const contentError = validateTaskContent(input);
+  if (contentError) return { ok: false, error: contentError };
+  const content = taskContent(input)!;
   if (input.status && !STATUSES.includes(input.status)) return { ok: false, error: 'bad_status' };
-  const detail = clampStr(input.detail, TASK_DETAIL_MAX + 1);
-  if (detail && detail.length > TASK_DETAIL_MAX) return { ok: false, error: 'detail_too_long' };
   const owner = await _resolveOwner(uid, pid, input);
   if (owner === 'owner_not_bound') return { ok: false, error: 'owner_not_bound' };
   const dependsOn = Array.isArray(input.depends_on)
@@ -425,16 +438,16 @@ export async function createTask(
   return withCreateLock(uid, pid, async () => {
     // A caller-supplied id lets the editor stage attachments before the task
     // JSON exists. Validate collisions under the same create lock that owns
-    // title de-duplication so concurrent creates cannot steal a draft.
+    // content de-duplication so concurrent creates cannot steal a draft.
     const suppliedId = typeof input.id === 'string' && TASK_ID_RE.test(input.id) ? input.id : '';
     if (suppliedId && fs.existsSync(_taskFile(uid, pid, suppliedId))) {
       return { ok: false as const, error: 'id_taken' as const };
     }
     if (!suppliedId && OPEN_STATUSES.has(requestedStatus)) {
-      const canonicalTitle = canonicalOpenTaskTitle(title);
+      const canonicalContent = canonicalOpenTaskContent(content);
       const existing = (await listTasks(uid, pid)).find((task) => (
         OPEN_STATUSES.has(task.status)
-        && canonicalOpenTaskTitle(task.title) === canonicalTitle
+        && canonicalOpenTaskContent(task.content) === canonicalContent
       ));
       if (existing) {
         log.info('reused open task', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(existing.id) });
@@ -447,12 +460,11 @@ export async function createTask(
     const now = nowIso();
     const task: ProjectTask = {
       id,
-      title,
+      content,
       status: requestedStatus,
       created_by: clampStr(input.created_by, 200) || 'user',
       created_at: now,
       updated_at: now,
-      ...(detail ? { detail } : {}),
       ...owner,
       ...(dependsOn.length ? { depends_on: dependsOn } : {}),
       ...(typeof input.origin_cid === 'string' && input.origin_cid ? { origin_cid: input.origin_cid } : {}),
@@ -464,17 +476,13 @@ export async function createTask(
   });
 }
 
-export interface UpdateTaskPatch {
-  title?: string;
-  detail?: string;
+export interface UpdateTaskPatch extends TaskContentInput {
   status?: TaskStatus;
   owner_agent?: string;
   owner_agent_id?: string;
   result_ref?: string;
-  /** Current task conversation. It is written only when the task has no
-   *  association yet; later conversations can update the task but cannot
-   *  replace its first associated conversation. Host-only, never exposed as
-   *  a model or renderer input field. */
+  /** Execution conversation, replaced only by a successful host dispatch.
+   *  Never exposed as a model or renderer input field. Ordinary edits omit it. */
   origin_cid?: string;
 }
 
@@ -493,16 +501,23 @@ export async function updateTask(
     }
 
     const next: ProjectTask = { ...cur };
-    if (patch.title !== undefined) {
-      const title = clampStr(patch.title, TASK_TITLE_MAX + 1);
-      if (!title) return { ok: false, error: 'title_empty' };
-      if (title.length > TASK_TITLE_MAX) return { ok: false, error: 'title_too_long' };
-      next.title = title;
-    }
-    if (patch.detail !== undefined) {
-      const detail = clampStr(patch.detail, TASK_DETAIL_MAX + 1);
-      if (detail && detail.length > TASK_DETAIL_MAX) return { ok: false, error: 'detail_too_long' };
-      if (detail) next.detail = detail; else delete next.detail;
+    if (patch.content !== undefined || patch.title !== undefined || patch.detail !== undefined) {
+      let fields: TaskContentInput = patch;
+      if (patch.content === undefined) {
+        const raw = await readJson(_taskFile(uid, pid, tid));
+        if (raw.content === undefined) {
+          fields = {
+            title: patch.title !== undefined ? patch.title : raw.title,
+            detail: patch.detail !== undefined ? patch.detail : raw.detail,
+          };
+        } else if (patch.title === undefined || patch.detail === undefined) {
+          // The old split cannot be recovered from canonical content safely.
+          return { ok: false, error: 'content_required_for_update' };
+        }
+      }
+      const contentError = validateTaskContent(fields);
+      if (contentError) return { ok: false, error: contentError };
+      next.content = taskContent(fields)!;
     }
     if (patch.status !== undefined) {
       if (!STATUSES.includes(patch.status)) return { ok: false, error: 'bad_status' };
@@ -521,7 +536,7 @@ export async function updateTask(
       const ref = clampStr(patch.result_ref, TASK_RESULT_REF_MAX);
       if (ref) next.result_ref = ref; else delete next.result_ref;
     }
-    if (!next.origin_cid && typeof patch.origin_cid === 'string' && patch.origin_cid.trim()) {
+    if (typeof patch.origin_cid === 'string' && patch.origin_cid.trim()) {
       next.origin_cid = patch.origin_cid.trim();
     }
     next.updated_at = nowIso();
@@ -529,6 +544,17 @@ export async function updateTask(
     log.info('updated', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(tid), status: next.status });
     return { ok: true, task: next };
   });
+}
+
+/** Record an admitted execution without rolling it back if its backlink fails.
+ *  Only dispatch entry points call this; creation and status edits do not. */
+export async function recordTaskExecution(uid: string, pid: string, tid: string, cid: string): Promise<void> {
+  try {
+    const linked = await updateTask(uid, pid, tid, { origin_cid: cid });
+    if (!linked.ok) log.error('task execution association rejected');
+  } catch {
+    log.error('task execution association failed');
+  }
 }
 
 /** Shortcut: mark done + record an optional result pointer. */

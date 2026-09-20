@@ -73,6 +73,79 @@ const cardButton = (host: Element, text: string) => host.all('button').find(el =
 const cardInputs = (host: Element) => host.all('textarea');
 
 describe('native asynchronous question drafts and delivery', () => {
+  it('hides cancellation in flight, ignores duplicate clicks, and restores the draft on failure', async () => {
+    const h = load();
+    h.api.setActiveTurns('chat-1', [{ actor: 'agent', turn_id: 'turn-1', steerable: true }]);
+    h.api.showConversation('chat-1');
+    h.api.showQuestion(h.message, { cid: 'chat-1', onAnswer: h.onAnswer });
+    const input = cardInputs(h.dock)[0];
+    input.value = 'My scope';
+    await input.fire('input');
+    let settle!: (result: any) => void;
+    h.invoke.mockImplementationOnce(() => new Promise(resolve => { settle = resolve; }));
+    const cancel = cardButton(h.dock, 'common.cancel');
+    const pending = cancel.fire('click');
+    await cancel.fire('click');
+    expect(h.dock.hidden).toBe(true);
+    h.api.showConversation('chat-2');
+    h.api.showConversation('chat-1');
+    expect(h.dock.hidden).toBe(true);
+    settle({ ok: false, error: 'save_failed' });
+    await pending;
+    expect(h.invoke).toHaveBeenCalledOnce();
+    expect(h.dock.hidden).toBe(false);
+    expect(cardInputs(h.dock)[0].value).toBe('My scope');
+    expect(h.dock.all('div').some(el => el.textContent === 'chat.cli_question.cancel_failed')).toBe(true);
+    expect(h.onAnswer).not.toHaveBeenCalled();
+    h.invoke.mockResolvedValueOnce({ ok: true, message: { ...h.message, cli_question: { ...h.message.cli_question, cancelled: true } } } as any);
+    await cardButton(h.dock, 'common.cancel').fire('click');
+    expect(h.dock.hidden).toBe(true);
+  });
+
+  it('disables cancellation during answer delivery and an accepted answer persistence retry', async () => {
+    const h = load();
+    const input = cardInputs(h.host)[0];
+    input.value = 'Current';
+    await input.fire('input');
+    let settle!: (result: any) => void;
+    h.invoke.mockImplementationOnce(() => new Promise(resolve => { settle = resolve; }));
+    const pending = send(h.host).fire('click');
+    expect(cardButton(h.host, 'common.cancel').disabled).toBe(true);
+    settle({ ok: false, error: 'save_failed' });
+    await pending;
+    expect(cardButton(h.host, 'common.cancel').disabled).toBe(true);
+    await cardButton(h.host, 'common.cancel').fire('click');
+    expect(h.invoke).toHaveBeenCalledOnce();
+  });
+
+  it('cancels an unanswered async question without an answer and keeps it closed through replay and reload', async () => {
+    const h = load();
+    h.api.setActiveTurns('chat-1', [{ actor: 'agent', turn_id: 'turn-1', steerable: true }]);
+    h.api.showConversation('chat-1');
+    h.api.showQuestion(h.message, { cid: 'chat-1', onAnswer: h.onAnswer });
+    const cancelled = { ...h.message, cli_question: { ...h.message.cli_question, cancelled: true } };
+    h.invoke.mockResolvedValueOnce({ ok: true, message: cancelled } as any);
+    const cancel = cardButton(h.dock, 'common.cancel');
+    expect(cancel).toBeDefined();
+    expect(cancel.disabled).toBe(false);
+    await cancel.fire('click');
+    expect(h.invoke).toHaveBeenCalledExactlyOnceWith('localAgents.asyncInputResponse', {
+      cid: 'chat-1', message_id: 'question-1', cancelled: true,
+    });
+    expect(h.onAnswer).not.toHaveBeenCalled();
+    expect(h.dock.hidden).toBe(true);
+    h.api.showConversation('chat-2');
+    h.api.showConversation('chat-1');
+    h.api.showQuestion(h.message, { cid: 'chat-1' });
+    expect(h.dock.hidden).toBe(true);
+    const reloaded = load();
+    reloaded.api.setActiveTurns('chat-1', [{ actor: 'agent', turn_id: 'turn-1', steerable: true }]);
+    reloaded.api.showConversation('chat-1');
+    reloaded.api.showQuestion(cancelled, { cid: 'chat-1' });
+    expect(reloaded.dock.hidden).toBe(true);
+    expect(reloaded.invoke).not.toHaveBeenCalled();
+  });
+
   it('keeps a draft answerable after twenty minutes and ignores a previously stored host deadline', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1000);

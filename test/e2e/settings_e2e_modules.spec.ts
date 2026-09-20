@@ -8,6 +8,14 @@ async function openSettingsTab(page: import('@playwright/test').Page, tabName: s
   await expect(page.locator(`[data-settings-pane="${tabName}"]`)).toBeVisible();
 }
 
+// Since the settings redesign the provider / model pickers live in the
+// "+ 添加模型" dialog (#settings-add-modal) instead of inline on the Models tab.
+async function openAddModelDialog(page: import('@playwright/test').Page): Promise<void> {
+  await page.locator('[data-settings-add="chat"]').click();
+  await expect(page.locator('#settings-add-modal')).toHaveClass(/\bopen\b/);
+  await expect(page.locator('#settings-add-modal [data-settings-add-form="chat"]')).toBeVisible();
+}
+
 test.describe('settings modules and model guard', () => {
   test('renders data, recycle bin, and BYO credential settings', async ({ appPage }) => {
     await openSettingsTab(appPage, 'data');
@@ -32,13 +40,19 @@ test.describe('settings modules and model guard', () => {
       hasText: 'E2E-Local-Model',
     })).toBeVisible();
     await expect(appPage.locator('#settings-entries .settings-empty')).toHaveCount(0);
+    await openAddModelDialog(appPage);
+    await expect(appPage.locator('#settings-add-entry-btn')).toBeVisible();
     await appPage.locator('#settings-add-entry-btn').click();
     await expect(appPage.locator('#settings-picker-status')).not.toHaveText('');
+    await expect(appPage.locator('#settings-add-modal')).toHaveClass(/\bopen\b/);
+    await appPage.locator('#settings-add-modal [data-settings-add-cancel]:visible').click();
+    await expect(appPage.locator('#settings-add-modal')).not.toHaveClass(/\bopen\b/);
   });
 
   test('persists a masked model credential entry and removes it from the UI', async ({ orkas }) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     await openSettingsTab(orkas.page, 'credentials');
+    await openAddModelDialog(orkas.page);
     await orkas.page.locator('#settings-picker-provider .ai-select-trigger').click();
     let popover = orkas.page.locator('.ai-select-popover:visible');
     await popover.locator('.ai-select-item', { hasText: 'Anthropic' }).click();
@@ -47,6 +61,8 @@ test.describe('settings modules and model guard', () => {
     await expect(popover.locator('.ai-select-item').first()).toBeVisible();
     await popover.locator('.ai-select-item').first().click();
     await orkas.page.locator('#settings-add-entry-btn').click();
+    // The picker dialog hands over to the credential dialog; they never stack.
+    await expect(orkas.page.locator('#settings-add-modal')).not.toHaveClass(/\bopen\b/);
     await orkas.page.locator('#add-account-modal .method-tile[data-method="api_key"]').click();
     await expect(orkas.page.locator('#add-account-modal .api-key-input')).toHaveAttribute('type', 'password');
     await orkas.page.locator('#add-account-modal .api-label-input').fill('E2E Model Account');
@@ -83,6 +99,7 @@ test.describe('settings modules and model guard', () => {
       .map((entry) => entry.entryId)
       .sort();
     await openSettingsTab(orkas.page, 'credentials');
+    await openAddModelDialog(orkas.page);
     await orkas.page.locator('#settings-picker-provider .ai-select-trigger').click();
     const popover = orkas.page.locator('.ai-select-popover:visible');
     await popover.locator('.ai-select-item', { hasText: 'Custom' }).click();
@@ -91,6 +108,7 @@ test.describe('settings modules and model guard', () => {
 
     const modal = orkas.page.locator('#add-account-modal');
     await expect(modal).toHaveClass(/\bopen\b/);
+    await expect(orkas.page.locator('#settings-add-modal')).not.toHaveClass(/\bopen\b/);
     await expect(modal.locator('.custom-key-input')).toHaveAttribute('type', 'password');
     await modal.locator('.custom-label-input').fill('E2E Private Gateway');
     await modal.locator('.custom-base-url-input').fill(

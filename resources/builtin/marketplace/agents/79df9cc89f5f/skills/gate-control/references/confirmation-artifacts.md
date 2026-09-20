@@ -22,12 +22,9 @@ bounces the reply.
 
 ## Direction and preview
 
-Direction comes before any plan file. Route the request, resolve locked brief
-facts, then show two or three genuinely different concepts for the same brief:
-one-line name and description each, locked production line/aspect/duration/video
-language/audio mode/supplied-asset usage/cost note, and one question. Write no
-copy, narration, manifest, or art direction yet. A brief that already specifies
-the video still stops here with one concept.
+The direction artifact is defined by
+[video-router's direction confirmation](../../video-router/SKILL.md#direction-confirmation).
+Use that contract before entering the production plan.
 
 The keyframe preview is the stop between capture and rendering/assembly. When a
 standalone composition's full snapshot set exists, or an assembled production
@@ -68,14 +65,15 @@ text as the user's decision.
 
 | Gate | Required review artifact | Evidence gate | Approved transition |
 | --- | --- | --- | --- |
-| Direction | two or three concepts plus locked facts; no plan file | `direction_decision` | write plan from the chosen concept |
+| Direction | video-router's direction confirmation | `direction_decision` | write plan from the chosen concept |
 | Production plan | locked direction summary plus COMPOSE manifest/narrator or production EDL; an unapproved EDL's native `plan_summary` is presented verbatim once | `gate_b_decision` | composition -> `composition.approve_plan`; production -> `production.approve_plan` |
 | Paid generation | exact billable segment count plus current credit/billing evidence | `gate_c_decision` | `production.approve_generation` before provider call |
 | COMPOSE narration retry | current visual candidate, uncertain prior request, and exactly one proposed new request | `narration_retry_decision` | one fresh `composition.materialize_narration` transaction |
 | COMPOSE narration timing | complete audio, measured duration/band, visual readiness, and exhausted automatic timing retry | `narration_retry_decision` | one user-authorized synthesis or duration waiver using complete audio |
 | Final video | draft plus QA headline plus the draft result's `delivery_options` | `gate_d_decision` | composition -> `composition.approve_draft`; production -> `production.status` delivery check |
 
-At the final-video stop, show both `delivery_options` with their
+The QA headline is one readiness sentence plus any unresolved issue that affects
+viewing or use. At the final-video stop, show both `delivery_options` with their
 `estimated_minutes` so the wait is chosen knowingly. A plain confirmation
 exports the high-quality default; picking the faster preview-quality option is
 itself the user's acceptance of the lower quality — pass its exact `call`

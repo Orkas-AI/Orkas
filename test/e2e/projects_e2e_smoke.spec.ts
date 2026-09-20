@@ -3,6 +3,17 @@ import path from 'node:path';
 
 import { expect, test, type OrkasTestApp } from './fixtures/orkas';
 
+
+async function expectProjectFileReady(orkas: OrkasTestApp, projectId: string, fileName: string): Promise<void> {
+  await expect.poll(async () => {
+    const status = await orkas.invoke<{
+      files: Array<{ path: string; status: string; error?: unknown }>;
+    }>('projects.files.status', { projectId, skipReconcile: true });
+    const file = status.files.find((item) => item.path === fileName);
+    return { status: file?.status, error: file?.error || null };
+  }, { timeout: 40_000 }).toEqual({ status: 'ready', error: null });
+}
+
 async function createProject(orkas: OrkasTestApp, name: string): Promise<void> {
   if (!orkas.page) throw new Error('Orkas renderer is unavailable');
   const page = orkas.page;
@@ -146,6 +157,9 @@ test.describe('projects', () => {
     await viewer.locator('[data-action="project-library-viewer-close"]').click();
     await expect(viewer).not.toHaveClass(/\bopen\b/);
 
+    const projects = await orkas.invoke<{ projects: Array<{ project_id: string; name: string }> }>('projects.list');
+    const projectId = projects.projects.find((project) => project.name === projectName)!.project_id;
+    await expectProjectFileReady(orkas, projectId, fileName);
     page = await orkas.relaunch();
     await page.locator('.project-row', {
       has: page.locator('.project-name', { hasText: projectName }),
@@ -284,6 +298,7 @@ test.describe('projects', () => {
     }).toContain(fileName);
     const globalTree = await modelOrkas.invoke<{ tree: unknown }>('contexts.tree');
     expect(JSON.stringify(globalTree.tree)).not.toContain(fileName);
+    await expectProjectFileReady(modelOrkas, projectId!, fileName);
   });
 
   test('injects project context into a self-contained model conversation and keeps its assignment', async ({

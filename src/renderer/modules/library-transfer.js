@@ -8,6 +8,43 @@
     ? createLogger('library-transfer')
     : { warn() {} };
 
+  let confirmingDrafts = false;
+
+  async function confirmUnsaved({ paths, drafts, getActivePath, getController, openFile, isCurrent }) {
+    if (confirmingDrafts || !isCurrent()) return false;
+    const selected = (rel) => paths.some((path) => rel === path || rel.startsWith(path + '/'));
+    const pending = new Set(Array.from(drafts.entries())
+      .filter(([rel, draft]) => selected(rel) && draft.dirty !== false)
+      .map(([rel]) => rel));
+    const activePath = getActivePath();
+    if (activePath && selected(activePath) && getController()?.isDirty()) pending.add(activePath);
+    if (!pending.size) return true;
+    confirmingDrafts = true;
+    try {
+      const save = await uiConfirm({
+        message: t('contexts.transfer.save_changes'),
+        okLabel: t('contexts.switch_save'),
+        cancelLabel: t('contexts.switch_discard'),
+      });
+      if (!isCurrent()) return false;
+      // Keep drafts until the actual operation succeeds. Copy, cancellation,
+      // or a failed move must not discard edits merely because Save was declined.
+      if (!save) return true;
+      for (const rel of pending) {
+        if (!isCurrent()) return false;
+        if (getActivePath() !== rel || !getController()) await openFile(rel);
+        if (!isCurrent() || getActivePath() !== rel || !getController()) return false;
+        if (!await getController().save()) return false;
+      }
+      return isCurrent();
+    } catch (_) {
+      await uiAlert(t('contexts.save_failed'));
+      return false;
+    } finally {
+      confirmingDrafts = false;
+    }
+  }
+
   function _libraryValue(ref) {
     return ref && ref.scope === 'project' ? `project:${ref.projectId || ''}` : 'global';
   }
@@ -382,7 +419,7 @@
     return { close };
   }
 
-  const api = Object.freeze({ open: openLibraryTransfer });
+  const api = Object.freeze({ open: openLibraryTransfer, confirmUnsaved });
   root.LibraryTransfer = api;
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {

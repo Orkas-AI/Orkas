@@ -443,7 +443,9 @@ async function main() {
 
   assertIntegrityMarker(manifest, process.env);
   if (process.env.ORKAS_LOCAL_CLI_CHECK_PERMISSIONS_ONLY === '1') {
-    if (provider === 'lark') checkLarkPermissions(node, npxCli, manifest, process.env);
+    if (provider === 'lark' && !checkLarkPermissions(node, npxCli, manifest, process.env)) {
+      throw new Error('local CLI permission verification unavailable');
+    }
     return;
   }
   // The host's session-start event owns progress; stdout/stderr carry provider output.

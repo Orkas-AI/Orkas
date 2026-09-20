@@ -8,7 +8,7 @@
  * a native fault escapes every JS handler, so in-process a bad chunk/batch/
  * platform build killed every window + in-flight conversation. Out-of-process,
  * a crash only kills the worker: in-flight embeds reject and the next call
- * respawns. Mirrors the isolation `ocr_runtime.ts` already has for its ONNX.
+ * respawns. Each embedding process owns its isolated ONNX session.
  *
  * Public API (`embedTexts` / `embedQuery` / `closeEmbedder`) is unchanged, so
  * every caller (vec_store, kb_indexer, project_library_indexer, rerank/kb

@@ -103,12 +103,16 @@ export async function detectVersionResult(
     let outputBytes = 0;
     let timer: NodeJS.Timeout | null = null;
     const maxOutputBytes = 64 * 1024;
-    const finish = (result: VersionProbeResult) => {
+    const finish = (result: VersionProbeResult, terminate?: NodeJS.Signals) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
       timer = null;
-      resolve(result);
+      // Own cleanup through completion before callers release probe resources
+      // or start another discovery. Mark settled first so close cannot replace
+      // the original timeout/output-limit result while taskkill is running.
+      if (terminate) killProcessTree(child, terminate, { onComplete: () => resolve(result) });
+      else resolve(result);
     };
 
     let stdout = '';
@@ -133,8 +137,7 @@ export async function detectVersionResult(
       const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       outputBytes += data.length;
       if (outputBytes > maxOutputBytes) {
-        killProcessTree(child, 'SIGKILL');
-        finish({ status: 'failed', version: null });
+        finish({ status: 'failed', version: null }, 'SIGKILL');
         return;
       }
       if (target === 'stdout') stdout += data.toString('utf8');
@@ -147,8 +150,7 @@ export async function detectVersionResult(
       // Windows npm CLIs are .cmd -> node process trees. Killing only the
       // command-shell parent leaves the real CLI (and any probe descendants)
       // running after discovery has already returned.
-      killProcessTree(child, 'SIGTERM');
-      finish({ status: 'timeout', version: null });
+      finish({ status: 'timeout', version: null }, 'SIGTERM');
     }, timeoutMs);
     timer.unref?.();
 

@@ -30,32 +30,32 @@ const _localAgentsLog = createLogger('local-agents');
 const CLI_DEFAULTS = {
   claude: {
     name: 'ClaudeCode',
-    description_zh: '代码研发智能体——在本地项目里端到端做软件开发：实现新功能、修复 bug、跨多文件重构、写测试、调试，可长时间自主迭代、直接改文件跑命令；适合"实现一下这个功能"、"把这个 bug 修了"、"重构这个模块"、"给这段代码加测试"；触发词：写代码、开发、实现、修 bug、重构、加功能、写测试、改代码、调试',
-    description_en: "Coding agent for end-to-end software development in your local project — builds features, fixes bugs, refactors across files, writes tests, and debugs autonomously, editing files and running commands directly over long sessions; For: 'implement this feature', 'fix this bug', 'refactor this module', 'add tests for this code'; Triggers: code, develop, implement, fix bug, refactor, add feature, write tests, edit code, debug",
+    description_zh: '在本地项目中实现功能、修复缺陷、跨文件重构、编写测试和调试，通过文件编辑与命令执行交付代码改动及验证结果。',
+    description_en: 'Implements features, fixes bugs, refactors across files, writes tests and debugs in a local project, using file edits and commands to deliver code changes and verification results.',
     isCoding: true,
   },
   codex: {
     name: 'Codex',
-    description_zh: '代码研发智能体——在本地项目里端到端做软件开发：实现新功能、修复 bug、跨多文件重构、按需求/issue 打补丁，可长时间自主迭代、直接改文件跑命令；适合"实现一下这个功能"、"按 issue 描述打个补丁"、"修一下这个 bug"、"重构这块逻辑"；触发词：写代码、开发、实现、修 bug、重构、加功能、补丁、改代码、issue',
-    description_en: "Coding agent for end-to-end software development in your local project — builds features, fixes bugs, refactors across files, and patches against requirements or issues autonomously, editing files and running commands directly over long sessions; For: 'implement this feature', 'patch following this issue', 'fix this bug', 'refactor this logic'; Triggers: code, develop, implement, fix bug, refactor, add feature, patch, edit code, issue",
+    description_zh: '在本地项目中按需求或 issue 实现功能、修复缺陷和跨文件重构，通过文件编辑与命令执行交付代码补丁及验证结果。',
+    description_en: 'Implements requirements or issues, fixes bugs and refactors across files in a local project, using file edits and commands to deliver code patches and verification results.',
     isCoding: true,
   },
   openclaw: {
     name: 'OpenClaw',
-    description_zh: '通用任务智能体——在多家模型/工具间路由,做任务编排与轻量自动化,擅长把不同模型/工具组合起来跑流程；适合"把这几个工具串起来跑一遍"、"用便宜的模型先草稿一版"、"换个模型再答一次比较"；触发词：编排、自动化、多模型、切换、跑流程、串起来、组合',
-    description_en: "General-purpose agent that routes across model/tool providers for task orchestration and lightweight automation, good at chaining different models/tools into a flow; For: 'chain these tools and run the flow', 'draft this with a cheap model first', 'try the same prompt on another model to compare'; Triggers: orchestrate, automate, multi-model, switch model, run flow, chain, compose",
+    description_zh: '组合可用工具执行通用多步任务与轻量自动化流程，汇总各步骤结果，交付所需的任务成果。',
+    description_en: 'Carries out general multi-step tasks and lightweight automation by combining available tools, consolidating their results into the requested deliverable.',
     isCoding: false,
   },
   opencode: {
     name: 'OpenCode',
-    description_zh: '代码研发智能体——在本地项目里做软件开发,支持自选模型(含本地模型),实现功能、修 bug、改文件、跑终端命令,可换模型对比；适合"用本地模型实现这个功能"、"修一下这个 bug"、"换个模型再写一版"、"在终端里跑一下"；触发词：写代码、开发、实现、修 bug、改代码、换模型、本地模型、终端',
-    description_en: "Coding agent for software development in your local project with bring-your-own-model (including local models) — builds features, fixes bugs, edits files, and runs terminal commands, swap models to compare; For: 'implement this feature with a local model', 'fix this bug', 'try another model and rewrite', 'run it in the terminal'; Triggers: code, develop, implement, fix bug, edit code, switch model, local model, terminal",
+    description_zh: '在本地项目中实现功能和修复缺陷，通过文件编辑与终端命令执行交付代码改动及验证结果。',
+    description_en: 'Implements features and fixes bugs in a local project, editing files and running terminal commands to deliver code changes and verification results.',
     isCoding: true,
   },
   hermes: {
     name: 'Hermes',
-    description_zh: '通用任务智能体——通过 ACP 协议跑多步任务、调用工具、按会话粒度续接,擅长按既定流程一步步推进；适合"按这个流程一步步做下来"、"接着上次的会话继续"、"调几个工具配合完成这件事"；触发词：多步、流程、任务、工具调用、会话续接、ACP、协同',
-    description_en: "General-purpose multi-step agent over the ACP protocol with tool use and session-scoped resume, good at walking a defined process step by step; For: 'walk through this process step by step', 'continue from the last session', 'coordinate a few tools to finish this'; Triggers: multi-step, process, task, tool use, resume session, ACP, coordinate",
+    description_zh: '使用可用工具按既定流程推进通用多步任务，汇总各步骤结果，交付所需的任务成果。',
+    description_en: 'Carries out general multi-step tasks by following defined workflows with available tools, consolidating step results into the requested deliverable.',
     isCoding: false,
   },
 };

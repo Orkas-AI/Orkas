@@ -76,11 +76,20 @@ test.describe('video review panel', () => {
     writeFileSync(contactSheet, TINY_PNG);
     writeFileSync(coverFrame, TINY_PNG);
     writeFileSync(frozenSheet, TINY_PNG);
-    writeFileSync(path.join(compositionDir, 'assets', 'narration.mp3'), Buffer.from('e2e-audio'));
-    // The renderer assertion below is about the review surface wiring the
-    // host-provided path into its real media flow. Media decoding belongs to
-    // the chat file viewer suite, so deterministic bytes are sufficient here.
-    writeFileSync(draftPath, Buffer.from('e2e-draft-video'));
+    // The real preview decodes these files, so fixture bytes must be playable.
+    await modelOrkas.electronApp!.evaluate(async (_electron, args) => {
+      const require = (process as any).mainModule.require.bind((process as any).mainModule);
+      const { ffmpeg } = require(args.module).bundledFfmpegPaths();
+      if (!ffmpeg) throw new Error('Bundled FFmpeg is required for the review fixture');
+      const encode = (argv: string[]) => new Promise<void>((resolve, reject) => {
+        require('node:child_process').execFile(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y', ...argv],
+          { windowsHide: true, timeout: 30000 }, (error: Error | null) => error ? reject(error) : resolve());
+      });
+      await encode(['-f', 'lavfi', '-i', 'color=c=blue:s=160x90:r=10:d=4.2',
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-threads', '1', args.video]);
+      await encode(['-f', 'lavfi', '-i', 'sine=frequency=440:duration=4.2', '-c:a', 'libmp3lame', args.audio]);
+    }, { module: path.resolve(__dirname, '../../src/main/util/bundled-runtime.ts'),
+      video: draftPath, audio: path.join(compositionDir, 'assets', 'narration.mp3') });
 
     const stateKey = createHash('sha256')
       .update(`${uid}\0${path.resolve(compositionDir)}`)
@@ -153,6 +162,58 @@ test.describe('video review panel', () => {
     await expect(page.locator('#video-review-toggle')).toBeVisible();
     await page.locator('#video-review-toggle').click();
     await expect(page.locator('#video-review-panel')).toBeVisible();
+    await expect(page.locator('#video-review-toggle')).toHaveClass(/\bis-active\b/);
+    await expect(page.locator('#video-review-toggle')).toHaveAttribute('aria-expanded', 'true');
+    const videoPanel = page.locator('#video-review-panel');
+    const details = page.locator('#conversation-info-panel');
+    await expect(details).toBeHidden();
+    await page.setViewportSize({ width: 1800, height: 900 });
+    await expect.poll(async () => (await videoPanel.boundingBox())!.width).toBe(540);
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await expect.poll(async () => (await videoPanel.boundingBox())!.width).toBe(400);
+    // Mount actual markdown media in the real reply bubble to exercise its
+    // intrinsic width while the user changes the adjacent panel width.
+    const audioPath = path.join(compositionDir, 'assets', 'narration.mp3');
+    const replyBody = page.locator('#chat-history .chat-message.assistant .markdown-body').last();
+    await replyBody.evaluate((el, file) => {
+      el.innerHTML = (window as any).renderMarkdownFull(`[Narration](<${file}>)`);
+    }, audioPath);
+    const audioCard = replyBody.locator('.chat-md-audio-card');
+    const audio = audioCard.locator('audio');
+    await expect(audio).toBeVisible();
+    const fits = () => audioCard.evaluate(el => {
+      const card = el.getBoundingClientRect();
+      const body = el.closest('.markdown-body')!.getBoundingClientRect();
+      const audio = el.querySelector('audio')!.getBoundingClientRect();
+      return card.right <= body.right + 1 && card.width <= body.width + 1 && audio.right <= card.right;
+    });
+    await expect.poll(fits).toBe(true);
+    const beforeWidth = (await audioCard.boundingBox())!.width;
+    const grip = (await page.locator('#video-review-resize').boundingBox())!;
+    await page.mouse.move(grip.x + grip.width / 2, grip.y + 100);
+    await page.mouse.down();
+    await page.mouse.move(grip.x - 150, grip.y + 100);
+    await page.mouse.up();
+    const draggedWidth = (await videoPanel.boundingBox())!.width;
+    expect(draggedWidth).toBeGreaterThan(500);
+    await expect.poll(fits).toBe(true);
+    expect((await audioCard.boundingBox())!.width).toBeLessThan(beforeWidth);
+    await audio.evaluate(async (element: HTMLAudioElement) => { element.muted = true; await element.play(); });
+    await expect.poll(() => audio.evaluate((element: HTMLAudioElement) => element.currentTime)).toBeGreaterThan(0);
+    await audio.evaluate((element: HTMLAudioElement) => element.pause());
+    await page.locator('#conversation-info-toggle').click();
+    await expect(details).toBeVisible();
+    await expect(videoPanel).toBeHidden();
+    await expect(page.locator('#video-review-toggle')).not.toHaveClass(/\bis-active\b/);
+    await expect(page.locator('#video-review-toggle')).toHaveAttribute('aria-expanded', 'false');
+    expect((await details.boundingBox())!.width).toBe(draggedWidth);
+    await page.locator('#video-review-toggle').click();
+    await expect(videoPanel).toBeVisible();
+    await expect(details).toBeHidden();
+    expect((await videoPanel.boundingBox())!.width).toBe(draggedWidth);
+    await expect(page.locator('#video-review-toggle')).toHaveClass(/\bis-active\b/);
+    await expect(page.locator('#conversation-info-toggle')).not.toHaveClass(/\bis-active\b/);
+    await page.screenshot({ path: testInfo.outputPath('audio-and-resizable-video-panel.png') });
     await expect(page.locator('.video-review-comp-name')).toHaveText('A 60-second Orkas product film');
     await expect(page.locator('.video-review-comp-name')).not.toContainText('project/composition');
     await expect(page.locator('.video-review-step')).toHaveCount(4);
@@ -166,10 +227,14 @@ test.describe('video review panel', () => {
     await expect(draftVideo).toHaveCount(1);
     await expect(draftVideo).toHaveAttribute('src', /^chat-media:\/\/local\//);
     await expect(draftVideo).toHaveAttribute('src', /draft\.mp4/);
-    await draftVideo.click();
-    await expect(page.locator('.chat-file-viewer')).toHaveClass(/\bis-open\b/);
-    await expect(page.locator('.chat-file-viewer-video')).toHaveAttribute('src', /draft\.mp4/);
-    await page.locator('.chat-file-viewer-close').click();
+    const videoPreview = await modelOrkas.openPreview(() => draftVideo.click());
+    await expect(videoPreview.locator('.chat-file-viewer')).toHaveClass(/\bis-open\b/);
+    await expect(videoPreview.locator('.chat-file-viewer-video')).toHaveAttribute('src', /draft\.mp4/);
+    const player = videoPreview.locator('.chat-file-viewer-video');
+    await player.evaluate(async (element: HTMLVideoElement) => { element.muted = true; await element.play(); });
+    await expect.poll(() => player.evaluate((element: HTMLVideoElement) => element.currentTime)).toBeGreaterThan(0);
+    expect(await player.evaluate((element: HTMLVideoElement) => element.error)).toBeNull();
+    await modelOrkas.closePreview(videoPreview);
     // Scenes are labelled by position, never by the authoring id (2026-08-06):
     // `cover` / `s2_body` mean nothing to the person watching the video.
     await expect(page.locator('.video-review-scene-id')).toHaveText(/^(Scene|场景|シーン|Cena)\s*1$/);
@@ -189,12 +254,16 @@ test.describe('video review panel', () => {
     // returns to the panel untouched.
     await expect(page.locator('.video-review-sheet-img')).toHaveCount(0);
     await expect(page.locator('.video-review-scene-frame')).toHaveClass(/\bis-expandable\b/);
-    await page.locator('.video-review-scene-frame').click();
-    await expect(page.locator('.chat-lightbox .chat-lightbox-img')).toBeVisible();
-    await expect.poll(async () => page.locator('.chat-lightbox .chat-lightbox-img')
+    const imagePreview = await modelOrkas.openPreview(() => page.locator('.video-review-scene-frame').click());
+    await expect(imagePreview.locator('.chat-lightbox .chat-lightbox-img')).toBeVisible();
+    await expect.poll(async () => imagePreview.locator('.chat-lightbox .chat-lightbox-img')
       .evaluate((el) => (el as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
-    await page.keyboard.press('Escape');
-    await expect(page.locator('.chat-lightbox')).toBeHidden();
+    // Escape destroys this native renderer during keydown, before Playwright
+    // can acknowledge keyup. Only the expected page closure may end the input.
+    await imagePreview.keyboard.press('Escape').catch(error => {
+      if (!imagePreview.isClosed()) throw error;
+    });
+    await expect.poll(() => imagePreview.isClosed()).toBe(true);
     await expect(page.locator('#video-review-panel')).toBeVisible();
 
     // 6. Modification entries prefill the composer and never auto-send.
@@ -225,5 +294,15 @@ test.describe('video review panel', () => {
     await expect(page.locator('#video-review-panel')).not.toContainText('candidate-e2e-older');
 
     await page.screenshot({ path: testInfo.outputPath('video-review-panel.png'), fullPage: false });
+    await page.locator('#video-review-panel-close').click();
+    await expect(videoPanel).toBeHidden();
+    await expect(page.locator('#video-review-toggle')).not.toHaveClass(/\bis-active\b/);
+    await page.locator('#video-review-toggle').click();
+    await expect(page.locator('#video-review-toggle')).toHaveClass(/\bis-active\b/);
+    const nextTask = await modelOrkas.invoke<{ conversation: { conversation_id: string } }>('conversations.create', { title: 'Another task' });
+    await page.evaluate(id => (window as any).setView('conversation', id), nextTask.conversation.conversation_id);
+    await expect(videoPanel).toBeHidden();
+    await expect(page.locator('#video-review-toggle')).not.toHaveClass(/\bis-active\b/);
+    await expect(page.locator('#video-review-toggle')).toHaveAttribute('aria-expanded', 'false');
   });
 });

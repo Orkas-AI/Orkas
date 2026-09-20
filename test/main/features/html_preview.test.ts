@@ -44,10 +44,11 @@ function pageEvidence(width: number, overflow = 0, unreachable = 0, scrollHeight
 
 function fakeRuntime(options: {
   mobileOverflow?: number;
+  ineffectiveTransforms?: string[];
   embedUnreachablePx?: number;
   embedScrollHeight?: number;
   externalRequest?: boolean;
-  consoleError?: string;
+  consoleMessage?: { level: number | string; message: string; modern: boolean };
   downloadCandidate?: boolean;
   downloadObserved?: boolean;
   downloadBytes?: number;
@@ -62,6 +63,8 @@ function fakeRuntime(options: {
   formsSubmitted?: number;
   interactionFailureCount?: number;
   interactionFailures?: string[];
+  interactionWarningCount?: number;
+  interactionWarnings?: string[];
   loadFailure?: boolean;
 } = {}): {
   deps: HtmlPreviewRuntimeDeps;
@@ -98,10 +101,11 @@ function fakeRuntime(options: {
     options: Record<string, any>;
     destroyed = false;
     webContents: any;
+    listeners = new Map<string, Function>();
 
     constructor(windowOptions: Record<string, any>) {
       this.options = windowOptions;
-      const listeners = new Map<string, Function>();
+      const listeners = this.listeners;
       this.webContents = {
         setWindowOpenHandler: () => undefined,
         on: (name: string, listener: Function) => listeners.set(name, listener),
@@ -150,6 +154,8 @@ function fakeRuntime(options: {
                 ?? options.interactionFailures?.length
                 ?? 0,
               failures: options.interactionFailures ?? [],
+              warningCount: options.interactionWarningCount ?? options.interactionWarnings?.length ?? 0,
+              warnings: options.interactionWarnings ?? [],
             };
           }
           {
@@ -158,12 +164,12 @@ function fakeRuntime(options: {
               && Number(windowOptions.height) === ARTIFACT_FRAME.maxHeight;
             return script.startsWith('(async')
               ? true
-              : pageEvidence(
+              : { ...pageEvidence(
                 width,
                 width <= 480 ? options.mobileOverflow ?? 0 : 0,
                 isEmbed ? options.embedUnreachablePx ?? 0 : 0,
                 isEmbed ? options.embedScrollHeight ?? 900 : 900,
-              );
+              ), ...(options.ineffectiveTransforms ? { ineffectiveTransforms: options.ineffectiveTransforms } : {}) };
           }
         },
         capturePage: async () => ({
@@ -187,9 +193,11 @@ function fakeRuntime(options: {
           (decision) => requestDecisions.push({ url: external, cancel: decision.cancel }),
         );
       }
-      if (options.consoleError) {
-        const listener = this.webContents.on && undefined;
-        void listener;
+      if (options.consoleMessage) {
+        const { level, message, modern } = options.consoleMessage;
+        const listener = this.listeners.get('console-message');
+        if (modern) listener?.({ level, message });
+        else listener?.({}, level, message);
       }
     }
 
@@ -245,6 +253,18 @@ function fakeRuntime(options: {
     interactionExecutions,
   };
 }
+
+it.each([
+  [2, false, false], [3, false, true], ['warning', true, false], ['error', true, true],
+] as const)('classifies console level %s (modern=%s) without losing diagnostics', async (level, modern, blocks) => {
+  const runtime = fakeRuntime({ consoleMessage: { level, modern, message: 'Synthetic diagnostic' } });
+  const { evidence } = await renderResponsiveHtmlPreview(path.join(root, 'index.html'), [
+    { name: 'desktop', width: 1280, height: 800 },
+  ], runtime.deps);
+  expect(evidence.ok).toBe(!blocks);
+  expect(evidence.viewports[0].consoleErrors).toEqual(blocks ? ['Synthetic diagnostic'] : []);
+  expect(evidence.warnings).toEqual(blocks ? [] : ['desktop: Synthetic diagnostic']);
+});
 
 const viewports = [
   { name: 'desktop' as const, width: 1440, height: 900 },
@@ -390,6 +410,17 @@ describe('responsive HTML preview renderer', () => {
     );
   });
 
+  it('returns the failing element when a rendered transform cannot apply, even with interactions disabled', async () => {
+    const runtime = fakeRuntime({ ineffectiveTransforms: ['#answer'] });
+    const result = await renderResponsiveHtmlPreview(path.join(root, 'index.html'), [viewports[0]], runtime.deps, { interactions: false });
+    expect(result.evidence.ok).toBe(false);
+    expect(result.evidence.blockers).toEqual([
+      'desktop: CSS transform does not apply to non-replaced inline box: #answer',
+    ]);
+    expect(result.evidence.interactions.performed).toBe(false);
+    expect(runtime.sessionCleanup).toEqual({ cache: true, storage: true });
+  });
+
   it('destroys the window and clears the isolated session after a render failure', async () => {
     const runtime = fakeRuntime({ loadFailure: true });
 
@@ -488,7 +519,7 @@ describe('responsive HTML preview renderer', () => {
     expect(result.evidence.blockers).toContain('1 keyboard traversal check(s) failed');
   });
 
-  it('returns multi-state coverage and blocks a control with no observable outcome', async () => {
+  it.each([false, true])('retains inconclusive coverage without hiding explicit failures (failure=%s)', async (explicitFailure) => {
     const runtime = fakeRuntime({
       controlsExercised: 7,
       stateChangesObserved: 5,
@@ -497,7 +528,8 @@ describe('responsive HTML preview renderer', () => {
       stateTransitionsObserved: 2,
       formsFound: 3,
       formsSubmitted: 3,
-      interactionFailures: ['enabled control produced no observable outcome: Create account'],
+      interactionWarnings: ['enabled control produced no observable outcome: Create account'],
+      interactionFailures: explicitFailure ? ['missing hash target for Help'] : [],
     });
     const result = await renderResponsiveHtmlPreview(
       path.join(root, 'index.html'),
@@ -505,17 +537,20 @@ describe('responsive HTML preview renderer', () => {
       runtime.deps,
     );
 
-    expect(result.evidence.ok).toBe(false);
+    expect(result.evidence.ok).toBe(!explicitFailure);
     expect(result.evidence.interactions).toMatchObject({
       stateControlsFound: 3,
       stateControlsExercised: 3,
       stateTransitionsObserved: 2,
       formsFound: 3,
       formsSubmitted: 3,
+      warningCount: 1,
+      warnings: ['enabled control produced no observable outcome: Create account'],
+      failureCount: explicitFailure ? 1 : 0,
     });
-    expect(result.evidence.blockers).toContain(
-      '1 safe interaction check(s) failed: enabled control produced no observable outcome: Create account',
-    );
+    expect(result.evidence.warnings).toContain('1 interaction check(s) were inconclusive: no observable change. '
+      + 'This does not establish a functional failure; details are in interactions.warnings.');
+    expect(result.evidence.blockers).toEqual(explicitFailure ? ['1 safe interaction check(s) failed: missing hash target for Help'] : []);
   });
 
   it('reports the true interaction failure count with at most ten bounded reasons', async () => {
@@ -526,6 +561,8 @@ describe('responsive HTML preview renderer', () => {
     const runtime = fakeRuntime({
       interactionFailureCount: 14,
       interactionFailures,
+      interactionWarningCount: 17,
+      interactionWarnings: interactionFailures,
     });
     const result = await renderResponsiveHtmlPreview(
       path.join(root, 'index.html'),
@@ -543,6 +580,10 @@ describe('responsive HTML preview renderer', () => {
     expect(blocker).toContain('[case-10]');
     expect(blocker).not.toContain('[case-11]');
     expect(blocker).toContain('(4 more not shown)');
+    expect(result.evidence.interactions.warningCount).toBe(17);
+    expect(result.evidence.interactions.warnings).toHaveLength(10);
+    expect(result.evidence.interactions.warnings!.every(warning => warning.length <= 400)).toBe(true);
+    expect(result.evidence.warnings[0]).toContain('17 interaction check(s) were inconclusive');
   });
 
   /**
@@ -610,16 +651,20 @@ describe('responsive HTML preview renderer', () => {
     expect(result.evidence.warnings.some((item) => item.startsWith('embed:'))).toBe(false);
   });
 
-  it('requires an observable behavior only for interactive artifact smoke', async () => {
+  it('keeps unobserved artifact behavior advisory while requiring an operable control', async () => {
     const staticRuntime = fakeRuntime({ controlsExercised: 1, stateChangesObserved: 0 });
     const staticResult = await renderInteractiveHtmlSmoke(
       path.join(root, 'index.html'),
       staticRuntime.deps,
     );
-    expect(staticResult.evidence.ok).toBe(false);
-    expect(staticResult.evidence.blockers).toContain(
-      'interactive artifact smoke observed no visible state change, artifact submission, or download',
+    expect(staticResult.evidence.ok).toBe(true);
+    expect(staticResult.evidence.blockers).toEqual([]);
+    expect(staticResult.evidence.warnings).toContain(
+      'interactive artifact smoke observed no visible state change, artifact submission, or download; functional behavior remains unverified',
     );
+    const noControls = await renderInteractiveHtmlSmoke(path.join(root, 'index.html'), fakeRuntime({ controlsExercised: 0 }).deps);
+    expect(noControls.evidence.ok).toBe(false);
+    expect(noControls.evidence.blockers).toContain('interactive artifact smoke found no operable control to exercise');
 
     const downloadRuntime = fakeRuntime({
       controlsExercised: 1,

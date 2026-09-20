@@ -1,7 +1,7 @@
 /** Host-owned confirmation gate for one sensitive connector action.
  *
  * Sensitive actions use the account's operation permission mode. Approval
- * modes accept a one-time or task-scoped connector-account decision; trusted
+ * modes accept a one-time, task or application-usage decision; trusted
  * mode executes without a dialog. Connector availability and prohibited actions
  * are separate gates.
  */
@@ -34,9 +34,19 @@ export interface ActionConfirmInfo {
   arguments_preview: string;
   cid: string;
   can_allow_run: boolean;
+  usage_scope?: true;
+}
+
+/** Host-created application instance; never accepted from tool arguments. */
+export interface AppUsageScope {
+  id: string;
+  owner: number;
 }
 
 interface GrantScope {
+  appUsage?: AppUsageScope;
+  risk?: string;
+  sensitiveOperation?: string;
   uid: string;
   cid: string;
   connectorId: string;
@@ -57,7 +67,8 @@ const _pending = new Map<string, Pending>();
 const _taskGrants = new Map<string, GrantScope>();
 
 function grantKey(scope: GrantScope): string {
-  return JSON.stringify([scope.uid, scope.cid, scope.connectorId, scope.accountLabel, scope.accountKey]);
+  return JSON.stringify([scope.uid, scope.cid, scope.connectorId, scope.accountLabel, scope.accountKey,
+    scope.appUsage && [scope.appUsage.id, scope.appUsage.owner, scope.risk, scope.sensitiveOperation]]);
 }
 
 /** Stable host-owned identity, unaffected by token refresh or tool-cache updates.
@@ -68,16 +79,24 @@ export function connectorAccountKey(instance: ConnectorInstance): string {
     instance.oauth_grant?.server_grant_id, instance.connection_parameters]);
 }
 
-let _broadcastOverride: ((channel: string, payload: unknown) => void | boolean) | null = null;
-export function _setBroadcastForTest(fn: ((channel: string, payload: unknown) => void | boolean) | null): void {
+let _broadcastOverride: ((channel: string, payload: unknown, owner?: number) => void | boolean) | null = null;
+export function _setBroadcastForTest(fn: ((channel: string, payload: unknown, owner?: number) => void | boolean) | null): void {
   _broadcastOverride = fn;
 }
 
-function _broadcast(channel: string, payload: unknown): boolean {
+function _broadcast(channel: string, payload: unknown, owner?: number): boolean {
+  if (owner !== undefined) payload = { ...(payload as Record<string, unknown>), usage_scope: true };
   if (_broadcastOverride) {
-    return _broadcastOverride(channel, payload) !== false;
+    return _broadcastOverride(channel, payload, owner) !== false;
   }
   try {
+    if (owner !== undefined) {
+      const { webContents } = require('electron') as typeof import('electron');
+      const target = webContents.fromId(owner);
+      if (!target || target.isDestroyed()) return false;
+      target.send(channel, payload);
+      return true;
+    }
     // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
     const ipc = require('../../ipc') as { broadcastToRenderer?: (name: string, value: unknown) => boolean };
     if (!ipc.broadcastToRenderer) return false;
@@ -144,6 +163,7 @@ export async function requestActionConfirm(opts: {
   userId?: string;
   onWaiting?: (elapsedMs: number) => void;
   cid?: string;
+  appUsage?: AppUsageScope;
   connectorId: string;
   displayName: string;
   accountLabel?: string;
@@ -159,10 +179,11 @@ export async function requestActionConfirm(opts: {
   if (uid !== getActiveUserId()) return false;
   if (getLocalExecMode() === 'all_files_auto') return true;
   const scope: GrantScope = {
-    uid, cid: opts.cid || '', connectorId: opts.connectorId, accountLabel: opts.accountLabel || '',
+    uid, cid: opts.appUsage ? '' : opts.cid || '', connectorId: opts.connectorId, accountLabel: opts.accountLabel || '',
     accountKey: opts.accountKey || '',
+    ...(opts.appUsage ? { appUsage: opts.appUsage, risk: opts.risk, sensitiveOperation: opts.sensitiveOperation || '' } : {}),
   };
-  if (scope.cid && _taskGrants.has(grantKey(scope))) return true;
+  if ((scope.cid || scope.appUsage) && _taskGrants.has(grantKey(scope))) return true;
   const requestId = crypto.randomBytes(12).toString('hex');
   const info: ActionConfirmInfo = {
     request_id: requestId,
@@ -175,7 +196,8 @@ export async function requestActionConfirm(opts: {
     sensitive_operation: opts.sensitiveOperation || '',
     arguments_preview: previewArguments(opts.args),
     cid: scope.cid,
-    can_allow_run: !!scope.cid,
+    can_allow_run: !!(scope.cid || scope.appUsage),
+    ...(scope.appUsage ? { usage_scope: true as const } : {}),
   };
   return new Promise<boolean>((resolve) => {
     const timer = setTimeout(() => {
@@ -184,20 +206,20 @@ export async function requestActionConfirm(opts: {
         connector_id: opts.connectorId,
         tool: opts.toolName,
       });
-      _broadcast('connectors:action-confirm-cancelled', { request_ids: [requestId], cid: info.cid });
+      _broadcast('connectors:action-confirm-cancelled', { request_ids: [requestId], cid: info.cid }, scope.appUsage?.owner);
     }, RESPONSE_TIMEOUT_MS);
     timer.unref?.();
     const pending: Pending = { ...scope, resolve, timer };
     if (opts.signal) {
       const abort = () => {
         if (!_settle(requestId, false)) return;
-        _broadcast('connectors:action-confirm-cancelled', { request_ids: [requestId], cid: info.cid });
+        _broadcast('connectors:action-confirm-cancelled', { request_ids: [requestId], cid: info.cid }, scope.appUsage?.owner);
       };
       opts.signal.addEventListener('abort', abort, { once: true });
       pending.removeAbortListener = () => opts.signal?.removeEventListener('abort', abort);
     }
     _pending.set(requestId, pending);
-    if (!_broadcast('connectors:action-confirm', info)) {
+    if (!_broadcast('connectors:action-confirm', info, scope.appUsage?.owner)) {
       log.warn('no renderer available for sensitive connector confirmation', {
         connector_id: opts.connectorId,
         tool: opts.toolName,
@@ -219,15 +241,16 @@ export async function requestActionConfirm(opts: {
   });
 }
 
-export function respond(requestId: string, approved: boolean, scope: 'once' | 'task' = 'once'): boolean {
+export function respond(requestId: string, approved: boolean, scope: 'once' | 'task' | 'usage' = 'once', owner?: number): boolean {
   const pending = _pending.get(requestId);
-  if (!pending || pending.uid !== getActiveUserId()) return false;
+  if (!pending || pending.uid !== getActiveUserId() || (pending.appUsage && pending.appUsage.owner !== owner)) return false;
   if (!approved || scope === 'once') return _settle(requestId, approved);
-  if (scope !== 'task' || !pending.cid) return false;
+  if (pending.appUsage ? scope !== 'usage' : scope !== 'task' || !pending.cid) return false;
   const key = grantKey(pending);
   _taskGrants.set(key, {
     uid: pending.uid, cid: pending.cid, connectorId: pending.connectorId,
     accountLabel: pending.accountLabel, accountKey: pending.accountKey,
+    appUsage: pending.appUsage, risk: pending.risk, sensitiveOperation: pending.sensitiveOperation,
   });
   _settle(requestId, true);
   // Concurrent callers may already be waiting in the renderer queue. Resolve
@@ -239,7 +262,7 @@ export function respond(requestId: string, approved: boolean, scope: 'once' | 't
     _settle(id, true);
   }
   if (requestIds.length) {
-    _broadcast('connectors:action-confirm-cancelled', { request_ids: requestIds, cid: pending.cid, approved: true });
+    _broadcast('connectors:action-confirm-cancelled', { request_ids: requestIds, cid: pending.cid, approved: true }, pending.appUsage?.owner);
   }
   return true;
 }
@@ -248,19 +271,24 @@ function cancelMatching(matches: (scope: GrantScope) => boolean, context: { cid?
   for (const [key, grant] of _taskGrants) {
     if (matches(grant)) _taskGrants.delete(key);
   }
-  const requestIds: string[] = [];
+  const byOwner = new Map<number | undefined, string[]>();
   for (const [requestId, pending] of _pending) {
     if (!matches(pending)) continue;
-    requestIds.push(requestId);
+    const owner = pending.appUsage?.owner;
+    const ids = byOwner.get(owner) || []; ids.push(requestId); byOwner.set(owner, ids);
     _settle(requestId, false);
   }
-  if (requestIds.length) {
-    _broadcast('connectors:action-confirm-cancelled', { request_ids: requestIds, ...context });
+  for (const [owner, requestIds] of byOwner) {
+    _broadcast('connectors:action-confirm-cancelled', { request_ids: requestIds, ...context }, owner);
   }
 }
 
+export function cancelForApp(uid: string, appUsage: AppUsageScope): void {
+  cancelMatching(scope => scope.uid === uid && scope.appUsage?.id === appUsage.id && scope.appUsage.owner === appUsage.owner);
+}
+
 export function cancelForCid(cid: string): void {
-  cancelMatching((scope) => scope.cid === cid, { cid });
+  cancelMatching((scope) => !scope.appUsage && scope.cid === cid, { cid });
 }
 
 export function cancelForConnector(uid: string, connectorId: string): void {

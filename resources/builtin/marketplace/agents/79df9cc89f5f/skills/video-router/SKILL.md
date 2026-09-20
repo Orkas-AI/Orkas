@@ -43,6 +43,8 @@ A finished video is built from one or more of three orthogonal axes. Decide whic
 - **Compose (B)** — deterministic HTML composition: explainers, kinetic typography, motion graphics, captions / lower-thirds / overlays, data viz, title cards, transitions. Use when the visuals are designed rather than filmed. This is the default for explainer/animation work.
 - **Edit (C)** — intelligent editing of supplied footage: evidence-based selection/cleanup, deterministic cut/join/reframe/captions/audio work, and semantic AI video editing when the user requests a pixel-level change that timeline operations cannot make.
 
+Before selecting a method, read [production-method.md](references/production-method.md). It owns the current-video `is_generation` decision, reference-analysis depth and delivery-check boundary.
+
 ## Decision rules
 
 1. Decide whether supplied video is the **edit target** or only a **production input** before choosing a line:
@@ -75,18 +77,36 @@ AUTO does not abandon the axes — it sequences them through one cross-modal pla
 
 ## Runtime handoff
 
+After route lock, for product listing or sales-creative work, also read [video-craft/references/ecommerce.md](../video-craft/references/ecommerce.md).
+
 For a fully specified one-shot deterministic EDIT, hand off directly to
 `stage-edit`: state the locked EDIT line, skip the direction artifact and plan,
 probe the source, and execute the requested operation. Load `stage-decide` first
 only when content or timing must be located from evidence.
 
-For every other job with the production runtime available, routing ends at the
-direction boundary, not at a production plan. For a Chinese UI, use the exact
-gate-control title `制作方向确认` (never `创意方向确认`) and show only two or three
-direction concepts plus the facts already locked by the brief. Do not write a
-manifest, script, narration copy, or art direction before that choice. End the
-direction question with `<plan-interaction status="open" />` — without it the
-runtime reads the stop as an unfinished turn and bounces the reply.
+For every other job with the production runtime available, finish routing with
+the direction confirmation below before loading plan-authoring or design Skills.
+
+### Direction confirmation
+
+Use the localized `gate-control` title: `制作方向确认` for Chinese UI, never
+`创意方向确认`. Preserve the brief's topic, audience, duration, language, aspect,
+and explicit audio/asset preferences; label any defaults as proposed.
+
+- Show two or three genuinely different concepts for that same brief, each with
+  a short name and one-line description. If the brief already specifies the
+  video, show one concept.
+- Summarize the production line, aspect, duration, video language, intended audio
+  mode and supplied-asset usage. With no supplied assets, say so.
+- Include a short assets-and-cost line: proposed visual and music sources,
+  known costs or costs still to be established in the plan, and which later
+  operations need authorization under `gate-control`. Make that boundary visible
+  to the user; choosing a direction only authorizes planning. Distinguish intended
+  sources from verified rights and estimated costs from actual quotes; do not
+  invent licenses, prices, or produced media.
+- Ask one concise question to choose or revise the direction, append
+  `<plan-interaction status="open" />`, and end the turn. Do not write a manifest,
+  script, narration copy, or art direction before that choice.
 
 ## Boundary / non-goals
 

@@ -154,6 +154,30 @@ export const workerSlots: SemaphoreInterface = new Semaphore(_workerCap);
 
 export type Releaser = MutexInterface.Releaser;
 
+/** Abandon only this wait. async-mutex cannot remove one queued waiter, so a
+ * lease arriving after cancellation is returned without entering the run. */
+export async function acquireWithAbort(
+  acquire: () => Promise<Releaser>,
+  signal: AbortSignal,
+): Promise<Releaser> {
+  signal.throwIfAborted();
+  const pending = acquire();
+  let onAbort!: () => void;
+  const cancelled = new Promise<never>((_, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+  try {
+    return await Promise.race([pending, cancelled]);
+  } catch (err) {
+    void pending.then((release) => release(), () => {});
+    throw err;
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
 /**
  * Acquire a mutex with a timeout. Resolves to the release function,
  * rejects with an Error on timeout.

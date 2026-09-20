@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PersistentSession } from "../src/agent/persistent-session.js";
+import { contextBudget } from "../src/agent/session.js";
 import type { Message, MessageContent } from "../src/shared/types.js";
 
 // Mirrors the constant in persistent-session.ts; kept inline (not exported)
@@ -28,10 +29,204 @@ describe("PersistentSession", () => {
     try { fs.unlinkSync(`${file}.context.json.tmp`); } catch { /* ignore */ }
   });
 
+  it("restores authoring images after checkpoint/restart without restoring them in the next turn", () => {
+    const session = new PersistentSession({ sessionFile: file });
+    session.beginUserTurn([{ type: "text", text: "Create using the reference" }]);
+    session.addAssistantMessage([{ type: "tool_use", id: "prepare", name: "fixture", input: {} }]);
+    session.addToolResult("prepare", "Source @ 1s maps to hero", [{ data: "SOURCE_PIXELS", mediaType: "image/png" }], false, undefined, "active_turn");
+    for (const id of ["read", "list", "author"]) {
+      session.addAssistantMessage([{ type: "tool_use", id, name: "fixture", input: {} }]);
+      session.addToolResult(id, "done");
+    }
+    session.applyActiveCheckpointSummary("Prepare finished; continue authoring", 6);
+    const expected = session.getMessagesForModel();
+    expect(JSON.stringify(expected)).toContain("SOURCE_PIXELS");
+    const restored = new PersistentSession({ sessionFile: file });
+    expect(restored.getMessagesForModel()).toEqual(expected);
+    expect(restored.estimateModelTokens()).toEqual(session.estimateModelTokens());
+    restored.completeActiveTurn();
+    restored.beginUserTurn([{ type: "text", text: "Another task" }]);
+    expect(JSON.stringify(restored.getMessagesForModel())).not.toContain("SOURCE_PIXELS");
+    expect(fs.readFileSync(file, "utf8")).toContain("SOURCE_PIXELS");
+  });
+
+  it("persists the turn-start history allowance across restart without losing original evidence", () => {
+    const session = new PersistentSession({ sessionFile: file });
+    for (let i = 0; i < 7; i++) {
+      session.beginUserTurn([{ type: "text", text: `INPUT_${i} ${"界".repeat(1000)}` }]);
+      session.addAssistantMessage([{ type: "text", text: `ANSWER_${i}` }]);
+      session.completeActiveTurn();
+    }
+    session.beginUserTurn([{ type: "text", text: "CURRENT" }]);
+    session.configureHistoryBudget(24_000, 19_680, 5000);
+    const expected = session.getMessagesForModel();
+    const restored = new PersistentSession({ sessionFile: file });
+    restored.configureHistoryBudget(24_000, 19_680, 18_000);
+    expect(restored.getMessagesForModel()).toEqual(expected);
+    expect(JSON.stringify(expected)).toContain("INPUT_6");
+    expect(JSON.stringify(expected)).not.toContain("INPUT_5");
+    expect(fs.readFileSync(file, "utf8")).toContain("INPUT_0");
+  });
+
+  it("keeps a clipped long historical reply stable across reload while preserving its original bytes", () => {
+    const session = new PersistentSession({ sessionFile: file });
+    const reply = "OLD_REPLY_HEAD " + "界🙂".repeat(25_000) + " LATEST_REPLY_TAIL";
+    session.beginUserTurn([{ type: "text", text: "Inspect the report" }]);
+    session.addAssistantMessage([{ type: "text", text: reply }]);
+    session.completeActiveTurn();
+    session.beginUserTurn([{ type: "text", text: "Continue" }]);
+    session.configureHistoryBudget(24_000, 19_680, 5000);
+    const expected = session.getMessagesForModel();
+    expect(JSON.stringify(expected)).toContain("LATEST_REPLY_TAIL");
+    expect(JSON.stringify(expected)).not.toContain("OLD_REPLY_HEAD");
+    expect(JSON.stringify(expected)).toContain("[Earlier history text omitted]");
+    expect(session.estimateHistoryTokens()).toBeLessThanOrEqual(2936);
+    expect(new PersistentSession({ sessionFile: file }).getMessagesForModel()).toEqual(expected);
+    expect(fs.readFileSync(file, "utf8")).toContain(reply);
+  });
+
+  it("restores the same five-turn window while retaining original older records on disk", () => {
+    const session = new PersistentSession({ sessionFile: file });
+    for (let i = 0; i < 9; i++) {
+      session.beginUserTurn([{ type: "text", text: `ORIGINAL_INPUT_${i}` }]);
+      session.addAssistantMessage([{ type: "text", text: `ORIGINAL_REPLY_${i}` }]);
+      session.completeActiveTurn();
+    }
+    session.beginUserTurn([{ type: "text", text: "ACTIVE_INPUT" }]);
+    const expected = session.getMessagesForModel();
+    const restored = new PersistentSession({ sessionFile: file });
+    expect(restored.getMessagesForModel()).toEqual(expected);
+    const text = JSON.stringify(expected);
+    expect(text).not.toContain("ORIGINAL_INPUT_3");
+    expect(text).toContain("ORIGINAL_INPUT_4");
+    expect(text).toContain("ORIGINAL_REPLY_8");
+    expect(text).toContain("ACTIVE_INPUT");
+    expect(fs.readFileSync(file, "utf8")).toContain("ORIGINAL_INPUT_0");
+    restored.applyEmergencyHistoryFold("legacy", restored.getArchivableHistoryTurns());
+    expect(new PersistentSession({ sessionFile: file }).getMessagesForModel()).toEqual(restored.getMessagesForModel());
+  });
+
+  it("preserves evidence across repeated mixed-size checkpoints and reloads", () => {
+    let session = new PersistentSession({ sessionFile: file });
+    session.beginUserTurn([{ type: "text", text: "Finish the repair using the inspected evidence" }]);
+    const expectedFacts: string[] = [];
+    for (let epoch = 0; epoch < 2; epoch++) {
+      [100_000, 80, 168_000, 800].forEach((size, group) => {
+        const id = `read-${epoch}-${group}`;
+        const fact = `FACT_${epoch}_${group}`;
+        expectedFacts.push(fact);
+        session.addAssistantMessage([{ type: "tool_use", id, name: "read_files", input: {} }]);
+        session.addToolResult(id, `${fact}\n${"x".repeat(size)}`);
+      });
+      const candidate = session.getPendingActiveCheckpoint(contextBudget({
+        usableInputTokens: 141_952, requestCeilingTokens: Math.floor(141_952 * 0.82), fixedOverheadTokens: 18_286,
+      }));
+      expect(candidate).not.toBeNull();
+      // A deterministic summarizer can retain ONLY facts actually supplied by
+      // the runtime, including the previous checkpoint. Never inject the oracle.
+      const suppliedFacts = [...new Set(JSON.stringify(candidate!.messages).match(/FACT_\d+_\d+/g) ?? [])];
+      session.applyActiveCheckpointSummary(`Observed facts: ${suppliedFacts.join(", ")}`, candidate!.checkpointThroughMessageIndex);
+      const beforeReload = session.getMessagesForModel();
+      session = new PersistentSession({ sessionFile: file });
+      expect(session.getMessagesForModel()).toEqual(beforeReload);
+      const restoredView = JSON.stringify(session.getMessagesForModel());
+      for (const fact of expectedFacts) expect(restoredView.includes(fact), `reload lost ${fact}`).toBe(true);
+      expect(session.activeTurnHasUserMessage([{ type: "text", text: "Finish the repair using the inspected evidence" }])).toBe(true);
+    }
+  });
+
+  it("persists a capacity-limited whole-group checkpoint with its newer raw suffix", () => {
+    let session = new PersistentSession({ sessionFile: file });
+    session.beginUserTurn([{ type: "text", text: "Continue from complete observations" }]);
+    for (let i = 0; i < 6; i++) {
+      session.addAssistantMessage([{
+        type: "tool_use", id: `capacity-${i}`, name: "read_files", input: { path: `source-${i}` },
+      }]);
+      session.addToolResult(
+        `capacity-${i}`,
+        `HEAD_${i}\n${"x".repeat(20_000)}\nPERSISTED_MIDDLE_${i}=yes\n${"y".repeat(20_000)}\nTAIL_${i}`,
+      );
+    }
+
+    const candidate = session.selectPendingActiveCheckpoint(undefined, 22_000).candidate!;
+    expect(candidate.capacityLimited).toBe(true);
+    expect(candidate.groups).toHaveLength(2);
+    const supplied = JSON.stringify(candidate.messages).match(/PERSISTED_MIDDLE_\d+=yes/g) ?? [];
+    session.applyActiveCheckpointSummary(
+      `Complete facts: ${supplied.join(", ")}`,
+      candidate.checkpointThroughMessageIndex,
+    );
+
+    const beforeReload = session.getMessagesForModel();
+    session = new PersistentSession({ sessionFile: file });
+    expect(session.getMessagesForModel()).toEqual(beforeReload);
+    const restored = JSON.stringify(session.getMessagesForModel());
+    expect(restored).toContain("PERSISTED_MIDDLE_0=yes");
+    expect(restored).toContain("PERSISTED_MIDDLE_1=yes");
+    expect(restored).toContain("PERSISTED_MIDDLE_2=yes");
+    expect(restored).not.toContain("HEAD_0");
+  });
+
   it("starts empty when backing file does not exist", () => {
     const s = new PersistentSession({ sessionFile: file });
     expect(s.length).toBe(0);
     expect(fs.existsSync(file)).toBe(false);
+  });
+
+  it("reloads an oversized parallel checkpoint without altering its persisted raw evidence", () => {
+    let session = new PersistentSession({ sessionFile: file });
+    session.beginUserTurn([{ type: "text", text: "Compare the parallel sources" }]);
+    const ids = Array.from({ length: 8 }, (_, i) => `parallel-${i}`);
+    session.addAssistantMessage(ids.map(id => ({ type: "tool_use" as const, id, name: "read_files", input: { path: id } })));
+    for (const id of ids) session.addToolResult(id, `HEAD_${id}\n${"x".repeat(100_000)}\nTAIL_${id}`);
+    session.addAssistantMessage([{ type: "tool_use", id: "next", name: "read_files", input: {} }]);
+    session.addToolResult("next", "LATEST_RAW");
+    // Load-time protocol healing coalesces parallel result messages. Establish
+    // that canonical transcript before comparing compaction's storage effects.
+    session = new PersistentSession({ sessionFile: file });
+    const originalTranscript = fs.readFileSync(file, "utf8");
+    const candidate = session.selectPendingActiveCheckpoint(undefined, 150_000).candidate!;
+    expect(candidate).not.toBeNull();
+    // A restart before summary application must still have every original byte.
+    session = new PersistentSession({ sessionFile: file });
+    expect(fs.readFileSync(file, "utf8") === originalTranscript).toBe(true);
+    expect(JSON.stringify(session.getMessagesForModel())).toContain("x".repeat(100_000));
+    const supplied = JSON.stringify(candidate.messages).match(/(?:HEAD|TAIL)_parallel-\d/g) ?? [];
+    expect(new Set(supplied).size).toBe(16);
+    session.applyActiveCheckpointSummary(supplied.join("\n"), candidate.checkpointThroughMessageIndex);
+    const view = session.getMessagesForModel();
+    session = new PersistentSession({ sessionFile: file });
+    expect(session.getMessagesForModel()).toEqual(view);
+    expect(JSON.stringify(view)).not.toContain("x".repeat(100_000));
+    expect(JSON.stringify(view)).toContain("LATEST_RAW");
+    for (const id of ids) expect(JSON.stringify(view)).toContain(`TAIL_${id}`);
+    expect(fs.readFileSync(file, "utf8") === originalTranscript).toBe(true);
+  });
+
+  it("protects the latest tool batch after interrupted execution and reload", () => {
+    let session = new PersistentSession({ sessionFile: file });
+    session.beginUserTurn([{ type: "text", text: "Inspect both sources" }]);
+    session.addAssistantMessage([
+      { type: "tool_use", id: "returned", name: "inspect", input: {} },
+      { type: "tool_use", id: "interrupted", name: "inspect", input: {} },
+    ]);
+    session.addToolResult("returned", `UNREAD_SOURCE\n${"x".repeat(100_000)}`);
+    session = new PersistentSession({ sessionFile: file });
+    expect(session.getPendingActiveCheckpoint()).toBeNull();
+    expect(session.getFoldableActiveProcess()).toBeNull();
+    const results = session.getMessagesForModel().flatMap(m => m.content).filter(c => c.type === "tool_result");
+    expect(results).toEqual(expect.arrayContaining([
+      expect.objectContaining({ toolUseId: "returned", content: `UNREAD_SOURCE\n${"x".repeat(100_000)}` }),
+      expect.objectContaining({ toolUseId: "interrupted", content: INTERRUPTED_TOOL_RESULT }),
+    ]));
+    session.addAssistantMessage([{ type: "tool_use", id: "next", name: "inspect", input: {} }]);
+    session.addToolResult("next", "LATEST_RESULT");
+    const candidate = session.getPendingActiveCheckpoint()!;
+    expect(candidate).not.toBeNull();
+    session.applyActiveCheckpointSummary("Earlier source inspected", candidate.checkpointThroughMessageIndex);
+    session = new PersistentSession({ sessionFile: file });
+    expect(JSON.stringify(session.getMessagesForModel())).toContain("LATEST_RESULT");
+    expect(session.getFoldableActiveProcess()).toBeNull();
   });
 
   it("reloads host observations and native tool images without creating a user turn", () => {
@@ -236,8 +431,8 @@ describe("PersistentSession", () => {
     expect(session.beginUserTurn([{ type: "text", text: "Fix that blocker." }])).toBe(4);
 
     model = JSON.stringify(session.getMessagesForModel());
-    expect(model).toContain("Summary of the first canonical turn");
-    expect(model).not.toContain("Make the video");
+    expect(model).not.toContain("Summary of the first canonical turn");
+    expect(model).toContain("Make the video");
     expect(model).toContain("E_NARRATION_REPAIR_AUTHORIZATION_NOT_PERSISTED");
     expect(model).toContain("Third exact request");
     expect(model).toContain("Fix that blocker.");
@@ -336,7 +531,7 @@ describe("PersistentSession", () => {
     expect(restored.getSerializedContextState()?.summaryThroughTurnId).toBe(10);
   });
 
-  it("persists turn context sidecar without rewriting raw tool history", () => {
+  it.each([false, true])("persists turn context without replaying raw history (experimental sidecar: %s)", (experimentalSidecar) => {
     const s1 = new PersistentSession({ sessionFile: file });
     s1.beginUserTurn([{ type: "text", text: "inspect" }]);
     s1.addAssistantMessage([{ type: "tool_use", id: "call-1", name: "bash", input: { command: "echo hidden" } }]);
@@ -348,6 +543,12 @@ describe("PersistentSession", () => {
     const raw = fs.readFileSync(file, "utf-8");
     expect(raw).toContain("hidden output");
 
+    if (experimentalSidecar) {
+      const context = JSON.parse(fs.readFileSync(`${file}.context.json`, "utf-8"));
+      context.previousTurnToolRecords = ["obsolete experimental process"];
+      fs.writeFileSync(`${file}.context.json`, JSON.stringify(context));
+    }
+
     const s2 = new PersistentSession({ sessionFile: file });
     s2.beginUserTurn([{ type: "text", text: "next" }]);
     const model = JSON.stringify(s2.getMessagesForModel());
@@ -356,6 +557,10 @@ describe("PersistentSession", () => {
     expect(model).toContain("next");
     expect(model).not.toContain("hidden output");
     expect(model).not.toContain("call-1");
+    expect(model).not.toContain("obsolete experimental process");
+    expect(JSON.parse(fs.readFileSync(`${file}.context.json`, "utf-8")))
+      .not.toHaveProperty("previousTurnToolRecords");
+    expect(fs.readFileSync(file, "utf-8")).toContain("hidden output");
   });
 
   it("persists workspace observations immediately in the context sidecar", () => {
@@ -829,8 +1034,8 @@ describe("PersistentSession", () => {
     const s = new PersistentSession({ sessionFile: file });
     const model = JSON.stringify(s.getMessagesForModel());
 
-    expect(model).toContain("older summary");
-    expect(model).toContain("resource.mov");
+    expect(model).not.toContain("older summary");
+    expect(JSON.stringify(s.getSerializedContextState()?.resources)).toContain("resource.mov");
     expect(model).toContain("First task");
     expect(model).toContain("First final answer");
     expect(model).toContain("Current task");
@@ -1241,7 +1446,7 @@ describe("PersistentSession", () => {
       expect(after?.historySummary).toBe("rolling summary");
       expect(after?.resources).toHaveLength(1);
       expect(after?.resources[0].name).toBe("report.mov");
-      expect(JSON.stringify(s.getMessagesForModel())).toContain("rolling summary");
+      expect(JSON.stringify(s.getMessagesForModel())).not.toContain("rolling summary");
     });
 
     it("merges parallel tool_results split across adjacent user messages", () => {
@@ -1365,5 +1570,108 @@ describe("PersistentSession", () => {
       const mtimeAfter = fs.statSync(file).mtimeMs;
       expect(mtimeAfter).toBe(mtimeBefore);
     });
+  });
+});
+
+
+describe("session save recovery", () => {
+  let dir: string;
+  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), "session-recovery-")); vi.useFakeTimers(); });
+  afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); fs.rmSync(dir, { recursive: true, force: true }); });
+
+  it("repairs a partially written row and retains every later message in order", async () => {
+    const file = path.join(dir, "session.jsonl");
+    const session = new PersistentSession({ sessionFile: file });
+    session.addUserMessage("earlier history");
+    const append = fs.appendFileSync;
+    const fault = vi.spyOn(fs, "appendFileSync").mockImplementationOnce((target, data, options) => {
+      append(target, String(data).slice(0, 17), options);
+      throw Object.assign(new Error("private path must not escape"), { code: "ENOSPC" });
+    });
+    session.beginUserTurn([{ type: "text", text: "current request" }]);
+    session.addAssistantMessage([{ type: "text", text: "completed answer" }]);
+    const flush = session.flushPending();
+    await vi.advanceTimersByTimeAsync(200);
+    await flush;
+    expect(session.hasPendingPersistence()).toBe(false);
+    const rows = fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(rows.map(row => row.content[0].text)).toEqual(["earlier history", "current request", "completed answer"]);
+    expect(new PersistentSession({ sessionFile: file }).getMessages()).toEqual(session.getMessages());
+    expect(fault).toHaveBeenCalled();
+  });
+
+  it("retries three times, retains completed evidence, and saves only the newest context on explicit recovery", async () => {
+    const file = path.join(dir, "session.jsonl");
+    const session = new PersistentSession({ sessionFile: file });
+    session.beginUserTurn([{ type: "text", text: "finish the work" }]);
+    fs.mkdirSync(`${file}.context.json.tmp`);
+    const writes = vi.spyOn(fs, "writeFileSync");
+    session.recordCompletedWork({ tool: "test", inputDigest: "a", inputSummary: "a", status: "succeeded", resultSummary: "done", checkpointEpoch: 0 });
+    session.updateExecutionPlan({ steps: [{ step: "verify", status: "completed" }] });
+    const failed = expect(session.flushPending()).rejects.toMatchObject({ code: "SESSION_PERSISTENCE_FAILED" });
+    await vi.advanceTimersByTimeAsync(4_200);
+    await failed;
+    expect(writes).toHaveBeenCalledTimes(4); // initial attempt plus three retries
+    expect(session.getCompletedWorkLedger()).toHaveLength(1);
+    expect(session.hasPendingPersistence()).toBe(true);
+    fs.rmdirSync(`${file}.context.json.tmp`);
+    const repaired = session.flushPending();
+    await vi.advanceTimersByTimeAsync(200);
+    await repaired;
+    const restored = new PersistentSession({ sessionFile: file });
+    expect(restored.getCompletedWorkLedger()).toEqual(session.getCompletedWorkLedger());
+    expect(restored.getExecutionPlan()).toEqual(session.getExecutionPlan());
+  });
+
+  it("cancels backoff promptly without dropping pending data or leaving background retries", async () => {
+    const file = path.join(dir, "session.jsonl");
+    const session = new PersistentSession({ sessionFile: file });
+    fs.mkdirSync(file);
+    const writes = vi.spyOn(fs, "appendFileSync");
+    session.addUserMessage("keep this request");
+    const controller = new AbortController();
+    const aborted = expect(session.flushPending(controller.signal)).rejects.toMatchObject({ code: "ABORT_ERR" });
+    controller.abort();
+    await aborted;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(writes).toHaveBeenCalledTimes(1);
+    expect(session.hasPendingPersistence()).toBe(true);
+    fs.rmdirSync(file);
+    const recovered = session.flushPending();
+    await vi.advanceTimersByTimeAsync(200);
+    await recovered;
+    expect(new PersistentSession({ sessionFile: file }).getMessages()).toEqual(session.getMessages());
+  });
+
+  it("recovers a failed full replacement followed by an append and an explicit clear", async () => {
+    const file = path.join(dir, "session.jsonl");
+    const session = new PersistentSession({ sessionFile: file });
+    session.addUserMessage("old history");
+    vi.spyOn(fs, "renameSync").mockImplementationOnce(() => { throw Object.assign(new Error("rename fault"), { code: "EACCES" }); });
+    session.replaceConversationHistory([{ role: "user", content: [{ type: "text", text: "canonical history" }] }], "canonical");
+    session.beginUserTurn([{ type: "text", text: "next request" }]);
+    const saved = session.flushPending();
+    await vi.advanceTimersByTimeAsync(200);
+    await saved;
+    expect(new PersistentSession({ sessionFile: file }).getMessages()).toEqual(session.getMessages());
+    vi.spyOn(fs, "appendFileSync").mockImplementationOnce(() => { throw Object.assign(new Error("append fault"), { code: "EIO" }); });
+    session.addAssistantMessage([{ type: "text", text: "discard by explicit reset" }]);
+    session.clear();
+    const cleared = session.flushPending();
+    await vi.advanceTimersByTimeAsync(200);
+    await cleared;
+    expect(new PersistentSession({ sessionFile: file }).getMessages()).toEqual([]);
+  });
+
+  it("retains the disk prefix outside the memory window when retrying an append", async () => {
+    const file = path.join(dir, "session.jsonl");
+    const session = new PersistentSession({ sessionFile: file, maxHistoryTurns: 2 });
+    for (let i = 0; i < 10; i++) session.addUserMessage(`history-${i}`);
+    vi.spyOn(fs, "appendFileSync").mockImplementationOnce(() => { throw Object.assign(new Error("fault"), { code: "EIO" }); });
+    session.addUserMessage("new request");
+    const recovered = session.flushPending();
+    await vi.advanceTimersByTimeAsync(200);
+    await recovered;
+    expect(fs.readFileSync(file, "utf8").trim().split("\n")).toHaveLength(11);
   });
 });

@@ -263,6 +263,25 @@ describe('html_preview tool', () => {
     ]);
   });
 
+  it('returns inconclusive observations without a tool error and retains requested screenshots', async () => {
+    const { render, tool, workspace, context } = await buildTool();
+    fs.writeFileSync(path.join(workspace, 'index.html'), '<!doctype html><button aria-pressed="true">Review</button>');
+    const original = render.getMockImplementation()!;
+    render.mockImplementation(async (...args) => {
+      const result = await original(...args);
+      result.evidence.warnings = ['interaction outcome is inconclusive'];
+      result.evidence.interactions.warnings = ['enabled control produced no observable outcome: Review'];
+      result.evidence.interactions.warningCount = 1;
+      return result;
+    });
+    const result = await tool.execute({ path: 'index.html', screenshots: true }, context);
+    expect(result.isError).toBeFalsy();
+    expect(result.images).toHaveLength(1);
+    expect(JSON.parse(result.content)).toMatchObject({ ok: true,
+      warnings: ['interaction outcome is inconclusive'], interactions: { warningCount: 1,
+        warnings: ['enabled control produced no observable outcome: Review'] } });
+  });
+
   it('keeps visual review evidence while explicitly skipping control and form playback', async () => {
     const { render, tool, workspace, context } = await buildTool();
     const entry = path.join(workspace, 'index.html');

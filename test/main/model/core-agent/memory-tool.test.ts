@@ -17,6 +17,54 @@ const enumOf = (tool: ReturnType<typeof createCrossSessionMemoryTool>): string[]
   ((tool.inputSchema as any).properties.target.enum as string[]);
 
 describe('cross_session_memory tool › project tier exposure', () => {
+  it.each([
+    { includeProjectTier: false, projectTierReadOnly: false },
+    { includeProjectTier: true, projectTierReadOnly: false },
+    { includeProjectTier: true, projectTierReadOnly: true },
+  ])('advertises and enforces global read-only access: %j', async (options) => {
+    const h = stubHandler();
+    const tool = createCrossSessionMemoryTool(h, { ...options, globalTiersReadOnly: true });
+    expect(tool.description).toContain('intended scope, not write access');
+    expect(tool.description).toContain('before replying, even without a save request');
+    expect(tool.description).toContain('stable facts, corrections or invalidations for future conversations');
+    expect(tool.description).toContain('User/shared writes belong to Commander');
+    expect(tool.description).toContain('hand back those changes without substituting or duplicating them in another store');
+    expect((tool.inputSchema as any).properties.target.description).toContain('Agent-only reusable lessons');
+    expect(tool.description).toContain('exclude task progress and temporary state');
+    expect(tool.description).not.toContain('<handback');
+    expect(tool.description.length).toBeLessThanOrEqual(480);
+    expect((tool.inputSchema as any).properties.target.description.length).toBeLessThanOrEqual(220);
+    for (const target of ['user', 'shared']) {
+      expect((await tool.execute({ action: 'list', target }, {} as any)).isError).toBe(false);
+      for (const input of [
+        { action: 'add', content: 'new' },
+        { action: 'replace', old_text: 'old', content: 'new' },
+        { action: 'remove', old_text: 'old' },
+      ]) expect((await tool.execute({ ...input, target }, {} as any)).isError).toBe(true);
+    }
+    expect(h.calls).toEqual([{ op: 'list', tier: 'user' }, { op: 'list', tier: 'shared' }]);
+    const writable = options.includeProjectTier && !options.projectTierReadOnly ? ['agent', 'project'] : ['agent'];
+    for (const target of writable) {
+      expect((await tool.execute({ action: 'add', target, content: 'local' }, {} as any)).isError).toBe(false);
+    }
+  });
+
+  it('keeps every global mutation available to Commander', async () => {
+    const h = stubHandler();
+    const tool = createCrossSessionMemoryTool(h, { globalTiersReadOnly: false });
+    for (const target of ['user', 'shared']) {
+      for (const input of [
+        { action: 'add', content: 'new' },
+        { action: 'replace', old_text: 'old', content: 'new' },
+        { action: 'remove', old_text: 'old' },
+      ]) expect((await tool.execute({ ...input, target }, {} as any)).isError).toBe(false);
+    }
+    expect(h.calls).toEqual([
+      { op: 'add', tier: 'user' }, { op: 'replace', tier: 'user' }, { op: 'remove', tier: 'user' },
+      { op: 'add', tier: 'shared' }, { op: 'replace', tier: 'shared' }, { op: 'remove', tier: 'shared' },
+    ]);
+  });
+
   it('non-project sessions expose three stores and keep routing in the target parameter', () => {
     const tool = createCrossSessionMemoryTool(stubHandler());
     const target = (tool.inputSchema as any).properties.target;
@@ -91,5 +139,22 @@ describe('cross_session_memory tool › project tier exposure', () => {
       error: expect.stringMatching(/ambiguous/),
       entries: ['release owner is Alice', 'release cadence is weekly'],
     });
+  });
+});
+
+
+describe('cross_session_memory async persistence', () => {
+  it('awaits the durable result and forwards cancellation to consolidation', async () => {
+    const h = stubHandler();
+    const controller = new AbortController();
+    let finish!: (value: any) => void;
+    h.add = vi.fn(() => new Promise(resolve => { finish = resolve; }));
+    const tool = createCrossSessionMemoryTool(h);
+    const pending = tool.execute({ action: 'add', target: 'agent', content: 'new fact' }, { signal: controller.signal } as any);
+    expect(h.add).toHaveBeenCalledWith('agent', 'new fact', controller.signal);
+    finish({ ok: false, error: 'memory changed during consolidation', entries: ['concurrent fact'], usage: { current: 15, limit: 2000 } });
+    const result = await pending;
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content)).toMatchObject({ ok: false, entries: ['concurrent fact'] });
   });
 });

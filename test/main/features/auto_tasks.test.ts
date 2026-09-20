@@ -26,10 +26,28 @@ const electronRuntime = vi.hoisted(() => ({
   idleState: 'active' as 'active' | 'idle' | 'locked' | 'unknown',
 }));
 
+const automationLogs = vi.hoisted(() => ({ records: [] as unknown[][] }));
+vi.mock('../../../src/main/logger', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../src/main/logger')>();
+  return { ...actual, createLogger(scope: string) {
+    if (scope !== 'auto-tasks') return actual.createLogger(scope);
+    const record = (...args: unknown[]) => { automationLogs.records.push(args); };
+    return { info: record, warn: record, error: record, debug: record };
+  } };
+});
+
 vi.mock('electron', () => ({
+  // Headless scheduler cases have no browser window to bind.
+  BrowserWindow: { getAllWindows: vi.fn(() => []) },
   powerMonitor: {
     getSystemIdleState: vi.fn(() => electronRuntime.idleState),
   },
+}));
+
+// Scheduler cases run without a host window; exercise the supported unbound
+// browser path instead of failing an unrelated Electron module import.
+vi.mock('../../../src/main/features/web_assist', () => ({
+  bindHostStartedWebAssistConversation: () => false,
 }));
 
 import {
@@ -50,8 +68,7 @@ import {
   createTask,
   deleteTask,
   deleteAttachment,
-  applyAutoTaskContainerFromCommander,
-  extractAutoTaskContainers,
+  applyAutoTaskMutation,
   getCurrentDevice,
   getTask,
   isDue,
@@ -144,6 +161,7 @@ async function waitForSchedulerOutcome(
 
 beforeEach(() => {
   stopScheduler();
+  automationLogs.records.length = 0;
   _setDeviceFingerprintForTests(null);
   electronRuntime.idleState = 'active';
   _setMarkRanFailureForTest(null);
@@ -585,38 +603,32 @@ describe('task CRUD normalization', () => {
   });
 });
 
-describe('commander auto-task container', () => {
-  it('extracts and applies create, update, disable, and delete containers', async () => {
-    const createdBlock = [
-      '<auto-task>',
-      '<action>create</action>',
-      '<title>Morning review</title>',
-      '<content>Summarize yesterday and plan today.</content>',
-      '<schedule>{"type":"daily","hour":9,"minute":0}</schedule>',
-      '<recipient>{"kind":"commander"}</recipient>',
-      '</auto-task>',
-    ].join('\n');
-    const createExtract = extractAutoTaskContainers(`done\n${createdBlock}\nvisible`);
-    expect(createExtract.cleanText).toBe('done\n\nvisible');
-    expect(createExtract.containers).toHaveLength(1);
-
-    const created = await applyAutoTaskContainerFromCommander(TEST_UID, createExtract.containers[0]);
+describe('automation mutations', () => {
+  it('applies create, update, disable, and delete through the shared applier', async () => {
+    const created = await applyAutoTaskMutation(TEST_UID, {
+      action: 'create',
+      updates: {
+        title: 'Morning review',
+        content: 'Summarize yesterday and plan today.',
+        schedule: { type: 'daily', hour: 9, minute: 0 },
+        recipient: { kind: 'commander' },
+      } as any,
+    });
     expect(created.ok).toBe(true);
     expect(created.kind).toBe('created');
     expect(created.task?.title).toBe('Morning review');
     expect(created.task?.schedule).toEqual({ type: 'daily', hour: 9, minute: 0 });
 
     const taskId = created.taskId!;
-    const updateExtract = extractAutoTaskContainers([
-      '<auto-task>',
-      '<action>update</action>',
-      `<task_id>${taskId}</task_id>`,
-      '<schedule>{"type":"hourly","interval_hours":6}</schedule>',
-      '<end_condition>{"type":"count","max_runs":10}</end_condition>',
-      '<skill>{"id":"research","name":"Research"}</skill>',
-      '</auto-task>',
-    ].join('\n'));
-    const updated = await applyAutoTaskContainerFromCommander(TEST_UID, updateExtract.containers[0]);
+    const updated = await applyAutoTaskMutation(TEST_UID, {
+      action: 'update',
+      taskId,
+      updates: {
+        schedule: { type: 'hourly', interval_hours: 6 },
+        end_condition: { type: 'count', max_runs: 10 },
+        skill: { id: 'research', name: 'Research' },
+      } as any,
+    });
     expect(updated.ok).toBe(true);
     expect(updated.kind).toBe('updated');
     expect(updated.task?.schedule).toEqual({ type: 'hourly', interval_hours: 6 });
@@ -624,42 +636,31 @@ describe('commander auto-task container', () => {
     expect(updated.task?.scheduled_run_count).toBe(0);
     expect(updated.task?.skill).toEqual({ id: 'research', name: 'Research' });
 
-    const disabled = await applyAutoTaskContainerFromCommander(TEST_UID, {
-      action: 'disable',
-      taskId,
-      updates: {},
-    });
+    const disabled = await applyAutoTaskMutation(TEST_UID, { action: 'disable', taskId, updates: {} });
     expect(disabled.ok).toBe(true);
     expect(disabled.kind).toBe('disabled');
     expect(disabled.task?.enabled).toBe(false);
 
-    const deleted = await applyAutoTaskContainerFromCommander(TEST_UID, {
-      action: 'delete',
-      taskId,
-      updates: {},
-    });
+    const deleted = await applyAutoTaskMutation(TEST_UID, { action: 'delete', taskId, updates: {} });
     expect(deleted.ok).toBe(true);
     expect(deleted.kind).toBe('deleted');
     expect(await getTask(TEST_UID, taskId)).toBeNull();
   });
 
-  it('stages current conversation attachments referenced by a container', async () => {
+  it('stages current conversation attachments named by a mutation', async () => {
     const sourceCid = 'cid_auto_source';
     const sourceDir = chatAttachmentDir(TEST_UID, sourceCid);
     fs.mkdirSync(sourceDir, { recursive: true });
     fs.writeFileSync(path.join(sourceDir, 'brief.md'), 'brief body');
 
-    const extracted = extractAutoTaskContainers([
-      '<auto-task>',
-      '<action>create</action>',
-      '<content>Use the attached brief every morning.</content>',
-      '<schedule>{"type":"daily","hour":8,"minute":0}</schedule>',
-      '<attachments>["brief.md"]</attachments>',
-      '</auto-task>',
-    ].join('\n'));
-    const created = await applyAutoTaskContainerFromCommander(TEST_UID, extracted.containers[0], {
-      sourceAttachmentCid: sourceCid,
-    });
+    const created = await applyAutoTaskMutation(TEST_UID, {
+      action: 'create',
+      updates: {
+        content: 'Use the attached brief every morning.',
+        schedule: { type: 'daily', hour: 8, minute: 0 },
+        attachments: ['brief.md'],
+      } as any,
+    }, { sourceAttachmentCid: sourceCid });
 
     expect(created.ok).toBe(true);
     const taskId = created.taskId!;
@@ -667,15 +668,168 @@ describe('commander auto-task container', () => {
     expect(fs.readFileSync(path.join(autoTaskAttachmentsDir(TEST_UID, taskId), 'brief.md'), 'utf8')).toBe('brief body');
   });
 
-  it('does not extract literal auto-task examples in non-xml code fences or inline mentions', () => {
-    const fenced = 'Format:\n```\n<auto-task><action>delete</action></auto-task>\n```\nreal text';
-    expect(extractAutoTaskContainers(fenced).containers).toEqual([]);
-    const inline = 'Use `<auto-task>` after reading the system skill.';
-    expect(extractAutoTaskContainers(inline).containers).toEqual([]);
+  // Retired 2026-09-13 (review P3-2): the commander's reply used to be parsed
+  // for `<auto-task>` blocks. The module must expose no text parser, so markup
+  // quoted into a reply can no longer mutate automations; `bus.test.ts` pins
+  // the same thing end to end.
+  it('exposes no container text parser at all', async () => {
+    const mod = await import('../../../src/main/features/auto_tasks');
+    expect(Object.keys(mod).filter((name) => /container/i.test(name))).toEqual([]);
+    expect((mod as Record<string, unknown>).extractAutoTaskContainers).toBeUndefined();
+  });
+});
+
+describe('private automation diagnostics', () => {
+  it('persists the chosen file and device without including their names in logs', async () => {
+    const taskId = 'at_56565656';
+    const name = 'Private salary forecast.txt';
+    _setDeviceFingerprintForTests({ id: '00:11:22:33:44:55', name: 'Private client workstation' });
+    expect(await uploadAttachment(TEST_UID, taskId, name, Buffer.from('private bytes'))).toEqual({ ok: true, name });
+    const created = await createTask(TEST_UID, {
+      id: taskId, content: 'Private task instructions', attachments: [name],
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    expect(created.ok && created.task.device_name).toBe('Private client workstation');
+    expect(fs.readFileSync(path.join(autoTaskAttachmentsDir(TEST_UID, taskId), name), 'utf8')).toBe('private bytes');
+    expect(automationLogs.records).toHaveLength(2);
+    const output = JSON.stringify(automationLogs.records);
+    for (const value of [name, 'Private client workstation', 'Private task instructions', 'private bytes']) expect(output).not.toContain(value);
+  });
+
+  it('retains a failed upload and successful retry while keeping filesystem messages out of logs', async () => {
+    const taskId = 'at_56565656';
+    const name = 'Private salary forecast.txt';
+    const target = path.join(autoTaskAttachmentsDir(TEST_UID, taskId), name);
+    const message = `Private filesystem context: ${target}`;
+    const original = nativeFs.writeFileSync;
+    const spy = vi.spyOn(nativeFs, 'writeFileSync').mockImplementation((...args: Parameters<typeof nativeFs.writeFileSync>) => {
+      if (String(args[0]) === target) throw Object.assign(new Error(message), { code: 'EACCES' });
+      return original(...args);
+    });
+    syncBuiltinESMExports();
+    try {
+      expect(await uploadAttachment(TEST_UID, taskId, name, Buffer.from('private bytes'))).toEqual({ ok: false, error: message });
+      expect(fs.existsSync(target)).toBe(false);
+      expect(automationLogs.records).toHaveLength(1);
+      const output = JSON.stringify(automationLogs.records);
+      for (const value of [name, message, 'Private filesystem context', userRoot(TEST_UID)]) expect(output).not.toContain(value);
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    expect(await uploadAttachment(TEST_UID, taskId, name, Buffer.from('private bytes'))).toEqual({ ok: true, name });
+    expect(fs.readFileSync(target, 'utf8')).toBe('private bytes');
   });
 });
 
 describe('attachments', () => {
+  it.each(['file', 'directory'])('scope migration preserves attachments when a destination %s conflicts', async (conflict) => {
+    const projectId = 'p_auto_move';
+    const taskId = 'at_56565656';
+    writeProject(TEST_UID, projectId);
+    expect((await createTask(TEST_UID, {
+      id: taskId, content: 'Keep both original files', project_id: projectId,
+      schedule: { type: 'daily', hour: 9, minute: 0 }, attachments: ['alpha.txt', 'beta.txt'],
+    })).ok).toBe(true);
+    for (const name of ['alpha.txt', 'beta.txt']) await uploadAttachment(TEST_UID, taskId, name, Buffer.from(`original ${name}`));
+    const sourceDir = projectAutoTaskAttachmentsDir(TEST_UID, projectId, taskId);
+    const sourceConfig = fs.readFileSync(projectAutoTaskConfigFile(TEST_UID, projectId, taskId), 'utf8');
+    const targetDir = autoTaskAttachmentsDir(TEST_UID, taskId);
+    fs.mkdirSync(targetDir, { recursive: true });
+    if (conflict === 'file') fs.writeFileSync(path.join(targetDir, 'beta.txt'), 'modified beta.txt');
+    else fs.mkdirSync(path.join(targetDir, 'beta.txt'));
+    let rejected = false;
+    try { await updateTask(TEST_UID, taskId, { project_id: null }); } catch { rejected = true; }
+    expect({ rejected, sourcePresent: fs.existsSync(sourceDir), newConfig: fs.existsSync(autoTaskConfigFile(TEST_UID, taskId)) })
+      .toEqual({ rejected: true, sourcePresent: true, newConfig: false });
+    expect(fs.readFileSync(projectAutoTaskConfigFile(TEST_UID, projectId, taskId), 'utf8')).toBe(sourceConfig);
+    for (const name of ['alpha.txt', 'beta.txt']) expect(fs.readFileSync(path.join(sourceDir, name), 'utf8')).toBe(`original ${name}`);
+    expect(fs.readdirSync(targetDir)).toEqual(['beta.txt']);
+    if (conflict === 'file') expect(fs.readFileSync(path.join(targetDir, 'beta.txt'), 'utf8')).toBe('modified beta.txt');
+    else expect(fs.statSync(path.join(targetDir, 'beta.txt')).isDirectory()).toBe(true);
+    // Resolve only the conflicting draft entry, then retry the exact move.
+    fs.rmSync(path.join(targetDir, 'beta.txt'), { recursive: true });
+    expect((await updateTask(TEST_UID, taskId, { project_id: null })).ok).toBe(true);
+    expect((await getTask(TEST_UID, taskId))?.project_id).toBeUndefined();
+    for (const name of ['alpha.txt', 'beta.txt']) expect(fs.readFileSync(path.join(targetDir, name), 'utf8')).toBe(`original ${name}`);
+    expect(fs.existsSync(sourceDir)).toBe(false);
+  });
+
+  it.each(['copy', 'config', 'activation', 'source-handoff'])(
+    'scope migration preserves both directories after a %s failure and retries', async (phase) => {
+      const projectId = 'p_auto_move';
+      const taskId = 'at_56565656';
+      writeProject(TEST_UID, projectId);
+      expect((await createTask(TEST_UID, {
+        id: taskId, content: 'Preserve on failure', project_id: projectId,
+        schedule: { type: 'daily', hour: 9, minute: 0 }, attachments: ['source.txt'],
+      })).ok).toBe(true);
+      await uploadAttachment(TEST_UID, taskId, 'source.txt', Buffer.from('source bytes'));
+      const sourceConfigPath = projectAutoTaskConfigFile(TEST_UID, projectId, taskId);
+      const sourceRoot = path.dirname(sourceConfigPath);
+      const before = fs.readFileSync(sourceConfigPath, 'utf8');
+      const due = armedDueAtForTest(taskId);
+      const targetRoot = autoTaskDir(TEST_UID, taskId);
+      const targetAttachments = autoTaskAttachmentsDir(TEST_UID, taskId);
+      fs.mkdirSync(targetAttachments, { recursive: true });
+      fs.writeFileSync(path.join(targetAttachments, 'draft.txt'), 'draft bytes');
+      const fault = Object.assign(new Error('injected migration failure'), { code: 'ENOSPC' });
+      const copy = nativeFs.copyFileSync;
+      const renameSync = nativeFs.renameSync;
+      const rename = nativeFs.promises.rename.bind(nativeFs.promises);
+      let injected = false;
+      const copySpy = vi.spyOn(nativeFs, 'copyFileSync').mockImplementation((from, to, mode) => {
+        if (phase === 'copy' && String(from).startsWith(sourceRoot + path.sep)) { injected = true; throw fault; }
+        copy(from, to, mode);
+      });
+      const renameSpy = vi.spyOn(nativeFs.promises, 'rename').mockImplementation(async (from, to) => {
+        const stagedConfig = path.basename(String(to)) === 'config.json' && String(to).includes('.install-');
+        if ((phase === 'config' && stagedConfig) || (phase === 'activation' && String(to) === targetRoot)) {
+          if (!injected) { injected = true; throw fault; }
+        }
+        await rename(from, to);
+      });
+      const sourceSpy = vi.spyOn(nativeFs, 'renameSync').mockImplementation((from, to) => {
+        if (phase === 'source-handoff' && String(from) === sourceRoot) { injected = true; throw fault; }
+        renameSync(from, to);
+      });
+      syncBuiltinESMExports();
+      try {
+        await expect(updateTask(TEST_UID, taskId, { project_id: null })).rejects.toThrow(fault);
+        expect(injected).toBe(true);
+        expect(fs.readFileSync(sourceConfigPath, 'utf8')).toBe(before);
+        expect(fs.readFileSync(path.join(sourceRoot, 'attachments', 'source.txt'), 'utf8')).toBe('source bytes');
+        expect(fs.readdirSync(targetRoot)).toEqual(['attachments']);
+        expect(fs.readdirSync(targetAttachments)).toEqual(['draft.txt']);
+        expect(fs.readFileSync(path.join(targetAttachments, 'draft.txt'), 'utf8')).toBe('draft bytes');
+        expect(armedDueAtForTest(taskId)).toBe(due);
+        expect(autoRuntime.send).not.toHaveBeenCalled();
+      } finally {
+        copySpy.mockRestore(); renameSpy.mockRestore(); sourceSpy.mockRestore(); syncBuiltinESMExports();
+      }
+      expect((await updateTask(TEST_UID, taskId, { project_id: null })).ok).toBe(true);
+      expect(await listTasks(TEST_UID)).toHaveLength(1);
+      expect(fs.existsSync(sourceRoot)).toBe(false);
+      expect(fs.readFileSync(path.join(targetAttachments, 'source.txt'), 'utf8')).toBe('source bytes');
+      expect(fs.readFileSync(path.join(targetAttachments, 'draft.txt'), 'utf8')).toBe('draft bytes');
+    },
+  );
+
+  it('scope migration reuses equal-byte attachments and retains unrelated draft files', async () => {
+    const taskId = 'at_56565656';
+    const projectId = 'p_auto_move';
+    writeProject(TEST_UID, projectId);
+    await createTask(TEST_UID, { id: taskId, project_id: projectId, content: 'Preserve all bytes',
+      schedule: { type: 'daily', hour: 9, minute: 0 }, attachments: ['same.txt'] });
+    await uploadAttachment(TEST_UID, taskId, 'same.txt', Buffer.from('identical bytes'));
+    const target = autoTaskAttachmentsDir(TEST_UID, taskId);
+    fs.mkdirSync(target, { recursive: true });
+    fs.writeFileSync(path.join(target, 'same.txt'), 'identical bytes');
+    fs.writeFileSync(path.join(target, 'draft.txt'), 'unrelated draft');
+    expect((await updateTask(TEST_UID, taskId, { project_id: null })).ok).toBe(true);
+    expect(await listTasks(TEST_UID)).toHaveLength(1);
+    expect(fs.readFileSync(path.join(target, 'same.txt'), 'utf8')).toBe('identical bytes');
+    expect(fs.readFileSync(path.join(target, 'draft.txt'), 'utf8')).toBe('unrelated draft');
+    expect(fs.existsSync(projectAutoTaskConfigFile(TEST_UID, projectId, taskId))).toBe(false);
+  });
+
   it('sanitizes uploaded names, filters non-files, and deletes by sanitized name', async () => {
     const taskId = 'at_55555555';
     expect((await uploadAttachment(TEST_UID, taskId, '.env', Buffer.from('secret'))).ok).toBe(false);

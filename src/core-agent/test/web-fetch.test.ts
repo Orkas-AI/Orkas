@@ -9,6 +9,7 @@ import {
   htmlToText,
   decodeNumericEntity,
   formatWebFetchNetworkFailure,
+  MAX_WEB_FETCH_RESPONSE_BYTES,
   webFetchTool,
 } from "../src/tools/web-fetch.js";
 
@@ -403,10 +404,10 @@ const ARTICLE_BODY = "Higgsfield users reported credit consumption issues. ".rep
 const RENDERED_ARTICLE_HTML =
   `<!doctype html><html><head><title>Higgsfield reviews</title></head><body><article>${ARTICLE_BODY}</article></body></html>`;
 
-function startStaticServer(status: number, body: string, contentType = "text/html"): Promise<{ server: Server; url: string }> {
+function startStaticServer(status: number, body: string, contentType = "text/html", headers: Record<string, string> = {}): Promise<{ server: Server; url: string }> {
   return new Promise((resolve) => {
     const server = createServer((_req, res) => {
-      res.writeHead(status, { "content-type": contentType });
+      res.writeHead(status, { "content-type": contentType, ...headers });
       res.end(body);
     });
     server.listen(0, "127.0.0.1", () => {
@@ -424,6 +425,123 @@ function stopServer(server: Server): Promise<void> {
 describe("web-fetch › blocked and client-rendered responses", () => {
   afterEach(() => {
     configureWebFetchRenderer(null);
+  });
+
+  // SSE filing probe: the requested .pdf returned HTTP 200, text/html,
+  // x-tengine-error: denied by bot, and an obfuscated cookie/reload script.
+  // The server's explicit denial must survive even when its script changes
+  // or contains no human-readable challenge marker.
+  it.each([
+    [200, '<html><script>document.location.reload()</script></html>'],
+    [200, `<html><script>${"/* obfuscated challenge */".repeat(300)}document.location.reload()</script></html>`],
+    [403, ""],
+  ])("recognizes a header-declared bot denial behind HTTP %i (%#)", async (status, body) => {
+    const { server, url } = await startStaticServer(status,
+      body, "text/html",
+      { "x-tengine-error": "denied by bot" });
+    try {
+      const state = {};
+      const result = await webFetchTool.execute({ url }, { state });
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("WAF_OR_BOT_CHECK");
+      const replay = await webFetchTool.execute({ url }, { state });
+      expect(replay.isError).toBe(true);
+      expect(replay.content).toContain("E_WEB_FETCH_NONRETRYABLE_CACHE_HIT");
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("does not let a bot-denial header bypass the response-size failure boundary", async () => {
+    const { server, url } = await startStaticServer(200, "", "text/html", {
+      "x-tengine-error": "denied by bot",
+      "content-length": String(MAX_WEB_FETCH_RESPONSE_BYTES + 1),
+    });
+    let renderCalls = 0;
+    configureWebFetchRenderer(async () => {
+      renderCalls += 1;
+      return { html: RENDERED_ARTICLE_HTML };
+    });
+    try {
+      const result = await webFetchTool.execute({ url }, { state: {} });
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("E_FETCH_RESPONSE_TOO_LARGE");
+      expect(renderCalls).toBe(0);
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("bounds blocked-origin attempts while allowing a readable filing on another source", async () => {
+    const denied = await startStaticServer(200, "<html><script>reload()</script></html>",
+      "text/html", { "x-tengine-error": "denied by bot" });
+    const mirror = await startStaticServer(200,
+      '<html><title>Issuer interim report</title><article><h1>2026 interim report</h1>'
+      + '<p>Unit: CNY. Reporting period: January–June 2026.</p>'
+      + '<table><tr><th>Revenue</th><td>1200000</td></tr>'
+      + '<tr><th>Net profit</th><td>150000</td></tr></table></article></html>');
+    let deniedRequests = 0;
+    denied.server.on("request", () => { deniedRequests += 1; });
+    try {
+      const state = {};
+      for (const suffix of ["?filing=1", "?filing=2"]) {
+        const failed = await webFetchTool.execute({ url: denied.url + suffix }, { state });
+        expect(failed.isError).toBe(true);
+        expect(failed.content).toContain("WAF_OR_BOT_CHECK");
+      }
+      const blocked = await webFetchTool.execute({ url: denied.url + "?filing=3" }, { state });
+      expect(blocked.isError).toBe(true);
+      expect(blocked.content).toContain("E_WEB_FETCH_ORIGIN_AUTH_BLOCKED");
+      expect(deniedRequests).toBe(2);
+      const recovered = await webFetchTool.execute({ url: mirror.url }, { state });
+      expect(recovered.isError).toBeFalsy();
+      expect(recovered.content).toContain(`URL: ${mirror.url}`);
+      expect(recovered.content).toContain("Reporting period: January–June 2026.");
+      expect(recovered.content).toContain("Revenue 1200000");
+      expect(recovered.content).toContain("Net profit 150000");
+    } finally {
+      await stopServer(denied.server);
+      await stopServer(mirror.server);
+    }
+  });
+
+  it.each([{}, { server: "Tengine" }, { "x-tengine-error": "unrelated diagnostic" }])(
+    "does not infer a bot denial from a server brand or an unrelated header: %j", async (headers) => {
+      const { server, url } = await startStaticServer(200, RENDERED_ARTICLE_HTML, "text/html", headers);
+      try {
+        const result = await webFetchTool.execute({ url }, { state: {} });
+        expect(result.isError).toBeFalsy();
+        expect(result.content).toContain(ARTICLE_BODY.trim());
+      } finally {
+        await stopServer(server);
+      }
+    },
+  );
+
+  it.each([true, false])("keeps the existing browser recovery evidence boundary (readable=%s)", async (readable) => {
+    const { server, url } = await startStaticServer(200,
+      '<html><script>document.location.reload()</script></html>', "text/html",
+      { "x-tengine-error": "denied by bot" });
+    let renderCalls = 0;
+    configureWebFetchRenderer(async () => {
+      renderCalls += 1;
+      return { html: readable ? RENDERED_ARTICLE_HTML : jsChallengeShellHtml() };
+    });
+    try {
+      const result = await webFetchTool.execute({ url }, { state: {} });
+      expect(renderCalls).toBe(1);
+      if (readable) {
+        expect(result.isError).toBeFalsy();
+        expect(result.content).toContain(ARTICLE_BODY.trim());
+        expect(result.content).toContain("Retrieved by: browser rendering");
+      } else {
+        expect(result.isError).toBe(true);
+        expect(result.content).toContain("WAF_OR_BOT_CHECK");
+        expect(result.content).not.toContain("Retrieved by: browser rendering");
+      }
+    } finally {
+      await stopServer(server);
+    }
   });
 
   it("names the bot check behind a 403 instead of reporting only the status", async () => {

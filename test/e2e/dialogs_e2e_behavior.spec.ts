@@ -29,6 +29,7 @@ test.describe('shared dialog behavior', () => {
     const questionRows = appPage.locator('#chat-history [data-msg-id="question"], #chat-history [data-msg-id="question-answered"]');
     const send = card.getByRole('button', { name: 'Send answer', exact: true });
     await expect(send).toBeDisabled();
+    await expect(card.getByRole('button', { name: 'Cancel', exact: true })).toBeEnabled();
     await expect(questionRows).toHaveCount(0);
     await expect(appPage.locator('#chat-history')).not.toContainText('需要使用哪份台账？');
     await expect(card.locator('.form-title')).toHaveText('Commander · Question');
@@ -40,6 +41,7 @@ test.describe('shared dialog behavior', () => {
     await input.fill('使用当前 Orkas 项目中的台账');
     await appPage.evaluate(() => (window as any).setLang('zh'));
     await expect(card.getByRole('button', { name: '发送回答', exact: true })).toBeEnabled();
+    await expect(card.getByRole('button', { name: '取消', exact: true })).toBeEnabled();
     await expect(card.locator('.form-title')).toHaveText('Commander · 需要你回答');
     await expect(appPage.locator('#chat-task-board')).toBeVisible();
     await expect(appPage.locator('#chat-attachments .chat-attach-chip')).toHaveCount(6);
@@ -75,6 +77,12 @@ test.describe('shared dialog behavior', () => {
       const answerButton = card.getByRole('button', { name: '发送回答', exact: true });
       await answerButton.scrollIntoViewIfNeeded();
       expect(await answerButton.evaluate((button) => {
+        const rect = button.getBoundingClientRect();
+        return button.contains(document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2));
+      })).toBe(true);
+      const cancelButton = card.getByRole('button', { name: '取消', exact: true });
+      await cancelButton.scrollIntoViewIfNeeded();
+      expect(await cancelButton.evaluate((button) => {
         const rect = button.getBoundingClientRect();
         return button.contains(document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2));
       })).toBe(true);
@@ -329,4 +337,41 @@ test.describe('shared dialog behavior', () => {
     ]);
     await expect(appPage.locator('#e2e-dialog-background')).toBeFocused();
   });
+
+  test('keeps translated cloud-data choices readable and cancellable in a small window', async ({ appPage }, testInfo) => {
+    await appPage.setViewportSize({ width: 760, height: 600 });
+    for (const language of ['es', 'fr', 'ko', 'de', 'ru', 'it']) {
+      await appPage.evaluate(async lang => {
+        const root = window as any;
+        await root.setLang(lang);
+        root.__localizedChoice = 'pending';
+        root.uiChoice({
+          title: root.t('settings.sync.disable_title'),
+          message: root.t('settings.sync.disable_message_with_cloud'),
+          choices: [
+            { id: 'purge', label: root.t('settings.sync.disable_purge_cloud'), style: 'danger' },
+            { id: 'keep', label: root.t('settings.sync.disable_keep_cloud'), style: 'primary' },
+          ],
+        }).then((value: unknown) => { root.__localizedChoice = value; });
+      }, language);
+      const dialog = appPage.getByRole('dialog');
+      await expect(dialog).toBeVisible();
+      await expect(dialog.locator('button')).toHaveCount(3);
+      expect(await dialog.evaluate(host => {
+        const panel = host.getBoundingClientRect();
+        return panel.left >= 0 && panel.right <= innerWidth && panel.top >= 0 && panel.bottom <= innerHeight
+          && [...host.querySelectorAll('button, .ui-dialog-title, .ui-dialog-message')].every(element => {
+            const rect = element.getBoundingClientRect();
+            return rect.left >= panel.left && rect.right <= panel.right
+              && rect.top >= panel.top && rect.bottom <= panel.bottom
+              && element.scrollWidth <= element.clientWidth + 1;
+          });
+      }), language).toBe(true);
+      await dialog.screenshot({ path: testInfo.outputPath(`sync-choice-${language}.png`) });
+      await appPage.keyboard.press('Escape');
+      await expect(dialog).toHaveCount(0);
+      expect(await appPage.evaluate(() => (window as any).__localizedChoice)).toBe(null);
+    }
+  });
+
 });

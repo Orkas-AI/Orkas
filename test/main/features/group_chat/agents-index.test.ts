@@ -73,6 +73,26 @@ async function buildBlock(uid: string): Promise<string> {
 }
 
 describe('agents_index block — header + per-entry shape', () => {
+  it('exposes the complete built-in corpus with each authored description once and no workflows', async () => {
+    const root = path.join(__dirname, '../../../../resources/builtin/marketplace/agents');
+    const agents = fs.readdirSync(root).flatMap((id) => {
+      const file = path.join(root, id, 'agent.json');
+      return fs.existsSync(file) ? [JSON.parse(fs.readFileSync(file, 'utf8'))] : [];
+    });
+    expect(agents).toHaveLength(10);
+    for (const agent of agents) {
+      writeAgent(builtinAgentsDir(), agent.agent_id, agent, { seed_source: 'builtin' });
+    }
+    const block = await buildBlock(TEST_UID);
+    expect(block.match(/^- @/gm)).toHaveLength(agents.length);
+    for (const agent of agents) {
+      expect(block.split(agent.description_en)).toHaveLength(2);
+      expect(block).toContain(`@${agent.name} (Source: builtin, id: ${agent.agent_id})`);
+      expect(block).not.toContain(agent.workflow);
+      expect(block).not.toContain(agent.description_zh);
+    }
+  });
+
   it('header carries Read pattern, resolved ROOT values, and anti-prior warning', async () => {
     writeAgent(customAgentsDir(), 'a1b2c3d4', { name: 'Alpha', description_zh: 'A', description_en: 'A' });
     writeAgent(builtinAgentsDir(), 'e5f6a7b8', { name: 'Beta', description_zh: 'B', description_en: 'B' });
@@ -281,11 +301,28 @@ describe('Commander project-task prompt gating', () => {
     expect(nonProject).not.toContain('## Orchestration continuity');
     expect(project).not.toContain('## Orchestration continuity');
     for (const prompt of [nonProject, project]) {
+      // Both real Commander entry points retain the ordered decision kernel
+      // before runtime facts, including explicit choice and blocking recovery.
+      const routing = prompt.split('## Routing-first algorithm')[1].split('## Creating or editing an agent / skill')[0];
+      const stages = ['### Choose the owner', '### Delegate', '### Sequence and recover'];
+      const positions = stages.map((stage) => routing.indexOf(stage));
+      expect(positions.every((position) => position >= 0)).toBe(true);
+      expect(positions).toEqual([...positions].sort((a, b) => a - b));
+      for (const stage of stages) expect(prompt.split(stage)).toHaveLength(2);
+      expect(routing).toContain('Honor an explicit agent / skill / connector pick');
+      expect(routing).toContain('never silently replace a user-selected Agent');
+      expect(routing).toContain('stop dependent work and wait for orchestration resume');
+      expect(prompt.indexOf(stages[2])).toBeLessThan(prompt.indexOf('## Runtime injection'));
       // Both Commander variants must support useful execution-time prose;
       // neither requires a preamble before the first tool.
       expect(prompt).toContain('one or two sentences when appropriate');
       expect(prompt.match(/These updates are not final replies/g)).toHaveLength(1);
       expect(prompt.indexOf('These updates are not final replies')).toBeLessThan(prompt.indexOf('## Runtime injection'));
+      expect(prompt).toMatch(/tool calls are already known and independent[\s\S]{0,80}together in one response/i);
+      expect(prompt).toMatch(/keep calls sequential[\s\S]{0,100}depends on an earlier result/i);
+      expect(prompt.match(/tool calls are already known and independent/g)).toHaveLength(1);
+      expect(prompt.indexOf('tool calls are already known and independent'))
+        .toBeLessThan(prompt.indexOf('## Runtime injection'));
       expect(prompt.includes('before the first tool call')).toBe(false);
     }
   });

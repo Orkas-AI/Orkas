@@ -256,8 +256,8 @@ export function cloudSessionToolResultsDirFor(uid: string, sessionId: string): s
 }
 
 /** Every cloud-side `<sid>.tool-results` spill dir for this user: main-chat
- *  sessions plus each project's sessions. Consumed by the activation-time
- *  retention sweep (`util/tool-result-cap.ts::sweepExpiredCloudToolResults`). */
+ *  sessions plus each project's sessions. Retained for conversation-scoped
+ *  storage inspection; these files do not expire by age. */
 export function listCloudSessionToolResultsDirs(uid: string): string[] {
   const out: string[] = [];
   const collect = (sessionsDir: string): void => {
@@ -278,6 +278,13 @@ export function listCloudSessionToolResultsDirs(uid: string): string[] {
 export function projectSessionRoots(uid: string, cid: string): string[] {
   const pid = findProjectIdForConversation(uid, cid);
   return pid ? [projectSessionsDir(uid, pid), userSessionsDir(uid)] : [userSessionsDir(uid)];
+}
+
+/** Read-only diagnostic hint. Never scan indexes or mutate layout on a cache miss. */
+export function cachedChatAttachmentDirForConversation(uid: string, cid: string): string | null {
+  const cached = conversationProjectCache.get(uid)?.get(cid);
+  if (!cached || (cached.projectId === null && Date.now() >= cached.expiresAt)) return null;
+  return cached.projectId ? projectChatAttachmentDir(uid, cached.projectId, cid) : chatAttachmentDir(uid, cid);
 }
 
 export function chatAttachmentDirForConversation(uid: string, cid: string, projectHint?: string | null): string {

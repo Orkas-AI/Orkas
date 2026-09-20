@@ -8,6 +8,13 @@ const speechMock = vi.hoisted(() => ({
   estimateNarrationDuration: vi.fn(),
   assessNarrationFit: vi.fn(),
   recordVideoProductionNarrationLine: vi.fn(),
+  listTtsCapabilities: vi.fn(),
+}));
+
+vi.mock('../../../../src/main/features/tts_capabilities', async (original) => ({
+  ...await original<typeof import('../../../../src/main/features/tts_capabilities')>(),
+  getTtsAvailabilityDetails: () => ({ available: true }),
+  listTtsCapabilities: speechMock.listTtsCapabilities,
 }));
 
 vi.mock('../../../../src/main/features/tts', () => ({
@@ -96,6 +103,41 @@ function lastOutputPath(): string {
 }
 
 describe('generate_speech output paths', () => {
+  it('lets an audio Agent discover paged voices without synthesis or host-only voice ids', async () => {
+    speechMock.listTtsCapabilities.mockResolvedValue([{
+      routeRef: 'configured:test', provider: 'doubao', model: 'test', displayName: 'Test speech',
+      catalogStatus: 'complete', supports: { speed: true, formats: ['wav'], languageContract: true },
+      voices: Array.from({ length: 23 }, (_, i) => ({
+        voiceRef: `voice-${i}`, displayName: `Voice ${i}`, providerVoiceId: `private-${i}`,
+        locale: 'zh-CN', nativeLocale: 'zh-CN', supportedLocales: ['zh-CN'], languageConfidence: 'verified',
+        styleTags: [], useCases: [], isDefault: i === 0,
+      })),
+    }]);
+    const tool = await createTool({ agentId: '5f890bd72ac4' });
+    const first = await tool.execute({ action: 'capabilities', language: 'zh-CN' }, {} as any);
+    const data = JSON.parse(String(first.content));
+    expect(data.routes[0]).toMatchObject({ total_voices: 23, next_offset: 20 });
+    expect(data.routes[0].voices).toHaveLength(20);
+    expect(first.content).not.toContain('providerVoiceId');
+    expect(first.content).not.toContain('private-');
+    const second = await tool.execute({ action: 'capabilities', offset: 20, route_ref: 'configured:test', language: 'zh-CN' }, {} as any);
+    expect(JSON.parse(String(second.content)).routes[0]).toMatchObject({ next_offset: null, voices: [{ voiceRef: 'voice-20' }, { voiceRef: 'voice-21' }, { voiceRef: 'voice-22' }] });
+    const foreign = await tool.execute({ action: 'capabilities', route_ref: 'missing' }, {} as any);
+    expect(JSON.parse(String(foreign.content)).routes).toEqual([]);
+    const invalid = await tool.execute({ action: 'capabilities', offset: -1 }, {} as any);
+    expect(invalid.isError).toBe(true);
+    expect(speechMock.generateSpeech).not.toHaveBeenCalled();
+    expect(speechMock.recordVideoProductionNarrationLine).not.toHaveBeenCalled();
+  });
+
+  it('still rejects missing generation fields and unknown actions without billing', async () => {
+    const tool = await createTool({});
+    expect((await tool.execute({}, {} as any)).isError).toBe(true);
+    expect((await tool.execute({ text: 'hello' }, {} as any)).isError).toBe(true);
+    expect((await tool.execute({ action: 'unknown', text: 'hello', output_path: 'test.wav' }, {} as any)).isError).toBe(true);
+    expect(speechMock.generateSpeech).not.toHaveBeenCalled();
+  });
+
   it('forces VideoStudio COMPOSE narration through the production-stage operation', async () => {
     const tool = await createTool({ cid: CID, agentId: '79df9cc89f5f' });
 

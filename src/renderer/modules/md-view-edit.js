@@ -17,7 +17,7 @@
 //   mountMdViewEdit({ bodyEl, actionsEl, source, capabilities?, initialMode?,
 //                     initialContent?, initialDraft?, actionIconOnly?, callbacks? })
 //     → { destroy, refreshContent, getMode, setMode, isDirty,
-//         getDraft, setDraftAsContent, getSource }
+//         getDraft, setDraftAsContent, getSource, save }
 //
 //   source: { kind: 'context',   rel: string }
 //         | { kind: 'workspace', absPath: string, cid?: string }
@@ -178,6 +178,11 @@ function mountMdViewEdit(opts) {
   function isDirty()  { return state.mode === 'edit' && state.draft !== state.content; }
   function getDraft() { return { content: state.draft, isPreview: state.preview }; }
   function getSource() { return state.source; }
+  async function save() {
+    if (state.destroyed || !state.caps.save) return false;
+    await _mveSave(state);
+    return !state.destroyed && state.mode === 'view' && !isDirty();
+  }
   /** Update the controller's source descriptor in place. Used when the
    *  host renamed the underlying file out from under us — `state.draft`
    *  / `state.content` stay intact (rename doesn't change bytes), only
@@ -202,7 +207,7 @@ function mountMdViewEdit(opts) {
     _mveRender(state);
   }
 
-  return { destroy, refreshContent, getMode, setMode, isDirty, getDraft, setDraftAsContent, getSource, setSource };
+  return { destroy, refreshContent, getMode, setMode, isDirty, getDraft, setDraftAsContent, getSource, setSource, save };
 }
 
 function _mveNoopController() {
@@ -215,6 +220,7 @@ function _mveNoopController() {
     getDraft()       { return { content: '', isPreview: false }; },
     setDraftAsContent() {},
     getSource()      { return null; },
+    async save()    { return false; },
     setSource()      {},
   };
 }

@@ -49,6 +49,39 @@ async function backgroundAppWindow(orkas: OrkasTestApp): Promise<void> {
 }
 
 test.describe('task notification navigation', () => {
+  test('keeps background completion unread after embedded content loads', async ({ modelOrkas }) => {
+    if (!modelOrkas.page || !modelOrkas.electronApp) throw new Error('Orkas is unavailable');
+    const page = modelOrkas.page;
+    // Embedded previews must not make the already-loaded task UI unavailable
+    // to Main's terminal channel. Use the real bus and local model fixture;
+    // webContents.send alone would bypass the delivery readiness gate.
+    await page.evaluate(async () => {
+      const frame = document.createElement('iframe');
+      frame.hidden = true;
+      const loaded = new Promise<void>((resolve) => { frame.onload = () => resolve(); });
+      frame.srcdoc = '<p>Embedded preview</p>';
+      document.body.appendChild(frame);
+      await loaded;
+      frame.remove();
+    });
+    modelOrkas.setModelMode('controlled-slow');
+    await page.locator('#new-chat-btn').click();
+    await page.locator('#new-chat-input').fill('Reply through the isolated E2E model.');
+    await page.locator('#new-chat-send-btn').click();
+    await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
+    await expect.poll(() => modelOrkas.modelRequests.length).toBe(1);
+    const cid = await page.locator('#conversation-list .conv-item.active').getAttribute('data-cid');
+    expect(cid).toBeTruthy();
+    await page.locator('#new-chat-btn').click();
+    modelOrkas.releaseControlledModelChunk();
+    modelOrkas.finishControlledModelStream();
+    const row = page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`);
+    await expect(row.locator('.conv-item-unread-dot')).toBeVisible({ timeout: 20_000 });
+    await expect(page.locator('#tasks-unread-dot')).toBeVisible();
+    await row.click();
+    await expect(row.locator('.conv-item-unread-dot')).toHaveCount(0);
+  });
+
   test('renders sidebar-only red unread dots from a background production terminal', async ({ orkas }) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     const page = orkas.page;

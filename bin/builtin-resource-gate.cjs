@@ -19,7 +19,7 @@ const CATEGORY_CODE = /^[a-z][a-z0-9_-]{0,79}$/;
 const INPUT_ID = /^[a-z_][a-z0-9_]{0,31}$/;
 const INPUT_TYPES = new Set(['text', 'textarea', 'select', 'multiselect', 'number', 'boolean', 'file', 'directory']);
 const OUTPUT_FORMATS = new Set(['auto', 'text', 'dashboard', 'artifact']);
-const INPUT_UI_LANGUAGES = new Set(['zh', 'en', 'ja', 'pt']);
+const INPUT_UI_LANGUAGES = new Set(['zh', 'en', 'ja', 'pt', 'es', 'fr', 'ko', 'de', 'ru', 'it']);
 const AVATAR_CATALOG = readJson(
   'avatar catalog',
   path.resolve(__dirname, '..', 'src', 'main', 'data', 'avatars.json'),
@@ -35,9 +35,11 @@ const REQUIRED_BUILTIN_INVENTORY = Object.freeze({
     'agent-creator',
     'package-installer',
     'skill-creator',
+    'web-app-sdk',
   ]),
   marketplace_agents: Object.freeze([
     '173d4235a431',
+    '5f890bd72ac4',
     '78900d8758bc',
     '79df9cc89f5f',
     '7e91cb9ec9e9',

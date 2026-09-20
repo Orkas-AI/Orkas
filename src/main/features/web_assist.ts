@@ -9,6 +9,7 @@
  */
 
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 
 import {
   app,
@@ -16,6 +17,7 @@ import {
   session,
   shell,
   WebContentsView,
+  type NativeImage,
   type Rectangle,
   type Session,
   type WebContents,
@@ -23,6 +25,7 @@ import {
 } from 'electron';
 
 import { userWebAssistProfileDir } from '../paths';
+import { chatAttachmentDirForConversation } from '../util/project-layout';
 import { genId12, safeId } from '../storage';
 import { createLogger } from '../logger';
 import { logErrorRef } from '../util/log-redact';
@@ -41,17 +44,34 @@ import {
   buildWebAssistTextConditionScript,
   sanitizeWebAssistObservation,
   webAssistObserveScript,
+  type WebAssistObserveWindow,
   type WebAssistPageAction,
   type WebAssistStoredElementRef,
 } from './web_assist_page';
+import {
+  clearWebAssistActionGrants,
+  hasWebAssistActionGrant,
+  isGateableWebAssistReason,
+  rememberWebAssistActionGrant,
+  requestWebAssistActionConfirm,
+  webAssistPageOrigin,
+  type WebAssistActionTarget,
+} from './web_assist_confirm';
 
 const log = createLogger('web-assist');
 const MAX_LABEL_LENGTH = 120;
 const MAX_SEARCH_INPUT_LENGTH = 2048;
-const MAX_TABS_PER_CONVERSATION = 10;
+/** Raised from 10 on 2026-09-18. Idle reclamation, not this ceiling, governs
+ *  live renderer count: `reclaimIdleWebAssistPages` closes any tab that is not
+ *  visible and has been idle for ten minutes, so steady-state cost follows
+ *  recent use. Ten was too low for a research session. */
+export const MAX_TABS_PER_CONVERSATION = 30;
 const IDLE_PAGE_TIMEOUT_MS = 10 * 60_000;
 const IDLE_PAGE_SCAN_MS = 30_000;
 const MIN_VIEW_EDGE = 80;
+/** 1280 is the common floor for a site's desktop breakpoint. */
+const DESKTOP_VIEWPORT_WIDTH = 1280;
+const DESKTOP_VIEWPORT_HEIGHT = 800;
 const WEB_ASSIST_ISOLATED_WORLD_ID = 1001;
 const WEB_ASSIST_SEARCH_URL = 'https://www.bing.com/search';
 
@@ -83,6 +103,8 @@ export interface WebAssistTabSnapshot {
   display_url: string;
   /** Full destination for trusted browser chrome only; absent from model results. */
   address_url?: string;
+  /** Pending download consent for trusted task chrome only. */
+  download_request?: { id: string; origin: string; filename: string };
   can_go_back: boolean;
   can_go_forward: boolean;
   conversation_id: string;
@@ -102,7 +124,71 @@ interface WebAssistObservationState {
   pageId: string;
   url: string;
   refs: Map<string, WebAssistStoredElementRef>;
+  hrefs: Set<string>;
 }
+
+/** One model-initiated navigation, kept so an unattended run stays reviewable.
+ *
+ *  This is a record, not a gate. A page that injects instructions cannot read
+ *  the agent's context itself — its own scripts already have the network — so
+ *  the one thing an injection buys is making the *agent* carry that context
+ *  somewhere. Navigation is where that would happen, and gating it was rejected
+ *  on 2026-09-18: research browsing crosses origins constantly, a per-navigation
+ *  dialog cannot be adjudicated, and Orkas has already measured users switching
+ *  a noisy gate off entirely. Recording costs nothing and makes the one thing
+ *  we cannot prevent at least visible. */
+export interface WebAssistNavigationEntry {
+  at: number;
+  tab_id: string;
+  url: string;
+  origin: string;
+  operation: 'open' | 'goto';
+  /** The destination was a link in an observation the model was holding.
+   *  False means the caller composed the URL. Reported, deliberately not
+   *  gated: search URLs and signed URLs are composed too, so the
+   *  false-positive rate has to be measured before it can carry a decision. */
+  from_link: boolean;
+}
+
+const NAVIGATION_LEDGER_LIMIT = 200;
+
+/** Downloads a task may take without asking again, once its origin is allowed. */
+const DOWNLOAD_TASK_FILE_LIMIT = 20;
+const DOWNLOAD_TASK_BYTE_LIMIT = 200 * 1024 * 1024;
+/** Never grantable. Archives are allowed: a zip of CSVs is ordinary data, the
+ *  file only lands in the task's attachments, and nothing here runs it. An
+ *  executable has no such reading. */
+const UNGRANTABLE_DOWNLOAD_EXTENSIONS = new Set([
+  'exe', 'msi', 'bat', 'cmd', 'com', 'scr', 'ps1', 'psm1', 'dll', 'sys',
+  'app', 'pkg', 'dmg', 'deb', 'rpm', 'sh', 'bash', 'zsh', 'jar', 'vbs', 'js', 'lnk',
+]);
+
+/** One download the task attempted. Refusals are kept too: a refusal the user
+ *  never sees is indistinguishable from the page being broken. */
+export interface WebAssistDownloadEntry {
+  at: number;
+  origin: string;
+  filename: string;
+  bytes: number;
+  state: 'downloading' | 'saved' | 'refused' | 'failed';
+  /** Why it was refused, when it was. `needs_origin_grant` is the one a user
+   *  can answer; the others are policy and are not offered. */
+  reason?: 'needs_origin_grant' | 'blocked_type' | 'task_budget';
+}
+
+const downloadLedgers = new Map<string, WebAssistDownloadEntry[]>();
+// Only terminal, task-owned downloads expose these paths to the model. The
+// trusted renderer keeps its existing filename-based attachment actions.
+const downloadPaths = new WeakMap<WebAssistDownloadEntry, string>();
+// Quota outlives the bounded display ledger. Active reservations include both
+// declared size and observed bytes so concurrent transfers share one budget.
+const downloadUsage = new Map<string, {
+  files: number;
+  bytes: number;
+  active: Map<object, () => number>;
+}>();
+const downloadOriginGrants = new Map<string, Set<string>>();
+const navigationLedgers = new Map<string, WebAssistNavigationEntry[]>();
 
 interface WebAssistTabRecord {
   id: string;
@@ -112,6 +198,9 @@ interface WebAssistTabRecord {
   visible: boolean;
   bounds?: Rectangle;
   virtualViewport?: boolean;
+  /** Drawer width the current emulation was computed for. */
+  virtualViewportWidth?: number;
+  virtualViewportHeight?: number;
   lastUsedAt: number;
   activeOperations: number;
   edited: boolean;
@@ -123,6 +212,7 @@ interface WebAssistTabRecord {
   label: string;
   loading: boolean;
   errorCode?: WebAssistSnapshot['error_code'];
+  downloadRequest?: WebAssistTabSnapshot['download_request'];
   controlContext?: WebAssistControlContext;
   assistantAction?: WebAssistSnapshot['assistant_action'];
   observation?: WebAssistObservationState;
@@ -149,6 +239,7 @@ const configuredSessions = new WeakMap<Session, ReturnType<typeof prepareBrowser
 const conversationBindings = new Map<string, WebAssistConversationBinding>();
 const boundSenders = new WeakSet<object>();
 const activeConversationBySender = new WeakMap<object, string>();
+const previewCaptures = new WeakMap<WebContents, Promise<NativeImage>>();
 
 /** Web Assist accepts credential-free HTTP(S) destinations only. */
 export function safeWebAssistUrl(raw: unknown): string | null {
@@ -193,6 +284,171 @@ function safeLabel(raw: unknown): string {
 
 function conversationBindingKey(userId: string, conversationId: string): string {
   return `${userId}\u0000${conversationId}`;
+}
+
+/** Did any observation this task is holding actually show this destination? */
+function wasObservedLink(userId: string, conversationId: string, url: string): boolean {
+  for (const record of records.values()) {
+    for (const tab of record.tabs.values()) {
+      if (tab.conversationId !== conversationId) continue;
+      if (tab.controlContext && tab.controlContext.userId !== userId) continue;
+      for (const href of tab.observation?.hrefs || []) {
+        if (safeWebAssistUrl(href) === url) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function recordModelNavigation(
+  userId: string,
+  conversationId: string,
+  tabId: string,
+  url: string,
+  operation: 'open' | 'goto',
+  fromLink: boolean,
+): void {
+  if (!safeId(userId) || !safeId(conversationId)) return;
+  const key = conversationBindingKey(userId, conversationId);
+  const ledger = navigationLedgers.get(key) || [];
+  ledger.push({
+    at: Date.now(),
+    tab_id: tabId,
+    url,
+    origin: webAssistPageOrigin(url),
+    operation,
+    from_link: fromLink,
+  });
+  // Newest wins; an unbounded ledger would outlive the task it describes.
+  if (ledger.length > NAVIGATION_LEDGER_LIMIT) ledger.splice(0, ledger.length - NAVIGATION_LEDGER_LIMIT);
+  navigationLedgers.set(key, ledger);
+  emitActivity(userId, conversationId);
+}
+
+/** Where this task's browser has been, newest last. Chrome, not model output. */
+export function webAssistNavigations(
+  userId: string,
+  conversationId: string,
+): { ok: true; navigations: WebAssistNavigationEntry[] } {
+  if (!safeId(userId) || !safeId(conversationId)) return { ok: true, navigations: [] };
+  return { ok: true, navigations: [...(navigationLedgers.get(conversationBindingKey(userId, conversationId)) || [])] };
+}
+
+export function forgetWebAssistNavigations(userId: string, conversationId: string): void {
+  navigationLedgers.delete(conversationBindingKey(userId, conversationId));
+}
+
+/** Keep a downloaded name inside the task's own folder and free of surprises. */
+function safeDownloadFilename(raw: string): string {
+  const base = path.basename(String(raw || '').replace(/[\u0000-\u001f\u007f]/g, ''));
+  const cleaned = base.replace(/[\\/:*?"<>|]/g, '_').replace(/^\.+/, '').trim();
+  return cleaned.slice(0, 120) || 'download';
+}
+
+/** Generated downloads have no HTTP request URL. Blob URLs carry their
+ * creator's origin; data URLs belong to the browser-owned page initiating the
+ * download. Never inherit that page's grant for opaque blobs or other schemes. */
+function downloadOrigin(url: string, pageUrl: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === 'blob:') return webAssistPageOrigin(parsed.origin);
+    if (parsed.protocol === 'data:') return webAssistPageOrigin(pageUrl);
+    return webAssistPageOrigin(url);
+  } catch {
+    return '';
+  }
+}
+
+function downloadExtension(filename: string): string {
+  const dot = filename.lastIndexOf('.');
+  return dot > 0 ? filename.slice(dot + 1).toLowerCase() : '';
+}
+
+function recordWebAssistDownload(
+  userId: string,
+  conversationId: string,
+  entry: WebAssistDownloadEntry,
+): WebAssistDownloadEntry {
+  const key = conversationBindingKey(userId, conversationId);
+  const ledger = downloadLedgers.get(key) || [];
+  ledger.push(entry);
+  if (ledger.length > NAVIGATION_LEDGER_LIMIT) {
+    ledger.splice(0, ledger.length - NAVIGATION_LEDGER_LIMIT);
+  }
+  downloadLedgers.set(key, ledger);
+  emitActivity(userId, conversationId);
+  return entry;
+}
+
+function taskDownloadUsage(userId: string, conversationId: string) {
+  const key = conversationBindingKey(userId, conversationId);
+  let usage = downloadUsage.get(key);
+  if (!usage) {
+    usage = { files: 0, bytes: 0, active: new Map() };
+    downloadUsage.set(key, usage);
+  }
+  return usage;
+}
+
+function reservedDownloadBytes(usage: ReturnType<typeof taskDownloadUsage>): number {
+  return usage.bytes + [...usage.active.values()].reduce((sum, read) => sum + read(), 0);
+}
+
+/** Where this task's browser has downloaded from, newest last. */
+export function webAssistDownloads(
+  userId: string,
+  conversationId: string,
+): { ok: true; downloads: WebAssistDownloadEntry[]; allowed_origins: string[] } {
+  if (!safeId(userId) || !safeId(conversationId)) {
+    return { ok: true, downloads: [], allowed_origins: [] };
+  }
+  const key = conversationBindingKey(userId, conversationId);
+  return {
+    ok: true,
+    downloads: [...(downloadLedgers.get(key) || [])],
+    allowed_origins: [...(downloadOriginGrants.get(key) || [])],
+  };
+}
+
+/** The user's answer to a refused download. Deliberately per origin and per
+ *  task, and deliberately granted *outside* the transfer: a download cannot be
+ *  held for a dialog. Measured 2026-09-18 — a 256 KB body reaches
+ *  done/completed before a 1.5 s approval gap elapses even with `pause()`
+ *  reporting true, so the only honest shape is refuse, ask, retry. */
+export function allowWebAssistDownloadOrigin(
+  userId: string,
+  conversationId: string,
+  origin: unknown,
+): { ok: boolean; error?: string; allowed_origins?: string[] } {
+  if (!safeId(userId) || !safeId(conversationId)) {
+    return { ok: false, error: 'The browser task scope is invalid.' };
+  }
+  const normalized = webAssistPageOrigin(String(origin || ''));
+  if (!normalized) return { ok: false, error: 'That is not a page origin.' };
+  const key = conversationBindingKey(userId, conversationId);
+  const grants = downloadOriginGrants.get(key) || new Set<string>();
+  grants.add(normalized);
+  downloadOriginGrants.set(key, grants);
+  for (const record of records.values()) {
+    if (record.ownerUserId !== userId) continue;
+    let changed = false;
+    for (const tab of record.tabs.values()) {
+      if (tab.conversationId !== conversationId || tab.downloadRequest?.origin !== normalized) continue;
+      tab.downloadRequest = undefined;
+      if (tab.errorCode === 'download_blocked') tab.errorCode = undefined;
+      changed = true;
+    }
+    if (changed) emit(record);
+  }
+  emitActivity(userId, conversationId);
+  return { ok: true, allowed_origins: [...grants] };
+}
+
+export function forgetWebAssistDownloads(userId: string, conversationId: string): void {
+  const key = conversationBindingKey(userId, conversationId);
+  downloadLedgers.delete(key);
+  downloadOriginGrants.delete(key);
+  downloadUsage.delete(key);
 }
 
 function displayUrl(raw: unknown): string {
@@ -270,16 +526,108 @@ function configureSession(userId: string, ses: Session): ReturnType<typeof prepa
     // Includes native child windows and subresources, not only loadURL callers.
     void ready.then(ready => callback({ cancel: !ready }));
   });
-  ses.on('will-download', (event, _item, webContents) => {
-    event.preventDefault();
+  // A download cannot be held for an approval dialog. Measured 2026-09-18: a
+  // 2.5 MB streamed body does stay at received=0 under `pause()`, but a 256 KB
+  // body sent in one write reaches done/completed before a 1.5 s gap elapses
+  // even though `isPaused()` reports true — and most documents arrive in one
+  // chunk. So the decision here is synchronous, and a refusal must call
+  // preventDefault *without* setSavePath: setting a path and cancelling later
+  // still leaves a partial file on disk.
+  ses.on('will-download', (event, item, webContents) => {
+    let owner: { record: WebAssistRecord; tab: WebAssistTabRecord } | null = null;
     for (const record of records.values()) {
       for (const tab of record.tabs.values()) {
         if (tab.view?.webContents !== webContents || tab.view.webContents.isDestroyed()) continue;
-        tab.errorCode = 'download_blocked';
-        emit(record);
-        return;
+        owner = { record, tab };
+        break;
       }
+      if (owner) break;
     }
+    if (!owner) { event.preventDefault(); return; }
+    const { record, tab } = owner;
+    const conversationId = tab.conversationId;
+    const origin = downloadOrigin(item.getURL(), webContents.getURL());
+    const filename = safeDownloadFilename(item.getFilename());
+    const declared = Math.max(0, Number(item.getTotalBytes()) || 0);
+
+    const refuse = (reason: WebAssistDownloadEntry['reason']): void => {
+      event.preventDefault();
+      tab.downloadRequest = reason === 'needs_origin_grant'
+        ? { id: genId12(), origin, filename } : undefined;
+      recordWebAssistDownload(userId, conversationId, {
+        at: Date.now(), origin, filename, bytes: declared, state: reason ? 'refused' : 'failed', reason,
+      });
+      tab.errorCode = 'download_blocked';
+      emit(record);
+    };
+
+    // An unknown site cannot be authorized; do not show an empty consent.
+    if (!origin) return refuse(undefined);
+    if (UNGRANTABLE_DOWNLOAD_EXTENSIONS.has(downloadExtension(filename))) return refuse('blocked_type');
+    if (!(downloadOriginGrants.get(conversationBindingKey(userId, conversationId))?.has(origin))) {
+      return refuse('needs_origin_grant');
+    }
+    const usage = taskDownloadUsage(userId, conversationId);
+    const remaining = DOWNLOAD_TASK_BYTE_LIMIT - reservedDownloadBytes(usage);
+    if (usage.files + usage.active.size >= DOWNLOAD_TASK_FILE_LIMIT || declared > remaining) return refuse('task_budget');
+
+    let target = '';
+    try {
+      const dir = chatAttachmentDirForConversation(userId, conversationId);
+      fs.mkdirSync(dir, { recursive: true });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const dot = filename.lastIndexOf('.');
+        const candidate = path.join(dir, attempt === 0 ? filename : dot > 0
+          ? `${filename.slice(0, dot)} (${attempt})${filename.slice(dot)}`
+          : `${filename} (${attempt})`);
+        try {
+          const fd = fs.openSync(candidate, 'wx');
+          target = candidate;
+          fs.closeSync(fd);
+          break;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        }
+      }
+      if (!target) return refuse('task_budget');
+      item.setSavePath(target);
+    } catch (error) {
+      if (target) { try { fs.unlinkSync(target); } catch { /* own reservation only */ } }
+      log.warn('download destination unavailable', { error: logErrorRef(error) });
+      return refuse('task_budget');
+    }
+
+    const received = () => Math.max(0, Number(item.getReceivedBytes()) || 0);
+    usage.active.set(item, () => Math.max(declared, received()));
+    let overBudget = false;
+    const entry = recordWebAssistDownload(userId, conversationId, {
+      at: Date.now(), origin, filename: path.basename(target), bytes: declared, state: 'downloading',
+    });
+    downloadPaths.set(entry, target);
+    // A declared size is the server's claim. Enforce the budget against what
+    // actually arrives, and clean up the partial rather than leaving it.
+    item.on('updated', () => {
+      if (reservedDownloadBytes(usage) <= DOWNLOAD_TASK_BYTE_LIMIT) return;
+      overBudget = true;
+      try { item.cancel(); } catch { /* already finishing; done also checks */ }
+    });
+    item.once('done', (_done, state) => {
+      entry.bytes = received();
+      overBudget ||= reservedDownloadBytes(usage) > DOWNLOAD_TASK_BYTE_LIMIT;
+      usage.active.delete(item);
+      if (state !== 'completed' || overBudget) {
+        entry.state = 'failed';
+        try { fs.unlinkSync(target); } catch { /* best effort */ }
+        tab.errorCode = 'download_blocked';
+      } else {
+        entry.state = 'saved';
+        usage.files += 1;
+        usage.bytes += entry.bytes;
+      }
+      emitActivity(userId, conversationId);
+      emit(record);
+    });
+    emit(record);
   });
   return proxy;
 }
@@ -361,9 +709,26 @@ function rendererSnapshot(record: WebAssistRecord): WebAssistSnapshot {
       const source = record.tabs.get(tab.tab_id)!;
       const contents = source.view?.webContents;
       const rawUrl = contents && !contents.isDestroyed() ? contents.getURL() : source.suspended?.url || '';
-      return { ...tab, address_url: rawUrl === 'about:blank' ? rawUrl : safeWebAssistUrl(rawUrl) || '' };
+      return {
+        ...tab,
+        address_url: rawUrl === 'about:blank' ? rawUrl : safeWebAssistUrl(rawUrl) || '',
+        ...(source.downloadRequest ? { download_request: source.downloadRequest } : {}),
+      };
     }),
   };
+}
+
+/** Invalidate only after the ledger mutation, independently of page-state timing. */
+function emitActivity(userId: string, conversationId: string): void {
+  for (const record of records.values()) {
+    if (record.ownerUserId !== userId || record.owner.isDestroyed() || record.owner.webContents.isDestroyed()) continue;
+    if (![...record.tabs.values()].some(tab => tab.conversationId === conversationId)) continue;
+    try {
+      record.owner.webContents.send('web-assist:activity', { conversation_id: conversationId });
+    } catch (error) {
+      log.warn('activity delivery failed', { error: logErrorRef(error) });
+    }
+  }
 }
 
 function emit(record: WebAssistRecord): void {
@@ -391,6 +756,7 @@ function closeRecord(record: WebAssistRecord, notifyRenderer = false): void {
   if (notifyRenderer) emitClosed(record);
   for (const tab of record.tabs.values()) {
     forgetBrowserTab(record.ownerUserId, tab.conversationId, tab.id);
+    clearWebAssistActionGrants({ tabId: tab.id });
     try { setTabVisible(tab, false); } catch { /* best effort */ }
     try { record.owner.contentView.removeChildView(tab.view); } catch { /* best effort */ }
     try {
@@ -414,12 +780,71 @@ function invalidateObservation(tab: WebAssistTabRecord): void {
 
 function setTabVisible(tab: WebAssistTabRecord, visible: boolean): void {
   if (tab.visible !== visible) tab.lastUsedAt = Date.now();
-  if (visible && tab.virtualViewport && tab.view && !tab.view.webContents.isDestroyed()) {
-    tab.view.webContents.disableDeviceEmulation();
-    tab.virtualViewport = false;
-  }
   tab.visible = visible;
   tab.view?.setVisible(visible);
+}
+
+/** Lay every task page out at desktop width, scaled into whatever room the
+ *  drawer has.
+ *
+ *  The drawer defaults to about 30% of the app window, which is a phone
+ *  viewport, and mobile layouts omit rather than rearrange: tables, bulk
+ *  controls and secondary navigation are absent from the DOM below a
+ *  breakpoint. A person notices a cramped page and widens it; a model sees a
+ *  DOM where the control it needs was never rendered and cannot tell that from
+ *  the control not existing.
+ *
+ *  An earlier version applied this only while a tab was hidden, on the
+ *  reasoning that widening a layout nobody is looking at costs no pixels. That
+ *  was self-defeating: `exposeTaskTabToModel` reveals the tab on every model
+ *  operation in a foreground task, the renderer then lays it out, and the
+ *  layout marked it visible — so the case the emulation was for was exactly
+ *  the case that switched it off. Measured 2026-09-18 at innerWidth=408 with a
+ *  mobile layout, which is the bug.
+ *
+ *  The cost is real and is the user's to manage: at the default width the page
+ *  renders about 2.2x smaller than the mobile layout would. Widening the
+ *  drawer raises the scale directly, and past DESKTOP_VIEWPORT_WIDTH the
+ *  emulation disengages because the viewport is genuinely a desktop one. */
+function applyDesktopViewport(tab: WebAssistTabRecord): void {
+  const contents = tab.view?.webContents;
+  if (!contents || contents.isDestroyed()) return;
+  const width = Math.round(Number(tab.bounds?.width) || 0);
+  const height = Math.round(Number(tab.bounds?.height) || 0);
+  try {
+    if (width >= DESKTOP_VIEWPORT_WIDTH) {
+      // Already desktop. Let the real viewport through rather than emulating
+      // a narrower one on top of it.
+      if (tab.virtualViewport) {
+        contents.disableDeviceEmulation();
+        tab.virtualViewport = false;
+        tab.virtualViewportWidth = 0;
+        tab.virtualViewportHeight = 0;
+      }
+      return;
+    }
+    // A tab with no bounds has never been laid out and nobody is looking at
+    // it; emulate unscaled so its layout is still a desktop one.
+    const scale = width > 0 ? width / DESKTOP_VIEWPORT_WIDTH : 1;
+    const emulatedHeight = height > 0
+      ? Math.round(height / scale)
+      : DESKTOP_VIEWPORT_HEIGHT;
+    if (tab.virtualViewport && tab.virtualViewportWidth === width && tab.virtualViewportHeight === height) return;
+    const size = { width: DESKTOP_VIEWPORT_WIDTH, height: emulatedHeight };
+    contents.enableDeviceEmulation({
+      screenPosition: 'desktop',
+      screenSize: size,
+      viewPosition: { x: 0, y: 0 },
+      viewSize: size,
+      deviceScaleFactor: 0,
+      scale,
+    });
+    tab.virtualViewport = true;
+    tab.virtualViewportWidth = width;
+    tab.virtualViewportHeight = height;
+  } catch (error) {
+    log.warn('desktop viewport emulation failed', { error: logErrorRef(error) });
+  }
 }
 
 // Inspect only structural reload hazards. No field contents leave the page.
@@ -555,6 +980,20 @@ function navigateTabHistory(record: WebAssistRecord, tab: WebAssistTabRecord, ac
   return { ok: true };
 }
 
+/** Drop every binding held by a sender once its window goes away. Registered
+ *  once per sender so repeated binds do not stack listeners. */
+function trackBoundSender(sender: WebContents): void {
+  const senderObject = sender as unknown as object;
+  if (boundSenders.has(senderObject)) return;
+  boundSenders.add(senderObject);
+  const eventSender = sender as WebContents & { once?: (event: string, listener: () => void) => void };
+  eventSender.once?.('destroyed', () => {
+    for (const [bindingKey, binding] of conversationBindings) {
+      if (binding.sender === sender) conversationBindings.delete(bindingKey);
+    }
+  });
+}
+
 /** Bind a renderer-originated conversation turn to its owning app window. */
 export function bindWebAssistConversation(
   userId: string,
@@ -568,17 +1007,120 @@ export function bindWebAssistConversation(
       || sender.isDestroyed()) return false;
   const key = conversationBindingKey(userId, conversationId);
   conversationBindings.set(key, { userId, conversationId, sender });
-  const senderObject = sender as unknown as object;
-  activeConversationBySender.set(senderObject, conversationId);
-  if (!boundSenders.has(senderObject)) {
-    boundSenders.add(senderObject);
-    const eventSender = sender as WebContents & { once?: (event: string, listener: () => void) => void };
-    eventSender.once?.('destroyed', () => {
-      for (const [bindingKey, binding] of conversationBindings) {
-        if (binding.sender === sender) conversationBindings.delete(bindingKey);
-      }
-    });
+  // A renderer send is the user arriving in this conversation, so it also
+  // becomes the foreground task for that window.
+  activeConversationBySender.set(sender as unknown as object, conversationId);
+  trackBoundSender(sender);
+  return true;
+}
+
+/** Windows that actually show the app, in creation order.
+ *
+ *  `BrowserWindow.getAllWindows()` also returns the offscreen hosts that PDF,
+ *  Office, HTML-preview, video and web-fetch rendering create while a turn runs.
+ *  Hosting a task browser in one of those would attach the page to a window the
+ *  user can never see and that is destroyed as soon as its render finishes, so
+ *  match the renderer entry document rather than taking whichever window is
+ *  first. Only the app window is ever loaded from `renderer/index.html`. */
+function liveAppWindows(): BrowserWindow[] {
+  return BrowserWindow.getAllWindows().filter((candidate) => {
+    if (candidate.isDestroyed() || candidate.webContents.isDestroyed()) return false;
+    try {
+      const url = new URL(candidate.webContents.getURL());
+      return url.protocol === 'file:' && url.pathname.endsWith('/renderer/index.html');
+    } catch {
+      return false;
+    }
+  });
+}
+
+/** How the app entry makes a window, for turns that start without one.
+ *
+ *  The browser needs a *restorable* window, not a visible one: every protected
+ *  step — credentials, OTP, upload, CAPTCHA — ends with a human acting in the
+ *  page, so a window that can never be surfaced is not an acceptable host. A
+ *  minimised real window satisfies both halves.
+ *
+ *  Registered by `index.ts`; absent under tests and in builds that strip the
+ *  app entry, where binding fails exactly as it did before. */
+let appWindowFactory: (() => BrowserWindow) | null = null;
+
+export function setAppWindowFactory(factory: (() => BrowserWindow) | null): void {
+  appWindowFactory = factory;
+}
+
+/** Make a window for an unattended turn without taking the user's screen. */
+function createUnattendedAppWindow(): BrowserWindow | null {
+  if (!appWindowFactory) return null;
+  try {
+    const created = appWindowFactory();
+    if (!created || created.isDestroyed()) return null;
+    // Nobody asked to look at this. Minimise rather than claim the foreground;
+    // `surfaceAppWindow` brings it back when the turn actually needs a human.
+    try { if (created.isFocusable() && !created.isMinimized()) created.minimize(); } catch { /* platform */ }
+    return liveAppWindows().includes(created) ? created : null;
+  } catch (error) {
+    log.warn('unattended app window creation failed', { error: logErrorRef(error) });
+    return null;
   }
+}
+
+/** Bring the app window back for a step only a human can complete.
+ *
+ *  No-ops when the window is already on screen. A visible window is somewhere
+ *  the user can already reach, so taking focus from whatever they are doing
+ *  buys nothing; the case worth interrupting for is the unattended one, where
+ *  the window is minimised or was created for this run. */
+export function surfaceAppWindow(): boolean {
+  const win = liveAppWindows()[0];
+  if (!win || !win.isFocusable()) return false;
+  if (win.isVisible() && !win.isMinimized()) return false;
+  try {
+    if (win.isMinimized()) win.restore();
+    if (!win.isVisible()) win.show();
+    win.focus();
+    return true;
+  } catch (error) {
+    log.warn('surfacing the app window failed', { error: logErrorRef(error) });
+    return false;
+  }
+}
+
+/** Give a host-started turn the window its task browser needs.
+ *
+ *  Automation fires and project-driver advances reach `groupChat.send` directly
+ *  instead of through the renderer IPC that binds a conversation, and both
+ *  create the conversation they are about to run — so its id can never have
+ *  been bound by a user send. Without an owner window every `inner_browser`
+ *  operation fails as `window_unavailable`, down to merely listing tabs, and
+ *  the model is told to "open this task in Orkas" for a task nobody opened.
+ *
+ *  Unlike the renderer bind this must NOT claim foreground: the user did not
+ *  navigate here. Leaving `activeConversationBySender` untouched keeps
+ *  `taskIsForeground` false for this conversation, so a tab the turn opens
+ *  stays behind whatever the user is actually watching.
+ *
+ *  Returns false only when the app genuinely has no live window — the one case
+ *  where a browser turn really cannot run. */
+export function bindHostStartedWebAssistConversation(
+  userId: string,
+  conversationId: string,
+): boolean {
+  if (!safeId(userId) || !safeId(conversationId)) return false;
+  // An existing binding is either this same window or the renderer the user is
+  // working in; both outrank an arbitrary pick, so never overwrite one.
+  if (boundSender(userId, conversationId)) return true;
+  // An automation fire or driver advance can land with every window closed —
+  // routine on macOS, where `window-all-closed` deliberately does not quit.
+  // Ensure a window rather than reporting the browser unavailable.
+  const owner = liveAppWindows()[0] || createUnattendedAppWindow();
+  if (!owner) return false;
+  const sender = owner.webContents;
+  conversationBindings.set(
+    conversationBindingKey(userId, conversationId),
+    { userId, conversationId, sender },
+  );
+  trackBoundSender(sender);
   return true;
 }
 
@@ -608,6 +1150,23 @@ function boundSender(userId: string, conversationId: string): WebContents | null
   return binding.sender;
 }
 
+/** Explain an unbound conversation without guessing at the cause.
+ *
+ *  "Open this task in Orkas" is only actionable while a window exists to open
+ *  it in. With every window gone — the app running from the tray or dock — the
+ *  browser is unavailable for a reason no reader of the task can act on, and
+ *  saying otherwise sends the model into retries that cannot succeed. */
+function unboundSenderFailure(subject: string): { ok: false; code: string; error: string } {
+  const hasWindow = liveAppWindows().length > 0;
+  return {
+    ok: false,
+    code: 'window_unavailable',
+    error: hasWindow
+      ? `Open this ${subject} in Orkas to use its browser.`
+      : 'No Orkas window is open, so this browser is unavailable until one is.',
+  };
+}
+
 function controlledRecord(
   userId: string,
   conversationId: string,
@@ -615,7 +1174,7 @@ function controlledRecord(
 ): { ok: true; record: WebAssistRecord; tab: WebAssistTabRecord } | { ok: false; code: string; error: string } {
   const sender = boundSender(userId, conversationId);
   if (!sender) {
-    return { ok: false, code: 'window_unavailable', error: 'Open this conversation in Orkas to use Web Assist.' };
+    return unboundSenderFailure('conversation');
   }
   const record = recordForSender(sender);
   if (!record) {
@@ -643,6 +1202,14 @@ type WebAssistResolvedTaskTab =
     }
   | { ok: false; code: string; error: string };
 
+/** Whether the user is currently looking at this task in the owning window.
+ *  Task scoping and authority come from the sender binding plus each tab's
+ *  conversationId, so this answers a UI question only: a background task still
+ *  drives its own tabs, it just must not take over what the user is watching. */
+function taskIsForeground(sender: WebContents, conversationId: string): boolean {
+  return activeConversationBySender.get(sender as unknown as object) === conversationId;
+}
+
 function taskTab(
   userId: string,
   conversationId: string,
@@ -653,10 +1220,7 @@ function taskTab(
   }
   const sender = boundSender(userId, conversationId);
   if (!sender) {
-    return { ok: false, code: 'window_unavailable', error: 'Open this task in Orkas to use its browser.' };
-  }
-  if (activeConversationBySender.get(sender as unknown as object) !== conversationId) {
-    return { ok: false, code: 'task_not_visible', error: 'Switch to this task in Orkas before using its browser.' };
+    return unboundSenderFailure('task');
   }
   const record = recordForSender(sender);
   if (!record) return { ok: false, code: 'not_open', error: 'This task has no browser tabs.' };
@@ -679,19 +1243,24 @@ function exposeTaskTabToModel(
 ): { ok: true } | { ok: false; code: string; error: string } {
   const { sender, record, tab } = resolved;
   if (!ensureTabLoaded(record, tab)) return { ok: false, code: tab.suspended && tab.view ? 'page_loading' : 'page_unavailable', error: 'The page is not ready. Wait, then observe it again.' };
-  record.activeTabId = tab.id;
-  for (const candidate of record.tabs.values()) {
-    if (candidate !== tab) setTabVisible(candidate, false);
-  }
   // A generic browser operation supersedes connector-specific authority on
   // this tab. This prevents connector_setup from inheriting an arbitrary URL
-  // or page state selected through the broader browser contract.
+  // or page state selected through the broader browser contract. This is
+  // authority rather than presentation, so it applies in the background too.
   tab.controlContext = {
     userId: record.ownerUserId,
     conversationId: tab.conversationId,
     scope: 'browser',
     scopeId: tab.id,
   };
+  // A background task drives its own tab without selecting it or revealing the
+  // panel over whatever the user is watching. The renderer re-reads state when
+  // the user returns to this task, so nothing needs to be pushed now.
+  if (!taskIsForeground(sender, tab.conversationId)) return { ok: true };
+  record.activeTabId = tab.id;
+  for (const candidate of record.tabs.values()) {
+    if (candidate !== tab) setTabVisible(candidate, false);
+  }
   try {
     sender.send('web-assist:show', rendererSnapshot(record));
     return { ok: true };
@@ -795,6 +1364,7 @@ function createRecord(owner: BrowserWindow, userId: string): WebAssistRecord {
 function removeTab(record: WebAssistRecord, tab: WebAssistTabRecord, notifyRenderer = true): void {
   if (record.tabs.get(tab.id) !== tab) return;
   forgetBrowserTab(record.ownerUserId, tab.conversationId, tab.id);
+  clearWebAssistActionGrants({ tabId: tab.id });
   record.tabs.delete(tab.id);
   for (const candidate of record.tabs.values()) candidate.relatedTabs.delete(tab.id);
   try { setTabVisible(tab, false); } catch { /* best effort */ }
@@ -854,6 +1424,20 @@ function mountTab(
       session: ses,
       devTools: false,
       spellcheck: true,
+      // A task tab is routinely off screen: another conversation is in front,
+      // Task Details is closed, or an unattended run made a minimised window.
+      // Chromium's default clamps a hidden renderer's timers to 1 Hz, measured
+      // here at 20 ticks/s visible against 1.0 ticks/s minimised — a page that
+      // polls or drives itself on a timer effectively stops while the agent is
+      // waiting on it.
+      //
+      // Measured cost of turning that off: a parked page stays at 0% CPU, and
+      // a page running a continuous rAF animation — the worst case — reaches
+      // 0.9%. Idle reclamation still closes any tab left unattended for ten
+      // minutes, so nothing accumulates. Scoped to task tabs; authorization
+      // popups below keep the default, since a popup the user is completing is
+      // on screen anyway.
+      backgroundThrottling: false,
     }),
   });
   try {
@@ -939,7 +1523,9 @@ function mountTab(
       overrideBrowserWindowOptions: {
         parent: record.owner,
         modal: false,
-        show: true,
+        // Native authorization windows inherit the host's background E2E mode.
+        show: record.owner.isFocusable(),
+        focusable: record.owner.isFocusable(),
         autoHideMenuBar: true,
         backgroundColor: '#ffffff',
         webPreferences: hardenedWebPreferences({
@@ -984,6 +1570,14 @@ function mountTab(
     // Error documents also emit did-finish-load; only a committed navigation
     // proves that a new page has replaced the previous load failure.
     if (tab.errorCode === 'page_load_failed') tab.errorCode = undefined;
+    // A committed navigation drops Chromium's emulation, and the cached flag
+    // would otherwise keep us from noticing. Measured 2026-09-19: a reload put
+    // the page back to the drawer's own width with the flag still set, so the
+    // next observe short-circuited and never restored it. Re-apply here rather
+    // than at observe, so the new document's own scripts see the width too.
+    tab.virtualViewport = false;
+    tab.virtualViewportWidth = 0;
+    applyDesktopViewport(tab);
     invalidateObservation(tab);
     emit(record);
   });
@@ -1073,7 +1667,7 @@ export async function openWebAssist(
   sender: WebContents,
   input: { url?: unknown; label?: unknown; conversationId?: unknown; tabId?: unknown },
   createdBy: BrowserTabLifetime['createdBy'] = 'user',
-): Promise<{ ok: true; state: WebAssistSnapshot; closed_tab_ids: string[] } | { ok: false; code: string; error: string }> {
+): Promise<{ ok: true; state: WebAssistSnapshot; closed_tab_ids: string[]; tab_id: string } | { ok: false; code: string; error: string }> {
   if (!safeId(userId)) return { ok: false, code: 'invalid_user', error: 'Web Assist is unavailable for this account.' };
   const url = safeWebAssistUrl(input?.url);
   if (!url) return { ok: false, code: 'invalid_url', error: 'Open an HTTP or HTTPS page in Web Assist.' };
@@ -1085,6 +1679,10 @@ export async function openWebAssist(
   if (conversationId && !safeId(conversationId)) {
     return { ok: false, code: 'invalid_conversation', error: 'Open Web Assist from a valid task.' };
   }
+  // A renderer-driven open is the user's own click and always presents. Only a
+  // model-driven open can belong to a task running in the background, and that
+  // one must not steal tab selection or visibility from the foreground task.
+  const foreground = createdBy !== 'model' || taskIsForeground(sender, conversationId);
 
   let record = records.get(owner.id);
   let createdRecord = false;
@@ -1113,7 +1711,7 @@ export async function openWebAssist(
   }
   if (!tab) {
     try {
-      const created = createTabWithinLimit(record, conversationId, safeLabel(input?.label), createdBy);
+      const created = createTabWithinLimit(record, conversationId, safeLabel(input?.label), createdBy, { activate: foreground });
       if (!created) return tabLimitFailure();
       tab = created.tab;
       closedTabIds = created.closedTabIds;
@@ -1128,16 +1726,21 @@ export async function openWebAssist(
   tab.errorCode = undefined;
   // A renderer-originated navigation never inherits a model control grant.
   tab.controlContext = undefined;
+  clearWebAssistActionGrants({ tabId: tab.id });
   tab.assistantAction = undefined;
   invalidateObservation(tab);
   tab.loading = true;
-  record.activeTabId = tab.id;
-  for (const candidate of record.tabs.values()) {
-    if (candidate !== tab) setTabVisible(candidate, false);
+  if (foreground) {
+    record.activeTabId = tab.id;
+    for (const candidate of record.tabs.values()) {
+      if (candidate !== tab) setTabVisible(candidate, false);
+    }
   }
   emit(record);
   tab.view.webContents.loadURL(url).catch(() => undefined);
-  return { ok: true, state: rendererSnapshot(record), closed_tab_ids: closedTabIds };
+  // Report the tab this call actually opened. A background open leaves the
+  // window's selection alone, so the snapshot's active tab may be another task.
+  return { ok: true, state: rendererSnapshot(record), closed_tab_ids: closedTabIds, tab_id: tab.id };
 }
 
 export function addWebAssistTab(
@@ -1192,6 +1795,7 @@ export function addWebAssistTab(
 export async function navigateWebAssistTo(
   sender: WebContents,
   input: { tabId?: unknown; url?: unknown },
+  activate = true,
 ): Promise<{ ok: true; state: WebAssistSnapshot } | { ok: false; code: string; error: string }> {
   const record = recordForSender(sender);
   if (!record) return { ok: false, code: 'not_open', error: 'Add a browser tab first.' };
@@ -1202,10 +1806,11 @@ export async function navigateWebAssistTo(
   if (!ensureTabLoaded(record, tab, false)) return { ok: false, code: 'page_unavailable', error: 'The page could not be restored. Try opening it again.' };
   tab.errorCode = undefined;
   tab.controlContext = undefined;
+  clearWebAssistActionGrants({ tabId: tab.id });
   tab.assistantAction = undefined;
   invalidateObservation(tab);
   tab.loading = true;
-  record.activeTabId = tab.id;
+  if (activate) record.activeTabId = tab.id;
   emit(record);
   tab.view.webContents.loadURL(url).catch(() => undefined);
   return { ok: true, state: rendererSnapshot(record) };
@@ -1258,7 +1863,7 @@ export async function openControlledWebAssist(
   }
   const sender = boundSender(userId, conversationId);
   if (!sender) {
-    return { ok: false, code: 'window_unavailable', error: 'Open this conversation in Orkas to use Web Assist.' };
+    return unboundSenderFailure('conversation');
   }
   const opened = await openWebAssist(userId, sender, {
     url: input.url,
@@ -1266,11 +1871,9 @@ export async function openControlledWebAssist(
     conversationId,
   }, 'model');
   if (!opened.ok) return opened;
-  const record = recordForSender(sender);
-  const tab = record ? activeTab(record) : null;
-  if (!record || !tab) {
-    return { ok: false, code: 'view_unavailable', error: 'Web Assist could not be controlled.' };
-  }
+  const resolved = taskTab(userId, conversationId, opened.tab_id);
+  if (resolved.ok === false) return resolved;
+  const { record, tab } = resolved;
   tab.controlContext = {
     userId,
     conversationId,
@@ -1278,12 +1881,20 @@ export async function openControlledWebAssist(
     scopeId: input.scopeId,
   };
   invalidateObservation(tab);
-  const state = snapshot(record);
+  const state: WebAssistSnapshot = {
+    open: true,
+    ...tabSnapshot(tab),
+    active_tab_id: tab.id,
+    tabs: [...record.tabs.values()]
+      .filter(candidate => candidate.conversationId === conversationId)
+      .map(tabSnapshot),
+  };
+  if (!taskIsForeground(sender, conversationId)) return { ok: true, state };
   try {
     sender.send('web-assist:show', rendererSnapshot(record));
   } catch (error) {
     log.warn('controlled view show failed', { error: logErrorRef(error) });
-    closeRecord(record, true);
+    removeTab(record, tab, true);
     return { ok: false, code: 'renderer_unavailable', error: 'Web Assist could not be shown.' };
   }
   return { ok: true, state };
@@ -1292,6 +1903,8 @@ export async function openControlledWebAssist(
 async function observeWebAssistTab(
   record: WebAssistRecord,
   tab: WebAssistTabRecord,
+  scope: 'full' | 'meta' = 'full',
+  window: WebAssistObserveWindow = {},
 ): Promise<Record<string, unknown>> {
   if (!ensureTabLoaded(record, tab)) return { ok: false, code: 'page_loading', error: 'The page is being restored; wait before observing it.' };
   const contents = tab.view.webContents;
@@ -1301,17 +1914,12 @@ async function observeWebAssistTab(
   const currentUrl = safeWebAssistUrl(contents.getURL());
   if (!currentUrl) return { ok: false, code: 'page_unavailable', error: 'There is no controllable web page.' };
   try {
-    // On macOS a recreated hidden view can have a zero-width Chromium viewport.
-    // Initialize desktop layout only after loading (before that this native API
-    // has no RenderViewHost), and remove the override when the user shows it.
-    if (!tab.visible && !tab.virtualViewport) {
-      const { width, height } = tab.bounds || { width: 800, height: 600 };
-      contents.enableDeviceEmulation({ screenPosition: 'desktop', screenSize: { width, height },
-        viewPosition: { x: 0, y: 0 }, viewSize: { width, height }, deviceScaleFactor: 0, scale: 1 });
-      tab.virtualViewport = true;
-    }
+    // Only after loading: before that this native API has no RenderViewHost.
+    // Also covers the macOS case where a recreated hidden view would otherwise
+    // have a zero-width Chromium viewport.
+    applyDesktopViewport(tab);
     const raw = await withAssistantAction(record, tab, 'observing', () => (
-      executeWebAssistScript(contents, webAssistObserveScript(tab.controlContext?.scope))
+      executeWebAssistScript(contents, webAssistObserveScript(tab.controlContext?.scope, window))
     ));
     if (contents.isDestroyed() || contents.getURL() !== currentUrl) {
       invalidateObservation(tab);
@@ -1322,7 +1930,22 @@ async function observeWebAssistTab(
     if (!sanitized) {
       return { ok: false, code: 'observation_failed', error: 'The page could not be observed.' };
     }
-    tab.observation = { pageId, url: currentUrl, refs: sanitized.refs };
+    tab.observation = { pageId, url: currentUrl, refs: sanitized.refs, hrefs: sanitized.hrefs };
+    // `meta` walks and stores refs exactly as `full` does, then drops the page
+    // payload from the reply. An act whose page_id went stale needs a fresh
+    // page_id and valid refs, not the page re-read; charging a full observation
+    // for that made scroll-then-read loops cost one whole page per step.
+    if (scope === 'meta') {
+      const { text, elements, ...rest } = sanitized.publicSnapshot as
+        Record<string, unknown> & { text?: unknown; elements?: unknown };
+      return {
+        ok: true,
+        tab_id: tab.id,
+        ...rest,
+        scope: 'meta',
+        text_length: typeof text === 'string' ? text.length : 0,
+      };
+    }
     return { ok: true, tab_id: tab.id, ...sanitized.publicSnapshot };
   } catch (error) {
     log.warn('page observation failed', { error: logErrorRef(error) });
@@ -1409,6 +2032,61 @@ function checkWebAssistAction(
   };
 }
 
+/** Decide whether a controller handback becomes a user-approved retry.
+ *
+ * Returns false for every handback the user is not offered: credential entry,
+ * uploads, the connector scope, and any action without a live element ref. */
+async function resolveProtectedWebAssistAction(
+  tab: WebAssistTabRecord,
+  checked: { ref?: WebAssistStoredElementRef; contents: WebContents },
+  result: Record<string, unknown>,
+  isCurrent: () => boolean,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (!isCurrent()) return false;
+  if (result.ok !== false || result.code !== 'user_action_required') return false;
+  if (!isGateableWebAssistReason(result.reason)) return false;
+  const context = tab.controlContext;
+  // connector_setup already runs ordinary submissions; what it still hands
+  // back is credential entry, which this gate must not offer to resolve.
+  if (context?.scope !== 'browser' || !checked.ref) return false;
+  const target: WebAssistActionTarget = {
+    userId: context.userId,
+    conversationId: context.conversationId,
+    tabId: tab.id,
+    origin: webAssistPageOrigin(tab.observation?.url || ''),
+    tag: checked.ref.signature.tag,
+    label: checked.ref.signature.label,
+  };
+  try {
+    if (hasWebAssistActionGrant(target)) return true;
+    let pageTitle = tab.label;
+    try { pageTitle = checked.contents.getTitle() || tab.label; } catch { /* a title is context, not a precondition */ }
+    // The decision is about a page the user is meant to look at.
+    surfaceAppWindow();
+    const decision = await requestWebAssistActionConfirm({
+      target,
+      reason: result.reason,
+      pageTitle,
+      controlKind: checked.ref.signature.role || checked.ref.signature.tag,
+      signal,
+    });
+    if (decision === 'deny' || !isCurrent()) return false;
+    if (decision === 'run') rememberWebAssistActionGrant(target);
+    return true;
+  } catch (error) {
+    // This gate only ever adds a way to say yes. If it cannot run, the caller
+    // keeps the handback it already has instead of reporting a page failure.
+    log.warn('web assist action confirmation unavailable', { error: logErrorRef(error) });
+    return false;
+  }
+}
+
+interface WebAssistActionLifetime {
+  signal?: AbortSignal;
+  isActive?: () => boolean;
+}
+
 async function actOnWebAssistTab(
   record: WebAssistRecord,
   tab: WebAssistTabRecord,
@@ -1419,10 +2097,25 @@ async function actOnWebAssistTab(
     text?: unknown;
     direction?: unknown;
   },
+  lifetime: WebAssistActionLifetime = {},
 ): Promise<Record<string, unknown>> {
   const checked = checkWebAssistAction(tab, input);
   if (!checked.ok) return checked;
-  try {
+  const context = tab.controlContext;
+  const validate = (): Record<string, unknown> | null => {
+    if (lifetime.signal?.aborted || lifetime.isActive?.() === false) {
+      return { ok: false, code: 'task_run_ended', error: 'This browser task turn has ended.' };
+    }
+    if (record.tabs.get(tab.id) !== tab || tab.controlContext !== context
+      || tab.view?.webContents !== checked.contents || checked.contents.isDestroyed()) {
+      return { ok: false, code: 'stale_page', error: 'The page changed; observe it again before acting.' };
+    }
+    const current = checkWebAssistAction(tab, input);
+    return current.ok ? null : current;
+  };
+  const runAction = async (grantedProtectedAction: boolean): Promise<Record<string, unknown>> => {
+    const invalid = validate();
+    if (invalid) return invalid;
     const result = await withAssistantAction(record, tab, 'acting', () => executeWebAssistScript(
       checked.contents,
       buildWebAssistActionScript({
@@ -1430,12 +2123,33 @@ async function actOnWebAssistTab(
         action: checked.action,
         ...(typeof input.text === 'string' ? { text: checked.text } : {}),
         direction: checked.direction,
-      }, tab.controlContext?.scope),
+      }, tab.controlContext?.scope, { grantedProtectedAction }),
       true,
     ));
-    const publicResult = result && typeof result === 'object'
+    return result && typeof result === 'object'
       ? result as Record<string, unknown>
       : { ok: false, code: 'action_failed', error: 'The page action failed.' };
+  };
+  try {
+    let publicResult = await runAction(false);
+    if (publicResult.ok === false) {
+      const approved = await resolveProtectedWebAssistAction(
+        tab, checked, publicResult, () => validate() === null, lifetime.signal,
+      );
+      const invalid = validate();
+      if (invalid) return invalid;
+      // Revalidate page identity and caller lifetime after the asynchronous
+      // decision; the DOM signature alone may match on a different page.
+      if (approved) publicResult = await runAction(true);
+      // Still handed back: this turn now waits on a person — credential entry,
+      // OTP, upload or CAPTCHA, none of which the model may complete. An
+      // unattended run reached here with its window minimised or freshly made
+      // for the fire, so the page has to become reachable or the wait never
+      // ends.
+      if (publicResult.ok === false && publicResult.code === 'user_action_required') {
+        surfaceAppWindow();
+      }
+    }
     if (publicResult.ok === true) {
       if (['fill', 'select', 'check', 'uncheck'].includes(checked.action)) tab.edited = true;
       invalidateObservation(tab);
@@ -1543,18 +2257,22 @@ export function listModelWebAssistTabs(
   }
   const sender = boundSender(userId, conversationId);
   if (!sender) {
-    return { ok: false, code: 'window_unavailable', error: 'Open this task in Orkas to use its browser.' };
-  }
-  if (activeConversationBySender.get(sender as unknown as object) !== conversationId) {
-    return { ok: false, code: 'task_not_visible', error: 'Switch to this task in Orkas before using its browser.' };
+    return unboundSenderFailure('task');
   }
   const record = recordForSender(sender);
-  if (!record) return { ok: true, active_tab_id: null, tabs: [], tab_limit: MAX_TABS_PER_CONVERSATION };
+  // Queries never start/retry a transfer or grant a download origin. A path is
+  // returned only after Chromium reports completion, within this task's normal
+  // attachment read scope. Closing a tab does not erase its download receipt.
+  const downloads = webAssistDownloads(userId, conversationId).downloads.map(entry => ({
+    ...entry,
+    ...(entry.state === 'saved' && downloadPaths.has(entry) ? { path: downloadPaths.get(entry) } : {}),
+  }));
+  if (!record) return { ok: true, active_tab_id: null, tabs: [], downloads, tab_limit: MAX_TABS_PER_CONVERSATION };
   const tabs = [...record.tabs.values()]
     .filter((tab) => tab.conversationId === conversationId)
     .map(tabSnapshot);
   const active = tabs.find((tab) => tab.tab_id === record.activeTabId) || tabs[0] || null;
-  return { ok: true, active_tab_id: active?.tab_id || null, tabs, tab_limit: MAX_TABS_PER_CONVERSATION };
+  return { ok: true, active_tab_id: active?.tab_id || null, tabs, downloads, tab_limit: MAX_TABS_PER_CONVERSATION };
 }
 
 /** Open one model-visible tab and reveal the shared task browser to the user. */
@@ -1568,23 +2286,24 @@ export async function openModelWebAssist(
   }
   const sender = boundSender(userId, conversationId);
   if (!sender) {
-    return { ok: false, code: 'window_unavailable', error: 'Open this task in Orkas to use its browser.' };
-  }
-  if (activeConversationBySender.get(sender as unknown as object) !== conversationId) {
-    return { ok: false, code: 'task_not_visible', error: 'Switch to this task in Orkas before using its browser.' };
+    return unboundSenderFailure('task');
   }
   const url = safeWebAssistUrl(input.url);
   if (!url) return { ok: false, code: 'invalid_url', error: 'Open an absolute HTTP or HTTPS URL.' };
+  // Judge link-derivation against what the model was holding, before opening
+  // the tab changes it.
+  const fromLink = wasObservedLink(userId, conversationId, url);
   const opened = await openWebAssist(userId, sender, {
     url,
     label: input.label,
     conversationId,
   }, 'model');
   if (!opened.ok) return opened;
-  const resolved = taskTab(userId, conversationId, opened.state.active_tab_id);
+  const resolved = taskTab(userId, conversationId, opened.tab_id);
   if (!resolved.ok) return resolved;
   const exposed = exposeTaskTabToModel(resolved);
   if (!exposed.ok) return exposed;
+  recordModelNavigation(userId, conversationId, resolved.tab.id, url, 'open', fromLink);
   return {
     ok: true,
     active_tab_id: resolved.tab.id,
@@ -1609,8 +2328,14 @@ export async function navigateModelWebAssist(
   if (action === 'goto') {
     const url = safeWebAssistUrl(input.url);
     if (!url) return { ok: false, code: 'invalid_url', error: 'goto requires an absolute HTTP or HTTPS URL.' };
-    const navigated = await navigateWebAssistTo(resolved.sender, { tabId: resolved.tab.id, url });
+    // Read link-derivation from the observation still in hand; navigating
+    // replaces it.
+    const fromLink = wasObservedLink(userId, conversationId, url);
+    const navigated = await navigateWebAssistTo(
+      resolved.sender, { tabId: resolved.tab.id, url }, taskIsForeground(resolved.sender, conversationId),
+    );
     if (!navigated.ok) return navigated;
+    recordModelNavigation(userId, conversationId, resolved.tab.id, url, 'goto', fromLink);
   } else {
     const navigation = navigateTabHistory(resolved.record, resolved.tab, action);
     if (navigation.ok === false) return navigation;
@@ -1626,12 +2351,16 @@ export async function observeModelWebAssist(
   userId: string,
   conversationId: string,
   tabId?: unknown,
+  scope?: 'full' | 'meta',
+  window?: WebAssistObserveWindow,
 ): Promise<Record<string, unknown>> {
   const resolved = taskTab(userId, conversationId, tabId);
   if (!resolved.ok) return resolved;
   const exposed = exposeTaskTabToModel(resolved);
   if (!exposed.ok) return exposed;
-  return observeWebAssistTab(resolved.record, resolved.tab);
+  return observeWebAssistTab(
+    resolved.record, resolved.tab, scope === 'meta' ? 'meta' : 'full', window || {},
+  );
 }
 
 export async function actOnModelWebAssist(
@@ -1645,6 +2374,7 @@ export async function actOnModelWebAssist(
     text?: unknown;
     direction?: unknown;
   },
+  lifetime: WebAssistActionLifetime = {},
 ): Promise<Record<string, unknown>> {
   const resolved = taskTab(userId, conversationId, input.tabId);
   if (!resolved.ok) return resolved;
@@ -1654,7 +2384,7 @@ export async function actOnModelWebAssist(
   if (!checked.ok) return checked;
   const exposed = exposeTaskTabToModel(resolved);
   if (!exposed.ok) return exposed;
-  return actOnWebAssistTab(resolved.record, resolved.tab, input);
+  return actOnWebAssistTab(resolved.record, resolved.tab, input, lifetime);
 }
 
 export async function waitForModelWebAssist(
@@ -1741,6 +2471,42 @@ export function closeModelWebAssistTab(
   return { ok: true, closed: true, tab_id: closedTabId };
 }
 
+/** Ephemeral browser chrome backdrop; never persisted or returned to models. */
+export async function captureWebAssistPreview(sender: WebContents, tabId: unknown) {
+  const record = recordForSender(sender);
+  const tab = record && activeTab(record);
+  const contents = tab?.view?.webContents;
+  const conversationId = activeConversationBySender.get(sender);
+  const available = () => !!record && recordForSender(sender) === record
+    && activeTab(record) === tab && tab?.id === tabId && tab.conversationId === conversationId
+    && tab.view?.webContents === contents && !contents?.isDestroyed()
+    && activeConversationBySender.get(sender) === conversationId;
+  if (!contents || !available()) return { preview: null };
+  const url = contents.getURL();
+  try {
+    let capture = previewCaptures.get(contents);
+    if (!capture) {
+      capture = contents.capturePage(undefined, { stayHidden: true });
+      previewCaptures.set(contents, capture);
+      // Retain a timed-out native call until settlement to bound repeated opens.
+      void capture.finally(() => previewCaptures.delete(contents)).catch(() => {});
+    }
+    let bitmap = await withOperationTimeout(capture, {
+      timeoutMs: 1500, code: 'preview_timeout', stage: 'browser_preview',
+    });
+    if (!available() || contents.getURL() !== url || bitmap.isEmpty()) return { preview: null };
+    const { width, height } = bitmap.getSize();
+    const scale = Math.min(1, 1600 / Math.max(width, height));
+    if (scale < 1) bitmap = bitmap.resize({ width: Math.round(width * scale), height: Math.round(height * scale) });
+    const jpeg = bitmap.toJPEG(80);
+    if (jpeg.length > 2 * 1024 * 1024) return { preview: null };
+    return { preview: `data:image/jpeg;base64,${jpeg.toString('base64')}` };
+  } catch {
+    log.warn('browser preview unavailable');
+    return { preview: null };
+  }
+}
+
 export function layoutWebAssist(
   sender: WebContents,
   rawBounds: unknown,
@@ -1762,6 +2528,8 @@ export function layoutWebAssist(
   tab.view.setBounds(bounds);
   tab.bounds = bounds;
   setTabVisible(tab, true);
+  // The drawer is user-draggable, so the room available changed with it.
+  applyDesktopViewport(tab);
   return { ok: true, state: rendererSnapshot(record) };
 }
 

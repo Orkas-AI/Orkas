@@ -60,9 +60,7 @@ On create or when the current icon is missing, choose the closest candidate. Oth
 This is the Commander's dispatch signal; workflow, inputs, and Skills are not visible at dispatch time.
 
 - Default: one current-language description only. Use `<description_zh>` / `<description_en>` only when the user explicitly asks for multilingual/bilingual descriptions.
-- Write three compact parts: (1) verb + typical objects/actions + deliverable; (2) `适合` / `For:` plus 2–3 quoted real user phrasings; (3) `触发词：` / `Triggers:` plus 5–8 natural keywords.
-- Start with the action and object, not a title, category label, Agent-name restatement, or “AI assistant” boilerplate.
-- Include a non-goal only when it prevents a likely routing collision.
+- Follow the root Skill's routing-description contract; this field is a selection aid, not an execution manual.
 
 ## `<workflow>`
 
@@ -80,7 +78,7 @@ Use ordered steps in physical execution order:
 - Name each invoked tool or Skill in backticks; do not attach a fake tool name to reasoning-only prose.
 - Carry prior step results implicitly instead of restating context.
 - Runtime recovery owns ordinary retry/skip behavior; encode only domain branches that change the workflow.
-- Prefer built-in tools, then listed Skills, then a discovered global Skill whose SKILL.md was read, then discovered connector actions. Never invent capability names.
+- Prefer built-in tools, then eligible listed Skills, then discovered connector actions. Never invent capability names.
 - For web access, write `web_search`; runtime provider selection is host-owned.
 
 ## `<knowhow>` and `<standards>`
@@ -93,16 +91,18 @@ Use ordered steps in physical execution order:
 ## `<skills>`
 
 - One model-visible Skill name per line. List exactly the Skills invoked by or required by the workflow; the host resolves these names to Skill ids but does not infer tool permissions from Skill prose.
-- Names must come from Available skills or from a `skill_search` result whose SKILL.md was read. Never use an internal id or invent a name.
+- Names must come from the host-generated `## Agent Skill dependencies` directory, supplied with the tool dependency directory. Read the selected Skill before using it.
+- These dependency restrictions apply to the finished Agent. You may still use your current session's capabilities to create or edit it; those capabilities and conversation history do not establish the target Agent's capabilities.
+- Do not put System protocols, external-package/global Skills, disabled or missing Skills, or another Agent's private Skills in its dependencies. Author workflow invocations from the target Skill and tool dependency directories. If a required capability is unavailable there, explain the limitation instead of claiming the Agent can perform it.
 - Empty is legal only when the workflow uses built-in tools/connectors alone.
 
 ## `<tools>`
 
 - One exact Agent-dependency group id per line from the host-generated `## Agent tool dependencies` directory. In Commander the directory precedes the root `agent-creator` Skill in the same read result; in a dedicated editor it is in the system prompt.
 - Each leaf entry names the exact built-in tools it activates. Match every directly invoked built-in tool. Prefer a leaf; use a parent only when several children are required.
-- If the workflow uses any Connector action, include `connectors`. On create, the host also runs the generic dependency resolver over explicit workflow tool calls and exact tool names from structured user selections; it may fill only a single unambiguous Agent-dependency group. This is a safety net, not permission to omit known dependencies.
+- If the workflow uses any Connector action, include `connectors` when listed in the target directory. On create, the host may fill a single unambiguous Agent-dependency group from exact tool names in trusted structured user selections; workflow prose does not grant tools.
 - This is the Agent's default capability boundary. A user-explicit current-turn selection activates its known group first; `tool_load` may add only Agent-declarable groups as a lower-priority current-turn fallback. Neither path rewrites this list. Host-managed and runtime-only tools do not belong here.
-- On create, always emit this tag. An empty `<tools></tools>` declares no authored groups; the create-time safety resolver may still add an exact, unambiguous dependency found in the workflow or a structured user selection.
+- On create, always emit this tag. An empty `<tools></tools>` declares no authored groups; the resolver may still add an exact, unambiguous dependency from a trusted structured user selection.
 
 ## `<inputs>`
 

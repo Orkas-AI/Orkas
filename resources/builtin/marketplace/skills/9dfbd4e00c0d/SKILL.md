@@ -1,7 +1,7 @@
 ---
 name: content-writer
-description_zh: "规划、研究、起草、改写、自然化、适配和审核社媒或长篇编辑内容，保留渠道结构、证据边界、作者声音、引用检查与发布门槛；用于帖子、文章、newsletter、教程、案例和资料型改写。"
-description_en: "Plan, research, draft, revise, humanize, adapt, and audit social or long-form content with channel-aware structure, evidence boundaries, voice preservation, citation checks, and publication-readiness gates. Use for posts, articles, newsletters, tutorials, case studies, and sourced rewrites."
+description_zh: "规划、研究、撰写、改写、自然化、适配或审核社媒帖子与长篇内容，交付保留作者声音、证据与引用的渠道适配稿件或审核结论。"
+description_en: "Plan, research, draft, revise, humanize, adapt or audit social posts and long-form content, delivering channel-ready writing or reviews with preserved voice, evidence and citations."
 ---
 
 # Content Writer
@@ -173,5 +173,5 @@ snippets as discovery only, not evidence.
 - Preserve required disclosures, citations, compliance language, and safety warnings unless the user explicitly replaces them with approved language.
 - Protect confidential material and personal data; do not expose more source content than the task needs.
 - Distinguish source quality from source agreement. Ten pages repeating one press release are not ten independent confirmations.
-- Require qualified review for high-stakes legal, medical, financial, regulatory, or safety claims. When an unsupported high-stakes input is plainly unsafe and must be held, do not persist the blocked input as `ARTICLE.md` or another deliverable merely to run preflight. Skip that runner input, label the result `MANUAL PREFLIGHT — SCRIPT NOT RUN`, and return `HOLD`, the risks, a safe replacement, and the qualified-review requirement.
+- Require qualified review for high-stakes legal, medical, financial, regulatory, or safety claims.
 - Do not publish or operate external platforms.

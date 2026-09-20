@@ -113,6 +113,44 @@ function parseJsonOutput(text: string) {
 }
 
 describe('stage-plan video_plan skill script', () => {
+  it('executes the authored plan example with complete timing, child plans and delivery promise', () => {
+    const skill = fs.readFileSync(path.join(pcDir(), 'resources', 'builtin', 'marketplace', 'agents',
+      '79df9cc89f5f', 'skills', 'stage-plan', 'SKILL.md'), 'utf8');
+    const plan = [...skill.matchAll(/```json\s*([\s\S]*?)\s*```/g)]
+      .map((match) => JSON.parse(match[1])).find((value) => Array.isArray(value.segments));
+    expect(plan).toBeDefined();
+    const cwd = makeProject(plan);
+    try {
+      const validation = runVideoPlan(cwd, ['--op', 'validate', '--plan', 'project/plan.json']);
+      expect(validation.status, validation.stderr).toBe(0);
+      expect(parseJsonOutput(validation.stdout).warnings).toEqual([]);
+      const promise = runVideoPlan(cwd, ['--op', 'promise_check', '--plan', 'project/plan.json']);
+      expect(promise.status, promise.stderr).toBe(0);
+      const assessment = parseJsonOutput(promise.stdout).assessment;
+      expect(assessment.verdict).toBe('pass');
+      expect(assessment.total_primary_sec).toBe(plan.total_target_sec);
+      // Overlay time must not disguise a short primary timeline.
+      const shortPlan = structuredClone(plan);
+      shortPlan.segments.filter((segment: any) => segment.layer === 'primary')
+        .forEach((segment: any) => { segment.target_sec = 1; });
+      fs.writeFileSync(path.join(cwd, 'project', 'plan.json'), JSON.stringify(shortPlan));
+      const short = runVideoPlan(cwd, ['--op', 'validate', '--plan', 'project/plan.json']);
+      const shortResult = parseJsonOutput(short.stdout || short.stderr);
+      expect([...shortResult.warnings, ...shortResult.errors].length).toBeGreaterThan(0);
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps deterministic editing on the canonical EDL with the one-shot exception', () => {
+    const edit = fs.readFileSync(path.join(pcDir(), 'resources', 'builtin', 'marketplace', 'agents',
+      '79df9cc89f5f', 'skills', 'stage-edit', 'SKILL.md'), 'utf8');
+    expect(edit).not.toContain('edit_plan.json');
+    expect(edit).toContain('project/plan.json');
+    expect(edit).toContain('write no plan.json');
+    expect(edit).toContain('production.status');
+  });
+
   it('validates a well-formed EDL through run-skill', () => {
     const cwd = makeProject(validPlan());
     const res = runVideoPlan(cwd, ['--op', 'validate', '--plan', 'project/plan.json']);

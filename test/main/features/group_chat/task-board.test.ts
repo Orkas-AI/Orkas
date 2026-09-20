@@ -65,6 +65,26 @@ afterEach(async () => {
 });
 
 describe('task_board › lifecycle', () => {
+  it('reports listener failure privately and still persists the task and notifies other listeners', async () => {
+    const tb = await board();
+    const next = vi.fn();
+    const unsubscribeBad = tb.onBacklogExecutionChanged(() => { throw new Error('Private task content'); });
+    const unsubscribeNext = tb.onBacklogExecutionChanged(next);
+    try {
+      const task = await tb.createTask(TEST_UID, TEST_CID, {
+        assignee: 'commander', instruction: 'Private task content', createdBy: 'user',
+        backlogTask: { project_id: 'p1', task_id: 't_123456789abc' },
+      });
+      expect(next).toHaveBeenCalledWith({ uid: TEST_UID, pid: 'p1' });
+      expect((await readSnapshot()).map(row => row.task_id)).toContain(task.task_id);
+      expect(loggerMocks.warn).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(loggerMocks.warn.mock.calls)).not.toContain('Private task content');
+    } finally {
+      unsubscribeBad();
+      unsubscribeNext();
+    }
+  });
+
   it('preserves pending admission through sync, confirms only waiting rows, and cancels it on restart', async () => {
     const tb = await board();
     const create = () => tb.createTask(TEST_UID, TEST_CID, {
@@ -785,5 +805,55 @@ describe('task_board › snapshot coalescing', () => {
       spy.mockRestore();
       syncBuiltinESMExports();
     }
+  });
+});
+
+
+describe('task_board › queued message edits', () => {
+  it('accepts one concurrent save, rejects the stale overwrite, and permits a retry from the latest text', async () => {
+    const tb = await board();
+    const queued = await tb.createTask(TEST_UID, TEST_CID, {
+      assignee: 'agent', instruction: 'original', createdBy: 'user', attachments: ['notes.txt'],
+    });
+    const applied: string[] = [];
+    const save = (text: string, expected: string) => tb.editQueued(
+      TEST_UID, TEST_CID, queued.task_id, text, expected,
+      () => { applied.push(text); return { sourceMsgId: 'source' }; },
+    );
+    const results = await Promise.all([save('first edit', 'original'), save('second edit', 'original')]);
+    expect(results.filter((result) => result.task)).toHaveLength(1);
+    expect(results.filter((result) => result.error === 'edit_conflict')).toHaveLength(1);
+    const winner = results.find((result) => result.task)!.task!.instruction;
+    expect(applied).toEqual([winner]);
+    expect(await readSnapshot()).toEqual([expect.objectContaining({
+      task_id: queued.task_id, instruction: winner, instruction_revision: 1, attachments: ['notes.txt'],
+    })]);
+    expect(await save('merged final edit', winner)).toMatchObject({ task: { instruction_revision: 2 } });
+    await tb.flushBoards();
+    tb.dropBoard(TEST_UID, TEST_CID, { persistPending: false });
+    expect((await tb.listTasks(TEST_UID, TEST_CID))[0].instruction).toBe('merged final edit');
+    expect(await readSnapshot()).toEqual([expect.objectContaining({ instruction: 'merged final edit', instruction_revision: 2 })]);
+  });
+
+  it('persists the edit and retains ordering, dependencies and attachments while rejecting stale or non-user edits', async () => {
+    const tb = await board();
+    const predecessor = await tb.createTask(TEST_UID, TEST_CID, { assignee: 'commander', instruction: 'first', createdBy: 'user' });
+    const queued = await tb.createTask(TEST_UID, TEST_CID, {
+      assignee: 'commander', instruction: 'original', createdBy: 'user', after: predecessor.task_id, attachments: ['file.txt'],
+    });
+    const apply = vi.fn(() => ({ sourceMsgId: 'edited-source' }));
+    expect(await tb.editQueued(TEST_UID, TEST_CID, queued.task_id, 'new text', 'original', apply))
+      .toMatchObject({ task: { task_id: queued.task_id, instruction: 'new text', after: predecessor.task_id, attachments: ['file.txt'], instruction_revision: 1 } });
+    expect((await readSnapshot()).find((row) => row.task_id === queued.task_id))
+      .toMatchObject({ instruction: 'new text', source_msg_id: 'edited-source', instruction_revision: 1 });
+    tb.dropBoard(TEST_UID, TEST_CID, { persistPending: false });
+    expect((await tb.listTasks(TEST_UID, TEST_CID)).find((row) => row.task_id === queued.task_id)?.instruction_revision).toBe(1);
+    expect(await tb.editQueued(TEST_UID, TEST_CID, queued.task_id, 'overwrite', 'original', apply)).toMatchObject({ error: 'edit_conflict' });
+    expect(await tb.editQueued(TEST_UID, TEST_CID, queued.task_id, '  ', 'new text', apply)).toMatchObject({ error: 'empty_instruction' });
+    const contract = await tb.createTask(TEST_UID, TEST_CID, { assignee: 'agent', instruction: 'contract', createdBy: 'commander' });
+    expect(await tb.editQueued(TEST_UID, TEST_CID, contract.task_id, 'overwrite', 'contract', apply)).toMatchObject({ error: 'not_editable' });
+    await tb.claimTask(TEST_UID, TEST_CID, queued.task_id);
+    expect(await tb.editQueued(TEST_UID, TEST_CID, queued.task_id, 'overwrite', 'new text', apply)).toMatchObject({ error: 'not_queued' });
+    expect(apply).toHaveBeenCalledTimes(1);
   });
 });

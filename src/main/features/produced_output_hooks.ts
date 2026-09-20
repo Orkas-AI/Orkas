@@ -14,6 +14,8 @@ export interface ProducedArtifactContext extends ProducedOutputContext {
 type MaybePromise<T> = T | Promise<T>;
 
 export interface ProducedOutputHooks {
+  /** Observe a completed write without modifying the produced bytes. */
+  recordFile?: (absPath: string, context: ProducedOutputContext, info?: { preExisting?: boolean }) => MaybePromise<void>;
   finalizeFile?: (absPath: string, context: ProducedOutputContext) => MaybePromise<void>;
   prepareFileInput?: (absPath: string, context: ProducedOutputContext) => MaybePromise<void>;
   finalizeArtifact?: (artifactDir: string, context: ProducedArtifactContext) => MaybePromise<void>;
@@ -29,6 +31,7 @@ export function registerProducedOutputHooks(next: ProducedOutputHooks): () => vo
     ...next,
   };
   return () => {
+    if (hooks.recordFile === next.recordFile) hooks.recordFile = previous.recordFile;
     if (hooks.finalizeFile === next.finalizeFile) hooks.finalizeFile = previous.finalizeFile;
     if (hooks.prepareFileInput === next.prepareFileInput) hooks.prepareFileInput = previous.prepareFileInput;
     if (hooks.finalizeArtifact === next.finalizeArtifact) hooks.finalizeArtifact = previous.finalizeArtifact;
@@ -62,4 +65,12 @@ export async function finalizeProducedArtifact(
 
 export function producedDocumentFooterText(context: ProducedOutputContext = {}): string | null {
   return hooks.documentFooterText?.(context) || null;
+}
+
+export async function recordProducedFile(
+  absPath: string,
+  context: ProducedOutputContext = {},
+  info?: { preExisting?: boolean },
+): Promise<void> {
+  await hooks.recordFile?.(path.resolve(absPath), context, info);
 }

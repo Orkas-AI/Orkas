@@ -2,7 +2,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import * as processBoundary from '../../../../src/main/features/local_agents/backends/base';
 
 import {
   mapClaudeModelList,
@@ -154,20 +155,32 @@ describe('local_agents/runtime_options discovery parsing', () => {
     expect(result.models.map(model => model.id)).toEqual([
       'opus[1m]', 'claude-fable-5[1m]', 'sonnet', 'haiku',
     ]);
+    // Every alias names the concrete version it runs today, so the picker can
+    // state a model instead of an unactionable "latest".
     expect(result.models[0]).toEqual({
       id: 'opus[1m]',
       label: 'Opus (1M context)',
       is_alias: true,
+      resolved_model: 'claude-opus-5[1m]',
       thinking_levels: [{ id: 'low' }, { id: 'medium' }, { id: 'high' }, { id: 'xhigh' }, { id: 'max' }],
     });
     // A pinned model id keeps its version, so it is not an alias; the context
-    // variant suffix alone must not make it look like one.
-    expect(result.models[1]).toMatchObject({ id: 'claude-fable-5[1m]', label: 'Fable' });
+    // variant suffix alone must not make it look like one. Its display name
+    // still carries no version, so the model behind it is published too.
+    expect(result.models[1]).toMatchObject({
+      id: 'claude-fable-5[1m]',
+      label: 'Fable',
+      resolved_model: 'claude-fable-5',
+    });
     expect(result.models[1].is_alias).toBeUndefined();
     // Haiku advertises no effort support, so it takes no thinking level at all
     // rather than inheriting the levels its siblings advertise.
     expect(result.models[3]).toEqual({
-      id: 'haiku', label: 'Haiku', is_alias: true, supports_thinking: false,
+      id: 'haiku',
+      label: 'Haiku',
+      is_alias: true,
+      resolved_model: 'claude-haiku-4-5-20251001',
+      supports_thinking: false,
     });
     expect(result.thinking_levels.map(level => level.id))
       .toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
@@ -192,7 +205,9 @@ describe('local_agents/runtime_options discovery parsing', () => {
       // A payload that never mentions effort support says nothing about it, so
       // no model is marked unsupported and the global levels still apply.
       models: [
-        { id: 'sonnet', label: 'Sonnet', is_alias: true },
+        { id: 'sonnet', label: 'Sonnet', is_alias: true, resolved_model: 'claude-sonnet-5' },
+        // A row that names no resolution publishes none; the picker must not
+        // invent a version for it.
         { id: 'plain', label: 'plain' },
       ],
       thinking_levels: [],
@@ -243,6 +258,18 @@ describe('local_agents/runtime_options discovery parsing', () => {
 });
 
 describe('local_agents/runtime_options process boundary', () => {
+  it.each(['claude', 'codex'] as const)('accepts an unsupported %s model probe closing without killing its stale PID', async cli => {
+    const dir = makeTempDir();
+    const fake = writeFakeCli(dir, 'process.exit(2);');
+    const kill = vi.spyOn(processBoundary, 'killProcessTree');
+    try {
+      const result = await getLocalCliRuntimeOptions(entry(cli, fake), dir, { force: true });
+      expect(result.status).toBe('partial');
+      if (cli === 'claude') expect(result.models.length).toBeGreaterThan(0);
+      else expect(result.models).toEqual([]);
+      expect(kill).not.toHaveBeenCalled();
+    } finally { kill.mockRestore(); }
+  });
   it.each(['claude', 'codex', 'hermes', 'opencode', 'openclaw'] as const)(
     'publishes the adapter-supported $cli permission levels even when discovery is unavailable',
     async (cli) => {
@@ -354,12 +381,14 @@ process.stdin.on('data', chunk => {
     const options = await getLocalCliRuntimeOptions(entry('claude', binPath), dir);
 
     // A model this build never heard of reaches the picker, and `default` stays
-    // out because the empty override already means it.
+    // out because the empty override already means it. The version the alias
+    // resolves to survives the spawn/parse boundary, so the picker can name it.
     expect(options.models).toEqual([
       {
         id: 'newest',
         label: 'Newest',
         is_alias: true,
+        resolved_model: 'claude-newest-9',
         thinking_levels: [{ id: 'low' }, { id: 'max' }],
       },
     ]);

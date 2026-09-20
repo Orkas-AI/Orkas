@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildMixFilter, escapeFfmpegFilterValue } from '../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edit';
+import { buildMixFilter } from '../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edit';
 
 const SR = 48000;
 // Every tail pins `aformat=channel_layouts=stereo` after the resample: a
@@ -28,12 +28,6 @@ describe('buildMixFilter — single segment', () => {
     const f = buildMixFilter({ sr: SR, segmentStartSec: [0], baseHasAudio: false, mode: 'mix', padWholeDurSec: null, loudnorm: LN });
     expect(f).not.toContain('apad');
     expect(f).toContain('[seg0]loudnorm=I=-14:TP=-1:LRA=11,aresample=48000,aformat=channel_layouts=stereo[aout]');
-  });
-});
-
-describe('escapeFfmpegFilterValue', () => {
-  it('escapes path characters that are meaningful inside ffmpeg filter options', () => {
-    expect(escapeFfmpegFilterValue("/tmp/a:b,c;d[1]it\\'s.srt")).toBe("/tmp/a\\:b\\,c\\;d\\[1\\]it\\\\\\'s.srt");
   });
 });
 

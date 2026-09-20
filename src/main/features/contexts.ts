@@ -22,6 +22,7 @@
  * generated.
  */
 
+import { fileFailureKind } from '../util/app-error';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
@@ -86,7 +87,7 @@ const TEXT_EXTS: ReadonlySet<string> = new Set([
 const BINARY_EXTS: ReadonlySet<string> = new Set([
   '.pdf',
   '.docx', '.docm',
-  '.xlsx', '.xlsm',
+  '.xlsx', '.xlsm', '.xls',
   '.pptx', '.pptm',
   '.png', '.jpg', '.jpeg', '.webp', '.gif',
 ]);
@@ -209,7 +210,17 @@ function resolvePath(
  *  the "ask the commander about this file" flow to import the KB file as a chat
  *  attachment. Throws on an invalid or missing path. */
 export function resolveContextFileAbsPath(relpath: string): string {
-  return resolvePath(relpath, { mustExist: true });
+  const target = resolvePath(relpath);
+  try { fs.statSync(target); }
+  catch (error) {
+    // existsSync erases EACCES/EPERM. Retain diagnosis while preserving the
+    // established caller-visible missing-file error and relative path.
+    const relative = relpath.trim().replace(/^\/+|\/+$/g, '');
+    throw Object.assign(new Error(`not found: ${relative}`), {
+      code: 'ENOENT', failure_kind: fileFailureKind(error),
+    });
+  }
+  return target;
 }
 
 /** Resolve either a file or folder for internal Library transfer workflows.
@@ -251,7 +262,12 @@ export function listContextsTree(): ContextNode[] {
       const relPath = rel ? `${rel}/${e.name}` : e.name;
       const full = path.join(d, e.name);
       if (e.isDirectory()) {
-        out.push({ name: e.name, path: relPath, type: 'dir', children: walk(full, relPath) });
+        // Folders carry an mtime too so the renderer can order them by recency
+        // alongside files. A directory's mtime moves when entries are added or
+        // removed directly inside it — close enough for "recently touched".
+        let dirMtime = 0;
+        try { dirMtime = fs.statSync(full).mtimeMs / 1000; } catch { /* ignore */ }
+        out.push({ name: e.name, path: relPath, type: 'dir', mtime: dirMtime, children: walk(full, relPath) });
       } else if (e.isFile()) {
         // Show every supported KB file kind in the tree — text + binary both
         // get vectorized, both deserve to be visible.
@@ -404,7 +420,7 @@ function kbKindForContextName(name: string): kbVector.KbKind {
   const ext = extOf(name);
   if (ext === '.pdf') return 'pdf';
   if (ext === '.docx' || ext === '.docm') return 'docx';
-  if (ext === '.xlsx' || ext === '.xlsm') return 'spreadsheet';
+  if (ext === '.xlsx' || ext === '.xlsm' || ext === '.xls') return 'spreadsheet';
   if (ext === '.pptx' || ext === '.pptm') return 'presentation';
   if (['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext)) return 'image';
   return 'text';

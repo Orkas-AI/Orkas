@@ -31,6 +31,7 @@ afterEach(() => {
   if (prevBuiltin === undefined) delete process.env.ORKAS_BUILTIN_ROOT;
   else process.env.ORKAS_BUILTIN_ROOT = prevBuiltin;
   fs.rmSync(tmpDir, { recursive: true, force: true });
+  vi.restoreAllMocks();
   vi.resetModules();
 });
 
@@ -54,7 +55,55 @@ function writeBuiltinAgentSkill(id: string, skillId: string, description: string
   ].join('\n'), 'utf8');
 }
 
+async function capturePrivateWarnings(scope: string): Promise<unknown[][]> {
+  const logger = await import('../../../src/main/logger');
+  const createLogger = logger.createLogger;
+  const records: unknown[][] = [];
+  vi.spyOn(logger, 'createLogger').mockImplementation((name) => {
+    const scoped = createLogger(name);
+    if (name !== scope) return scoped;
+    return { ...scoped, warn: (message: string, ...args: unknown[]) => {
+      records.push([message, ...args].map((value) => logger.redact(value)));
+    } };
+  });
+  return records;
+}
+
 describe('builtin marketplace startup seed', () => {
+  it('keeps active-user callback diagnostics private after successful publication', async () => {
+    const records = await capturePrivateWarnings('builtin-marketplace');
+    writeBuiltinAgent(TEST_AGENT_ID, { name: 'Example', version: '1.0.0' });
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const startup = await import('../../../src/main/features/builtin_marketplace_startup');
+    users.activateUser('u1');
+    expect(await startup.seedBuiltinMarketplaceForActiveUser({
+      reason: 'initial',
+      onChanged: () => { throw Object.assign(new Error('CONFIDENTIAL'), { code: 'EACCES' }); },
+    })).toBeNull();
+    expect(fs.existsSync(path.join(paths.userMarketplaceAgentDir('u1', TEST_AGENT_ID), 'agent.json'))).toBe(true);
+    expect(await startup.seedBuiltinMarketplaceForActiveUser({ reason: 'retry' })).not.toBeNull();
+    expect(records).toHaveLength(1);
+    expect(JSON.stringify(records)).not.toContain('CONFIDENTIAL');
+    expect(JSON.stringify(records)).toContain('EACCES');
+  });
+
+
+  it('records the installed bytes as the managed hash baseline while still detecting later edits', async () => {
+    writeBuiltinAgent(TEST_AGENT_ID, { name: 'Example', version: '1.0.0' });
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const startup = await import('../../../src/main/features/builtin_marketplace_startup');
+    const { marketplaceContentTreeHash } = await import('../../../src/main/util/marketplace-tree-hash');
+    users.activateUser('u1');
+    await startup.seedBuiltinMarketplaceForActiveUser({ reason: 'initial' });
+    const dir = paths.userMarketplaceAgentDir('u1', TEST_AGENT_ID);
+    const meta = JSON.parse(fs.readFileSync(path.join(dir, '_install.json'), 'utf8'));
+    expect(meta.content_tree_hash).toBe(marketplaceContentTreeHash(dir));
+    fs.appendFileSync(path.join(dir, 'agent.json'), '\n ');
+    expect(meta.content_tree_hash).not.toBe(marketplaceContentTreeHash(dir));
+  });
+
   it('runs for the active local user without requiring account verification', async () => {
     writeBuiltinAgent(TEST_AGENT_ID, {
       version: '1.0.0',

@@ -59,6 +59,7 @@ interface PendingDcrFlow {
   codeVerifier: string;     // PKCE
   redirectUri: string;
   resource: string;         // RFC 8707 canonical resource URI
+  requiredScopes: string[];
   client: DcrClientCredentials;
   resolve: (out: { grant: OAuthGrant; client: DcrClientCredentials }) => void;
   reject: (err: Error) => void;
@@ -409,6 +410,8 @@ export async function startMcpDcrOAuth(
   authUrl.searchParams.set('code_challenge', pkce.challenge);
   authUrl.searchParams.set('code_challenge_method', 'S256');
   authUrl.searchParams.set('resource', resource);
+  const requiredScopes = [...new Set(entry.required_oauth_scopes || [])];
+  if (requiredScopes.length) authUrl.searchParams.set('scope', requiredScopes.join(' '));
 
   log.info('opening DCR authorize URL', { catalog_id: entry.id });
 
@@ -425,6 +428,7 @@ export async function startMcpDcrOAuth(
       codeVerifier: pkce.verifier,
       redirectUri,
       resource,
+      requiredScopes,
       client: dcrClient,
       resolve,
       reject,
@@ -545,12 +549,20 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
     };
     if (_pending !== pending) return;
     if (!tokens.access_token) throw new Error('token response missing access_token');
+    // RFC 6749 permits omission when the granted scope equals the requested scope.
+    const scopes = tokens.scope === undefined ? pending.requiredScopes : tokens.scope.split(/[\s,]+/).filter(Boolean);
+    if (pending.requiredScopes.some(scope => !scopes.includes(scope))) {
+      _pending = null;
+      clearTimeout(pending.timer);
+      pending.reject(Object.assign(new Error('Required shop permissions were not granted; reconnect and approve the requested permissions'), { code: 'missing_required_scopes' }));
+      return;
+    }
     const expires_at = typeof tokens.expires_in === 'number' ? Date.now() + tokens.expires_in * 1000 : null;
     const localGrant: OAuthGrant = {
       access_token: tokens.access_token,
       refresh_token: tokens.refresh_token || null,
       expires_at,
-      scopes: tokens.scope ? tokens.scope.split(/[\s,]+/).filter(Boolean) : [],
+      scopes,
       token_type: tokens.token_type || 'Bearer',
     };
     if (_pending !== pending) return;

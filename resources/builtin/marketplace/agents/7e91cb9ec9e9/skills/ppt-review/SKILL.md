@@ -1,20 +1,20 @@
 ---
 ownerAgent: 7e91cb9ec9e9
 name: ppt-review
-description_zh: 在已有 office_review 结构检查和逐页渲染证据后，诊断单页审美、参考一致性与整套叙事节奏，以具体缺陷而非固定审美分数驱动定向修复和复验。
-description_en: After structural validation and per-slide renders exist, diagnose slide aesthetics, reference fit, and whole-deck narrative rhythm, then repair concrete evidence-based defects from current evidence.
+description_zh: 在首次质量检查前读取，指导结构检查、逐页视觉审查和整套叙事检查，记录具体问题并定向修复、复验。
+description_en: Guide structural checks, slide and deck review, evidence records, and targeted repairs; read before the first quality review.
 ---
 
 # PPT Review
 
-Read this skill only after current `office_review` structural output and relevant rendered images exist. Do not use source code, a tool success flag, or the first-slide preview as a substitute for deck evidence.
+Read this skill before the first deck or output quality review, so its criteria are available when the rendered images arrive. Apply the criteria to current `office_review` structural output and relevant rendered images. Do not use source code, a tool success flag, or the first-slide preview as a substitute for deck evidence.
 
 ## Evidence set
 
 - Run `office_review` with `action:"check_and_render"` after every create or edit. Invalid OpenXML is a blocker, not a warning.
 - For a new deck, render every slide. For an existing deck, render every changed slide plus the cover, a representative unchanged content slide, and any slide whose theme, master, or shared element could be affected. Every render intended as current visual-defect evidence must set `analysis_mode:"quality_review"`; ordinary source understanding keeps the default `understand` mode.
 - After a repair affects multiple pages, request them together in one `office_review` call with `action:"check_and_render"`, a `pages` array, and `analysis_mode:"quality_review"`. One collected image set lets managed visual preprocessing analyze the affected pages as a batch. If one render fails after a valid check, retry only that page with `action:"render"` rather than rerendering the successful set.
-- Rendered image blocks are transient after the next assistant response. In the first response that sees each collected `quality_review` image set, write one concise plain-language evidence sentence before any follow-up tool calls: name the reviewed pages, concrete pass/defect observations, and the next action. This sentence is the durable visual-review state for later tool rounds and compaction. When exact edit paths are needed, request the targeted `office_read` calls together in that same response; do not rerender an unchanged `artifact_revision` merely to recover forgotten pixels.
+- In the first response that sees each collected `quality_review` image set, record concrete findings with page numbers, supporting observations, and repair or retain decisions before follow-up tool calls. These are working notes, not the final handoff table; preserve observations for all reviewed pages, including pages without defects. Update only the affected findings after a repair, using the current render; retain unchanged-page evidence. When exact edit paths are needed, request targeted `office_read` calls together; do not rerender an unchanged `artifact_revision` merely to recover forgotten pixels.
 - Use the returned `artifact_revision` to distinguish current from stale check/render evidence and `image_revision` to compare rerenders. If an edit claimed to repair a visible defect but the affected page keeps the same `image_revision`, do not claim a visual repair: verify that the edited artifact revision was rendered, then make a supported layout/content change or retain the finding as unresolved.
 - If rendering is unavailable, mark visual checks `not_run`; do not infer a pass from structural validity.
 
@@ -134,54 +134,57 @@ quality record are complete. If any edit or render-based review happens after
 publication, treat the published result as stale and publish the validated
 candidate again only after all gates pass.
 
-Call `publish_outputs` with only that final `.pptx`. The handoff names the path, slide count, edits or produced scope, plain-language content/design/flow result, checks actually run, repair passes, source limitations, unsupported PowerPoint features, and any target-viewer review still needed. Do not expose the internal route or depth codes in the handoff.
+### Prepare the complete handoff before publication
 
-The final handoff must make the review evidence auditable instead of saying
-only “checked” or “looks good”. Include three short labeled lines—`内容`, `设计`,
-and `连贯性` (or natural equivalents in the user's language)—plus the number of
-slides structurally checked and rendered. Under `设计`, name the autonomous or
-reference-derived direction, the weakest observed page, material repairs, and
-remaining warnings. Do not include numeric aesthetic scores. Under `连贯性`, describe whether repetition,
-variation, and density support the narrative without forcing a numeric family
-count or prescribed rhythm. Do not invent observations that were not recorded
-from current renders.
+Assemble the complete handoff below from current structural checks, per-page
+observations, repairs, and the whole-deck review, whether or not an earlier audit
+table exists. Reuse available current evidence; do not depend on intermediate
+notes already having the final format. If a required record is missing, first
+reconcile the retained observations and current file, then verify only the
+missing evidence. Never default an unassessed dimension to PASS. When visual
+evidence is unavailable, disclose `not_run` rather than claiming a review.
+An omitted text record alone does not justify rerendering an unchanged revision.
 
-Use this compact handoff shape so the evidence is understandable and cannot be
-lost during a long tool run (replace every bracket with observed evidence):
+For a generated deck, fill one slide-map entry and one Content/Design/Coherence
+row per slide. Use `PASS`, `WARNING`, or `BLOCKER` for assessed findings, with
+concrete evidence; unavailable checks remain `not_run`. Every non-pass result
+retains its repair or retain decision. Complete the whole-deck review before
+finalizing Coherence. A positive summary or slide map cannot replace these rows.
+Count the rows against the actual generated slide count and check that every
+page number appears exactly once. Missing, duplicate, or deck-level-only audit
+evidence blocks publication. EDIT keeps its required review scope; disclose
+which pages were inspected rather than claiming unreviewed pages passed.
+
+Use this single handoff structure in the user's language, replacing every
+bracket with actual evidence. Include the slide map and page rows for generated
+decks, and the source ledger when supplied files or data ground the deck:
 
 ```text
-内容：目标动作是 [企业购方在汇报后要做的决策]；[8] 页均使用结论式标题且每页一个主结论，例如 [P2 实际标题] / [P5 实际标题]；[页面覆盖与叙事路径]；[证据边界]；结构检查 [8/8] 页通过。
-设计：[8/8] 页已逐页渲染；视觉来源为 [自主设计 / 文字方向 / 参考图 / 参考 PPT]；视觉系统为 [具体艺术方向、主要颜色、字体层级、画布/背景和图片处理]；最弱页面为 [P# 与实际观察]；[已完成的定向修复]；[原生可编辑文本、图形、图表/表格的实际覆盖]；[剩余非阻塞提示或无]。
-连贯性：[重复和变化如何服务叙事]；[信息密度和章节节奏的实际观察]；[参考一致性或自主设计一致性]。
+交付：[最终 PPTX 路径]；[页数与制作或修改范围]。
+内容：目标动作是 [受众需要做出的决策或行动]；[实际页面覆盖与叙事路径]；结论式标题例如 [P2 实际标题] / [P5 实际标题]；[证据边界]；结构检查 [已检查/总页数] 页通过。
+设计：[已渲染/总页数] 页已逐页审阅；视觉来源为 [自主设计 / 文字方向 / 参考图 / 参考 PPT]；视觉系统为 [艺术方向、颜色、字体层级、画布/背景和图片或图表处理]；最弱页面为 [P# 与比较其他页面后的具体观察]；定向修复：[修复页面、问题与复验结果，或无需修复]；[原生可编辑元素的实际覆盖]；剩余提示：[具体非阻塞问题或有证据支持的无]。
+连贯性：[重复、变化、信息密度和章节节奏如何服务叙事]；[参考一致性或自主设计一致性]。
+逐页内容与视觉重点（生成的每一页各一项）：
+P# — [实际主结论] | [实际视觉重点]
+逐页审阅（生成的每一页各一行）：
+P1 | Content: PASS — evidence | Design: WARNING — evidence | Coherence: PASS — evidence
+来源事实（有来源文件或数据时）：[每个来源文件；数值序列及期间或地区、单位、实际/目标状态；沿用的重要非数值约束或风险]。
+交付边界：[来源限制、不支持的 PowerPoint 特性、未执行检查与仍需在目标查看器核验的内容；没有时说明无]。
 ```
 
-Do not replace concrete render observations with vague claims such as “整体良好”. Include the actual visual source, art direction, palette behavior, type hierarchy, background/canvas language, and image/chart treatment so the user can understand what visual system was delivered. Exact grid, margin, and palette values are useful when they materially explain the result, but their omission alone is not a publication blocker.
+For a generated product deck, include at least two actual conclusion-title
+examples from the current file. Repair bare topic titles only when the user did
+not fix their visible wording; never rewrite a contracted title for this format.
+Use concrete render observations, not vague praise.
+Explain the actual visual source, art direction, palette behavior, type hierarchy,
+background/canvas language and image/chart treatment; exact token values are
+useful only when they explain the result, not a fixed release gate. Do not include numeric aesthetic scores.
+Keep the labels `Content`, `Design`, and `Coherence`; unlabeled adjectives do not
+replace status fields. The source ledger reports supplied facts, not permission
+to add or reinterpret them.
 
-For a generated product deck, the Content line must include the action
-objective and at least two actual conclusion-title examples from the current
-file. If the current titles are bare topic labels, repair them before handoff
-only when the user did not explicitly fix that visible wording. Never rewrite a
-contracted title merely to make it more assertion-like.
-After the three evidence lines, include a compact slide map for every slide in
-the form `P# — [actual takeaway] | [actual visual focus]`. This map is required
-for a generated deck so the story sequence and editable visual choices can be
-reviewed independently; do not substitute a topic-only agenda or a count of
-layout families.
-Then include one compact audit row for every generated slide, derived from the
-current render: `P# — Content PASS/WARNING/BLOCKER; Design
-PASS/WARNING/BLOCKER; Coherence PASS/WARNING/BLOCKER`. Every non-pass result
-must add the observed evidence in the same row. The takeaway/visual-focus map
-does not replace these per-slide three-dimensional records, and a positive
-summary does not override a page-level finding.
-Build this audit block before `publish_outputs`, count its rows, and verify that
-the count equals the generated slide count and that every page number appears
-exactly once. Missing, duplicate, or deck-level-only audit evidence blocks
-publication. After publishing, copy the already-counted block into the final
-handoff instead of reconstructing it from memory.
-For a generated deck grounded in supplied files or data, also include a compact
-`来源事实` ledger. Name every source file, reproduce every numeric sequence with
-its period or region, unit, and actual/target status, and list material
-non-numeric constraints or risks that the deck carries forward. This ledger
-must come from the current sources and deck; it is handoff evidence, not a
-license to add or reinterpret facts.
-The Design line should name the actual construction choices that matter to the current deck. Prefer concrete colors, type anchors, alignment logic, and crop/background treatment when they were recorded, but do not turn a fixed token checklist into a release gate for a reference-led or intentionally custom composition.
+Once this complete handoff and all gates are satisfied, call `publish_outputs`
+with only the final `.pptx`, then send the prepared handoff with the returned file
+path. Preserve its page records, weakest-page finding, repairs and remaining
+warnings rather than shortening it to a success summary. The handoff provides a
+plain-language content/design/flow result and checks actually run. Do not expose the internal route or depth codes.

@@ -102,6 +102,7 @@ const _taskBoardBatchIds = new Map();     // cid → Set(task_id)
 const _taskBoardCollapsedCids = new Set(); // cids the user collapsed
 const _taskBoardCollapsedAgents = new Map(); // cid → Set(assignee); groups start expanded
 const _taskBoardSendingNow = new Set();    // `${cid}:${task_id}` awaiting live-turn acknowledgement
+const _taskBoardEditing = new Set();       // `${cid}:${task_id}` with an open editor
 
 function _taskBoardBatchAfterCreate(batchIds, tasksById, createdId) {
   const ids = batchIds instanceof Set ? batchIds : new Set();
@@ -149,7 +150,8 @@ function _taskBoardMergeSeedRows(map, rows) {
     const cached = map.get(task.task_id);
     const admissionSettled = cached?.status === 'queued'
       && cached.admission_pending === true && task.admission_pending !== true;
-    if (_TASK_BOARD_TERMINAL.has(task.status) || !cached || admissionSettled) {
+    const edited = (task.instruction_revision || 0) > (cached?.instruction_revision || 0);
+    if (_TASK_BOARD_TERMINAL.has(task.status) || !cached || admissionSettled || edited) {
       map.set(task.task_id, task);
     }
   }
@@ -183,6 +185,7 @@ function _taskBoardOnEvent(cid, evData) {
     || ((task.status === 'queued' || task.status === 'blocked')
       && (cached.status === 'running' || cached.status === 'waiting_input'))
   )) return;
+  if (cached && (task.instruction_revision || 0) < (cached.instruction_revision || 0)) return;
   // A task id this board has never seen starts (or joins) the current batch;
   // if everything tracked is already terminal, the new task opens a FRESH
   // batch and the previous run's terminal rows leave the active board view.
@@ -325,6 +328,7 @@ function _taskBoardRender(cid) {
     _taskBoardDragging = null;
   }
   const all = cid ? [..._taskBoardMapFor(cid).values()] : [];
+  const editing = typeof _queueComposerEditFor === 'function' ? _queueComposerEditFor(cid) : null;
   const rows = _taskBoardLiveRows(all);
   const decision = _taskBoardVisibility(rows);
   if (!decision.visible) {
@@ -398,9 +402,12 @@ function _taskBoardRender(cid) {
         // blocked → the §4.8 user decision: run anyway or cancel.
         const sendNowKey = `${cid}:${task.task_id}`;
         const sendingNow = _taskBoardSendingNow.has(sendNowKey);
-        const canSendNow = _taskBoardCanSendNow(cid, task);
+        const canSendNow = task.task_id !== editing?.taskId && _taskBoardCanSendNow(cid, task);
         const sendNowBtn = (canSendNow || sendingNow)
           ? `<button class="chat-queue-btn" data-act="task-send-now"${sendingNow ? ' disabled' : ''}>${escapeHtml(t(sendingNow ? 'chat.queue_sending_now' : 'chat.queue_send_now'))}</button>`
+          : '';
+        const editBtn = task.status === 'queued' && task.created_by === 'user'
+          ? `<button class="chat-queue-btn" data-act="task-edit"${sendingNow || editing || _taskBoardEditing.has(sendNowKey) ? ' disabled' : ''}>${escapeHtml(t('chat.queue_edit'))}</button>`
           : '';
         const cancelBtn = task.status === 'queued' || task.status === 'blocked'
           ? `<button class="chat-queue-btn danger" data-act="task-cancel"${sendingNow ? ' disabled' : ''}>${escapeHtml(t('chat.task_cancel'))}</button>`
@@ -415,7 +422,7 @@ function _taskBoardRender(cid) {
           <div class="chat-queue-item" draggable="${draggable}"${draggable ? ` title="${escapeHtml(t('chat.queue_drag_title'))}"` : ''} data-task-id="${escapeHtml(task.task_id)}">
             ${draggable ? `<span class="chat-queue-drag" title="${escapeHtml(t('chat.queue_drag_title'))}">${uiIconHtml('grip-vertical', 'ui-icon')}</span>` : ''}
             <div class="chat-queue-text">${statusChip}${dispatchedChip}${depChip}${preview}</div>
-            <div class="chat-queue-actions">${sendNowBtn}${runAnywayBtn}${cancelBtn}</div>
+            <div class="chat-queue-actions">${sendNowBtn}${editBtn}${runAnywayBtn}${cancelBtn}</div>
           </div>
         `;
       }).join('')}</div>
@@ -452,6 +459,13 @@ function _taskBoardRender(cid) {
       e.stopPropagation();
       const taskId = btn.closest('.chat-queue-item')?.dataset.taskId;
       if (taskId) _taskBoardSendNow(cid, taskId);
+    });
+  });
+  list.querySelectorAll('.chat-queue-btn[data-act="task-edit"]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const taskId = btn.closest('.chat-queue-item')?.dataset.taskId;
+      if (taskId) void _taskBoardEdit(cid, taskId);
     });
   });
   list.querySelectorAll('.chat-queue-btn[data-act="task-cancel"]').forEach((btn) => {
@@ -625,12 +639,20 @@ async function _taskBoardSendNow(cid, taskId) {
 
 async function _taskBoardCancel(cid, taskId) {
   try {
-    const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/tasks/cancel`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ task_id: taskId }),
-    });
-    const data = await res.json();
+    const editing = typeof _queueComposerEditFor === 'function' ? _queueComposerEditFor(cid) : null;
+    let data;
+    if (editing?.taskId === taskId) {
+      // The composer owns both the edit lock and the displaced draft.
+      // Reuse its completion path, including pending-save and retry guards.
+      data = { ok: await _deleteQueueItemEdit(cid) };
+    } else {
+      const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/tasks/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task_id: taskId }),
+      });
+      data = await res.json();
+    }
     if (data && data.ok) {
       // The authoritative `task_state` event follows through the bus stream;
       // apply locally too so the row clears even if the stream is between
@@ -642,6 +664,20 @@ async function _taskBoardCancel(cid, taskId) {
     }
   } catch (_) {
     // Leave the row; the user can retry, and bus events reconcile the truth.
+  }
+}
+
+async function _taskBoardEdit(cid, taskId) {
+  const key = `${cid}:${taskId}`;
+  const task = _taskBoardMapFor(cid).get(taskId);
+  if (!task || task.status !== 'queued' || task.created_by !== 'user'
+    || _taskBoardSendingNow.has(key) || _taskBoardEditing.has(key)) return;
+  _taskBoardEditing.add(key);
+  try {
+    await _startQueueItemEdit(cid, taskId);
+  } finally {
+    _taskBoardEditing.delete(key);
+    _taskBoardRender(cid);
   }
 }
 

@@ -58,6 +58,10 @@ export interface LocalCliModelOption {
   label: string;
   /** Stable CLI alias whose concrete provider model can change over time. */
   is_alias?: boolean;
+  /** Concrete provider model this row runs right now, when the CLI reports
+   * it. An alias resolves to whatever its family points at today; a pinned id
+   * reports the model behind its context variant. */
+  resolved_model?: string;
   is_default?: boolean;
   /** Present only when the CLI states the model takes no thinking level. */
   supports_thinking?: boolean;
@@ -132,6 +136,7 @@ function uniqueModels(values: LocalCliModelOption[]): LocalCliModelOption[] {
       id,
       label: safeLabel(value.label, id),
       ...(value.is_alias ? { is_alias: true } : {}),
+      ...(safeToken(value.resolved_model) ? { resolved_model: safeToken(value.resolved_model) } : {}),
       ...(value.is_default ? { is_default: true } : {}),
       ...(value.supports_thinking === false ? { supports_thinking: false } : {}),
       ...(safeToken(value.default_thinking_level) ? {
@@ -314,12 +319,17 @@ export function mapClaudeModelList(result: unknown): Pick<LocalCliRuntimeOptions
       const resolved = safeToken(row?.resolvedModel);
       const levels = uniqueThinking(Array.isArray(row?.supportedEffortLevels)
         ? row.supportedEffortLevels : []);
+      // A value that resolves to a different model follows whatever that
+      // family points at today; a pinned model id stays on one version.
+      const isAlias = !!id && !!resolved && claudeModelBase(id) !== claudeModelBase(resolved);
       return {
         id,
         label: safeLabel(row?.displayName, id),
-        // A value that resolves to a different model follows whatever that
-        // family points at today; a pinned model id stays on one version.
-        is_alias: !!id && !!resolved && claudeModelBase(id) !== claudeModelBase(resolved),
+        is_alias: isAlias,
+        // Every row names the version it runs, so the picker states a model
+        // instead of an unactionable "latest" or a bare family name. A display
+        // name like "Fable" or "Opus (1M context)" carries no version itself.
+        ...(resolved ? { resolved_model: resolved } : {}),
         // The CLI states effort support per model, so a model that takes none
         // must not inherit the levels its siblings advertise.
         supports_thinking: !reportsEffort || row?.supportsEffort === true || levels.length > 0,
@@ -385,11 +395,13 @@ async function claudeModelList(entry: LocalCliEntry, cwd: string): Promise<unkno
     let settled = false;
     let stdoutBytes = 0;
     let timer: NodeJS.Timeout | undefined;
-    const finish = (value: unknown) => {
+    const finish = (value: unknown, closed = false) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
-      killProcessTree(child, 'SIGTERM');
+      // close has already released the process and its pipes. POSIX orphan
+      // groups are reaped by spawnCli's exit handler; Windows needs a live PID.
+      if (!closed) killProcessTree(child, 'SIGTERM');
       resolve(value);
     };
     child.stdout.setEncoding('utf8');
@@ -406,7 +418,7 @@ async function claudeModelList(entry: LocalCliEntry, cwd: string): Promise<unkno
       });
     });
     child.on('error', () => finish(null));
-    child.on('close', () => finish(null));
+    child.on('close', () => finish(null, true));
     try {
       child.stdin.write(`${JSON.stringify({
         type: 'control_request',
@@ -430,11 +442,11 @@ async function codexModelList(entry: LocalCliEntry, cwd: string): Promise<unknow
     const splitter = new LineSplitter();
     let settled = false;
     let stdoutBytes = 0;
-    const finish = (value: unknown) => {
+    const finish = (value: unknown, closed = false) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      killProcessTree(child, 'SIGTERM');
+      if (!closed) killProcessTree(child, 'SIGTERM');
       resolve(value);
     };
     const send = (message: object) => {
@@ -459,7 +471,7 @@ async function codexModelList(entry: LocalCliEntry, cwd: string): Promise<unknow
       });
     });
     child.on('error', () => finish(null));
-    child.on('close', () => finish(null));
+    child.on('close', () => finish(null, true));
     send({
       jsonrpc: '2.0', id: 1, method: 'initialize',
       params: {

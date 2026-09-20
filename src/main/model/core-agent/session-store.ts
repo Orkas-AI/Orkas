@@ -243,6 +243,7 @@ export function evictSession(sessionId: string): void {
 export function evictEphemeralSession(userId: string, sessionId: string): void {
   if (!isEphemeralSessionId(sessionId)) return;
   const key = cacheKey(userId, sessionId);
+  if (cache.get(key)?.hasPendingPersistence()) return;
   cache.delete(key);
   pending.delete(key);
 }
@@ -280,7 +281,7 @@ export function deleteSessionFile(sessionId: string): void {
 /** Same as deleteSessionFile but takes an explicit userId (caller has the
  *  uid in scope and doesn't want to depend on the global active uid — e.g.
  *  chats.deleteConversation passes ctx.userId). */
-export function deleteSessionFileForUser(userId: string, sessionId: string): void {
+export function deleteSessionFileForUser(userId: string, sessionId: string, opts?: { preserveToolResults?: boolean }): void {
   const file = resolveSessionPath(userId, sessionId);
   try { fs.unlinkSync(file); }
   catch (err) {
@@ -304,13 +305,16 @@ export function deleteSessionFileForUser(userId: string, sessionId: string): voi
       });
     }
   }
-  try { fs.rmSync(toolResultsDirForSession(userId, sessionId), { recursive: true, force: true }); }
-  catch (err) {
-    log.warn('session tool-results delete failed', {
-      user_id: maskId(userId),
-      session_id: maskId(sessionId),
-      error: logErrorRef(err),
-    });
+  // A message deletion resets model state; surviving canonical records still own these outputs.
+  if (!opts?.preserveToolResults) {
+    try { fs.rmSync(toolResultsDirForSession(userId, sessionId), { recursive: true, force: true }); }
+    catch (err) {
+      log.warn('session tool-results delete failed', {
+        user_id: maskId(userId),
+        session_id: maskId(sessionId),
+        error: logErrorRef(err),
+      });
+    }
   }
   try { fs.rmSync(sessionAnalysisInputsDir(userId, sessionId), { recursive: true, force: true }); }
   catch (err) {
@@ -322,10 +326,13 @@ export function deleteSessionFileForUser(userId: string, sessionId: string): voi
   }
 }
 
-/** Flush all cached sessions — called by `features/users.activateUser()` on uid switch. */
+/** Release saved sessions on account switch. Unsaved sessions remain keyed to
+ * their original user so switching accounts cannot discard a failed save. */
 export function _evictAll(): void {
   cacheGeneration += 1;
-  cache.clear();
+  for (const [key, session] of cache) {
+    if (!session.hasPendingPersistence()) cache.delete(key);
+  }
   pending.clear();
 }
 

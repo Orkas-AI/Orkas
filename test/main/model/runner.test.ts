@@ -57,6 +57,40 @@ async function loadRunner() {
 }
 
 describe('runner › buildRunner auth gate', () => {
+  it('keeps BYO provider windows aligned with the public catalog across a remote refresh', async ({ signal }) => {
+    const createPiProvider = vi.fn(({ customModel }: any) => ({
+      id: 'anthropic', name: 'Anthropic',
+      async *stream() {
+        yield { type: 'text_delta' as const, text: 'ok' };
+        yield { type: 'message_end' as const, model: customModel.id, stopReason: 'end_turn' as const };
+      },
+      complete: vi.fn(), validateAuth: vi.fn(),
+    }));
+    vi.doMock('#core-agent', async () => ({ ...(await vi.importActual<any>('#core-agent')), createPiProvider }));
+    const uid = 'runner-public-windows';
+    const users = await import('../../../src/main/features/users');
+    const auth = await import('../../../src/main/features/auth');
+    const { clientConfig } = await import('../../../src/main/features/client_config');
+    users.activateUser(uid);
+    const profile = await auth.addApiKey('anthropic', 'fixture-key', 'Fixture');
+    await auth.addEntry({ provider: 'anthropic', model: 'claude-opus-5', profileId: profile.profileId });
+    const apply = (window: number) => clientConfig.applyServerPayload({ immediate: { model_catalog: { providers: {
+      anthropic: [{ id: 'claude-opus-5', contextWindow: window, maxTokens: 32_000 }],
+    } } }, restart: {} }, 'public-window-fixture');
+    apply(272_000);
+    const { buildRunner } = await loadRunner();
+    signal.throwIfAborted();
+    const first = await buildRunner({ sessionId: 'gconv-public-window', userId: uid });
+    expect((first.runner as any).config.models.catalog).toMatchObject({
+      'claude-opus-5': { contextWindow: 272_000, maxOutputTokens: 32_000 },
+    });
+    apply(192_000);
+    const next = await buildRunner({ sessionId: 'gconv-public-window', userId: uid });
+    expect((next.runner as any).config.models.catalog).toMatchObject({
+      'claude-opus-5': { contextWindow: 192_000, maxOutputTokens: 32_000 },
+    });
+  });
+
   it('throws a clear "no model configured" error when no entries exist and no env fallback', async () => {
     // Fresh tmpDir → no workspace/auth/auth-profiles.json → pickChatEntry
     // returns null. ANTHROPIC_API_KEY cleared in beforeEach.
@@ -371,6 +405,78 @@ describe('runner › buildRunner auth gate', () => {
     expect(execution.content).toContain('"mode":"strict"');
   });
 
+  it('binds the native provider backstop to the conversation before the next request', async ({ onTestFinished }) => {
+    const oldLimit = process.env.ORKAS_MAX_TASK_TOKENS;
+    process.env.ORKAS_MAX_TASK_TOKENS = '500';
+    onTestFinished(() => {
+      if (oldLimit === undefined) delete process.env.ORKAS_MAX_TASK_TOKENS;
+      else process.env.ORKAS_MAX_TASK_TOKENS = oldLimit;
+    });
+    const physicalCall = vi.fn();
+    vi.doMock('#core-agent', async () => ({ ...await vi.importActual<any>('#core-agent'),
+      createPiProvider: () => ({ id: 'anthropic', name: 'Fixture', validateAuth: async () => true,
+        async *stream() {
+          physicalCall();
+          yield { type: 'text_delta', text: 'completed' };
+          yield { type: 'message_end', stopReason: 'end_turn', model: 'fixture',
+            usage: { inputTokens: 400, outputTokens: 100, totalTokens: 500 } };
+        },
+      }),
+    }));
+    const uid = 'runner-task-budget';
+    const users = await import('../../../src/main/features/users');
+    users.activateUser(uid);
+    const auth = await import('../../../src/main/features/auth');
+    const profile = await auth.addApiKey('anthropic', 'fixture-key', 'Fixture');
+    await auth.addEntry({ provider: 'anthropic', model: 'claude-opus-5', profileId: profile.profileId });
+    const { buildRunner } = await loadRunner();
+    const built = await buildRunner({ sessionId: 'gconv-task-budget', userId: uid, cid: 'budget-fixture' });
+    const provider = (built.runner as any).providers.get('anthropic');
+    const request = { model: built.modelId, messages: [{ role: 'user', content: [{ type: 'text', text: 'Continue' }] }] };
+    const call = async () => { for await (const _ of provider.stream(request)) { /* Drain the fixture response. */ } };
+    const meter = await import('../../../src/main/util/conversation-cost-meter');
+    onTestFinished(() => meter.resetTaskTokens('budget-fixture'));
+    await call();
+    expect(meter.taskTokens('budget-fixture')).toBe(500);
+    await expect(call()).rejects.toMatchObject({ code: 'TASK_TOKEN_LIMIT_REACHED' });
+    expect(physicalCall).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves omitted native reasoning and explicit per-request precedence on the SDK wire', async () => {
+    const payloads: any[] = [];
+    vi.doMock('#core-agent', async () => {
+      const actual = await vi.importActual<any>('#core-agent');
+      return { ...actual, createPiProvider: (config: any) => actual.createPiProvider({ ...config,
+        onPayload: (...args: any[]) => { payloads.push(args[0]); return config.onPayload?.(...args) ?? args[0]; },
+      }) };
+    });
+    const users = await import('../../../src/main/features/users');
+    users.activateUser('runner-reasoning-parity');
+    const { clientConfig } = await import('../../../src/main/features/client_config');
+    clientConfig.applyServerPayload({ immediate: { model_catalog: { providers: {
+      'openai-codex': [{ id: 'gpt-5.5', name: 'GPT-5.5' }],
+    } } } }, 'reasoning-parity-fixture');
+    const token = Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'fixture' } })).toString('base64url');
+    const auth = await import('../../../src/main/features/auth');
+    await auth.addApiKeyEntry('openai-codex', 'gpt-5.5', `fixture.${token}.fixture`, 'Fixture');
+    const { buildRunner } = await loadRunner();
+    const built = await buildRunner({ sessionId: 'gconv-reasoning-parity', userId: 'runner-reasoning-parity' });
+    const provider = (built.runner as any).providers.get('openai-codex');
+    const request = { model: built.modelId, messages: [{ role: 'user', content: [{ type: 'text', text: 'fixture' }] }] };
+    const fetchStub = vi.fn(async () => new Response(JSON.stringify({ error: {
+      message: 'fixture request rejected', type: 'invalid_request_error', code: 'invalid_request_error',
+    } }), { status: 400, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchStub);
+    try {
+      await expect(provider.complete(request)).rejects.toThrow(/fixture request rejected/);
+      await expect(provider.complete({ ...request, reasoning: 'low' })).rejects.toThrow(/fixture request rejected/);
+      expect(fetchStub).toHaveBeenCalledTimes(2);
+    } finally { vi.unstubAllGlobals(); }
+    expect(payloads).toHaveLength(2);
+    expect(payloads[0].reasoning?.effort).toBeUndefined();
+    expect(payloads[1].reasoning?.effort).toBe('low');
+  });
+
   it('passes an arbitrary OpenRouter ID to pi-ai as the resolved custom model', async () => {
     const createPiProvider = vi.fn(() => ({
       id: 'openrouter',
@@ -457,8 +563,8 @@ describe('runner › metacognition closed loop', () => {
   });
 });
 
-describe('runner › conditional OCR tool exposure', () => {
-  it('keeps OfficeWorker Office tools while routing OCR by capability and intent', async () => {
+describe('runner › retired OCR tool exposure', () => {
+  it('keeps document and image tools without OCR for images, PDFs, explicit requests and rich steer', async () => {
     const uid = 'runner-ocr-policy';
     const users = await import('../../../src/main/features/users');
     const auth = await import('../../../src/main/features/auth');
@@ -500,7 +606,7 @@ describe('runner › conditional OCR tool exposure', () => {
       userMessage: '读取这个文件',
       attachmentMetadata: { hasAttachments: true, attachmentTypes: ['pdf'] },
     });
-    expect(pdfTurn.toolDefs.some((tool) => tool.name === 'ocr_file')).toBe(true);
+    expect(pdfTurn.toolDefs.some((tool) => tool.name === 'ocr_file')).toBe(false);
 
     const explicitOcrTurn = await buildRunner({
       sessionId: `gmember-ocr-explicit-${OFFICE_WORKER_AGENT_ID}`,
@@ -510,7 +616,7 @@ describe('runner › conditional OCR tool exposure', () => {
       userMessage: '请从这张截图中提取表格文字',
       attachmentMetadata: { hasAttachments: true, attachmentTypes: ['image'] },
     });
-    expect(explicitOcrTurn.toolDefs.some((tool) => tool.name === 'ocr_file')).toBe(true);
+    expect(explicitOcrTurn.toolDefs.some((tool) => tool.name === 'ocr_file')).toBe(false);
 
     const richSteerTurn = await buildRunner({
       sessionId: `gmember-ocr-rich-steer-${OFFICE_WORKER_AGENT_ID}`,
@@ -521,7 +627,7 @@ describe('runner › conditional OCR tool exposure', () => {
       attachmentMetadata: { hasAttachments: false, attachmentTypes: [] },
       richSteerEnabled: true,
     });
-    expect(richSteerTurn.toolDefs.some((tool) => tool.name === 'ocr_file')).toBe(true);
+    expect(richSteerTurn.toolDefs.some((tool) => tool.name === 'ocr_file')).toBe(false);
   });
 });
 
@@ -564,7 +670,8 @@ describe('runner › generic host capabilities for built-in Agents', () => {
     expect(publicToolNames).not.toContain('library');
     expect(publicToolNames).not.toContain('create_pptx');
     expect(publicToolNames).not.toContain('edit_file');
-    expect(publicToolNames).not.toContain('process_session');
+    expect(publicToolNames).toContain('process_session');
+    expect(publicToolNames).not.toContain('interactive_cli');
     expect(built.resolvedSystemPrompt).toContain('## Loadable tool groups');
     expect(built.resolvedSystemPrompt).toContain('Fallback only');
     expect(built.turnEphemeral).not.toContain('## Active tool groups');
@@ -600,10 +707,10 @@ describe('runner › scoped tool loading', () => {
     expect((await tools.get('project_instructions').execute({ instructions: 'Stale replacement.' }, ctx)).isError).toBe(true);
     expect(await projects.readProjectInstructions(uid, projectId)).toMatchObject({ content: 'Newer user rule.' });
     if (kind === 'gmember') {
-      const added = await tools.get('todo_tasks').execute({ action: 'create', title: 'Authorized project item' }, ctx);
+      const added = await tools.get('todo_tasks').execute({ action: 'create', content: 'Authorized project item' }, ctx);
       expect(added.isError).toBeFalsy();
       const tasks = await import('../../../src/main/features/project_tasks');
-      expect((await tasks.listTasks(uid, projectId)).map((task) => task.title)).toContain('Authorized project item');
+      expect((await tasks.listTasks(uid, projectId)).map((task) => task.content)).toContain('Authorized project item');
       expect((await tools.get('todo_tasks').execute({ action: 'create', title: 'Wrong scope', project: '__global__' }, ctx)).isError).toBe(true);
     }
   });
@@ -619,6 +726,32 @@ describe('runner › scoped tool loading', () => {
       profileId: profile.profileId,
     });
   }
+
+  it('keeps learned Skill creation pending until host Agent metadata is saved', async () => {
+    const uid = 'learned-skill-drain';
+    await configureUser(uid);
+    const agents = await import('../../../src/main/features/agents');
+    let release!: () => void;
+    let entered!: () => void;
+    const ready = new Promise<void>((resolve) => { entered = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const append = vi.spyOn(agents, 'appendAgentSkill').mockImplementation(async () => {
+      entered(); await gate; return true;
+    });
+    const { buildRunner } = await loadRunner();
+    const built = await buildRunner({ sessionId: 'gmember-learned-drain', userId: uid, agentId: 'learner', toolList: [] });
+    const tool = (built.runner as any).tools.get('skill_manage');
+    let returned = false;
+    const create = tool.execute({ action: 'create', id: 'saved-lesson', name: 'Lesson', description: 'Test', body: 'Reusable lesson' }, { state: {} })
+      .then((value: { isError?: boolean }) => { returned = true; return value; });
+    try {
+      await ready;
+      await Promise.resolve();
+      expect(returned).toBe(false);
+      expect(append).toHaveBeenCalledWith('learner', 'saved-lesson');
+    } finally { release(); append.mockRestore(); }
+    expect((await create).isError).toBeFalsy();
+  });
 
   async function projectActor(uid: string, projectId: string, agentId: string, kind = 'gmember') {
     const { buildRunner } = await loadRunner();
@@ -639,6 +772,39 @@ describe('runner › scoped tool loading', () => {
       return tool!.execute(input, { workingDir: tmpDir, state: {} });
     };
   }
+
+  it.each([
+    { kind: 'gconv', inProject: false }, { kind: 'gmember', inProject: false },
+    { kind: 'gconv', inProject: true }, { kind: 'gmember', inProject: true },
+  ])('reserves global writes for Commander while preserving $kind local memory writes (project=$inProject)', async ({ kind, inProject }) => {
+    process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
+    const uid = 'global-memory-actors';
+    await configureUser(uid);
+    const projects = await import('../../../src/main/features/projects');
+    const memory = await import('../../../src/main/features/memory');
+    const project = await projects.createProject(uid, 'Memory boundary');
+    if (!project.ok) throw new Error('project fixture failed');
+    const actor = await projectActor(uid, inProject ? project.project.project_id : '', 'editor', kind);
+    for (const target of ['user', 'shared'] as const) {
+      const scope = target === 'shared' ? 'memory' : 'user';
+      memory.addEntry(uid, scope, 'Original global fact');
+      expect(JSON.parse((await actor('cross_session_memory', { action: 'list', target })).content).entries).toEqual(['Original global fact']);
+      for (const input of [
+        { action: 'add', content: 'Added global fact' },
+        { action: 'replace', old_text: 'Original global fact', content: 'Corrected global fact' },
+        { action: 'remove', old_text: 'Added global fact' },
+      ]) {
+        const result = await actor('cross_session_memory', { ...input, target });
+        expect(result.isError).toBe(kind !== 'gconv');
+      }
+      expect(memory.listEntries(uid, scope).entries).toEqual([kind === 'gconv' ? 'Corrected global fact' : 'Original global fact']);
+    }
+    for (const target of inProject ? ['agent', 'project'] : ['agent']) {
+      expect((await actor('cross_session_memory', { action: 'add', target, content: 'Local reusable fact' })).isError).toBe(false);
+      expect(JSON.parse((await actor('cross_session_memory', { action: 'list', target })).content).entries).toEqual(['Local reusable fact']);
+    }
+    if (!inProject) expect((await actor('cross_session_memory', { action: 'list', target: 'project' })).isError).toBe(true);
+  });
 
   it.each(['gconv', 'gmember'])('lets %s correct another Agent project memory without changing private or other-project records', async (kind) => {
     process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
@@ -811,7 +977,8 @@ describe('runner › scoped tool loading', () => {
     // With the same OfficeCLI fixture, resident prompts remain unchanged:
     // totals move from 38,370 / 91,255 to 43,747 / 97,868. Keep comparable
     // headroom; the independent tool and resident-prompt budgets still apply.
-    expect(combined).toBeLessThanOrEqual(maximal ? 100_000 : 45_500);
+    // Global task and automation schemas are now eligible in the maximal explicit surface (+5.7k).
+    expect(combined).toBeLessThanOrEqual(maximal ? 106_000 : 45_500);
   });
 
   it('defers unbound Commander project tasks and exposes bound reads without injecting backlog records', async () => {
@@ -830,7 +997,7 @@ describe('runner › scoped tool loading', () => {
     const tasks = await import('../../../src/main/features/project_tasks');
     const created = await projects.createProject(uid, 'On-demand backlog');
     if (!created.ok) throw new Error('project fixture failed');
-    await tasks.createTask(uid, created.project.project_id, { title: 'BACKLOG_NOT_IN_PROMPT' });
+    await tasks.createTask(uid, created.project.project_id, { content: 'BACKLOG_NOT_IN_PROMPT' });
     const project = await buildRunner({
       sessionId: 'gconv-project-task-gate-project',
       userId: uid,
@@ -852,7 +1019,7 @@ describe('runner › scoped tool loading', () => {
     expect(project.turnEphemeral).not.toContain('## Project status');
     expect(project.resolvedSystemPrompt + project.turnEphemeral).not.toContain('BACKLOG_NOT_IN_PROMPT');
     const listed = await (project.runner as any).tools.get('todo_tasks').execute({ action: 'list' }, { state: {} });
-    expect(JSON.parse(listed.content).tasks).toContainEqual(expect.objectContaining({ title: 'BACKLOG_NOT_IN_PROMPT' }));
+    expect(JSON.parse(listed.content).tasks).toContainEqual(expect.objectContaining({ content: 'BACKLOG_NOT_IN_PROMPT' }));
   });
 
   it('loads tasks outside a project and writes only to an explicitly resolved project or global scope', async () => {
@@ -882,16 +1049,17 @@ describe('runner › scoped tool loading', () => {
     const discovery = JSON.parse((await tool.execute({ action: 'list_projects' }, context)).content);
     expect(discovery.projects.map((project: any) => project.project_id).sort())
       .toEqual(['__global__', target.project.project_id, other.project.project_id].sort());
-    const globalCreated = await tool.execute({ action: 'create', project: '__global__', title: '全局待办' }, context);
+    const globalCreated = await tool.execute({ action: 'create', project: '__global__', content: '全局待办' }, context);
     expect(JSON.parse(globalCreated.content)).toMatchObject({
       ok: true,
       outcome: 'task_created',
       project: { project_id: '__global__', name: 'Global' },
     });
     expect(await tasks.listTasks(uid, '')).toEqual([
-      expect.objectContaining({ title: '全局待办', origin_cid: 'outside-project', status: 'todo' }),
+      expect.objectContaining({ content: '全局待办', status: 'todo' }),
     ]);
-    const request = { action: 'create', project: '测试项目', title: '这是一条测试待办' };
+    expect((await tasks.listTasks(uid, ''))[0]).not.toHaveProperty('origin_cid');
+    const request = { action: 'create', project: '测试项目', content: '这是一条测试待办' };
     const created = await tool.execute(request, context);
     expect(JSON.parse(created.content)).toMatchObject({
       ok: true, outcome: 'task_created', project: { project_id: target.project.project_id },
@@ -900,8 +1068,9 @@ describe('runner › scoped tool loading', () => {
     expect(JSON.parse(repeated.content)).toMatchObject({ ok: true, outcome: 'existing_task_reused' });
     const persisted = await tasks.listTasks(uid, target.project.project_id);
     expect(persisted).toHaveLength(1);
-    expect(persisted[0]).toMatchObject({ title: request.title, origin_cid: 'outside-project', status: 'todo' });
-    const userCreated = await tasks.createTask(uid, target.project.project_id, { title: 'Status-linked task' });
+    expect(persisted[0]).toMatchObject({ content: request.content, status: 'todo' });
+    expect(persisted[0]).not.toHaveProperty('origin_cid');
+    const userCreated = await tasks.createTask(uid, target.project.project_id, { content: 'Status-only task' });
     if (!userCreated.ok) throw new Error('user-created task fixture failed');
     const statusUpdate = await tool.execute({
       action: 'update',
@@ -912,9 +1081,9 @@ describe('runner › scoped tool loading', () => {
     expect(statusUpdate.isError).not.toBe(true);
     expect(await tasks.getTask(uid, target.project.project_id, userCreated.task.id)).toMatchObject({
       status: 'progress',
-      origin_cid: 'outside-project',
     });
-    const completedByConversation = await tasks.createTask(uid, target.project.project_id, { title: 'Complete-linked task' });
+    expect(await tasks.getTask(uid, target.project.project_id, userCreated.task.id)).not.toHaveProperty('origin_cid');
+    const completedByConversation = await tasks.createTask(uid, target.project.project_id, { content: 'Completion-only task' });
     if (!completedByConversation.ok) throw new Error('complete-linked task fixture failed');
     const completed = await tool.execute({
       action: 'complete',
@@ -924,15 +1093,15 @@ describe('runner › scoped tool loading', () => {
     expect(completed.isError).not.toBe(true);
     expect(await tasks.getTask(uid, target.project.project_id, completedByConversation.task.id)).toMatchObject({
       status: 'done',
-      origin_cid: 'outside-project',
     });
-    const titleOnly = await tasks.createTask(uid, target.project.project_id, { title: 'Title-only task' });
-    if (!titleOnly.ok) throw new Error('title-only task fixture failed');
+    expect(await tasks.getTask(uid, target.project.project_id, completedByConversation.task.id)).not.toHaveProperty('origin_cid');
+    const titleOnly = await tasks.createTask(uid, target.project.project_id, { content: 'Title-only task' });
+    if (!titleOnly.ok) throw new Error('content-only task fixture failed');
     await tool.execute({
       action: 'update',
       project: target.project.project_id,
       task_id: titleOnly.task.id,
-      title: 'Title-only edit',
+      content: 'Title-only edit',
     }, context);
     expect((await tasks.getTask(uid, target.project.project_id, titleOnly.task.id))?.origin_cid).toBeUndefined();
     expect(await tasks.listTasks(uid, other.project.project_id)).toEqual([]);
@@ -968,7 +1137,7 @@ describe('runner › scoped tool loading', () => {
     const runner = built.runner as any;
     const context = { state: {} };
     await runner.tools.get('tool_load').execute({ groups: ['management.projects'] }, context);
-    const rejected = await runner.tools.get('todo_tasks').execute({ action: 'create', project: 'Same', title: 'Do it' }, context);
+    const rejected = await runner.tools.get('todo_tasks').execute({ action: 'create', project: 'Same', content: 'Do it' }, context);
     expect(rejected.isError).toBe(true);
     expect(JSON.parse(rejected.content).candidates).toHaveLength(2);
     expect(await tasks.listTasks(uid, first.project.project_id)).toEqual([]);
@@ -977,7 +1146,7 @@ describe('runner › scoped tool loading', () => {
     await projects.deleteProject(uid, second.project.project_id);
     expect((await runner.tools.get('todo_tasks').execute({ action: 'list', project: second.project.project_id }, context)).isError).toBe(true);
 
-    const agentTask = await tasks.createTask(uid, first.project.project_id, { title: 'AGENT_BACKLOG_ON_DEMAND' });
+    const agentTask = await tasks.createTask(uid, first.project.project_id, { content: 'AGENT_BACKLOG_ON_DEMAND' });
     if (!agentTask.ok) throw new Error('agent task fixture failed');
     const agent = await buildRunner({
       sessionId: 'gmember-project-target-agent', userId: uid, agentId: 'reader', cid: 'agent-result',
@@ -994,30 +1163,49 @@ describe('runner › scoped tool loading', () => {
     expect((await automation.execute({ action: 'list', project_id: '__global__' }, context)).isError).toBe(true);
     expect(agent.resolvedSystemPrompt + agent.turnEphemeral).not.toContain('AGENT_BACKLOG_ON_DEMAND');
     expect(JSON.parse((await bound.execute({ action: 'list' }, context)).content).tasks)
-      .toContainEqual(expect.objectContaining({ title: 'AGENT_BACKLOG_ON_DEMAND' }));
+      .toContainEqual(expect.objectContaining({ content: 'AGENT_BACKLOG_ON_DEMAND' }));
     expect(agent.runner.getActiveToolDefinitions().map((tool) => tool.name)).toContain('todo_tasks');
     expect(bound.inputSchema.properties.action.enum).toEqual(['list', 'get', 'create', 'update', 'complete']);
     expect((await bound.execute({ action: 'update', task_id: agentTask.task.id, status: 'review', result_ref: 'artifact-1' }, context)).isError).toBeFalsy();
-    expect(await tasks.getTask(uid, first.project.project_id, agentTask.task.id)).toMatchObject({ status: 'review', result_ref: 'artifact-1', origin_cid: 'agent-result' });
+    expect(await tasks.getTask(uid, first.project.project_id, agentTask.task.id)).toMatchObject({ status: 'review', result_ref: 'artifact-1' });
+    expect(await tasks.getTask(uid, first.project.project_id, agentTask.task.id)).not.toHaveProperty('origin_cid');
     expect((await bound.execute({ action: 'complete', task_id: agentTask.task.id }, context)).isError).toBeFalsy();
     expect((await tasks.getTask(uid, first.project.project_id, agentTask.task.id))?.status).toBe('done');
     expect((await bound.execute({ action: 'update', task_id: agentTask.task.id, status: 'todo', owner: 'other' }, context)).isError).toBe(true);
     expect((await bound.execute({ action: 'update', task_id: agentTask.task.id, status: 'todo', project: second.project.project_id }, context)).isError).toBe(true);
     expect((await tasks.getTask(uid, first.project.project_id, agentTask.task.id))?.status).toBe('done');
     expect(bound.inputSchema.properties.project).toBeUndefined();
-    const added = await bound.execute({ action: 'create', title: 'Agent-created item' }, context);
+    const added = await bound.execute({ action: 'create', content: 'Agent-created item' }, context);
     expect(added.isError).toBeFalsy();
     const addedId = JSON.parse(added.content).task.id;
-    expect(await tasks.getTask(uid, first.project.project_id, addedId)).toMatchObject({ title: 'Agent-created item', origin_cid: 'agent-result' });
-    expect((await bound.execute({ action: 'update', task_id: addedId, title: 'Edited by Agent', detail: 'New detail' }, context)).isError).toBeFalsy();
-    expect(await tasks.getTask(uid, first.project.project_id, addedId)).toMatchObject({ title: 'Edited by Agent', detail: 'New detail' });
+    expect(await tasks.getTask(uid, first.project.project_id, addedId)).toMatchObject({ content: 'Agent-created item' });
+    expect(await tasks.getTask(uid, first.project.project_id, addedId)).not.toHaveProperty('origin_cid');
+    expect((await bound.execute({ action: 'update', task_id: addedId, content: 'Edited by Agent\nNew detail' }, context)).isError).toBeFalsy();
+    expect(await tasks.getTask(uid, first.project.project_id, addedId)).toMatchObject({ content: 'Edited by Agent\nNew detail' });
     for (const project of [second.project.project_id, '__global__']) {
-      expect((await bound.execute({ action: 'create', title: 'forbidden', project }, context)).isError).toBe(true);
+      expect((await bound.execute({ action: 'create', content: 'forbidden', project }, context)).isError).toBe(true);
     }
-    expect((await agentRunner.tools.get('tool_load').execute({ groups: ['management.projects'] }, context)).isError).toBe(true);
+    expect((await agentRunner.tools.get('tool_load').execute({ groups: ['management.projects'] }, context)).isError).toBeFalsy();
     const unboundAgent = await buildRunner({ sessionId: 'gmember-unbound-reader', userId: uid, agentId: 'reader', toolList: [] });
-    expect((unboundAgent.runner as any).tools.has('todo_tasks')).toBe(false);
-    expect((unboundAgent.runner as any).tools.has('auto_tasks')).toBe(false);
+    const globalTools = (unboundAgent.runner as any).tools;
+    expect((await globalTools.get('tool_load').execute({ groups: ['management.projects', 'management.automation'] }, context)).isError).toBeFalsy();
+    const globalTodo = globalTools.get('todo_tasks');
+    const createdGlobal = JSON.parse((await globalTodo.execute({ action: 'create', content: 'Global work' }, context)).content);
+    expect(createdGlobal.ok).toBe(true);
+    expect(await tasks.getTask(uid, '', createdGlobal.task.id)).toMatchObject({ content: 'Global work' });
+    expect((await globalTodo.execute({ action: 'complete', task_id: createdGlobal.task.id, project: '__global__' }, context)).isError).toBeFalsy();
+    expect((await tasks.getTask(uid, '', createdGlobal.task.id))?.status).toBe('done');
+    for (const input of [
+      { action: 'get', task_id: agentTask.task.id },
+      { action: 'complete', task_id: agentTask.task.id },
+      { action: 'create', content: 'forbidden', project: first.project.project_id },
+    ]) expect((await globalTodo.execute(input, context)).isError).toBe(true);
+    expect((await tasks.getTask(uid, first.project.project_id, agentTask.task.id))?.status).toBe('done');
+    const auto = JSON.parse((await globalTools.get('auto_tasks').execute({ action: 'create', content: 'Global automation', enabled: false, schedule: { type: 'daily', hour: 9, minute: 0 } }, context)).content);
+    expect(auto.ok).toBe(true);
+    const autoStore = await import('../../../src/main/features/auto_tasks');
+    expect(await autoStore.getTask(uid, auto.taskId)).not.toHaveProperty('project_id');
+
     duplicateNames.mockRestore();
   });
 
@@ -1081,16 +1269,17 @@ describe('runner › scoped tool loading', () => {
     const uid = 'runner-owner-studio-imports';
     await configureUser(uid);
     const videoModuleLoads = vi.fn();
+    const videoOptions = vi.fn();
     const imageModuleLoads = vi.fn();
     vi.doMock('../../../src/main/model/core-agent/video-studio-tool', () => {
       videoModuleLoads();
       return {
-        createVideoStudioTool: () => ({
+        createVideoStudioTool: (opts: unknown) => { videoOptions(opts); return ({
           name: 'video_studio',
           description: 'Test owner-only VideoStudio runtime.',
           inputSchema: { type: 'object', properties: {}, additionalProperties: false },
           async execute() { return { content: 'ok' }; },
-        }),
+        }); },
       };
     });
     vi.doMock('../../../src/main/model/core-agent/image-studio-tool', () => {
@@ -1127,14 +1316,21 @@ describe('runner › scoped tool loading', () => {
     expect(videoModuleLoads).not.toHaveBeenCalled();
     expect(image.toolDefs.map((tool) => tool.name)).toContain('image_studio');
 
+    const referenceRoots = [path.join(tmpDir, 'referenced-attachments')];
+    const runtimeRoots: string[] = [];
     const video = await buildRunner({
       sessionId: 'gmember-owner-studio-video',
       userId: uid,
       agentId: VIDEO_STUDIO_AGENT_ID,
       toolList: ['media.video'],
+      readOnlyExtraRoots: referenceRoots,
+      runtimeReadOnlyRoots: runtimeRoots,
     });
     expect(videoModuleLoads).toHaveBeenCalledTimes(1);
     expect(video.toolDefs.map((tool) => tool.name)).toContain('video_studio');
+    expect(videoOptions.mock.calls[0][0].readOnlyExtraRoots).toEqual(referenceRoots);
+    expect(videoOptions.mock.calls[0][0].runtimeReadOnlyRoots).toBe(runtimeRoots);
+    expect(videoOptions.mock.calls[0][0].extraRoots || []).not.toContain(referenceRoots[0]);
   });
 
   it('exposes citation verification on the real runner surface only to its four web owners', async () => {
@@ -1537,7 +1733,7 @@ describe('runner › scoped tool loading', () => {
     expect(commander.resolvedSystemPrompt).not.toMatch(/execution Plan/i);
     expect(commander.resolvedSystemPrompt).toContain('`management.app`');
     expect(commander.resolvedSystemPrompt).toContain('`management.skills`');
-    expect(commander.resolvedSystemPrompt).toContain('runtime only; not an Agent dependency');
+    expect(commander.resolvedSystemPrompt).not.toContain('runtime only; not an Agent dependency');
     const directory = commander.resolvedSystemPrompt.split('## Loadable tool groups')[1].split('\n## ')[0];
     for (const name of ['bash', 'read_files', 'web_search', 'web_fetch', 'open_app_view']) {
       expect(directory).not.toContain(`- \`${name}\` —`);
@@ -1549,6 +1745,7 @@ describe('runner › scoped tool loading', () => {
       .not.toContain('Fallback only');
     const initialPrompt = commander.resolvedSystemPrompt;
     expect(commander.turnEphemeral).not.toContain('## Active tool groups');
+    expect(commander.toolSurfaceTelemetry(['inner_browser']).webToolUsed).toBe(true);
     expect(commander.toolSurfaceTelemetry(['bash', 'web_search'])).toMatchObject({
       loadCallCount: 0,
       loadedGroupCount: 0,
@@ -1747,7 +1944,8 @@ describe('runner › scoped tool loading', () => {
       .toBeLessThan(agentCreator.content.indexOf('<file '));
     expect(agentCreator.content).toContain('Tools: `read_files`');
     expect(agentCreator.content).toContain('Tools: `web_search`');
-    expect(agentCreator.content).toContain('Tools: `list_connector_tools`, `call_connector_tool`.');
+    expect(agentCreator.content).not.toContain('`connectors`');
+    expect(agentCreator.content).not.toContain('`call_connector_tool`');
     expect(agentCreator.content).not.toContain('`add_custom_connector`');
     expect(agentCreator.content).not.toContain('`management`');
     expect(agentCreator.content).not.toContain('runtime only');
@@ -1756,6 +1954,124 @@ describe('runner › scoped tool loading', () => {
     expect(otherCreator.content).toContain('product usage guide');
     expect(otherCreator.content).not.toContain('## Agent tool dependencies');
     expect(otherCreator.content).not.toContain('## Skill runtime requirements');
+  });
+
+  it('offers only supported Skill and tool dependencies in both Agent authoring entry points', async () => {
+    const uid = 'runner-agent-authoring-candidates';
+    await configureUser(uid);
+    const config = await import('../../../src/main/features/config');
+    config.setGlobalSkillRootsEnabled(false);
+    const paths = await import('../../../src/main/paths');
+    for (const [root, id, extra] of [
+      [paths.userSystemSkillsDir(uid), 'agent-creator', ''],
+      [paths.userSystemSkillsDir(uid), 'package-installer', ''],
+      [paths.userSystemSkillsDir(uid), 'skill-creator', ''],
+      [paths.userSkillsDir(uid), 'shared-helper', ''],
+      [paths.userSkillsDir(uid), 'foreign-helper', 'ownerAgent: another-agent\n'],
+    ]) {
+      const dir = path.join(root, id);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'SKILL.md'),
+        `---\nname: ${id}\ndescription: Synthetic helper\n${extra}---\n${id} body`);
+    }
+    const externalDir = path.join(paths.userPackagesDir(uid), 'helpers', 'skills', 'external-helper');
+    fs.mkdirSync(externalDir, { recursive: true });
+    fs.writeFileSync(path.join(externalDir, 'SKILL.md'),
+      '---\nname: external-helper\ndescription: External helper\n---\nexternal helper body');
+    fs.writeFileSync(paths.userPackagesRegistryFile(uid), JSON.stringify({ version: 1, packages: [
+      { name: 'helpers', kind: 'skill', skill_roots: ['skills'], bin_entries: [], enabled: true },
+    ] }));
+    // The editor can inspect a connected service; the target Agent can call it.
+    vi.doMock('../../../src/main/model/core-agent/connector-meta-tools', () => ({
+      buildConnectorSurface: async (_opts: unknown, mode: string) => ({
+        promptBlock: '## Connectors\n- notion: Notion',
+        connectorDisplayNameById: new Map([['notion', 'Notion']]),
+        tools: (mode === 'discover' ? ['list_connector_tools'] : ['list_connector_tools', 'call_connector_tool'])
+          .map((name) => ({ name, description: 'Synthetic connector.',
+            inputSchema: { type: 'object', properties: {} },
+            async execute() { return { content: 'ok' }; } })),
+      }),
+    }));
+    const { buildRunner } = await loadRunner();
+    const forceOpenSkillRefs = [{ id: 'external-helper', source: 'external' as const }];
+    const commander = await buildRunner({ sessionId: 'gconv-authoring-candidates', userId: uid, forceOpenSkillRefs });
+    const editor = await buildRunner({ sessionId: 'agent-authoring-candidates', userId: uid,
+      systemSkillList: ['agent-creator'], agentToolDependencyAuthoring: true, forceOpenSkillRefs });
+    const ctx = { workingDir: tmpDir, state: new Map(), signal: undefined };
+    const read = (commander.runner as any).tools.get('read_files');
+    const result = await read.execute({ paths: [{ path: '@skill/agent-creator' }] }, ctx);
+    expect(result.isError).toBeFalsy();
+    const prelude = result.content.slice(0, result.content.indexOf('<file '));
+    for (const surface of [prelude, editor.resolvedSystemPrompt]) {
+      expect(surface).toContain('## Agent Skill dependencies');
+      const skills = surface.split('## Agent Skill dependencies')[1].split(/\n## /)[0];
+      expect(skills).toContain('shared-helper');
+      expect(skills).not.toContain('package-installer');
+      expect(skills).not.toContain('agent-creator');
+      expect(skills).not.toContain('foreign-helper');
+      expect(skills).not.toContain('external-helper');
+      expect(surface).toContain('Tools: `read_files`');
+      expect(surface).toContain('`call_connector_tool`');
+      expect(surface).not.toContain('`add_custom_connector`');
+      expect(surface).not.toContain('`hand_off_to`');
+    }
+    expect(commander.resolvedSystemPrompt).not.toContain('## Agent Skill dependencies');
+    expect(commander.resolvedSystemPrompt).toContain('external-helper');
+    expect(editor.resolvedSystemPrompt).not.toContain('external-helper');
+    const shared = await read.execute({ paths: [{ path: '@skill/shared-helper' }] }, ctx);
+    expect(shared.isError).toBeFalsy();
+    expect(shared.content).toContain('shared-helper body');
+    const editorRead = (editor.runner as any).tools.get('read_files');
+    const unavailable = await editorRead.execute({ paths: [{ path: '@skill/external-helper' }] }, ctx);
+    expect(unavailable.isError).toBe(true);
+    expect(unavailable.content).toContain('E_SKILL_NOT_AVAILABLE');
+    expect(editor.toolDefs.map((tool) => tool.name)).not.toContain('call_connector_tool');
+    // Authoring restrictions describe the product; they must not remove the
+    // creator's own installation protocol or Skill-editing capability.
+    const installer = await read.execute({ paths: [{ path: '@skill/package-installer' }] }, ctx);
+    expect(installer.isError).toBeFalsy();
+    expect(installer.content).toContain('package-installer body');
+    const skillEditor = await buildRunner({ sessionId: 'skill-authoring-candidates', userId: uid,
+      skillList: [], systemSkillList: ['skill-creator', 'package-installer'] });
+    expect(skillEditor.resolvedSystemPrompt).not.toContain('## Agent Skill dependencies');
+    const skillEditorRead = (skillEditor.runner as any).tools.get('read_files');
+    for (const ref of ['skill-creator', 'package-installer']) {
+      const result = await skillEditorRead.execute({ paths: [{ path: `@skill/${ref}` }] }, ctx);
+      expect(result.isError).toBeFalsy();
+      expect(result.content).toContain(`${ref} body`);
+    }
+  });
+
+  it('lets named app authors discover and read SDK resources on demand without creator authority', async () => {
+    const uid = 'runner-web-sdk-author';
+    await configureUser(uid);
+    const paths = await import('../../../src/main/paths');
+    const systemRoot = paths.userSystemSkillsDir(uid);
+    fs.cpSync(path.resolve(process.cwd(), 'resources/builtin/system/skills'), systemRoot, {recursive:true});
+    const { buildRunner } = await loadRunner();
+    const author = await buildRunner({sessionId:'gmember-web-sdk-author',userId:uid,agentId:'author',
+      systemSkillList:['web-app-sdk','skill-creator','orkas-guide']});
+    expect(author.resolvedSystemPrompt).toContain('@skill/web-app-sdk');
+    expect(author.resolvedSystemPrompt).not.toContain('@skill/skill-creator');
+    expect(author.resolvedSystemPrompt).not.toContain('@skill/orkas-guide');
+    expect(author.resolvedSystemPrompt).not.toContain('32,000-character AI prompts');
+    const read = (author.runner as any).tools.get('read_files');
+    const context = {workingDir:tmpDir,state:new Map(),signal:undefined};
+    const body = await read.execute({paths:[{path:'@skill/web-app-sdk'}]}, context);
+    expect(body.isError).toBeFalsy();
+    expect(body.content).toContain('references/api.json');
+    const schema = await read.execute({paths:[{path:'@skill/web-app-sdk/references/api.json'}]}, context);
+    expect(schema.isError).toBeFalsy();
+    expect(schema.content).toContain('ai.generate');
+    const denied = await read.execute({paths:[{path:'@skill/skill-creator'}]}, context);
+    expect(denied.isError).toBe(true);
+    const next = await read.execute({paths:[{path:'@skill/web-app-sdk/assets/starter/index.html'}]}, context);
+    expect(next.isError).toBeFalsy();
+    expect(next.content).toContain('Text notebook');
+    const anonymous = await buildRunner({sessionId:'gworker-sdk-anonymous',userId:uid,systemSkillList:['web-app-sdk']});
+    expect(anonymous.resolvedSystemPrompt).not.toContain('@skill/web-app-sdk');
+    const excluded = await buildRunner({sessionId:'gmember-sdk-excluded',userId:uid,agentId:'author',systemSkillList:[]});
+    expect(excluded.resolvedSystemPrompt).not.toContain('@skill/web-app-sdk');
   });
 
   it('keeps both LLM and CLI Agent editors on a fixed host-only surface', async () => {
@@ -1917,7 +2233,7 @@ describe('runner › scoped tool loading', () => {
         return JSON.parse(r.content);
       }
       const [todo, auto] = await Promise.all([
-        call('todo_tasks', {action:'create', title:'Program todo', detail:'Full task detail'}),
+        call('todo_tasks', {action:'create', content:'Program todo\\nFull task detail'}),
         call('auto_tasks', {action:'create', content:'Full automation detail', enabled:false,
           schedule:{type:'daily',hour:9,minute:0}})
       ]);
@@ -1945,11 +2261,12 @@ describe('runner › scoped tool loading', () => {
       { total: 1, next_offset: null, tasks: [{ enabled: false }] },
     ]);
     expect(receipt.details).toMatchObject([
-      { task: { detail: 'Full task detail' } }, { task: { content: 'Full automation detail' } },
+      { task: { content: 'Program todo\nFull task detail' } }, { task: { content: 'Full automation detail' } },
     ]);
     expect(await todos.getTask(uid, pid, receipt.todoId)).toMatchObject({
-      status: 'done', origin_cid: 'task-origin', result_ref: 'verified-delivery',
+      status: 'done', result_ref: 'verified-delivery',
     });
+    expect(await todos.getTask(uid, pid, receipt.todoId)).not.toHaveProperty('origin_cid');
     expect(await automations.getTask(uid, receipt.autoId)).toMatchObject({
       title: 'Edited automation', content: 'Full automation detail', project_id: pid, enabled: false,
     });
@@ -1976,7 +2293,7 @@ describe('runner › scoped tool loading', () => {
     expect(await automations.getTask(uid, receipt.autoId)).toBeNull();
   });
 
-  it('keeps programmatic task writes unavailable to anonymous workers and unbound Agents', async () => {
+  it('keeps anonymous workers read-only while global Agents use host-bound task executors', async () => {
     process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
     const uid = 'programmatic-task-readonly';
     await configureUser(uid);
@@ -1985,7 +2302,7 @@ describe('runner › scoped tool loading', () => {
     const project = await projects.createProject(uid, 'Worker project');
     if (!project.ok) throw new Error('project fixture failed');
     const pid = project.project.project_id;
-    const task = await todos.createTask(uid, pid, { title: 'Read only', detail: 'Complete detail' });
+    const task = await todos.createTask(uid, pid, { content: 'Read only\nComplete detail' });
     if (!task.ok) throw new Error('task fixture failed');
     const { buildRunner } = await loadRunner();
     const worker = await buildRunner({ sessionId: 'gworker-programmatic-task', userId: uid, projectId: pid, agentId: 'scoped-worker' });
@@ -1997,7 +2314,7 @@ describe('runner › scoped tool loading', () => {
     ` }, { workingDir: tmpDir, state: {} });
     expect(result.isError, result.content).not.toBe(true);
     expect(JSON.parse(result.content.slice(result.content.lastIndexOf('\n') + 1))).toMatchObject({
-      read: { task: { detail: 'Complete detail' } }, write: false,
+      read: { task: { content: 'Read only\nComplete detail' } }, write: false,
       writeError: expect.stringContaining('read-only'), automationAvailable: false,
     });
     expect(await todos.getTask(uid, pid, task.task.id)).toEqual(task.task);
@@ -2010,7 +2327,18 @@ describe('runner › scoped tool loading', () => {
     const absent = await (agent.runner as any).tools.get('run_program').execute({ code:
       "json({todo:typeof tools.todo_tasks,auto:typeof tools.auto_tasks});",
     }, { workingDir: tmpDir, state: {} });
-    expect(absent.content).toContain('"todo":"undefined","auto":"undefined"');
+    expect(absent.content).toContain('"todo":"function","auto":"function"');
+    const executed = await (agent.runner as any).tools.get('run_program').execute({ code: `
+      const created = await tools.todo_tasks({action:'create',content:'Global programmatic work'});
+      const denied = await tools.todo_tasks({action:'complete',task_id:${JSON.stringify(task.task.id)}});
+      json({created:JSON.parse(created.content),denied:JSON.parse(denied.content)});
+    ` }, { workingDir: tmpDir, state: {} });
+    expect(executed.isError, executed.content).not.toBe(true);
+    const receipt = JSON.parse(executed.content.slice(executed.content.lastIndexOf('\n') + 1));
+    expect(receipt).toMatchObject({ created: { ok: true }, denied: { ok: false } });
+    expect(await todos.getTask(uid, '', receipt.created.task.id)).toMatchObject({ content: 'Global programmatic work' });
+    expect(await todos.getTask(uid, pid, task.task.id)).toEqual(task.task);
+
   });
 
   it('keeps run_program independent of the directly active tool surface', async () => {
@@ -2094,10 +2422,14 @@ describe('runner › scoped tool loading', () => {
     expect(programDefinition().inputSchema.properties?.path?.description)
       .toContain('execute exactly as saved');
     expect(programDefinition().description).not.toContain('read_files raw_text:true');
-    expect(programDefinition().inputSchema.oneOf).toEqual([
-      { required: ['code'] },
-      { required: ['path'] },
-    ]);
+    // Portable provider schema; the executor still enforces one source.
+    expect(programDefinition().inputSchema.oneOf).toBeUndefined();
+    const conflictingSource = await runner.tools.get('run_program')?.execute(
+      { code: 'text("wrong source")', path: 'saved-program.js' },
+      { workingDir: workspace, state: {}, signal: undefined },
+    );
+    expect(conflictingSource?.isError).toBe(true);
+    expect(conflictingSource?.content).toContain('E_PROGRAM_BAD_INPUT');
     const savedResult = await runner.tools.get('run_program')?.execute(
       { path: 'saved-program.js' },
       { workingDir: workspace, state: {}, signal: undefined },
@@ -2182,9 +2514,9 @@ describe('runner › scoped tool loading', () => {
     expect(runner.activeTools().map((tool) => tool.name)).not.toContain('marketplace_search');
     expect(runner.activeTools().map((tool) => tool.name)).toContain('run_program');
     expect(built.resolvedSystemPrompt)
-      .toContain('`management.marketplace` (runtime only; not an Agent dependency)');
+      .toContain('`management.marketplace` — Marketplace management.');
     expect(built.resolvedSystemPrompt)
-      .toContain('`management.automation` (runtime only; not an Agent dependency)');
+      .toContain('`management.automation`');
     expect(managementCalls).toEqual([]);
 
     const loadResult = await runner.tools.get('tool_load')?.execute(
@@ -2420,6 +2752,28 @@ describe('runner › scoped tool loading', () => {
     expect(names).not.toContain('generate_image');
     expect(names).not.toContain('list_connector_tools');
   });
+
+  it('honors an explicit least-privilege profile for a host-owned internal worker', async () => {
+    process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
+    const uid = 'runner-scoped-internal-worker';
+    await configureUser(uid);
+    const { buildRunner } = await loadRunner();
+
+    const built = await buildRunner({
+      sessionId: 'gworker-writer-grounding-review-a',
+      userId: uid,
+      toolList: ['workspace.read'],
+    });
+    const names = built.toolDefs.map((tool) => tool.name);
+    expect(names).toEqual(expect.arrayContaining([
+      'read_files', 'list_files', 'search_files', 'grep_files',
+    ]));
+    expect(names).not.toContain('write_file');
+    expect(names).not.toContain('bash');
+    expect(names).not.toContain('web_search');
+    expect(names).not.toContain('library');
+    expect(names).not.toContain('publish_outputs');
+  });
 });
 
 describe('runner › ImageStudio turn-scoped generation accounting', () => {
@@ -2499,7 +2853,21 @@ describe('runner › ImageStudio turn-scoped generation accounting', () => {
 });
 
 describe('runner › conversation-history scope exposure', () => {
-  it('exposes only scopes available to each Agent and Commander conversation', async () => {
+  it.each(['gworker', 'agent', 'reflect'])('does not add history access to %s sessions', async (kind) => {
+    const uid = 'runner-history-non-conversation';
+    const users = await import('../../../src/main/features/users');
+    const auth = await import('../../../src/main/features/auth');
+    users.activateUser(uid);
+    const profile = await auth.addApiKey('anthropic', 'fixture-key', 'Anthropic');
+    await auth.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: profile.profileId });
+    const { buildRunner } = await loadRunner();
+    const built = await buildRunner({ sessionId: `${kind}-history-isolation`, userId: uid, agentId: 'reader', toolList: [] });
+    expect(built.toolDefs.map(tool => tool.name)).not.toContain('chat_history');
+    expect((built.runner as unknown as { tools: Map<string, unknown> }).tools.has('chat_history')).toBe(false);
+  });
+
+  it('assembles the shared retrieval gate and callable guidance with each actor scope', async () => {
+    process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
     const uid = 'runner-chat-history-scopes';
     const users = await import('../../../src/main/features/users');
     const auth = await import('../../../src/main/features/auth');
@@ -2516,13 +2884,23 @@ describe('runner › conversation-history scope exposure', () => {
     });
 
     const { buildRunner } = await loadRunner();
+    const { _buildCommanderSystemPromptForTest, _buildAgentInGroupSystemPromptForTest } = await import('../../../src/main/features/group_chat/bus');
+    const chats = await import('../../../src/main/features/chats');
+    const projects = await import('../../../src/main/features/projects');
+    const created = await projects.createProject(uid, 'History retrieval');
+    if (!created.ok) throw new Error('project fixture failed');
+    const projectId = created.project.project_id;
+    await chats.createConversation(uid, { conversationId: 'current-chat', title: 'Project history', projectId });
+    await chats.createConversation(uid, { conversationId: 'current-chat-non-project', title: 'Current history' });
     const agent = await buildRunner({
       sessionId: 'gmember-current-chat-agent-a',
+      toolList: [],
       userId: uid,
       agentId: 'agent-a',
       cid: 'current-chat',
       historyBoundaryMessageId: 'trigger-message',
       userMessage: 'continue',
+      systemPrompt: await _buildAgentInGroupSystemPromptForTest({ agent_id: 'agent-a', name: 'Writer' }, tmpDir, 'en'),
     });
     const nonProjectCommander = await buildRunner({
       sessionId: 'gconv-current-chat-non-project',
@@ -2530,14 +2908,16 @@ describe('runner › conversation-history scope exposure', () => {
       cid: 'current-chat-non-project',
       historyBoundaryMessageId: 'trigger-message-non-project',
       userMessage: 'continue',
+      systemPrompt: await _buildCommanderSystemPromptForTest(uid, 'current-chat-non-project', undefined, 'en'),
     });
     const projectCommander = await buildRunner({
       sessionId: 'gconv-current-chat',
       userId: uid,
       cid: 'current-chat',
-      projectId: 'project-a',
+      projectId,
       historyBoundaryMessageId: 'trigger-message',
       userMessage: 'continue',
+      systemPrompt: await _buildCommanderSystemPromptForTest(uid, 'current-chat', projectId, 'en'),
     });
     const summaryCid = 'shared-summary-chat';
     await buildRunner({
@@ -2569,7 +2949,7 @@ describe('runner › conversation-history scope exposure', () => {
       type: 'object',
       additionalProperties: false,
       properties: {
-        mode: { type: 'string', enum: ['latest', 'around', 'before'] },
+        mode: { type: 'string', enum: ['latest', 'around', 'before', 'from'] },
         index: { type: 'integer', minimum: 0 },
         count: { type: 'integer', minimum: 0 },
       },
@@ -2582,6 +2962,25 @@ describe('runner › conversation-history scope exposure', () => {
       .not.toContain('project stays in this project');
     expect((projectCommanderHistory?.inputSchema as any).properties.scope.enum)
       .toEqual(['current', 'project', 'all']);
+    for (const built of [agent, nonProjectCommander, projectCommander]) {
+      expect(built.toolDefs.map(tool => tool.name)).toContain('chat_history');
+      expect(built.toolSurfaceTelemetry([]).loadCallCount).toBe(0);
+      expect(built.resolvedSystemPrompt).not.toContain('`chat_history` —');
+      // Inspect the final host surface, not helper descriptions discarded by
+      // the consolidated tool factory. Semantic choices need live model cases.
+      const prompt = built.resolvedSystemPrompt;
+      expect(prompt.match(/even without a user lookup request/g)).toHaveLength(1);
+      expect(prompt).toContain('Skip history for self-contained tasks or sufficient supplied evidence');
+      expect(prompt).toContain('Read a known file/result reference directly');
+      expect(prompt).toContain('verify current state at its source');
+      expect(prompt.match(/Stop when the dependency is resolved/g)).toHaveLength(1);
+      expect(prompt.indexOf('Use supplied context first')).toBeLessThan(prompt.indexOf('## Runtime injection'));
+      expect(built.turnEphemeral).not.toContain('even without a user lookup request');
+      const schema = built.toolDefs.find((tool) => tool.name === 'chat_history')!.inputSchema as any;
+      expect(schema.properties.action.description).toContain('exact refs or latest for vague local references');
+      expect(schema.properties.action.description).toContain('Follow next_read');
+      expect(schema.properties.query.description).toContain('discriminative name, phrase, id, or fact');
+    }
   });
 
   it('lets a non-project Commander recover an older decision through current-history pages', async () => {
@@ -2738,6 +3137,57 @@ describe('splitCommanderOrchestrationBlock (cache-prefix hygiene)', () => {
 });
 
 describe('runner › conversation task board turn block (D8/P3)', () => {
+  it('preloads only app creation for Commander across rebuilds and clears the preload when the entry association is removed', async () => {
+    const uid = 'app-context-runner';
+    const users = await import('../../../src/main/features/users');
+    const auth = await import('../../../src/main/features/auth');
+    users.activateUser(uid);
+    const profile = await auth.addApiKey('anthropic', `k-${uid}`, 'Anthropic');
+    await auth.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: profile.profileId });
+    const chats = await import('../../../src/main/features/chats');
+    const conv = await chats.createConversation(uid, { title: 'Create an app with create_artifact' });
+    const artifactSink = vi.fn();
+    const cid = conv.conversation_id;
+    const { buildRunner } = await loadRunner();
+    const plain = await buildRunner({ sessionId: `gconv-${cid}`, userId: uid, cid, onArtifactCreated: artifactSink });
+    expect(plain.turnEphemeral).not.toContain('## App creation');
+    const plainNames = plain.toolDefs.map(tool => tool.name);
+    expect(plainNames).not.toContain('create_artifact');
+    let appSystemPrompt: string | undefined;
+    await chats.updateConversation(uid, cid, { assistance: { kind: 'app_creation' } });
+    const unavailable = await buildRunner({ sessionId: `gconv-${cid}`, userId: uid, cid });
+    expect(unavailable.toolDefs.map(tool => tool.name)).not.toContain('create_artifact');
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      chats.invalidateConversationCaches(uid);
+      const bound = await buildRunner({ sessionId: `gconv-${cid}`, userId: uid, cid, onArtifactCreated: artifactSink });
+      expect(bound.turnEphemeral).toContain('## App creation');
+      expect(bound.turnEphemeral).toContain('Commander owns delivery');
+      expect(bound.turnEphemeral).toContain('workspace.artifact with tool_load');
+      expect(bound.turnEphemeral).toContain('call create_artifact');
+      const appTool = bound.toolDefs.find(tool => tool.name === 'create_artifact');
+      expect(appTool?.inputSchema).toMatchObject({
+        type: 'object', required: ['files'], properties: { files: { type: 'array' } },
+      });
+      expect(bound.toolDefs.map(tool => tool.name).filter(name => !plainNames.includes(name))).toEqual(['create_artifact']);
+      expect(bound.toolDefs.filter(tool => tool.name === 'create_artifact')).toHaveLength(1);
+      expect(bound.resolvedSystemPrompt).not.toContain('## App creation');
+      if (appSystemPrompt !== undefined) expect(bound.resolvedSystemPrompt).toBe(appSystemPrompt);
+      appSystemPrompt = bound.resolvedSystemPrompt;
+      expect(bound.toolSurfaceTelemetry()).toMatchObject({ loadCallCount: 0, loadedGroupCount: 0, loadedSchemaChars: 0 });
+    }
+    for (const sessionId of [`gmember-${cid}-agent-x`, `agent-${cid}`, `reflect-${cid}`]) {
+      const other = await buildRunner({ sessionId, userId: uid, cid, onArtifactCreated: artifactSink, toolList: [] });
+      expect(other.turnEphemeral).not.toContain('## App creation');
+      expect(other.toolDefs.map(tool => tool.name)).not.toContain('create_artifact');
+    }
+    expect(artifactSink).not.toHaveBeenCalled();
+    await chats.updateConversation(uid, cid, { assistance: undefined });
+    const cleared = await buildRunner({ sessionId: `gconv-${cid}`, userId: uid, cid, onArtifactCreated: artifactSink });
+    expect(cleared.toolDefs.map(tool => tool.name)).toEqual(plainNames);
+    expect(cleared.turnEphemeral).not.toContain('## App creation');
+    expect(fs.readFileSync(path.join(tmpDir, uid, 'cloud', 'chats', `${cid}.jsonl`), 'utf8')).toBe('');
+  });
+
   it('passes setup guidance only through Commander turn context without loading connector tools or changing the system prefix', async () => {
     const uid = 'setup-context-runner';
     const users = await import('../../../src/main/features/users');
@@ -2808,5 +3258,36 @@ describe('runner › conversation task board turn block (D8/P3)', () => {
     expect(withBoard.resolvedSystemPrompt).not.toContain('## Conversation task board');
     const member = await buildRunner({ sessionId: `gmember-${cid}-agent-x`, userId: uid, cid });
     expect(member.turnEphemeral).not.toContain('## Conversation task board');
+  });
+});
+
+describe('runner › isolated memory consolidation', () => {
+  it('uses the configured provider with only the supplied records and no tools or task session', async () => {
+    const complete = vi.fn(async () => ({
+      content: [{ type: 'text', text: '{"groups":[]}' }], stopReason: 'end_turn', model: 'test-model',
+      usage: { inputTokens: 10, outputTokens: 5 },
+    }));
+    vi.doMock('#core-agent', async () => ({
+      ...(await vi.importActual<any>('#core-agent')),
+      createPiProvider: () => ({ id: 'openrouter', name: 'test', complete, validateAuth: async () => true }),
+    }));
+    const users = await import('../../../src/main/features/users');
+    const auth = await import('../../../src/main/features/auth');
+    users.activateUser('maintenance-model-owner');
+    const profile = await auth.addApiKey('openrouter', 'sk-or-maintenance-fixture', 'Fixture');
+    await auth.addEntry({ provider: 'openrouter', model: 'future-lab/test-model', profileId: profile.profileId });
+    const { completeMemoryConsolidation } = await loadRunner();
+    const signal = new AbortController().signal;
+    const message = 'Only the requested memory records.';
+    expect(await completeMemoryConsolidation('maintenance-model-owner', message, signal)).toBe('{"groups":[]}');
+    expect(complete).toHaveBeenCalledTimes(1);
+    const request = complete.mock.calls[0][0] as any;
+    expect(request.messages).toEqual([{ role: 'user', content: [{ type: 'text', text: message }] }]);
+    expect(request.tools).toEqual([]);
+    expect(request.systemPrompt).toBeUndefined();
+    expect(request.sessionId).toBeUndefined();
+    expect(request.maxTokens).toBe(4096);
+    await expect(completeMemoryConsolidation('other-owner', message, signal)).rejects.toThrow('cancelled');
+    expect(complete).toHaveBeenCalledTimes(1);
   });
 });

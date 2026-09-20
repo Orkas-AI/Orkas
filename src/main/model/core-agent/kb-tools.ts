@@ -510,7 +510,8 @@ const LIBRARY_ACTION_FIELDS: Readonly<Record<LibraryAction, ReadonlySet<string>>
 };
 
 function libraryActionError(action: LibraryAction, input: Record<string, unknown>): string | null {
-  const unexpected = Object.keys(input).filter((key) => !LIBRARY_ACTION_FIELDS[action].has(key));
+  const ignored = action === 'read' ? ['query', 'k', 'limit'] : ['chunk', 'window'];
+  const unexpected = Object.keys(input).filter((key) => !LIBRARY_ACTION_FIELDS[action].has(key) && !ignored.includes(key));
   if (!unexpected.length) return null;
   return `library(${action}): unsupported field(s): ${unexpected.sort().join(', ')}`;
 }
@@ -536,10 +537,6 @@ export function createLibraryTool(opts: KbToolsOpts): AgentTool {
     type: 'string',
     description: 'Search: optional exact-path filter. Read: required Library-relative path. Omit for list.',
   };
-  const branch = (action: LibraryAction, required: string[]) => ({
-    properties: { action: { enum: [action] } },
-    required: ['action', ...required],
-  });
 
   return {
     name: 'library',
@@ -562,11 +559,6 @@ export function createLibraryTool(opts: KbToolsOpts): AgentTool {
         path: pathProperty,
       },
       required: ['action'],
-      oneOf: [
-        branch('list', (list.inputSchema.required as string[] | undefined) ?? []),
-        branch('search', (search.inputSchema.required as string[] | undefined) ?? []),
-        branch('read', (read.inputSchema.required as string[] | undefined) ?? []),
-      ],
     },
     async execute(input, ctx) {
       const action = String(input.action ?? '').trim() as LibraryAction;

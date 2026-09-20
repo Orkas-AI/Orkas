@@ -143,6 +143,7 @@
     });
     window.addEventListener('message', (ev) => {
       if (!_appViewerFrame || !artifactSecurity.trustedArtifactMessage(ev, _appViewerFrame)) return;
+      if (window.OrkasWebAppHost.isManaged(_appViewerFrame)) return;
       const data = ev.data;
       if (String(data.type || '') !== 'open-external') return;
       const url = artifactSecurity.safeExternalHttpUrl(data.url);
@@ -156,6 +157,7 @@
     _appViewerEl.classList.remove('is-open');
     _appViewerEl.setAttribute('aria-hidden', 'true');
     if (_appViewerFrame) {
+      window.OrkasWebAppHost.release(_appViewerFrame);
       _appViewerFrame.removeAttribute('src');
       _appViewerFrame.setAttribute('title', '');
     }
@@ -164,20 +166,21 @@
       document.removeEventListener('keydown', _appViewerKeyHandler);
       _appViewerKeyHandler = null;
     }
+    window.OrkasPreviewHost?.close();
   }
 
-  function _openAppViewer(url, title) {
+  function _openAppViewer(info, title) {
     const root = _ensureAppViewer();
     if (_appViewerTitle) _appViewerTitle.textContent = title || _t('artifact.title', 'Interactive app');
     if (_appViewerFrame) {
       _appViewerFrame.setAttribute('title', title || _t('artifact.title', 'Interactive app'));
-      _appViewerFrame.src = url;
+      window.OrkasWebAppHost.attach(_appViewerFrame, info);
     }
     root.classList.add('is-open');
     root.setAttribute('aria-hidden', 'false');
     if (!_appViewerKeyHandler) {
       _appViewerKeyHandler = (e) => {
-        if (e.key === 'Escape' && _appViewerEl && _appViewerEl.classList.contains('is-open')) _closeAppViewer();
+        if (e.key === 'Escape' && !document.querySelector('.chat-share-overlay') && _appViewerEl && _appViewerEl.classList.contains('is-open')) _closeAppViewer();
       };
       document.addEventListener('keydown', _appViewerKeyHandler);
     }
@@ -272,6 +275,12 @@
   // ── actions ─────────────────────────────────────────────────────────────
   async function _openApp(appId) {
     const startedAt = Date.now();
+    if (window.OrkasPreviewWindows) {
+      const app = (_appsCache || []).find(item => item.id === appId);
+      const result = await window.OrkasPreviewWindows.open({ kind: 'app', appId, title: app?.title || _t('artifact.title', 'Interactive app') });
+      _trackOpenResult(startedAt, result?.ok ? 'success' : 'failure', result?.ok ? {} : { error_type: 'presentation', error_code: 'saved_app_viewer_failed' });
+      return;
+    }
     let r;
     try {
       r = await window.orkas.invoke('savedApps.openInApp', { appId: String(appId) });
@@ -288,7 +297,7 @@
     }
     try {
       const app = (_appsCache || []).find((a) => a && a.id === appId);
-      _openAppViewer(r.url, (app && app.title) || _t('artifact.title', 'Interactive app'));
+      _openAppViewer(r, (app && app.title) || _t('artifact.title', 'Interactive app'));
     } catch (err) {
       _trackError('saved_app_open', { error_message: 'saved_app_open_failed' });
       _fail(_t('apps.open_failed', 'Could not open the app'), err);
@@ -301,6 +310,8 @@
   // in as an `app-source.md` attachment; we navigate to it and pre-fill a draft
   // (mirrors `agents.js::useAgent`'s create-conv-and-go pattern, but doesn't
   // auto-send — the user completes the request and hits Send).
+  window.openSavedAppPreview = _openAppViewer;
+
   async function _editApp(appId) {
     const startedAt = Date.now();
     let r;
@@ -464,6 +475,173 @@
   }
 
   // ── render ──────────────────────────────────────────────────────────────
+  const _appTemplates = [
+    { id: 'products', icon: 'shopping-cart', tone: 'amber' },
+    { id: 'converter', icon: 'refresh', tone: 'blue' },
+    { id: 'flashcards', icon: 'book-open', tone: 'green' },
+    { id: 'game', icon: 'play', tone: 'violet' },
+  ];
+  let _createPanel = null;
+
+  function _createTemplateId(value) {
+    return _appTemplates.some(item => item.id === value) ? value : 'custom';
+  }
+
+  function _trackCreateAction(action, template = 'custom') {
+    const payload = { action, template: _createTemplateId(template) };
+    try { window.Monitor?.click('saved_app_create', payload); } catch (_) {}
+    _appsLog.info?.('app creation action', payload);
+  }
+
+  async function _createAppTask(prompt, template, onReady) {
+    const startedAt = Date.now();
+    let stage = 'preflight';
+    let reported = false;
+    let started = false;
+    const report = (result) => {
+      if (reported) return;
+      reported = true;
+      const payload = { result, template: _createTemplateId(template), stage,
+        duration_ms: Math.max(0, Date.now() - startedAt) };
+      if (result === 'failure') payload.error_code = stage === 'preflight'
+        ? 'model_not_configured' : stage === 'conversation_create' ? 'conversation_create_failed' : 'send_not_started';
+      try { window.Monitor?.event('saved_app_create_result', payload); } catch (_) {}
+      if (result === 'failure') _appsLog.warn('app creation did not start', payload);
+      else _appsLog.info?.('app creation started', payload);
+    };
+    try {
+      if (!ensureModelConfigured()) { report('failure'); return false; }
+      stage = 'conversation_create';
+      const result = await window.orkas.invoke('conversations.create', {
+        title: _autoTitle(prompt), assistance: { kind: 'app_creation' },
+      });
+      const conversation = result && result.ok !== false && result.conversation;
+      const cid = conversation && conversation.conversation_id;
+      if (!cid) throw new Error('conversation_create_failed');
+      conversation.last_active_at = new Date().toISOString();
+      conversations.unshift(conversation);
+      renderConversationList();
+      onReady();
+      setView('conversation', cid, { skipLoad: true });
+      _restoreDraft(cid);
+      setChatRecipient('conversation', { kind: 'commander' });
+      _rememberSentComposerSnapshot(cid, { text: prompt, recipient: { kind: 'commander' }, references: [], attachments: [] });
+      stage = 'send';
+      await sendInConversation(cid, prompt, { title_text: prompt }, {
+        source_view: 'conversation', restoreComposerOnFailure: true,
+        onAccepted: () => { started = true; report('success'); },
+      });
+      if (!started) throw new Error('send_not_started');
+      return true;
+    } catch (_) {
+      // Once accepted, the task owns its execution errors and retry controls.
+      if (!started) {
+        report('failure');
+        await uiAlert(_t('apps.create_failed', 'Could not start app creation. Please try again.'));
+      }
+      return started;
+    }
+  }
+
+  function _openCreatePanel(draft = '', selectedTemplate = 'custom') {
+    if (_createPanel) return;
+    _closeRowMenu();
+    const previousFocus = document.activeElement;
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay ui-dialog-overlay open apps-create-overlay';
+    const label = (key) => _esc(_t(key, key));
+    overlay.innerHTML = `
+      <div class="modal modal-standard apps-create-panel" role="dialog" aria-modal="true" aria-labelledby="apps-create-title">
+        <div class="modal-header">
+          <div class="modal-title">
+            <h2 id="apps-create-title">${label('apps.create_title')}</h2>
+          </div>
+        </div>
+        <div class="form-row apps-create-idea">
+          <label for="apps-create-idea">${label('apps.idea_label')}</label>
+          <textarea id="apps-create-idea" rows="4" placeholder="${label('apps.idea_placeholder')}"></textarea>
+        </div>
+        <div class="apps-create-section">
+          <h3>${label('apps.templates_title')}</h3>
+        </div>
+        <div class="apps-template-grid">
+          ${_appTemplates.map((item) => `
+            <button type="button" class="apps-template" data-app-template="${item.id}">
+              <span class="app-card-icon is-${item.tone}">${uiIconHtml(item.icon)}</span>
+              <span class="apps-template-content">
+                <strong>${label(`apps.template_${item.id}_title`)}</strong>
+                <span>${label(`apps.template_${item.id}_description`)}</span>
+              </span>
+            </button>
+          `).join('')}
+        </div>
+        <div class="modal-actions apps-create-actions">
+          <div class="header-actions">
+            <button type="button" class="btn" data-create-cancel>${label('common.cancel')}</button>
+            <button type="button" class="btn btn-primary" data-create-submit>${label('apps.create')}</button>
+          </div>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const idea = overlay.querySelector('#apps-create-idea');
+    const createButton = overlay.querySelector('[data-create-submit]');
+    const cancelButton = overlay.querySelector('[data-create-cancel]');
+    let submitting = false;
+    idea.value = draft;
+    const updateSubmit = () => { createButton.disabled = submitting || !idea.value.trim(); };
+    idea.addEventListener('input', updateSubmit);
+    updateSubmit();
+    const releaseFocusGuard = _uiKeepDialogFocus(overlay, idea);
+    const close = () => {
+      releaseFocusGuard();
+      document.removeEventListener('keydown', onKey, true);
+      overlay.remove();
+      _createPanel = null;
+      _uiRestoreDialogFocus(previousFocus);
+    };
+    const onKey = (event) => {
+      if (event.isComposing || event.keyCode === 229 || !_uiIsTopDialogOverlay(overlay)) return;
+      if (_uiTrapDialogTab(overlay, event)) return;
+      if (event.key === 'Escape') {
+        event.preventDefault(); event.stopPropagation();
+        if (!submitting) { _trackCreateAction('cancel', selectedTemplate); close(); }
+      }
+    };
+    document.addEventListener('keydown', onKey, true);
+    overlay.addEventListener('click', async (event) => {
+      if (submitting) return;
+      if (event.target === overlay || event.target.closest('[data-create-cancel]')) {
+        _trackCreateAction('cancel', selectedTemplate); close(); return;
+      }
+      const template = event.target.closest('[data-app-template]');
+      if (template) {
+        selectedTemplate = _createTemplateId(template.dataset.appTemplate);
+        _trackCreateAction('template', selectedTemplate);
+        idea.value = _t(`apps.template_${template.dataset.appTemplate}_prompt`, '');
+        updateSubmit();
+        idea.focus();
+        return;
+      }
+      if (!event.target.closest('[data-create-submit]') || !idea.value.trim()) return;
+      _trackCreateAction('submit', selectedTemplate);
+      submitting = true;
+      updateSubmit();
+      cancelButton.disabled = true;
+      idea.disabled = true;
+      createButton.setAttribute('aria-busy', 'true');
+      overlay.querySelectorAll('[data-app-template]').forEach(button => { button.disabled = true; });
+      await _createAppTask(idea.value, selectedTemplate, close);
+      submitting = false;
+      updateSubmit();
+      cancelButton.disabled = false;
+      idea.disabled = false;
+      createButton.removeAttribute('aria-busy');
+      overlay.querySelectorAll('[data-app-template]').forEach(button => { button.disabled = false; });
+    });
+    _createPanel = { close, getDraft: () => idea.value, getTemplate: () => selectedTemplate, isSubmitting: () => submitting };
+    idea.focus();
+  }
+
   function _renderApps(apps) {
     const grid = document.getElementById('apps-grid');
     const empty = document.getElementById('apps-empty');
@@ -488,13 +666,17 @@
       card.tabIndex = 0;
       card.setAttribute('aria-label', `${title} · ${_t('apps.open_hint', 'Open in Orkas')}`);
 
-      const stripe = document.createElement('span');
-      stripe.className = 'app-card-stripe';
-      stripe.setAttribute('aria-hidden', 'true');
-      card.appendChild(stripe);
-
+      // Identity-based decoration stays stable across renames and sorting.
+      const tones = ['violet', 'blue', 'green', 'amber', 'rose'];
+      let hash = 0;
+      for (const char of String(a.id)) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+      const icon = document.createElement('span');
+      icon.className = `app-card-icon is-${tones[hash % tones.length]}`;
+      icon.setAttribute('aria-hidden', 'true');
+      icon.innerHTML = uiIconHtml('layout-grid');
       const header = document.createElement('div');
       header.className = 'app-card-header';
+      header.appendChild(icon);
 
       const titleBlock = document.createElement('div');
       titleBlock.className = 'app-card-title-block';
@@ -515,10 +697,6 @@
       header.appendChild(titleBlock);
       header.appendChild(more);
       card.appendChild(header);
-
-      // Description paragraph — data layer carries no description field;
-      // omit the <p> entirely so the title-row + meta-row collapse tight.
-      // (Spec keeps the 3-line clamp CSS so a future field is drop-in.)
 
       const meta = document.createElement('div');
       meta.className = 'app-card-meta';
@@ -541,6 +719,7 @@
       });
       card.addEventListener('keydown', (e) => {
         if (e.target && e.target.closest && e.target.closest('[data-app-more]')) return;
+        if (e.isComposing || e.keyCode === 229) return;
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
           _openApp(a.id);
@@ -551,6 +730,12 @@
   }
 
   async function loadSavedApps(_force) {
+    const createButton = document.getElementById('apps-create-btn');
+    if (createButton) createButton.onclick = () => {
+      if (_createPanel) return;
+      _trackCreateAction('open');
+      _openCreatePanel();
+    };
     // `_force` accepted for parity with loadAgents/loadSkills; this module
     // keeps no "loaded once" flag — the list is cheap, always re-fetch.
     try {
@@ -566,6 +751,12 @@
   window.addEventListener('i18n-change', () => {
     _closeRowMenu();
     if (_appsCache) _renderApps(_appsCache);
+    if (_createPanel && !_createPanel.isSubmitting()) {
+      const selectedTemplate = _createPanel.getTemplate();
+      const draft = _createPanel.getDraft();
+      _createPanel.close();
+      _openCreatePanel(draft, selectedTemplate);
+    }
   });
 
   window.loadSavedApps = loadSavedApps;

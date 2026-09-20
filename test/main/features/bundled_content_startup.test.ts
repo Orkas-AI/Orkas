@@ -72,6 +72,43 @@ async function activateTestUser() {
 }
 
 describe('bundled content startup boundary', () => {
+  it.each(['context', 'system', 'marketplace', 'notification'] as const)(
+    'contains a %s failure without exposing private diagnostics and permits recovery', async (phase) => {
+      const paths = await activateTestUser();
+      const logger = await import('../../../src/main/logger');
+      const createLogger = logger.createLogger;
+      const records: unknown[][] = [];
+      vi.spyOn(logger, 'createLogger').mockImplementation((scope) => {
+        const scoped = createLogger(scope);
+        if (scope !== 'bundled-content') return scoped;
+        return { ...scoped, warn: (message: string, ...args: unknown[]) => {
+          records.push([message, ...args].map((value) => logger.redact(value)));
+        } };
+      });
+      const privateText = 'Confidential acquisition draft diagnostics';
+      const failure = Object.assign(new Error(privateText), { code: 'EACCES' });
+      const systemSkills = await import('../../../src/main/features/system_skills');
+      const marketplace = await import('../../../src/main/features/builtin_marketplace_startup');
+      if (phase === 'system') vi.spyOn(systemSkills, 'reconcileAllForUserWithRetry').mockRejectedValueOnce(failure);
+      if (phase === 'marketplace') vi.spyOn(marketplace, 'seedBuiltinMarketplaceForUser').mockRejectedValueOnce(failure);
+      const startup = await import('../../../src/main/features/bundled_content_startup');
+      const result = await startup.syncBundledContentForUser(UID, {
+        reason: 'startup',
+        shouldContinue: phase === 'context' ? () => { throw failure; } : undefined,
+        onMarketplaceChanged: phase === 'notification' ? () => { throw failure; } : undefined,
+      });
+      expect(result.failed).toEqual(phase === 'system' ? ['system_skills'] : phase === 'marketplace' ? ['marketplace'] : []);
+      if (phase === 'context') expect(result).toEqual({ system_skills: [], marketplace: null, failed: [] });
+      expect(records).toHaveLength(1);
+      const emitted = JSON.stringify(records);
+      expect(emitted).not.toContain(privateText);
+      expect(emitted).toContain('EACCES');
+      expect(await startup.syncBundledContentForUser(UID, { reason: 'startup' })).toMatchObject({ failed: [] });
+      expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'orkas-guide'), 'SKILL.md'))).toBe(true);
+      expect(fs.existsSync(path.join(paths.userMarketplaceAgentDir(UID, TEST_AGENT_ID), 'agent.json'))).toBe(true);
+    },
+  );
+
   it('publishes System Skills and platform Agents/Skills before a warm no-op pass', async () => {
     const paths = await activateTestUser();
     const startup = await import('../../../src/main/features/bundled_content_startup');

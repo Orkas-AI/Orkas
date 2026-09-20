@@ -318,26 +318,14 @@ describe('agents › normalizeAgent', () => {
     expect(norm?.skill_list).toEqual(['ok-one', 'also_ok']);
   });
 
-  it('normalizes delivery_checks like skill_list: exact array of kebab names, bounded', async () => {
+  it('loads legacy delivery metadata without activating text correction', async () => {
     const a = await loadAgents();
-    // Present as a clean array → preserved verbatim.
-    expect(a.normalizeAgent({
-      agent_id: 'x', name: 'N', delivery_checks: ['content-delivery'],
-    } as any, 'builtin')?.delivery_checks).toEqual(['content-delivery']);
-    // Omitted → absent (undefined sentinel), same three-state convention.
-    expect('delivery_checks' in (a.normalizeAgent({ agent_id: 'x', name: 'N' }, 'builtin') as any))
-      .toBe(false);
-    // Malformed entries dropped by shape; names are resolved (and warned on)
-    // later at wiring time, so look-alike junk must not survive this layer.
-    expect(a.normalizeAgent({
-      agent_id: 'x', name: 'N',
-      delivery_checks: ['content-delivery', 42, null, '', 'Bad Name', '-leading', 'UPPER'],
-    } as any, 'builtin')?.delivery_checks).toEqual(['content-delivery']);
-    // Bounded at 8 entries.
-    const many = Array.from({ length: 12 }, (_, i) => `check-${i}`);
-    expect(a.normalizeAgent({
-      agent_id: 'x', name: 'N', delivery_checks: many,
-    } as any, 'builtin')?.delivery_checks).toHaveLength(8);
+    const raw = { agent_id: 'x', name: 'N', workflow: 'Deliver the requested draft.',
+      delivery_checks: ['content-delivery'], tool_list: ['web'] };
+    const norm = a.normalizeAgent(raw as any, 'custom');
+    expect(norm).toMatchObject({ agent_id: 'x', workflow: raw.workflow, tool_list: ['web'] });
+    expect(norm).not.toHaveProperty('delivery_checks');
+    expect(raw.delivery_checks).toEqual(['content-delivery']);
   });
 
   it('loads an old Agent definition without exposing its retired connector field', async () => {
@@ -884,11 +872,11 @@ describe('agents › extractAgentFieldBlocks', () => {
     expect(r.blocks[0].skill_list).toEqual([]);
   });
 
-  it('filters non-safeId entries from <skills> child', async () => {
+  it('preserves nonempty <skills> refs so saving can reject invalid dependencies', async () => {
     const a = await loadAgents();
     const text = '<agent><skills>\nok-1\n../evil\n  \ngood_2\n</skills></agent>';
     const r = a.extractAgentFieldBlocks(text);
-    expect(r.blocks[0].skill_list).toEqual(['ok-1', 'good_2']);
+    expect(r.blocks[0].skill_list).toEqual(['ok-1', '../evil', 'good_2']);
   });
 
   it('does not set skill_list when no <skills> child present', async () => {
@@ -924,21 +912,6 @@ describe('agents › extractAgentFieldBlocks', () => {
     expect(invalid.tool_list_invalid_refs).toEqual(['context', 'management', 'not-real', 'bad group']);
     expect(a.extractAgentFieldBlocks('<agent><name>A</name></agent>').blocks[0])
       .not.toHaveProperty('tool_list');
-  });
-
-  it('extracts real workflow tool-call shapes while rejecting negated and incidental look-alikes', async () => {
-    const a = await loadAgents();
-    const calls = a.workflowBuiltinToolCalls([
-      '### 1. Inspect',
-      '- `read_files({"paths":[{"path":"source"}]})` inspects the source.',
-      '- Use `web_search` for current evidence.',
-      '- 调用 `office_read` 检查文档。',
-      '- Do not use `bash` for this task.',
-      '- Read `library` as a named Skill rather than invoking it.',
-      '- Mention write_file only as prose.',
-    ].join('\n'));
-
-    expect(calls).toEqual(['read_files', 'web_search', 'office_read']);
   });
 
   // <interactive> drives the input-box auto-target. Each branch matters:
@@ -1407,6 +1380,48 @@ describe('agents › createCustomAgent', () => {
 });
 
 describe('agents › createAgentFromBlocks', () => {
+  it.each([
+    'Summarizes supplied notes into an action list; does not send messages.',
+    `Summarizes supplied notes. ${'Preserve the supplied wording and exceptions. '.repeat(25)}For: weekly review. Triggers: notes, actions.`,
+  ])('persists authored descriptions verbatim without requiring a routing formula: %s', async (description) => {
+    const a = await loadAgents();
+    const fields = a.extractAgentFieldBlocks([
+      '<agent><operation>create</operation><name>NotesHelper</name>',
+      `<description_en>${description}</description_en>`,
+      '<workflow>Summarize supplied notes without sending messages.</workflow>',
+      '<tools></tools><category>office</category></agent>',
+    ].join('\n')).blocks[0];
+    const created = await a.createAgentFromBlocks(fields);
+    expect(created?.description_en).toBe(description);
+    expect(created).not.toBeNull();
+
+    await a.updateCustomAgent(created!.agent_id, { name: 'RenamedHelper' });
+    const raw = JSON.parse(fs.readFileSync(
+      path.join(customAgentsDir(), created!.agent_id, 'agent.json'), 'utf8',
+    ));
+    expect(raw.description_en).toBe(description);
+  });
+
+  it.each(['package-installer', '../invalid', 'foreign-private', 'disabled-skill'])(
+    'rejects unavailable Skill dependency %s before creating any Agent state', async (ref) => {
+      writeSkillOnDisk('known');
+      writeSkillOnDisk('foreign-private');
+      const foreignFile = path.join(customSkillsDir(), 'foreign-private', 'SKILL.md');
+      fs.writeFileSync(foreignFile, fs.readFileSync(foreignFile, 'utf8').replace('---\n', '---\nownerAgent: other-agent\n'));
+      writeSkillOnDisk('disabled-skill');
+      const { setSkillEnabled } = await import('../../../src/main/features/component_enabled');
+      setSkillEnabled(TEST_UID, 'disabled-skill', false);
+      const a = await loadAgents();
+      const fields = a.extractAgentFieldBlocks([
+        '<agent><name>DependencyHelper</name><workflow>Do the work.</workflow>',
+        `<skills>known\n${ref}</skills><tools></tools></agent>`,
+      ].join('\n')).blocks[0];
+
+      await expect(a.createAgentFromBlocks(fields)).rejects.toThrow(/unavailable Agent Skill dependencies/);
+      expect(fs.existsSync(customAgentsDir()) ? fs.readdirSync(customAgentsDir()) : []).toEqual([]);
+    },
+  );
+
   it('rejects an invalid explicit tool list before creating any Agent state', async () => {
     const a = await loadAgents();
     const fields = a.extractAgentFieldBlocks([
@@ -1520,20 +1535,17 @@ describe('agents › createAgentFromBlocks', () => {
     expect(created?.skill_list).toEqual([]);
   });
 
-  it('infers an unambiguous dependency from an explicit workflow tool call', async () => {
+  it.each([
+    'Explain how to use `bash`.',
+    '不要下载，请使用 `read_files`。',
+    '- `web_search(query)` finds current sources.',
+    'Do not use `bash`; answer directly.',
+  ])('keeps authored dependencies independent of workflow prose: %s', async (workflow) => {
     const a = await loadAgents();
-    const fields = a.extractAgentFieldBlocks([
-      '<agent>',
-      '<name>IncompleteResearcher</name>',
-      '<description>Researches public sources.</description>',
-      '<workflow>### 1. Research\n- `web_search(query)` finds current sources.</workflow>',
-      '<tools>workspace.read</tools>',
-      '<category>data</category>',
-      '</agent>',
-    ].join('\n')).blocks[0];
-
-    const created = await a.createAgentFromBlocks(fields);
-    expect(created?.tool_list).toEqual(['workspace.read', 'web']);
+    const created = await a.createAgentFromBlocks({ name: 'ProseOnly',
+      description_en: 'Explains the supplied workflow.', workflow, category: 'general', tool_list: [] });
+    expect(created?.tool_list).toEqual([]);
+    expect((await a.getAgent(created!.agent_id))?.tool_list).toEqual([]);
   });
 
   it('requires an authored leaf when one tool maps to several dependency groups', async () => {
@@ -1545,7 +1557,7 @@ describe('agents › createAgentFromBlocks', () => {
       workflow: '### 1. Inspect\n- `office_read(path)` inspects the input.',
       category: 'general',
       tool_list: [],
-    })).rejects.toThrow(
+    }, { dependencyToolNames: ['office_read'] })).rejects.toThrow(
       /office_read \(choose office\.word or office\.spreadsheet or office\.presentation\)/,
     );
     const entries = fs.existsSync(customAgentsDir()) ? fs.readdirSync(customAgentsDir()) : [];
@@ -1567,25 +1579,25 @@ describe('agents › createAgentFromBlocks', () => {
 
   it.each([
     {
-      label: 'runtime-only',
+      label: 'runtime-only', dependency: 'tool_load',
       workflow: '`tool_load(groups)` expands tools.',
       toolList: [] as string[],
       expected: /tool_load \(cannot be declared for a named Agent\)/,
     },
     {
-      label: 'owner-scoped',
+      label: 'owner-scoped', dependency: 'image_studio',
       workflow: '`image_studio(operation)` renders the candidate.',
       toolList: ['media.image'],
       expected: /image_studio \(owned by another Agent\)/,
     },
     {
-      label: 'Commander-only',
+      label: 'Commander-only', dependency: 'add_custom_connector',
       workflow: '`add_custom_connector(name, transport)` installs a connector.',
       toolList: ['connectors'],
       expected: /add_custom_connector \(cannot be declared for a named Agent\)/,
     },
   ])('rejects a $label built-in call that a custom Agent cannot receive', async ({
-    workflow, toolList, expected,
+    workflow, toolList, expected, dependency,
   }) => {
     const a = await loadAgents();
 
@@ -1595,7 +1607,7 @@ describe('agents › createAgentFromBlocks', () => {
       workflow: `### 1. Run\n- ${workflow}`,
       category: 'general',
       tool_list: toolList,
-    })).rejects.toThrow(expected);
+    }, { dependencyToolNames: [dependency] })).rejects.toThrow(expected);
     const entries = fs.existsSync(customAgentsDir()) ? fs.readdirSync(customAgentsDir()) : [];
     expect(entries).toEqual([]);
   });
@@ -1646,7 +1658,7 @@ describe('agents › createAgentFromBlocks', () => {
       category: 'writing',
       icon: 'spreadsheet',
       interactive: true,
-      skill_list: ['known-skill', 'missing-skill'],
+      skill_list: ['known-skill'],
       tool_list: [],
       inputs: [
         { id: 'topic', label: 'Topic', type: 'text', default: '', required: true },
@@ -2065,18 +2077,13 @@ describe('agents › updateCustomAgent', () => {
     expect(raw).toMatchObject({ name: 'Before', workflow: 'Old workflow.', tool_list: ['web'] });
   });
 
-  it('rejects an edit that adds an undeclared direct tool call without changing the file', async () => {
+  it('saves workflow examples without changing declared capabilities', async () => {
     writeCustomAgent('abc', { name: 'Before', workflow: 'Old workflow.', tool_list: ['web'] });
-    const file = path.join(customAgentsDir(), 'abc', 'agent.json');
-    const before = fs.readFileSync(file, 'utf8');
     const a = await loadAgents();
-
-    await expect(a.updateCustomAgent('abc', {
-      name: 'After',
-      workflow: '### 1. Save\n- `write_file(path, content)` saves the result.',
-    })).rejects.toThrow(/write_file \(add workspace\.write\.output\)/);
-
-    expect(fs.readFileSync(file, 'utf8')).toBe(before);
+    const workflow = 'Explain how to use `write_file` without executing it.';
+    const updated = await a.updateCustomAgent('abc', { name: 'After', workflow });
+    expect(updated).toMatchObject({ name: 'After', workflow, tool_list: ['web'] });
+    expect(await a.getAgent('abc')).toMatchObject({ name: 'After', workflow, tool_list: ['web'] });
   });
 
   it('writes inputs array and round-trips through normalize', async () => {
@@ -2114,15 +2121,17 @@ describe('agents › updateCustomAgent', () => {
     expect(reread?.inputs).toEqual([]);
   });
 
-  it('filters non-safeId entries on write', async () => {
+  it('rejects malformed dependency entries without partially updating the Agent', async () => {
     writeSkillOnDisk('ok-1');
     writeSkillOnDisk('ok_2');
     writeCustomAgent('abc', { name: 'N' });
     const a = await loadAgents();
-    const updated = await a.updateCustomAgent('abc', {
-      skill_list: ['ok-1', '../bad', 42 as any, 'ok_2'],
-    });
-    expect(updated?.skill_list).toEqual(['ok-1', 'ok_2']);
+    const file = path.join(customAgentsDir(), 'abc', 'agent.json');
+    const before = fs.readFileSync(file, 'utf8');
+    await expect(a.updateCustomAgent('abc', {
+      name: 'MustNotSave', skill_list: ['ok-1', '../bad', 42 as any, 'ok_2'],
+    })).rejects.toThrow(/unavailable Agent Skill dependencies/);
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
   });
 
   it('writes skill_list = [] as explicit zero (kept, not dropped)', async () => {
@@ -2152,20 +2161,75 @@ describe('agents › updateCustomAgent', () => {
     expect(updated?.skill_list).toEqual(['keep-me']);
   });
 
-  it('drops unknown skill ids from skill_list', async () => {
+  it('rejects unknown Skill dependencies and accepts a corrected retry', async () => {
     writeSkillOnDisk('known');
     writeCustomAgent('abc', { name: 'N' });
     const a = await loadAgents();
-    const updated = await a.updateCustomAgent('abc', { skill_list: ['known', 'ghost'] });
+    const file = path.join(customAgentsDir(), 'abc', 'agent.json');
+    const before = fs.readFileSync(file, 'utf8');
+    await expect(a.updateCustomAgent('abc', { name: 'MustNotSave', skill_list: ['known', 'ghost'] }))
+      .rejects.toThrow(/unavailable Agent Skill dependencies/);
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
+    const updated = await a.updateCustomAgent('abc', { skill_list: ['known'] });
     expect(updated?.skill_list).toEqual(['known']);
   });
 
-  it('drops external-package skills from runtime skill_list metadata', async () => {
+  it('rejects external-package Skills as durable dependencies without changing the Agent', async () => {
     writeExternalPackageSkill('pkg-tools', 'external-helper');
     writeCustomAgent('abc', { name: 'N' });
     const a = await loadAgents();
-    const updated = await a.updateCustomAgent('abc', { skill_list: ['external-helper'] });
-    expect(updated?.skill_list).toEqual([]);
+    const file = path.join(customAgentsDir(), 'abc', 'agent.json');
+    const before = fs.readFileSync(file, 'utf8');
+    await expect(a.updateCustomAgent('abc', { skill_list: ['external-helper'] }))
+      .rejects.toThrow(/unavailable Agent Skill dependencies/);
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
+  });
+
+  it('rechecks dependency enablement and installation on each explicit save', async () => {
+    writeSkillOnDisk('dynamic-skill');
+    writeCustomAgent('abc', { name: 'N' });
+    const a = await loadAgents();
+    const file = path.join(customAgentsDir(), 'abc', 'agent.json');
+    await a.updateCustomAgent('abc', { skill_list: ['dynamic-skill'] });
+    const before = fs.readFileSync(file, 'utf8');
+    const { setSkillEnabled } = await import('../../../src/main/features/component_enabled');
+    setSkillEnabled(TEST_UID, 'dynamic-skill', false);
+    await expect(a.updateCustomAgent('abc', { skill_list: ['dynamic-skill'] }))
+      .rejects.toThrow(/unavailable Agent Skill dependencies/);
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
+    setSkillEnabled(TEST_UID, 'dynamic-skill', true);
+    fs.rmSync(path.join(customSkillsDir(), 'dynamic-skill'), { recursive: true });
+    await expect(a.updateCustomAgent('abc', { skill_list: ['dynamic-skill'] }))
+      .rejects.toThrow(/unavailable Agent Skill dependencies/);
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
+    writeSkillOnDisk('new-skill', 'FreshHelper');
+    expect((await a.updateCustomAgent('abc', { skill_list: ['FreshHelper'] }))?.skill_list)
+      .toEqual(['new-skill']);
+  });
+
+  it('accepts the target own private dependency while rejecting a foreign owner', async () => {
+    writeCustomAgent('abc', { name: 'N' });
+    writeCustomAgent('other', { name: 'Other' });
+    const paths = await import('../../../src/main/paths');
+    const dir = path.join(paths.agentPrivateSkillsDir(TEST_UID, 'abc'), 'private-helper');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'SKILL.md'), '---\nname: PrivateHelper\ndescription: Own helper\nownerAgent: abc\n---\nUse the task data.');
+    const a = await loadAgents();
+    expect((await a.updateCustomAgent('abc', { skill_list: ['PrivateHelper'] }))?.skill_list)
+      .toEqual(['private-helper']);
+    const file = path.join(customAgentsDir(), 'other', 'agent.json');
+    const before = fs.readFileSync(file, 'utf8');
+    await expect(a.updateCustomAgent('other', { skill_list: ['private-helper'] }))
+      .rejects.toThrow(/unavailable Agent Skill dependencies/);
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
+  });
+
+  it('resolves a shared Skill by provenance even when its name matches a System Skill', async () => {
+    writeSkillOnDisk('custom-installer', 'package-installer');
+    writeCustomAgent('abc', { name: 'N' });
+    const a = await loadAgents();
+    expect((await a.updateCustomAgent('abc', { skill_list: ['package-installer'] }))?.skill_list)
+      .toEqual(['custom-installer']);
   });
 
   it('keeps skill_list verbatim when all ids are known (no closure expansion)', async () => {
@@ -2492,7 +2556,10 @@ describe('agents › streamSendToAgentEditChat synthesized progress', () => {
     expect(events.filter((e) => e.type === 'progress')).toHaveLength(0);
   });
 
-  it('keeps a newly staged Agent unchanged after an invalid edit-chat dependency and applies the corrected retry', async () => {
+  it.each([
+    ['tools', '<tools>workspace.read\nmanagement</tools>', 'invalid, unknown, host-managed, or runtime-only tool groups: management'],
+    ['Skills', '<tools>workspace.read\nweb</tools><skills>package-installer</skills>', 'unavailable Agent Skill dependencies'],
+  ])('keeps a newly staged Agent unchanged after invalid edit-chat %s and applies the corrected retry', async (_kind, dependencies, errorText) => {
     const a = await loadAgents();
     const staged = await a.createCustomAgent({
       name: 'EditChatResearcher',
@@ -2512,7 +2579,7 @@ describe('agents › streamSendToAgentEditChat synthesized progress', () => {
           '<agent>',
           '<name>MustNotPersist</name>',
           '<workflow>### 1. Research\n- `web_search(query)` finds current evidence.</workflow>',
-          '<tools>workspace.read</tools>',
+          dependencies,
           '</agent>',
         ].join('\n'),
       };
@@ -2524,7 +2591,7 @@ describe('agents › streamSendToAgentEditChat synthesized progress', () => {
 
     expect(rejectedEvents).toContainEqual(expect.objectContaining({
       type: 'error',
-      text: expect.stringContaining('web_search (add web)'),
+      text: expect.stringContaining(errorText),
     }));
     expect(fs.readFileSync(file, 'utf8')).toBe(before);
     expect((await a.getAgent(agentId))?.name).toBe('EditChatResearcher');
@@ -3054,6 +3121,72 @@ describe('agents › list cache invalidation', () => {
     const list = await a.listAgents();
     expect(list).toHaveLength(1);
     expect(list[0].name).toBe('New');
+  });
+
+  it('keeps a newly created CLI Agent visible when an older catalog scan finishes after creation', async () => {
+    writeCustomAgent('zz-existing', { name: 'Existing' });
+    const a = await loadAgents();
+    const storage = await import('../../../src/main/storage');
+    const readJson = storage.readJson;
+    const writeJson = storage.writeJson;
+    let releaseWrite!: () => void;
+    let writeStarted!: () => void;
+    let releaseRead!: () => void;
+    let readStarted!: () => void;
+    const writeGate = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    const atWrite = new Promise<void>((resolve) => { writeStarted = resolve; });
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    const atRead = new Promise<void>((resolve) => { readStarted = resolve; });
+    const writeSpy = vi.spyOn(storage, 'writeJson').mockImplementation(async (file, data, opts) => {
+      if ((data as any)?.name === 'FreshOpenCode') {
+        writeStarted();
+        await writeGate;
+      }
+      return writeJson(file, data, opts);
+    });
+    let readSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const creating = a.createCustomAgent({
+        name: 'FreshOpenCode', description: 'Local coding Agent', runtime: { kind: 'cli', cli: 'opencode' },
+      });
+      await Promise.race([atWrite, creating.then(() => { throw new Error('Create bypassed the write gate'); })]);
+      // The new directory exists, but its atomic agent.json write is pending.
+      // Pause the scan only after it has skipped that incomplete directory.
+      readSpy = vi.spyOn(storage, 'readJson').mockImplementation(async (file) => {
+        const result = await readJson(file);
+        if (file === path.join(customAgentsDir(), 'zz-existing', 'agent.json')) {
+          readStarted();
+          await readGate;
+        }
+        return result;
+      });
+      const oldScan = a.listAgents();
+      await atRead;
+      releaseWrite();
+      const created = await creating;
+      expect(created).toBeTruthy();
+      releaseRead();
+      await oldScan;
+      // A successful create must be visible to subsequent dispatch lookups,
+      // even if an earlier read raced with its invalidation.
+      expect((await a.getAgent(created!.agent_id))?.name).toBe('FreshOpenCode');
+      const catalog = await a.listAgents();
+      expect(catalog.map((agent) => agent.agent_id)).toContain(created!.agent_id);
+      const { resolveRecipients } = await import('../../../src/main/features/group_chat/router');
+      expect(resolveRecipients({
+        fromKind: 'user', fromId: 'user', members: [], text: '@FreshOpenCode inspect the fixture',
+        agentNameToId: new Map(catalog.map((agent) => [agent.name.toLowerCase(), agent.agent_id])),
+        agentDisplayNames: catalog.map((agent) => agent.name),
+      })).toMatchObject({ to: [created!.agent_id], unknown: [] });
+      const paths = await import('../../../src/main/paths');
+      const persisted = JSON.parse(fs.readFileSync(paths.userAgentCatalogCacheFile(TEST_UID), 'utf8'));
+      expect(persisted.data.map((agent: any) => agent.agent_id)).toContain(created!.agent_id);
+    } finally {
+      releaseWrite();
+      releaseRead();
+      writeSpy.mockRestore();
+      readSpy?.mockRestore();
+    }
   });
 
   it('reflects updates immediately', async () => {

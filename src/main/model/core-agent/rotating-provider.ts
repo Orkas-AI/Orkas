@@ -17,8 +17,10 @@
  * in order. The tricky bit is "when is it still safe to rotate?":
  *
  *   - Before any `text_delta` / `tool_use_start` / similar content event
- *     has been yielded → credential/account failure ⇒ mark cooldown, try
- *     next candidate; retryable provider/runtime failure ⇒ retry this
+ *     has been yielded → OAuth authentication failure ⇒ refresh and rebuild
+ *     once; rate limit ⇒ try next configured model without cross-request cooldown;
+ *     remaining credential/account failure ⇒ mark cooldown, try next
+ *     candidate; retryable provider/runtime failure ⇒ retry this
  *     candidate first, then rotate without cooldown. If AgentRunner is
  *     already retrying the model round, try each candidate once so the
  *     nested retry budget is not multiplied.
@@ -52,13 +54,14 @@
  * callers can clear any prior cooldown + bump lastUsed.
  */
 
+import type { CustomModelImageSupport } from './custom-model-image-support';
 import type { LLMProvider, CompletionParams, CompletionResult, Message } from '#core-agent';
 import type { ProviderEmptyKind, ProviderTerminationCategory, StreamEvent, Usage } from '#core-agent';
 import { classifyKeyFailure, formatKeyFailure, type KeyFailureKind } from './auth-error';
 import { markCooldown } from './profile-cooldown';
 import { createLogger } from '../../logger';
 import { getRetryErrorPolicyConfig } from '../../features/client_config';
-import { classifyRetryableErrorWithPolicy, type RetryableErrorKind } from '../../../core-agent/src/shared/errors';
+import { isProviderRateLimitError, classifyTransientNetworkError, classifyRetryableErrorWithPolicy, type RetryableErrorKind } from '../../../core-agent/src/shared/errors';
 import { maskId } from '../../util/log-redact';
 
 const log = createLogger('rotating-provider');
@@ -137,10 +140,16 @@ export interface RotatingCandidate {
    * Zero means text-only. Undefined preserves caller input for backwards
    * compatibility with non-chat/internal test candidates. */
   maxInputImages?: number;
+  /** Only custom models carry an explicit API capability observation. */
+  imageSupport?: CustomModelImageSupport;
   /** Factory is deferred-async because external providers need core-agent
-   *  loaded lazily. We call it at most once per stream/complete request —
-   *  if rotation happens to another candidate, we build that one too. */
+   *  loaded lazily. It may be rebuilt for a bounded retry or after an OAuth
+   *  credential refresh; if rotation happens, we build the next candidate. */
   build(): Promise<LLMProvider>;
+  /** OAuth-only recovery hook. On an authentication failure before any
+   * visible content, refresh the credential and make the next build use it.
+   * Returns false when refresh is unavailable or failed. */
+  refreshCredential?: () => Promise<boolean>;
 }
 
 /**
@@ -184,7 +193,7 @@ export function boundMessagesForImageLimit(
   const omittedImages = totalImages - limit;
   const notice = limit > 0
     ? `<model-image-limit max_images="${limit}" omitted_images="${omittedImages}">Only the retained image blocks in this request are visually available. Use attachment manifest paths with read_files one image at a time for omitted images; do not claim visual processing from a listed path alone.</model-image-limit>`
-    : `<model-image-limit max_images="0" omitted_images="${omittedImages}" vision_supported="false">This model cannot receive image blocks, including read_files image previews. Do not claim visual analysis. When ocr_file is available it may extract text; otherwise explain that a vision-capable model is required.</model-image-limit>`;
+    : `<model-image-limit max_images="0" omitted_images="${omittedImages}" vision_supported="false">This model cannot receive image blocks, including read_files image previews. Do not claim visual analysis. Ask for readable text or a vision-capable model when the task depends on image content.</model-image-limit>`;
   projected.push({
     role: 'developer',
     content: [{ type: 'text', text: notice }],
@@ -198,6 +207,8 @@ function messageImageCount(message: Message): number {
 }
 
 export interface CreateRotatingProviderConfig {
+  /** Request diagnostics bypass pre-commit buffering and do not commit a stream. */
+  onRequestFailure?: CompletionParams['onRequestFailure'];
   /** Ordered list of candidates. First entry is the primary (matches
    *  `pickChatEntryGroup()[0]`). Further entries are fallbacks. */
   candidates: RotatingCandidate[];
@@ -256,6 +267,10 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
   // later model rounds in this agent run. This is run-local only; only
   // credential failures enter the persisted cooldown.
   const unavailableProfiles = new Set<string>();
+  // Throttling can be model-specific even when models share one credential.
+  // Skip only that candidate for this task; a new user request starts fresh.
+  const rateLimitedCandidates = new Set<string>();
+  let exhaustedRateLimitError: Error | undefined;
   // W4-2: stream() runs once per tool-loop round with the full history, so
   // without this run-local latch the same "images omitted" notice repeats on
   // every remaining round of the turn.
@@ -265,11 +280,27 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     candidate.cooldownId || candidate.profileId
   );
 
+  const rateLimitIdFor = (candidate: RotatingCandidate): string => (
+    JSON.stringify([candidate.profileId, candidate.providerId, candidate.modelId])
+  );
+  const isUnavailable = (candidate: RotatingCandidate): boolean => (
+    unavailableProfiles.has(cooldownIdFor(candidate))
+    || rateLimitedCandidates.has(rateLimitIdFor(candidate))
+  );
+  const markUnavailable = (candidate: RotatingCandidate, kind: KeyFailureKind, reason: string): void => {
+    if (kind === 'rate_limit') {
+      rateLimitedCandidates.add(rateLimitIdFor(candidate));
+    } else {
+      markCooldown(cooldownIdFor(candidate), kind, reason);
+      unavailableProfiles.add(cooldownIdFor(candidate));
+    }
+  };
+
   const reportCandidates = (): void => {
     config.onCandidatesObserved?.({
       candidateCount: candidates.length,
       availableCandidateCount: candidates.filter(
-        (candidate) => !unavailableProfiles.has(cooldownIdFor(candidate)),
+        (candidate) => !isUnavailable(candidate),
       ).length,
     });
   };
@@ -292,24 +323,41 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
    */
   const PREAMBLE_TYPES = new Set<string>(['start', 'message_start', 'content_block_start']);
 
+  let terminalRateLimit: Error | undefined;
+
+  function observeFailure(cand: RotatingCandidate, params: CompletionParams, error: unknown, committed = false): void {
+    if (terminalRateLimit) throw terminalRateLimit;
+    if (cand.providerId === 'custom' && params.messages.some(message => messageImageCount(message) > 0)) {
+      cand.imageSupport?.observeRejection(error);
+    }
+    if (committed && (classifyKeyFailure(error) === 'rate_limit' || isProviderRateLimitError(error))) {
+      terminalRateLimit = exhaustedCredentialError(error, { kind: 'rate_limit', cooldownKind: null });
+      config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
+      throw terminalRateLimit;
+    }
+  }
+
   /** Substitute in the candidate's own model metadata so a cross-provider
    *  fallback hits its own endpoint and request limits even though
    *  AgentRunner only knows about the primary model.
    *
    *  Main turns mark their catalog-derived cap as `model_default`; only that
-   *  generated default follows the candidate. Auxiliary calls (compaction,
-   *  reflection, etc.) pass explicit small caps without the marker and must
-   *  retain them across fallback. */
+   *  generated default follows the candidate. Auxiliary semantic calls mark
+   *  `provider_default`, omit a call-specific cap, and keep that omission
+   *  across fallback. */
   function paramsFor(cand: RotatingCandidate, params: CompletionParams): CompletionParams {
-    const next = { ...params, model: cand.modelId };
-    if (typeof cand.maxInputImages === 'number' && Number.isFinite(cand.maxInputImages)) {
-      next.messages = boundMessagesForImageLimit(params.messages, cand.maxInputImages);
+    const next = { ...params, model: cand.modelId,
+      ...(config.onRequestFailure ? { onRequestFailure: config.onRequestFailure } : {}),
+    };
+    const imageLimit = cand.imageSupport?.unsupported ? 0 : cand.maxInputImages;
+    if (typeof imageLimit === 'number' && Number.isFinite(imageLimit)) {
+      next.messages = boundMessagesForImageLimit(params.messages, imageLimit);
       // W4-2 evidence: a text-only model silently loses every attached image
       // here, and the visible symptom is the model "admitting" it cannot see
       // — sampled users debugged that as their own mistake. Log the drop so
       // diagnosis has a recorded fact; the user-facing notice needs the
       // provider_fallback-style event plumbing (recorded in the plan doc).
-      if (cand.maxInputImages === 0) {
+      if (imageLimit === 0) {
         const dropped = params.messages.reduce(
           (sum, message) => sum + messageImageCount(message),
           0,
@@ -366,6 +414,15 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
   }
 
   function exhaustedNetworkError(lastErr: unknown): Error {
+    // An unknown error may use the bounded retry policy without proving a
+    // network fault. Preserve its original diagnostic instead of inventing one.
+    const transientKind = classifyTransientNetworkError(lastErr);
+    if (classifyKeyFailure(lastErr) === null
+      && (transientKind === null || transientKind === 'rate_limit')) {
+      return Object.assign(new Error(lastErr instanceof Error ? lastErr.message : String(lastErr)), {
+        code: 'PROVIDER_RETRIES_EXHAUSTED', cause: lastErr,
+      });
+    }
     const msg = formatKeyFailure(lastErr) || 'network error';
     return Object.assign(
       new Error(`All configured model candidates failed after network retries: ${msg.replace(/fetch[_\s-]?failed/ig, 'connection failed')}`),
@@ -404,6 +461,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     }
     const keyKind = classifyKeyFailure(err);
     if (keyKind) return { kind: keyKind, cooldownKind: keyKind };
+    if (isProviderRateLimitError(err)) return { kind: 'rate_limit', cooldownKind: 'rate_limit' };
 
     const retryableKind = classifyRetryableErrorLocal(err);
     if (retryableKind) return { kind: retryableKind, cooldownKind: null };
@@ -414,6 +472,41 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
   function shouldRetryCurrentCandidate(failure: PreCommitFailure): boolean {
     if (failure.retryCurrent === false) return false;
     return failure.cooldownKind === null || failure.kind === 'network';
+  }
+
+  async function tryRefreshAuthentication(
+    cand: RotatingCandidate,
+    failure: PreCommitFailure,
+    attemptedProfiles: Set<string>,
+  ): Promise<boolean> {
+    const candidateId = cooldownIdFor(cand);
+    if (
+      failure.kind !== 'auth'
+      || !cand.refreshCredential
+      || attemptedProfiles.has(candidateId)
+    ) return false;
+
+    attemptedProfiles.add(candidateId);
+    log.info('refreshing OAuth credential after pre-content auth failure', {
+      profile_id: maskId(cand.profileId),
+      provider_id: cand.providerId,
+    });
+    try {
+      const refreshed = await cand.refreshCredential();
+      log.info('OAuth credential refresh completed', {
+        profile_id: maskId(cand.profileId),
+        provider_id: cand.providerId,
+        result: refreshed ? 'success' : 'unavailable',
+      });
+      return refreshed;
+    } catch (err) {
+      log.warn('OAuth credential refresh failed', {
+        profile_id: maskId(cand.profileId),
+        provider_id: cand.providerId,
+        error_chars: err instanceof Error ? err.message.length : String(err).length,
+      });
+      return false;
+    }
   }
 
   function retryAttemptsFor(params: CompletionParams): number {
@@ -434,6 +527,18 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     if (category === 'normal') return 'normal_end_empty';
     if (category === 'safety') return 'safety_filtered_empty';
     return 'unknown_empty';
+  }
+
+  /** complete()'s counterpart of `normal_end_empty`: the provider ended the
+   *  turn normally with neither visible text nor a tool call. Thinking-only
+   *  content counts as empty — the reflection loop, the main complete()
+   *  caller, reads text blocks only. A truncated reply is not "empty". */
+  function isNormalEmptyCompletion(result: CompletionResult): boolean {
+    if (result.stopReason === 'max_tokens') return false;
+    return !result.content.some((block) => (
+      block.type === 'tool_use'
+      || (block.type === 'text' && typeof block.text === 'string' && block.text.trim().length > 0)
+    ));
   }
 
   type EmptyObservation = {
@@ -644,24 +749,30 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     name: providerId.charAt(0).toUpperCase() + providerId.slice(1),
 
     async complete(params: CompletionParams): Promise<CompletionResult> {
+      if (terminalRateLimit) throw terminalRateLimit;
       let lastErr: unknown = new Error('rotating-provider: no candidates');
       let lastCand: RotatingCandidate | null = null;
       let lastFailure: PreCommitFailure | null = null;
       let exhaustedNetwork = false;
       const retryAttempts = retryAttemptsFor(params);
+      // Like stream(), retry normal empty output on the same model, then fail.
+      // Auxiliary callers own recovery; empty output must not trigger rotation.
+      const allowedNormalEmptyRetries = normalEmptyRetriesFor(params);
+      let normalEmptyRetry = 0;
       // Deferred network latch — same contract as stream(); see the comment
       // there for why promotion only happens after a later candidate succeeds.
       const networkFailedThisCall = new Set<string>();
+      const authRefreshAttempted = new Set<string>();
       reportCandidates();
-      if (params.signal?.aborted) {
-        throw abortError(params.signal);
-      }
+      throwIfAborted(params.signal);
+      if (exhaustedRateLimitError) throw exhaustedRateLimitError;
       for (let i = 0; i < candidates.length; i++) {
         const cand = candidates[i];
-        if (unavailableProfiles.has(cooldownIdFor(cand))) continue;
+        if (isUnavailable(cand)) continue;
         lastCand = cand;
 
-        for (let retry = 0; retry <= retryAttempts; retry++) {
+        let networkRetry = 0;
+        while (true) {
           if (params.signal?.aborted) {
             throw abortError(params.signal);
           }
@@ -671,6 +782,18 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
             throwIfAborted((params as { signal?: AbortSignal }).signal);
             const result = await provider.complete(paramsFor(cand, params));
             throwIfAborted((params as { signal?: AbortSignal }).signal);
+            if (isNormalEmptyCompletion(result)) {
+              if (normalEmptyRetry < allowedNormalEmptyRetries) {
+                normalEmptyRetry += 1;
+                log.warn('complete retrying normal terminal empty response', {
+                  profile_id: maskId(cand.profileId),
+                  attempt: normalEmptyRetry,
+                  max_attempts: allowedNormalEmptyRetries,
+                });
+                continue;
+              }
+              throw new ProviderEmptyResponseError(cand.providerId, 'normal_end_empty');
+            }
             config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
             config.onSuccess?.(cand.profileId, cand);
             for (const id of networkFailedThisCall) unavailableProfiles.add(id);
@@ -681,8 +804,10 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
               config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
               throw abortError(signal);
             }
+            observeFailure(cand, params, err);
             lastErr = err;
-            const failure = classifyPreCommitFailure(err);
+            const failure = err instanceof ProviderEmptyResponseError && err.kind === 'normal_end_empty'
+              ? null : classifyPreCommitFailure(err);
             if (!failure) {
               // Non-rotatable → this candidate owns the visible error.
               config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
@@ -690,21 +815,25 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
             }
             lastFailure = failure;
 
-            if (shouldRetryCurrentCandidate(failure) && retry < retryAttempts) {
+            if (await tryRefreshAuthentication(cand, failure, authRefreshAttempted)) {
+              continue;
+            }
+
+            if (shouldRetryCurrentCandidate(failure) && networkRetry < retryAttempts) {
+              networkRetry += 1;
               log.warn('complete retrying current candidate', {
                 profile_id: maskId(cand.profileId),
                 kind: failure.kind,
-                attempt: retry + 1,
+                attempt: networkRetry,
                 max_attempts: retryAttempts,
               });
-              await sleep(networkRetryDelayMs(retry + 1), (params as { signal?: AbortSignal }).signal);
+              await sleep(networkRetryDelayMs(networkRetry), (params as { signal?: AbortSignal }).signal);
               continue;
             }
 
             const reason = formatKeyFailure(err);
             if (failure.cooldownKind && failure.cooldownKind !== 'network') {
-              markCooldown(cooldownIdFor(cand), failure.cooldownKind, reason);
-              unavailableProfiles.add(cooldownIdFor(cand));
+              markUnavailable(cand, failure.cooldownKind, reason);
             } else if (failure.kind === 'network') {
               networkFailedThisCall.add(cooldownIdFor(cand));
             }
@@ -722,11 +851,16 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
       // Exhausted: surface the last candidate's failure as the call's owner.
       if (lastCand) config.onCandidateChosen?.({ profileId: lastCand.profileId, providerId: lastCand.providerId, modelId: lastCand.modelId });
       if (exhaustedNetwork) throw exhaustedNetworkError(lastErr);
-      if (lastFailure) throw exhaustedCredentialError(lastErr, lastFailure);
+      if (lastFailure) {
+        const error = exhaustedCredentialError(lastErr, lastFailure);
+        if (lastFailure.kind === 'rate_limit' && candidates.every(isUnavailable)) exhaustedRateLimitError = error;
+        throw error;
+      }
       throw lastErr;
     },
 
     async *stream(params: CompletionParams): AsyncIterable<StreamEvent> {
+      if (terminalRateLimit) throw terminalRateLimit;
       let lastErr: unknown = new Error('rotating-provider: no candidates');
       let lastCand: RotatingCandidate | null = null;
       let lastFailure: PreCommitFailure | null = null;
@@ -741,11 +875,14 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
       // swallows the terminal error, so a full-network blip must leave the
       // next call free to retry every candidate.
       const networkFailedThisCall = new Set<string>();
+      const authRefreshAttempted = new Set<string>();
       reportCandidates();
+      throwIfAborted(params.signal);
+      if (exhaustedRateLimitError) throw exhaustedRateLimitError;
 
       for (let i = 0; i < candidates.length; i++) {
         const cand = candidates[i];
-        if (unavailableProfiles.has(cooldownIdFor(cand))) continue;
+        if (isUnavailable(cand)) continue;
         lastCand = cand;
         let attempt: Awaited<ReturnType<typeof streamOne>> | null = null;
         let networkRetry = 0;
@@ -803,13 +940,16 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
           lastErr = attempt.err;
 
           // Once recovery was triggered by a normal terminal empty response,
-          // the exactly-one follow-up request stays on this model. Any failure
-          // from that request is surfaced; it cannot consume transport retry
-          // budget or cross to a fallback model.
-          if (normalEmptyRecoveryActive) break;
+          // the exactly-one follow-up request stays on this model. A rate
+          // limit still advances to the next configured candidate; other
+          // failures cannot consume transport retry or fallback budgets.
+          if (normalEmptyRecoveryActive && attempt.failure.kind !== 'rate_limit') break;
 
           const failure = attempt.failure;
           lastFailure = failure;
+          if (await tryRefreshAuthentication(cand, failure, authRefreshAttempted)) {
+            continue;
+          }
           if (shouldRetryCurrentCandidate(failure) && networkRetry < retryAttempts) {
             networkRetry += 1;
             const reason = formatKeyFailure(attempt.err);
@@ -830,8 +970,9 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
         if (!attempt) continue;
 
         if ('rotatable' in attempt) {
+          observeFailure(cand, params, attempt.err);
           lastErr = attempt.err;
-          if (!attempt.rotatable || normalEmptyRecoveryActive) {
+          if (!attempt.rotatable || (normalEmptyRecoveryActive && attempt.failure.kind !== 'rate_limit')) {
             // Non-rotatable failure before any content event → this
             // candidate is what the user sees in the surfaced error.
             config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
@@ -841,18 +982,17 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
           const reason = formatKeyFailure(attempt.err);
           const fallbackCandidate = candidates
             .slice(i + 1)
-            .find((candidate) => !unavailableProfiles.has(cooldownIdFor(candidate)));
+            .find((candidate) => !isUnavailable(candidate));
           const hasFallback = !!fallbackCandidate;
           if (failure.cooldownKind && failure.cooldownKind !== 'network') {
-            markCooldown(cooldownIdFor(cand), failure.cooldownKind, reason);
-            unavailableProfiles.add(cooldownIdFor(cand));
+            markUnavailable(cand, failure.cooldownKind, reason);
             if (failure.kind === 'auth' && hasFallback) {
               yield {
                 type: 'provider_fallback',
-                reason: 'auth',
-                providerId: cand.providerId,
-                candidateIndex: i + 1,
-                candidateCount: candidates.length,
+              reason: 'auth',
+              providerId: cand.providerId,
+              candidateIndex: i + 1,
+              candidateCount: candidates.length,
               };
             }
           } else if (isProviderNoFirstEventTimeout(attempt.err) && hasFallback) {
@@ -895,7 +1035,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
         // every attached image. Say so — the visible alternative is the model
         // "admitting" it cannot see, which sampled users debugged as their
         // own mistake.
-        if (cand.maxInputImages === 0 && !imagesOmittedAnnounced) {
+        if ((cand.imageSupport?.unsupported || cand.maxInputImages === 0) && !imagesOmittedAnnounced) {
           const omitted = params.messages.reduce(
             (sum, message) => sum + messageImageCount(message),
             0,
@@ -912,10 +1052,12 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
           while (true) {
             const { value, done } = await iterator.next();
             if (done) return;
+            if (value?.type === 'error') observeFailure(cand, params, value.error, true);
             if (value) yield value;
           }
         } catch (err) {
           // Post-commit failure: surface upward, no rotation.
+          observeFailure(cand, params, err, true);
           throw err;
         } finally {
           cleanup();
@@ -927,7 +1069,11 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
       if (lastCand) config.onCandidateChosen?.({ profileId: lastCand.profileId, providerId: lastCand.providerId, modelId: lastCand.modelId });
       if (isProviderNoFirstEventTimeout(lastErr)) throw lastErr;
       if (exhaustedNetwork) throw exhaustedNetworkError(lastErr);
-      if (lastFailure) throw exhaustedCredentialError(lastErr, lastFailure);
+      if (lastFailure) {
+        const error = exhaustedCredentialError(lastErr, lastFailure);
+        if (lastFailure.kind === 'rate_limit' && candidates.every(isUnavailable)) exhaustedRateLimitError = error;
+        throw error;
+      }
       throw lastErr;
     },
 

@@ -447,16 +447,16 @@ async function loadConnectors() {
     if (catRes && catRes.ok && Array.isArray(catRes.catalog)) {
       _connectorsState.catalog = catRes.catalog;
     } else {
-      _connectorsLog.warn('catalog failed', { error: catRes && (catRes.error && catRes.error.message || catRes.error) });
+      _connectorsLog.warn('catalog failed', { error_type: _connectorTrackErrorType(catRes && catRes.error) });
     }
     if (listRes && listRes.ok && Array.isArray(listRes.instances)) {
       _connectorsState.instances = listRes.instances;
     } else {
-      _connectorsLog.warn('list failed', { error: listRes && (listRes.error && listRes.error.message || listRes.error) });
+      _connectorsLog.warn('list failed', { error_type: _connectorTrackErrorType(listRes && listRes.error) });
     }
     _persistConnectorsRenderCache();
   } catch (err) {
-    _connectorsLog.warn('list failed', { error: err && err.message });
+    _connectorsLog.warn('list failed', { error_type: _connectorTrackErrorType(err) });
   } finally {
     if (seq === _connectorsLoadSeq) {
       _connectorsState.loading = false;
@@ -487,7 +487,7 @@ async function verifyConnectors() {
       _renderConnectorsGrid();
     }
   } catch (err) {
-    _connectorsLog.warn('connector verification failed', { error: (err && err.message) || String(err) });
+    _connectorsLog.warn('connector verification failed', { error_type: _connectorTrackErrorType(err) });
   }
 }
 
@@ -535,11 +535,17 @@ function _connectorSearchText(entry) {
     entry.description_en,
     entry.description_ja,
     entry.description_pt,
+    entry.description_es,
+    entry.description_fr,
+    entry.description_ko,
+    entry.description_de,
+    entry.description_ru,
+    entry.description_it,
     entry.category,
   ];
   if (Array.isArray(entry.connection_variants)) {
     for (const variant of entry.connection_variants) {
-      parts.push(variant.catalog_id, variant.label_zh, variant.label_en, variant.label_ja, variant.label_pt);
+      parts.push(variant.catalog_id, variant.label_zh, variant.label_en, variant.label_ja, variant.label_pt, variant.label_es, variant.label_fr, variant.label_ko, variant.label_de, variant.label_ru, variant.label_it);
       const concrete = _catalogEntryById(variant.catalog_id);
       if (concrete && concrete !== entry) {
         parts.push(
@@ -550,6 +556,12 @@ function _connectorSearchText(entry) {
           concrete.description_en,
           concrete.description_ja,
           concrete.description_pt,
+          concrete.description_es,
+          concrete.description_fr,
+          concrete.description_ko,
+          concrete.description_de,
+          concrete.description_ru,
+          concrete.description_it,
         );
       }
     }
@@ -567,6 +579,12 @@ function _connectorSearchText(entry) {
       concrete.description_en,
       concrete.description_ja,
       concrete.description_pt,
+      concrete.description_es,
+      concrete.description_fr,
+      concrete.description_ko,
+      concrete.description_de,
+      concrete.description_ru,
+      concrete.description_it,
     );
   }
   if (Array.isArray(entry.bundle_member_ids)) {
@@ -582,6 +600,12 @@ function _connectorSearchText(entry) {
           member.description_en,
           member.description_ja,
           member.description_pt,
+          member.description_es,
+          member.description_fr,
+          member.description_ko,
+          member.description_de,
+          member.description_ru,
+          member.description_it,
         );
       }
     }
@@ -777,7 +801,7 @@ window.openConnectorSetupById = async function openConnectorSetupById(id) {
   }
   // The protected form is owned by the catalog, not by a filtered DOM card.
   // A user opening it must not reopen the guide and revoke Commander control.
-  _runConnect(entry).catch(() => uiAlert(t('connectors.errors.connect_failed')));
+  _runConnect(entry, 'agent').catch(() => uiAlert(t('connectors.errors.connect_failed')));
   return true;
 };
 
@@ -965,13 +989,13 @@ function _connectorSetupMarkup(entry, fields, lang, dialogId) {
     ? `<button type="button" class="connectors-setup-guide-link" data-act="open-setup-guide" data-url="${escapeHtml(guideUrl)}">${escapeHtml(guideLabel)}</button>`
     : '';
   return `
-    <div class="modal modal-card" role="dialog" aria-modal="true" aria-labelledby="${titleId}" aria-describedby="${messageId}">
+    <div class="modal modal-card" role="dialog" aria-modal="true" aria-labelledby="${titleId}" aria-describedby="${dialogId}-file-analysis ${messageId}">
       <div class="connectors-connect-header">
         <div class="modal-header">
           <div class="modal-title" id="${titleId}">${escapeHtml(t('connectors.setup.form_title', { name: _connectorDisplayName(entry) || entry.id }))}</div>
           ${_connectorSupportsSetupAssist(entry) ? `<button type="button" class="btn btn-sm" data-act="setup-assist">${escapeHtml(t('connectors.setup.assist'))}</button>` : ''}
         </div>
-        <div class="connectors-connect-intro" id="${messageId}">${escapeHtml(t(entry.auth_mode === 'local_api' && setup.requirement ? 'connectors.setup.user_app_message' : 'connectors.setup.form_message'))}</div>
+        <div class="connectors-connect-intro" id="${dialogId}-file-analysis">${escapeHtml(t('connectors.setup.file_analysis_hint'))}</div>
       </div>
       <form class="connectors-connect-form" data-act="setup-form">
         <div class="connectors-connect-fields">
@@ -979,6 +1003,7 @@ function _connectorSetupMarkup(entry, fields, lang, dialogId) {
           ${instructions ? `<div class="connectors-setup-instructions">${escapeHtml(instructions)}</div>` : ''}
           ${guideHtml}
         </div>` : ''}
+          <div class="connectors-connect-intro" id="${messageId}">${escapeHtml(t(!fields.length && setup.requirement ? 'connectors.setup.prerequisites_message' : entry.auth_mode === 'local_api' && setup.requirement ? 'connectors.setup.user_app_message' : 'connectors.setup.form_message'))}</div>
           ${callbackHtml}
           ${fields.map((field, index) => _connectorSetupFieldHtml(field, index, lang)).join('')}
         </div>
@@ -1008,9 +1033,9 @@ function _refreshConnectorDialogCopy(overlay, markup) {
 }
 
 /** Collect every catalog-defined connection value in one reviewable, validated panel. */
-function _collectConnectionParameters(entry) {
+function _collectConnectionParameters(entry, entryPoint = 'form') {
   const fields = entry && entry.connection_setup && entry.connection_setup.fields;
-  if (!Array.isArray(fields) || !fields.length) return Promise.resolve({});
+  if (!Array.isArray(fields) || (!fields.length && !_connectorSetupRequirement(entry))) return Promise.resolve({});
   if (_connectorSetupDialogOpen) return Promise.resolve(null);
   _connectorSetupDialogOpen = true;
   return new Promise((resolve) => {
@@ -1022,6 +1047,8 @@ function _collectConnectionParameters(entry) {
     const lang = (typeof getLang === 'function') ? getLang() : 'en';
     overlay.innerHTML = _connectorSetupMarkup(entry, fields, lang, dialogId);
     document.body.appendChild(overlay);
+    _connectorsTrackEvent('connector_config_view_result', { ..._connectorTrackPayload(entry, null),
+      entry_point: entryPoint === 'agent' ? 'agent' : 'form', action: 'form', result: 'success' });
 
     const form = overlay.querySelector('[data-act="setup-form"]');
     const cancelBtn = overlay.querySelector('[data-act="cancel"]');
@@ -1094,7 +1121,7 @@ function _collectConnectionParameters(entry) {
         window.orkas.invoke('auth.openExternal', { url }).catch((error) => {
           _connectorsLog.warn('connector setup guide could not be opened', {
             connector_id: entry.id,
-            error: (error && error.message) || String(error),
+            error_type: _connectorTrackErrorType(error),
           });
         });
       });
@@ -1416,7 +1443,6 @@ async function _toggleConnectorEnabled(entry, instance, nextEnabled) {
           duration_ms: Math.round(performance.now() - startedAt),
           ...failure,
         });
-        _logConnectorOperationFailure('connector_enable', { ...payload, ...failure });
         uiAlert(_formatConnectError(res, 'component.toggle_failed'));
         return;
       }
@@ -1434,7 +1460,6 @@ async function _toggleConnectorEnabled(entry, instance, nextEnabled) {
       duration_ms: Math.round(performance.now() - startedAt),
       ...failure,
     });
-    _logConnectorOperationFailure('connector_enable', { ...payload, ...failure });
     uiAlert(_formatConnectError(err, 'component.toggle_failed'));
     return;
   }
@@ -1496,7 +1521,6 @@ async function _quickDisconnect(entry, instance) {
           duration_ms: Math.round(performance.now() - startedAt),
           ...failure,
         });
-        _logConnectorOperationFailure('connector_disconnect', { ...payload, ...failure });
         uiAlert(_formatConnectError(res, 'connectors.errors.remove_failed'));
         return;
       }
@@ -1514,7 +1538,6 @@ async function _quickDisconnect(entry, instance) {
       duration_ms: Math.round(performance.now() - startedAt),
       ...failure,
     });
-    _logConnectorOperationFailure('connector_disconnect', { ...payload, ...failure });
     uiAlert(_formatConnectError(err, 'connectors.errors.remove_failed'));
     return;
   }
@@ -1558,7 +1581,6 @@ async function _ensureLocalCliReady(uiEntry, targetEntry) {
       } : {}),
     };
     _connectorsTrackEvent('connector_cli_setup_result', detail);
-    if (result === 'failure') _logConnectorOperationFailure('connector_cli_setup', detail);
   };
 
   _localCliInstallPhases.set(uiId, 'checking');
@@ -1634,7 +1656,7 @@ async function _ensureLocalCliReady(uiEntry, targetEntry) {
   }
 }
 
-async function _runConnect(entry) {
+async function _runConnect(entry, entryPoint = 'form') {
   if (_isConnectorVisibleDisabled(entry)) {
     _showConnectorUnsupportedToast();
     return;
@@ -1645,6 +1667,10 @@ async function _runConnect(entry) {
     uiAlert(t('connectors.setup.sandbox_disconnect_required'));
     return;
   }
+  const currentLaunch = _oauthLaunchAttempts.get(entry.id);
+  if ((_connectorsState.connecting && _connectorsState.connecting.has(entry.id))
+      || (currentLaunch && currentLaunch.throttled) || _oauthCallbackAttempts.has(entry.id)) return;
+  if (entryPoint !== 'agent') _connectorsTrackClick('connector_connect', _connectorTrackPayload(entry, null));
   let targetEntry = entry;
   const installedEntry = installed && _catalogEntryById(installed.id);
   if (installedEntry && installedEntry.catalog_parent_id === entry.id) {
@@ -1673,8 +1699,8 @@ async function _runConnect(entry) {
 
   let connectionParameters;
   const fields = targetEntry.connection_setup && targetEntry.connection_setup.fields;
-  if (Array.isArray(fields) && fields.length) {
-    connectionParameters = await _collectConnectionParameters(targetEntry);
+  if (Array.isArray(fields) && (fields.length || _connectorSetupRequirement(targetEntry))) {
+    connectionParameters = await _collectConnectionParameters(targetEntry, entryPoint);
     if (connectionParameters === null) return;
   }
   // The disabled button is the primary guard during the 2s launch throttle; this state guard also
@@ -1714,7 +1740,6 @@ async function _runConnect(entry) {
     if (currentView === 'connectors') _renderConnectorsGrid();
   }, _OAUTH_LAUNCH_THROTTLE_MS);
   _renderConnectorsGrid();
-  _connectorsTrackClick('connector_connect', payload);
   let accepted = false;
   try {
     const res = await window.orkas.invoke('connectors.start_oauth', {
@@ -1866,11 +1891,6 @@ async function _retryConnect(entry, event, instance) {
         error_code: firstFailure.error_code,
         error_type: firstFailure.error_type,
       });
-      _logConnectorOperationFailure(event, {
-        ...payload,
-        error_code: firstFailure.error_code,
-        error_type: firstFailure.error_type,
-      });
       uiAlert(_formatConnectorStatusError(firstFailure.error));
     } else {
       _connectorsTrackEvent(`${event}_result`, {
@@ -1887,7 +1907,6 @@ async function _retryConnect(entry, event, instance) {
       duration_ms: Math.round(performance.now() - startedAt),
       ...failure,
     });
-    _logConnectorOperationFailure(event, { ...payload, ...failure });
     uiAlert(_formatConnectorStatusError((err && err.message) || ''));
   } finally {
     _connectorsState.connecting.delete(entry.id);
@@ -1981,6 +2000,8 @@ function _openAddCustomDialog() {
   overlay.className = 'modal-overlay ui-dialog-overlay open';
   overlay.innerHTML = _customConnectorMarkup();
   document.body.appendChild(overlay);
+  _connectorsTrackEvent('connector_config_view_result', { connector_id: 'custom', origin: 'custom',
+    auth_mode: 'custom', entry_point: 'form', action: 'form', result: 'success' });
 
   const f = (name) => overlay.querySelector(`[data-f="${name}"]`);
   const secHttp = overlay.querySelector('[data-sec="http"]');
@@ -2062,6 +2083,8 @@ function _openAddCustomDialog() {
         _connectorsTrackEvent('connector_custom_add_result', {
           ...payload,
           result: 'success',
+          connection_state: ['connected', 'connecting', 'error', 'degraded', 'disconnected'].includes(res.instance.status && res.instance.status.kind)
+            ? res.instance.status.kind : 'unknown',
           duration_ms: Math.round(performance.now() - startedAt),
         });
         added = true;
@@ -2084,7 +2107,6 @@ function _openAddCustomDialog() {
           duration_ms: Math.round(performance.now() - startedAt),
           ...failure,
         });
-        _logConnectorOperationFailure('connector_custom_add', { ...payload, ...failure });
         uiAlert(_formatConnectError(res));
       }
     } catch (err) {
@@ -2095,7 +2117,6 @@ function _openAddCustomDialog() {
         duration_ms: Math.round(performance.now() - startedAt),
         ...failure,
       });
-      _logConnectorOperationFailure('connector_custom_add', { ...payload, ...failure });
       uiAlert(_formatConnectError(err));
     } finally {
       okBtn.disabled = false;
@@ -2258,23 +2279,10 @@ async function _drainConnectorInstallQueue() {
           error_code: 'response_failed',
           error_type: 'ipc',
         });
-        _connectorsLog.warn('install confirm response failed', { error: err && err.message });
+        _connectorsLog.warn('install confirm response failed', { error_type: _connectorTrackErrorType(err) });
       }
     }
   } finally {
     _connectorInstallDialogOpen = false;
   }
-}
-
-function _connectorActionMessage(info) {
-  const catalogEntry = _catalogEntryById(info.connector_id);
-  const displayName = catalogEntry ? _connectorDisplayName(catalogEntry) : (info.display_name || info.connector_id);
-  return [
-    `${t('connectors.action_confirm.connector')}: ${displayName}`,
-    `${t('connectors.action_confirm.action')}: ${info.action_name || info.tool_name}`,
-  ].join('\n');
-}
-
-function _connectorActionDetails(info) {
-  return String(info.arguments_preview || '{}');
 }

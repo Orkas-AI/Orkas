@@ -11,8 +11,8 @@ import { estimateTextTokens } from '../../src/core-agent/src/agent/session';
  * no pressure at all.
  *
  * Lower bound in aggregate: the active-process trigger derives from the model
- * window, and the E2E model is Orkas LLM (1M), whose trigger saturates the
- * budget module's ceiling. The files must exceed that together or compaction
+ * window, and this fresh Orkas LLM (1M) task also borrows unused history room.
+ * The files must exceed that effective trigger together or compaction
  * never fires — and a fixture that has quietly stopped applying pressure fails
  * as "0 compactions", which reads like a compaction bug rather than a sizing
  * problem. `assertFixturePressure` below turns that into a self-explaining
@@ -35,9 +35,14 @@ const E2E_ESTIMATOR_CALIBRATION_FLOOR = 0.5;
 
 /** The E2E model is Orkas LLM: a 1M window, and a fixed overhead large enough
  *  to be realistic without needing the real prompt here. */
+const E2E_USABLE_INPUT_TOKENS = 1_048_576 - 8_192;
 const E2E_ACTIVE_TRIGGER = contextBudget({
-  usableInputTokens: 1_048_576 - 8_192 - 2_048,
+  usableInputTokens: E2E_USABLE_INPUT_TOKENS,
+  // Match AgentRunner's request ceiling before dividing the remaining room.
+  requestCeilingTokens: Math.floor(E2E_USABLE_INPUT_TOKENS * 0.82),
   fixedOverheadTokens: 30_000,
+  // Both scenarios start a new task, so no completed history occupies its share.
+  historyOccupancyTokens: 0,
 }).activeProcessTrigger;
 
 const CONTEXT_PRESSURE_ROWS = pressureRowsFor(PER_FILE_TOKEN_TARGET);
@@ -208,6 +213,9 @@ test.describe('long-task context continuity', () => {
   test('stops a stalled context compaction without a late response or replay', async ({
     modelOrkas,
   }) => {
+    // Building pressure now reads 137 files before cancellation can be tested.
+    // Allow setup to cross the real trigger; the cancellation gates stay at 10s.
+    test.setTimeout(120_000);
     if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
     let page = modelOrkas.page;
     const sources = contextSources('STOP', ['cedar', 'iris', 'quartz']).map(({ label, fact }) => {
@@ -234,7 +242,7 @@ test.describe('long-task context continuity', () => {
     await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
     await expect.poll(() => modelOrkas.modelRequests.filter((request) => (
       JSON.stringify(request).includes('You are a context compaction engine.')
-    )).length, { timeout: 30_000 }).toBeGreaterThanOrEqual(1);
+    )).length, { timeout: 60_000 }).toBeGreaterThanOrEqual(1);
     await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
 
     const requestCountAtStop = modelOrkas.modelRequests.length;

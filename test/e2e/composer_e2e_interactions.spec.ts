@@ -427,9 +427,15 @@ test.describe('new chat composer', () => {
     await expect(selected.getByRole('button', { name: 'Remove: Commander', exact: true })).toBeVisible();
     await expect(commanderRow.locator('.recipient-picker-check')).toHaveCount(1);
     expect(await commanderRow.evaluate((el) => getComputedStyle(el, '::after').content)).toBe('none');
-    await cliRow.click();
+    await search.fill('ComposerCli');
+    for (const composition of [{ isComposing: true }, { keyCode: 229 }]) {
+      await search.dispatchEvent('keydown', { key: 'Enter', ...composition });
+      await expect(input).toHaveValue('');
+      await expect(cliRow).toHaveAttribute('aria-checked', 'false');
+    }
+    await search.press('Enter');
     await expect(picker).toBeVisible();
-    await expect(cliRow).toBeFocused();
+    await expect(search).toBeFocused();
     await expect(cliRow).toHaveAttribute('aria-checked', 'true');
     await expect(cliRow.locator('.composer-model-menu-check')).toBeVisible();
     await expect(selected.getByRole('button', { name: 'Remove: ComposerCli', exact: true })).toBeVisible();
@@ -441,6 +447,14 @@ test.describe('new chat composer', () => {
     await modelChip.evaluate((element) => (element as HTMLButtonElement).click());
     await expect(appPage.locator('#composer-model-menu')).toHaveCount(0);
 
+    // Enter on a focused row uses the same selection toggle as a click.
+    await cliRow.press('Enter');
+    await expect(cliRow).toHaveAttribute('aria-checked', 'false');
+    await expect(input).toHaveValue('');
+    await cliRow.press('Enter');
+    await expect(cliRow).toHaveAttribute('aria-checked', 'true');
+    await expect(input).toHaveValue('@ComposerCli ');
+    await search.fill('');
     await commanderRow.press('Space');
     await expect(commanderRow).toHaveAttribute('aria-checked', 'true');
     await expect(cliRow).toHaveAttribute('aria-checked', 'true');
@@ -459,7 +473,7 @@ test.describe('new chat composer', () => {
     await expect(modelChip).toBeDisabled();
     await search.fill('');
     await expect(commanderRow.locator('.recipient-picker-check')).toHaveCount(0);
-    await cliRow.press('Enter');
+    await cliRow.press('Escape');
     await expect(picker).toBeHidden();
     await appPage.locator('#panel-new-chat .new-chat-input-wrapper').screenshot({
       path: testInfo.outputPath('cli-recipient.png'),
@@ -528,7 +542,7 @@ test.describe('new chat composer', () => {
 
     await appPage.locator('#new-chat-recipient-chip').click();
     await appPage.locator(`.skill-picker-item[data-id="${agent.agent_id}"]`).click();
-    await appPage.locator(`.skill-picker-item[data-id="${agent.agent_id}"]`).press('Enter');
+    await appPage.locator(`.skill-picker-item[data-id="${agent.agent_id}"]`).press('Escape');
     await expect(agentChip).toHaveText('@OrkasCodex');
     await expect(agentChip).toHaveAttribute('contenteditable', 'false');
     await expect(model).toBeVisible();
@@ -630,7 +644,7 @@ test.describe('new chat composer', () => {
     await editor.press('Home');
     await page.locator('#new-chat-recipient-chip').click();
     await page.locator(`.skill-picker-item[data-id="${recipients[0].agent_id}"]`).click();
-    await page.locator(`.skill-picker-item[data-id="${recipients[0].agent_id}"]`).press('Enter');
+    await page.locator(`.skill-picker-item[data-id="${recipients[0].agent_id}"]`).press('Escape');
     await editor.press('Home');
     for (let i = 0; i < 5; i++) await editor.press('ArrowRight');
     await page.locator('#new-chat-recipient-chip').click();
@@ -640,7 +654,7 @@ test.describe('new chat composer', () => {
     await expect(page.locator('.skill-picker-item[data-id="__commander__"]')).toHaveAttribute('aria-checked', 'false');
     await expect(page.locator('[data-composer-model-chip="new-chat"]')).toBeDisabled();
     // Closing the panel restores the updated cursor; typed text stays after the chosen group.
-    await page.locator(`.skill-picker-item[data-id="${recipients[1].agent_id}"]`).press('Enter');
+    await page.locator(`.skill-picker-item[data-id="${recipients[1].agent_id}"]`).press('Escape');
     await expect(editor).toBeFocused();
     await editor.press('X');
     await expect(input).toHaveValue('@ComposerAlpha 你好， @ComposerBeta Xcheck the request');
@@ -650,7 +664,7 @@ test.describe('new chat composer', () => {
     await page.locator('#agent-picker-selected').getByRole('button', { name: 'Remove: ComposerBeta', exact: true }).click();
     await page.locator(`.skill-picker-item[data-id="${recipients[1].agent_id}"]`).click();
     await expect(input).toHaveValue('@ComposerAlpha 你好， Xcheck the request @ComposerBeta ');
-    await page.locator(`.skill-picker-item[data-id="${recipients[1].agent_id}"]`).press('Enter');
+    await page.locator(`.skill-picker-item[data-id="${recipients[1].agent_id}"]`).press('Escape');
     await editor.pressSequentially('verify the result');
     await expect(page.locator('#new-chat-recipient-name')).toHaveText('ComposerAlpha, ComposerBeta');
     await page.locator('#panel-new-chat .new-chat-input-wrapper').screenshot({ path: testInfo.outputPath('recipient-caret.png') });
@@ -697,10 +711,12 @@ test.describe('new chat composer', () => {
         prompt: 'Research AI desktop apps for everyday users, compare their main use cases, platform support, ease of setup, model capabilities, privacy, local operation, and pricing, then recommend options for different needs.',
       },
       {
-        id: 'office',
-        agentId: 'a19101ba698a',
-        agentName: 'OfficeWorker',
-        prompt: 'Create an editable ecommerce sales report using sample data, with core metrics, trend charts, and channel charts.',
+        id: 'ecommerce',
+        agentId: '5a1d43c2f28a',
+        // This offline GUI account has bundled Agents only; the real default-install
+        // owner is exercised by the renderer and production Agent evaluations.
+        agentName: 'Commander',
+        prompt: 'Assess whether pet water fountains are worth selling on Amazon US, with product selection and validation recommendations.',
       },
       {
         id: 'ppt',
@@ -709,10 +725,10 @@ test.describe('new chat composer', () => {
         prompt: 'Create an editable 8-slide product presentation for an AI office assistant, aimed at business buyers, covering pain points, the solution, core capabilities, use cases, value, and next steps.',
       },
       {
-        id: 'creation',
-        agentId: '173d4235a431',
-        agentName: 'ContentWriter',
-        prompt: 'Write a social post for workplace users about an AI office assistant.',
+        id: 'office',
+        agentId: 'a19101ba698a',
+        agentName: 'OfficeWorker',
+        prompt: 'Create an editable ecommerce sales report using sample data, with core metrics, trend charts, and channel charts.',
       },
       {
         id: 'image',
@@ -748,7 +764,7 @@ test.describe('new chat composer', () => {
         prompt: 'Create an SEO and GEO plan for orkas.ai covering keywords, core pages, content, and priorities.',
       },
     ] as const;
-    const sourceBundledAgentIds = new Set<string>(cases.map((item) => item.agentId));
+    const sourceBundledAgentIds = new Set<string>(cases.filter(item => item.id !== "ecommerce").map((item) => item.agentId));
 
     await expect.poll(
       async () => {
@@ -797,8 +813,8 @@ test.describe('new chat composer', () => {
       elements.map((element) => (element as HTMLElement).dataset.group)
     ));
     expect(renderedGroups).toEqual([
-      'knowledge-office', 'knowledge-office', 'knowledge-office',
-      'content-creation', 'content-creation', 'content-creation',
+      'knowledge-office', 'product-growth', 'knowledge-office',
+      'knowledge-office', 'content-creation', 'content-creation',
       'product-growth', 'product-growth', 'product-growth',
     ]);
     const pptCard = appPage.locator('.new-chat-scenario-chip[data-scenario="ppt"]');
@@ -825,7 +841,7 @@ test.describe('new chat composer', () => {
     await pptCard.hover();
     await expect.poll(() => pptCard.evaluate((element) => {
       const probe = document.createElement('span');
-      probe.style.color = 'var(--primary)';
+      probe.style.color = 'var(--primary-text)';
       document.body.appendChild(probe);
       const primaryColor = getComputedStyle(probe).color;
       probe.remove();
@@ -834,9 +850,11 @@ test.describe('new chat composer', () => {
       return {
         tileUsesPrimary: tile.color === primaryColor,
         hasTransform: card.transform !== 'none',
+        // Flat-tile pass (2026-09-20): hover is a 1px lift plus a primary
+        // border and tile tint — the drop shadow was dropped on purpose.
         hasShadow: card.boxShadow !== 'none',
       };
-    })).toEqual({ tileUsesPrimary: true, hasTransform: true, hasShadow: true });
+    })).toEqual({ tileUsesPrimary: true, hasTransform: true, hasShadow: false });
 
     const input = appPage.locator('#new-chat-input');
     for (const item of cases) {
@@ -932,13 +950,13 @@ test.describe('new chat composer', () => {
     expect(layout.greetingFontSize).toBe('32px');
     expect(layout.greetingTextAlign).toBe('center');
     expect(layout.composerHeight).toBeLessThanOrEqual(150);
-    expect(layout.quickCardHeight).toBeGreaterThanOrEqual(88);
-    expect(layout.quickCardHeight).toBeLessThanOrEqual(94);
+    expect(layout.quickCardHeight).toBeGreaterThanOrEqual(100);
+    expect(layout.quickCardHeight).toBeLessThanOrEqual(116);
     expect(layout.quickCardCount).toBe(9);
     expect(layout.quickGridColumns).toBe(3);
     expect(layout.quickTilesFit).toBe(true);
-    expect(layout.quickTileSizes).toEqual(Array(9).fill('40x40'));
-    expect(layout.quickIconSizes).toEqual(Array(9).fill('20x20'));
+    expect(layout.quickTileSizes).toEqual(Array(9).fill('36x36'));
+    expect(layout.quickIconSizes).toEqual(Array(9).fill('18x18'));
     expect(layout.quickCardContentFits).toBe(true);
     expect(layout.ossEntryOnHeaderRow).toBe(true);
     expect(layout.landingStartsInBounds).toBe(true);
@@ -1030,11 +1048,11 @@ test.describe('new chat composer', () => {
       });
     }).toEqual([fileName]);
 
-    await chip.locator('.chat-attach-preview').click();
-    await expect(orkas.page.locator('.chat-file-viewer')).toHaveClass(/\bis-open\b/);
-    await expect(orkas.page.locator('.chat-file-viewer-title')).toHaveText(fileName);
-    await expect(orkas.page.locator('.chat-file-viewer-body')).toContainText('Deterministic attachment.');
-    await orkas.page.locator('.chat-file-viewer-close').click();
+    const preview = await orkas.openPreview(() => chip.locator('.chat-attach-preview').click());
+    await expect(preview.locator('.chat-file-viewer')).toHaveClass(/\bis-open\b/);
+    await expect(preview.locator('.chat-file-viewer-title')).toHaveText(fileName);
+    await expect(preview.locator('.chat-file-viewer-body')).toContainText('Deterministic attachment.');
+    await orkas.closePreview(preview);
 
     await chip.locator('.chat-attach-remove').click();
     await expect(chip).toHaveCount(0);
@@ -1185,23 +1203,23 @@ test.describe('new chat composer', () => {
     await expect(imageChip.locator('.chat-attach-thumb')).toHaveCSS('width', '22px');
     await expect(imageChip.locator('.chat-attach-thumb')).toHaveCSS('height', '22px');
     await expect(userMessage.locator('video, audio, .chat-msg-attach-thumb-shell')).toHaveCount(0);
-    await userMessage.locator('.chat-msg-attach', { hasText: firstName }).click();
-    await expect(page.locator('.chat-file-viewer')).toHaveClass(/\bis-open\b/);
-    await expect(page.locator('.chat-file-viewer-title')).toHaveText(firstName);
-    await expect(page.locator('.chat-file-viewer-body')).toContainText('First body.');
-    await page.locator('.chat-file-viewer [data-mve-action="edit"]').click();
-    const markdownEditor = page.locator('.chat-file-viewer [data-mve-textarea]');
+    const preview = await modelOrkas.openPreview(() => userMessage.locator('.chat-msg-attach', { hasText: firstName }).click());
+    await expect(preview.locator('.chat-file-viewer')).toHaveClass(/\bis-open\b/);
+    await expect(preview.locator('.chat-file-viewer-title')).toHaveText(firstName);
+    await expect(preview.locator('.chat-file-viewer-body')).toContainText('First body.');
+    await preview.locator('.chat-file-viewer [data-mve-action="edit"]').click();
+    const markdownEditor = preview.locator('.chat-file-viewer [data-mve-textarea]');
     await expect(markdownEditor).toBeVisible();
     await markdownEditor.fill('# Multi attachment\n\nEdited through the conversation viewer.\n');
-    await page.locator('.chat-file-viewer [data-mve-action="save"]').click();
+    await preview.locator('.chat-file-viewer [data-mve-action="save"]').click();
     await expect(markdownEditor).toBeHidden();
-    await expect(page.locator('.chat-file-viewer-body')).toContainText(
+    await expect(preview.locator('.chat-file-viewer-body')).toContainText(
       'Edited through the conversation viewer.',
     );
-    await page.locator('.chat-file-viewer-close').click();
-    await imageChip.locator('.chat-attach-preview').click();
-    await expect(page.locator('.chat-lightbox')).toHaveClass(/\bis-open\b/);
-    await page.locator('.chat-lightbox-close').click();
+    await modelOrkas.closePreview(preview);
+    const imagePreview = await modelOrkas.openPreview(() => imageChip.locator('.chat-attach-preview').click());
+    await expect(imagePreview.locator('.chat-lightbox')).toHaveClass(/\bis-open\b/);
+    await modelOrkas.closePreview(imagePreview);
     expect(JSON.stringify(modelOrkas.modelRequests[0])).toContain(firstName);
     expect(JSON.stringify(modelOrkas.modelRequests[0])).toContain(secondName);
     expect(JSON.stringify(modelOrkas.modelRequests[0])).toContain(imageName);
@@ -1223,9 +1241,9 @@ test.describe('new chat composer', () => {
     await expect(relaunchedPage.locator('#chat-history .chat-message.assistant')).toContainText(
       'Hello from the local E2E model.',
     );
-    await restoredUserMessage.locator('.chat-msg-attach', { hasText: firstName }).click();
-    await expect(relaunchedPage.locator('.chat-file-viewer-title')).toHaveText(firstName);
-    await expect(relaunchedPage.locator('.chat-file-viewer-body')).toContainText(
+    const restoredPreview = await modelOrkas.openPreview(() => restoredUserMessage.locator('.chat-msg-attach', { hasText: firstName }).click());
+    await expect(restoredPreview.locator('.chat-file-viewer-title')).toHaveText(firstName);
+    await expect(restoredPreview.locator('.chat-file-viewer-body')).toContainText(
       'Edited through the conversation viewer.',
     );
   });

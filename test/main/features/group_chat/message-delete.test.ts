@@ -37,6 +37,17 @@ describe('group_chat message deletion', () => {
     fs.mkdirSync(attachmentDir, { recursive: true });
     const retainedAttachment = path.join(attachmentDir, 'retained.txt');
     fs.writeFileSync(retainedAttachment, 'kept for existing references');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    await state.seedReservedActors(UID, CID);
+    const sessions = await import('../../../../src/main/model/core-agent/session-store');
+    const sessionId = `gconv-${CID}`;
+    const sessionFile = sessions.sessionFileFor(sessionId);
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+    fs.writeFileSync(sessionFile, '{}\n');
+    const resultDirectory = sessions.toolResultsDirForSession(UID, sessionId);
+    fs.mkdirSync(resultDirectory, { recursive: true });
+    const retainedResult = path.join(resultDirectory, 'original.txt');
+    fs.writeFileSync(retainedResult, 'original output for a surviving record');
 
     const result = await groupChat.deleteMessages(UID, CID, ['delete-msg']);
 
@@ -47,5 +58,7 @@ describe('group_chat message deletion', () => {
     });
     expect((await groupChat.readMessages(UID, CID)).map((row) => row.id)).toEqual(['keep-msg']);
     expect(fs.existsSync(retainedAttachment)).toBe(true);
+    expect(fs.existsSync(sessionFile)).toBe(false);
+    expect(fs.readFileSync(retainedResult, 'utf8')).toBe('original output for a surviving record');
   });
 });

@@ -1,3 +1,4 @@
+import { estimateBudgetTokens, truncateBudgetText } from '../../../src/main/util/token-estimate';
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -114,5 +115,27 @@ describe('runtime text-budget calibration', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('token-bounded discovery text', () => {
+  it('uses tokens rather than character count and includes the marker', () => {
+    expect(truncateBudgetText('a'.repeat(800), 200)).toBe('a'.repeat(800));
+    expect(truncateBudgetText('a'.repeat(801), 200)).toBe('a'.repeat(799) + '…');
+    expect(truncateBudgetText('界'.repeat(134), 200)).toBe('界'.repeat(133) + '…');
+    expect(truncateBudgetText('a', 0)).toBe('');
+  });
+
+  it.each(['界😀a', '123,456,789', '{"id":12,"ok":true}', '---__::', '🙂界🙂'])
+  ('bounds %s without modifying source or splitting surrogate pairs', (unit) => {
+    const source = unit.repeat(300);
+    for (const limit of [1, 2, 3, 10, 80, 200]) {
+      const projected = truncateBudgetText(source, limit);
+      expect(estimateBudgetTokens(projected)).toBeLessThanOrEqual(limit);
+      expect(projected.endsWith('…')).toBe(true);
+      expect(source.startsWith(projected.slice(0, -1))).toBe(true);
+      expect(projected.isWellFormed()).toBe(true);
+    }
+    expect(source).toBe(unit.repeat(300));
   });
 });

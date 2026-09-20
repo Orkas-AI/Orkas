@@ -413,6 +413,31 @@ class NonNumericProbeTest(unittest.TestCase):
         self.assertIn("Bar 30%", md)   # good value preserved
 
 
+class MergeCoverageTest(unittest.TestCase):
+    def test_absent_performance_is_not_reported_as_a_clean_measurement(self):
+        primary = {"dimension_scores": {"indexability": 100}, "findings": []}
+        merged = merge_audits(primary, [{"content_score": 100, "findings": []}])
+        data = merged["data"]
+        self.assertIsNone(data["dimension_scores"]["performance"])
+        self.assertEqual(data["dimension_scores"]["content"], 100)
+        self.assertNotIn("performance", data["assessed_dimensions"])
+        dashboard = build_dashboard(merged)
+        validate_dashboard(dashboard)
+        plotted = {p["x"] for n in dashboard["root"]["children"] if n["type"] == "Chart"
+                   for p in n["props"]["data"]}
+        self.assertNotIn("Perf", plotted)
+        self.assertIn("performance", build_action_plan(merged))
+
+    def test_observed_performance_and_missing_provider_score_remain_distinct(self):
+        for score, expected in [(96, 100), (None, None)]:
+            with self.subTest(score=score):
+                merged = merge_audits({"findings": []}, [{"performance_score": score, "findings": []}])
+                self.assertEqual(merged["data"]["dimension_scores"]["performance"], expected)
+        finding = {"dimension": "performance", "severity": "high"}
+        merged = merge_audits({"findings": []}, [{"findings": [finding]}])
+        self.assertEqual(merged["data"]["dimension_scores"]["performance"], 88)
+
+
 class LocalFileDisclosureTest(unittest.TestCase):
     """What the user reads must say the live page was not requested.
 
@@ -477,7 +502,8 @@ class LocalFileDisclosureTest(unittest.TestCase):
         ]}}
         merged = merge_audits(self.AUDIT, [content_add])
         data = merged["data"]
-        self.assertEqual(data["not_assessed"], self.AUDIT["data"]["not_assessed"])
+        for gap in self.AUDIT["data"]["not_assessed"]:
+            self.assertIn(gap, data["not_assessed"])
         self.assertIsNone(data["dimension_scores"]["security"])
         self.assertIsNone(data["dimension_scores"]["indexability"])
         self.assertNotIn("security", data["assessed_dimensions"])

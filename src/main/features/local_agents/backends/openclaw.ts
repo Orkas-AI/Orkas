@@ -47,143 +47,148 @@ import {
   stripAnsi,
 } from './base.js';
 
+import { prepareOpenclawBridge } from './openclaw-bridge.js';
+
 const log = createLogger('local-agents:openclaw');
 
 export const openclawBackend: LocalBackend = {
   async run(opts: BackendRunOptions): Promise<void> {
     const sessionId = opts.resumeSessionId || crypto.randomUUID();
     const args = buildOpenclawArgs(opts, sessionId);
-    const child = spawnCli(opts.binPath, args, opts.cwd);
-    const detachAbort = bindAbort(child, opts.signal);
-    const tail = new StderrTail();
-    const startedAt = Date.now();
+    const bridgeConfig = await prepareOpenclawBridge(opts);
+    try {
+      const child = spawnCli(opts.binPath, args, opts.cwd, bridgeConfig.env);
+      const detachAbort = bindAbort(child, opts.signal);
+      const tail = new StderrTail();
+      const startedAt = Date.now();
 
-    let exited = false;
-    // openclaw writes everything to stderr; we accumulate the FULL
-    // stderr (no cap — the trailing JSON blob we need to parse can
-    // run several KB) AND keep a separate StderrTail for the
-    // diagnostic snippet on failure.
-    let fullStderr = '';
+      let exited = false;
+      // openclaw writes everything to stderr; we accumulate the FULL
+      // stderr (no cap — the trailing JSON blob we need to parse can
+      // run several KB) AND keep a separate StderrTail for the
+      // diagnostic snippet on failure.
+      let fullStderr = '';
 
-    opts.onEvent({
-      type: 'process-info',
-      pid: child.pid ?? -1,
-      cwd: opts.cwd,
-      cmd: opts.binPath,
-      args,
-    });
-
-    const watchdog = armKillWatchdog(child, {
-      timeoutMs: opts.timeoutMs,
-      deadlineAt: opts.deadlineAt,
-      idleKillMs: opts.idleKillMs,
-      lastEventAt: opts.lastEventAt,
-    });
-
-    // openclaw doesn't read stdin; close so it doesn't wait.
-    child.stdin.end();
-
-    // stdout is currently always empty for openclaw 2026.4.11 — keep a
-    // best-effort listener anyway in case future versions start using
-    // it (we'd surface the line as text-delta).
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => {
-      if (chunk) opts.onEvent({ type: 'text-delta', text: chunk });
-    });
-
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk: string) => {
-      fullStderr += chunk;
-      tail.push(chunk);
-      // Forward each line for the process rail. Strip ANSI escapes
-      // so colored log prefixes don't leak into the UI.
-      for (const line of chunk.split(/\r?\n/)) {
-        if (line) opts.onEvent({ type: 'stderr-line', line: stripAnsi(line) });
-      }
-    });
-
-    return new Promise<void>(resolve => {
-      const finish = (status: 'completed' | 'failed' | 'cancelled' | 'timeout', extra: Record<string, unknown> = {}) => {
-        if (exited) return;
-        exited = true;
-        watchdog.disarm();
-        detachAbort();
-        opts.onEvent({
-          type: 'done', status,
-          durationMs: Date.now() - startedAt,
-          ...extra,
-        });
-        resolve();
-      };
-      child.on('error', err => {
-        log.warn('spawn error', { error: logErrorSummary(err) });
-        finish('failed', {
-          error: (err as Error).message,
-          stderrTail: tail.toString(),
-          failureKind: 'cli_spawn',
-          retrySafe: true,
-        });
+      opts.onEvent({
+        type: 'process-info',
+        pid: child.pid ?? -1,
+        cwd: opts.cwd,
+        cmd: opts.binPath,
+        args,
       });
-      child.on('close', code => {
-        if (opts.signal.aborted) return finish('cancelled');
-if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`, stderrTail: tail.toString() });
 
-        const parsed = parseOpenclawReply(fullStderr);
-        const replyText = parsed?.text || '';
-        const media = parsed?.media || [];
-        const files = parsed?.files || [];
-        const sid = parsed?.sessionId || sessionId;
+      const watchdog = armKillWatchdog(child, {
+        timeoutMs: opts.timeoutMs,
+        deadlineAt: opts.deadlineAt,
+        idleKillMs: opts.idleKillMs,
+        lastEventAt: opts.lastEventAt,
+      });
 
-        if (replyText) {
-          // Surface the reply as a single text-delta so the standard
-          // delta-streaming path in bus.ts populates the bubble. (It
-          // arrives at end-of-run, not token-by-token — see file header.)
-          opts.onEvent({ type: 'text-delta', text: replyText });
+      // openclaw doesn't read stdin; close so it doesn't wait.
+      child.stdin.end();
+
+      // stdout is currently always empty for openclaw 2026.4.11 — keep a
+      // best-effort listener anyway in case future versions start using
+      // it (we'd surface the line as text-delta).
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (chunk: string) => {
+        if (chunk) opts.onEvent({ type: 'text-delta', text: chunk });
+      });
+
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (chunk: string) => {
+        fullStderr += chunk;
+        tail.push(chunk);
+        // Forward each line for the process rail. Strip ANSI escapes
+        // so colored log prefixes don't leak into the UI.
+        for (const line of chunk.split(/\r?\n/)) {
+          if (line) opts.onEvent({ type: 'stderr-line', line: stripAnsi(line) });
         }
-        if (media.length) {
+      });
+
+      return await new Promise<void>(resolve => {
+        const finish = (status: 'completed' | 'failed' | 'cancelled' | 'timeout', extra: Record<string, unknown> = {}) => {
+          if (exited) return;
+          exited = true;
+          watchdog.disarm();
+          detachAbort();
           opts.onEvent({
-            type: 'media-output',
-            source: 'openclaw',
-            items: media.map(uri => ({ uri })),
+            type: 'done', status,
+            durationMs: Date.now() - startedAt,
+            ...extra,
           });
-        }
-        if (files.length) {
-          // OpenClaw's structured attachment envelope can point at arbitrary
-          // documents (PDF/Office/etc.), not only previewable image/video
-          // media. Keep those paths on the generic produced-file channel; the
-          // group-chat boundary validates cwd ownership and existence before
-          // exposing them in the deliverable footer.
-          opts.onEvent({
-            type: 'file-change',
-            source: 'openclaw_attachment',
-            paths: files,
+          resolve();
+        };
+        child.on('error', err => {
+          log.warn('spawn error', { error: logErrorSummary(err) });
+          finish('failed', {
+            error: (err as Error).message,
+            stderrTail: tail.toString(),
+            failureKind: 'cli_spawn',
+            retrySafe: true,
           });
-        }
+        });
+        child.on('close', code => {
+          if (opts.signal.aborted) return finish('cancelled');
+          if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`, stderrTail: tail.toString() });
 
-        const usage = parsed?.usage;
-        if (code === 0 && (replyText || media.length || files.length)) {
-          return finish('completed', { output: replyText, sessionId: sid, ...(usage ? { usage } : {}) });
-        }
-        if (code === 0 && !replyText && !media.length && !files.length) {
-          // Exit clean but no parseable reply → treat as failed so
-          // the user sees an error bubble instead of an empty turn.
-          return finish('failed', {
-            error: 'openclaw exited cleanly but produced no agent reply (check stderr tail)',
-            output: '',
+          const parsed = parseOpenclawReply(fullStderr);
+          const replyText = parsed?.text || '';
+          const media = parsed?.media || [];
+          const files = parsed?.files || [];
+          const sid = parsed?.sessionId || sessionId;
+
+          if (replyText) {
+            // Surface the reply as a single text-delta so the standard
+            // delta-streaming path in bus.ts populates the bubble. (It
+            // arrives at end-of-run, not token-by-token — see file header.)
+            opts.onEvent({ type: 'text-delta', text: replyText });
+          }
+          if (media.length) {
+            opts.onEvent({
+              type: 'media-output',
+              source: 'openclaw',
+              items: media.map(uri => ({ uri })),
+            });
+          }
+          if (files.length) {
+            // OpenClaw's structured attachment envelope can point at arbitrary
+            // documents (PDF/Office/etc.), not only previewable image/video
+            // media. Keep those paths on the generic produced-file channel; the
+            // group-chat boundary validates cwd ownership and existence before
+            // exposing them in the deliverable footer.
+            opts.onEvent({
+              type: 'file-change',
+              source: 'openclaw_attachment',
+              paths: files,
+            });
+          }
+
+          const usage = parsed?.usage;
+          if (code === 0 && (replyText || media.length || files.length)) {
+            return finish('completed', { output: replyText, sessionId: sid, ...(usage ? { usage } : {}) });
+          }
+          if (code === 0 && !replyText && !media.length && !files.length) {
+            // Exit clean but no parseable reply → treat as failed so
+            // the user sees an error bubble instead of an empty turn.
+            return finish('failed', {
+              error: 'openclaw exited cleanly but produced no agent reply (check stderr tail)',
+              output: '',
+              sessionId: sid,
+              stderrTail: tail.toString(),
+              ...(usage ? { usage } : {}),
+            });
+          }
+          finish('failed', {
+            error: parsed?.error || `openclaw exited with code ${code}`,
+            output: replyText,
             sessionId: sid,
             stderrTail: tail.toString(),
             ...(usage ? { usage } : {}),
           });
-        }
-        finish('failed', {
-          error: parsed?.error || `openclaw exited with code ${code}`,
-          output: replyText,
-          sessionId: sid,
-          stderrTail: tail.toString(),
-          ...(usage ? { usage } : {}),
         });
       });
-    });
+    } finally { bridgeConfig.cleanup(); }
   },
 };
 

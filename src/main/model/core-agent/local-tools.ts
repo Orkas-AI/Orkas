@@ -64,12 +64,14 @@ import {
   createApplyPatchTool as createCoreApplyPatchTool,
   type ApplyPatchCommittedFile,
 } from '../../../core-agent/src/tools/apply-patch';
+import { managedCommandsEnabled } from '../../../core-agent/src/tools/command-sessions';
 import { getProcessSessionTools } from '../../../core-agent/src/tools/process-session';
 import type { FileChangeObservation } from '../../../core-agent/src/tools/base';
 import {
   BASH_PROGRESS_INTERVAL_MS,
   bashTool as coreBashTool,
   normalizeBashTimeoutMs,
+  renderCommandResult,
   writeFileTool as coreWriteFileTool,
 } from '../../../core-agent/src/tools/builtin';
 import {
@@ -89,7 +91,7 @@ import {
   localAccessRequiresSensitiveApproval,
 } from '../../features/permissions';
 import { classifyConfiguredBashCommand, sensitivePathReasons, type LocalAccessRiskCategory } from '../../features/local_access_policy';
-import { classifyBashCommand } from './bash-risk';
+import { classifyBashCommand, hasDestructiveBashRedirection } from './bash-risk';
 import {
   classifyExternalMutationScript,
   referencedExecutableScripts,
@@ -98,7 +100,7 @@ import {
 import { requestBashDecision } from './bash-permissions';
 import { markdownToPdf, htmlToPdf } from '../../util/md-to-pdf';
 import { uniquifyPathForWrite, renderRenameSignal } from '../../util/uniquify-path';
-import { isPathAllowed } from '../../util/path-sandbox';
+import { isPathAllowed, resolveSandboxEntry, resolveSandboxRoot, type PathAllowedOptions } from '../../util/path-sandbox';
 import { kindOf } from '../../features/file_indexer';
 import { getWorkspacePath } from '../../features/user_workspace';
 import * as projectFiles from '../../features/project_files';
@@ -132,6 +134,7 @@ import {
 } from './delete-file-confirm';
 import { fileEditLock } from '../../util/locks';
 import { fileFailure } from '../../../core-agent/src/tools/file-diagnostics';
+import { firstMatchOffsets, matchRecoveryContext } from '../../../core-agent/src/tools/match-context';
 import { checkEditFreshness, forgetRead, getReadState, recordRead } from './read-tracker';
 import {
   canonicalFileRevisionPath,
@@ -153,7 +156,6 @@ import type { InteractiveCliSessionView } from './interactive-cli-sessions';
 import { IMAGE_STUDIO_AGENT_ID, VIDEO_STUDIO_AGENT_ID } from './tool-catalog';
 import type { SkillRuntimeBinding } from './skill-registry';
 import {
-  browserAutomationHitWaf,
   browserRuntimeInstallRequiresExplicitRequest,
 } from './browser-automation-guard';
 import {
@@ -301,9 +303,6 @@ function translateFixedBashError(result: ToolResult): ToolResult {
   if (!content) return result;
 
   const structured = /^<command-result status="([^"]+)" exit_code="([^"]+)" duration_ms="(\d+)"[^>]*>\n\[no command output\]\n<\/command-result>$/.exec(content);
-  if (structured?.[1] === 'succeeded') {
-    return { ...result, content: '' };
-  }
   if (structured?.[1] === 'timed_out') {
     return { ...result, content: bashMsg('timeout', { ms: structured[3] }) };
   }
@@ -380,7 +379,7 @@ function shouldSkipBashProducedDir(name: string): boolean {
 }
 
 function shouldSkipBashProducedFile(name: string): boolean {
-  return BASH_PRODUCED_SKIP_FILES.has(name);
+  return BASH_PRODUCED_SKIP_FILES.has(name) || name.startsWith(`${BASH_OUTPUT_MANIFEST_NAME}-`);
 }
 
 function collectBashFileSnapshot(root: string): BashFileSnapshot {
@@ -1001,6 +1000,10 @@ function parseOrkasCliInvocation(
   if (!ORKAS_DIRECT_CLI_SCRIPTS.has(script)) return null;
   if (!sameResolvedPath(scriptPath, path.join(pcDir, 'bin', script))) return null;
 
+  // Direct spawn cannot reproduce shell expansion or its quoting rules in
+  // script arguments. Keep those commands on the existing guarded shell path.
+  if (words.slice(2).some((word) => /[$`]/.test(word))) return null;
+
   return {
     script,
     nodePath,
@@ -1268,7 +1271,7 @@ async function executeDirectOrkasCli(
       }
       discardStreamedToolOutput(capturedStderr?.streamedOutput);
       finish(withDirectCommandObservation({
-        content: stdout,
+        content: stdout || renderCommandResult(metadata, 'succeeded'),
         ...(capturedStdout?.streamedOutput
           ? { streamedOutput: capturedStdout.streamedOutput }
           : {}),
@@ -1383,52 +1386,87 @@ function formatBashDuration(ms: number): string {
   return `${Math.round(ms)}ms`;
 }
 
+// Only active calls are retained; a yielded command releases at terminal delivery.
+const bashWorkingDirs = new Map<string, { active: number; removeWhenIdle: boolean }>();
+function retainBashWorkingDir(workingDir: string, removeWhenIdle: boolean): () => void {
+  const entry = bashWorkingDirs.get(workingDir) ?? { active: 0, removeWhenIdle: false };
+  entry.active++;
+  entry.removeWhenIdle ||= removeWhenIdle;
+  bashWorkingDirs.set(workingDir, entry);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (--entry.active > 0) return;
+    bashWorkingDirs.delete(workingDir);
+    if (entry.removeWhenIdle) {
+      try { if (fs.readdirSync(workingDir).length === 0) fs.rmdirSync(workingDir); } catch { /* concurrent work */ }
+    }
+  };
+}
+
 async function executeCoreBashWithOutputTracking(
   opts: LocalToolsOpts,
   input: Record<string, unknown>,
   ctx: ToolContext,
   workingDir: string,
 ): Promise<ToolResult> {
+  // Per-call state is captured before yield; later calls cannot replace a
+  // running command's environment, manifest or terminal observer.
+  const managed = managedCommandsEnabled(ctx) && input.run_in_background !== true;
+  ctx = { ...ctx, state: { ...ctx.state, commandSessionEnabled: managed,
+    processSessionOwner: `${opts.userId ?? ''}:${opts.cid ?? ''}` } };
   const outputDir = workingDir;
   const command = String(input.command ?? '');
   const skillRuntime = resolveRunSkillRuntimeBinding(opts, command);
   if (skillRuntime.error) return { content: skillRuntime.error, isError: true };
-  const manifestPath = path.join(outputDir, BASH_OUTPUT_MANIFEST_NAME);
-  try { fs.rmSync(manifestPath, { force: true }); } catch { /* best-effort stale cleanup */ }
+  const removeEmptyWorkingDirOnCompletion = !fs.existsSync(workingDir);
+  if (removeEmptyWorkingDirOnCompletion) {
+    try { fs.mkdirSync(workingDir, { recursive: true }); }
+    catch { /* let spawn produce the canonical error */ }
+  }
+  const manifestPath = path.join(outputDir, `${BASH_OUTPUT_MANIFEST_NAME}-${crypto.randomUUID()}`);
+  try { fs.rmSync(manifestPath, { force: true }); } catch { /* stale cleanup */ }
   const before = collectBashFileSnapshot(outputDir);
-  const restoreSkillRuntimeEnv = withRunSkillRuntimeEnv(
-    ctx,
-    skillRuntime.binding,
-  );
+  const restoreSkillRuntimeEnv = withRunSkillRuntimeEnv(ctx, skillRuntime.binding);
   const restoreEnv = withBashOutputEnv(ctx, outputDir, manifestPath);
   const restoreWritableRoots = withBashWritableRoots(ctx, bashWritableRootsFor(opts, workingDir));
+  const releaseWorkingDir = retainBashWorkingDir(workingDir, removeEmptyWorkingDirOnCompletion);
+  let delegatedTerminal = false;
+  const finish = async (result: ToolResult): Promise<ToolResult> => {
+    try {
+      const manifestedPaths = readBashOutputManifest(manifestPath, outputDir);
+      const fileChanges = await emitBashProducedFiles(opts, before, outputDir, command, manifestedPaths);
+      return translateFixedBashError({ ...result,
+        ...(fileChanges.length ? { observations: { ...(result.observations ?? {}),
+          fileChanges: [...(result.observations?.fileChanges ?? []), ...fileChanges] } } : {}),
+      });
+    } finally {
+      try { fs.rmSync(manifestPath, { force: true }); } catch { /* cleanup */ }
+      releaseWorkingDir();
+    }
+  };
   try {
     const direct = parseOrkasCliInvocation(input, ctx);
     const macWriteSandboxActive = process.platform === 'darwin'
       && fs.existsSync('/usr/bin/sandbox-exec')
       && Array.isArray(ctx.state.sandboxAllowedDirs)
       && ctx.state.sandboxAllowedDirs.length > 0;
-    const result = direct && !macWriteSandboxActive
-      ? await executeDirectOrkasCli(direct, input, ctx, workingDir)
-      : await coreBashTool.execute(input, ctx);
-    const manifestedPaths = readBashOutputManifest(manifestPath, outputDir);
-    const fileChanges = await emitBashProducedFiles(opts, before, outputDir, command, manifestedPaths);
-    return translateFixedBashError({
-      ...result,
-      ...(fileChanges.length
-        ? {
-            observations: {
-              ...(result.observations ?? {}),
-              fileChanges: [
-                ...(result.observations?.fileChanges ?? []),
-                ...fileChanges,
-              ],
-            },
-          }
-        : {}),
-    });
+    // Structured run-skill invocations preserve their host-owned stdin and
+    // progress transport. They remain terminal-returning callers.
+    if (direct && !macWriteSandboxActive) return await finish(await executeDirectOrkasCli(direct, input, ctx, workingDir));
+    if (managed) {
+      ctx.state.commandSessionTerminal = finish;
+      const result = await coreBashTool.execute(input, ctx);
+      delegatedTerminal = !result.isError || !!result.observations?.execution;
+      return result;
+    }
+    return await finish(await coreBashTool.execute(input, ctx));
   } finally {
-    try { fs.rmSync(manifestPath, { force: true }); } catch { /* best-effort */ }
+    if (!delegatedTerminal) {
+      try { fs.rmSync(manifestPath, { force: true }); } catch { /* cleanup */ }
+      releaseWorkingDir();
+    }
     restoreWritableRoots();
     restoreEnv();
     restoreSkillRuntimeEnv();
@@ -1549,9 +1587,9 @@ function guardDeletePath(opts: LocalToolsOpts, abs: string): string | null {
   return null;
 }
 
-function isInWritableWorkspaceScope(opts: LocalToolsOpts, abs: string): boolean {
+function isInWritableWorkspaceScope(opts: LocalToolsOpts, abs: string, pathOptions: PathAllowedOptions = {}): boolean {
   const roots = allowedRootsFor(opts);
-  return roots.length > 0 && isPathAllowed(abs, roots);
+  return roots.length > 0 && isPathAllowed(abs, roots, pathOptions);
 }
 
 function deleteRequiresUserConfirmation(opts: LocalToolsOpts, abs: string): boolean {
@@ -1569,7 +1607,7 @@ type BashPathSegment = {
 /** `removesSource` marks an operand the command takes AWAY from where it is
  *  now — an `rm`/`shred`/`Remove-Item` target, or an `mv` source. Those are
  *  deletes as far as the user's file is concerned, whatever verb spelled it. */
-type BashPathCandidate = { raw: string; abs?: string; reason: string; dynamic?: boolean; removesSource?: boolean };
+type BashPathCandidate = { raw: string; abs?: string; reason: string; dynamic?: boolean; removesSource?: boolean; operatesOnEntry?: boolean };
 type BashPathGateResult = { error: string | null; approvedReasons: LocalAccessRiskCategory[] };
 type BashFilesystemGuardResult = {
   result: ToolResult | null;
@@ -1605,6 +1643,14 @@ const BASH_PROTECTED_READ_ONLY_CMDS = new Set([
   'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'find',
   'echo', 'printf', 'pwd', 'dirname', 'basename', 'true', 'false', 'test', '[',
   'get-content', 'get-childitem', 'get-item', 'test-path', 'resolve-path', 'write-output',
+]);
+/** Concurrency admission only (2026-09-18): the protected-root set plus
+ *  commands that take no filesystem operand at all. Built from the audited
+ *  set so widening here can never flow back into the sensitive-path gate,
+ *  which keeps using `BASH_PROTECTED_READ_ONLY_CMDS` unchanged. */
+const BASH_CONCURRENCY_READ_ONLY_CMDS = new Set([
+  ...BASH_PROTECTED_READ_ONLY_CMDS,
+  'sleep', 'start-sleep', 'date', 'uname', 'whoami', 'hostname', 'id', 'which',
 ]);
 const BASH_FIND_MUTATING_ACTIONS = new Set([
   '-delete', '-exec', '-execdir', '-ok', '-okdir', '-fls', '-fprint', '-fprint0', '-fprintf',
@@ -1654,9 +1700,9 @@ const POSIX_RM_SAFE_SWITCHES = new Set([
   '--preserve-root', '--no-preserve-root',
 ]);
 
-type BashHeredocSpec = { delimiter: string; stripTabs: boolean; shellPayload: boolean };
+type BashHeredocSpec = { delimiter: string; stripTabs: boolean; shellPayload: boolean; expand: boolean; language?: 'python' };
 
-function bashHeredocReceiverIsShell(prefix: string): boolean {
+function bashHeredocReceiver(prefix: string): string | undefined {
   let words: string[] = [];
   let expectOperand = false;
   for (const token of tokenizeBashPathGuard(prefix)) {
@@ -1671,7 +1717,7 @@ function bashHeredocReceiverIsShell(prefix: string): boolean {
     words.push(token.value);
   }
   const effective = bashEffectiveCommand(words);
-  return !!effective && BASH_POSIX_SHELL_CMDS.has(effective.cmd);
+  return effective?.cmd;
 }
 
 const BASH_SHELL_EVAL_CMDS = new Set(['eval', 'source', '.']);
@@ -1758,6 +1804,7 @@ function bashHeredocSpecs(line: string): BashHeredocSpec[] {
     let delimiter = '';
     let wordQuote: "'" | '"' | null = null;
     let wordEscaped = false;
+    let quotedDelimiter = false;
     let started = false;
     for (; j < line.length; j++) {
       const c = line[j];
@@ -1768,6 +1815,7 @@ function bashHeredocSpecs(line: string): BashHeredocSpec[] {
         continue;
       }
       if (c === '\\' && wordQuote !== "'") {
+        quotedDelimiter = true;
         wordEscaped = true;
         started = true;
         continue;
@@ -1779,6 +1827,7 @@ function bashHeredocSpecs(line: string): BashHeredocSpec[] {
         continue;
       }
       if (c === "'" || c === '"') {
+        quotedDelimiter = true;
         wordQuote = c;
         started = true;
         continue;
@@ -1788,10 +1837,13 @@ function bashHeredocSpecs(line: string): BashHeredocSpec[] {
       started = true;
     }
     if (started && delimiter) {
+      const receiver = bashHeredocReceiver(line.slice(0, i));
       specs.push({
         delimiter,
         stripTabs,
-        shellPayload: bashHeredocReceiverIsShell(line.slice(0, i))
+        expand: !quotedDelimiter,
+        language: quotedDelimiter && receiver && /^(?:python(?:3(?:\.\d+)?)?|py)(?:\.exe)?$/i.test(receiver) ? 'python' : undefined,
+        shellPayload: (!!receiver && BASH_POSIX_SHELL_CMDS.has(receiver))
           || bashHeredocPipelineReachesShell(line.slice(i + 2)),
       });
     }
@@ -1800,7 +1852,7 @@ function bashHeredocSpecs(line: string): BashHeredocSpec[] {
   return specs;
 }
 
-type BashHeredocAnalysis = { shellSurface: string; nonShellPayloads: string[] };
+type BashHeredocAnalysis = { shellSurface: string; nonShellPayloads: Array<{ source: string; language?: 'python' }>; unquotedPayloads: string[] };
 
 /** Preserve shell command lines/newlines while blanking non-shell heredoc
  * payloads and terminator lines. Python/Node/etc. payloads are source code,
@@ -1810,7 +1862,14 @@ type BashHeredocAnalysis = { shellSurface: string; nonShellPayloads: string[] };
  * for the external-mutation script scanner. */
 function analyzeBashHeredocs(command: string): BashHeredocAnalysis {
   const pending: Array<BashHeredocSpec & { bodyLines: string[] }> = [];
-  const nonShellPayloads: string[] = [];
+  const nonShellPayloads: BashHeredocAnalysis['nonShellPayloads'] = [];
+  const unquotedPayloads: string[] = [];
+  const retainPayload = (current: BashHeredocSpec & { bodyLines: string[] }) => {
+    if (!current.bodyLines.length) return;
+    const source = current.bodyLines.join('\n');
+    if (!current.shellPayload) nonShellPayloads.push({ source, language: current.language });
+    if (current.expand) unquotedPayloads.push(source);
+  };
   let out = '';
   let offset = 0;
   while (offset < command.length) {
@@ -1833,11 +1892,9 @@ function analyzeBashHeredocs(command: string): BashHeredocAnalysis {
       const comparable = current.stripTabs ? line.replace(/^\t+/, '') : line;
       const isTerminator = comparable === current.delimiter;
       out += (current.shellPayload && !isTerminator ? line : ' '.repeat(line.length)) + newline;
-      if (!current.shellPayload && !isTerminator) current.bodyLines.push(line);
+      if (!isTerminator) current.bodyLines.push(line);
       if (isTerminator) {
-        if (!current.shellPayload && current.bodyLines.length) {
-          nonShellPayloads.push(current.bodyLines.join('\n'));
-        }
+        retainPayload(current);
         pending.shift();
       }
     } else {
@@ -1846,12 +1903,8 @@ function analyzeBashHeredocs(command: string): BashHeredocAnalysis {
     }
     offset = end;
   }
-  for (const current of pending) {
-    if (!current.shellPayload && current.bodyLines.length) {
-      nonShellPayloads.push(current.bodyLines.join('\n'));
-    }
-  }
-  return { shellSurface: out, nonShellPayloads };
+  for (const current of pending) retainPayload(current);
+  return { shellSurface: out, nonShellPayloads, unquotedPayloads };
 }
 
 function maskBashHeredocBodies(command: string): string {
@@ -2169,13 +2222,65 @@ function bashGuardPathSegments(
   command: string,
   baseEnv: Record<string, string>,
   hostPlatform: NodeJS.Platform,
-): Array<{ segment: BashPathSegment; env: Record<string, string> }> {
-  return bashGuardCommandVariants(command, baseEnv, hostPlatform).flatMap((variant) => (
-    bashPathSegmentsWithEnv(variant.command, variant.env, hostPlatform)
-  ));
+  initialDirectory: string,
+): Array<{ segment: BashPathSegment; env: Record<string, string>; workingDir: string | null }> {
+  return bashGuardCommandVariants(command, baseEnv, hostPlatform).flatMap((variant) => {
+    const out: Array<{ segment: BashPathSegment; env: Record<string, string>; workingDir: string | null }> = [];
+    const segments = bashPathSegmentsWithEnv(variant.command, variant.env, hostPlatform);
+    const conditionalFlow = segments.some(({ segment }) => ['||', '|', '|&', '&'].includes(segment.separatorAfter ?? ''));
+    let directories: Array<string | null> = [initialDirectory];
+    let skippedDirectories: Array<string | null> = [];
+    let exitsOnError = false;
+    let changedDirectory = false;
+    for (const { segment, env } of segments) {
+      const scopedEnv = { ...env };
+      // A cd may succeed or fail on different branches. Do not keep the
+      // original injected PWD as an authoritative path after that transition.
+      if (changedDirectory) delete scopedEnv.PWD;
+      for (const workingDir of directories) {
+        out.push({ segment, env: scopedEnv, workingDir });
+      }
+      const [cmd, ...args] = segment.words;
+      // Only direct, sequential POSIX directory changes have these semantics.
+      // Keep both outcomes when a failed cd can fall through. Bound branching;
+      // unknown contexts use the existing unresolved-path approval mechanism.
+      if (cmd === 'set') {
+        exitsOnError = !conditionalFlow && hostPlatform !== 'win32'
+          && args.length === 1 && args[0] === '-e';
+      }
+      if (cmd === 'cd') {
+        if (hostPlatform === 'win32' || args.length !== 1 || args[0].startsWith('-')
+          || /[*?\[\]{}]/.test(expandKnownShellPathVars(args[0] ?? '', scopedEnv).value)
+          || (!!(scopedEnv.CDPATH || process.env.CDPATH) && !path.isAbsolute(args[0]) && !args[0].startsWith('.'))
+          || ['||', '|', '|&', '&'].includes(segment.separatorAfter ?? '')) {
+          directories = [null];
+        } else {
+          const next = directories.map((directory) => directory === null ? null
+            : resolveBashCandidate(args[0], directory, scopedEnv)?.abs ?? null);
+          if (segment.separatorAfter === '&&') {
+            // Failed cd skips the rest of this AND-list, but can resume at
+            // its following statement even under set -e.
+            skippedDirectories.push(...directories);
+            directories = next;
+          } else {
+            directories = exitsOnError ? next : [...directories, ...next];
+          }
+        }
+        changedDirectory = true;
+      }
+      if (segment.separatorAfter !== '&&') {
+        directories.push(...skippedDirectories);
+        skippedDirectories = [];
+      }
+      directories = [...new Set(directories)];
+      if (directories.length > BASH_PATH_LOOP_EXPANSION_MAX) directories = [null];
+      if (skippedDirectories.length > BASH_PATH_LOOP_EXPANSION_MAX) skippedDirectories = [null];
+    }
+    return out;
+  });
 }
 
-function bashEffectiveCommand(words: string[]): { cmd: string; args: string[] } | null {
+function bashEffectiveCommand(words: string[], hostPlatform: NodeJS.Platform = process.platform): { cmd: string; args: string[] } | null {
   let w = words.slice();
   while (w.length && BASH_ENV_ASSIGN_RE.test(w[0])) w = w.slice(1);
   if (!w.length) return null;
@@ -2199,6 +2304,13 @@ function bashEffectiveCommand(words: string[]): { cmd: string; args: string[] } 
     if (!w.length) return null;
     cmd = path.basename(w[0]).toLowerCase();
   }
+  // The Windows executor uses PowerShell. Resolve its built-in filesystem
+  // aliases before extracting operands; POSIX commands keep their own meaning.
+  if (hostPlatform === 'win32') {
+    if (['rm', 'rmdir', 'rd', 'ri', 'del', 'erase'].includes(cmd)) cmd = 'remove-item';
+    else if (['mv', 'move', 'mi'].includes(cmd)) cmd = 'move-item';
+    else if (['cp', 'copy', 'cpi'].includes(cmd)) cmd = 'copy-item';
+  }
   return { cmd, args: w.slice(1) };
 }
 
@@ -2209,12 +2321,18 @@ function bashEffectiveCommand(words: string[]): { cmd: string; args: string[] } 
  * read-only command subset continue to the normal read/write path checks.
  */
 function bashProtectedRootMentionIsProvablyReadOnly(command: string): boolean {
+  return bashSegmentsUseOnlyReadOnlyCommands(command, BASH_PROTECTED_READ_ONLY_CMDS);
+}
+
+/** Every pipeline/list segment runs a command from `readOnly`, with no
+ *  command/process substitution, no `find` mutating action and no `rg --pre`. */
+function bashSegmentsUseOnlyReadOnlyCommands(command: string, readOnly: ReadonlySet<string>): boolean {
   if (!command.trim() || /\$\(|`|[<>]\(/.test(command)) return false;
   const segments = bashPathSegments(command);
   if (!segments.length) return false;
   for (const segment of segments) {
     const effective = bashEffectiveCommand(segment.words);
-    if (!effective || !BASH_PROTECTED_READ_ONLY_CMDS.has(effective.cmd)) return false;
+    if (!effective || !readOnly.has(effective.cmd)) return false;
     if (effective.cmd === 'find' && effective.args.some((arg) => BASH_FIND_MUTATING_ACTIONS.has(arg))) {
       return false;
     }
@@ -2222,6 +2340,39 @@ function bashProtectedRootMentionIsProvablyReadOnly(command: string): boolean {
       && effective.args.some((arg) => arg === '--pre' || arg.startsWith('--pre='))) {
       return false;
     }
+  }
+  return true;
+}
+
+/**
+ * Whether a shell command provably reads only: every pipeline/list segment
+ * runs a command from the audited read-only set — or one of the listed
+ * commands that take no filesystem operand (`sleep`, `date`, `uname`,
+ * `whoami`, `hostname`, `id`, `which`) — with no substitution, no `find`
+ * mutating action, no `rg --pre`, and no segment redirects output anywhere
+ * but the null device. This is the admission test for running two `bash`
+ * calls concurrently (2026-09-18 decision): anything it cannot prove — a
+ * redirection, `sed -i`, `npm`, `node -e`, a `cd` — stays a barrier, because
+ * overlapping writes in one cwd race on files and on the ordering the model
+ * assumed. It never authorizes anything; the permission gates still run.
+ */
+export function bashCommandIsProvablyReadOnly(
+  command: string,
+  hostPlatform: NodeJS.Platform = process.platform,
+): boolean {
+  if (!bashSegmentsUseOnlyReadOnlyCommands(command, BASH_CONCURRENCY_READ_ONLY_CMDS)) return false;
+  for (const segment of bashPathSegments(command)) {
+    const effective = bashEffectiveCommand(segment.words, hostPlatform);
+    if (!effective) return false;
+    // These utilities also expose state-changing modes. Unknown arguments
+    // remain sequential; this does not change their permission checks.
+    if (effective.cmd === 'date'
+      && !effective.args.every(arg => arg.startsWith('+') || ['-u', '--utc', '--universal', '-R', '--rfc-email', '-I', '--iso-8601'].includes(arg))) return false;
+    if (effective.cmd === 'hostname'
+      && !effective.args.every(arg => ['-s', '-f', '-d', '-i', '-I', '--short', '--fqdn', '--domain', '--ip-address', '--all-ip-addresses'].includes(arg))) return false;
+    if (effective.cmd === 'file'
+      && effective.args.some(arg => arg === '--compile' || /^-[^-]*C/.test(arg))) return false;
+    if (segment.redirectTargets.some((target) => !isBashNullRedirection(target, hostPlatform))) return false;
   }
   return true;
 }
@@ -2326,7 +2477,17 @@ function windowsDeleteOperands(args: string[]): string[] {
   return args.filter((arg) => !/^\/(?:[afq]|a(?::.*)?)$/i.test(arg));
 }
 
-function simpleFileDeleteOperands(cmd: string, args: string[]): string[] | null {
+type SimpleDeletion = { operands: string[]; kind: 'unlink' | 'empty_directory' | 'remove' };
+
+function simpleDeletion(cmd: string, args: string[], hostPlatform: NodeJS.Platform): SimpleDeletion | null {
+  if (cmd === 'rmdir' && hostPlatform !== 'win32') {
+    // rmdir itself enforces emptiness at execution time. Parent traversal and
+    // unknown switches must never receive the ordinary deletion exemption.
+    const optionEnd = args.indexOf('--');
+    const options = optionEnd < 0 ? args : args.slice(0, optionEnd);
+    if (options.some((arg) => arg.startsWith('-') && arg !== '-v' && arg !== '--verbose')) return null;
+    return { operands: bashNonFlagOperands(args, new Set()), kind: 'empty_directory' };
+  }
   if (cmd === 'rm') {
     if (args.some((arg) => arg === '--recursive' || /^-[A-Za-z]*[rR][A-Za-z]*$/.test(arg))) return null;
     for (const arg of args) {
@@ -2335,14 +2496,17 @@ function simpleFileDeleteOperands(cmd: string, args: string[]): string[] | null 
       if (/^-[fv]+$/.test(arg)) continue;
       return null;
     }
-    return bashNonFlagOperands(args, new Set());
+    return { operands: bashNonFlagOperands(args, new Set()), kind: 'unlink' };
   }
   if (cmd === 'unlink') {
     if (args.some((arg) => arg.startsWith('-') && arg !== '--')) return null;
-    return bashNonFlagOperands(args, new Set());
+    return { operands: bashNonFlagOperands(args, new Set()), kind: 'unlink' };
   }
   if (cmd === 'remove-item') {
     const lower = args.map((arg) => arg.toLowerCase());
+    // Keep cmd-style recursive deletion behind its existing risk gate even
+    // when a Windows spelling is also a PowerShell alias.
+    if (hostPlatform === 'win32' && lower.some((arg) => arg === '/s' || arg === '/p')) return null;
     if (lower.some((arg) => POWERSHELL_DELETE_UNSAFE_FLAGS.has(arg))) return null;
     for (let i = 0; i < args.length; i++) {
       const flag = lower[i];
@@ -2355,19 +2519,19 @@ function simpleFileDeleteOperands(cmd: string, args: string[]): string[] | null 
       if (POWERSHELL_DELETE_SWITCHES.has(flag)) continue;
       return null;
     }
-    return powershellDeleteOperands(args);
+    return { operands: powershellDeleteOperands(args), kind: 'remove' };
   }
   if (cmd === 'del' || cmd === 'erase') {
     if (args.some((arg) => /^\/[ps]$/i.test(arg))) return null;
     if (args.some((arg) => arg.startsWith('/') && !/^\/(?:[afq]|a(?::.*)?)$/i.test(arg))) return null;
-    return windowsDeleteOperands(args);
+    return { operands: windowsDeleteOperands(args), kind: 'remove' };
   }
   return null;
 }
 
 function isLiteralAcceptedDeleteTarget(
   raw: string,
-  workingDir: string,
+  workingDir: string | null,
   env: Record<string, string>,
   acceptsPath: (absPath: string) => boolean,
 ): boolean {
@@ -2378,22 +2542,42 @@ function isLiteralAcceptedDeleteTarget(
   return !!resolved?.abs && !resolved.dynamic && acceptsPath(resolved.abs);
 }
 
+function isLiteralEntry(raw: string): boolean {
+  return !!raw && !/[$`*?\[\]{}]/.test(raw)
+    && !raw.endsWith('/') && raw.split('/').at(-1) !== '.' && !raw.split('/').includes('..');
+}
+
+function movesLiteralEntry(args: string[], raw: string, hostPlatform: NodeJS.Platform): boolean {
+  if (hostPlatform === 'win32' || !isLiteralEntry(raw)) return false;
+  const optionEnd = args.indexOf('--');
+  const options = optionEnd < 0 ? args : args.slice(0, optionEnd);
+  return options.every((arg) => !arg.startsWith('-') || /^-[finv]+$/.test(arg)
+    || ['--force', '--interactive', '--no-clobber', '--verbose'].includes(arg));
+}
+
 function bashDestructiveRiskIsOnlyAcceptedFileDeletion(
   command: string,
   workingDir: string,
   env: Record<string, string>,
-  acceptsPath: (absPath: string) => boolean,
+  acceptsPath: (absPath: string, pathOptions: PathAllowedOptions) => boolean,
+  hostPlatform: NodeJS.Platform,
 ): boolean {
   if (!command.trim()) return false;
   let sawAcceptedFileDelete = false;
-  for (const { segment, env: segmentEnv } of bashPathSegmentsWithEnv(command, env)) {
-    if (segment.redirectTargets.length || segment.inputTargets.length) return false;
-    const effective = bashEffectiveCommand(segment.words);
+  for (const { segment, env: segmentEnv, workingDir: segmentDirectory } of bashGuardPathSegments(command, env, hostPlatform, workingDir)) {
+    // Read/write scope and unresolved targets have their own filesystem gate.
+    // Redirection does not change deletion semantics, but raw-device writes
+    // contribute an independent destructive risk that this exemption must keep.
+    if (hasDestructiveBashRedirection(segment.redirectTargets)) return false;
+    const effective = bashEffectiveCommand(segment.words, hostPlatform);
     if (!effective) continue;
-    const operands = simpleFileDeleteOperands(effective.cmd, effective.args);
-    if (operands !== null) {
+    const deletion = simpleDeletion(effective.cmd, effective.args, hostPlatform);
+    if (deletion !== null) {
+      const { operands } = deletion;
       if (!operands.length || !operands.every((raw) => (
-        isLiteralAcceptedDeleteTarget(raw, workingDir, segmentEnv, acceptsPath)
+        isLiteralAcceptedDeleteTarget(raw, segmentDirectory, segmentEnv, (abs) => acceptsPath(abs, {
+          followFinalSymlink: !(hostPlatform !== 'win32' && deletion.kind === 'unlink' && isLiteralEntry(raw)),
+        }))
       ))) return false;
       sawAcceptedFileDelete = true;
       continue;
@@ -2405,18 +2589,19 @@ function bashDestructiveRiskIsOnlyAcceptedFileDeletion(
 
 /**
  * Narrow ownership exception for the generic `destructive` command category.
- * Every destructive segment must be a simple, literal, non-recursive file
- * deletion and every target must be owned by this conversation. Other risk
- * categories and configured policy matches are evaluated separately.
+ * Every destructive segment must be a simple, literal, non-recursive deletion
+ * (including empty-directory removal) and every target must be owned by this
+ * conversation. Other risk categories and configured policy matches are evaluated separately.
  */
 export function bashDestructiveRiskIsOnlyProducedFileDeletion(
   command: string,
   workingDir: string,
   env: Record<string, string>,
   hasProducedPath: ((absPath: string) => boolean) | undefined,
+  hostPlatform: NodeJS.Platform = process.platform,
 ): boolean {
   if (!hasProducedPath || !command.trim()) return false;
-  return bashDestructiveRiskIsOnlyAcceptedFileDeletion(command, workingDir, env, hasProducedPath);
+  return bashDestructiveRiskIsOnlyAcceptedFileDeletion(command, workingDir, env, hasProducedPath, hostPlatform);
 }
 
 function bashDestructiveRiskIsOnlyWorkspaceFileDeletion(
@@ -2434,7 +2619,8 @@ function bashDestructiveRiskIsOnlyWorkspaceFileDeletion(
     command,
     workingDir,
     env,
-    (candidate) => isPathAllowed(candidate, [workspaceRoot]),
+    (candidate, pathOptions) => isPathAllowed(candidate, [workspaceRoot], pathOptions),
+    opts.hostPlatform ?? process.platform,
   );
 }
 
@@ -2463,9 +2649,28 @@ export function expandKnownShellPathVars(raw: string, env: Record<string, string
   };
 }
 
-function resolveBashCandidate(raw: string, workingDir: string, env: Record<string, string>): { abs?: string; dynamic?: boolean } | null {
+function resolveBashCandidate(raw: string, workingDir: string | null, env: Record<string, string>): { abs?: string; dynamic?: boolean } | null {
   const trimmed = String(raw || '').trim();
   if (!trimmed || trimmed === '-' || /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) return null;
+  // Lexical normalization cannot resolve `link/..`: the OS traverses the
+  // link first. Keep that uncertainty in the existing one-time approval path.
+  if (workingDir === null) {
+    const expanded = expandKnownShellPathVars(trimmed, env);
+    if (expanded.dynamic || !path.isAbsolute(expanded.value)) return { dynamic: true };
+    workingDir = path.parse(expanded.value).root;
+  }
+  const unnormalized = replaceKnownShellEnvTokens(trimmed, env, () => {});
+  const parts = unnormalized.split(path.sep);
+  if (parts.includes('..')) {
+    let prefix = path.isAbsolute(unnormalized) ? path.parse(unnormalized).root : workingDir;
+    let crossedLink = false;
+    for (const part of parts) {
+      if (part === '..' && crossedLink) return { dynamic: true };
+      prefix = path.join(prefix, part);
+      try { crossedLink ||= fs.lstatSync(prefix).isSymbolicLink(); }
+      catch { /* Missing paths retain the existing lexical fallback. */ }
+    }
+  }
   const expanded = expandKnownShellPathVars(trimmed, env);
   if (expanded.dynamic) return { dynamic: true };
   let value = expanded.value;
@@ -2486,9 +2691,10 @@ function addBashCandidate(
   out: BashPathCandidate[],
   raw: string,
   reason: string,
-  workingDir: string,
+  workingDir: string | null,
   env: Record<string, string>,
   removesSource = false,
+  operatesOnEntry = false,
 ): void {
   const resolved = resolveBashCandidate(raw, workingDir, env);
   if (!resolved) return;
@@ -2498,6 +2704,7 @@ function addBashCandidate(
     ...(resolved.abs ? { abs: resolved.abs } : {}),
     ...(resolved.dynamic ? { dynamic: true } : {}),
     ...(removesSource ? { removesSource: true } : {}),
+    ...(operatesOnEntry ? { operatesOnEntry: true } : {}),
   });
 }
 
@@ -2534,7 +2741,7 @@ function bashMoveOperands(args: string[]): { sources: string[]; destination: str
   return { sources: positional.slice(0, -1), destination: positional[positional.length - 1] };
 }
 
-function addBashCurlTargets(out: BashPathCandidate[], args: string[], workingDir: string, env: Record<string, string>): void {
+function addBashCurlTargets(out: BashPathCandidate[], args: string[], workingDir: string | null, env: Record<string, string>): void {
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if ((a === '-o' || a === '--output') && args[i + 1]) addBashCandidate(out, args[++i], 'download output', workingDir, env);
@@ -2542,7 +2749,7 @@ function addBashCurlTargets(out: BashPathCandidate[], args: string[], workingDir
   }
 }
 
-function addBashWgetTargets(out: BashPathCandidate[], args: string[], workingDir: string, env: Record<string, string>): void {
+function addBashWgetTargets(out: BashPathCandidate[], args: string[], workingDir: string | null, env: Record<string, string>): void {
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if ((a === '-O' || a === '--output-document') && args[i + 1]) addBashCandidate(out, args[++i], 'download output', workingDir, env);
@@ -2619,6 +2826,15 @@ function awkReadOperands(args: string[]): string[] {
   return hasScriptFile ? operands : operands.slice(1);
 }
 
+function isBashNullRedirection(target: string, hostPlatform: NodeJS.Platform): boolean {
+  if (hostPlatform === 'win32') return target.toLowerCase() === '$null';
+  if (target !== '/dev/null') return false;
+  // Only the actual null device is a stream sink/source, never a look-alike
+  // file, symlink, or a deletion operand bearing the same path.
+  try { return fs.lstatSync(target).isCharacterDevice(); }
+  catch { return false; }
+}
+
 function collectBashMutationCandidates(
   command: string,
   workingDir: string,
@@ -2626,79 +2842,82 @@ function collectBashMutationCandidates(
   hostPlatform: NodeJS.Platform,
 ): BashPathCandidate[] {
   const out: BashPathCandidate[] = [];
-  for (const { segment: seg, env: segmentEnv } of bashGuardPathSegments(command, env, hostPlatform)) {
+  for (const { segment: seg, env: segmentEnv, workingDir: segmentDirectory } of bashGuardPathSegments(command, env, hostPlatform, workingDir)) {
     for (const target of seg.redirectTargets) {
-      if (hostPlatform === 'win32' && target.toLowerCase() === '$null') continue;
-      addBashCandidate(out, target, 'redirection', workingDir, segmentEnv);
+      if (isBashNullRedirection(target, hostPlatform)) continue;
+      addBashCandidate(out, target, 'redirection', segmentDirectory, segmentEnv);
     }
-    const eff = bashEffectiveCommand(seg.words);
+    const eff = bashEffectiveCommand(seg.words, hostPlatform);
     if (!eff) continue;
     const { cmd, args } = eff;
 
     if (POWERSHELL_CONTENT_WRITE_CMDS.has(cmd)) {
       for (const operand of powershellContentWriteOperands(args)) {
-        addBashCandidate(out, operand, cmd, workingDir, segmentEnv);
+        addBashCandidate(out, operand, cmd, segmentDirectory, segmentEnv);
       }
     } else if (cmd === 'remove-item') {
       for (const operand of powershellDeleteOperands(args)) {
-        addBashCandidate(out, operand, cmd, workingDir, segmentEnv, true);
+        addBashCandidate(out, operand, cmd, segmentDirectory, segmentEnv, true);
       }
     } else if (cmd === 'del' || cmd === 'erase') {
       for (const operand of windowsDeleteOperands(args)) {
-        addBashCandidate(out, operand, cmd, workingDir, segmentEnv, true);
+        addBashCandidate(out, operand, cmd, segmentDirectory, segmentEnv, true);
       }
     } else if (cmd === 'mv') {
       const { sources, destination } = bashMoveOperands(args);
-      for (const operand of sources) addBashCandidate(out, operand, 'mv source', workingDir, segmentEnv, true);
-      if (destination !== null) addBashCandidate(out, destination, 'mv destination', workingDir, segmentEnv);
+      for (const operand of sources) addBashCandidate(out, operand, 'mv source', segmentDirectory, segmentEnv, true,
+        movesLiteralEntry(args, operand, hostPlatform));
+      if (destination !== null) addBashCandidate(out, destination, 'mv destination', segmentDirectory, segmentEnv);
     } else if (cmd === 'move-item' || cmd === 'copy-item') {
       const { sources, destination } = powershellTransferOperands(args);
       if (cmd === 'move-item') {
-        for (const operand of sources) addBashCandidate(out, operand, 'move-item source', workingDir, segmentEnv, true);
+        for (const operand of sources) addBashCandidate(out, operand, 'move-item source', segmentDirectory, segmentEnv, true);
       }
-      if (destination !== null) addBashCandidate(out, destination, `${cmd} destination`, workingDir, segmentEnv);
+      if (destination !== null) addBashCandidate(out, destination, `${cmd} destination`, segmentDirectory, segmentEnv);
     } else if (BASH_MUTATE_ALL_OPERANDS.has(cmd)) {
       const removesSource = BASH_DELETE_MUTATION_CMDS.has(cmd) || cmd === 'shred';
+      const deletion = simpleDeletion(cmd, args, hostPlatform);
       for (const operand of bashMutationOperands(cmd, args)) {
-        addBashCandidate(out, operand, cmd, workingDir, segmentEnv, removesSource);
+        addBashCandidate(out, operand, cmd, segmentDirectory, segmentEnv, removesSource,
+          hostPlatform !== 'win32' && deletion?.kind === 'unlink' && isLiteralEntry(operand));
       }
     } else if (BASH_DEST_LAST_OPERAND.has(cmd)) {
       const operands = bashNonFlagOperands(args);
-      if (operands.length) addBashCandidate(out, operands[operands.length - 1], cmd, workingDir, segmentEnv);
+      if (operands.length) addBashCandidate(out, operands[operands.length - 1], cmd, segmentDirectory, segmentEnv);
     } else if (cmd === 'tee') {
       for (const operand of bashNonFlagOperands(args, new Set(['-a', '-i', '-p', '--append', '--ignore-interrupts']))) {
-        addBashCandidate(out, operand, 'tee output', workingDir, segmentEnv);
+        addBashCandidate(out, operand, 'tee output', segmentDirectory, segmentEnv);
       }
     } else if (cmd === 'dd') {
-      for (const a of args) if (a.startsWith('of=')) addBashCandidate(out, a.slice(3), 'dd output', workingDir, segmentEnv);
+      for (const a of args) if (a.startsWith('of=')) addBashCandidate(out, a.slice(3), 'dd output', segmentDirectory, segmentEnv);
     } else if (cmd === 'sed' && args.some((a) => a === '-i' || a.startsWith('-i'))) {
       for (const operand of bashNonFlagOperands(args).filter((a) => {
-        const r = resolveBashCandidate(a, workingDir, segmentEnv);
-        return !!r?.abs && fs.existsSync(r.abs);
-      })) addBashCandidate(out, operand, 'sed in-place edit', workingDir, segmentEnv);
+        const r = resolveBashCandidate(a, segmentDirectory, segmentEnv);
+        return r?.dynamic || (!!r?.abs && fs.existsSync(r.abs));
+      })) addBashCandidate(out, operand, 'sed in-place edit', segmentDirectory, segmentEnv);
     } else if (cmd === 'perl' && args.some((a) => /^-.*i/.test(a))) {
       for (const operand of bashNonFlagOperands(args).filter((a) => {
-        const r = resolveBashCandidate(a, workingDir, segmentEnv);
-        return !!r?.abs && fs.existsSync(r.abs);
-      })) addBashCandidate(out, operand, 'perl in-place edit', workingDir, segmentEnv);
+        const r = resolveBashCandidate(a, segmentDirectory, segmentEnv);
+        return r?.dynamic || (!!r?.abs && fs.existsSync(r.abs));
+      })) addBashCandidate(out, operand, 'perl in-place edit', segmentDirectory, segmentEnv);
     } else if (cmd === 'curl') {
-      addBashCurlTargets(out, args, workingDir, segmentEnv);
+      addBashCurlTargets(out, args, segmentDirectory, segmentEnv);
     } else if (cmd === 'wget') {
-      addBashWgetTargets(out, args, workingDir, segmentEnv);
+      addBashWgetTargets(out, args, segmentDirectory, segmentEnv);
     } else if (cmd === 'git' && args[0] === 'clone') {
       const dest = gitCloneDestination(args);
-      if (dest) addBashCandidate(out, dest, 'git clone destination', workingDir, segmentEnv);
+      if (dest) addBashCandidate(out, dest, 'git clone destination', segmentDirectory, segmentEnv);
     } else if (cmd === 'gh' && args[0] === 'repo' && args[1] === 'clone') {
       const dest = gitCloneDestination(args, true);
-      if (dest) addBashCandidate(out, dest, 'gh repo clone destination', workingDir, segmentEnv);
+      if (dest) addBashCandidate(out, dest, 'gh repo clone destination', segmentDirectory, segmentEnv);
     } else if (cmd === 'tar' && args.some((a) => /^-.*x/.test(a) || a === '--extract')) {
       const cIdx = args.findIndex((a) => a === '-C' || a === '--directory');
       const eq = args.find((a) => a.startsWith('--directory='));
-      if (cIdx >= 0 && args[cIdx + 1]) addBashCandidate(out, args[cIdx + 1], 'tar extract directory', workingDir, segmentEnv);
-      else if (eq) addBashCandidate(out, eq.slice('--directory='.length), 'tar extract directory', workingDir, segmentEnv);
+      if (cIdx >= 0 && args[cIdx + 1]) addBashCandidate(out, args[cIdx + 1], 'tar extract directory', segmentDirectory, segmentEnv);
+      else if (eq) addBashCandidate(out, eq.slice('--directory='.length), 'tar extract directory', segmentDirectory, segmentEnv);
     } else if (cmd === 'unzip') {
       const dIdx = args.findIndex((a) => a === '-d');
-      if (dIdx >= 0 && args[dIdx + 1]) addBashCandidate(out, args[dIdx + 1], 'unzip output directory', workingDir, segmentEnv);
+      if (dIdx >= 0 && args[dIdx + 1]) addBashCandidate(out, args[dIdx + 1], 'unzip output directory', segmentDirectory, segmentEnv);
     }
   }
   return out;
@@ -2711,41 +2930,44 @@ function collectBashReadCandidates(
   hostPlatform: NodeJS.Platform,
 ): BashPathCandidate[] {
   const out: BashPathCandidate[] = [];
-  for (const { segment: seg, env: segmentEnv } of bashGuardPathSegments(command, env, hostPlatform)) {
-    for (const target of seg.inputTargets) addBashCandidate(out, target, 'input redirection', workingDir, segmentEnv);
-    const eff = bashEffectiveCommand(seg.words);
+  for (const { segment: seg, env: segmentEnv, workingDir: segmentDirectory } of bashGuardPathSegments(command, env, hostPlatform, workingDir)) {
+    for (const target of seg.inputTargets) {
+      if (hostPlatform !== 'win32' && isBashNullRedirection(target, hostPlatform)) continue;
+      addBashCandidate(out, target, 'input redirection', segmentDirectory, segmentEnv);
+    }
+    const eff = bashEffectiveCommand(seg.words, hostPlatform);
     if (!eff) continue;
     const { cmd, args } = eff;
 
     if (cmd === 'find') {
-      for (const operand of findStartingPoints(args)) addBashCandidate(out, operand, cmd, workingDir, segmentEnv);
+      for (const operand of findStartingPoints(args)) addBashCandidate(out, operand, cmd, segmentDirectory, segmentEnv);
     } else if (BASH_READ_ALL_OPERANDS.has(cmd)) {
-      for (const operand of bashNonFlagOperands(args)) addBashCandidate(out, operand, cmd, workingDir, segmentEnv);
+      for (const operand of bashNonFlagOperands(args)) addBashCandidate(out, operand, cmd, segmentDirectory, segmentEnv);
     } else if (BASH_READ_PATTERN_FIRST_CMDS.has(cmd)) {
-      for (const operand of grepReadOperands(args)) addBashCandidate(out, operand, cmd, workingDir, segmentEnv);
+      for (const operand of grepReadOperands(args)) addBashCandidate(out, operand, cmd, segmentDirectory, segmentEnv);
     } else if (cmd === 'sed') {
-      for (const operand of sedReadOperands(args)) addBashCandidate(out, operand, 'sed read', workingDir, segmentEnv);
+      for (const operand of sedReadOperands(args)) addBashCandidate(out, operand, 'sed read', segmentDirectory, segmentEnv);
     } else if (cmd === 'awk') {
-      for (const operand of awkReadOperands(args)) addBashCandidate(out, operand, 'awk read', workingDir, segmentEnv);
+      for (const operand of awkReadOperands(args)) addBashCandidate(out, operand, 'awk read', segmentDirectory, segmentEnv);
     } else if (cmd === 'cd' || cmd === 'pushd') {
       const operand = bashNonFlagOperands(args)[0];
-      if (operand) addBashCandidate(out, operand, cmd, workingDir, segmentEnv);
+      if (operand) addBashCandidate(out, operand, cmd, segmentDirectory, segmentEnv);
     } else if (BASH_DEST_LAST_OPERAND.has(cmd)) {
       const operands = bashNonFlagOperands(args);
-      for (const operand of operands.slice(0, -1)) addBashCandidate(out, operand, `${cmd} source`, workingDir, segmentEnv);
+      for (const operand of operands.slice(0, -1)) addBashCandidate(out, operand, `${cmd} source`, segmentDirectory, segmentEnv);
     } else if (cmd === 'copy-item') {
       for (const operand of powershellTransferOperands(args).sources) {
-        addBashCandidate(out, operand, 'copy-item source', workingDir, segmentEnv);
+        addBashCandidate(out, operand, 'copy-item source', segmentDirectory, segmentEnv);
       }
     } else if (BASH_READ_SCRIPT_CMDS.has(cmd)) {
       const operand = bashScriptOperand(cmd, args);
-      if (operand) addBashCandidate(out, operand, `${cmd} script`, workingDir, segmentEnv);
+      if (operand) addBashCandidate(out, operand, `${cmd} script`, segmentDirectory, segmentEnv);
     } else if (cmd === 'tar') {
       const operand = tarFileOperand(args);
-      if (operand) addBashCandidate(out, operand, 'tar archive', workingDir, segmentEnv);
+      if (operand) addBashCandidate(out, operand, 'tar archive', segmentDirectory, segmentEnv);
     } else if (cmd === 'unzip') {
       const operand = bashNonFlagOperands(args)[0];
-      if (operand) addBashCandidate(out, operand, 'unzip archive', workingDir, segmentEnv);
+      if (operand) addBashCandidate(out, operand, 'unzip archive', segmentDirectory, segmentEnv);
     }
   }
   return out;
@@ -2768,9 +2990,10 @@ function bashWritableRootsFor(opts: LocalToolsOpts, workingDir: string): string[
   return roots;
 }
 
-function guardBashScopedPath(opts: LocalToolsOpts, abs: string, workingDir: string, access: 'read' | 'write'): string | null {
+function guardBashScopedPath(opts: LocalToolsOpts, abs: string, workingDir: string, access: 'read' | 'write', pathOptions: PathAllowedOptions = {}): string | null {
   if (access === 'write') {
-    const protectedRoot = protectedRootForPath(opts, abs);
+    const protectedRoot = protectedRootForPath(opts, abs)
+      || (pathOptions.followFinalSymlink === false ? protectedRootForPath(opts, resolveSandboxEntry(abs)) : null);
     if (protectedRoot) return protectedWriteError(abs, protectedRoot);
   }
   const roots = access === 'read'
@@ -2781,7 +3004,7 @@ function guardBashScopedPath(opts: LocalToolsOpts, abs: string, workingDir: stri
       ? null
       : errText('E_NO_SCOPE', `no ${access === 'read' ? 'readable' : 'writable'} roots for this bash command`);
   }
-  if (isPathAllowed(abs, roots)) return null;
+  if (isPathAllowed(abs, roots, pathOptions)) return null;
   if (!localAccessAllowsOutsideWorkspace()) {
     return errText(
       'E_PATH_OUT_OF_SCOPE',
@@ -2801,8 +3024,9 @@ async function gateBashPathAccess(
   workingDir: string,
   access: 'read' | 'write',
   ctx?: ToolContext,
+  pathOptions: PathAllowedOptions = {},
 ): Promise<BashPathGateResult> {
-  const denied = guardBashScopedPath(opts, abs, workingDir, access);
+  const denied = guardBashScopedPath(opts, abs, workingDir, access, pathOptions);
   if (denied) return { error: denied, approvedReasons: [] };
   if (opts.analysisInputRoots?.length && isPathAllowed(abs, opts.analysisInputRoots)) {
     return { error: null, approvedReasons: [] };
@@ -2831,8 +3055,11 @@ async function gateBashSourceRemoval(
 ): Promise<{ error: string | null; approvedReasons: LocalAccessRiskCategory[] }> {
   if (!candidate.removesSource || !candidate.abs) return { error: null, approvedReasons: [] };
   if (!localAccessRequiresSensitiveApproval()) return { error: null, approvedReasons: [] };
-  if (isInWritableWorkspaceScope(opts, candidate.abs)) return { error: null, approvedReasons: [] };
-  if (!fs.existsSync(candidate.abs)) return { error: null, approvedReasons: [] };
+  if (isInWritableWorkspaceScope(opts, candidate.abs, { followFinalSymlink: !candidate.operatesOnEntry })) return { error: null, approvedReasons: [] };
+  if (candidate.operatesOnEntry) {
+    try { fs.lstatSync(candidate.abs); }
+    catch { return { error: null, approvedReasons: [] }; }
+  } else if (!fs.existsSync(candidate.abs)) return { error: null, approvedReasons: [] };
   const decision = await requestBashDecision({
     uid: opts.userId ?? '',
     cid: opts.cid ?? '',
@@ -2862,40 +3089,80 @@ function mergeRiskReasons(target: LocalAccessRiskCategory[], source: readonly Lo
 
 const EXTERNAL_MUTATION_SCRIPT_MAX_BYTES = 512 * 1024;
 
-async function classifyBashRiskIncludingScripts(command: string, workingDir: string) {
+async function classifyBashRiskIncludingScripts(command: string, workingDir: string, opts: LocalToolsOpts, ctx?: ToolContext) {
   const heredocs = analyzeBashHeredocs(command);
   const base = classifyBashCommand(heredocs.shellSurface);
+  let scope: ReturnType<typeof bashGuardPathSegments> | undefined;
+  const scriptScope = () => scope ??= bashGuardPathSegments(heredocs.shellSurface, bashEnvForPathResolution(ctx, workingDir), opts.hostPlatform ?? process.platform, workingDir);
   const externalMutations: ExternalMutationFinding[] = [...base.externalMutations];
-  for (const source of heredocs.nonShellPayloads) {
-    for (const finding of classifyExternalMutationScript(source)) {
-      if (!externalMutations.some((item) => (
-        item.kind === finding.kind && item.action === finding.action && item.target === finding.target
-      ))) externalMutations.push(finding);
-    }
+  for (const payload of heredocs.nonShellPayloads) {
+    externalMutations.push(...classifyExternalMutationScript(payload.source, payload));
   }
-  for (const scriptRef of referencedExecutableScripts(command)) {
+  const scriptRefs = referencedExecutableScripts(command);
+  for (const scriptRef of scriptRefs) {
     const abs = path.isAbsolute(scriptRef) ? path.resolve(scriptRef) : path.resolve(workingDir, scriptRef);
     try {
       const stat = await fs.promises.stat(abs);
       if (!stat.isFile() || stat.size <= 0 || stat.size > EXTERNAL_MUTATION_SCRIPT_MAX_BYTES) continue;
       const source = await fs.promises.readFile(abs, 'utf8');
-      for (const finding of classifyExternalMutationScript(source)) {
-        if (!externalMutations.some((item) => (
-          item.kind === finding.kind && item.action === finding.action && item.target === finding.target
-        ))) externalMutations.push(finding);
-      }
+      const findings = classifyExternalMutationScript(source, { language: path.extname(abs) === '.py' ? 'python' : undefined });
+      const exactSource = !findings.some(f => f.resource) || path.isAbsolute(scriptRef)
+        || scriptScope().every(s => s.workingDir === workingDir);
+      externalMutations.push(...findings.map(f => exactSource ? f : (({ resource: _resource, ...rest }) => rest)(f)));
     } catch {
       // Missing/unreadable scripts are not evidence of a specific mutation;
       // the execution layer will surface the canonical launch/read failure.
     }
   }
-  const reasons = [...base.reasons];
-  if (externalMutations.length && !reasons.includes('external_mutation')) reasons.push('external_mutation');
+  const segments = externalMutations.some(f => f.resource) ? scriptScope() : [];
+  const directories = [...new Set(segments.map(s => s.workingDir))];
+  const uncertainDirectory = segments.some(({ segment }) => segment.words.some(word =>
+    ['pushd', 'popd', 'set-location', 'chdir', '--chdir'].includes(word.split('=')[0].toLowerCase()) || word.startsWith('-C')));
+  const roots = allowedRootsFor(opts);
+  if (!opts.userId) roots.push(workingDir);
+  // A workspace module can shadow Python's standard library. Such an import
+  // does not establish a SQLite connection, even with a familiar module name.
+  const importRoots = [...new Set([
+    ...directories.filter((dir): dir is string => dir !== null),
+    ...scriptRefs.map(ref => path.dirname(path.resolve(workingDir, ref))),
+    ...segments.flatMap(s => (s.env.PYTHONPATH || '').split(path.delimiter).filter(Boolean).map(p => path.resolve(s.workingDir || workingDir, p))),
+  ])];
+  const shadowedImport = externalMutations.some(f => f.resource) && (importRoots.length > 32 || importRoots.some(root =>
+    ['sqlite3.py', 'sqlite3/__init__.py', 'pathlib.py', 'pathlib/__init__.py'].some(name => fs.existsSync(path.join(root, name)))));
+  const localResources = new Map<string, boolean>();
+  const isLocal = (database: string): boolean => {
+    if (shadowedImport || uncertainDirectory || !directories.length || directories.some(dir => dir === null)) return false;
+    if (localResources.has(database)) return localResources.get(database)!;
+    let allowed = database === ':memory:';
+    // URI/VFS options and foreign path syntaxes need their existing approval;
+    // never resolve a URI or a Windows path as an innocuous POSIX filename.
+    if (!allowed && database && !/[\x00-\x1f]/.test(database) && !/^file:|^[a-z]+:\/\//i.test(database)
+      && !(process.platform !== 'win32' && (path.win32.isAbsolute(database) || database.includes('\\')))
+      && !uncertainDirectory && directories.length > 0 && directories.every(Boolean)) {
+      allowed = directories.every(dir => {
+        const abs = resolveSandboxRoot(path.resolve(dir!, database));
+        return !protectedRootForPath(opts, abs) && isPathAllowed(abs, roots)
+          && sensitivePathReasons(abs, 'write', { trustedRoots: roots }).length === 0;
+      });
+    }
+    localResources.set(database, allowed);
+    return allowed;
+  };
+  const seen = new Set<string>();
+  const remaining = externalMutations.filter(f => !f.resource || !isLocal(f.resource.database)).flatMap(f => {
+    const { resource: _resource, ...finding } = f;
+    const key = JSON.stringify(finding);
+    if (seen.has(key)) return [];
+    seen.add(key);
+    return [finding];
+  });
+  const reasons: typeof base.reasons = base.reasons.filter(reason => reason !== 'external_mutation');
+  if (remaining.length) reasons.push('external_mutation');
   return {
     ...base,
     reasons,
     risky: reasons.length > 0,
-    externalMutations,
+    externalMutations: remaining,
     shellSurface: heredocs.shellSurface,
   };
 }
@@ -2915,9 +3182,12 @@ async function guardBashPathCandidates(
   // known targets first so an approval never overrides a concrete scope denial.
   const unresolvedPaths = !allowUnresolvedPaths && candidates.some((c) => c.dynamic || !c.abs);
   for (const c of candidates) {
-    if (!c.abs || seen.has(c.abs)) continue;
-    seen.add(c.abs);
-    const gated = await gateBashPathAccess(opts, c.abs, workingDir, access, ctx);
+    const key = `${c.removesSource ? 'remove' : 'access'}:${c.operatesOnEntry ? 'entry' : 'target'}:${c.abs}`;
+    if (!c.abs || seen.has(key)) continue;
+    seen.add(key);
+    const gated = await gateBashPathAccess(opts, c.abs, workingDir, access, ctx, {
+      followFinalSymlink: !c.operatesOnEntry,
+    });
     mergeRiskReasons(approvedReasons, gated.approvedReasons);
     if (gated.error) {
       log.warn(access === 'write' ? 'bash filesystem mutation scope reject' : 'bash filesystem read scope reject', {
@@ -3199,28 +3469,32 @@ function shellCommandSubstitution(input: string, start: number, depth = 0): { bo
 
 function extractRunSkillRefs(command: string, depth = 0, hostPlatform: NodeJS.Platform = process.platform): string[] {
   const out: string[] = [];
-  // Substitutions execute even within double-quoted arguments to a data-only
-  // command. Single-quoted examples and non-shell heredoc bodies stay data.
+  // Unquoted heredocs expand command substitutions before stdin reaches the
+  // receiver. Quotes and comment markers inside that payload are ordinary data.
+  // Quoted delimiters suppress expansion; plain filename mentions remain data.
   if (hostPlatform !== 'win32' && depth < 4) {
-    const surface = maskBashHeredocBodies(command);
-    let quote: "'" | '"' | null = null;
-    for (let i = 0; i < surface.length; i++) {
-      const ch = surface[i];
-      if (quote === "'") { if (ch === "'") quote = null; continue; }
-      if (ch === '\\') { i++; continue; }
-      if (!quote && ch === '#' && (i === 0 || /[\s;&|]/.test(surface[i - 1]))) {
-        while (i < surface.length && surface[i] !== '\n') i++;
-        continue;
+    const heredocs = analyzeBashHeredocs(command);
+    for (const [surface, payload] of [[heredocs.shellSurface, false],
+      ...heredocs.unquotedPayloads.map(body => [body, true] as const)] as const) {
+      let quote: "'" | '"' | null = null;
+      for (let i = 0; i < surface.length; i++) {
+        const ch = surface[i];
+        if (!payload && quote === "'") { if (ch === "'") quote = null; continue; }
+        if (ch === '\\') { i++; continue; }
+        if (!payload && !quote && ch === '#' && (i === 0 || /[\s;&|]/.test(surface[i - 1]))) {
+          while (i < surface.length && surface[i] !== '\n') i++;
+          continue;
+        }
+        const substitution = (surface.startsWith('$(', i) || ch === '`')
+          ? shellCommandSubstitution(surface, i) : null;
+        if (substitution) {
+          out.push(...extractRunSkillRefs(substitution.body, depth + 1, hostPlatform));
+          i = substitution.end;
+          continue;
+        }
+        if (!payload && quote === '"') { if (ch === '"') quote = null; continue; }
+        if (!payload && (ch === "'" || ch === '"')) quote = ch;
       }
-      const substitution = (surface.startsWith('$(', i) || ch === '`')
-        ? shellCommandSubstitution(surface, i) : null;
-      if (substitution) {
-        out.push(...extractRunSkillRefs(substitution.body, depth + 1, hostPlatform));
-        i = substitution.end;
-        continue;
-      }
-      if (quote === '"') { if (ch === '"') quote = null; continue; }
-      if (ch === "'" || ch === '"') quote = ch;
     }
   }
   const basename = (value: string): string => value.replace(/\\/g, '/').split('/').pop()!.toLowerCase();
@@ -3690,7 +3964,6 @@ export function windowsPowerShellCompatibilityError(
 
 /** Wrapped `bash` tool — identical schema, permission-gated, host-shell wording. */
 function createBashTool(opts: LocalToolsOpts): AgentTool {
-  const wafBlockedCommands = new Set<string>();
   const windowsShellDescription = process.platform === 'win32'
     ? ' On Windows this compatibility-named tool runs PowerShell; use PowerShell syntax and invoke quoted executables with `&`.'
     : '';
@@ -3700,9 +3973,15 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
 
   return {
     name: 'bash',
+    // Adjacent bash calls overlap only when each command is provably
+    // read-only (2026-09-18); everything else is a barrier, as before the
+    // 2026-09-17 opt-in. The predicate runs on the model's input and never
+    // replaces the permission gates inside execute().
+    executionMode: 'parallel',
+    parallelWhen: (input) => bashCommandIsProvablyReadOnly(String(input.command ?? '')),
     description:
       'Run one shell command on the user\'s local machine and return its output. Built-in Python and Node.js are available as `python` and `node`; use a script for deterministic transformations over many local files or records, and a dedicated tool for a targeted operation. ' +
-      'Use process_session for persistent processes and interactive_cli for user-entered secrets or OAuth.',
+      'A running result includes a session_id for process_session; use interactive_cli for user-entered secrets or OAuth.',
     inputSchema: {
       ...(coreBashTool.inputSchema as Record<string, unknown>),
       properties: {
@@ -3722,7 +4001,6 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
     async execute(input, ctx) {
       const mode = getLocalExecMode();
       const command = String(input.command ?? '');
-      const commandKey = command.trim();
       const shellMismatch = windowsPowerShellCompatibilityError(command, opts.hostPlatform ?? process.platform);
       if (shellMismatch) {
         log.warn('bash host shell syntax reject', {
@@ -3731,15 +4009,6 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
           command_chars: command.length,
         });
         return { content: shellMismatch, isError: true } as ToolResult;
-      }
-      if (wafBlockedCommands.has(commandKey)) {
-        return {
-          content: errText(
-            'E_BROWSER_WAF_USER_ACTION_REQUIRED',
-            'this exact browser automation command already reached an anti-bot/WAF challenge. Do not retry or install another browser runtime. Ask the user to complete the site interaction manually, or use an accessible official source/search result.',
-          ),
-          isError: true,
-        } as ToolResult;
       }
       if (browserRuntimeInstallRequiresExplicitRequest(command)
         && input.allow_browser_runtime_install !== true) {
@@ -3751,17 +4020,6 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
           isError: true,
         } as ToolResult;
       }
-      const finalizeBrowserResult = (result: ToolResult): ToolResult => {
-        if (!browserAutomationHitWaf(command, String(result.content || ''))) return result;
-        if (commandKey) wafBlockedCommands.add(commandKey);
-        return {
-          content: errText(
-            'E_BROWSER_WAF_USER_ACTION_REQUIRED',
-            'the browser reached an anti-bot/WAF or human-verification page instead of the requested content. Stop browser retries; ask the user to complete the interaction manually, or use an accessible official source/search result.',
-          ),
-          isError: true,
-        } as ToolResult;
-      };
       const unmanagedRuntimeErr = guardVideoStudioUnmanagedRuntime(opts, command, ctx.workingDir);
       if (unmanagedRuntimeErr) {
         log.warn('bash VideoStudio unmanaged runtime reject', {
@@ -3820,7 +4078,7 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
       // package changes still enter approval in the otherwise non-prompting
       // all_files_auto mode; project-local dependencies are not in that class.
       if (command.trim()) {
-        const base = await classifyBashRiskIncludingScripts(command, workingDirForGuard);
+        const base = await classifyBashRiskIncludingScripts(command, workingDirForGuard, opts, ctx);
         const approvalMode = localAccessRequiresSensitiveApproval(mode);
         const pathApprovalCoveredSensitive = filesystemGate.approvedReasons.includes('sensitive_path');
         // The per-path removal gate above already asked about this command's
@@ -3853,6 +4111,7 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
             workingDirForGuard,
             pathEnv,
             opts.hasProducedPath,
+            opts.hostPlatform ?? process.platform,
           )) {
             baseReasons = baseReasons.filter((reason) => reason !== 'destructive');
           }
@@ -3900,27 +4159,10 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
           }
         }
       }
-      // `conv_workspace.ts` intentionally defers materialising the
-      // per-conversation workspace dir; bash is a frequent first toucher
-      // because `child_process.spawn` fails ENOENT if cwd doesn't exist.
-      // Two distinct paths so the rmdir-if-empty cleanup only runs on
-      // the cold path (this call is the FIRST to need the dir):
-      //
-      //   hot path  — `ctx.workingDir` already exists (a prior write_file
-      //               or earlier bash call materialised it). Skip mkdir,
-      //               skip post-check, just delegate. This is every bash
-      //               call from the second one onward in a productive
-      //               conversation, and stays zero-overhead.
-      //
-      //   cold path — `ctx.workingDir` doesn't exist yet. We create it,
-      //               run bash, then if the command produced nothing
-      //               (`ls` / `cat` / `pwd` / `gh search` / pure python
-      //               heredoc returning via stdout) the dir is rmdir'd
-      //               so a read-only conversation leaves no footprint.
-      //               Best-effort cleanup: any rmdir failure (concurrent
-      //               bash on same cwd, ENOTEMPTY, EACCES) is silently
-      //               swallowed.
+      // Materialize lazy workspaces only when a command needs one. Cleanup is
+      // shared by overlapping calls and waits for the last terminal result.
       if (!ctx.workingDir) {
+        ctx = { ...ctx, state: { ...ctx.state } };
         const skillRuntime = resolveRunSkillRuntimeBinding(opts, command);
         if (skillRuntime.error) return { content: skillRuntime.error, isError: true };
         const restoreSkillRuntimeEnv = withRunSkillRuntimeEnv(
@@ -3928,26 +4170,15 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
           skillRuntime.binding,
         );
         try {
-          return finalizeBrowserResult(translateFixedBashError(await coreBashTool.execute(input, ctx)));
+          return translateFixedBashError(await coreBashTool.execute(input, {
+            ...ctx, state: { ...ctx.state, commandSessionEnabled: managedCommandsEnabled(ctx),
+              processSessionOwner: `${opts.userId ?? ''}:${opts.cid ?? ''}` },
+          }));
         } finally {
           restoreSkillRuntimeEnv();
         }
       }
-      const workingDir = path.resolve(ctx.workingDir);
-      if (fs.existsSync(workingDir)) {
-        return finalizeBrowserResult(await executeCoreBashWithOutputTracking(opts, input, ctx, workingDir));
-      }
-      try { fs.mkdirSync(ctx.workingDir, { recursive: true }); }
-      catch { /* let spawn produce the canonical error */ }
-      try {
-        return finalizeBrowserResult(await executeCoreBashWithOutputTracking(opts, input, ctx, workingDir));
-      } finally {
-        try {
-          if (fs.readdirSync(ctx.workingDir).length === 0) {
-            fs.rmdirSync(ctx.workingDir);
-          }
-        } catch { /* best-effort */ }
-      }
+      return executeCoreBashWithOutputTracking(opts, input, ctx, path.resolve(ctx.workingDir));
     },
   };
 }
@@ -4019,7 +4250,7 @@ async function gateInteractiveCliStart(
     };
   }
   if (command.trim()) {
-    const base = await classifyBashRiskIncludingScripts(command, path.resolve(settings?.workingDir ?? '.'));
+    const base = await classifyBashRiskIncludingScripts(command, path.resolve(settings?.workingDir ?? '.'), opts, ctx);
     const approvalMode = localAccessRequiresSensitiveApproval(mode);
     const approvedReasons = settings?.approvedReasons ?? [];
     let baseReasons = (approvalMode ? base.reasons : base.reasons.filter(
@@ -4036,6 +4267,7 @@ async function gateInteractiveCliStart(
           workingDir,
           pathEnv,
           opts.hasProducedPath,
+          opts.hostPlatform ?? process.platform,
         )) {
         baseReasons = baseReasons.filter((reason) => reason !== 'destructive');
       }
@@ -4392,12 +4624,6 @@ function createInteractiveCliTool(opts: LocalToolsOpts): AgentTool {
         reason: { type: 'string', description: 'Close only. Brief reason for a forced close.' },
       },
       required: ['action'],
-      oneOf: [
-        { properties: { action: { enum: ['start'] } }, required: ['action', 'command'] },
-        { properties: { action: { enum: ['read'] } }, required: ['action', 'session_id'] },
-        { properties: { action: { enum: ['send'] } }, required: ['action', 'session_id', 'input'] },
-        { properties: { action: { enum: ['close'] } }, required: ['action', 'session_id'] },
-      ],
     },
     async execute(input, ctx) {
       const action = String(input.action ?? '') as InteractiveCliAction;
@@ -4408,7 +4634,8 @@ function createInteractiveCliTool(opts: LocalToolsOpts): AgentTool {
         };
       }
       const unexpected = Object.keys(input)
-        .filter((key) => !actionFields[action].has(key))
+        .filter((key) => !Object.values(actionFields).some((fields) => fields.has(key))
+          || (action === 'start' && key === 'session_id'))
         .sort();
       if (unexpected.length) {
         return {
@@ -4419,6 +4646,7 @@ function createInteractiveCliTool(opts: LocalToolsOpts): AgentTool {
           isError: true,
         };
       }
+      input = Object.fromEntries(Object.entries(input).filter(([key]) => actionFields[action].has(key)));
       if (action === 'start') return start.execute(input, ctx);
       if (action === 'read') return read.execute(input, ctx);
       if (action === 'send') return send.execute(input, ctx);
@@ -4499,6 +4727,12 @@ async function finalizeProcessWorkspaceSnapshot(
 function createHostProcessTools(opts: LocalToolsOpts): AgentTool[] {
   return getProcessSessionTools().map((coreTool) => ({
     ...coreTool,
+    inspectReadContinuation(input, ctx) {
+      return coreTool.inspectReadContinuation?.(input, {
+        ...ctx,
+        state: { ...ctx.state, processSessionOwner: `${opts.userId ?? ''}:${opts.cid ?? ''}` },
+      });
+    },
     async execute(input, ctx) {
       const action = String(input.action ?? '');
       if (action === 'start') {
@@ -4664,7 +4898,7 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
         },
         base_revision: {
           type: 'string',
-          description: 'Opaque revision from the preceding read_files, write_file, or append_file result. Required unless legacy expected_size is provided; stale revisions fail without writing and exact replay is idempotent.',
+          description: 'Opaque revision from the preceding file-tool result. Required unless legacy expected_size is provided; stale revisions fail without writing and exact replay is idempotent.',
           pattern: '^file_rev_[A-Za-z0-9_-]{16}$',
         },
         expected_size: {
@@ -4939,7 +5173,25 @@ function createHostApplyPatchTool(opts: LocalToolsOpts): AgentTool {
   return {
     ...coreTool,
     async execute(input, ctx) {
-      return coreTool.execute(input, ctx);
+      const result = await coreTool.execute(input, ctx);
+      if (result.isError) return result;
+      // The core owns the transaction; run-scoped revision receipts belong to
+      // this host. Use committed observations, never re-read potentially newer
+      // bytes and silently grant an append against an unseen external edit.
+      const revisions = new Map<string, string>();
+      for (const file of result.observations?.fileChanges ?? []) {
+        if (file.afterExists && file.afterHash && file.afterBytes !== undefined) {
+          revisions.set(file.sourcePath, issueFileRevision(
+            ctx, file.destinationPath ?? file.sourcePath, file.afterBytes, file.afterHash,
+          ));
+        }
+      }
+      const receipt = JSON.parse(result.content);
+      for (const file of receipt.files) {
+        const revision = revisions.get(file.path);
+        if (revision) file.revision = revision;
+      }
+      return { ...result, content: JSON.stringify(receipt) };
     },
   };
 }
@@ -4960,7 +5212,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'edit_file',
     description:
-      'Replace text in an existing UTF-8 file. Use write_file to create files and apply_patch for multi-file edits.',
+      'Replace one text pattern in an existing UTF-8 file. Requires an unchanged read/write baseline from this run or a matching expected_hash; earlier turns alone do not establish a baseline. Use write_file to create files and apply_patch for multiple known edits in one or more files.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -5086,10 +5338,10 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
         }
         if (count > 1 && !replaceAll) {
           return {
-            content: errText(
+            content: `${errText(
               'E_MULTIPLE_MATCHES',
               `${abs}: \`old_string\` matches ${count} occurrences. Provide more surrounding context to make it unique, or set replace_all=true.`,
-            ),
+            )}\n<edit-recovery>\n${matchRecoveryContext(body, currentHash, firstMatchOffsets(body, matchText), count, 1200)}\n</edit-recovery>`,
             isError: true,
             observations: fileFailure('E_MULTIPLE_MATCHES', 'ambiguous_match', { stage: 'match', ...baseline, match_count: count }),
           };
@@ -5114,6 +5366,8 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
         // later round doesn't trip OCC on this same intended change.
         const nextHash = editableFileHash(next);
         recordRead(ctx, abs, undefined, nextHash);
+        const nextBytes = Buffer.byteLength(next, 'utf8');
+        const revision = issueFileRevision(ctx, abs, nextBytes, nextHash);
 
         const replaced = replaceAll ? count : 1;
         log.info('edit_file applied', { user_id: maskId(opts.userId), path: logPathRef(abs), replaced });
@@ -5129,7 +5383,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
           // `match="whitespace_relaxed"` says the edit landed on text that
           // differs from `old_string` in line-end whitespace only, so a caller
           // comparing its own string against the file is not left guessing.
-          content: `<file path="${abs}" edited="${replaced}" kind="${kind}"${whitespaceRelaxed ? ' match="whitespace_relaxed"' : ''} file_hash="${nextHash}"/>`,
+          content: `<file path="${abs}" edited="${replaced}" kind="${kind}"${whitespaceRelaxed ? ' match="whitespace_relaxed"' : ''} file_hash="${nextHash}" revision="${revision}"/>`,
           observations: {
             fileChanges: [{
               operation: 'update',
@@ -5139,7 +5393,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
               beforeHash: currentHash,
               afterHash: nextHash,
               beforeBytes: Buffer.byteLength(body),
-              afterBytes: Buffer.byteLength(next),
+              afterBytes: nextBytes,
               beforeContent: body,
               afterContent: next,
               coverage: 'exact',

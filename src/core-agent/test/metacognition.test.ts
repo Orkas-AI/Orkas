@@ -1,38 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
-  detectUserCorrection,
   buildReviewPrompt,
 } from '../src/evolution/metacognition.js';
-
-// ── detectUserCorrection ────────────────────────────────────────────────
-
-describe('detectUserCorrection', () => {
-  it('detects Chinese corrections', () => {
-    expect(detectUserCorrection('不是这样的')).toBe(true);
-    expect(detectUserCorrection('你搞错了')).toBe(true);
-    expect(detectUserCorrection('不要这样做')).toBe(true);
-    expect(detectUserCorrection('应该是另一种方式')).toBe(true);
-    expect(detectUserCorrection('不对，重新来')).toBe(true);
-    expect(detectUserCorrection('改一下格式')).toBe(true);
-  });
-
-  it('detects English corrections', () => {
-    expect(detectUserCorrection('No, that is wrong')).toBe(true);
-    expect(detectUserCorrection('Actually, I meant something else')).toBe(true);
-    expect(detectUserCorrection('Use X instead')).toBe(true);
-    expect(detectUserCorrection("Don't do that"  )).toBe(true);
-    expect(detectUserCorrection('Please fix the layout')).toBe(true);
-    expect(detectUserCorrection('Stop doing that')).toBe(true);
-  });
-
-  it('returns false for normal messages', () => {
-    expect(detectUserCorrection('请帮我写一段代码')).toBe(false);
-    expect(detectUserCorrection('谢谢你的帮助')).toBe(false);
-    expect(detectUserCorrection('Can you help me with this?')).toBe(false);
-    expect(detectUserCorrection('Great work!')).toBe(false);
-    expect(detectUserCorrection('Tell me about Docker')).toBe(false);
-  });
-});
 
 // ── buildReviewPrompt ───────────────────────────────────────────────────
 

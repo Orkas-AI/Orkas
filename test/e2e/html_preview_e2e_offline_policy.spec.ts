@@ -33,6 +33,41 @@ async function holdFirstHtmlResponse(app: ElectronApplication, html: string) {
 }
 
 test.describe('local HTML offline preview', () => {
+  test('audits filter panels after a dense graphic and retains missing effects as inconclusive', async ({ orkas }) => {
+    const modulePath = path.resolve(__dirname, '../../src/main/features/html_preview.ts');
+    for (const working of [true, false]) {
+      const htmlPath = orkas.createWorkspaceFile(`dense-filter-${working}.html`, `<!doctype html>
+<html><head><style>
+  button:focus-visible { outline: 2px solid blue; }
+  .dot { display: inline-block; width: 2px; height: 2px; }
+  #panel { position: fixed; top: 80px; background: white; }
+  #panel[hidden] { display: none; }
+</style></head><body>
+  <button onclick="${working ? "document.getElementById('panel').hidden = false" : ''}">FILTER</button>
+  ${'<span class="dot"></span>'.repeat(300)}
+  <section id="panel" hidden><p>Filter options</p>
+    <button onclick="document.getElementById('panel').hidden = true">Close</button>
+  </section>
+</body></html>`);
+      const evidence = await orkas.electronApp!.evaluate(async (_, args) => {
+        const { renderResponsiveHtmlPreview } = (process as any).mainModule.require(args.modulePath);
+        const result = await renderResponsiveHtmlPreview(args.htmlPath, [
+          { name: 'desktop', width: 1280, height: 800 },
+        ]);
+        return result.evidence;
+      }, { modulePath, htmlPath });
+
+      expect(evidence.blockedResourceCount).toBe(0);
+      expect(evidence.viewports[0].consoleErrors).toEqual([]);
+      expect(evidence.ok).toBe(true);
+      expect(evidence.interactions.stateTransitionsObserved).toBe(working ? 2 : 0);
+      expect(evidence.interactions.failures).toEqual([]);
+      expect(evidence.interactions.warnings).toEqual(working ? [] : [
+        'enabled control produced no observable outcome: FILTER',
+      ]);
+    }
+  });
+
   test('keeps layout inference responsive for long HTML with blocking resource tags', async ({
     appPage,
     orkas,
@@ -45,15 +80,15 @@ test.describe('local HTML offline preview', () => {
 <body><main id="ready">${'preview-ready '.repeat(8_000)}</main></body></html>`);
 
     const startedAt = Date.now();
-    await appPage.evaluate((pathValue) => {
+    const preview = await orkas.openPreview(() => appPage.evaluate((pathValue) => {
       void (window as any).openChatFileViewer(pathValue, 'blocking-resource-preview.html');
-    }, htmlPath);
+    }, htmlPath));
 
-    const body = appPage.locator('.chat-file-viewer-body');
+    const body = preview.locator('.chat-file-viewer-body');
     await expect(body).not.toHaveAttribute('aria-busy', 'true', { timeout: 5_000 });
     const elapsedMs = Date.now() - startedAt;
     expect(elapsedMs).toBeLessThan(5_000);
-    const frame = appPage.locator('.chat-file-viewer-html');
+    const frame = preview.locator('.chat-file-viewer-html');
     expect(await frame.getAttribute('src')).toMatch(/^chat-media:\/\/local\//);
     await expect(frame.contentFrame().locator('#ready')).toContainText('preview-ready');
   });
@@ -69,11 +104,11 @@ test.describe('local HTML offline preview', () => {
       '<!doctype html><main id="ready">preview-ready</main>');
     try {
       // This resolves after layout IPC, while the HTML response remains held.
-      await appPage.evaluate((pathValue) => (
+      const preview = await orkas.openPreview(() => appPage.evaluate((pathValue) => (
         (window as any).openChatFileViewer(pathValue, 'loading-preview.html')
-      ), htmlPath);
+      ), htmlPath));
 
-      const viewer = appPage.locator('.chat-file-viewer');
+      let viewer = preview.locator('.chat-file-viewer');
       const body = viewer.locator('.chat-file-viewer-body');
       await expect(viewer).toHaveClass(/is-open/);
       await expect(body).toHaveAttribute('aria-busy', 'true');
@@ -98,22 +133,22 @@ test.describe('local HTML offline preview', () => {
     const release = await holdFirstHtmlResponse(orkas.electronApp!,
       '<!doctype html><button id="action" onclick="this.textContent=\'done\'">ready</button>');
     try {
-      await appPage.evaluate((pathValue) => (
+      let preview = await orkas.openPreview(() => appPage.evaluate((pathValue) => (
         (window as any).openChatFileViewer(pathValue, 'reopen-preview.html')
-      ), htmlPath);
+      ), htmlPath));
       await expect.poll(() => orkas.electronApp!.evaluate(() => (
         (globalThis as any).__htmlResponseGate.requested
       ))).toBe(true);
-      const viewer = appPage.locator('.chat-file-viewer');
-      await viewer.locator('.chat-file-viewer-close').click();
-      await expect(viewer).toBeHidden();
-      await expect(viewer.locator('iframe')).toHaveCount(0);
+      let viewer = preview.locator('.chat-file-viewer');
+      await orkas.closePreview(preview);
+      await expect.poll(() => preview.isClosed()).toBe(true);
 
       // Reopen while the old response is still held, then let that stale
       // response finish. It must not dismiss or overwrite the new preview.
-      await appPage.evaluate((pathValue) => (
+      preview = await orkas.openPreview(() => appPage.evaluate((pathValue) => (
         (window as any).openChatFileViewer(pathValue, 'reopen-preview.html')
-      ), htmlPath);
+      ), htmlPath));
+      viewer = preview.locator('.chat-file-viewer');
       await release();
       const body = viewer.locator('.chat-file-viewer-body');
       await expect(body).not.toHaveAttribute('aria-busy', 'true');
@@ -122,9 +157,8 @@ test.describe('local HTML offline preview', () => {
       await expect(action).toHaveText('ready');
       await action.press('Enter');
       await expect(action).toHaveText('done');
-      await viewer.locator('.chat-file-viewer-close').click();
-      await expect(viewer).toBeHidden();
-      await expect(viewer.locator('iframe')).toHaveCount(0);
+      await orkas.closePreview(preview);
+      await expect.poll(() => preview.isClosed()).toBe(true);
     } finally {
       await release();
     }
@@ -220,15 +254,15 @@ test.describe('local HTML offline preview', () => {
 </body>
 </html>`);
 
-      await appPage.evaluate((pathValue) => {
+      const preview = await orkas.openPreview(() => appPage.evaluate((pathValue) => {
         void (window as any).openChatFileViewer(pathValue, 'offline-preview.html');
-      }, htmlPath);
+      }, htmlPath));
 
-      const previewElement = appPage.locator('.chat-file-viewer-html');
+      const previewElement = preview.locator('.chat-file-viewer-html');
       await expect(previewElement).toBeVisible();
       const previewSrc = await previewElement.getAttribute('src');
-      await expect.poll(() => appPage.frames().some((frame) => frame.url() === previewSrc)).toBe(true);
-      const previewFrame = appPage.frames().find((frame) => frame.url() === previewSrc);
+      await expect.poll(() => preview.frames().some((frame) => frame.url() === previewSrc)).toBe(true);
+      const previewFrame = preview.frames().find((frame) => frame.url() === previewSrc);
       if (!previewFrame) throw new Error('Local HTML preview frame did not load');
 
       await expect.poll(async () => previewFrame.evaluate(() => {

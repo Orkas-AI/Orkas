@@ -32,6 +32,43 @@ function extractFunction(source: string, name: string): string {
 }
 
 describe('global search conversation navigation', () => {
+  it('shows incomplete-history status for empty and partial results, clears it after migration, and scopes it to chats', () => {
+    const body = { innerHTML: '', classList: { remove: vi.fn() }, querySelectorAll: () => [] };
+    const context: any = {
+      _searchResults: [], _searchVisibleResults: [], _searchActiveIdx: -1,
+      _searchTab: 'all', _searchChatIndexComplete: false,
+      document: { getElementById: () => body },
+      escapeHtml: (s: string) => s, t: (key: string) => key,
+      _partitionSearchResults: (rows: any[]) => ({ chats: rows, agents: [], skills: [], contexts: [] }),
+      _sectionRows: (s: any) => s.bucket,
+      _renderSearchRow: () => '<div class="search-result">match</div>',
+      Math,
+    };
+    vm.createContext(context);
+    vm.runInContext(extractFunction(searchSource, '_renderSearchResults'), context);
+    context._renderSearchResults('query');
+    expect(body.innerHTML).toContain('role="status"');
+    expect(body.innerHTML).toContain('search.history_indexing');
+    expect(body.innerHTML).not.toContain('search.no_results');
+
+    context._searchResults = [{ kind: 'chat' }];
+    context._renderSearchResults('query');
+    expect(body.innerHTML).toContain('search.history_indexing');
+    expect(body.innerHTML).toContain('search-result');
+    expect(context._searchVisibleResults).toHaveLength(1);
+
+    context._searchTab = 'context';
+    context._renderSearchResults('query');
+    expect(body.innerHTML).not.toContain('search.history_indexing');
+    expect(body.innerHTML).toContain('search.no_results');
+
+    context._searchTab = 'chat';
+    context._searchChatIndexComplete = true;
+    context._renderSearchResults('query');
+    expect(body.innerHTML).not.toContain('search.history_indexing');
+    expect(body.innerHTML).toContain('search-result');
+  });
+
   it('tracks the bounded entry that opened global search', () => {
     const events: Array<{ action: string; data: Record<string, unknown> }> = [];
     const input: any = { value: 'old query', focus: vi.fn() };
@@ -105,11 +142,53 @@ describe('global search conversation navigation', () => {
     ]);
   });
 
-  it('opens a global Library body hit in the Library viewer', async () => {
+  // The chat section of the "all" tab holds ten rows. Choosing them by recency
+  // means the best match is displaced by whatever the user happened to discuss
+  // most recently, which is how a search that did find the right message still
+  // shows nothing useful. Pick by relevance, then read newest-first.
+  it('picks chat rows by relevance and shows the ones it kept newest-first', () => {
+    const context: any = { Array, String, Number, _SEARCH_ALL_PER_SECTION: 2 };
+    vm.createContext(context);
+    vm.runInContext(extractFunction(searchSource, '_partitionSearchResults'), context);
+    vm.runInContext(extractFunction(searchSource, '_sectionRows'), context);
+
+    const { chats } = context._partitionSearchResults([
+      { kind: 'chat', cid: 'recent-partial', score: 9, term_coverage: 1, time: '2026-03-01T00:00:00Z' },
+      { kind: 'chat', cid: 'older-full', score: 2, term_coverage: 2, time: '2026-01-01T00:00:00Z' },
+      { kind: 'chat', cid: 'newest-full', score: 1, term_coverage: 2, time: '2026-02-01T00:00:00Z' },
+    ]);
+
+    // Relevance decides who survives the cut...
+    expect(Array.from(chats, (row: any) => row.cid))
+      .toEqual(['older-full', 'newest-full', 'recent-partial']);
+    // ...and the rows that survived are read in time order.
+    const shown = context._sectionRows({ tab: 'chat', bucket: chats }, 'all');
+    expect(Array.from(shown, (row: any) => row.cid)).toEqual(['newest-full', 'older-full']);
+  });
+
+  it('keeps a non-chat section in its ranked order', () => {
+    const context: any = { Array, String, Number, _SEARCH_ALL_PER_SECTION: 2 };
+    vm.createContext(context);
+    vm.runInContext(extractFunction(searchSource, '_sectionRows'), context);
+
+    const bucket = [{ path: 'a' }, { path: 'b' }, { path: 'c' }];
+    expect(Array.from(
+      context._sectionRows({ tab: 'context', bucket }, 'all'),
+      (row: any) => row.path,
+    )).toEqual(['a', 'b']);
+    expect(Array.from(
+      context._sectionRows({ tab: 'context', bucket }, 'context'),
+      (row: any) => row.path,
+    )).toEqual(['a', 'b', 'c']);
+  });
+
+  it('opens a global Library body hit after leaving a selected project Library', async () => {
     const setView = vi.fn();
     const loadRendererFeature = vi.fn(async () => {});
     const loadContexts = vi.fn(async () => {});
-    const openCtxFile = vi.fn();
+    let selectedProject = 'project-a';
+    const switchCtxProject = vi.fn(async (projectId: string) => { selectedProject = projectId; return true; });
+    const openCtxFile = vi.fn(() => { expect(selectedProject).toBe(''); });
     const context: any = {
       _SEARCH_KIND_META: { context: {} },
       _searchActiveIdx: 0,
@@ -117,6 +196,7 @@ describe('global search conversation navigation', () => {
       setView,
       loadRendererFeature,
       loadContexts,
+      switchCtxProject,
       openCtxFile,
       window: { loadRendererFeature },
     };

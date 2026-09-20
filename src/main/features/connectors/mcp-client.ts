@@ -107,10 +107,9 @@ async function _loadSdk(): Promise<SdkBundle> {
 }
 
 const CLIENT_INFO = { name: 'orkas-pc', version: '0.1.0' };
-const DEFAULT_STDIO_CONNECT_TIMEOUT_MS = 3 * 60 * 1000;
-const DEFAULT_HTTP_CONNECT_TIMEOUT_MS = 30 * 1000;
+const DEFAULT_CONNECT_TIMEOUT_MS = 30 * 1000;
 const DEFAULT_LIST_TOOLS_TIMEOUT_MS = 30 * 1000;
-const DEFAULT_CALL_TOOL_TIMEOUT_MS = 60 * 1000;
+const DEFAULT_CALL_TOOL_TIMEOUT_MS = 10 * 60 * 1000;
 
 function resolveBoundedTimeout(raw: string | undefined, fallback: number): number {
   if (!raw) return fallback;
@@ -123,14 +122,12 @@ function resolveMcpConnectTimeoutMs(kind: Transport['kind']): number {
   const specific = kind === 'stdio'
     ? process.env.ORKAS_MCP_STDIO_CONNECT_TIMEOUT_MS
     : process.env.ORKAS_MCP_HTTP_CONNECT_TIMEOUT_MS;
-  const fallback = kind === 'stdio' ? DEFAULT_STDIO_CONNECT_TIMEOUT_MS : DEFAULT_HTTP_CONNECT_TIMEOUT_MS;
-  return resolveBoundedTimeout(specific || process.env.ORKAS_MCP_CONNECT_TIMEOUT_MS, fallback);
+  return resolveBoundedTimeout(specific || process.env.ORKAS_MCP_CONNECT_TIMEOUT_MS, DEFAULT_CONNECT_TIMEOUT_MS);
 }
 
 export interface McpRequestOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
-  maxTotalTimeoutMs?: number;
 }
 
 export class McpConnection {
@@ -182,9 +179,8 @@ export class McpConnection {
     }
     const client = new sdk.Client(CLIENT_INFO, {});
     try {
-      // First-run `npx -y @modelcontextprotocol/server-github` can download ~10-30 MB. Bound
-      // the wait so a stuck spawn surfaces as a clear error, but keep the default above weak-link
-      // cold-install time so a working connector is not reported as failed too early.
+      // Bound process/transport startup and initialization together. Pass the same budget
+      // to the SDK so its default handshake timeout cannot terminate a configured wait early.
       const connectTimeoutMs = resolveMcpConnectTimeoutMs(this.transport.kind);
       let to: NodeJS.Timeout | undefined;
       const timeout = new Promise<never>((_resolve, reject) => {
@@ -192,7 +188,7 @@ export class McpConnection {
         to = setTimeout(() => reject(new Error(`MCP connect timed out (>${seconds}s); likely npx/network is slow or the server crashed on launch`)), connectTimeoutMs);
       });
       try {
-        await Promise.race([client.connect(transport), timeout]);
+        await Promise.race([client.connect(transport, { timeout: connectTimeoutMs }), timeout]);
       } finally {
         if (to) clearTimeout(to);
       }
@@ -237,11 +233,8 @@ export class McpConnection {
       undefined,
       {
         timeout: opts.timeoutMs || DEFAULT_CALL_TOOL_TIMEOUT_MS,
-        ...(opts.maxTotalTimeoutMs ? {
-          maxTotalTimeout: opts.maxTotalTimeoutMs,
-          resetTimeoutOnProgress: true,
-          onprogress: () => {},
-        } : {}),
+        // Accept progress notifications without extending the fixed operation deadline.
+        onprogress: () => {},
         ...(opts.signal ? { signal: opts.signal } : {}),
       },
     );

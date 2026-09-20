@@ -37,6 +37,7 @@ afterEach(() => {
   if (prevBuiltin === undefined) delete process.env.ORKAS_BUILTIN_ROOT;
   else process.env.ORKAS_BUILTIN_ROOT = prevBuiltin;
   fs.rmSync(tmpDir, { recursive: true, force: true });
+  vi.restoreAllMocks();
   vi.resetModules();
 });
 
@@ -74,20 +75,6 @@ function sha256(text: string): string {
   return crypto.createHash('sha256').update(text).digest('hex');
 }
 
-/**
- * `readInstalls` prunes uninstall tombstones older than the wall-clock
- * retention window, so a fixed calendar date silently expires: the tombstone
- * vanishes, the content reseeds, and the case stops exercising the
- * `reseed_if_deleted_before` cutoff at all — the "respected" cases start
- * failing and the "re-seeds" cases start passing for the wrong reason. Anchor
- * both the cutoff and the tombstone to now, well inside the window.
- */
-const RESEED_CUTOFF_MS = Date.now() - 5 * 24 * 60 * 60 * 1000;
-const RESEED_CUTOFF_ISO = new Date(RESEED_CUTOFF_MS).toISOString();
-/** Uninstalled before the cutoff -> packaged metadata supersedes the tombstone. */
-const DELETED_BEFORE_CUTOFF_MS = RESEED_CUTOFF_MS - 1_000;
-/** Uninstalled at the cutoff -> the boundary is exclusive, so it stays respected. */
-const DELETED_AT_CUTOFF_MS = RESEED_CUTOFF_MS;
 
 function writeResourceSeedManifest(dir: string, kind: 'agent' | 'skill', id: string): void {
   fs.writeFileSync(path.join(dir, MARKETPLACE_RESOURCE_MANIFEST_NAME), JSON.stringify({
@@ -101,7 +88,55 @@ function writeResourceSeedManifest(dir: string, kind: 'agent' | 'skill', id: str
   }, null, 2), 'utf8');
 }
 
+async function capturePrivateWarnings(scope: string): Promise<unknown[][]> {
+  const logger = await import('../../../src/main/logger');
+  const createLogger = logger.createLogger;
+  const records: unknown[][] = [];
+  vi.spyOn(logger, 'createLogger').mockImplementation((name) => {
+    const scoped = createLogger(name);
+    if (name !== scope) return scoped;
+    return { ...scoped, warn: (message: string, ...args: unknown[]) => {
+      records.push([message, ...args].map((value) => logger.redact(value)));
+    } };
+  });
+  return records;
+}
+
 describe('builtin marketplace seed', () => {
+  it('keeps malformed package diagnostics private and permits corrected seeding', async () => {
+    const records = await capturePrivateWarnings('builtin-marketplace');
+    writeBuiltinAgent(TEST_AGENT_ID, { name: 'Writer', workflow: 'Write.' });
+    const file = path.join(tmpDir, 'builtin', 'marketplace', 'agents', TEST_AGENT_ID, 'agent.json');
+    fs.writeFileSync(file, 'CONFIDENTIAL');
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    expect((await seed.seedBuiltinMarketplaceForUser('u1')).seeded_agents).toBe(0);
+    writeBuiltinAgent(TEST_AGENT_ID, { name: 'Writer', workflow: 'Write.' });
+    expect((await seed.seedBuiltinMarketplaceForUser('u1')).seeded_agents).toBe(1);
+    expect(records.length).toBeGreaterThan(0);
+    expect(JSON.stringify(records)).not.toContain('CONFIDENTIAL');
+    expect(JSON.stringify(records)).not.toContain(tmpDir);
+  });
+
+  it('keeps both lookup failures private without dropping installed packages', async () => {
+    const records = await capturePrivateWarnings('builtin-marketplace');
+    writeBuiltinAgent(TEST_AGENT_ID, { name: 'Writer', workflow: 'Write.' });
+    writeBuiltinSkill('lookup-skill');
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    await seed.seedBuiltinMarketplaceForUser('u1');
+    const before = await installs.readInstalls('u1');
+    postJsonMock.mockRejectedValue(Object.assign(new Error('CONFIDENTIAL'), { code: 'EACCES' }));
+    expect((await seed.resolveBuiltinMarketplaceInstalls('u1')).failed).toEqual([
+      `agent:${TEST_AGENT_ID}`, 'skill:lookup-skill',
+    ]);
+    expect(await installs.readInstalls('u1')).toEqual(before);
+    expect(records).toHaveLength(2);
+    expect(JSON.stringify(records)).not.toContain('CONFIDENTIAL');
+    expect(JSON.stringify(records)).toContain('EACCES');
+    postJsonMock.mockResolvedValue({ list: [], total: 0 });
+    expect((await seed.resolveBuiltinMarketplaceInstalls('u1')).failed).toEqual([]);
+  });
+
   it('seeds agents and skills without requiring marketplace versions', async () => {
     writeBuiltinAgent(TEST_AGENT_ID, {
       name: 'Writer',
@@ -435,6 +470,7 @@ describe('builtin marketplace seed', () => {
     expect(agentJson.version).toBe('1.1.0');
     expect(agentJson.workflow).toBe('Write bundled newer.');
     const meta = JSON.parse(fs.readFileSync(path.join(localAgentDir, '_install.json'), 'utf8'));
+    expect(meta.content_tree_hash).toBe(marketplaceContentTreeHash(localAgentDir));
     expect(meta).toMatchObject({
       version: '1.1.0',
       seed_source: 'builtin',
@@ -694,161 +730,26 @@ describe('builtin marketplace seed', () => {
     });
   });
 
-  it('re-seeds a builtin skill when packaged metadata supersedes an old uninstall tombstone', async () => {
-    const skillId = 'ee99fbb42964';
-    writeBuiltinSkill(skillId, 'deep-research');
-    writeBuiltinSkillMeta(skillId, {
-      version: '1.0.1',
-      reseed_if_deleted_before: RESEED_CUTOFF_ISO,
-    });
-
-    const seed = await import('../../../src/main/features/builtin_marketplace');
-    const paths = await import('../../../src/main/paths');
-    const installs = await import('../../../src/main/features/marketplace_installs');
-    await installs.writeInstalls('u1', {
-      version: installs.CURRENT_VERSION,
-      agents: [],
-      skills: [],
-      _deleted_at: {
-        skills: { [skillId]: DELETED_BEFORE_CUTOFF_MS },
-      },
-    });
-
-    await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({
-      seeded_skills: 1,
-      manifest_skills: 1,
-    });
-
-    expect(fs.existsSync(path.join(paths.userMarketplaceSkillDir('u1', skillId), 'SKILL.md'))).toBe(true);
-    const manifest = await installs.readInstalls('u1');
-    expect(manifest._deleted_at?.skills?.[skillId]).toBeUndefined();
-    expect(manifest.skills).toEqual([
-      expect.objectContaining({
-        id: skillId,
-        version: '1.0.1',
-        seed_source: 'builtin',
-      }),
-    ]);
-  });
-
-  it('re-seeds a builtin agent when packaged metadata supersedes an old uninstall tombstone', async () => {
+  it.each([1, 45])('keeps agents and skills uninstalled after %i days despite packaged reseed metadata', async (days) => {
     const agentId = '78900d8758bc';
-    writeBuiltinAgent(agentId, {
-      version: '1.0.2',
-      name: 'DeepResearcher',
-      description: 'Research deeply',
-      category: 'data',
-      workflow: 'Research.',
-      updated_at: '2026-07-04T00:00:00Z',
-    });
-    writeBuiltinAgentMeta(agentId, {
-      reseed_if_deleted_before: RESEED_CUTOFF_ISO,
-    });
-
-    const seed = await import('../../../src/main/features/builtin_marketplace');
-    const paths = await import('../../../src/main/paths');
-    const installs = await import('../../../src/main/features/marketplace_installs');
-    await installs.writeInstalls('u1', {
-      version: installs.CURRENT_VERSION,
-      agents: [],
-      skills: [],
-      _deleted_at: {
-        agents: { [agentId]: DELETED_BEFORE_CUTOFF_MS },
-      },
-    });
-
-    await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({
-      seeded_agents: 1,
-      manifest_agents: 1,
-    });
-
-    const agentJson = JSON.parse(fs.readFileSync(path.join(paths.userMarketplaceAgentDir('u1', agentId), 'agent.json'), 'utf8'));
-    expect(agentJson.name).toBe('DeepResearcher');
-    const manifest = await installs.readInstalls('u1');
-    expect(manifest._deleted_at?.agents?.[agentId]).toBeUndefined();
-    expect(manifest.agents).toEqual([
-      expect.objectContaining({
-        id: agentId,
-        version: '1.0.2',
-        seed_source: 'builtin',
-      }),
-    ]);
-  });
-
-  it('keeps a newer builtin agent uninstall tombstone respected', async () => {
-    const agentId = '78900d8758bc';
-    writeBuiltinAgent(agentId, {
-      version: '1.0.2',
-      name: 'DeepResearcher',
-      description: 'Research deeply',
-      category: 'data',
-      workflow: 'Research.',
-      updated_at: '2026-07-04T00:00:00Z',
-    });
-    writeBuiltinAgentMeta(agentId, {
-      reseed_if_deleted_before: RESEED_CUTOFF_ISO,
-    });
-
-    const seed = await import('../../../src/main/features/builtin_marketplace');
-    const paths = await import('../../../src/main/paths');
-    const installs = await import('../../../src/main/features/marketplace_installs');
-    const retention = await import('../../../src/main/util/tombstone_retention');
-    // Precondition, not the oracle: an expired tombstone would be pruned on
-    // read and the agent would reseed for a reason this case is not testing.
-    expect(retention.isExpiredMsTombstone(DELETED_AT_CUTOFF_MS)).toBe(false);
-    await installs.writeInstalls('u1', {
-      version: installs.CURRENT_VERSION,
-      agents: [],
-      skills: [],
-      _deleted_at: {
-        agents: { [agentId]: DELETED_AT_CUTOFF_MS },
-      },
-    });
-
-    await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({
-      seeded_agents: 0,
-      manifest_agents: 0,
-    });
-
-    expect(fs.existsSync(path.join(paths.userMarketplaceAgentDir('u1', agentId), 'agent.json'))).toBe(false);
-    const manifest = await installs.readInstalls('u1');
-    expect(manifest._deleted_at?.agents?.[agentId]).toEqual(DELETED_AT_CUTOFF_MS);
-    expect(manifest.agents).toEqual([]);
-  });
-
-  it('keeps a newer builtin skill uninstall tombstone respected', async () => {
     const skillId = 'ee99fbb42964';
-    writeBuiltinSkill(skillId, 'deep-research');
-    writeBuiltinSkillMeta(skillId, {
-      version: '1.0.1',
-      reseed_if_deleted_before: RESEED_CUTOFF_ISO,
-    });
-
+    writeBuiltinAgent(agentId, { version: '2.0.0', name: 'Research', workflow: 'Research.' });
+    writeBuiltinAgentMeta(agentId, { reseed_if_deleted_before: new Date().toISOString() });
+    writeBuiltinSkill(skillId, 'research');
+    writeBuiltinSkillMeta(skillId, { version: '2.0.0', reseed_if_deleted_before: new Date().toISOString() });
     const seed = await import('../../../src/main/features/builtin_marketplace');
     const paths = await import('../../../src/main/paths');
     const installs = await import('../../../src/main/features/marketplace_installs');
-    const retention = await import('../../../src/main/util/tombstone_retention');
-    // Precondition, not the oracle: an expired tombstone would be pruned on
-    // read and the skill would reseed for a reason this case is not testing.
-    expect(retention.isExpiredMsTombstone(DELETED_AT_CUTOFF_MS)).toBe(false);
-    await installs.writeInstalls('u1', {
-      version: installs.CURRENT_VERSION,
-      agents: [],
-      skills: [],
-      _deleted_at: {
-        skills: { [skillId]: DELETED_AT_CUTOFF_MS },
-      },
+    const deletedAt = Date.now() - days * 86400000;
+    const removed = { version: 1 as const, agents: [], skills: [],
+      _deleted_at: { agents: { [agentId]: deletedAt }, skills: { [skillId]: deletedAt } } };
+    await installs.writeInstalls('u1', removed);
+    await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toEqual({
+      seeded_agents: 0, seeded_skills: 0, manifest_agents: 0, manifest_skills: 0,
     });
-
-    await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({
-      seeded_skills: 0,
-      manifest_skills: 0,
-    });
-
-    expect(fs.existsSync(path.join(paths.userMarketplaceSkillDir('u1', skillId), 'SKILL.md'))).toBe(false);
-    const manifest = await installs.readInstalls('u1');
-    expect(manifest._deleted_at?.skills?.[skillId]).toEqual(DELETED_AT_CUTOFF_MS);
-    expect(manifest.skills).toEqual([]);
+    expect(fs.existsSync(paths.userMarketplaceAgentDir('u1', agentId))).toBe(false);
+    expect(fs.existsSync(paths.userMarketplaceSkillDir('u1', skillId))).toBe(false);
+    expect(await installs.readInstalls('u1')).toEqual(removed);
   });
 
   it('overlays newer builtin skill content onto a lower-version marketplace install', async () => {

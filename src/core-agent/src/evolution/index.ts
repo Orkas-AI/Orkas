@@ -9,7 +9,6 @@ export type {
 export { SkillStore, parseFrontmatter, serializeFrontmatter } from "./skill-store.js";
 export { createSkillManageTool } from "./skill-tools.js";
 export {
-  detectUserCorrection,
   buildReviewPrompt,
   REFLECTION_SYSTEM_PROMPT,
 } from "./metacognition.js";

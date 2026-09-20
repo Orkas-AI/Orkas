@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import * as fs from 'node:fs';
+import fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
@@ -68,6 +68,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   try {
     const idx = await import('../../../src/main/features/project_library_indexer');
     idx._resetQueuesForTests();
@@ -109,6 +110,61 @@ function collectEvents(ev: { on: (e: string, fn: (x: unknown) => void) => void }
 }
 
 describe('project_library_indexer › enqueue + processing', () => {
+  it('retains oversized text without reading or embedding it, removes stale chunks, and recovers after shrinking', async () => {
+    await createProject();
+    const idx = await indexer();
+    const source = path.join(await filesRoot(), 'growing.txt');
+    await writeSource('growing.txt', 'previous searchable content');
+    idx.enqueue(TEST_UID, PID, 'growing.txt');
+    await idx.drain(TEST_UID, PID);
+    expect(idx.readFileChunks(TEST_UID, PID, 'growing.txt').length).toBeGreaterThan(0);
+    const previousEmbeds = embedCalls.count;
+    fs.truncateSync(source, 5 * 1024 * 1024 + 1);
+    const read = vi.spyOn(fs.promises, 'readFile');
+    const stream = vi.spyOn(fs, 'createReadStream');
+    try {
+      idx.enqueue(TEST_UID, PID, 'growing.txt');
+      await idx.drain(TEST_UID, PID);
+      expect(idx.getFileByPath(TEST_UID, PID, 'growing.txt')).toMatchObject({
+        status: 'failed', bytes: 5 * 1024 * 1024 + 1, chunks: 0, error: expect.stringContaining('5'),
+      });
+      expect(idx.readFileChunks(TEST_UID, PID, 'growing.txt')).toEqual([]);
+      expect(idx.listFiles(TEST_UID, PID)).toEqual([
+        expect.objectContaining({ errorCode: 'E_LIBRARY_FILE_TOO_LARGE' }),
+      ]);
+      expect((await idx.reconcile(TEST_UID, PID)).enqueuedUpsert).toBe(0);
+      await idx.drain(TEST_UID, PID);
+      expect(read.mock.calls.some(([file]) => file === source)).toBe(false);
+      expect(stream.mock.calls.some(([file]) => file === source)).toBe(false);
+      expect(embedCalls.count).toBe(previousEmbeds);
+      expect(fs.statSync(source).size).toBe(5 * 1024 * 1024 + 1);
+    } finally { read.mockRestore(); stream.mockRestore(); }
+
+    const boundary = Buffer.alloc(5 * 1024 * 1024, ' ');
+    boundary.write('replacement searchable content');
+    fs.writeFileSync(source, boundary);
+    expect((await idx.reconcile(TEST_UID, PID)).enqueuedUpsert).toBe(1);
+    await idx.drain(TEST_UID, PID);
+    expect(idx.getFileByPath(TEST_UID, PID, 'growing.txt')).toMatchObject({ status: 'ready' });
+    expect(idx.readFileChunks(TEST_UID, PID, 'growing.txt').map(chunk => chunk.content).join(''))
+      .toContain('replacement searchable content');
+    expect(embedCalls.count).toBeGreaterThan(previousEmbeds);
+  });
+
+  it('imports a legacy XLS and stores searchable content from every sheet', async () => {
+    await createProject();
+    const files = await import('../../../src/main/features/project_files');
+    const bytes = fs.readFileSync(path.join(__dirname, '../../fixtures/xls/inventory.xls'));
+    expect(await files.uploadProjectFile(TEST_UID, PID, 'inventory.xls', bytes)).toMatchObject({ ok: true });
+    const idx = await indexer();
+    await idx.drain(TEST_UID, PID);
+    expect(idx.getFileByPath(TEST_UID, PID, 'inventory.xls')).toMatchObject({ status: 'ready', kind: 'spreadsheet' });
+    const body = idx.readFileChunks(TEST_UID, PID, 'inventory.xls').map(c => c.content).join('\n');
+    expect(body).toContain('冷却泵');
+    expect(body).toContain('Inventory sentinel 8384');
+    expect(fs.readFileSync(path.join(await filesRoot(), 'inventory.xls'))).toEqual(bytes);
+  });
+
   it('vectorizes a new source file: pending → processing → ready', async () => {
     const idx = await indexer();
     const events = collectEvents(idx.projectLibraryEvents);
