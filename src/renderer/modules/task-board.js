@@ -80,12 +80,15 @@ function _taskBoardDropOrder(tasks, taskId, targetId, afterTarget) {
 // remains visible because the board owns its run-anyway/cancel recovery.
 // Initial admission is not actual waiting: the host marks newly created
 // rows until its scheduler either starts them or confirms they must queue.
+// Exclude those rows from BOTH visibility gates: counting a pending send as
+// a second task flashes the board while the previous turn is settling.
 // Pure decision function — renderer tests extract it.
 function _taskBoardVisibility(liveRows) {
-  const rows = Array.isArray(liveRows) ? liveRows : [];
+  const rows = (Array.isArray(liveRows) ? liveRows : []).filter((task) => (
+    task && !(task.status === 'queued' && task.admission_pending === true)
+  ));
   const hasStandaloneControl = rows.some((task) => (
-    task && (task.status === 'blocked'
-      || (task.status === 'queued' && task.admission_pending !== true))
+    task.status === 'blocked' || task.status === 'queued'
   ));
   return { visible: rows.length >= 2 || hasStandaloneControl };
 }
