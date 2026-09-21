@@ -1,4 +1,7 @@
 {
+  "chat.skill_creation_correcting": "Для создания Skill требуется исправление. Выполняется одна попытка.",
+  "chat.skill_creation_corrected": "Skill исправлен и создан.",
+  "chat.skill_creation_correction_failed": "Не удалось создать Skill после одной попытки исправления.",
   "errors.reveal_invalid_path": "Укажите полный путь к локальному файлу или папке.",
   "errors.reveal_unavailable": "Файл или папка недоступны. Убедитесь, что они существуют и у вас есть к ним доступ.",
   "errors.reveal_failed": "Не удалось открыть папку. Попробуйте открыть её в файловом менеджере.",

@@ -321,6 +321,23 @@ vi.mock('../../../../src/main/model/client', () => ({
       yield { type: 'done' };
       return;
     }
+    if (message.includes('NON_CLI_DRAFT_TEST')) {
+      yield { type: 'delta', text: 'Inspect sources.', phase: 'pending' };
+      yield { type: 'commentary-finalized', text: 'Inspect sources.' };
+      yield { type: 'event', event: { stream: 'tool', data: { phase: 'end', id: 'read-draft', name: 'read_files' } } };
+      yield { type: 'delta', text: 'Verify results.', phase: 'pending' };
+      yield { type: 'commentary-finalized', text: 'Verify results.' };
+      if (message.includes('NON_CLI_DRAFT_TEST_ABORT')) {
+        yield { type: 'error', text: 'Stopped', aborted: true };
+      } else if (message.includes('NON_CLI_DRAFT_TEST_FAIL')) {
+        yield { type: 'error', text: 'Connection dropped', failureKind: 'model', failureCode: 'provider_network' };
+      } else {
+        yield { type: 'delta', text: 'Delivered.', phase: 'pending' };
+        yield { type: 'final', text: 'Delivered.' };
+      }
+      yield { type: 'done' };
+      return;
+    }
     if (message.includes('NON_CLI_PHASED_TEXT_TEST')) {
       yield { type: 'delta', text: 'Inspect the code.', phase: 'commentary' };
       yield {
@@ -665,6 +682,38 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       && item.event?.stream === 'assistant'
       && item.event.data?.phase === 'commentary'
     ))).toBe(true);
+  });
+
+  it.each(['success', 'failure', 'abort'])('preserves visible draft and commentary without duplication or silent replay: %s', async ending => {
+    const cid = `cid-native-draft-${ending}`;
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const snapshots: any[] = [];
+    const events: any[] = [];
+    bus.subscribe(TEST_UID, cid, event => {
+      events.push(event);
+      if (event.type === 'process') snapshots.push(structuredClone(bus.liveDisplaySnapshot(TEST_UID, cid)));
+    });
+    const marker = `NON_CLI_DRAFT_TEST${ending === 'failure' ? '_FAIL' : ending === 'abort' ? '_ABORT' : ''}`;
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: marker });
+    await waitForQuiescent(TEST_UID, cid);
+    expect(snapshots[0].turns[0].records.at(-1).text).toBe('Inspect sources.');
+    expect(snapshots[1].turns[0].records.at(-1).text).toBe('');
+    expect(snapshots[1].turns[0].records.at(-1).process)
+      .toContainEqual(expect.objectContaining({ text: 'Inspect sources.' }));
+    expect(streamProbe.messages.filter(text => text.includes(marker))).toHaveLength(1);
+    const rows = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8')
+      .trim().split('\n').map(line => JSON.parse(line));
+    const reply = rows.find(row => row.from === 'commander');
+    expect(reply.process.filter((p: any) => p.event?.stream === 'assistant').map((p: any) => p.text))
+      .toEqual(['Inspect sources.', 'Verify results.']);
+    if (ending === 'success') expect(reply.text).toBe('Delivered.');
+    if (ending === 'abort') {
+      expect(reply.text).not.toContain('Inspect sources.');
+      expect(reply.text).not.toContain('Verify results.');
+    }
+    expect(events.filter(e => e.type === 'process' && e.data?.type === 'delta').map(e => e.data.text))
+      .toEqual(ending === 'success' ? ['Inspect sources.', 'Verify results.', 'Delivered.'] : ['Inspect sources.', 'Verify results.']);
   });
 
   it.each(['codex', 'claude'])('recovers the complete active %s display without retaining another event log', async cli => {
@@ -2482,6 +2531,72 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(history).toContain('E_NARRATION_REPAIR_AUTHORIZATION_NOT_PERSISTED');
     expect(history).toContain('AGENT_BLOCKER_RESULT_TEST');
     expect(streamProbe.dispatchResults).toHaveLength(0);
+  });
+
+  it.each([
+    ['commander', 'missing-file'], ['commander', 'missing-boundary'], ['commander', 'read-error'],
+    ['agent', 'missing-boundary'],
+  ])('reports unavailable canonical history for %s/%s without replacing it, and recovers', async (actor, fault) => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const sessions = await import('../../../../src/main/model/core-agent/session-store');
+    const storage = await import('../../../../src/main/storage');
+    const cid = `cid-history-${actor}-${fault}`;
+    const recipient = actor === 'agent' ? AGENT_NAME : 'commander';
+    const send = async (text: string) => {
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: `@${recipient} ${text}` });
+      await waitForQuiescent(TEST_UID, cid);
+    };
+    await send('HISTORY_FIRST_REQUEST');
+    const first = streamProbe.conversationHistories.at(-1);
+    expect(first.messages).toEqual([]);
+    expect(streamProbe.messages.at(-1)).not.toContain('<history-availability');
+    const session = await sessions.getSessionForUser(TEST_UID, actor === 'agent'
+      ? state.buildGmemberSessionId(cid, AGENT_ID) : state.buildGconvSessionId(cid));
+    session.replaceConversationHistory(first.messages, first.source, { checkpoint: first.checkpoint });
+    session.beginUserTurn([{ type: 'text', text: 'HISTORY_FIRST_REQUEST' }]);
+    session.addAssistantMessage([{ type: 'text', text: 'prior reply' }]);
+    session.completeActiveTurn();
+    const retainedLength = session.length;
+
+    // Force a full rebuild by replacing the canonical file, as sync does.
+    const file = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    fs.copyFileSync(file, `${file}.replacement`);
+    fs.renameSync(`${file}.replacement`, file);
+    const originalRead = storage.readJsonl;
+    const readFault = vi.spyOn(storage, 'readJsonl').mockImplementation(async (target, limit) => {
+      if (target !== file || limit !== 0) return originalRead(target, limit);
+      if (fault === 'read-error') throw new Error('EACCES private-history-path');
+      if (fault === 'missing-file') {
+        fs.renameSync(file, `${file}.unavailable`);
+        try { return await originalRead(target, limit); }
+        finally { fs.renameSync(`${file}.unavailable`, file); }
+      }
+      // A partial sync omitted this trigger, but includes another user's later record.
+      return [{ id: 'future', from: 'user', to: ['commander'], text: 'FUTURE_MUST_NOT_REPLAY' }];
+    });
+    try { await send('HISTORY_FAILURE_REQUEST'); }
+    finally { readFault.mockRestore(); }
+    expect(streamProbe.conversationHistories.at(-1)).toBeUndefined();
+    expect(streamProbe.messages.at(-1)).toContain('<history-availability');
+    expect(streamProbe.messages.at(-1)).toContain('not evidence of empty history');
+    expect(streamProbe.messages.at(-1)).not.toContain('FUTURE_MUST_NOT_REPLAY');
+    expect(streamProbe.messages.at(-1)).not.toContain('private-history-path');
+    expect(session.getConversationHistoryCheckpoint(first.source)).toBe(first.checkpoint);
+    expect(session.length).toBe(retainedLength);
+    const warning = loggerMocks.warn.mock.calls.find(([message]) => message === 'conversation history build failed');
+    expect(warning).toBeDefined();
+    expect(JSON.stringify(warning)).not.toContain('private-history-path');
+    expect(JSON.stringify(warning)).not.toContain(cid);
+
+    await send('HISTORY_RECOVERED_REQUEST');
+    const recovered = streamProbe.conversationHistories.at(-1);
+    expect(JSON.stringify(recovered.messages)).toContain('HISTORY_FIRST_REQUEST');
+    expect(JSON.stringify(recovered.messages)).toContain('HISTORY_FAILURE_REQUEST');
+    expect(JSON.stringify(recovered.messages)).not.toContain('HISTORY_RECOVERED_REQUEST');
+    expect(streamProbe.messages.at(-1)).not.toContain('<history-availability');
+    expect(streamProbe.messages).toHaveLength(3);
   });
 
   it('uses the persisted Commander checkpoint to read and replace only the new history tail', async () => {
@@ -4778,7 +4893,8 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     });
   });
 
-  it('logs canonical CLI history failures without exposing private paths or actor ids', async () => {
+  it.each(['read-error', 'missing-boundary'])(
+    'rejects canonical CLI history %s without dispatch or cursor mutation', async (fault) => {
     const paths = await import('../../../../src/main/paths');
     const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
     const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
@@ -4791,6 +4907,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     await sessions.setSessionId(TEST_UID, cid, AGENT_ID, 'codex', 'thread-private-log', {
       permissionPolicy: 'inherit',
     });
+    const originalBinding = await sessions.getBinding(TEST_UID, cid, AGENT_ID, 'codex');
     const storage = await import('../../../../src/main/storage');
     // The CLI turn reads the canonical log through the bounded tail pager.
     const originalReadJsonlPage = storage.readJsonlPage.bind(storage);
@@ -4801,7 +4918,10 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       limit?: number,
       before?: number | null,
     ) => {
-      if (path.resolve(filePath) === path.resolve(mainFile)) throw new Error(privateFailure);
+      if (path.resolve(filePath) === path.resolve(mainFile)) {
+        if (fault === 'read-error') throw new Error(privateFailure);
+        return { records: [{ id: 'later', from: 'user', text: 'FUTURE_CLI_RECORD' }], nextCursor: null };
+      }
       return originalReadJsonlPage(filePath, limit, before);
     });
 
@@ -4824,7 +4944,8 @@ describe('group_chat bus › enqueue routing + persistence', () => {
         error: expect.objectContaining({
           name: 'Error',
           message_hash: expect.any(String),
-          message_chars: privateFailure.length,
+          message_chars: fault === 'read-error' ? privateFailure.length
+            : 'Canonical conversation history turn boundary is unavailable.'.length,
         }),
       }),
     );
@@ -4834,6 +4955,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(JSON.stringify(canonicalLog)).not.toContain(privateFailure);
     expect(JSON.stringify(canonicalLog)).not.toContain(cid);
     expect(JSON.stringify(canonicalLog)).not.toContain(AGENT_ID);
+    expect(await sessions.getBinding(TEST_UID, cid, AGENT_ID, 'codex')).toEqual(originalBinding);
   });
 
   it('lets a matching Codex thread reuse durable instructions without resending an override', async () => {

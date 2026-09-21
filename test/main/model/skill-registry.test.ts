@@ -5,6 +5,12 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { SKILL_ROSTER_MAX_TOKENS } from '../../../src/main/util/skill-description-policy';
 
+// These registry cases own filesystem fixtures, not asynchronous log delivery.
+// Keep the logger worker from recreating their root during teardown.
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+}));
+
 // skill-registry.ts wraps core-agent's SkillLoader. To test allowlist
 // filtering without pulling in the real core-agent import, we write fake
 // SKILL.md files under the new skills layout and let the real SkillLoader

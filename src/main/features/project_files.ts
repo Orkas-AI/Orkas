@@ -7,6 +7,7 @@
  * file tools get read-only access to this directory.
  */
 
+import { readTextPreview } from '../util/text-preview';
 import { fileFailureKind, type FileFailureKind } from '../util/app-error';
 import * as fs from 'node:fs';
 import { isUtf8 } from 'node:buffer';
@@ -39,7 +40,7 @@ import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 const log = createLogger('project_files');
 
 const TEXT_EXTS: ReadonlySet<string> = new Set([
-  '.md', '.markdown', '.txt', '.csv', '.tsv',
+  '.md', '.markdown', '.txt', '.csv', '.tsv', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt',
   '.json', '.yaml', '.yml', '.log',
   '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
   '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
@@ -835,13 +836,20 @@ export async function readProjectTextFile(
   userId: string,
   projectId: string,
   name: string,
-): Promise<Result<{ content: string; name: string }>> {
+  preview = false,
+): Promise<Result<{ content: string; name: string; truncated?: boolean }>> {
   const r = await resolveProjectFileAbsPath(userId, projectId, name);
   if (!r.ok) return { ok: false, error: (r as { error?: string }).error || 'not_found' };
   if (r.kind !== 'text') return { ok: false, error: 'binary file cannot be read as text' };
   let st: fs.Stats;
   try { st = fs.statSync(r.absPath); }
   catch { return { ok: false, error: 'not_found' }; }
+  if (preview && /\.(csv|tsv)$/i.test(name)) {
+    try {
+      const result = readTextPreview(r.absPath);
+      return { ok: true, content: result.text, name, truncated: result.truncated };
+    } catch (err) { return { ok: false, error: (err as Error).message }; }
+  }
   if (st.size > MAX_BYTES_TEXT) {
     return { ok: false, error: t('errors.file_too_large_mb', { mb: Math.round(MAX_BYTES_TEXT / 1024 / 1024) }) };
   }

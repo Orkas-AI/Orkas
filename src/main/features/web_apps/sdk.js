@@ -2,14 +2,15 @@
 (function () {
   'use strict';
   const pending = new Map();
+  let hostConnected = false;
+  const documentId = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
   let nextId = 0;
   function fail(code, message) { return Object.assign(new Error(message || code), { code }); }
   function call(method, args, options) {
     const opts = options || {};
     if (window.parent === window) return Promise.reject(fail('E_HOST_UNAVAILABLE'));
     if (opts.signal && opts.signal.aborted) return Promise.reject(fail('E_CANCELLED'));
-    if (pending.size >= 4) return Promise.reject(fail('E_LIMIT'));
-    const id = 'q' + (++nextId);
+    const id = 'd' + documentId + 'q' + (++nextId);
     return new Promise((resolve, reject) => {
       const cancel = () => {
         parent.postMessage({ __orkasApp: 1, type: 'cancel', id }, '*');
@@ -21,7 +22,7 @@
         if (opts.signal) opts.signal.removeEventListener('abort', cancel);
         if (ok) resolve(value); else reject(fail(value.code || 'E_FAILED', value.message));
       };
-      const timer = setTimeout(() => {
+      const timer = hostConnected ? undefined : setTimeout(() => {
         parent.postMessage({ __orkasApp: 1, type: 'cancel', id }, '*');
         finish(false, { code: 'E_HOST_UNAVAILABLE' });
       }, 10000);
@@ -34,12 +35,12 @@
   window.addEventListener('message', event => {
     if (event.source !== parent || !event.data || event.data.__orkasApp !== 1) return;
     const d = event.data; const p = pending.get(d.id); if (!p) return;
+    if (!hostConnected && ['ack', 'progress', 'result'].includes(d.type)) {
+      hostConnected = true;
+      for (const request of pending.values()) clearTimeout(request.timer);
+    }
     if (d.type === 'ack') {
       clearTimeout(p.timer);
-      p.timer = setTimeout(() => {
-        parent.postMessage({ __orkasApp: 1, type: 'cancel', id: d.id }, '*');
-        p.finish(false, { code: 'E_CANCELLED' });
-      }, 310000);
     } else if (d.type === 'progress') {
       if (typeof p.progress === 'function') { try { p.progress(d.value); } catch (_) {} }
     } else if (d.type === 'result') p.finish(d.ok, d.value);

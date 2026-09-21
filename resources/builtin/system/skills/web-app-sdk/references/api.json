@@ -23,8 +23,7 @@
         "properties": {
           "method": {
             "type": "string",
-            "minLength": 1,
-            "maxLength": 128
+            "minLength": 1
           }
         },
         "required": [
@@ -73,8 +72,7 @@
         "properties": {
           "key": {
             "type": "string",
-            "minLength": 1,
-            "maxLength": 128
+            "minLength": 1
           },
           "scope": {
             "type": "string",
@@ -99,14 +97,13 @@
     {
       "name": "storage.set",
       "capability": "storage",
-      "description": "Atomically save an app-private JSON value; total store limit 1 MiB.",
+      "description": "Atomically save an app-private JSON value; total store limit 200 MiB.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "key": {
             "type": "string",
-            "minLength": 1,
-            "maxLength": 128
+            "minLength": 1
           },
           "scope": {
             "type": "string",
@@ -140,8 +137,7 @@
         "properties": {
           "key": {
             "type": "string",
-            "minLength": 1,
-            "maxLength": 128
+            "minLength": 1
           },
           "scope": {
             "type": "string",
@@ -166,7 +162,7 @@
     {
       "name": "storage.keys",
       "capability": "storage",
-      "description": "List up to 256 keys in the selected app store.",
+      "description": "List keys in the selected app store.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -188,7 +184,7 @@
     {
       "name": "appFiles.list",
       "capability": "appFiles",
-      "description": "List sandbox files recursively. cloud (default) syncs with the account; local is for caches. At most 256 files and 16 MiB per scope.",
+      "description": "List sandbox files recursively. cloud (default) syncs with the account; local is for caches.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -212,15 +208,14 @@
     {
       "name": "appFiles.readText",
       "capability": "appFiles",
-      "description": "Read a sandbox UTF-8 file up to 512 KiB; missing files return null.",
+      "description": "Read a sandbox UTF-8 file up to 200 MiB; missing files return null.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "path": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 240,
-            "description": "Relative path, at most 8 segments. No atomic temporary filenames, hidden/traversal segments, backslashes, Windows reserved names, trailing dots/spaces, visibility, Thumbs.db or desktop.ini."
+            "description": "Relative path. No atomic temporary filenames, hidden/traversal segments, backslashes, Windows reserved names, trailing dots/spaces, visibility, Thumbs.db or desktop.ini."
           },
           "scope": {
             "type": "string",
@@ -245,15 +240,14 @@
     {
       "name": "appFiles.readBase64",
       "capability": "appFiles",
-      "description": "Read a sandbox binary file up to 512 KiB; missing files return null.",
+      "description": "Read a sandbox binary file up to 200 MiB; missing files return null.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "path": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 240,
-            "description": "Relative path, at most 8 segments. No atomic temporary filenames, hidden/traversal segments, backslashes, Windows reserved names, trailing dots/spaces, visibility, Thumbs.db or desktop.ini."
+            "description": "Relative path. No atomic temporary filenames, hidden/traversal segments, backslashes, Windows reserved names, trailing dots/spaces, visibility, Thumbs.db or desktop.ini."
           },
           "scope": {
             "type": "string",
@@ -278,15 +272,14 @@
     {
       "name": "appFiles.writeText",
       "capability": "appFiles",
-      "description": "Atomically replace an app-owned UTF-8 file (512 KiB). Creates parent directories. Saved means local persistence, not completed upload.",
+      "description": "Atomically replace an app-owned UTF-8 file (200 MiB). Creates parent directories. Saved means local persistence, not completed upload.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "path": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 240,
-            "description": "Relative path, at most 8 segments. No atomic temporary filenames, hidden/traversal segments, backslashes, Windows reserved names, trailing dots/spaces, visibility, Thumbs.db or desktop.ini."
+            "description": "Relative path. No atomic temporary filenames, hidden/traversal segments, backslashes, Windows reserved names, trailing dots/spaces, visibility, Thumbs.db or desktop.ini."
           },
           "scope": {
             "type": "string",
@@ -298,7 +291,7 @@
           },
           "text": {
             "type": "string",
-            "maxLength": 524288
+            "maxLength": 209715200
           }
         },
         "required": [
@@ -317,15 +310,14 @@
     {
       "name": "appFiles.writeBase64",
       "capability": "appFiles",
-      "description": "Atomically replace an app-owned binary file (512 KiB). Requires canonical base64.",
+      "description": "Atomically replace an app-owned binary file (200 MiB). Requires canonical base64.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "path": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 240,
-            "description": "Relative path, at most 8 segments. No atomic temporary filenames, hidden/traversal segments, backslashes, Windows reserved names, trailing dots/spaces, visibility, Thumbs.db or desktop.ini."
+            "description": "Relative path. No atomic temporary filenames, hidden/traversal segments, backslashes, Windows reserved names, trailing dots/spaces, visibility, Thumbs.db or desktop.ini."
           },
           "scope": {
             "type": "string",
@@ -337,7 +329,7 @@
           },
           "base64": {
             "type": "string",
-            "maxLength": 700000
+            "maxLength": 279620268
           }
         },
         "required": [
@@ -363,8 +355,7 @@
           "path": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 240,
-            "description": "Relative path, at most 8 segments. No atomic temporary filenames, hidden/traversal segments, backslashes, Windows reserved names, trailing dots/spaces, visibility, Thumbs.db or desktop.ini."
+            "description": "Relative path. No atomic temporary filenames, hidden/traversal segments, backslashes, Windows reserved names, trailing dots/spaces, visibility, Thumbs.db or desktop.ini."
           },
           "scope": {
             "type": "string",
@@ -402,7 +393,7 @@
     {
       "name": "files.readText",
       "capability": "files",
-      "description": "Read a selected UTF-8 file, at most 512 KiB.",
+      "description": "Read a selected UTF-8 file, at most 200 MiB.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -425,7 +416,7 @@
     {
       "name": "files.readBase64",
       "capability": "files",
-      "description": "Read a selected file as base64, at most 512 KiB.",
+      "description": "Read a selected file as base64, at most 200 MiB.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -455,12 +446,11 @@
           "name": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 120,
             "pattern": "^[^/\\\\\\x00-\\x1f]+$"
           },
           "text": {
             "type": "string",
-            "maxLength": 524288
+            "maxLength": 209715200
           }
         },
         "required": [
@@ -508,14 +498,13 @@
         "properties": {
           "prompt": {
             "type": "string",
-            "minLength": 1,
-            "maxLength": 32000
+            "minLength": 1
           },
           "maxTokens": {
             "type": "integer",
-            "minimum": 1,
-            "maximum": 4096,
-            "default": 1024
+            "exclusiveMinimum": 0,
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
           }
         },
         "required": [
@@ -552,8 +541,7 @@
         "properties": {
           "name": {
             "type": "string",
-            "minLength": 1,
-            "maxLength": 128
+            "minLength": 1
           },
           "arguments": {
             "type": "object",
@@ -610,10 +598,6 @@
     {
       "capability": "media.generate",
       "reason": "Deferred: owning studio plan, output and spending gates must be adapted first."
-    },
-    {
-      "capability": "network",
-      "reason": "Deferred: private app data must not reach arbitrary remote endpoints; bundled resources only."
     }
   ]
 }

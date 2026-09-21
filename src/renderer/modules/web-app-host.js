@@ -6,7 +6,7 @@
   function release(frame) {
     opening.delete(frame);
     const b = bindings.get(frame); if (!b) return;
-    bindings.delete(frame); frame.removeEventListener('load', b.onLoad);
+    bindings.delete(frame);
     for (const stream of b.streams.values()) stream.cancel();
     window.orkas.invoke('webApps.close', { token: b.token }).catch(() => {});
   }
@@ -15,13 +15,8 @@
     frame._orkasUsesSdk = !!info.token;
     if (!info.token) { frame.src = info.url; return; }
     const parsed = new URL(info.url);
-    const b = { token: info.token, origin: parsed.protocol + '//' + parsed.host, streams: new Map(), loaded: false, onLoad: null };
-    b.onLoad = () => {
-      if (b.loaded) release(frame); // A second document never inherits authority.
-      else b.loaded = true;
-    };
+    const b = { token: info.token, origin: parsed.protocol + '//' + parsed.host, streams: new Map() };
     bindings.set(frame, b);
-    frame.addEventListener('load', b.onLoad);
     frame.src = info.url;
   }
   async function open(frame, source) {
@@ -59,12 +54,9 @@
       return;
     }
     if (d.type !== 'call' || typeof d.method !== 'string') return;
-    if (b.streams.has(d.id) || b.streams.size >= 4) {
+    if (b.streams.has(d.id)) {
       reply('result', { ok: false, value: { code: 'E_LIMIT' } }); return;
     }
-    let bytes;
-    try { bytes = new TextEncoder().encode(JSON.stringify(d.args)).length; } catch (_) { bytes = Infinity; }
-    if (bytes > 1024 * 1024) { reply('result', { ok: false, value: { code: 'E_LIMIT' } }); return; }
     reply('ack', {});
     let terminal = false;
     const stream = window.orkas.stream('webApps.call', { token: b.token, requestId: d.id, method: d.method, args: d.args }, ev => {

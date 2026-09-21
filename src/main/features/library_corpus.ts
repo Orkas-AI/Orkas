@@ -111,7 +111,7 @@ const RECONCILE_FILE_CONCURRENCY = 4;
 const MAX_PATH_SEGMENT_LEN = 200;
 
 const TEXT_EXTS: ReadonlySet<string> = new Set([
-  '.md', '.markdown', '.txt', '.csv', '.tsv',
+  '.md', '.markdown', '.txt', '.csv', '.tsv', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt',
   '.json', '.yaml', '.yml', '.log',
   '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
   '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',

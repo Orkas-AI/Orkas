@@ -13,6 +13,29 @@ export interface ProviderRequestFailure {
   contextWindow?: number;
   outputLimit?: number;
   budgetObserved?: boolean;
+  contextBudget?: Record<string, number | string>;
+}
+
+/** Existing runner observations, never a second scan of request content. */
+export type FailureContextBudget = Record<string, number | string>;
+const BUDGET_NUMBERS = ['budget_context_window', 'output_reservation', 'usable_input_tokens',
+  'input_ceiling_tokens', 'estimated_input_tokens', 'emergency_before_tokens', 'emergency_after_tokens',
+  'compaction_before_tokens', 'compaction_after_tokens', 'compaction_attempts', 'compaction_failures'];
+
+function safeContextBudget(value: unknown): FailureContextBudget | undefined {
+  if (!value || typeof value !== 'object') return;
+  const raw = value as Record<string, unknown>;
+  if (raw.version !== 1) return;
+  const out: FailureContextBudget = { version: 1 };
+  for (const key of BUDGET_NUMBERS) {
+    const v = raw[key];
+    if (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0) out[key] = Math.min(1_000_000_000, v);
+  }
+  for (const [key, values] of Object.entries({
+    estimate_source: ['estimated', 'anchored'], window_source: ['catalog', 'fallback'],
+    emergency_result: ['not_needed', 'applied', 'nothing_to_drop'],
+  })) if (typeof raw[key] === 'string' && values.includes(raw[key] as string)) out[key] = raw[key] as string;
+  return out;
 }
 
 export type ProviderFailureSource = 'unknown' | 'payload' | 'transport' | 'http' | 'sdk_error' | 'exception';
@@ -51,6 +74,7 @@ export function createRequestDiagnostics(
   signal?: AbortSignal,
   onFailure?: (failure: ProviderRequestFailure) => void,
   requestRef?: unknown,
+  contextBudget?: unknown,
 ) {
   const started = performance.now();
   const requestSequence = onFailure ? Math.min(1_000_000_000, (requestSequences.get(onFailure) ?? 0) + 1) : undefined;
@@ -131,6 +155,10 @@ export function createRequestDiagnostics(
         elapsedMs: Math.min(1_000_000_000, Math.max(0, Math.round(performance.now() - started))),
         aborted: aborted || signal?.aborted === true,
       };
+      // Only a failed request copies/sanitizes this small metadata record.
+      if (!failure.aborted) {
+        try { failure.contextBudget = safeContextBudget(contextBudget); } catch { /* Best effort. */ }
+      }
       try { if (onFailure) { onFailure({ ...failure }); observed = true; } } catch { /* Best-effort observer. */ }
       return failure;
     },

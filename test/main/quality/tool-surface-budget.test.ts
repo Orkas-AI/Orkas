@@ -69,6 +69,7 @@ const BUILTIN_AGENT_INITIAL_SURFACE_BUDGETS: Readonly<Record<
   ProductDeveloper: { tools: 25, tokens: 8_800 },
   UIDesigner: { tools: 25, tokens: 8_800 },
   SeoGeoAgent: { tools: 24, tokens: 8_500 },
+  StockAnalyser: { tools: 22, tokens: 7_300 },
 });
 
 describe('injected tool surface budget', () => {

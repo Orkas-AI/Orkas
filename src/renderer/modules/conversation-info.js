@@ -40,7 +40,7 @@ const ConversationInfo = (() => {
     attachments: [],
   };
   const _CI_TEXT_EXTS = new Set([
-    'md', 'markdown', 'txt', 'csv', 'tsv', 'json', 'yaml', 'yml', 'log',
+    'md', 'markdown', 'txt', 'csv', 'tsv', 'jsonl', 'ndjson', 'rst', 'tex', 'srt', 'vtt', 'json', 'yaml', 'yml', 'log',
     'html', 'htm', 'xml', 'toml', 'ini', 'conf',
     'py', 'pyi', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs',
     'sh', 'bash', 'zsh', 'ps1', 'cmd', 'bat', 'rb', 'go', 'rs', 'java', 'kt',

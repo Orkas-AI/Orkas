@@ -32,7 +32,7 @@ async function holdFirstHtmlResponse(app: ElectronApplication, html: string) {
   return () => app.evaluate(() => (globalThis as any).__htmlResponseGate.release());
 }
 
-test.describe('local HTML offline preview', () => {
+test.describe('local HTML preview', () => {
   test('audits filter panels after a dense graphic and retains missing effects as inconclusive', async ({ orkas }) => {
     const modulePath = path.resolve(__dirname, '../../src/main/features/html_preview.ts');
     for (const working of [true, false]) {
@@ -164,146 +164,27 @@ test.describe('local HTML offline preview', () => {
     }
   });
 
-  test('runs self-contained code while blocking remote code, assets, connections, and navigation', async ({
-    appPage,
-    orkas,
-  }) => {
-    const requests: string[] = [];
-    const server = createServer((request, response) => {
-      requests.push(request.url || '/');
-      if (request.url?.startsWith('/external.js')) {
-        response.writeHead(200, { 'Content-Type': 'text/javascript' });
-        response.end('window.__offlinePreviewEvidence.externalScriptRan = true;');
-        return;
-      }
-      if (request.url?.startsWith('/pixel.png')) {
-        response.writeHead(200, { 'Content-Type': 'image/png' });
-        response.end(PNG_1X1);
-        return;
-      }
-      if (request.url?.startsWith('/external.css')) {
-        response.writeHead(200, { 'Content-Type': 'text/css' });
-        response.end('#inline-result { color: rgb(1, 2, 3); }');
-        return;
-      }
-      response.writeHead(200, { 'Content-Type': 'text/html' });
-      response.end('<!doctype html><title>remote</title>');
+  test('loads remote code, styles and APIs while keeping the host isolated', async ({ appPage, orkas }) => {
+    const requests:string[]=[];
+    const server=createServer((req,res)=>{
+      requests.push(req.url || '/');res.setHeader('Access-Control-Allow-Origin','*');
+      if(req.url==='/app.js'){res.setHeader('Content-Type','text/javascript');res.end('document.querySelector("output").textContent="remote loaded";');}
+      else if(req.url==='/app.css'){res.setHeader('Content-Type','text/css');res.end('output{color:rgb(1,2,3)}');}
+      else if(req.url==='/api'){res.setHeader('Content-Type','application/json');res.end('{"value":42}');}
+      else {res.setHeader('Content-Type','text/html');res.end('<h1>External page</h1>');}
     });
-
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(0, '127.0.0.1', () => resolve());
-    });
-
+    await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
     try {
-      const address = server.address() as AddressInfo;
-      const remoteBase = `http://127.0.0.1:${address.port}`;
-      const localImagePath = path.join(orkas.userWorkspaceRoot, 'offline-preview-local.png');
-      const htmlPath = path.join(orkas.userWorkspaceRoot, 'offline-preview.html');
-      const localImageUrl = chatMediaLocalUrl(localImagePath);
-
-      writeFileSync(localImagePath, PNG_1X1);
-      writeFileSync(htmlPath, `<!doctype html>
-<html>
-<body>
-  <script>
-    window.__offlinePreviewEvidence = {
-      inlineRan: false,
-      dataImageLoaded: false,
-      localImageLoaded: false,
-      externalScriptRan: false,
-      fetchRejected: false,
-      navigationAttempted: false,
-      violations: [],
-    };
-    document.addEventListener('securitypolicyviolation', (event) => {
-      window.__offlinePreviewEvidence.violations.push(event.effectiveDirective);
-    });
-  </script>
-  <link rel="stylesheet" href="${remoteBase}/external.css?private=value">
-  <link rel="preload" as="font" href="${remoteBase}/external.woff2?private=value">
-  <div id="inline-result">pending</div>
-  <img id="data-image"
-       src="data:image/png;base64,${PNG_1X1.toString('base64')}"
-       onload="window.__offlinePreviewEvidence.dataImageLoaded = true">
-  <img id="local-image"
-       src="${localImageUrl}"
-       onload="window.__offlinePreviewEvidence.localImageLoaded = true">
-  <script>
-    window.__offlinePreviewEvidence.inlineRan = true;
-    document.getElementById('inline-result').textContent = 'inline-ok';
-    fetch('${remoteBase}/connect?private=value').catch(() => {
-      window.__offlinePreviewEvidence.fetchRejected = true;
-    });
-    const xhr = new XMLHttpRequest();
-    xhr.open('GET', '${remoteBase}/xhr?private=value');
-    xhr.send();
-    try {
-      new WebSocket('${remoteBase.replace('http:', 'ws:')}/socket?private=value');
-    } catch {}
-    navigator.sendBeacon('${remoteBase}/beacon?private=value', 'private=value');
-    setTimeout(() => {
-      window.__offlinePreviewEvidence.navigationAttempted = true;
-      window.location.href = '${remoteBase}/navigate?private=value';
-    }, 100);
-  </script>
-  <script src="${remoteBase}/external.js?private=value"></script>
-  <img src="${remoteBase}/pixel.png?private=value">
-  <video autoplay src="${remoteBase}/external.mp4?private=value"></video>
-  <iframe src="${remoteBase}/nested?private=value"></iframe>
-</body>
-</html>`);
-
-      const preview = await orkas.openPreview(() => appPage.evaluate((pathValue) => {
-        void (window as any).openChatFileViewer(pathValue, 'offline-preview.html');
-      }, htmlPath));
-
-      const previewElement = preview.locator('.chat-file-viewer-html');
-      await expect(previewElement).toBeVisible();
-      const previewSrc = await previewElement.getAttribute('src');
-      await expect.poll(() => preview.frames().some((frame) => frame.url() === previewSrc)).toBe(true);
-      const previewFrame = preview.frames().find((frame) => frame.url() === previewSrc);
-      if (!previewFrame) throw new Error('Local HTML preview frame did not load');
-
-      await expect.poll(async () => previewFrame.evaluate(() => {
-        const evidence = (window as any).__offlinePreviewEvidence;
-        return evidence ? {
-          inlineRan: evidence.inlineRan,
-          dataImageLoaded: evidence.dataImageLoaded,
-          localImageLoaded: evidence.localImageLoaded,
-          externalScriptRan: evidence.externalScriptRan,
-          fetchRejected: evidence.fetchRejected,
-          navigationAttempted: evidence.navigationAttempted,
-          violations: Array.from(new Set(evidence.violations)).sort(),
-          inlineText: document.getElementById('inline-result')?.textContent || '',
-        } : null;
-      })).toMatchObject({
-        inlineRan: true,
-        dataImageLoaded: true,
-        localImageLoaded: true,
-        externalScriptRan: false,
-        fetchRejected: true,
-        navigationAttempted: true,
-        inlineText: 'inline-ok',
-      });
-
-      const evidence = await previewFrame.evaluate(() => (window as any).__offlinePreviewEvidence);
-      expect(evidence.violations).toEqual(expect.arrayContaining([
-        'connect-src',
-        'font-src',
-        'frame-src',
-        'img-src',
-        'media-src',
-        'script-src-elem',
-        'style-src-elem',
-      ]));
-      expect(previewFrame.url()).toMatch(/^chat-media:\/\/local\//);
-      expect(requests).toEqual([]);
-    } finally {
-      if ('closeAllConnections' in server && typeof server.closeAllConnections === 'function') {
-        server.closeAllConnections();
-      }
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    }
+      const base=`http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      const entry=orkas.createWorkspaceFile('online-preview.html',`<!doctype html><link rel="stylesheet" href="${base}/app.css"><output></output><script src="${base}/app.js"></script><a href="${base}/page">Open page</a>`);
+      const preview=await orkas.openPreview(()=>appPage.evaluate(p=>{void (window as any).openChatFileViewer(p,'online-preview.html');},entry));
+      const frame=preview.locator('.chat-file-viewer-html').contentFrame();
+      await expect(frame.locator('output')).toHaveText('remote loaded');
+      await expect(frame.locator('output')).toHaveCSS('color','rgb(1, 2, 3)');
+      expect(await frame.locator('body').evaluate(async(_node,base)=>({api:await (await fetch(base+'/api')).json(),node:typeof (window as any).require,ipc:typeof (window as any).orkas}),base)).toEqual({api:{value:42},node:'undefined',ipc:'undefined'});
+      await frame.getByRole('link',{name:'Open page'}).click();
+      await expect(frame.getByRole('heading')).toHaveText('External page');
+      expect(requests).toEqual(expect.arrayContaining(['/app.js','/app.css','/api','/page']));
+    }finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}
   });
 });

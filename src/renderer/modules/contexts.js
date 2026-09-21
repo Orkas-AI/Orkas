@@ -1556,7 +1556,7 @@ function _ctxListChildren(dirPath) {
 // ── Upload ──
 
 const CTX_ALLOWED_EXTS = [
-  '.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log',
+  '.md', '.markdown', '.txt', '.csv', '.tsv', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt', '.json', '.yaml', '.yml', '.log',
   '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
   '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
   '.sh', '.bash', '.zsh', '.ps1', '.cmd', '.bat', '.rb', '.go', '.rs', '.java', '.kt',
@@ -1876,7 +1876,7 @@ async function handleCtxNativeUpload(targetDir = '') {
 //                         delete + "open in system" actions for consistency.
 
 const CTX_TEXT_EXTS = new Set([
-  '.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log',
+  '.md', '.markdown', '.txt', '.csv', '.tsv', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt', '.json', '.yaml', '.yml', '.log',
   '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
   '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
   '.sh', '.bash', '.zsh', '.ps1', '.cmd', '.bat', '.rb', '.go', '.rs', '.java', '.kt',
@@ -1924,11 +1924,11 @@ async function openCtxFile(rel) {
   const kind = _kindOfPath(rel);
   try {
     if (kind === 'text') {
-      const res = await _ctxFetch(`/api/contexts/read?path=${encodeURIComponent(rel)}`);
+      const res = await _ctxFetch(`/api/contexts/read?path=${encodeURIComponent(rel)}&preview=true`);
       const data = await res.json();
       if (seq !== _ctxOpenSeq) return;
       if (!data.ok) { await uiAlert(t('contexts.read_failed')); return; }
-      _showCtxTextViewer(rel, data.content || '');
+      _showCtxTextViewer(rel, data.content || '', data.truncated === true);
     } else if (kind === 'image') {
       const res = await _ctxFetch(`/api/contexts/image?path=${encodeURIComponent(rel)}`);
       const data = await res.json();
@@ -2096,7 +2096,7 @@ function _ctxClearDraft(path) {
   if (key) _ctxDrafts.delete(key);
 }
 
-function _showCtxTextViewer(rel, content) {
+function _showCtxTextViewer(rel, content, partial = false) {
   const els = _prepCtxViewerShell(rel);
   if (!els) return;
   const drafts = _ctxDrafts;
@@ -2107,6 +2107,9 @@ function _showCtxTextViewer(rel, content) {
     return (source?.kind === 'project-file' ? source.name : source?.rel) || rel;
   };
   controller = mountMdViewEdit({
+    plainText: !/\.(md|markdown)$/i.test(rel),
+    partial,
+    ...(partial ? { capabilities: { edit: false, save: false, taskCheckbox: false } } : {}),
     bodyEl: els.bodyEl,
     actionsEl: els.actionsEl,
     source: _ctxProjectId
@@ -2116,7 +2119,7 @@ function _showCtxTextViewer(rel, content) {
     initialContent: content,
     // Restore in-progress edits if the user was previously typing in this
     // file. mountMdViewEdit forces edit mode when `initialDraft` is present.
-    initialDraft: drafts.get(rel) || null,
+    initialDraft: partial ? null : drafts.get(rel) || null,
     callbacks: {
       // Mirror draft state into the per-file Map so it survives switching
       // to another file in the tree and back.

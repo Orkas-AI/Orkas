@@ -1,5 +1,6 @@
 import { completedRepeatKey } from "./repeat-evidence.js";
 import { fileFailureForLog } from "../tools/file-diagnostics.js";
+import { toolInputDiagnostic } from "../providers/tool-input-diagnostics.js";
 import { createHash, randomBytes } from "node:crypto";
 import type {
   Message,
@@ -617,6 +618,7 @@ function logTextRef(value: unknown): { text_hash: string; text_chars: number } {
 function toolFailureForLog(call: ToolUseCall, result: ToolResult, sessionId?: string, correlation?: { runner_ref: string; batch_sequence: number; execution_mode: "single" | "parallel" | "programmatic" }): Record<string, unknown> {
   const execution = result.observations?.execution;
   const fileFailure = fileFailureForLog(result.observations?.fileFailure);
+  const inputDiagnostic = toolInputDiagnostic(call.input);
   const count = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? value : undefined;
   const flag = (value: unknown) => typeof value === "boolean" ? value : undefined;
@@ -624,6 +626,7 @@ function toolFailureForLog(call: ToolUseCall, result: ToolResult, sessionId?: st
     tool: call.name,
     ...correlation,
     ...(fileFailure ? { file_failure: fileFailure } : {}),
+    ...(inputDiagnostic ? { input_parse: inputDiagnostic } : {}),
     ...(sessionId ? { session_hash: logTextRef(sessionId).text_hash } : {}),
     call_hash: logTextRef(call.id).text_hash,
     input_digest: stableToolInputDigest(call),
@@ -850,7 +853,7 @@ function requestMetadataForModelCall(
     planStepCount: number;
     noProgressRounds: number;
   },
-): Record<string, unknown> | undefined {
+): Record<string, unknown> {
   const metadata: Record<string, unknown> = {
     ...(base || {}),
     // The main agent turn gets its output limit from the model catalog (or the
@@ -1864,6 +1867,16 @@ export class AgentRunner {
           servedModelId,
         );
         const callUsableInputTokens = this.resolveUsableInputTokens(modelId, servedModelId);
+        // In-memory scalar evidence only; the provider emits it on failure.
+        // Reuse compaction's existing estimates rather than rescan healthy requests.
+        const contextBudgetDiagnostics: Record<string, number | string> = {
+          version: 1,
+          budget_context_window: historyModel?.contextWindow ?? 200_000,
+          output_reservation: historyModel?.maxOutputTokens ?? 8_192,
+          usable_input_tokens: callUsableInputTokens,
+          input_ceiling_tokens: Math.floor(callUsableInputTokens * CONTEXT_COMPACTION_TRIGGER_RATIO),
+          window_source: historyModel?.contextWindow ? 'catalog' : 'fallback',
+        };
 
         const prepareContextStartedAt = Date.now();
         const progressContextEpoch = this.session.contentEpoch();
@@ -1881,6 +1894,7 @@ export class AgentRunner {
             {
               usableInputTokens: callUsableInputTokens,
               fixedOverheadTokens: estimateFixedOverheadTokens(systemPrompt, toolDefs, budgetEphemeral || undefined),
+              diagnostics: contextBudgetDiagnostics,
             },
           );
           // Layered compaction has had its turn. If the request is still over
@@ -1893,6 +1907,7 @@ export class AgentRunner {
             callUsableInputTokens,
             compactionControl,
             requestTokenAnchor,
+            contextBudgetDiagnostics,
           );
         } finally {
           if (this.session.contentEpoch() !== progressContextEpoch) resetProgressEvidence();
@@ -1909,6 +1924,9 @@ export class AgentRunner {
           planStepCount: this.session.getExecutionPlan()?.steps.length || 0,
           noProgressRounds: guards.consecutiveNoProgressRounds,
         });
+        contextBudgetDiagnostics.compaction_attempts = compactionControl.attempts;
+        contextBudgetDiagnostics.compaction_failures = compactionControl.failures;
+        modelRequestMetadata.contextBudgetDiagnostics = contextBudgetDiagnostics;
 
         // Consume the provider stream token-by-token so callers (UI) can
         // paint partial text as it arrives. We still assemble a full
@@ -3518,6 +3536,7 @@ export class AgentRunner {
     usableInputTokens: number,
     control: CompactionControl,
     anchor: RequestTokenAnchor | null = null,
+    diagnostics?: Record<string, number | string>,
   ): AsyncIterable<AgentRunEvent> {
     // Anchored to the previous call's real usage when the anchor is still
     // valid; a fold earlier in this prepare phase bumps the content epoch, so
@@ -3530,10 +3549,15 @@ export class AgentRunner {
       this.session.getEstimatorCalibration(),
     );
     const before = requestTokens();
+    if (diagnostics) Object.assign(diagnostics, {
+      emergency_before_tokens: before.tokens, emergency_after_tokens: before.tokens,
+      estimated_input_tokens: before.tokens, estimate_source: before.source, emergency_result: 'not_needed',
+    });
     if (before.tokens <= usableInputTokens * CONTEXT_COMPACTION_TRIGGER_RATIO) return;
 
     const { foldedGroups, archivedTurns } = this.applyDeterministicEmergencyFold();
     if (foldedGroups === 0 && archivedTurns === 0) {
+      if (diagnostics) diagnostics.emergency_result = 'nothing_to_drop';
       // Nothing left that this pass is allowed to drop: what remains is the
       // system prompt, tool schemas, the user message, injected ledgers and
       // prior summaries and the protected latest tool round. Report it and let
@@ -3554,6 +3578,10 @@ export class AgentRunner {
     }
 
     const after = requestTokens();
+    if (diagnostics) Object.assign(diagnostics, {
+      emergency_after_tokens: after.tokens, estimated_input_tokens: after.tokens,
+      estimate_source: after.source, emergency_result: 'applied',
+    });
     control.readCursor = this.session.workspaceObservationCursor();
     log.error("emergency context reduction applied", {
       sessionId: this.session.getSessionId(),
@@ -3669,7 +3697,7 @@ export class AgentRunner {
     signal?: AbortSignal,
     retryContext?: CompletionParams["retryContext"],
     budget: ContextBudget = DEFAULT_CONTEXT_BUDGET,
-    costContext?: { usableInputTokens: number; fixedOverheadTokens: number },
+    costContext?: { usableInputTokens: number; fixedOverheadTokens: number; diagnostics?: Record<string, number | string> },
   ): AsyncIterable<AgentRunEvent> {
     throwIfAborted(signal);
     const compactionControl = control ?? {
@@ -3710,6 +3738,7 @@ export class AgentRunner {
     if (activeCandidate && this.claimCompactionCandidate(compactionControl, activeFingerprint)) {
       const activeCompactionStartedAt = Date.now();
       const modelViewTokensBefore = this.session.estimateModelTokens();
+      if (costContext?.diagnostics) costContext.diagnostics.compaction_before_tokens = modelViewTokensBefore;
       const activeCostFields = costContext
         ? compactionCostFields(this.session, compactionControl, budget, costContext.usableInputTokens, costContext.fixedOverheadTokens)
         : {};
@@ -3783,6 +3812,7 @@ export class AgentRunner {
           budget.summaryHardTokens,
         );
         const appliedCheckpointTokens = estimateTextTokens(appliedSummary);
+        if (costContext?.diagnostics) costContext.diagnostics.compaction_after_tokens = tokensAfter;
         const durationMs = Math.max(0, Date.now() - activeCompactionStartedAt);
         compactionControl.consecutiveFailures = 0;
         compactionControl.readCursor = this.session.workspaceObservationCursor();

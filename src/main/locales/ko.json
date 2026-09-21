@@ -1,4 +1,7 @@
 {
+  "chat.skill_creation_correcting": "Skill 생성 내용을 한 번 수정하고 있습니다.",
+  "chat.skill_creation_corrected": "Skill을 수정하여 생성했습니다.",
+  "chat.skill_creation_correction_failed": "한 번 수정했지만 Skill을 생성하지 못했습니다.",
   "errors.reveal_invalid_path": "로컬 파일 또는 폴더의 전체 경로를 사용해 주세요.",
   "errors.reveal_unavailable": "파일 또는 폴더를 사용할 수 없습니다. 아직 존재하며 접근할 수 있는지 확인해 주세요.",
   "errors.reveal_failed": "폴더를 열 수 없습니다. 파일 관리자에서 열어 보세요.",

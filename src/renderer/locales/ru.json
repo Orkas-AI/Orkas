@@ -1,4 +1,8 @@
 {
+  "files.delimited.table": "Таблица",
+  "files.delimited.source": "Исходный текст",
+  "files.delimited.limited": "Предпросмотр ограничен. Откройте файл во внешнем приложении для просмотра всех данных.",
+  "files.delimited.invalid": "Незакрытые или некорректные поля в кавычках. Показан исходный текст.",
   "connectors.action_confirm.operation.external_or_financial_change": "Внешнее действие или финансовое изменение",
   "connectors.action_confirm.operation.destructive": "Удаление или необратимое действие",
   "connectors.action_confirm.operation.financial_record_change": "Изменение финансовой записи",

@@ -148,7 +148,8 @@ test.describe('scaffold child motion', () => {
         .replace('// ORKAS-SCENE-MOTION-BEGIN:blue',
           "tl.from('#scene-blue [data-role=visual]', {y:30, autoAlpha:.55, duration:.2, stagger:.05}, 2.1);");
       fs.writeFileSync(htmlPath, html);
-      const results: {time: number; path: string; opacity: number; visibility: string}[] = [];
+      const results: {time: number; path: string; opacity: number; visibility: string;
+        x: number; y: number; viewportWidth: number; viewportHeight: number}[] = [];
       for (const times of [[1.5], [0, .5, 1.5, 2.5, .5, 1.5]]) {
         const win = new BrowserWindow({ show:false, width:1920, height:1080, useContentSize:true,
           webPreferences: { offscreen:true, nodeIntegration:false, contextIsolation:true, sandbox:true } });
@@ -162,8 +163,11 @@ test.describe('scaffold child motion', () => {
             win.webContents.invalidate();
             await win.webContents.executeJavaScript('new Promise(r=>requestAnimationFrame(()=>setTimeout(()=>requestAnimationFrame(r),0)))');
             const state = await win.webContents.executeJavaScript(`(() => {
-              const style=getComputedStyle(document.querySelector('#scene-${['red','green','blue'][Math.floor(time)]} [data-role="visual"]'));
-              return {opacity:Number(style.opacity), visibility:style.visibility};
+              const node=document.querySelector('#scene-${['red','green','blue'][Math.floor(time)]} [data-role="visual"]');
+              const style=getComputedStyle(node), rect=node.getBoundingClientRect();
+              return {opacity:Number(style.opacity), visibility:style.visibility,
+                x:rect.left+rect.width/2, y:rect.top+rect.height/2,
+                viewportWidth:innerWidth, viewportHeight:innerHeight};
             })()`);
             const png = path.join(args.dir, `child-${results.length}.png`);
             fs.writeFileSync(png, (await win.webContents.capturePage()).toPNG());
@@ -179,7 +183,11 @@ test.describe('scaffold child motion', () => {
       const visible = sample.time !== .5;
       expect(sample.opacity, `child at ${sample.time}s`).toBe(visible ? 1 : 0);
       expect(sample.visibility === 'hidden').toBe(!visible);
-      const pixel = await sharp(sample.path).resize(1920, 1080).extract({left:900,top:500,width:1,height:1}).raw().toBuffer();
+      const image = sharp(sample.path);
+      const metadata = await image.metadata();
+      const left = Math.floor(sample.x * Number(metadata.width) / sample.viewportWidth);
+      const top = Math.floor(sample.y * Number(metadata.height) / sample.viewportHeight);
+      const pixel = await image.extract({left,top,width:1,height:1}).raw().toBuffer();
       const expected = visible ? [255,255,255] : [25,93,239];
       for (let c=0;c<3;c++) expect(Math.abs(pixel[c]-expected[c]), sample.path).toBeLessThan(8);
     }

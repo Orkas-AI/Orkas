@@ -1,4 +1,8 @@
 {
+  "files.delimited.table": "표",
+  "files.delimited.source": "원문",
+  "files.delimited.limited": "일부 미리보기만 표시됩니다. 전체 데이터는 외부 앱에서 파일을 열어 확인하세요.",
+  "files.delimited.invalid": "따옴표로 묶인 필드가 불완전하거나 유효하지 않아 원문을 표시합니다.",
   "connectors.action_confirm.operation.external_or_financial_change": "외부 동작 또는 재무 변경",
   "connectors.action_confirm.operation.destructive": "삭제 또는 되돌릴 수 없는 동작",
   "connectors.action_confirm.operation.financial_record_change": "재무 기록 변경",

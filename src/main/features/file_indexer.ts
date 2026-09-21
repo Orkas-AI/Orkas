@@ -84,8 +84,13 @@ export class UnsupportedFileKindError extends Error {
 }
 
 const TEXT_EXTS: ReadonlySet<string> = new Set([
-  '.md', '.markdown', '.txt', '.csv', '.tsv',
+  '.md', '.markdown', '.txt', '.csv', '.tsv', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt',
   '.json', '.yaml', '.yml', '.log',
+  '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
+  '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.sh', '.bash', '.zsh', '.ps1', '.cmd', '.bat', '.rb', '.go', '.rs', '.java', '.kt',
+  '.c', '.cpp', '.cc', '.h', '.hpp', '.css', '.scss', '.less',
+  '.sql', '.graphql', '.gql',
 ]);
 const IMAGE_EXTS: ReadonlySet<string> = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 // Match the attachment media contract without importing its feature lifecycle.

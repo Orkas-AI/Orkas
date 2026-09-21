@@ -1,4 +1,8 @@
 {
+  "files.delimited.table": "Tabla",
+  "files.delimited.source": "Texto original",
+  "files.delimited.limited": "Vista previa limitada. Abra el archivo en otra aplicación para ver todos los datos.",
+  "files.delimited.invalid": "Hay campos entre comillas incompletos o inválidos. Se muestra el texto original.",
   "connectors.action_confirm.operation.external_or_financial_change": "Acción externa o cambio financiero",
   "connectors.action_confirm.operation.destructive": "Eliminación o acción irreversible",
   "connectors.action_confirm.operation.financial_record_change": "Cambio en un registro financiero",

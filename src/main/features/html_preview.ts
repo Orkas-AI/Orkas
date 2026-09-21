@@ -747,7 +747,7 @@ function blockedResourceLabel(raw: string): string {
 }
 
 function allowedPreviewRequest(raw: string, entryRootReal: string): boolean {
-  if (/^(?:data|blob|about):/i.test(raw)) return true;
+  if (/^(?:https?|wss?|data|blob|about):/i.test(raw)) return true;
   if (!raw.startsWith('file:')) return false;
   try {
     const requested = fs.realpathSync(fileURLToPath(raw));
@@ -766,7 +766,7 @@ function registerNetworkIsolation(
   ses.webRequest.onBeforeRequest((details, callback) => {
     const raw = String(details.url || '');
     const allowed = sdkOrigin.current
-      ? /^(?:data|blob|about):/i.test(raw) || raw.startsWith(sdkOrigin.current + '/')
+      ? /^(?:https?|wss?|data|blob|about):/i.test(raw) || raw.startsWith(sdkOrigin.current + '/')
       : allowedPreviewRequest(raw, entryRootReal);
     if (!allowed) {
       blocked.count += 1;
@@ -935,8 +935,7 @@ async function renderViewport(
 
 /**
  * Render one local HTML entry at one or more declared viewports using the
- * packaged Electron runtime. Network access is denied; only data/blob/about
- * URLs and real files below the entry directory are allowed.
+ * packaged Electron runtime. Web resources are allowed; local files remain confined to the entry directory.
  */
 export async function renderResponsiveHtmlPreview(
   entryPath: string,
@@ -955,7 +954,7 @@ export async function renderResponsiveHtmlPreview(
     throw new Error('E_HTML_PREVIEW_BROWSER_UNAVAILABLE: Electron BrowserWindow is unavailable');
   }
 
-  const bundle = previewBundle(entryReal);
+  const bundle = await previewBundle(entryReal);
   const sdkOrigin: { current?: string } = {};
   const blocked = { count: 0, samples: [] as string[] };
   const partition = `html-preview-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;

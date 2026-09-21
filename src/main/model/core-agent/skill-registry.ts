@@ -1,4 +1,5 @@
 import { estimateBudgetTokens, estimateBudgetTokenQuarters, truncateBudgetText } from '../../util/token-estimate';
+import { isPortableRuntimeRef } from './skill-runtime-ref';
 /**
  * Skill registry implementation: source loaders, prompt rosters, conflict
  * resolution, and run-scoped logical bindings. The complete runtime policy is
@@ -254,11 +255,6 @@ export function getAgentSkillDependenciesPromptBlock(
   }
   if (lines.length === 2) lines.push('(none)');
   return lines.join('\n');
-}
-
-function isPortableRuntimeRef(value: string): boolean {
-  const ref = String(value || '').trim();
-  return /^[A-Za-z0-9][A-Za-z0-9._:@+-]*$/u.test(ref);
 }
 
 function sameRuntimeBinding(a: SkillRuntimeBinding, b: SkillRuntimeBinding): boolean {

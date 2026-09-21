@@ -421,7 +421,7 @@ async function apiLibraryFetch(projectId, url, options = {}) {
     }
     const routes = {
       '/api/contexts/tree': ['tree', {}],
-      '/api/contexts/read': ['readText', { name }],
+      '/api/contexts/read': ['readText', { name, ...(new URLSearchParams(query).get('preview') === 'true' ? { preview: true } : {}) }],
       '/api/contexts/image': ['image', { name }],
       '/api/contexts/office': ['officeHtml', { name }],
       '/api/contexts/mkdir': ['mkdir', { path: name }],

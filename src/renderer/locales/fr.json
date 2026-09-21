@@ -1,4 +1,8 @@
 {
+  "files.delimited.table": "Tableau",
+  "files.delimited.source": "Source",
+  "files.delimited.limited": "Aperçu limité. Ouvrez le fichier dans une application externe pour voir toutes les données.",
+  "files.delimited.invalid": "Champs entre guillemets incomplets ou invalides. Affichage du texte source.",
   "connectors.action_confirm.operation.external_or_financial_change": "Action externe ou modification financière",
   "connectors.action_confirm.operation.destructive": "Suppression ou action irréversible",
   "connectors.action_confirm.operation.financial_record_change": "Modification de données financières",

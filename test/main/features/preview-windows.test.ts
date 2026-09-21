@@ -130,6 +130,26 @@ describe('independent preview ownership and lifecycle', () => {
     expect(isPreviewContents(child.webContents)).toBe(false);
   });
 
+  it('opens more than sixteen apps and releases every window and owner listener on account switch', async () => {
+    const main = new BrowserWindow({});
+    const sources = Array.from({ length: 20 }, (_, index) => ({ kind: 'app', appId: `app-${index}`, title: `App ${index}` }));
+    const opened = [];
+    for (const source of sources) opened.push(await openPreview('user-a', main.webContents, source));
+    expect(new Set(opened.map(value => value.windowId)).size).toBe(20);
+    for (const [index, child] of runtime.windows.slice(1).entries()) {
+      expect(initializePreview('user-a', child.webContents).source).toEqual(sources[index]);
+      expect(child.dead).toBe(false);
+    }
+    expect(await openPreview('user-a', main.webContents, sources[0])).toEqual(opened[0]);
+    runtime.hook('user-a', 'user-b');
+    expect(runtime.windows.slice(1).every(child => child.dead && !isPreviewContents(child.webContents))).toBe(true);
+    expect(main.webContents.listenerCount('destroyed')).toBe(0);
+    expect(main.webContents.listenerCount('did-start-navigation')).toBe(0);
+    const fresh = await openPreview('user-b', main.webContents, sources[0]);
+    expect(fresh.windowId).not.toBe(opened[0].windowId);
+    expect(initializePreview('user-b', runtime.windows.at(-1).webContents).source).toEqual(sources[0]);
+  });
+
   it('binds gallery pages to the original task, accepts only its owner response, and cancels requests on account switch', async () => {
     const main = new BrowserWindow({});
     const other = new BrowserWindow({});

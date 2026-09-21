@@ -1,4 +1,7 @@
 {
+  "chat.skill_creation_correcting": "Skill 创建内容需要修正，正在尝试一次。",
+  "chat.skill_creation_corrected": "已修正并创建 Skill。",
+  "chat.skill_creation_correction_failed": "尝试修正一次后，仍未能创建 Skill。",
   "errors.reveal_invalid_path": "请使用本机文件或文件夹的完整路径。",
   "errors.reveal_unavailable": "文件或文件夹不可用，请确认它仍然存在且可以访问。",
   "errors.reveal_failed": "无法打开文件夹，请尝试在系统文件管理器中打开。",

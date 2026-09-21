@@ -4,16 +4,14 @@
 // that the matching backend contract will reject.
 (function initFileOperationPolicy(root) {
   const textExts = new Set([
-    '.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log',
+    '.md', '.markdown', '.txt', '.csv', '.tsv', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt', '.json', '.yaml', '.yml', '.log',
     '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
     '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
     '.sh', '.bash', '.zsh', '.ps1', '.cmd', '.bat', '.rb', '.go', '.rs', '.java', '.kt',
     '.c', '.cpp', '.cc', '.h', '.hpp', '.css', '.scss', '.less',
     '.sql', '.graphql', '.gql',
   ]);
-  const chatTextExts = new Set([
-    '.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log',
-  ]);
+  const chatTextExts = textExts;
   const imageExts = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
   const videoExts = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
   const audioExts = new Set(['.mp3', '.wav', '.ogg', '.opus', '.m4a', '.aac', '.flac']);

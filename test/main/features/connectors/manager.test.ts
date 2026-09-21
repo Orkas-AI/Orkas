@@ -2,11 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { captureMainLogWorkers } from '../../../helpers/capture-main-log-workers';
 
 const TEST_UID = 'u-connectors-manager';
 
 let tmpDir: string;
 let prevWs: string | undefined;
+let closeLogWorkers: () => Promise<void>;
 
 // ── Mock binding: ONE hoisted controller, mocked ONCE at top level ──────────
 // Previously each test re-mocked mcp-client / oauth / oauth-dcr with per-test
@@ -436,12 +438,14 @@ beforeEach(async () => {
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
+  closeLogWorkers = await captureMainLogWorkers();
   vi.clearAllMocks();
   resetMockBehaviors();
   await writeGoogleConnectorsConfig({ google: 'enabled', gmail: 'enabled' });
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await closeLogWorkers();
   if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
   else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -457,9 +461,9 @@ describe('features/connectors/manager authorization recovery', () => {
     const { default: electronLog } = await import('electron-log/main');
     const records: Array<{ level: string; data: unknown[] }> = [];
     const capture = (message: any, transport: unknown) => {
-      // electron-log runs hooks separately for file/console/IPC. Observe one
-      // actual output transport, not three copies of the same log invocation.
-      if (transport === electronLog.transports.console && message.data[0] === 'connector request completed') {
+      // Direct sinks are disabled: observe the single background-worker
+      // transport instead of the obsolete console transport.
+      if (transport === (electronLog.transports as any).background && message.data[0] === 'connector request completed') {
         records.push({ level: message.level, data: message.data });
       }
       return message;

@@ -1,4 +1,8 @@
 {
+  "files.delimited.table": "Tabella",
+  "files.delimited.source": "Testo originale",
+  "files.delimited.limited": "Anteprima limitata. Apri il file in un’app esterna per visualizzare tutti i dati.",
+  "files.delimited.invalid": "Campi tra virgolette incompleti o non validi. Viene mostrato il testo originale.",
   "connectors.action_confirm.operation.external_or_financial_change": "Azione esterna o modifica finanziaria",
   "connectors.action_confirm.operation.destructive": "Eliminazione o azione irreversibile",
   "connectors.action_confirm.operation.financial_record_change": "Modifica di un dato finanziario",

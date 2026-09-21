@@ -26,6 +26,7 @@
  * write_file) live in local-tools.ts.
  */
 
+import { lookupSkillRuntimeRef } from './skill-runtime-ref';
 import { fileFailure, type FileFailureDiagnostic } from '../../../core-agent/src/tools/file-diagnostics';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
@@ -210,8 +211,8 @@ function resolveAbs(ctx: ToolContext, p: string): string {
 }
 
 type RequestedPathResolution =
-  | { abs: string; displayPath: string; skillRef?: string; error?: never }
-  | { abs?: never; displayPath?: never; skillRef?: never; error: string };
+  | { abs: string; displayPath: string; skillRef?: string; error?: never; diagnostic?: never }
+  | { abs?: never; displayPath?: never; skillRef?: never; error: string; diagnostic?: FileFailureDiagnostic };
 
 /** Resolve the virtual Skill namespace before the ordinary cwd resolver. The
  * final containment check is the same symlink-safe guard used by all file
@@ -233,18 +234,9 @@ function resolveRequestedPath(
   const slash = tail.indexOf('/');
   const ref = (slash >= 0 ? tail.slice(0, slash) : tail).trim();
   const relative = slash >= 0 ? tail.slice(slash + 1) : '';
-  if (!ref || ref === '.' || ref === '..') {
-    return { error: errText('E_SKILL_REF_INVALID', 'Use @skill/<read-ref> with the exact read ref advertised in Available skills.') };
-  }
-  const binding = opts.skillRuntimeBindings?.get(ref);
-  if (!binding) {
-    return {
-      error: errText(
-        'E_SKILL_NOT_AVAILABLE',
-        `@skill/${ref} is not bound for this run. Use an exact read ref from the current Available skills block.`,
-      ),
-    };
-  }
+  const lookup = lookupSkillRuntimeRef(ref, opts.skillRuntimeBindings);
+  if (lookup.error) return { error: lookup.error, diagnostic: lookup.diagnostic };
+  const binding = lookup.binding!;
 
   const segments = relative ? relative.split('/') : [];
   if (segments.some((segment) => !segment || segment === '.' || segment === '..')) {
@@ -548,8 +540,8 @@ function taggedReadRangeSchema(): Record<string, unknown> {
         enum: ['line', 'char'],
         description: 'Addressing unit: line is 1-based/inclusive; char is 0-based with an exclusive end.',
       },
-      start: { type: 'integer', description: 'Start position in the selected unit.' },
-      end: { type: 'integer', description: 'End position: inclusive for line, exclusive for char.' },
+      start: { type: 'integer', minimum: 0, description: 'Start position in the selected unit.' },
+      end: { type: 'integer', minimum: 0, description: 'End position: inclusive for line, exclusive for char.' },
     },
     required: ['unit', 'start', 'end'],
   };
@@ -643,7 +635,7 @@ function createReadFileTool(
       type: 'object',
       additionalProperties: false,
       properties: {
-        path: { type: 'string', description: 'Path relative to the working directory, a visible absolute path, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
+        path: { type: 'string', minLength: 1, description: 'Path relative to the working directory, a visible absolute path, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
         range: taggedReadRangeSchema(),
       },
       required: ['path'],
@@ -652,7 +644,7 @@ function createReadFileTool(
       const raw = String(input.path ?? '');
       if (!raw) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
       const resolvedPath = resolveRequestedPath(opts, ctx, raw);
-      if (resolvedPath.error) return { content: resolvedPath.error, isError: true };
+      if (resolvedPath.error) return { content: resolvedPath.error, isError: true, observations: { fileFailure: resolvedPath.diagnostic } };
       const { abs, displayPath } = resolvedPath;
       const parsedAddress = parseReadAddress(input);
       if (parsedAddress.error) {
@@ -1094,6 +1086,15 @@ function readFilesInlineTokenBudget(ctx: ToolContext, verbatimDocument = false):
   return Math.max(0, Math.floor(Math.min(...candidates)));
 }
 
+/** Retain one bounded, structured failure through both read envelopes. */
+function readBatchFailure(results: readonly ToolResult[], inputFailure?: FileFailureDiagnostic): Pick<ToolObservations, 'fileFailure'> {
+  if (inputFailure) return { fileFailure: inputFailure };
+  const index = results.findIndex(result => result.observations?.fileFailure);
+  return index < 0 ? {} : {
+    fileFailure: { ...results[index].observations!.fileFailure!, item_index: index },
+  };
+}
+
 /** Unified one-or-many reader. It deliberately delegates every item to the
  * same internal reader so scope checks, rich-file handling,
  * line-number rendering, skill attribution, and OCC stamps stay identical. */
@@ -1119,7 +1120,7 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
             type: 'object',
             additionalProperties: false,
             properties: {
-              path: { type: 'string', description: 'Path relative to the working directory, a visible absolute path, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
+              path: { type: 'string', minLength: 1, description: 'Path relative to the working directory, a visible absolute path, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
               range: taggedReadRangeSchema(),
             },
             required: ['path'],
@@ -1268,7 +1269,7 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
           content,
           ...(errors === files.length ? { isError: true } : {}),
           observations: {
-            ...(inputFailure ? { fileFailure: inputFailure } : {}),
+            ...readBatchFailure(results, inputFailure),
             fileReads: results.flatMap((result) => result.observations?.fileReads ?? []),
             fileReadBatch: fileReadBatchObservation(files.map((file) => (
               file.ok === false
@@ -1329,7 +1330,7 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
         ...(errors === results.length ? { isError: true } : {}),
         ...(includesVerbatimDocument ? { verbatimDocument: true } : {}),
         observations: {
-          ...(inputFailure ? { fileFailure: inputFailure } : {}),
+          ...readBatchFailure(results, inputFailure),
           fileReads: results.flatMap((result) => result.observations?.fileReads ?? []),
           fileReadBatch: fileReadBatchObservation(results.map((result) => ({
             ok: !result.isError,
@@ -1457,7 +1458,7 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
         ? resolveRequestedPath(opts, ctx, requestedRootInput, { bareSkillRefTarget: 'root' })
         : null;
       if (requestedRootResolution?.error) {
-        return { content: requestedRootResolution.error, isError: true };
+        return { content: requestedRootResolution.error, isError: true, observations: { fileFailure: requestedRootResolution.diagnostic } };
       }
       const requestedRoot = requestedRootResolution?.abs || '';
       const requestedRootDisplay = requestedRootResolution?.displayPath || requestedRoot;
@@ -1747,7 +1748,7 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
         ? resolveRequestedPath(opts, ctx, requestedRootInput, { bareSkillRefTarget: 'root' })
         : null;
       if (requestedRootResolution?.error) {
-        return { content: requestedRootResolution.error, isError: true };
+        return { content: requestedRootResolution.error, isError: true, observations: { fileFailure: requestedRootResolution.diagnostic } };
       }
       const requestedRoot = requestedRootResolution?.abs || '';
       const requestedRootDisplay = requestedRootResolution?.displayPath || requestedRoot;
@@ -1990,7 +1991,7 @@ function createListFilesTool(opts: FileToolsOpts): AgentTool {
       const raw = String(input.path ?? '');
       if (!raw) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
       const resolvedPath = resolveRequestedPath(opts, ctx, raw, { bareSkillRefTarget: 'root' });
-      if (resolvedPath.error) return { content: resolvedPath.error, isError: true };
+      if (resolvedPath.error) return { content: resolvedPath.error, isError: true, observations: { fileFailure: resolvedPath.diagnostic } };
       const { abs, displayPath } = resolvedPath;
 
       const scopeErr = await gatePathAccess(opts, abs, 'list_files', ctx);

@@ -195,6 +195,7 @@ describe('avatar catalogs', () => {
     const knownIcons = new Set(catalog.icons.map((icon: any) => icon.id));
     const knownColors = new Set(catalog.colors.map((color: any) => color.id));
     const expected = [
+      ['resources/builtin/marketplace/agents/1040b336306f/agent.json', 'StockAnalyser', 'chart', 'mint'],
       ['resources/builtin/marketplace/agents/79df9cc89f5f/agent.json', 'VideoStudio', 'film', 'violet'],
       ['resources/builtin/marketplace/agents/5f890bd72ac4/agent.json', 'VoiceStudio', 'music', 'violet'],
       ['resources/builtin/marketplace/agents/814b61b027f0/agent.json', 'ImageStudio', 'image', 'violet'],

@@ -2096,7 +2096,7 @@ describe('host-started task browser binding', () => {
       expect(allowWebAssistDownloadOrigin('u1', cid, origin)).toMatchObject({ ok: true });
       const retry = attempt(url, 'site-export.csv');
       expect(retry.prevented.value).toBe(false);
-      expect(retry.item.savePath).toBe(`${DOWNLOAD_ROOT}/u1/${cid}/site-export.csv`);
+      expect(retry.item.savePath).toBe(path.join(DOWNLOAD_ROOT, 'u1', cid, 'site-export.csv'));
     });
 
     it.each(['blob:null/opaque-id', 'blob:file:///tmp/private.csv', 'file:///tmp/private.csv', 'not-a-url'])

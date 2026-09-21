@@ -275,6 +275,70 @@ it('passes provider-native assistant phases through unchanged', async () => {
   ]);
 });
 
+it('delivers task draft text before a stalled provider reaches a phase boundary', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const source = (async function* () {
+    yield { type: 'text_delta', text: 'First chunk' };
+    await gate;
+    yield { type: 'provider_call', outcome: 'completed', stopReason: 'end_turn' };
+    yield { type: 'done', result: { text: 'First chunk', meta: { error: null } } };
+  })();
+  const output = mapCoreAgentEvents(source as any, { failureTrackingScope: {}, streamUnphasedText: true });
+  // The first next() must settle while the provider is still blocked. A
+  // bounded race makes the old buffering implementation fail without hanging.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let first: any;
+  try {
+    first = await Promise.race([output.next(), new Promise(resolve => {
+      timer = setTimeout(() => resolve(null), 100);
+    })]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    release();
+  }
+  const rest: any[] = [];
+  for await (const event of output) rest.push(event);
+  expect(first?.value).toEqual({ type: 'delta', text: 'First chunk', phase: 'pending' });
+  expect(rest).toEqual([{ type: 'final', text: 'First chunk' }]);
+});
+
+it('moves successive task drafts into commentary once and never replays final deltas', async () => {
+  const out = await collect([
+    { type: 'text_delta', text: 'Inspect ' },
+    { type: 'text_delta', text: 'sources.' },
+    { type: 'tool_delta', id: 'read-1', name: 'read_files', inputDelta: '{}' },
+    { type: 'provider_call', durationMs: 1, outcome: 'completed', stopReason: 'tool_use', model: 'test' },
+    { type: 'text_delta', text: 'Check results.' },
+    { type: 'provider_call', durationMs: 1, outcome: 'completed', stopReason: 'tool_use', model: 'test' },
+    { type: 'text_delta', text: 'Delivered.' },
+    { type: 'text_phase', phase: 'final_answer' },
+    { type: 'done', result: { text: 'Delivered.', meta: { error: null } } },
+  ], { streamUnphasedText: true });
+  expect(out.filter(e => e.type === 'delta').map(e => e.text).join(''))
+    .toBe('Inspect sources.Check results.Delivered.');
+  expect(out.filter(e => e.type === 'commentary-finalized')).toEqual([
+    { type: 'commentary-finalized', text: 'Inspect sources.' },
+    { type: 'commentary-finalized', text: 'Check results.' },
+  ]);
+  expect(out.filter(e => e.type === 'final')).toEqual([{ type: 'final', text: 'Delivered.' }]);
+});
+
+it.each(['error', 'incomplete'] as const)('retains visible task draft on %s without inventing success', async ending => {
+  const out = await collect([
+    { type: 'text_delta', text: 'Partial work' },
+    ...(ending === 'error' ? [{ type: 'done' as const, result: {
+      text: '', meta: { error: { kind: 'timeout' as const, message: 'timed out' } },
+    } }] : []),
+  ], { streamUnphasedText: true });
+  expect(out[0]).toEqual({ type: 'delta', text: 'Partial work', phase: 'pending' });
+  expect(out.filter(e => e.type === 'commentary-finalized')).toEqual([
+    { type: 'commentary-finalized', text: 'Partial work' },
+  ]);
+  expect(out.some(e => e.type === 'final')).toBe(false);
+  expect(out.some(e => e.type === 'error')).toBe(true);
+});
+
 it('does not fabricate process prose when a tool round contains no assistant text', async () => {
   const out = await collect([
     { type: 'tool_start', name: 'lookup', id: 'lookup-1', input: {} },

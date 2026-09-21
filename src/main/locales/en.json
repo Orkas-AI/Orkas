@@ -1,4 +1,7 @@
 {
+  "chat.skill_creation_correcting": "Skill creation needs a correction. Trying once.",
+  "chat.skill_creation_corrected": "The Skill was corrected and created.",
+  "chat.skill_creation_correction_failed": "The Skill could not be created after one correction.",
   "errors.reveal_invalid_path": "Use a full local file or folder path.",
   "errors.reveal_unavailable": "The file or folder is unavailable. Check that it still exists and is accessible.",
   "errors.reveal_failed": "Could not open the folder. Try opening it in your file manager.",

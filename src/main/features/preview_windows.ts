@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { SRC_ROOT } from '../paths';
 import { createLogger } from '../logger';
-import { hardenedWebPreferences, installExternalNavigationGuard, installOfflineHtmlPreviewNavigationGuard } from '../util/window-security';
+import { hardenedWebPreferences, installExternalNavigationGuard, installHtmlPreviewNavigationGuard } from '../util/window-security';
 import { registerUserSwitchHook } from './user-switch-hooks';
 import { subscribeBus } from './group_chat';
 
@@ -99,7 +99,6 @@ export async function openPreview(uid: string, owner: WebContents, payload: unkn
     }
     return { windowId: existing.win.id };
   }
-  if (records.size >= 16) throw new Error('Close a preview window before opening another.');
   const parent = BrowserWindow.fromWebContents(owner);
   if (!parent || parent.isDestroyed()) throw new Error('Preview is unavailable.');
   // Background E2E owners must keep all their native previews off the desktop.
@@ -134,7 +133,7 @@ export async function openPreview(uid: string, owner: WebContents, payload: unkn
   }
   ownerState.windows.add(win);
   installExternalNavigationGuard(win.webContents, url => shell.openExternal(url), () => log.warn('external link failed', { code: 'open_failed' }));
-  installOfflineHtmlPreviewNavigationGuard(win.webContents);
+  installHtmlPreviewNavigationGuard(win.webContents);
   win.on('close', event => {
     if (!record.dirty) return;
     event.preventDefault();

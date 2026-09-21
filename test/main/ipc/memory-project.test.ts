@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { captureMainLogWorkers } from '../../helpers/capture-main-log-workers';
 
 vi.mock('../../../src/main/model/client', () => ({
   async *streamChatWithModel() {
@@ -13,6 +14,7 @@ vi.mock('../../../src/main/model/client', () => ({
 
 let tmpDir: string;
 let prevWs: string | undefined;
+let closeLogWorkers: () => Promise<void>;
 const UID = 'u-memory-ipc';
 
 beforeEach(async () => {
@@ -20,11 +22,13 @@ beforeEach(async () => {
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
+  closeLogWorkers = await captureMainLogWorkers();
   const users = await import('../../../src/main/features/users');
   users.activateUser(UID);
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await closeLogWorkers();
   if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
   else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });

@@ -1,4 +1,8 @@
 {
+  "files.delimited.table": "Table",
+  "files.delimited.source": "Source",
+  "files.delimited.limited": "Showing a limited preview. Open the file externally to view all data.",
+  "files.delimited.invalid": "This file contains incomplete or invalid quoted fields. Showing the source.",
   "connectors.action_confirm.operation.external_or_financial_change": "External action or financial change",
   "connectors.action_confirm.operation.destructive": "Deletion or irreversible action",
   "connectors.action_confirm.operation.financial_record_change": "Financial record change",

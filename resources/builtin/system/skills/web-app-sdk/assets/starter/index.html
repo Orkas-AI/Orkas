@@ -15,7 +15,7 @@
 <body>
   <h1 data-label="title">Text notebook</h1>
   <label data-label="draft" for="draft">Text to summarize</label>
-  <textarea id="draft" maxlength="30000"></textarea>
+  <textarea id="draft"></textarea>
   <div>
     <button id="open" disabled>Open text file</button>
     <button id="save" disabled>Save draft</button>
@@ -87,7 +87,6 @@
         "Configure a model in Orkas, then reopen this app.": "请在 Orkas 中配置模型，然后重新打开应用。",
         "Action failed. Check the input or choose a new export filename before trying again.": "操作失败。请检查输入或选择新的导出文件名后重试。",
         "File selection cancelled.": "已取消文件选择。",
-        "Choose text with at most 30,000 characters.": "请选择不超过 30,000 个字符的文本。",
         "File loaded. The original is unchanged.": "文件已加载，原文件未修改。",
         "Draft saved.": "草稿已保存。",
         "Enter some text first.": "请先输入文本。",
@@ -108,7 +107,6 @@
         "Configure a model in Orkas, then reopen this app.": "Orkas でモデルを設定してからアプリを開き直してください。",
         "Action failed. Check the input or choose a new export filename before trying again.": "操作に失敗しました。入力を確認するか、新しい出力ファイル名で再試行してください。",
         "File selection cancelled.": "ファイル選択をキャンセルしました。",
-        "Choose text with at most 30,000 characters.": "30,000 文字以内のテキストを選んでください。",
         "File loaded. The original is unchanged.": "ファイルを読み込みました。元ファイルは変更していません。",
         "Draft saved.": "下書きを保存しました。",
         "Enter some text first.": "先にテキストを入力してください。",
@@ -129,7 +127,6 @@
         "Configure a model in Orkas, then reopen this app.": "Configure um modelo no Orkas e reabra este app.",
         "Action failed. Check the input or choose a new export filename before trying again.": "Falha na ação. Confira a entrada ou escolha um novo nome de exportação e tente novamente.",
         "File selection cancelled.": "Seleção de arquivo cancelada.",
-        "Choose text with at most 30,000 characters.": "Escolha um texto com até 30.000 caracteres.",
         "File loaded. The original is unchanged.": "Arquivo carregado. O original não foi alterado.",
         "Draft saved.": "Rascunho salvo.",
         "Enter some text first.": "Digite algum texto primeiro.",
@@ -188,7 +185,6 @@
       if (!file) { status.textContent = t("File selection cancelled."); return; }
       try {
         const {text} = await api.files.readText({handle:file.handle});
-        if (text.length > 30000) { status.textContent = t("Choose text with at most 30,000 characters."); return; }
         draft.value = text; status.textContent = t("File loaded. The original is unchanged.");
       } finally { await api.files.release({handle:file.handle}); }
     });

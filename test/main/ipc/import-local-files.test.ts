@@ -7,6 +7,7 @@ import { trustedIpcSender } from '../../helpers/trusted-ipc-sender';
 import { makeMinimalPdf } from '../../fixtures/make-minimal-pdf';
 import { makeMinimalDocx } from '../../fixtures/make-minimal-docx';
 import { makeMinimalXlsx, makeMinimalPptx } from '../../fixtures/make-minimal-office';
+import { captureMainLogWorkers } from '../../helpers/capture-main-log-workers';
 
 // `orkas.importLocalFiles` is the private preload → main channel that carries
 // paths resolved from genuine user-selected File objects. The conversation
@@ -43,6 +44,7 @@ vi.mock('../../../src/main/features/kb_vector', () => ({
 let tmpDir: string;
 let sourceDir: string;
 let prevWs: string | undefined;
+let closeLogWorkers: () => Promise<void>;
 const TEST_UID = 'uImportLocalFiles';
 const CID = 'conv-import-local';
 
@@ -52,12 +54,14 @@ beforeEach(async () => {
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
+  closeLogWorkers = await captureMainLogWorkers();
   vi.clearAllMocks();
   const users = await import('../../../src/main/features/users');
   users.activateUser(TEST_UID);
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await closeLogWorkers();
   vi.restoreAllMocks();
   if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
   else process.env.ORKAS_WORKSPACE_ROOT = prevWs;

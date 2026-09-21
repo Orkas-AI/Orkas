@@ -337,7 +337,7 @@ const _MARKDOWN_EXTS = new Set(['.md', '.markdown']);
 // highlighting in this round; <pre> with white-space:pre-wrap is enough.
 const _TEXT_EXTS = new Set([
   '.txt', '.log',
-  '.csv', '.tsv',
+  '.csv', '.tsv', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt',
   '.json', '.yaml', '.yml',
   '.xml', '.ini', '.toml', '.conf',
   '.py', '.pyi',
@@ -941,13 +941,11 @@ async function _renderHtmlBody(absPath, displayName, cid, projectId) {
   if (!seq) return;
   const state = _viewerBeginHtmlPreview(cid, projectId);
   const url = _chatMediaLocalUrl(absPath);
-  // sandbox: allow-scripts ONLY. chat-media:// is a distinct origin from
+  // sandbox: opaque origin. chat-media:// is a distinct origin from
   // file://, so SOP blocks parent.* access; we additionally forbid
   // allow-same-origin (no cookie / localStorage / sibling-fetch reach),
-  // allow-popups (no window.open), and allow-top-navigation (no top-frame
-  // redirects). Self-contained LLM-generated HTML still runs its inline
-  // scripts and styles.
-  const sandbox = 'allow-scripts';
+  // top navigation. Browser actions use existing host handlers.
+  const sandbox = 'allow-scripts allow-forms allow-downloads allow-popups allow-modals';
   const iframe = document.createElement('iframe');
   iframe.className = 'chat-file-viewer-html';
   iframe.setAttribute('sandbox', sandbox);
@@ -1251,7 +1249,8 @@ async function _renderTextBody(absPath, displayName, cid, projectId) {
   // back to the "open the folder?" dialog (same UX as the read-only path
   // before). On success, hand the text to mountTextViewEdit; it owns the
   // view ↔ edit transitions, save IPC, and dirty tracking from there.
-  const text = await _readTextFile(absPath, cid, projectId, seq);
+  const preview = {};
+  const text = await _readTextFile(absPath, cid, projectId, seq, preview);
   if (text === null || seq !== _viewerRenderSeq || !_isViewerOpen()) return;
   _viewerFinishLoading();
   if (typeof mountTextViewEdit !== 'function') {
@@ -1265,7 +1264,8 @@ async function _renderTextBody(absPath, displayName, cid, projectId) {
     source: { absPath, cid: cid || undefined, projectId: projectId || undefined },
     // Project Library files are read-only by design (the LLM owns project workspace
     // mutations); workspace / per-conv attachments allow edit + save.
-    capabilities: projectId ? { edit: false, save: false } : { edit: true, save: true },
+    partial: preview.truncated === true,
+    capabilities: projectId || preview.truncated ? { edit: false, save: false } : { edit: true, save: true },
     initialMode: 'view',
     initialContent: text,
     actionIconOnly: true,
@@ -1279,17 +1279,21 @@ async function _renderTextBody(absPath, displayName, cid, projectId) {
 // surfaces the fallback dialog (and returns null so the caller knows to
 // stop). Closes the overlay before showing the dialog so it doesn't stack
 // on top of a half-built viewer.
-async function _readTextFile(absPath, cid, projectId, seq) {
+async function _readTextFile(absPath, cid, projectId, seq, preview) {
   _viewerCurrentPath = absPath;
   _viewerCurrentCid = cid || null;
   _viewerCurrentProjectId = projectId || null;
   try {
     const payload = { path: absPath };
+    if (preview && /\.(csv|tsv)$/i.test(absPath)) payload.preview = true;
     if (cid) payload.cid = cid;
     if (projectId) payload.projectId = projectId;
     const res = await window.orkas.invoke('produced.readText', payload);
     if (seq && seq !== _viewerRenderSeq) return null;
-    if (res && res.ok) return String(res.text || '');
+    if (res && res.ok) {
+      if (preview) preview.truncated = res.truncated === true;
+      return String(res.text || '');
+    }
     // Specifically distinguish too_large so the user sees "file is X MB,
     // open in folder?" instead of a generic failure.
     const err = (res && res.error) || 'unknown';
@@ -1400,7 +1404,7 @@ async function openChatFileViewer(absPath, displayName, opts) {
   if (!absPath) return;
   if (window.OrkasPreviewWindows) {
     if (!(await _ensureViewerFileExists(absPath, opts?.cid, opts?.projectId))) return;
-    if (_kindOf(displayName || absPath) === 'image') return window.OrkasPreviewWindows.image(_chatMediaLocalUrl(absPath), displayName || absPath.split(/[\\/]/).pop(), { ...opts, absPath });
+    if (_kindOf(absPath) === 'image') return window.OrkasPreviewWindows.image(_chatMediaLocalUrl(absPath), displayName || absPath.split(/[\\/]/).pop(), { ...opts, absPath });
     return window.OrkasPreviewWindows.open({ kind: 'file', path: absPath, title: displayName || absPath.split(/[\\/]/).pop(), options: window.OrkasPreviewWindows.options(opts) });
   }
   const cid = (opts && opts.cid) || null;
@@ -1408,7 +1412,7 @@ async function openChatFileViewer(absPath, displayName, opts) {
   const name = displayName || (absPath.split(/[\\/]/).pop() || absPath);
   const exists = await _ensureViewerFileExists(absPath, cid, projectId);
   if (!exists) return;
-  const kind = _kindOf(name);
+  const kind = _kindOf(absPath);
 
   if (kind === 'image') {
     // Delegate — the image lightbox already has zoom / pan / keyboard. We

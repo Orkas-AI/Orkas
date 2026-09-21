@@ -94,6 +94,28 @@ describe("runner error metadata", () => {
 });
 
 describe("model history continuity", () => {
+  it("carries real context-budget observations as metadata without adding them to model input", async () => {
+    const requests: CompletionParams[] = [];
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => createMockProvider([{
+      model: 'mock-model', stopReason: 'end_turn', content: [{ type: 'text', text: 'Done' }],
+      usage: { inputTokens: 10, outputTokens: 1, totalTokens: 11 },
+    }], request => requests.push(request)));
+    const runner = new AgentRunner({ providers: registry, session: new Session(), tools: [],
+      config: createConfig({ agent: { defaultProvider: 'mock', defaultModel: 'mock-model' },
+        models: { catalog: { 'mock-model': { provider: 'mock', model: 'mock-model', contextWindow: 272000, maxOutputTokens: 32000 } } },
+        evolution: { enabled: false } }),
+    });
+    expect((await runner.run({ message: 'Hello' })).text).toBe('Done');
+    expect(requests).toHaveLength(1);
+    const budget = requests[0].requestMetadata?.contextBudgetDiagnostics;
+    expect(budget).toMatchObject({ version: 1, budget_context_window: 272000, output_reservation: 32000,
+      usable_input_tokens: 240000, input_ceiling_tokens: 196800, window_source: 'catalog',
+      estimate_source: 'estimated', emergency_result: 'not_needed', compaction_attempts: 0, compaction_failures: 0 });
+    expect((budget as any).estimated_input_tokens).toBeGreaterThan(0);
+    expect((budget as any).emergency_after_tokens).toBe((budget as any).estimated_input_tokens);
+    expect(JSON.stringify(requests[0].messages)).not.toContain('estimated_input_tokens');
+  });
   it.each(["sequential", "parallel"] as const)("carries authoring references into later provider requests through %s tool execution", async executionMode => {
     const requests: CompletionParams[] = [];
     const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
@@ -3587,6 +3609,7 @@ describe("AgentRunner", () => {
     let summaryCalls = 0;
     let streamCalls = 0;
     const capturedRequests: Message[][] = [];
+    const budgets: any[] = [];
     const provider: LLMProvider = {
       id: "mock",
       name: "Mock",
@@ -3601,6 +3624,7 @@ describe("AgentRunner", () => {
         }
         const call = streamCalls++;
         capturedRequests.push([...params.messages]);
+        budgets.push(params.requestMetadata?.contextBudgetDiagnostics);
         // Report usage consistent with the request actually received, like a
         // real provider: request-level decisions anchor on this real usage,
         // so a fixed tiny count would (correctly) read as a small request and
@@ -3665,6 +3689,11 @@ describe("AgentRunner", () => {
     expect(reductions.length).toBeGreaterThan(0);
     const applied = reductions.filter((e) => e.data?.result === "applied");
     expect(applied.length).toBeGreaterThan(0);
+    const reducedBudget = budgets.find(budget => budget?.emergency_result === 'applied');
+    expect(reducedBudget).toBeDefined();
+    expect(reducedBudget.emergency_after_tokens).toBeLessThan(reducedBudget.emergency_before_tokens);
+    expect(reducedBudget.compaction_failures).toBeGreaterThan(0);
+    expect(reducedBudget.estimated_input_tokens).toBe(reducedBudget.emergency_after_tokens);
     expect(Number(applied[0].data?.requestTokensAfter))
       .toBeLessThan(Number(applied[0].data?.requestTokensBefore));
 
@@ -5311,6 +5340,7 @@ describe("AgentRunner", () => {
   it("checkpoints oversized active-turn tool process before the next model call", async () => {
     let completeCalls = 0;
     let streamCalls = 0;
+    const budgets: any[] = [];
     let finalStreamMessages: Message[] = [];
     let checkpointPrompt = "";
     let checkpointSystemPrompt = "";
@@ -5346,6 +5376,7 @@ describe("AgentRunner", () => {
           return;
         }
         const n = streamCalls++;
+        budgets.push(params.requestMetadata?.contextBudgetDiagnostics);
         if (n > 0) {
           const latest = params.messages.flatMap(m => m.content)
             .find(c => c.type === "tool_result" && c.toolUseId === `call-${n - 1}`);
@@ -5398,6 +5429,11 @@ describe("AgentRunner", () => {
     for await (const ev of runner.runStream({ message: "large active process", systemPrompt: mainAgentPrompt })) events.push(ev);
 
     expect(completeCalls).toBe(1);
+    const compacted = budgets.find(budget => budget?.compaction_after_tokens !== undefined);
+    expect(compacted).toBeDefined();
+    expect(compacted.compaction_after_tokens).toBeLessThan(compacted.compaction_before_tokens);
+    expect(compacted.compaction_attempts).toBe(1);
+    expect(compacted.compaction_failures).toBe(0);
     expect(checkpointSystemPrompt).toBe(CONTEXT_COMPACTION_SYSTEM_PROMPT);
     expect(checkpointSystemPrompt).not.toContain("MAIN_AGENT_ONLY");
     expect(checkpointParams?.reasoning).toBe("off");

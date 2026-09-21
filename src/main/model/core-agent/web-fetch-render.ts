@@ -55,24 +55,22 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-/**
- * Electron's default user agent advertises `Electron/<ver>` and the app name
- * beside the real Chromium version. Drop only those two tokens so the claimed
- * engine still matches what actually renders — hardcoding a Chrome version
- * would drift away from the shipped Chromium at the next upgrade.
+/*
+ * This path exists to survive challenge pages, so it must not break the very
+ * fingerprint those pages check. We deliberately keep Electron's default user
+ * agent, `Electron/<ver>` token and all.
+ *
+ * Electron never sends the `Sec-CH-UA` client hints, with or without a UA
+ * override — Chromium builds them from user agent *metadata*, which
+ * `setUserAgent()` cannot reach. Washing the UA down to plain Chrome therefore
+ * produces a self-contradicting request: it claims to be Chrome yet omits the
+ * three headers every real Chrome sends. Keeping the Electron token instead
+ * presents an honest non-Chrome client, which challenge pages accept.
+ *
+ * Measured against a Cloudflare-protected page on 2026-09-21: default UA
+ * passed 3/3, the washed UA hard-blocked 1/3 even with a 25s settle window.
+ * See the fuller note in features/web_assist.ts.
  */
-function chromeLikeUserAgent(): string {
-  const base = String(app.userAgentFallback || '');
-  if (!base) return '';
-  const appName = String(app.getName() || '');
-  let ua = base.replace(/\sElectron\/\S+/i, '');
-  if (appName) ua = ua.replace(new RegExp(`\\s${escapeRegExp(appName)}\\/\\S+`, 'i'), '');
-  return ua.replace(/\s{2,}/g, ' ').trim();
-}
 
 function prepareSession(ses: Session): void {
   // Electron grants permission requests by default. A rendered third-party page
@@ -129,8 +127,6 @@ async function renderOnce(url: string, signal?: AbortSignal): Promise<WebFetchRe
   signal?.addEventListener('abort', stop, { once: true });
 
   try {
-    const userAgent = chromeLikeUserAgent();
-    if (userAgent) webContents.setUserAgent(userAgent);
     webContents.setWindowOpenHandler?.(() => ({ action: 'deny' }));
     // Challenge pages resolve by navigating (redirect or an auto-submitted
     // form), so navigation must stay allowed — but only to web origins.

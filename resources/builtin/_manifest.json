@@ -1,7 +1,67 @@
 {
   "schema": 1,
-  "content_tree_sha256": "46e079bbd12d3ad84066830ecbcf6b21af99530cdede68d63f78bade516b5749",
+  "content_tree_sha256": "1a54db9542e5d6e42bf27a8710783b3e51b55ec8df4d15b50c1b916a56395cb0",
   "files": [
+    {
+      "path": "marketplace/agents/1040b336306f/agent.json",
+      "bytes": 5184,
+      "sha256": "e8a9a677acd8de2b23917ba123df2b778e36deae4a5a8420824eac02b441a756"
+    },
+    {
+      "path": "marketplace/agents/1040b336306f/README.md",
+      "bytes": 2347,
+      "sha256": "c3d00d6220ec5689400667fe39d210cc88b68f25d9473b48fc122f24e5d5a777"
+    },
+    {
+      "path": "marketplace/agents/1040b336306f/skills/investment-report/SKILL.md",
+      "bytes": 3190,
+      "sha256": "bc519b7b3c7181a27ef4b0083e66d46a360a9f979b6472159fb0421ba7d75767"
+    },
+    {
+      "path": "marketplace/agents/1040b336306f/skills/market-data/requirements.history.txt",
+      "bytes": 17,
+      "sha256": "279c6e16b07af3bfc395318be3a41935b1e9a225112b82d18299ffc93422dd16"
+    },
+    {
+      "path": "marketplace/agents/1040b336306f/skills/market-data/scripts/history.py",
+      "bytes": 10192,
+      "sha256": "ad4bced7369d8ec5bee5c31d46f609478c61cb2832444114e555ee561a72e249"
+    },
+    {
+      "path": "marketplace/agents/1040b336306f/skills/market-data/scripts/market.py",
+      "bytes": 13604,
+      "sha256": "969ddd7a625cd78004c68aa602e8a5f58d39bed3ed18ec00478f5f14804e38f2"
+    },
+    {
+      "path": "marketplace/agents/1040b336306f/skills/market-data/scripts/stock.py",
+      "bytes": 58704,
+      "sha256": "b178ccf98e6fa92b2d0f04d51b9760ff19f1ed0af48c2c21d1be0face633a29f"
+    },
+    {
+      "path": "marketplace/agents/1040b336306f/skills/market-data/SKILL.md",
+      "bytes": 4392,
+      "sha256": "b1a65408f2e0738817e5a4bc6f737d009e4750c7733b90648ef82fdc735c611c"
+    },
+    {
+      "path": "marketplace/agents/1040b336306f/skills/portfolio-risk/SKILL.md",
+      "bytes": 2722,
+      "sha256": "d878a3d82373ba5f0af9f3a0b7cde88922b56974e8c84da88e2f70ac6e7737c8"
+    },
+    {
+      "path": "marketplace/agents/1040b336306f/skills/quant-lab/SKILL.md",
+      "bytes": 2556,
+      "sha256": "bd9d4b813bc822ca214ca3e43b4a6a8dc1181eec27aaa824ac85d41113723f35"
+    },
+    {
+      "path": "marketplace/agents/1040b336306f/skills/security-research/SKILL.md",
+      "bytes": 2421,
+      "sha256": "0becdc19a761db731b726dfbec895d39e33ca45f1a346dcd06b4153176cf7be2"
+    },
+    {
+      "path": "marketplace/agents/1040b336306f/skills/trade-control/SKILL.md",
+      "bytes": 2325,
+      "sha256": "4bca4732057f9797fb6b8247aec5b16561a40b84f3605de69ccbaa4df664fcd2"
+    },
     {
       "path": "marketplace/agents/173d4235a431/_meta.json",
       "bytes": 57,
@@ -1495,7 +1555,7 @@
     {
       "path": "system/skills/_system.json",
       "bytes": 273,
-      "sha256": "172acfe9a83f1c0e85393db6dcadcf1c397b3b38907835980ea8b794ae15e6ed"
+      "sha256": "fa87ccfc5f1efb3fe44fd71966f52948a3846ed8bae69aa72941d842fb612afb"
     },
     {
       "path": "system/skills/agent-creator/references/cli-and-prose.md",
@@ -1549,8 +1609,8 @@
     },
     {
       "path": "system/skills/web-app-sdk/assets/starter/index.html",
-      "bytes": 13768,
-      "sha256": "48139adfe7661239c5d5483aec57a76686a0e9e4959ea511c64501e11a0ce0c2"
+      "bytes": 13305,
+      "sha256": "e3624924ff995993472486591c38bd49551826d78e93c1bcfec7f4c20c2a0262"
     },
     {
       "path": "system/skills/web-app-sdk/assets/starter/orkas-app.json",
@@ -1559,13 +1619,13 @@
     },
     {
       "path": "system/skills/web-app-sdk/references/api.json",
-      "bytes": 18164,
-      "sha256": "e75dff61c315244e499d3afd42f5a19db6815117c7b11a6729a97e5ed4622827"
+      "bytes": 17541,
+      "sha256": "6f7605ad0dfaf979378dbe70f35dd462e38be579d50d29f43504d3376dac9b1c"
     },
     {
       "path": "system/skills/web-app-sdk/SKILL.md",
-      "bytes": 7096,
-      "sha256": "70cd08e9d6c080a9a4bc4ca985b3292190a18351415b44ffb226cf6089b621bc"
+      "bytes": 7657,
+      "sha256": "2f2ffcf01f462bf2bc32c97f2e117f58136066cc3b962e7bc0e76291e511de0b"
     }
   ],
   "inventory": {
@@ -1584,10 +1644,34 @@
       },
       {
         "id": "web-app-sdk",
-        "update_at": 1789511205555
+        "update_at": 1789990251573
       }
     ],
     "marketplace_agents": [
+      {
+        "id": "1040b336306f",
+        "name": "StockAnalyser",
+        "version": "1.1.13",
+        "icon": "chart",
+        "color": "mint",
+        "updated_at": "2026-09-21T08:21:00.000Z",
+        "skill_list": [
+          "investment-report",
+          "market-data",
+          "portfolio-risk",
+          "quant-lab",
+          "security-research",
+          "trade-control"
+        ],
+        "embedded_skills": [
+          "investment-report",
+          "market-data",
+          "portfolio-risk",
+          "quant-lab",
+          "security-research",
+          "trade-control"
+        ]
+      },
       {
         "id": "173d4235a431",
         "name": "ContentWriter",

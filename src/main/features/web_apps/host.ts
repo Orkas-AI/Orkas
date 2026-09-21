@@ -1,10 +1,8 @@
 /** Native adapters for the Web-only runtime. Never forwards arbitrary IPC. */
 import * as fs from 'node:fs';
-import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { dialog } from 'electron';
-import { userLocalRoot } from '../../paths';
 import { getActiveUserId } from '../users';
 import { registerUserSwitchHook } from '../user-switch-hooks';
 import { getLanguage } from '../config';
@@ -14,7 +12,6 @@ import * as artifacts from '../chat_artifacts';
 import * as saved from '../saved_apps';
 import { AppError, WebAppRuntime, type AppTool, type Bundle } from './runtime';
 import { MANIFEST_FILE } from './catalog';
-import { capToolResult, ToolResultPersistenceError, DEFAULT_INLINE_RESULT_TOKENS } from '../../util/tool-result-cap';
 import type { AgentTool } from '#core-agent';
 import { appResource as scopedAppResource } from './resources';
 import { cancelForApp, type AppUsageScope } from '../connectors/action_confirm';
@@ -42,16 +39,9 @@ export async function appTools(uid: string, appUsage?: AppUsageScope): Promise<A
       const context = { signal, state: {} };
       const result = await tool.execute(args, context);
       if (signal.aborted || getActiveUserId() !== uid) throw new AppError('E_CLOSED');
-      const spool = path.join(userLocalRoot(uid), 'web_apps', 'results', crypto.randomBytes(16).toString('hex'));
-      try {
-        const capped = capToolResult(tool.name, result, context, { maxInlineTokens: DEFAULT_INLINE_RESULT_TOKENS, toolResultsDir: spool });
-        if (capped !== result) throw new AppError('E_RESULT_LIMIT');
-        // Host observations, backing paths and provider diagnostics never cross the bridge.
-        return { content: capped.content, ...(capped.isError ? { isError: true } : {}) };
-      } catch (err) {
-        if (err instanceof ToolResultPersistenceError) throw new AppError('E_RESULT_LIMIT');
-        throw err;
-      } finally { await fsp.rm(spool, { recursive: true, force: true }); }
+      // Model-context budgets belong to AgentRunner, not application data.
+      // Project only public tool content; never expose backing paths or observations.
+      return { content: result.content, ...(result.isError ? { isError: true } : {}) };
     },
   });
   return [wrap(library, 'library'), ...connectors.map(tool => wrap(tool, 'connectors'))];
@@ -82,7 +72,7 @@ export const runtime = new WebAppRuntime({
 registerUserSwitchHook('web-apps', previousUid => runtime.closeUser(previousUid));
 
 export type Source = { appId: string } | { cid: string; artifactId: string };
-export function resolveBundle(uid: string, source: Source): { bundle: Bundle | null; url: string; entry: string } {
+export async function resolveBundle(uid: string, source: Source): Promise<{ bundle: Bundle | null; url: string; entry: string }> {
   const isSaved = 'appId' in source;
   const resolve = (rel: string) => {
     const result = isSaved ? saved.resolveSavedAppFilePath(uid, source.appId, rel)
@@ -109,14 +99,14 @@ export function resolveBundle(uid: string, source: Source): { bundle: Bundle | n
     const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
     if (typeof meta.title === 'string') title = meta.title.slice(0, 120);
   } catch { /* A missing legacy title uses the localized default. */ }
-  let revision: ReturnType<typeof bundleRevision>;
-  try { revision = bundleRevision(path.dirname(manifestFile.absPath), [initial.absPath, manifestFile.absPath]); }
+  let revision: Awaited<ReturnType<typeof bundleRevision>>;
+  try { revision = await bundleRevision(path.dirname(manifestFile.absPath), [initial.absPath, manifestFile.absPath]); }
   catch { throw new AppError('E_BUNDLE'); }
   return { url, entry, bundle: { kind: isSaved ? 'saved' : 'artifact', key, title, entry, manifest, valid: () => revision.valid(),
     resolve: rel => { const file = resolve(rel); return file && revision.accept(file.absPath) ? file : null; } } };
 }
-export function openApp(uid: string, owner: number, source: Source) {
-  const found = resolveBundle(uid, source);
+export async function openApp(uid: string, owner: number, source: Source) {
+  const found = await resolveBundle(uid, source);
   return found.bundle ? runtime.open(uid, owner, found.bundle) : { url: found.url, entry: found.entry };
 }
 export { sdkScript, APP_CSP } from './resources';

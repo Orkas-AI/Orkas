@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import { SRC_ROOT } from '../../paths';
 import * as artifacts from '../chat_artifacts';
 import { METHODS, SDK_PATH, catalogDocument } from './catalog';
+import { webContentCsp } from '../../util/web-content-policy';
 import type { WebAppRuntime } from './runtime';
 
 let sdk: string | null = null;
@@ -12,8 +13,7 @@ export function sdkScript() {
     .replace('/* HOST_METHOD_NAMES */ []', JSON.stringify(Object.keys(METHODS)));
   return sdk;
 }
-export const APP_CSP = ["default-src 'none'", "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'", "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' data: blob:", "font-src 'self' data:", "media-src 'self' blob:", "connect-src 'self'", "frame-src 'none'", "object-src 'none'", "form-action 'none'", "base-uri 'none'"].join('; ');
+export const APP_CSP = webContentCsp();
 export function appResource(request: Request, runtime: WebAppRuntime) {
   const url = new URL(request.url);
   if (!/^app-[a-f0-9]{32}$/.test(url.host)) return null;

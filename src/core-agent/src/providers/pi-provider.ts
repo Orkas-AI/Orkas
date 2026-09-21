@@ -52,6 +52,7 @@ import { providerCredentialFailure } from "../shared/provider-error-facts.js";
 import type { CompletionParams, CompletionResult, LLMProvider, ToolDefinition } from "./base.js";
 
 import { createRequestDiagnostics, type ProviderFailureSource } from "./request-diagnostics.js";
+import { ToolInputDiagnostics } from "./tool-input-diagnostics.js";
 
 const log = createLogger("pi-provider");
 
@@ -1028,7 +1029,7 @@ export function createPiProvider(config: {
       const suppliedHeaders = requestHeaders(params);
       const turnRouting = codexTurnRouting(model, params, config.apiKey, suppliedHeaders);
       const headers = turnRouting?.headers ?? suppliedHeaders;
-      const requestDiagnostics = createRequestDiagnostics(params.signal, params.onRequestFailure);
+      const requestDiagnostics = createRequestDiagnostics(params.signal, params.onRequestFailure, undefined, params.requestMetadata?.contextBudgetDiagnostics);
       const onPayload = (useOfficialReasoningDefaults || useProviderOutputDefault || config.onPayload || context.hostMessageIndexes.length)
         ? ((payload: unknown, hookModel: Model<Api>) => requestDiagnostics.observePayload(() => {
             payload = restoreHostMessageRoles(payload, context, hookModel);
@@ -1155,7 +1156,7 @@ export function createPiProvider(config: {
       const turnRouting = codexTurnRouting(model, params, config.apiKey, suppliedHeaders);
       const headers = turnRouting?.headers ?? suppliedHeaders;
       let responseErrorStatus: number | undefined;
-      const requestDiagnostics = createRequestDiagnostics(params.signal, params.onRequestFailure);
+      const requestDiagnostics = createRequestDiagnostics(params.signal, params.onRequestFailure, undefined, params.requestMetadata?.contextBudgetDiagnostics);
       const onResponse = (response: ProviderHttpResponse) => {
         turnRouting?.observe(response);
         responseErrorStatus = response.status >= 400 ? response.status : undefined;
@@ -1250,6 +1251,7 @@ export function createPiProvider(config: {
               onPayload: onPayload as any,
             });
 
+        const toolInputs = new ToolInputDiagnostics(model.api === 'openai-completions');
         for await (const event of eventStream) {
           requestDiagnostics.observeEvent(event.type);
           switch (event.type) {
@@ -1286,6 +1288,7 @@ export function createPiProvider(config: {
               yield { type: "thinking_end" };
               break;
             case "toolcall_start":
+              toolInputs.start(event.contentIndex);
               {
                 const text = leadingThinkFilter?.finish() || "";
                 yield* takeLeadingThinkEvents();
@@ -1302,9 +1305,11 @@ export function createPiProvider(config: {
               };
               break;
             case "toolcall_delta":
+              toolInputs.delta(event.contentIndex, event.delta);
               yield { type: "tool_use_delta", id: "", input: event.delta };
               break;
             case "toolcall_end":
+              toolInputs.end(event.contentIndex, event.toolCall.arguments);
               yield { type: "tool_use_end", id: event.toolCall.id };
               break;
             case "done":

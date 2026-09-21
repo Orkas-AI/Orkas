@@ -26,7 +26,8 @@ eligible existing executors; never invent SDK methods from host tool names.
 1. Put `orkas-app.json` at the app bundle root. Set `sdkVersion: 1` and declare
    only needed families from `storage`, `appFiles`, `files`, `ai`, `library`, `connectors`.
 2. Load `<script src="/__orkas/sdk.js"></script>` before app code. Use
-   `window.orkasApp`. Bundle every other script, style and asset locally.
+   `window.orkasApp`. Local bundles and external HTTP(S) scripts, styles and assets
+   are supported in running apps and previews.
 3. Call `capabilities.list()` to check support, declaration, availability and
    authorization separately. Use `capabilities.describe({method})` for the
    current schema. Never treat a declaration or discovery result as consent.
@@ -69,8 +70,16 @@ eligible existing executors; never invent SDK methods from host tool names.
   inherit it. External writes and fees are possible; inspect business errors.
   Connector installation is not exposed.
 
+Use browser `fetch`/XHR, EventSource or WebSocket for external APIs; no SDK network
+method or manifest capability is needed. Browser CORS, mixed-content and endpoint
+authentication still apply. External scripts run with the app's declared SDK
+abilities. Handle failures and cancellation without replaying uncertain writes.
+Automated `html_preview` allows Web
+resources but isolates storage and disables account services; verify business
+actions in the running app.
+
 Read `unsupported` in the reference for excluded families and reasons. Shell,
-arbitrary network/CDNs, task/Agent execution, Skill execution, project/history/
+task/Agent execution, Skill execution, project/history/
 memory access, media generation and editing selected original files have no v1 adapter.
 
 ## Failure and lifecycle
@@ -80,17 +89,16 @@ must leave the UI usable for an explicit retry. Never automatically replay AI or
 tool calls after uncertain failure: spending or a remote write may already have
 occurred. Aborting does not undo a completed external action.
 
-Close, navigation, account switch, source change and `permissions.revoke()`
+Close, navigation away from the app, account switch, source change and `permissions.revoke()`
 invalidate the instance. Reopen for fresh grants. Do not persist file handles.
 When the host/model is unavailable, explain how to reopen in Orkas or configure
 a model; do not substitute fabricated results or direct provider requests.
 
-Keep requests bounded: four concurrent calls, two host-wide model/tool calls,
-1 MiB request/result/store, 256 storage keys per scope, sandbox files up to
-512 KiB each (256 files / 16 MiB per scope), 16 selected files up to 512 KiB,
-32,000-character AI prompts and at most 4096 output tokens. Large tool results
-fail without automatic replay. A missing host times out after 10 seconds;
-acknowledged operations have a five-minute host deadline.
+File and JSON-store byte limits follow PC's 200 MiB ceiling. The SDK adds no
+quotas on file count, aggregate file bytes, storage-key count, instance count,
+cumulative requests or concurrent calls. Owning services retain their limits; AI output defaults to the configured model. Tool results are application data and do not use
+model-context token budgets. Initial host discovery times out after 10 seconds;
+after connecting, operations use the owning service's timeout and cancellation.
 
 ## Language and interface quality
 

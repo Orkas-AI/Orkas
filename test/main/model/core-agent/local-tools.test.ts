@@ -75,9 +75,60 @@ it('keeps Redis service shutdown behind one-time host approval without executing
 });
 
 describe('local-tools › Windows PowerShell compatibility preflight', () => {
+  it('authorizes the original chain once before passing it to the shell adapter', async () => {
+    await allFilesAuto();
+    const core = await import('../../../../src/core-agent/src/tools/builtin');
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const execute = vi.spyOn(core.bashTool, 'execute').mockResolvedValue({ content: 'completed' });
+    const command = "Write-Output 'first && literal' && Write-Output second || Write-Output recovery";
+    try {
+      const bash = createLocalTools({ userId: UID, cid: CID, hostPlatform: 'win32' })
+        .find(tool => tool.name === 'bash')!;
+      const result = await bash.execute({ command }, { workingDir: tmpDir, state: {} } as any);
+      expect(result.isError).toBeFalsy();
+      expect(execute).toHaveBeenCalledOnce();
+      expect(execute.mock.calls[0][0].command).toBe(command);
+    } finally { execute.mockRestore(); }
+  });
+
+  it.each(['bash', 'process_session', 'interactive_cli'])('keeps conditional removal behind approval: %s', async name => {
+    await allFilesApproval();
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const bp = await import('../../../../src/main/model/core-agent/bash-permissions');
+    const target = path.join(tmpDir, 'protected-chain-target.txt');
+    fs.writeFileSync(target, 'keep');
+    const command = `Write-Output ready && Remove-Item '${target.replace(/'/g, "''")}'`;
+    const requests: any[] = [];
+    bp._setBroadcastForTest((_channel, info: any) => {
+      requests.push(info);
+      bp.respond(info.request_id, 'deny');
+    });
+    try {
+      const tool = createLocalTools({ userId: UID, cid: CID, hostPlatform: 'win32' })
+        .find(candidate => candidate.name === name)!;
+      const result = await tool.execute({ command, ...(name === 'bash' ? {} : { action: 'start' }) }, {
+        workingDir: path.join(tmpDir, 'chain-workspace'), state: {},
+      } as any);
+      expect(requests).toHaveLength(1);
+      expect(result.isError).toBe(true);
+      expect(result.content).not.toContain('E_SHELL_SYNTAX_MISMATCH');
+      expect(fs.readFileSync(target, 'utf8')).toBe('keep');
+      expect(fs.existsSync(path.join(tmpDir, 'chain-workspace'))).toBe(false);
+    } finally {
+      bp._setBroadcastForTest(null);
+      bp._resetForTest();
+    }
+  });
+
   it('rejects high-confidence POSIX syntax before execution and leaves PowerShell syntax alone', async () => {
     const { windowsPowerShellCompatibilityError } = await import('../../../../src/main/model/core-agent/local-tools');
-    expect(windowsPowerShellCompatibilityError('npm install && npm test', 'win32')).toContain('E_SHELL_SYNTAX_MISMATCH');
+    expect(windowsPowerShellCompatibilityError('npm install && npm test', 'win32')).toBeNull();
+    expect(windowsPowerShellCompatibilityError('npm test || npm run report', 'win32')).toBeNull();
+    expect(windowsPowerShellCompatibilityError('echo done && mkdir -p api', 'win32')).toContain('POSIX mkdir -p');
+    expect(windowsPowerShellCompatibilityError('npm test && (npm run report)', 'win32')).toContain('unsupported complex');
+    expect(windowsPowerShellCompatibilityError('Write-Output "C:\\data\\" "&&"', 'win32')).toBeNull();
+    expect(windowsPowerShellCompatibilityError('Write-Output "C:\\data\\" "&&" && Write-Output done', 'win32')).toBeNull();
+    expect(windowsPowerShellCompatibilityError('Write-Output `&`&', 'win32')).toBeNull();
     expect(windowsPowerShellCompatibilityError("cat <<'TEXT'\nnode run-skill.cjs missing-skill probe\nTEXT", 'win32')).toContain('POSIX heredoc');
     expect(windowsPowerShellCompatibilityError('export TOKEN=x; head -n 3 a.txt > /dev/null', 'win32')).toContain('source/export');
     expect(windowsPowerShellCompatibilityError('mkdir -p api core/data core/analysis', 'win32')).toContain('POSIX mkdir -p');
@@ -95,7 +146,7 @@ describe('local-tools › Windows PowerShell compatibility preflight', () => {
     const processStart = tools.find((tool) => tool.name === 'process_session')!;
     const interactive = tools.find((tool) => tool.name === 'interactive_cli')!;
     const marker = path.join(tmpDir, 'must-not-run.txt');
-    const command = `node -e "require('fs').writeFileSync('${marker}', 'ran')" && echo done`;
+    const command = `node -e "require('fs').writeFileSync('${marker}', 'ran')" && (echo done)`;
     const ctx = { workingDir: tmpDir, signal: undefined, state: {} } as any;
 
     const bashResult = await bash.execute({ command }, ctx);
@@ -159,7 +210,7 @@ describe('local-tools › Windows PowerShell compatibility preflight', () => {
     fs.mkdirSync(cwd, { recursive: true });
 
     const result = await bash.execute({
-      command: 'Write-Output $env:ORKAS_NATIVE_SMOKE',
+      command: 'Write-Output $env:ORKAS_NATIVE_SMOKE && Write-Output chain-complete',
       timeoutMs: 10_000,
     }, {
       workingDir: cwd,
@@ -169,6 +220,7 @@ describe('local-tools › Windows PowerShell compatibility preflight', () => {
     expect(result.isError).toBeUndefined();
     expect(result.content).toContain('<command-result status="succeeded" exit_code="0"');
     expect(result.content).toContain('Windows-你好');
+    expect(result.content).toContain('chain-complete');
     expect(result.observations?.execution).toMatchObject({ status: 'succeeded', exitCode: 0 });
   });
 
@@ -739,6 +791,24 @@ describe('local-tools › bash › disabled skills', () => {
 });
 
 describe('local-tools › bash › run-scoped Skill binding', () => {
+  it('rejects malformed Skill operands before executing or changing the environment', async () => {
+    await allFilesAuto();
+    const core = await import('../../../../src/core-agent/src/tools/builtin');
+    const execute = vi.spyOn(core.bashTool, 'execute').mockResolvedValue({ content: 'must not execute' });
+    try {
+      const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+      const bash = createLocalTools({ userId: UID, skillRuntimeBindings: new Map() }).find(t => t.name === 'bash')!;
+      const ctx = { workingDir: tmpDir, state: { sandboxEnv: { SENTINEL: 'unchanged' } } } as any;
+      const invalid = await bash.execute({ command: "node run-skill.cjs 'skill-creator},{' probe" }, ctx);
+      expect(invalid.content).toContain('E_SKILL_REF_INVALID');
+      expect(invalid.observations?.fileFailure).toMatchObject({ skill_ref_valid: false });
+      const missing = await bash.execute({ command: 'node run-skill.cjs missing-skill probe' }, ctx);
+      expect(missing.content).toContain('E_SKILL_NOT_AVAILABLE');
+      expect(missing.observations?.fileFailure).toMatchObject({ skill_ref_valid: true, skill_binding_found: false });
+      expect(execute).not.toHaveBeenCalled();
+      expect(ctx.state.sandboxEnv).toEqual({ SENTINEL: 'unchanged' });
+    } finally { execute.mockRestore(); }
+  });
   it.runIf(process.platform !== 'win32')('finds the runner file without attempting to execute a Skill', async () => {
     await allFilesAuto();
     fs.writeFileSync(path.join(tmpDir, 'run-skill.cjs'), 'throw new Error("must not execute");');
@@ -2505,10 +2575,10 @@ describe('local-tools › create_artifact › permission mode', () => {
     const r = await run(tool, { title: 'X', files: MIN_FILES });
     expect(r.isError).toBeFalsy();
     expect(r.content).toMatch(/do NOT paste/i);
-    expect(r.content).toMatch(/interaction smoke passed/i);
+    expect(r.content).toMatch(/preview checks passed/i);
   });
 
-  it('rejects and discards a candidate with explicit blockers before firing onArtifactCreated', async () => {
+  it('publishes a valid bundle with honest diagnostics even when preview checks find issues', async () => {
     await allFilesAuto();
     const created: unknown[] = [];
     let candidateDir = '';
@@ -2531,16 +2601,15 @@ describe('local-tools › create_artifact › permission mode', () => {
     });
     const r = await run(tool, { title: 'Static app', files: MIN_FILES });
 
-    expect(r.isError).toBe(true);
-    expect(r.content).toContain('E_ARTIFACT_INTERACTION_INCOMPLETE');
-    expect(r.content).toContain('Repair the app behavior');
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('preview reported issues');
     expect(r.content).toContain('keyboard traversal could not reach the primary action');
-    expect(created).toEqual([]);
+    expect(created).toHaveLength(1);
     expect(candidateDir).toBeTruthy();
-    expect(fs.existsSync(candidateDir)).toBe(false);
+    expect(fs.existsSync(candidateDir)).toBe(true);
   });
 
-  it('turns blocked remote images into a bounded self-contained recovery path', async () => {
+  it('retains unavailable remote resource diagnostics without forcing an offline rewrite', async () => {
     await allFilesAuto();
     const tool = await buildCreateArtifactTool({
       onArtifactCreated: () => {},
@@ -2556,16 +2625,21 @@ describe('local-tools › create_artifact › permission mode', () => {
     });
     const r = await run(tool, { title: 'Remote image app', files: MIN_FILES });
 
-    expect(r.isError).toBe(true);
-    expect(r.content).toContain('E_ARTIFACT_INTERACTION_INCOMPLETE');
-    expect(r.content).toMatch(/user explicitly supplied or required an asset/i);
-    expect(r.content).toMatch(/bundle it under files.*base64/i);
-    expect(r.content).toMatch(/model-chosen remote assets.*local CSS\/SVG or data\/blob/i);
-    expect(r.content).toMatch(/Do not retry the same remote URLs/i);
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('6 images failed to load');
+    expect(r.content).not.toContain('Do not retry the same remote URLs');
   });
 });
 
 describe('local-tools › create_artifact › success + callback', () => {
+  it('preserves the application and reports unavailable preview without claiming verification', async () => {
+    const created: unknown[]=[];
+    const tool=await buildCreateArtifactTool({onArtifactCreated:a=>created.push(a),artifactInteractionSmoke:async()=>{throw new Error('fixture preview unavailable');}});
+    const result=await run(tool,{title:'Retained',files:MIN_FILES});
+    expect(result.isError).toBeFalsy();expect(created).toHaveLength(1);
+    expect(result.content).toContain('Preview unavailable');
+    expect(result.content).not.toContain('checks passed');
+  });
   it('publishes an artifact with inconclusive effects and preserves the warning', async () => {
     await allFilesAuto();
     const created: unknown[] = [];

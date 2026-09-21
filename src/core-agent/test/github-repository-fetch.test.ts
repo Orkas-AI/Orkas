@@ -47,9 +47,97 @@ function repositoryResource() {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 describe("GitHub repository web_fetch provider", () => {
+  it.each([false, true])("does not claim cached source evidence after a denied repository fetch (in flight: %s)", async inFlight => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const fetchMock = vi.fn(async () => {
+      if (inFlight) await gate;
+      return textResponse("Forbidden", 403);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const webFetch = getBuiltinTools().find(tool => tool.name === "web_fetch")!;
+    const context = { state: { runScopedLedger: new Map() } };
+    const root = webFetch.execute({ url: REPOSITORY_URL }, context);
+    if (!inFlight) await root;
+    const alias = webFetch.execute({ url: README_URL }, context);
+    release();
+    expect((await root).isError).toBe(true);
+    for (const result of [await alias, await webFetch.execute({ url: METADATA_URL }, context)]) {
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("HTTP 403");
+      expect(result.content).not.toContain("GITHUB_REPOSITORY_SNAPSHOT_CACHE_HIT");
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not start repository requests after the task was cancelled", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(metadata));
+    vi.stubGlobal("fetch", fetchMock);
+    const controller = new AbortController();
+    controller.abort();
+    const webFetch = getBuiltinTools().find(tool => tool.name === "web_fetch")!;
+    const result = await webFetch.execute({ url: REPOSITORY_URL }, { state: {}, signal: controller.signal });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("cancelled");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("releases the sibling request when one parallel request fails", async () => {
+    let siblingSignal: AbortSignal | undefined;
+    vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init: RequestInit) => {
+      if (requestUrl(input) === METADATA_URL) return Promise.reject(new Error("fetch failed"));
+      siblingSignal = init.signal!;
+      return new Promise<Response>((_resolve, reject) => {
+        siblingSignal!.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+      });
+    }));
+    const result = await fetchGitHubRepositorySnapshot(repositoryResource());
+    expect(result.isError).toBe(true);
+    expect(siblingSignal?.aborted).toBe(true);
+  });
+
+  it.each(["headers", "body"])("cancels both repository requests while waiting for %s", async stage => {
+    vi.useFakeTimers();
+    const signals: AbortSignal[] = [];
+    const fetchMock = vi.fn((_input: unknown, init: RequestInit) => {
+      const signal = init.signal!;
+      signals.push(signal);
+      if (stage === "headers") {
+        return new Promise<Response>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+        });
+      }
+      return Promise.resolve(new Response(new ReadableStream({
+        start(stream) {
+          signal.addEventListener("abort", () => stream.error(new DOMException("aborted", "AbortError")), { once: true });
+        },
+      })));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const controller = new AbortController();
+    const webFetch = getBuiltinTools().find(tool => tool.name === "web_fetch")!;
+    const pending = webFetch.execute({ url: REPOSITORY_URL }, { state: {}, signal: controller.signal });
+    await vi.advanceTimersByTimeAsync(0);
+    controller.abort();
+    try {
+      expect(signals).toHaveLength(2);
+      expect(signals.every(signal => signal.aborted)).toBe(true);
+      const result = await pending;
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("cancelled");
+      expect(result.content).not.toContain("Timeout");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      // Also release the pre-fix implementation through its existing deadline.
+      await vi.advanceTimersByTimeAsync(60_000);
+      await pending;
+    }
+  });
+
   it("keeps metadata when the README request fails", async () => {
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
       const url = requestUrl(input);

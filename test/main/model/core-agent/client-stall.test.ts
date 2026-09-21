@@ -542,6 +542,29 @@ describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
     expect(result.error).not.toBe('');
   });
 
+  it('streams a task draft immediately and preserves it when cancelled before phase resolution', async () => {
+    const controller = new AbortController();
+    h.makeStream = () => (async function* () {
+      yield { type: 'text_delta', text: 'Partial task result' };
+      await new Promise(() => {});
+    })();
+    const { streamChatWithModel } = await import('../../../../src/main/model/core-agent/client');
+    const events: any[] = [];
+    for await (const event of streamChatWithModel({
+      userId: 'u', message: 'Complete the task', cid: 'draft-cancel',
+      sessionId: 'gconv-draft-cancel', abortSignal: controller.signal, idleTimeout: 0.2,
+    })) {
+      events.push(event);
+      if (event.type === 'delta') controller.abort();
+    }
+    expect(events).toContainEqual({ type: 'delta', text: 'Partial task result', phase: 'pending' });
+    expect(events.filter(e => e.type === 'commentary-finalized'))
+      .toEqual([{ type: 'commentary-finalized', text: 'Partial task result' }]);
+    expect(events.some(e => e.type === 'final')).toBe(false);
+    expect(events.find(e => e.type === 'error')).toMatchObject({ aborted: true });
+    expect(h.runStreamCalls).toBe(1);
+  });
+
   it('SHORT model-stream window catches a stream that started then stalled (no long wait)', async () => {
     // Stream emits one delta, then goes silent. After the first text event, the
     // model-stream phase uses streamIdleTimeout (0.3s), NOT idleTimeout (10s).

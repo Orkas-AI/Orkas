@@ -19,12 +19,6 @@ if (process.isMainFrame) {
     /** @type {(value: any) => void} */
     let resolve = () => {};
     const promise = new Promise(done => { resolve = done; });
-    if (pending.size >= 8) {
-      const value = { code: 'E_LIMIT' };
-      queueMicrotask(() => onEvent?.({ type: 'result', ok: false, value }));
-      resolve(value);
-      return { promise, cancel() {} };
-    }
     const cancel = () => {
       const item = pending.get(id); if (!item) return;
       ipcRenderer.send(channel, { id, operation: 'webApps.cancel', payload });

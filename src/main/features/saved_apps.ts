@@ -19,6 +19,7 @@
  */
 
 import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 
@@ -42,14 +43,8 @@ const DEFAULT_TITLE = 'Interactive app';
 // wasm / …) becomes a one-line `[binary asset …]` placeholder — it can't be
 // represented in a text `.md` bundle, and changing it means re-supplying it
 // via `create_artifact` with `"encoding":"base64"` anyway.
-const TEXT_LIKE_EXTS: ReadonlySet<string> = new Set([
-  '.html', '.htm', '.js', '.mjs', '.css', '.json', '.map', '.svg', '.xml', '.txt', '.csv',
-]);
-const BUNDLE_RESOURCE_EXTS: ReadonlySet<string> = new Set([
-  '.html', '.htm', '.css', '.js', '.mjs', '.json', '.svg', '.png', '.jpg', '.jpeg', '.webp',
-  '.gif', '.avif', '.bmp', '.ico', '.webmanifest', '.woff', '.woff2', '.ttf', '.wasm',
-  '.mp3', '.wav', '.ogg', '.mp4', '.webm', '.glb', '.gltf', '.txt', '.md', '.csv', '.xml',
-]);
+const TEXT_LIKE_EXTS = chatArtifacts.TEXT_EXTS;
+const BUNDLE_RESOURCE_EXTS = chatArtifacts.SERVED_EXTS;
 const HTML_ENTRY_EXTS: ReadonlySet<string> = new Set(['.html', '.htm']);
 // Only application source files express an intent to save the surrounding
 // HTML bundle. Images, media, fonts, manifests, data, and models remain valid
@@ -58,12 +53,9 @@ const BUNDLE_TRIGGER_EXTS: ReadonlySet<string> = new Set([
   '.html', '.htm', '.css', '.js', '.mjs',
 ]);
 const BUNDLE_EXCLUDED_DIRS: ReadonlySet<string> = new Set([
-  '.git', '.hg', '.svn', 'node_modules', 'dist', 'build', '.next', '.vite', 'coverage',
+  '.git', '.hg', '.svn', 'node_modules', '.next', '.vite', 'coverage',
 ]);
 const SOURCE_BUNDLE_NAME = 'app-source.md';
-const MAX_BUNDLE_FILES = 300;
-const MAX_BUNDLE_BYTES = 30 * 1024 * 1024;
-const MAX_BUNDLE_ANCESTORS = 8;
 
 export type Result<T = {}> = ({ ok: true } & T) | { ok: false; error: string };
 type ResolveCode = 'bad_input' | 'forbidden' | 'not_found';
@@ -181,9 +173,9 @@ function nearestFenceRoot(candidate: string, roots: string[]): string {
   return best;
 }
 
-function inferTitleFromHtml(entryPath: string, rootDir: string): string {
+async function inferTitleFromHtml(entryPath: string, rootDir: string): Promise<string> {
   try {
-    const html = fs.readFileSync(entryPath, 'utf8');
+    const html = await fsp.readFile(entryPath, 'utf8');
     const title = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1]
       || /<h1[^>]*>([\s\S]*?)<\/h1>/i.exec(html)?.[1]
       || '';
@@ -252,9 +244,9 @@ function savedAppMimeFor(name: string): string {
   }
 }
 
-function chooseHtmlEntryInDir(dir: string): string {
+async function chooseHtmlEntryInDir(dir: string): Promise<string> {
   let entries: fs.Dirent[];
-  try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+  try { entries = await fsp.readdir(dir, { withFileTypes: true }); }
   catch { return ''; }
   const html = entries
     .filter((e) => e.isFile() && isHtmlEntryName(e.name) && shouldIncludeBundleFile(e.name))
@@ -275,42 +267,43 @@ function shouldIncludeBundleFile(name: string): boolean {
   return BUNDLE_RESOURCE_EXTS.has(path.extname(name).toLowerCase());
 }
 
-function collectBundleFiles(rootDir: string): { ok: true; files: string[]; totalBytes: number } | { ok: false; reason: string } {
+async function collectBundleFiles(rootDir: string): Promise<{ ok: true; files: string[]; totalBytes: number } | { ok: false; reason: string }> {
   const files: string[] = [];
   let totalBytes = 0;
-  const walk = (dir: string): void => {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-    for (const e of entries) {
-      if (e.isSymbolicLink()) continue;
-      const abs = path.join(dir, e.name);
-      if (e.isDirectory()) {
-        if (!shouldSkipBundleDir(e.name)) walk(abs);
-        continue;
+  const pending = [rootDir];
+  try {
+    while (pending.length) {
+      const dir = pending.pop()!;
+      if (!isPathAllowed(dir, [rootDir])) throw new Error('path traversal blocked');
+      const directory = await fsp.opendir(dir);
+      for await (const e of directory) {
+        if (e.isSymbolicLink()) continue;
+        const abs = path.join(dir, e.name);
+        if (e.isDirectory()) {
+          if (!shouldSkipBundleDir(e.name)) pending.push(abs);
+        } else if (e.isFile() && shouldIncludeBundleFile(e.name)) {
+          const st = await fsp.lstat(abs);
+          if (!st.isFile() || !isPathAllowed(abs, [rootDir])) throw new Error('source file changed');
+          files.push(abs);
+          totalBytes += st.size;
+        }
       }
-      if (!e.isFile() || !shouldIncludeBundleFile(e.name)) continue;
-      const st = fs.statSync(abs);
-      files.push(abs);
-      totalBytes += st.size;
-      if (files.length > MAX_BUNDLE_FILES) throw new Error(`too many files (>${MAX_BUNDLE_FILES})`);
-      if (totalBytes > MAX_BUNDLE_BYTES) throw new Error(`bundle is too large (>${Math.round(MAX_BUNDLE_BYTES / 1024 / 1024)} MB)`);
     }
-  };
-  try { walk(rootDir); }
-  catch (err) { return { ok: false, reason: (err as Error).message || 'could not scan bundle' }; }
+  } catch (err) { return { ok: false, reason: (err as Error).message || 'could not scan bundle' }; }
   return { ok: true, files, totalBytes };
 }
 
-function findBundleRoot(target: string, opts: BundleInspectOptions = {}): { ok: true; rootDir: string; entry: string } | { ok: false; reason: string } {
+async function findBundleRoot(target: string, opts: BundleInspectOptions = {}): Promise<{ ok: true; rootDir: string; entry: string } | { ok: false; reason: string }> {
   const abs = path.resolve(target);
   let st: fs.Stats;
-  try { st = fs.statSync(abs); }
+  try { st = await fsp.stat(abs); }
   catch { return { ok: false, reason: 'file not found' }; }
 
   const roots = (opts.fenceRoots || []).filter(Boolean).map((r) => path.resolve(r));
   if (roots.length && !isInsideAnyRoot(abs, roots)) return { ok: false, reason: 'outside allowed workspace' };
 
   if (st.isDirectory()) {
-    const entry = chooseHtmlEntryInDir(abs);
+    const entry = await chooseHtmlEntryInDir(abs);
     if (!entry) return { ok: false, reason: 'folder has no HTML entry' };
     return { ok: true, rootDir: abs, entry };
   }
@@ -322,8 +315,8 @@ function findBundleRoot(target: string, opts: BundleInspectOptions = {}): { ok: 
 
   const fence = nearestFenceRoot(abs, roots);
   let dir = path.dirname(abs);
-  for (let i = 0; i <= MAX_BUNDLE_ANCESTORS; i++) {
-    const entry = chooseHtmlEntryInDir(dir);
+  while (true) {
+    const entry = await chooseHtmlEntryInDir(dir);
     if (entry) return { ok: true, rootDir: dir, entry };
     if (fence && path.resolve(dir) === fence) break;
     const parent = path.dirname(dir);
@@ -333,9 +326,9 @@ function findBundleRoot(target: string, opts: BundleInspectOptions = {}): { ok: 
   return { ok: false, reason: 'no HTML entry found for this file' };
 }
 
-export function inspectBundleFromPath(targetPath: string, opts: BundleInspectOptions = {}): BundleInspection {
+async function inspectBundle(targetPath: string, opts: BundleInspectOptions): Promise<BundleInspection & { files?: string[] }> {
   if (typeof targetPath !== 'string' || !targetPath.trim()) return { ok: false, error: 'path required' };
-  const found = findBundleRoot(targetPath, opts);
+  const found = await findBundleRoot(targetPath, opts);
   if (!found.ok) return { ok: true, canSave: false, reason: (found as { ok: false; reason: string }).reason };
   const rootDir = found.rootDir;
   if (opts.fenceRoots?.length && !isInsideAnyRoot(rootDir, opts.fenceRoots)) {
@@ -344,10 +337,10 @@ export function inspectBundleFromPath(targetPath: string, opts: BundleInspectOpt
   const entry = found.entry;
   const entryAbs = path.join(rootDir, entry);
   let entryStat: fs.Stats;
-  try { entryStat = fs.statSync(entryAbs); }
+  try { entryStat = await fsp.stat(entryAbs); }
   catch { return { ok: true, canSave: false, reason: 'bundle is missing its HTML entry' }; }
   if (!entryStat.isFile()) return { ok: true, canSave: false, reason: 'HTML entry is not a file' };
-  const scanned = collectBundleFiles(rootDir);
+  const scanned = await collectBundleFiles(rootDir);
   if (!scanned.ok) return { ok: true, canSave: false, reason: (scanned as { ok: false; reason: string }).reason };
   const includesEntry = scanned.files.some((p) => path.resolve(p) === path.resolve(entryAbs));
   if (!includesEntry) return { ok: true, canSave: false, reason: 'HTML entry is not a supported app file' };
@@ -356,23 +349,30 @@ export function inspectBundleFromPath(targetPath: string, opts: BundleInspectOpt
     canSave: true,
     rootDir,
     entry,
-    title: inferTitleFromHtml(entryAbs, rootDir),
+    title: await inferTitleFromHtml(entryAbs, rootDir),
+    files: scanned.files,
     fileCount: scanned.files.length,
     totalBytes: scanned.totalBytes,
   };
 }
 
-function copyBundleFiles(srcRoot: string, destRoot: string): { fileCount: number; totalBytes: number } {
-  const scanned = collectBundleFiles(srcRoot);
-  if (!scanned.ok) throw new Error((scanned as { ok: false; reason: string }).reason);
-  for (const src of scanned.files) {
+export async function inspectBundleFromPath(targetPath: string, opts: BundleInspectOptions = {}): Promise<BundleInspection> {
+  const { files: _files, ...inspection } = await inspectBundle(targetPath, opts);
+  return inspection;
+}
+
+async function copyBundleFiles(srcRoot: string, destRoot: string, files: string[]): Promise<{ fileCount: number; totalBytes: number }> {
+  let totalBytes = 0;
+  for (const src of files) {
     const rel = path.relative(srcRoot, src);
     if (rel.startsWith('..') || path.isAbsolute(rel)) throw new Error('path traversal blocked');
     const dst = path.join(destRoot, rel);
-    fs.mkdirSync(path.dirname(dst), { recursive: true });
-    fs.copyFileSync(src, dst);
+    if (!(await fsp.lstat(src)).isFile() || !isPathAllowed(src, [srcRoot])) throw new Error('source file changed');
+    await fsp.mkdir(path.dirname(dst), { recursive: true });
+    await fsp.copyFile(src, dst);
+    totalBytes += (await fsp.stat(dst)).size;
   }
-  return { fileCount: scanned.files.length, totalBytes: scanned.totalBytes };
+  return { fileCount: files.length, totalBytes };
 }
 
 function mintAppId(userId: string): { appId: string; destDir: string } {
@@ -387,7 +387,7 @@ function mintAppId(userId: string): { appId: string; destDir: string } {
 // ── Public API ───────────────────────────────────────────────────────────
 
 /** Copy a chat artifact bundle into a new `saved_apps/<appId>/`. */
-export function saveFromArtifact(userId: string, cid: string, artifactId: string): Result<{ id: string; title: string }> {
+export async function saveFromArtifact(userId: string, cid: string, artifactId: string): Promise<Result<{ id: string; title: string }>> {
   const resolved = chatArtifacts.resolveArtifactDir(userId, cid, artifactId);
   if (!resolved.ok) return { ok: false, error: (resolved as { error?: string }).error || 'artifact not found' };
   const srcDir = (resolved as { dirPath: string }).dirPath;
@@ -409,7 +409,7 @@ export function saveFromArtifact(userId: string, cid: string, artifactId: string
   try {
     // Copy everything except the source `__orkas-meta.json` (we write a fresh
     // one stamped with the source provenance).
-    fs.cpSync(srcDir, tmpDir, {
+    await fsp.cp(srcDir, tmpDir, {
       recursive: true,
       filter: (src) => path.basename(src) !== META_FILENAME,
     });
@@ -422,12 +422,12 @@ export function saveFromArtifact(userId: string, cid: string, artifactId: string
       sourceArtifactId: typeof artifactId === 'string' ? artifactId : '',
       savedAt: new Date().toISOString(),
     };
-    writeMeta(tmpDir, meta);
-    fs.mkdirSync(path.dirname(destDir), { recursive: true });
-    fs.renameSync(tmpDir, destDir);
+    await fsp.writeFile(path.join(tmpDir, META_FILENAME), JSON.stringify(meta, null, 2));
+    await fsp.mkdir(path.dirname(destDir), { recursive: true });
+    await fsp.rename(tmpDir, destDir);
   } catch (err) {
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
-    try { fs.rmSync(destDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    try { await fsp.rm(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    try { await fsp.rm(destDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     log.warn('saveFromArtifact failed', {
       user_id: maskId(userId),
       conversation_id: maskId(cid),
@@ -447,12 +447,12 @@ export function saveFromArtifact(userId: string, cid: string, artifactId: string
 }
 
 /** Copy a workspace/file-tab-discovered HTML app bundle into saved_apps. */
-export function saveFromPath(
+export async function saveFromPath(
   userId: string,
   targetPath: string,
   opts: BundleInspectOptions & { title?: unknown; sourceCid?: unknown } = {},
-): Result<{ id: string; title: string; rootDir: string; entry: string; fileCount: number; totalBytes: number }> {
-  const inspected = inspectBundleFromPath(targetPath, opts);
+): Promise<Result<{ id: string; title: string; rootDir: string; entry: string; fileCount: number; totalBytes: number }>> {
+  const inspected = await inspectBundle(targetPath, opts);
   if (!inspected.ok) return { ok: false, error: (inspected as { ok: false; error: string }).error };
   if (!inspected.canSave) return { ok: false, error: (inspected as { ok: true; canSave: false; reason: string }).reason };
 
@@ -469,8 +469,8 @@ export function saveFromPath(
 
   const tmpDir = `${destDir}.tmp-${crypto.randomBytes(4).toString('hex')}`;
   try {
-    fs.mkdirSync(tmpDir, { recursive: true });
-    const copied = copyBundleFiles(inspected.rootDir, tmpDir);
+    await fsp.mkdir(tmpDir, { recursive: true });
+    const copied = await copyBundleFiles(inspected.rootDir, tmpDir, inspected.files!);
     if (!fs.existsSync(path.join(tmpDir, inspected.entry))) throw new Error('bundle is missing its HTML entry');
     const meta: SavedAppMeta = {
       title,
@@ -479,9 +479,9 @@ export function saveFromPath(
       entry: inspected.entry,
       savedAt: new Date().toISOString(),
     };
-    writeMeta(tmpDir, meta);
-    fs.mkdirSync(path.dirname(destDir), { recursive: true });
-    fs.renameSync(tmpDir, destDir);
+    await fsp.writeFile(path.join(tmpDir, META_FILENAME), JSON.stringify(meta, null, 2));
+    await fsp.mkdir(path.dirname(destDir), { recursive: true });
+    await fsp.rename(tmpDir, destDir);
     log.info('saveFromPath completed', {
       user_id: maskId(userId),
       app_id: maskId(appId),
@@ -493,8 +493,8 @@ export function saveFromPath(
     notifySavedAppDirty(appId);
     return { ok: true, id: appId, title, rootDir: inspected.rootDir, entry: inspected.entry, ...copied };
   } catch (err) {
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
-    try { fs.rmSync(destDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    try { await fsp.rm(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    try { await fsp.rm(destDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     log.warn('saveFromPath failed', {
       user_id: maskId(userId),
       target: logPathRef(targetPath),
@@ -710,7 +710,7 @@ function buildSourceBundle(dir: string, title: string): string {
   const lines: string[] = [
     `# Interactive app source — "${title}"`,
     '',
-    `This is the current source of a self-contained interactive web app. Its current entry HTML is \`${entry}\`. To modify it: read the files below, then call \`create_artifact\` again with the updated \`files\` array — include a top-level HTML entry, keep the app offline (inline your CSS/JS or reference sibling files by relative URL), and the result is embedded in a sandboxed iframe.`,
+    `This is the current source of a self-contained interactive web app. Its current entry HTML is \`${entry}\`. To modify it: read the files below, then call \`create_artifact\` again with the updated \`files\` array — include a top-level HTML entry, use relative URLs for bundled files or HTTP(S) URLs for external resources, and the result is embedded in a sandboxed iframe.`,
     '',
   ];
   for (const rel of files) {

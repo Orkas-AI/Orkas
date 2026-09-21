@@ -1,4 +1,8 @@
 {
+  "files.delimited.table": "表",
+  "files.delimited.source": "原文",
+  "files.delimited.limited": "プレビューは一部のみです。すべてのデータは外部アプリで開いてください。",
+  "files.delimited.invalid": "引用符で囲まれたフィールドが不完全または無効です。原文を表示します。",
   "connectors.action_confirm.operation.external_or_financial_change": "外部への操作・資金の変動",
   "connectors.action_confirm.operation.destructive": "削除・取り消せない操作",
   "connectors.action_confirm.operation.financial_record_change": "財務記録の変更",

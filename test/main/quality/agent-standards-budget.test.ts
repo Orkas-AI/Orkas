@@ -71,8 +71,7 @@ describe('built-in Agent runtime guidance contract', () => {
   const rows = measureAll();
 
   it('finds the complete built-in Agent corpus', () => {
-    // StockAnalyser remains a Resource Agent, outside the PC built-in bundle.
-    expect(rows).toHaveLength(10);
+    expect(rows).toHaveLength(11);
   });
 
   it('keeps knowhow and standards at five items or fewer', () => {

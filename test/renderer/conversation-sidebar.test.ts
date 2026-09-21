@@ -6126,6 +6126,54 @@ describe('conversation process metadata formatting', () => {
     expect(body.children[2].innerHTML).not.toContain('stream-process-icon');
   });
 
+  it('paints draft text before phase resolution and moves each round into process only once', async () => {
+    const context = loadConversationRenderer();
+    // This scenario exercises cancellation of a queued preview paint. Match
+    // the browser's paired request/cancel API, absent from the minimal shim.
+    context.requestAnimationFrame = (fn: () => void) => setTimeout(fn, 0);
+    context.cancelAnimationFrame = (handle: ReturnType<typeof setTimeout>) => clearTimeout(handle);
+    context.document.createElement = (tag: string) => createProcessTestElement(tag);
+    const body = createProcessTestElement('div');
+    const container = createProcessTestElement('details');
+    container.dataset.processState = 'active';
+    container.open = true;
+    container.style = { display: '' };
+    const finalEl: any = { style: { display: 'none' }, innerHTML: '', querySelector: () => null };
+    const msg: any = {
+      dataset: {},
+      querySelector(selector: string) {
+        if (selector === '[data-role="final"]') return finalEl;
+        if (selector === '[data-role="process"]') return body;
+        if (selector === '[data-role="process-container"]' || selector === '.stream-process') return container;
+        return null;
+      },
+    };
+    context._bindProcessStickToBottom = () => {};
+    context._stickProcessBottomIfPinned = () => {};
+    context._stickBottomFromMsg = () => {};
+    context._streamingDisplayText = (text: string) => text;
+    context._paintStreamingFinalMarkdown = (_msg: any, el: any, text: string) => { el.innerHTML = text; };
+    context._attachAssistantActions = () => {};
+    context._stripSurvivingStructuralBlocks = (text: string) => text;
+    for (const text of ['Inspect sources.', 'Verify results.']) {
+      context._streamingAppendFinalDelta(msg, text, 'pending');
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(finalEl.innerHTML).toBe(text);
+      expect(container.dataset.processState).toBe('active');
+      context._streamingFinalizeCommentary(msg, text);
+      context._streamingFinalizeCommentary(msg, text);
+      expect(finalEl.style.display).toBe('none');
+      expect(msg.dataset.streamBuf).toBe('');
+    }
+    expect(body.children.map((line: any) => line.dataset.processText))
+      .toEqual(['Inspect sources.', 'Verify results.']);
+    context._streamingAppendFinalDelta(msg, 'Delivered.', 'pending');
+    context._streamingSetFinal(msg, 'Delivered.');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(finalEl.innerHTML).toBe('Delivered.');
+    expect(body.children).toHaveLength(2);
+  });
+
   it('renders commentary through the markdown pipeline and keeps the raw source text', () => {
     const context = loadConversationRenderer();
     context.document.createElement = (tagName: string) => createProcessTestElement(tagName);

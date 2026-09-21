@@ -100,6 +100,78 @@ function firstHitCid(content: string): string {
   return match ? match[1] : '';
 }
 
+describe('history availability', () => {
+  const earlier = { id: 'earlier', from: 'user', text: 'availabilityword earlier fact' };
+  const trigger = { id: 'trigger', from: 'user', text: 'current request' };
+
+  it('reports unavailable bodies separately from empty history and recovers after restoration', async () => {
+    writeConversation('availability', 'History', [earlier, trigger]);
+    const [search, read] = await createChatHistoryActions({
+      userId: TEST_UID, currentCid: 'availability', currentMessageId: 'trigger',
+    });
+    const file = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'availability.jsonl');
+    fs.unlinkSync(file);
+    for (const result of [
+      await read.execute({ scope: 'all', cid: 'availability', record_id: 'earlier' }, ctxFor()),
+      await search.execute({ scope: 'current', query: 'availabilityword' }, ctxFor()),
+    ]) {
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain('source_unavailable');
+      expect(result.content).not.toContain('No conversation-history results');
+      expect(result.content).not.toContain('has no messages');
+    }
+    writeConversation('availability', 'History', [earlier, trigger]);
+    const restored = await read.execute({ scope: 'current', record_id: 'earlier' }, ctxFor());
+    expect(restored.isError).toBeFalsy();
+    expect(restored.content).toContain(earlier.text);
+  });
+
+  it('rejects an unavailable current boundary in read/search and keeps cross-conversation results explicitly partial', async () => {
+    writeConversation('availability', 'History', [earlier]);
+    writeConversation('other', 'Other', [{ ...earlier, text: 'availabilityword other fact' }]);
+    const [search, read] = await createChatHistoryActions({
+      userId: TEST_UID, currentCid: 'availability', currentMessageId: 'trigger',
+    });
+    for (const result of [
+      await read.execute({ scope: 'current' }, ctxFor()),
+      await read.execute({ scope: 'all', cid: 'availability' }, ctxFor()),
+      await search.execute({ scope: 'current', query: 'availabilityword' }, ctxFor()),
+    ]) {
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain('boundary_unavailable');
+      expect(result.content).not.toContain(earlier.text);
+    }
+    const partial = await search.execute({ scope: 'all', include_current: true, query: 'availabilityword' }, ctxFor());
+    expect(partial.content).toContain('boundary_unavailable');
+    expect(partial.content).toContain('other fact');
+    expect(partial.content).not.toContain('earlier fact');
+    expect(partial.content).not.toContain('index_complete=true');
+    const excluded = await search.execute({ scope: 'all', include_current: false, query: 'availabilityword' }, ctxFor());
+    expect(excluded.content).toContain('index_complete=true');
+    expect(excluded.content).not.toContain('boundary_unavailable');
+  });
+
+  it('keeps genuine empty history and a first-turn empty scope successful', async () => {
+    writeConversation('empty', 'Empty', []);
+    writeConversation('first', 'First', [trigger]);
+    const [search, read] = await createChatHistoryActions({
+      userId: TEST_UID, currentCid: 'first', currentMessageId: 'trigger',
+    });
+    for (const result of [
+      await read.execute({ scope: 'all', cid: 'empty' }, ctxFor()),
+      await read.execute({ scope: 'current' }, ctxFor()),
+    ]) {
+      expect(result.isError).toBeFalsy();
+      expect(result.content).toContain('No readable messages in the requested history scope');
+      expect(result.content).not.toContain('unavailable');
+    }
+    const result = await search.execute({ scope: 'current', query: 'current' }, ctxFor());
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toContain('index_complete=true');
+    expect(result.content).toContain('No conversation-history results');
+  });
+});
+
 describe('chat-history-tools › chat_history(search)', () => {
   it('finds current group-chat message text and returns cid/msg metadata', async () => {
     writeConversation('cgroup', 'Planning chat', [

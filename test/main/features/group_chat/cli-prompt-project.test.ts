@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { captureMainLogWorkers } from '../../../helpers/capture-main-log-workers';
 
 // A CLI agent dispatched into a project must receive that project's ORKAS.md
 // in the durable instruction channel, while the user turn remains the actual
@@ -9,18 +10,21 @@ import * as path from 'node:path';
 
 let tmpDir: string;
 let prevWs: string | undefined;
+let closeLogWorkers: () => Promise<void>;
 const TEST_UID = 'uCliProj';
 const CID = 'c_cli_proj';
 const REPO_LINE = 'Orkas 代码仓库路径:`~/Documents/GitHub/AITeamRelease`。';
 
-beforeEach(() => {
+beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-cli-prompt-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
+  closeLogWorkers = await captureMainLogWorkers();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await closeLogWorkers();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });

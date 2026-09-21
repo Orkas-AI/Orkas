@@ -175,6 +175,60 @@ function getTool(tools: any[], name: string) {
   throw new Error(`tool ${name} not found`);
 }
 
+describe('file-tools › Skill reference validation', () => {
+  it.each([false, true])('distinguishes malformed and unavailable refs without changing valid reads (raw=%s)', async (rawText) => {
+    const root = path.join(tmpDir, 'ref-fixture');
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'SKILL.md'), 'protocol sentinel');
+    fs.writeFileSync(path.join(root, 'part},{.txt'), 'child sentinel');
+    const { bindRuntimeSkillTarget } = await import('../../../../src/main/model/core-agent/skill-registry');
+    const bindings = new Map();
+    const ref = bindRuntimeSkillTarget({ id: 'ref-fixture', name: 'system:skill-creator.v1_2+test@host', root, entry: path.join(root, 'SKILL.md'), source: 'system' }, bindings);
+    expect(ref).toBe('system:skill-creator.v1_2+test@host');
+    const { createFileTools } = await import('../../../../src/main/model/core-agent/file-tools');
+    const tool = createFileTools({ userId: UID, skillRuntimeBindings: bindings }).find(t => t.name === 'read_files')!;
+    const ctx = { workingDir: tmpDir, state: {} } as any;
+    for (const requested of [`@skill/${ref}`, `@skill/${ref}/part},{.txt`]) {
+      const result = await tool.execute({ paths: [{ path: requested }], raw_text: rawText }, ctx);
+      expect(result.isError).toBeFalsy();
+      expect(result.content).toContain('sentinel');
+    }
+    for (const suffix of ['},{', ' extra', '%7D', '\"', '<ref>', '']) {
+      const requested = suffix ? `@skill/${ref}${suffix}` : '@skill/';
+      const input = { paths: [{ path: requested }], raw_text: rawText };
+      const result = await tool.execute(input, ctx);
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain('E_SKILL_REF_INVALID');
+      expect(result.content).not.toContain('sentinel');
+      expect(result.observations?.fileFailure).toEqual({ code: 'E_SKILL_REF_INVALID', reason: 'skill_ref_format', stage: 'input', skill_ref_valid: false, item_index: 0 });
+      expect(input.paths[0].path).toBe(requested);
+    }
+    const missing = await tool.execute({ paths: [{ path: '@skill/missing' }], raw_text: rawText }, ctx);
+    expect(missing.content).toContain('E_SKILL_NOT_AVAILABLE');
+    expect(missing.observations?.fileFailure).toMatchObject({ skill_ref_valid: true, skill_binding_found: false });
+    // Partial success still preserves the failed item's classification and index.
+    const mixed = await tool.execute({ paths: [{ path: `@skill/${ref}` }, { path: '@skill/skill-creator},{' }], raw_text: rawText }, ctx);
+    expect(mixed.isError).toBeFalsy();
+    expect(mixed.content).toContain('protocol sentinel');
+    expect(mixed.observations?.fileFailure).toMatchObject({ code: 'E_SKILL_REF_INVALID', item_index: 1 });
+  });
+
+  it('rejects malformed references consistently at directory, search and source-loading boundaries', async () => {
+    const { createFileTools, createProgramSourceLoader } = await import('../../../../src/main/model/core-agent/file-tools');
+    const opts = { userId: UID, skillRuntimeBindings: new Map() };
+    const tools = createFileTools(opts);
+    const ctx = { workingDir: tmpDir, state: {} } as any;
+    for (const name of ['list_files', 'search_files', 'grep_files']) {
+      const result = await tools.find(t => t.name === name)!.execute({ path: '@skill/skill-creator},{', root: '@skill/skill-creator},{', query: 'sample', pattern: 'sample' }, ctx);
+      expect(result.content).toContain('E_SKILL_REF_INVALID');
+      expect(result.isError).toBe(true);
+      expect(result.observations?.fileFailure).toMatchObject({ skill_ref_valid: false });
+    }
+    const source = await createProgramSourceLoader(opts)('@skill/skill-creator},{', ctx, 100);
+    expect(source).toMatchObject({ status: 'denied', code: 'E_PROGRAM_SOURCE_PATH', reason: expect.stringContaining('E_SKILL_REF_INVALID') });
+  });
+});
+
 describe('file-tools › run_program source loader', () => {
   it('loads exact UTF-8 source through the ordinary workspace scope', async () => {
     const perm = await import('../../../../src/main/features/permissions');
@@ -1454,7 +1508,8 @@ describe('file-tools › read_files', () => {
   it('advertises and executes the same tagged range contract for every batch item', async () => {
     const { tools, wsDir } = await buildTools();
     const readFiles = getTool(tools, 'read_files');
-    const schema = readFiles.inputSchema as any;
+    const { toToolDefinition } = await import('../../../../src/core-agent/src/tools');
+    const schema = toToolDefinition(readFiles).inputSchema as any;
     const itemSchema = schema.properties.paths.items;
     expect(schema.required).toEqual(['paths']);
     expect(schema.properties.metadata_only.type).toBe('boolean');
@@ -1467,10 +1522,15 @@ describe('file-tools › read_files', () => {
     expect(schema.properties.raw_text.description).not.toContain('run_program only');
     expect(itemSchema.properties).not.toHaveProperty('charStart');
     expect(itemSchema.properties).not.toHaveProperty('lineStart');
+    expect(itemSchema.properties.path).toMatchObject({ type: 'string', minLength: 1 });
     expect(itemSchema.properties.range).toMatchObject({
       type: 'object',
       additionalProperties: false,
       required: ['unit', 'start', 'end'],
+      properties: {
+        start: { type: 'integer', minimum: 0 },
+        end: { type: 'integer', minimum: 0 },
+      },
     });
 
     const p = path.join(wsDir, 'batch-range.txt');

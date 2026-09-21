@@ -53,6 +53,14 @@ class FakeNode {
 
 class FakeContainer {
   rows: FakeNode[] = [];
+  dataset: Record<string, string> = {};
+  classList = { remove() {} };
+  style = { removeProperty() {} };
+
+  set innerHTML(_value: string) {
+    for (const row of this.rows) row.parentElement = null;
+    this.rows = [];
+  }
 
   appendChild(node: FakeNode) {
     node.parentElement = this as any;
@@ -87,6 +95,7 @@ class FakeContainer {
     const msgId = selector.match(/data-msg-id="([^"]+)"/)?.[1];
     const actor = selector.match(/data-from-actor="([^"]+)"/)?.[1];
     const wantsNoMsgId = selector.includes(':not([data-msg-id])');
+    if (!selector.startsWith('.chat-message')) return [];
     return this.rows.filter((row) => {
       if (exactKey && row.dataset.renderKey !== exactKey) return false;
       if (prefixKey && !(row.dataset.renderKey || '').startsWith(prefixKey)) return false;
@@ -156,11 +165,11 @@ function loadRenderer(cid: string) {
       container.appendChild(node);
       return node;
     };
-    appendChatMessage = function(legacy) {
+    appendChatMessage = function(legacy, _scroll, opts = {}) {
       // Mirrors production's dedupe entry: identity first, create only when the
       // record has no row yet. Uses the REAL matcher so these tests exercise
       // render-key identity rather than a simplified stand-in.
-      var existing = _findRenderedGroupMessage(__container, legacy);
+      var existing = opts.historyHydration ? null : _findRenderedGroupMessage(__container, legacy);
       if (existing) {
         _syncRenderedGroupMessageIdentity(existing, legacy);
         return existing;
@@ -172,6 +181,8 @@ function loadRenderer(cid: string) {
       if (legacy._from) node.dataset.fromActor = String(legacy._from);
       // Production sets this too; cross-page absorb finds a turn's bubble by it.
       if (legacy._turn_id) node.dataset.turnId = String(legacy._turn_id);
+      node.bodies.final.textContent = legacy.content || '';
+      node.message = legacy;
       // Mirror production's narration hydration (conversation.js, assistant
       // branch) so a merged record's earlier segments reach the row.
       if (legacy._narration && legacy._narration.length) {
@@ -180,7 +191,7 @@ function loadRenderer(cid: string) {
         }
         _applyNarrationFold(node);
       }
-      __container.appendChild(node);
+      (opts.container || __container).appendChild(node);
       return node;
     };
     _finalizeActorPlaceholder = function(node, gm) {
@@ -244,6 +255,81 @@ describe('keyed rendering › reconnect history', () => {
     expect(container.rows[0]).toBe(live);
     expect(appended).toHaveLength(1);
     expect(finalized.map(item => item.gm.text)).toEqual(['Saved answer']);
+  });
+});
+
+describe('history refresh overlapping a Codex handback', () => {
+  it.each([
+    { included: false, superseded: false },
+    { included: true, superseded: false },
+    { included: true, superseded: true },
+  ])('keeps the completed reply through stale active history and stream cleanup ($included, $superseded)', async ({ included, superseded }) => {
+    const { context, container } = loadRenderer(CID);
+    const warnings: unknown[] = [];
+    context.__warnings = warnings;
+    vm.runInContext('_convLog.warn = (...args) => __warnings.push(args)', context);
+    context.performance = performance;
+    context.convAgentEnabledByCid = new Map();
+    context.pollMsgCounts = new Map();
+    context._agentsCache = [];
+    context.document.createDocumentFragment = () => new FakeContainer();
+    const append = container.appendChild.bind(container);
+    container.appendChild = (node: any) => {
+      if (node instanceof FakeContainer) {
+        for (const row of [...node.rows]) append(row);
+        return node;
+      }
+      return append(node);
+    };
+    for (const name of ['_setChatScrollOffset', '_ensureCreateAgentInlineObserver',
+      '_ensureConvCreateAgentInline', '_syncFailedFromHistory',
+      '_setLoadEarlierHistory', '_scheduleConversationTurnNavigation', '_renderConvDisabledBanner',
+      '_scrollToBottomNoAnim', '_observeConversationRunFromPlanAction', '_startRuntimeActorRecovery']) {
+      context[name] = () => {};
+    }
+    let resolveHistory!: (value: any) => void;
+    context.apiFetch = () => new Promise(resolve => { resolveHistory = resolve; });
+    const loading = context.loadConversationHistory(CID);
+    const reply = { id: 'codex-result', from: 'codex-agent', to: ['user'], turn_id: TURN,
+      seg: 0, text: 'Changes saved; Commander will update the automation.',
+      ts: new Date().toISOString(), produced: ['result.md'] };
+    context._handleGroupBusEvent(CID, null, { type: 'message', turn_end: true, msg: reply });
+    const finishOlder = resolveHistory;
+    const replacement = superseded ? context.loadConversationHistory(CID) : null;
+    // The history request began before Codex settled; its snapshot still lists
+    // that turn as active even though the terminal event has already arrived.
+    resolveHistory({ json: async () => ({ ok: true, history: included ? [reply] : [],
+      conversation: { processing: true, processing_since: new Date().toISOString() },
+      live_display: { sequence: 1, active_turns: [{ actor: reply.from, turn_id: TURN },
+        { actor: 'commander', turn_id: 'commander-turn' }],
+        turns: [{ actor: reply.from, turn_id: TURN,
+          records: [{ ...reply, id: '', text: 'Working...', produced: [] }] }] },
+    }) });
+    if (replacement) {
+      await replacement;
+      finishOlder({ json: async () => ({ ok: true, history: [] }) });
+    }
+    await loading;
+    expect(warnings.filter(args => String(args).includes('history load failed'))).toEqual([]);
+    const codex = container.rows.find(row => row.dataset.msgId === reply.id);
+    expect(codex, 'history refresh must retain the canonical Codex reply').toBeDefined();
+    expect(codex!.bodies.final.textContent).toBe(reply.text);
+    expect((codex as any).message.produced).toEqual(['result.md']);
+    context._handleGroupBusEvent(CID, null, { ...delta(0, 'Stale Codex delta', reply.from), display_seq: 2 });
+    context._handleGroupBusEvent(CID, null, {
+      type: 'process', actor: 'commander', turn_id: 'commander-turn', seg: 0,
+      data: { type: 'delta', text: 'Updating automation...' },
+    });
+    expect(container.rows.find(row => row.dataset.fromActor === 'commander')?.bodies.final.textContent)
+      .toBe('Updating automation...');
+    expect(codex!.bodies.final.textContent).toBe(reply.text);
+    context._handleGroupBusEvent(CID, null, {
+      type: 'message', turn_end: true,
+      msg: { id: 'commander-result', from: 'commander', turn_id: 'commander-turn', seg: 0,
+        text: 'Automation updated.', ts: new Date().toISOString() },
+    });
+    context._settleDanglingActorPlaceholders(CID);
+    expect(container.rows.map(row => row.dataset.msgId)).toEqual(['codex-result', 'commander-result']);
   });
 });
 

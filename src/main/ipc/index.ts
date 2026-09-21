@@ -14,6 +14,7 @@
  * dropping it into `invokeHandlers` or `streamHandlers`.
  */
 
+import { readTextPreview } from '../util/text-preview';
 import { app, ipcMain, dialog, BrowserWindow, type WebContents } from 'electron';
 
 import * as users from '../features/users';
@@ -205,7 +206,7 @@ const CHAT_PICK_EXTENSIONS = [...chatAttachments.ALLOWED_EXTENSIONS]
   .map((ext) => ext.replace(/^\./, ''))
   .sort();
 const CONTEXT_PICK_EXTENSIONS = [
-  'md', 'markdown', 'txt', 'csv', 'tsv', 'json', 'yaml', 'yml', 'log',
+  'md', 'markdown', 'txt', 'csv', 'tsv', 'jsonl', 'ndjson', 'rst', 'tex', 'srt', 'vtt', 'json', 'yaml', 'yml', 'log',
   'html', 'htm', 'xml', 'toml', 'ini', 'conf',
   'py', 'pyi', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs',
   'sh', 'bash', 'zsh', 'ps1', 'cmd', 'bat', 'rb', 'go', 'rs', 'java', 'kt',
@@ -1518,10 +1519,10 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return projectFiles.createProjectTextFile(ctx.userId, projectId, name);
   },
 
-  'projects.files.readText': async ({ projectId, name }, ctx) => {
+  'projects.files.readText': async ({ projectId, name, preview }, ctx) => {
     if (!safeId(projectId)) throw new Error('invalid projectId');
     if (typeof name !== 'string' || !name) throw new Error('invalid name');
-    return projectFiles.readProjectTextFile(ctx.userId, projectId, name);
+    return projectFiles.readProjectTextFile(ctx.userId, projectId, name, preview === true || preview === 'true');
   },
 
   'projects.files.updateText': async ({ projectId, name, content }, ctx) => {
@@ -2156,7 +2157,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // `⋯` → "保存".
   'conversations.artifacts.save': async ({ cid, artifactId }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
-    const r = savedApps.saveFromArtifact(ctx.userId, String(cid), String(artifactId || ''));
+    const r = await savedApps.saveFromArtifact(ctx.userId, String(cid), String(artifactId || ''));
     if (!r.ok) throw new Error((r as { error?: string }).error || 'failed to save app');
     return { ok: true, id: (r as { id: string }).id, title: (r as { title: string }).title };
   },
@@ -2180,7 +2181,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!await _isAllowedFileActionPath(ctx.userId, payload, norm)) {
       throw new Error('path is outside the user workspace');
     }
-    const r = savedApps.saveFromPath(ctx.userId, norm, {
+    const r = await savedApps.saveFromPath(ctx.userId, norm, {
       title: payload?.title,
       sourceCid: payload?.cid,
       fenceRoots: await _ipcFileSandboxAllowedRoots(ctx.userId, payload),
@@ -2668,8 +2669,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // ── Contexts (user-owned directory tree; vectorized via kb_indexer) ──
   'contexts.tree': async () => ({ tree: contexts.listContextsTree() }),
 
-  'contexts.read': async ({ path }) => {
-    return contexts.readContextFile(path || '');
+  'contexts.read': async ({ path, preview }) => {
+    return contexts.readContextFile(path || '', preview === true || preview === 'true');
   },
 
   'contexts.index': async () => ({
@@ -3403,6 +3404,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!st.isFile()) return { ok: false, error: 'not_found' };
     const MAX_TEXT_BYTES = 2 * 1024 * 1024;
     const htmlPreviewLayoutOnly = payload?.htmlPreviewLayoutOnly === true;
+    if (payload?.preview === true && /\.(csv|tsv)$/i.test(norm)) {
+      return { ok: true, ...readTextPreview(norm), size: st.size };
+    }
     if (!htmlPreviewLayoutOnly && st.size > MAX_TEXT_BYTES) {
       return { ok: false, error: 'too_large', size: st.size, cap: MAX_TEXT_BYTES };
     }

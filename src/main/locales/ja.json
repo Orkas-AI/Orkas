@@ -1,4 +1,7 @@
 {
+  "chat.skill_creation_correcting": "Skill の作成内容を一度だけ修正しています。",
+  "chat.skill_creation_corrected": "Skill を修正して作成しました。",
+  "chat.skill_creation_correction_failed": "一度修正しましたが、Skill を作成できませんでした。",
   "errors.reveal_invalid_path": "ローカルのファイルまたはフォルダーの絶対パスを指定してください。",
   "errors.reveal_unavailable": "ファイルまたはフォルダーを利用できません。存在し、アクセスできることを確認してください。",
   "errors.reveal_failed": "フォルダーを開けませんでした。システムのファイルマネージャーで開いてみてください。",

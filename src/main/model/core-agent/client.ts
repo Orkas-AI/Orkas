@@ -83,7 +83,7 @@ export async function* stopStreamOnAbort<T>(
   events: AsyncIterable<T>,
   signal: AbortSignal,
   label = 'stream',
-  flushBeforeAbort?: () => T | null | undefined,
+  flushBeforeAbort?: () => T | readonly T[] | null | undefined,
 ): AsyncGenerator<T, void, unknown> {
   const iterator = events[Symbol.asyncIterator]();
   const aborted = Symbol('aborted');
@@ -101,7 +101,10 @@ export async function* stopStreamOnAbort<T>(
       if (result === aborted) {
         try {
           const pending = flushBeforeAbort?.();
-          if (pending !== null && pending !== undefined) yield pending;
+          if (pending !== null && pending !== undefined) {
+            if (Array.isArray(pending)) yield* pending;
+            else yield pending as T;
+          }
         } catch (err) {
           log.warn('abortable stream flush failed', { label, error: logErrorSummary(err) });
         }
@@ -2094,8 +2097,10 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     // terminal final/error synthesis. Only raw protocol events own liveness.
     let eventCount = 0;
     let flushReasoningBeforeAbort: (() => StreamEvent | null) | null = null;
+    let flushTextBeforeAbort: (() => StreamEvent | null) | null = null;
     const mappedEvents = mapCoreAgentEvents(captureResult(rawEvents), {
       userId,
+      streamUnphasedText: !!cid,
       failureTrackingScope,
       isDev: false,
       workingDir,
@@ -2104,12 +2109,14 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       agentDisplayNameById,
       connectorDisplayNameById,
       registerReasoningAbortFlush: (flush) => { flushReasoningBeforeAbort = flush; },
+      registerTextAbortFlush: (flush) => { flushTextBeforeAbort = flush; },
     });
     const abortableEvents = stopStreamOnAbort(
       mappedEvents,
       controller.signal,
       turnTag,
-      () => flushReasoningBeforeAbort?.() ?? null,
+      () => [flushReasoningBeforeAbort?.(), flushTextBeforeAbort?.()]
+        .filter((event): event is StreamEvent => !!event),
     );
     for await (const ev of abortableEvents) {
       eventCount += 1;

@@ -435,7 +435,7 @@ describe('responsive HTML preview renderer', () => {
     expect(runtime.sessionCleanup).toEqual({ cache: true, storage: true });
   });
 
-  it('blocks remote resources and reports only a bounded origin label', async () => {
+  it('permits external resources without weakening local file containment', async () => {
     const runtime = fakeRuntime({ externalRequest: true });
     const result = await renderResponsiveHtmlPreview(
       path.join(root, 'index.html'),
@@ -443,16 +443,13 @@ describe('responsive HTML preview renderer', () => {
       runtime.deps,
     );
 
-    expect(result.evidence.ok).toBe(false);
-    expect(result.evidence.blockedResourceCount).toBe(2);
-    expect(result.evidence.blockedResourceSamples).toEqual(['https://example.invalid']);
-    expect(result.evidence.blockers).toContain(
-      '2 external or out-of-directory resource request(s) were blocked',
-    );
+    expect(result.evidence.ok).toBe(true);
+    expect(result.evidence.blockedResourceCount).toBe(0);
+    expect(result.evidence.blockedResourceSamples).toEqual([]);
     expect(runtime.requestDecisions.filter((item) => item.url.startsWith('https:')))
       .toEqual([
-        { url: 'https://example.invalid/tracker.png', cancel: true },
-        { url: 'https://example.invalid/tracker.png', cancel: true },
+        { url: 'https://example.invalid/tracker.png', cancel: false },
+        { url: 'https://example.invalid/tracker.png', cancel: false },
       ]);
   });
 

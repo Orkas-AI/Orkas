@@ -11,9 +11,14 @@
  *   • `chat_files`    — per-conversation watermark (mtime + size + next index),
  *                       the same contiguity proof the JSON index kept
  *   • `chat_docs`     — one row per indexed message
- *   • `chat_postings` — (term, doc) → tf, i.e. the inverted index
+ *   • `chat_terms`    — interned term text, referenced by `chat_postings`
+ *   • `chat_postings` — (term_id, doc) → tf, i.e. the inverted index
  *   • `chat_meta`     — the source fingerprint that decides whether a search
  *                       may trust the index without a history-wide re-scan
+ *
+ * Every table here is derived from the conversation JSONL, so a store written
+ * by a different `CHAT_STORE_SCHEMA_VERSION` is discarded and rebuilt rather
+ * than migrated or refused. Bump that constant whenever this layout changes.
  *
  * `chat_postings` deliberately stores `tf` rather than delegating to FTS5:
  * chat ranking is BM25 *plus* the CJK bigram anchor in `search/index.ts`, and
@@ -45,7 +50,15 @@ function warn(message: string, error: unknown): void {
   createLogger('search:chat_store').warn(message, { error: (error as Error).message });
 }
 
-export const CHAT_STORE_SCHEMA_VERSION = 1;
+/** Record an expected but consequential event. Unlike `warn`, this must not
+ *  abort a worker: discarding a stale store is recovery, not failure. */
+function note(message: string, fields: Record<string, unknown>): void {
+  if (!isMainThread) return;
+  const { createLogger } = require('../../logger') as typeof import('../../logger');
+  createLogger('search:chat_store').info(message, fields);
+}
+
+export const CHAT_STORE_SCHEMA_VERSION = 2;
 
 export interface ChatDocInput {
   cid: string;
@@ -103,63 +116,84 @@ export function chatStorePath(uid: string): string {
   return path.join(userSearchDir(uid), 'chats.db');
 }
 
-function ensureSchema(db: Database.Database, dbPath: string): void {
-  const hasTables = db
-    .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='chat_docs'")
-    .get() as { n: number };
-  if (!hasTables.n) {
-    db.exec(`
-      CREATE TABLE chat_files (
-        cid   TEXT PRIMARY KEY,
-        mtime REAL    NOT NULL,
-        size  INTEGER NOT NULL,
-        next  INTEGER NOT NULL
-      );
+/** Tables a usable store must already have. A database missing any of them
+ *  predates a schema change and cannot answer a query. */
+const REQUIRED_TABLES = ['chat_files', 'chat_docs', 'chat_terms', 'chat_postings', 'chat_meta'];
 
-      CREATE TABLE chat_docs (
-        id        INTEGER PRIMARY KEY AUTOINCREMENT,
-        doc_id    TEXT    NOT NULL UNIQUE,
-        cid       TEXT    NOT NULL,
-        msg_index INTEGER NOT NULL,
-        role      TEXT    NOT NULL,
-        time      TEXT    NOT NULL,
-        len       INTEGER NOT NULL
-      );
-      CREATE INDEX chat_docs_cid ON chat_docs(cid);
+function tableNames(db: Database.Database): Set<string> {
+  return new Set((db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+    .all() as Array<{ name: string }>).map((row) => row.name));
+}
 
-      CREATE TABLE chat_meta (
-        key   TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
+function schemaIsUsable(db: Database.Database, names: Set<string>): boolean {
+  if (!REQUIRED_TABLES.every((name) => names.has(name))) return false;
+  return ((db.pragma('user_version', { simple: true }) as number) || 0) === CHAT_STORE_SCHEMA_VERSION;
+}
 
-      -- Terms are interned. Storing the term text on every posting row makes
-      -- the table larger than the JSON index it replaces, because JSON wrote
-      -- each term once and listed its documents underneath; measured on a real
-      -- 230 MB corpus that cost 298 MB against the snapshot's 241 MB.
-      CREATE TABLE chat_terms (
-        id   INTEGER PRIMARY KEY AUTOINCREMENT,
-        term TEXT NOT NULL UNIQUE
-      );
-
-      CREATE TABLE chat_postings (
-        term_id INTEGER NOT NULL,
-        doc     INTEGER NOT NULL,
-        tf      INTEGER NOT NULL,
-        PRIMARY KEY (term_id, doc)
-      ) WITHOUT ROWID;
-      -- Primary key order puts a term's postings together, which is the read
-      -- path; deleting one document's postings needs the other direction.
-      CREATE INDEX chat_postings_doc ON chat_postings(doc);
-    `);
-    db.pragma(`user_version = ${CHAT_STORE_SCHEMA_VERSION}`);
-    return;
-  }
-  const version = (db.pragma('user_version', { simple: true }) as number) || 0;
-  if (version !== CHAT_STORE_SCHEMA_VERSION) {
-    throw new Error(
-      `chat_store schema version mismatch (${version} vs ${CHAT_STORE_SCHEMA_VERSION}) at ${dbPath}`,
+function createSchema(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE chat_files (
+      cid   TEXT PRIMARY KEY,
+      mtime REAL    NOT NULL,
+      size  INTEGER NOT NULL,
+      next  INTEGER NOT NULL
     );
+
+    CREATE TABLE chat_docs (
+      id        INTEGER PRIMARY KEY AUTOINCREMENT,
+      doc_id    TEXT    NOT NULL UNIQUE,
+      cid       TEXT    NOT NULL,
+      msg_index INTEGER NOT NULL,
+      role      TEXT    NOT NULL,
+      time      TEXT    NOT NULL,
+      len       INTEGER NOT NULL
+    );
+    CREATE INDEX chat_docs_cid ON chat_docs(cid);
+
+    CREATE TABLE chat_meta (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+
+    -- Terms are interned. Storing the term text on every posting row makes
+    -- the table larger than the JSON index it replaces, because JSON wrote
+    -- each term once and listed its documents underneath; measured on a real
+    -- 230 MB corpus that cost 298 MB against the snapshot's 241 MB.
+    CREATE TABLE chat_terms (
+      id   INTEGER PRIMARY KEY AUTOINCREMENT,
+      term TEXT NOT NULL UNIQUE
+    );
+
+    CREATE TABLE chat_postings (
+      term_id INTEGER NOT NULL,
+      doc     INTEGER NOT NULL,
+      tf      INTEGER NOT NULL,
+      PRIMARY KEY (term_id, doc)
+    ) WITHOUT ROWID;
+    -- Primary key order puts a term's postings together, which is the read
+    -- path; deleting one document's postings needs the other direction.
+    CREATE INDEX chat_postings_doc ON chat_postings(doc);
+  `);
+  db.pragma(`user_version = ${CHAT_STORE_SCHEMA_VERSION}`);
+}
+
+/** Remove a database whose schema this build cannot use, sidecars included. */
+function discardStore(dbPath: string): void {
+  for (const suffix of ['', '-wal', '-shm']) {
+    try { fs.rmSync(dbPath + suffix, { force: true }); }
+    catch (err) { warn('discard chat store failed', err); }
   }
+}
+
+function openDatabase(dbPath: string): Database.Database {
+  const db = new Database(dbPath);
+  // WAL keeps a reader (a search) from blocking behind an append; DELETE mode
+  // would serialize them. `synchronous = NORMAL` is the same durability trade
+  // vec_store makes for a derived index that reconciles from source.
+  db.pragma('journal_mode = WAL');
+  db.pragma('synchronous = NORMAL');
+  return db;
 }
 
 function handleFor(uid: string): Handle {
@@ -168,14 +202,25 @@ function handleFor(uid: string): Handle {
 
   const dbPath = chatStorePath(uid);
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-  const db = new Database(dbPath);
+  let db = openDatabase(dbPath);
   try {
-    // WAL keeps a reader (a search) from blocking behind an append; DELETE
-    // mode would serialize them. `synchronous = NORMAL` is the same durability
-    // trade vec_store makes: a derived index that reconciles from source.
-    db.pragma('journal_mode = WAL');
-    db.pragma('synchronous = NORMAL');
-    ensureSchema(db, dbPath);
+    const names = tableNames(db);
+    if (!names.size) {
+      createSchema(db);
+    } else if (!schemaIsUsable(db, names)) {
+      // The index is derived state whose source of truth is the conversation
+      // JSONL, so a store this build cannot read is discarded and rebuilt
+      // rather than reported as an error. Throwing here left search
+      // permanently broken for everyone who already had a store when the
+      // schema changed — the JSON index it replaced rebuilt from source.
+      const previous = (db.pragma('user_version', { simple: true }) as number) || 0;
+      db.close();
+      discardStore(dbPath);
+      note('chat store discarded for a schema change',
+        { previous, schema: CHAT_STORE_SCHEMA_VERSION });
+      db = openDatabase(dbPath);
+      createSchema(db);
+    }
   } catch (err) {
     // Never let a failed handle reach the cache: on Windows the leaked SQLite
     // handle locks the file and blocks repair or workspace cleanup.

@@ -102,6 +102,8 @@ function mountMdViewEdit(opts) {
   // ── State ─────────────────────────────────────────────────────────────
   const state = {
     source,
+    plainText: opts.plainText === true,
+    partial: opts.partial === true,
     caps,
     callbacks,
     bodyEl,
@@ -358,8 +360,14 @@ function _mveRenderView(state) {
   const bodyEl = state.bodyEl;
   const actionsEl = state.actionsEl;
   const content = state.content || '';
-  bodyEl.innerHTML = `<div class="ctx-viewer-md markdown-body">${renderMarkdown(content)}</div>`;
-  if (state.caps.taskCheckbox) _mveBindTaskCheckboxes(state, bodyEl);
+  if (state.plainText) {
+    const name = state.source.name || state.source.rel || state.source.absPath;
+    if (window.DelimitedPreview?.isDelimited(name)) window.DelimitedPreview.mount(bodyEl, content, name, !!state.partial);
+    else bodyEl.innerHTML = `<pre class="chat-file-viewer-text">${escapeHtml(content)}</pre>`;
+  } else {
+    bodyEl.innerHTML = `<div class="ctx-viewer-md markdown-body">${renderMarkdown(content)}</div>`;
+    if (state.caps.taskCheckbox) _mveBindTaskCheckboxes(state, bodyEl);
+  }
 
   const actions = [];
   if (state.caps.edit)   actions.push(_mveActionButton(state, 'edit', 'contexts.viewer.edit', 'edit-pencil'));
@@ -387,7 +395,7 @@ function _mveEnterEdit(state) {
 function _mveRenderEditor(state) {
   const bodyEl = state.bodyEl;
   const actionsEl = state.actionsEl;
-  const toolbarHtml = _MVE_EDITOR_TOOLBAR.map(item => {
+  const toolbarHtml = (state.plainText ? [] : _MVE_EDITOR_TOOLBAR).map(item => {
     if (item.kind === 'sep') return `<span class="ctx-editor-toolbar-sep" aria-hidden="true"></span>`;
     const disabled = state.preview ? 'disabled' : '';
     const extraCls = item.cls ? ` ${item.cls}` : '';
@@ -401,10 +409,10 @@ function _mveRenderEditor(state) {
     ? window.uiIconHtml(state.preview ? 'edit-pencil' : 'eye', 'ui-icon ctx-editor-toggle-icon')
     : '';
   const draft = state.draft;
-  const bodyHtml = state.preview
+  const bodyHtml = state.preview && !state.plainText
     ? `<div class="ctx-viewer-md markdown-body ctx-editor-preview">${draft.trim() ? renderMarkdown(draft) : `<div class="ctx-viewer-msg">${escapeHtml(t('contexts.editor.preview_empty'))}</div>`}</div>`
     : `<textarea class="ctx-viewer-editor" data-mve-textarea spellcheck="false">${escapeHtml(draft)}</textarea>`;
-  bodyEl.innerHTML = `
+  bodyEl.innerHTML = state.plainText ? bodyHtml : `
     <div class="ctx-editor-toolbar" role="toolbar">
       ${toolbarHtml}
       <span class="ctx-editor-toolbar-spacer"></span>
@@ -772,6 +780,17 @@ function _mveOnKey(state, ta, e) {
   // IME composition guard (CLAUDE.md §8).
   if (e.isComposing || e.keyCode === 229) return;
 
+  if (state.plainText) {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's' && state.caps.save) {
+      e.preventDefault(); return _mveSave(state);
+    }
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      const start = ta.selectionStart;
+      _mveReplaceRange(state, ta, start, ta.selectionEnd, '\t', start + 1, start + 1);
+    }
+    return;
+  }
   const mod = e.metaKey || e.ctrlKey;
   if (mod && !e.shiftKey && !e.altKey) {
     const k = (e.key || '').toLowerCase();

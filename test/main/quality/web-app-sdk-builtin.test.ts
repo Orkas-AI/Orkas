@@ -16,6 +16,8 @@ describe('Web app authoring package', () => {
     const body = fs.readFileSync(path.join(skill, 'SKILL.md'), 'utf8');
     const links = [...body.matchAll(/\]\(([^)]+)\)/g)].map(match => match[1]);
     expect(links.length).toBeGreaterThan(0);
+    expect(body).toContain('200 MiB');
+    expect(body).not.toMatch(/four concurrent|two host-wide|256 storage keys|512 KiB|16 selected files|five-minute/);
     for (const link of links) expect(fs.statSync(path.join(skill, link)).isFile()).toBe(true);
     const manifest = JSON.parse(fs.readFileSync(path.join(skill, 'assets/starter/orkas-app.json'), 'utf8'));
     expect(manifestSchema.safeParse(manifest).success).toBe(true);

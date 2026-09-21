@@ -6,6 +6,10 @@ import AdmZip from 'adm-zip';
 import { drainMainRuntimeForTest } from '../../../helpers/drain-main-runtime';
 
 const retryInfoLog = vi.hoisted(() => vi.fn());
+const correctionModel = vi.hoisted(() => vi.fn(async (_input: any): Promise<string> => ''));
+vi.mock('../../../../src/main/model/core-agent/runner', async (importOriginal) => ({
+  ...(await importOriginal<any>()), completeSkillCreationCorrection: correctionModel,
+}));
 vi.mock('../../../../src/main/logger', () => ({
   createLogger: () => ({ debug: vi.fn(), info: retryInfoLog, warn: vi.fn(), error: vi.fn() }),
 }));
@@ -212,6 +216,7 @@ function newCid(): string {
 }
 
 beforeEach(async () => {
+  correctionModel.mockReset().mockResolvedValue('');
   retryInfoLog.mockClear();
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-int-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
@@ -266,6 +271,11 @@ afterEach(async () => {
     bashPermissions._setBroadcastForTest(null);
     bashPermissions._resetForTest();
   } catch { /* ignore */ }
+  await drainMainRuntimeForTest();
+  // A Stop can land between a failed channel attempt and its queued retry.
+  // Let that cancellation microtask settle, then close any runtime store it
+  // touched after the first drain before Windows removes the temp workspace.
+  await new Promise((resolve) => setTimeout(resolve, 50));
   await drainMainRuntimeForTest();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   if (prevTestGlobalSkillsRoot === undefined) delete process.env.ORKAS_TEST_GLOBAL_SKILLS_ROOT;
@@ -4754,6 +4764,9 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     expect(message?.form.fields).toHaveLength(3);
     expect(message.form.fields.every((f: any) => !Object.hasOwn(f, 'default'))).toBe(true);
     expect(message.text || '').not.toContain('<agent-input-form>');
+    await vi.waitFor(async () => {
+      expect((await state.readState(TEST_UID, cid)).status).toBe('idle');
+    });
     const stateBefore = await state.readState(TEST_UID, cid);
     const callsBefore = _recordedCalls.length;
     const submit = (values: Record<string, unknown>) => groupChat.markFormSubmittedAndDispatch({
@@ -8385,4 +8398,146 @@ describe('group_chat bus integration › D9 same-agent multi-segment (on-device 
     expect(calls[0]).toContain('DELTA_FIRST');
     expect(calls[1]).toContain('EPSILON_SECOND');
   }, 15_000);
+});
+describe('group_chat bus integration › Skill creation correction', () => {
+  const rejected = '<skill>\n<<<skill-file path=notes.txt\nKeep source notes.\n>>>\n</skill>';
+  const corrected = '<skill>\n<<<skill-file path=SKILL.md\n---\nname: recovered-notes\ndescription: Summarize supplied notes\n---\n\n# Instructions\nRead and summarize supplied notes.\n>>>\n<<<skill-file path=notes.txt\nKeep source notes.\n>>>\n</skill>';
+
+  it('corrects only the rejected proposal without replaying the Commander or its tools', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const sid = state.buildGconvSessionId(cid);
+    _setScript(sid, [{ type: 'final', text: rejected }]);
+    correctionModel.mockResolvedValue(corrected);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Create a notes Skill' });
+    // The first correction in a Windows Vitest worker cold-loads the dynamic
+    // runner/quality modules; preserve the quiescence assertion without using
+    // the 2s steady-state polling budget as a module-transform benchmark.
+    await waitForQuiescent(TEST_UID, cid, 8000);
+    expect(_recordedCalls.filter(call => call.sid === sid)).toHaveLength(1);
+    expect(correctionModel).toHaveBeenCalledTimes(1);
+    expect(correctionModel.mock.calls[0][0]).toMatchObject({ userId: TEST_UID, cid, message: expect.stringContaining('missing_skill_md') });
+    const messages = await (await import('../../../../src/main/features/group_chat')).readMessages(TEST_UID, cid);
+    expect(messages.flatMap(message => message.created_skills || []))
+      .toEqual([expect.objectContaining({ skill_id: 'recovered-notes', name: 'recovered-notes' })]);
+    expect(messages.at(-1)?.text).toContain('corrected and created');
+    const paths = await import('../../../../src/main/paths');
+    expect(fs.readFileSync(path.join(paths.userSkillsDir(TEST_UID), 'recovered-notes', 'notes.txt'), 'utf8')).toBe('Keep source notes.');
+  });
+
+  it('stops after one failed correction and replaces the premature success claim', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const sid = state.buildGconvSessionId(cid);
+    _setScript(sid, [{ type: 'final', text: 'Already created and ready!\n' + rejected }]);
+    correctionModel.mockResolvedValue(rejected);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Create a notes Skill' });
+    await waitForQuiescent(TEST_UID, cid);
+    expect(_recordedCalls.filter(call => call.sid === sid)).toHaveLength(1);
+    expect(correctionModel).toHaveBeenCalledTimes(1);
+    const messages = await (await import('../../../../src/main/features/group_chat')).readMessages(TEST_UID, cid);
+    expect(messages.flatMap(message => message.created_skills || [])).toEqual([]);
+    expect(messages.at(-1)?.text).toContain('could not be created');
+    expect(messages.at(-1)?.text).not.toContain('Already created');
+    expect(messages.at(-1)?.failure_kind).toBe('validation');
+  });
+
+  it('preserves the successful sibling of a mixed batch without launching correction', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    _setScript(state.buildGconvSessionId(cid), [{ type: 'final', text: corrected + rejected }]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Create two Skills' });
+    await waitForQuiescent(TEST_UID, cid);
+    expect(correctionModel).not.toHaveBeenCalled();
+    const messages = await (await import('../../../../src/main/features/group_chat')).readMessages(TEST_UID, cid);
+    expect(messages.flatMap(message => message.created_skills || []))
+      .toEqual([expect.objectContaining({ skill_id: 'recovered-notes' })]);
+  });
+
+  it('times out one correction and ignores a late result without replay', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    _setScript(state.buildGconvSessionId(cid), [{ type: 'final', text: rejected }]);
+    let finish!: (value: string) => void;
+    correctionModel.mockImplementationOnce(() => new Promise<string>(resolve => { finish = resolve; }));
+    // Accelerate only the declared correction wall bound; scheduler timers keep
+    // real time. The callback still goes through the production abort path.
+    const nativeTimeout = globalThis.setTimeout;
+    const timer = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: any, ms: any, ...args: any[]) =>
+      nativeTimeout(fn, ms === 60_000 ? 10 : ms, ...args)) as typeof setTimeout);
+    try {
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Create a notes Skill' });
+      await waitForQuiescent(TEST_UID, cid);
+      expect(correctionModel).toHaveBeenCalledTimes(1);
+      expect(correctionModel.mock.calls[0][0].signal.aborted).toBe(true);
+      finish(corrected);
+      const messages = await (await import('../../../../src/main/features/group_chat')).readMessages(TEST_UID, cid);
+      expect(messages.flatMap(message => message.created_skills || [])).toEqual([]);
+      expect(messages.at(-1)?.text).toContain('could not be created');
+      expect(messages.at(-1)?.failure_kind).toBe('validation');
+    } finally { timer.mockRestore(); }
+  });
+
+  it('does not write to either account when the account changes during correction', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    _setScript(state.buildGconvSessionId(cid), [{ type: 'final', text: rejected }]);
+    correctionModel.mockImplementationOnce(async () => {
+      (await import('../../../../src/main/features/users')).activateUser('other-owner');
+      return corrected;
+    });
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Create a notes Skill' });
+    await waitForQuiescent(TEST_UID, cid);
+    const paths = await import('../../../../src/main/paths');
+    for (const owner of [TEST_UID, 'other-owner']) {
+      expect(fs.existsSync(path.join(paths.userSkillsDir(owner), 'recovered-notes'))).toBe(false);
+    }
+    expect(correctionModel).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not chain Skill correction onto an Agent correction turn', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const sid = state.buildGconvSessionId(cid);
+    _setScript(sid, [{ type: 'final', text: '<agent><operation>create</operation><name>Invalid Name!</name><workflow>Coordinate notes</workflow></agent>' }]);
+    _setScript(sid, [{ type: 'final', text: rejected }]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Create a notes Agent' });
+    await waitForQuiescent(TEST_UID, cid);
+    expect(_recordedCalls.filter(call => call.sid === sid)).toHaveLength(2);
+    expect(correctionModel).not.toHaveBeenCalled();
+    const paths = await import('../../../../src/main/paths');
+    expect(fs.existsSync(path.join(paths.userSkillsDir(TEST_UID), 'recovered-notes'))).toBe(false);
+  });
+
+  it('honors Stop during correction and discards even a late valid model result', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    _setScript(state.buildGconvSessionId(cid), [{ type: 'final', text: rejected }]);
+    let admitted!: () => void;
+    const started = new Promise<void>(resolve => { admitted = resolve; });
+    let finish!: (value: string) => void;
+    correctionModel.mockImplementationOnce(async () => {
+      admitted();
+      return await new Promise<string>(resolve => { finish = resolve; });
+    });
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Create a notes Skill' });
+    await started;
+    await bus.abort(TEST_UID, cid);
+    finish(corrected);
+    await waitForQuiescent(TEST_UID, cid);
+    expect(correctionModel).toHaveBeenCalledTimes(1);
+    expect(correctionModel.mock.calls[0][0].signal.aborted).toBe(true);
+    const messages = await (await import('../../../../src/main/features/group_chat')).readMessages(TEST_UID, cid);
+    expect(messages.flatMap(message => message.created_skills || [])).toEqual([]);
+    const paths = await import('../../../../src/main/paths');
+    expect(fs.existsSync(path.join(paths.userSkillsDir(TEST_UID), 'recovered-notes'))).toBe(false);
+    expect((await state.readState(TEST_UID, cid)).status).toBe('aborted');
+  });
 });

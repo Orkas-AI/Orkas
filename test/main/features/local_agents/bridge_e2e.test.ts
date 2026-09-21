@@ -854,7 +854,9 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         name: 'chat_history',
         arguments: { action: 'search', query: 'missing', scope: 'current' },
       });
-      expect(historyCall.result.content[0].text).toContain('No conversation-history results');
+      expect(historyCall.result.isError).toBe(true);
+      expect(historyCall.result.content[0].text).toContain('history_status=source_unavailable');
+      expect(historyCall.result.content[0].text).toContain('does not establish that history is empty');
 
       const handoff = await client.request(7, 'tools/call', {
         name: 'orkas_handoff_to_commander',

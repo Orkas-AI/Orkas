@@ -84,6 +84,13 @@ function commonPrefixLength(left: string, right: string): number {
 
 export interface MapCoreAgentEventsOptions {
   userId?: string;
+  /** Task conversations can display an unclassified draft and move it into
+   * the process body at a structured commentary boundary. Authoring consumers
+   * retain their existing protocol buffering unless they opt in. */
+  streamUnphasedText?: boolean;
+  /** Preserve an already displayed task draft when cancellation interrupts
+   * the source before a structured phase boundary arrives. */
+  registerTextAbortFlush?: (flush: (() => StreamEvent | null) | null) => void;
   /** Opaque identity of the persisted model session that owns this run.
    *  Repeated-failure guidance is isolated by object identity and is released
    *  automatically when the session cache releases the underlying session. */
@@ -692,6 +699,14 @@ export async function* mapCoreAgentEvents(
     if (!pendingUnphasedText.length) return [];
     const pieces = pendingUnphasedText;
     pendingUnphasedText = [];
+    if (opts.streamUnphasedText) {
+      const text = pieces.join('');
+      if (phase === 'final_answer') {
+        finalText += text;
+        return [];
+      }
+      return [{ type: 'commentary-finalized', text }];
+    }
     return phasedTextEvents(pieces, phase);
   };
 
@@ -784,6 +799,9 @@ export async function* mapCoreAgentEvents(
   };
 
   opts.registerReasoningAbortFlush?.(() => endThinking());
+  opts.registerTextAbortFlush?.(() => opts.streamUnphasedText
+    ? flushPendingText('commentary')[0] ?? null
+    : null);
 
   const eventIterator = events[Symbol.asyncIterator]();
   let nextEvent: Promise<IteratorResult<AgentRunEvent>> | null = null;
@@ -845,9 +863,13 @@ export async function* mapCoreAgentEvents(
         } else {
           // Chat Completions, Anthropic Messages, Gemini GenerateContent and
           // other phase-less protocols all expose structured tool boundaries.
-          // Hold only this provider round until one of those boundaries tells
-          // us whether the text is commentary or the terminal answer.
+          // Retain this round for classification. Task consumers can display
+          // the draft immediately, before a boundary establishes its phase.
           pendingUnphasedText.push(piece);
+          if (opts.streamUnphasedText) {
+            hasAssistantText = true;
+            yield { type: 'delta', text: piece, phase: 'pending' };
+          }
         }
         break;
       }
@@ -1253,6 +1275,7 @@ export async function* mapCoreAgentEvents(
     }
   } finally {
     opts.registerReasoningAbortFlush?.(null);
+    opts.registerTextAbortFlush?.(null);
   }
 
   // A stream that ended without a provider/done boundary did not establish a

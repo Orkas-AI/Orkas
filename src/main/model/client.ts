@@ -25,11 +25,11 @@ import {
 } from './core-agent/client';
 
 export interface StreamEvent {
-  type: 'progress' | 'event' | 'delta' | 'final' | 'error' | 'done';
+  type: 'progress' | 'event' | 'delta' | 'commentary-finalized' | 'final' | 'error' | 'done';
   text?: string;
-  /** Assistant text presentation channel. Present on model text deltas after
-   * provider-native phase preservation or structured tool-round inference. */
-  phase?: 'commentary' | 'final_answer';
+  /** Assistant text presentation channel. Pending drafts are visible before
+   * a structured boundary classifies them as commentary or a final answer. */
+  phase?: 'commentary' | 'final_answer' | 'pending';
   event?: Record<string, unknown>;
   aborted?: boolean;
   /** Structured source for terminal failures. */

@@ -159,10 +159,10 @@ test('legacy application results return to their original task after main-window
   const page = orkas.page!;
   const created: any = await orkas.invoke('conversations.create', { title: 'Application result destination' });
   const cid = created.conversation.conversation_id;
-  const artifact: any = await orkas.electronApp!.evaluate((_electron, args) => {
-    return (process as any).mainModule.require(args.module).createArtifact('account-e2e', args.cid, 'commander', {
+  const artifact: any = await orkas.electronApp!.evaluate(async (_electron, args) => {
+    return (await (process as any).mainModule.require(args.module).createArtifact('account-e2e', args.cid, 'commander', {
       title: 'Choice', files: [{ path: 'index.html', content: '<!doctype html><button onclick="parent.postMessage({__orkasArtifact:true,type:\'submit\',payload:{choice:7}},\'*\')">Submit choice</button>' }],
-    });
+    }));
   }, { module: path.resolve(__dirname, '../../src/main/features/chat_artifacts.ts'), cid });
   expect(artifact.ok).toBe(true);
   const preview = await orkas.openPreview(() => page.evaluate(async args => {
@@ -193,13 +193,13 @@ test('saving from an app preview retains its original bundle after task navigati
   const page = orkas.page!;
   const created: any = await orkas.invoke('conversations.create', { title: 'App to keep' });
   const cid = created.conversation.conversation_id;
-  const artifact: any = await orkas.electronApp!.evaluate((_electron, args) =>
-    (process as any).mainModule.require(args.module).createArtifact('account-e2e', args.cid, 'commander', {
+  const artifact: any = await orkas.electronApp!.evaluate(async (_electron, args) =>
+    (await (process as any).mainModule.require(args.module).createArtifact('account-e2e', args.cid, 'commander', {
       title: 'Keep this app', files: [
         { path: 'index.html', content: '<!doctype html><h1>Original app</h1><script src="app.js"></script>' },
         { path: 'app.js', content: 'document.querySelector("h1").textContent = "Bundle loaded";' },
       ],
-    }), { module: path.resolve(__dirname, '../../src/main/features/chat_artifacts.ts'), cid });
+    })), { module: path.resolve(__dirname, '../../src/main/features/chat_artifacts.ts'), cid });
   expect(artifact.ok).toBe(true);
   const preview = await orkas.openPreview(() => page.evaluate(source =>
     (window as any).openChatArtifactViewer(source), { cid, artifactId: artifact.artifactId, title: 'Keep this app' }));

@@ -124,11 +124,8 @@ describe('project to-do controls', () => {
   });
 
   it('sets a todo status from the row status dropdown (four states)', async () => {
-    // Telemetry contract (restored 2026-08-24 — the 1.6.6 merge kept the
-    // _result-event code style but dropped both oracles): the toggle emits
-    // one terminal result event and no start click.
-    expect(source).not.toContain("_projectTrackClick('project_todo_toggle'");
-    expect(source).toContain("_projectTrackEvent('project_todo_toggle_result'");
+    expect(source).not.toContain('_projectTrackClick');
+    expect(source).not.toContain('_projectTrackEvent');
     const invocations: Array<{ channel: string; payload: Record<string, any> }> = [];
     const listeners: Record<string, (event: any) => Promise<void>> = {};
     let menuItems: Array<{ label: string; icon?: string; onClick?: () => void }> = [];

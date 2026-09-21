@@ -650,6 +650,9 @@ export const webFetchTool: AgentTool = defineTool({
       ? fetchCache.get(`github:${githubResource.key}`)
       : undefined;
     if (githubResource && githubResource.kind !== "repository" && priorGitHubSnapshot) {
+      // A pending or failed root fetch is not successful source evidence.
+      const result = await priorGitHubSnapshot.result;
+      if (result.isError) return applyExplicitCharacterLimit(result, maxChars);
       log.info("github repository alias cache hit; skipped network request", {
         repository: githubResource.key,
         requestedKind: githubResource.kind,
@@ -668,7 +671,7 @@ export const webFetchTool: AgentTool = defineTool({
     }
 
     const request = githubResource?.kind === "repository"
-      ? fetchGitHubRepositorySnapshot(githubResource)
+      ? fetchGitHubRepositorySnapshot(githubResource, ctx.signal)
       : fetchGeneralUrl(url, ctx.signal);
     const cacheEntry = { epoch, result: request };
     fetchCache.set(requestKey, cacheEntry);

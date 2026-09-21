@@ -1886,7 +1886,7 @@ async function buildRotatingProvider(
  * and no automatic generation retries. No Agent session or prompt assembly. */
 export async function generateWebAppText(
   uid: string,
-  input: { prompt: string; maxTokens: number },
+  input: { prompt: string; maxTokens?: number },
   signal: AbortSignal,
   progress: (event: { type: 'delta'; text: string }) => void,
 ): Promise<{ text: string; usage: Record<string, number>; stopReason: string }> {
@@ -1895,15 +1895,14 @@ export async function generateWebAppText(
     if (signal.aborted || getActiveUserId() !== uid) throw new Error('app generation cancelled');
   };
   check();
-  if (!input.prompt || input.prompt.length > 32000 || !Number.isInteger(input.maxTokens)
-    || input.maxTokens < 1 || input.maxTokens > 4096) throw new Error('invalid app model input');
+  if (!input.prompt || (input.maxTokens !== undefined && (!Number.isSafeInteger(input.maxTokens) || input.maxTokens < 1))) throw new Error('invalid app model input');
   const group = (await pickChatEntryGroup()).slice(0, 1);
   check();
   if (!group.length) throw new Error('app model unavailable');
   const mod = await ca();
   const primary = group[0];
   const provider = await buildRotatingProvider(mod, primary.provider, group, undefined, undefined, undefined,
-    45_000, uid, { networkRetryAttempts: 0, normalEmptyRetryAttempts: 0 });
+    undefined, uid, { networkRetryAttempts: 0, normalEmptyRetryAttempts: 0 });
   check();
   let text = '';
   let stopReason = '';
@@ -1918,7 +1917,6 @@ export async function generateWebAppText(
     }
     if (event.type === 'text_delta') {
       text += event.text;
-      if (text.length > 256 * 1024) throw new Error('app model output limit');
       // Provider chunks can exceed the bridge event budget; split deterministically.
       for (let at = 0; at < event.text.length; at += 4000) progress({ type: 'delta', text: event.text.slice(at, at + 4000) });
     }
@@ -1936,6 +1934,49 @@ export async function generateWebAppText(
   check();
   if (!stopReason) throw new Error('incomplete app model response');
   return { text, usage, stopReason };
+}
+
+/** One tools-free Skill repair request. The feature supplies only the rejected
+ * proposal and current request; no task replay, session, roster or discovery. */
+export async function completeSkillCreationCorrection(input: {
+  userId: string;
+  cid: string;
+  turnId: string;
+  message: string;
+  signal: AbortSignal;
+}): Promise<string> {
+  const { getActiveUserId } = await import('../../features/users');
+  const check = () => {
+    if (input.signal.aborted || getActiveUserId() !== input.userId) {
+      throw new Error('Skill correction cancelled');
+    }
+  };
+  check();
+  if (!input.message || input.message.length > 64_000) throw new Error('Skill correction input limit');
+  const group = (await pickChatEntryGroup()).slice(0, 1);
+  check();
+  if (!group.length) throw new Error('Skill correction model unavailable');
+  const mod = await ca();
+  const primary = group[0];
+  const provider = await buildRotatingProvider(mod, primary.provider, group,
+    undefined, undefined, undefined, 45_000, input.userId,
+    { networkRetryAttempts: 0, normalEmptyRetryAttempts: 0 }, undefined, input.cid);
+  check();
+  const result = await provider.complete({
+    model: primary.model,
+    messages: [{ role: 'user', content: [{ type: 'text', text: input.message }] }],
+    tools: [], maxTokens: 8192, reasoning: 'off', signal: input.signal,
+    requestMetadata: { creditContext: {
+      conversationId: input.cid, turnId: input.turnId,
+    } },
+  });
+  check();
+  if (result.stopReason !== 'end_turn' || result.content.some(part => part.type !== 'text')) {
+    throw new Error('Skill correction incomplete');
+  }
+  const text = result.content.map(part => (part as { text: string }).text).join('').trim();
+  if (!text || text.length > 64_000) throw new Error('Skill correction output limit');
+  return text;
 }
 
 /** A feature-owned memory transformation, using the same auth/candidate and

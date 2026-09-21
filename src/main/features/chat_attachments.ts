@@ -21,7 +21,7 @@
  *                        (`main_chat`, `projchat-*`) are local-only until
  *                        adoptDraftAttachments moves them into a real cid.
  *                        PDF/DOCX/
- *                        XLSX/PPTX extract + image grayscale happen lazily on read via
+ *                        XLSX/PPTX extraction and color image compression happen lazily on read via
  *                        features/file_indexer (which caches under
  *                        <uid>/local/file_cache/<hash>/). Video is kept raw
  *                        and never cached.
@@ -71,16 +71,22 @@ const log = createLogger('chat_attachments');
 // ── Whitelists & caps (aligned with features/contexts) ────────────────────
 
 const TEXT_EXTS: ReadonlySet<string> = new Set([
-  '.md', '.markdown', '.txt', '.csv', '.tsv',
+  '.md', '.markdown', '.txt', '.csv', '.tsv', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt',
   '.json', '.yaml', '.yml', '.log',
+  '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
+  '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.sh', '.bash', '.zsh', '.ps1', '.cmd', '.bat', '.rb', '.go', '.rs', '.java', '.kt',
+  '.c', '.cpp', '.cc', '.h', '.hpp', '.css', '.scss', '.less',
+  '.sql', '.graphql', '.gql',
 ]);
 const IMAGE_EXTS: ReadonlySet<string> = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
-// SVG is intentionally display-only. Keep it out of IMAGE_EXTS so attachment
+// Additional browser formats are display-only. Keep them out of IMAGE_EXTS so attachment
 // upload, model vision input, image transforms, and per-cid attachment serving
 // retain their existing raster-only contract.
-const LOCAL_DISPLAY_IMAGE_EXTS: ReadonlySet<string> = new Set([...IMAGE_EXTS, '.svg']);
+const LOCAL_DISPLAY_IMAGE_EXTS: ReadonlySet<string> = new Set([...IMAGE_EXTS, '.apng', '.jpe', '.jfif', '.avif', '.bmp', '.ico', '.svg']);
 const VIDEO_EXTS: ReadonlySet<string> = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
 const AUDIO_EXTS: ReadonlySet<string> = new Set(['.mp3', '.wav', '.ogg', '.opus', '.m4a', '.aac', '.flac']);
+const LOCAL_DISPLAY_AUDIO_EXTS: ReadonlySet<string> = new Set([...AUDIO_EXTS, '.oga', '.weba']);
 const PDF_EXT = '.pdf';
 const DOCX_EXTS: ReadonlySet<string> = new Set(['.docx', '.docm']);
 const SPREADSHEET_EXTS: ReadonlySet<string> = new Set(['.xlsx', '.xlsm', '.xls']);
@@ -854,14 +860,14 @@ export async function diagnoseMediaFile(
     } catch { return { diagnosis: 'bad_input' }; }
   }
   const ext = path.extname(abs).toLowerCase();
-  if (local && !LOCAL_DISPLAY_IMAGE_EXTS.has(ext) && !VIDEO_EXTS.has(ext) && !AUDIO_EXTS.has(ext)) {
+  if (local && !LOCAL_DISPLAY_IMAGE_EXTS.has(ext) && !VIDEO_EXTS.has(ext) && !LOCAL_DISPLAY_AUDIO_EXTS.has(ext)) {
     return { diagnosis: 'bad_input' };
   }
-  const media_kind = LOCAL_DISPLAY_IMAGE_EXTS.has(ext) ? 'image' : kindOf(ext);
+  const media_kind = LOCAL_DISPLAY_IMAGE_EXTS.has(ext) ? 'image' : (LOCAL_DISPLAY_AUDIO_EXTS.has(ext) ? 'audio' : kindOf(ext));
   try {
     const stat = await fs.promises.stat(abs);
     if (!stat.isFile()) return { diagnosis: 'not_file', media_kind };
-    const cap = LOCAL_DISPLAY_IMAGE_EXTS.has(ext) ? MAX_BYTES_IMAGE : maxBytesFor(ext);
+    const cap = LOCAL_DISPLAY_IMAGE_EXTS.has(ext) ? MAX_BYTES_IMAGE : (LOCAL_DISPLAY_AUDIO_EXTS.has(ext) ? MAX_BYTES_AUDIO : maxBytesFor(ext));
     if (local && stat.size > cap) return { diagnosis: 'too_large', media_kind };
     return { diagnosis: 'stat_available', media_kind };
   } catch (error) {
@@ -936,14 +942,14 @@ export function resolveLocalMediaPath(
   }
   const normalized = path.resolve(absPath);
   const ext = path.extname(normalized).toLowerCase();
-  if (!LOCAL_DISPLAY_IMAGE_EXTS.has(ext) && !VIDEO_EXTS.has(ext) && !AUDIO_EXTS.has(ext)) {
+  if (!LOCAL_DISPLAY_IMAGE_EXTS.has(ext) && !VIDEO_EXTS.has(ext) && !LOCAL_DISPLAY_AUDIO_EXTS.has(ext)) {
     return { ok: false, code: 'bad_input', error: `unsupported extension: ${ext || '(none)'}` };
   }
   let stat: fs.Stats;
   try { stat = fs.statSync(normalized); }
   catch (error) { return { ok: false, code: 'not_found', error: 'not found', diagnosticCode: mediaFileFailureCode(error) }; }
   if (!stat.isFile()) return { ok: false, code: 'not_found', error: 'not a file', diagnosticCode: 'not_file' };
-  const cap = LOCAL_DISPLAY_IMAGE_EXTS.has(ext) ? MAX_BYTES_IMAGE : maxBytesFor(ext);
+  const cap = LOCAL_DISPLAY_IMAGE_EXTS.has(ext) ? MAX_BYTES_IMAGE : (LOCAL_DISPLAY_AUDIO_EXTS.has(ext) ? MAX_BYTES_AUDIO : maxBytesFor(ext));
   if (stat.size > cap) {
     const mb = Math.round(cap / 1024 / 1024);
     return { ok: false, code: 'too_large', error: `file exceeds ${mb}MB cap` };
@@ -970,7 +976,7 @@ export function resolveLocalMediaPath(
       return { ok: false, code: 'bad_input', error: 'unsafe SVG content' };
     }
   }
-  const kind = VIDEO_EXTS.has(ext) ? 'video' : (AUDIO_EXTS.has(ext) ? 'audio' : 'image');
+  const kind = VIDEO_EXTS.has(ext) ? 'video' : (LOCAL_DISPLAY_AUDIO_EXTS.has(ext) ? 'audio' : 'image');
   return { ok: true, absPath: normalized, kind };
 }
 
@@ -1112,10 +1118,16 @@ export function mediaMimeFor(name: string): string {
   return 'application/octet-stream';
 }
 
-/** MIME lookup for `chat-media://local`. SVG support is deliberately kept
+/** MIME lookup for `chat-media://local`. Browser display aliases are kept
  * separate from `mediaMimeFor`, which is also used by per-cid attachments. */
 export function localMediaMimeFor(name: string): string {
-  if (path.extname(name).toLowerCase() === '.svg') return 'image/svg+xml';
+  const aliases: Record<string, string> = {
+    '.apng': 'image/apng', '.jpe': 'image/jpeg', '.jfif': 'image/jpeg',
+    '.avif': 'image/avif', '.bmp': 'image/bmp', '.ico': 'image/x-icon',
+    '.svg': 'image/svg+xml', '.oga': 'audio/ogg', '.weba': 'audio/webm',
+  };
+  const alias = aliases[path.extname(name).toLowerCase()];
+  if (alias) return alias;
   return mediaMimeFor(name);
 }
 
@@ -1244,7 +1256,7 @@ export interface AttachmentManifest {
    *  attachments are attached. The model uses this as a directory listing
    *  and calls the on-demand file tools for content. */
   manifest: string;
-  /** Compressed gray JPEG images formatted for `ChatOptions.images` (pi-ai
+  /** Compressed color JPEG images formatted for `ChatOptions.images` (pi-ai
    *  ImageContent). Produced in real time on each call — no cache. */
   images: Array<{ data: string; mediaType: ImageMimeType }>;
   /** Names of attachments we couldn't use (missing / too big / load error). */
@@ -1284,7 +1296,7 @@ export interface BuildConversationAttachmentIndexOpts {
  *                       Otherwise `total_chars` is omitted and the model must
  *                       let read_files prepare extraction. Never eagerly extract
  *                       here — upload stays zero-cost.
- *   - image           → compressed grayscale JPEG via real-time
+ *   - image           → compressed color JPEG via real-time
  *                       toCompressedGrayJpeg on the raw source → images[]
  *                       for pi-ai vision.
  *   - video/audio     → listed by path for media tools, without inline bytes.
@@ -1342,7 +1354,8 @@ export async function buildAttachmentManifest(
       }
       try {
         const buf = fs.readFileSync(abs);
-        const compressed = await toCompressedGrayJpeg(buf, { maxDim: 1024, quality: 70, grayscale: true });
+        // Preserve reference colors on first delivery, just as read_files does.
+        const compressed = await toCompressedGrayJpeg(buf, { maxDim: 1024, quality: 70, grayscale: false });
         images.push({ data: compressed.buf.toString('base64'), mediaType: 'image/jpeg' });
         // Candidate providers enforce their own N-image request limit after
         // this manifest is built. `image_order` preserves a deterministic

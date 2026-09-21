@@ -1,9 +1,10 @@
-/** Offline authoring preview: real SDK/runtime, temporary storage, no account services. */
+/** Isolated authoring preview: real SDK/runtime, temporary storage, no account services. */
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type { Session, WebContents } from 'electron';
+import { safeExternalHttpUrl } from '../../util/window-security';
 import { getLanguage } from '../config';
 import { SRC_ROOT } from '../../paths';
 import { serveFileRange } from '../../util/http-range';
@@ -23,7 +24,7 @@ export interface PreviewSdkEvidence {
 }
 
 /** Absence preserves legacy HTML; an invalid opt-in must never downgrade. */
-export function previewBundle(entry: string): Bundle | null {
+export async function previewBundle(entry: string): Promise<Bundle | null> {
   const root = path.dirname(entry);
   const manifestPath = path.join(root, MANIFEST_FILE);
   let stat: fs.Stats;
@@ -33,8 +34,8 @@ export function previewBundle(entry: string): Bundle | null {
   let manifest: unknown;
   try { manifest = manifestSchema.parse(JSON.parse(fs.readFileSync(manifestPath, 'utf8'))); }
   catch { throw new AppError('E_MANIFEST'); }
-  let revision: ReturnType<typeof bundleRevision>;
-  try { revision = bundleRevision(root, [entry, manifestPath]); }
+  let revision: Awaited<ReturnType<typeof bundleRevision>>;
+  try { revision = await bundleRevision(root, [entry, manifestPath]); }
   catch { throw new AppError('E_BUNDLE'); }
   return { key: 'preview', title: 'HTML preview', entry: path.basename(entry), manifest,
     valid: () => revision.valid(),
@@ -114,10 +115,15 @@ export async function createPreviewSdk(ses: Session, contents: WebContents, bund
     contents.on('ipc-message', listener);
     contents.on('will-frame-navigate', event => {
       if (event.isMainFrame) { event.preventDefault(); return; }
-      // After the initial attach every navigation revokes this preview instance.
-      if (event.frame?.url && event.frame.url !== 'about:blank') {
-        event.preventDefault(); runtime.closeOwner(contents.id);
-      } else if (event.url !== open.url) event.preventDefault();
+      if (event.frame?.parent && event.frame.parent !== contents.mainFrame && safeExternalHttpUrl(event.url)) return;
+      const source = event.frame ? event.frame.url : event.initiator?.url || '';
+      if (runtime.canNavigate(contents.id, source, event.url)) {
+        runtime.cancelOriginRequests(contents.id, source);
+        return;
+      }
+      // Automated playback cannot leave the inspected bundle. A blocked link
+      // does not close the document or interrupt subsequent SDK checks.
+      if (event.url !== open.url) event.preventDefault();
     });
     ses.protocol.handle('chat-app', async request => {
       const resource = appResource(request, runtime);

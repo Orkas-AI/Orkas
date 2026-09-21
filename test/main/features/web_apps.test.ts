@@ -7,6 +7,7 @@ import { constants } from 'node:fs';
 import nativeFs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { spawnSync } from 'node:child_process';
+import { MAX_TEXT_FILE_BYTES } from '../../../src/main/util/file-size-limits';
 import type { WebAppRuntime, HostAdapters, Bundle } from '../../../src/main/features/web_apps/runtime';
 let root: string, prev: string | undefined, uid: string, runtime: WebAppRuntime, host: HostAdapters;
 let mod: typeof import('../../../src/main/features/web_apps/runtime');
@@ -89,8 +90,9 @@ describe('Web app capability journeys', () => {
   it('discovers real schemas and distinguishes declaration from authorization', async () => {
     const a = open(); const catalog = await call(a.token, 'capabilities.list');
     expect(catalog.methods.find((m: any) => m.name === 'ai.generate')).toMatchObject({ available: true, declared: true, authorized: true, authorization: 'none' });
-    expect((await call(a.token,'capabilities.describe',{method:'ai.generate'})).inputSchema.properties.maxTokens.maximum).toBe(4096);
+    expect((await call(a.token,'capabilities.describe',{method:'ai.generate'})).inputSchema.properties.maxTokens.default).toBeUndefined();
     expect(catalog.unsupported.find((m: any) => m.capability === 'shell').reason).toContain('Host-only');
+    expect(catalog.unsupported.some((m: any) => m.capability === 'network')).toBe(false);
     await expect(call(a.token,'invented.execute')).rejects.toMatchObject({code:'E_METHOD'});
     await expect(call(a.token,'storage.get',{key:'x',userId:'other'})).rejects.toMatchObject({code:'E_INPUT'});
   });
@@ -150,11 +152,12 @@ describe('Web app capability journeys', () => {
     const a=open(), selected=await call(a.token,'files.pick');
     await expect(call(a.token,'files.readText',{handle:selected.handle})).rejects.toMatchObject({code:'E_ENCODING'});
     expect(await call(a.token,'files.readBase64',{handle:selected.handle})).toEqual({base64:'//4='});
-    await fs.writeFile(file,Buffer.alloc(512*1024+1));
+    await fs.truncate(file, MAX_TEXT_FILE_BYTES + 1);
     await expect(call(a.token,'files.pick')).rejects.toMatchObject({code:'E_LIMIT'});
   });
   it('bounds nested and oversized JSON before persistence', async () => {
-    const a=open(); await expect(call(a.token,'storage.set',{key:'x',value:'a'.repeat(1024*1024)})).rejects.toMatchObject({code:'E_LIMIT'});
+    const a=open();
+    expect(() => mod.boundedJson({ value: 'x'.repeat(1024) }, 1024)).toThrow('E_LIMIT');
     let deep:any={}; for(let i=0;i<40;i++) deep={child:deep};
     await expect(call(a.token,'storage.set',{key:'x',value:deep})).rejects.toMatchObject({code:'E_LIMIT'});
     expect(await call(a.token,'storage.keys')).toEqual({keys:[]});
@@ -184,11 +187,11 @@ describe('Web app capability journeys', () => {
     expect(host.closed).toHaveBeenCalledTimes(2);
     expect(host.closed).toHaveBeenLastCalledWith(uid, { id: b.token, owner: 1 });
   });
-  it('delivers streaming progress and usage with a bounded default output', async () => {
+  it('delivers streaming progress and usage without an app-specific output default', async () => {
     const a=open(), progress=vi.fn(); host.generate=vi.fn(async(_uid,_args,_signal,out)=>{out({type:'delta',text:'Hi'});return {text:'Hi',usage:{outputTokens:1},stopReason:'end_turn'};});
     expect(await runtime.call(uid,1,a.token,'model','ai.generate',{prompt:'Hello'},progress)).toMatchObject({text:'Hi',usage:{outputTokens:1}});
     expect(progress).toHaveBeenCalledWith({type:'delta',text:'Hi'});
-    expect(host.generate).toHaveBeenCalledWith(uid,{prompt:'Hello',maxTokens:1024},expect.any(AbortSignal),expect.any(Function));
+    expect(host.generate).toHaveBeenCalledWith(uid,{prompt:'Hello'},expect.any(AbortSignal),expect.any(Function));
   });
   it('revocation aborts generation and rejects stale instance calls', async () => {
     const a=open(); let start!:()=>void; const ready=new Promise<void>(r=>{start=r;});
@@ -230,11 +233,12 @@ describe('Web app capability journeys', () => {
     await expect(runtime.call(uid,1,a.token,'once','storage.set',{key:'x',value:3})).rejects.toMatchObject({code:'E_DUPLICATE'});
     expect(await call(a.token,'storage.get',{key:'x'})).toEqual({value:2});
   });
-  it('preserves owning tool failures and rejects oversized results without replay', async () => {
+  it('preserves owning tool failures and rejects unserializable results without replay', async () => {
     const execute=vi.fn(async()=>({content:'Denied',isError:true}));
     host.tools=vi.fn(async()=>[{name:'library',capability:'library',description:'',inputSchema:{},execute}]); const a=open();
     expect(await call(a.token,'tools.call',{name:'library',arguments:{action:'list'}})).toEqual({content:'Denied',isError:true});
-    execute.mockResolvedValueOnce({content:'x'.repeat(1024*1024+1),isError:false});
+    const cyclic: any = {}; cyclic.self = cyclic;
+    execute.mockResolvedValueOnce(cyclic);
     await expect(call(a.token,'tools.call',{name:'library',arguments:{}})).rejects.toMatchObject({code:'E_RESULT_LIMIT'});
     expect(execute).toHaveBeenCalledTimes(2);
     await expect(call(a.token,'tools.call',{name:'bash',arguments:{}})).rejects.toMatchObject({code:'E_TOOL'});
@@ -257,26 +261,31 @@ describe('Web app resource lifetime and contention', () => {
     await expect(call(a.token, 'storage.get', { key: 'private' })).rejects.toMatchObject({ code: 'E_FILE' });
     expect(await call(b.token, 'storage.get', { key: 'private' })).toEqual({ value: 'Other app' });
   });
-  it('bounds expensive work across applications and releases capacity after cancellation', async () => {
+  it('accepts concurrent work across applications and cancels it without blocking recovery', async () => {
     let started = 0;
     host.generate = vi.fn(async (_u, _a, signal) => {
       started++;
       return new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(new mod.AppError('E_CANCELLED')), { once: true }));
     });
-    const a = open('a'), b = open('b'), c = open('c');
-    const runs = [call(a.token, 'ai.generate', { prompt: 'First' }), call(b.token, 'ai.generate', { prompt: 'Second' })];
+    const apps = Array.from({ length: 40 }, (_, i) => open('app-' + i));
+    const runs = Array.from({ length: 8 }, (_, i) => call(apps[i % 2].token, 'ai.generate', { prompt: 'Parallel ' + i }));
     const outcomes = Promise.allSettled(runs);
-    await vi.waitFor(() => expect(started).toBe(2));
-    await expect(call(c.token, 'ai.generate', { prompt: 'Third' })).rejects.toMatchObject({ code: 'E_BUSY' });
-    runtime.closeOrigin(1, a.url); runtime.closeOrigin(1, b.url);
+    await vi.waitFor(() => expect(started).toBe(8));
+    expect(await call(apps[0].token, 'host.getContext')).toMatchObject({ sdkVersion: 1 });
+    runtime.closeOrigin(1, apps[0].url); runtime.closeOrigin(1, apps[1].url);
     expect((await outcomes).every(r => r.status === 'rejected')).toBe(true);
     host.generate = vi.fn(async () => ({ text: 'Recovered' }));
-    expect(await call(c.token, 'ai.generate', { prompt: 'Recovered' })).toEqual({ text: 'Recovered' });
+    expect(await call(apps[39].token, 'ai.generate', { prompt: 'Recovered' })).toEqual({ text: 'Recovered' });
   });
-  it('expires authority even if no new application is opened', async () => {
+  it('keeps an open app usable across days and still revokes it explicitly', async () => {
     const a = open(); const now = Date.now();
-    const time = vi.spyOn(Date, 'now').mockReturnValue(now + 13 * 60 * 60 * 1000);
+    await call(a.token, 'storage.set', { key: 'draft', value: 'Still working' });
+    const time = vi.spyOn(Date, 'now').mockReturnValue(now + 7 * 24 * 60 * 60 * 1000);
     try {
+      expect(await call(a.token, 'storage.get', { key: 'draft' })).toEqual({ value: 'Still working' });
+      open('another-app');
+      expect(await call(a.token, 'storage.get', { key: 'draft' })).toEqual({ value: 'Still working' });
+      await call(a.token, 'permissions.revoke');
       await expect(call(a.token, 'storage.keys')).rejects.toMatchObject({ code: 'E_CLOSED' });
       expect(runtime.resource(new URL(a.url).host, 'index.html', null)).toBeNull();
     } finally { time.mockRestore(); }
@@ -338,7 +347,7 @@ describe('app sandboxes and compatibility', () => {
     expect(await call(otherAccount.token, 'appFiles.list')).toEqual({ files: [] });
   });
 
-  it('rejects undeclared calls, traversal, aliases, malformed binary and excessive data without publication', async () => {
+  it('rejects undeclared calls, traversal, aliases and malformed binary without publication', async () => {
     const a = open('sandbox', ['appFiles']);
     const limited = open('limited', []);
     await expect(call(limited.token, 'appFiles.list')).rejects.toMatchObject({ code: 'E_NOT_DECLARED' });
@@ -346,7 +355,6 @@ describe('app sandboxes and compatibility', () => {
       await expect(call(a.token, 'appFiles.writeText', { path: file, text: 'escape' })).rejects.toMatchObject({ code: 'E_INPUT' });
     }
     await expect(call(a.token, 'appFiles.writeBase64', { path: 'bad', base64: 'not base64' })).rejects.toMatchObject({ code: 'E_INPUT' });
-    await expect(call(a.token, 'appFiles.writeText', { path: 'large', text: '你'.repeat(200000) })).rejects.toMatchObject({ code: 'E_LIMIT' });
     await expect(call(a.token, 'appFiles.list', { scope: 'outside' })).rejects.toMatchObject({ code: 'E_INPUT' });
     const paths = await import('../../../src/main/paths');
     const files = path.join(paths.webAppSandboxRoot(uid, bundle('sandbox').key, 'cloud'), 'files');
@@ -365,16 +373,21 @@ describe('app sandboxes and compatibility', () => {
     await expect(call(a.token, 'appFiles.writeText', { path: 'nested/outside/new', text: 'evil' })).rejects.toMatchObject({ code: 'E_FILE' });
   });
 
-  it('enforces aggregate quota and supports recovery by deleting a file', async () => {
+  it('grows beyond old aggregate quotas without scanning unrelated files for each write', async () => {
     const a = open('quota', ['appFiles']);
     const paths = await import('../../../src/main/paths');
     const rootFiles = path.join(paths.webAppSandboxRoot(uid, bundle('quota').key, 'cloud'), 'files');
     await fs.mkdir(rootFiles, { recursive: true });
-    for (let i = 0; i < 32; i++) await fs.writeFile(path.join(rootFiles, `${i}.bin`), Buffer.alloc(512 * 1024));
-    await expect(call(a.token, 'appFiles.writeText', { path: 'one.txt', text: 'one' })).rejects.toMatchObject({ code: 'E_LIMIT' });
-    await call(a.token, 'appFiles.remove', { path: '0.bin' });
-    await call(a.token, 'appFiles.writeText', { path: 'one.txt', text: 'one' });
+    for (let i = 0; i < 300; i++) await fs.writeFile(path.join(rootFiles, `${i}.bin`), Buffer.alloc(64 * 1024, i % 256));
+    const scan = vi.spyOn(nativeFs.promises, 'readdir'); syncBuiltinESMExports();
+    try {
+      await call(a.token, 'appFiles.writeText', { path: 'one.txt', text: 'one' });
+      expect(scan).not.toHaveBeenCalled();
+    } finally { scan.mockRestore(); syncBuiltinESMExports(); }
+    expect((await call(a.token, 'appFiles.list')).files).toHaveLength(301);
     expect(await call(a.token, 'appFiles.readText', { path: 'one.txt' })).toEqual({ text: 'one' });
+    await call(a.token, 'appFiles.remove', { path: '0.bin' });
+    expect((await call(a.token, 'appFiles.list')).files).toHaveLength(300);
   });
 
   it('keeps both preview scopes temporary without cloud notifications', async () => {
@@ -415,4 +428,207 @@ it.each(['switch', 'revoke', 'cancel'])('does not publish sandbox bytes after %s
     expect(await fs.readdir(path.dirname(file))).toEqual(['note.txt']);
     expect((host.storageChanged as any).mock.calls).toHaveLength(changeCount);
   } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+});
+
+// A working notebook must grow beyond the old demo quotas and stay usable.
+it('persists larger files and JSON, many entries and long-lived request sequences', async () => {
+  const app = open('growing-notebook', ['storage', 'appFiles']);
+  const text = 'data:α\n'.repeat(180000);
+  await call(app.token, 'appFiles.writeText', { path: 'large.txt', text });
+  expect(await call(app.token, 'appFiles.readText', { path: 'large.txt' })).toEqual({ text });
+  await call(app.token, 'storage.set', { key: 'large', value: text });
+  expect(await call(app.token, 'storage.get', { key: 'large' })).toEqual({ value: text });
+  const paths = await import('../../../src/main/paths');
+  const key = bundle('growing-notebook').key;
+  // Pre-existing synced state is subject to the same admission as app writes.
+  const entries = Object.fromEntries(Array.from({ length: 300 }, (_, i) => ['k' + i, i]));
+  await fs.writeFile(paths.webAppDataFile(uid, key), JSON.stringify({ version: 1, entries }));
+  await call(app.token, 'storage.set', { key: 'new', value: 'retained' });
+  expect((await call(app.token, 'storage.keys')).keys).toHaveLength(301);
+  runtime.closeOwner(1); runtime = new mod.WebAppRuntime(host);
+  const reopened = open('growing-notebook', ['storage', 'appFiles']);
+  expect(await call(reopened.token, 'appFiles.readText', { path: 'large.txt' })).toEqual({ text });
+  expect(await call(reopened.token, 'storage.get', { key: 'new' })).toEqual({ value: 'retained' });
+  for (let i = 0; i < 4200; i++) await call(reopened.token, 'host.getContext');
+  expect(await call(reopened.token, 'storage.get', { key: 'new' })).toEqual({ value: 'retained' });
+  await expect(runtime.call(uid, 1, reopened.token, 'q' + seq, 'storage.remove', { key: 'new' }))
+    .rejects.toMatchObject({ code: 'E_DUPLICATE' });
+  expect(await call(reopened.token, 'storage.get', { key: 'new' })).toEqual({ value: 'retained' });
+});
+
+it('remembers cancelled and completed SDK ids out of order without rejecting intervening work', async () => {
+  const a = open();
+  runtime.cancel(uid, 1, a.token, 'q4');
+  for (const id of ['q2', 'q1', 'q3', 'q5'])
+    await runtime.call(uid, 1, a.token, id, 'storage.set', { key: id, value: id });
+  for (const id of ['q1', 'q2', 'q3', 'q4', 'q5'])
+    await expect(runtime.call(uid, 1, a.token, id, 'storage.set', { key: 'replay', value: true }))
+      .rejects.toMatchObject({ code: 'E_DUPLICATE' });
+  expect(await runtime.call(uid, 1, a.token, 'q6', 'storage.keys', {})).toEqual({ keys: ['q1', 'q2', 'q3', 'q5'] });
+});
+
+it('lets the owning service complete long work without an additional SDK deadline', async () => {
+  vi.useFakeTimers();
+  let finish!: (value: unknown) => void;
+  let signal!: AbortSignal;
+  host.generate = async (_u, _args, ownedSignal) => {
+    signal = ownedSignal;
+    return new Promise(resolve => { finish = resolve; });
+  };
+  try {
+    const app = open();
+    const work = call(app.token, 'ai.generate', { prompt: 'Long operation' });
+    await vi.advanceTimersByTimeAsync(30 * 60 * 1000);
+    expect(signal.aborted).toBe(false);
+    finish({ text: 'Completed once' });
+    expect(await work).toEqual({ text: 'Completed once' });
+    expect(await call(app.token, 'host.getContext')).toMatchObject({ sdkVersion: 1 });
+  } finally { vi.useRealTimers(); }
+});
+
+it('keeps acknowledged browser calls alive until result or explicit cancellation', async () => {
+  const { runInNewContext } = await import('node:vm');
+  const source = await fs.readFile(path.resolve('src/main/features/web_apps/sdk.js'), 'utf8');
+  vi.useFakeTimers();
+  try {
+    const listeners: Record<string, (event: any) => void> = {};
+    const parent = { postMessage: vi.fn() };
+    const window: any = { parent, addEventListener: (type: string, fn: any) => { listeners[type] = fn; } };
+    runInNewContext(source, { window, parent, setTimeout, clearTimeout, crypto: (await import('node:crypto')).webcrypto });
+    const unavailable = window.orkasApp.call('tools.call', {});
+    const missing = expect(unavailable).rejects.toMatchObject({ code: 'E_HOST_UNAVAILABLE' });
+    await vi.advanceTimersByTimeAsync(10000);
+    await missing;
+    parent.postMessage.mockClear();
+    const work = window.orkasApp.call('tools.call', {});
+    const { id } = parent.postMessage.mock.calls[0][0];
+    listeners.message({ source: parent, data: { __orkasApp: 1, id, type: 'ack' } });
+    await vi.advanceTimersByTimeAsync(30 * 60 * 1000);
+    expect(parent.postMessage).toHaveBeenCalledTimes(1);
+    listeners.message({ source: parent, data: { __orkasApp: 1, id, type: 'result', ok: true, value: 'Complete' } });
+    expect(await work).toBe('Complete');
+    const delayed = window.orkasApp.call('tools.call', {});
+    const delayedId = parent.postMessage.mock.calls.at(-1)![0].id;
+    // A known host can be busy; subsequent transport acknowledgements do not
+    // impose a second deadline on the owning service's operation.
+    await vi.advanceTimersByTimeAsync(60 * 1000);
+    expect(parent.postMessage).toHaveBeenCalledTimes(2);
+    listeners.message({ source: parent, data: { __orkasApp: 1, id: delayedId, type: 'result', ok: true, value: 'Delayed' } });
+    expect(await delayed).toBe('Delayed');
+    const controller = new AbortController();
+    const cancelled = window.orkasApp.call('tools.call', {}, { signal: controller.signal });
+    const outcome = expect(cancelled).rejects.toMatchObject({ code: 'E_CANCELLED' });
+    controller.abort();
+    await outcome;
+    expect(parent.postMessage.mock.calls.at(-1)![0].type).toBe('cancel');
+  } finally { vi.useRealTimers(); }
+});
+
+it('can select more than sixteen files and release snapshots independently', async () => {
+  const source = path.join(root, 'selected.txt');
+  await fs.writeFile(source, 'Selected content');
+  host.pick = async () => source;
+  const a = open();
+  const handles: string[] = [];
+  for (let i = 0; i < 20; i++) handles.push((await call(a.token, 'files.pick')).handle);
+  for (const handle of handles) {
+    expect(await call(a.token, 'files.readText', { handle })).toEqual({ text: 'Selected content' });
+    await call(a.token, 'files.release', { handle });
+    await expect(call(a.token, 'files.readText', { handle })).rejects.toMatchObject({ code: 'E_HANDLE' });
+  }
+});
+
+it('keeps deep application paths and long storage keys usable across reopening', async () => {
+  const a=open('first',['storage','appFiles']);const rel=Array.from({length:12},(_,i)=>'directory-'+i+'-long-name').join('/')+'/value.txt';
+  await call(a.token,'appFiles.writeText',{path:rel,text:'Preserved'});
+  const key='k'.repeat(256);await call(a.token,'storage.set',{key,value:42});
+  runtime.closeOwner(1);const b=open('first',['storage','appFiles']);
+  expect(await call(b.token,'appFiles.readText',{path:rel})).toEqual({text:'Preserved'});
+  expect(await call(b.token,'appFiles.list')).toMatchObject({files:[{path:rel,size:9}]});
+  expect(await call(b.token,'storage.get',{key})).toEqual({value:42});
+  await expect(call(b.token,'appFiles.readText',{path:'../private.txt'})).rejects.toMatchObject({code:'E_INPUT'});
+});
+
+it('measures JSON bytes and nesting while preserving state after a rejected update', async () => {
+  expect(mod.boundedJson('汉', 5)).toBe('"汉"');
+  expect(() => mod.boundedJson('汉', 4)).toThrow('E_LIMIT');
+  const nested = (depth: number) => { let value: any = 0; for (let i = 0; i < depth; i++) value = [value]; return value; };
+  expect(JSON.parse(mod.boundedJson(nested(32)))).toEqual(nested(32));
+  expect(() => mod.boundedJson(nested(33))).toThrow('E_LIMIT');
+  const a = open();
+  await call(a.token, 'storage.set', { key: 'draft', value: 'Original' });
+  await expect(call(a.token, 'storage.set', { key: 'draft', value: nested(33) })).rejects.toMatchObject({ code: 'E_LIMIT' });
+  runtime.closeOwner(1);
+  const reopened = open();
+  expect(await call(reopened.token, 'storage.get', { key: 'draft' })).toEqual({ value: 'Original' });
+  await call(reopened.token, 'storage.set', { key: 'draft', value: 'Recovered' });
+  expect(await call(reopened.token, 'storage.get', { key: 'draft' })).toEqual({ value: 'Recovered' });
+});
+
+it('exports an ordinary long filename without weakening path validation or create-only publication', async () => {
+  const a = open();
+  const name = 'report-'.repeat(25) + '.txt';
+  const target = path.join(root, name);
+  host.save = vi.fn(async () => target);
+  expect(await call(a.token, 'files.saveAs', { name, text: 'Preserved report' })).toEqual({ saved: true, name });
+  expect(host.save).toHaveBeenCalledWith(name);
+  expect(await fs.readFile(target, 'utf8')).toBe('Preserved report');
+  await expect(call(a.token, 'files.saveAs', { name: '../outside.txt', text: 'Not saved' })).rejects.toMatchObject({ code: 'E_INPUT' });
+  expect(host.save).toHaveBeenCalledOnce();
+  await expect(call(a.token, 'files.saveAs', { name, text: 'Do not overwrite' })).rejects.toMatchObject({ code: 'EEXIST' });
+  expect(await fs.readFile(target, 'utf8')).toBe('Preserved report');
+});
+
+it('rejects oversized progress without replay and allows a new explicit request', async () => {
+  const a = open();
+  const progress = vi.fn();
+  host.generate = vi.fn(async (_uid, _args, _signal, emit) => {
+    emit({ text: '汉'.repeat(22000) }); // Below 64 Ki characters, above 64 KiB.
+    return { text: 'Must not be reported as success' };
+  });
+  await expect(runtime.call(uid, 1, a.token, 'oversized', 'ai.generate', { prompt: 'Report' }, progress))
+    .rejects.toMatchObject({ code: 'E_LIMIT' });
+  expect(progress).not.toHaveBeenCalled();
+  expect(host.generate).toHaveBeenCalledOnce();
+  host.generate = vi.fn(async (_uid, _args, _signal, emit) => { emit({ text: 'Recovered' }); return { text: 'Recovered' }; });
+  expect(await runtime.call(uid, 1, a.token, 'retry', 'ai.generate', { prompt: 'Retry' }, progress)).toEqual({ text: 'Recovered' });
+  expect(progress).toHaveBeenCalledOnce();
+  expect(host.generate).toHaveBeenCalledOnce();
+});
+
+it('keeps replay and cancellation independent across page generations and legacy SDK requests', async () => {
+  const a = open();
+  const first = 'd' + 'a'.repeat(32) + 'q';
+  const second = 'd' + 'b'.repeat(32) + 'q';
+  const write = (id: string, value: number) => runtime.call(uid, 1, a.token, id, 'storage.set', { key: 'counter', value });
+  await write(first + '1', 1);
+  await write(second + '1', 2);
+  runtime.cancel(uid, 1, a.token, first + '2');
+  await expect(write(first + '2', 99)).rejects.toMatchObject({ code: 'E_DUPLICATE' });
+  await expect(write(first + '1', 99)).rejects.toMatchObject({ code: 'E_DUPLICATE' });
+  await write(second + '2', 3);
+  await write('q1', 4);
+  expect(await runtime.call(uid, 1, a.token, 'read-counter', 'storage.get', { key: 'counter' })).toEqual({ value: 4 });
+});
+
+it('shares initial host discovery across concurrent requests and cancels all work on page departure', async () => {
+  const { runInNewContext } = await import('node:vm');
+  const source = await fs.readFile(path.resolve('src/main/features/web_apps/sdk.js'), 'utf8');
+  vi.useFakeTimers();
+  try {
+    const listeners: Record<string, (event?: any) => void> = {};
+    const parent = { postMessage: vi.fn() };
+    const window: any = { parent, addEventListener: (type: string, fn: any) => { listeners[type] = fn; } };
+    runInNewContext(source, { window, parent, setTimeout, clearTimeout, crypto: (await import('node:crypto')).webcrypto });
+    const requests = [window.orkasApp.call('storage.keys'), window.orkasApp.call('host.getContext')];
+    const outcomes = requests.map(request => expect(request).rejects.toMatchObject({ code: 'E_CLOSED' }));
+    const ids = parent.postMessage.mock.calls.map(([message]) => message.id);
+    listeners.message({ source: parent, data: { __orkasApp: 1, id: ids[0], type: 'ack' } });
+    await vi.advanceTimersByTimeAsync(60 * 1000);
+    expect(parent.postMessage).toHaveBeenCalledTimes(2);
+    listeners.pagehide();
+    await Promise.all(outcomes);
+    expect(parent.postMessage.mock.calls.slice(2).map(([message]) => message)).toEqual(ids.map(id => ({ __orkasApp: 1, type: 'cancel', id })));
+    expect(vi.getTimerCount()).toBe(0);
+  } finally { vi.useRealTimers(); }
 });

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { captureMainLogWorkers } from '../../helpers/capture-main-log-workers';
 
 import type { AgentSummary } from '../../../src/main/features/agents';
 import { TOOL_CATALOG_REVISION } from '../../../src/main/model/core-agent/tool-catalog-revision';
@@ -15,6 +16,7 @@ let tmpDir: string;
 let prevWs: string | undefined;
 let prevAnthropicKey: string | undefined;
 let prevToolLoadingMode: string | undefined;
+let closeLogWorkers: () => Promise<void>;
 
 const CONTENT_WRITER_AGENT_ID = '173d4235a431';
 const CITATION_VERIFY_AGENT_IDS = [
@@ -27,7 +29,7 @@ const OFFICE_WORKER_AGENT_ID = 'a19101ba698a';
 const IMAGE_STUDIO_AGENT_ID = '814b61b027f0';
 const VIDEO_STUDIO_AGENT_ID = '79df9cc89f5f';
 
-beforeEach(() => {
+beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-runner-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
@@ -35,9 +37,11 @@ beforeEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   delete process.env.ANTHROPIC_API_KEY;
   vi.resetModules();
+  closeLogWorkers = await captureMainLogWorkers();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await closeLogWorkers();
   vi.doUnmock('@earendil-works/pi-ai/oauth');
   vi.doUnmock('#core-agent');
   vi.doUnmock('../../../src/main/model/core-agent/video-studio-tool');
@@ -3231,6 +3235,63 @@ describe('runner › isolated memory consolidation', () => {
     expect(request.sessionId).toBeUndefined();
     expect(request.maxTokens).toBe(4096);
     await expect(completeMemoryConsolidation('other-owner', message, signal)).rejects.toThrow('cancelled');
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('runner › bounded Skill creation correction', () => {
+  async function setup(result: any) {
+    const complete = vi.fn(async () => {
+      if (result instanceof Error) throw result;
+      return result;
+    });
+    vi.doMock('#core-agent', async () => ({
+      ...(await vi.importActual<any>('#core-agent')),
+      createPiProvider: () => ({ id: 'openrouter', name: 'test', complete, validateAuth: async () => true }),
+    }));
+    const users = await import('../../../src/main/features/users');
+    const auth = await import('../../../src/main/features/auth');
+    users.activateUser('skill-correction-owner');
+    const profile = await auth.addApiKey('openrouter', 'sk-or-correction-fixture', 'Fixture');
+    await auth.addEntry({ provider: 'openrouter', model: 'future-lab/test-model', profileId: profile.profileId });
+    const { completeSkillCreationCorrection } = await loadRunner();
+    const input = { userId: 'skill-correction-owner', cid: 'correction-task', turnId: 'correction-turn',
+      message: 'Repair only the supplied proposal.', signal: new AbortController().signal };
+    return { complete, run: completeSkillCreationCorrection, input };
+  }
+
+  it('offers no tools or task session, retains billing attribution and charges the task token backstop', async () => {
+    const { complete, run, input } = await setup({
+      content: [{ type: 'text', text: '<skill>corrected</skill>' }], stopReason: 'end_turn',
+      usage: { inputTokens: 20, outputTokens: 10 }, model: 'test-model',
+    });
+    const meter = await import('../../../src/main/util/conversation-cost-meter');
+    meter.resetTaskTokens(input.cid);
+    expect(await run(input)).toBe('<skill>corrected</skill>');
+    expect(complete).toHaveBeenCalledTimes(1);
+    const request = complete.mock.calls[0][0] as any;
+    expect(request.tools).toEqual([]);
+    expect(request.maxTokens).toBe(8192);
+    expect(request.messages).toEqual([{ role: 'user', content: [{ type: 'text', text: input.message }] }]);
+    expect(request.systemPrompt).toBeUndefined();
+    expect(request.requestMetadata.creditContext).toEqual({ conversationId: input.cid, turnId: input.turnId });
+    expect(meter.taskTokens(input.cid)).toBe(30);
+    await expect(run({ ...input, userId: 'another-account' })).rejects.toThrow('cancelled');
+    await expect(run({ ...input, message: 'x'.repeat(64_001) })).rejects.toThrow('input limit');
+    const controller = new AbortController(); controller.abort();
+    await expect(run({ ...input, signal: controller.signal })).rejects.toThrow('cancelled');
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['truncated', { content: [{ type: 'text', text: '<skill>partial</skill>' }], stopReason: 'max_tokens' }],
+    ['tool request', { content: [{ type: 'tool_use', id: 't', name: 'bash', input: {} }], stopReason: 'tool_use' }],
+    ['oversized', { content: [{ type: 'text', text: 'x'.repeat(64_001) }], stopReason: 'end_turn' }],
+    ['empty', { content: [], stopReason: 'end_turn' }],
+    ['network failure', Object.assign(new Error('network fixture'), { code: 'ECONNRESET' })],
+  ])('rejects %s without another generation attempt', async (_, result) => {
+    const { complete, run, input } = await setup(result);
+    await expect(run(input)).rejects.toThrow();
     expect(complete).toHaveBeenCalledTimes(1);
   });
 });

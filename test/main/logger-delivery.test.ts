@@ -1,0 +1,63 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { expect, it, vi } from 'vitest';
+
+it('main and renderer records bypass direct file/console sinks and snapshot once before the worker', async () => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'orkas-main-log-'));
+  const workspace = process.env.ORKAS_WORKSPACE_ROOT;
+  const level = process.env.ORKAS_LOG_LEVEL;
+  const devtools = process.env.ORKAS_DEVTOOLS;
+  const originalConsole = { info: console.info, warn: console.warn, error: console.error };
+  process.env.ORKAS_WORKSPACE_ROOT = directory;
+  process.env.ORKAS_LOG_LEVEL = 'info';
+  delete process.env.ORKAS_DEVTOOLS;
+  const send = vi.fn(), canAccept = vi.fn(() => true), noteDrop = vi.fn();
+  vi.doMock('../../src/main/util/log-delivery', () => ({ createLogDelivery: () => ({ send, canAccept, noteDrop }) }));
+  vi.resetModules();
+  const { default: electronLog } = await import('electron-log/main');
+  const originalFile = electronLog.transports.file;
+  const originalTransportConsole = electronLog.transports.console;
+  const originalIpcLevel = electronLog.transports.ipc?.level;
+  const fileSink: any = Object.assign(vi.fn(() => { throw new Error('disk must not run here'); }), { level: 'silly' });
+  const consoleSink: any = Object.assign(vi.fn(), { level: 'silly' });
+  electronLog.transports.file = fileSink;
+  electronLog.transports.console = consoleSink;
+  try {
+    const { initLogger, createLogger, logFromRenderer } = await import('../../src/main/logger');
+    initLogger();
+    const logger = createLogger('business');
+    const getter = vi.fn(() => { throw new Error('diagnostic accessor'); });
+    const data = { result: 'success', token: 'private-canary', get details() { return getter(); } };
+    logger.debug('disabled', data);
+    expect(send).not.toHaveBeenCalled();
+    logger.info('completed', data);
+    data.result = 'later';
+    expect(send.mock.calls[0][0]).toMatchObject({ scope: 'business', data: ['completed', { result: 'success', token: '***REDACTED***', details: '[accessor]' }] });
+    const error = Object.assign(new Error('failed'), { code: 'ECONNRESET', token: 'private-canary' });
+    logger.error('request failed', error);
+    expect(structuredClone(send.mock.calls[1][0]).data[1]).toMatchObject({ message: 'failed', code: 'ECONNRESET', token: '***REDACTED***' });
+    logFromRenderer({ level: 'warn', module: 'ui', message: 'renderer result' });
+    expect(send.mock.calls[2][0].scope).toBe('renderer/ui');
+    canAccept.mockReturnValue(false);
+    logger.info('saturated', data);
+    expect(noteDrop).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledTimes(3);
+    expect(getter).not.toHaveBeenCalled();
+    expect(fileSink).not.toHaveBeenCalled();
+    expect(consoleSink).not.toHaveBeenCalled();
+  } finally {
+    electronLog.errorHandler.stopCatching();
+    Object.assign(console, originalConsole);
+    electronLog.transports.file = originalFile;
+    electronLog.transports.console = originalTransportConsole;
+    if (electronLog.transports.ipc) electronLog.transports.ipc.level = originalIpcLevel;
+    delete (electronLog.transports as any).background;
+    if (workspace === undefined) delete process.env.ORKAS_WORKSPACE_ROOT; else process.env.ORKAS_WORKSPACE_ROOT = workspace;
+    if (level === undefined) delete process.env.ORKAS_LOG_LEVEL; else process.env.ORKAS_LOG_LEVEL = level;
+    if (devtools === undefined) delete process.env.ORKAS_DEVTOOLS; else process.env.ORKAS_DEVTOOLS = devtools;
+    vi.doUnmock('../../src/main/util/log-delivery');
+    vi.resetModules();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

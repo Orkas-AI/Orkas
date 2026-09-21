@@ -74,23 +74,6 @@ function loadFailedRetrySender() {
   };
 }
 
-function loadModelOutputTracker() {
-  const source = [
-    extractFunction('_normalizeFeedbackFieldText'),
-    extractFunction('_trimTelemetryText'),
-    extractFunction('_handleModelOutputErrorForUi'),
-  ].join('\n');
-  return vm.runInNewContext(`
-    const currentCid = 'fallback-cid';
-    const calls = [];
-    function _convTrackError(action, data) { calls.push({ action, data }); }
-    function _groupActorLabel(actorId) { return actorId === 'commander' ? 'Commander' : ''; }
-    const window = {};
-    ${source}
-    ({ track: _handleModelOutputErrorForUi, calls });
-  `, {});
-}
-
 describe('conversation failed assistant retry actions', () => {
   it('offers retry from recorded failure state even without error prose, but not for successful empty deliveries', () => {
     const isFailed = loadFailedClassifier();
@@ -231,7 +214,6 @@ describe('conversation failed assistant retry actions', () => {
     expect(finalizeBody).toContain('archive: archive && !failedAssistant && !interruptedAssistant');
     expect(finalizeBody).toContain('_attachFailedAssistantActions(ph, () => _messageTextForActions(ph, text));');
     expect(finalizeBody).toContain('_attachInterruptedAssistantActions(ph, () => _messageTextForActions(ph, text), { archive });');
-    expect(finalizeBody).toContain("failure_kind: String(gm.failure_kind || '')");
 
     const failedActionsBody = extractFunction('_attachFailedAssistantActions');
     expect(failedActionsBody).toContain("msgDiv.dataset.failed = '1';");
@@ -253,21 +235,9 @@ describe('conversation failed assistant retry actions', () => {
   });
 
   it('does not send model output error telemetry in the open build', () => {
-    const { track, calls } = loadModelOutputTracker();
-    const msgDiv = {
-      dataset: {
-        msgId: 'm123',
-        turnId: 'turn-1',
-        fromActor: 'commander',
-      },
-    };
-    const longError = `Model call failed: ${'x'.repeat(900)}`;
-
-    track('cid-1', msgDiv, longError, { stage: 'stream_event' });
-    track('cid-1', msgDiv, longError, { stage: 'stream_event' });
-    track('cid-1', msgDiv, 'aborted', { aborted: true });
-
-    expect(calls).toHaveLength(0);
+    expect(source).not.toContain('_handleModelOutputErrorForUi');
+    expect(source).not.toContain('_trimTelemetryText');
+    expect(source).not.toContain("_convTrackError('model_output_error'");
   });
 
 });

@@ -142,7 +142,7 @@ describe('contexts › writeContextFile', () => {
 
   it('accepts every text extension in the whitelist', async () => {
     const c = await loadContexts();
-    const exts = ['.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log'];
+    const exts = ['.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log', '.html', '.xml', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt'];
     for (const ext of exts) {
       const r = c.writeContextFile(`f${ext}`, 'content');
       expect(r.ok, ext).toBe(true);
@@ -554,6 +554,17 @@ describe('contexts › createContextDir', () => {
 });
 
 describe('contexts › readContextFile', () => {
+  it('offers a bounded CSV preview while preserving the full stored source', async () => {
+    const c = await loadContexts();
+    const body = 'id,value\n' + '001,中文\n'.repeat(300_000);
+    writeFile('large.csv', body);
+    const result = c.readContextFile('large.csv', true);
+    expect(result).toMatchObject({ ok: true, truncated: true });
+    expect((result as any).content.startsWith('id,value\n001,中文')).toBe(true);
+    expect(Buffer.byteLength((result as any).content)).toBeLessThanOrEqual(2 * 1024 * 1024);
+    expect(fs.readFileSync(path.join(ctxRoot(), 'large.csv'), 'utf8')).toBe(body);
+    expect(c.readContextFile('../outside.csv', true).ok).toBe(false);
+  });
   it('returns content for an existing text file', async () => {
     writeFile('a.md', '# hello');
     const c = await loadContexts();

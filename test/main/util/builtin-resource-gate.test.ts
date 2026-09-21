@@ -67,9 +67,29 @@ describe('builtin-resource-gate', () => {
       .toEqual([...gate.REQUIRED_BUILTIN_INVENTORY.marketplace_agents].sort());
     expect(manifest.inventory.marketplace_skills.map((row) => row.id).sort())
       .toEqual([...gate.REQUIRED_BUILTIN_INVENTORY.marketplace_skills].sort());
-    // Normal Resource development does not move an Agent into the PC bundle.
     expect(manifest.inventory.marketplace_agents)
-      .not.toContainEqual(expect.objectContaining({ id: '1040b336306f' }));
+      .toContainEqual(expect.objectContaining({
+        id: '1040b336306f',
+        name: 'StockAnalyser',
+        icon: 'chart',
+        color: 'mint',
+        skill_list: [
+          'investment-report',
+          'market-data',
+          'portfolio-risk',
+          'quant-lab',
+          'security-research',
+          'trade-control',
+        ],
+        embedded_skills: [
+          'investment-report',
+          'market-data',
+          'portfolio-risk',
+          'quant-lab',
+          'security-research',
+          'trade-control',
+        ],
+      }));
     expect(manifest.inventory.marketplace_agents)
       .toContainEqual(expect.objectContaining({
         id: '173d4235a431',

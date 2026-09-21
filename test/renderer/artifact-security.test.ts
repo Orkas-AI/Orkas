@@ -27,14 +27,14 @@ describe('artifact iframe security boundary', () => {
     expect(savedSource).toContain('artifactSecurity.trustedArtifactMessage');
   });
 
-  it('does not grant popup or top-navigation capabilities', () => {
+  it('allows ordinary browser actions without top-level navigation', () => {
     const security = loadSecurity();
     expect(security.SANDBOX.split(/\s+/)).toEqual([
       'allow-scripts',
       'allow-same-origin',
-      'allow-forms',
+      'allow-forms', 'allow-downloads', 'allow-popups', 'allow-modals',
     ]);
-    expect(security.SANDBOX).not.toMatch(/allow-popups|allow-top-navigation/);
+    expect(security.SANDBOX).not.toMatch(/allow-popups-to-escape-sandbox|allow-top-navigation/);
   });
 
   it('accepts only credential-free absolute HTTP(S) external URLs', () => {

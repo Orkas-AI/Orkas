@@ -7,7 +7,10 @@ require(path.join(root, 'node_modules/tsx/dist/cjs/index.cjs'));
 const { PPTX_TEXT_COLLISION_SCRIPT } = require(path.join(root, 'src/main/features/office/pptx_text_collision.ts'));
 const { hardenedWebPreferences } = require(path.join(root, 'src/main/util/window-security.ts'));
 const shape = (id, x, y, text, css = '') => `<div class="shape" data-path="/slide[1]/shape[@id=${id}]" style="left:${x}px;top:${y}px;${css.replace(/"/g, "&quot;")}"><div class="shape-text"><span>${text}</span></div></div>`;
-const overlap = shape(1, 10, 10, 'ABCDEFG') + shape(2, 85, 10, 'XYZ');
+// Chromium's generic monospace advances differ by platform (10px on Windows,
+// roughly 12px on macOS at this font size). Keep the fixture's overlap real in
+// either layout engine instead of relying on the wider macOS fallback.
+const overlap = shape(1, 10, 10, 'ABCDEFG') + shape(2, 75, 10, 'XYZ');
 const cases = {
   collision: overlap,
   observedCjkPair: shape(100114, 91.2, 494.4, '需要客户确认的信息', 'width:220.8px;font: bold 24px/24px "Microsoft YaHei","PingFang SC","Noto Sans CJK SC",sans-serif')

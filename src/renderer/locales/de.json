@@ -1,4 +1,8 @@
 {
+  "files.delimited.table": "Tabelle",
+  "files.delimited.source": "Quelltext",
+  "files.delimited.limited": "Begrenzte Vorschau. Öffnen Sie die Datei extern, um alle Daten zu sehen.",
+  "files.delimited.invalid": "Unvollständige oder ungültige Felder in Anführungszeichen. Der Quelltext wird angezeigt.",
   "connectors.action_confirm.operation.external_or_financial_change": "Externe Aktion oder finanzielle Änderung",
   "connectors.action_confirm.operation.destructive": "Löschung oder unumkehrbare Aktion",
   "connectors.action_confirm.operation.financial_record_change": "Änderung von Finanzdaten",

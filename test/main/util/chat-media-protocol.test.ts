@@ -31,7 +31,7 @@ beforeEach(async () => {
     log: { warn: (...args: unknown[]) => logs.push(args), info: () => {} },
     _mediaKindForContentType: () => 'image', _protocolServeFailureCode: () => 'serve_failed',
     serveFileRange: () => new Response('fixture-image'),
-    withOfflineHtmlPreviewPolicy: (response: Response) => response,
+    withHtmlPreviewPolicy: (response: Response) => response,
   });
 });
 afterEach(() => {

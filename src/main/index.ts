@@ -43,8 +43,8 @@ import { desktopPlatform, osVersion, preferredSystemLanguage } from './system_in
 import {
   hardenedWebPreferences,
   installExternalNavigationGuard,
-  installOfflineHtmlPreviewNavigationGuard,
-  withOfflineHtmlPreviewPolicy,
+  installHtmlPreviewNavigationGuard,
+  withHtmlPreviewPolicy,
 } from './util/window-security';
 import {
   createRendererChannel,
@@ -329,7 +329,7 @@ function createWindow(): BrowserWindow {
     (url) => shell.openExternal(url),
     (err) => log.warn('openExternal failed', { error: (err as Error)?.message || String(err) }),
   );
-  installOfflineHtmlPreviewNavigationGuard(win.webContents);
+  installHtmlPreviewNavigationGuard(win.webContents);
 
   // Hijack Cmd/Ctrl+R / F5 uniformly:
   //   - Packaged: refresh disabled (the App doesn't need reload).
@@ -1198,7 +1198,7 @@ function registerChatMediaProtocol(): void {
           'chat_local',
         );
         return resolved.kind === 'html'
-          ? withOfflineHtmlPreviewPolicy(response)
+          ? withHtmlPreviewPolicy(response)
           : response;
       }
 

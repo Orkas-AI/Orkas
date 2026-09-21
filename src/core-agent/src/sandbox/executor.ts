@@ -17,6 +17,7 @@ import { createLogger } from "../shared/logger.js";
 import { errorCodeForLog } from "../shared/errors.js";
 import { blockedCommand } from "./command-policy.js";
 import { windowsTreeCleanupCommand } from "./windows-process-tree.js";
+import { compilePowerShellChain, parsePowerShellChain } from "./powershell-chain.js";
 import {
   ProcessOutputCapture,
   type StreamedToolOutput,
@@ -239,11 +240,14 @@ export function buildShellInvocation(
 
   const kind = inferShellKind(shell, platform);
   if (platform === "win32" && kind === "powershell") {
+    const chain = shellBaseName(shell).replace(/\.exe$/i, "") === "powershell"
+      ? parsePowerShellChain(command) : { kind: "none" as const };
+    const executableCommand = chain.kind === "chain" ? compilePowerShellChain(chain) : command;
     // powershell.exe otherwise normalizes a failed native child's exit code to
     // 1. Preserve $LASTEXITCODE so process tools can report the real code.
     const powershellCommand = [
       "& {",
-      command,
+      executableCommand,
       "$orkasCommandSucceeded = $?",
       "$orkasNativeExitCode = $LASTEXITCODE",
       "if ($null -ne $orkasNativeExitCode) { exit $orkasNativeExitCode }",

@@ -4,6 +4,15 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 
+// Keep diagnostics in Vitest's captured streams. Real logger workers can
+// recreate logs after this suite removes its per-case temporary workspace.
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: (scope: string) => Object.fromEntries(
+    ['info', 'debug', 'warn', 'error'].map(level => [level, (...args: unknown[]) =>
+      console[level as 'info' | 'debug' | 'warn' | 'error'](`[${scope}]`, ...args)]),
+  ),
+}));
+
 /**
  * Project Library indexer: queue lifecycle, reconcile diffing, and the
  * project-scoped concerns nothing else covers (deletion tombstone/epoch,

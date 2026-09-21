@@ -1,4 +1,8 @@
 {
+  "files.delimited.table": "表格",
+  "files.delimited.source": "原文",
+  "files.delimited.limited": "当前仅显示部分预览。请使用外部应用打开文件查看全部数据。",
+  "files.delimited.invalid": "文件含有未闭合或无效的引号字段，已显示原文。",
   "connectors.action_confirm.operation.external_or_financial_change": "对外操作或资金变动",
   "connectors.action_confirm.operation.destructive": "删除或不可逆操作",
   "connectors.action_confirm.operation.financial_record_change": "财务记录变更",

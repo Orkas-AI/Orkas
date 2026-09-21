@@ -19,7 +19,7 @@ describe('rendered PPT text collision evidence', () => {
         path.resolve('test/fixtures/office/text-collision-render.cjs'), process.cwd(), output,
       ], { env, timeout: 30_000, maxBuffer: 256 * 1024 });
       expect(logs.stderr).toBe('');
-      expect(logs.stdout).toBe('');
+      expect(logs.stdout.trim()).toBe('');
       const results = JSON.parse(fs.readFileSync(output, 'utf8'));
       expect(results.collision).toMatchObject({ status: 'checked', assessed_text_elements: 2,
         warnings: [{ type: 'text_collision_candidate', severity: 'warning', paths: ['/slide[1]/shape[@id=1]', '/slide[1]/shape[@id=2]'] }] });

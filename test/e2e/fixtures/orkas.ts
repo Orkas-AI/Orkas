@@ -102,6 +102,15 @@ type ModelToolScenario =
   | { kind: 'connector'; connectorId: string }
   | { kind: 'agent-authoring'; finalText: string }
   | {
+    kind: 'create-pdf';
+    sourceType: 'markdown' | 'html';
+    content: string;
+    outputPath: string;
+    finalText: string;
+    issued: boolean;
+    toolLoadRequested: boolean;
+  }
+  | {
     kind: 'bash-sequence';
     commands: string[];
     finalText: string;
@@ -800,6 +809,8 @@ export class OrkasTestApp {
   private activeUserId: string;
   private readonly configuredModelSeededUsers = new Set<string>();
   private modelToolScenario: ModelToolScenario | null = null;
+  private generatedImageBytes = Buffer.from(E2E_PNG_B64, 'base64');
+  private generatedVideoBytes = E2E_MP4_BYTES;
   private modelToolScenarioRequestStart = 0;
   private pendingAgentHandoffReply: (() => void) | null = null;
   private pendingCommentaryReply: (() => void) | null = null;
@@ -1152,7 +1163,7 @@ export class OrkasTestApp {
   }
 
   setClientConfigImmediate(immediate: Record<string, unknown>): string {
-    if (!this.updateStub) throw new Error('The local client-config stub is not enabled for this fixture');
+    if (!this.updateStub && !this.modelStub) throw new Error('The local client-config stub is not enabled for this fixture');
     this.clientConfigGeneration += 1;
     this.clientConfigImmediate = {
       'feature.e2e_published': 'generation-a',
@@ -1285,6 +1296,22 @@ export class OrkasTestApp {
       writeIssued: false,
       toolLoadRequested: false,
     };
+  }
+
+  setCreatePdfScenario(sourceType: 'markdown' | 'html', content: string, outputPath: string, finalText: string): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (!content.trim() || !path.isAbsolute(outputPath) || !finalText.trim()) {
+      throw new Error('The PDF scenario requires content, an absolute output path, and a final reply');
+    }
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = { kind: 'create-pdf', sourceType, content, outputPath, finalText,
+      issued: false, toolLoadRequested: false };
+  }
+
+  setGeneratedMediaFixture(kind: 'image' | 'video', bytes: Buffer): void {
+    if (!this.modelStub || !bytes.length) throw new Error('Generated media requires a local model stub and nonempty bytes');
+    if (kind === 'image') this.generatedImageBytes = Buffer.from(bytes);
+    else this.generatedVideoBytes = Buffer.from(bytes);
   }
 
   setDelayedWriteFileScenario(
@@ -1902,7 +1929,7 @@ export class OrkasTestApp {
         return;
       }
       if (request.method === 'GET' && isImageOutput && this.modelStub) {
-        const image = Buffer.from(E2E_PNG_B64, 'base64');
+        const image = this.generatedImageBytes;
         response.writeHead(200, {
           'Content-Type': 'image/png',
           'Content-Length': String(image.length),
@@ -1928,9 +1955,9 @@ export class OrkasTestApp {
       if (request.method === 'GET' && isVideoOutput && this.modelStub) {
         response.writeHead(200, {
           'Content-Type': 'video/mp4',
-          'Content-Length': String(E2E_MP4_BYTES.length),
+          'Content-Length': String(this.generatedVideoBytes.length),
         });
-        response.end(E2E_MP4_BYTES);
+        response.end(this.generatedVideoBytes);
         return;
       }
       const validGenerationUpload = this.modelStub
@@ -2739,6 +2766,21 @@ export class OrkasTestApp {
             ));
           } else {
             finishImmediately(finalTextEvents('E2E interactive CLI session finished.'));
+          }
+          return;
+        }
+        if (scenario?.kind === 'create-pdf') {
+          if (!scenario.issued && !advertisedToolNames.has('create_pdf')
+            && advertisedToolNames.has('tool_load') && !scenario.toolLoadRequested) {
+            scenario.toolLoadRequested = true;
+            requestToolGroup('call-e2e-load-create-pdf', 'office.pdf');
+          } else if (!scenario.issued) {
+            scenario.issued = true;
+            finishImmediately(toolCallEvents('call-e2e-create-pdf', 'create_pdf', {
+              path: scenario.outputPath, source_type: scenario.sourceType, content: scenario.content,
+            }));
+          } else {
+            finishImmediately(finalTextEvents(scenario.finalText));
           }
           return;
         }

@@ -48,13 +48,6 @@ try {
   }
 } catch (_) {}
 
-function _handleModelOutputErrorForUi(cid, msgDiv, rawError, extra) {
-  void cid;
-  void msgDiv;
-  void rawError;
-  void extra;
-}
-
 function _uiIconHtml(name, className) {
   if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') return window.uiIconHtml(name, className || 'ui-icon');
   return '';
@@ -4889,7 +4882,12 @@ const _chatAttachmentSendLocks = new Set();  // cid values currently being prepa
 const DRAFT_CID = 'main_chat';
 
 const CHAT_ATTACH_ACCEPT = [
-  '.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log',
+  '.md', '.markdown', '.txt', '.csv', '.tsv', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt', '.json', '.yaml', '.yml', '.log',
+  '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
+  '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.sh', '.bash', '.zsh', '.ps1', '.cmd', '.bat', '.rb', '.go', '.rs', '.java', '.kt',
+  '.c', '.cpp', '.cc', '.h', '.hpp', '.css', '.scss', '.less',
+  '.sql', '.graphql', '.gql',
   '.pdf', '.docx', '.docm', '.xlsx', '.xlsm', '.xls', '.pptx', '.pptm',
   '.zip',
   '.png', '.jpg', '.jpeg', '.webp', '.gif',
@@ -7858,11 +7856,12 @@ function _isCurrentHistoryLoad(load) {
     && document.getElementById('chat-history') === load.container;
 }
 
-function _rememberHistoryLoadMessage(cid, message) {
+function _rememberHistoryLoadMessage(cid, message, turnEnd = false) {
   const load = _conversationHistoryLoad;
   if (!load || !load.collecting || load.cid !== cid || !_isCurrentHistoryLoad(load)
       || !message?.id || message.deleted_at || !_isVisibleGroupHistoryRecord(message)) return;
   load.messages.set(String(message.id), message);
+  if (turnEnd && message.turn_id) load.endedTurnIds.add(String(message.turn_id));
 }
 
 async function loadConversationHistory(cid, opts = {}) {
@@ -7876,6 +7875,8 @@ async function loadConversationHistory(cid, opts = {}) {
       ? previousLoad.processEvents : [],
     messages: previousLoad?.cid === cid && previousLoad.collecting
       ? previousLoad.messages : new Map(),
+    endedTurnIds: previousLoad?.cid === cid && previousLoad.collecting
+      ? previousLoad.endedTurnIds : new Set(),
   };
   _conversationHistoryLoad = load;
   const preserveScroll = opts && opts.preserveScroll === true;
@@ -7970,6 +7971,14 @@ async function loadConversationHistory(cid, opts = {}) {
         convMeta.processing_since ||= new Date().toISOString();
       }
     }
+    // A terminal event received during this request is newer than its active
+    // snapshot. Keep the persisted reply out of live-segment folding; otherwise
+    // stream cleanup deletes it as an orphan when the next actor finishes.
+    if (Array.isArray(convMeta.active_turns) && load.endedTurnIds.size) {
+      convMeta.active_turns = convMeta.active_turns.filter(
+        (turn) => !load.endedTurnIds.has(_normaliseTurnId(turn?.turn_id || turn?.turnId)),
+      );
+    }
     _rememberServerFloor(cid, convMeta);
     // History reload: drop ALL per-actor placeholder map entries — the
     // `container.innerHTML=''` below detaches every placeholder DOM node,
@@ -8049,15 +8058,20 @@ async function loadConversationHistory(cid, opts = {}) {
       // tree scans. Live messages and recovery paths still use the guarded
       // incremental insertion path below.
       const historyFragment = document.createDocumentFragment();
-      history.forEach((msg) => appendChatMessage(msg, false, {
-        cid,
-        // Only stamp authoritative source indexes returned by an anchored
-        // history read. A normal latest-page row has no global index; using
-        // its local 0..9 offset would let a later search falsely match it.
-        msgIndex: Number.isSafeInteger(msg?._history_index) ? msg._history_index : undefined,
-        container: historyFragment,
-        historyHydration: true,
-      }));
+      history.forEach((msg) => {
+        const row = appendChatMessage(msg, false, {
+          cid,
+          // Only stamp authoritative source indexes returned by an anchored
+          // history read. A normal latest-page row has no global index; using
+          // its local 0..9 offset would let a later search falsely match it.
+          msgIndex: Number.isSafeInteger(msg?._history_index) ? msg._history_index : undefined,
+          container: historyFragment,
+          historyHydration: true,
+        });
+        // Retain terminal identity across the DOM rebuild so a stale live
+        // display snapshot or deferred process event cannot reopen this turn.
+        _stampTurnEndRow(row, { turn_id: msg._turn_id }, load.endedTurnIds.has(msg._turn_id));
+      });
       container.appendChild(historyFragment);
     }
     load.painted = true;
@@ -13906,12 +13920,6 @@ function createChatController(config) {
       } else {
         _streamingSetError(msgEl, err.message || String(err));
         pending.errored = true;
-        _handleModelOutputErrorForUi(id, msgEl, err.message || String(err), {
-          stage: 'stream_request',
-          error_type: 'stream',
-          failure_kind: 'runtime',
-          failure_code: 'stream_request_failed',
-        });
         if (hooks.onError) hooks.onError(err.message || String(err), msgEl, id);
       }
     } finally {
@@ -14094,6 +14102,9 @@ function _handleStreamEvent(cid, msg, ev, { archive = false } = {}) {
     }
     _advanceStreamingMessageActivityPosition(msg);
     _renderAgentEvent(msg, ev.event);
+  } else if (ev.type === 'commentary-finalized') {
+    _advanceStreamingMessageActivityPosition(msg);
+    _streamingFinalizeCommentary(msg, ev.text);
   } else if (ev.type === 'delta') {
     const text = ev.text || '';
     if (text) _advanceStreamingMessageActivityPosition(msg);
@@ -15075,12 +15086,6 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
   if (failedAssistant) {
     _mountEmptyResponseNotice(ph, gm);
     _attachFailedAssistantActions(ph, () => _messageTextForActions(ph, text));
-    _handleModelOutputErrorForUi(cid, ph, _failedAssistantErrorText(ph) || text, {
-      stage: 'actor_final',
-      error_type: 'model_output',
-      failure_kind: String(gm.failure_kind || ''),
-      failure_code: String(gm.failure_code || ''),
-    });
   } else if (interruptedAssistant) {
     _attachInterruptedAssistantActions(ph, () => _messageTextForActions(ph, text), { archive });
   }
@@ -15264,7 +15269,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
   if (evData.type === 'message') {
     const gm = evData.msg;
     if (!gm) return;
-    _rememberHistoryLoadMessage(cid, gm);
+    _rememberHistoryLoadMessage(cid, gm, !!evData.turn_end);
     // Edit chats may already have an optimistic node; main conversations do
     // not paint one until this persisted event arrives. The shared helper
     // claims an existing node when present or creates the admitted bubble.
@@ -15960,6 +15965,12 @@ function _streamingAppendFinalDelta(msg, piece, phase = '') {
     return;
   }
   _sealStreamingCommentary(msg);
+  if (phase === 'pending' && msg.dataset.streamPhase !== 'pending') {
+    // Each unclassified model round has its own later commentary boundary.
+    // CLI's existing one-boundary replay guard must not suppress later rounds.
+    delete msg.dataset.commentaryFinalized;
+    delete msg.dataset.commentaryStreamed;
+  }
   const finalEl = msg.querySelector('[data-role="final"]');
   if (!finalEl) return;
   if (phase) msg.dataset.streamPhase = String(phase);
@@ -15968,7 +15979,7 @@ function _streamingAppendFinalDelta(msg, piece, phase = '') {
   // remaining text streams. Async questions can precede more work, so leave
   // the execution clock running until the authoritative terminal event.
   const details = msg.querySelector('.stream-process');
-  if (!prev && details) {
+  if (!prev && details && phase !== 'pending') {
     _setProcessSummaryState(msg, 'complete');
     details.removeAttribute('open');
   }

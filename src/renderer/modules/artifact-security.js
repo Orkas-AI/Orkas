@@ -11,7 +11,7 @@
 
   // Generated apps may run code, submit forms, and use same-origin storage.
   // They may not create popups or navigate the top-level renderer.
-  const SANDBOX = 'allow-scripts allow-same-origin allow-forms';
+  const SANDBOX = 'allow-scripts allow-same-origin allow-forms allow-downloads allow-popups allow-modals';
 
   function safeExternalHttpUrl(raw) {
     const value = String(raw == null ? '' : raw).trim();

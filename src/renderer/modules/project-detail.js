@@ -14,7 +14,7 @@ const PROJECT_LIBRARY_INTERNAL_DRAG_TYPE = 'application/x-project-library-path';
 // Keep DOM drag uploads aligned with the native project-file picker and the
 // main-process allow-list. Project Libraries additionally support video files.
 const PROJECT_LIBRARY_ALLOWED_EXTS = [
-  '.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log',
+  '.md', '.markdown', '.txt', '.csv', '.tsv', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt', '.json', '.yaml', '.yml', '.log',
   '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
   '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
   '.sh', '.bash', '.zsh', '.ps1', '.cmd', '.bat', '.rb', '.go', '.rs', '.java', '.kt',

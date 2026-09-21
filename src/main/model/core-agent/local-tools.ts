@@ -65,6 +65,7 @@ import {
   type ApplyPatchCommittedFile,
 } from '../../../core-agent/src/tools/apply-patch';
 import { managedCommandsEnabled } from '../../../core-agent/src/tools/command-sessions';
+import { parsePowerShellChain } from '../../../core-agent/src/sandbox/powershell-chain';
 import { getProcessSessionTools } from '../../../core-agent/src/tools/process-session';
 import type { FileChangeObservation } from '../../../core-agent/src/tools/base';
 import {
@@ -133,7 +134,8 @@ import {
   waitForConfirmationVisible as waitForDeleteConfirmationVisible,
 } from './delete-file-confirm';
 import { fileEditLock } from '../../util/locks';
-import { fileFailure } from '../../../core-agent/src/tools/file-diagnostics';
+import { fileFailure, type FileFailureDiagnostic } from '../../../core-agent/src/tools/file-diagnostics';
+import { lookupSkillRuntimeRef } from './skill-runtime-ref';
 import { firstMatchOffsets, matchRecoveryContext } from '../../../core-agent/src/tools/match-context';
 import { checkEditFreshness, forgetRead, getReadState, recordRead } from './read-tracker';
 import {
@@ -1419,7 +1421,7 @@ async function executeCoreBashWithOutputTracking(
   const outputDir = workingDir;
   const command = String(input.command ?? '');
   const skillRuntime = resolveRunSkillRuntimeBinding(opts, command);
-  if (skillRuntime.error) return { content: skillRuntime.error, isError: true };
+  if (skillRuntime.error) return { content: skillRuntime.error, isError: true, observations: { fileFailure: skillRuntime.diagnostic } };
   const removeEmptyWorkingDirOnCompletion = !fs.existsSync(workingDir);
   if (removeEmptyWorkingDirOnCompletion) {
     try { fs.mkdirSync(workingDir, { recursive: true }); }
@@ -3547,6 +3549,7 @@ function extractRunSkillRefs(command: string, depth = 0, hostPlatform: NodeJS.Pl
 type RunSkillRuntimeResolution = {
   binding?: SkillRuntimeBinding;
   error?: string;
+  diagnostic?: FileFailureDiagnostic;
 };
 
 function resolveRunSkillRuntimeBinding(
@@ -3568,15 +3571,9 @@ function resolveRunSkillRuntimeBinding(
   const roots = new Set<string>();
   const bindings: SkillRuntimeBinding[] = [];
   for (const ref of refs) {
-    const binding = opts.skillRuntimeBindings.get(ref);
-    if (!binding) {
-      return {
-        error: errText(
-          'E_SKILL_NOT_AVAILABLE',
-          `@skill/${ref} is not bound for this run. Read and use the exact read ref from the current Available skills entry.`,
-        ),
-      };
-    }
+    const lookup = lookupSkillRuntimeRef(ref, opts.skillRuntimeBindings);
+    if (lookup.error) return lookup;
+    const binding = lookup.binding!;
     roots.add(path.resolve(binding.root));
     bindings.push(binding);
   }
@@ -3904,20 +3901,22 @@ function guardVideoStudioUnmanagedRuntime(opts: LocalToolsOpts, command: string,
 
 function unquotedShellSurface(command: string): string {
   let quote = '';
-  let escaped = false;
   let out = '';
-  for (const ch of command) {
-    if (escaped) {
-      out += quote ? ' ' : ch;
-      escaped = false;
-      continue;
-    }
-    if (ch === '\\' || (quote === '"' && ch === '`')) {
-      escaped = true;
-      out += quote ? ' ' : ch;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    // PowerShell backslashes are literal, including immediately before a
+    // closing path quote. Backticks escape outside single-quoted strings.
+    if (ch === '`' && quote !== "'") {
+      out += ' ';
+      if (i + 1 < command.length) out += command[++i] === '\n' ? '\n' : ' ';
       continue;
     }
     if (quote) {
+      if (ch === quote && command[i + 1] === quote) {
+        out += '  ';
+        i++;
+        continue;
+      }
       if (ch === quote) quote = '';
       out += ch === '\n' ? '\n' : ' ';
       continue;
@@ -3941,9 +3940,12 @@ export function windowsPowerShellCompatibilityError(
   platform: NodeJS.Platform = process.platform,
 ): string | null {
   if (platform !== 'win32') return null;
-  const surface = unquotedShellSurface(String(command || ''));
+  const chain = parsePowerShellChain(String(command || ''));
+  const surface = chain.kind === 'chain'
+    ? chain.commands.map(unquotedShellSurface).join('\n')
+    : unquotedShellSurface(String(command || ''));
   const findings: string[] = [];
-  if (/&&|\|\|/.test(surface)) findings.push('POSIX &&/|| chaining');
+  if (chain.kind === 'unsupported' || /&&|\|\|/.test(surface)) findings.push('unsupported complex &&/|| chain');
   if (/<<-?\s*[A-Za-z_][A-Za-z0-9_]*/.test(surface)) findings.push('POSIX heredoc');
   if (/(?:^|[;\r\n]\s*)(?:source|export)\b/m.test(surface)) findings.push('source/export');
   if (/(?:^|[;|\r\n]\s*)head(?:\s|$)/m.test(surface)) findings.push('head');
@@ -3955,7 +3957,9 @@ export function windowsPowerShellCompatibilityError(
   return errText(
     'E_SHELL_SYNTAX_MISMATCH',
     `host shell is Windows PowerShell, but the command contains ${findings.join(', ')}. `
-    + 'Rewrite it as PowerShell before retrying: use `;` for sequencing, `$env:NAME = value` for environment variables, '
+    + 'Simple single-line &&/|| command chains are supported. For complex control flow, use PowerShell: '
+    + '`;` runs unconditionally; `if ($?) { ... }` runs after success; `if (-not $?) { ... }` runs after failure. '
+    + 'Use `$env:NAME = value` for environment variables, '
     + '`$null` for discarded output, `Select-Object -First N` for head, and a `[System.IO.Path]::GetTempFileName()` or '
     + '`New-Item` temporary path. Create directories with `New-Item -ItemType Directory -Force -Path ...`. '
     + 'For a multi-line script, write a `.ps1` file and invoke it with PowerShell.',
@@ -4164,7 +4168,7 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
       if (!ctx.workingDir) {
         ctx = { ...ctx, state: { ...ctx.state } };
         const skillRuntime = resolveRunSkillRuntimeBinding(opts, command);
-        if (skillRuntime.error) return { content: skillRuntime.error, isError: true };
+        if (skillRuntime.error) return { content: skillRuntime.error, isError: true, observations: { fileFailure: skillRuntime.diagnostic } };
         const restoreSkillRuntimeEnv = withRunSkillRuntimeEnv(
           ctx,
           skillRuntime.binding,
@@ -4239,7 +4243,7 @@ async function gateInteractiveCliStart(
     return { content: unsupportedNoBrowserAuthErr, isError: true };
   }
   const skillRuntime = resolveRunSkillRuntimeBinding(opts, command);
-  if (skillRuntime.error) return { content: skillRuntime.error, isError: true };
+  if (skillRuntime.error) return { content: skillRuntime.error, isError: true, observations: { fileFailure: skillRuntime.diagnostic } };
   if (skillRuntime.binding) {
     return {
       content: errText(
@@ -5952,20 +5956,20 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'create_artifact',
     description:
-      'Create and validate a self-contained offline interactive HTML/CSS/JS app rendered in chat; use a dashboard for static summaries. Remote and out-of-directory URLs are blocked: bundle authorized assets in files or use data/blob URLs. The app must expose an operable control with an observable effect.',
+      'Create an interactive HTML/CSS/JS app rendered in chat, with preview diagnostics. Bundled resources and external HTTP(S) URLs are supported; use a dashboard for static summaries.',
     inputSchema: {
       type: 'object',
       properties: {
         title: { type: 'string', description: 'Short title shown above the embedded app. Optional; defaults to "Interactive app".' },
         files: {
           type: 'array',
-          description: 'Relative local app files with a top-level index.html. Maximum 20 files, 256KB each and 1MB total. Apps may load __orkas/bridge.js for send and resize.',
+          description: 'Relative local app files with a top-level index.html. Apps may load __orkas/bridge.js for send and resize.',
           items: {
             type: 'object',
             properties: {
               path: { type: 'string', description: 'Forward-slash relative path, e.g. "index.html" or "assets/app.js". No "..", no leading "/", no dotfiles, no "__orkas/...".' },
               content: { type: 'string', description: 'File contents. UTF-8 text by default; for a binary extension set "encoding":"base64" and pass base64.' },
-              encoding: { type: 'string', enum: ['utf8', 'base64'], description: 'Default "utf8". Use "base64" for image / font / wasm files.' },
+              encoding: { type: 'string', enum: ['utf8', 'base64'], description: 'Default "utf8". Use "base64" for binary resources.' },
             },
             required: ['path', 'content'],
           },
@@ -5979,7 +5983,7 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
       if (!uid || !cid) {
         return { content: errText('E_NO_CONVERSATION', 'create_artifact is only available inside a conversation.'), isError: true };
       }
-      const r = chatArtifacts.createArtifact(uid, cid, opts.agentId || '', {
+      const r = await chatArtifacts.createArtifact(uid, cid, opts.agentId || '', {
         title: (input as { title?: unknown }).title,
         files: (input as { files?: unknown }).files,
       });
@@ -6037,52 +6041,8 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
         });
         smoke = await runSmoke(path.join(resolved.dirPath, 'index.html'));
       } catch (err) {
-        const discarded = chatArtifacts.discardArtifact(uid, cid, r.artifactId);
-        log.warn('create_artifact interaction smoke failed to run', {
-          user_id: maskId(uid),
-          cid: maskId(cid),
-          artifact_id: maskId(r.artifactId),
-          discarded: discarded.ok,
-          error: logErrorRef(err),
-        });
-        return {
-          content: errText('E_ARTIFACT_SMOKE_FAILED', (err as Error).message || 'artifact interaction smoke failed to run'),
-          isError: true,
-        };
-      }
-      if (!smoke.ok) {
-        // Keep every known blocker. The shared tool-result token policy owns
-        // oversized-output persistence; truncating here would discard repair
-        // material before Result Store can preserve it.
-        const blockers = smoke.blockers.join('; ') || 'no observable interaction completed';
-        const hasBlockedExternalAsset = smoke.blockers.some((blocker) => (
-          /(?:external|remote|out[- ]of[- ]directory|network).{0,48}(?:block|denied|unavailable)|(?:image|resource).{0,48}(?:failed|blocked|unavailable)/i
-            .test(blocker)
-        ));
-        const recovery = hasBlockedExternalAsset
-          ? [
-            'Remote and out-of-directory resources cannot load inside the artifact sandbox.',
-            'If the user explicitly supplied or required an asset, acquire it through an available authorized tool and bundle it under files (base64 for binary content).',
-            'Otherwise replace model-chosen remote assets with local CSS/SVG or data/blob content.',
-            'Do not retry the same remote URLs; repair the bundle and call create_artifact again.',
-          ].join(' ')
-          : 'Repair the app behavior and call create_artifact again.';
-        const discarded = chatArtifacts.discardArtifact(uid, cid, r.artifactId);
-        log.warn('create_artifact interaction smoke rejected artifact', {
-          user_id: maskId(uid),
-          cid: maskId(cid),
-          artifact_id: maskId(r.artifactId),
-          controls_exercised: smoke.controlsExercised,
-          observable_effects: smoke.observableEffects,
-          discarded: discarded.ok,
-        });
-        return {
-          content: errText(
-            'E_ARTIFACT_INTERACTION_INCOMPLETE',
-            `${blockers}. ${recovery}`,
-          ),
-          isError: true,
-        };
+        log.warn('create_artifact preview unavailable', { error: logErrorRef(err) });
+        smoke = { ok: false, blockers: ['Preview unavailable; verify the application in its window.'] };
       }
       if (opts.onArtifactCreated) {
         try { opts.onArtifactCreated({ id: r.artifactId, title: r.title }); }
@@ -6099,10 +6059,10 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
       // description: this is the text the model actually reads back, and an
       // artifact that does not know the box it lands in writes a full-screen
       // shell and ships it clipped.
-      const smokeWarnings = (smoke.warnings ?? []).slice(0, 3);
+      const smokeWarnings = [...smoke.blockers, ...(smoke.warnings ?? [])];
       return {
         content:
-          `Artifact "${r.title}" created (id ${r.artifactId}); interaction smoke passed ` +
+          `Artifact "${r.title}" created (id ${r.artifactId}); preview ${smoke.ok ? 'checks passed' : 'reported issues'} ` +
           `(${smoke.controlsExercised ?? 0} control(s), ${smoke.observableEffects ?? 0} observable effect(s)) ` +
           `at desktop, chat-embed, and mobile viewports. ` +
           `It is now shown to the user inside this reply, so do NOT paste its HTML in your message. ` +

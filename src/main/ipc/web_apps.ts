@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { catalogDocument } from '../features/web_apps/catalog';
 import { runtime, openApp, safeFailure } from '../features/web_apps/host';
 import { AppError } from '../features/web_apps/runtime';
+import { safeExternalHttpUrl } from '../util/window-security';
 
 type Context = { userId: string; sender: WebContents };
 const sourceSchema = z.union([
@@ -19,11 +20,16 @@ function bindOwner(sender: WebContents) {
     if (event.isMainFrame) runtime.closeOwner(sender.id);
     else {
       // Electron can omit frame for cross-process/document navigation.
-      const source = [event.frame?.url, event.initiator?.url]
-        .find(url => url?.startsWith('chat-app://app-'));
-      if (source) {
-        event.preventDefault();
-        runtime.closeOrigin(sender.id, source);
+      const source = event.frame ? event.frame.url : event.initiator?.url;
+      if (source?.startsWith('chat-app://app-')) {
+        if (runtime.canNavigate(sender.id, source, event.url)) {
+          runtime.cancelOriginRequests(sender.id, source);
+          return;
+        }
+        // Rejected navigation leaves the current document usable. Only an
+        // actual departure to a website revokes this application's authority.
+        if (!safeExternalHttpUrl(event.url)) event.preventDefault();
+        else runtime.closeOrigin(sender.id, source);
       }
     }
   });
@@ -40,7 +46,12 @@ export const webAppInvokeHandlers = {
       const parsed = sourceSchema.safeParse(payload?.source);
       if (!parsed.success) throw new AppError('E_INPUT');
       bindOwner(ctx.sender);
-      return openApp(ctx.userId, ctx.sender.id, parsed.data as any);
+      const opened = await openApp(ctx.userId, ctx.sender.id, parsed.data as any);
+      if (ctx.sender.isDestroyed()) {
+        runtime.closeOwner(ctx.sender.id);
+        throw new AppError('E_CLOSED');
+      }
+      return opened;
     } catch (err) { return failure(err); }
   },
   'webApps.close': async (payload: any, ctx: Context) => {

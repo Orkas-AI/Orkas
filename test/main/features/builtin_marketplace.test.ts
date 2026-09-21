@@ -550,6 +550,76 @@ describe('builtin marketplace seed', () => {
     });
   });
 
+  it('takes over an older resource-owned agent when it becomes a platform builtin', async () => {
+    writeBuiltinAgent(TEST_AGENT_ID, {
+      version: '1.1.13',
+      name: 'StockAnalyser',
+      description: 'Bundled stock analysis Agent',
+      category: 'finance',
+      workflow: 'Use the bundled workflow.',
+      skill_list: ['market-data'],
+      updated_at: '2026-09-21T08:21:00.000Z',
+    });
+    writeBuiltinAgentSkill(TEST_AGENT_ID, 'market-data', 'market-data');
+
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const paths = await import('../../../src/main/paths');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    const localRoot = paths.userMarketplaceAgentDir('u1', TEST_AGENT_ID);
+    fs.mkdirSync(path.join(localRoot, 'skills', 'legacy-stock'), { recursive: true });
+    fs.writeFileSync(path.join(localRoot, 'agent.json'), JSON.stringify({
+      agent_id: TEST_AGENT_ID,
+      version: '1.1.12',
+      name: 'StockAnalyser',
+      category: 'finance',
+      workflow: 'Use the Resource workflow.',
+      skill_list: ['legacy-stock'],
+    }, null, 2), 'utf8');
+    fs.writeFileSync(
+      path.join(localRoot, 'skills', 'legacy-stock', 'SKILL.md'),
+      '---\nname: legacy-stock\ndescription: legacy\n---\n\nlegacy body\n',
+      'utf8',
+    );
+    writeResourceSeedManifest(localRoot, 'agent', TEST_AGENT_ID);
+    fs.writeFileSync(path.join(localRoot, 'runtime-note.txt'), 'preserve local runtime data\n', 'utf8');
+    fs.writeFileSync(path.join(localRoot, '_install.json'), JSON.stringify({
+      version: '1.1.12',
+      installed_at: 12,
+      create_uid: '0',
+      default_install: false,
+      seed_source: 'resource',
+    }, null, 2), 'utf8');
+
+    await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({
+      seeded_agents: 1,
+      manifest_agents: 1,
+    });
+
+    expect(JSON.parse(fs.readFileSync(path.join(localRoot, 'agent.json'), 'utf8'))).toMatchObject({
+      version: '1.1.13',
+      workflow: 'Use the bundled workflow.',
+      skill_list: ['market-data'],
+    });
+    expect(fs.existsSync(path.join(localRoot, 'skills', 'market-data', 'SKILL.md'))).toBe(true);
+    expect(fs.existsSync(path.join(localRoot, 'skills', 'legacy-stock'))).toBe(false);
+    expect(fs.existsSync(path.join(localRoot, MARKETPLACE_RESOURCE_MANIFEST_NAME))).toBe(false);
+    expect(fs.readFileSync(path.join(localRoot, 'runtime-note.txt'), 'utf8'))
+      .toBe('preserve local runtime data\n');
+    expect(JSON.parse(fs.readFileSync(path.join(localRoot, '_install.json'), 'utf8'))).toMatchObject({
+      version: '1.1.13',
+      seed_source: 'builtin',
+      default_install: false,
+    });
+    expect((await installs.readInstalls('u1')).agents).toEqual([
+      expect.objectContaining({
+        id: TEST_AGENT_ID,
+        version: '1.1.13',
+        seed_source: 'builtin',
+        default_install: true,
+      }),
+    ]);
+  });
+
   it('refreshes builtin skill content without replacing local-only files', async () => {
     writeBuiltinSkill('ee99fbb42964', 'deep-research');
     writeBuiltinSkillMeta('ee99fbb42964', {

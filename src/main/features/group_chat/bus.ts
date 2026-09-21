@@ -57,6 +57,7 @@ import {
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { inspectCodingDirectory } from '../local_agents/project-directory';
+import { getActiveUserId } from '../users';
 import type {
   LocalActiveRunIngress,
   LocalActiveRunInput,
@@ -1916,7 +1917,8 @@ async function readCommanderHistoryTail(
  *  carries its process trail) on every CLI turn — O(conversation bytes) per
  *  turn on the main thread. Page back from the tail until the turn boundary,
  *  the stored history cursor (when the binding has one) and enough prior user
- *  turns are in hand. A boundary that never shows up reads the whole log. */
+ *  turns are in hand. A missing boundary is unavailable history, not permission
+ *  to replay the whole log as prior context. */
 const CLI_CANONICAL_TAIL_PAGE = 256;
 const CLI_CANONICAL_TAIL_USER_TURNS = CLI_HISTORY_MAX_TURNS;
 async function _readCliCanonicalTail(
@@ -1942,6 +1944,7 @@ async function _readCliCanonicalTail(
     if (page.nextCursor === null) break;
     before = page.nextCursor;
   }
+  if (!boundarySeen) throw new Error('Canonical conversation history turn boundary is unavailable.');
   return pages.flat();
 }
 
@@ -1989,6 +1992,7 @@ async function buildGroupHistoryForTurn(params: {
   const source = groupConversationHistorySource(cid, actorId);
   const file = conversationMessageReadFile(uid, cid);
   const fileIdentity = commanderHistoryFileIdentity(file);
+  if (!fileIdentity) throw new Error('Canonical conversation history is unavailable.');
   const sessions = await import('../../model/core-agent/session-store');
   const session = await sessions.getSessionForUser(uid, sessionId);
   const checkpoint = parseCommanderHistoryCheckpoint(
@@ -2058,8 +2062,12 @@ async function buildGroupHistoryForTurn(params: {
 
   const rows = await readJsonl<GroupMessage>(file, 0);
   const currentIndex = rows.findIndex((message) => message.id === currentMsgId);
-  const throughCurrent = currentIndex >= 0 ? rows.slice(0, currentIndex + 1) : rows;
-  const priorRows = currentIndex >= 0 ? rows.slice(0, currentIndex) : rows;
+  // Storage's tolerant readers also return [] for an unreadable/missing file.
+  // Every admitted turn has a persisted trigger, including the first turn;
+  // without it neither a full rebase nor a new checkpoint is trustworthy.
+  if (currentIndex < 0) throw new Error('Canonical conversation history turn boundary is unavailable.');
+  const throughCurrent = rows.slice(0, currentIndex + 1);
+  const priorRows = rows.slice(0, currentIndex);
   const userRows = throughCurrent.filter((message) => message.from === USER_ID);
   const latestUser = userRows.at(-1);
   const nextCheckpoint = latestUser ? JSON.stringify({
@@ -5043,7 +5051,14 @@ async function runActorTurnWithDisplay(
       });
     }
   } catch (err) {
-    log.warn(`conversation history build failed cid=${cid} actor=${actor.id}: ${(err as Error).message}`);
+    log.warn('conversation history build failed', {
+      cid: maskId(cid), actor: maskId(actor.id), error: logErrorSummary(err),
+    });
+    // Keep the prior session/checkpoint; report the gap only on this turn.
+    messageText = '<history-availability status="unavailable">'
+      + 'Canonical conversation history could not be refreshed for this turn. '
+      + 'Any retained history may be incomplete or stale; this is not evidence of empty history.'
+      + '</history-availability>\n' + messageText;
   }
 
   // Attach a `<attachments>` manifest block listing files uploaded on this
@@ -5495,6 +5510,7 @@ async function runActorTurnWithDisplay(
   // the fallback for mid-stream failures and tells abort settlement whether a
   // status row is needed, without promoting the partial text to a final answer.
   let streamingText = '';
+  let unphasedTextWasStreamed = false;
   let cliDisplayText = '';
   const nativeDisplaySegments: GroupMessage[] = [];
   if (actor.kind !== 'worker') {
@@ -6007,6 +6023,21 @@ async function runActorTurnWithDisplay(
       // Stream events → process channel.
       if (ev.type === 'final') {
         finalText = ev.text || '';
+      } else if (ev.type === 'commentary-finalized') {
+        const text = ev.text || '';
+        // The draft was already visible. Move only this round's suffix into
+        // process history; previous settled display segments retain their text.
+        if (text && streamingText.endsWith(text)) {
+          streamingText = streamingText.slice(0, -text.length);
+        }
+        appendChronologicalCommentary(processItems, text);
+        if (actor.kind !== 'worker') {
+          emit(state, {
+            type: 'process', cid, actor: actor.id,
+            turn_id: item.turnId, seg: segState.seg,
+            data: ev as unknown as Record<string, unknown>,
+          });
+        }
       } else if (ev.type === 'delta') {
         // Pulled out of the generic branch below so we can mirror the text
         // into `streamingText` for failure/abort settlement. The activity++ +
@@ -6015,6 +6046,7 @@ async function runActorTurnWithDisplay(
         const piece = (ev as { text?: string }).text;
         const phase = (ev as { phase?: unknown }).phase;
         if (typeof piece === 'string') {
+          if (phase === 'pending' && piece) unphasedTextWasStreamed = true;
           if (phase === 'commentary') {
             appendChronologicalCommentary(processItems, piece);
           } else {
@@ -6136,6 +6168,7 @@ async function runActorTurnWithDisplay(
         && !toolPhaseHang
         && !!errText
         && CHANNEL_RETRY_FAILURE_CODES.has(turnFailureCode)
+        && !unphasedTextWasStreamed
         && !streamingText.trim()
         && !finalText.trim();
     if (canRetryChannel && turnFailureRetryExhausted) {
@@ -6623,6 +6656,8 @@ async function runActorTurnWithDisplay(
     // covers built-in / not-found / charset / collision cases — bus only
     // appends the pill.
     const skillR = extractSkillContainers(workingText);
+    let skillCorrectionAttempted = false;
+    let skillCorrectionSucceeded = false;
     if (skillR.containers.length) {
       workingText = skillR.cleanText;
       // Apply each `<skill>` container independently. A failed container
@@ -6630,7 +6665,56 @@ async function runActorTurnWithDisplay(
       // the chip slot only fills when the spec was actually written.
       for (const container of skillR.containers) {
         try {
-          const result = await skillsFeat.applySkillContainerFromCommander(container);
+          let result = await skillsFeat.applySkillContainerFromCommander(container);
+          if (!result.ok && !errText && !aborted && !w.stopRequested
+              && skillR.containers.length === 1 && !r.blocks.length
+              && !toolCreatedSkills.length && !terminalHandoffCompleted
+              && !item.llmPayload.includes(AGENT_MUTATION_FEEDBACK_TAG)) {
+            const correction = await import('./skill-creation-correction');
+            const message = correction.skillCreationCorrectionMessage(container, result, messageText);
+            if (message && !w.stopRequested && getActiveUserId() === uid && Date.now() < executionDeadlineAt) {
+              skillCorrectionAttempted = true;
+              const controller = new AbortController();
+              w.abortController = controller;
+              const timeout = setTimeout(() => controller.abort(),
+                Math.max(0, Math.min(60_000, executionDeadlineAt - Date.now())));
+              const progress = { type: 'progress' as const, text: t('chat.skill_creation_correcting', undefined, turnLanguage) };
+              appendProcessItem(processItems, progress);
+              emit(state, { type: 'process', cid, actor: actor.id, turn_id: item.turnId,
+                seg: segState.seg, data: progress });
+              let detachAbort = () => {};
+              try {
+                await markInFlight(uid, cid, actor.id, true);
+                await emitStateChanged(state);
+                const { completeSkillCreationCorrection } = await import('../../model/core-agent/runner');
+                const cancelled = new Promise<never>((_, reject) => {
+                  const onAbort = () => reject(new Error('Skill correction cancelled'));
+                  controller.signal.addEventListener('abort', onAbort, { once: true });
+                  detachAbort = () => controller.signal.removeEventListener('abort', onAbort);
+                  if (controller.signal.aborted) onAbort();
+                });
+                const text = await Promise.race([
+                  completeSkillCreationCorrection({ userId: uid, cid, turnId: item.turnId,
+                    message, signal: controller.signal }),
+                  cancelled,
+                ]);
+                const corrected = await correction.applySkillCreationCorrection(text, container, uid, controller.signal);
+                if (corrected) result = corrected;
+                skillCorrectionSucceeded = result.ok && !result.rejected?.length && !result.validation_failed?.length;
+              } catch {
+                // Preserve the original actionable rejection. No raw content or
+                // provider errors enter diagnostics, and no second correction.
+                log.warn('Skill creation correction did not complete');
+              } finally {
+                clearTimeout(timeout);
+                detachAbort();
+                w.abortController = null;
+                aborted ||= w.stopRequested;
+                await markInFlight(uid, cid, actor.id, false);
+                await emitStateChanged(state);
+              }
+            }
+          }
           if (result.ok && result.skillId && result.name && result.kind) {
             recordCreatedSkill({ skill_id: result.skillId, name: result.name, kind: result.kind });
             if (result.rejected && result.rejected.length) {
@@ -6681,6 +6765,14 @@ async function runActorTurnWithDisplay(
           appendCommanderMutationNotice(`<span style="color:var(--danger)">⚠️ Skill ${verb} failed: ${(err as Error).message}</span>`);
         }
       }
+    }
+
+    if (skillCorrectionAttempted) {
+      // Only a single Skill operation enters correction. Its draft success
+      // claim cannot override the host result; preserve concrete diagnostics.
+      workingText = [t(skillCorrectionSucceeded ? 'chat.skill_creation_corrected'
+        : 'chat.skill_creation_correction_failed', undefined, turnLanguage),
+      ...commanderMutationNotices].join('\n\n');
     }
 
     // Rejected mutation prose is host-owned. The model may have claimed

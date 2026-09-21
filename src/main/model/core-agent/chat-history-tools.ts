@@ -301,9 +301,9 @@ function currentBoundaryIndex(
 function currentVisibleRows(
   rows: IndexedMessage[],
   currentMessageId?: string,
-): IndexedMessage[] {
+): IndexedMessage[] | undefined {
   const boundary = currentBoundaryIndex(rows, currentMessageId);
-  if (currentMessageId && boundary === undefined) return [];
+  if (currentMessageId && boundary === undefined) return undefined;
   return rows.filter(({ index, message }) => (
     (boundary === undefined || index < boundary)
     && !message.deleted_at
@@ -369,6 +369,17 @@ export function diversifyChatHitsForTest(
   return out;
 }
 
+function unavailableHistory(action: 'read' | 'search', reason: 'source_unavailable' | 'boundary_unavailable') {
+  return {
+    content: `chat_history(${action}): history_status=${reason}. `
+      + (reason === 'source_unavailable'
+        ? 'Conversation records could not be loaded.'
+        : 'The current turn boundary could not be established; earlier records cannot be selected safely.')
+      + ' This does not establish that history is empty.',
+    isError: true as const,
+  };
+}
+
 function createChatSearchTool(opts: ChatHistoryToolsOpts): AgentTool {
   const scopeEnum = [...allowedScopes(opts)];
   const hasCrossConversationScope = scopeEnum.some((scope) => scope !== 'current');
@@ -424,10 +435,13 @@ function createChatSearchTool(opts: ChatHistoryToolsOpts): AgentTool {
         : !opts.projectId;
 
       let boundary: CurrentBoundary | undefined;
+      let currentUnavailable: 'source_unavailable' | 'boundary_unavailable' | undefined;
       if (scope === 'current' || (includeCurrent && opts.currentCid && opts.currentMessageId)) {
         boundary = await cachedCurrentBoundaryIndex(opts.userId, opts.currentCid!, opts.currentMessageId);
-        if (scope === 'current' && opts.currentMessageId && !boundary) {
-          return { content: `No conversation-history results for "${query}".` };
+        if (opts.currentMessageId && !boundary) {
+          currentUnavailable = currentBoundarySource(opts.userId, opts.currentCid!)
+            ? 'boundary_unavailable' : 'source_unavailable';
+          if (scope === 'current') return unavailableHistory('search', currentUnavailable);
         }
       }
       const page = await search.searchChatsWithStatus(opts.userId, query, {
@@ -452,9 +466,12 @@ function createChatSearchTool(opts: ChatHistoryToolsOpts): AgentTool {
         k,
         scope === 'current' ? Number.POSITIVE_INFINITY : MAX_HITS_PER_CONVERSATION,
       );
-      const status = page.indexComplete ? 'index_complete=true'
+      const complete = page.indexComplete && !currentUnavailable;
+      const status = currentUnavailable
+        ? `index_complete=false: current_history_status=${currentUnavailable}; current-conversation records were excluded. Other matches do not establish complete history coverage.`
+        : page.indexComplete ? 'index_complete=true'
         : 'index_complete=false: history indexing is incomplete; matches may be missing. Retry search after indexing or read known records directly.';
-      if (!hits.length) return { content: page.indexComplete
+      if (!hits.length) return { content: complete
         ? `${status}\nNo conversation-history results for "${query}".`
         : `${status}\nNo matches in the indexed portion. This does not establish that the records are absent.`
           + (scope === 'current' ? '\nRead recent records: {"action":"read","scope":"current","page":{"mode":"latest"},"include_process":true}' : '') };
@@ -573,11 +590,13 @@ function createChatReadTool(opts: ChatHistoryToolsOpts): AgentTool {
       }
 
       const historySource = await historyMessageIndex(opts.userId, cid);
+      if (!historySource.stamp) return unavailableHistory('read', 'source_unavailable');
       const indexedMessages = historySource.entries.map((entry) => ({ index: entry.index, message: entry.metadata }));
       const available = cid === opts.currentCid && opts.currentMessageId
         ? currentVisibleRows(indexedMessages, opts.currentMessageId)
         : indexedMessages.filter(({ message }) => !message.deleted_at && !message.dispatch);
-      if (!available.length) return { content: `chat_history(read): conversation has no messages — ${cid}` };
+      if (!available) return unavailableHistory('read', 'boundary_unavailable');
+      if (!available.length) return { content: `chat_history(read): No readable messages in the requested history scope — ${cid}` };
 
       let selected: IndexedMessage[];
       let note: string;

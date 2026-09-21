@@ -12,17 +12,31 @@ const UID = 'system-skills-user';
 
 let tmpDir: string;
 let prevWs: string | undefined;
+let logDeliveries: ReturnType<typeof import('../../../src/main/util/log-delivery').createLogDelivery>[];
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.doUnmock('node:fs');
   vi.doUnmock('../../../src/main/paths');
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-system-skills-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
+  logDeliveries = [];
+  const delivery = await import('../../../src/main/util/log-delivery');
+  const create = delivery.createLogDelivery;
+  vi.spyOn(delivery, 'createLogDelivery').mockImplementation((...args) => {
+    const instance = create(...args);
+    logDeliveries.push(instance);
+    return instance;
+  });
 });
 
-afterEach(() => {
+afterEach(async () => {
+  // Account activation starts a real log worker. Drain and close it before
+  // removing its directory so late file creation cannot race the teardown.
+  try {
+    for (const delivery of logDeliveries) await vi.waitFor(() => expect(delivery.stats().pending).toBe(0));
+  } finally { await Promise.all(logDeliveries.map(delivery => delivery.close())); }
   if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
   else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });

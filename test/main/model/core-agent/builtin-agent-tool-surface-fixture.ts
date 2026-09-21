@@ -200,15 +200,6 @@ export const BUILTIN_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurfaceC
       'library', 'create_pptx', 'create_artifact', 'generate_image',
     ],
   },
-] as const;
-
-/**
- * Reviewed fixed capability decisions for the Resource marketplace Agents.
- * These packages are installed into the same platform marketplace root as the
- * built-ins, so they must obey the same runtime boundary without relying on a
- * Skill being installed to supply native tools.
- */
-export const RESOURCE_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurfaceCase[] = [
   {
     agentId: '1040b336306f',
     name: 'StockAnalyser',
@@ -233,6 +224,15 @@ export const RESOURCE_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurface
       'library', 'create_pptx', 'create_artifact', 'generate_image',
     ],
   },
+] as const;
+
+/**
+ * Reviewed fixed capability decisions for the Resource marketplace Agents.
+ * These packages are installed into the same platform marketplace root as the
+ * built-ins, so they must obey the same runtime boundary without relying on a
+ * Skill being installed to supply native tools.
+ */
+export const RESOURCE_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurfaceCase[] = [
   {
     agentId: '14ba06897645',
     name: 'StudyTutor',

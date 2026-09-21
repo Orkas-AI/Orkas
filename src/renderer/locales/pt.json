@@ -1,4 +1,8 @@
 {
+  "files.delimited.table": "Tabela",
+  "files.delimited.source": "Texto original",
+  "files.delimited.limited": "Prévia limitada. Abra o arquivo em outro aplicativo para ver todos os dados.",
+  "files.delimited.invalid": "Campos entre aspas incompletos ou inválidos. Exibindo o texto original.",
   "connectors.action_confirm.operation.external_or_financial_change": "Ação externa ou alteração financeira",
   "connectors.action_confirm.operation.destructive": "Exclusão ou ação irreversível",
   "connectors.action_confirm.operation.financial_record_change": "Alteração de registros financeiros",

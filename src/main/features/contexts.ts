@@ -22,6 +22,7 @@
  * generated.
  */
 
+import { readTextPreview } from '../util/text-preview';
 import { fileFailureKind } from '../util/app-error';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -77,7 +78,7 @@ const CONTEXTS_IGNORE: ReadonlySet<string> = new Set([
 // for-byte. Size cap defensive only — content gets chunked before hitting
 // the LLM so no practical ceiling on "how big a file can the KB take".
 const TEXT_EXTS: ReadonlySet<string> = new Set([
-  '.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log',
+  '.md', '.markdown', '.txt', '.csv', '.tsv', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt', '.json', '.yaml', '.yml', '.log',
   '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
   '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
   '.sh', '.bash', '.zsh', '.ps1', '.cmd', '.bat', '.rb', '.go', '.rs', '.java', '.kt',
@@ -283,7 +284,7 @@ export function listContextsTree(): ContextNode[] {
   return walk(contextsRoot());
 }
 
-export function readContextFile(relpath: string): Result<{ content: string; path: string }> {
+export function readContextFile(relpath: string, preview = false): Result<{ content: string; path: string; truncated?: boolean }> {
   let p: string;
   try { p = resolvePath(relpath, { mustExist: true }); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
@@ -292,7 +293,13 @@ export function readContextFile(relpath: string): Result<{ content: string; path
   if (!TEXT_EXTS.has(ext)) {
     return { ok: false, error: `binary file cannot be read as text: ${ext}` };
   }
-  try { return { ok: true, content: fs.readFileSync(p, 'utf8'), path: relpath }; }
+  try {
+    if (preview && /\.(csv|tsv)$/i.test(p)) {
+      const result = readTextPreview(p);
+      return { ok: true, content: result.text, path: relpath, truncated: result.truncated };
+    }
+    return { ok: true, content: fs.readFileSync(p, 'utf8'), path: relpath };
+  }
   catch (err) { return { ok: false, error: (err as Error).message }; }
 }
 

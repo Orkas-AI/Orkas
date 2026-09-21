@@ -31,6 +31,16 @@ describe('Web app governed pure inference',()=>{
     expect(requests[0].systemPrompt).toBeUndefined();expect(requests[0].sessionId).toBeUndefined();
     expect(progress).toHaveBeenCalledWith({type:'delta',text:'Hello'});
   });
+  it('passes long input and caller output budgets through the existing model path', async () => {
+    const {generateWebAppText}=await import('../../../src/main/model/core-agent/runner');
+    const prompt='a'.repeat(40000), output='b'.repeat(270000);
+    events=[{type:'text_delta',text:output},{type:'message_end',stopReason:'end_turn'}];
+    expect(await generateWebAppText('app-inference-owner',{prompt,maxTokens:8192},new AbortController().signal,()=>{})).toMatchObject({text:output});
+    expect(requests[0]).toMatchObject({maxTokens:8192,messages:[{role:'user',content:[{type:'text',text:prompt}]}]});
+    await generateWebAppText('app-inference-owner',{prompt:'Default'},new AbortController().signal,()=>{});
+    expect(requests[1].maxTokens).not.toBe(1024);
+    expect(requests[1].maxTokens).not.toBe(4096);
+  });
   it('does not retry a failed generation or rotate to spend through another configuration',async()=>{
     failing=true;const {generateWebAppText}=await import('../../../src/main/model/core-agent/runner');
     await expect(generateWebAppText('app-inference-owner',{prompt:'Greeting',maxTokens:128},new AbortController().signal,()=>{})).rejects.toThrow();expect(requests).toHaveLength(1);

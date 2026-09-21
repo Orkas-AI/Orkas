@@ -8,6 +8,8 @@ import { METHODS, SDK_VERSION, UNSUPPORTED, describeMethod, manifestSchema, type
 import { writeJson, writeBytesAtomic, isAtomicWriteTempPath } from '../../storage';
 import { webAppDataFile, webAppSandboxRoot, userLocalRoot, userCloudRoot, userRoot, WS_ROOT } from '../../paths';
 import { isPathAllowed } from '../../util/path-sandbox';
+import { MAX_TEXT_FILE_BYTES } from '../../util/file-size-limits';
+import { RequestHistory } from './request-history';
 
 export class AppError extends Error {
   constructor(readonly code: string) { super(code); }
@@ -36,7 +38,7 @@ export interface HostAdapters {
   closed?(uid: string, usage: AppUsageScope): void;
   pick(): Promise<string | null>;
   save(name: string): Promise<string | null>;
-  generate(uid: string, args: { prompt: string; maxTokens: number }, signal: AbortSignal, progress: (event: unknown) => void): Promise<unknown>;
+  generate(uid: string, args: { prompt: string; maxTokens?: number }, signal: AbortSignal, progress: (event: unknown) => void): Promise<unknown>;
   tools(uid: string, usage: AppUsageScope): Promise<AppTool[]>;
 }
 interface Instance {
@@ -49,28 +51,31 @@ interface Instance {
   controller: AbortController;
   handles: Map<string, { name: string; bytes: Buffer }>;
   requests: Map<string, AbortController>;
-  seen: Set<string>;
-  createdAt: number;
+  seen: RequestHistory;
 }
 const id = () => crypto.randomBytes(16).toString('hex');
-const MAX_FILE_BYTES = 512 * 1024;
-const STORE_BYTES = 1024 * 1024;
-const STORE_KEYS = 256;
-const MAX_INSTANCES = 32;
-const REQUEST_LIMIT = 4096;
+const MAX_FILE_BYTES = MAX_TEXT_FILE_BYTES;
+const STORE_BYTES = MAX_TEXT_FILE_BYTES;
 const error = (code: string): never => { throw new AppError(code); };
 async function readFileBytes(file: fs.FileHandle, check: () => void): Promise<Buffer> {
-  const bytes = Buffer.alloc(MAX_FILE_BYTES + 1);
+  // Allocate for this file, not the admission ceiling; read in chunks so
+  // cancellation still interrupts large snapshots. Short reads are not EOF.
+  let bytes = Buffer.allocUnsafe(Math.min((await file.stat()).size, MAX_FILE_BYTES) + 1);
   let offset = 0;
-  while (offset < bytes.length) {
+  while (true) {
     check();
-    const { bytesRead } = await file.read(bytes, offset, bytes.length - offset, offset);
+    const { bytesRead } = await file.read(bytes, offset, Math.min(1024 * 1024, bytes.length - offset), offset);
     check();
-    if (!bytesRead) break;
+    if (!bytesRead) return bytes.subarray(0, offset);
     offset += bytesRead;
+    if (offset > MAX_FILE_BYTES) return error('E_LIMIT');
+    if (offset === bytes.length) {
+      // The source grew after stat; expand only as needed, with one sentinel
+      // byte so a file crossing the shared ceiling cannot be truncated silently.
+      const grown = Buffer.allocUnsafe(Math.min(MAX_FILE_BYTES + 1, Math.max(64 * 1024, bytes.length * 2)));
+      bytes.copy(grown); bytes = grown;
+    }
   }
-  if (offset > MAX_FILE_BYTES) return error('E_LIMIT');
-  return bytes.subarray(0, offset);
 }
 export function boundedJson(value: unknown, max = MAX_PAYLOAD_BYTES): string {
   let json: string;
@@ -80,7 +85,8 @@ export function boundedJson(value: unknown, max = MAX_PAYLOAD_BYTES): string {
   let depth = 0;
   let quoted = false;
   let escaped = false;
-  for (const c of json) {
+  for (let i = 0; i < json.length; i++) {
+    const c = json[i];
     if (quoted) { if (escaped) escaped = false; else if (c === '\\') escaped = true; else if (c === '"') quoted = false; }
     else if (c === '"') quoted = true;
     else if (c === '{' || c === '[') { if (++depth > 32) return error('E_LIMIT'); }
@@ -92,7 +98,6 @@ export function boundedJson(value: unknown, max = MAX_PAYLOAD_BYTES): string {
 /** Instances and grants are memory-only and bound to the trusted host renderer. */
 export class WebAppRuntime {
   private instances = new Map<string, Instance>();
-  private heavyCalls = 0;
   private stores = new Map<string, { mutex: Mutex; users: number }>();
   constructor(private host: HostAdapters, private preview?: { storageRoot: string }) {}
 
@@ -103,23 +108,19 @@ export class WebAppRuntime {
 
   open(uid: string, owner: number, bundle: Bundle) {
     if (uid !== this.host.activeUser()) return error('E_CLOSED');
-    for (const [token, instance] of this.instances) {
-      if (Date.now() - instance.createdAt > 12 * 60 * 60 * 1000) this.close(instance.uid, instance.owner, token);
-    }
-    if (this.instances.size >= MAX_INSTANCES) return error('E_LIMIT');
     const parsed = manifestSchema.safeParse(bundle.manifest);
     if (!parsed.success) return error('E_MANIFEST');
     const token = id();
     const instance: Instance = { token, host: `app-${id()}`, uid, owner, bundle, manifest: parsed.data,
       controller: new AbortController(), handles: new Map(), requests: new Map(),
-      seen: new Set(), createdAt: Date.now() };
+      seen: new RequestHistory() };
     this.instances.set(token, instance);
     return { token, entry: bundle.entry, url: `chat-app://${instance.host}/${bundle.entry.split('/').map(encodeURIComponent).join('/')}`, sdkVersion: SDK_VERSION };
   }
   private current(uid: string, owner: number, token: string): Instance {
     const s = this.instances.get(token);
     if (!s || s.uid !== uid || s.owner !== owner || uid !== this.host.activeUser() || s.controller.signal.aborted) return error('E_CLOSED');
-    if (Date.now() - s.createdAt > 12 * 60 * 60 * 1000 || s.bundle.valid?.() === false) {
+    if (s.bundle.valid?.() === false) {
       this.close(uid, owner, token); return error('E_CLOSED');
     }
     return s;
@@ -132,6 +133,23 @@ export class WebAppRuntime {
     for (const c of s.requests.values()) c.abort();
     this.host.closed?.(s.uid, { id: s.token, owner: s.owner });
     s.handles.clear(); s.seen.clear();
+  }
+  canNavigate(owner: number, source: string, destination: string): boolean {
+    try {
+      const from = new URL(source), to = new URL(destination);
+      if (from.protocol !== 'chat-app:' || to.protocol !== from.protocol || to.host !== from.host
+        || to.username || to.password) return false;
+      const instance = [...this.instances.values()].find(s => s.owner === owner && s.host === from.host);
+      if (!instance) return false;
+      const rel = to.pathname.slice(1).split('/').map(decodeURIComponent).join('/');
+      return this.resource(to.host, rel, `chat-app://${from.host}`)?.resolved?.mime.startsWith('text/html') === true;
+    } catch { return false; }
+  }
+  cancelOriginRequests(owner: number, url: string): void {
+    let host: string; try { host = new URL(url).host; } catch { return; }
+    for (const s of this.instances.values()) {
+      if (s.owner === owner && s.host === host) for (const request of s.requests.values()) request.abort();
+    }
   }
   closeOrigin(owner: number, url: string): void {
     let host: string; try { host = new URL(url).host; } catch { return; }
@@ -147,7 +165,6 @@ export class WebAppRuntime {
     const s = this.current(uid, owner, token);
     if (!/^[a-zA-Z0-9_-]{1,64}$/.test(requestId)) return error('E_INPUT');
     // Tombstones also stop a cancellation arriving before its invoke.
-    if (s.seen.size >= REQUEST_LIMIT && !s.seen.has(requestId)) return error('E_LIMIT');
     s.seen.add(requestId);
     s.requests.get(requestId)?.abort();
   }
@@ -167,21 +184,16 @@ export class WebAppRuntime {
     const s = this.current(uid, owner, token);
     if (!/^[a-zA-Z0-9_-]{1,64}$/.test(requestId)) return error('E_INPUT');
     if (s.seen.has(requestId)) return error('E_DUPLICATE');
-    if (s.seen.size >= REQUEST_LIMIT || s.requests.size >= 4) return error('E_LIMIT');
     if (!Object.hasOwn(METHODS, method)) return error('E_METHOD');
     boundedJson(raw);
     const def = METHODS[method as Method];
     const parsed = def.input.safeParse(raw);
     if (!parsed.success) return error('E_INPUT');
-    const heavy = method === 'ai.generate' || method === 'tools.call';
-    if (heavy && this.heavyCalls >= 2) return error('E_BUSY');
     if (!this.available(def.capability) || (this.preview && method === 'tools.call')) return error('E_UNAVAILABLE');
-    if (heavy) this.heavyCalls++;
     s.seen.add(requestId);
     const controller = new AbortController();
     s.requests.set(requestId, controller);
     const signal = controller.signal;
-    const timer = setTimeout(() => controller.abort(), 5 * 60 * 1000);
     try {
       if (def.capability) this.requireCapability(s, def.capability);
       this.check(s, signal);
@@ -196,7 +208,7 @@ export class WebAppRuntime {
       // The request signal, not provider wording, determines SDK cancellation.
       if (signal.aborted) return error('E_CANCELLED');
       throw cause;
-    } finally { clearTimeout(timer); s.requests.delete(requestId); if (heavy) this.heavyCalls--; }
+    } finally { s.requests.delete(requestId); }
   }
   private check(s: Instance, signal: AbortSignal) {
     if (signal.aborted) return error('E_CANCELLED');
@@ -232,7 +244,6 @@ export class WebAppRuntime {
       const saved = { version: 1, entries };
       boundedJson(saved, STORE_BYTES);
       if (Buffer.byteLength(JSON.stringify(saved, null, 2)) > STORE_BYTES) return error('E_LIMIT');
-      if (Object.keys(entries).length > STORE_KEYS) return error('E_LIMIT');
       await writeJson(file, saved, { shouldCommit: () => { this.check(s, signal); return true; } });
       this.check(s, signal);
       this.changed(s, input.scope, file);
@@ -246,7 +257,7 @@ export class WebAppRuntime {
     const base = this.preview ? path.join(this.preview.storageRoot, input.scope) : webAppSandboxRoot(s.uid, s.bundle.key, input.scope);
     const root = path.join(base, 'files');
     const file = input.path ? path.join(root, ...input.path.split('/')) : root;
-    // Serialize quota checks and publication across instances of this app.
+    // Serialize file operations and publication across instances of this app.
     let lock = this.stores.get(root);
     if (!lock) { lock = { mutex: new Mutex(), users: 0 }; this.stores.set(root, lock); }
     lock.users++;
@@ -287,31 +298,28 @@ export class WebAppRuntime {
         this.changed(s, input.scope, file);
         return { removed: true };
       }
-      const files: Array<{ path: string; size: number }> = [];
-      let total = 0, visited = 0;
-      const walk = async (dir: string, depth: number): Promise<void> => {
-        guard(dir); if (depth > 8) return error('E_LIMIT');
-        let entries; try { entries = await fs.readdir(dir, { withFileTypes: true }); }
-        catch (err) { if ((err as NodeJS.ErrnoException).code === 'ENOENT') return; throw err; }
-        for (const entry of entries) {
-          if (isAtomicWriteTempPath(entry.name)) continue;
-          if (++visited > 2048) return error('E_LIMIT');
-          const abs = path.join(dir, entry.name); guard(abs);
-          if (entry.isDirectory()) await walk(abs, depth + 1);
-          else if (entry.isFile()) {
-            const st = await fs.lstat(abs); total += st.size;
-            files.push({ path: path.relative(root, abs).split(path.sep).join('/'), size: st.size });
-            if (files.length > 256 || total > 16 * 1024 * 1024) return error('E_LIMIT');
-          } else return error('E_FILE');
-        }
-      };
-      await walk(root, 0);
-      if (action === 'appFiles.list') return { files: files.sort((a, b) => a.path.localeCompare(b.path)) };
+      if (action === 'appFiles.list') {
+        const files: Array<{ path: string; size: number }> = [];
+        const walk = async (dir: string, depth: number): Promise<void> => {
+          guard(dir);
+          let entries; try { entries = await fs.readdir(dir, { withFileTypes: true }); }
+          catch (err) { if ((err as NodeJS.ErrnoException).code === 'ENOENT') return; throw err; }
+          for (const entry of entries) {
+            if (isAtomicWriteTempPath(entry.name)) continue;
+            const abs = path.join(dir, entry.name); guard(abs);
+            if (entry.isDirectory()) await walk(abs, depth + 1);
+            else if (entry.isFile()) {
+              const st = await fs.lstat(abs);
+              files.push({ path: path.relative(root, abs).split(path.sep).join('/'), size: st.size });
+            } else return error('E_FILE');
+          }
+        };
+        await walk(root, 0);
+        return { files: files.sort((a, b) => a.path.localeCompare(b.path)) };
+      }
       const bytes = action === 'appFiles.writeText' ? Buffer.from(input.text, 'utf8') : Buffer.from(input.base64, 'base64');
       if (action === 'appFiles.writeBase64' && bytes.toString('base64') !== input.base64) return error('E_INPUT');
       if (bytes.length > MAX_FILE_BYTES) return error('E_LIMIT');
-      const old = files.find(item => item.path === input.path);
-      if ((!old && files.length >= 256) || total - (old?.size ?? 0) + bytes.length > 16 * 1024 * 1024) return error('E_LIMIT');
       guard(file);
       await writeBytesAtomic(file, bytes, { shouldCommit: () => { guard(file); return true; } });
       guard(file); this.changed(s, input.scope, file);
@@ -334,7 +342,6 @@ export class WebAppRuntime {
       }), unsupported: UNSUPPORTED };
       case 'permissions.revoke': this.close(s.uid, s.owner, s.token); return { revoked: true };
       case 'files.pick': {
-        if (s.handles.size >= 16) return error('E_LIMIT');
         const selected = await this.host.pick(); this.check(s, signal);
         if (!selected) return null;
         const real = await fs.realpath(selected);
@@ -345,7 +352,6 @@ export class WebAppRuntime {
           if (!stat.isFile() || stat.size > MAX_FILE_BYTES) return error('E_LIMIT');
           const bytes = await readFileBytes(file, () => this.check(s, signal));
           this.check(s, signal);
-          if (s.handles.size >= 16) return error('E_LIMIT');
           const handle = id(); const name = path.basename(real);
           s.handles.set(handle, { name, bytes });
           return { handle, name, size: bytes.length };
@@ -359,6 +365,7 @@ export class WebAppRuntime {
       }
       case 'files.release': s.handles.delete(a.handle); return { released: true };
       case 'files.saveAs': {
+        if (Buffer.byteLength(a.text, 'utf8') > MAX_FILE_BYTES) return error('E_LIMIT');
         const selected = await this.host.save(a.name); this.check(s, signal);
         if (!selected) return null;
         const parent = await fs.realpath(path.dirname(selected));

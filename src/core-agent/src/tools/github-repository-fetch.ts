@@ -190,11 +190,19 @@ export function compactGitHubReadme(readme: string): string {
 /** Fetch one deterministic repository snapshot with two parallel HTTP requests. */
 export async function fetchGitHubRepositorySnapshot(
   resource: GitHubRepositoryResource,
+  signal?: AbortSignal,
 ): Promise<ToolResult> {
+  const cancelled = (): ToolResult => ({
+    content: `Fetch of ${resource.canonicalUrl} was cancelled`,
+    isError: true,
+  });
+  if (signal?.aborted) return cancelled();
   const metadataUrl =
     `https://api.github.com/repos/${encodeURIComponent(resource.owner)}/${encodeURIComponent(resource.repo)}`;
   const readmeUrl = `${metadataUrl}/readme`;
   const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  signal?.addEventListener("abort", onAbort, { once: true });
   const timer = setTimeout(() => controller.abort(), DEFAULT_WEB_FETCH_TIMEOUT_MS);
   try {
     const [metadataResponse, readmeResponse] = await Promise.all([
@@ -215,6 +223,7 @@ export async function fetchGitHubRepositorySnapshot(
       readWebFetchResponse(metadataResponse),
       readWebFetchResponse(readmeResponse),
     ]);
+    if (signal?.aborted) return cancelled();
 
     if ("error" in metadataBody && "error" in readmeBody) {
       return {
@@ -297,6 +306,7 @@ export async function fetchGitHubRepositorySnapshot(
       ].join("\n"),
     };
   } catch (error) {
+    if (signal?.aborted) return cancelled();
     const message = error instanceof Error ? error.message : String(error);
     return {
       content: message.includes("abort")
@@ -306,6 +316,9 @@ export async function fetchGitHubRepositorySnapshot(
     };
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+    // A failed parallel request must not leave its sibling running after return.
+    controller.abort();
   }
 }
 

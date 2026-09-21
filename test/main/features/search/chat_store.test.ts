@@ -210,22 +210,55 @@ describe('search/chat_store', () => {
     expect([...store.indexedConversationIds(UID)].sort()).toEqual(['c1', 'c2', 'c3']);
   });
 
-  it('refuses a database written by a different schema version', async () => {
-    // A silently accepted mismatch would read the wrong columns and report an
-    // empty history as a legitimate result.
+  it('rebuilds a database written by an older schema version', async () => {
+    // The index is derived state; the conversation JSONL can always rebuild it.
+    // Refusing to open a store from an earlier build instead turned every
+    // search into a permanent failure for anyone who already had one.
     const store = await loadStore();
-    store.upsertDoc(UID, doc('c1', 0, 'alpha'));
+    store.upsertDoc(UID, doc('c1', 0, 'staleword'));
     const dbPath = store.chatStorePath(UID);
     store.closeAllChatStores();
 
     const { default: Database } = await import('better-sqlite3');
     const raw = new Database(dbPath);
-    raw.pragma(`user_version = ${store.CHAT_STORE_SCHEMA_VERSION + 1}`);
+    raw.pragma(`user_version = ${store.CHAT_STORE_SCHEMA_VERSION - 1}`);
     raw.close();
 
     const { vi } = await import('vitest');
     vi.resetModules();
     const reopened = await loadStore();
-    expect(() => reopened.docCount(UID)).toThrow(/schema version mismatch/);
+    // Discarded rather than silently accepted: the old document is gone, and
+    // the store reports itself unbuilt so search says it is still preparing
+    // instead of presenting an empty index as a real answer.
+    expect(reopened.docCount(UID)).toBe(0);
+    expect(reopened.postingsFor(UID, 'staleword')).toHaveLength(0);
+    expect(reopened.hasCompletedRebuild(UID)).toBe(false);
+    reopened.upsertDoc(UID, doc('c1', 0, 'freshword'));
+    expect(reopened.postingsFor(UID, 'freshword')).toHaveLength(1);
+  });
+
+  it('rebuilds a database missing a table this build needs', async () => {
+    // The shipped defect had exactly this shape: a release added `chat_terms`
+    // without bumping the version, so a version-only check called the store
+    // usable and every query failed on the missing table.
+    const store = await loadStore();
+    store.upsertDoc(UID, doc('c1', 0, 'staleword'));
+    const dbPath = store.chatStorePath(UID);
+    store.closeAllChatStores();
+
+    const { default: Database } = await import('better-sqlite3');
+    const raw = new Database(dbPath);
+    raw.exec('DROP TABLE chat_terms');
+    raw.pragma(`user_version = ${store.CHAT_STORE_SCHEMA_VERSION}`);
+    raw.close();
+
+    const { vi } = await import('vitest');
+    vi.resetModules();
+    const reopened = await loadStore();
+    expect(reopened.docCount(UID)).toBe(0);
+    expect(reopened.hasCompletedRebuild(UID)).toBe(false);
+    reopened.upsertDoc(UID, doc('c2', 0, 'freshword'));
+    expect(reopened.postingsFor(UID, 'freshword')).toHaveLength(1);
+    expect(reopened.postingsFor(UID, 'staleword')).toHaveLength(0);
   });
 });

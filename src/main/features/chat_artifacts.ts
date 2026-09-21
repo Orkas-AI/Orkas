@@ -29,12 +29,11 @@
  *     `<cid>/<artifactId>/` (belt-and-braces anti-traversal)
  *   - file must exist and be a regular file
  *
- * If binary assets larger than the per-file cap are ever needed, the right
- * extension is base64-encoded content (already supported below) — never widen
- * the served allowlist to executable types.
  */
 
 import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
+import { setImmediate as yieldToHost } from 'node:timers/promises';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 
@@ -49,25 +48,21 @@ import { isPathAllowed } from '../util/path-sandbox';
 
 const log = createLogger('chat_artifacts');
 
-// ── Caps & extension allowlists ──────────────────────────────────────────
-
-export const MAX_ARTIFACT_FILES = 20;
-export const MAX_BYTES_PER_FILE = 256 * 1024;       // 256 KB
-export const MAX_BYTES_TOTAL    = 1 * 1024 * 1024;  // 1 MB
-const MAX_RELPATH_LEN = 200;
+// ── Paths & extension allowlists ──────────────────────────────────────────
 
 // What the `chat-app://` handler is willing to serve. Web assets only — no
 // executables, no archives.
-const SERVED_EXTS: ReadonlySet<string> = new Set([
+export const SERVED_EXTS: ReadonlySet<string> = new Set([
   '.html', '.htm', '.js', '.mjs', '.css', '.json', '.map', '.svg', '.xml', '.txt',
   '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.bmp',
   '.wasm', '.woff', '.woff2', '.ttf', '.otf', '.csv',
+  '.avif', '.webmanifest', '.mp3', '.wav', '.ogg', '.mp4', '.webm', '.glb', '.gltf', '.md',
 ]);
 // Extensions whose content is text (so `create_artifact` can validate UTF-8
 // for utf8-encoded files, and which is the natural shape for hand-written app
 // code). Anything else must be supplied as base64.
-const TEXT_EXTS: ReadonlySet<string> = new Set([
-  '.html', '.htm', '.js', '.mjs', '.css', '.json', '.map', '.svg', '.xml', '.txt', '.csv',
+export const TEXT_EXTS: ReadonlySet<string> = new Set([
+  '.html', '.htm', '.js', '.mjs', '.css', '.json', '.map', '.svg', '.xml', '.txt', '.csv', '.webmanifest', '.gltf', '.md',
 ]);
 
 const META_FILENAME = '__orkas-meta.json';
@@ -152,7 +147,6 @@ function safeRelPath(rel: unknown): string {
   let s = rel.trim();
   if (s.startsWith('/')) s = s.slice(1);
   if (!s) throw new Error('empty relpath');
-  if (s.length > MAX_RELPATH_LEN) throw new Error('relpath too long');
   if (s.includes('\x00') || s.includes('\\')) throw new Error('invalid relpath');
   const segs = s.split('/');
   for (const seg of segs) {
@@ -201,6 +195,16 @@ export function mimeFor(name: string): string {
     case '.js': case '.mjs':   return 'text/javascript; charset=utf-8';
     case '.css':               return 'text/css; charset=utf-8';
     case '.json': case '.map': return 'application/json; charset=utf-8';
+    case '.webmanifest':       return 'application/manifest+json';
+    case '.avif':              return 'image/avif';
+    case '.mp3':               return 'audio/mpeg';
+    case '.wav':               return 'audio/wav';
+    case '.ogg':               return 'audio/ogg';
+    case '.mp4':               return 'video/mp4';
+    case '.webm':              return 'video/webm';
+    case '.glb':               return 'model/gltf-binary';
+    case '.gltf':              return 'model/gltf+json';
+    case '.md':                return 'text/markdown; charset=utf-8';
     case '.svg':               return 'image/svg+xml';
     case '.xml':               return 'application/xml; charset=utf-8';
     case '.txt': case '.csv':  return 'text/plain; charset=utf-8';
@@ -293,17 +297,16 @@ export function ensureBridgeScript(html: string): string {
 
 /**
  * Write a new artifact bundle for (uid, cid, agentId). Validates the file set
- * (must include exactly one top-level `index.html`; per-file + total + count
- * caps; extension allowlist; UTF-8 for utf8-encoded text files; relpath
+ * (must include exactly one top-level `index.html`; extension allowlist; UTF-8 for utf8-encoded text files; relpath
  * safety; no `__orkas/` or `__orkas-meta.json` clobber), writes atomically
  * (temp dir → rename), and stamps `__orkas-meta.json`.
  */
-export function createArtifact(
+export async function createArtifact(
   userId: string,
   cid: string,
   agentId: string,
   input: { title?: unknown; files?: unknown },
-): Result<{ artifactId: string; title: string }> {
+): Promise<Result<{ artifactId: string; title: string }>> {
   let safeConvId: string;
   try { safeConvId = safeCid(cid); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
@@ -315,13 +318,9 @@ export function createArtifact(
   if (!Array.isArray(input?.files) || input.files.length === 0) {
     return { ok: false, error: 'files: required, must be a non-empty array of { path, content }' };
   }
-  if (input.files.length > MAX_ARTIFACT_FILES) {
-    return { ok: false, error: `too many files (max ${MAX_ARTIFACT_FILES})` };
-  }
-
-  // Validate + materialise every file in memory first; only touch disk once
-  // the whole set checks out.
-  const prepared: Array<{ rel: string; buf: Buffer }> = [];
+  // Validate names before staging. Retain source strings, not a decoded copy
+  // of every asset; decode and write one file at a time below.
+  const prepared: Array<{ rel: string; content: string; encoding: 'base64' | 'utf8' }> = [];
   const seen = new Set<string>();
   let hasIndex = false;
   let totalBytes = 0;
@@ -346,28 +345,12 @@ export function createArtifact(
     if (encoding === 'utf8' && !TEXT_EXTS.has(ext)) {
       return { ok: false, error: `file "${rel}": ${ext} content must be base64-encoded (set "encoding":"base64")` };
     }
-    let buf: Buffer;
-    if (encoding === 'base64') {
-      if (!/^[A-Za-z0-9+/_\-=\s]*$/.test(f.content)) {
-        return { ok: false, error: `file "${rel}": invalid base64 content` };
-      }
-      buf = Buffer.from(f.content, 'base64'); // tolerant of url-safe alphabet + whitespace
-    } else {
-      buf = Buffer.from(f.content, 'utf8');
-      if (buf.toString('utf8') !== f.content) return { ok: false, error: `file "${rel}": content is not valid UTF-8` };
-      // Before the size accounting below, so the caps still describe what
-      // actually lands on disk.
-      if (rel === 'index.html') buf = Buffer.from(ensureBridgeScript(f.content), 'utf8');
-    }
-    if (buf.length > MAX_BYTES_PER_FILE) {
-      return { ok: false, error: `file "${rel}": exceeds ${Math.round(MAX_BYTES_PER_FILE / 1024)}KB per-file cap` };
-    }
-    totalBytes += buf.length;
-    if (totalBytes > MAX_BYTES_TOTAL) {
-      return { ok: false, error: `bundle exceeds ${Math.round(MAX_BYTES_TOTAL / 1024)}KB total cap` };
+    if (encoding === 'base64' && !/^[A-Za-z0-9+/_\-=\s]*$/.test(f.content)) {
+      return { ok: false, error: `file "${rel}": invalid base64 content` };
     }
     if (rel === 'index.html') hasIndex = true;
-    prepared.push({ rel, buf });
+    prepared.push({ rel, content: f.content, encoding });
+    if (prepared.length % 256 === 0) await yieldToHost();
   }
   if (!hasIndex) return { ok: false, error: 'files must include a top-level "index.html"' };
 
@@ -391,17 +374,23 @@ export function createArtifact(
 
   const tmpDir = `${finalDir}.tmp-${crypto.randomBytes(4).toString('hex')}`;
   try {
-    for (const { rel, buf } of prepared) {
+    for (const { rel, content, encoding } of prepared) {
+      let buf = Buffer.from(content, encoding);
+      if (encoding === 'utf8') {
+        if (buf.toString('utf8') !== content) throw new Error(`file "${rel}": content is not valid UTF-8`);
+        if (rel === 'index.html') buf = Buffer.from(ensureBridgeScript(content), 'utf8');
+      }
       const dst = path.join(tmpDir, rel);
-      fs.mkdirSync(path.dirname(dst), { recursive: true });
-      fs.writeFileSync(dst, buf);
+      await fsp.mkdir(path.dirname(dst), { recursive: true });
+      await fsp.writeFile(dst, buf);
+      totalBytes += buf.length;
     }
-    fs.writeFileSync(path.join(tmpDir, META_FILENAME), metaBuf);
-    fs.mkdirSync(path.dirname(finalDir), { recursive: true });
-    fs.renameSync(tmpDir, finalDir);
+    await fsp.writeFile(path.join(tmpDir, META_FILENAME), metaBuf);
+    await fsp.mkdir(path.dirname(finalDir), { recursive: true });
+    await fsp.rename(tmpDir, finalDir);
   } catch (err) {
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
-    try { fs.rmSync(finalDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    try { await fsp.rm(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    try { await fsp.rm(finalDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     log.warn(`createArtifact failed user=${userId} cid=${safeConvId}: ${(err as Error).message}`);
     return { ok: false, error: `failed to write artifact: ${(err as Error).message}` };
   }
@@ -537,8 +526,7 @@ export interface ArtifactSummary {
  * a `create_artifact` app could not be found again.
  *
  * Best-effort: an unreadable or malformed entry is skipped rather than failing
- * the whole listing, and the caps here are the same ones `createArtifact`
- * enforces on write.
+ * the whole listing.
  */
 export function listArtifacts(userId: string, cid: string): ArtifactSummary[] {
   let safeConvId: string;

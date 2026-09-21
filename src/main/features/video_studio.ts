@@ -1507,6 +1507,7 @@ export async function withVideoStudioTimeout<T>(
  * inspect, snapshot, audio-only track reuse) is deliberately not gated. */
 let compositionRenderSlotTail: Promise<void> = Promise.resolve();
 const RENDER_SLOT_WAIT_PROGRESS_INTERVAL_MS = 30_000;
+const softwareOnscreenCompositionWindows = new WeakSet<ElectronBrowserWindow>();
 
 export async function acquireCompositionRenderSlot(input: {
   signal?: AbortSignal;
@@ -1554,8 +1555,13 @@ async function withCompositionWindow<T>(
   fn: (win: ElectronBrowserWindow) => Promise<T>,
 ): Promise<T> {
   const electron = await import('electron');
-  const { BrowserWindow, session } = electron;
+  const { BrowserWindow, session, app } = electron;
   if (!BrowserWindow) throw new Error('Electron BrowserWindow unavailable');
+  const observedGpuMode = await observeElectronGpuMode();
+  const softwareRendering = observedGpuMode === 'software'
+    || app.commandLine.hasSwitch('disable-gpu')
+    || process.argv.includes('--disable-gpu');
+  const useOffscreenPainting = !(process.platform === 'win32' && softwareRendering);
   const partition = `video-studio-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const ses = session.fromPartition(partition);
   ses.webRequest.onBeforeRequest((details, callback) => {
@@ -1576,12 +1582,14 @@ async function withCompositionWindow<T>(
     backgroundColor: '#000000',
     webPreferences: hardenedWebPreferences({
       session: ses,
-      // Hidden on-screen windows can retain the previous composited scene
-      // even after seek/RAF settles, particularly with software-rendered masks.
-      // Offscreen painting keeps preview and encoder captures at the seek time.
-      offscreen: true,
+      // Offscreen painting fixes stale hidden-window captures on hardware and
+      // macOS software compositors. Windows software compositing has the
+      // inverse defect: its offscreen surface retains the prior scene while a
+      // hidden on-screen surface tracks timeline seeks correctly.
+      offscreen: useOffscreenPainting,
     }),
   });
+  if (!useOffscreenPainting) softwareOnscreenCompositionWindows.add(win);
   try {
     // Electron centers new Windows/Linux windows within the display work
     // area, which can shrink even a useContentSize window (1920x1080 became
@@ -1784,6 +1792,11 @@ new Promise((resolve) => requestAnimationFrame(() => {
 `, true), COMPOSITION_SCRIPT_TIMEOUT_MS, 'E_COMPOSITION_PAINT_TIMEOUT', 'composition paint did not settle before capture.', () => {
     try { win.destroy(); } catch { /* best effort */ }
   });
+  // On Windows the software compositor needs an on-screen backing surface and
+  // a short post-RAF grace period before capturePage observes its invalidation.
+  if (softwareOnscreenCompositionWindows.has(win)) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
 }
 
 /** How many times a capture may be retaken when the pixels contradict the DOM.

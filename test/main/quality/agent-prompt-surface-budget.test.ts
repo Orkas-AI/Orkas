@@ -87,15 +87,16 @@ const RECORDED_CEILING: Readonly<Record<string, number>> = {
   DeepResearcher: 2_382,
   OfficeWorker: 2_219,
   ContentWriter: 1_912,
+  StockAnalyser: 4_725,
 };
 
-/** The corpus total matters on its own: ten agents each creeping under their
+/** The corpus total matters on its own: eleven agents each creeping under their
  *  own ceiling is still a shared regression, because a user with several
  *  agents in one group chat pays for all of them. */
 // 2026-09-15: routing descriptions lost 2,224 characters of duplicated prose;
 // lower the existing ceilings by that delta, preserving their prior headroom.
 // 2026-09-17: ProductDeveloper delegates execution procedures to product-dev.
-const RECORDED_CORPUS_CEILING = 40_701;
+const RECORDED_CORPUS_CEILING = 45_379;
 
 interface AgentSurface {
   name: string;

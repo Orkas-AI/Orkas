@@ -38,6 +38,7 @@ const REQUIRED_BUILTIN_INVENTORY = Object.freeze({
     'web-app-sdk',
   ]),
   marketplace_agents: Object.freeze([
+    '1040b336306f',
     '173d4235a431',
     '5f890bd72ac4',
     '78900d8758bc',

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { drainMainRuntimeForTest } from '../../helpers/drain-main-runtime';
 
 vi.mock('../../../src/main/logger', () => ({
   createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
@@ -15,7 +16,8 @@ beforeEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = root;
   vi.resetModules();
 });
-afterEach(() => {
+afterEach(async () => {
+  await drainMainRuntimeForTest();
   if (previousRoot === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
   else process.env.ORKAS_WORKSPACE_ROOT = previousRoot;
   fs.rmSync(root, { recursive: true, force: true });

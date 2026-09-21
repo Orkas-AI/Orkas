@@ -6,6 +6,7 @@ const CODES = [
   "E_BAD_INPUT", "E_PATCH_FORMAT", "E_PATCH_TOO_LARGE", "E_PATCH_NO_MATCH", "E_PATCH_AMBIGUOUS",
   "E_NO_MATCH", "E_MULTIPLE_MATCHES", "E_NOT_READ", "E_STALE", "E_REVISION_UNKNOWN",
   "E_REVISION_PATH_MISMATCH", "E_NOT_DIRECTORY", "E_NOT_FOUND",
+  "E_SKILL_REF_INVALID", "E_SKILL_NOT_AVAILABLE",
 ] as const;
 const REASONS = [
   "patch_input", "patch_size", "patch_envelope", "file_limit", "file_header", "file_path",
@@ -15,6 +16,7 @@ const REASONS = [
   "range_order", "append_precondition", "revision_unknown", "revision_path", "revision_changed",
   "size_changed", "not_read", "file_changed", "expected_hash_changed", "target_type", "target_missing",
   "target_stat",
+  "skill_ref_format", "skill_ref_unbound",
 ] as const;
 const COUNTS = [
   "line", "file_index", "hunk_index", "added_lines", "removed_lines", "context_lines", "item_index",
@@ -24,6 +26,7 @@ const FLAGS = [
   "begin_marker", "end_marker", "start_present", "end_present", "start_integer", "end_integer",
   "start_in_bounds", "ordered", "revision_provided", "revision_found", "revision_matches",
   "size_provided", "size_valid", "baseline_present", "baseline_changed", "expected_hash_provided",
+  "skill_ref_valid", "skill_binding_found",
 ] as const;
 const ENUMS = {
   stage: ["input", "parse", "stat", "freshness", "match"],

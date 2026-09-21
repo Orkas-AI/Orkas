@@ -509,10 +509,12 @@ describe('tool-catalog', () => {
     // by deleting a sentence `retention` already said and by tightening
     // operational wording. Nothing about credentials, approval, untrusted
     // content or failing closed was touched.
+    // 2026-09-21: read_files advertises its existing nonempty path and
+    // nonnegative range bounds; file-tools tests pin the provider definition.
     expect(
       fingerprint,
       'A model-visible field, enum, bound, default, or required rule changed; review it as a schema change, not description cleanup.',
-    ).toBe('9c25a24b0adb7cdc4a3589c9337980e16ba661573533805f9e7d8da34023caea');
+    ).toBe('5a0fc883f32fe8057b10014975c25a3e898316399c2cb17bbcedfbae656b21b0');
   });
 
   it('keeps the reviewed stable tool corpus within the description budgets', () => {
@@ -573,8 +575,8 @@ describe('tool-catalog', () => {
     expect(propertyDescription(outputs, 'paths')).toContain('replaces the prior declaration');
 
     const artifact = toolByName('create_artifact');
-    expect(artifact.description).toMatch(/Remote and out-of-directory URLs are blocked/i);
-    expect(artifact.description).toMatch(/bundle authorized assets in files or use data\/blob URLs/i);
+    expect(artifact.description).toContain('Bundled resources and external HTTP(S) URLs are supported');
+    expect(artifact.description).toContain('preview diagnostics');
     expect(artifact.description).not.toContain('top-level index.html');
     expect(propertyDescription(artifact, 'files')).toContain('top-level index.html');
     expect(propertyDescription(artifact, 'files')).toContain('__orkas/bridge.js');

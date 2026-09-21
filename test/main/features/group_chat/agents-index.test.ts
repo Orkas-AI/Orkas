@@ -28,6 +28,17 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+// Module resets create a workspace per case. Console diagnostics keep this
+// roster suite observable without file-log workers racing workspace deletion.
+vi.mock('../../../../src/main/logger', () => ({
+  createLogger: (scope: string) => ({
+    debug: (...args: unknown[]) => console.debug(`[${scope}]`, ...args),
+    info: (...args: unknown[]) => console.info(`[${scope}]`, ...args),
+    warn: (...args: unknown[]) => console.warn(`[${scope}]`, ...args),
+    error: (...args: unknown[]) => console.error(`[${scope}]`, ...args),
+  }),
+}));
+
 let tmpDir: string;
 let prevWs: string | undefined;
 const TEST_UID = 'u-agents-idx';
@@ -79,7 +90,13 @@ describe('agents_index block — header + per-entry shape', () => {
       const file = path.join(root, id, 'agent.json');
       return fs.existsSync(file) ? [JSON.parse(fs.readFileSync(file, 'utf8'))] : [];
     });
-    expect(agents).toHaveLength(10);
+    const manifest = JSON.parse(fs.readFileSync(path.join(root, '../../_manifest.json'), 'utf8'));
+    const shippedIds = manifest.files.flatMap((entry: { path: string }) => {
+      const match = /^marketplace\/agents\/([^/]+)\/agent\.json$/.exec(entry.path);
+      return match ? [match[1]] : [];
+    });
+    expect(shippedIds.length).toBeGreaterThan(0);
+    expect(agents.map(agent => agent.agent_id).sort()).toEqual(shippedIds.sort());
     for (const agent of agents) {
       writeAgent(builtinAgentsDir(), agent.agent_id, agent, { seed_source: 'builtin' });
     }

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { drainMainRuntimeForTest } from '../../../helpers/drain-main-runtime';
 
 vi.mock('../../../../src/main/model/client', () => ({
   async *streamChatWithModel() {
@@ -33,6 +34,7 @@ afterEach(async () => {
       await bus.dropConv(UID, cid);
     }
   } catch (_) {}
+  await drainMainRuntimeForTest();
   process.env.ORKAS_WORKSPACE_ROOT = previousWorkspace;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
