@@ -39,6 +39,7 @@ function pickerHarness(anchorId: string, atKey: boolean) {
   const header = new Element();
   const input = {
     value: '@Codex work @',
+    focus() {},
     setSelectionRange() {},
     dispatchEvent() {},
   };
@@ -59,6 +60,7 @@ function pickerHarness(anchorId: string, atKey: boolean) {
     escapeHtml: (s: string) => s,
     _composerSelectedRecipients: vi.fn(() => selected),
     _toggleComposerRecipient: vi.fn(),
+    _composerRecipientInput: () => input,
     setTimeout: (fn: Function) => fn(),
     Event: class {},
     addEventListener() {},
@@ -97,12 +99,22 @@ describe('agent picker selection display', () => {
     expect(vm.runInContext('_atKeyMark', context)).toBeNull();
   });
 
-  it('keeps Enter on a focused autocomplete result as selection', () => {
-    const { list } = pickerHarness('new-chat-recipient-chip', true);
+  it.each([false, true])('selects a focused result with Enter (opened with @: %s)', (atKey) => {
+    const { list } = pickerHarness('new-chat-recipient-chip', atKey);
     const select = vi.fn();
     list.children[2].handlers.click = select;
     list.children[2].handlers.keydown({ key: 'Enter', preventDefault() {} });
     expect(select).toHaveBeenCalledOnce();
+  });
+
+  it.each([{ isComposing: true }, { keyCode: 229 }])('does not select while confirming an IME candidate: %j', (composition) => {
+    const { list } = pickerHarness('new-chat-recipient-chip', false);
+    const select = vi.fn();
+    list.children[2].handlers.click = select;
+    const preventDefault = vi.fn();
+    list.children[2].handlers.keydown({ key: 'Enter', preventDefault, ...composition });
+    expect(select).not.toHaveBeenCalled();
+    expect(preventDefault).not.toHaveBeenCalled();
   });
 
   it('keeps automation outside the multi-recipient display', () => {

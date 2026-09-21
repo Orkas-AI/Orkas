@@ -4583,23 +4583,19 @@ function _refreshAgentPickerSelection() {
       el.dataset.recipientKeyboardWired = '1';
       el.addEventListener('keydown', (event) => {
         if (event.isComposing || event.keyCode === 229) return;
-        if (event.key === ' ') {
+        if (event.key === ' ' || event.key === 'Enter') {
           event.preventDefault();
           el.dataset.pickerSourceType = 'keyboard';
           el.click();
+          return;
         }
         if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
           event.preventDefault();
           _moveAgentPickerActive(event.key === 'ArrowDown' ? 1 : -1);
           list.querySelector('.skill-picker-item.active')?.focus();
         }
-        if (event.key === 'Enter' || event.key === 'Escape') {
+        if (event.key === 'Escape') {
           event.preventDefault();
-          if (event.key === 'Enter' && _atKeyMark) {
-            el.dataset.pickerSourceType = 'keyboard';
-            el.click();
-            return;
-          }
           _closeAgentPicker();
           _focusInput(_composerRecipientInput(_targetFromPickerAnchor(picker.dataset.anchorId)));
         }
@@ -4966,13 +4962,6 @@ function bindAgentPickers() {
       return;
     }
     if (e.key === 'Enter') {
-      const picker = document.getElementById('agent-picker');
-      if (_agentPickerTab === 'agents' && _isMultiRecipientPicker(picker?.dataset.anchorId) && !_atKeyMark) {
-        e.preventDefault();
-        _closeAgentPicker();
-        _focusInput(_composerRecipientInput(_targetFromPickerAnchor(picker.dataset.anchorId)));
-        return;
-      }
       const listEl = document.getElementById('agent-picker-list');
       const active = listEl?.querySelector('.skill-picker-item.active[data-id]')
         || listEl?.querySelector('.skill-picker-item[data-id]');
