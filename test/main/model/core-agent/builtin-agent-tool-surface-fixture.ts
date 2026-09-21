@@ -224,6 +224,84 @@ export const BUILTIN_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurfaceC
       'library', 'create_pptx', 'create_artifact', 'generate_image',
     ],
   },
+  {
+    agentId: '5a1d43c2f28a',
+    name: 'ECommerceResearcher',
+    configuredGroups: ['workspace.read', 'workspace.write.output', 'workspace.execute.command', 'web'],
+    groupRequirements: [
+      { group: 'workspace.read', outcome: 'inspect marketplace exports and product evidence', witnessTools: ['list_files'] },
+      { group: 'workspace.write.output', outcome: 'persist research evidence and requested opportunity reports', witnessTools: ['write_file'] },
+      { group: 'workspace.execute.command', outcome: 'run bounded social-data and local comparison calculations', witnessTools: ['bash', 'process_session'] },
+      { group: 'web', outcome: 'gather and verify public market and brand evidence', witnessTools: ['web_search', 'web_fetch'] },
+    ],
+    overbroadReplacements: [
+      { narrowGroup: 'workspace.write.output', broadGroup: 'workspace.write', newlyExposedTool: 'edit_file' },
+      { narrowGroup: 'workspace.execute.command', broadGroup: 'workspace.execute', newlyExposedTool: 'interactive_cli' },
+    ],
+    requiredTools: ['read_files', 'write_file', 'bash', 'process_session', 'web_search', 'web_fetch'],
+    forbiddenTools: ['edit_file', 'create_xlsx', 'generate_image', 'list_connector_tools'],
+  },
+  {
+    agentId: 'a4930d19ba6c',
+    name: 'ECommerceReviewer',
+    configuredGroups: ['workspace.read', 'workspace.execute.command'],
+    groupRequirements: [
+      { group: 'workspace.read', outcome: 'extract review exports and feedback documents', witnessTools: ['list_files'] },
+      { group: 'workspace.execute.command', outcome: 'run social sample and metric analysis scripts', witnessTools: ['bash', 'process_session'] },
+    ],
+    overbroadReplacements: [
+      { narrowGroup: 'workspace.execute.command', broadGroup: 'workspace.execute', newlyExposedTool: 'interactive_cli' },
+    ],
+    requiredTools: ['read_files', 'bash', 'process_session'],
+    forbiddenTools: ['write_file', 'web_search', 'create_xlsx', 'generate_image', 'list_connector_tools'],
+  },
+  {
+    agentId: 'bc7e2a904d18',
+    name: 'ECommerceAnalyzer',
+    configuredGroups: ['workspace.read', 'workspace.write.output', 'workspace.execute.command'],
+    groupRequirements: [
+      { group: 'workspace.read', outcome: 'inspect sales, refund and inventory exports', witnessTools: ['list_files'] },
+      { group: 'workspace.write.output', outcome: 'deliver reproducible business analysis files', witnessTools: ['write_file'] },
+      { group: 'workspace.execute.command', outcome: 'calculate and reconcile complete multi-row inputs', witnessTools: ['bash', 'process_session'] },
+    ],
+    overbroadReplacements: [
+      { narrowGroup: 'workspace.execute.command', broadGroup: 'workspace.execute', newlyExposedTool: 'interactive_cli' },
+    ],
+    requiredTools: ['read_files', 'write_file', 'bash', 'process_session'],
+    forbiddenTools: ['web_search', 'generate_image', 'list_connector_tools'],
+  },
+  {
+    agentId: 'e0f3a98c624b',
+    name: 'ECommerceOperator',
+    configuredGroups: ['workspace.read', 'workspace.write.output', 'connectors'],
+    groupRequirements: [
+      { group: 'workspace.read', outcome: 'inspect supplied store records and proposed changes', witnessTools: ['list_files'] },
+      { group: 'workspace.write.output', outcome: 'deliver concrete change previews and reconciliation', witnessTools: ['write_file'] },
+      { group: 'connectors', outcome: 'discover actual available store operations and execute authorized changes', witnessTools: ['list_connector_tools', 'call_connector_tool'] },
+    ],
+    overbroadReplacements: [
+      { narrowGroup: 'workspace.write.output', broadGroup: 'workspace.write', newlyExposedTool: 'edit_file' },
+    ],
+    requiredTools: ['read_files', 'write_file', 'list_connector_tools', 'call_connector_tool'],
+    forbiddenTools: ['edit_file', 'bash', 'process_session', 'web_search', 'generate_image'],
+  },
+  {
+    agentId: 'fa3e1f2f9e07',
+    name: 'ECommerceWriter',
+    configuredGroups: ['workspace.read', 'workspace.write.output', 'workspace.execute.command', 'web'],
+    groupRequirements: [
+      { group: 'workspace.read', outcome: 'extract product facts and VOC source materials', witnessTools: ['list_files'] },
+      { group: 'workspace.write.output', outcome: 'deliver complete requested listing and creative files', witnessTools: ['write_file'] },
+      { group: 'workspace.execute.command', outcome: 'assemble source-bearing statements verbatim into requested copy files', witnessTools: ['bash', 'process_session'] },
+      { group: 'web', outcome: 'verify current market and category listing constraints', witnessTools: ['web_search'] },
+    ],
+    overbroadReplacements: [
+      { narrowGroup: 'workspace.write.output', broadGroup: 'workspace.write', newlyExposedTool: 'edit_file' },
+      { narrowGroup: 'workspace.execute.command', broadGroup: 'workspace.execute', newlyExposedTool: 'interactive_cli' },
+    ],
+    requiredTools: ['read_files', 'write_file', 'bash', 'process_session', 'web_search'],
+    forbiddenTools: ['edit_file', 'create_xlsx', 'generate_image', 'list_connector_tools'],
+  },
 ] as const;
 
 /**
@@ -327,23 +405,6 @@ export const RESOURCE_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurface
     forbiddenTools: ['write_file', 'web_search', 'create_docx', 'generate_image', 'list_connector_tools'],
   },
   {
-    agentId: '5a1d43c2f28a',
-    name: 'ECommerceResearcher',
-    configuredGroups: ['workspace.read', 'workspace.write.output', 'workspace.execute.command', 'web'],
-    groupRequirements: [
-      { group: 'workspace.read', outcome: 'inspect marketplace exports and product evidence', witnessTools: ['list_files'] },
-      { group: 'workspace.write.output', outcome: 'persist research evidence and requested opportunity reports', witnessTools: ['write_file'] },
-      { group: 'workspace.execute.command', outcome: 'run bounded social-data and local comparison calculations', witnessTools: ['bash', 'process_session'] },
-      { group: 'web', outcome: 'gather and verify public market and brand evidence', witnessTools: ['web_search', 'web_fetch'] },
-    ],
-    overbroadReplacements: [
-      { narrowGroup: 'workspace.write.output', broadGroup: 'workspace.write', newlyExposedTool: 'edit_file' },
-      { narrowGroup: 'workspace.execute.command', broadGroup: 'workspace.execute', newlyExposedTool: 'interactive_cli' },
-    ],
-    requiredTools: ['read_files', 'write_file', 'bash', 'process_session', 'web_search', 'web_fetch'],
-    forbiddenTools: ['edit_file', 'create_xlsx', 'generate_image', 'list_connector_tools'],
-  },
-  {
     agentId: '5dd962efb425',
     name: 'KnowledgeManager',
     configuredGroups: ['workspace.read', 'workspace.write', 'workspace.execute.command', 'web', 'connectors'],
@@ -393,20 +454,6 @@ export const RESOURCE_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurface
     ],
     requiredTools: ['read_files', 'write_file', 'bash', 'process_session', 'web_search', 'web_fetch'],
     forbiddenTools: ['edit_file', 'create_docx', 'generate_image', 'list_connector_tools'],
-  },
-  {
-    agentId: 'a4930d19ba6c',
-    name: 'ECommerceReviewer',
-    configuredGroups: ['workspace.read', 'workspace.execute.command'],
-    groupRequirements: [
-      { group: 'workspace.read', outcome: 'extract review exports and feedback documents', witnessTools: ['list_files'] },
-      { group: 'workspace.execute.command', outcome: 'run social sample and metric analysis scripts', witnessTools: ['bash', 'process_session'] },
-    ],
-    overbroadReplacements: [
-      { narrowGroup: 'workspace.execute.command', broadGroup: 'workspace.execute', newlyExposedTool: 'interactive_cli' },
-    ],
-    requiredTools: ['read_files', 'bash', 'process_session'],
-    forbiddenTools: ['write_file', 'web_search', 'create_xlsx', 'generate_image', 'list_connector_tools'],
   },
   {
     agentId: 'cca3f16d3a01',
@@ -493,53 +540,6 @@ export const RESOURCE_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurface
     ],
     requiredTools: ['list_files', 'grep_files', 'bash', 'process_session'],
     forbiddenTools: ['write_file', 'web_search', 'create_artifact', 'generate_image', 'list_connector_tools'],
-  },
-  {
-    agentId: 'fa3e1f2f9e07',
-    name: 'ECommerceWriter',
-    configuredGroups: ['workspace.read', 'workspace.write.output', 'workspace.execute.command', 'web'],
-    groupRequirements: [
-      { group: 'workspace.read', outcome: 'extract product facts and VOC source materials', witnessTools: ['list_files'] },
-      { group: 'workspace.write.output', outcome: 'deliver complete requested listing and creative files', witnessTools: ['write_file'] },
-      { group: 'workspace.execute.command', outcome: 'assemble source-bearing statements verbatim into requested copy files', witnessTools: ['bash', 'process_session'] },
-      { group: 'web', outcome: 'verify current market and category listing constraints', witnessTools: ['web_search'] },
-    ],
-    overbroadReplacements: [
-      { narrowGroup: 'workspace.write.output', broadGroup: 'workspace.write', newlyExposedTool: 'edit_file' },
-      { narrowGroup: 'workspace.execute.command', broadGroup: 'workspace.execute', newlyExposedTool: 'interactive_cli' },
-    ],
-    requiredTools: ['read_files', 'write_file', 'bash', 'process_session', 'web_search'],
-    forbiddenTools: ['edit_file', 'create_xlsx', 'generate_image', 'list_connector_tools'],
-  },
-  {
-    agentId: 'bc7e2a904d18',
-    name: 'ECommerceAnalyzer',
-    configuredGroups: ['workspace.read', 'workspace.write.output', 'workspace.execute.command'],
-    groupRequirements: [
-      { group: 'workspace.read', outcome: 'inspect sales, refund and inventory exports', witnessTools: ['list_files'] },
-      { group: 'workspace.write.output', outcome: 'deliver reproducible business analysis files', witnessTools: ['write_file'] },
-      { group: 'workspace.execute.command', outcome: 'calculate and reconcile complete multi-row inputs', witnessTools: ['bash', 'process_session'] },
-    ],
-    overbroadReplacements: [
-      { narrowGroup: 'workspace.execute.command', broadGroup: 'workspace.execute', newlyExposedTool: 'interactive_cli' },
-    ],
-    requiredTools: ['read_files', 'write_file', 'bash', 'process_session'],
-    forbiddenTools: ['web_search', 'generate_image', 'list_connector_tools'],
-  },
-  {
-    agentId: 'e0f3a98c624b',
-    name: 'ECommerceOperator',
-    configuredGroups: ['workspace.read', 'workspace.write.output', 'connectors'],
-    groupRequirements: [
-      { group: 'workspace.read', outcome: 'inspect supplied store records and proposed changes', witnessTools: ['list_files'] },
-      { group: 'workspace.write.output', outcome: 'deliver concrete change previews and reconciliation', witnessTools: ['write_file'] },
-      { group: 'connectors', outcome: 'discover actual available store operations and execute authorized changes', witnessTools: ['list_connector_tools', 'call_connector_tool'] },
-    ],
-    overbroadReplacements: [
-      { narrowGroup: 'workspace.write.output', broadGroup: 'workspace.write', newlyExposedTool: 'edit_file' },
-    ],
-    requiredTools: ['read_files', 'write_file', 'list_connector_tools', 'call_connector_tool'],
-    forbiddenTools: ['edit_file', 'bash', 'process_session', 'web_search', 'generate_image'],
   },
 ] as const;
 

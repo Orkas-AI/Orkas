@@ -70,6 +70,14 @@ const BUILTIN_AGENT_INITIAL_SURFACE_BUDGETS: Readonly<Record<
   UIDesigner: { tools: 25, tokens: 8_800 },
   SeoGeoAgent: { tools: 24, tokens: 8_500 },
   StockAnalyser: { tools: 22, tokens: 7_300 },
+  // September 21 packaging migration: preserve fixed capabilities, adding
+  // coverage for the five newly bundled Agents. Measured tokens are
+  // 6,471/4,344/6,471/5,189/4,365; caps allow at most about 10% wording growth.
+  ECommerceResearcher: { tools: 18, tokens: 7_100 },
+  ECommerceReviewer: { tools: 11, tokens: 4_700 },
+  ECommerceWriter: { tools: 18, tokens: 7_100 },
+  ECommerceAnalyzer: { tools: 15, tokens: 5_700 },
+  ECommerceOperator: { tools: 13, tokens: 4_800 },
 });
 
 describe('injected tool surface budget', () => {
