@@ -17,6 +17,20 @@ async function openAddModelDialog(page: import('@playwright/test').Page): Promis
 }
 
 test.describe('settings modules and model guard', () => {
+  test('Escape closes the model picker before the dialog and returns focus to Add', async ({ appPage }) => {
+    await openSettingsTab(appPage, 'credentials');
+    await openAddModelDialog(appPage);
+    const trigger = appPage.locator('#settings-picker-provider .ai-select-trigger');
+    await trigger.click();
+    await expect(appPage.locator('.ai-select-popover:visible')).toBeVisible();
+    await appPage.keyboard.press('Escape');
+    await expect(appPage.locator('.ai-select-popover:visible')).toHaveCount(0);
+    await expect(appPage.locator('#settings-add-modal')).toHaveClass(/\bopen\b/);
+    await appPage.keyboard.press('Escape');
+    await expect(appPage.locator('#settings-add-modal')).not.toHaveClass(/\bopen\b/);
+    await expect(appPage.locator('[data-settings-add="chat"]')).toBeFocused();
+  });
+
   test('renders data, recycle bin, and BYO credential settings', async ({ appPage }) => {
     await openSettingsTab(appPage, 'data');
     await expect(appPage.locator('#settings-data-root-btn')).toBeVisible();
@@ -35,7 +49,7 @@ test.describe('settings modules and model guard', () => {
     expect(recycleLayout.maxHeight).toBeLessThanOrEqual(320);
 
     await openSettingsTab(appPage, 'credentials');
-    await expect(appPage.locator('#settings-add-entry-btn')).toBeVisible();
+    await expect(appPage.locator('[data-settings-add="chat"]')).toBeVisible();
     await expect(appPage.locator('#settings-entries .entry-row', {
       hasText: 'E2E-Local-Model',
     })).toBeVisible();

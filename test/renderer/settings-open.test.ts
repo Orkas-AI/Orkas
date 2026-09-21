@@ -133,6 +133,49 @@ describe('settings sidebar navigation', () => {
     expect(loadRendererFeature).toHaveBeenCalledWith('settings');
     expect(loadSettings).toHaveBeenCalledOnce();
   });
+
+  it('ships the complete local Settings shell and the five-purpose add dialog', () => {
+    const html = fs.readFileSync(path.join(root, 'src/renderer/index.html'), 'utf8');
+    const settings = html.slice(
+      html.indexOf('<!-- Settings -->'),
+      html.indexOf('<!-- Memory detail page'),
+    );
+
+    expect(settings).toContain('class="settings-tabs" role="tablist" aria-orientation="horizontal"');
+    expect(settings).toContain('data-ui-icon="database" data-ui-icon-class="settings-tab-icon"');
+    expect(settings).toContain('data-ui-icon="sparkles" data-ui-icon-class="settings-tab-icon"');
+    expect(settings).toContain('data-ui-icon="settings" data-ui-icon-class="settings-tab-icon"');
+    expect(settings).toContain('class="settings-page"');
+    expect(settings).toContain('data-settings-model-tab="chat"');
+    expect(settings).toContain('data-settings-model-panel="tts"');
+    expect(settings).toContain('data-settings-add="chat"');
+    expect(settings).not.toContain('data-settings-pane="account"');
+
+    expect(html).toContain('id="settings-add-modal"');
+    for (const kind of ['chat', 'search', 'image', 'video', 'tts']) {
+      expect(html).toContain(`data-settings-add-form="${kind}"`);
+    }
+  });
+
+  it('keeps all three named AI Team entries and the external-only CLI route', () => {
+    const html = fs.readFileSync(path.join(root, 'src/renderer/index.html'), 'utf8');
+    const state = fs.readFileSync(path.join(root, 'src/renderer/modules/state.js'), 'utf8');
+    const header = html.slice(
+      html.indexOf('<div class="agents-grid-header">'),
+      html.indexOf('<div class="marketplace-reconcile-banner" data-reconcile-banner data-reconcile-kind="agent"'),
+    );
+    const handlerStart = state.indexOf("document.getElementById('agents-connect-cli-btn')");
+    const handler = state.slice(handlerStart, state.indexOf("document.getElementById('agents-back-btn')", handlerStart));
+
+    expect(header).toContain('id="create-agent-btn"');
+    expect(header).toContain('id="agents-connect-cli-btn"');
+    expect(header).toContain('data-i18n="agents.connect_cli_sub"');
+    expect(header).toContain('id="agents-more-btn"');
+    expect(handlerStart).toBeGreaterThan(-1);
+    expect(handler).toContain("initialTab: 'external'");
+    expect(handler).toContain('externalOnly: true');
+    expect(handler).toContain("entryPoint: 'agents_connect_cli_button'");
+  });
 });
 
 it('restores unread state after the real user initialization boundary', async () => {

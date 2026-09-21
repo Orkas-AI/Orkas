@@ -1687,6 +1687,9 @@ function _settingsShowCustomModelForm(provider) {
   const actions = document.getElementById('add-account-actions');
   if (!overlay || !title || !body || !actions) return;
 
+  // Hand over from the purpose-specific picker to the credential dialog.
+  // Keeping both overlays open traps focus behind the topmost dialog.
+  _settingsCloseAddModal();
   title.innerHTML = `
     <span class="modal-title-text">${escapeHtml(t('settings.custom.title'))}</span>
     <span class="form-hint custom-model-intro">${escapeHtml(t('settings.custom.compat_hint'))}</span>
