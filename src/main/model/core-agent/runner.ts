@@ -438,20 +438,6 @@ export interface ToolDefSnapshot {
   source: 'core-agent' | 'orkas' | 'extra';
 }
 
-/** Run-local tool-surface counters. Raw group ids remain inside main and are
- * reduced to bounded counts/buckets before analytics emission. */
-export interface ToolSurfaceTelemetrySnapshot {
-  mode: 'scoped' | 'legacy_all' | 'unknown';
-  peakToolCount: number;
-  loadCallCount: number;
-  loadedGroupCount: number;
-  /** Provider-definition characters added specifically by model tool_load
-   * calls. Host-granted runtime tools are excluded. */
-  loadedSchemaChars: number;
-  loadedUnusedGroupCount: number;
-  webToolUsed: boolean;
-}
-
 /** Exported for unit tests — see runner.test.ts. */
 export const _splitCommanderOrchestrationBlock = splitCommanderOrchestrationBlock;
 
@@ -473,9 +459,6 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   modelId: string;
   /** Actual activation mode after rollout, eligibility, and history-compat checks. */
   toolSurfaceMode: 'scoped' | 'legacy_all';
-  /** Snapshot current run-local loading/usage counters at the terminal
-   * boundary. No tool/group names leave the main process. */
-  toolSurfaceTelemetry(usedToolNames?: readonly string[]): ToolSurfaceTelemetrySnapshot;
   /** Final tool set visible to the LLM (after last-write-wins merge of
    *  core-agent builtins + buildRunner-injected + caller-supplied extras).
    *  Used by the dev-only archiver. */
@@ -1662,7 +1645,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
 
   // This is the same active-definition path used by AgentRunner immediately
   // before an ordinary provider request. Reading it after construction keeps
-  // diagnostics, the dev archive, tests, and telemetry aligned with late core
+  // diagnostics, the dev archive, and tests aligned with late core
   // tools without serializing dormant schemas.
   const snapshotToolDefinition = (definition: {
     name: string;
@@ -1677,34 +1660,6 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const toolDefs = runner.getActiveToolDefinitions()
     .map(snapshotToolDefinition)
     .sort((a, b) => a.name.localeCompare(b.name));
-  const toolSurfaceTelemetry = (
-    usedToolNames: readonly string[] = [],
-  ): ToolSurfaceTelemetrySnapshot => {
-    const used = new Set(usedToolNames);
-    const currentToolDefs = runner.getActiveToolDefinitions();
-    const stats = toolSurface.runtimeStats();
-    const toolLoadActivatedNames = new Set(stats.newlyActivatedToolNames);
-    const loadedToolDefs = currentToolDefs.filter((tool) => toolLoadActivatedNames.has(tool.name));
-    return {
-      mode: toolSurface.mode,
-      peakToolCount: currentToolDefs.length,
-      loadCallCount: stats.loadCalls,
-      loadedGroupCount: stats.newlyLoadedGroups.length,
-      loadedSchemaChars: loadedToolDefs.reduce(
-        (total, tool) => total + JSON.stringify({
-          name: tool.name,
-          description: tool.description,
-          inputSchema: tool.inputSchema,
-        }).length,
-        0,
-      ),
-      loadedUnusedGroupCount: stats.newlyLoadedGroups.filter((group) => (
-        !toolNamesForGroups([group]).some((name) => used.has(name))
-      )).length,
-      webToolUsed: used.has('web_search') || used.has('web_fetch') || used.has('inner_browser'),
-    };
-  };
-
   return {
     runner,
     failureTrackingScope: session,
@@ -1715,7 +1670,6 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     providerId,
     modelId,
     toolSurfaceMode: toolSurface.mode,
-    toolSurfaceTelemetry,
     toolDefs,
     skillDisplayNameById,
     skillMetadataByReadRef,

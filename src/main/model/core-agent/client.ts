@@ -41,7 +41,6 @@ import type { ChatOptions, ChatResult, StreamEvent } from '../client';
 import {
   buildRunner,
   type ToolDefSnapshot,
-  type ToolSurfaceTelemetrySnapshot,
 } from './runner';
 import type { SkillSelectionInput } from './skill-registry';
 import { mapCoreAgentEvents } from './event-mapper';
@@ -1375,89 +1374,9 @@ export function summarizeModelRunForLog(stats: ModelRunLogDiagnostics, nowMs = D
   };
 }
 
-function providerCategoryForTelemetry(providerId?: string): string {
-  const text = String(providerId || '').trim().toLowerCase();
-  if (!text) return 'unknown';
-  const patterns: Array<[string, RegExp]> = [
-    ['openai', /\b(openai|chatgpt|gpt)\b/],
-    ['anthropic', /\b(anthropic|claude)\b/],
-    ['google', /\b(google|gemini|vertex)\b/],
-    ['xai', /\b(xai|grok)\b/],
-    ['deepseek', /\bdeepseek\b/],
-    ['qwen', /\b(qwen|dashscope|aliyun)\b/],
-    ['doubao', /\b(doubao|volc|bytedance)\b/],
-    ['moonshot', /\b(moonshot|kimi)\b/],
-    ['zhipu', /\b(zhipu|glm|zai|z-ai)\b/],
-    ['minimax', /\bminimax\b/],
-    ['mistral', /\bmistral\b/],
-    ['openrouter', /\bopenrouter\b/],
-    ['azure', /\bazure\b/],
-    ['bedrock', /\bbedrock\b/],
-    ['ollama', /\bollama\b/],
-    ['lmstudio', /\b(lmstudio|lm-studio)\b/],
-    ['siliconflow', /\bsiliconflow\b/],
-  ];
-  for (const [category, pattern] of patterns) {
-    if (pattern.test(text)) return category;
-  }
-  return 'custom';
-}
-
-function modelFamilyForTelemetry(modelId?: string, providerId?: string): string {
-  const providerText = String(providerId || '').trim().toLowerCase();
-  const modelText = String(modelId || '').trim().toLowerCase();
-  if (!modelText && !providerText) return 'unknown';
-  const text = `${providerText} ${modelText}`;
-  const patterns: Array<[string, RegExp]> = [
-    ['gpt', /\b(gpt|o[1-9]|chatgpt)\b/],
-    ['claude', /\bclaude\b/],
-    ['gemini', /\bgemini\b/],
-    ['grok', /\bgrok\b/],
-    ['deepseek', /\bdeepseek\b/],
-    ['qwen', /\bqwen\b/],
-    ['doubao', /\bdoubao\b/],
-    ['kimi', /\b(kimi|moonshot)\b/],
-    ['glm', /\b(glm|zhipu)\b/],
-    ['minimax', /\bminimax\b/],
-    ['mistral', /\bmistral\b/],
-    ['mimo', /\bmimo\b/],
-  ];
-  for (const [family, pattern] of patterns) {
-    if (pattern.test(text)) return family;
-  }
-  return 'other';
-}
-
-export function modelRunIdsForTelemetry(
-  activeProviderId?: string,
-  activeModelId?: string,
-  responseProviderId?: string,
-  responseModelId?: string,
-): { providerId: string; modelId: string } {
-  const configuredProvider = String(activeProviderId || '').trim();
-  const configuredModel = String(activeModelId || '').trim();
-  return {
-    providerId: String(responseProviderId || '').trim() || configuredProvider,
-    modelId: String(responseModelId || '').trim() || configuredModel,
-  };
-}
-
-function toolCountBucketForTelemetry(count: number): string {
-  const n = Math.max(0, Math.floor(Number.isFinite(count) ? count : 0));
-  if (n === 0) return '0';
-  if (n <= 5) return '1-5';
-  if (n <= 20) return '6-20';
-  if (n <= 50) return '21-50';
-  return '51+';
-}
-
-function agentRunResultEventForTelemetry(input: {
+function agentRunResultEvent(input: {
   status: 'completed' | 'stopped' | 'waiting_input' | 'aborted' | 'idle_timeout' | 'error' | 'empty';
   durationMs: number;
-  providerId?: string;
-  modelId?: string;
-  toolCount: number;
-  nested: boolean;
   idleWindowSec?: number;
   idleTimeoutSec?: number;
   streamIdleTimeoutSec?: number;
@@ -1475,12 +1394,7 @@ function agentRunResultEventForTelemetry(input: {
   const data: Record<string, unknown> = {
     result,
     terminal_status: input.status,
-    provider: providerCategoryForTelemetry(input.providerId),
-    model: modelFamilyForTelemetry(input.modelId, input.providerId),
     duration_ms: Math.max(0, Math.round(input.durationMs)),
-    run_kind: input.nested ? 'nested' : 'top_level',
-    has_tools: input.toolCount > 0,
-    tool_count_bucket: toolCountBucketForTelemetry(input.toolCount),
   };
   if (Number.isFinite(input.idleTimeoutSec)) data.idle_timeout_sec = Math.max(0, Math.round(input.idleTimeoutSec || 0));
   if (Number.isFinite(input.streamIdleTimeoutSec)) data.stream_idle_timeout_sec = Math.max(0, Math.round(input.streamIdleTimeoutSec || 0));
@@ -1494,7 +1408,7 @@ function agentRunResultEventForTelemetry(input: {
     data.other_ms = Math.max(0, Math.round(input.timings.otherMs));
   }
   if (errorCode) data.error_code = errorCode;
-  return { type: 'event', event: { stream: 'agent_run_result', data } };
+  return { type: 'event', event: { stream: 'agent_run_terminal', data } };
 }
 
 export function modelTurnContextForLog(input: {
@@ -1860,9 +1774,6 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   // produced by an attempted model run; do not replace it with text matching.
   let modelRunStarted = false;
   let runnerBuildStarted = false;
-  let activeProviderId = '';
-  let activeModelId = '';
-  let activeToolCount = 0;
   try {
     log.info('model turn queued', turnLogContext);
     const sessionLockWaitStartedAt = Date.now();
@@ -1995,7 +1906,6 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       providerId,
       modelId,
       toolSurfaceMode,
-      toolSurfaceTelemetry,
       resolvedSystemPrompt,
       turnEphemeral,
       profileId,
@@ -2006,9 +1916,6 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       agentDisplayNameById,
       connectorDisplayNameById,
     } = built;
-    activeProviderId = providerId || '';
-    activeModelId = modelId || '';
-    activeToolCount = toolDefs.length;
     turnLogContext = modelTurnContextForLog({
       userId,
       sessionId,
@@ -2393,19 +2300,9 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
                   // A handed-off model invocation completed normally; task
                   // completion remains owned by the host's queued Agent run.
                   : (finalText || agentRunResult?.meta.termination?.status === 'handed_off' ? 'completed' : 'empty'))));
-    const telemetryIds = modelRunIdsForTelemetry(
-      activeProviderId,
-      activeModelId,
-      diagnostics.provider,
-      diagnostics.model,
-    );
-    yield agentRunResultEventForTelemetry({
+    yield agentRunResultEvent({
       status: terminalStatus,
       durationMs: Date.now() - runStartedAt,
-      providerId: telemetryIds.providerId,
-      modelId: telemetryIds.modelId,
-      toolCount: activeToolCount,
-      nested,
       idleWindowSec: idleHit ? idleHitWindow : undefined,
       idleTimeoutSec: idleTimeout,
       streamIdleTimeoutSec: streamIdleTimeout,

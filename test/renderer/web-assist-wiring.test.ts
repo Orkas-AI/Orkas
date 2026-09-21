@@ -610,11 +610,10 @@ describe('Web Assist renderer wiring', () => {
     const handlers = new Map<string, (state: unknown) => void>();
     const showFromMain = vi.fn();
     const renderState = vi.fn();
-    const error = vi.fn();
     const start = webAssistSource.indexOf("  window.orkas.onPushEvent('web-assist:state'");
     const end = webAssistSource.indexOf('  window.WebAssist =', start);
     vm.runInNewContext(webAssistSource.slice(start, end), {
-      window: { Monitor: { error }, orkas: { onPushEvent: (name: string, handler: (state: unknown) => void) => handlers.set(name, handler) } },
+      window: { orkas: { onPushEvent: (name: string, handler: (state: unknown) => void) => handlers.set(name, handler) } },
       showFromMain, renderState, rememberMainActiveTab() {},
     });
     const state = { conversation_id: 'c1', loading: true };
@@ -626,12 +625,7 @@ describe('Web Assist renderer wiring', () => {
     expect(showFromMain).toHaveBeenCalledWith(activity);
     handlers.get('web-assist:show')!(state);
     expect(showFromMain).toHaveBeenCalledTimes(2);
-    const failure = { error_code: 'renderer_gone', suppressed_count: 2 };
-    handlers.get('web-assist:failure')!(failure);
-    expect(error).toHaveBeenCalledExactlyOnceWith('browser', failure);
-    expect(showFromMain).toHaveBeenCalledTimes(2);
-    error.mockImplementationOnce(() => { throw new Error('fixture monitor unavailable'); });
-    expect(() => handlers.get('web-assist:failure')!(failure)).not.toThrow();
+    expect(handlers.has('web-assist:failure')).toBe(false);
   });
 
   it.each(['close', 'switch', 'decode-failure', 'ready'])('keeps overlay capture safe during %s', async scenario => {

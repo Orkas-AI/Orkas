@@ -263,7 +263,6 @@ function loadHarness(
   const pushHandlers = new Map<string, (info: any) => void>();
   const dialogs: DialogView[] = [];
   const invokeCalls: Array<{ channel: string; payload: any }> = [];
-  const monitorEvent = vi.fn();
   const warn = vi.fn();
   const document = new FakeDocument((overlay) => {
     dialogs.push(dialogView(overlay));
@@ -340,11 +339,9 @@ function loadHarness(
       }
       return text;
     },
-    Monitor: { event: monitorEvent },
     window: {
       location: { pathname: options.preview ? '/preview.html' : '/index.html' },
       addEventListener() {},
-      Monitor: { event: monitorEvent },
       orkas: {
         invoke: vi.fn(async (channel: string, payload: any) => {
           invokeCalls.push({ channel, payload });
@@ -386,7 +383,6 @@ function loadHarness(
     openDialogs: () => document.body.querySelectorAll('[role="dialog"]').length,
     dialogs,
     invokeCalls,
-    monitorEvent,
     warn,
   };
 }
@@ -448,7 +444,7 @@ describe('connector actions share local operation permissions', () => {
     expect(h.openDialogs()).toBe(0);
   });
 
-  it('renders connector and operation markup as literal text and keeps it out of telemetry', async () => {
+  it('renders connector and operation markup as literal text', async () => {
     const h = loadHarness('pending');
     const markup = '<img src=x onerror=alert(1)>';
     h.emitPush('connectors:action-confirm', { ...action, connector_id: 'custom-markup', display_name: markup, action_name: markup });
@@ -457,7 +453,6 @@ describe('connector actions share local operation permissions', () => {
     expect([...h.document.body.descendants()].some((node) => node.tag === 'img')).toBe(false);
     h.document.body.querySelector('[data-act="cancel"]')!.click();
     await flush();
-    expect(JSON.stringify(h.monitorEvent.mock.calls)).not.toContain(markup);
     expect(h.invokeCalls).toContainEqual({
       channel: 'connectors.action_confirm_response', payload: { request_id: action.request_id, approved: false },
     });
@@ -502,9 +497,6 @@ describe('connector actions share local operation permissions', () => {
     expect(h.openDialogs()).toBe(0);
     expect(h.dialogs).toHaveLength(1);
     expect(h.invokeCalls.every((call) => call.channel === 'permissions.getLocalExec')).toBe(true);
-    const outcomes = h.monitorEvent.mock.calls.filter(([name]) => name === 'connector_action_confirmation_result');
-    expect(outcomes).toHaveLength(2);
-    for (const [, outcome] of outcomes) expect(outcome).toMatchObject({ decision: 'approved', result: 'success' });
   });
 
   it.each(['built-in', 'codex', 'claude'])('shows the local mode menu for %s connector calls', async (caller) => {
@@ -533,32 +525,6 @@ describe('connector actions share local operation permissions', () => {
       { channel: 'permissions.getLocalExec', payload: undefined },
       { channel: 'connectors.action_confirm_response', payload: { request_id: action.request_id, approved: true } },
     ]);
-    expect(h.monitorEvent).toHaveBeenCalledWith('connector_action_confirmation_result', expect.objectContaining({
-      result: 'success', decision: 'approved',
-    }));
-    expect(JSON.stringify(h.monitorEvent.mock.calls)).not.toMatch(/private-message|Work account|im\.\+messages-send/);
-  });
-
-  it('coarsens a custom MCP connector to `custom` and omits its tool name in confirmation telemetry', async () => {
-    // Custom ids are derived from the user's display name and the tool name is
-    // the server's own free text; neither belongs in analytics. Catalog
-    // connectors keep both (negative control).
-    const h = loadHarness('allow_once');
-    h.emitPush('connectors:action-confirm', {
-      ...action, request_id: 'custom-request', connector_id: 'custom-my-private-server', tool_name: 'run_private_query',
-    });
-    await flush();
-    const custom = h.monitorEvent.mock.calls.find((call: any[]) => call[0] === 'connector_action_confirmation_result');
-    expect(custom?.[1]).toMatchObject({ connector_id: 'custom', decision: 'approved' });
-    expect(custom?.[1]).not.toHaveProperty('tool_name');
-    expect(JSON.stringify(h.monitorEvent.mock.calls)).not.toMatch(/my-private-server|run_private_query/);
-
-    h.monitorEvent.mockClear();
-    h.emitPush('connectors:action-confirm', { ...action, request_id: 'catalog-request' });
-    await flush();
-    expect(h.monitorEvent).toHaveBeenCalledWith('connector_action_confirmation_result', expect.objectContaining({
-      connector_id: 'feishu', tool_name: 'execute_high_impact',
-    }));
   });
 
   it('persists Trusted before approval and does not prompt again for an already queued connector', async () => {
@@ -636,7 +602,7 @@ describe('connector actions share local operation permissions', () => {
     expect(h.invokeCalls.some((call) => call.channel === 'connectors.action_confirm_response')).toBe(false);
   });
 
-  it.each(['stale', 'rejected', 'unavailable'])('reports a %s approval response without success or private errors', async (failure) => {
+  it.each(['stale', 'rejected', 'unavailable'])('handles a %s approval response without exposing private errors', async (failure) => {
     const h = loadHarness('allow_once', async (channel) => {
       if (channel === 'permissions.getLocalExec') return { ok: true, mode: 'all_files_approval' };
       if (failure === 'unavailable') throw new Error('/private/approval-response');
@@ -644,10 +610,7 @@ describe('connector actions share local operation permissions', () => {
     });
     h.emitPush('connectors:action-confirm', action);
     await flush();
-    expect(h.monitorEvent).toHaveBeenCalledWith('connector_action_confirmation_result', expect.objectContaining({
-      result: failure === 'stale' ? 'cancelled' : 'failure',
-    }));
-    expect(JSON.stringify([h.monitorEvent.mock.calls, h.warn.mock.calls])).not.toContain('/private/approval-response');
+    expect(JSON.stringify(h.warn.mock.calls)).not.toContain('/private/approval-response');
   });
 
   it('denies a broken dialog and still presents the next queued action', async () => {
@@ -661,11 +624,8 @@ describe('connector actions share local operation permissions', () => {
       { channel: 'connectors.action_confirm_response', payload: { request_id: action.request_id, approved: false } },
       { channel: 'connectors.action_confirm_response', payload: { request_id: 'after-ui-recovery', approved: true } },
     ]);
-    expect(h.monitorEvent).toHaveBeenCalledWith('connector_action_confirmation_result', expect.objectContaining({
-      result: 'failure', decision: 'denied',
-    }));
     expect(h.dialogs).toHaveLength(1);
-    expect(JSON.stringify([h.monitorEvent.mock.calls, h.warn.mock.calls])).not.toContain('/private/dialog-failure');
+    expect(JSON.stringify(h.warn.mock.calls)).not.toContain('/private/dialog-failure');
   });
 });
 
@@ -773,12 +733,6 @@ describe('renderer bash permission prompt', () => {
         permission_policy: 'ask',
       },
     }]);
-    expect(h.monitorEvent).toHaveBeenCalledWith('connector_bridge_permission_result', {
-      result: 'success',
-      decision: 'allow_run',
-      effective_decision: 'allow_run',
-      duration_ms: expect.any(Number),
-    });
   });
 
   it('returns a changed CLI full-access level through the native approval response', async () => {
@@ -934,13 +888,6 @@ describe('renderer bash permission prompt', () => {
       { error_type: 'Error' },
     );
     expect(JSON.stringify(h.warn.mock.calls)).not.toContain('/private/workspace');
-    expect(h.monitorEvent).toHaveBeenCalledWith('connector_bridge_permission_result', expect.objectContaining({
-      result: 'failure',
-      decision: 'deny',
-      effective_decision: 'deny',
-      error_code: 'response_failed',
-      error_type: 'ipc',
-    }));
   });
 
   it('offers task-level approval when main marks the risk category eligible', async () => {
@@ -984,51 +931,6 @@ describe('renderer bash permission prompt', () => {
       { channel: 'permissions.setLocalExecMode', payload: { mode: 'all_files_auto' } },
       { channel: 'bash.permission_response', payload: { request_id: 'req-1', decision: 'allow_once' } },
     ]);
-    expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_result', expect.objectContaining({
-      result: 'success',
-      decision: 'allow_once',
-      effective_decision: 'allow_once',
-      mode: 'all_files_auto',
-      mode_changed: true,
-      categories: 'network_egress',
-      duration_ms: expect.any(Number),
-    }));
-    expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_requested', {
-      categories: 'network_egress',
-      visibility_state: 'unknown',
-    });
-    expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_presented', expect.objectContaining({
-      categories: 'network_egress',
-      mode: 'all_files_approval',
-      visibility_state: 'unknown',
-      queue_wait_ms: expect.any(Number),
-    }));
-    expect(h.monitorEvent.mock.calls
-      .map(([name]) => name)
-      .filter((name) => name.startsWith('bash_risk_prompt_'))).toEqual([
-      'bash_risk_prompt_requested',
-      'bash_risk_prompt_presented',
-      'bash_risk_prompt_result',
-    ]);
-  });
-
-  it.each([
-    ['a focused window', { state: 'visible', focused: true } as const, 'visible_focused'],
-    ['an unfocused window', { state: 'visible', focused: false } as const, 'visible_unfocused'],
-    ['a hidden window', { state: 'hidden', focused: true } as const, 'hidden'],
-  ])('records bounded visibility when presenting in %s', async (_label, visibility, expectedState) => {
-    const h = loadHarness('deny', undefined, { visibility });
-
-    h.pushHandler({ request_id: `req-${expectedState}`, reasons: ['destructive'] });
-    await flush();
-
-    expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_requested', expect.objectContaining({
-      visibility_state: expectedState,
-    }));
-    expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_presented', expect.objectContaining({
-      visibility_state: expectedState,
-    }));
-    expect(h.monitorEvent.mock.calls.filter(([name]) => name === 'bash_risk_prompt_result')).toHaveLength(1);
   });
 
   // A user who deliberately turned prompts off and then sees one has to be
@@ -1093,35 +995,6 @@ describe('renderer bash permission prompt', () => {
     expect(h.dialogs[0].message).not.toContain('cannot be undone');
   });
 
-  it('keeps private prompt fields and unknown categories out of telemetry', async () => {
-    const privatePath = '/private/workspace/customer-secret.txt';
-    const h = loadHarness('deny');
-
-    h.pushHandler({
-      request_id: 'req-private-identifier',
-      agent_id: 'private-agent-identifier',
-      agent_name: 'Private Agent Name',
-      command: `rm ${privatePath}`,
-      operation: 'delete_file',
-      subject: privatePath,
-      reasons: ['destructive', 'unbounded-private-category', 'destructive'],
-      cid: 'private-conversation-identifier',
-    });
-    await flush();
-
-    const serialized = JSON.stringify(h.monitorEvent.mock.calls);
-    expect(serialized).not.toContain(privatePath);
-    expect(serialized).not.toContain('private-agent-identifier');
-    expect(serialized).not.toContain('Private Agent Name');
-    expect(serialized).not.toContain('private-conversation-identifier');
-    expect(serialized).not.toContain('req-private-identifier');
-    expect(serialized).not.toContain('unbounded-private-category');
-    expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_requested', {
-      categories: 'destructive',
-      visibility_state: 'unknown',
-    });
-  });
-
   it.each([
     'network_egress',
     'destructive',
@@ -1144,13 +1017,6 @@ describe('renderer bash permission prompt', () => {
       { channel: 'permissions.getLocalExec', payload: undefined },
       { channel: 'bash.permission_response', payload: { request_id: `req-${reason}`, decision: 'allow_run' } },
     ]);
-    expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_result', expect.objectContaining({
-      result: 'success',
-      decision: 'allow_run',
-      effective_decision: 'allow_run',
-      mode: 'all_files_approval',
-      mode_changed: false,
-    }));
   });
 
   // The rendered dialog is the approval boundary: a strict category gets no
@@ -1276,16 +1142,9 @@ describe('renderer bash permission prompt', () => {
       { channel: 'permissions.setLocalExecMode', payload: { mode: 'all_files_auto' } },
       { channel: 'bash.permission_response', payload: { request_id: 'req-mode-failed', decision: 'deny' } },
     ]);
-    expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_result', expect.objectContaining({
-      result: 'success',
-      decision: 'allow_once',
-      effective_decision: 'deny',
-      mode: 'all_files_approval',
-      mode_changed: false,
-    }));
   });
 
-  it('marks a verdict cancelled when main reports that the request is stale', async () => {
+  it('sends the selected response even when main reports that the request is stale', async () => {
     const h = loadHarness('allow_once', async (channel) => {
       if (channel === 'permissions.getLocalExec') return { ok: true, mode: 'all_files_approval' };
       if (channel === 'bash.permission_response') return { ok: true, handled: false };
@@ -1300,16 +1159,13 @@ describe('renderer bash permission prompt', () => {
     });
     await flush();
 
-    expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_result', expect.objectContaining({
-      result: 'cancelled',
-      decision: 'allow_once',
-      effective_decision: 'allow_once',
-      error_type: 'state',
-      error_code: 'stale_request',
-    }));
+    expect(h.invokeCalls).toContainEqual({
+      channel: 'bash.permission_response',
+      payload: { request_id: 'req-stale', decision: 'allow_once' },
+    });
   });
 
-  it('keeps a resolved IPC rejection in the terminal failure denominator', async () => {
+  it('contains a resolved IPC rejection without exposing its private error', async () => {
     const h = loadHarness('deny', async (channel) => {
       if (channel === 'permissions.getLocalExec') return { ok: true, mode: 'all_files_approval' };
       if (channel === 'bash.permission_response') return { ok: false, error: '/private/request' };
@@ -1324,13 +1180,11 @@ describe('renderer bash permission prompt', () => {
     });
     await flush();
 
-    expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_result', expect.objectContaining({
-      result: 'failure',
-      decision: 'deny',
-      error_type: 'ipc',
-      error_code: 'response_failed',
-    }));
-    expect(JSON.stringify(h.monitorEvent.mock.calls)).not.toContain('/private/request');
+    expect(h.invokeCalls).toContainEqual({
+      channel: 'bash.permission_response',
+      payload: { request_id: 'req-rejected', decision: 'deny' },
+    });
+    expect(JSON.stringify(h.warn.mock.calls)).not.toContain('/private/request');
   });
 
   it('closes a cancelled prompt without sending a stale renderer response', async () => {
@@ -1350,19 +1204,9 @@ describe('renderer bash permission prompt', () => {
     expect(h.invokeCalls).toEqual([
       { channel: 'permissions.getLocalExec', payload: undefined },
     ]);
-    expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_requested', expect.any(Object));
-    expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_presented', expect.any(Object));
-    expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_result', expect.objectContaining({
-      result: 'cancelled',
-      decision: 'none',
-      effective_decision: 'deny',
-      error_type: 'state',
-      error_code: 'request_cancelled',
-    }));
-    expect(h.monitorEvent.mock.calls.filter(([name]) => name === 'bash_risk_prompt_result')).toHaveLength(1);
   });
 
-  it('records cancellation during mode lookup without claiming presentation', async () => {
+  it('cancels during mode lookup without presenting or responding', async () => {
     let resolveMode!: (value: { ok: boolean; mode: string }) => void;
     const modeLookup = new Promise<{ ok: boolean; mode: string }>((resolve) => { resolveMode = resolve; });
     const h = loadHarness('deny', async (channel) => {
@@ -1380,16 +1224,9 @@ describe('renderer bash permission prompt', () => {
     expect(h.invokeCalls).toEqual([
       { channel: 'permissions.getLocalExec', payload: undefined },
     ]);
-    expect(h.monitorEvent.mock.calls.filter(([name]) => name === 'bash_risk_prompt_requested')).toHaveLength(1);
-    expect(h.monitorEvent.mock.calls.filter(([name]) => name === 'bash_risk_prompt_presented')).toHaveLength(0);
-    expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_result', expect.objectContaining({
-      result: 'cancelled',
-      error_code: 'request_cancelled',
-    }));
-    expect(h.monitorEvent.mock.calls.filter(([name]) => name === 'bash_risk_prompt_result')).toHaveLength(1);
   });
 
-  it('records a queued cancellation without claiming that its dialog was presented', async () => {
+  it('drops a queued cancellation without presenting or responding', async () => {
     const h = loadHarness('pending');
 
     h.pushHandler({ request_id: 'req-open', reasons: ['destructive'] });
@@ -1398,14 +1235,10 @@ describe('renderer bash permission prompt', () => {
     h.cancelHandler({ request_ids: ['req-queued'] });
     await flush();
 
-    const presented = h.monitorEvent.mock.calls.filter(([name]) => name === 'bash_risk_prompt_presented');
-    expect(presented).toHaveLength(1);
-    expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_result', expect.objectContaining({
-      result: 'cancelled',
-      categories: 'network_egress',
-      error_code: 'request_cancelled',
-    }));
-    expect(h.monitorEvent.mock.calls.filter(([name]) => name === 'bash_risk_prompt_result')).toHaveLength(1);
+    expect(h.dialogs).toHaveLength(1);
+    expect(h.invokeCalls).toEqual([
+      { channel: 'permissions.getLocalExec', payload: undefined },
+    ]);
   });
 
   it('declines on Escape but leaves an IME composition alone', async () => {
@@ -1469,7 +1302,7 @@ describe('web assist page actions reuse the same permission dialog', () => {
     });
   });
 
-  it('answers once without a grant and reports the verdict without page content', async () => {
+  it('answers once without a grant', async () => {
     const h = loadHarness('allow_once');
     h.emitPush('web-assist:action-confirm', handback);
     await flush();
@@ -1477,11 +1310,6 @@ describe('web assist page actions reuse the same permission dialog', () => {
       channel: 'webAssist.actionConfirmResponse',
       payload: { request_id: handback.request_id, decision: 'once' },
     });
-    expect(h.monitorEvent).toHaveBeenCalledWith('web_assist_action_confirmation_result', expect.objectContaining({
-      result: 'success', decision: 'approved', reason: 'high_impact_action', control_kind: 'button',
-    }));
-    // Origin, title and control label are user content and stay out of analytics.
-    expect(JSON.stringify(h.monitorEvent.mock.calls)).not.toMatch(/chatgpt\.com|Send prompt|ChatGPT/);
   });
 
   it('declines with a deny decision the host can distinguish from an approval', async () => {
@@ -1492,9 +1320,6 @@ describe('web assist page actions reuse the same permission dialog', () => {
       channel: 'webAssist.actionConfirmResponse',
       payload: { request_id: handback.request_id, decision: 'deny' },
     });
-    expect(h.monitorEvent).toHaveBeenCalledWith('web_assist_action_confirmation_result', expect.objectContaining({
-      decision: 'denied',
-    }));
   });
 
   it('drops a withdrawn request without answering it', async () => {

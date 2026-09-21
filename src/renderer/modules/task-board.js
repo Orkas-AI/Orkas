@@ -681,9 +681,8 @@ async function _taskBoardEdit(cid, taskId) {
   }
 }
 
-// Queued rows currently known for a conversation. Telemetry-facing (the
-// task_stop click reports how much work was waiting behind the stopped
-// execution); 0 for a conversation whose board was never observed.
+// Queued rows currently known for a conversation; 0 for a conversation whose
+// board was never observed.
 function _taskBoardQueuedCount(cid) {
   const m = cid ? _taskBoardTasks.get(cid) : null;
   if (!m) return 0;

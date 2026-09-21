@@ -121,7 +121,7 @@ const ConversationInfo = (() => {
     return { error_type: errorType, error_code: errorCode };
   }
 
-  function _trackSavedAppSaveResult(startedAt, result, path, resourceKind, failure = {}) {
+  function _logSavedAppSaveResult(startedAt, result, path, resourceKind, failure = {}) {
     const payload = {
       result,
       surface: 'conversation_info',
@@ -129,7 +129,6 @@ const ConversationInfo = (() => {
       duration_ms: Math.max(0, Date.now() - startedAt),
     };
     if (result !== 'success') Object.assign(payload, failure);
-    try { if (window.Monitor) Monitor.event('file_preview_save_app_result', payload); } catch (_) {}
     if (result === 'failure') {
       _infoLog.warn('conversation info app save failed', {
         error_type: payload.error_type,
@@ -232,7 +231,7 @@ const ConversationInfo = (() => {
     return 'unsupported';
   }
 
-  function _telemetryFileKind(name) {
+  function _fileKindForLog(name) {
     const ext = _extForName(name);
     if (ext === 'html' || ext === 'htm') return 'html';
     if (ext === 'md' || ext === 'markdown') return 'markdown';
@@ -242,11 +241,11 @@ const ConversationInfo = (() => {
     return kind;
   }
 
-  function _trackLibraryImportResult(startedAt, result, absPath, response, failure = {}) {
+  function _logLibraryImportResult(startedAt, result, absPath, response, failure = {}) {
     const payload = {
       result,
       surface: 'conversation_info',
-      kind: _telemetryFileKind(absPath),
+      kind: _fileKindForLog(absPath),
       duration_ms: Math.max(0, Date.now() - startedAt),
     };
     if (result === 'success') {
@@ -256,7 +255,6 @@ const ConversationInfo = (() => {
     } else {
       Object.assign(payload, failure);
     }
-    try { if (window.Monitor) Monitor.event('file_preview_add_library_result', payload); } catch (_) {}
     if (result === 'failure') {
       _infoLog.warn('conversation info library import failed', {
         error_type: payload.error_type,
@@ -1119,7 +1117,7 @@ const ConversationInfo = (() => {
     try {
       res = await window.orkas.invoke('library.importProduced', _fileActionPayload(absPath, cidOverride));
     } catch (err) {
-      _trackLibraryImportResult(
+      _logLibraryImportResult(
         startedAt,
         'failure',
         absPath,
@@ -1132,7 +1130,7 @@ const ConversationInfo = (() => {
       return;
     }
     if (!res || !res.ok) {
-      _trackLibraryImportResult(
+      _logLibraryImportResult(
         startedAt,
         'failure',
         absPath,
@@ -1145,7 +1143,7 @@ const ConversationInfo = (() => {
       return;
     }
 
-    _trackLibraryImportResult(startedAt, 'success', absPath, res);
+    _logLibraryImportResult(startedAt, 'success', absPath, res);
     try {
       const libraryLabel = res.scope === 'project'
         ? _label('contexts.transfer.project_library', 'Project Library')
@@ -1175,7 +1173,7 @@ const ConversationInfo = (() => {
     try {
       res = await window.orkas.invoke('savedApps.saveFromPath', _fileActionPayload(absPath, cidOverride));
     } catch (err) {
-      _trackSavedAppSaveResult(startedAt, 'failure', absPath, resourceKind, _savedAppSaveFailure(err, 'ipc'));
+      _logSavedAppSaveResult(startedAt, 'failure', absPath, resourceKind, _savedAppSaveFailure(err, 'ipc'));
       try {
         await uiAlert(_label('apps.save_failed', 'Could not save the app') + ': ' + String(err && err.message || err));
       } catch (_) {
@@ -1187,7 +1185,7 @@ const ConversationInfo = (() => {
       return;
     }
     if (!res || res.ok === false) {
-      _trackSavedAppSaveResult(startedAt, 'failure', absPath, resourceKind, _savedAppSaveFailure(res, 'operation'));
+      _logSavedAppSaveResult(startedAt, 'failure', absPath, resourceKind, _savedAppSaveFailure(res, 'operation'));
       try {
         await uiAlert(_label('apps.save_failed', 'Could not save the app') + ': ' + String((res && res.error) || 'failed'));
       } catch (_) {
@@ -1199,7 +1197,7 @@ const ConversationInfo = (() => {
       return;
     }
 
-    _trackSavedAppSaveResult(startedAt, 'success', absPath, resourceKind);
+    _logSavedAppSaveResult(startedAt, 'success', absPath, resourceKind);
     try {
       const message = _label('apps.saved_toast', 'Saved to Apps');
       if (typeof uiToast === 'function') uiToast(message, { variant: 'success' });

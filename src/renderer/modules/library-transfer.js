@@ -77,7 +77,7 @@
     return state?.loading === false && state?.destinationReady === true;
   }
 
-  function _transferFailureTelemetry(error) {
+  function _transferFailureDetails(error) {
     const raw = typeof error === 'string'
       ? error.trim()
       : String((error && (error.error_code || error.code || error.error || error.message)) || '').trim();
@@ -158,12 +158,6 @@
     const data = await root.orkas.invoke('projects.files.tree', { projectId: ref.projectId });
     if (!Array.isArray(data?.tree)) throw new Error(data?.error || 'load_failed');
     return data.tree;
-  }
-
-  function _track(name, payload, kind = 'event') {
-    void name;
-    void payload;
-    void kind;
   }
 
   async function openLibraryTransfer(opts) {
@@ -319,15 +313,8 @@
     overlay.querySelector('[data-transfer-cancel]')?.addEventListener('click', close);
     confirmBtn.addEventListener('click', async () => {
       if (!_canSubmitTransfer({ loading: loadingFolders, destinationReady }) || confirmBtn.disabled) return;
-      const startedAt = performance.now();
       confirmBtn.disabled = true;
       showError('');
-      _track('library_transfer_submit', {
-        mode,
-        source_scope: source.scope,
-        destination_scope: currentRef.scope,
-        entry_count: paths.length,
-      }, 'click');
       let result;
       try {
         result = await root.orkas.invoke('library.transfer', {
@@ -337,36 +324,14 @@
           destination: { ...currentRef, dir: targetDir },
         });
       } catch (err) {
-        const failure = _transferFailureTelemetry(err);
-        _track('library_transfer_result', {
-          result: 'failure',
-          mode,
-          source_scope: source.scope,
-          destination_scope: currentRef.scope,
-          entry_count: paths.length,
-          succeeded_count: 0,
-          failed_count: paths.length,
-          duration_ms: Math.round(performance.now() - startedAt),
-          ...failure,
-        });
+        const failure = _transferFailureDetails(err);
         transferLog.warn('library transfer failed', { mode, source_scope: source.scope, destination_scope: currentRef.scope, ...failure });
         showError(t('contexts.transfer.error_generic'));
         confirmBtn.disabled = false;
         return;
       }
       if (!result?.ok) {
-        const failure = _transferFailureTelemetry(result);
-        _track('library_transfer_result', {
-          result: 'failure',
-          mode,
-          source_scope: source.scope,
-          destination_scope: currentRef.scope,
-          entry_count: paths.length,
-          succeeded_count: 0,
-          failed_count: paths.length,
-          duration_ms: Math.round(performance.now() - startedAt),
-          ...failure,
-        });
+        const failure = _transferFailureDetails(result);
         transferLog.warn('library transfer failed', { mode, source_scope: source.scope, destination_scope: currentRef.scope, ...failure });
         showError(_errorLabel(failure.error_code));
         confirmBtn.disabled = false;
@@ -378,18 +343,7 @@
         ? 'success'
         : (succeededCount > 0 ? 'partial' : 'failure');
       const firstError = result.results?.find((row) => !row.ok)?.error;
-      const failure = resultValue === 'success' ? {} : _transferFailureTelemetry(firstError || 'transfer_failed');
-      _track('library_transfer_result', {
-        result: resultValue,
-        mode,
-        source_scope: source.scope,
-        destination_scope: currentRef.scope,
-        entry_count: paths.length,
-        succeeded_count: succeededCount,
-        failed_count: failedCount,
-        duration_ms: Math.round(performance.now() - startedAt),
-        ...failure,
-      });
+      const failure = resultValue === 'success' ? {} : _transferFailureDetails(firstError || 'transfer_failed');
       if (succeededCount === 0) {
         transferLog.warn('library transfer failed', { mode, source_scope: source.scope, destination_scope: currentRef.scope, ...failure });
         showError(_errorLabel(firstError));
@@ -428,7 +382,7 @@
       _folderRows,
       _projectsFromResponse,
       _canSubmitTransfer,
-      _transferFailureTelemetry,
+      _transferFailureDetails,
       _createLatestFolderLoader,
     };
   }

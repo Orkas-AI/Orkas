@@ -353,16 +353,6 @@ function _mveActionButton(state, action, labelKey, iconName, extraClass) {
   return `<button type="button" class="${cls}" data-mve-action="${action}" aria-label="${escapeHtml(label)}" title="${escapeHtml(label)}">${icon}</button>`;
 }
 
-function _mveTrack(action, state, data) {
-  try {
-    if (!window.Monitor) return;
-    (() => {})(action, Object.assign({
-      source: state && state.source ? String(state.source.kind || '') : '',
-      can_save: !!(state && state.caps && state.caps.save),
-    }, data || {}));
-  } catch (_) {}
-}
-
 function _mveRenderView(state) {
   state.mode = 'view';
   const bodyEl = state.bodyEl;
@@ -485,21 +475,6 @@ function _mveSourceType(source) {
   return source.cid ? 'conversation' : 'workspace';
 }
 
-function _mveTrackSaveResult(source, content, startedAt, result, errorCode = '') {
-  try {
-    if (!window.Monitor) return;
-    const payload = {
-      result,
-      surface: 'markdown_editor',
-      source_type: _mveSourceType(source),
-      char_count: String(content || '').length,
-      duration_ms: Math.max(0, Date.now() - startedAt),
-    };
-    if (result !== 'success') payload.error_code = errorCode || 'unknown';
-    Monitor.event('text_editor_save_result', payload);
-  } catch (_) {}
-}
-
 async function _mveSave(state) {
   if (state.saving && state.savePromise) return state.savePromise;
   const ta = state.bodyEl.querySelector('[data-mve-textarea]');
@@ -611,13 +586,6 @@ async function _mveToggleTask(state, lineIdx, liEl, boxEl) {
   if (liEl) liEl.classList.toggle('is-done', !wasChecked);
   if (boxEl) boxEl.checked = !wasChecked;
   const res = await _mveWriteSource(state.source, next);
-  _mveTrackSaveResult(
-    state.source,
-    next,
-    startedAt,
-    res && res.ok ? 'success' : 'failure',
-    res && res.ok ? '' : 'write_failed',
-  );
   if (!res.ok) {
     if (liEl) liEl.classList.toggle('is-done', wasChecked);
     if (boxEl) boxEl.checked = wasChecked;

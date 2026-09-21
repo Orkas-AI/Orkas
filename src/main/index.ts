@@ -1478,7 +1478,7 @@ if (!gotLock) {
         !win.isDestroyed() && win.isFocused()
       )),
       // Test and packaged-smoke launches use synthetic workspaces and must not
-      // write production analytics. Normal source and packaged runs behave alike.
+      // write lifecycle reports. Normal source and packaged runs behave alike.
       enabled: !E2E_USER_DATA_DIR && !IS_PACKAGED_LAUNCH_SMOKE,
     });
     app.once('will-quit', () => {

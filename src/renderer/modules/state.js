@@ -93,19 +93,13 @@ function _consumePendingTaskNotificationConversation() {
   return _openTaskNotificationConversation(_pendingTaskNotificationNavigation);
 }
 
-// Keep sidebar navigation independent from private analytics. The commercial
-// build decorates this boundary with click tracking; the open build still
-// needs the routing wrapper because every sidebar handler calls it.
+// Keep the shared routing wrapper because every sidebar handler calls it.
 function _setViewFromSidebar(targetView) {
   // The shell becomes clickable before asynchronous boot stages finish.
   // Preserve explicit user navigation over the later startup restore.
   if (typeof _markBootUserNavigation === 'function') _markBootUserNavigation();
   setView(targetView);
 }
-
-// Public agent creation has no analytics dependency, but its click handler
-// intentionally keeps the same hook as the commercial build.
-function _trackAgentCreateOpen() {}
 
 const _DRAFT_KEY = (cid) => `draft_${cid}`;
 
@@ -427,7 +421,6 @@ function bindStaticHandlers() {
   // Agents (grid + detail)
   // "Done" button (only visible while editing) — exits edit mode.
   document.getElementById('create-agent-btn')?.addEventListener('click', () => {
-    _trackAgentCreateOpen('agents_create_button');
     openAgentModal({
       entryPoint: 'agents_create_button',
       sourceView: currentView || '',
@@ -462,7 +455,6 @@ function bindStaticHandlers() {
   // what the button promises. Its own `entry_point` keeps the funnel separable
   // from the create button's.
   document.getElementById('agents-connect-cli-btn')?.addEventListener('click', () => {
-    _trackAgentCreateOpen('agents_connect_cli_button', { agent_type: 'cli' });
     openAgentModal({
       initialTab: 'external',
       externalOnly: true,

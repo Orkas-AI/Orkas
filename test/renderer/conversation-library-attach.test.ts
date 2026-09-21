@@ -16,7 +16,7 @@ function harness(invoke: ReturnType<typeof vi.fn>) {
   const host = { innerHTML: '', style: { display: '' }, querySelectorAll: () => [] };
   const apiFetch = vi.fn(async () => ({ json: async () => ({ ok: true }) }));
   const uiAlert = vi.fn();
-  const warn = vi.fn(), event = vi.fn(), error = vi.fn(), focus = vi.fn(), consume = vi.fn();
+  const warn = vi.fn(), conversationWarn = vi.fn(), focus = vi.fn(), consume = vi.fn();
   const context: any = vm.createContext({
     window: { orkas: { invoke } },
     document: { getElementById: () => host },
@@ -27,10 +27,9 @@ function harness(invoke: ReturnType<typeof vi.fn>) {
     _chatAttachmentRevisions: new Map(),
     _chatAttachHostIdFor: () => 'chips',
     _chatFileIconHtml: () => '',
-    _convLog: { warn },
+    _convLog: { warn: conversationWarn }, _agentsLog: { warn },
     _targetFromPickerAnchor: () => 'conversation', _resolveActiveProjectId: () => '',
     _libraryPickerDraftCidFor: () => 'main_chat', _libraryPickerInputIdForTarget: () => 'input',
-    _agentsTrackEvent: event, _agentsTrackError: error,
     _consumeAtKeyChar: consume, _focusInput: focus,
     escapeHtml: (value: string) => value,
     t: (key: string, data?: { reason?: string }) => data?.reason || key,
@@ -63,7 +62,7 @@ function harness(invoke: ReturnType<typeof vi.fn>) {
     beginSend: () => context._chatAttachTryBeginSend('main_chat'),
     apiFetch,
     uiAlert,
-    warn, event, error, focus, consume,
+    warn, focus, consume,
     select: (scope: string) => context._triggerLibraryFile({
       libraryRel: 'PRIVATE_FILE_PATH', libraryScope: scope, projectId: scope === 'project' ? 'project-test' : '',
     }, 'picker'),
@@ -140,7 +139,7 @@ describe('Library attachment draft lifecycle', () => {
     ['global', 'attachment_import', 'disk_full', 'attachment_import', 'disk_full'],
     ['project', 'attachment_import', 'operation_failed', 'attachment_import', 'operation_failed'],
     ['global', 'PRIVATE_STAGE', 'PRIVATE_KIND', 'ipc_request', 'operation_failed'],
-  ])('preserves %s/%s/%s through IPC, local logging and picker events before recovery', async (scope, stage, kind, expectedStage, expectedKind) => {
+  ])('preserves %s/%s/%s through IPC and local logging before recovery', async (scope, stage, kind, expectedStage, expectedKind) => {
     const invoke = vi.fn().mockResolvedValueOnce({
       ok: false, error: 'PRIVATE_ERROR_TEXT', failure_stage: stage, failure_kind: kind,
     }).mockResolvedValue(imported);
@@ -153,23 +152,16 @@ describe('Library attachment draft lifecycle', () => {
     expect(fixture.consume).not.toHaveBeenCalled();
     expect(fixture.uiAlert).toHaveBeenCalledExactlyOnceWith('PRIVATE_ERROR_TEXT');
     const diagnosis = { failure_stage: expectedStage, failure_kind: expectedKind };
-    expect(fixture.warn).toHaveBeenCalledExactlyOnceWith('library attachment failed', diagnosis);
-    expect(fixture.event).toHaveBeenCalledExactlyOnceWith('chat_library_attach_result', expect.objectContaining({
-      ...diagnosis, result: 'failure', scope, telemetry_version: 3,
-    }));
-    expect(fixture.error).toHaveBeenCalledExactlyOnceWith('chat_library_attach', expect.objectContaining({
-      ...diagnosis, error_type: 'operation', error_message: 'library_attach_failed', telemetry_version: 3,
-    }));
-    expect(JSON.stringify([fixture.warn.mock.calls, fixture.event.mock.calls, fixture.error.mock.calls])).not.toContain('PRIVATE_');
+    expect(fixture.warn).toHaveBeenCalledExactlyOnceWith('library attachment failed', {
+      target: 'conversation', scope, ...diagnosis,
+    });
+    expect(JSON.stringify(fixture.warn.mock.calls)).not.toContain('PRIVATE_');
     const release = fixture.beginSend();
     expect(release).toBeTypeOf('function');
     release();
     await fixture.select(scope);
     expect(fixture.names()).toEqual(['note.md']);
     expect(fixture.readyChips()).toBe(1);
-    expect(fixture.event).toHaveBeenLastCalledWith('chat_library_attach_result', expect.objectContaining({ result: 'success', scope }));
-    expect(fixture.event).toHaveBeenCalledTimes(2);
-    expect(fixture.error).toHaveBeenCalledTimes(1);
     expect(fixture.warn).toHaveBeenCalledTimes(1);
     expect(fixture.focus).toHaveBeenCalledOnce();
     expect(fixture.consume).toHaveBeenCalledOnce();

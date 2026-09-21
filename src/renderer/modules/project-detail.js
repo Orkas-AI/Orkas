@@ -25,16 +25,6 @@ const PROJECT_LIBRARY_ALLOWED_EXTS = [
   '.mp4', '.webm', '.mov', '.m4v', '.ogv',
 ];
 
-function _projectTrackClick(action, data) {
-  void action;
-  void data;
-}
-
-function _projectTrackEvent(action, data) {
-  void action;
-  void data;
-}
-
 function _projectLogFailure(action, data) {
   _projectDetailLog.warn('project detail operation failed', { action, ...(data || {}) });
 }
@@ -473,7 +463,6 @@ function _bindProjectAutoAddBtn() {
   btn.dataset.bound = '1';
   btn.addEventListener('click', () => {
     if (!_projectDetailPid || typeof openAutoTaskDialog !== 'function') return;
-    _projectTrackClick('project_auto_task_open', {});
     openAutoTaskDialog({
       projectId: _projectDetailPid,
       onSaved: () => {
@@ -631,19 +620,13 @@ function _bindProjectInstructions() {
       const res = await window.orkas.invoke('projects.instructions.set', { projectId, content });
       if (!res?.ok) {
         const failure = _projectDetailFailure(res, 'instructions_save_failed');
-        _projectTrackEvent('project_instructions_update_result', {
-          result: 'failure',
-          source: 'detail',
-          duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
-          ...failure,
-        });
         _projectLogFailure('project_instructions_update', { source: 'detail', ...failure });
         if (typeof uiAlert === 'function') uiAlert(t('project.instructions.save_failed'));
         _updateProjectInstructionsFoot();
         return;
       }
       // The user may switch projects while this save is in flight. The
-      // mutation still belongs to the captured project and its telemetry is
+      // mutation still belongs to the captured project and its result is
       // valid, but the shared detail input may already render another one.
       if (input.dataset.projectId === projectId) input.dataset.savedValue = content;
       if (projectId === _projectDetailPid && _projectDetailMeta?.instructions) {
@@ -652,19 +635,8 @@ function _bindProjectInstructions() {
       _renderProjectInstructionsRead();
       _closeProjectInstructionsEditor({ force: true });
       _setProjectInstructionsStatus(t('project.instructions.saved'));
-      _projectTrackEvent('project_instructions_update_result', {
-        result: 'success',
-        source: 'detail',
-        duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
-      });
     } catch (err) {
       const failure = _projectDetailFailure(err, 'instructions_save_exception');
-      _projectTrackEvent('project_instructions_update_result', {
-        result: 'failure',
-        source: 'detail',
-        duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
-        ...failure,
-      });
       _projectLogFailure('project_instructions_update', { source: 'detail', ...failure });
       _projectDetailLog.warn('save project instructions failed', err);
       if (typeof uiAlert === 'function') uiAlert(t('project.instructions.save_failed'));
@@ -996,16 +968,6 @@ async function _saveProjectMemoryEditor() {
     isEdit ? 'memory.replace' : 'memory.add',
     isEdit ? { oldText, content } : { content },
   );
-  _projectTrackEvent('memory_entry_save_result', {
-    result: outcome.ok ? 'success' : 'failure',
-    target: 'project',
-    mode: isEdit ? 'edit' : 'add',
-    duration_ms: Math.max(0, Date.now() - startedAt),
-    ...(outcome.ok ? {
-      chars: content.length,
-      char_count: content.length,
-    } : outcome.failure),
-  });
   if (outcome.ok) _closeProjectMemoryEditor();
 }
 
@@ -1071,12 +1033,6 @@ function _bindProjectMemory() {
       if (!confirmed) return;
       const startedAt = Date.now();
       const outcome = await _mutateProjectMemory('memory.remove', { oldText: text });
-      _projectTrackEvent('memory_entry_delete_result', {
-        result: outcome.ok ? 'success' : 'failure',
-        target: 'project',
-        duration_ms: Math.max(0, Date.now() - startedAt),
-        ...(!outcome.ok ? outcome.failure : {}),
-      });
       if (outcome.ok && _projectMemoryEditor?.oldText === text) _closeProjectMemoryEditor();
     });
   }
@@ -1730,12 +1686,6 @@ async function _saveProjectTodoEditor() {
       ...owner,
       ...(_todoEditorTid ? { taskId: _todoEditorTid } : {}),
     })), pid);
-  _projectTrackEvent('project_todo_action_result', {
-    result: outcome.ok ? 'success' : 'failure',
-    action: taskId ? 'edit' : 'create',
-    duration_ms: Math.max(0, Date.now() - startedAt),
-    ...(!outcome.ok ? outcome.failure : {}),
-  });
   if (!outcome.ok) {
     _projectLogFailure('project_todo_action', { action: taskId ? 'edit' : 'create', ...outcome.failure });
   } else if (generation === _todoEditorGeneration) {
@@ -1771,13 +1721,6 @@ async function _setTodoStatus(tid, status, context = _projectTodoContext()) {
     taskId: tid,
     status,
   }), context.pid);
-  _projectTrackEvent('project_todo_toggle_result', {
-    result: outcome.ok ? 'success' : 'failure',
-    from_status: fromStatus,
-    to_status: status,
-    duration_ms: Date.now() - startedAt,
-    ...(!outcome.ok ? outcome.failure : {}),
-  });
   if (!outcome.ok) {
     _projectLogFailure('project_todo_toggle', {
       from_status: fromStatus, to_status: status, ...outcome.failure,
@@ -1812,12 +1755,6 @@ async function _assignTodoAgent(tid, agent, context = _projectTodoContext()) {
     owner_agent: agent ? String(agent.name || '') : '',
     owner_agent_id: agent ? String(agent.agent_id || '') : '',
   }), context.pid);
-  _projectTrackEvent('project_todo_assign_result', {
-    result: outcome.ok ? 'success' : 'failure',
-    action: agent ? 'assign' : 'clear',
-    duration_ms: Date.now() - startedAt,
-    ...(!outcome.ok ? outcome.failure : {}),
-  });
   if (!outcome.ok) {
     _projectLogFailure('project_todo_assign', {
       action: agent ? 'assign' : 'clear', ...outcome.failure,
@@ -1854,10 +1791,6 @@ async function _runTodoTask(tid, context = _projectTodoContext()) {
   } finally {
     _projectTodoRunning = false;
   }
-  _projectTrackEvent('project_todo_run_result', {
-    result: ok ? 'success' : 'failure',
-    duration_ms: Date.now() - startedAt,
-  });
   if (!ok) {
     _projectLogFailure('project_todo_run', { error_type: 'run_failed' });
     if (typeof uiAlert === 'function') uiAlert(t('project.todo.run_failed'));
@@ -2090,9 +2023,6 @@ function _bindProjectDriver() {
     } finally {
       _projectDriverMutating = false;
     }
-    _projectTrackEvent('project_driver_toggle_result', {
-      result: ok ? 'success' : 'failure', enabled: next, duration_ms: Date.now() - startedAt,
-    });
     if (!ok) _projectLogFailure('project_driver_toggle', { enabled: next, error_type: 'set_failed' });
   });
 }
@@ -2240,9 +2170,6 @@ async function _removeProjectAgent(agentId) {
   if (!_projectDetailPid || !agentId) return;
   const projectId = _projectDetailPid;
   const startedAt = performance.now();
-  // One terminal result at the binding write boundary (analytics contract);
-  // the presentation refresh that follows is not part of the outcome.
-  _projectTrackClick('project_binding_remove', { binding_kind: 'agent' });
   let removed = false;
   try {
     const res = await window.orkas.invoke('projects.bindings.remove', {
@@ -2252,19 +2179,8 @@ async function _removeProjectAgent(agentId) {
     });
     if (!res?.ok) throw res || new Error('remove_failed');
     removed = true;
-    _projectTrackEvent('project_binding_remove_result', {
-      binding_kind: 'agent',
-      result: 'success',
-      duration_ms: Math.round(performance.now() - startedAt),
-    });
   } catch (err) {
     const failure = _projectDetailFailure(err, 'binding_remove_failed');
-    _projectTrackEvent('project_binding_remove_result', {
-      binding_kind: 'agent',
-      result: 'failure',
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...failure,
-    });
     _projectLogFailure('project_binding_remove', { binding_kind: 'agent', ...failure });
     _projectDetailLog.warn('remove project agent failed', err);
     return;
@@ -2882,7 +2798,6 @@ async function _openProjectFile(name, options = {}) {
   const row = _findProjectFileRow(name);
   const kind = row?.dataset?.projectFileKind || '';
   if (options.trackIntent !== false) {
-    _projectTrackClick('project_file_open', { file_kind: kind || 'other' });
   }
   _projectLibraryActiveName = name;
   _markProjectLibraryActive();
@@ -3146,7 +3061,6 @@ async function _reprocessProjectFile(name) {
   if (!_projectDetailPid || !name) return;
   const projectId = _projectDetailPid;
   const startedAt = performance.now();
-  _projectTrackClick('project_file_reprocess', {});
   try {
     _projectKbStatusByName[name] = {
       ...(_projectKbStatusByName[name] || {}),
@@ -3159,17 +3073,8 @@ async function _reprocessProjectFile(name) {
       name,
     });
     if (!res?.ok) throw res || new Error('reprocess_failed');
-    _projectTrackEvent('project_file_reprocess_result', {
-      result: 'success',
-      duration_ms: Math.round(performance.now() - startedAt),
-    });
   } catch (err) {
     const failure = _projectDetailFailure(err, 'reprocess_failed');
-    _projectTrackEvent('project_file_reprocess_result', {
-      result: 'failure',
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...failure,
-    });
     _projectLogFailure('project_file_reprocess', failure);
     _projectDetailLog.warn('reprocess project file failed', err);
     if (typeof uiAlert === 'function') uiAlert(t('project.files.reprocess_failed'));
@@ -3188,9 +3093,6 @@ async function _deleteProjectFile(name) {
     : t('contexts.file.del_confirm', { name: _projectBasename(name) });
   if (!(await uiConfirm(prompt))) return;
   const startedAt = performance.now();
-  _projectTrackClick('project_file_delete', {
-    file_kind: kind || 'other',
-  });
   let res;
   try {
     res = await window.orkas.invoke('projects.files.delete', {
@@ -3200,23 +3102,11 @@ async function _deleteProjectFile(name) {
     if (!res?.ok) throw res || new Error('delete_failed');
   } catch (err) {
     const failure = _projectDetailFailure(err, 'delete_failed');
-    _projectTrackEvent('project_file_delete_result', {
-      result: 'failure',
-      file_kind: kind || 'other',
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...failure,
-    });
     _projectLogFailure('project_file_delete', { file_kind: kind || 'other', ...failure });
     _projectDetailLog.warn('delete project file failed', err);
     if (typeof uiAlert === 'function') uiAlert(t('project.files.delete_failed'));
     return;
   }
-
-  _projectTrackEvent('project_file_delete_result', {
-    result: 'success',
-    file_kind: kind || 'other',
-    duration_ms: Math.round(performance.now() - startedAt),
-  });
   try {
     if (_projectLibraryActiveName === name || _projectLibraryActiveName.startsWith(`${name}/`)) {
       for (const key of Array.from(_projectLibraryDrafts.keys())) {
@@ -3538,9 +3428,6 @@ async function _createProjectTextFile(parentDir = '') {
   const stem = t('contexts.new.untitled_stem');
   const fullPath = _projectJoinPath(parentDir, `${stem}.md`);
   const startedAt = performance.now();
-  _projectTrackClick('project_file_create_text', {
-    has_target_dir: !!parentDir,
-  });
   let createdName = fullPath;
   try {
     const res = await window.orkas.invoke('projects.files.createText', {
@@ -3551,23 +3438,11 @@ async function _createProjectTextFile(parentDir = '') {
     createdName = res.info?.relPath || res.info?.name || fullPath;
   } catch (err) {
     const failure = _projectDetailFailure(err, 'create_text_failed');
-    _projectTrackEvent('project_file_create_text_result', {
-      result: 'failure',
-      has_target_dir: !!parentDir,
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...failure,
-    });
     _projectLogFailure('project_file_create_text', { has_target_dir: !!parentDir, ...failure });
     _projectDetailLog.warn('create project text failed', err);
     if (typeof uiAlert === 'function') uiAlert(t('contexts.file.create_failed'));
     return;
   }
-
-  _projectTrackEvent('project_file_create_text_result', {
-    result: 'success',
-    has_target_dir: !!parentDir,
-    duration_ms: Math.round(performance.now() - startedAt),
-  });
   try {
     if (parentDir) _projectLibraryExpanded.add(parentDir);
     _projectLibraryActiveName = createdName;
@@ -3590,9 +3465,6 @@ async function _createProjectDir(parentDir = '') {
   }
   const rel = _projectJoinPath(parentDir, nameRaw);
   const startedAt = performance.now();
-  _projectTrackClick('project_folder_create', {
-    has_target_dir: !!parentDir,
-  });
   let createdPath = rel;
   try {
     const res = await window.orkas.invoke('projects.files.mkdir', {
@@ -3603,23 +3475,11 @@ async function _createProjectDir(parentDir = '') {
     createdPath = res.path || rel;
   } catch (err) {
     const failure = _projectDetailFailure(err, 'create_folder_failed');
-    _projectTrackEvent('project_folder_create_result', {
-      result: 'failure',
-      has_target_dir: !!parentDir,
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...failure,
-    });
     _projectLogFailure('project_folder_create', { has_target_dir: !!parentDir, ...failure });
     _projectDetailLog.warn('create project folder failed', err);
     if (typeof uiAlert === 'function') uiAlert(t('contexts.dir.create_failed'));
     return;
   }
-
-  _projectTrackEvent('project_folder_create_result', {
-    result: 'success',
-    has_target_dir: !!parentDir,
-    duration_ms: Math.round(performance.now() - startedAt),
-  });
   try {
     if (parentDir) _projectLibraryExpanded.add(parentDir);
     _projectLibraryExpanded.add(createdPath);
@@ -3688,13 +3548,6 @@ async function _handleProjectLibraryMove(srcName, targetDir) {
   const next = _projectJoinPath(targetDir, base);
   if (next === srcName) return;
   if (targetDir === srcName || targetDir.startsWith(`${srcName}/`)) {
-    _projectTrackEvent('project_file_move_result', {
-      result: 'blocked',
-      entry_type: 'dir',
-      has_target_dir: !!targetDir,
-      error_code: 'invalid_target',
-      error_type: 'validation',
-    });
     if (typeof uiAlert === 'function') await uiAlert(t('contexts.dnd.invalid_self'));
     return;
   }
@@ -3712,13 +3565,6 @@ async function _handleProjectLibraryMove(srcName, targetDir) {
     actual = res.name || next;
   } catch (err) {
     const failure = _projectDetailFailure(err, 'move_failed');
-    _projectTrackEvent('project_file_move_result', {
-      result: 'failure',
-      entry_type: entryType,
-      has_target_dir: !!targetDir,
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...failure,
-    });
     _projectLogFailure('project_file_move', {
       entry_type: entryType,
       has_target_dir: !!targetDir,
@@ -3733,13 +3579,6 @@ async function _handleProjectLibraryMove(srcName, targetDir) {
     }
     return;
   }
-
-  _projectTrackEvent('project_file_move_result', {
-    result: 'success',
-    entry_type: entryType,
-    has_target_dir: !!targetDir,
-    duration_ms: Math.round(performance.now() - startedAt),
-  });
   try {
     _applyProjectLibraryPathChange(srcName, actual, targetDir);
     if (projectId === _projectDetailPid) await loadProjectDetail(projectId);
@@ -3768,9 +3607,6 @@ async function _renameProjectFile(name) {
   const kind = row?.dataset?.projectFileKind || '';
   const startedAt = performance.now();
   let failureKey = 'contexts.entry.rename_failed';
-  _projectTrackClick('project_file_rename', {
-    file_kind: kind || 'other',
-  });
   let actual = next;
   try {
     const res = await window.orkas.invoke('projects.files.rename', {
@@ -3785,23 +3621,11 @@ async function _renameProjectFile(name) {
     actual = res.name || next;
   } catch (err) {
     const failure = _projectDetailFailure(err, 'rename_file_failed');
-    _projectTrackEvent('project_file_rename_result', {
-      result: 'failure',
-      file_kind: kind || 'other',
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...failure,
-    });
     _projectLogFailure('project_file_rename', { file_kind: kind || 'other', ...failure });
     _projectDetailLog.warn('rename project file failed', err);
     if (typeof uiAlert === 'function') uiAlert(t(failureKey));
     return;
   }
-
-  _projectTrackEvent('project_file_rename_result', {
-    result: 'success',
-    file_kind: kind || 'other',
-    duration_ms: Math.round(performance.now() - startedAt),
-  });
   try {
     _applyProjectLibraryPathChange(name, actual, parentDir);
     if (projectId === _projectDetailPid) await loadProjectDetail(projectId);
@@ -3923,7 +3747,6 @@ async function _uploadProjectFiles(fileList, targetDir = '', source = 'drop') {
   if (targetDir) _projectLibraryExpanded.add(targetDir);
   const payload = _projectFileUploadPayload(files, source, targetDir);
   const startedAt = performance.now();
-  _projectTrackClick('project_file_upload', payload);
   _setProjectFilesStatus(t('project.files.uploading'));
   const hiddenRejected = files
     .filter((file) => _projectUploadHasHiddenPath(file))
@@ -3978,15 +3801,6 @@ async function _uploadProjectFiles(fileList, targetDir = '', source = 'drop') {
       error_type: rejectedCount && !failed.length ? 'validation' : 'operation',
     }
     : {};
-  _projectTrackEvent('project_file_upload_result', {
-    ...payload,
-    result: unsuccessfulCount ? (unsuccessfulCount < files.length ? 'partial_failure' : 'failure') : 'success',
-    uploaded_count: Math.max(0, uploadable.length - failed.length),
-    failed_count: unsuccessfulCount,
-    rejected_count: rejectedCount,
-    duration_ms: Math.round(performance.now() - startedAt),
-    ...uploadFailure,
-  });
   if (unsuccessfulCount) {
     _projectLogFailure('project_file_upload', {
       source,
@@ -4022,7 +3836,6 @@ async function _uploadProjectFilesNative(targetDir = '') {
   if (targetDir) _projectLibraryExpanded.add(targetDir);
   const payload = { source: 'picker', has_target_dir: !!targetDir };
   const startedAt = performance.now();
-  _projectTrackClick('project_file_upload', payload);
   _setProjectFilesStatus(t('project.files.uploading'));
   let data;
   try {
@@ -4033,14 +3846,6 @@ async function _uploadProjectFilesNative(targetDir = '') {
   } catch (err) {
     _setProjectFilesStatus('');
     const failure = _projectDetailFailure(err, 'picker_failed');
-    _projectTrackEvent('project_file_upload_result', {
-      ...payload,
-      result: 'failure',
-      uploaded_count: 0,
-      failed_count: 1,
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...failure,
-    });
     _projectLogFailure('project_file_upload', { source: 'picker', ...failure });
     if (typeof uiAlert === 'function') {
       await uiAlert(t('contexts.upload_picker_failed'));
@@ -4050,42 +3855,16 @@ async function _uploadProjectFilesNative(targetDir = '') {
   _setProjectFilesStatus('');
   if (!data?.ok) {
     const failure = _projectDetailFailure(data, 'picker_failed');
-    _projectTrackEvent('project_file_upload_result', {
-      ...payload,
-      result: 'failure',
-      uploaded_count: 0,
-      failed_count: 1,
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...failure,
-    });
     _projectLogFailure('project_file_upload', { source: 'picker', ...failure });
     if (typeof uiAlert === 'function') await uiAlert(t('contexts.upload_picker_failed'));
     return;
   }
   if (data.cancelled) {
-    _projectTrackEvent('project_file_upload_result', {
-      ...payload,
-      result: 'cancelled',
-      uploaded_count: 0,
-      failed_count: 0,
-      file_count: 0,
-      duration_ms: Math.round(performance.now() - startedAt),
-      error_code: 'picker_cancelled',
-    });
     return;
   }
   const rows = Array.isArray(data && data.files) ? data.files : [];
   const failed = rows.filter((r) => !r || r.ok === false);
   const pickerFailure = failed.length ? { error_code: 'upload_failed', error_type: 'operation' } : {};
-  _projectTrackEvent('project_file_upload_result', {
-    ...payload,
-    result: failed.length ? (failed.length < rows.length ? 'partial_failure' : 'failure') : 'success',
-    uploaded_count: Math.max(0, rows.length - failed.length),
-    failed_count: failed.length,
-    file_count: rows.length,
-    duration_ms: Math.round(performance.now() - startedAt),
-    ...pickerFailure,
-  });
   if (failed.length) {
     _projectLogFailure('project_file_upload', {
       source: 'picker',
@@ -4131,39 +3910,7 @@ async function _submitProjectChat() {
     ? _chatAttachList(draftCid)
     : [];
   let intendedAttachmentCount = draftItems.filter((item) => item && item.status !== 'error').length;
-  const modelTelemetry = typeof _chatModelTelemetryContext === 'function'
-    ? _chatModelTelemetryContext()
-    : {};
-  const sendAttemptStartedAt = performance.now();
-  const commonSendPayload = {
-    source_view: 'project',
-    content_length: requestText.length,
-    recipient_type: recipientType,
-    has_skill: pendingUseSelections.some((sel) => sel.kind === 'skill'),
-    has_connector: pendingUseSelections.some((sel) => sel.kind === 'connector'),
-    attachment_count: intendedAttachmentCount,
-    ...modelTelemetry,
-  };
-  _projectTrackClick('project_chat_send', {
-    ...commonSendPayload,
-  });
-  _projectTrackClick('chat_send', commonSendPayload);
   if (typeof ensureModelConfigured === 'function' && !ensureModelConfigured()) {
-    const resultPayload = {
-      result: 'failure',
-      source_view: 'project',
-      content_length: requestText.length,
-      attachment_count: intendedAttachmentCount,
-      duration_ms: Math.max(0, Math.round(performance.now() - sendAttemptStartedAt)),
-      failure_stage: 'preflight',
-      failure_reason: 'model_not_configured',
-      ...modelTelemetry,
-    };
-    if (typeof _trackChatSendResult === 'function') {
-      _trackChatSendResult('failure', resultPayload);
-    } else {
-      _projectTrackEvent('chat_send_result', resultPayload);
-    }
     return;
   }
   const releaseAttachmentSend = typeof _chatAttachTryBeginSend === 'function'
@@ -4172,21 +3919,6 @@ async function _submitProjectChat() {
       ? null
       : (() => {}));
   if (!releaseAttachmentSend) {
-    const resultPayload = {
-      result: 'failure',
-      source_view: 'project',
-      content_length: requestText.length,
-      attachment_count: intendedAttachmentCount,
-      duration_ms: Math.max(0, Math.round(performance.now() - sendAttemptStartedAt)),
-      failure_stage: 'preflight',
-      failure_reason: 'attachment_uploading',
-      ...modelTelemetry,
-    };
-    if (typeof _trackChatSendResult === 'function') {
-      _trackChatSendResult('failure', resultPayload);
-    } else {
-      _projectTrackEvent('chat_send_result', resultPayload);
-    }
     if (typeof uiAlert === 'function') await uiAlert(t('chat.attach_still_uploading'));
     return;
   }
@@ -4195,21 +3927,6 @@ async function _submitProjectChat() {
     : { ok: true, items: draftItems };
   if (!attachmentSnapshot.ok) {
     releaseAttachmentSend();
-    const resultPayload = {
-      result: 'failure',
-      source_view: 'project',
-      content_length: requestText.length,
-      attachment_count: intendedAttachmentCount,
-      duration_ms: Math.max(0, Math.round(performance.now() - sendAttemptStartedAt)),
-      failure_stage: 'preflight',
-      failure_reason: 'attachment_adopt_failed',
-      ...modelTelemetry,
-    };
-    if (typeof _trackChatSendResult === 'function') {
-      _trackChatSendResult('failure', resultPayload);
-    } else {
-      _projectTrackEvent('chat_send_result', resultPayload);
-    }
     if (typeof uiAlert === 'function') await uiAlert(t('chat.attach_sync_failed'));
     return;
   }
@@ -4256,21 +3973,6 @@ async function _submitProjectChat() {
     }
     createdConversation = conv;
   } catch (err) {
-    const resultPayload = {
-      result: 'failure',
-      source_view: 'project',
-      content_length: requestText.length,
-      attachment_count: intendedAttachmentCount,
-      duration_ms: Math.max(0, Math.round(performance.now() - sendAttemptStartedAt)),
-      failure_stage: 'conversation_create',
-      failure_reason: 'conversation_create_failed',
-      ...modelTelemetry,
-    };
-    if (typeof _trackChatSendResult === 'function') {
-      _trackChatSendResult('failure', resultPayload);
-    } else {
-      _projectTrackEvent('chat_send_result', resultPayload);
-    }
     if (typeof uiAlert === 'function') {
       await uiAlert(t('chat.create_conv_failed_with_reason', { reason: err?.message || err }));
     }
@@ -4326,21 +4028,6 @@ async function _submitProjectChat() {
       _projectDetailLog.warn('discard empty project conversation failed', {
         error_code: 'discard_empty_failed',
       });
-    }
-    const resultPayload = {
-      result: 'failure',
-      source_view: 'project',
-      content_length: requestText.length,
-      attachment_count: intendedAttachmentCount,
-      duration_ms: Math.max(0, Math.round(performance.now() - sendAttemptStartedAt)),
-      failure_stage: 'preflight',
-      failure_reason: 'attachment_adopt_failed',
-      ...modelTelemetry,
-    };
-    if (typeof _trackChatSendResult === 'function') {
-      _trackChatSendResult('failure', resultPayload);
-    } else {
-      _projectTrackEvent('chat_send_result', resultPayload);
     }
     if (typeof uiAlert === 'function') {
       await uiAlert(t('chat.attach_adopt_failed', { reason: adoptionError }));
@@ -4438,11 +4125,6 @@ function _projectBindingSourceHtml(source) {
 async function _openAddPicker() {
   // Dispose any previously-open picker so re-clicks don't stack.
   document.getElementById('project-binding-picker-overlay')?.remove();
-  // `binding_kind` stays on the wire as a constant so the existing PMS
-  // Project funnel keeps reading these rows across the removal.
-  _projectTrackClick('project_binding_picker_open', {
-    binding_kind: 'agent',
-  });
 
   let candidates;
   try {
@@ -4536,19 +4218,11 @@ async function _openAddPicker() {
         const k = row.dataset.kind;
         const projectId = _projectDetailPid;
         const startedAt = performance.now();
-        _projectTrackClick('project_binding_add', {
-          binding_kind: k,
-        });
         try {
           const res = await window.orkas.invoke('projects.bindings.add', {
             projectId, kind: k, id,
           });
           if (!res?.ok) throw res || new Error('add_failed');
-          _projectTrackEvent('project_binding_add_result', {
-            binding_kind: k,
-            result: 'success',
-            duration_ms: Math.round(performance.now() - startedAt),
-          });
           // Drop the picked id from the local candidate set so it
           // disappears from subsequent renders without a server round-trip.
           candidates = candidates.filter((c) => {
@@ -4563,12 +4237,6 @@ async function _openAddPicker() {
           }
         } catch (err) {
           const failure = _projectDetailFailure(err, 'binding_add_failed');
-          _projectTrackEvent('project_binding_add_result', {
-            binding_kind: k,
-            result: 'failure',
-            duration_ms: Math.round(performance.now() - startedAt),
-            ...failure,
-          });
           _projectLogFailure('project_binding_add', { binding_kind: k, ...failure });
           _projectDetailLog.warn('add binding failed', err);
         }
@@ -4626,9 +4294,6 @@ async function _commitRename(newName) {
   let failure = null;
   const startedAt = performance.now();
   _projectRenameCommitInFlight = true;
-  _projectTrackClick('project_rename_submit', {
-    source: 'detail',
-  });
   try {
     const res = await window.orkas.invoke('projects.rename', {
       projectId: _projectDetailPid, name: trimmed,
@@ -4637,11 +4302,6 @@ async function _commitRename(newName) {
       code = (res && res.error) || 'generic';
       failure = _projectDetailFailure(res, 'rename_failed');
     } else {
-      _projectTrackEvent('project_rename_result', {
-        result: 'success',
-        source: 'detail',
-        duration_ms: Math.round(performance.now() - startedAt),
-      });
       _projectDetailMeta.project = res.project;
       if (typeof loadProjects === 'function') loadProjects(true);
       _exitRenameMode();
@@ -4653,12 +4313,6 @@ async function _commitRename(newName) {
     code = (err && err.message) || 'generic';
     failure = _projectDetailFailure(err, 'rename_exception');
   }
-  _projectTrackEvent('project_rename_result', {
-    result: 'failure',
-    source: 'detail',
-    duration_ms: Math.round(performance.now() - startedAt),
-    ...(failure || _projectDetailFailure(null, 'rename_failed')),
-  });
   _projectLogFailure('project_rename', {
     source: 'detail',
     ...(failure || _projectDetailFailure(null, 'rename_failed')),

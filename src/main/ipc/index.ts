@@ -2207,7 +2207,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'previewWindows.ready': async (_payload, ctx) => { previewWindows.readyPreview(ctx.userId, ctx.sender); return {}; },
   'previewWindows.replace': async (payload, ctx) => { await previewWindows.replacePreview(ctx.userId, ctx.sender, payload.accepted); return {}; },
   'previewWindows.setDirty': async (payload, ctx) => { previewWindows.setPreviewDirty(ctx.userId, ctx.sender, payload.dirty); return {}; },
-  'previewWindows.report': async (payload, ctx) => { previewWindows.reportPreview(ctx.userId, ctx.sender, payload); return {}; },
+  'previewWindows.filesChanged': async (_payload, ctx) => { previewWindows.notifyPreviewFilesChanged(ctx.userId, ctx.sender); return {}; },
   'previewWindows.close': async (_payload, ctx) => { previewWindows.closePreview(ctx.userId, ctx.sender); return {}; },
   'previewWindows.requestOwner': async (payload, ctx) => previewWindows.requestPreviewOwner(ctx.userId, ctx.sender, payload),
   'previewWindows.resolveOwner': async (payload, ctx) => { previewWindows.resolvePreviewOwner(ctx.sender, payload); return {}; },
@@ -3341,7 +3341,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // Diagnose a failed <img>/<video> request without returning or reporting a
-  // local path. Monitor uses the stable reason to distinguish missing/moved
+  // local path. The stable reason distinguishes missing/moved
   // files from unsupported/oversized media and browser decode/stream errors.
   'media.diagnose': async ({ url, diagnosticOnly }, ctx) => {
     let parsed: URL;

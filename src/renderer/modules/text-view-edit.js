@@ -144,15 +144,6 @@ function _tveRender(state) {
   else _tveRenderView(state);
 }
 
-function _tveTrack(action, state, data) {
-  try {
-    if (!window.Monitor) return;
-    (() => {})(action, Object.assign({
-      can_save: !!(state && state.caps && state.caps.save),
-    }, data || {}));
-  } catch (_) {}
-}
-
 function _tveRenderView(state) {
   state.mode = 'view';
   state.bodyEl.innerHTML = `<pre class="chat-file-viewer-text">${escapeHtml(state.content)}</pre>`;

@@ -15,14 +15,6 @@
 
 const _projectsLog = createLogger('projects');
 
-function _projectsTrackClick(action, data) {
-  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
-}
-
-function _projectsTrackEvent(action, data) {
-  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
-}
-
 function _projectsLogFailure(action, data) {
   _projectsLog.warn('project operation failed', { action, ...(data || {}) });
 }
@@ -416,7 +408,6 @@ function _bindProjectsHandlers(container) {
         return;
       }
       if (!_isProjectSelected(pid)) {
-        _projectsTrackClick('project_open', {});
         if (typeof setView === 'function') setView('project', pid);
         renderProjectsSection();
         return;
@@ -472,7 +463,6 @@ window.addEventListener('sidebar-section-toggle', (event) => {
 function _startProjectInlineCreate() {
   if (_projectsInlineCreate) return;
   if (_projectsInlineRenameSubmitting) return;
-  _projectsTrackClick('project_create_open', {});
   _projectsInlineRenamePid = null;
   _projectsInlineRenameOriginal = '';
   _projectsInlineRenameDraft = '';
@@ -518,17 +508,11 @@ function _bindInlineCreateInput(input) {
     _projectsInlineCreateError = '';
     const requestId = ++_projectsInlineCreateRequestId;
     const startedAt = performance.now();
-    _projectsTrackClick('project_create_submit', {});
     try {
       const res = await window.orkas.invoke('projects.create', { name });
       if (requestId !== _projectsInlineCreateRequestId || !_projectsInlineCreate) return;
       if (!res || !res.ok) {
         const failure = _projectsFailureDetail(res, 'create_failed');
-        _projectsTrackEvent('project_create_result', {
-          result: 'failure',
-          duration_ms: Math.round(performance.now() - startedAt),
-          ...failure,
-        });
         _projectsLogFailure('project_create', failure);
         _projectsInlineCreateSubmitting = false;
         _showProjectInlineCreateError(res && res.error);
@@ -538,10 +522,6 @@ function _bindInlineCreateInput(input) {
       // successful create lands on the project detail instead of leaving the
       // user on the previous page with only an empty sidebar row.
       const pid = res.project && res.project.project_id;
-      _projectsTrackEvent('project_create_result', {
-        result: 'success',
-        duration_ms: Math.round(performance.now() - startedAt),
-      });
       if (pid) {
         _projectsExpanded[pid] = true;
         _saveProjectsExpanded();
@@ -557,11 +537,6 @@ function _bindInlineCreateInput(input) {
     } catch (err) {
       if (requestId !== _projectsInlineCreateRequestId || !_projectsInlineCreate) return;
       const failure = _projectsFailureDetail(err, 'create_exception');
-      _projectsTrackEvent('project_create_result', {
-        result: 'failure',
-        duration_ms: Math.round(performance.now() - startedAt),
-        ...failure,
-      });
       _projectsLogFailure('project_create', failure);
       _projectsInlineCreateSubmitting = false;
       _showProjectInlineCreateError(err && err.message);
@@ -645,9 +620,6 @@ function _bindInlineRenameInput(input) {
     _projectsInlineRenameError = '';
     const requestId = ++_projectsInlineRenameRequestId;
     const startedAt = performance.now();
-    _projectsTrackClick('project_rename_submit', {
-      source: 'sidebar',
-    });
     try {
       const res = await window.orkas.invoke('projects.rename', { projectId: pid, name: next });
       if (
@@ -656,22 +628,11 @@ function _bindInlineRenameInput(input) {
       ) return;
       if (!res || !res.ok) {
         const failure = _projectsFailureDetail(res, 'rename_failed');
-        _projectsTrackEvent('project_rename_result', {
-          result: 'failure',
-          source: 'sidebar',
-          duration_ms: Math.round(performance.now() - startedAt),
-          ...failure,
-        });
         _projectsLogFailure('project_rename', { source: 'sidebar', ...failure });
         _projectsInlineRenameSubmitting = false;
         _showProjectInlineRenameError(res && res.error);
         return;
       }
-      _projectsTrackEvent('project_rename_result', {
-        result: 'success',
-        source: 'sidebar',
-        duration_ms: Math.round(performance.now() - startedAt),
-      });
       _projectsInlineRenamePid = null;
       _projectsInlineRenameOriginal = '';
       _projectsInlineRenameDraft = '';
@@ -684,12 +645,6 @@ function _bindInlineRenameInput(input) {
         || _projectsInlineRenamePid !== pid
       ) return;
       const failure = _projectsFailureDetail(err, 'rename_exception');
-      _projectsTrackEvent('project_rename_result', {
-        result: 'failure',
-        source: 'sidebar',
-        duration_ms: Math.round(performance.now() - startedAt),
-        ...failure,
-      });
       _projectsLogFailure('project_rename', { source: 'sidebar', ...failure });
       _projectsInlineRenameSubmitting = false;
       _showProjectInlineRenameError(err && err.message);
@@ -906,20 +861,11 @@ async function _confirmDeleteProject(pid, source = 'sidebar') {
   if (!ok) return;
 
   const startedAt = performance.now();
-  _projectsTrackClick('project_delete', {
-    source,
-  });
   let deleted = false;
   try {
     const res = await window.orkas.invoke('projects.delete', { projectId: pid });
     if (!res || !res.ok) {
       const failure = _projectsFailureDetail(res, 'delete_failed');
-      _projectsTrackEvent('project_delete_result', {
-        result: 'failure',
-        source,
-        duration_ms: Math.round(performance.now() - startedAt),
-        ...failure,
-      });
       _projectsLogFailure('project_delete', { source, ...failure });
       const code = res && res.error;
       if (code === 'has_running_conv') {
@@ -931,20 +877,9 @@ async function _confirmDeleteProject(pid, source = 'sidebar') {
       }
       return;
     }
-    _projectsTrackEvent('project_delete_result', {
-      result: 'success',
-      source,
-      duration_ms: Math.round(performance.now() - startedAt),
-    });
     deleted = true;
   } catch (err) {
     const failure = _projectsFailureDetail(err, 'delete_exception');
-    _projectsTrackEvent('project_delete_result', {
-      result: 'failure',
-      source,
-      duration_ms: Math.round(performance.now() - startedAt),
-      ...failure,
-    });
     _projectsLogFailure('project_delete', { source, ...failure });
     _projectsLog.error('delete project failed', err);
     await uiAlert(t('project.delete_failed_generic'));

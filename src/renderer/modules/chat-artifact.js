@@ -61,16 +61,7 @@
   // contexts row menus); the acting context is stashed per-open.
   let _menuEl = null;
   let _menuCtx = null;     // { frame, cid, artifactId, title } of the open menu
-  let _menuAnchor = null;  // the ⋯ button that opened it
-
-  function _track(action, data) {
-    try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
-  }
-
-  function _trackEvent(action, data) {
-    void action;
-    void data;
-  }
+  let _menuAnchor = null;
 
   function _logArtifactFailure(action, data) {
     try { _convLog.warn('chat artifact operation failed', { action, ...(data || {}) }); } catch (_) {}
@@ -99,7 +90,7 @@
     }
   }
 
-  function _trackArtifactSaveResult(startedAt, result, sourceView, failure = {}) {
+  function _logArtifactSaveResult(startedAt, result, sourceView, failure = {}) {
     if (result === 'success') return;
     _logArtifactFailure('artifact_save', {
       source_view: sourceView,
@@ -443,7 +434,6 @@
   async function _doSave(ctx) {
     const startedAt = Date.now();
     const sourceView = _artifactSaveSourceView(ctx?.cid);
-    _track('artifact_save', { surface: 'conversation', source_view: sourceView });
     let r;
     try {
       r = await window.orkas.invoke('conversations.artifacts.save', {
@@ -451,20 +441,20 @@
       });
     } catch (err) {
       const failure = _artifactSaveFailure(err, 'ipc');
-      _trackArtifactSaveResult(startedAt, 'failure', sourceView, failure);
+      _logArtifactSaveResult(startedAt, 'failure', sourceView, failure);
       _logArtifactSaveFailure(failure);
       _notifyFail(_t('apps.save_failed', 'Could not save the app'), err);
       return;
     }
     if (!r || r.ok === false) {
       const failure = _artifactSaveFailure(r, 'operation');
-      _trackArtifactSaveResult(startedAt, 'failure', sourceView, failure);
+      _logArtifactSaveResult(startedAt, 'failure', sourceView, failure);
       _logArtifactSaveFailure(failure);
       _notifyFail(_t('apps.save_failed', 'Could not save the app'), { message: (r && r.error) || 'save failed' });
       return;
     }
 
-    _trackArtifactSaveResult(startedAt, 'success', sourceView);
+    _logArtifactSaveResult(startedAt, 'success', sourceView);
     try {
       const message = _t('apps.saved_toast', 'Saved to Apps');
       if (typeof uiToast === 'function') uiToast(message, { variant: 'success' });

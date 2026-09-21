@@ -75,13 +75,6 @@ function _reportGlobalSearchFailure(stage, error, fallbackCode) {
   return { stage: safeStage, error_code: errorCode };
 }
 
-// Search-result telemetry is commercial-only. Keep a stable local hook so
-// shared control flow can report outcomes without coupling OSS search to the
-// private Monitor runtime.
-function _trackGlobalSearchResult() {
-  // Intentionally empty in the open build.
-}
-
 function _bindGlobalSearch() {
   document.getElementById('sidebar-search-btn')?.addEventListener('click', () => openGlobalSearch('sidebar'));
   // Library page-header search button reuses the same Cmd+K overlay
@@ -267,19 +260,11 @@ async function _runSearchNow(queryArg) {
     });
     const data = await res.json();
     if (seq !== _searchSeq) {
-      _trackGlobalSearchResult('cancelled', 'superseded', startedAt, {
-        has_project: !!projectId,
-      });
       return;     // a newer query arrived; drop this
     }
     _searchLoading = false;
     if (!data.ok) {
       const failure = _reportGlobalSearchFailure('response', data, 'search_rejected');
-      _trackGlobalSearchResult('failure', failure.stage, startedAt, {
-        has_project: !!projectId,
-        error_type: 'http',
-        error_code: failure.error_code,
-      });
       _renderSearchError(data.error);
       return;
     }
@@ -294,33 +279,12 @@ async function _runSearchNow(queryArg) {
     _searchLastQuery = query;
     _setSearchTabsVisible(true);
     _renderSearchResults(query);
-    _trackGlobalSearchResult(
-      degradation ? 'partial_failure' : 'success',
-      degradation ? 'partial' : 'complete',
-      startedAt,
-      {
-        item_count: _searchResults.length,
-        has_project: !!projectId,
-        ...(degradation ? {
-          error_type: 'runtime',
-          error_code: degradation.error_code,
-        } : {}),
-      },
-    );
   } catch (e) {
     if (seq !== _searchSeq) {
-      _trackGlobalSearchResult('cancelled', 'superseded', startedAt, {
-        has_project: !!projectId,
-      });
       return;
     }
     _searchLoading = false;
     const failure = _reportGlobalSearchFailure('request', e, 'search_request_failed');
-    _trackGlobalSearchResult('failure', failure.stage, startedAt, {
-      has_project: !!projectId,
-      error_type: 'network',
-      error_code: failure.error_code,
-    });
     _renderSearchError(e.message || String(e));
   } finally {
     pending.active = false;

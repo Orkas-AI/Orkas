@@ -1098,7 +1098,7 @@ function _dbImage(props) {
   const alt = escapeHtml(props.alt || '');
   const caption = props.caption
     ? `<figcaption class="db-image-caption">${escapeHtml(props.caption)}</figcaption>` : '';
-  return `<figure class="db-image"><img src="${escapeHtml(src)}" alt="${alt}" data-monitor-resource="dashboard-image">${caption}</figure>`;
+  return `<figure class="db-image"><img src="${escapeHtml(src)}" alt="${alt}">${caption}</figure>`;
 }
 
 // ── Chart (minimal inline SVG; line/bar/area/pie) ─────────────────────
@@ -1329,7 +1329,7 @@ function _markdownVideoHtml(src, label, title) {
   const openButton = localPath
     ? `<button type="button" class="chat-md-video-float" data-chat-md-video-open="1" data-video-src="${escapeHtml(src)}" aria-label="${escapeHtml(openLabel)}" title="${escapeHtml(openLabel)}">${_markdownVideoOpenIconHtml()}</button>`
     : '';
-  return `<span class="chat-md-video-shell" data-chat-video-playback-surface="markdown_bubble"><video class="chat-md-video" width="640" height="360" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(renderedSrc)}"${t}${materializationAttrs} aria-label="${escapeHtml(label || 'video')}" data-monitor-resource="chat-markdown-video"></video>${openButton}</span>`;
+  return `<span class="chat-md-video-shell" data-chat-video-playback-surface="markdown_bubble"><video class="chat-md-video" width="640" height="360" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(renderedSrc)}"${t}${materializationAttrs} aria-label="${escapeHtml(label || 'video')}"></video>${openButton}</span>`;
 }
 
 function _markdownMediaLabel(src, label, fallback) {
@@ -1369,7 +1369,7 @@ function _markdownAudioHtml(src, label, title) {
   return `<span class="chat-md-audio-card"${titleAttr} role="group" aria-label="${escapeHtml(name)}">
     <span class="chat-md-audio-icon">${_markdownAudioIconHtml(name)}</span>
     <span class="chat-md-audio-header"><span class="chat-md-audio-name">${escapeHtml(name)}</span>${menuButton}</span>
-    <audio class="chat-md-audio" controls controlslist="nodownload noplaybackrate noremoteplayback" preload="metadata" src="${escapeHtml(src)}" aria-label="${escapeHtml(name)}" data-monitor-resource="chat-markdown-audio"></audio>
+    <audio class="chat-md-audio" controls controlslist="nodownload noplaybackrate noremoteplayback" preload="metadata" src="${escapeHtml(src)}" aria-label="${escapeHtml(name)}"></audio>
   </span>`;
 }
 
@@ -1571,7 +1571,7 @@ function _markdownImageHtml(src, alt, title) {
   const materializationAttrs = mediaMeta && managedLocalSrc
     ? ` data-orkas-remote-src="${escapeHtml(mediaMeta.remoteSrc)}" data-orkas-local-src="${escapeHtml(managedLocalSrc)}"`
     : '';
-  return `<span class="chat-image-shell chat-md-img-shell is-loading"><img class="chat-md-img" src="${escapeHtml(renderedSrc)}" alt="${escapeHtml(alt)}"${t}${materializationAttrs} data-monitor-resource="chat-markdown-image"></span>`;
+  return `<span class="chat-image-shell chat-md-img-shell is-loading"><img class="chat-md-img" src="${escapeHtml(renderedSrc)}" alt="${escapeHtml(alt)}"${t}${materializationAttrs}></span>`;
 }
 
 function _notifyChatImageSettled(node) {

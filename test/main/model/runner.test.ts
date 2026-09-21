@@ -1464,27 +1464,12 @@ describe('runner › scoped tool loading', () => {
       { state: {} },
     ))
       .toMatchObject({ content: 'ok' });
-    expect(lazy.toolSurfaceTelemetry(['list_connector_tools'])).toMatchObject({
-      loadCallCount: 1,
-      loadedGroupCount: 1,
-      loadedUnusedGroupCount: 0,
-    });
-    expect(lazy.toolSurfaceTelemetry().loadedSchemaChars).toBeGreaterThan(0);
-
     runtimeGrantedToolGroups.push('connectors');
 
     expect(runner.activeTools().map((tool) => tool.name)).toEqual(expect.arrayContaining([
       'list_connector_tools',
       'call_connector_tool',
     ]));
-    expect(built.toolSurfaceTelemetry()).toMatchObject({
-      loadCallCount: 0,
-      loadedGroupCount: 0,
-      loadedSchemaChars: 0,
-      loadedUnusedGroupCount: 0,
-    });
-    expect(built.toolSurfaceTelemetry().peakToolCount).toBeGreaterThan(built.toolDefs.length);
-
     const selectedAtStart = await buildRunner({
       sessionId: 'gmember-runtime-connector-selected-at-start',
       userId: uid,
@@ -1745,13 +1730,6 @@ describe('runner › scoped tool loading', () => {
       .not.toContain('Fallback only');
     const initialPrompt = commander.resolvedSystemPrompt;
     expect(commander.turnEphemeral).not.toContain('## Active tool groups');
-    expect(commander.toolSurfaceTelemetry(['inner_browser']).webToolUsed).toBe(true);
-    expect(commander.toolSurfaceTelemetry(['bash', 'web_search'])).toMatchObject({
-      loadCallCount: 0,
-      loadedGroupCount: 0,
-      loadedSchemaChars: 0,
-      webToolUsed: true,
-    });
     const runner = commander.runner as unknown as {
       tools: Map<string, {
         execute: (input: unknown, ctx: unknown) => Promise<{ content: string }>;
@@ -1770,12 +1748,6 @@ describe('runner › scoped tool loading', () => {
     expect(loadedNames).toContain('skill_search');
     expect(loadedNames).not.toContain('marketplace_search');
     expect(loadedNames).not.toContain('app_health');
-    expect(commander.toolSurfaceTelemetry(['tool_load', 'skill_search'])).toMatchObject({
-      loadCallCount: 1,
-      loadedGroupCount: 1,
-      loadedUnusedGroupCount: 0,
-    });
-
     const appLoadResult = await runner.tools.get('tool_load')?.execute(
       { groups: ['management.app'] },
       { workingDir: tmpDir, state: {}, signal: undefined },
@@ -1790,11 +1762,6 @@ describe('runner › scoped tool loading', () => {
     expect(appLoadedNames).toContain('skill_search');
     expect(appLoadedNames).not.toContain('marketplace_search');
     expect(commander.resolvedSystemPrompt).toBe(initialPrompt);
-    expect(commander.toolSurfaceTelemetry(['tool_load', 'skill_search', 'app_health'])).toMatchObject({
-      loadCallCount: 2,
-      loadedGroupCount: 2,
-      loadedUnusedGroupCount: 0,
-    });
   });
 
   it('does not serialize a deferred tool schema until its group is loaded', async () => {
@@ -1834,12 +1801,9 @@ describe('runner › scoped tool loading', () => {
       { workingDir: tmpDir, state: {}, signal: undefined },
     );
     expect(schemaReads).toBe(0);
-    const telemetry = built.toolSurfaceTelemetry();
-    expect(telemetry.loadedSchemaChars).toBeGreaterThan(0);
-    expect(schemaReads).toBe(1);
     const activeNames = runner.getActiveToolDefinitions().map((tool) => tool.name);
+    expect(schemaReads).toBe(1);
     expect(activeNames).toContain('marketplace_search');
-    expect(telemetry.peakToolCount).toBe(activeNames.length);
   });
 
   it('builds process labels from lightweight Agent summaries without full enrichment', async () => {
@@ -2186,7 +2150,6 @@ describe('runner › scoped tool loading', () => {
       .map((tool) => tool.name);
     expect(activeRunnerTools).toContain('skill_manage');
     expect([...names].sort()).toEqual([...activeRunnerTools].sort());
-    expect(built.toolSurfaceTelemetry().peakToolCount).toBe(activeRunnerTools.length);
     expect(built.resolvedSystemPrompt).toContain('## Loadable tool groups');
     expect(built.turnEphemeral).not.toContain('## Active tool groups');
     expect(built.resolvedSystemPrompt).not.toContain('**bash**');
@@ -2540,19 +2503,6 @@ describe('runner › scoped tool loading', () => {
       name: 'marketplace_search',
     });
     expect(managementCalls).toEqual(['marketplace_search']);
-    expect(built.toolSurfaceTelemetry(['tool_load', 'marketplace_search'])).toMatchObject({
-      mode: 'scoped',
-      loadCallCount: 1,
-      loadedGroupCount: 1,
-      loadedUnusedGroupCount: 0,
-      webToolUsed: false,
-    });
-    expect(built.toolSurfaceTelemetry()).toMatchObject({
-      loadedUnusedGroupCount: 1,
-      webToolUsed: false,
-    });
-    expect(built.toolSurfaceTelemetry().loadedSchemaChars).toBeGreaterThan(0);
-
     expect(runner.tools.has('auto_tasks_list')).toBe(false);
     const automationLoad = await runner.tools.get('tool_load')?.execute(
       { groups: ['management.automation'] },
@@ -2582,11 +2532,6 @@ describe('runner › scoped tool loading', () => {
       extraTools: managementTools,
     });
     expect(nextTurn.toolDefs.map((tool) => tool.name)).not.toContain('marketplace_search');
-    expect(nextTurn.toolSurfaceTelemetry()).toMatchObject({
-      loadCallCount: 0,
-      loadedGroupCount: 0,
-      loadedSchemaChars: 0,
-    });
   });
 
   it('recomputes configured groups each turn without retaining removed Agent dependencies', async () => {
@@ -2964,7 +2909,6 @@ describe('runner › conversation-history scope exposure', () => {
       .toEqual(['current', 'project', 'all']);
     for (const built of [agent, nonProjectCommander, projectCommander]) {
       expect(built.toolDefs.map(tool => tool.name)).toContain('chat_history');
-      expect(built.toolSurfaceTelemetry([]).loadCallCount).toBe(0);
       expect(built.resolvedSystemPrompt).not.toContain('`chat_history` —');
       // Inspect the final host surface, not helper descriptions discarded by
       // the consolidated tool factory. Semantic choices need live model cases.
@@ -3173,7 +3117,6 @@ describe('runner › conversation task board turn block (D8/P3)', () => {
       expect(bound.resolvedSystemPrompt).not.toContain('## App creation');
       if (appSystemPrompt !== undefined) expect(bound.resolvedSystemPrompt).toBe(appSystemPrompt);
       appSystemPrompt = bound.resolvedSystemPrompt;
-      expect(bound.toolSurfaceTelemetry()).toMatchObject({ loadCallCount: 0, loadedGroupCount: 0, loadedSchemaChars: 0 });
     }
     for (const sessionId of [`gmember-${cid}-agent-x`, `agent-${cid}`, `reflect-${cid}`]) {
       const other = await buildRunner({ sessionId, userId: uid, cid, onArtifactCreated: artifactSink, toolList: [] });

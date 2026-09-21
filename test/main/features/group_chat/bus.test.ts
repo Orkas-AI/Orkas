@@ -306,7 +306,7 @@ vi.mock('../../../../src/main/model/client', () => ({
       yield {
         type: 'event',
         event: {
-          stream: 'agent_run_result',
+          stream: 'agent_run_terminal',
           data: {
             provider_ms: 40,
             tool_ms: 20,

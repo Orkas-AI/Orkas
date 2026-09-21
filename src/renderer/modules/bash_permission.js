@@ -22,96 +22,6 @@ const _CLI_PERMISSION_POLICIES = ['inherit', 'ask', 'full_access'];
 const _BASH_PERMISSION_RISK_CATEGORIES = ['network_egress', 'destructive', 'priv_esc', 'sensitive_path', 'system_package_change', 'external_mutation'];
 const _BASH_IRREVERSIBLE_ACTIONS = ['recursive_delete', 'untargeted_process_kill'];
 
-function _bashPermissionVisibilityState() {
-  try {
-    if (typeof document !== 'undefined' && typeof document.visibilityState === 'string') {
-      if (document.visibilityState !== 'visible') return 'hidden';
-      if (typeof document.hasFocus === 'function') {
-        return document.hasFocus() ? 'visible_focused' : 'visible_unfocused';
-      }
-      return 'visible_unknown_focus';
-    }
-  } catch (_) { /* fall through */ }
-  return 'unknown';
-}
-
-function _bashPermissionTelemetry(name, properties) {
-  try {
-    if (window.Monitor) Monitor.event(name, properties);
-  } catch (_) { /* permission delivery must not depend on observability */ }
-}
-
-function _bashPermissionCategories(info) {
-  const reasons = Array.isArray(info && info.reasons) ? info.reasons : [];
-  return [...new Set(reasons.filter((reason) => _BASH_PERMISSION_RISK_CATEGORIES.includes(reason)))].join('|');
-}
-
-// Whether the new-in-auto-mode gate is doing useful work or only adding
-// clicks is only answerable if the verdict carries the finding that caused it.
-// Same closed-world/pipe-joined shape as `categories`; no path or command.
-function _bashPermissionIrreversible(info) {
-  const list = Array.isArray(info && info.irreversible) ? info.irreversible : [];
-  return [...new Set(list.filter((a) => _BASH_IRREVERSIBLE_ACTIONS.includes(a)))].join('|');
-}
-
-function _bashPermissionReceivedAt(info, fallback = Date.now()) {
-  const value = Number(info && info._renderer_received_at_ms);
-  return Number.isFinite(value) && value > 0 ? value : fallback;
-}
-
-function _bashTrackCancelledPermission(info, currentMode, errorCode = 'request_cancelled') {
-  const approved = _bashPermTaskApproved.delete(info.request_id);
-  _bashTrackPermissionResult(info, {
-    result: approved ? 'success' : 'cancelled',
-    decision: approved ? 'allow_run' : 'none',
-    effective_decision: approved ? 'allow_run' : 'deny',
-    ...(currentMode ? { mode: currentMode } : {}),
-    mode_changed: false,
-    categories: _bashPermissionCategories(info),
-    ...(_bashPermissionIrreversible(info) ? { irreversible: _bashPermissionIrreversible(info) } : {}),
-    duration_ms: Math.max(0, Date.now() - _bashPermissionReceivedAt(info)),
-    ...(approved ? {} : { error_type: 'state', error_code: errorCode }),
-  });
-}
-
-function _bashTrackPermissionResult(info, properties) {
-  if (info._permission_kind === 'web-assist') {
-    // Page origin and control label are user content: report the handback
-    // reason and the verdict, which is what tells us whether this gate is
-    // catching real intent or only adding clicks.
-    _bashPermissionTelemetry('web_assist_action_confirmation_result', {
-      reason: String(info.reason || ''),
-      control_kind: String(info.control_kind || ''),
-      decision: properties.effective_decision === 'deny' ? 'denied' : 'approved',
-      ...(properties.decision ? { requested_decision: properties.decision } : {}),
-      result: properties.result,
-      duration_ms: properties.duration_ms,
-    });
-    return;
-  }
-  if (info._permission_kind === 'connector') {
-    // Custom MCP ids derive from a user-authored display name and their tool
-    // names are server-defined free text: report the stable `custom` bucket and
-    // omit the tool name (same coarsening as connectors.js `_connectorTrackPayload`).
-    const rawConnectorId = String(info.connector_id || '');
-    const customConnector = rawConnectorId.startsWith('custom-');
-    _bashPermissionTelemetry('connector_action_confirmation_result', {
-      connector_id: customConnector ? 'custom' : rawConnectorId,
-      ...(customConnector ? {} : { tool_name: String(info.tool_name || '') }),
-      risk: info.risk || '',
-      sensitive_operation: info.sensitive_operation || '',
-      decision: properties.effective_decision === 'deny' ? 'denied' : 'approved',
-      result: properties.result,
-      duration_ms: properties.duration_ms,
-      ...((typeof window.getOnboardingTelemetryContext === 'function')
-        ? window.getOnboardingTelemetryContext(info.cid)
-        : {}),
-    });
-    return;
-  }
-  _bashPermissionTelemetry('bash_risk_prompt_result', properties);
-}
-
 function _bashIsMode(mode) {
   return _BASH_PERMISSION_MODES.includes(mode);
 }
@@ -266,7 +176,6 @@ function _showBashPermissionModeDialog({
   detailsLabel,
   currentMode,
   requestId,
-  onPresented,
   allowRun = true,
   allowRunLabel = t('bash.permission.allow_run'),
   showModeControl = true,
@@ -332,8 +241,6 @@ function _showBashPermissionModeDialog({
       </div>
     `;
     document.body.appendChild(overlay);
-    try { if (typeof onPresented === 'function') onPresented(); } catch (_) { /* telemetry only */ }
-
     const selectedMode = () => {
       return modeValidator(selectedModeValue) ? selectedModeValue : safeCurrentMode;
     };
@@ -473,10 +380,9 @@ function _webAssistActionMessage(info) {
 }
 
 async function _showBashPermissionDialog(info) {
-  const startedAt = Date.now();
   const requestId = String(info.request_id || '');
   if (_bashPermCancelled.delete(requestId)) {
-    _bashTrackCancelledPermission(info, null);
+    _bashPermTaskApproved.delete(info.request_id);
     return;
   }
   const isConnector = info._permission_kind === 'connector';
@@ -501,7 +407,7 @@ async function _showBashPermissionDialog(info) {
 
   const currentMode = await _getBashPermissionCurrentMode();
   if (_bashPermCancelled.delete(requestId)) {
-    _bashTrackCancelledPermission(info, currentMode);
+    _bashPermTaskApproved.delete(info.request_id);
     return;
   }
   // Needs the resolved mode: the same step is worth flagging in every mode,
@@ -511,7 +417,6 @@ async function _showBashPermissionDialog(info) {
     _bashIrreversibleText(info, currentMode),
     externalMutationText,
   ].filter(Boolean).join('\n\n');
-  let presented = false;
   const isSensitiveApproval = isConnector || isWebAssist || (Array.isArray(info.reasons)
     && info.reasons.some((reason) => _BASH_PERMISSION_RISK_CATEGORIES.includes(reason)));
   // A page grant is safe to offer: the host binds it to this tab, origin and
@@ -523,7 +428,6 @@ async function _showBashPermissionDialog(info) {
   // An earlier queued permission can switch the account to Trusted while this
   // connector waits. Its host gate already checked availability/prohibitions.
   let result;
-  let dialogFailed = false;
   try {
     result = isConnector && currentMode === 'all_files_auto'
       ? { choice: 'allow_once', mode: currentMode }
@@ -540,21 +444,8 @@ async function _showBashPermissionDialog(info) {
         allowRun: canAllowRun,
         ...(isConnector && info.usage_scope === true ? { allowRunLabel: t('bash.permission.allow_usage') } : {}),
         showModeControl: true,
-        onPresented: () => {
-          if (isConnector) return;
-          if (presented) return;
-          presented = true;
-          _bashPermissionTelemetry('bash_risk_prompt_presented', {
-            categories: _bashPermissionCategories(info),
-            ...(_bashPermissionIrreversible(info) ? { irreversible: _bashPermissionIrreversible(info) } : {}),
-            mode: currentMode,
-            visibility_state: _bashPermissionVisibilityState(),
-            queue_wait_ms: Math.max(0, Date.now() - _bashPermissionReceivedAt(info, startedAt)),
-          });
-        },
       });
   } catch (err) {
-    dialogFailed = true;
     result = { choice: 'deny', mode: currentMode };
     _bashPermLog.warn('operation permission dialog failed', {
       error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
@@ -562,16 +453,13 @@ async function _showBashPermissionDialog(info) {
   }
   if (result && result.cancelled) {
     _bashPermCancelled.delete(requestId);
-    _bashTrackCancelledPermission(info, currentMode);
+    _bashPermTaskApproved.delete(info.request_id);
     return;
   }
   const choice = result && typeof result === 'object' ? result.choice : result;
   const selectedMode = _bashIsMode(result && result.mode)
     ? result.mode
     : currentMode;
-  const requestedDecision = (choice === 'allow_once' || choice === 'allow_run' || choice === 'allow_always')
-    ? choice
-    : 'deny';
   let decision = (choice === 'allow_once' || choice === 'allow_run') ? choice : 'deny';
   if (!canAllowRun && decision === 'allow_run') decision = 'allow_once';
   let effectiveMode = currentMode;
@@ -591,20 +479,12 @@ async function _showBashPermissionDialog(info) {
     else decision = 'deny';
   }
   if (_bashPermCancelled.delete(requestId)) {
-    _bashTrackCancelledPermission(info, effectiveMode);
+    _bashPermTaskApproved.delete(info.request_id);
     return;
   }
 
-  const baseResult = {
-    decision: requestedDecision,
-    effective_decision: decision,
-    mode: effectiveMode,
-    mode_changed: effectiveMode !== currentMode,
-    categories: _bashPermissionCategories(info),
-    ...(_bashPermissionIrreversible(info) ? { irreversible: _bashPermissionIrreversible(info) } : {}),
-  };
   try {
-    const response = await window.orkas.invoke(
+    await window.orkas.invoke(
       isWebAssist ? 'webAssist.actionConfirmResponse'
         : isConnector ? 'connectors.action_confirm_response' : 'bash.permission_response',
       isWebAssist
@@ -613,32 +493,10 @@ async function _showBashPermissionDialog(info) {
           ? { request_id: info.request_id, approved: decision !== 'deny', ...(decision === 'allow_run' ? { scope: info.usage_scope === true ? 'usage' : 'task' } : {}) }
           : { request_id: info.request_id, decision },
     );
-    const failed = !response || response.ok === false;
-    const stale = !failed && response.handled === false;
-    try {
-      _bashTrackPermissionResult(info, {
-        ...baseResult,
-        result: failed || dialogFailed ? 'failure' : (stale ? 'cancelled' : 'success'),
-        duration_ms: Math.max(0, Date.now() - startedAt),
-        ...(dialogFailed
-          ? { error_code: 'dialog_failed', error_type: 'ui' }
-          : failed ? { error_code: 'response_failed', error_type: 'ipc' }
-          : (stale ? { error_code: 'stale_request', error_type: 'state' } : {})),
-      });
-    } catch (_e) { /* permission delivery must not depend on observability */ }
   } catch (err) {
     _bashPermLog.warn('bash permission response failed', {
       error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
     });
-    try {
-      _bashTrackPermissionResult(info, {
-        ...baseResult,
-        result: 'failure',
-        duration_ms: Math.max(0, Date.now() - startedAt),
-        error_type: 'ipc',
-        error_code: 'response_failed',
-      });
-    } catch (_) { /* the permission response must not depend on observability */ }
   }
   _bashPermCancelled.delete(requestId);
 }
@@ -661,10 +519,8 @@ async function _drainBashPermissionQueue() {
 }
 
 async function _showLocalAgentPermissionDialog(info) {
-  const startedAt = Date.now();
   const requestId = String(info && info.request_id || '');
   if (_bashPermCancelled.delete(requestId)) return;
-  const isConnectorPermission = info && info.permission_kind === 'connector';
   const agent = _bashAgentLabel(info);
   const conversationTitle = _bashPermissionConversationTitle(info);
   const action = String(info && (info.tool || info.description) || '').trim()
@@ -712,56 +568,15 @@ async function _showLocalAgentPermissionDialog(info) {
   const decision = choice === 'allow_run'
     ? 'allow_run'
     : choice === 'allow_once' ? 'allow_once' : 'deny';
-  let response = null;
-  let telemetryResult = 'success';
-  let effectiveDecision = decision;
-  let errorCode = '';
-  let errorType = '';
   try {
-    response = await window.orkas.invoke('localAgents.permissionResponse', {
+    await window.orkas.invoke('localAgents.permissionResponse', {
       request_id: requestId,
       decision,
       permission_policy: selectedMode,
     });
-    if (!response || response.ok === false) {
-      telemetryResult = 'failure';
-      effectiveDecision = 'deny';
-      errorCode = 'response_failed';
-      errorType = 'ipc';
-    } else if (response.handled === false) {
-      telemetryResult = 'cancelled';
-      effectiveDecision = 'deny';
-      errorCode = 'stale_request';
-      errorType = 'state';
-    } else {
-      const returnedDecision = response.decision;
-      if (returnedDecision === 'allow_once' || returnedDecision === 'allow_run' || returnedDecision === 'deny') {
-        effectiveDecision = returnedDecision;
-      }
-      if (decision !== 'deny' && response.policy_saved === false) {
-        telemetryResult = 'failure';
-        effectiveDecision = 'deny';
-        errorCode = 'permission_level_save_failed';
-        errorType = 'storage';
-      }
-    }
   } catch (err) {
-    telemetryResult = 'failure';
-    effectiveDecision = 'deny';
-    errorCode = 'response_failed';
-    errorType = 'ipc';
     _bashPermLog.warn('external CLI permission response failed', {
       error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
-    });
-  }
-  if (isConnectorPermission) {
-    _bashPermissionTelemetry('connector_bridge_permission_result', {
-      result: telemetryResult,
-      decision,
-      effective_decision: effectiveDecision,
-      duration_ms: Math.max(0, Date.now() - startedAt),
-      ...(errorCode ? { error_code: errorCode } : {}),
-      ...(errorType ? { error_type: errorType } : {}),
     });
   }
   _bashPermCancelled.delete(requestId);
@@ -783,7 +598,7 @@ function _cancelBashPermissionRequests(payload, kind) {
     if (info && info._permission_kind === kind && cancelled.has(info.request_id)) {
       _bashPermQueue.splice(i, 1);
       _bashPermCancelled.delete(info.request_id);
-      if (kind !== 'local-agent') _bashTrackCancelledPermission(info, null);
+      if (kind !== 'local-agent') _bashPermTaskApproved.delete(info.request_id);
     }
   }
 }
@@ -794,16 +609,7 @@ if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
     if (!appWindow) {
       window.orkas.onPushEvent('bash:permission', (info) => {
         if (!info || typeof info.request_id !== 'string') return;
-        const queuedInfo = {
-          ...info,
-          _renderer_received_at_ms: Date.now(),
-        };
-        _bashPermissionTelemetry('bash_risk_prompt_requested', {
-          categories: _bashPermissionCategories(info),
-          ...(_bashPermissionIrreversible(info) ? { irreversible: _bashPermissionIrreversible(info) } : {}),
-          visibility_state: _bashPermissionVisibilityState(),
-        });
-        _bashPermQueue.push(queuedInfo);
+        _bashPermQueue.push(info);
         _drainBashPermissionQueue();
       });
       window.orkas.onPushEvent('bash:permission_cancelled', (payload) => {

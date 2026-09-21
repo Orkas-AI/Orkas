@@ -113,7 +113,7 @@ function logRecord(record) {
 // a known prefix list so the renderer can't tap into arbitrary internal IPC traffic.
 const PUSH_EVENT_CHANNELS = new Set([
   'preview-windows:owner-request',
-  'preview-windows:report',
+  'preview-windows:files-changed',
   'preview-windows:close-request',
   'preview-windows:replace-request',
   'preview-windows:gallery-refresh',

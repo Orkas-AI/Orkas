@@ -2165,7 +2165,7 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
       yield {
         type: 'event',
         event: {
-          stream: 'agent_run_result',
+          stream: 'agent_run_terminal',
           data: {
             result: 'success',
             terminal_status: terminalStatus,
@@ -2185,7 +2185,7 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
     }
 
     expect(events).not.toContainEqual(expect.objectContaining({
-      event: expect.objectContaining({ stream: 'agent_run_result' }),
+      event: expect.objectContaining({ stream: 'agent_run_terminal' }),
     }));
     expect(events).toContainEqual(expect.objectContaining({
       type: 'event',

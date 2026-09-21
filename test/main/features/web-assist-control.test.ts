@@ -1,9 +1,9 @@
 import * as vm from 'node:vm';
 import * as path from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { reportWebAssistFailure } from '../../../src/main/features/web_assist_diagnostics';
+import { logWebAssistFailure } from '../../../src/main/features/web_assist_diagnostics';
 
-vi.mock('../../../src/main/features/web_assist_diagnostics', () => ({ reportWebAssistFailure: vi.fn() }));
+vi.mock('../../../src/main/features/web_assist_diagnostics', () => ({ logWebAssistFailure: vi.fn() }));
 
 const DOWNLOAD_ROOT = vi.hoisted(() => {
   const fs = require('node:fs') as typeof import('node:fs');
@@ -354,7 +354,7 @@ import {
 describe('Web Assist controlled connector lifecycle', () => {
   beforeEach(() => {
     electronMock.createWindow?.();
-    vi.mocked(reportWebAssistFailure).mockClear();
+    vi.mocked(logWebAssistFailure).mockClear();
     confirmMock.decision = 'deny';
     confirmMock.requests.length = 0;
     confirmMock.grants.clear();
@@ -592,11 +592,11 @@ describe('Web Assist controlled connector lifecycle', () => {
       page.emit('did-fail-load', {}, -105, 'ERR_NAME_NOT_RESOLVED', 'https://frame.invalid/', false);
       page.emit('did-fail-load', {}, -3, 'ERR_ABORTED', 'https://example.com/old', true);
       expect(webAssistState(electronMock.renderer).state.error_code).toBeUndefined();
-      expect(reportWebAssistFailure).not.toHaveBeenCalled();
+      expect(logWebAssistFailure).not.toHaveBeenCalled();
       page.emit('did-fail-load', {}, -105, 'ERR_NAME_NOT_RESOLVED', 'https://missing.invalid/', true);
       page.emit('did-stop-loading');
       expect(webAssistState(electronMock.renderer).state).toMatchObject({ loading: false, error_code: 'page_load_failed' });
-      expect(reportWebAssistFailure).toHaveBeenCalledExactlyOnceWith(electronMock.renderer, 'page_load_failed', -105);
+      expect(logWebAssistFailure).toHaveBeenCalledExactlyOnceWith(electronMock.renderer, 'page_load_failed', -105);
       page.emit('did-finish-load');
       expect(webAssistState(electronMock.renderer).state.error_code).toBe('page_load_failed');
       page.emit('did-navigate', {}, 'https://example.com/recovered', 200, 'OK');
@@ -604,11 +604,11 @@ describe('Web Assist controlled connector lifecycle', () => {
       page.emit('unresponsive');
       page.emit('did-navigate', {}, 'https://example.com/recovered', 200, 'OK');
       expect(webAssistState(electronMock.renderer).state.error_code).toBe('page_unresponsive');
-      expect(reportWebAssistFailure).toHaveBeenLastCalledWith(electronMock.renderer, 'page_unresponsive');
+      expect(logWebAssistFailure).toHaveBeenLastCalledWith(electronMock.renderer, 'page_unresponsive');
       page.emit('render-process-gone', {}, { reason: 'clean-exit' });
-      expect(reportWebAssistFailure).toHaveBeenCalledTimes(2);
+      expect(logWebAssistFailure).toHaveBeenCalledTimes(2);
       page.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 1 });
-      expect(reportWebAssistFailure).toHaveBeenLastCalledWith(electronMock.renderer, 'renderer_gone');
+      expect(logWebAssistFailure).toHaveBeenLastCalledWith(electronMock.renderer, 'renderer_gone');
     });
   });
 

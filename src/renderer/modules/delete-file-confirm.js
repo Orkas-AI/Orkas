@@ -230,26 +230,6 @@ function _createDeleteConfirmBatch(container, key, hasTurnId) {
         duration_ms: Math.max(0, Date.now() - batch.createdAt),
       });
     } catch (_) {}
-    try {
-      if (window.Monitor) {
-        const decision = granted ? 'allow' : 'deny';
-        const result = failedCount > 0 ? 'failure' : 'success';
-        const payload = {
-          result,
-          decision,
-          file_count: count,
-          failed_count: failedCount,
-          duration_ms: Math.max(0, Date.now() - batch.createdAt),
-        };
-        if (failedCount > 0) {
-          payload.error_code = 'response_failed';
-          payload.error_type = 'ipc';
-        }
-        Monitor.event('delete_file_confirmation_result', payload);
-      }
-    } catch (_) {
-      // File approval must not depend on observability.
-    }
     // The token state flip alone doesn't wake the LLM — Step 1 already
     // ended the turn, so without a fresh user message Step 2 never fires
     // and the file isn't actually unlinked. Auto-dispatch a short user

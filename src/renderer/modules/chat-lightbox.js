@@ -363,7 +363,7 @@ function _ensureLightbox() {
         <span class="chat-file-viewer-loading-spinner" aria-hidden="true"></span>
         <span class="chat-lightbox-loading-label">${_lightboxEscapeHtml(_lightboxLoadingLabel())}</span>
       </div>
-      <img class="chat-lightbox-img" alt="" draggable="false" data-monitor-resource="chat-image-lightbox" />
+      <img class="chat-lightbox-img" alt="" draggable="false" />
       <div class="chat-lightbox-actions">
         <button type="button" class="chat-lightbox-add-library" aria-label="${addLabel}" title="${addLabel}" hidden>
           ${libraryIcon}

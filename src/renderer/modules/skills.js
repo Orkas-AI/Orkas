@@ -1,7 +1,7 @@
 const _skillsLog = createLogger('skills');
 // ─── Skills ───
 
-function _skillsTrackError(action, data) {
+function _skillsLogError(action, data) {
   _skillsLog.warn('skill operation failed', { action, ...(data || {}) });
 }
 
@@ -43,7 +43,7 @@ function _reportSkillAutosaveFailure(value) {
   if (previousAt && now - previousAt < _SKILL_AUTOSAVE_FAILURE_DEDUPE_MS) return;
   _skillAutosaveFailureState.lastAtByCode.set(errorCode, now);
   _skillAutosaveFailureState.uploadCount += 1;
-  _skillsTrackError('skill_manage', {
+  _skillsLogError('skill_manage', {
     action: 'edit',
     error_type: 'ipc',
     error_code: errorCode,
@@ -750,11 +750,9 @@ function _wireOpenSkillCards(gridEl) {
 }
 
 async function _setOpenSkillEnabled(id, nextEnabled) {
-  const trackResult = _createSkillManageTracker('toggle');
   try {
     const res = await window.orkas.invoke('skills.setEnabled', { id, enabled: nextEnabled });
     if (!res || !res.ok) {
-      trackResult('failure', _skillManageErrorCode(res, 'update_failed'));
       await uiAlert(t('component.toggle_failed'));
       return false;
     }
@@ -762,10 +760,8 @@ async function _setOpenSkillEnabled(id, nextEnabled) {
     // external and global, so flip every matching row's optimistic state.
     for (const r of _openSkillsCache) if (r.id === id) r.enabled = nextEnabled;
     renderSkillsList(_skillsCache || []);
-    trackResult('success');
     return true;
   } catch (error) {
-    trackResult('failure', _skillManageErrorCode(error, 'invoke_failed'));
     await uiAlert(t('component.toggle_failed'));
     return false;
   }
@@ -777,13 +773,11 @@ async function _setGlobalSkillGroupEnabled(key, nextEnabled) {
     .filter((row) => (row.enabled !== false) !== nextEnabled)
     .map((row) => row.id));
   if (!targetIds.size) return true;
-  const trackResult = _createSkillManageTracker('toggle');
   try {
     const results = await Promise.allSettled(Array.from(targetIds).map((id) => (
       window.orkas.invoke('skills.setEnabled', { id, enabled: nextEnabled })
     )));
     if (results.some((res) => res.status === 'rejected' || !res.value || !res.value.ok)) {
-      trackResult('failure', 'partial_failure');
       await loadSkills(true);
       await uiAlert(t('component.toggle_failed'));
       return false;
@@ -792,10 +786,8 @@ async function _setGlobalSkillGroupEnabled(key, nextEnabled) {
       if (targetIds.has(row.id)) row.enabled = nextEnabled;
     }
     renderSkillsList(_skillsCache || []);
-    trackResult('success');
     return true;
   } catch (error) {
-    trackResult('failure', _skillManageErrorCode(error, 'invoke_failed'));
     await loadSkills(true);
     await uiAlert(t('component.toggle_failed'));
     return false;
@@ -967,21 +959,17 @@ async function _flipOpenSkillEnabled(id) {
  *  and the detail-page enable/disable button). On failure, alerts and does
  *  not mutate UI state; on success, refreshes the grid + detail page. */
 async function _flipSkillEnabled(skillId, nextEnabled) {
-  const trackResult = _createSkillManageTracker('toggle');
   let res;
   try {
     res = await window.orkas.invoke('skills.setEnabled', { id: skillId, enabled: nextEnabled });
   } catch (err) {
-    trackResult('failure', 'invoke_failed');
     await uiAlert(t('component.toggle_failed'));
     return false;
   }
   if (!res || !res.ok) {
-    trackResult('failure', 'update_failed');
     await uiAlert(t('component.toggle_failed'));
     return false;
   }
-  trackResult('success');
   const cached = _skillsCache?.find((s) => s.id === skillId);
   if (cached) cached.enabled = nextEnabled;
   try {
@@ -993,22 +981,6 @@ async function _flipSkillEnabled(skillId, nextEnabled) {
     _skillsLog.warn('skill toggle refresh failed', { error_code: 'refresh_failed' });
   }
   return true;
-}
-
-function _createSkillManageTracker(action) {
-  const startedAt = Date.now();
-  let done = false;
-  return (result, errorCode = '') => {
-    if (done) return;
-    done = true;
-    const payload = {
-      result,
-      action,
-      duration_ms: Math.max(0, Date.now() - startedAt),
-    };
-    if (result !== 'success') payload.error_code = errorCode || 'unknown';
-    _skillsLog.info('skill operation result', payload);
-  };
 }
 
 // ─── View switching: grid ↔ detail ─────────────────────────────────────
@@ -1764,7 +1736,6 @@ function _renderSkillDetailCategory(skill, source) {
   _mountDetailCategorySelect(sourceEl, {
     value: skill?.category || 'general',
     onChange: async (category, api) => {
-      const trackResult = _createSkillManageTracker('edit');
       try {
         const res = await window.orkas.invoke('skills.update', {
           id: skillId,
@@ -1772,12 +1743,10 @@ function _renderSkillDetailCategory(skill, source) {
           skipRename: true,
         });
         if (!res || res.ok === false || !res.skill) {
-          trackResult('failure', _skillManageErrorCode(res, 'update_failed'));
           api.setValue(skill?.category || 'general');
           uiAlert((res && res.error) || t('skills.save_failed'));
           return;
         }
-        trackResult('success');
         skill.category = res.skill.category || category || 'general';
         _skillsCache = null;
         await loadSkills(true);
@@ -1785,7 +1754,6 @@ function _renderSkillDetailCategory(skill, source) {
           await selectSkillFile('custom', skillId, _selectedSkill.filepath || 'SKILL.md', null);
         }
       } catch (err) {
-        trackResult('failure', _skillManageErrorCode(err, 'invoke_failed'));
         api.setValue(skill?.category || 'general');
         uiAlert((err && err.message) || t('skills.save_failed'));
       }
@@ -2580,55 +2548,6 @@ async function pickSkillImportDir() {
 }
 window.pickSkillImportDir = pickSkillImportDir;
 
-function _skillCreateNow() {
-  if (typeof performance !== 'undefined' && performance && typeof performance.now === 'function') {
-    return performance.now();
-  }
-  return Date.now();
-}
-
-function _skillCreateDuration(startedAt) {
-  return Math.max(0, Math.round(_skillCreateNow() - Number(startedAt || 0)));
-}
-
-function _skillCreatePayload(creationMethod, data) {
-  return Object.assign({ creation_method: creationMethod }, data || {});
-}
-
-function _skillCreateTrackClick(creationMethod, data) {
-  try {
-    const monitor = (typeof window !== 'undefined') ? window.Monitor : null;
-    if (monitor && typeof monitor.click === 'function') {
-      monitor.click('skill_create_submit', _skillCreatePayload(creationMethod, data));
-    }
-  } catch (_) {}
-}
-
-function _skillCreateTrackResult(tracking, result, data) {
-  if (!tracking || tracking.done) return false;
-  tracking.done = true;
-  try {
-    const monitor = (typeof window !== 'undefined') ? window.Monitor : null;
-    if (monitor && typeof monitor.event === 'function') {
-      monitor.event('skill_create_result', _skillCreatePayload(tracking.creationMethod, Object.assign({
-        result,
-        duration_ms: _skillCreateDuration(tracking.startedAt),
-      }, data || {})));
-    }
-  } catch (_) {}
-  return true;
-}
-
-function _skillCreateTracking(creationMethod, clickData) {
-  const tracking = {
-    creationMethod,
-    startedAt: _skillCreateNow(),
-    done: false,
-  };
-  _skillCreateTrackClick(creationMethod, clickData);
-  return tracking;
-}
-
 function _skillCreateIdFromResponse(data) {
   return data?.skill?.id || data?.skills?.[0]?.id || '';
 }
@@ -2656,7 +2575,6 @@ async function saveSkill() {
 window.saveSkill = saveSkill;
 
 async function _saveSkillManual({ editId, msgEl }) {
-  const tracking = editId ? null : _skillCreateTracking('manual');
   const rawName = document.getElementById('skill-name').value;
   const name = rawName.trim();
   const description = document.getElementById('skill-description').value.trim();
@@ -2664,21 +2582,18 @@ async function _saveSkillManual({ editId, msgEl }) {
     msgEl.textContent = t('skills.input_name_needed');
     msgEl.className = 'form-msg err';
     document.getElementById('skill-name').focus();
-    if (tracking) _skillCreateTrackResult(tracking, 'blocked', { error_code: 'no_name' });
     return;
   }
   if (!_isValidSkillNameCharset(rawName)) {
     msgEl.textContent = t('skills.name_invalid');
     msgEl.className = 'form-msg err';
     document.getElementById('skill-name').focus();
-    if (tracking) _skillCreateTrackResult(tracking, 'blocked', { error_code: 'name_invalid' });
     return;
   }
   if (!description) {
     msgEl.textContent = t('skills.input_desc_needed');
     msgEl.className = 'form-msg err';
     document.getElementById('skill-description').focus();
-    if (tracking) _skillCreateTrackResult(tracking, 'blocked', { error_code: 'no_desc' });
     return;
   }
   try {
@@ -2701,38 +2616,21 @@ async function _saveSkillManual({ editId, msgEl }) {
     if (!data.ok) {
       msgEl.textContent = data.error || t('skills.save_failed');
       msgEl.className = 'form-msg err';
-      if (tracking) {
-        _skillCreateTrackResult(tracking, 'failure', {
-          error_code: _skillManageErrorCode(data, 'create_failed'),
-        });
-      }
       return;
-    }
-    if (tracking) {
-      _skillCreateTrackResult(tracking, 'success', {
-        skill_count: _skillCreateCountFromResponse(data),
-      });
     }
     await _afterSkillCreated(data.skill?.id || editId, !editId, null);
   } catch (e) {
     msgEl.textContent = t('skills.network_error_plain');
     msgEl.className = 'form-msg err';
-    if (tracking) {
-      if (!_skillCreateTrackResult(tracking, 'failure', { error_code: 'network_failed' })) {
-        _skillsLog.warn('skill post-create refresh failed', { creation_method: 'manual', error_code: 'refresh_failed' });
-      }
-    }
   }
 }
 
 async function _saveSkillFromUrl({ msgEl }) {
-  const tracking = _skillCreateTracking('url');
   const url = document.getElementById('skill-url-input').value.trim();
   if (!/^https?:\/\//i.test(url)) {
     msgEl.textContent = t('skill_modal.err_url_invalid');
     msgEl.className = 'form-msg err';
     document.getElementById('skill-url-input').focus();
-    _skillCreateTrackResult(tracking, 'blocked', { error_code: 'url_invalid' });
     return;
   }
   try {
@@ -2750,9 +2648,6 @@ async function _saveSkillFromUrl({ msgEl }) {
       msgEl.textContent = data.error || t('skills.save_failed');
       msgEl.className = 'form-msg err';
       _setSkillModalBusy(false);
-      _skillCreateTrackResult(tracking, 'failure', {
-        error_code: _skillManageErrorCode(data, 'import_failed'),
-      });
       return;
     }
     const createdId = _skillCreateIdFromResponse(data);
@@ -2760,35 +2655,26 @@ async function _saveSkillFromUrl({ msgEl }) {
     // URL imports start as empty placeholders. If the user backs out before
     // the edit chat authors real content, offer to discard that placeholder.
     _importDraftId = data.skill?.id && _skillAutoSeedHasModelText(autoSeed) ? data.skill.id : null;
-    _skillCreateTrackResult(tracking, 'success', {
-      skill_count: _skillCreateCountFromResponse(data),
-    });
     await _afterSkillCreated(createdId, true, autoSeed);
   } catch (e) {
     msgEl.textContent = t('skills.network_error_plain');
     msgEl.className = 'form-msg err';
-    if (!_skillCreateTrackResult(tracking, 'failure', { error_code: 'network_failed' })) {
-      _skillsLog.warn('skill post-create refresh failed', { creation_method: 'url', error_code: 'refresh_failed' });
-    }
   } finally {
     _setSkillModalBusy(false);
   }
 }
 
 async function _saveSkillFromDir({ msgEl }) {
-  const tracking = _skillCreateTracking('dir');
   const srcDir = document.getElementById('skill-dir-path').value.trim();
   if (!srcDir) {
     msgEl.textContent = t('skill_modal.err_dir_missing');
     msgEl.className = 'form-msg err';
-    _skillCreateTrackResult(tracking, 'blocked', { error_code: 'dir_missing' });
     return;
   }
   return _saveSkillFromDirWithQuality({
     msgEl,
     srcDir,
     force: false,
-    tracking,
   });
 }
 
@@ -2805,8 +2691,7 @@ function _qualityImportRejectedTitle(name) {
     : tmpl.replace('{name}', name);
 }
 
-async function _saveSkillFromDirWithQuality({ msgEl, srcDir, force, tracking }) {
-  tracking = tracking || _skillCreateTracking('dir');
+async function _saveSkillFromDirWithQuality({ msgEl, srcDir, force }) {
   try {
     msgEl.textContent = t('skills.saving');
     msgEl.className = 'form-msg';
@@ -2828,39 +2713,21 @@ async function _saveSkillFromDirWithQuality({ msgEl, srcDir, force, tracking }) 
           forceLabel: _qualityForceImportLabel(),
         });
         if (action === 'force') {
-          return await _saveSkillFromDirWithQuality({ msgEl, srcDir, force: true, tracking });
+          return await _saveSkillFromDirWithQuality({ msgEl, srcDir, force: true });
         }
-        _skillCreateTrackResult(tracking, 'blocked', {
-          forced: false,
-          error_code: _skillManageErrorCode(data, 'quality_validation'),
-        });
         msgEl.textContent = data.error || t('skills.save_failed');
         msgEl.className = 'form-msg err';
         return;
       }
       msgEl.textContent = data.error || t('skills.save_failed');
       msgEl.className = 'form-msg err';
-      _skillCreateTrackResult(tracking, 'failure', {
-        forced: !!force,
-        error_code: _skillManageErrorCode(data, data.report ? 'quality_validation' : 'import_failed'),
-      });
       return;
     }
     const createdId = _skillCreateIdFromResponse(data);
-    _skillCreateTrackResult(tracking, 'success', {
-      skill_count: _skillCreateCountFromResponse(data),
-      forced: !!force,
-    });
     await _afterSkillCreated(createdId, true, _skillImportAutoSeedFromResponse(data));
   } catch (e) {
     msgEl.textContent = t('skills.network_error_plain');
     msgEl.className = 'form-msg err';
-    if (!_skillCreateTrackResult(tracking, 'failure', {
-      forced: !!force,
-      error_code: 'network_failed',
-    })) {
-      _skillsLog.warn('skill post-create refresh failed', { creation_method: 'dir', error_code: 'refresh_failed' });
-    }
   } finally {
     _setSkillModalBusy(false);
   }
@@ -2918,23 +2785,19 @@ async function deleteSelectedSkill() {
   const confirmKey = isMarketplace ? 'skills.uninstall_confirm' : 'skills.delete_confirm';
   const failedWithKey = isMarketplace ? 'skills.uninstall_failed_with' : 'skills.delete_failed_with';
   if (!(await uiConfirm(t(confirmKey, { name: cached?.name || sid })))) return;
-  const trackResult = _createSkillManageTracker('delete');
   let result;
   try {
     result = isMarketplace
       ? await window.orkas.invoke('skills.builtin.delete', { id: sid })
       : await (await apiFetch(`/api/skills/${sid}`, { method: 'DELETE' })).json();
   } catch (e) {
-    trackResult('failure', 'request_failed');
     await uiAlert(t(failedWithKey, { reason: e.message || e }));
     return;
   }
   if (!result || !result.ok) {
-    trackResult('failure', 'delete_failed');
     await uiAlert(t(failedWithKey, { reason: result?.error || '' }));
     return;
   }
-  trackResult('success');
   _selectedSkill = null;
   _skillsCache = null;
   _skillTreeCache.clear();

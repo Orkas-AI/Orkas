@@ -5174,7 +5174,7 @@ describe('group_chat bus integration › task terminal boundary', () => {
       {
         type: 'event',
         event: {
-          stream: 'agent_run_result',
+          stream: 'agent_run_terminal',
           data: {
             run_kind: 'top_level',
             terminal_status: 'stopped',
@@ -5441,7 +5441,7 @@ describe('group_chat bus integration › task terminal boundary', () => {
     const unsubscribe = bus.subscribeTaskTerminals((event) => {
       if (event.conversation_id === cid) terminals.push(event);
     });
-    _setScript(sid, [{ type: 'event', event: { stream: 'agent_run_result', data: {
+    _setScript(sid, [{ type: 'event', event: { stream: 'agent_run_terminal', data: {
       result: 'success', terminal_status: 'waiting_input', duration_ms: 20, run_kind: 'top_level',
     } } }]);
     try {

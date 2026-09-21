@@ -161,7 +161,7 @@ function _mockErrorResponse(error, status) {
   };
 }
 
-function _monitorIpcError(kind, channel, data) {
+function _logIpcError(kind, channel, data) {
   try {
     if (_ipcErrorSentCount >= _IPC_ERROR_MAX_PER_SESSION) return;
     const payload = {
@@ -248,7 +248,7 @@ function _streamResponse(channel, payload, signal) {
             try { controller.close(); } catch (_) {}
             return;
           }
-          _monitorIpcError('ipc_stream', channel, _ipcFailureMeta(err));
+          _logIpcError('ipc_stream', channel, _ipcFailureMeta(err));
           try { controller.error(new Error('ipc stream failed')); } catch (_) {}
         });
     },
@@ -307,7 +307,7 @@ async function _uploadBinary(channel, options, extraParams) {
     const result = await window.orkas.invoke(channel, { ...(extraParams || {}), name, data });
     return _mockJsonResponse(result);
   } catch (err) {
-    _monitorIpcError('ipc_invoke', channel, { ..._ipcFailureMeta(err), transport: 'upload' });
+    _logIpcError('ipc_invoke', channel, { ..._ipcFailureMeta(err), transport: 'upload' });
     throw new Error('ipc upload failed');
   }
 }
@@ -333,7 +333,7 @@ function apiFetch(url, options) {
   const route = _matchRoute(method, pathname);
   if (!route) {
     _shimLog.warn('unmatched API route', { method });
-    _monitorIpcError('ipc_unmatched_route', 'unmatched', { method });
+    _logIpcError('ipc_unmatched_route', 'unmatched', { method });
     return Promise.resolve(_mockErrorResponse('unknown API route', 404));
   }
 
@@ -386,7 +386,7 @@ function apiFetch(url, options) {
       return _mockJsonResponse(result);
     })
     .catch((err) => {
-      _monitorIpcError('ipc_invoke', channel, _ipcFailureMeta(err));
+      _logIpcError('ipc_invoke', channel, _ipcFailureMeta(err));
       return _mockErrorResponse('ipc request failed', 500);
     });
 }
@@ -444,7 +444,7 @@ async function apiLibraryFetch(projectId, url, options = {}) {
     }
     return _mockJsonResponse(result);
   } catch (err) {
-    _monitorIpcError('ipc_invoke', channel || 'projects.files.upload', _ipcFailureMeta(err));
+    _logIpcError('ipc_invoke', channel || 'projects.files.upload', _ipcFailureMeta(err));
     return _mockErrorResponse('ipc request failed', 500);
   }
 }

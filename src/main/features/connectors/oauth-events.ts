@@ -6,10 +6,8 @@ export interface OAuthConnectOutcome {
   duration_ms: number;
   code?: string;
   error?: string;
-  /** Sanitized official CLI cause for the local UI only; excluded from logs and analytics. */
+  /** Sanitized official CLI cause for the local UI only; excluded from logs. */
   authorization_detail?: string;
-  /** Main already queued the canonical terminal with account ownership. */
-  telemetry_reported?: boolean;
 }
 
 export interface OAuthConnectProgress {

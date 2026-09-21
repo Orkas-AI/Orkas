@@ -253,20 +253,6 @@ describe('core-agent client skill sandbox env', () => {
       .toBe('unknown');
   });
 
-  it('uses the response provider and model for external-provider fallbacks', async () => {
-    const client = await import('../../../../src/main/model/core-agent/client');
-
-    expect(client.modelRunIdsForTelemetry(
-      'openrouter',
-      'openai/gpt-5.6-sol',
-      'anthropic',
-      'claude-opus-4-8',
-    )).toEqual({
-      providerId: 'anthropic',
-      modelId: 'claude-opus-4-8',
-    });
-  });
-
   it('summarizes model events without tool arguments, tool results, or final text', async () => {
     const client = await import('../../../../src/main/model/core-agent/client');
     const stats = client.createModelRunLogDiagnostics(1000);
@@ -562,7 +548,7 @@ describe('core-agent client skill sandbox env', () => {
     expect(JSON.stringify(summary)).not.toContain('private provider body');
   });
 
-  it('counts context-gate interventions and compaction-span re-reads for run telemetry', async () => {
+  it('counts context-gate interventions and compaction-span re-reads for run diagnostics', async () => {
     const client = await import('../../../../src/main/model/core-agent/client');
     const stats = client.createModelRunLogDiagnostics(1000);
 

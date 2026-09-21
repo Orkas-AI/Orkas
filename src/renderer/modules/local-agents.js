@@ -96,9 +96,8 @@ let _localCliEntriesInFlight = null;
 let _localCliPresenceEntries = null;
 let _localCliPresenceInFlight = null;
 let _externalCliVisibleEntries = [];
-let _externalCliDetectionTelemetryInFlight = false;
 
-/** Bounded telemetry/UI state for the current renderer-side discovery cache.
+/** Bounded UI state for the current renderer-side discovery cache.
  * A background refresh never hides a completed cache; `detecting` is reserved
  * for a cold path lookup where no result exists yet. Once path-only discovery
  * finds a CLI, availability can be reported immediately while its version is
@@ -181,8 +180,7 @@ function _replaceLocalCliEntry(entries, nextEntry) {
 /** Validate installed CLI entries concurrently through the single-type IPC.
  * Each successful response is merged into the stable presence-order list and
  * surfaced immediately. The aggregate promise still resolves only after all
- * probes settle so callers can emit one bounded telemetry row and cache only
- * a fully validated snapshot. */
+ * probes settle so callers can cache one fully validated snapshot. */
 async function _validateInstalledLocalCliEntries(entries, installedTypes, onEntry) {
   if (_localCliEntriesInFlight) return _localCliEntriesInFlight;
   const initialEntries = Array.isArray(entries)
@@ -233,45 +231,6 @@ async function loadLocalCliEntries(options = {}) {
 // ── External-tab CLI selector (create modal) ───────────────────────────
 //
 let _extCliSelectApi = null;
-
-function _trackExternalCliDetectionResult({
-  result,
-  entries,
-  startedAt,
-  errorCode = '',
-}) {
-  if (!window.Monitor) return;
-  const list = Array.isArray(entries) ? entries : [];
-  const typesFor = (predicate) => list
-    .filter(predicate)
-    .map(entry => String(entry?.type || ''))
-    .filter(Boolean)
-    .sort()
-    .join(',');
-  const availableTypes = typesFor(entry => entry?.available === true);
-  const notFoundTypes = typesFor(entry => entry?.error === 'not_found');
-  const versionTooOldTypes = typesFor(entry => entry?.error === 'version_too_old');
-  const versionTimeoutTypes = typesFor(entry => entry?.error === 'version_timeout');
-  const versionUnknownTypes = typesFor(entry => entry?.error === 'version_unknown');
-  const payload = {
-    result,
-    available_count: availableTypes ? availableTypes.split(',').length : 0,
-    not_found_count: notFoundTypes ? notFoundTypes.split(',').length : 0,
-    version_too_old_count: versionTooOldTypes ? versionTooOldTypes.split(',').length : 0,
-    version_timeout_count: versionTimeoutTypes ? versionTimeoutTypes.split(',').length : 0,
-    version_unknown_count: versionUnknownTypes ? versionUnknownTypes.split(',').length : 0,
-    available_types: availableTypes,
-    not_found_types: notFoundTypes,
-    version_too_old_types: versionTooOldTypes,
-    version_timeout_types: versionTimeoutTypes,
-    version_unknown_types: versionUnknownTypes,
-    duration_ms: Math.max(0, Date.now() - startedAt),
-  };
-  if (result !== 'success') payload.error_code = errorCode || 'unknown';
-  try {
-    Monitor.event('external_cli_detect_result', payload);
-  } catch (_) {}
-}
 
 function _setExternalCliDetectionBusy(
   busy,
@@ -419,14 +378,6 @@ async function mountExternalCliSelect(onChange) {
   const mount = document.getElementById('agent-modal-ext-cli-select');
   if (!mount) return null;
   const cachedEntries = _localCliEntries;
-  // Concurrent mounts share the same two discovery requests. Only the mount
-  // that starts the path lookup owns the aggregate telemetry row.
-  const ownsDetectionTelemetry = !_externalCliDetectionTelemetryInFlight;
-  if (ownsDetectionTelemetry) _externalCliDetectionTelemetryInFlight = true;
-  const detectionStartedAt = Date.now();
-
-  try {
-
   // Cold entry: put the progress copy in the menu itself and keep the title
   // clean. Cached entry: immediately select its first available CLI and use
   // the title-side live region only for the background update.
@@ -471,13 +422,6 @@ async function mountExternalCliSelect(onChange) {
       _localCliEntries = presence.entries;
       _localCliPresenceEntries = null;
       _setExternalCliDetectionBusy(false);
-      if (ownsDetectionTelemetry) {
-        _trackExternalCliDetectionResult({
-          result: 'success',
-          entries: presence.entries,
-          startedAt: detectionStartedAt,
-        });
-      }
       return _extCliSelectApi;
     }
     _setExternalCliDetectionBusy(true, {
@@ -506,21 +450,7 @@ async function mountExternalCliSelect(onChange) {
   );
   _localCliPresenceEntries = null;
   _setExternalCliDetectionBusy(false);
-  if (ownsDetectionTelemetry) {
-    const hasFallback = !!cachedEntries || presence.ok;
-    _trackExternalCliDetectionResult({
-      result: validated.ok ? 'success' : (hasFallback ? 'fallback' : 'failure'),
-      entries: validated.entries.length > 0
-        ? validated.entries
-        : (presence.ok ? presence.entries : (cachedEntries || [])),
-      startedAt: detectionStartedAt,
-      errorCode: validated.ok ? '' : (hasFallback ? 'validation_failed' : 'invoke_failed'),
-    });
-  }
-    return _extCliSelectApi;
-  } finally {
-    if (ownsDetectionTelemetry) _externalCliDetectionTelemetryInFlight = false;
-  }
+  return _extCliSelectApi;
 }
 
 /** Read the currently-selected CLI type from the External tab, or null when

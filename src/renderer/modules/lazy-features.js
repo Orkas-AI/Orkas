@@ -57,7 +57,7 @@ function _rendererFeatureNow() {
   return Date.now();
 }
 
-function _rendererFeatureTelemetryName(feature) {
+function _rendererFeatureLogName(feature) {
   return Object.prototype.hasOwnProperty.call(_rendererFeatureManifest, feature)
     ? feature
     : 'unknown';
@@ -65,7 +65,7 @@ function _rendererFeatureTelemetryName(feature) {
 
 function _trackRendererFeatureLoad(result, feature, startedAt, retryCount, errorCode = '') {
   const normalizedResult = result === 'success' ? 'success' : 'failure';
-  const normalizedFeature = _rendererFeatureTelemetryName(feature);
+  const normalizedFeature = _rendererFeatureLogName(feature);
   const normalizedCode = errorCode === 'unknown_feature'
     ? 'unknown_feature'
     : 'script_load_failed';

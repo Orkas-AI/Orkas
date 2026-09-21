@@ -170,15 +170,9 @@ export function initializePreview(uid: string, sender: WebContents) {
 export function closePreview(uid: string, sender: WebContents) { owned(uid, sender).win.destroy(); }
 export function setPreviewDirty(uid: string, sender: WebContents, dirty: unknown) { owned(uid, sender).dirty = dirty === true; }
 
-export function reportPreview(uid: string, sender: WebContents, payload: any) {
+export function notifyPreviewFilesChanged(uid: string, sender: WebContents) {
   const r = owned(uid, sender);
-  if (payload?.kind === 'files-changed') r.owner.send('preview-windows:report', { kind: 'files-changed' });
-  else {
-    const report = z.object({ kind: z.literal('telemetry'), method: z.enum(['click', 'event', 'error']),
-      action: z.string().min(1).max(128), data: z.record(z.string(), z.unknown()) }).strict().parse(payload);
-    if (JSON.stringify(report).length > 16384) return;
-    r.owner.send('preview-windows:report', report);
-  }
+  r.owner.send('preview-windows:files-changed', {});
 }
 
 // Projection stays with the transcript renderer, which owns visibility,

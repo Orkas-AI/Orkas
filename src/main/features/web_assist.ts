@@ -32,7 +32,7 @@ import { logErrorRef } from '../util/log-redact';
 import { prepareBrowserProxy } from '../util/browser-proxy';
 import { withOperationTimeout } from '../util/operation-timeout';
 import { prepareWebAssistSession } from './web_assist_session';
-import { reportWebAssistFailure } from './web_assist_diagnostics';
+import { logWebAssistFailure } from './web_assist_diagnostics';
 import { registerUserSwitchHook } from './user-switch-hooks';
 import {
   registerBrowserTab, forgetBrowserTab, retainBrowserTab,
@@ -952,7 +952,7 @@ function ensureTabLoaded(record: WebAssistRecord, tab: WebAssistTabRecord, load 
     return true;
   } catch {
     tab.errorCode = 'page_load_failed';
-    reportWebAssistFailure(record.owner.webContents, 'view_unavailable');
+    logWebAssistFailure(record.owner.webContents, 'view_unavailable');
     emit(record);
     return false;
   }
@@ -1325,7 +1325,7 @@ function readWebAssistTextCondition(contents: WebContents, text: string, deadlin
 function handleLoadFailure(record: WebAssistRecord, tab: WebAssistTabRecord, netCode: number): void {
   tab.loading = false;
   tab.errorCode = 'page_load_failed';
-  reportWebAssistFailure(record.owner.webContents, 'page_load_failed', netCode);
+  logWebAssistFailure(record.owner.webContents, 'page_load_failed', netCode);
   emit(record);
 }
 
@@ -1593,14 +1593,14 @@ function mountTab(
   contents.on('unresponsive', () => {
     if (tab.view !== view) return;
     tab.errorCode = 'page_unresponsive';
-    reportWebAssistFailure(record.owner.webContents, 'page_unresponsive');
+    logWebAssistFailure(record.owner.webContents, 'page_unresponsive');
     emit(record);
   });
   contents.on('render-process-gone', (_event, details) => {
     if (tab.view !== view) return;
     tab.loading = false;
     tab.errorCode = 'page_load_failed';
-    if (details?.reason !== 'clean-exit') reportWebAssistFailure(record.owner.webContents, 'renderer_gone');
+    if (details?.reason !== 'clean-exit') logWebAssistFailure(record.owner.webContents, 'renderer_gone');
     emit(record);
   });
   contents.once('destroyed', () => {
@@ -1696,7 +1696,7 @@ export async function openWebAssist(
       records.set(owner.id, record);
       createdRecord = true;
     } catch (error) {
-      reportWebAssistFailure(sender, 'view_unavailable');
+      logWebAssistFailure(sender, 'view_unavailable');
       return { ok: false, code: 'view_unavailable', error: 'Web Assist could not be opened.' };
     }
   }
@@ -1716,7 +1716,7 @@ export async function openWebAssist(
       tab = created.tab;
       closedTabIds = created.closedTabIds;
     } catch (error) {
-      reportWebAssistFailure(sender, 'view_unavailable');
+      logWebAssistFailure(sender, 'view_unavailable');
       if (createdRecord && !record.tabs.size) closeRecord(record);
       return { ok: false, code: 'view_unavailable', error: 'Web Assist could not be opened.' };
     }
@@ -1771,7 +1771,7 @@ export function addWebAssistTab(
       records.set(owner.id, record);
       createdRecord = true;
     } catch (error) {
-      reportWebAssistFailure(sender, 'view_unavailable');
+      logWebAssistFailure(sender, 'view_unavailable');
       return { ok: false, code: 'view_unavailable', error: 'Web Assist could not be opened.' };
     }
   }
@@ -1783,7 +1783,7 @@ export function addWebAssistTab(
     if (!created) return tabLimitFailure();
     tab = created.tab;
   } catch (error) {
-    reportWebAssistFailure(sender, 'view_unavailable');
+    logWebAssistFailure(sender, 'view_unavailable');
     if (createdRecord && !record.tabs.size) closeRecord(record);
     return { ok: false, code: 'view_unavailable', error: 'Web Assist could not be opened.' };
   }

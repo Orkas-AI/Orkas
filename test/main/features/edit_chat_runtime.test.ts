@@ -68,7 +68,7 @@ describe('edit chat runtime normalization', () => {
     const normalized = normalizeEditChatRuntimeEvent({
       type: 'event',
       event: {
-        stream: 'agent_run_result',
+        stream: 'agent_run_terminal',
         data: {
           result: 'success',
           terminal_status: terminalStatus,
@@ -106,7 +106,7 @@ describe('edit chat runtime normalization', () => {
     const normalized = normalizeEditChatRuntimeEvent({
       type: 'event',
       event: {
-        stream: 'agent_run_result',
+        stream: 'agent_run_terminal',
         data: { result, terminal_status: terminalStatus, duration_ms: 9_000 },
       },
     });
@@ -125,7 +125,7 @@ describe('edit chat runtime normalization', () => {
     const normalized = normalizeEditChatRuntimeEvent({
       type: 'event',
       event: {
-        stream: 'agent_run_result',
+        stream: 'agent_run_terminal',
         data: { result: 'success', terminal_status: 'completed', duration_ms: 'invalid' },
       },
     });

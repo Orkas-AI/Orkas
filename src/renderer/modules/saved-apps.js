@@ -36,9 +36,6 @@
     } catch (_) {}
   }
 
-  function _track(action, data) { void action; void data; }
-  function _trackError(action, data) { void action; void data; }
-
   const _SAVED_APP_STABLE_ERROR_CODES = new Set([
     'invalid_response',
     'invalid_title',
@@ -81,7 +78,7 @@
     _appsLog.warn('saved app operation failed', { action, ...(data || {}) });
   }
 
-  function _trackManageResult(startedAt, action, result, failure = {}) {
+  function _logManageResult(startedAt, action, result, failure = {}) {
     const payload = {
       result,
       action,
@@ -97,7 +94,7 @@
     }
   }
 
-  function _trackOpenResult(startedAt, result, failure = {}) {
+  function _logOpenResult(startedAt, result, failure = {}) {
     const payload = {
       result,
       duration_ms: Math.max(0, Date.now() - startedAt),
@@ -278,20 +275,20 @@
     if (window.OrkasPreviewWindows) {
       const app = (_appsCache || []).find(item => item.id === appId);
       const result = await window.OrkasPreviewWindows.open({ kind: 'app', appId, title: app?.title || _t('artifact.title', 'Interactive app') });
-      _trackOpenResult(startedAt, result?.ok ? 'success' : 'failure', result?.ok ? {} : { error_type: 'presentation', error_code: 'saved_app_viewer_failed' });
+      _logOpenResult(startedAt, result?.ok ? 'success' : 'failure', result?.ok ? {} : { error_type: 'presentation', error_code: 'saved_app_viewer_failed' });
       return;
     }
     let r;
     try {
       r = await window.orkas.invoke('savedApps.openInApp', { appId: String(appId) });
     } catch (err) {
-      _trackOpenResult(startedAt, 'failure', _savedAppFailure(err, 'saved_app_open_failed', 'ipc'));
+      _logOpenResult(startedAt, 'failure', _savedAppFailure(err, 'saved_app_open_failed', 'ipc'));
       _fail(_t('apps.open_failed', 'Could not open the app'), err);
       return;
     }
     if (!r || r.ok === false || !r.url) {
       const failure = _savedAppFailure(r, r && r.ok === false ? 'saved_app_open_failed' : 'invalid_response');
-      _trackOpenResult(startedAt, 'failure', failure);
+      _logOpenResult(startedAt, 'failure', failure);
       _fail(_t('apps.open_failed', 'Could not open the app'), { message: (r && r.error) || 'open failed' });
       return;
     }
@@ -299,11 +296,10 @@
       const app = (_appsCache || []).find((a) => a && a.id === appId);
       _openAppViewer(r, (app && app.title) || _t('artifact.title', 'Interactive app'));
     } catch (err) {
-      _trackError('saved_app_open', { error_message: 'saved_app_open_failed' });
       _fail(_t('apps.open_failed', 'Could not open the app'), err);
       return;
     }
-    _trackOpenResult(startedAt, 'success');
+    _logOpenResult(startedAt, 'success');
   }
 
   // "Edit" — backend creates a fresh conversation with the app's source bundled
@@ -318,22 +314,22 @@
     try {
       r = await window.orkas.invoke('savedApps.openForEditing', { appId: String(appId) });
     } catch (err) {
-      _trackManageResult(startedAt, 'edit', 'failure', _savedAppFailure(err, 'saved_app_edit_failed', 'ipc'));
+      _logManageResult(startedAt, 'edit', 'failure', _savedAppFailure(err, 'saved_app_edit_failed', 'ipc'));
       _fail(_t('apps.edit_failed', 'Could not open an edit conversation'), err);
       return;
     }
     if (!r || r.ok === false) {
-      _trackManageResult(startedAt, 'edit', 'failure', _savedAppFailure(r, 'saved_app_edit_failed'));
+      _logManageResult(startedAt, 'edit', 'failure', _savedAppFailure(r, 'saved_app_edit_failed'));
       _fail(_t('apps.edit_failed', 'Could not open an edit conversation'), { message: (r && r.error) || 'open-for-editing failed' });
       return;
     }
     const conv = r.conversation;
     if (!conv || !conv.conversation_id) {
-      _trackManageResult(startedAt, 'edit', 'failure', _savedAppFailure(r, 'invalid_response'));
+      _logManageResult(startedAt, 'edit', 'failure', _savedAppFailure(r, 'invalid_response'));
       _fail(_t('apps.edit_failed', 'Could not open an edit conversation'));
       return;
     }
-    _trackManageResult(startedAt, 'edit', 'success');
+    _logManageResult(startedAt, 'edit', 'success');
     // Add to the sidebar list. Set last_active_at explicitly — backend
     // create response doesn't include the derived field, so timeBucket
     // would otherwise put this brand-new row in the 'older' bucket.
@@ -384,16 +380,16 @@
     try {
       r = await window.orkas.invoke('savedApps.rename', { appId: String(appId), title: next });
     } catch (err) {
-      _trackManageResult(startedAt, 'rename', 'failure', _savedAppFailure(err, 'saved_app_rename_failed', 'ipc'));
+      _logManageResult(startedAt, 'rename', 'failure', _savedAppFailure(err, 'saved_app_rename_failed', 'ipc'));
       _fail(_t('apps.rename_failed', 'Could not rename'), err);
       return;
     }
     if (!r || r.ok === false) {
-      _trackManageResult(startedAt, 'rename', 'failure', _savedAppFailure(r, 'saved_app_rename_failed'));
+      _logManageResult(startedAt, 'rename', 'failure', _savedAppFailure(r, 'saved_app_rename_failed'));
       _fail(_t('apps.rename_failed', 'Could not rename'), { message: (r && r.error) || 'rename failed' });
       return;
     }
-    _trackManageResult(startedAt, 'rename', 'success');
+    _logManageResult(startedAt, 'rename', 'success');
     try { loadSavedApps(true); } catch (_) {
       _appsLogFailure('saved_app_refresh', { error_type: 'presentation', error_code: 'saved_app_viewer_failed' });
     }
@@ -419,16 +415,16 @@
     try {
       r = await window.orkas.invoke('savedApps.delete', { appId: String(appId) });
     } catch (err) {
-      _trackManageResult(startedAt, 'delete', 'failure', _savedAppFailure(err, 'saved_app_delete_failed', 'ipc'));
+      _logManageResult(startedAt, 'delete', 'failure', _savedAppFailure(err, 'saved_app_delete_failed', 'ipc'));
       _fail(_t('apps.delete_failed', 'Could not delete'), err);
       return;
     }
     if (!r || r.ok === false) {
-      _trackManageResult(startedAt, 'delete', 'failure', _savedAppFailure(r, 'saved_app_delete_failed'));
+      _logManageResult(startedAt, 'delete', 'failure', _savedAppFailure(r, 'saved_app_delete_failed'));
       _fail(_t('apps.delete_failed', 'Could not delete'), { message: (r && r.error) || 'delete failed' });
       return;
     }
-    _trackManageResult(startedAt, 'delete', 'success');
+    _logManageResult(startedAt, 'delete', 'success');
     try { loadSavedApps(true); } catch (_) {
       _appsLogFailure('saved_app_refresh', { error_type: 'presentation', error_code: 'saved_app_viewer_failed' });
     }
@@ -487,9 +483,8 @@
     return _appTemplates.some(item => item.id === value) ? value : 'custom';
   }
 
-  function _trackCreateAction(action, template = 'custom') {
+  function _logCreateAction(action, template = 'custom') {
     const payload = { action, template: _createTemplateId(template) };
-    try { window.Monitor?.click('saved_app_create', payload); } catch (_) {}
     _appsLog.info?.('app creation action', payload);
   }
 
@@ -505,7 +500,6 @@
         duration_ms: Math.max(0, Date.now() - startedAt) };
       if (result === 'failure') payload.error_code = stage === 'preflight'
         ? 'model_not_configured' : stage === 'conversation_create' ? 'conversation_create_failed' : 'send_not_started';
-      try { window.Monitor?.event('saved_app_create_result', payload); } catch (_) {}
       if (result === 'failure') _appsLog.warn('app creation did not start', payload);
       else _appsLog.info?.('app creation started', payload);
     };
@@ -604,26 +598,26 @@
       if (_uiTrapDialogTab(overlay, event)) return;
       if (event.key === 'Escape') {
         event.preventDefault(); event.stopPropagation();
-        if (!submitting) { _trackCreateAction('cancel', selectedTemplate); close(); }
+        if (!submitting) { _logCreateAction('cancel', selectedTemplate); close(); }
       }
     };
     document.addEventListener('keydown', onKey, true);
     overlay.addEventListener('click', async (event) => {
       if (submitting) return;
       if (event.target === overlay || event.target.closest('[data-create-cancel]')) {
-        _trackCreateAction('cancel', selectedTemplate); close(); return;
+        _logCreateAction('cancel', selectedTemplate); close(); return;
       }
       const template = event.target.closest('[data-app-template]');
       if (template) {
         selectedTemplate = _createTemplateId(template.dataset.appTemplate);
-        _trackCreateAction('template', selectedTemplate);
+        _logCreateAction('template', selectedTemplate);
         idea.value = _t(`apps.template_${template.dataset.appTemplate}_prompt`, '');
         updateSubmit();
         idea.focus();
         return;
       }
       if (!event.target.closest('[data-create-submit]') || !idea.value.trim()) return;
-      _trackCreateAction('submit', selectedTemplate);
+      _logCreateAction('submit', selectedTemplate);
       submitting = true;
       updateSubmit();
       cancelButton.disabled = true;
@@ -733,7 +727,7 @@
     const createButton = document.getElementById('apps-create-btn');
     if (createButton) createButton.onclick = () => {
       if (_createPanel) return;
-      _trackCreateAction('open');
+      _logCreateAction('open');
       _openCreatePanel();
     };
     // `_force` accepted for parity with loadAgents/loadSkills; this module

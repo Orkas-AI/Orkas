@@ -11,16 +11,6 @@
 
 const _ossLog = createLogger('oss');
 
-function _ossTrackClick(action, data) {
-  void action;
-  void data;
-}
-
-function _ossTrackEvent(action, data) {
-  void action;
-  void data;
-}
-
 // category code → centralized ui-icon name (icons.js). We deliberately do NOT
 // render the unicode project glyph as an icon (CLAUDE.md: icons go through the
 // icon module).
@@ -416,10 +406,6 @@ function _ossPromptForComposer(p, input) {
 }
 
 function _openOssMarketplace() {
-  _ossTrackClick('commander_oss_quick_task', {
-    source_view: 'new_chat',
-    destination: 'marketplace_oss',
-  });
   const load = typeof loadRendererFeature === 'function' ? loadRendererFeature : window.loadRendererFeature;
   if (typeof load !== 'function') {
     _ossLog.warn('Commander OSS quick task failed: marketplace loader unavailable');

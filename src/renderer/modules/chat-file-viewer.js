@@ -76,15 +76,6 @@ const _viewerLog = (typeof createLogger === 'function')
   ? createLogger('chat-file-viewer')
   : { warn: () => {}, info: () => {}, error: () => {} };
 
-function _viewerTrack(action, data) {
-  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
-}
-
-function _viewerTrackEvent(action, data) {
-  void action;
-  void data;
-}
-
 function _viewerClearPdfSlowTimer(state) {
   if (!state || !state.slowTimer) return;
   clearTimeout(state.slowTimer);
@@ -661,7 +652,6 @@ async function _onAddLibraryClick() {
   if (!p || !_viewerCurrentCid || !_viewerAddLibraryBtn || _viewerAddLibraryBtn.disabled) return;
   if (!_viewerCanAddToLibrary(p, { projectScoped: _viewerLibraryProjectScoped })) return;
   const startedAt = Date.now();
-  _viewerTrack('file_preview_add_library', { kind: _kindOf(p), has_project: !!_viewerCurrentProjectId });
   const label = _viewerLabel('chat.preview_add_library_title', 'Add to Library');
   const doneLabel = _viewerLabel('chat.preview_add_library_done', 'Added');
   const original = _viewerAddLibraryButtonHtml(label);
@@ -675,12 +665,6 @@ async function _onAddLibraryClick() {
   } catch (err) {
     const failure = _viewerStableFailure(err, 'library_import_failed', 'ipc');
     const reason = String(err && err.message || err);
-    _viewerTrackEvent('file_preview_add_library_result', {
-      result: 'failure',
-      kind: _kindOf(p),
-      duration_ms: _viewerDurationSince(startedAt),
-      ...failure,
-    });
     _viewerLogFailure('file_preview_add_library', failure);
     let message = `Add to Library failed: ${reason}`;
     if (typeof t === 'function') {
@@ -700,12 +684,6 @@ async function _onAddLibraryClick() {
   if (!res || !res.ok) {
     const failure = _viewerStableFailure(res, 'library_import_failed', 'operation');
     const reason = String((res && res.error) || 'failed');
-    _viewerTrackEvent('file_preview_add_library_result', {
-      result: 'failure',
-      kind: _kindOf(p),
-      duration_ms: _viewerDurationSince(startedAt),
-      ...failure,
-    });
     _viewerLogFailure('file_preview_add_library', failure);
     await _viewerShowAlert(`Add to Library failed: ${reason}`, 'file_preview_add_library_presentation');
     return;
@@ -713,12 +691,6 @@ async function _onAddLibraryClick() {
 
   const scope = res.scope === 'project' ? 'project' : (res.scope === 'global' ? 'global' : 'unknown');
   window.OrkasPreviewHost?.filesChanged();
-  _viewerTrackEvent('file_preview_add_library_result', {
-    result: 'success',
-    kind: _kindOf(p),
-    scope,
-    duration_ms: _viewerDurationSince(startedAt),
-  });
   try {
     _viewerAddLibraryBtn.innerHTML = _viewerAddLibraryButtonHtml(doneLabel, 'check');
     if (scope === 'global' && typeof currentView !== 'undefined' && currentView === 'contexts' && typeof loadContexts === 'function') {
@@ -765,14 +737,6 @@ async function _onSaveAppClick() {
   if (!p || !_viewerSaveAppBtn || _viewerSaveAppBtn.disabled) return;
   const startedAt = Date.now();
   if (_viewerDirty) {
-    _viewerTrackEvent('file_preview_save_app_result', {
-      result: 'failure',
-      surface: 'file_preview',
-      kind: _kindOf(p),
-      duration_ms: _viewerDurationSince(startedAt),
-      error_type: 'validation',
-      error_code: 'unsaved_changes',
-    });
     const message = _viewerLabel('apps.save_from_file_dirty', 'Save the file changes before saving it as an app.');
     await _viewerShowAlert(message, 'file_preview_save_app_presentation');
     return;
@@ -792,13 +756,6 @@ async function _onSaveAppClick() {
   } catch (err) {
     const failure = _viewerStableFailure(err, 'saved_app_save_failed', 'ipc');
     const reason = String(err && err.message || err);
-    _viewerTrackEvent('file_preview_save_app_result', {
-      result: 'failure',
-      surface: 'file_preview',
-      kind: _kindOf(p),
-      duration_ms: _viewerDurationSince(startedAt),
-      ...failure,
-    });
     _viewerLogFailure('file_preview_save_app', failure);
     const prefix = _viewerLabel('apps.save_failed', 'Could not save the app');
     await _viewerShowAlert(`${prefix}: ${reason}`, 'file_preview_save_app_presentation');
@@ -808,26 +765,12 @@ async function _onSaveAppClick() {
   if (!res || res.ok === false) {
     const failure = _viewerStableFailure(res, 'saved_app_save_failed', 'operation');
     const reason = String((res && res.error) || 'failed');
-    _viewerTrackEvent('file_preview_save_app_result', {
-      result: 'failure',
-      surface: 'file_preview',
-      kind: _kindOf(p),
-      duration_ms: _viewerDurationSince(startedAt),
-      ...failure,
-    });
     _viewerLogFailure('file_preview_save_app', failure);
     const prefix = _viewerLabel('apps.save_failed', 'Could not save the app');
     await _viewerShowAlert(`${prefix}: ${reason}`, 'file_preview_save_app_presentation');
     _scheduleSaveAppButtonRestore(p, original);
     return;
   }
-
-  _viewerTrackEvent('file_preview_save_app_result', {
-    result: 'success',
-    surface: 'file_preview',
-    kind: _kindOf(p),
-    duration_ms: _viewerDurationSince(startedAt),
-  });
   window.OrkasPreviewHost?.filesChanged();
   try {
     _viewerSaveAppBtn.innerHTML = _viewerSaveAppButtonHtml(doneLabel, 'check');

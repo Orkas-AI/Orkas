@@ -36,7 +36,7 @@ export function isEditChatWaitingForInputEvent(event: any): boolean {
 }
 
 export function normalizeEditChatRuntimeEvent(event: any): any {
-  if (event?.type !== 'event' || event?.event?.stream !== 'agent_run_result') return event;
+  if (event?.type !== 'event' || event?.event?.stream !== 'agent_run_terminal') return event;
   const data = event.event.data && typeof event.event.data === 'object'
     ? event.event.data as Record<string, unknown>
     : {};

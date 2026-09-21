@@ -38,13 +38,10 @@
     return open({ kind: 'image', src, title: title || '', options: options({ ...opts, cid }), gallery });
   }
   window.OrkasPreviewWindows = { open, image, options };
-  window.orkas.onPushEvent('preview-windows:report', report => {
-    if (report.kind === 'telemetry') window.Monitor?.[report.method]?.(report.action, report.data);
-    else if (report.kind === 'files-changed') {
-      if (currentView === 'contexts' && typeof loadContexts === 'function') loadContexts();
-      if (currentView === 'apps' && typeof loadSavedApps === 'function') loadSavedApps(true);
-      if (currentView === 'project' && typeof loadProjectDetail === 'function' && typeof _projectDetailPid !== 'undefined') void loadProjectDetail(_projectDetailPid);
-    }
+  window.orkas.onPushEvent('preview-windows:files-changed', () => {
+    if (currentView === 'contexts' && typeof loadContexts === 'function') loadContexts();
+    if (currentView === 'apps' && typeof loadSavedApps === 'function') loadSavedApps(true);
+    if (currentView === 'project' && typeof loadProjectDetail === 'function' && typeof _projectDetailPid !== 'undefined') void loadProjectDetail(_projectDetailPid);
   });
   window.orkas.onPushEvent('preview-windows:owner-request', async request => {
     let result = { ok: false };

@@ -21,14 +21,6 @@ const _autoLog = (typeof createLogger === 'function')
   ? createLogger('auto')
   : { info() {}, warn() {}, error() {} };
 
-function _autoTrackClick(action, data) {
-  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
-}
-
-function _autoTrackEvent(action, data) {
-  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
-}
-
 function _autoLogFailure(action, data) {
   _autoLog.warn('automation operation failed', { action, ...(data || {}) });
 }
@@ -112,19 +104,6 @@ function _autoAttachmentPayload(files, source) {
     total_bytes: totalBytes,
     mode: _autoEditingTaskId ? 'edit' : 'create',
   };
-}
-
-function _autoTrackAttachmentResult(payload, startedAt, result, counts, failure = null) {
-  const eventPayload = {
-    ...payload,
-    result,
-    ...counts,
-    duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
-  };
-  if (failure && (result === 'failure' || result === 'partial_failure')) {
-    Object.assign(eventPayload, failure);
-  }
-  _autoTrackEvent('auto_attachment_upload_result', eventPayload);
 }
 
 const AUTO_ATTACH_ACCEPT = (typeof CHAT_ATTACH_ACCEPT !== 'undefined' && Array.isArray(CHAT_ATTACH_ACCEPT))
@@ -835,8 +814,7 @@ function _closeAutoRowMenu(restoreFocus = false) {
   if (restoreFocus && anchor && anchor.isConnected) anchor.focus();
 }
 
-function _autoCreateActionTracker(action) {
-  const startedAt = Date.now();
+function _autoCreateActionLogger(action) {
   let done = false;
   return (result, errorCode = '') => {
     if (done) return;
@@ -844,16 +822,12 @@ function _autoCreateActionTracker(action) {
     const payload = {
       result,
       action,
-      duration_ms: Math.max(0, Date.now() - startedAt),
     };
     if (result !== 'success') {
       const failure = _autoResultFailure(errorCode, 'action_failed', 'ipc');
       payload.error_code = failure.error_code;
       payload.error_type = failure.error_type;
     }
-    try {
-      if (window.Monitor) Monitor.event('auto_task_action_result', payload);
-    } catch (_) {}
     if (result === 'failure') {
       _autoLogFailure('auto_task_action', {
         action,
@@ -903,37 +877,37 @@ function _openAutoRowMenu(anchorBtn, task, opts) {
         }
       } else if (action === 'toggle-enabled') {
         const next = !task.enabled;
-        const trackResult = _autoCreateActionTracker('toggle');
+        const logResult = _autoCreateActionLogger('toggle');
         try {
           const res = await window.orkas.invoke('autoTasks.setEnabled', { taskId: task.id, enabled: next });
           if (res && res.ok && res.task) {
-            trackResult('success');
+            logResult('success');
             Object.assign(task, res.task);
             const row = document.querySelector(`.auto-row[data-task-id="${task.id}"]`);
             if (row) row.classList.toggle('is-disabled', !next);
             if (opts && typeof opts.afterChange === 'function') opts.afterChange();
           } else {
-            trackResult('failure', 'update_failed');
+            logResult('failure', 'update_failed');
           }
         } catch (err) {
-          trackResult('failure', 'invoke_failed');
+          logResult('failure', 'invoke_failed');
           _autoLog.warn('toggle failed', err);
         }
       } else if (action === 'edit') {
         if (opts && typeof opts.onEdit === 'function') opts.onEdit(task);
       } else if (action === 'delete') {
         if (!(await uiConfirm(t('auto.delete_confirm')))) return;
-        const trackResult = _autoCreateActionTracker('delete');
+        const logResult = _autoCreateActionLogger('delete');
         try {
           const res = await window.orkas.invoke('autoTasks.delete', { taskId: task.id });
           if (res && res.deleted) {
-            trackResult('success');
+            logResult('success');
             if (opts && typeof opts.afterChange === 'function') opts.afterChange();
           } else {
-            trackResult('failure', 'delete_failed');
+            logResult('failure', 'delete_failed');
           }
         } catch (err) {
-          trackResult('failure', 'invoke_failed');
+          logResult('failure', 'invoke_failed');
           await uiAlert(t('auto.delete_failed', { reason: (err && err.message) || err }));
         }
       }
@@ -1863,30 +1837,15 @@ async function _autoPrepareUploadFiles(fileList) {
 async function _autoUploadFiles(files, source = 'drop') {
   const list = Array.from(files || []);
   if (!list.length) return;
-  const startedAt = performance.now();
   const payload = _autoAttachmentPayload(list, source);
   const taskId = await _ensureAutoDraftId();
   if (!taskId) {
-    _autoTrackAttachmentResult(payload, startedAt, 'failure', {
-      uploaded_count: 0,
-      failed_count: list.length,
-      rejected_count: 0,
-    }, _autoResultFailure('no_draft_id', 'upload_failed', 'ipc'));
     await uiAlert(t('auto.save_failed', { reason: 'no_draft_id' }));
     return;
   }
   const { prepared, rejected } = await _autoPrepareUploadFiles(list);
   const rejectedCount = rejected.length;
   if (!prepared.length) {
-    _autoTrackAttachmentResult(payload, startedAt, 'failure', {
-      uploaded_count: 0,
-      failed_count: rejected.length || list.length,
-      rejected_count: rejectedCount,
-    }, _autoResultFailure(
-      rejected.length ? 'file_prepare_failed' : 'no_valid_files',
-      'file_prepare_failed',
-      'operation',
-    ));
     if (rejected.length) await _autoAlertAttachmentFailures(rejected);
     return;
   }
@@ -1948,11 +1907,6 @@ async function _autoUploadFiles(files, source = 'drop') {
   const uploadedCount = Math.max(0, placeholders.length - uploadFailed);
   const failedCount = rejected.length;
   const result = failedCount ? (uploadedCount ? 'partial_failure' : 'failure') : 'success';
-  _autoTrackAttachmentResult(payload, startedAt, result, {
-    uploaded_count: uploadedCount,
-    failed_count: failedCount,
-    rejected_count: rejectedCount,
-  }, failedCount ? _autoResultFailure('upload_failed', 'upload_failed') : null);
   if (rejected.length) await _autoAlertAttachmentFailures(rejected);
 }
 
@@ -2001,11 +1955,6 @@ async function _autoImportPaths(entries, source = 'internal_drop') {
   const payload = _autoAttachmentPayload(files, source);
   const taskId = await _ensureAutoDraftId();
   if (!taskId) {
-    _autoTrackAttachmentResult(payload, startedAt, 'failure', {
-      uploaded_count: 0,
-      failed_count: files.length,
-      rejected_count: 0,
-    }, _autoResultFailure('no_draft_id', 'upload_failed', 'ipc'));
     await uiAlert(t('auto.save_failed', { reason: 'no_draft_id' }));
     return;
   }
@@ -2063,11 +2012,6 @@ async function _autoImportPaths(entries, source = 'internal_drop') {
   }));
   const uploadedCount = Math.max(0, placeholders.length - uploadFailed);
   const result = rejected.length ? (uploadedCount ? 'partial_failure' : 'failure') : 'success';
-  _autoTrackAttachmentResult(payload, startedAt, result, {
-    uploaded_count: uploadedCount,
-    failed_count: rejected.length,
-    rejected_count: rejectedCount,
-  }, rejected.length ? _autoResultFailure('upload_failed', 'upload_failed') : null);
   if (rejected.length) await _autoAlertAttachmentFailures(rejected);
 }
 
@@ -2077,7 +2021,7 @@ async function _autoAttachLibraryFile(ref) {
   const rel = String(ref && ref.rel || '');
   const projectId = _autoValidProjectId(ref && ref.projectId || '');
   if (!rel) return;
-  const telemetry = {
+  const operationContext = {
     scope,
     mode: _autoEditingTaskId ? 'edit' : 'create',
     has_project: !!projectId,
@@ -2115,22 +2059,10 @@ async function _autoAttachLibraryFile(ref) {
     attachedName = name;
   } catch (err) {
     const failure = _autoResultFailure(err, 'library_attach_failed');
-    _autoLogFailure('auto_library_attach', { ...telemetry, ...failure });
-    _autoTrackEvent('auto_library_attach_result', {
-      ...telemetry,
-      result: 'failure',
-      duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
-      ...failure,
-    });
+    _autoLogFailure('auto_library_attach', { ...operationContext, ...failure });
     try { _autoReplaceAttachmentByTempId(tempId, null); } catch (_) {}
     throw err;
   }
-
-  _autoTrackEvent('auto_library_attach_result', {
-    ...telemetry,
-    result: 'success',
-    duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
-  });
   try {
     _autoReplaceAttachmentByTempId(tempId, {
       name: attachedName,
@@ -2149,12 +2081,6 @@ async function _autoPickAndUploadFiles() {
   const payload = _autoAttachmentPayload([], 'picker');
   const taskId = await _ensureAutoDraftId();
   if (!taskId) {
-    _autoTrackAttachmentResult(payload, startedAt, 'failure', {
-      file_count: 0,
-      uploaded_count: 0,
-      failed_count: 1,
-      rejected_count: 0,
-    }, _autoResultFailure('no_draft_id', 'upload_failed', 'ipc'));
     await uiAlert(t('auto.save_failed', { reason: 'no_draft_id' }));
     return;
   }
@@ -2163,12 +2089,6 @@ async function _autoPickAndUploadFiles() {
     data = await window.orkas.invoke('autoTasks.attachments.pickAndUpload', { taskId });
   } catch (err) {
     _autoLog.warn('native picker upload failed', err);
-    _autoTrackAttachmentResult(payload, startedAt, 'failure', {
-      file_count: 0,
-      uploaded_count: 0,
-      failed_count: 1,
-      rejected_count: 0,
-    }, _autoResultFailure(err, 'upload_failed', 'ipc'));
     await uiAlert(t('chat.attach_upload_fail', {
       name: '',
       reason: (err && err.message) || t('chat.attach_upload_generic_fail'),
@@ -2176,12 +2096,6 @@ async function _autoPickAndUploadFiles() {
     return;
   }
   if (data && data.cancelled === true) {
-    _autoTrackAttachmentResult(payload, startedAt, 'cancelled', {
-      file_count: 0,
-      uploaded_count: 0,
-      failed_count: 0,
-      rejected_count: 0,
-    });
     return;
   }
   const names = Array.isArray(data && data.items) ? data.items : [];
@@ -2193,12 +2107,6 @@ async function _autoPickAndUploadFiles() {
   const failure = result === 'success'
     ? null
     : _autoResultFailure(failed[0] && failed[0].error, 'upload_failed', 'operation');
-  _autoTrackAttachmentResult(payload, startedAt, result, {
-    uploaded_count: names.length,
-    failed_count: failed.length,
-    rejected_count: 0,
-    file_count: fileCount,
-  }, failure);
   for (const name of names) {
     _autoPushReadyAttachment(name, { displayName: name });
   }
@@ -2557,35 +2465,10 @@ async function _autoSubmitForm() {
   const isUpdate = !!_autoEditingTaskId;
   const readyAttachments = _autoCurrentAttachments
     .filter((a) => a && a.name && a.status !== 'error' && a.status !== 'uploading');
-  const startedAt = performance.now();
-  const resultContext = {
-    schedule_type: type,
-    recipient_type: _autoCurrentRecipient.kind === 'agent' ? 'agent' : 'commander',
-    has_skill: !!skillField,
-    has_connector: !!connectorField,
-    has_project: !!projectId,
-    attachment_count: readyAttachments.length,
-    content_length: content.length,
-  };
-  const resultEventName = isUpdate ? 'auto_task_update_result' : 'auto_task_create_result';
-  let terminalRecorded = false;
-  const trackSaveResult = (result, failure = null) => {
-    if (terminalRecorded) return;
-    terminalRecorded = true;
-    _autoTrackEvent(resultEventName, {
-      result,
-      ...resultContext,
-      duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
-      ...(failure || {}),
-    });
-  };
-  const blockSave = async (errorCode, messageKey) => {
-    trackSaveResult('blocked', _autoResultFailure(errorCode, errorCode, 'validation'));
+  let operationCompleted = false;
+  const blockSave = async (_errorCode, messageKey) => {
     await uiAlert(t(messageKey));
   };
-  // Create remains the canonical funnel-intent click. Updates intentionally
-  // use only their terminal result, including client-side validation blocks.
-  if (!isUpdate) _autoTrackClick('auto_task_create_submit', resultContext);
 
   if (!content) {
     await blockSave('invalid_content', 'auto.invalid_content');
@@ -2714,7 +2597,6 @@ async function _autoSubmitForm() {
       }
     } catch (err) {
       const failure = _autoResultFailure(err, 'invoke_failed', 'ipc');
-      trackSaveResult('failure', failure);
       _autoLogFailure(isUpdate ? 'auto_task_update' : 'auto_task_create', failure);
       await uiAlert(t('auto.save_failed', { reason: (err && err.message) || err }));
       return;
@@ -2722,13 +2604,12 @@ async function _autoSubmitForm() {
     if (!res || !res.task) {
       const fallback = isUpdate ? 'update_failed' : 'create_failed';
       const failure = _autoResultFailure(res && res.error, fallback, 'api');
-      trackSaveResult('failure', failure);
       _autoLogFailure(isUpdate ? 'auto_task_update' : 'auto_task_create', failure);
       await uiAlert(t('auto.save_failed', { reason: (res && res.error) || '' }));
       return;
     }
     const savedTask = res.task;
-    trackSaveResult('success');
+    operationCompleted = true;
     const savedCb = _autoOnSaved;
     try { _hideAutoDialog(); } catch (err) { _autoLog.warn('close after automation save failed', err); }
     try { _autoResetForm(); } catch (err) { _autoLog.warn('reset after automation save failed', err); }
@@ -2743,10 +2624,9 @@ async function _autoSubmitForm() {
       try { savedCb(savedTask); } catch (_) { /* ignore */ }
     }
   } catch (err) {
-    if (!terminalRecorded) {
+    if (!operationCompleted) {
       const fallback = isUpdate ? 'update_failed' : 'create_failed';
       const failure = _autoResultFailure(err, fallback, 'operation');
-      trackSaveResult('failure', failure);
       _autoLogFailure(isUpdate ? 'auto_task_update' : 'auto_task_create', failure);
       await uiAlert(t('auto.save_failed', { reason: (err && err.message) || err }));
     } else {

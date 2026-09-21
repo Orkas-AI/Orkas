@@ -56,15 +56,6 @@ vi.mock('../../../../src/main/model/core-agent/runner', () => ({
     providerId: 'mock-provider',
     modelId: 'mock-model',
     toolDefs: [],
-    toolSurfaceTelemetry: () => ({
-      mode: 'fixed',
-      peakToolCount: 0,
-      loadCallCount: 0,
-      loadedGroupCount: 0,
-      loadedSchemaChars: 0,
-      loadedUnusedGroupCount: 0,
-      webToolUsed: false,
-    }),
     skillDisplayNameById: new Map(),
     agentDisplayNameById: new Map(),
   }); },
@@ -135,7 +126,6 @@ type DrainedEvent = {
   failureKind?: 'model' | 'config';
   failureCode?: string;
   failurePhase?: string;
-  telemetry?: Record<string, unknown>;
   event?: { stream?: string; data?: Record<string, unknown> };
 };
 
@@ -359,7 +349,7 @@ describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
     expect(events.filter((event) => event.type === 'error' || event.type === 'final')).toEqual([]);
     expect(events.filter((event) => event.type === 'done')).toHaveLength(1);
     // This metric describes the completed model invocation, not the downstream task.
-    expect(events.find((event) => event.event?.stream === 'agent_run_result')?.event?.data)
+    expect(events.find((event) => event.event?.stream === 'agent_run_terminal')?.event?.data)
       .toMatchObject({ result: 'success', terminal_status: 'completed' });
     expect(h.logEntries.filter((entry) => entry.level === 'error' || entry.level === 'warn')).toEqual([]);
   });
@@ -949,7 +939,7 @@ describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
     setTimeout(() => controller.abort(), 80);
 
     const { events } = await drain({ abortSignal: controller.signal, idleTimeout: 10 });
-    const result = events.find((event) => event.event?.stream === 'agent_run_result')?.event?.data;
+    const result = events.find((event) => event.event?.stream === 'agent_run_terminal')?.event?.data;
     expect(result).toMatchObject({
       result: 'aborted',
       failure_phase: 'tool',

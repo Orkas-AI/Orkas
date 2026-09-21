@@ -46,7 +46,7 @@ const _convLog = createLogger('preview-host');
   }
   window.OrkasPreviewHost = { close, loadGalleryPage, projectScopedFor: cid => !!cid && cid === currentCid && projectScoped,
     setDirty: dirty => window.orkas.invoke('previewWindows.setDirty', { dirty }).catch(() => {}),
-    filesChanged: () => window.orkas.invoke('previewWindows.report', { kind: 'files-changed' }).catch(() => {}) };
+    filesChanged: () => window.orkas.invoke('previewWindows.filesChanged', {}).catch(() => {}) };
   window.orkas.onPushEvent('preview-windows:close-request', requestClose);
   window.orkas.onPushEvent('preview-windows:replace-request', async () => {
     if (replacing || closing) return;

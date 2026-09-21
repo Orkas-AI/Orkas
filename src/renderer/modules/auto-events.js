@@ -40,15 +40,12 @@ function _autoEventsOpenSubscription() {
       const activeUserId = _autoEventsActiveUserId();
       if (!activeUserId || inner.user_id !== activeUserId) return;
       _autoEventsRetryAttempt = 0;
-      if (inner.type === 'fire_failed') {
-        // Main reports the reliable privacy-safe telemetry terminal. This
-        // stream only refreshes visible state and must never duplicate it.
-      } else if (inner.type === 'conv_created') {
+      if (inner.type === 'conv_created') {
         if (typeof loadConversations === 'function') {
           Promise.resolve(loadConversations())
             .catch(() => _autoEventsLog.warn('reload after fire failed'));
         }
-      } else {
+      } else if (inner.type !== 'fire_failed') {
         return;
       }
       if (typeof _autoLoadedOnce !== 'undefined' && _autoLoadedOnce && typeof loadAutoList === 'function') {

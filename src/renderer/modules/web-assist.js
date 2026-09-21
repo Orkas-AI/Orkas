@@ -908,10 +908,6 @@
     renderState(state);
   });
   window.orkas.onPushEvent('web-assist:show', (state) => showFromMain(state));
-  window.orkas.onPushEvent('web-assist:failure', (payload) => {
-    // Main owns classification, privacy projection and the shared rate budget.
-    try { window.Monitor?.error('browser', payload); } catch { /* telemetry is best effort */ }
-  });
   window.WebAssist = {
     openForModel,
     close,

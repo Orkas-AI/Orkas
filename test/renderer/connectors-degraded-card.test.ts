@@ -2037,7 +2037,7 @@ describe('explicit connector failure codes', () => {
     [{ code: 'invalid_grant', error: 'Previous operation canceled; grant invalid' }, true],
   ])('shows hard failures without mistaking incidental cancel text for user cancellation: %j', (error, shouldAlert) => {
     const context = loadConnectorsRenderer();
-    context._handleConnectFailure({}, 0, error);
+    context._handleConnectFailure(error);
     expect(context.__alerts.length).toBe(shouldAlert ? 1 : 0);
     if (error.code === 'storage_unavailable') expect(context.__alerts[0]).toBe(context.t('connectors.errors.storage_unavailable'));
   });

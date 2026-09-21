@@ -799,9 +799,6 @@ export type GroupEvent =
   /** Streaming work belongs to the same numbered reasoning segment as the
    * message that eventually persists that segment. */
   | { type: 'process'; cid: string; actor: string; turn_id?: string; seg?: number; display_seq?: number; data: Record<string, unknown> }
-  /** Low-volume model run telemetry. Emitted live for analytics only; never
-   * persisted as process history and never rendered in the process rail. */
-  | { type: 'agent_run_result'; cid: string; actor: string; actor_type: 'commander' | 'agent'; turn_id?: string; data: Record<string, unknown> }
   /** A `create_artifact` tool call finished writing its bundle. The final
    * end-of-turn message still carries `msg.artifacts` for persistence; this
    * live event lets the renderer mount the iframe immediately instead of
@@ -825,7 +822,7 @@ export type GroupEvent =
   /** Conversation task-board lifecycle (task_board.ts). `task_created` fires
    * once when a row enters the board; `task_state` on every deterministic
    * status transition (running / waiting_input / done / stopped / failed / cancelled).
-   * Distinct from the privacy-safe `taskRun` terminal telemetry above — these
+   * Distinct from the privacy-safe `taskRun` terminal state above — these
    * carry the task snapshot for the board UI. */
   | { type: 'task_created'; cid: string; task: taskBoard.ConversationTask }
   | { type: 'task_state'; cid: string; task: taskBoard.ConversationTask };
@@ -2116,7 +2113,7 @@ export interface EnqueueParams {
   /** Renderer-generated id for a user send; persisted verbatim so the
    * optimistic bubble can be claimed by identity. See GroupMessage. */
   client_msg_id?: string;
-  /** Structured source for a user-visible failure. This controls analytics
+  /** Structured source for a user-visible failure. This controls diagnostics
    * taxonomy only; the rendered text still controls failure actions/UI. */
   failure_kind?: GroupMessageFailureKind;
   failure_code?: string;
@@ -2129,7 +2126,7 @@ export interface EnqueueParams {
   failedTurnRetryMode?: 'resume' | 'restart';
   retrySourceMessageId?: string;
   /** Host-computed count of possibly non-idempotent operations whose outcome
-   * is unknown. Telemetry-only; never persisted into message content. */
+   * is unknown. Diagnostic-only; never persisted into message content. */
   retryUncertainOperationCount?: number;
   attachments?: string[];
   use_selections?: ChatUseSelection[];
@@ -6053,21 +6050,11 @@ async function runActorTurnWithDisplay(
           );
         }
         log.warn('stream error', { cid, actor: actor.id, aborted, error: logErrorRef(errText) });
-      } else if (ev.type === 'event' && (ev.event as { stream?: unknown } | undefined)?.stream === 'agent_run_result') {
+      } else if (ev.type === 'event' && (ev.event as { stream?: unknown } | undefined)?.stream === 'agent_run_terminal') {
         const inner = (ev.event as { data?: unknown } | undefined)?.data;
         agentRunTimingData = inner && typeof inner === 'object'
           ? inner as Record<string, unknown>
           : undefined;
-        if (actor.kind !== 'worker') {
-          emit(state, {
-            type: 'agent_run_result',
-            cid,
-            actor: actor.id,
-            actor_type: actor.kind === 'commander' ? 'commander' : 'agent',
-            turn_id: item.turnId,
-            data: inner && typeof inner === 'object' ? (inner as Record<string, unknown>) : {},
-          });
-        }
       } else if (ev.type !== 'done') {
         activityEvents += 1;
         void touchActivity(uid, cid);

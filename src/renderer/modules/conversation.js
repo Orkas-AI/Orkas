@@ -8,7 +8,7 @@ let _conversationBucketDateKey = _conversationLocalDateKey();
 let _conversationBucketDateRefreshTimer = null;
 let _conversationBucketDateRefreshBound = false;
 
-function _trackConversationManageResult(action, startedAt, result, errorCode = '', extra = {}) {
+function _logConversationManageResult(action, startedAt, result, errorCode = '', extra = {}) {
   const payload = {
     action: String(action || 'unknown'),
     result: String(result || 'failure'),
@@ -20,18 +20,6 @@ function _trackConversationManageResult(action, startedAt, result, errorCode = '
     const level = result === 'failure' ? 'warn' : 'info';
     _convLog[level]('conversation management result', payload);
   } catch (_) {}
-}
-
-function _convTrackClick(action, data) {
-  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
-}
-
-function _convTrackEvent(action, data) {
-  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
-}
-
-function _convTrackError(action, data) {
-  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
 function _taskTerminalHandlePresentation(payload) {
@@ -59,18 +47,6 @@ try {
     window.orkas.onPushEvent('conversation:task_terminal', _taskTerminalHandlePresentation);
   }
 } catch (_) {}
-
-function _trackAgentRunResultTelemetry(cid, evData) {
-  void cid;
-  void evData;
-}
-
-function _trimTelemetryText(value, max) {
-  const text = _normalizeFeedbackFieldText(value);
-  const limit = Math.max(0, Number(max) || 0);
-  if (!text || limit <= 0 || text.length <= limit) return text;
-  return text.slice(0, limit) + '...';
-}
 
 function _handleModelOutputErrorForUi(cid, msgDiv, rawError, extra) {
   void cid;
@@ -3104,7 +3080,6 @@ const _DEFAULT_QUICK_START_ITEMS = [
 let _quickStartItems = _DEFAULT_QUICK_START_ITEMS.map((item) => ({ ...item }));
 let _quickStartConfigPromise = null;
 let _quickStartSource = 'pc_default';
-let _quickStartLoadTelemetrySent = false;
 let _SCENARIO_CONFIGS = {};
 // English fallback templates — used when the i18n table doesn't yet carry
 // the scenario template key. These are complete, ready-to-run tasks so a
@@ -3148,7 +3123,7 @@ function _setQuickStartItems(raw, source) {
   return !!normalized;
 }
 
-function _commanderTelemetryId(value) {
+function _commanderAttributionId(value) {
   const text = String(value || '').trim();
   return /^[A-Za-z0-9._-]{1,64}$/.test(text) ? text : '';
 }
@@ -3161,8 +3136,8 @@ function _normalizeCommanderTemplateAttribution(raw, defaultManual = false) {
     : (defaultManual ? 'manual' : '');
   if (!validEntryPoint) return {};
   const out = { entry_point: validEntryPoint };
-  const resourceId = _commanderTelemetryId(src.resource_id || src.resourceId);
-  const agentId = _commanderTelemetryId(src.agent_id || src.agentId);
+  const resourceId = _commanderAttributionId(src.resource_id || src.resourceId);
+  const agentId = _commanderAttributionId(src.agent_id || src.agentId);
   const source = String(src.source || '').trim();
   const recipientType = String(src.recipient_type || src.recipientType).trim();
   const position = Math.round(Number(src.position) || 0);
@@ -3618,22 +3593,14 @@ function _bindEmptyStateScenarioButtons(row) {
       const id = btn.dataset.scenario || '';
       const config = _SCENARIO_CONFIGS[id];
       const position = index + 1;
-      const startedAt = Date.now();
-      const telemetry = {
+      const attribution = {
         resource_id: id,
         agent_id: String((config && config.agentId) || ''),
         position,
         source: _quickStartSource,
       };
-      _convTrackClick('commander_quick_start', telemetry);
       if (!config) {
         _convLog.warn('Commander quick-start scenario config missing', { resource_id: id, position });
-        _convTrackEvent('commander_quick_start_result', {
-          ...telemetry,
-          result: 'failure',
-          reason: 'config_missing',
-          duration_ms: Date.now() - startedAt,
-        });
         return;
       }
       const key = config && config.templateKey;
@@ -3641,40 +3608,22 @@ function _bindEmptyStateScenarioButtons(row) {
       const tmpl = (raw && raw !== key) ? raw : (_SCENARIO_TEMPLATES_FALLBACK_EN[id] || '');
       if (!tmpl) {
         _convLog.warn('Commander quick-start template missing', { resource_id: id, position });
-        _convTrackEvent('commander_quick_start_result', {
-          ...telemetry,
-          result: 'failure',
-          reason: 'template_missing',
-          duration_ms: Date.now() - startedAt,
-        });
         return;
       }
       const applied = await _scenarioApplyAgent(config, id);
       if (!applied || applied.kind === 'unavailable') {
         _convLog.warn('Commander quick-start recipient API unavailable', { resource_id: id, position });
-        _convTrackEvent('commander_quick_start_result', {
-          ...telemetry,
-          result: 'failure',
-          reason: (applied && applied.reason) || 'recipient_unavailable',
-          duration_ms: Date.now() - startedAt,
-        });
         return;
       }
       const input = document.getElementById('new-chat-input');
       if (!input) {
         _convLog.warn('Commander quick-start composer missing', { resource_id: id, position });
-        _convTrackEvent('commander_quick_start_result', {
-          ...telemetry,
-          result: 'failure',
-          reason: 'composer_missing',
-          duration_ms: Date.now() - startedAt,
-        });
         return;
       }
       input.value = tmpl;
       _setCommanderTemplateAttribution(input, {
         entry_point: 'quick_start',
-        ...telemetry,
+        ...attribution,
         recipient_type: applied.kind === 'agent' ? 'agent' : 'commander',
       });
       input.focus();
@@ -3696,13 +3645,6 @@ function _bindEmptyStateScenarioButtons(row) {
         input.setSelectionRange(tmpl.length, tmpl.length);
       }
       try { input.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
-      _convTrackEvent('commander_quick_start_result', {
-        ...telemetry,
-        result: applied.kind === 'agent' ? 'success' : 'fallback',
-        reason: applied.reason || '',
-        recipient_type: applied.kind === 'agent' ? 'agent' : 'commander',
-        duration_ms: Date.now() - startedAt,
-      });
     });
   });
 }
@@ -5435,10 +5377,9 @@ async function _chatAttachUpload(cid, fileList, source = 'drop') {
 // inside preload and are copied by main, so their bytes never cross IPC as
 // base64; only path-less Files (clipboard image data, browser drags) keep the
 // byte upload. Both routes paint the same placeholder chip, are bounded by the
-// same main-side per-kind caps and hash dedupe, and share one telemetry pair.
+// same main-side per-kind caps and hash dedupe.
 async function _chatAttachUploadCore(cid, fileList, source) {
   const clickPayload = _chatAttachPayload(cid, fileList, source);
-  _convTrackClick('chat_attachment_upload', clickPayload);
   const rejected = [];
   const accepted = [];
   for (const file of Array.from(fileList || [])) {
@@ -5456,22 +5397,10 @@ async function _chatAttachUploadCore(cid, fileList, source) {
   ]);
   if (!localOutcome.attempted && !byteOutcome.attempted) {
     if (rejected.length) uiAlert(t('chat.attach_rejected_prefix', { list: rejected.join('\n') }));
-    _convTrackEvent('chat_attachment_upload_result', {
-      ...clickPayload,
-      result: rejected.length ? 'failure' : 'skipped',
-      uploaded_count: 0,
-      failed_count: rejected.length,
-    });
     return;
   }
   const uploadedCount = localOutcome.uploaded + byteOutcome.uploaded;
   const failedCount = rejected.length;
-  _convTrackEvent('chat_attachment_upload_result', {
-    ...clickPayload,
-    result: failedCount ? (uploadedCount ? 'partial_failure' : 'failure') : 'success',
-    uploaded_count: uploadedCount,
-    failed_count: failedCount,
-  });
 
   if (rejected.length) {
     uiAlert(t('chat.attach_rejected_prefix', { list: rejected.join('\n') }));
@@ -5663,7 +5592,6 @@ async function _chatAttachPickAndUpload(cid, source = 'picker') {
 
 async function _chatAttachPickAndUploadCore(cid, source) {
   const basePayload = { source, target: _chatAttachTargetOf(cid) };
-  _convTrackClick('chat_attachment_upload', basePayload);
   let data;
   try {
     data = await window.orkas.invoke('conversations.attachments.pickAndUpload', { cid });
@@ -5671,34 +5599,14 @@ async function _chatAttachPickAndUploadCore(cid, source) {
     _convLog.warn('native attachment picker failed', {
       error_type: err && typeof err === 'object' ? 'Error' : typeof err,
     });
-    _convTrackEvent('chat_attachment_upload_result', {
-      ...basePayload,
-      result: 'failure',
-      uploaded_count: 0,
-      failed_count: 1,
-    });
     await uiAlert(t('chat.attach_upload_fail', { name: '', reason: err.message || t('chat.attach_upload_generic_fail') }));
     return;
   }
   if (data && data.cancelled) {
-    _convTrackEvent('chat_attachment_upload_result', {
-      ...basePayload,
-      result: 'cancelled',
-      uploaded_count: 0,
-      failed_count: 0,
-      file_count: 0,
-    });
     return;
   }
   const picked = Array.isArray(data && data.items) ? data.items : [];
   const failed = Array.isArray(data && data.failed) ? data.failed : [];
-  _convTrackEvent('chat_attachment_upload_result', {
-    ...basePayload,
-    result: failed.length ? (picked.length ? 'partial_failure' : 'failure') : 'success',
-    uploaded_count: picked.length,
-    failed_count: failed.length,
-    file_count: picked.length + failed.length,
-  });
   if (picked.length) {
     const current = _chatAttachList(cid).slice();
     for (const item of picked) {
@@ -5772,7 +5680,6 @@ async function _chatAttachImportPaths(cid, entries, source = 'internal_drop') {
 
 async function _chatAttachImportPathsCore(cid, files, source) {
   const clickPayload = _chatAttachPayload(cid, files, source);
-  _convTrackClick('chat_attachment_upload', clickPayload);
 
   const placeholders = [];
   const current = _chatAttachList(cid).slice();
@@ -5827,12 +5734,6 @@ async function _chatAttachImportPathsCore(cid, files, source) {
     }
   }));
   const uploadedCount = Math.max(0, placeholders.length - uploadFailed);
-  _convTrackEvent('chat_attachment_upload_result', {
-    ...clickPayload,
-    result: uploadFailed ? (uploadedCount ? 'partial_failure' : 'failure') : 'success',
-    uploaded_count: uploadedCount,
-    failed_count: rejected.length,
-  });
 
   if (rejected.length) {
     uiAlert(t('chat.attach_rejected_prefix', { list: rejected.join('\n') }));
@@ -5893,7 +5794,7 @@ window.attachKbFileToDraft = async function attachKbFileToDraft(channel, payload
     const safeKind = error && error.failure_kind;
     const failure_stage = ['input_validation', 'source_resolve', 'attachment_import'].includes(safeStage) ? safeStage : stage;
     const failure_kind = ['not_found', 'permission_denied', 'disk_full'].includes(safeKind) ? safeKind : 'operation_failed';
-    // Keep the UI's original message; logs/telemetry receive only the enums.
+    // Keep the UI's original message; diagnostics receive only the enums.
     const wrapped = new Error((error && error.message) || String(error));
     wrapped.failure_stage = failure_stage;
     wrapped.failure_kind = failure_kind;
@@ -5946,7 +5847,7 @@ function _renderMessageAttachmentsHtml(names, cid) {
     const kind = _chatAttachKindFromExt(ext);
     const label = escapeHtml(n);
     const icon = kind === 'image' && cid
-      ? `<img class="chat-attach-thumb" src="${_chatMediaUrl(cid, n)}" alt="" data-monitor-resource="chat-attachment-image" />`
+      ? `<img class="chat-attach-thumb" src="${_chatMediaUrl(cid, n)}" alt="" />`
       : _chatFileIconHtml(n, kind);
     return `<span class="chat-attach-chip chat-msg-attach" data-attach-name="${label}"${cidAttr} title="${label}">
       <button type="button" class="chat-attach-preview" aria-label="${label}"${previewDisabled}>
@@ -6187,7 +6088,6 @@ function _hydrateMessageCreatedSkillChip(msgDiv) {
     chip.addEventListener('click', async () => {
       const sid = chip.dataset.skillId;
       if (!sid) return;
-      if (window.Monitor) (() => {})('created_skill_chip_open', { skill_id: sid });
       setView('skills');
       const featureLoader = typeof loadRendererFeature === 'function'
         ? loadRendererFeature
@@ -6513,7 +6413,6 @@ async function loadConversations(options = {}) {
       }
     } catch (e) {
       _convLog.error('load conversations failed', e);
-      if (window.Monitor) (() => {})('load_conversations', { error_message: (e && e.message) || String(e) });
     } finally {
       _loadConversationsInFlight = null;
       _loadConversationsMode = '';
@@ -6927,12 +6826,12 @@ async function _toggleConversationPinned(cid, pinned) {
       renderConversationList();
       _refreshChatHeader();
     }
-    _trackConversationManageResult('pin', startedAt, 'success', '', { target_state: pinned });
+    _logConversationManageResult('pin', startedAt, 'success', '', { target_state: pinned });
   } catch (err) {
     conversations = snapshot;
     renderConversationList();
     _refreshChatHeader();
-    _trackConversationManageResult('pin', startedAt, 'failure', 'pin_failed', { target_state: pinned });
+    _logConversationManageResult('pin', startedAt, 'failure', 'pin_failed', { target_state: pinned });
     _convLog.warn('toggle conversation pin failed', {
       error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
     });
@@ -6954,7 +6853,7 @@ async function _saveConversationTitle(cid, raw, opts = {}) {
   const current = (conv && conv.title) || t('chat.new_conv_title');
   const title = _normaliseConversationTitle(raw);
   if (!title) {
-    _trackConversationManageResult('rename', startedAt, 'blocked', 'empty_title');
+    _logConversationManageResult('rename', startedAt, 'blocked', 'empty_title');
     try { await uiAlert(t('chat.conv_rename_empty')); } catch (_) {}
     return false;
   }
@@ -6985,7 +6884,7 @@ async function _saveConversationTitle(cid, raw, opts = {}) {
     if (window.ConversationInfo && typeof window.ConversationInfo.refresh === 'function') {
       window.ConversationInfo.refresh(cid, { silent: true });
     }
-    _trackConversationManageResult('rename', startedAt, 'success');
+    _logConversationManageResult('rename', startedAt, 'success');
     if (typeof opts.afterSave === 'function') {
       try { await opts.afterSave(data.conversation); } catch (err) {
         _convLog.warn('conversation rename follow-up failed', {
@@ -6995,7 +6894,7 @@ async function _saveConversationTitle(cid, raw, opts = {}) {
     }
     return true;
   } catch (err) {
-    _trackConversationManageResult('rename', startedAt, 'failure', 'rename_failed');
+    _logConversationManageResult('rename', startedAt, 'failure', 'rename_failed');
     _convLog.warn('rename conversation failed', {
       error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
     });
@@ -7076,7 +6975,7 @@ async function _deleteConversationWithConfirm(cid, opts = {}) {
       throw new Error(result?.error || `delete failed (${response.status || 'unknown'})`);
     }
   } catch (err) {
-    _trackConversationManageResult('delete', startedAt, 'failure', 'delete_failed');
+    _logConversationManageResult('delete', startedAt, 'failure', 'delete_failed');
     _convLog.warn('delete conversation failed', {
       error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
     });
@@ -7103,7 +7002,7 @@ async function _deleteConversationWithConfirm(cid, opts = {}) {
     }
   }
   renderConversationList();
-  _trackConversationManageResult('delete', startedAt, 'success');
+  _logConversationManageResult('delete', startedAt, 'success');
   if (typeof opts.afterDelete === 'function') {
     try { await opts.afterDelete(cid); } catch (err) {
       _convLog.warn('conversation delete follow-up failed', {
@@ -7275,9 +7174,6 @@ function _bindConversationSidebarItems(container, opts = {}) {
       // the transcript, reset its scroll position, refresh attachments, and
       // steal composer focus even though the user's destination did not change.
       if (currentView === 'conversation' && currentCid === cid) return;
-      _convTrackClick('sidebar_conversation_open', {
-        scope: opts.scope || (selector.includes('nested') ? 'project' : 'unprojected'),
-      });
       setView('conversation', cid);
     });
   });
@@ -7388,7 +7284,6 @@ function _ensureConvCreateAgentInline() {
     btn.textContent = t('chat.create_agent_inline');
     btn.addEventListener('click', () => {
       if (!currentCid) return;
-      if (window.Monitor) (() => {})('create_agent_from_chat', { cid: currentCid });
       const input = document.getElementById('chat-input');
       if (!input) return;
       input.value = t('chat.create_agent_message');
@@ -9516,25 +9411,6 @@ function _marketplaceInstallRequestErrorType(errorCode) {
   return 'runtime';
 }
 
-function _marketplaceTrackInstallRequestResult(startedAt, req, result, errorCode = '') {
-  const safeResult = /^(?:success|failure|cancelled)$/.test(result) ? result : 'failure';
-  const safeCode = /^[a-z][a-z0-9_]{0,63}$/.test(String(errorCode || ''))
-    ? String(errorCode)
-    : 'install_request_failed';
-  const payload = {
-    result: safeResult,
-    action: 'install',
-    resource_kind: req?.kind === 'skill' ? 'skill' : 'agent',
-    surface: 'conversation',
-    duration_ms: Math.max(0, Date.now() - startedAt),
-  };
-  if (safeResult !== 'success') {
-    payload.error_type = _marketplaceInstallRequestErrorType(safeCode);
-    payload.error_code = safeCode;
-  }
-  _convTrackEvent('marketplace_action_result', payload);
-}
-
 function _marketplaceRequestStatusLabel(status) {
   if (status === 'installed') return t('marketplace_request.status_installed');
   if (status === 'skipped') return t('marketplace_request.status_skipped');
@@ -9875,13 +9751,6 @@ function _mountMarketplaceInstallRequests(host, msgDiv, message, opts) {
 
 async function _resolveMarketplaceInstallRequest(card, req, cid, msgId, decision) {
   if (!card || card.dataset.busy === '1') return;
-  const startedAt = Date.now();
-  let resultTracked = false;
-  const trackResult = (result, errorCode = '') => {
-    if (resultTracked) return;
-    resultTracked = true;
-    _marketplaceTrackInstallRequestResult(startedAt, req, result, errorCode);
-  };
   _setMarketplaceCardBusy(card, true);
   const installBtn = card.querySelector('[data-mp-decision="install"]');
   if (decision === 'install' && installBtn) installBtn.textContent = t('marketplace.installing');
@@ -9896,13 +9765,6 @@ async function _resolveMarketplaceInstallRequest(card, req, cid, msgId, decision
       throw new Error((data && data.error) || 'marketplace install request failed');
     }
     const updated = data.request || { ...req, status: decision === 'install' ? 'installed' : 'skipped' };
-    if (updated.status === 'installed') trackResult('success');
-    else if (updated.status === 'skipped') trackResult('cancelled', 'user_skipped');
-    else if (updated.status === 'failed') {
-      trackResult('failure', _marketplaceInstallRequestErrorCode(data.install_error));
-    } else {
-      trackResult('failure', 'unknown_status');
-    }
     _renderMarketplaceInstallCard(card, updated, cid, msgId);
     if (updated.status === 'installed') {
       if (updated.kind === 'agent') { try { loadAgents?.(true); } catch (_) {} }
@@ -9911,13 +9773,10 @@ async function _resolveMarketplaceInstallRequest(card, req, cid, msgId, decision
     const submissionText = data.submission && data.submission.text;
     if (submissionText) await sendInCurrentConversation(submissionText);
   } catch (err) {
-    trackResult('failure', 'request_failed');
     _setMarketplaceCardBusy(card, false);
     const reason = (err && err.message) || String(err);
     _convLog.warn('marketplace install request failed', reason);
     try { await uiAlert(_marketplaceInstallFailedText(req.kind, req.name || req.id, reason)); } catch (_) {}
-  } finally {
-    if (!resultTracked) trackResult('failure', 'install_request_failed');
   }
 }
 
@@ -10918,44 +10777,6 @@ async function _retryFailedAssistantMessage(msgDiv) {
   });
 }
 
-// ─── Send flows ───
-
-function _chatModelTelemetryContext(data = {}) {
-  const source = data && typeof data === 'object' ? data : {};
-  const provider = String(source.provider || '').trim().slice(0, 80);
-  const model = String(source.model || '').trim().slice(0, 160);
-  if (provider || model) {
-    try {
-      if (typeof _composerModelTelemetryContext === 'function') {
-        return _composerModelTelemetryContext({ provider, model }, model);
-      }
-    } catch (_) {}
-    const legacyDynamicProvider = /^cp:/i.test(provider) || provider === 'custom-openai';
-    const userEnteredModel = legacyDynamicProvider || provider === 'custom' || provider === 'openrouter';
-    const normalizedProvider = legacyDynamicProvider ? 'custom' : provider;
-    return {
-      provider: /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(normalizedProvider)
-        ? normalizedProvider
-        : 'unknown',
-      model: userEnteredModel
-        ? 'custom'
-        : (/^[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,159}$/.test(model) ? model : 'unknown'),
-    };
-  }
-  try {
-    return typeof _currentComposerModelTelemetryContext === 'function'
-      ? _currentComposerModelTelemetryContext()
-      : {};
-  } catch (_) {
-    return {};
-  }
-}
-
-function _trackChatSendResult(result, data = {}) {
-  void result;
-  void data;
-}
-
 // Re-entrancy gate for handleNewChatSubmit. The Enter-key path (state.js) calls
 // the function directly — it never checks the send button's disabled state — and
 // the composer text is deliberately NOT cleared until conversation-create
@@ -10978,65 +10799,30 @@ async function handleNewChatSubmit() {
     ? getChatUseSelections('new-chat')
     : [];
   const entryAttribution = _readCommanderTemplateAttribution(input);
-  const modelTelemetry = _chatModelTelemetryContext();
-  const sendAttemptStartedAt = performance.now();
-  const sendAttempt = {
-    conversation_id: '',
-    source_view: 'new_chat',
-    content_length: requestText.length,
-    attachment_count: draftItems.filter((a) => a.status !== 'error').length,
-    ...modelTelemetry,
-    ...entryAttribution,
-  };
   const multiDispatch = _composerEffectiveDispatchMode('new-chat');
   const unresolvedQuickStart = _unresolvedQuickStartPlaceholder(input);
   const unresolvedOss = typeof unresolvedOssTemplatePlaceholder === 'function'
     ? unresolvedOssTemplatePlaceholder(input)
     : '';
   if (unresolvedQuickStart || unresolvedOss) {
-    _trackChatSendResult('failure', {
-      ...sendAttempt,
-      duration_ms: performance.now() - sendAttemptStartedAt,
-      failure_stage: 'preflight',
-      failure_reason: 'template_incomplete',
-    });
     await uiAlert(t(unresolvedQuickStart ? 'new_chat.quick.task_required' : 'oss.task_required'));
     return;
   }
   if (!ensureModelConfigured()) {
-    _trackChatSendResult('failure', {
-      ...sendAttempt,
-      duration_ms: performance.now() - sendAttemptStartedAt,
-      failure_stage: 'preflight',
-      failure_reason: 'model_not_configured',
-    });
     return;
   }
   const releaseAttachmentSend = _chatAttachTryBeginSend(DRAFT_CID);
   if (!releaseAttachmentSend) {
-    _trackChatSendResult('failure', {
-      ...sendAttempt,
-      duration_ms: performance.now() - sendAttemptStartedAt,
-      failure_stage: 'preflight',
-      failure_reason: 'attachment_uploading',
-    });
     await uiAlert(t('chat.attach_still_uploading'));
     return;
   }
   const attachmentSnapshot = await _chatAttachSnapshotForSend(DRAFT_CID, { requireServerMatch: true });
   if (!attachmentSnapshot.ok) {
     releaseAttachmentSend();
-    _trackChatSendResult('failure', {
-      ...sendAttempt,
-      duration_ms: performance.now() - sendAttemptStartedAt,
-      failure_stage: 'preflight',
-      failure_reason: 'attachment_adopt_failed',
-    });
     await uiAlert(t('chat.attach_sync_failed'));
     return;
   }
   draftItems = attachmentSnapshot.items;
-  sendAttempt.attachment_count = draftItems.length;
   const references = _referenceSnapshotsForQuotes(quotes);
   // Keep resource selections in the composer until attachment adoption has
   // completed. A failed preflight must leave the whole request retryable.
@@ -11100,12 +10886,6 @@ async function handleNewChatSubmit() {
       resource_id: entryAttribution.resource_id || '',
       error: e && e.message ? e.message : String(e || ''),
     });
-    _trackChatSendResult('failure', {
-      ...sendAttempt,
-      duration_ms: performance.now() - sendAttemptStartedAt,
-      failure_stage: 'conversation_create',
-      failure_reason: 'conversation_create_failed',
-    });
     await uiAlert(t('chat.create_conv_failed_with_reason', { reason: e.message || e }));
     if (newBtn) newBtn.disabled = false;
     _newChatSubmitting = false; // text kept in the input — allow a retry submit
@@ -11157,12 +10937,6 @@ async function handleNewChatSubmit() {
         error_code: 'discard_empty_failed',
       });
     }
-    _trackChatSendResult('failure', {
-      ...sendAttempt,
-      duration_ms: performance.now() - sendAttemptStartedAt,
-      failure_stage: 'preflight',
-      failure_reason: 'attachment_adopt_failed',
-    });
     await uiAlert(t('chat.attach_adopt_failed', { reason: adoptionError }));
     if (newBtn) newBtn.disabled = false;
     _newChatSubmitting = false;
@@ -11570,7 +11344,6 @@ async function sendInConversation(cid, content, extra, options = {}) {
   if (!cid) return { started: false, aborted: false, errored: false, result: 'failure' };
   const startedAt = performance.now();
   const sendOptions = options && typeof options === 'object' ? options : {};
-  const modelTelemetry = _chatModelTelemetryContext(sendOptions);
   const entryAttribution = _normalizeCommanderTemplateAttribution(sendOptions);
   const statAgentId = String(sendOptions.agent_id || '');
   let doneResult = null;
@@ -11706,20 +11479,6 @@ async function sendInConversation(cid, content, extra, options = {}) {
         duration_ms: durationMs,
         errored: true,
         success: false,
-      });
-    }
-    if (window.Monitor) {
-      (() => {})('chat_send_result', {
-        result: 'failure',
-        conversation_id: cid,
-        source_view: sendOptions.source_view || 'conversation',
-        content_length: measuredContentLength,
-        attachment_count: attachmentCount,
-        duration_ms: durationMs,
-        failure_stage: taskStarted ? 'stream' : 'preflight',
-        failure_reason: taskStarted ? 'stream_error' : 'stream_not_started',
-        ...modelTelemetry,
-        ...entryAttribution,
       });
     }
     _convLog.warn('chat send request failed', {
@@ -14158,33 +13917,7 @@ function createChatController(config) {
     } finally {
       const wasAborted = pending?.aborted;
       const wasErrored = pending?.errored;
-      const terminalPending = pending;
       terminalResult = { started: true, aborted: !!wasAborted, errored: !!wasErrored, accepted: !!pending?.accepted };
-      const telemetrySurface = String(config.telemetrySurface || '');
-      if (telemetrySurface === 'agent_edit' || telemetrySurface === 'skill_edit') {
-        const waitingForInput = terminalPending?.waitingForInput === true;
-        const missingTerminal = !wasAborted && !wasErrored && !terminalPending?.sawFinal && !waitingForInput;
-        const result = wasAborted ? 'cancelled' : ((wasErrored || missingTerminal) ? 'failure' : 'success');
-        const payload = {
-          surface: telemetrySurface === 'agent_edit' ? 'agent' : 'skill',
-          result,
-          terminal_status: wasAborted ? 'cancelled' : ((wasErrored || missingTerminal) ? 'failed' : waitingForInput ? 'waiting_input' : 'completed'),
-          duration_ms: Math.max(
-            0,
-            Date.now() - Number(terminalPending?.startedAtMs || Date.now()),
-          ),
-          has_output: !!terminalPending?.sawOutput,
-        };
-        if (result === 'failure') {
-          payload.failure_phase = missingTerminal
-            ? 'result'
-            : String(terminalPending?.failurePhase || 'stream_event');
-          payload.error_code = missingTerminal
-            ? 'missing_terminal'
-            : String(terminalPending?.failureCode || 'interactive_run_failed');
-        }
-        _convTrackEvent('interactive_task_run_result', payload);
-      }
       _clearOffViewGroupProcessEvents(id);
       pending = null;
       _updateSendUI();
@@ -15426,7 +15159,6 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
 // Group-chat bus event router. Each event is one of:
 //   { type: 'message', cid, msg: GroupMessage, turn_id? }
 //   { type: 'process', cid, actor, turn_id?, data: { type, text?, event? } }
-//   { type: 'agent_run_result', cid, actor, actor_type, turn_id?, data }
 //   { type: 'artifact_created', cid, actor, turn_id?, artifact: { id, title, agent_id } }
 //   { type: 'state_changed', cid, state: { status, in_flight }, active_turns? }
 //   { type: 'member_joined', cid, actor }
@@ -15434,9 +15166,6 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
 function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {}) {
   if (!evData || typeof evData !== 'object') return;
   if (evData.type === 'message') window.CliAsyncInput?.observe(cid, evData.msg);
-  if (evData.type === 'agent_run_result') {
-    return;
-  }
   if (
     evData.type === 'process'
     || evData.type === 'artifact_created'
@@ -16339,7 +16068,7 @@ function _formatEventLine(evt, displayContext) {
     if (runtimeDurationMs == null) return null;
     // Keep the process summary compact: expose only total wall time. Provider,
     // aggregate tool, compaction, and retry breakdowns remain internal
-    // telemetry; individual completed tool rows show their persisted E2E time.
+    // diagnostics; individual completed tool rows show their persisted E2E time.
     return t('chat.stream.runtime_total', { duration: _formatProcessDuration(runtimeDurationMs) });
   }
 
