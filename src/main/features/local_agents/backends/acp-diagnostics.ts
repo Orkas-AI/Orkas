@@ -1,5 +1,5 @@
 /** Content-free ACP observations, independent of tool-result presentation.
- * One snapshot per dispatch, consumed by local logs and task-turn sampling.
+ * One bounded snapshot per dispatch is emitted into the local process log.
  * Tool IDs stay private and bounded; missing/overflowed IDs make counts partial.
  * A progress update is not evidence that a tool completed.
  */

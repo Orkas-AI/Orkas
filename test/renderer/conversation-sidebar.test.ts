@@ -9066,7 +9066,6 @@ describe('conversation controller settlement', () => {
       hooks = config.hooks;
       return { abort() {} };
     };
-    context._taskTurnFinish = () => {};
     context._finishStreamingMsg = (cid: string) => cleanups.push(cid);
     context._scheduleHistoryReconcileAfterStream = () => {};
     context._updateConvSendUI = () => {};
@@ -9317,16 +9316,14 @@ describe('conversation controller settlement', () => {
     context._streamingStopActivity(msg);
   });
 
-  it('cleans an aborted send from onDone without locally finalizing bus-owned sampling', () => {
+  it('cleans an aborted send from onDone without locally finalizing bus-owned lifecycle state', () => {
     const context = loadConversationRenderer();
-    const finishes: any[] = [];
     const cleanups: string[] = [];
     let hooks: any = null;
     context.createChatController = (config: any) => {
       hooks = config.hooks;
       return { abort() {} };
     };
-    context._taskTurnFinish = (...args: any[]) => finishes.push(args);
     context._finishStreamingMsg = (cid: string) => cleanups.push(cid);
     context._updateConvSendUI = () => {};
     context._updateConvSidebarBadge = () => {};
@@ -9348,15 +9345,12 @@ describe('conversation controller settlement', () => {
     expect(browserTurnStarts).toEqual(['c1']);
     expect(context.pendingConvs.get('c1').controller).toBe(ctrl);
     hooks.onAbort(msg, 'c1');
-    expect(finishes).toHaveLength(0);
     expect(cleanups).toHaveLength(0);
 
     hooks.onDone(msg, 'c1', { started: true, aborted: true, errored: false });
-    expect(finishes).toHaveLength(0);
     expect(cleanups).toEqual(['c1']);
 
     hooks.onDone(msg, 'c1', { started: true, aborted: true, errored: false });
-    expect(finishes).toHaveLength(0);
     expect(cleanups).toEqual(['c1']);
   });
 
@@ -9493,7 +9487,6 @@ describe('conversation controller settlement', () => {
   ])('returns the terminal chat result from controller state %#', async (terminal, expected) => {
     const context = loadConversationRenderer();
     context.performance = performance;
-    context._taskTurnStart = () => {};
     context._makeConvChatController = (_cid: string, options: any) => ({
       abort() {},
       async send() {

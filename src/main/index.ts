@@ -242,7 +242,7 @@ function setTaskNotificationBadgeCount(count: number): void {
   app.setBadgeCount(normalized);
 }
 
-let taskTurnRendererReady = false;
+let mainRendererReady = false;
 
 // Renderer channels replay what the window could not take while loading; the
 // owner-scoped ones never hand one account's rows to the next (see
@@ -251,7 +251,7 @@ let taskTurnRendererReady = false;
 const rendererChannels: RendererChannel[] = [];
 const rendererChannelDeps: RendererChannelDeps = {
   broadcast: (channel, payload) => ipc.broadcastToRenderer(channel, payload),
-  rendererReady: () => taskTurnRendererReady,
+  rendererReady: () => mainRendererReady,
   activeUserId: () => (users.hasActiveUser() ? users.getActiveUserId() : null),
 };
 function rendererChannel(channel: string, options: RendererChannelOptions): RendererChannel {
@@ -299,17 +299,17 @@ function createWindow(): BrowserWindow {
     // Embedded previews also trigger did-start-loading, but only a new main
     // document replaces our subscribers and later emits did-finish-load.
     if (!isMainFrame || isInPlace) return;
-    taskTurnRendererReady = false;
+    mainRendererReady = false;
   });
   win.webContents.on('did-finish-load', () => {
-    taskTurnRendererReady = true;
+    mainRendererReady = true;
     for (const channel of rendererChannels) channel.flush();
   });
   win.webContents.on('render-process-gone', () => {
-    taskTurnRendererReady = false;
+    mainRendererReady = false;
   });
   win.on('closed', () => {
-    taskTurnRendererReady = false;
+    mainRendererReady = false;
   });
 
   // Block HTML <title> from populating the native titlebar — we want a

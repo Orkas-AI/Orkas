@@ -341,7 +341,7 @@ function _buildMethods(
 
   if (capabilities.has('browser')) {
     // CLI runtimes may issue parallel calls; never race a page mutation with
-    // another observation/action. Capture the task turn once, not per call.
+    // another observation/action. Reuse one browser scope for the active run.
     let signal: AbortSignal | undefined;
     const browser = buildConversationBrowserTool(opts.uid, opts.cid,
       () => isBridgeActive() && !signal?.aborted && getActiveUserId() === opts.uid);
