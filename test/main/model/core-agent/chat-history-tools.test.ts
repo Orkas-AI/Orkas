@@ -316,8 +316,9 @@ describe('chat-history-tools › chat_history(search)', () => {
     // index of the triggering message. Parsing the whole JSONL for it on
     // every call was the per-turn cost (K-5). While the source revision stays
     // unchanged, the first lookup serves later searches of the turn.
-    // Oracle: opens of the log (the page reader goes through
-    // fs.promises.open; the search snippet reader does not).
+    // Oracle: full source scans for boundary metadata. Snippets now use a
+    // separate worker, so counting main-process snippet opens proves nothing
+    // about whether this boundary is being repeatedly parsed.
     const { _resetCurrentBoundaryCacheForTest } = await import('../../../../src/main/model/core-agent/chat-history-tools');
     _resetCurrentBoundaryCacheForTest();
     writeConversation('boundary-cache', 'Boundary', [
@@ -328,10 +329,9 @@ describe('chat-history-tools › chat_history(search)', () => {
       userId: TEST_UID, currentCid: 'boundary-cache', currentMessageId: 'trigger',
     });
     const logPath = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'boundary-cache.jsonl');
-    // storage.ts binds `node:fs/promises` as an ESM namespace, so the patched
-    // property has to be re-synced into that namespace.
-    const { syncBuiltinESMExports } = await import('node:module');
-    const openSpy = vi.spyOn(fs.promises, 'open');
+    const { createRequire, syncBuiltinESMExports } = await import('node:module');
+    const nativeFs = createRequire(import.meta.url)('node:fs') as typeof fs;
+    const openSpy = vi.spyOn(nativeFs, 'createReadStream');
     syncBuiltinESMExports();
     const logOpens = () => openSpy.mock.calls.filter((call) => String(call[0]) === logPath).length;
     const search = () => chatSearch.execute({ query: 'CACHEDBOUNDARY', scope: 'current', k: 10 }, ctxFor());
@@ -343,12 +343,12 @@ describe('chat-history-tools › chat_history(search)', () => {
 
       const second = await search();
       expect(second.content).toContain('CACHEDBOUNDARY earlier result');
-      expect(logOpens()).toBe(opensForFirst + 1); // one direct hit read, no full transcript read
+      expect(logOpens()).toBe(opensForFirst);
 
-      // Forgetting the boundary still reuses the metadata index and seeks only the hit.
+      // Forgetting the boundary still reuses the metadata index.
       _resetCurrentBoundaryCacheForTest();
       await search();
-      expect(logOpens()).toBe(opensForFirst + 2);
+      expect(logOpens()).toBe(opensForFirst);
     } finally {
       openSpy.mockRestore();
       syncBuiltinESMExports();

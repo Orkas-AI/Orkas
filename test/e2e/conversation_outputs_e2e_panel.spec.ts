@@ -51,6 +51,32 @@ function pngBytes(width: number, height: number): Buffer {
   ]);
 }
 
+/** A short, valid PCM WAV so Chromium has real metadata to distinguish the
+ *  usable produced narration from the stale same-named reference. */
+function wavBytes(): Buffer {
+  const sampleRate = 8_000;
+  const samples = 800;
+  const pcm = Buffer.alloc(samples * 2);
+  for (let i = 0; i < samples; i += 1) {
+    pcm.writeInt16LE(Math.round(Math.sin((i / sampleRate) * Math.PI * 2 * 440) * 8_000), i * 2);
+  }
+  const out = Buffer.alloc(44 + pcm.length);
+  out.write('RIFF', 0, 'ascii');
+  out.writeUInt32LE(out.length - 8, 4);
+  out.write('WAVEfmt ', 8, 'ascii');
+  out.writeUInt32LE(16, 16);
+  out.writeUInt16LE(1, 20);
+  out.writeUInt16LE(1, 22);
+  out.writeUInt32LE(sampleRate, 24);
+  out.writeUInt32LE(sampleRate * 2, 28);
+  out.writeUInt16LE(2, 32);
+  out.writeUInt16LE(16, 34);
+  out.write('data', 36, 'ascii');
+  out.writeUInt32LE(pcm.length, 40);
+  pcm.copy(out, 44);
+  return out;
+}
+
 test.describe.configure({ timeout: 120_000 });
 
 test('surfaces produced files, outside files, and artifacts for one conversation', async ({ orkas }, testInfo) => {
@@ -180,6 +206,31 @@ test('surfaces produced files, outside files, and artifacts for one conversation
   await expect(pasted.locator('.chat-msg-produced-item')).toHaveCount(1);
   await expect(pasted.locator('img.chat-md-img')).toHaveCount(1);
   await expect(pasted.locator('.chat-msg-produced-media')).toHaveCount(0);
+
+  // A model can retain an earlier audition path while the completed turn
+  // publishes a new same-named narration. The stale player reports 0:00 and
+  // the host-rendered produced player works; once that failure is known, keep
+  // only the usable narration rather than showing two indistinguishable cards.
+  const narrationPath = path.join(wsDir, 'narration.wav');
+  writeFileSync(narrationPath, wavBytes());
+  const staleNarrationPath = path.join(listing.root, 'discarded-audition', 'narration.wav');
+  const staleNarrationUrl = `chat-media://local/${
+    staleNarrationPath.replace(/^\//, '').split('/').map(encodeURIComponent).join('/')
+  }`;
+  appendFileSync(chatFile(cid), `${JSON.stringify({
+    id: 'm_outputs_reply_stale_narration',
+    ts: new Date().toISOString(),
+    from: 'commander',
+    to: ['user'],
+    text: `Narration audition:\n\n[narration.wav](${staleNarrationUrl})`,
+    produced: [narrationPath],
+  })}\n`, 'utf8');
+  await reopen();
+
+  const narration = page.locator('#chat-history .chat-message.assistant').last();
+  await expect(narration.locator('.chat-md-audio-card')).toHaveCount(1);
+  await expect(narration.locator('.chat-msg-produced-media .chat-md-audio')).toHaveJSProperty('duration', 0.1);
+  await expect(narration.locator('.chat-msg-produced-item')).toContainText('narration.wav');
 
   // Revisit existing files in the body while the footer contains only this
   // reply's new output. The outside file needs the current conversation scope;

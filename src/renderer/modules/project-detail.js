@@ -486,6 +486,11 @@ function _bindProjectAutoAddBtn() {
 // ── Project instructions (user-authored ORKAS.md) ─────────────────────────
 // The user's own rules for this project — injected into every conversation
 // in the project. User-owned: saved only from here, agents just read it.
+//
+// The rail reads: it shows the last saved rules as copy. Editing happens in
+// a dialog, so a draft is never mistaken for what conversations actually get.
+
+let _projectInstructionsStatusTimer = 0;
 
 function _renderProjectInstructions() {
   const input = document.getElementById('project-instructions-input');
@@ -499,7 +504,75 @@ function _renderProjectInstructions() {
   // Instructions failed to load (e.g. legacy main) → disable rather than
   // let a save blank out content we never saw.
   input.disabled = !meta;
+  _renderProjectInstructionsRead();
   _updateProjectInstructionsFoot();
+}
+
+/** Mirror the saved rules into the rail. Reads `savedValue`, never the live
+ *  textarea, so an open draft cannot leak into the read view. */
+function _renderProjectInstructionsRead() {
+  const input = document.getElementById('project-instructions-input');
+  const readEl = document.getElementById('project-instructions-read');
+  const emptyEl = document.getElementById('project-instructions-empty');
+  const headEl = document.querySelector('.project-side-instructions-panel .project-context-section-head');
+  const editBtn = document.getElementById('project-instructions-edit-btn');
+  const setupBtn = document.getElementById('project-instructions-setup-btn');
+  if (!readEl) return;
+  const saved = String(input?.dataset.savedValue || '');
+  const hasContent = !!saved.trim();
+  readEl.textContent = saved;
+  readEl.hidden = !hasContent;
+  if (emptyEl) emptyEl.hidden = hasContent;
+  // With no rules yet the empty state owns the call to action, so the
+  // "rules in effect" heading and its Edit button step aside.
+  if (headEl) headEl.hidden = !hasContent;
+  const locked = !input || input.disabled;
+  if (editBtn) editBtn.disabled = locked;
+  if (setupBtn) setupBtn.disabled = locked;
+}
+
+function _setProjectInstructionsStatus(text) {
+  const el = document.getElementById('project-instructions-status');
+  if (!el) return;
+  el.textContent = text || '';
+  clearTimeout(_projectInstructionsStatusTimer);
+  if (text) _projectInstructionsStatusTimer = setTimeout(() => { el.textContent = ''; }, 2400);
+}
+
+function _openProjectInstructionsEditor() {
+  const modal = document.getElementById('project-instructions-modal');
+  const input = document.getElementById('project-instructions-input');
+  if (!modal || !input || input.disabled) return;
+  input.value = input.dataset.savedValue || '';
+  _setProjectInstructionsStatus('');
+  modal.classList.add('open');
+  modal.setAttribute('aria-hidden', 'false');
+  _updateProjectInstructionsFoot();
+  input.focus();
+  const end = input.value.length;
+  input.setSelectionRange(end, end);
+}
+
+/** Close the editor. An unsaved draft asks first; `force` is for the path
+ *  that already persisted the content. */
+async function _closeProjectInstructionsEditor({ force = false } = {}) {
+  const modal = document.getElementById('project-instructions-modal');
+  const input = document.getElementById('project-instructions-input');
+  if (!modal || !modal.classList.contains('open')) return;
+  const saved = input ? (input.dataset.savedValue || '') : '';
+  const dirty = !!input && !input.disabled && input.value !== saved;
+  if (!force && dirty && typeof uiConfirm === 'function') {
+    const ok = await uiConfirm(t('project.instructions.discard_confirm'));
+    if (!ok) return;
+  }
+  if (input) input.value = saved;
+  modal.classList.remove('open');
+  modal.setAttribute('aria-hidden', 'true');
+  _updateProjectInstructionsFoot();
+  const returnTo = saved.trim()
+    ? document.getElementById('project-instructions-edit-btn')
+    : document.getElementById('project-instructions-setup-btn');
+  returnTo?.focus();
 }
 
 function _updateProjectInstructionsFoot() {
@@ -524,6 +597,30 @@ function _bindProjectInstructions() {
   if (!input || input.dataset.bound === '1') return;
   input.dataset.bound = '1';
   input.addEventListener('input', _updateProjectInstructionsFoot);
+  input.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key !== 'Enter' || !(e.metaKey || e.ctrlKey)) return;
+    if (saveBtn?.disabled) return;
+    e.preventDefault();
+    saveBtn?.click();
+  });
+  document.getElementById('project-instructions-edit-btn')?.addEventListener('click', _openProjectInstructionsEditor);
+  document.getElementById('project-instructions-setup-btn')?.addEventListener('click', _openProjectInstructionsEditor);
+  document.getElementById('project-instructions-cancel-btn')?.addEventListener('click', () => {
+    _closeProjectInstructionsEditor();
+  });
+  document.getElementById('project-instructions-close-btn')?.addEventListener('click', () => {
+    _closeProjectInstructionsEditor();
+  });
+  document.getElementById('project-instructions-modal')?.addEventListener('mousedown', (e) => {
+    if (e.target === e.currentTarget) _closeProjectInstructionsEditor();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.keyCode === 229 || e.key !== 'Escape') return;
+    if (!document.getElementById('project-instructions-modal')?.classList.contains('open')) return;
+    e.preventDefault();
+    _closeProjectInstructionsEditor();
+  });
   saveBtn?.addEventListener('click', async () => {
     if (!_projectDetailPid || input.disabled) return;
     const projectId = _projectDetailPid;
@@ -552,6 +649,9 @@ function _bindProjectInstructions() {
       if (projectId === _projectDetailPid && _projectDetailMeta?.instructions) {
         _projectDetailMeta.instructions.content = content;
       }
+      _renderProjectInstructionsRead();
+      _closeProjectInstructionsEditor({ force: true });
+      _setProjectInstructionsStatus(t('project.instructions.saved'));
       _projectTrackEvent('project_instructions_update_result', {
         result: 'success',
         source: 'detail',
@@ -746,14 +846,14 @@ function _renderProjectMemoryList() {
 
     const actions = document.createElement('div');
     actions.className = 'project-memory-item-actions';
+    // Written-out verbs, not glyphs: these two sit under body copy the user
+    // is reading, and a pencil next to a paragraph reads as decoration.
     const edit = document.createElement('button');
     edit.type = 'button';
     edit.className = 'project-memory-item-action';
     edit.dataset.action = 'project-memory-edit';
     edit.dataset.memoryIndex = String(index);
-    edit.title = t('project.memory.edit');
-    edit.setAttribute('aria-label', edit.title);
-    edit.innerHTML = typeof uiIconHtml === 'function' ? uiIconHtml('edit-pencil') : '✎';
+    edit.textContent = t('project.memory.edit');
     actions.appendChild(edit);
 
     const remove = document.createElement('button');
@@ -761,9 +861,7 @@ function _renderProjectMemoryList() {
     remove.className = 'project-memory-item-action is-danger';
     remove.dataset.action = 'project-memory-delete';
     remove.dataset.memoryIndex = String(index);
-    remove.title = t('project.memory.delete');
-    remove.setAttribute('aria-label', remove.title);
-    remove.innerHTML = typeof uiIconHtml === 'function' ? uiIconHtml('x') : '×';
+    remove.textContent = t('project.memory.delete');
     actions.appendChild(remove);
     row.appendChild(actions);
 
@@ -773,6 +871,10 @@ function _renderProjectMemoryList() {
   listEl.style.display = shown ? '' : 'none';
   if (countEl) countEl.textContent = shown > 0 ? String(shown) : '';
   if (emptyEl) emptyEl.style.display = shown ? 'none' : '';
+  // Guidance until there is something saved, heading after — the same swap
+  // the goals-and-rules panel makes.
+  const headEl = document.getElementById('project-memory-section-head');
+  if (headEl) headEl.hidden = !shown;
 }
 
 function _updateProjectMemoryEditor() {
@@ -908,13 +1010,19 @@ async function _saveProjectMemoryEditor() {
 }
 
 function _bindProjectMemory() {
-  const add = document.getElementById('project-memory-add-btn');
+  // Two ways in, one action: the header button once entries exist, and the
+  // empty state's own call to action before that.
+  const addButtons = [
+    document.getElementById('project-memory-add-btn'),
+    document.getElementById('project-memory-add-empty-btn'),
+  ];
   const input = document.getElementById('project-memory-editor-input');
   const cancel = document.getElementById('project-memory-editor-cancel');
   const save = document.getElementById('project-memory-editor-save');
   const list = document.getElementById('project-memory-list');
 
-  if (add && add.dataset.bound !== '1') {
+  for (const add of addButtons) {
+    if (!add || add.dataset.bound === '1') continue;
     add.dataset.bound = '1';
     add.addEventListener('click', () => _openProjectMemoryEditor('add'));
   }

@@ -45,7 +45,7 @@ async function sendNewChatToAgent(
 function destructiveDeleteCommand(filePath: string, recursive = false): string {
   return process.platform === 'win32'
     ? `Remove-Item -Force${recursive ? ' -Recurse' : ''} -LiteralPath ${JSON.stringify(filePath)}`
-    : `rm ${recursive ? '-rf' : '-f'} ${JSON.stringify(filePath)}`;
+    : `rm ${recursive ? '-r' : '-f'} ${JSON.stringify(filePath)}`;
 }
 
 async function requireApprovalMode(
@@ -278,7 +278,7 @@ test.describe('real chat pipeline with a local model', () => {
     expect(modelOrkas.modelRequests).toHaveLength(3);
   });
 
-  test('shows a started tool action before delayed arguments and replaces only that lifecycle row', async ({ modelOrkas }) => {
+  test('shows a preparing tool action before delayed arguments and replaces only that lifecycle row', async ({ modelOrkas }) => {
     const outputPath = path.join(modelOrkas.userWorkspaceRoot, 'delayed-process.html');
     expect(existsSync(outputPath)).toBe(false);
     modelOrkas.setDelayedWriteFileScenario(
@@ -292,7 +292,7 @@ test.describe('real chat pipeline with a local model', () => {
     const lifecycleRow = page.locator(
       '#chat-history .stream-process-line[data-process-call-id^="tool:call-e2e-write-conflict-file"]',
     );
-    await expect(lifecycleRow).toHaveText('Started · Edit file', { timeout: 20_000 });
+    await expect(lifecycleRow).toHaveText('Preparing: Edit file', { timeout: 20_000 });
     expect(existsSync(outputPath)).toBe(false);
 
     await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]')).toContainText(

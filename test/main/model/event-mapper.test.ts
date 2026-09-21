@@ -1797,6 +1797,37 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     expect(out[0].failureRawCode).toBeUndefined();
   });
 
+  it('maps exhausted in-run candidates to actionable unavailable-model guidance', async () => {
+    setCurrentLang('zh');
+    try {
+      const out = await collect([
+        {
+          type: 'done',
+          result: {
+            text: '',
+            meta: {
+              error: {
+                kind: 'provider_error',
+                message: 'rotating-provider: no candidates',
+                code: 'PROVIDER_CANDIDATES_UNAVAILABLE',
+              },
+            },
+          },
+        },
+      ]);
+      expect(out).toEqual([expect.objectContaining({
+        type: 'error',
+        failureKind: 'model',
+        failureCode: 'provider_unavailable',
+      })]);
+      expect(String(out[0].text || '')).toContain('暂时不可用');
+      expect(String(out[0].text || '')).not.toContain('rotating-provider');
+      expect(String(out[0].text || '')).not.toContain('no candidates');
+    } finally {
+      setCurrentLang('en');
+    }
+  });
+
   it('diagnoses a repeatedly failing custom endpoint on the second consecutive 4xx', async () => {
     // W4-1 replay: a custom provider answered `410 (no body)` three runs in a
     // row; the user only ever saw "模型调用失败：410" and left with nothing.

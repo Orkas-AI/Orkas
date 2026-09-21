@@ -178,6 +178,8 @@ describe('settings sidebar navigation', () => {
     expect(handler).toContain("entryPoint: 'agents_connect_cli_button'");
     expect(css).toMatch(/\.header-entry-actions\s*{[\s\S]*?gap:\s*6px;[\s\S]*?align-items:\s*stretch;/);
     expect(css).toMatch(/\.header-entry-btn\s*{[\s\S]*?min-height:\s*36px;[\s\S]*?padding:\s*4px 10px;[\s\S]*?font-size:\s*12px;/);
+    expect(css).toMatch(/\.header-entry-btn\s*{[\s\S]*?background:\s*var\(--surface\);/);
+    expect(css).not.toMatch(/\.header-entry-btn-create\s*{[^}]*background:/);
     expect(css).toMatch(/\.header-entry-icon\s*{[^}]*width:\s*14px;[^}]*height:\s*14px;/);
   });
 });

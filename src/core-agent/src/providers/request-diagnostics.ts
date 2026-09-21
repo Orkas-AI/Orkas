@@ -8,6 +8,11 @@ export interface ProviderRequestFailure {
   source: ProviderFailureSource;
   lastEvent: string;
   requestSequence?: number;
+  /** Opaque transport correlation; restricted diagnostics only. */
+  requestRef?: string;
+  contextWindow?: number;
+  outputLimit?: number;
+  budgetObserved?: boolean;
 }
 
 export type ProviderFailureSource = 'unknown' | 'payload' | 'transport' | 'http' | 'sdk_error' | 'exception';
@@ -45,6 +50,7 @@ function safeCode(error: unknown): string {
 export function createRequestDiagnostics(
   signal?: AbortSignal,
   onFailure?: (failure: ProviderRequestFailure) => void,
+  requestRef?: unknown,
 ) {
   const started = performance.now();
   const requestSequence = onFailure ? Math.min(1_000_000_000, (requestSequences.get(onFailure) ?? 0) + 1) : undefined;
@@ -56,6 +62,9 @@ export function createRequestDiagnostics(
   let code = 'unknown';
   let reported = false;
   let observed = false;
+  let contextWindow: number | undefined;
+  let outputLimit: number | undefined;
+  let budgetObserved = false;
   const onResponse = (response: { status: number }) => {
     phase = 'after_response';
     status = Number.isInteger(response.status) && response.status >= 100 && response.status <= 599
@@ -79,6 +88,17 @@ export function createRequestDiagnostics(
   return {
     get observed(): boolean { return observed; },
     onResponse,
+    observeBudget(payload: unknown, window: unknown): void {
+      // O(1) observation of the final adapter payload. Never estimate tokens here.
+      try {
+        if (!payload || typeof payload !== 'object') return;
+        const body = payload as Record<string, unknown>;
+        const bounded = (value: unknown) => typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= 1_000_000_000 ? value : undefined;
+        contextWindow = bounded(window);
+        outputLimit = bounded(body.max_output_tokens ?? body.max_completion_tokens ?? body.max_tokens);
+        budgetObserved = true;
+      } catch { /* Metadata cannot change the payload result. */ }
+    },
     requestFetch,
     observeEvent(type: string): void {
       // Retain the event preceding failure, not the generic terminal error.
@@ -101,6 +121,8 @@ export function createRequestDiagnostics(
       reported = true;
       const failure: ProviderRequestFailure = {
         phase,
+        ...(budgetObserved ? { budgetObserved, contextWindow, outputLimit } : {}),
+        ...(typeof requestRef === 'string' && /^(?:[a-f0-9]{12}|[a-f0-9]{32})$/.test(requestRef) ? { requestRef } : {}),
         source: source !== 'unknown' ? source : status !== undefined && status >= 400 ? 'http' : boundary,
         lastEvent,
         ...(requestSequence === undefined ? {} : { requestSequence }),

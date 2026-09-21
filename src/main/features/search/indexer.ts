@@ -10,7 +10,7 @@ import { historyRecordText } from '../chat-history-records';
  *      re-tokenized, missing files have their docs dropped
  *   4. `flushAll()` is called from app quit
  *
- * Chat rebuilds yield between bounded transactions. Live messages remain in
+ * Chat rebuilds run in an independent worker. Live messages remain in
  * their durable JSONL until catch-up; source revisions guard the ready handoff.
  */
 
@@ -20,6 +20,7 @@ import * as path from 'node:path';
 import { Mutex } from 'async-mutex';
 
 import * as chatStore from './chat_store';
+import { ChatRebuildWorker } from './chat-rebuild';
 
 import {
   userContextsDir, userChatsDir, projectChatsDir,
@@ -28,6 +29,7 @@ import {
 import { conversationMessageReadFile, listProjectIds } from '../../util/project-layout';
 import { getActiveUserId } from '../users';
 import { createLogger } from '../../logger';
+import { closeChatSnippetReader } from './chat-snippets';
 import { logErrorSummary, logPathRef } from '../../util/log-redact';
 import { isBootAdmissionIdle, scheduleBootBackground, type ScheduledBootBackgroundTask } from '../../util/boot_init';
 
@@ -227,6 +229,7 @@ export async function flushOne(idxPath: string): Promise<void> {
 
 export async function flushAll(): Promise<void> {
   _closing = true;
+  await closeChatSnippetReader();
   for (const uid of _chatRepairTasks.keys()) cancelChatIndexRepair(uid);
   await Promise.allSettled([..._chatReconcileRuns.values()]);
   await drainDeferredChatWrites();
@@ -336,24 +339,6 @@ function _putDoc(idx: RuntimeIndex, docId: string, doc: Doc, text: string): void
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
-
-async function _readJsonl(file: string, signal?: AbortSignal): Promise<ChatMessage[] | null> {
-  let text: string;
-  try { text = await fsp.readFile(file, 'utf8'); }
-  catch { return null; }
-  const out: ChatMessage[] = [];
-  const lines = text.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    if (i > 0 && i % CPU_YIELD_EVERY === 0) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      if (signal?.aborted) return null;
-    }
-    const line = lines[i];
-    if (!line.trim()) continue;
-    try { out.push(JSON.parse(line)); } catch { /* skip malformed */ }
-  }
-  return out;
-}
 
 function _msgText(msg: ChatMessage | null | undefined): string {
   return msg ? historyRecordText(msg, true) : '';
@@ -654,36 +639,15 @@ function _docId(kind: IndexKind, fileKey: string, msgIndex: number): string {
 }
 
 async function _reindexChatFile(
-  userId: string, f: ChatFileInfo, shouldStop: () => boolean,
+  userId: string, f: ChatFileInfo, shouldStop: () => boolean, worker: ChatRebuildWorker,
 ): Promise<boolean> {
   const revision = _chatRevisions.get(userId) || 0;
-  const msgs = await _readJsonl(f.file);
-  if (!msgs || shouldStop()) return false;
-  // A sync pull or append during the read cannot certify this source snapshot.
-  const stat = await fsp.stat(f.file).catch(() => undefined);
-  if (!stat || stat.mtimeMs !== f.mtime || stat.size !== f.size
-      || revision !== (_chatRevisions.get(userId) || 0)) return false;
-  const cursor = chatStore.readRebuildCursor(userId, f.fileKey);
-  const resume = cursor && cursor.mtime === f.mtime && cursor.size === f.size;
-  let next = resume ? cursor.next : 0;
-  let reset = !resume;
-  do {
+  while (true) {
     if (shouldStop() || revision !== (_chatRevisions.get(userId) || 0)) return false;
-    const end = Math.min(next + 16, msgs.length);
-    const docs: chatStore.ChatDocInput[] = [];
-    for (let i = next; i < end; i++) {
-      const m = msgs[i];
-      const text = _msgText(m);
-      if (text) docs.push({ cid: f.fileKey, msgIndex: i, role: _msgRole(m), time: _msgTime(m), text });
-    }
-    chatStore.writeRebuildBatch(userId, f.fileKey, docs,
-      { mtime: f.mtime, size: f.size, next: end }, reset, end === msgs.length);
-    reset = false;
-    next = end;
-    // Yield after the actual tokenization/SQLite work, not just after building
-    // an input array. The persisted cursor survives a slice or process exit.
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  } while (next < msgs.length);
+    const batch = await worker.rebuildBatch(f);
+    if (!batch.valid) return false;
+    if (batch.complete) break;
+  }
   // Sync can replace the file before its completion callback invalidates the
   // index. Recheck the source after the final yielded batch as well as before it.
   const finalStat = await fsp.stat(f.file).catch(() => undefined);
@@ -733,24 +697,41 @@ async function _reconcileChatsPass(
   let deleted = 0;
   let cancelled = false;
   const seen = new Set(scan.files.map(f => f.fileKey));
-  for (const f of scan.files) {
-    if (shouldStop()) { cancelled = true; break; }
-    const known = chatStore.readFileWatermark(userId, f.fileKey);
-    if (!_dirtyChats.get(userId)?.has(f.fileKey)
-        && known && known.mtime === f.mtime && known.size === f.size) continue;
-    if (!await _reindexChatFile(userId, f, shouldStop)) { cancelled = true; break; }
-    updated++;
+  // The pass owns the writer until the worker is closed. Invalidation and
+  // live appends only mark durable source work meanwhile; a main-thread SQL
+  // write here would block behind the worker's transaction via busy_timeout.
+  let worker: ChatRebuildWorker | undefined;
+  try {
+    for (const f of scan.files) {
+      if (shouldStop() || revision !== (_chatRevisions.get(userId) || 0)) { cancelled = true; break; }
+      const known = chatStore.readFileWatermark(userId, f.fileKey);
+      if (!_dirtyChats.get(userId)?.has(f.fileKey)
+          && known && known.mtime === f.mtime && known.size === f.size) continue;
+      worker ??= new ChatRebuildWorker(userId);
+      if (!await _reindexChatFile(userId, f, shouldStop, worker)) { cancelled = true; break; }
+      updated++;
+    }
+    if (!cancelled && !shouldStop() && revision === (_chatRevisions.get(userId) || 0)) {
+      const missing = [...chatStore.indexedConversationIds(userId)].some(cid => !seen.has(cid));
+      if (missing) {
+        worker ??= new ChatRebuildWorker(userId);
+        deleted = await worker.deleteMissing([...seen]);
+      }
+    }
+  } finally {
+    await worker?.close();
   }
   const sourceStampAfter = cancelled ? undefined : await _chatSourceStamp(userId);
   const complete = !cancelled && !shouldStop()
     && revision === (_chatRevisions.get(userId) || 0) && sourceStampBefore === sourceStampAfter;
   if (complete) {
-    // Deletion and the ready marker share a synchronous boundary. No new
-    // append/invalidation can interleave between the final check and handoff.
-    for (const cid of chatStore.indexedConversationIds(userId)) {
-      if (!seen.has(cid)) { chatStore.deleteConversation(userId, cid); deleted++; }
-    }
+    // The worker is closed. No append/invalidation can interleave between
+    // this final revision check and the synchronous ready handoff.
     _dirtyChats.delete(userId);
+    // Rebuilds replace or delete rows and leave free SQLite pages behind.
+    // Reclaim them once while the index is still marked as migrating, never
+    // on the latency-sensitive incremental append path.
+    if (updated > 0 || deleted > 0) chatStore.compact(userId);
     chatStore.markRebuildComplete(userId, sourceStampAfter!);
     _migratingChats.delete(userId);
     _currentChatIndexes.add(userId);
@@ -767,12 +748,18 @@ async function _reconcileChatsPass(
  * directory walk on the query path. */
 export async function isChatsIndexCurrent(userId: string): Promise<boolean> {
   if (_chatReconcileRuns.has(userId) || _isMigrating(userId)) return false;
+  const revision = _chatRevisions.get(userId) || 0;
   const stamp = chatStore.readSourceStamp(userId);
   if (!stamp) {
     _currentChatIndexes.delete(userId);
     return false;
   }
-  const current = stamp === await _chatSourceStamp(userId);
+  const sourceStamp = await _chatSourceStamp(userId);
+  // The async catalog read can overlap sync invalidation or a new repair.
+  // An old read must not resurrect trust after either has cleared it.
+  const current = stamp === sourceStamp && !_chatReconcileRuns.has(userId)
+    && !_isMigrating(userId) && revision === (_chatRevisions.get(userId) || 0)
+    && stamp === chatStore.readSourceStamp(userId);
   if (current) _currentChatIndexes.add(userId);
   else _currentChatIndexes.delete(userId);
   return current;
@@ -792,7 +779,8 @@ export function isChatsIndexTrusted(userId: string): boolean {
 export function invalidateChatsIndex(userId: string): void {
   _noteChatChange(userId);
   _currentChatIndexes.delete(userId);
-  chatStore.writeSourceStamp(userId, undefined);
+  // A running pass persisted invalidation before opening its writer.
+  if (!_chatReconcileRuns.has(userId)) chatStore.writeSourceStamp(userId, undefined);
   scheduleChatIndexRepair(userId, 1_000);
 }
 
@@ -874,6 +862,11 @@ export function indexChatMessage(
 async function _dropChatFile(userId: string, fileKey: string): Promise<void> {
   _noteChatChange(userId, fileKey);
   await _getLock(_chatIdxPath(userId)).runExclusive(async () => {
+    if (_chatReconcileRuns.has(userId)) {
+      _currentChatIndexes.delete(userId);
+      scheduleChatIndexRepair(userId, 1_000);
+      return;
+    }
     chatStore.deleteConversation(userId, fileKey);
   });
 }

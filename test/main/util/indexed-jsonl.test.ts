@@ -1,9 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { getIndexedJsonl, readIndexedJsonlRecords } from '../../../src/main/util/indexed-jsonl';
+import { getIndexedJsonl, readIndexedJsonlRecords, mapIndexedJsonlRecords } from '../../../src/main/util/indexed-jsonl';
 import { appendJsonlAtomic, readJsonlWindow, writeTextAtomicSync } from '../../../src/main/storage';
+
+vi.mock('node:fs', async (original) => {
+  const actual = await original<typeof import('node:fs')>();
+  return { ...actual, createReadStream: vi.fn(actual.createReadStream) };
+});
 
 let directory: string;
 beforeEach(() => { directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-indexed-history-')); });
@@ -11,6 +16,55 @@ afterEach(() => { fs.rmSync(directory, { recursive: true, force: true }); });
 const metadata = (record: { id: string }) => ({ id: record.id });
 
 describe('indexed JSONL history reads', () => {
+  it('reads only the requested prefix, projects cold records once, and closes the source before returning', async () => {
+    const file = path.join(directory, 'prefix.jsonl');
+    fs.writeFileSync(file, '\ninvalid\n' + JSON.stringify({ id: 'first', text: '用户🧾' }) + '\n' +
+      JSON.stringify({ id: 'second', text: 'evidence' }) + '\n' +
+      JSON.stringify({ id: 'large-tail', text: 'x'.repeat(4_000_000) }) + '\n');
+    const reader = vi.mocked(fs.createReadStream); reader.mockClear();
+    const project = vi.fn((row: { id: string }) => row.id);
+    expect([...await mapIndexedJsonlRecords(file, new Set([1, 0]), project)])
+      .toEqual([[0, 'first'], [1, 'second']]);
+    expect(project.mock.calls.map(([row]) => row.id)).toEqual(['first', 'second']);
+    const streams = reader.mock.results.map(result => result.value as fs.ReadStream);
+    expect(streams.every(stream => stream.closed)).toBe(true);
+    expect(streams.reduce((sum, stream) => sum + stream.bytesRead, 0)).toBeLessThan(256 * 1024);
+    // A later history request must extend the prefix, never mistake it for
+    // the complete conversation or count a malformed row as a message.
+    expect([...await mapIndexedJsonlRecords(file, new Set([2]), row => row.id)])
+      .toEqual([[2, 'large-tail']]);
+    expect((await getIndexedJsonl(file, metadata)).entries).toHaveLength(3);
+  });
+
+  it('keeps a normal search working set warm beyond 32 conversations without retaining source bodies', async () => {
+    const files = Array.from({ length: 96 }, (_, index) => path.join(directory, `${index}.jsonl`));
+    for (const [index, file] of files.entries()) {
+      fs.writeFileSync(file, JSON.stringify({ id: String(index), text: 'private body' }) + '\n');
+      await mapIndexedJsonlRecords(file, new Set([0]), row => row.id);
+    }
+    const reader = vi.mocked(fs.createReadStream); reader.mockClear();
+    for (const [index, file] of files.entries()) {
+      expect([...await mapIndexedJsonlRecords(file, new Set([0]), row => row.id)]).toEqual([[0, String(index)]]);
+    }
+    expect(reader.mock.results, 'repeat lookup must seek selected rows instead of rescanning each source').toHaveLength(0);
+  });
+
+  it('does not skip an unscanned suffix after append, and rejects rewritten or missing source data', async () => {
+    const file = path.join(directory, 'changing.jsonl');
+    fs.writeFileSync(file, '{"id":"a"}\ninvalid\n{"id":"b"}\n');
+    expect([...await mapIndexedJsonlRecords(file, new Set([0]), row => row.id)]).toEqual([[0, 'a']]);
+    await appendJsonlAtomic(file, { id: 'c' });
+    expect([...await mapIndexedJsonlRecords(file, new Set([1, 2]), row => row.id)]).toEqual([[1, 'b'], [2, 'c']]);
+    fs.writeFileSync(file, '{"id":"new"}\n');
+    expect([...await mapIndexedJsonlRecords(file, new Set([0, 2]), row => row.id)]).toEqual([[0, 'new']]);
+    fs.writeFileSync(file, '{"id":"race"}\n');
+    await expect(mapIndexedJsonlRecords(file, new Set([0]), row => {
+      fs.writeFileSync(file, '{"id":"changed during read"}\n'); return row.id;
+    })).rejects.toThrow('Conversation changed');
+    fs.unlinkSync(file);
+    expect([...await mapIndexedJsonlRecords(file, new Set([0]), row => row.id)]).toEqual([]);
+  });
+
   it('keeps valid-record numbering and exact UTF-8 source bytes across malformed rows', async () => {
     const file = path.join(directory, 'history.jsonl');
     const records = [{ id: 'a', text: '用户🧾' }, { id: 'b', text: 'quoted\n"input"' }];

@@ -56,13 +56,16 @@ export function* historyProcessTexts(message: { process?: unknown }, contentOnly
 
 /** Explicit process events are archived evidence, never inferred intent. Public
  * tool calls/results and progress only; private model reasoning is excluded. */
-export function historyRecordText(message: { text?: unknown; content?: unknown; process?: unknown; attachments?: unknown; references?: unknown; produced?: unknown }, includeProcess = false): string {
-  const parts = [projectHistoryMediaText(typeof message.text === 'string' ? message.text : typeof message.content === 'string' ? message.content : '')];
+export function* historyRecordTextParts(message: { text?: unknown; content?: unknown; process?: unknown; attachments?: unknown; references?: unknown; produced?: unknown }, includeProcess = false): Generator<string> {
+  yield projectHistoryMediaText(typeof message.text === 'string' ? message.text : typeof message.content === 'string' ? message.content : '');
   for (const field of ['attachments', 'references', 'produced'] as const) {
-    if (Array.isArray(message[field]) && message[field].length) parts.push(`${field}: ${stringifyHistoryMedia(message[field])}`);
+    if (Array.isArray(message[field]) && message[field].length) yield `${field}: ${stringifyHistoryMedia(message[field])}`;
   }
-  if (includeProcess) for (const text of historyProcessTexts(message)) parts.push(text);
-  return parts.filter(Boolean).join('\n');
+  if (includeProcess) yield* historyProcessTexts(message);
+}
+
+export function historyRecordText(message: Parameters<typeof historyRecordTextParts>[0], includeProcess = false): string {
+  return [...historyRecordTextParts(message, includeProcess)].filter(Boolean).join('\n');
 }
 
 export async function historyMessagesAtFile(file: string, indexes: ReadonlySet<number>): Promise<Map<number, MessageRecord>> {

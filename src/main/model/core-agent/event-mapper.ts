@@ -174,6 +174,7 @@ function modelFailureDetails(
 
   if (isStorageFullError(error)) failureCode = 'storage_full';
   else if (code === 'OUTPUT_LIMIT') failureCode = 'provider_max_tokens';
+  else if (code === 'PROVIDER_CANDIDATES_UNAVAILABLE') failureCode = 'provider_unavailable';
   else if (code === 'PROVIDER_RETRIES_EXHAUSTED') failureCode = 'provider_retries_exhausted';
   else if (code === 'PROVIDER_NO_FIRST_EVENT_TIMEOUT') failureCode = 'provider_no_first_event';
   else if (code === 'PROVIDER_EMPTY_NORMAL') failureCode = 'empty_response_normal';
@@ -391,6 +392,7 @@ function localizeKnownRunnerError(error: AgentErrorMeta, providerId?: string): s
   const known = localizeKnownRunnerText(raw, error.code);
   if (known !== raw) return known;
   const code = String(error.code || '').trim().toUpperCase();
+  if (code === 'PROVIDER_CANDIDATES_UNAVAILABLE') return t('errors.model_temporarily_unavailable');
   const explicitKind: KeyFailureKind | null = /BALANCE|QUOTA|CREDIT|FUNDS|PAYMENT/.test(code)
     ? 'balance'
     : error.kind === 'auth' || code === 'PROVIDER_AUTH_EXHAUSTED'

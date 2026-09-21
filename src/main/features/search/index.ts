@@ -1,4 +1,3 @@
-import { hasHistoryProcess, historyMessagesAtFile, historyProcessTexts } from '../chat-history-records';
 /**
  * Global search query API.
  *
@@ -26,7 +25,6 @@ import { hasHistoryProcess, historyMessagesAtFile, historyProcessTexts } from '.
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
-import { Semaphore } from 'async-mutex';
 
 import {
   WS_ROOT,
@@ -44,6 +42,8 @@ import { tokenize, isCJK } from './tokenize';
 import { SCHEMA_VERSION, type Index, type Doc } from './storage';
 import * as indexer from './indexer';
 import * as chatStore from './chat_store';
+import type { ChatSnippet } from './snippet';
+import { readChatSnippets } from './chat-snippets';
 import {
   isRelevantLibraryContentHit,
   libraryContentDisplayScore,
@@ -216,18 +216,6 @@ function _queryEmbedding(
 }
 
 // ── Source readers ──────────────────────────────────────────────────────
-
-interface ChatSourceMessage {
-  id?: unknown;
-  content?: unknown;
-  text?: unknown;
-  process?: unknown;
-  deleted_at?: unknown;
-  dispatch?: unknown;
-}
-
-// Bound concurrent exact source reads, including cold index construction.
-const _chatSnippetIo = new Semaphore(4);
 
 export function invalidateChatsIndex(userId: string): void {
   indexer.invalidateChatsIndex(userId);
@@ -634,6 +622,11 @@ export async function searchChats(
   return (await searchChatsWithStatus(userId, query, options)).results;
 }
 
+/** Cheap coverage-only IPC path: no source bodies, embeddings or rebuild. */
+export async function searchIndexStatus(userId: string): Promise<{ chat_index_complete: boolean }> {
+  return { chat_index_complete: indexer.isChatsIndexTrusted(userId) || await indexer.isChatsIndexCurrent(userId) };
+}
+
 /** Query-local index status: a scheduled repair must not turn a partial miss
  * into proof that history contains no matches. Existing UI callers keep arrays. */
 export async function searchChatsWithStatus(
@@ -649,7 +642,7 @@ export async function searchChatsWithStatus(
 
   // Cold and partial indexes use the same background path. Searching must
   // never inherit a history-wide rebuild, including during first migration.
-  let indexComplete = indexer.isChatsIndexTrusted(userId) || await indexer.isChatsIndexCurrent(userId);
+  let indexComplete = (await searchIndexStatus(userId)).chat_index_complete;
   if (!indexComplete) indexer.scheduleChatIndexRepair(userId);
   const tokens = tokenize(q);
   // Normalize BM25 against the currently available corpus, including a
@@ -684,10 +677,6 @@ export async function searchChatsWithStatus(
       if (Number.isInteger(options.beforeMsgIndex) && msgIndex >= Number(options.beforeMsgIndex)) return null;
       if (options.excludeCid && cid === options.excludeCid) return null;
       if (options.scope === 'project' && (!options.projectId || pid !== options.projectId)) return null;
-      // The catalog above already resolved project membership. Supplying it
-      // avoids `conversationMessageReadFile` re-scanning every project index
-      // once per search result.
-      const file = conversationMessageReadFile(userId, cid, pid || undefined);
       const result: ChatCandidate = {
         kind: 'chat',
         cid: doc.cid,
@@ -701,7 +690,7 @@ export async function searchChatsWithStatus(
         // ranking full-query matches first; the row list they cut down to is
         // otherwise re-sorted by raw score and loses the tier.
         term_coverage: scored.coverage,
-        sourceFile: file,
+        sourceFile: '',
         sourceIndex: msgIndex,
       };
       if (pid) {
@@ -715,48 +704,33 @@ export async function searchChatsWithStatus(
   );
 
   const byFile = new Map<string, Set<number>>();
+  const filesByCid = new Map<string, string>();
   for (const candidate of candidates) {
+    const cid = String(candidate.cid);
+    let file = filesByCid.get(cid);
+    if (!file) {
+      // Resolve only selected conversations, not every scored document. An
+      // explicit global hint avoids rediscovering catalog ownership on disk.
+      const pid = displayCatalog.cidToPid.get(cid);
+      file = conversationMessageReadFile(userId, cid, pid || (displayCatalog.titles.has(cid) ? null : undefined));
+      filesByCid.set(cid, file);
+    }
+    candidate.sourceFile = file;
     const indexes = byFile.get(candidate.sourceFile) || new Set<number>();
     indexes.add(candidate.sourceIndex);
     byFile.set(candidate.sourceFile, indexes);
   }
-  const sourceRows = new Map<string, Map<number, ChatSourceMessage>>();
+  const sourceRows = new Map<string, Map<number, ChatSnippet | undefined>>();
   await Promise.all(Array.from(byFile, async ([file, indexes]) => {
-    sourceRows.set(file, await _chatSnippetIo.runExclusive(async () => {
-      try { return await historyMessagesAtFile(file, indexes); }
-      catch { return new Map(); } // Source changes/missing files are repaired by reconciliation.
-    }));
+    try { sourceRows.set(file, await readChatSnippets(file, indexes, tokens)); }
+    catch { sourceRows.set(file, new Map()); } // Source changes/missing files are repaired by reconciliation.
   }));
   const results = candidates.flatMap(({ sourceFile, sourceIndex, ...result }) => {
-    const msg = sourceRows.get(sourceFile)?.get(sourceIndex);
-    if (!msg) indexComplete = false;
-    if (
-      options.userVisibleOnly
-      && (
-        !msg
-        || !!msg.deleted_at
-        || !!msg.dispatch
-        || !indexer.readMsgText(msg).trim()
-      )
-    ) {
-      return [];
-    }
-    result.snippet = _makeSnippet(indexer.readMsgText(msg), q);
-    if (msg && hasHistoryProcess(msg)) {
-      result.has_process = true;
-      // Compare public execution entries separately so a leading dialogue
-      // acknowledgement or call input cannot hide a more relevant result.
-      let best = '', coverage = 0;
-      const terms = [...new Set(tokens)];
-      for (const text of historyProcessTexts(msg, true)) {
-        const lower = text.toLowerCase();
-        const matched = terms.reduce((count, term) => count + Number(lower.includes(term)), 0);
-        if (matched > coverage) { best = text; coverage = matched; }
-      }
-      if (best) result.process_snippet = _makeSnippet(best, q);
-    }
-    if (typeof msg?.id === 'string' && msg.id) result.msg_id = msg.id;
-    return [result];
+    const projected = sourceRows.get(sourceFile)?.get(sourceIndex);
+    if (!projected) indexComplete = false;
+    if (options.userVisibleOnly && !projected?.visible) return [];
+    const { visible: _visible, ...snippet } = projected || { visible: false, snippet: '' };
+    return [{ ...result, ...snippet }];
   });
   return { results, indexComplete };
 }

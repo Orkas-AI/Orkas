@@ -31,12 +31,164 @@ function extractFunction(source: string, name: string): string {
   throw new Error(`unterminated ${name}`);
 }
 
+function loadingHarness() {
+  const body = { innerHTML: '', classList: { add: vi.fn(), remove: vi.fn() },
+    querySelectorAll: () => [], querySelector: () => null };
+  const input = { value: '', focus: vi.fn() };
+  const overlay = { style: { display: '' } };
+  const requests: Array<{ resolve: (data: any) => void; reject: (error: Error) => void }> = [];
+  const locale = JSON.parse(fs.readFileSync(path.join(root, 'src/renderer/locales/zh.json'), 'utf8'));
+  const context: any = {
+    setTimeout, clearTimeout, window: {},
+    document: {
+      addEventListener: vi.fn(), querySelectorAll: () => [],
+      getElementById: (id: string) => ({ 'search-body': body, 'search-input': input,
+        'search-overlay': overlay }[id] || null),
+    },
+    escapeHtml: (s: string) => s, t: (key: string) => locale[key], formatTime: () => '',
+    localStorage: { getItem: () => null, setItem: vi.fn() },
+    apiFetch: (url: string) => url.endsWith('/status')
+      ? Promise.resolve({ json: async () => ({ ok: true, chat_index_complete: true }) })
+      : new Promise((resolve, reject) => requests.push({
+        resolve: data => resolve({ json: async () => data }), reject,
+      })),
+  };
+  vm.createContext(context);
+  vm.runInContext(searchSource, context);
+  return { body, input, overlay, requests, context };
+}
+
 describe('global search conversation navigation', () => {
+  // Visible wait feedback must survive reordering; no stale hit may become
+  // actionable while the next input is still waiting for its debounce.
+  it('keeps loading for the latest input through stale replies, tabs, clearing and reopening', async () => {
+    vi.useFakeTimers();
+    try {
+      const { body, input, overlay, requests, context } = loadingHarness();
+      const old = context._runSearchNow('old');
+      expect(body.innerHTML).toContain('加载中…');
+      context._scheduleSearch('next');
+      requests[0].resolve({ ok: true, results: [{ kind: 'chat', conv_title: 'stale hit' }] });
+      await old;
+      expect(body.innerHTML).toContain('加载中…');
+      expect(body.innerHTML).not.toContain('stale hit');
+      context._setSearchTab('chat');
+      expect(body.innerHTML).toContain('加载中…');
+      await vi.advanceTimersByTimeAsync(300);
+      expect(requests).toHaveLength(2);
+      context._scheduleSearch('');
+      expect(body.innerHTML).not.toContain('search-loading');
+      requests[1].reject(new Error('obsolete failure'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(body.innerHTML).not.toContain('obsolete failure');
+      expect(body.innerHTML).not.toContain('search-loading');
+
+      input.value = 'closing';
+      context._scheduleSearch(input.value);
+      context.closeGlobalSearch();
+      expect(overlay.style.display).toBe('none');
+      context.openGlobalSearch();
+      await vi.advanceTimersByTimeAsync(300);
+      expect(requests).toHaveLength(2);
+      expect(body.innerHTML).not.toContain('search-loading');
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(['results', 'empty', 'rejected', 'network'])('replaces loading with the current %s outcome and permits retry', async outcome => {
+    const { body, requests, context } = loadingHarness();
+    const pending = context._runSearchNow('marker');
+    expect(body.innerHTML).toContain('role="status"');
+    expect(body.innerHTML).toContain('加载中…');
+    expect(body.innerHTML).not.toContain('search-result');
+    if (outcome === 'network') requests[0].reject(new Error('offline'));
+    else requests[0].resolve(outcome === 'rejected' ? { ok: false, error: 'unavailable' }
+      : { ok: true, results: outcome === 'empty' ? [] : [{ kind: 'chat', conv_title: 'matching conversation' }] });
+    await pending;
+    expect(body.innerHTML).not.toContain('search-loading');
+    if (outcome === 'results') expect(body.innerHTML).toContain('matching conversation');
+    else if (outcome === 'empty') expect(body.innerHTML).toContain('未找到');
+    else expect(body.innerHTML).toContain('搜索失败');
+    const retry = context._runSearchNow('retry');
+    expect(body.innerHTML).toContain('加载中…');
+    requests[1].resolve({ ok: true, results: [{ kind: 'chat', conv_title: 'retry hit' }] });
+    await retry;
+    expect(body.innerHTML).toContain('retry hit');
+    expect(body.innerHTML).not.toContain('search-loading');
+  });
+
+  it('paints the localized preparation notice before results settle and rejects late status after a ready result', async () => {
+    const body = { innerHTML: '', classList: { remove: vi.fn() }, querySelectorAll: () => [] };
+    const locale = JSON.parse(fs.readFileSync(path.join(root, 'src/renderer/locales/zh.json'), 'utf8'));
+    let resolveStatus!: (value: any) => void;
+    let resolveResults!: (value: any) => void;
+    const context: any = {
+      _searchResults: [], _searchVisibleResults: [], _searchActiveIdx: -1,
+      _searchLoading: false, _searchTab: 'all', _searchChatIndexComplete: true, _searchSeq: 0, _searchLastQuery: '',
+      _searchTimer: null,
+      _SEARCH_FETCH_LIMIT: 200,
+      document: { getElementById: () => body }, escapeHtml: (s: string) => s,
+      t: (key: string) => locale[key], _activeProjectIdForSearch: () => '',
+      _setSearchTabsVisible: vi.fn(), _trackGlobalSearchResult: vi.fn(),
+      _renderSearchError: vi.fn(), _reportGlobalSearchFailure: vi.fn(),
+      _partitionSearchResults: (rows: any[]) => ({ chats: rows, agents: [], skills: [], contexts: [] }),
+      _sectionRows: (s: any) => s.bucket, _renderSearchRow: () => '<div class="search-result">existing hit</div>',
+      apiFetch: (url: string) => new Promise(resolve => {
+        if (url.endsWith('/status')) resolveStatus = data => resolve({ json: async () => data });
+        else resolveResults = data => resolve({ json: async () => data });
+      }),
+    };
+    vm.createContext(context);
+    for (const name of ['_refreshSearchIndexStatus', '_showSearchLoading', '_runSearchNow', '_renderSearchResults']) {
+      vm.runInContext(extractFunction(searchSource, name), context);
+    }
+    const pending = context._runSearchNow('marker');
+    expect(body.innerHTML).toContain('search-loading');
+    expect(body.innerHTML).toContain(locale['common.loading']);
+    resolveStatus({ ok: true, chat_index_complete: false });
+    await new Promise(resolve => setImmediate(resolve));
+    const copy = '正在准备中，结果暂不完整，请稍后重试。';
+    expect(body.innerHTML).toContain(copy);
+    expect(body.innerHTML).toContain('search-loading');
+    expect(body.innerHTML).not.toContain(locale['search.no_results']);
+    resolveResults({ ok: true, chat_index_complete: false, results: [{ kind: 'chat' }] });
+    await pending;
+    expect(body.innerHTML).toContain(copy);
+    expect(body.innerHTML).toContain('existing hit');
+    expect(body.innerHTML).not.toContain('search-loading');
+
+    const ready = context._runSearchNow('marker');
+    resolveResults({ ok: true, chat_index_complete: true, results: [{ kind: 'chat' }] });
+    await ready;
+    resolveStatus({ ok: true, chat_index_complete: false });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(body.innerHTML).not.toContain(copy);
+    expect(body.innerHTML).toContain('existing hit');
+    expect(context._renderSearchError).not.toHaveBeenCalled();
+  });
+
+  it('ignores preparation status from a closed or superseded search session', async () => {
+    let reply!: (value: any) => void;
+    const context: any = {
+      _searchSeq: 1, _searchChatIndexComplete: true,
+      apiFetch: () => new Promise(resolve => { reply = data => resolve({ json: async () => data }); }),
+      _renderSearchEmptyState: vi.fn(), _renderSearchResults: vi.fn(),
+    };
+    vm.createContext(context);
+    vm.runInContext(extractFunction(searchSource, '_refreshSearchIndexStatus'), context);
+    const pending = context._refreshSearchIndexStatus(1, '', { active: true });
+    context._searchSeq++;
+    reply({ ok: true, chat_index_complete: false });
+    await pending;
+    expect(context._searchChatIndexComplete).toBe(true);
+    expect(context._renderSearchEmptyState).not.toHaveBeenCalled();
+    expect(context._renderSearchResults).not.toHaveBeenCalled();
+  });
+
   it('shows incomplete-history status for empty and partial results, clears it after migration, and scopes it to chats', () => {
     const body = { innerHTML: '', classList: { remove: vi.fn() }, querySelectorAll: () => [] };
     const context: any = {
       _searchResults: [], _searchVisibleResults: [], _searchActiveIdx: -1,
-      _searchTab: 'all', _searchChatIndexComplete: false,
+      _searchLoading: false, _searchTab: 'all', _searchChatIndexComplete: false,
       document: { getElementById: () => body },
       escapeHtml: (s: string) => s, t: (key: string) => key,
       _partitionSearchResults: (rows: any[]) => ({ chats: rows, agents: [], skills: [], contexts: [] }),
@@ -84,6 +236,8 @@ describe('global search conversation navigation', () => {
       _setSearchTab: vi.fn(),
       _setSearchTabsVisible: vi.fn(),
       _renderSearchEmptyState: vi.fn(),
+      _showSearchLoading: vi.fn(),
+      _refreshSearchIndexStatus: vi.fn(),
       setTimeout: (fn: () => void) => { fn(); return 1; },
       window: { Monitor: true },
       Monitor: {
@@ -298,6 +452,7 @@ describe('global search conversation navigation', () => {
     const trackResult = vi.fn();
     const context: any = {
       Date,
+      _searchTimer: null,
       _SEARCH_FETCH_LIMIT: 200,
       _searchSeq: 0,
       _searchResults: [],
@@ -310,6 +465,8 @@ describe('global search conversation navigation', () => {
       _activeProjectIdForSearch: () => '',
       _setSearchTabsVisible: () => {},
       _renderSearchEmptyState: () => { rendered.push('empty'); },
+      _showSearchLoading: vi.fn(),
+      _refreshSearchIndexStatus: vi.fn(),
       _renderSearchResults: (query: string) => { rendered.push(`results:${query}`); },
       _renderSearchError: (message: string) => { rendered.push(`error:${message}`); },
       _trackGlobalSearchResult: trackResult,
@@ -346,9 +503,9 @@ describe('global search conversation navigation', () => {
     const overlay: any = { style: { display: '' } };
     const input: any = { value: 'private query' };
     const context: any = {
+      _searchTimer: null,
       _SEARCH_FETCH_LIMIT: 200,
       _searchSeq: 0,
-      _searchTimer: null,
       document: {
         getElementById: (id: string) => (id === 'search-overlay' ? overlay : (id === 'search-input' ? input : null)),
       },
@@ -356,6 +513,8 @@ describe('global search conversation navigation', () => {
       _activeProjectIdForSearch: () => '',
       _setSearchTabsVisible: vi.fn(),
       _renderSearchEmptyState: vi.fn(),
+      _showSearchLoading: vi.fn(),
+      _refreshSearchIndexStatus: vi.fn(),
       _renderSearchResults: vi.fn(),
       _renderSearchError: renderError,
       _reportGlobalSearchFailure: reportFailure,

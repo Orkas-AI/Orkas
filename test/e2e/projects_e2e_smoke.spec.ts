@@ -74,15 +74,23 @@ test.describe('projects', () => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     let page = orkas.page;
 
+    // A project with no rules yet shows the empty state; the textarea lives in
+    // the editor dialog behind it.
+    await page.locator('#project-instructions-setup-btn').click();
     const instructions = page.locator('#project-instructions-input');
     await expect(instructions).toBeEnabled();
     await instructions.fill('Always verify generated artifacts before reporting completion.');
     await page.locator('#project-instructions-save-btn').click();
     await expect(page.locator('#project-instructions-save-btn')).toBeDisabled();
+    await expect(page.locator('#project-instructions-modal')).not.toHaveClass(/open/);
+    await expect(page.locator('#project-instructions-read')).toHaveText(
+      'Always verify generated artifacts before reporting completion.',
+    );
 
     await page.locator('[data-project-side-tabs="context"] [data-project-side-tab="memory"]').click();
     await expect(page.locator('[data-project-side-panel="memory"]')).toBeVisible();
-    await page.locator('#project-memory-add-btn').click();
+    // No memory yet, so the empty state owns the call to action.
+    await page.locator('#project-memory-add-empty-btn').click();
     await page.locator('#project-memory-editor-input').fill('The release checklist is the source of truth.');
     await page.locator('#project-memory-editor-save').click();
     await expect(page.locator('.project-memory-item', { hasText: 'The release checklist is the source of truth.' })).toBeVisible();
@@ -103,7 +111,7 @@ test.describe('projects', () => {
       has: page.locator('.project-name', { hasText: projectName }),
     });
     await projectRow.click();
-    await expect(page.locator('#project-instructions-input')).toHaveValue(
+    await expect(page.locator('#project-instructions-read')).toHaveText(
       'Always verify generated artifacts before reporting completion.',
     );
     await page.locator('[data-project-side-tabs="context"] [data-project-side-tab="memory"]').click();

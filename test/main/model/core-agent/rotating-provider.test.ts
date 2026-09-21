@@ -1362,6 +1362,24 @@ describe('rotating-provider › exhausted stream candidates', () => {
     })).toThrow(/candidates list is empty/);
   });
 
+  it('returns a structured unavailable error when every candidate was exhausted earlier in the run', async () => {
+    const authErr = Object.assign(new Error('Unauthorized'), { status: 401 });
+    const p = createRotatingProvider({
+      providerId: 'test',
+      candidates: [candidate('p1', { throwBefore: authErr })],
+    });
+
+    await expect(collect(p.stream(PARAMS))).rejects.toMatchObject({
+      code: 'PROVIDER_AUTH_EXHAUSTED',
+    });
+    await expect(p.complete(PARAMS)).rejects.toMatchObject({
+      code: 'PROVIDER_CANDIDATES_UNAVAILABLE',
+    });
+    await expect(collect(p.stream(PARAMS))).rejects.toMatchObject({
+      code: 'PROVIDER_CANDIDATES_UNAVAILABLE',
+    });
+  });
+
   it('retries each network-failing candidate and surfaces a stable exhausted error without cooldown', async () => {
     const netErr = new TypeError('fetch failed');
     let p1Builds = 0;

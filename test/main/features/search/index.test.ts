@@ -962,9 +962,13 @@ describe('search › startup reconcile', () => {
     fs.writeFileSync(snapshot, JSON.stringify({ version: 4, kind: 'chat', files: {}, docs: {}, postings: {} }));
     fs.writeFileSync(`${snapshot}.tmp`, 'half-written flush');
 
+    const chatStore = await import('../../../../src/main/features/search/chat_store');
+    const compact = vi.spyOn(chatStore, 'compact').mockImplementation(() => undefined);
     const s = await loadSearch();
     await s.reconcileActive();
 
+    expect(compact).toHaveBeenCalledTimes(1);
+    expect(compact).toHaveBeenCalledWith(TEST_UID);
     expect(fs.existsSync(snapshot), 'the retired snapshot is removed').toBe(false);
     expect(fs.existsSync(`${snapshot}.tmp`), 'and so is a half-written flush').toBe(false);
     const results = await s.searchChats(TEST_UID, 'quokka');

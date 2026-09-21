@@ -18,6 +18,7 @@ let _searchResults = [];
 let _searchActiveIdx = -1;
 let _searchLastQuery = '';
 let _searchChatIndexComplete = true;
+let _searchLoading = false;
 const _SEARCH_FAILURE_DEDUPE_MS = 60 * 1000;
 const _SEARCH_FAILURE_MAX_KEYS = 16;
 const _SEARCH_FAILURE_STAGES = new Set(['request', 'response', 'partial']);
@@ -136,6 +137,7 @@ function openGlobalSearch(entryPoint = 'unknown') {
   const input = document.getElementById('search-input');
   if (input) {
     input.value = '';
+    _searchLoading = false;
     _searchResults = [];
     _searchActiveIdx = -1;
     _searchLastQuery = '';
@@ -145,6 +147,7 @@ function openGlobalSearch(entryPoint = 'unknown') {
     _setSearchTabsVisible(false);   // hide tabs while empty/history state is shown
     setTimeout(() => input.focus(), 30);
     _renderSearchEmptyState();
+    void _refreshSearchIndexStatus(_searchSeq, '', { active: true });
   }
 }
 
@@ -165,12 +168,18 @@ function closeGlobalSearch() {
   // flight so it cannot repaint hidden state or report a failure the user no
   // longer encountered.
   _searchSeq++;
+  _searchLoading = false;
   overlay.style.display = 'none';
   if (_searchTimer) { clearTimeout(_searchTimer); _searchTimer = null; }
 }
 
 function _scheduleSearch(query) {
   if (_searchTimer) clearTimeout(_searchTimer);
+  _searchTimer = null;
+  // Invalidate at input time, including the debounce window.
+  _searchSeq++;
+  if (!query.trim()) { void _runSearchNow(''); return; }
+  _showSearchLoading(query.trim());
   // Library body search embeds the settled query once. A slightly longer
   // debounce avoids running native inference for every intermediate IME or
   // fast-typing state while keeping filename/chat feedback responsive.
@@ -190,10 +199,44 @@ function _activeProjectIdForSearch() {
   return '';
 }
 
+// Coverage must not wait for the all-scope query (including embeddings and
+// snippets). A late status response must never overwrite newer query results.
+async function _refreshSearchIndexStatus(seq, query, pending) {
+  try {
+    const response = await apiFetch('/api/search/status');
+    const data = await response.json();
+    if (seq !== _searchSeq || !pending.active || !data.ok) return;
+    _searchChatIndexComplete = data.chat_index_complete !== false;
+    if (!_searchChatIndexComplete) {
+      if (query) {
+        if (query !== _searchLastQuery) {
+          _searchResults = [];
+          _searchVisibleResults = [];
+        }
+        _searchLastQuery = query;
+        _setSearchTabsVisible(true);
+        _renderSearchResults(query);
+      } else _renderSearchEmptyState();
+    }
+  } catch (_) { /* the result response remains the authoritative fallback */ }
+}
+
+function _showSearchLoading(query) {
+  _searchLoading = true;
+  _searchResults = [];
+  _searchVisibleResults = [];
+  _searchActiveIdx = -1;
+  _searchLastQuery = query;
+  _setSearchTabsVisible(true);
+  _renderSearchResults(query);
+}
+
 async function _runSearchNow(queryArg) {
+  if (_searchTimer) { clearTimeout(_searchTimer); _searchTimer = null; }
   const input = document.getElementById('search-input');
   const query = (queryArg !== undefined ? queryArg : (input?.value || '')).trim();
   if (!query) {
+    _searchLoading = false;
     _searchSeq++;
     _searchResults = [];
     _searchVisibleResults = [];
@@ -202,11 +245,15 @@ async function _runSearchNow(queryArg) {
     _searchChatIndexComplete = true;
     _setSearchTabsVisible(false);
     _renderSearchEmptyState();
+    void _refreshSearchIndexStatus(_searchSeq, '', { active: true });
     return;
   }
   const seq = ++_searchSeq;
   const startedAt = Date.now();
   const projectId = _activeProjectIdForSearch();
+  _showSearchLoading(query);
+  const pending = { active: true };
+  void _refreshSearchIndexStatus(seq, query, pending);
   try {
     const res = await apiFetch('/api/search/global', {
       method: 'POST',
@@ -225,6 +272,7 @@ async function _runSearchNow(queryArg) {
       });
       return;     // a newer query arrived; drop this
     }
+    _searchLoading = false;
     if (!data.ok) {
       const failure = _reportGlobalSearchFailure('response', data, 'search_rejected');
       _trackGlobalSearchResult('failure', failure.stage, startedAt, {
@@ -266,6 +314,7 @@ async function _runSearchNow(queryArg) {
       });
       return;
     }
+    _searchLoading = false;
     const failure = _reportGlobalSearchFailure('request', e, 'search_request_failed');
     _trackGlobalSearchResult('failure', failure.stage, startedAt, {
       has_project: !!projectId,
@@ -273,6 +322,8 @@ async function _runSearchNow(queryArg) {
       error_code: failure.error_code,
     });
     _renderSearchError(e.message || String(e));
+  } finally {
+    pending.active = false;
   }
 }
 
@@ -331,7 +382,9 @@ function _renderSearchEmptyState() {
         ${history.map((q) => `<button class="search-history-item" data-history-q="${escapeHtml(q)}">${escapeHtml(q)}</button>`).join('')}
       </div>`
     : '';
-  body.innerHTML = historyHtml || `<div class="search-empty">${escapeHtml(t('search.empty_hint'))}</div>`;
+  const notice = !_searchChatIndexComplete
+    ? `<div class="search-section-label is-status" role="status">${escapeHtml(t('search.history_indexing'))}</div>` : '';
+  body.innerHTML = notice + (historyHtml || (notice ? '' : `<div class="search-empty">${escapeHtml(t('search.empty_hint'))}</div>`));
   body.querySelectorAll('[data-history-q]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const q = btn.dataset.historyQ;
@@ -449,6 +502,10 @@ function _renderSearchResults(query) {
   const notice = indexing
     ? `<div class="search-section-label is-status" role="status">${escapeHtml(t('search.history_indexing'))}</div>`
     : '';
+  if (_searchLoading) {
+    body.innerHTML = notice + `<div class="search-empty search-loading" role="status"><span class="search-loading-spinner" aria-hidden="true"></span><span>${escapeHtml(t('common.loading'))}</span></div>`;
+    return;
+  }
   if (!_searchResults.length) {
     _searchVisibleResults = [];
     body.innerHTML = indexing
@@ -644,7 +701,8 @@ function _saveSearchHistoryEntry(query) {
 // with the active locale as well.
 document.addEventListener('i18n-change', () => {
   const overlay = document.getElementById('search-overlay');
-  if (overlay && overlay.style.display !== 'none' && _searchLastQuery) {
-    _renderSearchResults(_searchLastQuery);
+  if (overlay && overlay.style.display !== 'none') {
+    if (_searchLastQuery) _renderSearchResults(_searchLastQuery);
+    else _renderSearchEmptyState();
   }
 });

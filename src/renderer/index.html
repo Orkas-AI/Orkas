@@ -775,39 +775,57 @@
               </div>
               <aside class="project-detail-side" aria-label="Project resources">
                 <section class="project-side-card project-side-context">
+                  <!-- Head is two rows: the card identity, then the context
+                       type tabs. Instructions and memory are different
+                       long-lived stores, so the tabs get their own line
+                       instead of sharing one 44px strip with the title. -->
                   <div class="project-side-card-head project-side-card-head-tabs">
-                    <div class="project-side-card-title-wrap">
-                      <span class="project-side-card-title" data-i18n="project.context.title">Context</span>
+                    <div class="project-side-card-head-top">
+                      <div class="project-side-card-title-wrap">
+                        <span class="project-side-card-title" data-i18n="project.context.title">Context</span>
+                      </div>
+                      <span class="project-side-card-scope" data-i18n="project.context.scope">Shared by every conversation</span>
                     </div>
                     <div class="project-side-tabs" role="tablist" data-project-side-tabs="context">
                       <button type="button" class="project-side-tab is-active" data-project-side-tab="instructions">
-                        <span data-i18n="project.context.instructions_tab">Instructions</span>
+                        <span data-i18n="project.context.instructions_tab">Goals &amp; rules</span>
                       </button>
                       <button type="button" class="project-side-tab" data-project-side-tab="memory">
                         <span data-i18n="project.context.memory_tab">Memory</span>
                         <span class="project-side-tab-count" id="project-memory-count"></span>
                       </button>
                     </div>
-                    <button type="button" class="project-side-icon-btn" id="project-memory-add-btn"
-                            data-project-context-action="memory" hidden
-                            data-i18n-title="project.memory.add" title="Add memory"
-                            data-i18n-aria-label="project.memory.add" aria-label="Add memory">
-                      <span data-ui-icon="plus" data-ui-icon-class="project-side-add-icon"></span>
-                    </button>
                   </div>
+                  <!-- Instructions read first, edit on demand: the saved rules
+                       are what every conversation actually gets, so the panel
+                       shows them as copy and moves the editor into a dialog
+                       instead of parking an empty textarea in the rail. -->
                   <div class="project-side-panel project-side-instructions-panel" data-project-side-panel="instructions">
-                    <p class="project-context-help" data-i18n="project.instructions.subtitle">Set project goals, priorities, and rules. The AI follows them in every conversation.</p>
-                    <textarea class="project-instructions-input" id="project-instructions-input" rows="5"
-                              data-i18n-placeholder="project.instructions.placeholder"
-                              placeholder="Rules and context every conversation in this project should follow"></textarea>
-                    <div class="project-instructions-foot">
-                      <span class="project-instructions-counter muted" id="project-instructions-counter"></span>
-                      <button type="button" class="btn btn-sm btn-primary" id="project-instructions-save-btn"
-                              data-i18n="project.instructions.save" disabled>Save</button>
+                    <div class="project-context-section-head">
+                      <h3 class="project-context-section-title" data-i18n="project.instructions.heading">Rules in effect</h3>
+                      <button type="button" class="btn btn-sm project-context-action" id="project-instructions-edit-btn"
+                              data-i18n="common.edit">Edit</button>
                     </div>
+                    <div class="project-instructions-read" id="project-instructions-read"></div>
+                    <div class="project-instructions-empty" id="project-instructions-empty" hidden>
+                      <p class="project-context-help" data-i18n="project.instructions.subtitle">Set project goals, priorities, and rules. The AI follows them in every conversation.</p>
+                      <button type="button" class="btn btn-sm" id="project-instructions-setup-btn"
+                              data-i18n="project.instructions.setup">Set goals and rules</button>
+                    </div>
+                    <div class="project-context-status" id="project-instructions-status" role="status"></div>
                   </div>
                   <div class="project-side-panel project-side-memory-panel" data-project-side-panel="memory" hidden>
-                    <p class="project-context-help" data-i18n="project.memory.subtitle">Record project facts, decisions, and progress for the AI to reference in future conversations.</p>
+                    <!-- Same shape as the rules panel: guidance while the
+                         store is empty, heading once there is something to
+                         read. -->
+                    <div class="project-context-section-head" id="project-memory-section-head" hidden>
+                      <h3 class="project-context-section-title" data-i18n="project.memory.heading">Saved facts and decisions</h3>
+                      <button type="button" class="btn btn-sm project-context-action" id="project-memory-add-btn"
+                              data-project-context-action="memory" hidden
+                              data-i18n="project.memory.add_short"
+                              data-i18n-title="project.memory.add" title="Add memory"
+                              data-i18n-aria-label="project.memory.add" aria-label="Add memory">Add</button>
+                    </div>
                     <div class="project-memory-editor" id="project-memory-editor" hidden>
                       <textarea class="project-memory-editor-input" id="project-memory-editor-input" rows="3" maxlength="2500"
                                 data-i18n-placeholder="project.memory.placeholder" placeholder="Record a durable fact, decision, or project update"></textarea>
@@ -820,14 +838,32 @@
                       </div>
                     </div>
                     <div class="project-side-card-list project-memory-list" id="project-memory-list"></div>
-                    <div class="empty muted" id="project-memory-empty" data-i18n="project.memory.empty">No project memory yet</div>
+                    <div class="empty project-memory-empty-state" id="project-memory-empty">
+                      <p class="project-context-help" data-i18n="project.memory.subtitle">Record project facts, decisions, and progress for the AI to reference in future conversations.</p>
+                      <button type="button" class="btn btn-sm" id="project-memory-add-empty-btn"
+                              data-i18n="project.memory.add">Add memory</button>
+                    </div>
                   </div>
                 </section>
 
                 <section class="project-side-card project-side-resources">
                   <div class="project-side-card-head project-side-card-head-tabs">
-                    <div class="project-side-card-title-wrap">
-                      <span class="project-side-card-title" data-i18n="project.resources.title">Resources</span>
+                    <div class="project-side-card-head-top">
+                      <div class="project-side-card-title-wrap">
+                        <span class="project-side-card-title" data-i18n="project.resources.title">Resources</span>
+                      </div>
+                      <button type="button" class="project-side-icon-btn" id="project-add-agent-btn"
+                              data-project-resource-action="agents"
+                              data-i18n-title="project.bindings.add_agent" title="Add"
+                              data-i18n-aria-label="project.bindings.add_agent" aria-label="Add">
+                        <span data-ui-icon="plus" data-ui-icon-class="project-side-add-icon"></span>
+                      </button>
+                      <button type="button" class="project-side-icon-btn project-library-add-btn ctx-row-menu-btn ctx-root-menu-btn" id="project-library-root-menu-btn"
+                              data-project-resource-action="files" hidden
+                              data-i18n-title="contexts.menu.more_actions" title="More actions"
+                              data-i18n-aria-label="contexts.menu.more_actions" aria-label="More actions">
+                        <span data-ui-icon="plus" data-ui-icon-class="project-side-add-icon"></span>
+                      </button>
                     </div>
                     <div class="project-side-tabs" role="tablist" data-project-side-tabs="resources">
                       <button type="button" class="project-side-tab is-active" data-project-side-tab="agents">
@@ -839,18 +875,6 @@
                         <span class="project-side-tab-count" id="project-detail-files-count"></span>
                       </button>
                     </div>
-                    <button type="button" class="project-side-icon-btn" id="project-add-agent-btn"
-                            data-project-resource-action="agents"
-                            data-i18n-title="project.bindings.add_agent" title="Add"
-                            data-i18n-aria-label="project.bindings.add_agent" aria-label="Add">
-                      <span data-ui-icon="plus" data-ui-icon-class="project-side-add-icon"></span>
-                    </button>
-                    <button type="button" class="project-side-icon-btn project-library-add-btn ctx-row-menu-btn ctx-root-menu-btn" id="project-library-root-menu-btn"
-                            data-project-resource-action="files" hidden
-                            data-i18n-title="contexts.menu.more_actions" title="More actions"
-                            data-i18n-aria-label="contexts.menu.more_actions" aria-label="More actions">
-                      <span data-ui-icon="plus" data-ui-icon-class="project-side-add-icon"></span>
-                    </button>
                   </div>
                   <div class="project-side-panel project-side-agents-panel" data-project-side-panel="agents">
                     <div class="project-side-card-list project-agent-rail-list" id="project-agents-list"></div>
@@ -865,6 +889,36 @@
                 </section>
 
               </aside>
+            </div>
+
+            <!-- Goals & rules editor. The rail shows saved rules; writing
+                 them happens here so the draft has room and never looks like
+                 the live value. Save path is unchanged. -->
+            <div class="modal-overlay project-instructions-modal" id="project-instructions-modal" aria-hidden="true">
+              <div class="modal project-instructions-dialog" role="dialog" aria-modal="true" aria-labelledby="project-instructions-dialog-title">
+                <div class="modal-header">
+                  <h3 class="modal-title" id="project-instructions-dialog-title" data-i18n="project.instructions.edit_title">Goals and rules</h3>
+                  <button type="button" class="modal-close-btn" id="project-instructions-close-btn"
+                          data-i18n-title="common.close" title="Close"
+                          data-i18n-aria-label="common.close" aria-label="Close">
+                    <span data-ui-icon="x" data-ui-icon-class="modal-close-icon"></span>
+                  </button>
+                </div>
+                <div class="modal-body">
+                  <p class="project-context-help" data-i18n="project.instructions.subtitle">Set project goals, priorities, and rules. The AI follows them in every conversation.</p>
+                  <textarea class="project-instructions-input" id="project-instructions-input" rows="12"
+                            data-i18n-placeholder="project.instructions.placeholder"
+                            placeholder="Rules and context every conversation in this project should follow"></textarea>
+                </div>
+                <div class="project-instructions-foot">
+                  <span class="project-instructions-counter muted" id="project-instructions-counter"></span>
+                  <span class="project-instructions-foot-actions">
+                    <button type="button" class="btn btn-sm" id="project-instructions-cancel-btn" data-i18n="common.cancel">Cancel</button>
+                    <button type="button" class="btn btn-sm btn-primary" id="project-instructions-save-btn"
+                            data-i18n="project.instructions.save" disabled>Save</button>
+                  </span>
+                </div>
+              </div>
             </div>
 
             <div class="modal-overlay project-library-viewer-modal" id="project-library-viewer-modal" aria-hidden="true">
@@ -1820,8 +1874,8 @@
       </div>
       <div class="form-msg" id="kb-picker-msg"></div>
       <div class="modal-actions">
-        <button class="btn" onclick="closeKbPicker()" data-i18n="common.cancel">Cancel</button>
-        <button class="btn btn-primary" onclick="confirmKbPicker()" data-i18n="common.confirm">Confirm</button>
+        <button class="btn" id="kb-picker-cancel" type="button" data-i18n="common.cancel">Cancel</button>
+        <button class="btn btn-primary" id="kb-picker-confirm" type="button" data-i18n="common.confirm">Confirm</button>
       </div>
     </div>
   </div>

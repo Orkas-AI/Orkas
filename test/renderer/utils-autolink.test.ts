@@ -32,6 +32,7 @@ const {
   _chatMediaLocalPathFromUrl,
   _normalizeLocalMediaSrc,
   _mediaDedupKey,
+  _localMediaReferenceBasename,
   _parseOrkasMediaTitle,
   _chatVideoNativeControlsHit,
   renderMarkdown,
@@ -48,6 +49,7 @@ const {
   _chatMediaLocalPathFromUrl: (src: string) => string;
   _normalizeLocalMediaSrc: (src: string) => string;
   _mediaDedupKey: (src: string) => string;
+  _localMediaReferenceBasename: (src: string) => string;
   _parseOrkasMediaTitle: (title: string) => { kind: 'image' | 'video'; remoteSrc: string } | null;
   _chatVideoNativeControlsHit: (clientY: number, rectTop: number, rectBottom: number) => boolean;
   renderMarkdown: (md: string) => string;
@@ -377,6 +379,14 @@ describe('markdown media links', () => {
     expect(_chatMediaLocalPathFromUrl('chat-media://local/Users/test/has%20space.mp4')).toBe('/Users/test/has space.mp4');
     expect(_chatMediaLocalPathFromUrl('chat-media://local/C:/Users/test/clip.mp4')).toBe('C:/Users/test/clip.mp4');
     expect(_chatMediaLocalPathFromUrl('https://x.test/a.mp4')).toBe('');
+  });
+
+  it('matches stale local media by basename without treating remote media as a produced-file duplicate', () => {
+    expect(_localMediaReferenceBasename('chat-media://local/Users/user/old/narration%20final.wav?v=1'))
+      .toBe('narration final.wav');
+    expect(_localMediaReferenceBasename('drafts/narration.wav#preview')).toBe('narration.wav');
+    expect(_localMediaReferenceBasename('https://cdn.example/narration.wav')).toBe('');
+    expect(_localMediaReferenceBasename('data:audio/wav;base64,AAAA')).toBe('');
   });
 
   it('reserves native video controls while allowing the rest of the surface to toggle playback', () => {

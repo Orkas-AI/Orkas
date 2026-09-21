@@ -511,6 +511,12 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   color: #94a3b8;
   font-size: 13px;
 }
+.search-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
 .search-section-label {
   padding: 8px 16px 4px;
   font-size: 11px;
@@ -1135,14 +1141,19 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 .project-detail-grid {
   flex: 1;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 336px;
-  gap: 22px;
+  grid-template-columns: minmax(0, 1fr) 352px;
+  gap: 20px;
   align-items: stretch;
   padding: 24px 28px;
   min-height: 0;
   width: 100%;
   box-sizing: border-box;
   overflow: hidden;
+}
+/* Narrow windows (or a pinned app sidebar) get the previous rail width back
+   before the composer and task rows start losing room. */
+@media (max-width: 1280px) {
+  .project-detail-grid { grid-template-columns: minmax(0, 1fr) 336px; }
 }
 .project-detail-main {
   flex: 1;
@@ -1205,10 +1216,36 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 .project-detail-tabs {
   flex: 0 0 auto;
   display: flex;
-  align-items: center;
-  min-height: 48px;
+  align-items: stretch;
+  min-height: 44px;
   padding: 0 16px;
   border-bottom: 1px solid var(--border);
+}
+.project-detail-tabs > .project-detail-tab-group {
+  align-items: stretch;
+  gap: 20px;
+  min-height: 0;
+  margin-bottom: -1px;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.project-detail-tabs .project-detail-tab {
+  align-self: stretch;
+  min-height: 0;
+  padding: 0;
+  border-radius: 0;
+  border-bottom: 2px solid transparent;
+  font-size: 13px;
+}
+.project-detail-tabs .project-detail-tab:hover {
+  color: var(--text);
+  background: transparent;
+}
+.project-detail-tabs .project-detail-tab.is-active {
+  border-bottom-color: var(--primary);
+  background: transparent;
+  box-shadow: none;
 }
 .project-detail-tab-group {
   display: inline-flex;
@@ -1254,7 +1291,7 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   color: var(--muted);
   background: transparent;
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: 11px;
   font-weight: 500;
   line-height: 1;
   text-align: center;
@@ -1281,16 +1318,23 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   text-align: center;
 }
 
+/* Right rail sizes to its content. The two cards used to split the column
+   in half, which left the Context card holding a tall empty textarea and the
+   Resources card stretched past its last row. The rail itself scrolls when
+   the cards outgrow the viewport. */
 .project-detail-side {
   min-width: 0;
   min-height: 0;
-  display: grid;
-  grid-template-rows: repeat(2, minmax(0, 1fr));
-  gap: 12px;
-  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  align-content: flex-start;
+  gap: 16px;
+  overflow-y: auto;
+  padding-right: 2px;
 }
 
 .project-side-card {
+  flex: 0 0 auto;
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -1301,38 +1345,114 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 }
 
 /* Instructions are user-authored rules injected into every conversation in
-   the project. They share the Context card with agent-written memory. */
+   the project. They share the Context card with agent-written memory. The
+   panel shows the saved text; `.project-instructions-input` lives in the
+   editor dialog. */
 .project-context-help {
   flex: 0 0 auto;
-  margin: 0;
-  padding: 8px 12px 0;
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1.45;
+  margin: 0 0 12px;
+  padding: 0;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.5;
 }
+.project-context-section-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 28px;
+  margin-bottom: 8px;
+}
+.project-context-section-head[hidden] { display: none; }
+.project-context-section-title {
+  margin: 0;
+  min-width: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Secondary by default: saving and sending are the only primary-filled
+   actions on this surface. */
+.project-context-action {
+  flex: 0 0 auto;
+}
+.project-instructions-read {
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: 248px;
+  overflow-y: auto;
+  margin-bottom: 14px;
+  color: var(--text);
+  font-size: 13.5px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.project-instructions-read[hidden] { display: none; }
+.project-instructions-empty {
+  flex: 0 0 auto;
+  padding: 2px 0 4px;
+}
+.project-instructions-empty[hidden] { display: none; }
+.project-context-status {
+  flex: 0 0 auto;
+  min-height: 16px;
+  margin-top: 6px;
+  color: var(--primary-text);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+.project-context-status:empty { min-height: 0; }
+
+/* Editor dialog — one text field, sized for writing a page of rules. */
+.project-instructions-dialog {
+  max-width: 640px;
+  padding: 24px;
+}
+.project-instructions-dialog .project-context-help { margin-bottom: 10px; }
 .project-instructions-input {
-  flex: 1 1 auto;
-  width: calc(100% - 24px);
+  width: 100%;
   box-sizing: border-box;
-  margin: 7px 12px 6px;
-  padding: 8px 10px;
-  border: 1px solid var(--border);
+  padding: 12px;
+  border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   background: var(--surface);
   color: var(--text);
-  font-size: 12.5px;
-  line-height: 1.5;
-  resize: none;
-  min-height: 0;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.7;
+  resize: vertical;
+  min-height: 240px;
+  outline: none;
+}
+.project-instructions-input:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px var(--primary-soft);
 }
 .project-instructions-foot {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 0 12px 10px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
 }
-.project-instructions-counter { font-size: 11px; }
+.project-instructions-foot-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.project-instructions-counter {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
 .project-instructions-counter.is-over { color: var(--danger); }
 
 .project-side-card-head {
@@ -1347,31 +1467,47 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   border-bottom: 1px solid var(--border);
   background: var(--surface);
 }
+/* Card identity on one line, the two context/resource types on the next.
+   One 44px strip could not hold a title, two tabs and an action without
+   shrinking the tabs to 11px. */
 .project-side-card-head-tabs {
-  min-height: 44px;
+  flex-direction: column;
+  align-items: stretch;
   justify-content: flex-start;
-  padding-top: 0;
-  padding-bottom: 0;
+  gap: 10px;
+  min-height: 0;
+  padding: 14px 16px 0;
 }
-.project-side-card-head-tabs > .project-side-card-title-wrap {
-  flex: 0 0 auto;
-  align-self: center;
+.project-side-card-head-top {
+  display: flex;
   align-items: center;
+  gap: 8px;
+  min-height: 24px;
+}
+.project-side-card-head-top > .project-side-card-title-wrap { flex: 1 1 auto; }
+.project-side-card-head-top > .project-side-icon-btn { flex: 0 0 auto; }
+.project-side-card-scope {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-left: auto;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.4;
+  text-align: right;
 }
 .project-side-card-head-tabs > .project-side-tabs {
-  flex: 0 1 auto;
-  align-self: center;
+  flex: 0 0 auto;
+  align-self: stretch;
   min-width: 0;
-  min-height: 28px;
-  height: 28px;
-  gap: 2px;
-  padding: 2px;
+  min-height: 34px;
+  margin-bottom: -1px;
+  gap: 20px;
+  padding: 0;
   border-bottom: 0;
-  border-radius: 8px;
-  background: var(--surface-2);
-}
-.project-side-card-head-tabs > .project-side-icon-btn {
-  margin-left: auto;
+  background: transparent;
 }
 
 .project-side-card-title-wrap {
@@ -1382,7 +1518,7 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 }
 
 .project-side-card-title {
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--text);
   min-width: 0;
@@ -1424,20 +1560,22 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 .project-side-card-count,
 .project-side-tab-count {
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: 11px;
   color: var(--muted);
 }
 
 .project-side-card-count:empty,
 .project-side-tab-count:empty { display: none; }
 
+/* Underlined tabs, same size and rhythm as the workbench tabs in the main
+   column — one tab idiom on the page instead of two pill sizes. */
 .project-side-tabs {
   flex: 0 0 auto;
   display: flex;
-  align-items: center;
-  gap: 16px;
-  min-height: 38px;
-  padding: 0 12px;
+  align-items: stretch;
+  gap: 20px;
+  min-height: 34px;
+  padding: 0 16px;
   border-bottom: 1px solid var(--border);
 }
 .project-side-tab {
@@ -1445,45 +1583,25 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   align-self: stretch;
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   padding: 0;
   border: 0;
   border-bottom: 2px solid transparent;
-  color: var(--muted);
+  color: var(--text-2);
   background: transparent;
   font-family: inherit;
-  font-size: 11.5px;
+  font-size: 13px;
+  font-weight: 500;
   cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
 }
-.project-side-tab:hover { color: var(--text-2); }
+.project-side-tab:hover { color: var(--text); }
 .project-side-tab.is-active {
-  margin-bottom: -1px;
   border-bottom-color: var(--primary);
-  color: var(--text);
+  color: var(--primary-text);
   font-weight: 600;
 }
-.project-side-card-head-tabs .project-side-tab {
-  align-self: stretch;
-  padding: 0 8px;
-  border: 0;
-  border-radius: 6px;
-  color: var(--muted);
-  font-size: 11px;
-}
-.project-side-card-head-tabs .project-side-tab:hover {
-  color: var(--text-2);
-  background: rgba(255, 255, 255, 0.55);
-}
-.project-side-card-head-tabs .project-side-tab.is-active {
-  margin-bottom: 0;
-  border-bottom-color: transparent;
-  color: var(--primary-text);
-  background: var(--surface);
-  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
-}
-.project-side-card-head-tabs .project-side-tab.is-active .project-side-tab-count {
-  color: var(--primary-text);
-}
+.project-side-tab.is-active .project-side-tab-count { color: var(--primary-text); }
 .project-side-panel {
   flex: 1 1 auto;
   min-height: 0;
@@ -1492,15 +1610,31 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   overflow: hidden;
 }
 .project-side-panel[hidden] { display: none; }
+.project-side-instructions-panel,
+.project-side-memory-panel {
+  padding: 14px 16px 16px;
+}
 .project-side-memory-panel .project-memory-list {
-  padding: 7px 12px 12px;
+  flex: 0 1 auto;
+  max-height: 320px;
+  padding: 0;
+}
+/* Empty memory reads like the empty rules panel — guidance left-aligned with
+   its call to action, not a centred placeholder. Keeps `.empty` so the open
+   editor still hides it through the sibling rule below. */
+#project-memory-empty {
+  display: block;
+  flex: 0 0 auto;
+  min-height: 0;
+  padding: 2px 0 4px;
+  text-align: left;
 }
 .project-memory-editor {
-  flex: 1 1 auto;
+  flex: 0 0 auto;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding: 7px 12px 12px;
+  padding: 0 0 8px;
   background: var(--surface);
 }
 .project-memory-editor[hidden] { display: none; }
@@ -1511,7 +1645,7 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 .project-memory-editor-input {
   flex: 1 1 auto;
   width: 100%;
-  min-height: 56px;
+  min-height: 84px;
   box-sizing: border-box;
   padding: 8px 10px;
   resize: none;
@@ -1521,8 +1655,8 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   color: var(--text);
   background: var(--surface);
   font-family: inherit;
-  font-size: 12.5px;
-  line-height: 1.5;
+  font-size: 13px;
+  line-height: 1.6;
 }
 .project-memory-editor-input:focus {
   border-color: var(--primary);
@@ -1545,7 +1679,8 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   gap: 6px;
 }
 .project-side-files-panel .project-library-side-list {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
+  max-height: 320px;
 }
 /* To-do lives in the normal project workbench as a third tab. The composer and
    right rail remain part of the project detail layout in every tab. */
@@ -1568,14 +1703,15 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 0;
+  min-height: 84px;
   padding: 12px;
   text-align: center;
 }
 
 .project-side-card-list {
-  flex: 1;
+  flex: 0 1 auto;
   min-height: 0;
+  max-height: 320px;
   overflow-y: auto;
 }
 
@@ -1890,16 +2026,20 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 
 
 /* Project memory card — plain body-copy rows from the project's MEMORY.md. */
-.project-memory-list { display: flex; flex-direction: column; gap: 2px; }
+.project-memory-list { display: flex; flex-direction: column; gap: 0; }
 .project-memory-item {
   display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 6px 0;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
   color: var(--text);
-  font-size: 12.5px;
-  line-height: 1.5;
+  font-size: 13px;
+  line-height: 1.6;
 }
+.project-memory-item:first-child { padding-top: 2px; }
+.project-memory-item:last-child { border-bottom: 0; padding-bottom: 2px; }
 .project-memory-item-text {
   flex: 1 1 auto;
   min-width: 0;
@@ -1908,23 +2048,24 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 }
 .project-memory-item-actions {
   flex: 0 0 auto;
-  display: inline-flex;
+  display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 2px;
 }
 .project-memory-item-action {
-  width: 22px;
-  height: 22px;
-  padding: 0;
+  min-height: 24px;
+  padding: 2px 8px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   border: 0;
-  border-radius: 5px;
-  color: var(--muted);
+  border-radius: 6px;
+  color: var(--text-2);
   background: transparent;
   font-family: inherit;
-  font-size: 14px;
+  font-size: 12px;
+  line-height: 1.4;
   cursor: pointer;
 }
 .project-memory-item-action:hover {
@@ -1935,7 +2076,6 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   color: var(--danger);
   background: rgba(220, 38, 38, 0.08);
 }
-.project-memory-item-action svg { width: 13px; height: 13px; }
 
 .project-side-card-list::-webkit-scrollbar,
 .project-detail-tab-panel::-webkit-scrollbar,
@@ -2043,6 +2183,19 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   min-width: 44px;
   height: 28px;
 }
+.project-agent-row .agent-card-use {
+  background: transparent;
+  border-color: var(--border-strong);
+  color: var(--text-2);
+  transition: background 0.12s, color 0.12s, border-color 0.12s, box-shadow 0.12s;
+}
+.project-agent-row:hover .agent-card-use:not(:disabled),
+.project-agent-row .agent-card-use:not(:disabled):hover,
+.project-agent-row .agent-card-use:not(:disabled):focus-visible {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
 .project-agent-row-remove {
   flex-shrink: 0;
   width: 24px;
@@ -2066,6 +2219,7 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 }
 #project-agents-empty {
   flex: 1;
+  min-height: 84px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2490,8 +2644,15 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 }
 
 @media (max-width: 980px) {
+  /* Single column: each row takes its content height and the page scrolls.
+     Auto rows here still get stretched to equal halves by the grid's definite
+     height, which squeezes the task list until the rail paints over it —
+     hence min-content tracks packed from the top. */
   .project-detail-grid {
     grid-template-columns: 1fr;
+    grid-template-rows: min-content min-content;
+    align-content: start;
+    align-items: start;
     min-height: 0;
     overflow-y: auto;
   }
@@ -2499,8 +2660,7 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
     overflow: visible;
   }
   .project-detail-side {
-    grid-template-rows: repeat(2, minmax(220px, 1fr));
-    min-height: 452px;
+    overflow: visible;
   }
   .chat-input-area.is-project {
     max-width: 100%;
@@ -4030,8 +4190,9 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 /* AI-team grid only: a screen of filled primary "use" blocks reads as noise,
    so inside `.agent-card` the button rests as a ghost and fills only while
    its own card is hovered (or the button is keyboard-focused). Other reuses
-   of `.agent-card-use` (detail dialog, connector cards, project rows) render
-   a single button and keep the filled default. Rules sit after the shared
+   of `.agent-card-use` (detail dialog, connector cards) render a single
+   button and keep the filled default; the project rail does the same ghost
+   trick as the grid for the same reason. Rules sit after the shared
    family so the equal-specificity disabled override below wins by order. */
 .agent-card .agent-card-use {
   background: transparent;
@@ -5846,6 +6007,7 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
 .chat-history-load-earlier.is-error {
   color: var(--danger);
 }
+.search-loading-spinner,
 .chat-history-inline-spinner {
   width: 14px;
   height: 14px;
@@ -5854,6 +6016,10 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
   border-top-color: var(--primary);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .search-loading-spinner { animation: none; }
 }
 
 /* While a new exchange is in flight, a DOM spacer (`.chat-scroll-spacer`)
@@ -15808,7 +15974,6 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
   background: var(--surface);
   border-color: var(--border-strong);
 }
-.header-entry-btn-create { background: var(--surface-2); }
 .header-entry-btn:hover { background: var(--surface-2); }
 .header-entry-btn:active { background: var(--primary-soft); }
 .header-entry-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }

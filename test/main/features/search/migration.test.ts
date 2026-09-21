@@ -4,20 +4,10 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 const gate = vi.hoisted(() => ({ wait: null as Promise<void> | null, entered: null as (() => void) | null }));
-vi.mock('node:fs/promises', async (original) => {
-  const actual = await original<typeof import('node:fs/promises')>();
-  const readFile = async (...args: any[]) => {
-    if (String(args[0]).endsWith('c2.jsonl') && gate.wait) {
-      gate.entered?.();
-      await gate.wait;
-    }
-    return (actual.readFile as any)(...args);
-  };
-  return { ...actual, readFile, default: { ...actual, readFile } };
-});
 vi.mock('../../../../src/main/logger', () => ({ createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }) }));
 let root: string;
 let oldRoot: string | undefined;
+let realBatch: import('../../../../src/main/features/search/chat-rebuild').ChatRebuildWorker['rebuildBatch'];
 function write(cid: string, text: string) {
   const file = path.join(root, 'u1/cloud/chats', `${cid}.jsonl`);
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -37,6 +27,13 @@ beforeEach(async () => {
   gate.wait = null;
   gate.entered = null;
   (await import('../../../../src/main/features/users')).activateUser('u1');
+  const { ChatRebuildWorker } = await import('../../../../src/main/features/search/chat-rebuild');
+  const real = ChatRebuildWorker.prototype.rebuildBatch;
+  realBatch = real;
+  vi.spyOn(ChatRebuildWorker.prototype, 'rebuildBatch').mockImplementation(async function(file) {
+    if (file.fileKey === 'c2' && gate.wait) { gate.entered?.(); await gate.wait; }
+    return real.call(this, file);
+  });
 });
 afterEach(async () => {
   const search = await import('../../../../src/main/features/search');
@@ -66,9 +63,9 @@ it('keeps the old files on interruption and resumes a large conversation after r
   const ix = await import('../../../../src/main/features/search/indexer');
   const store = await import('../../../../src/main/features/search/chat_store');
   const controller = new AbortController();
-  const real = store.writeRebuildBatch;
-  const spy = vi.spyOn(store, 'writeRebuildBatch').mockImplementation((...args) => {
-    real(...args); controller.abort();
+  const { ChatRebuildWorker } = await import('../../../../src/main/features/search/chat-rebuild');
+  const spy = vi.spyOn(ChatRebuildWorker.prototype, 'rebuildBatch').mockImplementation(async function(file) {
+    const batch = await realBatch.call(this, file); controller.abort(); return batch;
   });
   expect((await ix.reconcileChatsIndex('u1', controller.signal)).complete).toBe(false);
   expect(store.docCount('u1')).toBe(16);
@@ -76,14 +73,14 @@ it('keeps the old files on interruption and resumes a large conversation after r
   expect(store.readRebuildCursor('u1', 'c1')?.next).toBe(16);
   expect(fs.existsSync(legacy)).toBe(true);
   expect(fs.existsSync(`${legacy}.tmp`)).toBe(true);
+  const prefixId = store._allDocsForTests('u1')[0].id;
   spy.mockRestore();
   await search.flushAll();
   vi.resetModules();
   const resumedStore = await import('../../../../src/main/features/search/chat_store');
   const resumedIx = await import('../../../../src/main/features/search/indexer');
-  const batches = vi.spyOn(resumedStore, 'writeRebuildBatch');
   expect((await resumedIx.reconcileChatsIndex('u1')).complete).toBe(true);
-  expect(batches.mock.calls[0][2][0].msgIndex, 'resume the committed prefix, not a fresh rebuild').toBe(16);
+  expect(resumedStore._allDocsForTests('u1')[0].id, 'keep the committed prefix, not a fresh rebuild').toBe(prefixId);
   expect(resumedStore.docCount('u1')).toBe(70);
   expect(resumedStore.postingsFor('u1', 'record0')).toHaveLength(1);
   expect(resumedStore.postingsFor('u1', 'record69')).toHaveLength(1);
@@ -159,9 +156,9 @@ it('automatically resumes an interrupted startup slice only after the runtime be
   let busy = false;
   boot.configureBootAdmission({ isRuntimeBusy: () => busy });
   const controller = new AbortController();
-  const real = store.writeRebuildBatch;
-  const spy = vi.spyOn(store, 'writeRebuildBatch').mockImplementationOnce((...args) => {
-    real(...args); controller.abort(); busy = true;
+  const { ChatRebuildWorker } = await import('../../../../src/main/features/search/chat-rebuild');
+  const spy = vi.spyOn(ChatRebuildWorker.prototype, 'rebuildBatch').mockImplementationOnce(async function(file) {
+    const batch = await realBatch.call(this, file); controller.abort(); busy = true; return batch;
   });
   await search.reconcileActive(controller.signal);
   expect(store.hasCompletedRebuild('u1')).toBe(false);
@@ -199,7 +196,8 @@ it('preserves old files and retries after a failed batch instead of declaring su
   const legacy = legacySnapshot();
   const search = await import('../../../../src/main/features/search');
   const store = await import('../../../../src/main/features/search/chat_store');
-  vi.spyOn(store, 'writeRebuildBatch').mockImplementationOnce(() => { throw new Error('injected write failure'); });
+  const { ChatRebuildWorker } = await import('../../../../src/main/features/search/chat-rebuild');
+  vi.spyOn(ChatRebuildWorker.prototype, 'rebuildBatch').mockRejectedValueOnce(new Error('injected worker failure'));
   await search.reconcileActive();
   expect(store.hasCompletedRebuild('u1')).toBe(false);
   expect(fs.existsSync(legacy)).toBe(true);
@@ -231,11 +229,12 @@ it('does not certify a source replaced after its read but before its final batch
   const legacy = legacySnapshot();
   const ix = await import('../../../../src/main/features/search/indexer');
   const store = await import('../../../../src/main/features/search/chat_store');
-  const real = store.writeRebuildBatch;
-  vi.spyOn(store, 'writeRebuildBatch').mockImplementationOnce((...args) => {
-    real(...args);
+  const { ChatRebuildWorker } = await import('../../../../src/main/features/search/chat-rebuild');
+  vi.spyOn(ChatRebuildWorker.prototype, 'rebuildBatch').mockImplementationOnce(async function(file) {
+    const batch = await realBatch.call(this, file);
     // A sync file write can precede the end-of-pass invalidation event.
     write('c1', 'replacementword');
+    return batch;
   });
   expect((await ix.reconcileChatsIndex('u1')).complete).toBe(false);
   expect(fs.existsSync(legacy)).toBe(true);

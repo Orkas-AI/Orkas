@@ -299,6 +299,8 @@ async function confirmKbPicker() {
   }
 }
 window.confirmKbPicker = confirmKbPicker;
+document.getElementById('kb-picker-cancel')?.addEventListener('click', closeKbPicker);
+document.getElementById('kb-picker-confirm')?.addEventListener('click', confirmKbPicker);
 
 /**
  * Derive a default filename stem from message content. Strips markdown

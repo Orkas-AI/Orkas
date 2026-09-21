@@ -23,19 +23,27 @@
  * sampled terms and identical document lengths).
  *
  * Concurrency: better-sqlite3 is synchronous and every mutation here is a
- * single `db.transaction(...)`, which cannot interleave on one thread, so this
- * store needs no write mutex. Reads are lock-free.
+ * single `db.transaction(...)`. The indexer admits exactly one writer: main
+ * for live upserts, or a worker for reconciliation. WAL readers remain usable
+ * during rebuilds; data_version invalidates their cached scoring aggregates.
  */
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { isMainThread } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 
-import { createLogger } from '../../logger';
 import { userSearchDir } from '../../paths';
 import { tokenize } from './tokenize';
 
-const log = createLogger('search:chat_store');
+function warn(message: string, error: unknown): void {
+  // Electron APIs are unavailable in Node workers. In dev, the electron npm
+  // package masks that boundary; packaged workers cannot import electron-log.
+  // Worker failures go back through its bounded, redacted reply instead.
+  if (!isMainThread) throw new Error(message);
+  const { createLogger } = require('../../logger') as typeof import('../../logger');
+  createLogger('search:chat_store').warn(message, { error: (error as Error).message });
+}
 
 export const CHAT_STORE_SCHEMA_VERSION = 1;
 
@@ -86,6 +94,7 @@ interface Handle {
   /** Aggregates the scorer needs on every query; recomputing them per query is
    *  a full table scan, so they are cached and dropped by any document write. */
   stats: { count: number; avgLen: number } | null;
+  dataVersion: number;
 }
 
 const _stores = new Map<string, Handle>();
@@ -173,7 +182,7 @@ function handleFor(uid: string): Handle {
     try { db.close(); } catch { /* preserve the original failure */ }
     throw err;
   }
-  const handle: Handle = { db, dbPath, stats: null };
+  const handle: Handle = { db, dbPath, stats: null, dataVersion: -1 };
   _stores.set(uid, handle);
   return handle;
 }
@@ -428,6 +437,11 @@ export function docsByIds(uid: string, ids: number[]): Map<number, ChatDocRow> {
 
 function statsFor(uid: string): { count: number; avgLen: number } {
   const handle = handleFor(uid);
+  const dataVersion = handle.db.pragma('data_version', { simple: true }) as number;
+  if (dataVersion !== handle.dataVersion) {
+    handle.stats = null;
+    handle.dataVersion = dataVersion;
+  }
   if (handle.stats) return handle.stats;
   const row = handle.db
     .prepare('SELECT COUNT(*) AS n, AVG(len) AS avg FROM chat_docs')
@@ -493,7 +507,7 @@ export function compact(uid: string): void {
     handle.db.pragma('wal_checkpoint(TRUNCATE)');
     handle.db.exec('VACUUM');
   } catch (err) {
-    log.warn('chat store vacuum failed', { error: (err as Error).message });
+    warn('chat store vacuum failed', err);
   }
 }
 
@@ -501,7 +515,7 @@ export function closeChatStore(uid: string): void {
   const handle = _stores.get(uid);
   if (!handle) return;
   try { handle.db.close(); }
-  catch (err) { log.warn('close chat store failed', { error: (err as Error).message }); }
+  catch (err) { warn('close chat store failed', err); }
   _stores.delete(uid);
 }
 

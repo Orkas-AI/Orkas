@@ -3,18 +3,17 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-vi.mock('node:fs', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('node:fs')>();
-  return { ...actual, createReadStream: vi.fn(actual.createReadStream) };
-});
-
 // Pass-through by default. One case needs to hold a single `stat` so two
 // deferred upserts would reach the index out of order; the namespace of a
 // built-in cannot be spied, so the seam lives here.
-const statHook = vi.hoisted(() => ({ holdNextChatStat: false, holdMs: 40 }));
+const statHook = vi.hoisted(() => ({ holdNextChatStat: false, holdNextCatalogStat: false, holdMs: 40 }));
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
   const stat = (async (target: unknown, ...rest: unknown[]) => {
+    if (statHook.holdNextCatalogStat && String(target).endsWith(`${path.sep}cloud${path.sep}chats`)) {
+      statHook.holdNextCatalogStat = false;
+      await new Promise((resolve) => setTimeout(resolve, statHook.holdMs));
+    }
     if (statHook.holdNextChatStat && String(target).endsWith('c1.jsonl')) {
       statHook.holdNextChatStat = false;
       await new Promise((resolve) => setTimeout(resolve, statHook.holdMs));
@@ -38,6 +37,7 @@ let prevWs: string | undefined;
 const TEST_UID = 'u1';
 
 beforeEach(async () => {
+  statHook.holdNextCatalogStat = false;
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-indexer-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
@@ -233,6 +233,19 @@ describe('search/indexer › reconcileChatsIndex', () => {
     expect(await chatDocIds()).toEqual(['chat:c1:2']);
   });
 
+  it('does not let an in-flight coverage check re-trust a concurrently invalidated index', async () => {
+    writeChat('u1', 'c1', [{ role: 'user', content: 'catalogmarker', time: 't' }]);
+    const ix = await loadIndexer();
+    await ix.reconcileChatsIndex('u1');
+    statHook.holdNextCatalogStat = true;
+    const coverage = ix.isChatsIndexCurrent('u1');
+    // Sync can invalidate an existing JSONL without changing the chat-root
+    // stat. An old pending catalog read must not undo that explicit signal.
+    ix.invalidateChatsIndex('u1');
+    expect(await coverage).toBe(false);
+    expect(ix.isChatsIndexTrusted('u1')).toBe(false);
+  });
+
   it('does not delete chat docs from a cancelled partial scan', async () => {
     writeChat('u1', 'c1', [{ role: 'user', content: 'one', time: 't' }]);
     writeChat('u1', 'c2', [{ role: 'user', content: 'two', time: 't' }]);
@@ -256,28 +269,6 @@ describe('search/indexer › reconcileChatsIndex', () => {
 // conversation stops being searchable with no error anywhere. Observed in the
 // field as a 260-message conversation with only its last 16 messages indexed.
 describe('search/indexer › chat index completeness across incremental appends', () => {
-  it('closes snippet readers before returning an early history match', async () => {
-    writeChat(TEST_UID, 'c1', [
-      { from: 'user', text: 'quokka first match' },
-      { from: 'user', text: 'unrelated trailing row' },
-    ]);
-    await (await loadIndexer()).reconcileChatsIndex(TEST_UID);
-    const search = await import('../../../../src/main/features/search/index');
-    const reader = vi.mocked(fs.createReadStream);
-    reader.mockClear();
-    const hits = await search.searchChats(TEST_UID, 'quokka');
-    const streams = reader.mock.results.filter(result => result.type === 'return')
-      .map(result => result.value as fs.ReadStream);
-    try {
-      expect(hits.map(hit => hit.msg_index)).toEqual([0]);
-      expect(streams.length).toBeGreaterThan(0);
-      expect(streams.every(stream => stream.closed)).toBe(true);
-    } finally {
-      await Promise.all(streams.filter(stream => !stream.closed)
-        .map(stream => new Promise<void>(resolve => stream.once('close', resolve))));
-    }
-  });
-
   it('keeps history the index never read reachable after a later message arrives', async () => {
     // History exists on disk but no reconcile ever covered this file.
     writeChat('u1', 'c1', [

@@ -962,6 +962,7 @@ async function _afterRecycleRestore(ctx: IpcContext, paths: string[]): Promise<v
 // merged into a `{ ok: true, ...result }` response. Throw to signal error.
 
 const invokeHandlers: Record<string, InvokeHandler> = {
+  ...webAppInvokeHandlers,
   'clientConfig.getQuickStart': async () => getQuickStartConfigState(),
   'user.init': async () => {
     const user = await users.getOrCreateSelfUser();
@@ -2834,6 +2835,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // ── Global search (knowledge base + chat history) ──
+  'search.status': async (_payload, ctx) => search.searchIndexStatus(ctx.userId),
   'search.global': async ({ query, limit, scope, projectId }, ctx) => {
     return search.searchAll(ctx.userId, query || '', {
       limit: typeof limit === 'number' ? limit : 30,

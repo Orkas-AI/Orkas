@@ -1857,8 +1857,9 @@ if (typeof document !== 'undefined') document.addEventListener('loadedmetadata',
  * old conversation whose workspace was since cleaned would grow one tombstone
  * per generated file where previously there was none.
  *
- * Media the model wrote into its own prose keeps the placeholder: the
- * surrounding text refers to it, so its absence has to be visible.
+ * Media the model wrote into its own prose stays on the authored failure path:
+ * the surrounding text refers to it, so its absence normally has to remain
+ * visible. The narrow stale-duplicate exception is handled separately below.
  */
 function _dropFailedProducedPreview(el) {
   const host = el?.closest?.('.chat-msg-produced-media');
@@ -1866,6 +1867,47 @@ function _dropFailedProducedPreview(el) {
   const blockSelector = '.chat-image-shell, .chat-md-video-shell, .chat-md-audio-card';
   (el.closest(blockSelector) || el).remove();
   if (!host.querySelector(blockSelector)) host.remove();
+  return true;
+}
+
+// Return a basename only for media references that claim to be local. Remote
+// URLs with a coincidentally equal basename must never be folded into a file
+// produced by this turn.
+function _localMediaReferenceBasename(src) {
+  const raw = String(src || '').trim();
+  if (!raw || /[\u0000-\u001f\u007f]/.test(raw)) return '';
+  let local = _chatMediaLocalPathFromUrl(raw);
+  if (!local) {
+    if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(raw)) return '';
+    local = raw.split(/[?#]/, 1)[0];
+  }
+  let base = String(local).split(/[\\/]/).filter(Boolean).pop() || '';
+  try { base = decodeURIComponent(base); } catch (_) { return ''; }
+  return base && !/[\u0000-\u001f\u007f]/.test(base) ? base : '';
+}
+
+/**
+ * A failed model-authored media reference normally stays visible so the user
+ * can see that the surrounding prose points at something missing. There is
+ * one stronger recovery signal: the same bubble already contains the host's
+ * produced-file preview with the same local basename and media kind. In that
+ * case the failed card is only a stale duplicate (for example an earlier
+ * narration audition path), while the produced preview is the usable result.
+ */
+function _dropFailedDuplicateMarkdownPreview(el) {
+  if (!el || el.closest?.('.chat-msg-produced-media')) return false;
+  const bubble = el.closest?.('.chat-bubble');
+  const base = _localMediaReferenceBasename(el.getAttribute?.('src'));
+  if (!bubble || !base || typeof bubble.querySelectorAll !== 'function') return false;
+  const tag = String(el.tagName || '').toLowerCase();
+  if (tag !== 'img' && tag !== 'video' && tag !== 'audio') return false;
+  const candidates = bubble.querySelectorAll(`.chat-msg-produced-media ${tag}[src]`);
+  const duplicate = Array.from(candidates).some((candidate) => (
+    _localMediaReferenceBasename(candidate.getAttribute?.('src')) === base
+  ));
+  if (!duplicate) return false;
+  const blockSelector = '.chat-image-shell, .chat-md-video-shell, .chat-md-audio-card';
+  (el.closest(blockSelector) || el).remove();
   return true;
 }
 
@@ -1877,6 +1919,7 @@ if (typeof document !== 'undefined') document.addEventListener('error', (e) => {
     || (target.tagName === 'AUDIO' && target.classList?.contains('chat-md-audio'));
   if (!isChatMedia) return;
   if (_dropFailedProducedPreview(target)) return;
+  if (_dropFailedDuplicateMarkdownPreview(target)) return;
   if (target.tagName === 'IMG') {
     _replaceMissingMarkdownImage(target);
     return;
@@ -2627,6 +2670,7 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     _normalizeLocalMediaSrc,
     _mediaDedupKey,
     _dropFailedProducedPreview,
+    _localMediaReferenceBasename,
     _parseOrkasMediaTitle,
     _chatVideoNativeControlsHit,
     escapeHtml,

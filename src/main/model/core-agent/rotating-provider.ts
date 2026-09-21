@@ -78,6 +78,16 @@ export const PROVIDER_EMPTY_TRANSPORT_CODE = 'PROVIDER_EMPTY_TRANSPORT';
 export const PROVIDER_EMPTY_NORMAL_CODE = 'PROVIDER_EMPTY_NORMAL';
 export const PROVIDER_EMPTY_SAFETY_CODE = 'PROVIDER_EMPTY_SAFETY';
 export const PROVIDER_EMPTY_UNKNOWN_CODE = 'PROVIDER_EMPTY_UNKNOWN';
+export const PROVIDER_CANDIDATES_UNAVAILABLE_CODE = 'PROVIDER_CANDIDATES_UNAVAILABLE';
+
+class ProviderCandidatesUnavailableError extends Error {
+  readonly code = PROVIDER_CANDIDATES_UNAVAILABLE_CODE;
+
+  constructor() {
+    super('No configured model candidate is currently available');
+    this.name = 'ProviderCandidatesUnavailableError';
+  }
+}
 
 class ProviderNoFirstEventTimeoutError extends Error {
   readonly code = PROVIDER_NO_FIRST_EVENT_TIMEOUT_CODE;
@@ -750,7 +760,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
 
     async complete(params: CompletionParams): Promise<CompletionResult> {
       if (terminalRateLimit) throw terminalRateLimit;
-      let lastErr: unknown = new Error('rotating-provider: no candidates');
+      let lastErr: unknown = new ProviderCandidatesUnavailableError();
       let lastCand: RotatingCandidate | null = null;
       let lastFailure: PreCommitFailure | null = null;
       let exhaustedNetwork = false;
@@ -861,7 +871,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
 
     async *stream(params: CompletionParams): AsyncIterable<StreamEvent> {
       if (terminalRateLimit) throw terminalRateLimit;
-      let lastErr: unknown = new Error('rotating-provider: no candidates');
+      let lastErr: unknown = new ProviderCandidatesUnavailableError();
       let lastCand: RotatingCandidate | null = null;
       let lastFailure: PreCommitFailure | null = null;
       let exhaustedNetwork = false;
