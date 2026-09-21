@@ -7,8 +7,15 @@ const source = readFileSync(
   resolve(__dirname, '../../src/renderer/modules/kb-picker.js'),
   'utf8',
 );
+const indexSource = readFileSync(
+  resolve(__dirname, '../../src/renderer/index.html'),
+  'utf8',
+);
 
-function load(initialStorage: Record<string, string> = {}) {
+function load(
+  initialStorage: Record<string, string> = {},
+  elements: Record<string, unknown> = {},
+) {
   const values = new Map(Object.entries(initialStorage));
   const translations: Record<string, string> = {
     'contexts.root_label': 'Root',
@@ -31,7 +38,7 @@ function load(initialStorage: Record<string, string> = {}) {
       setItem: (key: string, value: string) => { values.set(key, value); },
       removeItem: (key: string) => { values.delete(key); },
     },
-    document: { getElementById: () => null },
+    document: { getElementById: (id: string) => elements[id] ?? null },
     setTimeout: vi.fn(),
     window: {},
   };
@@ -41,6 +48,22 @@ function load(initialStorage: Record<string, string> = {}) {
 }
 
 describe('Library location picker', () => {
+  it('binds the visible cancel and confirm actions without inline global lookups', () => {
+    const cancel = { addEventListener: vi.fn() };
+    const confirm = { addEventListener: vi.fn() };
+    const { sandbox } = load({}, {
+      'kb-picker-cancel': cancel,
+      'kb-picker-confirm': confirm,
+    });
+
+    expect(indexSource).toContain('id="kb-picker-cancel"');
+    expect(indexSource).toContain('id="kb-picker-confirm"');
+    expect(indexSource).not.toContain('onclick="closeKbPicker()"');
+    expect(indexSource).not.toContain('onclick="confirmKbPicker()"');
+    expect(cancel.addEventListener).toHaveBeenCalledWith('click', sandbox.window.closeKbPicker);
+    expect(confirm.addEventListener).toHaveBeenCalledWith('click', sandbox.window.confirmKbPicker);
+  });
+
   it('identifies the Global or Project Library in both the title and destination', () => {
     const { sandbox } = load();
     const target = { textContent: '' };
