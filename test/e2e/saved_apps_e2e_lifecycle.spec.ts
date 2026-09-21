@@ -234,6 +234,20 @@ test.describe('My Apps', () => {
     await expect(card).toContainText('E2E Saved App');
     await expect(page.locator('#apps-page-header-count')).toHaveText('1');
 
+    const moreButton = card.locator('[data-app-more]');
+    await expect(moreButton).toHaveCSS('position', 'absolute');
+    await expect(moreButton).toHaveCSS('top', '12px');
+    await expect(moreButton).toHaveCSS('right', '12px');
+    await expect(moreButton).toBeHidden();
+    await card.hover();
+    await expect(moreButton).toBeVisible();
+    await page.locator('.apps-page-header-title').hover();
+    await expect(moreButton).toBeHidden();
+    await card.focus();
+    await expect(moreButton).toBeVisible();
+    await page.locator('#apps-create-btn').focus();
+    await expect(moreButton).toBeHidden();
+
     const opened = orkas.electronApp!.waitForEvent('window');
     await card.click();
     const preview = await opened;

@@ -8742,9 +8742,11 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
   overflow-wrap: anywhere;
 }
 .app-card-more {
-  flex: 0 0 auto;
-  width: 24px;
-  height: 24px;
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 22px;
+  height: 22px;
   padding: 0;
   border: 0;
   background: transparent;
@@ -8754,7 +8756,11 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  visibility: hidden;
 }
+.app-card:hover .app-card-more,
+.app-card:focus-within .app-card-more,
+.app-card.is-menu-open .app-card-more { visibility: visible; }
 .app-card-more:hover { background: var(--surface-2); color: var(--text); }
 .app-card-more:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 .app-card-more-icon { width: 17px; height: 17px; }
