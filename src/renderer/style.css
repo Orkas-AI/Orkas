@@ -15783,9 +15783,43 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
 }
 
 /* Wrapper for the multi-button cluster on the right side of agents-grid-header /
-   skills-grid-header. Keeps `+ Create` / `More` glued together while the parent
+   skills-grid-header. Keeps the entries glued together while the parent
    header's `justify-content: space-between` still separates title from cluster. */
 .header-actions { display: flex; gap: 8px; align-items: center; }
+
+/* Named header entry cluster shared by AI Team and Skills. */
+.header-entry-actions {
+  gap: 6px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: stretch;
+}
+.header-entry-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 4px 10px;
+  font-size: 12px;
+  line-height: 16px;
+  white-space: nowrap;
+  background: var(--surface);
+  border-color: var(--border-strong);
+}
+.header-entry-btn-create { background: var(--surface-2); }
+.header-entry-btn:hover { background: var(--surface-2); }
+.header-entry-btn:active { background: var(--primary-soft); }
+.header-entry-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+.header-entry-icon { width: 14px; height: 14px; flex-shrink: 0; }
+.header-entry-copy { display: flex; flex-direction: column; align-items: flex-start; }
+.header-entry-copy small {
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--text-2);
+  line-height: 1.2;
+}
 /* AI Team page header: bold title with a muted definition subtitle inline to
    its RIGHT (baseline-aligned); action buttons stay right-aligned. The title
    never shrinks; the subtitle truncates so a long definition can't push the
@@ -18541,19 +18575,6 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
 .driver-badge--cli { color: #8b5cf6; background: color-mix(in srgb, #8b5cf6 12%, transparent); }
 .driver-badge--mcp { color: #10b981; background: color-mix(in srgb, #10b981 12%, transparent); }
 
-/* ---- sidebar coding-agent entry (relocated from home) ---- */
-.sb-connect {
-  display: flex; align-items: center; gap: 9px; width: 100%; margin: 2px 0 6px;
-  background: var(--surface); border: 1px solid var(--border-strong); border-radius: 9px;
-  padding: 8px 10px; cursor: pointer; font-family: inherit; text-align: left; transition: background .16s;
-}
-.sb-connect:hover { background: var(--surface-2); }
-.sb-connect-ic { width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
-.sb-connect-icon { width: 28px; height: 28px; color: var(--primary); stroke-width: 1.5; }
-.sb-connect-tx { display: flex; flex-direction: column; line-height: 1.2; min-width: 0; flex: 1 1 auto; }
-.sb-connect-tx b { font-size: 13px; font-weight: 600; color: var(--text); }
-.sb-connect-tx small { font-size: 10.5px; color: var(--muted); }
-.sb-connect-plus { width: 15px; height: 15px; color: var(--muted); margin-left: auto; flex-shrink: 0; }
 .agent-card .agent-card-use {
   background: transparent;
   color: var(--primary);

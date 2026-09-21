@@ -424,17 +424,6 @@ function bindStaticHandlers() {
   // The "Create agent" inline entry is dynamically created inside
   // conversation.js and binds its own click handler.
 
-  document.getElementById('new-chat-external-agent-btn')?.addEventListener('click', () => {
-    _trackAgentCreateOpen('new_chat_external_agent', { agent_type: 'cli' });
-    openAgentModal({
-      initialTab: 'external',
-      externalOnly: true,
-      returnFocusId: 'new-chat-input',
-      entryPoint: 'new_chat_external_agent',
-      sourceView: currentView || '',
-    });
-  });
-
   // Agents (grid + detail)
   // "Done" button (only visible while editing) — exits edit mode.
   document.getElementById('create-agent-btn')?.addEventListener('click', () => {

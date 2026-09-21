@@ -4,25 +4,14 @@ import path from 'node:path';
 import { expect, test } from './fixtures/orkas';
 
 test.describe('persistent sidebar', () => {
-  test('keeps the commercial external-agent entry above Settings and opens its flow', async ({ appPage }) => {
-    const entry = appPage.locator('.sidebar-footer-actions #new-chat-external-agent-btn');
+  test('keeps the open-source footer focused on local Settings', async ({ appPage }) => {
+    const footer = appPage.locator('.sidebar-footer-actions');
     const settings = appPage.locator('.sidebar-footer-actions #settings-btn');
-    await expect(entry).toContainText('Connect agents');
-    await expect(entry).toContainText('Claude Code · Codex & more');
-    await expect(appPage.locator('#panel-new-chat #new-chat-external-agent-btn')).toHaveCount(0);
-
-    const [entryBox, settingsBox] = await Promise.all([entry.boundingBox(), settings.boundingBox()]);
-    expect(entryBox).not.toBeNull();
-    expect(settingsBox).not.toBeNull();
-    expect(entryBox!.y + entryBox!.height).toBeLessThanOrEqual(settingsBox!.y);
-
-    await entry.click();
-    await expect(appPage.locator('#agent-modal')).toHaveClass(/\bopen\b/);
-    await expect(appPage.locator('#agent-modal-tabs')).toBeHidden();
-    await expect(appPage.locator('#agent-modal [data-agent-panel="external"]')).toHaveClass(/\bis-active\b/);
-
-    await appPage.locator('#agent-modal .modal-actions .btn').first().click();
-    await expect(appPage.locator('#agent-modal')).not.toHaveClass(/\bopen\b/);
+    await expect(footer.locator('#new-chat-external-agent-btn')).toHaveCount(0);
+    await expect(footer.locator('#sidebar-invite-btn')).toHaveCount(0);
+    await expect(settings).toBeVisible();
+    await settings.click();
+    await expect(appPage.locator('#panel-settings')).toHaveClass(/\bactive\b/);
   });
 });
 

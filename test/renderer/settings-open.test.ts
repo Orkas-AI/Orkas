@@ -160,6 +160,7 @@ describe('settings sidebar navigation', () => {
   it('keeps all three named AI Team entries and the external-only CLI route', () => {
     const html = fs.readFileSync(path.join(root, 'src/renderer/index.html'), 'utf8');
     const state = fs.readFileSync(path.join(root, 'src/renderer/modules/state.js'), 'utf8');
+    const css = fs.readFileSync(path.join(root, 'src/renderer/style.css'), 'utf8');
     const header = html.slice(
       html.indexOf('<div class="agents-grid-header">'),
       html.indexOf('<div class="marketplace-reconcile-banner" data-reconcile-banner data-reconcile-kind="agent"'),
@@ -175,6 +176,9 @@ describe('settings sidebar navigation', () => {
     expect(handler).toContain("initialTab: 'external'");
     expect(handler).toContain('externalOnly: true');
     expect(handler).toContain("entryPoint: 'agents_connect_cli_button'");
+    expect(css).toMatch(/\.header-entry-actions\s*{[\s\S]*?gap:\s*6px;[\s\S]*?align-items:\s*stretch;/);
+    expect(css).toMatch(/\.header-entry-btn\s*{[\s\S]*?min-height:\s*36px;[\s\S]*?padding:\s*4px 10px;[\s\S]*?font-size:\s*12px;/);
+    expect(css).toMatch(/\.header-entry-icon\s*{[^}]*width:\s*14px;[^}]*height:\s*14px;/);
   });
 });
 
