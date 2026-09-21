@@ -263,18 +263,6 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
     type: 'string',
     pattern: TOOL_RESULT_REF_SCHEMA_PATTERN,
   });
-  const searchRequest = {
-    type: 'object',
-    additionalProperties: false,
-    properties: {
-      ref: refProperty(),
-      query: {
-        type: 'string',
-        description: 'Narrow text expression under 256 estimated tokens. Do not use for structured aggregation.',
-      },
-    },
-    required: ['ref', 'query'],
-  };
   const structuredQueryProperties = () => ({
     ref: refProperty(),
     dataset: {
@@ -283,7 +271,7 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
     },
     explode: {
       type: 'string',
-      description: 'Expand one advertised array by its record-relative path; no dataset prefix or [].',
+      description: 'Expand one advertised array by its record-relative path; no dataset prefix or []. With explode, field, filters.field and group_by use $item.<field>, $parent.<field>, or $index; scalar items use $item.',
     },
     field: {
       type: 'string',
@@ -313,33 +301,21 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
     order: { type: 'string', enum: ['asc', 'desc'], description: 'Structured aggregate sort order; default desc.' },
     limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Maximum structured result groups; default 20.' },
   });
-  // One structured request covers count and numeric aggregates; the runtime
-  // (`toolResultActionRequestError` + the query tool) enforces which fields
-  // each operation needs, so the schema does not repeat the property set per
-  // operation.
-  const structuredRequest = {
+  // Conditional requirements and incompatible fields are checked by the
+  // action executor, independently of provider schema validation.
+  const requestSchema = {
     type: 'object',
-    description: 'With explode, field, filters.field and group_by use $item.<field>, $parent.<field>, or $index; scalar items use $item.',
     additionalProperties: false,
     properties: {
       ...structuredQueryProperties(),
+      query: {
+        type: 'string',
+        description: 'Required for search: narrow text expression under 256 estimated tokens.',
+      },
       operation: {
         type: 'string',
         enum: ['count', 'sum', 'average', 'minimum', 'maximum'],
-        description: 'Structured aggregate. count needs no field; sum/average/minimum/maximum require field. Never include match or count_unit.',
-      },
-    },
-    required: ['ref', 'operation'],
-  };
-  const textCountRequest = {
-    type: 'object',
-    additionalProperties: false,
-    properties: {
-      ref: refProperty(),
-      operation: {
-        type: 'string',
-        enum: ['count'],
-        description: 'Exact count over a marker advertised as unstructured text.',
+        description: 'Required for query. Structured count needs no field; numeric aggregates require field. Unstructured text supports only count with match and count_unit; omit both for structured data.',
       },
       match: {
         type: 'string',
@@ -350,29 +326,16 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
         enum: ['matching_lines', 'occurrences'],
         description: 'Required count unit. Use only for unstructured-text count.',
       },
-    },
-    required: ['ref', 'operation', 'match', 'count_unit'],
-  };
-  const readRequest = {
-    type: 'object',
-    additionalProperties: false,
-    properties: {
-      ref: refProperty(),
-      cursor: { type: 'integer', minimum: 0, description: 'Exact non-negative character cursor. Do not prefetch sequential chunks.' },
+      cursor: { type: 'integer', minimum: 0, description: 'Required for read: exact non-negative character cursor. Do not prefetch sequential chunks.' },
       max_tokens: {
         type: 'integer',
         minimum: 256,
         maximum: TOOL_RESULT_CHUNK_MAX_TOKENS,
-        description: 'Slice budget including framing; defaults to 10000.',
+        description: 'Read slice budget including framing; defaults to 10000.',
       },
     },
-    required: ['ref', 'cursor'],
-  };
-  const materializeRequest = {
-    type: 'object',
-    additionalProperties: false,
-    properties: { ref: refProperty() },
     required: ['ref'],
+    description: 'Use only fields for the selected action. materialize takes ref only.',
   };
   const actionProperty = {
     type: 'string',
@@ -393,7 +356,7 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
           minItems: 1,
           maxItems: TOOL_RESULT_BATCH_MAX_ITEMS,
           description: 'One to eight same-action requests. The whole batch shares 10000 tokens and remaining model-step capacity; earlier items use space first.',
-          items: { oneOf: [searchRequest, structuredRequest, textCountRequest, readRequest, materializeRequest] },
+          items: requestSchema,
         },
       },
       required: ['action', 'requests'],

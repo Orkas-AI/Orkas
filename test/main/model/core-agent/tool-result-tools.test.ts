@@ -68,6 +68,24 @@ describe('persisted tool-result retrieval', () => {
 
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
 
+  it('rejects incomplete or incompatible requests after schema flattening without materializing files or marking data as retrieved', async () => {
+    const tool = getTool(tools, 'tool_result');
+    const before = fs.readdirSync(dir);
+    for (const [action, request] of [
+      ['search', { ref }], ['search', { ref, query: 'needle', operation: 'count' }],
+      ['read', { ref }], ['read', { ref, cursor: 0, operation: 'count' }],
+      ['query', { ref }], ['query', { ref, operation: 'count', match: 'needle' }],
+      ['materialize', { ref, query: 'needle' }],
+    ] as const) {
+      const result = await tool.execute({ action, requests: [request] }, ctx);
+      expect(result.isError, JSON.stringify({ action, request })).toBe(true);
+      expect(fs.readdirSync(dir)).toEqual(before);
+      expect(fs.existsSync(materializeDir)).toBe(false);
+      // Error receipts may consume inline tokens, but never a successful read key.
+      expect((ctx.state.toolResultReadLedger as { readKeys: Set<string> }).readKeys.size).toBe(0);
+    }
+  });
+
   it('reads beyond the retired 2K limit and finalizes without a second charge or spill', async () => {
     const source = '界'.repeat(15_000);
     const sourceRef = toolResultRefForPath(persistToolResult(dir, 'fixture', source));
@@ -327,15 +345,13 @@ describe('persisted tool-result retrieval', () => {
 
   it('explains record-relative explode syntax at the provider boundary', () => {
     const schema = toToolDefinition(getTool(tools, 'tool_result')).inputSchema as any;
-    const structured = schema.properties.requests.items.oneOf.find(
-      (shape: any) => shape.properties.explode,
-    );
+    const structured = schema.properties.requests.items;
     const description = structured.properties.explode.description;
     expect(description).toMatch(/record-relative/i);
     expect(description).toMatch(/no dataset prefix or \[\]/i);
-    expect(structured.description).toMatch(/With explode, field, filters.field and group_by/);
-    expect(structured.description).toMatch(/\$item\.<field>[\s\S]*\$parent\.<field>[\s\S]*\$index/);
-    expect(structured.description).toContain('scalar items use $item');
+    expect(structured.properties.explode.description).toMatch(/With explode, field, filters.field and group_by/);
+    expect(structured.properties.explode.description).toMatch(/\$item\.<field>[\s\S]*\$parent\.<field>[\s\S]*\$index/);
+    expect(structured.properties.explode.description).toContain('scalar items use $item');
     expect(description).not.toContain('Subsequent paths');
   });
 
@@ -497,7 +513,6 @@ describe('persisted tool-result retrieval', () => {
       pattern?: string;
       properties?: Record<string, Schema>;
       items?: Schema;
-      oneOf?: Schema[];
     };
     const definitions = tools.map(toToolDefinition);
     const refs: Schema[] = [];
@@ -506,12 +521,11 @@ describe('persisted tool-result retrieval', () => {
       if (schema.properties?.ref) refs.push(schema.properties.ref);
       for (const property of Object.values(schema.properties ?? {})) visit(property);
       visit(schema.items);
-      for (const branch of schema.oneOf ?? []) visit(branch);
     };
     for (const tool of definitions) visit(tool.inputSchema as Schema);
 
-    // search, structured aggregate, text count, read, materialize: one ref each.
-    expect(refs).toHaveLength(5);
+    // All five request forms share the same ref property.
+    expect(refs).toHaveLength(1);
     for (const schema of refs) {
       expect(schema.pattern).toBe(TOOL_RESULT_REF_SCHEMA_PATTERN);
       expect(schema.description).toBeUndefined();
@@ -536,24 +550,18 @@ describe('persisted tool-result retrieval', () => {
     expect(schema.oneOf).toBeUndefined();
     expect(schema.required).toEqual(['action', 'requests']);
     expect(schema.properties.action.enum).toEqual(['search', 'query', 'read', 'materialize']);
-    const shapes = schema.properties.requests.items.oneOf as any[];
-    expect(shapes).toHaveLength(5);
-    const byKeys = (keys: string[]) => shapes.find(
-      (shape) => JSON.stringify(Object.keys(shape.properties).sort()) === JSON.stringify([...keys].sort()),
-    );
-    expect(byKeys(['ref', 'query'])).toBeTruthy();
-    expect(byKeys(['ref', 'cursor', 'max_tokens'])).toBeTruthy();
-    expect(byKeys(['ref'])).toBeTruthy();
-    const structured = shapes.find((shape) => shape.properties.operation?.enum?.includes('sum'));
-    const textCount = shapes.find((shape) => shape.properties.match);
-    expect(structured.properties.operation.enum).toEqual(['count', 'sum', 'average', 'minimum', 'maximum']);
-    expect(structured.required).toEqual(['ref', 'operation']);
-    expect(structured.properties).not.toHaveProperty('match');
-    expect(structured.properties).not.toHaveProperty('count_unit');
-    expect(structured.description)
-      .toMatch(/\$item[\s\S]*\$parent[\s\S]*\$index/);
-    expect(textCount.required).toEqual(['ref', 'operation', 'match', 'count_unit']);
-    expect(textCount.properties).not.toHaveProperty('dataset');
+    const request = schema.properties.requests.items;
+    expect(request).not.toHaveProperty('anyOf');
+    expect(request).toMatchObject({ type: 'object', additionalProperties: false, required: ['ref'] });
+    expect(Object.keys(request.properties).sort()).toEqual([
+      'ref', 'query', 'operation', 'dataset', 'explode', 'field', 'filters',
+      'group_by', 'order', 'limit', 'match', 'count_unit', 'cursor', 'max_tokens',
+    ].sort());
+    expect(request.properties.operation.enum).toEqual(['count', 'sum', 'average', 'minimum', 'maximum']);
+    expect(request.properties.operation.description).toContain('Required for query');
+    expect(request.properties.query.description).toContain('Required for search');
+    expect(request.properties.cursor.description).toContain('Required for read');
+    expect(request.properties.explode.description).toMatch(/\$item[\s\S]*\$parent[\s\S]*\$index/);
     expect(getTool(tools, 'tool_result').description).toMatch(/at most one tool_result call per model step/i);
 
     const invalid = await getTool(tools, 'tool_result').execute({

@@ -656,6 +656,25 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         if (!bound) expect(await autoTasks.getTask(TEST_UID, automationId)).not.toHaveProperty('project_id');
         const { createAutoTasksTool } = await import('../../../../src/main/features/auto_tasks_tool');
         const nativeAuto = createAutoTasksTool({ userId: TEST_UID, projectId: scope || null });
+        const automationSchema = listed.result.tools.find((t: any) => t.name === 'auto_tasks').inputSchema;
+        expect(automationSchema).toEqual(nativeAuto.inputSchema);
+        expect(JSON.stringify(listed.result.tools)).not.toMatch(/"(?:oneOf|anyOf)":/);
+        const savedAutomation = await autoTasks.getTask(TEST_UID, automationId);
+        for (const fields of [
+          { schedule: { type: 'daily', hour: 9 } },
+          { schedule: { type: 'daily', hour: 9, minute: 0, day: 1 } },
+          { end_condition: { type: 'count' } },
+          { recipient: { kind: 'agent' } },
+        ]) {
+          const rejected = await client.request(1000, 'tools/call', { name: 'auto_tasks', arguments: { action: 'update', task_id: automationId, ...fields } });
+          expect(rejected.result?.isError || rejected.error).toBeTruthy();
+          expect(await autoTasks.getTask(TEST_UID, automationId)).toEqual(savedAutomation);
+        }
+        const cleared = await client.request(1001, 'tools/call', { name: 'auto_tasks', arguments: {
+          action: 'update', task_id: automationId, skill: null, connector: null, end_condition: null,
+        } });
+        expect(cleared.result.isError).toBeFalsy();
+        expect(await autoTasks.getTask(TEST_UID, automationId)).toMatchObject({ schedule: savedAutomation!.schedule, enabled: false });
         const queryAuto = { action: 'list', enabled: false, offset: 0, limit: 1 };
         const autoPage = await client.request(90, 'tools/call', { name: 'auto_tasks', arguments: queryAuto });
         const nativeAutoPage = JSON.parse((await nativeAuto.execute(queryAuto, { state: {} })).content);

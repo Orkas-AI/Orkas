@@ -28,6 +28,7 @@ import {
 import {
   enumerateAllInjectedToolNames,
   enumerateAllInjectedTools,
+  enumerateRuntimeSchemaTools,
 } from './injected-tool-fixture';
 import { createToolSurfaceController } from '../../../../src/main/model/core-agent/tool-surface';
 import {
@@ -511,10 +512,12 @@ describe('tool-catalog', () => {
     // content or failing closed was touched.
     // 2026-09-21: read_files advertises its existing nonempty path and
     // nonnegative range bounds; file-tools tests pin the provider definition.
+    // 2026-09-21: XLSX cells use an equivalent primitive/object type array;
+    // tool-schema-compat tests compare accepted/rejected values to the old union.
     expect(
       fingerprint,
       'A model-visible field, enum, bound, default, or required rule changed; review it as a schema change, not description cleanup.',
-    ).toBe('5a0fc883f32fe8057b10014975c25a3e898316399c2cb17bbcedfbae656b21b0');
+    ).toBe('a40b858fb9236a98666aab74fa5c468a99f5f1eaf47b7cd5e2d077f3d3ad6d4e');
   });
 
   it('keeps the reviewed stable tool corpus within the description budgets', () => {
@@ -727,9 +730,10 @@ describe('isToolVisibleToAgent (ownerAgent gate)', () => {
 });
 
 it('keeps first-party provider roots compatible with object-only function interfaces', () => {
-  for (const tool of enumerateAllInjectedTools()) {
+  for (const tool of [...enumerateAllInjectedTools(), ...enumerateRuntimeSchemaTools()]) {
     const schema = toToolDefinition(tool).inputSchema;
     expect(schema.type, tool.name).toBe('object');
+    expect(JSON.stringify(schema), tool.name).not.toMatch(/"(?:oneOf|anyOf)":/);
     for (const key of ['oneOf', 'anyOf', 'allOf', 'not', 'const', 'enum']) {
       expect(schema, `${tool.name}: ${key}`).not.toHaveProperty(key);
     }

@@ -4,6 +4,7 @@ import nativeFs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
 
 const logProbe = vi.hoisted(() => ({ warn: vi.fn() }));
 vi.mock('../../../src/main/logger', () => ({
@@ -43,6 +44,68 @@ const run = async (tool: ReturnType<typeof createTool>, args: Record<string, unk
 };
 
 describe('auto_tasks shared tool', () => {
+  it('exposes union-free definitions for each scope while retaining types, bounds and nullable clears', () => {
+    const validator = new AjvJsonSchemaValidator();
+    for (const projectId of [undefined, null, pid]) {
+      const schema = createTool({ userId: uid, projectId }).inputSchema;
+      expect(JSON.stringify(schema)).not.toMatch(/"(?:anyOf|oneOf|\$ref)":/);
+      const accepts = validator.getValidator(schema);
+      for (const args of [
+        { action: 'create', ...draft },
+        { action: 'update', skill: null, connector: null, end_condition: null },
+        { action: 'update', skill: { id: 's1', name: 'Skill' }, connector: { id: 'c1', name: 'Connector' } },
+        { action: 'update', recipient: { kind: 'agent', id: 'a1', name: 'Agent' } },
+      ]) expect(accepts(args).valid).toBe(true);
+      for (const fields of [
+        { schedule: null }, { schedule: { type: 'daily', hour: 24 } },
+        { recipient: null }, { skill: {} }, { connector: { id: '', name: 'Invalid' } },
+        { end_condition: { type: 'count', max_runs: 0 } }, { unknown: true },
+      ]) expect(accepts({ action: 'update', ...fields }).valid).toBe(false);
+      expect(accepts({ action: 'list', project_id: null }).valid).toBe(projectId === undefined);
+      expect(accepts({ action: 'list', project_id: '' }).valid).toBe(false);
+    }
+  });
+
+  it.each([
+    { type: 'one_time', at: '2099-01-01T09:00:00+08:00' },
+    { type: 'hourly', interval_hours: 2 },
+    { type: 'daily', hour: 9, minute: 5 },
+    { type: 'weekly', weekday: 1, hour: 9, minute: 5 },
+    { type: 'monthly', day: 31, hour: 9, minute: 5 },
+  ])('saves and reads the $type schedule through the real executor', async schedule => {
+    const tool = createTool({ userId: uid, projectId: pid });
+    const result = await run(tool, { action: 'create', ...draft, schedule });
+    expect(result).toMatchObject({ ok: true, isError: false });
+    expect(await tasks.getTask(uid, result.taskId)).toMatchObject({ schedule, enabled: false, project_id: pid });
+    expect((await run(tool, { action: 'get', task_id: result.taskId })).task.schedule).toEqual(schedule);
+  });
+
+  it('rejects conditional omissions and mixed variants without changing saved state, then clears nullable fields', async () => {
+    const tool = createTool({ userId: uid, projectId: pid });
+    const created = await run(tool, { action: 'create', ...draft, end_condition: { type: 'count', max_runs: 3 } });
+    expect(created.ok).toBe(true);
+    const before = await tasks.getTask(uid, created.taskId);
+    for (const fields of [
+      { schedule: { type: 'one_time' } }, { schedule: { type: 'hourly' } },
+      { schedule: { type: 'daily', hour: 9 } }, { schedule: { type: 'weekly', hour: 9, minute: 0 } },
+      { schedule: { type: 'monthly', hour: 9, minute: 0 } },
+      { schedule: { type: 'daily', hour: 9, minute: 0, day: 1 } },
+      { end_condition: { type: 'count' } }, { end_condition: { type: 'date' } },
+      { end_condition: { type: 'count', max_runs: 2, date: '2099-01-01' } },
+      { recipient: { kind: 'agent' } }, { recipient: { kind: 'commander', id: 'unrelated' } },
+      { skill: { id: 's1' } }, { connector: { name: 'Missing id' } },
+    ]) {
+      expect((await run(tool, { action: 'update', task_id: created.taskId, ...fields })).isError).toBe(true);
+      expect(await tasks.getTask(uid, created.taskId)).toEqual(before);
+    }
+    expect((await run(tool, { action: 'update', task_id: created.taskId, end_condition: { type: 'date', date: '2099-01-01' } })).ok).toBe(true);
+    expect(await tasks.getTask(uid, created.taskId)).toMatchObject({ end_condition: { type: 'date', date: '2099-01-01' } });
+    expect((await run(tool, { action: 'update', task_id: created.taskId, end_condition: null, skill: null, connector: null })).ok).toBe(true);
+    const cleared = await tasks.getTask(uid, created.taskId);
+    for (const name of ['end_condition', 'skill', 'connector']) expect(cleared).not.toHaveProperty(name);
+    expect(cleared).toMatchObject({ schedule: draft.schedule, content: draft.content, enabled: false, project_id: pid });
+  });
+
   it('reports a saved automation for the host click-through, and nothing on delete', async () => {
     // The retired `<auto-task>` container had the bus stage this offer; the tool
     // is the only writer now, so it reports the save (2026-09-13, review P3-2).

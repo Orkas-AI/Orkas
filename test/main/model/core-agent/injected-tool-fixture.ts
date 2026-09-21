@@ -1,3 +1,4 @@
+import { createAutoTasksTool } from '../../../../src/main/features/auto_tasks_tool';
 import {
   createExecutionPlanTool,
   getBuiltinTools,
@@ -10,11 +11,30 @@ import { createFileTools, createLocalTools } from '../../../../src/main/model/co
 import { createGenerateSpeechTool } from '../../../../src/main/model/core-agent/generate-speech-tool';
 import { createImageGenTool } from '../../../../src/main/model/core-agent/image-gen-tool';
 import { createImageStudioTool } from '../../../../src/main/model/core-agent/image-studio-tool';
-import { createVideoGenTool } from '../../../../src/main/model/core-agent/video-gen-tool';
 import { createLibraryTool } from '../../../../src/main/model/core-agent/kb-tools';
 import { createOfficeTools } from '../../../../src/main/model/core-agent/office-tools';
 import { createPdfTools } from '../../../../src/main/model/core-agent/pdf-tools';
+import { createVideoGenTool } from '../../../../src/main/model/core-agent/video-gen-tool';
 import { buildBrowserTool } from '../../../../src/main/features/group_chat/browser_tool';
+import { createSkillManageTool } from '../../../../src/core-agent/src/evolution/skill-tools';
+import type { SkillStore } from '../../../../src/core-agent/src/evolution/skill-store';
+import { createRunProgramTool } from '../../../../src/core-agent/src/tools/run-program';
+import { createProjectTasksTool } from '../../../../src/core-agent/src/tools/project-tasks-tool';
+import { createToolResultTools } from '../../../../src/main/model/core-agent/tool-result-tools';
+
+/** Late/runtime definitions omitted from the common actor-budget corpus below.
+ * Dependencies fail closed: schema inspection must not read or mutate state. */
+export function enumerateRuntimeSchemaTools(): AgentTool[] {
+  const fail = async () => { throw new Error('Schema probe must not execute tools'); };
+  const store = { list: fail, read: fail, touch: fail, create: fail, patch: fail, delete: fail };
+  return [
+    createSkillManageTool(store as unknown as SkillStore),
+    createAutoTasksTool({ userId: 'schema-probe' }),
+    createProjectTasksTool({ list: fail, get: fail, create: fail, update: fail, complete: fail }),
+    createRunProgramTool({ listToolNames: () => [], invokeTool: fail, loadSourceFile: fail }),
+    ...createToolResultTools({ toolResultsDir: '/unused', materializeDir: '/unused', isProgrammaticToolCallContext: () => false }),
+  ];
+}
 
 /**
  * Assemble the stable built-in tool corpus measured by both runner-facing
@@ -70,8 +90,8 @@ export function enumerateAllInjectedTools(): AgentTool[] {
   tools.push(createLibraryTool({ userId }));
   tools.push(createChatHistoryTool({ userId }));
   tools.push(createImageGenTool({ userId, cid }));
-  tools.push(createGenerateSpeechTool({ userId, cid }));
   tools.push(createVideoGenTool({ userId, cid }));
+  tools.push(createGenerateSpeechTool({ userId, cid }));
   tools.push(createImageStudioTool({ userId, cid }));
   tools.push(...createOfficeTools({ userId, cid }));
   tools.push(...createPdfTools({ userId, cid }));

@@ -451,12 +451,11 @@ describe("Evolution: skill_manage tool", () => {
     expect(action.description).toContain("list: no fields");
     expect(action.description).toContain("create: id/name/description/body");
     expect(action.description).toContain("patch: id/old_string/new_string");
-    const branches = Object.fromEntries(schema.oneOf.map((branch: any) => [
-      branch.properties.action.enum[0],
-      branch.required,
-    ]));
-    expect(branches.patch).toEqual(["action", "id", "old_string", "new_string"]);
-    expect(branches.create).toEqual(["action", "id", "name", "description", "body"]);
+    expect(schema.type).toBe("object");
+    expect(schema.oneOf).toBeUndefined();
+    expect(schema.required).toEqual(["action"]);
+    expect(schema.additionalProperties).toBe(false);
+    expect(action.enum).toEqual(["create", "read", "patch", "list", "delete"]);
   });
 
   it("rejects fields from another skill action", async () => {
@@ -535,10 +534,28 @@ describe("Evolution: skill_manage tool", () => {
     expect(readResult.isError).toBe(true);
   });
 
-  it("returns error for missing required fields on create", async () => {
-    const result = await tool.execute({ action: "create", id: "x" }, ctx);
+  it.each([
+    ["read", "id"], ["delete", "id"],
+    ["create", "id"], ["create", "name"], ["create", "description"], ["create", "body"],
+    ["patch", "id"], ["patch", "old_string"], ["patch", "new_string"],
+  ])("rejects %s without %s before changing stored skills", async (action, missing) => {
+    await store.create({ id: "existing", name: "Existing", description: "Test", body: "original" });
+    const before = await store.read("existing");
+    const inputs: Record<string, Record<string, unknown>> = {
+      read: { action, id: "existing" },
+      delete: { action, id: "existing" },
+      create: { action, id: "new-skill", name: "New", description: "Test", body: "body" },
+      patch: { action, id: "existing", old_string: "original", new_string: "replacement" },
+    };
+    const input = inputs[action];
+    delete input[missing];
+    const created = vi.fn();
+    const result = await createSkillManageTool(store, created).execute(input, ctx);
     expect(result.isError).toBe(true);
     expect(result.content).toContain("required");
+    expect(await store.read("existing")).toEqual(before);
+    expect((await store.list()).map(skill => skill.id)).toEqual(["existing"]);
+    expect(created).not.toHaveBeenCalled();
   });
 
   it("returns error for unknown action", async () => {
@@ -617,6 +634,7 @@ describe("Evolution: AgentRunner integration", () => {
   afterEach(cleanTmpDir);
 
   it("registers skill_manage tool when evolution is enabled", async () => {
+    let definitions: CompletionParams["tools"];
     const mockProvider = createMockProvider([
       {
         content: [{ type: "text", text: "Hello" }],
@@ -624,7 +642,7 @@ describe("Evolution: AgentRunner integration", () => {
         usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
         model: "mock-model",
       },
-    ]);
+    ], params => { definitions = params.tools; });
 
     const registry = new ProviderRegistry();
     registry.registerFactory("mock", () => mockProvider);
@@ -636,6 +654,10 @@ describe("Evolution: AgentRunner integration", () => {
 
     const runner = new AgentRunner({ config, providers: registry, tools: [] });
     expect(runner.getSkillStore()).not.toBeNull();
+    await runner.run({ message: "Hello" });
+    const definition = definitions?.find(tool => tool.name === "skill_manage");
+    expect(definition?.inputSchema.type).toBe("object");
+    expect(definition?.inputSchema).not.toHaveProperty("oneOf");
   });
 
   it("advertises learned skills without assigning self-improvement work to the main task", async () => {

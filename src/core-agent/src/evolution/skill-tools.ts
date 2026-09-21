@@ -78,19 +78,6 @@ export function createSkillManageTool(
       },
       required: ["action"],
       additionalProperties: false,
-      oneOf: [
-        { properties: { action: { enum: ["list"] } }, required: ["action"] },
-        { properties: { action: { enum: ["read"] } }, required: ["action", "id"] },
-        { properties: { action: { enum: ["delete"] } }, required: ["action", "id"] },
-        {
-          properties: { action: { enum: ["create"] } },
-          required: ["action", "id", "name", "description", "body"],
-        },
-        {
-          properties: { action: { enum: ["patch"] } },
-          required: ["action", "id", "old_string", "new_string"],
-        },
-      ],
     },
     async execute(input) {
       const action = input.action as SkillManageAction;

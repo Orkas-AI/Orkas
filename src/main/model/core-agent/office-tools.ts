@@ -800,15 +800,8 @@ function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
     required: ['type'],
   };
   const cellSchema = {
-    oneOf: [
-      { type: 'string' },
-      { type: 'number' },
-      { type: 'boolean' },
-      {
-        type: 'object',
-        properties: xlsxCellPropertySchema(),
-      },
-    ],
+    type: ['string', 'number', 'boolean', 'object'],
+    properties: xlsxCellPropertySchema(),
   };
   const columnSchema = {
     type: 'object',
