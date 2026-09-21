@@ -12,6 +12,7 @@ const gate = require('../../../bin/builtin-resource-gate.cjs') as {
       system_skills: unknown[];
       marketplace_agents: Array<{
         id: string;
+        name: string;
         icon: string;
         color: string;
         updated_at: string;
@@ -98,6 +99,36 @@ describe('builtin-resource-gate', () => {
         color: 'lavender',
         skill_list: ['9dfbd4e00c0d'],
       }));
+    expect(manifest.inventory.marketplace_agents
+      .filter((row) => row.name.startsWith('ECommerce'))
+      .map(({ id, name, skill_list }) => ({ id, name, skill_list })))
+      .toEqual([
+        {
+          id: '5a1d43c2f28a',
+          name: 'ECommerceResearcher',
+          skill_list: ['272355bc883d', '6743aa0797a2', 'e7f5c0e6f1be', 'e8868f762c1d'],
+        },
+        {
+          id: 'a4930d19ba6c',
+          name: 'ECommerceReviewer',
+          skill_list: ['59d186285161', 'de52c67d49dd', 'e7f5c0e6f1be', 'e8868f762c1d'],
+        },
+        {
+          id: 'bc7e2a904d18',
+          name: 'ECommerceAnalyzer',
+          skill_list: ['c91a84e7b206'],
+        },
+        {
+          id: 'e0f3a98c624b',
+          name: 'ECommerceOperator',
+          skill_list: ['d47b20f9a631'],
+        },
+        {
+          id: 'fa3e1f2f9e07',
+          name: 'ECommerceWriter',
+          skill_list: ['59d186285161', 'de52c67d49dd', 'e8868f762c1d'],
+        },
+      ]);
     expect(manifest.inventory.marketplace_agents)
       .toContainEqual(expect.objectContaining({
         id: '78900d8758bc',

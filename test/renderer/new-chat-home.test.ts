@@ -59,9 +59,9 @@ describe('new chat home surface', () => {
     const clientConfig = read('src/main/features/client_config.ts');
     const expected = [
       'data',
-      'office',
+      'ecommerce',
       'ppt',
-      'creation',
+      'office',
       'image',
       'video',
       'ui_design',

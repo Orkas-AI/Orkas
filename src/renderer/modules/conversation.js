@@ -3061,9 +3061,9 @@ const _SCENARIO_CATALOG = {
 };
 const _DEFAULT_QUICK_START_ITEMS = [
   { id: 'data', agent_id: '78900d8758bc' },
-  { id: 'office', agent_id: 'a19101ba698a' },
+  { id: 'ecommerce', agent_id: '5a1d43c2f28a' },
   { id: 'ppt', agent_id: '7e91cb9ec9e9' },
-  { id: 'creation', agent_id: '173d4235a431' },
+  { id: 'office', agent_id: 'a19101ba698a' },
   { id: 'image', agent_id: '814b61b027f0' },
   { id: 'video', agent_id: '79df9cc89f5f' },
   { id: 'ui_design', agent_id: 'bcfcb4921dce' },

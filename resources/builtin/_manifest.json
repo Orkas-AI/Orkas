@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "1a54db9542e5d6e42bf27a8710783b3e51b55ec8df4d15b50c1b916a56395cb0",
+  "content_tree_sha256": "85d12c52d7415a07da70df23cf422dc950f2d8f6d8a3f6a25cb66e4af0d3a8e6",
   "files": [
     {
       "path": "marketplace/agents/1040b336306f/agent.json",
@@ -71,6 +71,11 @@
       "path": "marketplace/agents/173d4235a431/agent.json",
       "bytes": 3041,
       "sha256": "b69bd9cd250fec1322559a4f62d94f0e92a4ab130b7f63ce6de57d48e1c584eb"
+    },
+    {
+      "path": "marketplace/agents/5a1d43c2f28a/agent.json",
+      "bytes": 4345,
+      "sha256": "22d6d5ba56ef8d246e04921057d875a131ab11aee7abfa4caaed3820b37e5ae6"
     },
     {
       "path": "marketplace/agents/5f890bd72ac4/agent.json",
@@ -453,6 +458,16 @@
       "sha256": "4add035f71b469c868a24e67eb3f6ec50f1652fc339cca09d64201bffb262acf"
     },
     {
+      "path": "marketplace/agents/a4930d19ba6c/agent.json",
+      "bytes": 4311,
+      "sha256": "5106262cd9d5e6f8dd2eaf59ae426acf17fc481793f70b6ea9eaba0c7b02f5a1"
+    },
+    {
+      "path": "marketplace/agents/bc7e2a904d18/agent.json",
+      "bytes": 2926,
+      "sha256": "f9e7ef3ff20612e5ffa7556561aefcfbdf7e58ad945ff5d6777bc15e55b746e8"
+    },
+    {
       "path": "marketplace/agents/bcfcb4921dce/agent.json",
       "bytes": 6039,
       "sha256": "893bf9c1a616a1506db86912ee2b9d34d016d8812f11e80842046b7b8d2d2e9e"
@@ -743,6 +758,16 @@
       "sha256": "e87478d14d8b78be5aac4c34dd63300befda341f0ae8e0c7de8e24d1b253cf0c"
     },
     {
+      "path": "marketplace/agents/e0f3a98c624b/agent.json",
+      "bytes": 3129,
+      "sha256": "7b09c0ccff99f4c6ffa23f41a2ee94aa3cc6083c4a282856d2d5bdb2787adfbc"
+    },
+    {
+      "path": "marketplace/agents/fa3e1f2f9e07/agent.json",
+      "bytes": 3347,
+      "sha256": "c0e97df11d0ded610462eb747b85f37b3fcaa3f5371bad60f64fc6a08ce7f362"
+    },
+    {
       "path": "marketplace/skills/081c15ffbab4/_meta.json",
       "bytes": 178,
       "sha256": "92b109893458932a1e830b410cd5d3c12ed768111563467b944cc9dd69f774a6"
@@ -818,6 +843,41 @@
       "sha256": "21298f89e81ae84363a1a8ef4d1dd6b71c6d494c3d648511c75a2b1023a2ac1c"
     },
     {
+      "path": "marketplace/skills/272355bc883d/_meta.json",
+      "bytes": 96,
+      "sha256": "6573bc20d2a77b6f4d893c44149e51356d1042a21b2ab018197ec8ec030b0e53"
+    },
+    {
+      "path": "marketplace/skills/272355bc883d/references/amazon-market-research.md",
+      "bytes": 1092,
+      "sha256": "d952dce2941df749d4125a0028991db8f03da6a53fe55355f4cfff9d89f62abb"
+    },
+    {
+      "path": "marketplace/skills/272355bc883d/references/china-platform-research.md",
+      "bytes": 1128,
+      "sha256": "9cb54c026868092de9c273429017fdee2f9d5151f575fefb24fd08a9f8353945"
+    },
+    {
+      "path": "marketplace/skills/272355bc883d/references/data-provenance-and-confidence.md",
+      "bytes": 4831,
+      "sha256": "12cfd379b967f76a78c53d1e6f217a1170d29bc60be31c3e7efaf881032570b4"
+    },
+    {
+      "path": "marketplace/skills/272355bc883d/references/product-research-output.md",
+      "bytes": 6447,
+      "sha256": "5ed429c97e597d1634d8b97c5ae3514c71a1851402710a85fea5c5308a3a0f45"
+    },
+    {
+      "path": "marketplace/skills/272355bc883d/references/product-selection-method.md",
+      "bytes": 5235,
+      "sha256": "a516e8c6626e944fe40c9e3c0cd04d1953877ef155a2898f383a1633fbe35120"
+    },
+    {
+      "path": "marketplace/skills/272355bc883d/SKILL.md",
+      "bytes": 4231,
+      "sha256": "76017b6c9fadde9a4129768253a04c5d75ee7a71f36a34ed3a674a8985b9afd6"
+    },
+    {
       "path": "marketplace/skills/36bd44ae956c/_meta.json",
       "bytes": 177,
       "sha256": "0c1d4a8bb1a74168e4673eb27b8c23afd15770e379cdcb35ba9608c662554f17"
@@ -826,6 +886,51 @@
       "path": "marketplace/skills/36bd44ae956c/SKILL.md",
       "bytes": 2858,
       "sha256": "fc6d3d9793d00ead20d67ceafb6c23f547e7dcef9abfc2a8503dddcdc0bf69bb"
+    },
+    {
+      "path": "marketplace/skills/59d186285161/_meta.json",
+      "bytes": 99,
+      "sha256": "7b8e1814e60855d95d136031baa2cbfb0a5d187bbb93a67fe2b2af88d105e7b0"
+    },
+    {
+      "path": "marketplace/skills/59d186285161/references/creative-compliance.md",
+      "bytes": 905,
+      "sha256": "ef092accf0963a5c858ce1420b4bc0799c2f847bc30fb456970df90a408fd34f"
+    },
+    {
+      "path": "marketplace/skills/59d186285161/references/creative-output-templates.md",
+      "bytes": 1015,
+      "sha256": "eed05b0345378e3d1b04ac502aae409f45592a61e85b95747a70a1951652ce63"
+    },
+    {
+      "path": "marketplace/skills/59d186285161/references/product-visual-prompts.md",
+      "bytes": 1203,
+      "sha256": "98fb6ee6a47d4eba7618421c561d393f84120a984fb423e4753cff955a00f794"
+    },
+    {
+      "path": "marketplace/skills/59d186285161/references/video-ad-storyboard.md",
+      "bytes": 3256,
+      "sha256": "13cb9c7d4bde8163a1729355f951bc933b2683b85f0db443210877988dcee7be"
+    },
+    {
+      "path": "marketplace/skills/59d186285161/references/visual-copywriting.md",
+      "bytes": 1075,
+      "sha256": "ba33c21bf9f8c03c9cb14c827f29571d5e721b5f40ea785069afab542a147236"
+    },
+    {
+      "path": "marketplace/skills/59d186285161/scripts/lib/narration-timing.cjs",
+      "bytes": 2741,
+      "sha256": "490d9a3840edf3710650e722de45928558f682a4bedbdc53db307511037052a9"
+    },
+    {
+      "path": "marketplace/skills/59d186285161/scripts/storyboard_timing.js",
+      "bytes": 4238,
+      "sha256": "3d9fffb122914669abe28d1e26e418b56ae18d62eab89e81a861a440c0e3d349"
+    },
+    {
+      "path": "marketplace/skills/59d186285161/SKILL.md",
+      "bytes": 1856,
+      "sha256": "c3c977d1ce61f16f83d7596abe6f27567cff98c93a8c2e102107bfe0f0472a2e"
     },
     {
       "path": "marketplace/skills/6743aa0797a2/_meta.json",
@@ -1083,6 +1188,86 @@
       "sha256": "b34ab09aad8700899072262597d9d6a1f543a113fef522614bc99f43e5c6bbd3"
     },
     {
+      "path": "marketplace/skills/c91a84e7b206/_meta.json",
+      "bytes": 96,
+      "sha256": "9b388284994dc1f7a0369074903320011f33b4f439934f3a396601312489f646"
+    },
+    {
+      "path": "marketplace/skills/c91a84e7b206/references/channel-mapping.md",
+      "bytes": 1356,
+      "sha256": "acab0ff597f712a4c0ccb005216185e1101ae8cb1287efdef0b9d14b3c62a0ab"
+    },
+    {
+      "path": "marketplace/skills/c91a84e7b206/references/metrics.md",
+      "bytes": 4189,
+      "sha256": "29b81037ed3aeb784b89bce6a9b0518c61fa8a56a44c82b0daacb8194bc0b183"
+    },
+    {
+      "path": "marketplace/skills/c91a84e7b206/SKILL.md",
+      "bytes": 1768,
+      "sha256": "a65e33f2bb7e3072e6f4e73f718d1277cc488a718438778716b5752da2bd3afe"
+    },
+    {
+      "path": "marketplace/skills/d47b20f9a631/_meta.json",
+      "bytes": 96,
+      "sha256": "36cb5682f92c8d2100d3905f86ce551015e353accec5c66d896e563cef2ec502"
+    },
+    {
+      "path": "marketplace/skills/d47b20f9a631/references/changes.md",
+      "bytes": 5227,
+      "sha256": "2ac0c8d2ab7cccad10aef37e751d0d0c930b29dd05d688cd9a07cc9c24fe66ce"
+    },
+    {
+      "path": "marketplace/skills/d47b20f9a631/SKILL.md",
+      "bytes": 1937,
+      "sha256": "a1ccb3cc8088c7ff4bde2568eb858dd918a5e5f353f8f992e8d7de47de8704ed"
+    },
+    {
+      "path": "marketplace/skills/de52c67d49dd/_meta.json",
+      "bytes": 97,
+      "sha256": "718b3b18cd4b62692d0fe00e040dd2046a7bb7a52c57309b0e13d92c39b40be0"
+    },
+    {
+      "path": "marketplace/skills/de52c67d49dd/references/amazon-listing-and-a-plus.md",
+      "bytes": 1162,
+      "sha256": "32f2a984edd9608d82e95cbb2919aab8fe0ba48fd874fde1b1af4385ea6f6e44"
+    },
+    {
+      "path": "marketplace/skills/de52c67d49dd/references/copy-constructor.md",
+      "bytes": 1647,
+      "sha256": "1bd7beca12fc9febb70b4dba508fbc4197d7bd6c845b4bd0eb8b718701e4b73f"
+    },
+    {
+      "path": "marketplace/skills/de52c67d49dd/references/cross-platform-listing.md",
+      "bytes": 2940,
+      "sha256": "6ecde4e3bd1c71a2a1dd335051fb31d7de9864b619aeb6659418c635c9532f6d"
+    },
+    {
+      "path": "marketplace/skills/de52c67d49dd/references/listing-compliance.md",
+      "bytes": 1347,
+      "sha256": "a17e306f6ff713459e57ad603ec17e3ea9d0a229782df467d078d688f3b08110"
+    },
+    {
+      "path": "marketplace/skills/de52c67d49dd/references/listing-output-templates.md",
+      "bytes": 613,
+      "sha256": "a9070ef113bca300a60102e908fc862cf5135f138af71650791275bb54d0b5ed"
+    },
+    {
+      "path": "marketplace/skills/de52c67d49dd/references/source-based-writing.md",
+      "bytes": 5741,
+      "sha256": "19525d8ea4593144162251e2396f3061064f03d5cbcc8da9f838ca71ab363b89"
+    },
+    {
+      "path": "marketplace/skills/de52c67d49dd/scripts/compose_copy.py",
+      "bytes": 3516,
+      "sha256": "cbc21be4e63201e64277f2d99cda787a02afae80e716554eb0054fbab0020eaa"
+    },
+    {
+      "path": "marketplace/skills/de52c67d49dd/SKILL.md",
+      "bytes": 1546,
+      "sha256": "abeaa45ef62e9ada863f19d14f11033f1b184ed7849748835ea58eda3bc2a3b5"
+    },
+    {
       "path": "marketplace/skills/e7f5c0e6f1be/_meta.json",
       "bytes": 145,
       "sha256": "516ee58dca1496ec7708e8c568740c4ed094b0ec698e516474a301c8f2f21613"
@@ -1131,6 +1316,36 @@
       "path": "marketplace/skills/e7f5c0e6f1be/test/test_missing_requests.py",
       "bytes": 4648,
       "sha256": "fb73b29362330a34f95e57b68b6626ffa61addaebc1e8ac1901326917f7d320a"
+    },
+    {
+      "path": "marketplace/skills/e8868f762c1d/_meta.json",
+      "bytes": 96,
+      "sha256": "63f70c030c4cac08709c1cd798952d80cc7a94889aae7588e84c4bcad81277f5"
+    },
+    {
+      "path": "marketplace/skills/e8868f762c1d/references/review-data-privacy.md",
+      "bytes": 2442,
+      "sha256": "a66e8921c4e5203ffd831e96edf9b05e20122b3d1b6dd74ce49855c2efb82861"
+    },
+    {
+      "path": "marketplace/skills/e8868f762c1d/references/root-cause-and-actions.md",
+      "bytes": 991,
+      "sha256": "13072eb9836008d9ea578554b01a0bf1dfc709fa26b8e5f85505356124b1f8fd"
+    },
+    {
+      "path": "marketplace/skills/e8868f762c1d/references/voc-output-templates.md",
+      "bytes": 1182,
+      "sha256": "47f63ac4e1ceb7a20d0696ddf58570da5f306ad844cd6f209d683a06932eb9aa"
+    },
+    {
+      "path": "marketplace/skills/e8868f762c1d/references/voc-taxonomy.md",
+      "bytes": 1489,
+      "sha256": "9454fc691502cfdc393259107af6de8711bfdbb78c3f14382a28b94d5b686807"
+    },
+    {
+      "path": "marketplace/skills/e8868f762c1d/SKILL.md",
+      "bytes": 1619,
+      "sha256": "19e232cf38a542a9a0b6822c08f7884962f708c2d68aa69fc797e9caea0d3c62"
     },
     {
       "path": "marketplace/skills/ee99fbb42964/_meta.json",
@@ -1685,6 +1900,21 @@
         "embedded_skills": []
       },
       {
+        "id": "5a1d43c2f28a",
+        "name": "ECommerceResearcher",
+        "version": "1.1.4",
+        "icon": "shopping-bag",
+        "color": "lime",
+        "updated_at": "2026-09-17T03:52:11.385Z",
+        "skill_list": [
+          "272355bc883d",
+          "6743aa0797a2",
+          "e7f5c0e6f1be",
+          "e8868f762c1d"
+        ],
+        "embedded_skills": []
+      },
+      {
         "id": "5f890bd72ac4",
         "name": "VoiceStudio",
         "version": "1.0.7",
@@ -1829,6 +2059,33 @@
         "embedded_skills": []
       },
       {
+        "id": "a4930d19ba6c",
+        "name": "ECommerceReviewer",
+        "version": "1.1.1",
+        "icon": "shopping-bag",
+        "color": "sky",
+        "updated_at": "2026-09-14T09:03:29.348Z",
+        "skill_list": [
+          "59d186285161",
+          "de52c67d49dd",
+          "e7f5c0e6f1be",
+          "e8868f762c1d"
+        ],
+        "embedded_skills": []
+      },
+      {
+        "id": "bc7e2a904d18",
+        "name": "ECommerceAnalyzer",
+        "version": "1.0.0",
+        "icon": "shopping-bag",
+        "color": "sky",
+        "updated_at": "2026-09-11T11:02:39.004Z",
+        "skill_list": [
+          "c91a84e7b206"
+        ],
+        "embedded_skills": []
+      },
+      {
         "id": "bcfcb4921dce",
         "name": "UIDesigner",
         "version": "1.3.39",
@@ -1901,6 +2158,32 @@
           "seo-schema",
           "seo-tech-audit"
         ]
+      },
+      {
+        "id": "e0f3a98c624b",
+        "name": "ECommerceOperator",
+        "version": "1.0.0",
+        "icon": "shopping-bag",
+        "color": "lime",
+        "updated_at": "2026-09-11T11:02:39.004Z",
+        "skill_list": [
+          "d47b20f9a631"
+        ],
+        "embedded_skills": []
+      },
+      {
+        "id": "fa3e1f2f9e07",
+        "name": "ECommerceWriter",
+        "version": "1.1.8",
+        "icon": "shopping-bag",
+        "color": "peach",
+        "updated_at": "2026-09-17T02:52:44.766Z",
+        "skill_list": [
+          "59d186285161",
+          "de52c67d49dd",
+          "e8868f762c1d"
+        ],
+        "embedded_skills": []
       }
     ],
     "marketplace_skills": [
@@ -1917,10 +2200,22 @@
         "updated_at": "2026-09-05T17:05:00.000Z"
       },
       {
+        "id": "272355bc883d",
+        "name": "ecommerce-product-research",
+        "version": "1.1.9",
+        "updated_at": "2026-09-16T13:18:00.000Z"
+      },
+      {
         "id": "36bd44ae956c",
         "name": "pdf-editing",
         "version": "1.0.8",
         "updated_at": "2026-09-15T09:12:53.592Z"
+      },
+      {
+        "id": "59d186285161",
+        "name": "ecommerce-creative",
+        "version": "1.1.5",
+        "updated_at": "2026-09-15T11:49:34.911624Z"
       },
       {
         "id": "6743aa0797a2",
@@ -1971,10 +2266,34 @@
         "updated_at": "2026-09-08T03:37:56.000Z"
       },
       {
+        "id": "c91a84e7b206",
+        "name": "ecommerce-analytics",
+        "version": "1.0.1",
+        "updated_at": "2026-09-12T03:21:47.770Z"
+      },
+      {
+        "id": "d47b20f9a631",
+        "name": "ecommerce-operations",
+        "version": "1.0.3",
+        "updated_at": "2026-09-12T03:32:09.066Z"
+      },
+      {
+        "id": "de52c67d49dd",
+        "name": "ecommerce-listing",
+        "version": "1.2.15",
+        "updated_at": "2026-09-17T02:52:44.766Z"
+      },
+      {
         "id": "e7f5c0e6f1be",
         "name": "social-data",
         "version": "1.0.9",
         "updated_at": "2026-09-15T09:12:53.592Z"
+      },
+      {
+        "id": "e8868f762c1d",
+        "name": "ecommerce-review-analysis",
+        "version": "1.1.3",
+        "updated_at": "2026-09-12T04:42:13.015Z"
       },
       {
         "id": "ee99fbb42964",

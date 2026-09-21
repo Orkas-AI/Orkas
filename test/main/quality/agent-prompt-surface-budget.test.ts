@@ -88,6 +88,14 @@ const RECORDED_CEILING: Readonly<Record<string, number>> = {
   OfficeWorker: 2_219,
   ContentWriter: 1_912,
   StockAnalyser: 4_725,
+  // Added as built-ins on 2026-09-21. Each ceiling is the measured resident
+  // surface plus about one percent; route-specific procedures remain in the
+  // six standalone ecommerce Skills shipped with them.
+  ECommerceResearcher: 2_569,
+  ECommerceReviewer: 2_568,
+  ECommerceOperator: 1_642,
+  ECommerceWriter: 1_605,
+  ECommerceAnalyzer: 1_445,
 };
 
 /** The corpus total matters on its own: eleven agents each creeping under their
@@ -96,7 +104,7 @@ const RECORDED_CEILING: Readonly<Record<string, number>> = {
 // 2026-09-15: routing descriptions lost 2,224 characters of duplicated prose;
 // lower the existing ceilings by that delta, preserving their prior headroom.
 // 2026-09-17: ProductDeveloper delegates execution procedures to product-dev.
-const RECORDED_CORPUS_CEILING = 45_379;
+const RECORDED_CORPUS_CEILING = 55_208;
 
 interface AgentSurface {
   name: string;
