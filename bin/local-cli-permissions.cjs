@@ -13,6 +13,64 @@ function isScopeName(value) {
 // Preserve the legacy filename/profile reader; empty scope lists require an
 // explicit reauthorize marker. Business calls never log in or replay themselves.
 const MAX_PENDING_SCOPES = 50;
+const LARK_ACCESS_RECOVERIES = new Set(['check_bot_availability', 'check_app_permissions', 'check_resource_access']);
+const LARK_IDENTITIES = new Set(['user', 'bot', 'unknown']);
+const LARK_PERMISSION_SUBTYPES = new Set(['missing_scope', 'token_scope_insufficient', 'app_scope_not_applied', 'access_denied']);
+
+// One latest reason per identity/recovery pair bounds the advisory ledger to
+// nine entries. No resource identifiers or provider prose are persisted.
+function larkAccessIssues(pending) {
+  if (!pending) return [];
+  const issues = new Map();
+  let unknown = !Array.isArray(pending.access_issues)
+    && (pending.unresolved_access === true || !pending.scopes.length);
+  if (Array.isArray(pending.access_issues)) {
+    for (const issue of pending.access_issues) {
+      if (!LARK_IDENTITIES.has(issue?.identity) || !LARK_ACCESS_RECOVERIES.has(issue?.recovery)) {
+        unknown = true;
+        continue;
+      }
+      const safe = { identity: issue.identity, recovery: issue.recovery,
+        ...(Number.isSafeInteger(issue.code) ? { code: issue.code } : {}),
+        ...(LARK_PERMISSION_SUBTYPES.has(issue.subtype) ? { subtype: issue.subtype } : {}) };
+      issues.set(`${safe.identity}:${safe.recovery}`, safe);
+    }
+    if (!issues.size && pending.unresolved_access) unknown = true;
+  }
+  if (unknown) issues.set('unknown:check_resource_access', { identity: 'unknown', recovery: 'check_resource_access' });
+  return [...issues.values()];
+}
+
+function rememberLarkPermissionRequest(error, env, file, prior) {
+  const failure = error.provider_error || {};
+  const identity = LARK_IDENTITIES.has(failure.identity) ? failure.identity : 'unknown';
+  const scopes = Array.isArray(failure.missing_scopes) ? failure.missing_scopes.filter(isScopeName) : [];
+  const recovery = failure.code === 230013 ? 'check_bot_availability'
+    : failure.subtype === 'app_scope_not_applied' || (identity === 'bot' && scopes.length)
+      ? 'check_app_permissions'
+      : identity === 'user' && scopes.length && failure.subtype !== 'access_denied'
+        ? 'reauthorize' : 'check_resource_access';
+  const value = { profile: env.ORKAS_LOCAL_CLI_PROFILE, reauthorize: true, revision: randomUUID(),
+    scopes: [...new Set([...(prior?.scopes || []), ...(recovery === 'reauthorize' ? scopes : [])])].sort(),
+    access_issues: larkAccessIssues(prior), unresolved_access: false };
+  if (recovery !== 'reauthorize') {
+    value.access_issues = larkAccessIssues({ ...value, access_issues: [...value.access_issues, {
+      identity, recovery, code: failure.code, subtype: failure.subtype,
+    }] });
+  }
+  if (value.scopes.length > MAX_PENDING_SCOPES) {
+    value.scopes = [];
+    value.access_issues = larkAccessIssues({ ...value, access_issues: [...value.access_issues,
+      { identity: 'unknown', recovery: 'check_resource_access' }] });
+  }
+  // Retain the legacy fields for old readers; new readers separate this advisory
+  // from user consent. Do not clear either state from a business success.
+  value.unresolved_access = value.access_issues.length > 0;
+  if (writePermissionRequest(file, value) && error.provider_error) {
+    error.provider_error.recovery = value.scopes.length || recovery !== 'reauthorize'
+      ? recovery : 'check_resource_access';
+  }
+}
 function permissionRequestPath(env) {
   return path.isAbsolute(env.ORKAS_LOCAL_CLI_RUNTIME_DIR || '') && env.ORKAS_LOCAL_CLI_PROFILE
     ? path.join(env.ORKAS_LOCAL_CLI_RUNTIME_DIR, '.orkas-user-permissions.json') : null;
@@ -45,6 +103,10 @@ function rememberPermissionRequest(error, env) {
   const file = permissionRequestPath(env);
   if (!file) return;
   const prior = readPermissionRequest(env);
+  if (env.ORKAS_LOCAL_CLI_PROVIDER === 'lark') {
+    rememberLarkPermissionRequest(error, env, file, prior);
+    return;
+  }
   const value = { profile: env.ORKAS_LOCAL_CLI_PROFILE, reauthorize: true, revision: randomUUID(), scopes: [...new Set([...(prior?.scopes || []), ...scopes])].sort(),
     unresolved_access: prior?.unresolved_access === true || (scopes.length === 0 && patScopes.length === 0) };
   if (patScopes.length || prior?.pat_scopes?.length) value.pat_scopes = [...new Set([...(prior?.pat_scopes || []), ...patScopes])].sort();
@@ -78,6 +140,22 @@ function recordUserScopeCheck(env, granted, expected, required) {
   if (!Array.isArray(granted) || !granted.every(isScopeName)) return;
   if (JSON.stringify(readPermissionRequest(env)) !== JSON.stringify(expected)) return;
   const scopes = [...new Set([...(expected?.scopes || []), ...required])].filter(scope => !granted.includes(scope)).sort();
+  if (env.ORKAS_LOCAL_CLI_PROVIDER === 'lark') {
+    let issues = larkAccessIssues(expected);
+    if (scopes.length > MAX_PENDING_SCOPES) issues = larkAccessIssues({ scopes: [], unresolved_access: true,
+      access_issues: [...issues, { identity: 'unknown', recovery: 'check_resource_access' }] });
+    if (!scopes.length && !issues.length) {
+      clearPermissionRequest(env, expected);
+      return;
+    }
+    const file = permissionRequestPath(env);
+    const remaining = scopes.length > MAX_PENDING_SCOPES ? [] : scopes;
+    if (!file || (JSON.stringify(expected?.scopes) === JSON.stringify(remaining)
+      && JSON.stringify(expected?.access_issues) === JSON.stringify(issues))) return;
+    writePermissionRequest(file, { profile: env.ORKAS_LOCAL_CLI_PROFILE, reauthorize: true,
+      revision: randomUUID(), scopes: remaining, access_issues: issues, unresolved_access: issues.length > 0 });
+    return;
+  }
   const unresolved = expected?.unresolved_access === true || (expected && !expected.scopes.length);
   if (!scopes.length && !unresolved) {
     clearPermissionRequest(env, expected);
@@ -148,9 +226,11 @@ function structuredPermissionFailure(result, provider) {
   if (!found && provider === 'xero' && result.status !== 0) {
     found = /^(?:\s*Error:\s*)?Xero API error \(403\)(?::|\s*$)/m.test(result.stderr || '');
   }
-  return found ? Object.assign(new Error('connector permission is insufficient; reauthorize this connector'), {
+  return found ? Object.assign(new Error(provider === 'lark'
+    ? 'connector permission is insufficient; check access to the affected resource'
+    : 'connector permission is insufficient; reauthorize this connector'), {
     code: 'connector_permission_denied', provider_error: { type: 'authorization', ...detail },
   }) : null;
 }
 
-module.exports = { isScopeName, readPermissionRequest, rememberPermissionRequest, clearPermissionRequest, recordUserScopeCheck, recordPatScopeGrant, structuredPermissionFailure };
+module.exports = { isScopeName, readPermissionRequest, rememberPermissionRequest, clearPermissionRequest, recordUserScopeCheck, recordPatScopeGrant, structuredPermissionFailure, larkAccessIssues };

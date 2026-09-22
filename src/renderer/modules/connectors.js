@@ -1147,6 +1147,9 @@ function _renderCatalogCard(entry, instance) {
   const installPhase = _localCliInstallPhases.get(e.id) || '';
   const installError = _localCliInstallErrors.get(e.id) || null;
   const permissionNotice = e.auth_mode === 'local_cli' && instance?.reauthorization_required;
+  const accessAdvisories = e.auth_mode === 'local_cli' && Array.isArray(instance?.access_advisories)
+    ? [...new Set(instance.access_advisories)].filter(kind =>
+      ['check_bot_availability', 'check_app_permissions', 'check_resource_access'].includes(kind)) : [];
 
   // The ⋯ menu lives on installed cards — it hosts the destructive disconnect action so it stays
   // one click away from accidental triggers. Un-connected / errored cards still surface the
@@ -1236,10 +1239,15 @@ function _renderCatalogCard(entry, instance) {
     </div>
     <div class="connector-card-desc muted"></div>
     ${permissionNotice ? '<div class="connector-card-unverified" data-role="permission-notice"></div>' : ''}
+    ${accessAdvisories.length ? '<div class="connector-card-unverified" data-role="access-notice"></div>' : ''}
     <div class="connector-card-foot">${cardBadgesHtml}${action}</div>
   `;
   card.querySelector('.connector-card-name').textContent = displayName;
   card.querySelector('.connector-card-desc').textContent = desc;
+  if (accessAdvisories.length) {
+    card.querySelector('[data-role="access-notice"]').textContent = accessAdvisories
+      .map(kind => t('connectors.permissions.' + kind)).join(' ');
+  }
   if (permissionNotice) {
     const scopes = Array.isArray(instance.missing_permissions) ? instance.missing_permissions : [];
     const permissionLabels = {

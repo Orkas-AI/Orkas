@@ -84,7 +84,9 @@ describe('ipc/connectors renderer DTO', () => {
     const entry = { id: 'feishu', auth_mode: 'local_cli' };
     const check = vi.fn(async () => undefined);
     vi.doMock('../../../src/main/features/connectors/local-cli', () => ({
-      checkLocalCliPermissions: check, localCliMissingPermissions: () => ['im:message.send_as_user'],
+      checkLocalCliPermissions: check, localCliPermissionRecovery: () => ({
+        missingPermissions: ['im:message.send_as_user'], accessAdvisories: [],
+      }),
     }));
     vi.doMock('../../../src/main/features/connectors', () => ({
       connectorCatalog: () => [entry], listInstances: () => [instance],
@@ -119,6 +121,28 @@ describe('ipc/connectors renderer DTO', () => {
     expect(_toClientInstanceForTest(instance, true, 'another-account').reauthorization_required).toBeUndefined();
     expect(_toClientInstanceForTest({ ...instance, id: 'lark' }, true, 'u-ipc').reauthorization_required).toBeUndefined();
     expect(_toClientInstanceForTest({ ...instance, origin: 'custom' }, true, 'u-ipc').reauthorization_required).toBeUndefined();
+  });
+
+  it.each(['legacy', 'bot', 'mixed'])('projects %s Lark access issues separately from user reauthorization', async variant => {
+    const runtime = await import('../../../src/main/features/connectors/local-cli');
+    const { _toClientInstanceForTest } = await import('../../../src/main/ipc/connectors');
+    const directory = runtime.localCliRuntimeDir('u-access', 'feishu');
+    fs.mkdirSync(directory, { recursive: true });
+    const issue = { identity: 'bot', recovery: 'check_bot_availability', code: 230013, private_detail: 'must-not-cross-ipc' };
+    fs.writeFileSync(path.join(directory, '.orkas-user-permissions.json'), JSON.stringify({
+      profile: runtime.localCliProfileName('u-access', 'feishu'), reauthorize: true, unresolved_access: true,
+      scopes: variant === 'mixed' ? ['im:message.send_as_user'] : [],
+      ...(variant === 'legacy' ? {} : { access_issues: [issue] }),
+    }));
+    const instance = { ...baseInstance({ kind: 'stdio' }), id: 'feishu', origin: undefined };
+    const dto = _toClientInstanceForTest(instance, true, 'u-access');
+    expect(dto.status.kind).toBe('connected');
+    expect(dto.reauthorization_required).toBe(variant === 'mixed' ? true : undefined);
+    expect(dto.access_advisories).toEqual([variant === 'legacy' ? 'check_resource_access' : 'check_bot_availability']);
+    expect(JSON.stringify(dto)).not.toMatch(/must-not-cross-ipc|230013|orkas-/);
+    expect(runtime.localCliMissingPermissions('u-access', 'feishu'))
+      .toEqual(variant === 'mixed' ? ['im:message.send_as_user'] : null);
+    expect(_toClientInstanceForTest(instance, true, 'other-account').access_advisories).toBeUndefined();
   });
 
   it('accepts OAuth start without waiting for the browser callback', async () => {

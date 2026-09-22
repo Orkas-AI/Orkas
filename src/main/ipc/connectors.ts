@@ -24,7 +24,7 @@ import type { ConnectorInstance, ConnectorStatus, ToolSchema } from '../features
 import { isConnectorEnabled, setConnectorEnabled } from '../features/component_enabled';
 import { catalogWithAvailability, isConnectorRuntimeEnabled } from '../features/connectors/availability';
 import { requireConnectorApiKey } from '../features/connectors/api-key';
-import { checkLocalCliPermissions, localCliMissingPermissions } from '../features/connectors/local-cli';
+import { checkLocalCliPermissions, localCliPermissionRecovery } from '../features/connectors/local-cli';
 
 /**
  * Renderer-safe view of a connector instance. The hydrated `ConnectorInstance`
@@ -54,6 +54,7 @@ interface ClientConnectorInstance {
   enabled?: boolean;
   reauthorization_required?: boolean;
   missing_permissions?: string[];
+  access_advisories?: string[];
 }
 
 function _safeTransportSummary(inst: ConnectorInstance): ClientConnectorInstance['transport'] | undefined {
@@ -101,11 +102,12 @@ function toClientInstance(inst: ConnectorInstance, enabled?: boolean, uid?: stri
   }
   if (typeof enabled === 'boolean') out.enabled = enabled;
   if (uid && inst.origin !== 'custom') {
-    const missing = localCliMissingPermissions(uid, inst.id);
-    if (missing !== null) {
+    const recovery = localCliPermissionRecovery(uid, inst.id);
+    if (recovery.missingPermissions !== null) {
       out.reauthorization_required = true;
-      out.missing_permissions = missing;
+      out.missing_permissions = recovery.missingPermissions;
     }
+    if (recovery.accessAdvisories.length) out.access_advisories = recovery.accessAdvisories;
   }
   return out;
 }

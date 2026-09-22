@@ -331,20 +331,17 @@ async function authorizeLark(node, npxCli, manifest, env, dependencies = {}) {
     const existingScopes = authorizationScopes();
     if (ready && !existingScopes) throw new Error('current user permissions could not be verified');
     const requestedScopes = [...new Set([...(existingScopes || []), ...pendingPermissions.scopes])].sort();
-    // A permission failure requires a real interactive login, including when the
-    // current token is valid or the provider supplied no missing scope list.
+    // An explicit authorization attempt preserves existing grants. Access
+    // advisories are independent of the verified user-consent result.
     await execute(pendingPermissions.scopes.length
       ? ['auth', 'login', '--profile', env.ORKAS_LOCAL_CLI_PROFILE, '--scope', requestedScopes.join(' ')]
       : [...commands[1], ...(requestedScopes.length ? ['--scope', requestedScopes.join(' ')] : [])]);
     if (!authorizationReady(requestedScopes)) {
       throw new Error('requested permissions are still unavailable');
     }
-    // Verified user scopes cannot establish bot visibility or unknown resource
-    // access. Keep that advisory, just as a read-only scope check does.
-    if (pendingPermissions.unresolved_access || !pendingPermissions.scopes.length) {
-      throw new Error('requested permissions could not be verified');
-    }
-    permissions.clearPermissionRequest(env, pendingPermissions);
+    // Verification establishes these user scopes, not bot/resource access.
+    // Keep unrelated advisories and any denial newer than this attempt.
+    permissions.recordUserScopeCheck(env, requestedScopes, pendingPermissions, []);
     return;
   }
 
