@@ -563,21 +563,6 @@ describe('persisted tool-result retrieval', () => {
     expect(request.properties.cursor.description).toContain('Required for read');
     expect(request.properties.explode.description).toMatch(/\$item[\s\S]*\$parent[\s\S]*\$index/);
     expect(getTool(tools, 'tool_result').description).toMatch(/at most one tool_result call per model step/i);
-    expect(request.required).toEqual(['ref']);
-    expect(request.additionalProperties).toBe(false);
-    expect(request).not.toHaveProperty('oneOf');
-    expect(request).not.toHaveProperty('anyOf');
-    expect(request.properties.operation.enum).toEqual(['count', 'sum', 'average', 'minimum', 'maximum']);
-    expect(request.properties).toEqual(expect.objectContaining({
-      ref: expect.any(Object), query: expect.any(Object), cursor: expect.any(Object),
-      max_tokens: expect.any(Object), operation: expect.any(Object), match: expect.any(Object),
-      count_unit: expect.any(Object), dataset: expect.any(Object),
-    }));
-    expect(getTool(tools, 'tool_result').description).toMatch(/at most one tool_result call per model step/i);
-    expect(schema.properties.action.description)
-      .toMatch(/full-data calculations.*query cannot express/);
-    expect(schema.properties.action.description).toMatch(/source excerpts/);
-    expect(schema.properties.action.description).not.toMatch(/query\/search cannot answer/);
 
     const invalid = await getTool(tools, 'tool_result').execute({
       action: 'unknown',

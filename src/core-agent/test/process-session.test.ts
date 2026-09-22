@@ -176,6 +176,7 @@ describe("persistent process sessions", () => {
   it("uses a portable schema and ignores startup fields on reads", async () => {
     const processSession = tool("process_session");
     const schema = processSession.inputSchema as any;
+
     expect(schema.oneOf).toBeUndefined();
     expect(schema.required).toEqual(["action", "session_id"]);
     const rejected = await processSession.execute({

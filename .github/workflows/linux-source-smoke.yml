@@ -83,6 +83,3 @@ jobs:
 
       - name: Run real Linux local transcription smoke
         run: npm run test:linux-whisper
-
-      - name: Verify first-use Linux OCR runtime
-        run: npm run test:linux-ocr

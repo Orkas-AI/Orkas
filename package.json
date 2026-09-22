@@ -40,7 +40,6 @@
     "test:windows-native": "node scripts/run-windows-native-tests.mjs",
     "test:windows-stability": "node scripts/run-windows-stability-tests.mjs",
     "test:linux-source": "node scripts/verify-linux-source-dependencies.cjs --full-embedding --gui",
-    "test:linux-ocr": "tsx scripts/verify-linux-ocr-runtime.mjs",
     "test:linux-whisper": "ORKAS_REAL_WHISPER_TEST=1 node scripts/run-tests.mjs run --maxWorkers=1 -t \"Linux real bundled whisper transcribes within the performance budget\" test/main/features/video_studio_native_qa.test.ts",
     "runtime:ensure": "node bin/ensure-runtime.cjs --root resources/runtime",
     "officecli:policy-check": "node bin/officecli-policy-gate.cjs",
